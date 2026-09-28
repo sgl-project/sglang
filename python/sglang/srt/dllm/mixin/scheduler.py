@@ -488,7 +488,7 @@ class DllmManager:
             queue = getattr(self, queue_name)
             kept_queue = []
             for req in queue:
-                if abort_all or req.rid.startswith(rid):
+                if abort_all or req.rid == rid:
                     req_id = id(req)
                     if req_id not in seen:
                         aborted_reqs.append(req)
