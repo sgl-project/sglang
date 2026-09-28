@@ -292,12 +292,12 @@ def _reserved_floor_bytes(sub_pool_specs: List[SubPoolSpec], page_size: int) -> 
     """Bytes at the bottom of the buffer reserved as the slot-0 padding sink.
 
     Slot-0 dummy writes for every sub-pool land here; each sub-pool's first
-    allocatable slot is chosen so real data starts past it. For a PAGE-AWARE
-    sub-pool the slot-0 write touches layer blocks spread across the whole
-    page-0 envelope (page_size * entry_bytes), not just one slot envelope --
-    but a mamba sub-pool is page_size=1, so its entry is charged ONCE. Charging
-    a mamba entry per page would reserve page_size * ~100 MB of buffer that the
-    sink never touches.
+    allocatable slot is chosen so real data starts past it. A slot-0 write
+    touches only slot 0's entry, but a PAGE-AWARE sub-pool allocates whole
+    pages, so its first allocatable page starts past all of page 0
+    (page_size * entry_bytes) -- while a mamba sub-pool is page_size=1, so its
+    entry is charged ONCE. Charging a mamba entry per page would reserve
+    page_size * ~100 MB of buffer that the sink never touches.
 
     Single source of truth: `UnifiedKVPool` reserves exactly this, and the
     factories' bs=1 feasibility floors charge exactly this.
@@ -389,9 +389,9 @@ class UnifiedKVPool:
 
         # Slot-0 dummy writes for both pools land in the reserved low-byte sink;
         # each pool's first allocatable slot is chosen so real data starts past it.
-        # For a page-aware sub-pool the slot-0 write touches layer blocks spread
-        # across the WHOLE page-0 envelope (up to page_size * entry_bytes), not
-        # just one slot envelope — reserve the max of both.
+        # A page-aware sub-pool allocates whole pages, so the sink is all of page
+        # 0 (up to page_size * entry_bytes), not one slot entry -- reserve the
+        # max of both.
         reserved_floor = _reserved_floor_bytes(self.sub_pool_specs, page_size)
 
         for spec in self.sub_pool_specs:

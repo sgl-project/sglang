@@ -671,9 +671,8 @@ def _validate_unified_memory_dcp(server_args: Any) -> None:
 
 
 def handle_page_major_kv_layout(server_args: Any):
-    # The unified pool stores state in the page-major envelope layout, so
-    # enabling it implies --enable-page-major-kv-layout — routing it through the
-    # single page-major path + stride-aware Triton asserts (set before the guard).
+    # --enable-unified-memory implies --enable-page-major-kv-layout, so the
+    # unified pool goes through this one gate (declared before the guard).
 
     cfg = resolving_view(server_args)
     if cfg.enable_unified_memory:
@@ -715,9 +714,8 @@ def handle_page_major_kv_layout(server_args: Any):
     #     snap).
     #   * MHA/SWA models: fa3 / fa4 / flashinfer / trtllm_mha alongside
     #     Triton. fa4 is the fa3 class.
-    #   * Without the unified pool, plain page-major stays Triton-only.
     # Names are the RESOLVED ids from attention_backends_of.
-    if cfg.enable_unified_memory and use_mla_backend(server_args):
+    if use_mla_backend(server_args):
         allowed_full = {
             "triton",
             "fa3",
@@ -727,7 +725,7 @@ def handle_page_major_kv_layout(server_args: Any):
             "tokenspeed_mla",
             "flashmla",
         }
-    elif cfg.enable_unified_memory:
+    else:
         allowed_full = {
             "triton",
             "fa3",
@@ -735,8 +733,6 @@ def handle_page_major_kv_layout(server_args: Any):
             "flashinfer",
             "trtllm_mha",
         }
-    else:
-        allowed_full = {"triton"}
     backends = set(attention_backends_of(resolved_view(server_args)))
     backends.discard(None)
     assert backends <= allowed_full, (

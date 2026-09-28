@@ -71,10 +71,10 @@ class Memory(msgspec.Struct):
     enable_page_major_kv_layout: A[
         bool,
         "Enable the page-major KV layout: lay out the Mamba state and full/SWA "
-        "KV caches in a page-granularity envelope (page is the outermost axis, "
-        "layer-major within a page) instead of the default per-layer "
-        "(layer-major) layout. Requires the Triton attention / linear-attn / "
-        "Mamba backends.",
+        "KV caches in a page-granularity envelope (page is the outermost axis; "
+        "within a page, each token's entry holds every layer's K/V) instead of "
+        "the default per-layer (layer-major) layout. Requires the Triton "
+        "attention / linear-attn / Mamba backends.",
     ] = False
     enable_unified_memory: A[
         bool,
