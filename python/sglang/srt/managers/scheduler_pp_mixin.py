@@ -55,6 +55,22 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
     )
 
 
+def _pp_exchange_outputs_before_forward(
+    cur_batch: Optional[ScheduleBatch],
+    spec_relay: bool,
+    is_last_rank: bool,
+    async_batch_depth: int,
+) -> bool:
+    """Extend microbatches launch first: they need nothing from the relay, and
+    exchanging first caps every stage at (pp_size - 1) / pp_size. A verify round
+    must exchange first or the ring deadlocks on its tree rebuild."""
+    if async_batch_depth > 0:
+        return True
+    if not spec_relay or is_last_rank or cur_batch is None:
+        return False
+    return not (cur_batch.forward_mode.is_extend() or cur_batch.is_extend_in_batch)
+
+
 @dataclass
 class PPBatchMetadata:
     can_run_cuda_graph: bool
@@ -131,15 +147,11 @@ class SchedulerPPMixin:
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
-                # With zero async depth, non-last speculative ranks must
-                # exchange the previous outputs before launching the next batch.
-                # Tree planning synchronizes CUDA on the host; sending alone
-                # leaves the peer's return send unmatched and can block that
-                # synchronization while the peer waits for our next proxy.
-                # The last rank must launch first to produce its output.
-                exchange_outputs_before_forward = (
-                    get_parallel().pp_async_batch_depth > 0
-                    or (self._pp_spec_relay and not self.pp_group.is_last_rank)
+                exchange_outputs_before_forward = _pp_exchange_outputs_before_forward(
+                    cur_batch=cur_batch,
+                    spec_relay=self._pp_spec_relay,
+                    is_last_rank=self.pp_group.is_last_rank,
+                    async_batch_depth=get_parallel().pp_async_batch_depth,
                 )
                 if exchange_outputs_before_forward:
                     next_pp_outputs, next_batch_result, d2h_event = (
@@ -815,7 +827,7 @@ class SchedulerPPMixin:
         p2p_work = []
         if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
             dp_offset = (
-                self.ps.attn_dp_rank
+                get_parallel().attn_dp_rank
                 * get_parallel().attn_cp_size
                 * get_parallel().attn_tp_size
             )
@@ -834,7 +846,7 @@ class SchedulerPPMixin:
     def _pp_recv_pyobj_from_prev_stage(self: Scheduler):
         if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
             dp_offset = (
-                self.ps.attn_dp_rank
+                get_parallel().attn_dp_rank
                 * get_parallel().attn_cp_size
                 * get_parallel().attn_tp_size
             )
