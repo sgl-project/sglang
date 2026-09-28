@@ -62,7 +62,10 @@ from sglang.srt.beam_search.output import (
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import (
+    MAX_DISAGG_TOKEN_IDS_LOGPROB,
+    DisaggregationMode,
+)
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
@@ -1442,6 +1445,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return
         if not isinstance(token_ids_logprob, list):
             raise ValueError("token_ids_logprob must be a flat list of integers.")
+        if (
+            len(token_ids_logprob) > MAX_DISAGG_TOKEN_IDS_LOGPROB
+            and self.disaggregation_mode != DisaggregationMode.NULL
+        ):
+            raise ValueError(
+                "token_ids_logprob exceeds disaggregation metadata capacity "
+                f"{MAX_DISAGG_TOKEN_IDS_LOGPROB}. Request fewer token IDs."
+            )
         vocab_size = self.model_config.vocab_size
         for token_id in token_ids_logprob:
             if not isinstance(token_id, int):

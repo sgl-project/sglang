@@ -2419,6 +2419,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             output_token_sampling_mask_len,
             output_token_sampling_mask_idx,
             output_token_sampling_logprobs,
+            output_token_ids_logprobs_val,
+            output_token_ids_logprobs_idx,
             output_topk_p,
             output_topk_index,
             output_hidden_states,
@@ -2490,6 +2492,22 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             decode_req.is_rebootstrap
             and decode_req.req.pd_rebootstrap_forced_output_id is not None
         )
+        if decode_req.req.return_logprob and not replayed_boundary:
+            token_ids = decode_req.req.logprob.token_ids_logprob
+            if token_ids is not None and not _is_fake_transfer(decode_req.req):
+                num_tokens = len(token_ids)
+                if (
+                    cached_tokens[7].item() != num_tokens
+                    or output_token_ids_logprobs_idx[:num_tokens].tolist() != token_ids
+                ):
+                    prepare_abort(
+                        decode_req.req,
+                        "Incomplete requested-token logprob metadata",
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+                    decode_req.kv_receiver.clear()
+                    decode_req.kv_receiver = None
+                    return
         if replayed_boundary:
             committed_output_id = decode_req.req.pd_rebootstrap_forced_output_id
             decode_req.req.pd_rebootstrap_forced_output_id = None
@@ -2554,6 +2572,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     : decode_req.req.logprob.top_logprobs_num
                 ].tolist()
             )
+            if decode_req.req.logprob.token_ids_logprob is not None:
+                num_tokens = len(decode_req.req.logprob.token_ids_logprob)
+                decode_req.req.logprob.output_token_ids_logprobs_val.append(
+                    output_token_ids_logprobs_val[:num_tokens].tolist()
+                )
+                decode_req.req.logprob.output_token_ids_logprobs_idx.append(
+                    output_token_ids_logprobs_idx[:num_tokens].tolist()
+                )
         if decode_req.req.return_sampling_mask:
             assert output_token_sampling_mask_idx is not None, (
                 "sampling mask buffer disabled on decode side"
