@@ -7,8 +7,8 @@
 //! built-in V4 chat formatter — the engine-equivalent path — with no template fixture.
 
 use sgl_router::config::{
-    ActiveLoadConfig, CacheAwareConfig, Config, DiscoveryBackend, ModelConfig, ObservabilityConfig,
-    PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
+    CacheAwareConfig, Config, DiscoveryBackend, InflightLoadConfig, ModelConfig,
+    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
 
 pub const MODEL: &str = "deepseek-v4-tiny";
@@ -37,11 +37,12 @@ pub fn config() -> Config {
             fused: None,
             eligibility: None,
             sampling_overrides: Default::default(),
+            default_chat_template_kwargs: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig::default(),
-        active_load: ActiveLoadConfig::default(),
+        router_inflight_load: InflightLoadConfig::default(),
     }
 }

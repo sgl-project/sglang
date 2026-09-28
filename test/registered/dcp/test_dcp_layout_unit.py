@@ -134,7 +134,9 @@ class TestFilterDcpLocalChunkKvIndices(CustomTestCase):
 
     def test_identity_without_dcp(self):
         kv = torch.arange(37)
-        with rc.get_parallel().override(dcp_enabled=False, dcp_size=1, dcp_rank=0):
+        with rc.get_parallel().override(
+            dcp_enabled=False, dcp_size=1, dcp_rank=0, attn_dcp_rank=0
+        ):
             self.assertIs(
                 filter_dcp_local_chunk_kv_indices(
                     kv, torch.tensor([0]), torch.tensor([37])

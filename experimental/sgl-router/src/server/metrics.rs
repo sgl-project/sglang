@@ -42,6 +42,7 @@
 //! | `sgl_router_cache_aware_decisions_total` | Counter | `model_id`, `decision` |
 //! | `sgl_router_diverted_overlap_blocks` | Histogram | `model_id` |
 //! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
+//! | `sgl_router_input_ids_forwarding_total` | Counter | `model_id`, `outcome` |
 //! | `sgl_router_sampling_contract_rejections_total` | Counter | `param` |
 //!
 //! `sgl_router_cache_aware_decisions_total` records exactly one decision per
@@ -83,6 +84,20 @@
 //!   hit-rate query must not absorb it, or a fully saturated fleet reads as a
 //!   healthy one.
 //!
+//! `sgl_router_input_ids_forwarding_total` records one outcome per dispatched
+//! `/v1/chat/completions` request, so `outcome!="forwarded"` over the sum is
+//! the share the engine tokenized itself:
+//!
+//! - `forwarded` — router-rendered `input_ids` replaced engine tokenization.
+//! - `disabled` — forwarding is off for the model (`--disable-input-ids-forwarding`,
+//!   or no chat formatter).
+//! - `ineligible_multimodal` — the chat carries image, video, or audio content
+//!   parts, which only the engine's multimodal processor can tokenize.
+//! - `ineligible` — the forwarding guard excluded some other request shape
+//!   (tools, non-string content, caller `input_ids`, template controls, ...).
+//! - `tokenize_failed` — eligible, but ingress rendering failed (the same
+//!   requests `sgl_router_ingress_tokenize_errors_total` counts).
+//!
 //! The four `sgl_router_worker*` gauges and `sgl_router_workers` are sampled
 //! at scrape time from the live [`crate::workers::WorkerRegistry`] (passed to
 //! [`MetricsRegistry::render_with_workers`]) rather than pushed — there is no
@@ -92,7 +107,7 @@
 //! The exposition is text/plain; version=0.0.4 per the Prometheus spec.
 
 use crate::config::PolicyKind;
-use crate::proxy::sse::StreamEnd;
+use crate::proxy::sse::{StreamEnd, StreamEndReason};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -223,6 +238,8 @@ pub struct RequestLogContext {
     /// line and `worker_requests_total` cannot disagree — the middleware can
     /// only see the status, which cannot express a router-side cancellation.
     pub outcome: RequestOutcome,
+    /// Router-minted engine ID, logged beside the caller's correlation ID.
+    pub engine_rid: Option<String>,
 }
 
 /// Final outcome of a 2xx SSE stream.
@@ -236,14 +253,19 @@ pub enum StreamOutcome {
     UpstreamError,
     /// The client disconnected before the stream finished.
     ClientDisconnect,
+    /// The router's stale-request deadline aborted the stream.
+    Expired,
 }
 
 pub(crate) fn classify_stream_end(end: StreamEnd) -> StreamOutcome {
-    match (end.transport_ok, end.saw_error_event, end.client_disconnect) {
-        (false, _, _) => StreamOutcome::UpstreamError,
-        (_, true, _) => StreamOutcome::StreamErrorEvent,
-        (_, _, true) => StreamOutcome::ClientDisconnect,
-        _ => StreamOutcome::Ok,
+    match end.reason {
+        StreamEndReason::Expired => StreamOutcome::Expired,
+        StreamEndReason::UpstreamError
+        | StreamEndReason::IdleTimeout
+        | StreamEndReason::PumpPanicked => StreamOutcome::UpstreamError,
+        _ if end.saw_error_event => StreamOutcome::StreamErrorEvent,
+        StreamEndReason::ClientDisconnect => StreamOutcome::ClientDisconnect,
+        StreamEndReason::Completed => StreamOutcome::Ok,
     }
 }
 
@@ -254,6 +276,7 @@ impl StreamOutcome {
             Self::StreamErrorEvent => "stream_error_event",
             Self::UpstreamError => "upstream_error",
             Self::ClientDisconnect => "client_disconnect",
+            Self::Expired => "expired",
         }
     }
 }
@@ -363,6 +386,29 @@ impl CacheAwareDecision {
     }
 }
 
+/// Whether a dispatched chat request carried router-rendered `input_ids` to
+/// the engine, and why not otherwise. See the module doc for each label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputIdsForwarding {
+    Forwarded,
+    Disabled,
+    Ineligible,
+    IneligibleMultimodal,
+    TokenizeFailed,
+}
+
+impl InputIdsForwarding {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Forwarded => "forwarded",
+            Self::Disabled => "disabled",
+            Self::Ineligible => "ineligible",
+            Self::IneligibleMultimodal => "ineligible_multimodal",
+            Self::TokenizeFailed => "tokenize_failed",
+        }
+    }
+}
+
 impl PolicySelectionFailureReason {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
@@ -375,12 +421,12 @@ impl PolicySelectionFailureReason {
 
 /// Active-load kind label — separates the two axes of per-worker load.
 #[derive(Debug, Clone, Copy)]
-pub enum ActiveLoadKind {
+pub enum RouterInflightLoadKind {
     PrefillTokens,
     DecodeBlocks,
 }
 
-impl ActiveLoadKind {
+impl RouterInflightLoadKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::PrefillTokens => "prefill_tokens",
@@ -408,7 +454,7 @@ pub struct MetricsRegistry {
     request_duration: Mutex<HashMap<String, Histogram>>,
     ttft_seconds: Mutex<HashMap<String, Histogram>>,
     stream_outcome_total: Mutex<HashMap<StreamOutcomeKey, Arc<AtomicU64>>>,
-    active_load: Mutex<HashMap<ActiveLoadKey, Arc<AtomicI64>>>,
+    router_inflight_load: Mutex<HashMap<RouterInflightLoadKey, Arc<AtomicI64>>>,
     stale_requests_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     decode_affinity_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     sticky_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
@@ -422,6 +468,7 @@ pub struct MetricsRegistry {
     cache_aware_decisions_total: Mutex<HashMap<CacheAwareDecisionKey, Arc<AtomicU64>>>,
     diverted_overlap_blocks: Mutex<HashMap<String, Histogram>>,
     ingress_tokenize_errors_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
+    input_ids_forwarding_total: Mutex<HashMap<InputIdsForwardingKey, Arc<AtomicU64>>>,
     sampling_contract_rejections_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
 }
 
@@ -470,12 +517,12 @@ pub struct WorkerSnapshot {
     pub healthy: bool,
     /// Circuit breaker state code: 0=closed, 1=open, 2=half_open.
     pub cb_state: u8,
-    /// In-flight request count for this worker (`Worker::active_load`).
+    /// In-flight request count for this worker (`Worker::router_inflight_load`).
     pub inflight: i64,
 }
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
-struct ActiveLoadKey {
+struct RouterInflightLoadKey {
     worker_url: String,
     kind: &'static str,
 }
@@ -490,6 +537,12 @@ struct PolicyDecisionKey {
 struct CacheAwareDecisionKey {
     model_id: String,
     decision: &'static str,
+}
+
+#[derive(Debug, Hash, Eq, PartialEq, Clone)]
+struct InputIdsForwardingKey {
+    model_id: String,
+    outcome: &'static str,
 }
 
 #[derive(Debug)]
@@ -657,12 +710,17 @@ impl MetricsRegistry {
 
     /// Set `sgl_router_active_load` for the given worker + kind. Replaces the
     /// previous value (gauge semantics).
-    pub fn set_active_load(&self, worker_url: &str, kind: ActiveLoadKind, value: i64) {
-        let key = ActiveLoadKey {
+    pub fn set_router_inflight_load(
+        &self,
+        worker_url: &str,
+        kind: RouterInflightLoadKind,
+        value: i64,
+    ) {
+        let key = RouterInflightLoadKey {
             worker_url: worker_url.to_owned(),
             kind: kind.as_str(),
         };
-        let mut guard = self.active_load.lock();
+        let mut guard = self.router_inflight_load.lock();
         let gauge = guard
             .entry(key)
             .or_insert_with(|| Arc::new(AtomicI64::new(0)))
@@ -810,6 +868,22 @@ impl MetricsRegistry {
         let mut guard = self.ingress_tokenize_errors_total.lock();
         let counter = guard
             .entry(model_id.to_owned())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_input_ids_forwarding_total{model_id,outcome}`
+    /// — exactly one call per dispatched chat request.
+    pub fn record_input_ids_forwarding(&self, model_id: &str, outcome: InputIdsForwarding) {
+        let key = InputIdsForwardingKey {
+            model_id: model_id.to_owned(),
+            outcome: outcome.as_str(),
+        };
+        let mut guard = self.input_ids_forwarding_total.lock();
+        let counter = guard
+            .entry(key)
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
             .clone();
         drop(guard);
@@ -984,13 +1058,13 @@ impl MetricsRegistry {
         }
         drop(guard);
 
-        // active_load gauge
+        // router_inflight_load gauge
         out.push_str(
             "# HELP sgl_router_active_load Per-worker active load (prefill_tokens or decode_blocks).\n",
         );
         out.push_str("# TYPE sgl_router_active_load gauge\n");
-        let guard = self.active_load.lock();
-        let mut entries: Vec<(&ActiveLoadKey, i64)> = guard
+        let guard = self.router_inflight_load.lock();
+        let mut entries: Vec<(&RouterInflightLoadKey, i64)> = guard
             .iter()
             .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
             .collect();
@@ -1277,6 +1351,27 @@ impl MetricsRegistry {
         }
         drop(guard);
 
+        // input_ids_forwarding_total
+        out.push_str(
+            "# HELP sgl_router_input_ids_forwarding_total Dispatched chat requests by whether router-rendered input_ids were forwarded to the engine (outcome=forwarded) or why not (disabled, ineligible_multimodal, ineligible, tokenize_failed).\n",
+        );
+        out.push_str("# TYPE sgl_router_input_ids_forwarding_total counter\n");
+        let guard = self.input_ids_forwarding_total.lock();
+        let mut entries: Vec<(&InputIdsForwardingKey, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by(|a, b| (&a.0.model_id, a.0.outcome).cmp(&(&b.0.model_id, b.0.outcome)));
+        for (key, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_input_ids_forwarding_total{{model_id=\"{}\",outcome=\"{}\"}} {}\n",
+                escape_label(&key.model_id),
+                key.outcome,
+                value,
+            ));
+        }
+        drop(guard);
+
         // sampling_contract_rejections_total
         out.push_str(
             "# HELP sgl_router_sampling_contract_rejections_total Requests refused by the fleet-wide sampling contract (--override-sampling-params under --sampling-param-conflict reject), by parameter.\n",
@@ -1495,22 +1590,26 @@ mod tests {
     fn stream_outcome_precedence() {
         use StreamOutcome::*;
 
-        for (transport_ok, saw_error_event, client_disconnect, expected) in [
-            (false, false, false, UpstreamError),
-            (false, false, true, UpstreamError),
-            (false, true, false, UpstreamError),
-            (false, true, true, UpstreamError),
-            (true, false, false, Ok),
-            (true, false, true, ClientDisconnect),
-            (true, true, false, StreamErrorEvent),
-            (true, true, true, StreamErrorEvent),
+        for (reason, expected) in [
+            (StreamEndReason::Completed, Ok),
+            (StreamEndReason::ClientDisconnect, ClientDisconnect),
+            (StreamEndReason::UpstreamError, UpstreamError),
+            (StreamEndReason::IdleTimeout, UpstreamError),
+            (StreamEndReason::PumpPanicked, UpstreamError),
+            (StreamEndReason::Expired, Expired),
         ] {
-            let end = StreamEnd {
-                transport_ok,
-                saw_error_event,
-                client_disconnect,
-            };
-            assert_eq!(classify_stream_end(end), expected, "{end:?}");
+            for saw_error_event in [false, true] {
+                let end = StreamEnd {
+                    reason,
+                    saw_error_event,
+                };
+                let expected = if saw_error_event && matches!(expected, Ok | ClientDisconnect) {
+                    StreamErrorEvent
+                } else {
+                    expected
+                };
+                assert_eq!(classify_stream_end(end), expected, "{end:?}");
+            }
         }
     }
 
@@ -1522,12 +1621,14 @@ mod tests {
         reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::StreamErrorEvent);
         reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::UpstreamError);
         reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::ClientDisconnect);
+        reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::Expired);
         let out = reg.render();
         for expected in [
             r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="ok"} 2"#,
             r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="stream_error_event"} 1"#,
             r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="upstream_error"} 1"#,
             r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="client_disconnect"} 1"#,
+            r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="expired"} 1"#,
         ] {
             assert_metric_line(&out, expected);
         }
@@ -1651,8 +1752,8 @@ mod tests {
     #[test]
     fn set_active_load_gauge_overwrites() {
         let reg = MetricsRegistry::new();
-        reg.set_active_load("http://w:30000", ActiveLoadKind::PrefillTokens, 100);
-        reg.set_active_load("http://w:30000", ActiveLoadKind::PrefillTokens, 250);
+        reg.set_router_inflight_load("http://w:30000", RouterInflightLoadKind::PrefillTokens, 100);
+        reg.set_router_inflight_load("http://w:30000", RouterInflightLoadKind::PrefillTokens, 250);
         let out = reg.render();
         assert!(out.contains(
             r#"sgl_router_active_load{worker_url="http://w:30000",kind="prefill_tokens"} 250"#,
@@ -1814,6 +1915,22 @@ mod tests {
             out.contains(r#"sgl_router_ingress_tokenize_errors_total{model_id="other"} 1"#),
             "expected other=1; got:\n{out}",
         );
+    }
+
+    #[test]
+    fn input_ids_forwarding_counter_labels_outcome() {
+        let reg = MetricsRegistry::new();
+        reg.record_input_ids_forwarding("tiny", InputIdsForwarding::Forwarded);
+        reg.record_input_ids_forwarding("tiny", InputIdsForwarding::Forwarded);
+        reg.record_input_ids_forwarding("tiny", InputIdsForwarding::Ineligible);
+        let out = reg.render();
+        assert!(out.contains("# TYPE sgl_router_input_ids_forwarding_total counter"));
+        for series in [
+            r#"sgl_router_input_ids_forwarding_total{model_id="tiny",outcome="forwarded"} 2"#,
+            r#"sgl_router_input_ids_forwarding_total{model_id="tiny",outcome="ineligible"} 1"#,
+        ] {
+            assert!(out.contains(series), "missing {series}; got:\n{out}");
+        }
     }
 
     #[test]

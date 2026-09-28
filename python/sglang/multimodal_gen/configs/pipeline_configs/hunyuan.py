@@ -169,3 +169,27 @@ class FastHunyuanConfig(HunyuanConfig):
             keep_resident_min_available_gb=60,
             keep_resident_components=("dit", "vae"),
         )
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.hunyuan import (
+        FastHunyuanSamplingParam,
+        HunyuanSamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=HunyuanSamplingParams,
+        pipeline_config_cls=HunyuanConfig,
+        hf_model_paths=[
+            "hunyuanvideo-community/HunyuanVideo",
+        ],
+        model_detectors=[lambda hf_id: "hunyuanvideo" in hf_id.lower()],
+    )
+    register_configs(
+        sampling_param_cls=FastHunyuanSamplingParam,
+        pipeline_config_cls=FastHunyuanConfig,
+        hf_model_paths=[
+            "FastVideo/FastHunyuan-diffusers",
+        ],
+    )
