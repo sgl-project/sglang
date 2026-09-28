@@ -38,6 +38,9 @@ from sglang.srt.layers.attention.linear.kernels.kda_triton import (  # noqa: E40
 from sglang.srt.layers.attention.linear.utils import (  # noqa: E402
     LinearAttnKernelBackend,
 )
+from sglang.srt.layers.attention.mamba.prefill_track_metadata import (  # noqa: E402
+    build_prefill_track_plan,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
 from sglang.srt.runtime_context import get_parallel  # noqa: E402
 from sglang.test.kits.attention_unittest.attention_methods.kda_attention import (  # noqa: E402
@@ -199,6 +202,120 @@ def test_kda_prefill_indexed_state_and_130_token_checkpoint(
         extend_seq_lens_cpu=[128],
     )
     torch.testing.assert_close(fi_track[0], prefix_state[0].float(), atol=0, rtol=0)
+
+
+def test_kda_prefill_dcp8_interior_checkpoint_after_cached_prefix():
+    torch.manual_seed(11)
+    prefix_len = 512
+    extend_len = 578
+    track_depth = 1024
+    track_seqlen = track_depth + 1
+    heads = 2
+    dim = 128
+
+    def randn(*shape, scale=1):
+        return torch.randn(*shape, device="cuda", dtype=torch.bfloat16) * scale
+
+    q = randn(1, extend_len, heads, dim, scale=0.01)
+    k = randn(1, extend_len, heads, dim, scale=0.01)
+    v = randn(1, extend_len, heads, dim, scale=0.01)
+    g = randn(1, extend_len, heads, dim, scale=0.1)
+    beta = randn(1, extend_len, heads)
+    initial = torch.randn(2, heads, dim, dim, device="cuda") * 0.01
+    slots = torch.tensor([1], device="cuda", dtype=torch.int32)
+    offsets = torch.tensor([0, extend_len], device="cuda", dtype=torch.int32)
+    batch = SimpleNamespace(
+        extend_seq_lens_cpu=[extend_len],
+        mamba_track_seqlens_cpu=[track_seqlen],
+        extend_prefix_lens_cpu=[prefix_len],
+        mamba_prefill_track_mask_cpu=[True],
+    )
+    host_plan = build_prefill_track_plan(
+        [True], [track_seqlen], [extend_len], [prefix_len], 64, mamba2=False
+    )
+    assert host_plan.chunk_indices == [8]
+    metadata = SimpleNamespace(
+        track_ssm_h_src=torch.tensor(host_plan.h_src, device="cuda"),
+        track_ssm_h_batch_src=torch.tensor(host_plan.unaligned_rows, device="cuda"),
+    )
+    build_flashinfer_kda_checkpoint_plan(batch, metadata, "cuda", 64)
+    assert metadata.state_checkpoint_cu_starts.tolist() == [0, 9]
+    assert metadata.num_state_checkpoints == 1
+    assert metadata.state_checkpoint_indices.tolist() == [-1] * 7 + [0, -1]
+
+    triton = TritonKDAKernel()
+    flashinfer = FlashInferKDAPrefillKernel(triton)
+    ref_state, fi_state = initial.clone(), initial.clone()
+    ref_track = torch.full((1, heads, dim, dim), torch.nan, device="cuda")
+    fi_track = torch.full_like(ref_track, torch.nan)
+    common = dict(
+        A_log=torch.zeros(heads, device="cuda"),
+        dt_bias=torch.zeros((heads, dim), device="cuda"),
+        lower_bound=-5.0,
+        beta_is_raw=True,
+        return_intermediate_states=True,
+        extend_seq_lens_cpu=[extend_len],
+        track_chunk_idx=torch.tensor(
+            host_plan.chunk_indices, device="cuda", dtype=torch.int32
+        ),
+    )
+    ref_output, _ = triton.extend(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        ssm_states=ref_state,
+        cache_indices=slots,
+        query_start_loc=offsets,
+        track_state=ref_track,
+        **common,
+    )
+    with patch.object(triton, "extend", side_effect=AssertionError("Triton fallback")):
+        fi_output, _ = flashinfer.extend(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ssm_states=fi_state,
+            cache_indices=slots,
+            query_start_loc=offsets,
+            track_state=fi_track,
+            state_checkpoint_cu_starts=metadata.state_checkpoint_cu_starts,
+            num_state_checkpoints=metadata.num_state_checkpoints,
+            state_checkpoint_every_n_tokens=metadata.state_checkpoint_every_n_tokens,
+            state_checkpoint_indices=metadata.state_checkpoint_indices,
+            track_ssm_h_batch_src=metadata.track_ssm_h_batch_src,
+            **common,
+        )
+
+    assert torch.isfinite(fi_track).all()
+    torch.testing.assert_close(
+        fi_output.float(), ref_output.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        fi_state.float(), ref_state.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(fi_track, ref_track, atol=1e-2, rtol=5e-2)
+
+    truncated_state = initial.clone()
+    flashinfer.extend(
+        q[:, :512],
+        k[:, :512],
+        v[:, :512],
+        g[:, :512],
+        beta[:, :512],
+        ssm_states=truncated_state,
+        cache_indices=slots,
+        query_start_loc=torch.tensor([0, 512], device="cuda", dtype=torch.int32),
+        A_log=common["A_log"],
+        dt_bias=common["dt_bias"],
+        lower_bound=-5.0,
+        beta_is_raw=True,
+        extend_seq_lens_cpu=[512],
+    )
+    torch.testing.assert_close(fi_track[0], truncated_state[1], atol=1e-2, rtol=5e-2)
 
 
 @pytest.mark.parametrize("lower_bound,num_tokens", [(None, 128), (-5.0, 1)])
