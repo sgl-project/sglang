@@ -8,6 +8,8 @@ import asyncio
 import json
 import logging
 import time
+
+from sglang.srt.observability.req_time_stats import monotonic_time
 from contextlib import AsyncExitStack
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, AsyncIterator, Optional, Union
@@ -287,6 +289,9 @@ class OpenAIServingResponses(OpenAIServingChat):
         request: ResponsesRequest,
         raw_request: Optional[Request] = None,
     ) -> Union[AsyncGenerator[str, None], ResponsesResponse, ORJSONResponse]:
+        # Timestamp at the HTTP entry; propagated to the internal request
+        # so trace/e2e latency covers responses-specific preprocessing.
+        received_time = monotonic_time()
         # Validate model
         if not self.tokenizer_manager:
             return self.create_error_response("Model not loaded")
@@ -561,6 +566,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         # background+stream streams on this connection, so don't detach.
                         background=request.background and not request.stream,
                         require_reasoning=require_reasoning,
+                        received_time=received_time,
                     )
 
                     generator = self._generate_with_builtin_tools(
@@ -2714,6 +2720,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 return_hidden_states=adapted_request.return_hidden_states,
                 background=adapted_request.background,
                 require_reasoning=adapted_request.require_reasoning,
+                received_time=adapted_request.received_time,
             )
 
             # Update sampling params with reduced max_tokens
