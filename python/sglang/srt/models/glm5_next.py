@@ -27,13 +27,13 @@ from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
-    LayerScatterModes,
+    LayerFacts,
+    MHCLayerCommunicator,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
     layer_input_buffer,
     reduce_output,
 )
-from sglang.srt.layers.communicator_mhc import MHCLayerCommunicator
 from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -730,7 +730,7 @@ class Glm5NextDecoderLayer(nn.Module):
         is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
         is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
 
-        self.layer_scatter_modes = LayerScatterModes.init_new(
+        self.layer_facts = LayerFacts.init_new(
             layer_id=layer_id,
             num_layers=1 if is_nextn else config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
@@ -788,7 +788,7 @@ class Glm5NextDecoderLayer(nn.Module):
             )
 
         shared_kwargs: Dict[str, Any] = dict(
-            layer_scatter_modes=self.layer_scatter_modes,
+            layer_facts=self.layer_facts,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
@@ -799,7 +799,6 @@ class Glm5NextDecoderLayer(nn.Module):
 
         if self.config.mhc:
             mhc_kwargs: Dict[str, Any] = dict(
-                is_first_layer=(self.layer_id == 0),
                 hc_mult=config.hc_mult,
                 hc_attn_pre=self.hc_attn_pre,
                 hc_ffn_pre=self.hc_ffn_pre,
@@ -937,7 +936,9 @@ class Glm5NextDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
-            layer_scatter_modes=self.layer_scatter_modes,
+            input_on_attention_tp_slices=(
+                self.layer_communicator.input_on_attention_tp_slices
+            ),
             prev_topk_indices=prev_topk_indices,
         )
         if isinstance(hidden_states, tuple):
@@ -1188,9 +1189,6 @@ class Glm5NextModel(nn.Module):
                 forward_batch=forward_batch,
                 hidden_states=hidden_states,
                 residual=residual,
-                input_data_scatter_mode=self.layers[
-                    normal_end_layer - 1
-                ].layer_scatter_modes.layer_output_mode,
                 zero_allocator=zero_allocator,
             )
 

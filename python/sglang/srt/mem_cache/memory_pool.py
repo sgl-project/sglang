@@ -1036,7 +1036,7 @@ class MambaPool:
         (``write_pos[src] == 0``). Only ``temporal`` is copied, not the ring, so
         an un-flushed source would drop its last ``write_pos`` updates. Callers
         comply: COW copies radix checkpoints; ``cache_unfinished_req`` copies an
-        active slot only during prefill (ring empty); ``cache_finished_req``
+        active slot only during prefill (ring empty); ``insert_req``
         caps the donate to the last flush boundary. The dst cursor is reset to 0
         (the copied checkpoint has no pending ring entries).
         """
