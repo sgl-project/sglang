@@ -32,6 +32,27 @@ from types import SimpleNamespace
 import torch
 import torch.multiprocessing as mp
 
+from sglang.srt.distributed import (
+    init_distributed_environment,
+    initialize_model_parallel,
+)
+from sglang.srt.mem_cache.allocator.page_interleave import (
+    PageInterleavePoolAllocator,
+)
+from sglang.srt.mem_cache.kv_cache_configurator import (
+    KVCacheConfigurator,
+    _PoolSizes,
+)
+from sglang.srt.mem_cache.page_interleave import PageShardSpec, get_kv_shard_group
+from sglang.srt.mem_cache.page_interleave_pool import (
+    PageInterleaveMHATokenToKVPool,
+    PageInterleaveMLATokenToKVPool,
+)
+from sglang.srt.runtime_context import get_context, publish
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.test.test_utils import publish_build_topology
+
 WORLD = 2
 PAGE_SIZE = 16
 SIZE = 32 * PAGE_SIZE  # Physical token capacity of each pool on each rank.
@@ -54,14 +75,6 @@ def _dist_init(rank, port, kind):
     os.environ.setdefault("no_proxy", "127.0.0.1,localhost")
     torch.cuda.set_device(rank)
 
-    from sglang.srt.distributed import (
-        init_distributed_environment,
-        initialize_model_parallel,
-    )
-    from sglang.srt.runtime_context import publish
-    from sglang.srt.server_args import ServerArgs
-    from sglang.test.test_utils import publish_build_topology
-
     init_distributed_environment(
         world_size=WORLD,
         rank=rank,
@@ -79,12 +92,6 @@ def _dist_init(rank, port, kind):
 
 
 def _make_pool(rank, group, kind, start_layer, layer_num):
-    from sglang.srt.mem_cache.page_interleave import PageShardSpec
-    from sglang.srt.mem_cache.page_interleave_pool import (
-        PageInterleaveMHATokenToKVPool,
-        PageInterleaveMLATokenToKVPool,
-    )
-
     kwargs = dict(
         size=SIZE,
         page_size=PAGE_SIZE,
@@ -127,13 +134,6 @@ def _buffers(pool, kind, local_layer):
 
 
 def _make_draft_pool(target, allocator, kind, start_layer):
-    from sglang.srt.mem_cache.kv_cache_configurator import (
-        KVCacheConfigurator,
-        _PoolSizes,
-    )
-    from sglang.srt.runtime_context import get_context
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-
     # Skip model loading while using the production pool dispatch and sharing
     # the target allocator. A replicated draft pool must fail this test.
     kvc = KVCacheConfigurator.__new__(KVCacheConfigurator)
@@ -298,11 +298,6 @@ def _check_scratch(pool, kind, locs, prefix_len, tag, local_layer):
 
 def _run(rank, port, kind):
     _dist_init(rank, port, kind)
-    from sglang.srt.mem_cache.allocator.page_interleave import (
-        PageInterleavePoolAllocator,
-    )
-    from sglang.srt.mem_cache.page_interleave import get_kv_shard_group
-
     group = get_kv_shard_group(use_mla_backend=kind == "mla")
     assert group.world_size == WORLD
     target = _make_pool(rank, group, kind, start_layer=0, layer_num=TARGET_LAYERS)

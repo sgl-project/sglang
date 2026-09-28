@@ -37,7 +37,12 @@ from typing import TYPE_CHECKING, Optional, Tuple
 import msgspec
 import torch
 
-from sglang.srt.runtime_context import get_parallel, get_schedule
+from sglang.srt.mem_cache import page_interleave_pool
+from sglang.srt.mem_cache.allocator.page_interleave import (
+    PageInterleavePoolAllocator,
+)
+from sglang.srt.runtime_context import get_parallel, get_schedule, get_spec
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -133,18 +138,12 @@ def get_shared_kv_shard_pool(
     if not kvc.is_draft_worker:
         return None
 
-    from sglang.srt.mem_cache.allocator.page_interleave import (
-        PageInterleavePoolAllocator,
-    )
-
     allocator = kvc.token_to_kv_pool_allocator
     if not isinstance(allocator, PageInterleavePoolAllocator):
         return None
 
-    from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
-
     pool = allocator.get_kvcache()
-    if not isinstance(pool, PageInterleaveKVPoolMixin):
+    if not isinstance(pool, page_interleave_pool.PageInterleaveKVPoolMixin):
         raise ValueError("A sharded MTP draft requires the target's sharded KV pool.")
     if (
         allocator.shard_spec != pool.shard_spec
@@ -241,9 +240,6 @@ def compute_page_shard_scratch_bytes(
         return 0
     scratch_bytes = 2 * spec.scratch_rows * _page_shard_row_bytes(kvc)
     if include_mtp:
-        from sglang.srt.runtime_context import get_spec
-        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-
         if (
             kvc.is_draft_worker
             or kvc.spec_algorithm != SpeculativeAlgorithm.EAGLE

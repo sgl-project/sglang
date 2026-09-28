@@ -31,6 +31,8 @@ arithmetic that rotated owner-classed allocation hangs on:
 5. ``begin_shard_extend`` plan capture (page positions, padded send rows,
    owner-congruence guard) with the gather stubbed out, following the
    SimpleNamespace binding pattern of ``test_dsa_layer_shard_utils.py``.
+6. MTP draft pool construction, shared allocator/layout validation, and scratch
+   sizing for separate target and draft pools.
 
 The second section (``TestPageInterleaveGatherMultiGpu``, at the bottom) drives
 real pools over a real 2-rank process group. It is the only check that the plan
@@ -71,12 +73,15 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import _evict_until_allocatable
+from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.page_interleave import (
     PageInterleavePlacement,
     PageShardSpec,
     compute_page_shard_scratch_bytes,
     get_kv_shard_group,
+    get_kv_shard_group_info,
+    get_shared_kv_shard_pool,
     make_page_shard_spec,
 )
 from sglang.srt.mem_cache.page_interleave_pool import (
@@ -87,8 +92,15 @@ from sglang.srt.mem_cache.page_interleave_pool import (
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.srt.runtime_context import get_parallel, publish
+from sglang.srt.runtime_context import (
+    get_context,
+    get_memory,
+    get_parallel,
+    get_spec,
+    publish,
+)
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import ceil_div
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.mem_cache_utils import finish_req
@@ -214,6 +226,28 @@ class TestPageShardScratchSizing(CustomTestCase):
         self.assertEqual(estimated, 2 * (8 * 65536 + 4096 + 16) * 32768)
         self.assertGreater(estimated, 64 << 20)
 
+    def test_target_with_mtp_budgets_one_extra_scratch_pair(self):
+        with (
+            self._fixture(context_len=100, chunk_tokens=64, shard_size=2) as kvc,
+            get_context().override_server_args(enable_multi_layer_eagle=False),
+        ):
+            kvc.spec_algorithm = SpeculativeAlgorithm.EAGLE
+            # Target configs can omit next-N layers; use the resolved draft count.
+            kvc.model_config.num_nextn_predict_layers = None
+            kvc.spec_aux_config = SimpleNamespace(eagle_draft_num_layers=1)
+            expected = 2 * (8 * 128 + 64 + 16) * (16 + 8) * 2
+            for layers in (1, 3):
+                with self.subTest(layers=layers):
+                    kvc.spec_aux_config.eagle_draft_num_layers = layers
+                    self.assertEqual(compute_page_shard_scratch_bytes(kvc), expected)
+                    self.assertEqual(
+                        compute_page_shard_scratch_bytes(kvc, include_mtp=True),
+                        2 * expected,
+                    )
+            kvc.spec_aux_config.eagle_draft_num_layers = None
+            with self.assertRaisesRegex(ValueError, "EAGLE MTP"):
+                compute_page_shard_scratch_bytes(kvc, include_mtp=True)
+
     def test_estimate_matches_actual_mla_and_gqa_scratch_tensors(self):
         for use_mla in (True, False):
             with (
@@ -241,6 +275,251 @@ class TestPageShardScratchSizing(CustomTestCase):
                     for tensor in tensors.values()
                 )
                 self.assertEqual(estimated, actual)
+
+
+def _make_mtp_configurator(use_mla=True):
+    # Keep real pool/allocator types for validation; allocate only CPU metadata.
+    pool_class = (
+        PageInterleaveMLATokenToKVPool if use_mla else PageInterleaveMHATokenToKVPool
+    )
+    target = pool_class.__new__(pool_class)
+    target.shard_spec = PageShardSpec(1, 2, 16, 128, 64)
+    target.shard_group = SimpleNamespace(rank_in_group=1, world_size=2)
+    target.size, target.page_size, target.dtype = 128, 16, torch.bfloat16
+    target.kv_lora_rank, target.qk_rope_head_dim = 8, 4
+    target.head_num, target.head_dim, target.v_head_dim = 2, 4, 6
+    kvc = KVCacheConfigurator.__new__(KVCacheConfigurator)
+    kvc.token_to_kv_pool_allocator = PageInterleavePoolAllocator(
+        size=target.size,
+        physical_page_size=target.page_size,
+        shard_size=target.shard_spec.shard_size,
+        dtype=target.dtype,
+        device="cpu",
+        kvcache=target,
+        need_sort=False,
+        shard_spec=target.shard_spec,
+    )
+    kvc.device = "cpu"
+    kvc.is_draft_worker = True
+    kvc.page_size = target.page_size
+    kvc.use_mla_backend = use_mla
+    kvc.kv_cache_dtype = target.dtype
+    kvc.kv_cache_dtype_str = "bfloat16"
+    kvc.spec_algorithm = SpeculativeAlgorithm.EAGLE
+    kvc.model_config = SimpleNamespace(
+        num_nextn_predict_layers=1,
+        context_len=9999,
+        kv_lora_rank=8,
+        qk_rope_head_dim=4,
+        head_dim=4,
+        v_head_dim=6,
+        get_num_kv_heads=lambda tp: 4 // tp,
+        hf_config=SimpleNamespace(architectures=["DeepseekV3ForCausalLM"]),
+    )
+    kvc.layer_info = SimpleNamespace(start_layer=5, end_layer=6, num_effective_layers=1)
+    kvc.is_hybrid_swa = False
+    kvc.sliding_window_size = None
+    kvc.mambaish_config = None
+    kvc.post_capture_kv_active = False
+    return kvc, target
+
+
+def _build_mtp_pool(kvc, *, capacity=128, is_dsa_model=False, is_dsv4_model=False):
+    return kvc._build_token_to_kv_pool(
+        sizes=SimpleNamespace(max_total_num_tokens=capacity),
+        is_dsa_model=is_dsa_model,
+        is_dsv4_model=is_dsv4_model,
+        req_to_token_pool=None,
+    )
+
+
+class TestMTPKVShardConfig(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        self.enterContext(
+            get_context().override_server_args(
+                page_size=16, chunked_prefill_size=1024, enable_multi_layer_eagle=False
+            )
+        )
+        self.enterContext(
+            get_parallel().override(
+                tp_size=2, attn_tp_size=2, moe_tp_size=2, attn_dcp_size=1
+            )
+        )
+
+    def test_draft_shares_target_layout_but_has_its_own_pool(self):
+        for use_mla in (True, False):
+            with self.subTest(use_mla=use_mla):
+                kvc, target = _make_mtp_configurator(use_mla)
+                pool_class = type(target)
+                # Mock allocation only; preserve real types and distinct instances.
+                with (
+                    unittest.mock.patch.object(
+                        pool_class, "__init__", return_value=None
+                    ) as init,
+                    unittest.mock.patch.object(
+                        page_interleave,
+                        "get_kv_shard_group",
+                        side_effect=AssertionError,
+                    ),
+                ):
+                    self.assertIs(get_shared_kv_shard_pool(kvc), target)
+                    self.assertEqual(get_kv_shard_group_info(kvc), (1, 2))
+                    self.assertIs(make_page_shard_spec(kvc), target.shard_spec)
+                    pool = _build_mtp_pool(kvc)
+                self.assertIsInstance(pool, pool_class)
+                self.assertIsNot(pool, target)
+                kwargs = init.call_args.kwargs
+                self.assertIs(kwargs["shard_spec"], target.shard_spec)
+                self.assertIs(kwargs["shard_group"], target.shard_group)
+                for name, expected in dict(
+                    size=128,
+                    page_size=16,
+                    dtype=torch.bfloat16,
+                    layer_num=1,
+                    start_layer=5,
+                    end_layer=6,
+                ).items():
+                    self.assertEqual(kwargs[name], expected, name)
+                allocator = kvc.token_to_kv_pool_allocator
+                self.assertIs(
+                    kvc._build_token_to_kv_pool_allocator(
+                        sizes=SimpleNamespace(max_total_num_tokens=128),
+                        token_to_kv_pool=pool,
+                        is_dsv4_model=False,
+                        req_to_token_pool=None,
+                        token_to_kv_pool_allocator=allocator,
+                    ),
+                    allocator,
+                )
+                # Scratch uses inherited bounds despite different draft context/chunk sizes.
+                row_bytes = (8 + 4) * 2 if use_mla else 2 * (4 + 6) * 2
+                self.assertEqual(
+                    compute_page_shard_scratch_bytes(kvc),
+                    2 * (128 + 64 + 16) * row_bytes,
+                )
+                with self.assertRaisesRegex(ValueError, "target"):
+                    compute_page_shard_scratch_bytes(kvc, include_mtp=True)
+
+    def test_without_shared_allocator_keeps_existing_pool(self):
+        for draft, allocator in ((True, None), (True, object()), (False, None)):
+            with self.subTest(draft=draft, allocator=allocator):
+                kvc, _ = _make_mtp_configurator()
+                kvc.is_draft_worker = draft
+                kvc.token_to_kv_pool_allocator = allocator
+                self.assertIsNone(get_shared_kv_shard_pool(kvc))
+                if draft:
+                    self.assertEqual(get_kv_shard_group_info(kvc), (None, 1))
+                    self.assertIsNone(make_page_shard_spec(kvc))
+                    self.assertEqual(compute_page_shard_scratch_bytes(kvc), 0)
+                with unittest.mock.patch.object(
+                    KVCacheConfigurator, "_build_mla_kv_pool"
+                ) as build:
+                    self.assertIs(_build_mtp_pool(kvc), build.return_value)
+                build.assert_called_once_with(max_total_num_tokens=128)
+
+    def test_rejects_invalid_shared_allocator(self):
+        kvc, _ = _make_mtp_configurator()
+        for name, value, message in (
+            ("_kvcache", object(), "target's sharded KV pool"),
+            ("shard_spec", PageShardSpec(0, 2, 16, 128, 64), "different shard layouts"),
+            ("shard_size", 4, "different shard layouts"),
+            ("page_size", 32, "different shard layouts"),
+            ("size", 128, "different shard layouts"),
+        ):
+            with (
+                self.subTest(attribute=name),
+                unittest.mock.patch.object(kvc.token_to_kv_pool_allocator, name, value),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                get_shared_kv_shard_pool(kvc)
+
+    def test_rejects_incompatible_pool_geometry(self):
+        for use_mla in (True, False):
+            kvc, _ = _make_mtp_configurator(use_mla)
+            geometry = (
+                ("kv_lora_rank", "qk_rope_head_dim")
+                if use_mla
+                else ("head_dim", "v_head_dim")
+            )
+            cases = [
+                (kvc, "page_size", 32, "physical page size"),
+                (kvc, "kv_cache_dtype", torch.float16, "geometry and dtype"),
+                (kvc, "use_mla_backend", not use_mla, "attention geometry"),
+                *(
+                    (kvc.model_config, field, 16, "geometry and dtype")
+                    for field in geometry
+                ),
+            ]
+            if not use_mla:
+                cases.append(
+                    (
+                        kvc.model_config,
+                        "get_num_kv_heads",
+                        lambda tp: 4,
+                        "geometry and dtype",
+                    )
+                )
+            for obj, name, value, message in cases:
+                with (
+                    self.subTest(use_mla=use_mla, attribute=name),
+                    unittest.mock.patch.object(obj, name, value),
+                    self.assertRaisesRegex(ValueError, message),
+                ):
+                    _build_mtp_pool(kvc)
+            for capacity in (64, 256):
+                with (
+                    self.subTest(use_mla=use_mla, capacity=capacity),
+                    self.assertRaisesRegex(ValueError, "same per-rank capacity"),
+                ):
+                    _build_mtp_pool(kvc, capacity=capacity)
+
+    def test_rejects_unsupported_draft_config(self):
+        kvc, _ = _make_mtp_configurator()
+        cases = [
+            (kvc, "spec_algorithm", algorithm, "EAGLE MTP")
+            for algorithm in (
+                SpeculativeAlgorithm.EAGLE3,
+                SpeculativeAlgorithm.DFLASH,
+                SpeculativeAlgorithm.FROZEN_KV_MTP,
+            )
+        ] + [
+            (kvc.model_config, "num_nextn_predict_layers", None, "EAGLE MTP"),
+            (kvc.model_config, "num_nextn_predict_layers", 0, "EAGLE MTP"),
+            (kvc, "is_hybrid_swa", True, "dense MLA and MHA"),
+            (kvc, "mambaish_config", object(), "dense MLA and MHA"),
+            (kvc, "sliding_window_size", 128, "dense MLA and MHA"),
+            (kvc, "post_capture_kv_active", True, "plain per-layer KV layout"),
+            (kvc, "kv_cache_dtype_str", "mxfp8", "plain per-layer KV layout"),
+        ]
+        for obj, name, value, message in cases:
+            with (
+                self.subTest(attribute=name, value=value),
+                unittest.mock.patch.object(obj, name, value),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                _build_mtp_pool(kvc)
+        for options in ({"is_dsa_model": True}, {"is_dsv4_model": True}):
+            with (
+                self.subTest(options=options),
+                self.assertRaisesRegex(ValueError, "dense MLA and MHA"),
+            ):
+                _build_mtp_pool(kvc, **options)
+        for context, options, message in (
+            (get_spec(), {"enable_multi_layer_eagle": True}, "EAGLE MTP"),
+            (get_parallel(), {"attn_dcp_size": 2}, "incompatible with DCP"),
+            (
+                get_memory(),
+                {"enable_page_major_kv_layout": True},
+                "plain per-layer KV layout",
+            ),
+        ):
+            with (
+                self.subTest(options=options),
+                context.override(**options),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                _build_mtp_pool(kvc)
 
 
 def _make_spec(shard_rank=0, max_prefix_groups=64, chunk_pages=32):
