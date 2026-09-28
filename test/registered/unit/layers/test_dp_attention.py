@@ -39,7 +39,7 @@ class TestSetDpBufferLenFromBatch(unittest.TestCase):
 
     def test_publishes_the_padded_list_and_this_ranks_entry(self):
         batch = _batch()
-        with get_parallel().override(attn_dp_rank=1):
+        with get_parallel().override(attn_dp_rank=1, attn_dp_size=2):
             set_dp_buffer_len_from_batch(batch)
         self.assertEqual(get_global_dp_buffer_len(), 8)
         self.assertEqual(get_local_dp_buffer_len(), 4)
@@ -56,7 +56,7 @@ class TestSetDpBufferLenFromBatch(unittest.TestCase):
             global_num_tokens_padded_cpu=None,
             dp_padding_mode=DpPaddingMode.SUM_LEN,
         )
-        with get_parallel().override(attn_dp_rank=0):
+        with get_parallel().override(attn_dp_rank=0, attn_dp_size=2):
             set_dp_buffer_len_from_batch(batch)
         self.assertEqual(get_local_dp_buffer_len(), 3)
         self.assertFalse(is_dp_max_padding())
