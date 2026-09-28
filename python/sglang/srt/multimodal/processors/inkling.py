@@ -78,7 +78,7 @@ def _resolve_media_item(item):
         url = getattr(item, "url")
     if not isinstance(url, str):
         return item
-    if not url:
+    if not url.strip():
         raise ValueError("empty image_url")
     try:
         if url.startswith("data:"):

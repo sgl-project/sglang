@@ -41,8 +41,11 @@ def _load_audio_bytes(audio) -> bytes:
         return audio.read()
     if isinstance(audio, str):
         path = audio[len("file://") :] if audio.startswith("file://") else audio
-        with open(path, "rb") as f:
-            return f.read()
+        try:
+            with open(path, "rb") as f:
+                return f.read()
+        except OSError as e:
+            raise ValueError(f"Could not read audio from path {path!r}: {e}") from e
     raise TypeError(
         f"Unsupported audio input type for Inkling audio extractor: {type(audio)}"
     )
@@ -56,9 +59,12 @@ def _to_exact_int(value: float, name: str, tolerance: float = 1e-6) -> int:
 
 
 def _decode_audio(audio_bytes: bytes, sample_rate: int) -> torch.Tensor:
-    samples, src_sample_rate = sf.read(
-        io.BytesIO(audio_bytes), dtype="float32", always_2d=True
-    )
+    try:
+        samples, src_sample_rate = sf.read(
+            io.BytesIO(audio_bytes), dtype="float32", always_2d=True
+        )
+    except sf.LibsndfileError as e:
+        raise ValueError(f"Could not decode audio: {e}") from e
     mono = samples.mean(axis=1)
     if src_sample_rate != sample_rate:
         mono = _resample(mono, src_sample_rate, sample_rate)

@@ -34,7 +34,11 @@ _pil_pool = ThreadPoolExecutor(max_workers=8)
 
 
 def _pil_decode(raw: bytes) -> np.ndarray:
-    return np.ascontiguousarray(np.array(Image.open(io.BytesIO(raw)).convert("RGB")))
+    try:
+        image = Image.open(io.BytesIO(raw)).convert("RGB")
+    except OSError as e:
+        raise ValueError(f"Could not decode image: {e}") from e
+    return np.ascontiguousarray(np.array(image))
 
 
 class InklingRustImageProcessor(BaseImageProcessor):

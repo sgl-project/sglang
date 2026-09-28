@@ -86,8 +86,11 @@ def _load_image_bytes(image) -> bytes:
                 "upstream (e.g. via SGLang load_mm_data) before preprocessing."
             )
         path = image[len("file://") :] if image.startswith("file://") else image
-        with open(path, "rb") as f:
-            return f.read()
+        try:
+            with open(path, "rb") as f:
+                return f.read()
+        except OSError as e:
+            raise ValueError(f"Could not read image from path {path!r}: {e}") from e
 
     from PIL import Image
 
