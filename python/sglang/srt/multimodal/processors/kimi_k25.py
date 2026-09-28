@@ -20,6 +20,9 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
+from sglang.srt.multimodal.processors.kimi_cache_config import (
+    validate_kimi_wide_pad_config,
+)
 from sglang.srt.multimodal.processors.kimi_common import KimiGridMMDataMixin
 from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
@@ -521,8 +524,10 @@ class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
     auto_mm_processor_worker_num = 2
     auto_mm_io_worker_num = 16
     supports_mm_processor_concurrency = True
+    uses_wide_image_identity = True
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+        validate_kimi_wide_pad_config(server_args)
         mm_tokens = MultimodalSpecialTokens(
             image_token="<|media_pad|>",
             # TODO: could we convert in MultimodalSpecialTokens?
@@ -556,6 +561,7 @@ class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
+        self.reject_caller_image_identity(image_data, request_obj)
         expected_image_count = len(image_data or [])
         placeholder_count = self.count_image_placeholders(
             input_text, self.mm_tokens.image_token_id

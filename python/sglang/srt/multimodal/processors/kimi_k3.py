@@ -17,13 +17,14 @@ import numpy as np
 import torch
 from PIL import Image
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
     MultimodalProcessorOutput,
 )
 from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
-from sglang.srt.multimodal.cache import resolve_multimodal_item_hash
+from sglang.srt.multimodal.cache import resolve_multimodal_item_hash, snapshot_media
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     DEFERRED_PREPROCESSING_KEY,
     KimiK3DeferredPreprocessing,
@@ -49,7 +50,13 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
-from sglang.srt.multimodal.processors.kimi_common import KimiGridMMDataMixin
+from sglang.srt.multimodal.processors.kimi_cache_config import (
+    validate_kimi_wide_pad_config,
+)
+from sglang.srt.multimodal.processors.kimi_common import (
+    KimiGridMMDataMixin,
+    kimi_image_identity,
+)
 from sglang.srt.multimodal.processors.kimi_k25 import (
     KimiGPUProcessorWrapper,
     _get_image_dimensions,
@@ -381,8 +388,10 @@ class KimiK3ImageProcessor(
     auto_mm_preprocess_cache_size_mb = 256
     supports_mm_processor_concurrency = True
     preserve_processor_input_ids = True
+    uses_wide_image_identity = True
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+        validate_kimi_wide_pad_config(server_args)
         mm_tokens = MultimodalSpecialTokens(
             image_token="<|media_pad|>",
             image_token_id=hf_config.media_placeholder_token_id,
@@ -487,6 +496,7 @@ class KimiK3ImageProcessor(
             )
             items.append(item)
 
+        self.assign_kimi_image_identities(items, base_output.images)
         self._precompute_hashes_before_cpu_transfer(items)
         return MultimodalProcessorOutput(
             input_ids=input_ids.flatten().tolist(),
@@ -644,7 +654,12 @@ class KimiK3ImageProcessor(
                 offsets=[offset],
                 model_specific_data=model_specific_data,
             )
-            item.set_hash(artifact.feature_hash)
+            if envs.SGLANG_MM_SKIP_COMPUTE_HASH.get():
+                item.set_hash(artifact.feature_hash)
+            else:
+                item.set_identity(
+                    kimi_image_identity(artifact.artifact_key, artifact.grid_thw)
+                )
             if self.keep_mm_features_on_device and item.feature is not None:
                 item.model_specific_data[DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY] = (
                     True
@@ -703,6 +718,10 @@ class KimiK3ImageProcessor(
             im_token_id=self.mm_tokens.image_token_id,
         )
 
+    def kimi_content_config_digest(self, media) -> str:
+        self._kimi_config_fingerprint()
+        return self._artifact_key(snapshot_media(media).content_digest, media)
+
     async def process_mm_data_async(
         self,
         image_data: List[Union[str, bytes, Dict]],
@@ -713,6 +732,7 @@ class KimiK3ImageProcessor(
     ):
         if request_obj.video_data or kwargs.get("audio_data"):
             raise ValueError("Kimi-K3 supports image input only")
+        self.reject_caller_image_identity(image_data, request_obj)
 
         expected_image_count = len(image_data or [])
         placeholder_count = self.count_image_placeholders(
