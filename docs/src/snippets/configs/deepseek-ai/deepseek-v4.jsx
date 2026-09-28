@@ -221,10 +221,10 @@ sgl-eval run mmmu_pro \\
     gb300: "lmsysorg/sglang:latest",
     // AMD daily-updated lmsysorg/sglang-rocm images. Bump the dated tag when you
     // re-verify on a newer build.
-    // Pro Official's DSpark PD + UMBP pairs ran end-to-end on this build.
+    // Pro Official agentic + DSpark PD + UMBP pairs ran end-to-end on this build.
     "mi355x|pro-official|fp4": "lmsysorg/sglang-rocm:v0.5.20-rocm720-mi35x-20260923",
-    mi300x: "lmsysorg/sglang-rocm:v0.5.19-rocm720-mi30x-20260914",
-    mi355x: "lmsysorg/sglang-rocm:v0.5.19-rocm720-mi35x-20260914",
+    mi300x: "lmsysorg/sglang-rocm:v0.5.20-rocm720-mi30x-20260926",
+    mi355x: "lmsysorg/sglang-rocm:v0.5.20-rocm720-mi35x-20260926",
   },
 
   // Pre-selects the issue template's `model` dropdown on "Submit verified cell".

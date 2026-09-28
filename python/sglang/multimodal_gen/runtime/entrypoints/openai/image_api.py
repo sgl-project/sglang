@@ -25,6 +25,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
     generate_request_id,
 )
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.entrypoints.openai.prompt_enhancement import (
     maybe_enhance_prompt,
 )
@@ -84,6 +85,14 @@ def _image_request_model_kwargs(
 def _runtime_sampling_quality(quality: str | None) -> str | None:
     """Keep OpenAI's automatic default out of SGLang's sampling contract."""
     return None if quality in (None, "auto") else quality
+
+
+def _resolve_image_output_format(
+    output_format: str | None, sampling_params_cls: type[SamplingParams]
+) -> str | None:
+    if output_format is not None:
+        return output_format
+    return sampling_params_cls.default_image_output_format()
 
 
 def _read_b64_for_paths(paths: list[str]) -> list[str]:
@@ -271,10 +280,8 @@ async def generations(
     server_args = get_global_server_args()
     sampling_params_cls = resolve_sampling_params_cls(server_args)
     model_kwargs = _image_request_model_kwargs(request, sampling_params_cls)
-    output_format = (
-        request.output_format
-        if request.output_format is not None
-        else sampling_params_cls.default_image_output_format()
+    output_format = _resolve_image_output_format(
+        request.output_format, sampling_params_cls
     )
     ext = choose_output_image_ext(output_format, request.background)
     prompt = await maybe_enhance_prompt(
@@ -285,6 +292,8 @@ async def generations(
         sampling = build_sampling_params(
             request_id,
             prompt=prompt,
+            task_type=request.task_type,
+            request_data_type=DataType.IMAGE,
             size=request.size,
             width=request.width,
             height=request.height,
@@ -413,6 +422,7 @@ async def edits(
     enhance_prompt: bool = Form(False),
     mask: Optional[UploadFile] = File(None),
     model: Optional[str] = Form(None),
+    task_type: Optional[str] = Form(None),
     n: Optional[int] = Form(1),
     response_format: Optional[str] = Form(None),
     size: Optional[str] = Form(None),
@@ -437,6 +447,8 @@ async def edits(
 ):
     request_id = generate_request_id()
     server_args = get_global_server_args()
+    sampling_params_cls = resolve_sampling_params_cls(server_args)
+    output_format = _resolve_image_output_format(output_format, sampling_params_cls)
     # Resolve images from either `image` or `image[]` (OpenAI SDK sends `image[]` when list is provided)
     images = image or image_array
     urls = url or url_array
@@ -481,6 +493,8 @@ async def edits(
         sampling = build_sampling_params(
             request_id,
             prompt=prompt,
+            task_type=task_type,
+            request_data_type=DataType.IMAGE,
             size=size,
             num_outputs_per_prompt=max(1, min(int(n or 1), 10)),
             output_file_name=f"{request_id}.{ext}",
