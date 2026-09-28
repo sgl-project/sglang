@@ -871,7 +871,9 @@ impl KvEventIndex {
     ///
     /// `max_age` is the oldest export this requester can use — see
     /// [`PRODUCER_CACHE_TTL`] for why a fixed TTL cannot answer this and the
-    /// consumer can. A cached entry is reused only if it meets the requirement.
+    /// consumer can. It is pinned to an absolute instant on ARRIVAL, before the
+    /// cache lock: "exported after `now - max_age`". A cached entry is reused
+    /// only if it was exported after that instant.
     ///
     /// # Single-flight, without spending threads on it
     ///
@@ -879,10 +881,19 @@ impl KvEventIndex {
     /// scale-up has every new replica asking at once, and serialising the
     /// builders means the fleet pays one walk per generation of requesters
     /// rather than one per requester. Waiters re-check against their OWN
-    /// `max_age` after acquiring, so a build that started after a waiter began
-    /// holding satisfies it and it returns without a second walk; one that
-    /// started before does not, and that waiter builds. The herd therefore costs
-    /// a walk per build-duration of arrival spread, not a walk per member.
+    /// pinned instant after acquiring, so a build that started after the
+    /// instant a waiter demands satisfies it and it returns without a second
+    /// walk; one that started before does not, and that waiter builds. The herd
+    /// therefore costs a walk per build-duration of arrival spread, not a walk
+    /// per member.
+    ///
+    /// Pinning on arrival is what makes that true. Re-deriving the age after
+    /// the lock would charge a waiter for the time it spent queued behind the
+    /// very build it wants: a build that started after the demanded instant,
+    /// but less than its lock wait ago, would read as too old. With consumers
+    /// demanding an export newer than their last answer from this peer (see
+    /// the sweep's `export_floor`), that turned every waiter behind a
+    /// multi-second walk into a walk of its own.
     ///
     /// Both halves of that serialisation must yield, because this runs on the
     /// runtime that also proxies requests, and the requesters are a boot herd
@@ -1044,9 +1055,13 @@ impl KvEventIndex {
     }
 
     async fn snapshot_entry(&self, max_age: Duration) -> (Arc<PeerSnapshot>, Bytes) {
+        // Pinned BEFORE the lock; see "Single-flight" on `peer_snapshot_body`.
+        // `None` — an age reaching back past this process's clock origin —
+        // accepts any cached export, which is what such an age means.
+        let exported_after = Instant::now().checked_sub(max_age);
         let mut cache = self.snapshot_cache.lock().await;
         if let Some(c) = cache.as_ref() {
-            if c.exported_at.elapsed() < max_age {
+            if exported_after.is_none_or(|after| c.exported_at > after) {
                 return (Arc::clone(&c.snap), c.body.clone());
             }
         }
@@ -1878,9 +1893,11 @@ impl SweepState {
     /// transit latency, and forces the peer to take a fresh one.
     ///
     /// Only re-fetches ratchet, and only as often as cooldown lets this peer
-    /// be asked. The producer's single-flight is untouched: requesters still
-    /// share any build that started after the instant each demands, so a boot
-    /// herd still pays about one walk per build-duration of arrival spread.
+    /// be asked. Requesters still share any build that started after the
+    /// instant each demands, however long they queue behind it, because the
+    /// producer pins that instant on arrival (see
+    /// `KvEventIndex::peer_snapshot_body`) — so a herd re-fetching one peer
+    /// still pays about one walk per build-duration of arrival spread.
     fn export_floor(&self, peer: &str, floor: Instant) -> Instant {
         self.received_at
             .get(peer)
@@ -3482,6 +3499,59 @@ mod tests {
         assert!(
             exported_at >= before && exported_at <= after,
             "the stamp must sit inside the build, at its start",
+        );
+    }
+
+    /// Single-flight under the freshness ratchet: a herd that arrives while a
+    /// build is in flight — each demanding an export newer than an instant
+    /// before that build started — must be served by that one build, however
+    /// long it waits for the lock. Re-deriving the age after the lock charged
+    /// the wait to the requester, so each waiter behind a multi-second walk
+    /// ran a walk of its own.
+    #[tokio::test]
+    async fn one_build_serves_a_herd_that_arrived_while_it_ran() {
+        let index = KvEventIndex::new();
+        let demanded = Instant::now();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        // A build in flight: the builder holds the cache lock from before it
+        // stamps `exported_at` until it stores the entry — exactly this.
+        let mut building = index.snapshot_cache.lock().await;
+        let exported_at = Instant::now();
+        let herd: Vec<_> = (0..4)
+            .map(|_| {
+                let index = Arc::clone(&index);
+                // Each asks, on arrival, for an export newer than `demanded`.
+                tokio::spawn(async move { index.peer_snapshot_body(demanded.elapsed()).await })
+            })
+            .collect();
+        // The walk: long against the few ms between `demanded` and the build.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let marker = Bytes::from_static(b"the one build");
+        *building = Some(CachedSnapshot {
+            exported_at,
+            snap: Arc::new(index.not_ready_snapshot()),
+            body: marker.clone(),
+        });
+        drop(building);
+
+        for member in herd {
+            assert_eq!(
+                member.await.unwrap(),
+                marker,
+                "a build that started after the demanded instant must serve the herd",
+            );
+        }
+        assert_eq!(
+            index
+                .snapshot_cache
+                .lock()
+                .await
+                .as_ref()
+                .unwrap()
+                .exported_at,
+            exported_at,
+            "no member of the herd walked again",
         );
     }
 
