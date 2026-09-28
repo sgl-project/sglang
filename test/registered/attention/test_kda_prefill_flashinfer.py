@@ -246,8 +246,7 @@ def test_kda_prefill_dcp8_interior_checkpoint_after_cached_prefix():
     triton = TritonKDAKernel()
     flashinfer = FlashInferKDAPrefillKernel(triton)
     ref_state, fi_state = initial.clone(), initial.clone()
-    ref_track = torch.full((1, heads, dim, dim), torch.nan, device="cuda")
-    fi_track = torch.full_like(ref_track, torch.nan)
+    fi_track = torch.full((1, heads, dim, dim), torch.nan, device="cuda")
     common = dict(
         A_log=torch.zeros(heads, device="cuda"),
         dt_bias=torch.zeros((heads, dim), device="cuda"),
@@ -259,7 +258,11 @@ def test_kda_prefill_dcp8_interior_checkpoint_after_cached_prefix():
             host_plan.chunk_indices, device="cuda", dtype=torch.int32
         ),
     )
-    ref_output, _ = triton.extend(
+    ref_common = {
+        key: value for key, value in common.items() if key != "track_chunk_idx"
+    }
+    ref_common["return_intermediate_states"] = False
+    ref_output = triton.extend(
         q,
         k,
         v,
@@ -268,8 +271,7 @@ def test_kda_prefill_dcp8_interior_checkpoint_after_cached_prefix():
         ssm_states=ref_state,
         cache_indices=slots,
         query_start_loc=offsets,
-        track_state=ref_track,
-        **common,
+        **ref_common,
     )
     with patch.object(triton, "extend", side_effect=AssertionError("Triton fallback")):
         fi_output, _ = flashinfer.extend(
@@ -297,11 +299,6 @@ def test_kda_prefill_dcp8_interior_checkpoint_after_cached_prefix():
     torch.testing.assert_close(
         fi_state.float(), ref_state.float(), atol=1e-2, rtol=1e-2
     )
-    track_relative_error = torch.linalg.vector_norm(fi_track - ref_track) / (
-        torch.linalg.vector_norm(ref_track) + 1e-12
-    )
-    assert track_relative_error < 5e-2
-
     truncated_state = initial.clone()
     flashinfer.extend(
         q[:, :512],
@@ -322,6 +319,26 @@ def test_kda_prefill_dcp8_interior_checkpoint_after_cached_prefix():
         fi_track[0] - truncated_state[1]
     ) / (torch.linalg.vector_norm(truncated_state[1]) + 1e-12)
     assert truncated_relative_error < 5e-2
+
+    triton_truncated_state = initial.clone()
+    triton.extend(
+        q[:, :512],
+        k[:, :512],
+        v[:, :512],
+        g[:, :512],
+        beta[:, :512],
+        ssm_states=triton_truncated_state,
+        cache_indices=slots,
+        query_start_loc=torch.tensor([0, 512], device="cuda", dtype=torch.int32),
+        A_log=common["A_log"],
+        dt_bias=common["dt_bias"],
+        lower_bound=-5.0,
+        beta_is_raw=True,
+        extend_seq_lens_cpu=[512],
+    )
+    torch.testing.assert_close(
+        fi_track[0], triton_truncated_state[1], atol=1e-5, rtol=5e-2
+    )
 
 
 @pytest.mark.parametrize("lower_bound,num_tokens", [(None, 128), (-5.0, 1)])
