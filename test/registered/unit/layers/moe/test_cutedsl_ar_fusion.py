@@ -1,10 +1,22 @@
+from functools import partial
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
-from sglang.srt.layers.communicator import LayerCommunicator
+from sglang.srt.layers.communicator import (
+    ADD,
+    NORM_QUANT_READ,
+    FfnExitFusion,
+    LayerCommunicator,
+    Layout,
+    SumGroup,
+    TokenAxis,
+    UnreducedOutput,
+    reduce_output,
+)
+from sglang.srt.layers.communicator.ops import _consumer_step, _read_input
 from sglang.srt.layers.flashinfer_mnnvl_cutedsl import (
     FlashInferMNNVLCuteDSLARFusion,
     _retargeted_config,
@@ -12,7 +24,7 @@ from sglang.srt.layers.flashinfer_mnnvl_cutedsl import (
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.moe.cutedsl_ar_fusion import (
-    CuteDSLFusionLayerCommunicator,
+    CuteDSLFusion,
     MoeFinalizeHandoff,
     install_cutedsl_fusion,
     prepare_cutedsl_fusion,
@@ -22,6 +34,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_forward, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.communicator_patch import patch_communicator
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
@@ -30,10 +43,39 @@ _DECODE = SimpleNamespace(forward_mode=ForwardMode.DECODE, input_ids=torch.zeros
 
 
 def _communicator():
-    comm = CuteDSLFusionLayerCommunicator.__new__(CuteDSLFusionLayerCommunicator)
+    comm = LayerCommunicator.__new__(LayerCommunicator)
+    comm.fusions = CuteDSLFusion()
     comm.input_layernorm = RMSNorm(8, eps=1e-6)
     comm.post_attention_layernorm = RMSNorm(8, eps=1e-6)
+    comm.enable_fused_ar_quant = False
+    comm._attn_input_fusions = comm._select_attn_input_fusions()
+    comm._ffn_exit_fusions = comm._select_ffn_exit_fusions()
+    # Only the ordinary batches' attention input half, with these entries.
+    comm._context = SimpleNamespace()
+    comm._sp_steps = comm._input_scattered_steps = comm._cp_steps = None
+    comm._steps = SimpleNamespace(
+        attention=SimpleNamespace(
+            prepare=partial(
+                _consumer_step,
+                step=partial(
+                    _read_input,
+                    layer_input=None,
+                    enters_stack=False,
+                    read=NORM_QUANT_READ,
+                    update=ADD,
+                ),
+                carried_fusions=comm._attn_input_fusions,
+            ),
+            input_move=None,
+            handoff=None,
+        )
+    )
     return comm
+
+
+def _bound(entry):
+    """What an entry runs and the layer it is bound to."""
+    return entry.func, entry.args
 
 
 def _install(layers, **kwargs):
@@ -54,9 +96,7 @@ def _install(layers, **kwargs):
 def eligible():
     """Every shared gate open, so a case varies only the predicate it names."""
     with (
-        patch.object(
-            CuteDSLFusionLayerCommunicator, "_common_eligible", return_value=True
-        ),
+        patch.object(CuteDSLFusion, "_common_eligible", return_value=True),
         patch(
             f"{_MODULE}.get_exec",
             return_value=SimpleNamespace(
@@ -69,37 +109,118 @@ def eligible():
 
 def test_last_layer_consumes_but_does_not_skip_the_pending_all_reduce(eligible):
     """The last layer must fuse the reduction its predecessor skipped, or the
-    tagged tensor reaches the final norm unreduced; it must not skip its own."""
+    unreduced output reaches the final norm; it must not skip its own."""
     last = _communicator()
-    last.successor_absorbs_all_reduce = False
-    last.fusion_service = SimpleNamespace(
-        all_reduce_residual_rms_norm=lambda *, local_contribution, residual, gamma: (
-            local_contribution + 1,
-            residual + 1,
-        )
+    last.fusions.install(
+        SimpleNamespace(
+            all_reduce_residual_rms_norm=lambda *, local_contribution, residual, gamma: (
+                local_contribution + 1,
+                residual + 1,
+            )
+        ),
+        hands_off_finalize=False,
+        next_input_absorbs=False,
+        output_is_replicated=False,
     )
-    hidden_states = torch.zeros(8, 8)
-    hidden_states._sglang_needs_allreduce_fusion = True
+    hidden_states = UnreducedOutput(torch.zeros(8, 8))
 
     with (
-        patch.object(
-            CuteDSLFusionLayerCommunicator,
-            "_finish_prepare_attn",
-            lambda self, *, hidden_states, residual, forward_batch: (
-                hidden_states,
-                residual,
-            ),
-        ),
-        patch.object(
-            LayerCommunicator,
-            "prepare_attn",
+        patch_communicator(
+            "reduce_output",
             lambda *a, **k: pytest.fail("fell through to the unfused path"),
         ),
     ):
         out_hidden, _ = last.prepare_attn(hidden_states, torch.zeros(8, 8), _DECODE)
 
     assert torch.equal(out_hidden, torch.ones(8, 8))
-    assert last._can_absorb_post_moe_all_reduce(_DECODE, 8) is False
+    defer, absorb, _ = last._ffn_exit_fusions
+    assert defer(_DECODE) is None and absorb(_DECODE) is None
+
+
+def test_cutedsl_entries_come_before_the_base_fused_kernel():
+    comm = _communicator()
+    fusion = comm.fusions
+    finalize, reduce, base_input = comm._attn_input_fusions
+    assert _bound(finalize) == (
+        fusion._finalize_output_and_update_and_read_residual,
+        (comm,),
+    )
+    assert _bound(reduce) == (
+        fusion._reduce_output_and_update_and_read_residual,
+        (comm,),
+    )
+    assert base_input == comm._reduce_output_and_update_and_read_residual
+    base = comm._mlp_input_reduce_output_and_update_and_read_residual
+    cutedsl = (fusion._mlp_input_reduce_output_and_update_and_read_residual, (comm,))
+    with patch(
+        f"{_MODULE}.get_parallel",
+        return_value=SimpleNamespace(attn_tp_size=2, tp_size=2),
+    ):
+        comm._declared = SimpleNamespace(input_rows=Layout(frozenset()))
+        fusions = comm._select_mlp_input_fusions()
+        assert _bound(fusions[0].run) == cutedsl
+        assert fusions[1].run == base
+        # The workspace reduces over the TP group, which is the attention-TP group here.
+        assert [f.completes for f in fusions] == [SumGroup.ATTN_TP] * 2
+        assert all(f.may_return_new_residual for f in fusions)
+        # A residual on each rank's slice is gathered first, which the
+        # workspace does not do.
+        comm._declared = SimpleNamespace(
+            input_rows=Layout(frozenset({TokenAxis.ATTN_TP_SCATTER}))
+        )
+        assert [f.run for f in comm._select_mlp_input_fusions()] == [base]
+
+
+def test_the_fusion_runs_only_on_the_ffn_full_rows():
+    """The finalize and the AR + norm sum over the whole TP group, so they need
+    the batch's FFN input on the full rows, not each rank's own slice (a2a, the
+    fp4 all-gather, DWDP or a dense MLP on every rank)."""
+    comm = _communicator()
+    fusion = comm.fusions
+    fusion.service = SimpleNamespace(supports=lambda m: True)
+    with (
+        patch(
+            f"{_MODULE}.get_parallel",
+            return_value=SimpleNamespace(attn_cp_size=1, tp_size=2),
+        ),
+        patch(f"{_MODULE}.is_dp_attention_enabled", return_value=False),
+        patch(
+            f"{_MODULE}.get_attn_tp_context",
+            return_value=SimpleNamespace(input_scattered=False),
+        ),
+        patch(
+            f"{_MODULE}.get_moe_a2a_backend",
+            return_value=SimpleNamespace(is_none=lambda: True),
+        ),
+    ):
+        for sharded, eligible in (
+            (frozenset(), True),
+            (frozenset({TokenAxis.ATTN_TP_SCATTER}), False),
+        ):
+            comm._batch_steps = lambda fb, rows=Layout(sharded): SimpleNamespace(
+                ffn=SimpleNamespace(input_rows=rows)
+            )
+            assert fusion._common_eligible(comm, _DECODE, 8) is eligible
+
+
+def test_the_exit_tries_the_handoff_then_the_absorb_then_the_base_kernel(eligible):
+    comm = _communicator()
+    fusion = comm.fusions
+    defer, absorb, base = comm._ffn_exit_fusions
+    assert _bound(defer) == (fusion._defer_moe_finalize, (comm,))
+    assert _bound(absorb) == (fusion._absorb_all_reduce, (comm,))
+    assert base == comm._next_input_norm_takes_ffn_sum
+    # Before install() chooses them, neither CuTe DSL kernel takes the sum.
+    assert defer(_DECODE) is None and absorb(_DECODE) is None
+    fusion.install(
+        SimpleNamespace(),
+        hands_off_finalize=True,
+        next_input_absorbs=True,
+        output_is_replicated=False,
+    )
+    with patch.object(CuteDSLFusion, "_should_use_finalize", return_value=True):
+        assert defer(_DECODE) is FfnExitFusion.DEFER_MOE_FINALIZE
+    assert absorb(_DECODE) is FfnExitFusion.NEXT_INPUT
 
 
 def test_a_replicated_output_producer_keeps_its_own_all_reduce(eligible):
@@ -112,15 +233,24 @@ def test_a_replicated_output_producer_keeps_its_own_all_reduce(eligible):
     _install(layers, requires_local_reduction=lambda layer: layer.replicated)
     replicated, plain = (layer.layer_communicator for layer in layers[:2])
 
+    def exit_fusion(communicator):
+        return next(
+            filter(None, (fused(_DECODE) for fused in communicator._ffn_exit_fusions)),
+            None,
+        )
+
     with patch.object(
         LayerCommunicator,
         "should_fuse_mlp_allreduce_with_next_layer",
         return_value=False,
     ):
-        assert replicated.should_fuse_mlp_allreduce_with_next_layer(_DECODE) is False
-        assert plain.should_fuse_mlp_allreduce_with_next_layer(_DECODE) is True
+        assert exit_fusion(replicated) is None
+        assert exit_fusion(plain) is FfnExitFusion.NEXT_INPUT
     # Consuming what a predecessor skipped stays independently eligible.
-    assert replicated._can_consume_post_moe_all_reduce(_DECODE, 8) is True
+    assert (
+        replicated.fusions._can_consume_post_moe_all_reduce(replicated, _DECODE, 8)
+        is True
+    )
 
 
 def test_a_service_nested_under_a_wrapper_is_prepared():
@@ -132,7 +262,7 @@ def test_a_service_nested_under_a_wrapper_is_prepared():
     wrapper = torch.nn.Module()
     wrapper.language_model = torch.nn.Sequential(layer)
     _install([layer])
-    layer.layer_communicator.fusion_service.prepare = lambda *, max_m: prepared.append(
+    layer.layer_communicator.fusions.service.prepare = lambda *, max_m: prepared.append(
         max_m
     )
 
@@ -202,11 +332,95 @@ def test_the_handoff_views_the_producer_storage():
         ),
         gated_shared_output=torch.empty(m, 16, dtype=torch.bfloat16),
         m=m,
+        reduce=lambda h: h,
     )
 
     assert handoff.routed_output.data_ptr() == gemm2_out.data_ptr()
     assert handoff.permuted_indices.data_ptr() == permuted_indices.data_ptr()
     assert tuple(handoff.expert_weights.shape) == (m, top_k)
+
+
+def _handoff(finish):
+    rows = torch.zeros(2, 8)
+    return MoeFinalizeHandoff(
+        routed_output=rows,
+        expert_weights=rows,
+        permuted_indices=rows,
+        gated_shared_output=rows,
+        m=2,
+        finish=finish,
+    )
+
+
+def test_its_producer_completes_a_handoff_for_any_other_reader():
+    """Only the fused kernel reads the handoff's parts; everything else gets
+    the MoE's own unfused tail, run once."""
+    finished = torch.full((2, 8), 3.0)
+    finish = MagicMock(return_value=finished)
+    assert reduce_output(_handoff(finish)) is finished
+    finish.assert_called_once_with()
+
+
+def test_from_flashinfer_completes_with_the_moe_s_own_sum():
+    deferred = SimpleNamespace(
+        gemm2_out=torch.zeros(4, 8),
+        expert_weights=torch.zeros(2, 2),
+        expanded_idx_to_permuted_idx=torch.zeros(2, 2, dtype=torch.int32),
+        top_k=2,
+    )
+    shared = torch.ones(2, 8)
+    with patch(
+        "sglang.srt.layers.moe.moe_runner.flashinfer_trtllm."
+        "finalize_flashinfer_trtllm_deferred_output",
+        side_effect=lambda d, s: s + 1,
+    ) as finalize:
+        handoff = MoeFinalizeHandoff.from_flashinfer(
+            deferred, gated_shared_output=shared, m=2, reduce=lambda h: h * 10
+        )
+        finalize.assert_not_called()
+        torch.testing.assert_close(handoff.complete(), torch.full((2, 8), 20.0))
+    finalize.assert_called_once_with(deferred, shared)
+
+
+def test_a_handoff_the_kernel_does_not_take_is_completed_then_normed():
+    """The consumer asks only whether its own kernel takes the batch; when it
+    does not, the handoff is completed and the input read as usual."""
+
+    class AddNorm(torch.nn.Module):
+        def forward(self, x, residual=None, post_residual_addition=None):
+            residual.add_(x)
+            return residual * 2, residual
+
+    comm = _communicator()
+    comm.input_layernorm = AddNorm()
+    comm.fusions.service = SimpleNamespace(
+        finalize=lambda **kw: pytest.fail("the kernel does not take this batch")
+    )
+    finish = MagicMock(return_value=torch.ones(2, 8))
+    with (
+        # A norm the kernel could fold in, on a batch it does not take.
+        patch(f"{_MODULE}._fused_norm_gamma", return_value=torch.ones(8)),
+        patch.object(CuteDSLFusion, "_should_use_finalize", return_value=False),
+        patch.object(CuteDSLFusion, "_common_eligible", return_value=False),
+    ):
+        hidden, residual = comm.prepare_attn(
+            _handoff(finish), torch.full((2, 8), 2.0), _DECODE
+        )
+    finish.assert_called_once_with()
+    torch.testing.assert_close(residual, torch.full((2, 8), 3.0))
+    torch.testing.assert_close(hidden, torch.full((2, 8), 6.0))
+
+
+def test_the_layer_stack_hands_a_handoff_only_to_a_final_norm_that_takes_it():
+    comm = LayerCommunicator.__new__(LayerCommunicator)
+    for takes, completed in ((True, 0), (False, 1)):
+        finish = MagicMock(return_value=torch.ones(2, 8))
+        handoff = _handoff(finish)
+        hidden, _ = comm.finish_layer_stack(
+            handoff, torch.zeros(2, 8), _DECODE, final_norm_takes_handoff=takes
+        )
+        assert finish.call_count == completed
+        assert (hidden is handoff) == takes
 
 
 def test_early_shared_load_touches_only_the_finalize_routes():

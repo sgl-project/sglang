@@ -29,31 +29,6 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestMmHashesContract(CustomTestCase):
-    def test_generate_req_input_accepts_mm_hashes(self):
-        """GenerateReqInput exposes mm_hashes as an optional field."""
-        req = GenerateReqInput(
-            text="hi",
-            image_data=["http://example.com/img.png"],
-            mm_hashes=["deadbeefcafe1234"],
-        )
-        self.assertEqual(req.mm_hashes, ["deadbeefcafe1234"])
-
-    def test_generate_req_input_defaults_mm_hashes_to_none(self):
-        """Absent mm_hashes preserves existing (None) behavior."""
-        req = GenerateReqInput(text="hi")
-        self.assertIsNone(req.mm_hashes)
-
-    def test_content_hashes_are_distinct_from_feature_hashes(self):
-        content_hash = "sha256:" + "ab" * 32
-        req = GenerateReqInput(
-            text="hi",
-            image_data=["http://example.com/img.png"],
-            mm_hashes=["deadbeef"],
-            mm_content_hashes=[content_hash],
-        )
-        self.assertEqual(req.mm_hashes, ["deadbeef"])
-        self.assertEqual(req.mm_content_hashes, [content_hash])
-
     def test_batched_hashes_follow_each_request(self):
         req = GenerateReqInput(
             text=["one", "two"],

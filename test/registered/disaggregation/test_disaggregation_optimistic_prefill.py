@@ -35,10 +35,10 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, CustomTestCase
 
 register_cuda_ci(est_time=300, stage="base-b", runner_config="2-gpu-large")
@@ -129,12 +129,11 @@ class TestOptimisticPrefill(
         args = SimpleNamespace(
             base_url=f"http://{self.base_host}:{self.lb_port}",
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=200,
             num_threads=128,
         )
-        metrics = self.assert_retry_counter_increases(lambda: run_eval(args))
+        metrics = self.assert_retry_counter_increases(lambda: run_sgl_eval(args))
         print(f"Evaluation metrics: {metrics}")
         self.assertGreater(metrics["score"], 0.62)
         time.sleep(1)  # trigger memory check
@@ -302,12 +301,11 @@ class TestOptimisticPrefillL3BufferWriteThrough(
         args = SimpleNamespace(
             base_url=f"http://{self.base_host}:{self.lb_port}",
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=200,
             num_threads=128,
         )
-        metrics = self.assert_retry_counter_increases(lambda: run_eval(args))
+        metrics = self.assert_retry_counter_increases(lambda: run_sgl_eval(args))
         print(f"Evaluation metrics: {metrics}")
         self.assertGreater(metrics["score"], 0.62)
         # Write-through published prefixes to L3; report what retries fetched back.
