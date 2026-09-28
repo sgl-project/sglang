@@ -62,6 +62,14 @@ class Spec(msgspec.Struct):
         Optional[int],
         "The number of tokens sampled from the draft model in Speculative Decoding.",
     ] = None
+    speculative_dcp_size: A[
+        int,
+        Arg(
+            help="Decode context parallelism size of the draft model. Only 1 is "
+            "supported: the draft KV cache is replicated across the target's DCP ranks.",
+            aliases=["--speculative-decode-context-parallel-size"],
+        ),
+    ] = 1
     speculative_dflash_block_size: A[
         Optional[int],
         "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",

@@ -258,12 +258,38 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 
 def _validate_dcp_spec(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
+
+    # Ahead of every early return below: a bad width must be rejected even when
+    # speculative decoding or DCP is off, or it is silently accepted.
+    spec_dcp_size = cfg.speculative_dcp_size
+    if spec_dcp_size < 1:
+        raise ValueError(
+            f"--speculative-dcp-size must be at least 1, got {spec_dcp_size}."
+        )
+    if spec_dcp_size != 1:
+        raise ValueError(
+            "--speculative-dcp-size > 1 is not supported yet: the draft shares the "
+            "target's single decode context parallel group, so it cannot split the "
+            "token dimension on its own."
+        )
+    if cfg.dcp_size % spec_dcp_size:
+        raise ValueError(
+            f"--speculative-dcp-size ({spec_dcp_size}) must divide --dcp-size "
+            f"({cfg.dcp_size}): a draft group is a sub-partition of the target's."
+        )
+
     if cfg.speculative_algorithm is None or cfg.dcp_size <= 1:
         return
 
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
     algo = SpeculativeAlgorithm.from_string(cfg.speculative_algorithm)
+    if algo.is_frozen_kv_mtp():
+        raise ValueError(
+            "FROZEN_KV_MTP reads the target's DCP-sharded KV pool directly instead "
+            "of owning a replicated draft pool, so --speculative-dcp-size cannot "
+            "describe it. Run without --dcp-size."
+        )
     if not (algo.is_eagle() or algo.is_standalone() or algo.is_dflash()):
         return
 

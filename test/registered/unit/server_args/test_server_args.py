@@ -53,6 +53,7 @@ from sglang.srt.arg_groups.moe_hook import (
 )
 from sglang.srt.arg_groups.overrides import (
     cutedsl_moe_max_num_tokens,
+    declare_resolution,
     max_speculative_num_draft_tokens,
     resolution_result,
 )
@@ -72,7 +73,10 @@ from sglang.srt.arg_groups.serving_hook import (
     handle_tokenizer_batching,
     ssl_verify_of,
 )
-from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
+from sglang.srt.arg_groups.speculative_hook import (
+    _validate_dcp_spec,
+    handle_speculative_decoding,
+)
 from sglang.srt.arg_groups.validation_hook import (
     check_pipeline_parallel_compat,
     check_two_batch_overlap,
@@ -4021,6 +4025,94 @@ class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):
                     resolution_result(server_args, "enable_tp_lm_head_all_to_all")
                 )
                 self.assertNotIn("NCCL_GRAPH_REGISTER", os.environ)
+
+
+class TestDcpSpecValidation(CustomTestCase):
+    """--speculative-dcp-size and the DCP x speculative-decoding gates."""
+
+    def _validate(self, **fields):
+        _validate_dcp_spec(ServerArgs(model_path="dummy", tp_size=8, **fields))
+
+    def test_rejects_tree_draft_under_dcp(self):
+        for algo in ("EAGLE", "EAGLE3", "STANDALONE"):
+            with self.subTest(algo=algo):
+                with self.assertRaisesRegex(ValueError, "chain speculative drafts"):
+                    self._validate(
+                        speculative_algorithm=algo,
+                        speculative_eagle_topk=2,
+                        dcp_size=8,
+                    )
+
+    def test_allows_chain_draft_under_dcp(self):
+        for algo in ("EAGLE", "EAGLE3", "STANDALONE", "DFLASH"):
+            for topk in (None, 1):
+                with self.subTest(algo=algo, topk=topk):
+                    self._validate(
+                        speculative_algorithm=algo,
+                        speculative_eagle_topk=topk,
+                        dcp_size=8,
+                    )
+
+    def test_ignores_topk_without_dcp(self):
+        self._validate(
+            speculative_algorithm="EAGLE3", speculative_eagle_topk=4, dcp_size=1
+        )
+
+    def test_ignores_when_no_spec_algorithm(self):
+        self._validate(speculative_eagle_topk=4, dcp_size=8)
+
+    def test_dspark_is_not_gated(self):
+        """DSPARK + DCP already ships (Kimi-Linear); it must not be newly rejected."""
+        for topk in (None, 1, 4):
+            with self.subTest(topk=topk):
+                self._validate(
+                    speculative_algorithm="DSPARK",
+                    speculative_eagle_topk=topk,
+                    dcp_size=8,
+                )
+
+    def test_reads_the_resolved_topk_not_the_raw_field(self):
+        """The hook declares an auto-chosen topk; the record keeps the raw one."""
+        args = ServerArgs(
+            model_path="dummy",
+            tp_size=8,
+            speculative_algorithm="EAGLE3",
+            dcp_size=8,
+        )
+        declare_resolution(args, "test_dcp_spec_validation", speculative_eagle_topk=4)
+        with self.assertRaisesRegex(ValueError, "chain speculative drafts"):
+            _validate_dcp_spec(args)
+
+    def test_frozen_kv_mtp_is_rejected_under_dcp(self):
+        """Its draft reads the target's sharded pool, so replication cannot apply."""
+        with self.assertRaisesRegex(ValueError, "FROZEN_KV_MTP"):
+            self._validate(speculative_algorithm="FROZEN_KV_MTP", dcp_size=8)
+
+    def test_speculative_dcp_size_defaults_to_one(self):
+        self.assertEqual(ServerArgs(model_path="dummy").speculative_dcp_size, 1)
+        self._validate(speculative_algorithm="EAGLE3", dcp_size=8)
+
+    def test_rejects_a_width_below_one(self):
+        with self.assertRaisesRegex(ValueError, "at least 1"):
+            self._validate(speculative_dcp_size=0, dcp_size=8)
+
+    def test_rejects_a_width_above_one(self):
+        with self.assertRaisesRegex(ValueError, "not supported yet"):
+            self._validate(
+                speculative_algorithm="EAGLE3", speculative_dcp_size=2, dcp_size=8
+            )
+
+    def test_the_width_is_checked_even_when_the_gates_below_return(self):
+        """Both early returns sit under these checks; a bad width must not slip
+        through with speculative decoding off or DCP off."""
+        for fields in (
+            dict(speculative_dcp_size=0, dcp_size=8),
+            dict(speculative_dcp_size=0, dcp_size=1),
+            dict(speculative_dcp_size=0, speculative_algorithm="NGRAM", dcp_size=8),
+        ):
+            with self.subTest(**fields):
+                with self.assertRaises(ValueError):
+                    self._validate(**fields)
 
 
 class TestDcpCommBackendDefault(CustomTestCase):
