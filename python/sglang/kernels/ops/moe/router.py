@@ -5,9 +5,10 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_cpu, is_hip
 
 _is_hip = is_hip()
+_is_cpu = is_cpu()
 
 
 @triton.jit
@@ -352,6 +353,17 @@ def fused_moe_router_shim(
     )
     bs, hidden_dim = hidden_states.shape
     num_experts = gating_output.shape[0]
+
+    if _is_cpu:
+        import sgl_kernel  # noqa: F401
+
+        return torch.ops.sgl_kernel.fused_moe_router_cpu(
+            hidden_states,
+            gating_output,
+            topk,
+            moe_softcapping,
+            correction_bias,
+        )
 
     BLOCK_SIZE_M = 32
 

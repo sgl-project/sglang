@@ -284,6 +284,85 @@ void topk_softmax_kernel_impl(
   });
 }
 
+template <typename scalar_t>
+inline float router_dot_fp32_accum(
+    const scalar_t* __restrict__ hidden_states,
+    const float* __restrict__ router_weight,
+    int64_t hidden_dim) {
+  using fVec = at::vec::Vectorized<float>;
+  constexpr int64_t kVecSize = fVec::size();
+
+  fVec acc_vec = fVec(0.f);
+  int64_t k = 0;
+  for (; k <= hidden_dim - kVecSize; k += kVecSize) {
+    fVec x_vec = load_float_vec(hidden_states + k);
+    fVec w_vec = fVec::loadu(router_weight + k);
+    acc_vec += x_vec * w_vec;
+  }
+
+  float acc = vec_reduce_sum(acc_vec);
+  for (; k < hidden_dim; ++k) {
+    acc += static_cast<float>(hidden_states[k]) * router_weight[k];
+  }
+  return acc;
+}
+
+template <typename scalar_t>
+void fused_moe_router_kernel_impl(
+    float* __restrict__ topk_weights,
+    int32_t* __restrict__ topk_ids,
+    const scalar_t* __restrict__ hidden_states,
+    const float* __restrict__ router_weight,
+    const float* __restrict__ correction_bias,
+    int64_t num_tokens,
+    int64_t hidden_dim,
+    int64_t num_experts,
+    int64_t topk,
+    float moe_softcapping) {
+  using elem_t = std::pair<float, int32_t>;
+  const bool use_softcap = moe_softcapping != 0.0f;
+  const bool use_correction_bias = correction_bias != nullptr;
+
+  at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
+    std::vector<float> logits(num_experts);
+    std::vector<elem_t> queue(num_experts);
+
+    for (int64_t token = begin; token < end; ++token) {
+      float max_logit = -std::numeric_limits<float>::infinity();
+      const scalar_t* token_hidden = hidden_states + token * hidden_dim;
+
+      for (int64_t expert = 0; expert < num_experts; ++expert) {
+        float logit = router_dot_fp32_accum(token_hidden, router_weight + expert * hidden_dim, hidden_dim);
+        if (use_softcap) {
+          logit = std::tanh(logit / moe_softcapping) * moe_softcapping;
+        }
+        if (use_correction_bias) {
+          logit += correction_bias[expert];
+        }
+        logits[expert] = logit;
+        queue[expert] = {logit, static_cast<int32_t>(expert)};
+        max_logit = std::max(max_logit, logit);
+      }
+
+      float inv_sum_exp = 0.0f;
+      for (int64_t expert = 0; expert < num_experts; ++expert) {
+        inv_sum_exp += std::exp(logits[expert] - max_logit);
+      }
+      inv_sum_exp = 1.0f / inv_sum_exp;
+
+      std::partial_sort(queue.begin(), queue.begin() + topk, queue.end(), [](const elem_t& x, const elem_t& y) -> bool {
+        return x.first > y.first;
+      });
+
+      for (int64_t k = 0; k < topk; ++k) {
+        const int32_t expert = queue[k].second;
+        topk_ids[token * topk + k] = expert;
+        topk_weights[token * topk + k] = std::exp(logits[expert] - max_logit) * inv_sum_exp;
+      }
+    }
+  });
+}
+
 template <typename param_t, int SIZE>
 inline void
 apply_bias(float* __restrict__ scores2, const float* __restrict__ scores, const param_t* __restrict__ bias) {
@@ -457,6 +536,19 @@ void biased_grouped_topk_kernel_impl(
       topk,                               \
       renormalize);
 
+#define LAUNCH_FUSED_MOE_ROUTER_KERNEL() \
+  fused_moe_router_kernel_impl<scalar_t>( \
+      topk_weights.data_ptr<float>(),     \
+      topk_ids.data_ptr<int32_t>(),       \
+      hidden_states.data_ptr<scalar_t>(), \
+      gating_output.data_ptr<float>(),    \
+      correction_bias_ptr,                \
+      num_tokens,                         \
+      hidden_dim,                         \
+      num_experts,                        \
+      topk,                               \
+      moe_softcapping);
+
 #define LAUNCH_BIASED_GROUPED_TOPK_KERNEL(NE, NTOPK)             \
   biased_grouped_topk_kernel_impl<scalar_t, param_t, NE, NTOPK>( \
       topk_weights.data_ptr<float>(),                            \
@@ -605,6 +697,40 @@ std::tuple<at::Tensor, at::Tensor> topk_softmax_cpu(
         TORCH_CHECK(false, "Unexpected num_experts: ", num_experts);
     }
   });
+  return std::make_tuple(topk_weights, topk_ids);
+}
+
+std::tuple<at::Tensor, at::Tensor> fused_moe_router_cpu(
+    at::Tensor& hidden_states,
+    at::Tensor& gating_output,
+    int64_t topk,
+    double moe_softcapping,
+    const std::optional<at::Tensor>& correction_bias) {
+  CHECK_INPUT(hidden_states);
+  CHECK_INPUT(gating_output);
+
+  CHECK_DIM(2, hidden_states);
+  CHECK_DIM(2, gating_output);
+  TORCH_CHECK(gating_output.scalar_type() == at::kFloat, "fused_moe_router_cpu: gating_output must be float32");
+
+  const auto st = hidden_states.scalar_type();
+  const int64_t num_tokens = hidden_states.size(0);
+  const int64_t hidden_dim = hidden_states.size(1);
+  const int64_t num_experts = gating_output.size(0);
+  TORCH_CHECK(gating_output.size(1) == hidden_dim, "fused_moe_router_cpu: hidden dimension mismatch");
+  TORCH_CHECK(topk > 0 && topk <= num_experts, "fused_moe_router_cpu: topk must satisfy 0 < topk <= num_experts");
+
+  const float* correction_bias_ptr = nullptr;
+  if (correction_bias.has_value()) {
+    const auto& correction_bias_tensor = correction_bias.value();
+    CHECK_INPUT_SHAPE_DTYPE<false>(correction_bias_tensor, {num_experts}, at::kFloat);
+    correction_bias_ptr = correction_bias_tensor.data_ptr<float>();
+  }
+
+  at::Tensor topk_weights = at::empty({num_tokens, topk}, hidden_states.options().dtype(at::kFloat));
+  at::Tensor topk_ids = at::empty({num_tokens, topk}, hidden_states.options().dtype(at::kInt));
+
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "fused_moe_router_cpu", [&] { LAUNCH_FUSED_MOE_ROUTER_KERNEL(); });
   return std::make_tuple(topk_weights, topk_ids);
 }
 
