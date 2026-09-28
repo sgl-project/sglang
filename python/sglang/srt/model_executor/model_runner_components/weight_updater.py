@@ -158,13 +158,26 @@ class WeightUpdater:
         )
 
         target_device = torch.device(self.device)
-        self.model_config.model_path = model_path
+        # This field is the loader's only input for the checkpoint location and
+        # it persists on success, so every failure exit below must put the old
+        # path back; a later rollback re-derives its iterator from it and would
+        # otherwise reload a checkpoint this call already rejected.
+        original_model_path = self.model_config.model_path
+        # Built before the mutation on purpose: it validates load_format and
+        # raises on a bad value, which would otherwise escape with the path
+        # already moved.
         load_config = LoadConfig(load_format=load_format)
+        self.model_config.model_path = model_path
 
         # Only support DefaultModelLoader for now
-        loader = get_model_loader(load_config, self.model_config)
+        try:
+            loader = get_model_loader(load_config, self.model_config)
+        except Exception:
+            self.model_config.model_path = original_model_path
+            raise
         if not isinstance(loader, DefaultModelLoader):
             message = f"Failed to get model loader: {loader}."
+            self.model_config.model_path = original_model_path
             return False, message
 
         def get_weight_iter(config):
@@ -187,6 +200,7 @@ class WeightUpdater:
                 iter = get_weight_iter(self.model_config)
             except Exception as e:
                 message = f"Failed to get weights iterator: {e}."
+                self.model_config.model_path = original_model_path
                 return False, message
             try:
                 model = model_load_weights(self.get_model(), iter)
@@ -196,6 +210,7 @@ class WeightUpdater:
                 )
                 del iter
                 gc.collect()
+                self.model_config.model_path = original_model_path
                 iter = get_weight_iter(self.model_config)
                 model_load_weights(self.get_model(), iter)
                 return False, message

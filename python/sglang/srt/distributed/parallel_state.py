@@ -1017,7 +1017,25 @@ class GroupCoordinator:
     def _all_reduce_in_place(self, input_: torch.Tensor) -> None:
         pynccl_comm = self.pynccl_comm
         torch_symm_mem_comm = self.torch_symm_mem_comm
-        if pynccl_comm is not None and not pynccl_comm.disabled:
+        if input_.is_xpu and self._deterministic_collectives_enabled():
+            gathered = torch.empty(
+                (self.world_size, input_.numel()),
+                dtype=input_.dtype,
+                device=input_.device,
+            )
+            torch.distributed.all_gather_into_tensor(
+                gathered.view(-1), input_.contiguous().view(-1), group=self.device_group
+            )
+            accumulation_dtype = (
+                torch.float32
+                if input_.dtype in (torch.float16, torch.bfloat16)
+                else input_.dtype
+            )
+            reduced = gathered[0].to(accumulation_dtype).clone()
+            for rank in range(1, self.world_size):
+                reduced.add_(gathered[rank])
+            input_.copy_(reduced.view_as(input_))
+        elif pynccl_comm is not None and not pynccl_comm.disabled:
             pynccl_comm.all_reduce(input_)
         elif (
             torch_symm_mem_comm is not None

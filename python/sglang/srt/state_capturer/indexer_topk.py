@@ -97,12 +97,13 @@ def create_indexer_capturer(
 ) -> Optional[IndexerTopkCapturer]:
 
     enable = get_exec().features.enable_return_indexer_topk
-    # Producer wiring is CUDA-only (Indexer.forward_cuda + MLA skip_topk
-    # path); other backends would create a capturer but never feed it.
-    if enable and device != "cuda":
+    # Producer wiring covers CUDA and XPU: Indexer.forward_xpu delegates to
+    # forward_cuda, so its maybe_capture_indexer_topk sites and the MLA
+    # skip_topk path both run. Other backends would create a capturer but
+    # never feed it.
+    if enable and device not in ("cuda", "xpu"):
         logger.warning(
-            "indexer-topk capture is CUDA-only; %s backend not yet wired. "
-            "Disabling capturer.",
+            "indexer-topk capture is not wired for the %s backend. Disabling capturer.",
             device,
         )
         return None
