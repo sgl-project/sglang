@@ -112,6 +112,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_DSPARK_DRAFT_RAW_METADATA = envs.SGLANG_HIP_DSPARK_DRAFT_RAW_METADATA.get()
+
 SWA_WINDOW = 128
 DEFAULT_INDEX_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
@@ -790,6 +792,20 @@ def _grouped_asm_enabled() -> bool:
     Grouped target-verify decode through the asm kernel, off by default.
     """
     return os.environ.get("SGLANG_DSV4_GROUPED_ASM", "0") == "1"
+
+
+@dataclass
+class DSV4RawDSparkDraftMetadata:
+    req_pool_indices: torch.Tensor
+    seq_lens: torch.Tensor
+    out_cache_loc: torch.Tensor
+    block_size: int
+
+    def copy_(self, other: DSV4RawDSparkDraftMetadata):
+        assert self.block_size == other.block_size
+        self.req_pool_indices.copy_(other.req_pool_indices)
+        self.seq_lens.copy_(other.seq_lens)
+        self.out_cache_loc.copy_(other.out_cache_loc)
 
 
 class _GraphBucket(enum.Enum):
@@ -1540,6 +1556,16 @@ class DeepseekV4HipRadixBackend(
             self.forward_metadata = self.make_forward_metadata_from_raw_decode(
                 raw_metadata=self.forward_metadata,
             )
+        elif isinstance(self.forward_metadata, DSV4RawDSparkDraftMetadata):
+            raw = self.forward_metadata
+            # Graph path only: the page table is sized for the capture maximum.
+            self.forward_metadata = self.init_forward_metadata_dspark_draft_block(
+                max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
+                req_pool_indices=raw.req_pool_indices,
+                seq_lens=raw.seq_lens,
+                out_cache_loc=raw.out_cache_loc,
+                block_size=raw.block_size,
+            )
 
         metadata = self.forward_metadata
         if isinstance(metadata, DSV4Metadata):
@@ -1785,13 +1811,21 @@ class DeepseekV4HipRadixBackend(
                 mode="constant",
                 value=0,
             )
-            temp_metadata = self.init_forward_metadata_dspark_draft_block(
-                max_seq_len=chosen_max_seq_len,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                out_cache_loc=out_cache_loc_padded,
-                block_size=block_size,
-            )
+            if _DSPARK_DRAFT_RAW_METADATA:
+                temp_metadata = DSV4RawDSparkDraftMetadata(
+                    req_pool_indices=req_pool_indices,
+                    seq_lens=seq_lens,
+                    out_cache_loc=out_cache_loc_padded,
+                    block_size=block_size,
+                )
+            else:
+                temp_metadata = self.init_forward_metadata_dspark_draft_block(
+                    max_seq_len=chosen_max_seq_len,
+                    req_pool_indices=req_pool_indices,
+                    seq_lens=seq_lens,
+                    out_cache_loc=out_cache_loc_padded,
+                    block_size=block_size,
+                )
         elif bucket == _GraphBucket.TARGET_VERIFY:
             assert out_cache_loc is not None
             ragged_layout = resolve_ragged_verify_layout(forward_batch)
@@ -1856,7 +1890,11 @@ class DeepseekV4HipRadixBackend(
                 metadata
                 if isinstance(
                     metadata,
-                    (DSV4RawDecodeMetadata, DSV4RawVerifyMetadata),
+                    (
+                        DSV4RawDecodeMetadata,
+                        DSV4RawVerifyMetadata,
+                        DSV4RawDSparkDraftMetadata,
+                    ),
                 )
                 else None
             )
@@ -2286,6 +2324,7 @@ class DeepseekV4HipRadixBackend(
             DSV4Metadata,
             DSV4RawVerifyMetadata,
             DSV4RawDecodeMetadata,
+            DSV4RawDSparkDraftMetadata,
         ],
         bucket: _GraphBucket,
     ) -> None:
