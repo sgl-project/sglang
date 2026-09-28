@@ -17,6 +17,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils.common import Range
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -90,12 +91,14 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.last_batch = None
     s.require_mlp_sync = False
     s.spec_algorithm = MagicMock()
+    s.spec_algorithm.is_none.return_value = True
     s.server_args = MagicMock(speculative_skip_dp_mlp_sync=True)
     s.running_batch = MagicMock()
     s.running_batch.is_empty.return_value = True
     s.running_batch.is_prefill_only = False
     s.running_batch.batch_is_full = False
     s.running_batch.reqs = []
+    s.running_batch.forward_mode = ForwardMode.DECODE
     s.prefill_decode_interval = 0
     s.dp_phase_lockstep = False
     s._prefill_decode_interval_remaining = 0
@@ -106,6 +109,7 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.dp_attn_adapter.maybe_prepare_mlp_sync_batch = MagicMock(
         side_effect=lambda batch, **_: batch
     )
+    s.dp_attn_adapter.maybe_convert_decode_to_extend.side_effect = lambda batch: batch
     s.ngram_embedding_manager = MagicMock()
     s.ngram_embedding_manager.prepare_for_forward = MagicMock(
         side_effect=lambda batch, **_: batch
@@ -151,11 +155,17 @@ class TestStashGatePreservesPrefixIndices(CustomTestCase):
         # A parked chunk has fill_len == len(prefix_indices): no new KV was
         # computed, so the gate must skip stash and leave prefix_indices intact.
         s, req, initial_prefix, _ = self._build(fill_len=self.INITIAL_PREFIX_LEN)
+        s.dp_phase_lockstep = True
+        s.require_mlp_sync = True
+        s.running_batch.is_empty.return_value = False
 
-        Scheduler.get_next_batch_to_run(
+        plan = Scheduler.get_next_batch_to_run(
             s, running_batch=s.running_batch, last_batch=s.last_batch
         )
 
+        self.assertIs(plan.batch_to_run, s.running_batch)
+        s.update_running_batch.assert_called_once_with(s.running_batch)
+        s.dp_attn_adapter.get_idle_batch.assert_not_called()
         self.assertEqual(req.prefix_indices.shape[0], self.INITIAL_PREFIX_LEN)
         self.assertTrue(torch.equal(req.prefix_indices, initial_prefix))
 
@@ -185,6 +195,59 @@ class TestStashGatePreservesPrefixIndices(CustomTestCase):
             s, running_batch=s.running_batch, last_batch=s.last_batch
         )
         self.assertIsNone(s.chunked_req)
+
+
+class TestDPPhaseLockstep(CustomTestCase):
+    def test_remote_prefill_idles_local_decode_only_with_lockstep(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                s = _scheduler_for_get_next_batch(
+                    tree_cache=MagicMock(), chunked_req=None
+                )
+                s.dp_phase_lockstep = enabled
+                s.require_mlp_sync = True
+                s.running_batch.is_empty.return_value = False
+                s.get_new_batch_prefill.return_value = NextBatchPlan(
+                    batch_to_run=None,
+                    running_batch=s.running_batch,
+                    delayer_phase_prefill=True,
+                )
+                idle_batch = s.dp_attn_adapter.get_idle_batch.return_value
+
+                plan = Scheduler.get_next_batch_to_run(
+                    s, running_batch=s.running_batch, last_batch=None
+                )
+
+                self.assertIs(plan.running_batch, s.running_batch)
+                if enabled:
+                    self.assertIs(plan.batch_to_run, idle_batch)
+                    s.dp_attn_adapter.get_idle_batch.assert_called_once_with()
+                    s.update_running_batch.assert_not_called()
+                else:
+                    self.assertIs(plan.batch_to_run, s.running_batch)
+                    s.dp_attn_adapter.get_idle_batch.assert_not_called()
+                    s.update_running_batch.assert_called_once_with(s.running_batch)
+
+    def test_local_prefill_is_preserved_with_lockstep(self):
+        s = _scheduler_for_get_next_batch(tree_cache=MagicMock(), chunked_req=None)
+        s.dp_phase_lockstep = True
+        s.require_mlp_sync = True
+        s.running_batch.is_empty.return_value = False
+        prefill_batch = MagicMock()
+        s.get_new_batch_prefill.return_value = NextBatchPlan(
+            batch_to_run=prefill_batch,
+            running_batch=s.running_batch,
+            delayer_phase_prefill=True,
+        )
+
+        plan = Scheduler.get_next_batch_to_run(
+            s, running_batch=s.running_batch, last_batch=None
+        )
+
+        self.assertIs(plan.batch_to_run, prefill_batch)
+        self.assertIs(plan.running_batch, s.running_batch)
+        s.dp_attn_adapter.get_idle_batch.assert_not_called()
+        s.update_running_batch.assert_not_called()
 
 
 if __name__ == "__main__":

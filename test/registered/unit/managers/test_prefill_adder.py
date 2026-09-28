@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.page_interleave import PageShardSpec, make_page_shard_
 from sglang.srt.mem_cache.prefill_budget import (
     PrefillBudget,
     SWAPrefillBudget,
+    SharedSWAPrefillBudget,
     estimate_swa_kv_tokens,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -1126,20 +1127,32 @@ class TestPrefillAdder(CustomTestCase):
         )
 
     def test_parked_chunk_leaves_pass_in_decode_phase(self):
-        PAGE_SIZE = 64
-        adder, req = self._build_hybrid_swa_chunked_req(
-            page_size=PAGE_SIZE, rem_swa=PAGE_SIZE
-        )
-        executor = _single_rank_delaying_executor()
-        adder.prefill_delayer_single_pass = executor
-        adder.running_batch.batch_size.return_value = 0
-        adder.max_running_requests = 64
+        for shared_pool in (False, True):
+            with self.subTest(shared_pool=shared_pool):
+                adder, req = self._build_hybrid_swa_chunked_req(
+                    page_size=64, rem_swa=64
+                )
+                if shared_pool:
+                    self.mock_token_allocator.can_reserve.return_value = False
+                    adder.memory_budget = SharedSWAPrefillBudget(
+                        self.mock_token_allocator, self.mock_tree_cache
+                    )
+                    self.assertIsNotNone(
+                        adder.memory_budget.available_chunk_tokens(
+                            adder.rem_chunk_tokens
+                        )
+                    )
+                executor = _single_rank_delaying_executor()
+                adder.prefill_delayer_single_pass = executor
+                adder.running_batch.batch_size.return_value = 0
+                adder.max_running_requests = 64
 
-        self.assertIs(adder.add_chunked_req(req), req)
-        executor.finalize(actual_prefill_bs=0)
+                self.assertIs(adder.add_chunked_req(req), req)
+                executor.finalize(actual_prefill_bs=0)
 
-        self.assertEqual(len(adder.can_run_list), 0)
-        self.assertFalse(executor.is_phase_prefill)
+                self.assertEqual(adder.can_run_list, [])
+                req.set_extend_range.assert_not_called()
+                self.assertFalse(executor.is_phase_prefill)
 
     def test_admitted_chunk_forces_prefill_phase_even_when_delayed(self):
         PAGE_SIZE = 64
