@@ -1880,61 +1880,30 @@ class AscendAttnBackend(AttentionBackend):
                             return_softmax_lse=True,
                         )
                     )
-                else:
-                    num_tokens = q_nope.size(0)
-                    attn_output = torch.zeros(
-                        num_tokens,
-                        layer.tp_q_head_num,
-                        layer.v_head_dim,
-                        dtype=q_nope.dtype,
-                        device=q_nope.device,
+
+                    k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                    v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+                    kv_cached = gather_mla_cache_pages(
+                        k_buffer,
+                        self.forward_metadata.flatten_prefix_block_tables,
+                        is_nz=is_fia_nz(),
                     )
-                    attn_lse = torch.zeros(
-                        layer.tp_q_head_num,
-                        num_tokens,
-                        dtype=torch.float32,
-                        device=q_nope.device,
+                    k_rope_cached = gather_mla_cache_pages(
+                        v_buffer,
+                        self.forward_metadata.flatten_prefix_block_tables,
+                        is_nz=is_fia_nz(),
+                    ).flatten(0, 1)
+
+                    assert layer.kv_b_proj is not None
+                    kv = layer.kv_b_proj(kv_cached)[0].view(
+                        -1,
+                        layer.tp_k_head_num,
+                        self.qk_nope_head_dim + layer.v_head_dim,
                     )
-                    torch_npu.atb.npu_ring_mla(
-                        q_nope=q_nope,
-                        q_rope=q_rope,
-                        k_nope=k_nope,
-                        k_rope=k_rope,
-                        value=v,
-                        mask=self.ringmla_mask,
-                        seqlen=self.forward_metadata.extend_seq_lens_cpu_int,
-                        head_num=layer.tp_q_head_num,
-                        kv_head_num=layer.tp_k_head_num,
-                        pre_out=None,
-                        prev_lse=None,
-                        qk_scale=layer.scaling,
-                        kernel_type="kernel_type_high_precision",
-                        mask_type="mask_type_triu",
-                        calc_type="calc_type_first_ring",
-                        output=attn_output,
-                        softmax_lse=attn_lse,
+                    k_nope, v = kv.split(
+                        [self.qk_nope_head_dim, layer.v_head_dim], dim=-1
                     )
 
-                k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-                v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
-                kv_cached = gather_mla_cache_pages(
-                    k_buffer,
-                    self.forward_metadata.flatten_prefix_block_tables,
-                    is_nz=is_fia_nz(),
-                )
-                k_rope_cached = gather_mla_cache_pages(
-                    v_buffer,
-                    self.forward_metadata.flatten_prefix_block_tables,
-                    is_nz=is_fia_nz(),
-                ).flatten(0, 1)
-
-                assert layer.kv_b_proj is not None
-                kv = layer.kv_b_proj(kv_cached)[0].view(
-                    -1, layer.tp_k_head_num, self.qk_nope_head_dim + layer.v_head_dim
-                )
-                k_nope, v = kv.split([self.qk_nope_head_dim, layer.v_head_dim], dim=-1)
-
-                if self.use_fia:
                     k_rope = k_rope_cached.expand(-1, layer.tp_k_head_num, -1)
                     prefix_lens = self.forward_metadata.prefix_lens
                     prefix_output, prefix_lse = (
@@ -1974,6 +1943,63 @@ class AscendAttnBackend(AttentionBackend):
                     )
                     attn_output = attn_output.to(q.dtype)
                 else:
+                    num_tokens = q_nope.size(0)
+                    attn_output = torch.zeros(
+                        num_tokens,
+                        layer.tp_q_head_num,
+                        layer.v_head_dim,
+                        dtype=q_nope.dtype,
+                        device=q_nope.device,
+                    )
+                    attn_lse = torch.zeros(
+                        layer.tp_q_head_num,
+                        num_tokens,
+                        dtype=torch.float32,
+                        device=q_nope.device,
+                    )
+                    torch_npu.atb.npu_ring_mla(
+                        q_nope=q_nope,
+                        q_rope=q_rope,
+                        k_nope=k_nope,
+                        k_rope=k_rope,
+                        value=v,
+                        mask=self.ringmla_mask,
+                        seqlen=self.forward_metadata.extend_seq_lens_cpu_int,
+                        head_num=layer.tp_q_head_num,
+                        kv_head_num=layer.tp_k_head_num,
+                        pre_out=None,
+                        prev_lse=None,
+                        qk_scale=layer.scaling,
+                        kernel_type="kernel_type_high_precision",
+                        mask_type="mask_type_triu",
+                        calc_type="calc_type_first_ring",
+                        output=attn_output,
+                        softmax_lse=attn_lse,
+                    )
+
+                    k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                    v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+                    kv_cached = gather_mla_cache_pages(
+                        k_buffer,
+                        self.forward_metadata.flatten_prefix_block_tables,
+                        is_nz=is_fia_nz(),
+                    )
+                    k_rope_cached = gather_mla_cache_pages(
+                        v_buffer,
+                        self.forward_metadata.flatten_prefix_block_tables,
+                        is_nz=is_fia_nz(),
+                    ).flatten(0, 1)
+
+                    assert layer.kv_b_proj is not None
+                    kv = layer.kv_b_proj(kv_cached)[0].view(
+                        -1,
+                        layer.tp_k_head_num,
+                        self.qk_nope_head_dim + layer.v_head_dim,
+                    )
+                    k_nope, v = kv.split(
+                        [self.qk_nope_head_dim, layer.v_head_dim], dim=-1
+                    )
+
                     k_rope = k_rope_cached.expand(-1, layer.tp_k_head_num, -1)
                     seq_len = torch.stack(
                         [
