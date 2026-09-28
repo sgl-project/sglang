@@ -1128,12 +1128,12 @@ class OpenAIServingChat(OpenAIServingBase):
         pre-rendered input_ids with single placeholder ids and leave the text
         empty; pass those through rather than re-tokenizing an empty prompt.
         """
-        # Send the ids already encoded while rendering: re-tokenizing long text
-        # prompts is costly, and a lossy text round-trip makes the text unusable.
-        # Only when nothing needs placeholder expansion: with media attached the
-        # MM processor still has to tokenize the text itself.
+        # A lossy text round-trip makes the rendered prompt unusable, so send the
+        # ids instead. Only when nothing needs placeholder expansion: with media
+        # attached the MM processor still has to tokenize the text itself.
         prefers_prompt_ids = (
-            isinstance(processed_messages.prompt_ids, list)
+            self._prompt_text_round_trip_is_lossy
+            and isinstance(processed_messages.prompt_ids, list)
             and processed_messages.prompt_ids
             and not (
                 processed_messages.image_data
