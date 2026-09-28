@@ -80,6 +80,8 @@ class TestDisaggregationWire(unittest.TestCase):
                 manager.request_status = {42: KVPoll.Failed}
                 manager._staging_outstanding = {42: outstanding}
                 manager._deferred_ack_targets = {42: ("127.0.0.1", 1234)}
+                manager._deferred_ack_fanout_snapshots = {}
+                manager.transfer_infos = {}
                 with patch.object(manager, "_send_abort_ack") as ack:
                     sender.clear()
                     if outstanding:
