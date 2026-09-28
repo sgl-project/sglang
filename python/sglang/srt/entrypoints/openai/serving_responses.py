@@ -78,7 +78,10 @@ from sglang.srt.entrypoints.openai.responses_adapters import (
     encode_reasoning_state,
     label_developer_content,
 )
-from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+from sglang.srt.entrypoints.openai.serving_chat import (
+    OpenAIServingChat,
+    _incomplete_tool_call_indices,
+)
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
 from sglang.srt.entrypoints.openai.utils import to_openai_style_logprobs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -493,6 +496,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                         not processed_messages.skip_special_tokens
                     ):
                         sampling_params["skip_special_tokens"] = False
+                    if (
+                        processed_messages is not None
+                        and processed_messages.uses_response_template
+                    ):
+                        sampling_params["spaces_between_special_tokens"] = False
 
                     context: ConversationContext
                     if self.use_harmony:
@@ -578,6 +586,11 @@ class OpenAIServingResponses(OpenAIServingChat):
 
             assert len(generators) == 1
             (result_generator,) = generators
+            if (
+                processed_messages is not None
+                and processed_messages.uses_response_template
+            ):
+                self._set_response_parser_context(request, adapted_request)
 
             # Store the input messages
             persist = self.enable_response_store and bool(request.store)
@@ -801,7 +814,15 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
             output = self._make_response_output_items(
                 request,
-                final_res["text"],
+                self._drop_kept_tool_close(
+                    final_res["text"],
+                    (
+                        meta_info.get("finish_reason")
+                        if isinstance(meta_info, dict)
+                        else None
+                    ),
+                    request,
+                ),
                 tokenizer,
                 output_logprobs=output_logprobs,
                 require_reasoning=require_reasoning,
@@ -1081,6 +1102,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 chat_tools,
                 self.tool_call_parser,
                 tokenizer=self.tokenizer_manager.tokenizer,
+                prefix=request._response_parser_prefix,
             )
             detector_owns_format = self._tool_parser_owns_format(parser)
             should_try_native = not is_required or detector_owns_format
@@ -2011,6 +2033,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     chat_tools,
                     self.tool_call_parser,
                     tokenizer=self.tokenizer_manager.tokenizer,
+                    prefix=request._response_parser_prefix,
                 )
                 detector_owns_format = self._tool_parser_owns_format(probe)
             if is_required and not detector_owns_format:
@@ -2020,6 +2043,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     chat_tools,
                     self.tool_call_parser,
                     tokenizer=self.tokenizer_manager.tokenizer,
+                    prefix=request._response_parser_prefix,
                 )
         reasoning_parser_obj: Optional[ReasoningParser] = None
         if self.reasoning_parser:
@@ -2244,13 +2268,18 @@ class OpenAIServingResponses(OpenAIServingChat):
                     )
                 )
             else:
+                item_status = (
+                    "incomplete"
+                    if tool_index in _incomplete_tool_call_indices(tool_parser)
+                    else "completed"
+                )
                 completed_item = ResponseFunctionToolCall(
                     arguments=arguments,
                     call_id=state["call_id"],
                     name=state["name"] or "",
                     type="function_call",
                     id=state["item_id"],
-                    status="completed",
+                    status=item_status,
                 )
                 events.append(
                     _send_event(
@@ -2302,6 +2331,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 else:
                     delta = text[stream_offset:]
                     stream_offset = len(text)
+                if finish_reason is not None:
+                    delta = self._drop_kept_tool_close(delta, finish_reason, request)
                 if not delta and finish_reason is None:
                     continue
                 # finish_reason is sticky, so it would otherwise re-flush.
@@ -2393,6 +2424,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                 if isinstance(tool_parser, JsonArrayParser):
                     sp = tool_parser.parse_streaming_increment(delta, chat_tools)
                     normal_text, tool_calls = sp.normal_text or "", sp.calls
+                    if flush:
+                        end = tool_parser.finish(chat_tools)
+                        normal_text += end.normal_text
+                        tool_calls = list(tool_calls) + end.calls
                 elif tool_parser is not None:
                     normal_text, tool_calls = tool_parser.parse_stream_chunk(delta)
                     if flush:

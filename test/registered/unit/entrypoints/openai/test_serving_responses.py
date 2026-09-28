@@ -33,6 +33,7 @@ from sglang.srt.entrypoints.openai.serving_responses import (
     _should_emit_normal_text_as_message,
 )
 from sglang.srt.function_call.core_types import ToolCallItem
+from sglang.srt.parser.response_template import ResponseTemplateReasoningDetector
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.runtime_context import get_serving, publish, reset_context
 from sglang.srt.sampling.sampling_params import (
@@ -647,6 +648,136 @@ class SkipSpecialTokensForwardingTestCase(CustomTestCase):
         # The chat request's True is a synthesized default (ResponsesRequest has
         # no such field), so leave it unset for --preferred-sampling-params.
         self.assertNotIn("skip_special_tokens", params)
+
+    def test_response_template_parser_keeps_special_tokens_unspaced(self):
+        serving = make_serving()
+        serving.reasoning_parser = "response_template"
+        serving._reasoning_detector = ResponseTemplateReasoningDetector(
+            response_template={
+                "start_anchor": "<assistant>",
+                "fields": {"content": {"content": "text"}},
+            },
+        )
+        params = self._create_responses_sampling_params(serving)
+        self.assertFalse(params["skip_special_tokens"])
+        self.assertFalse(params["spaces_between_special_tokens"])
+
+
+class ResponseTemplateRequiredToolTestCase(CustomTestCase):
+    # Every field is delimited, so the template gives no field to the JSON.
+    TEMPLATE = {
+        "start_anchor": "<assistant>",
+        "fields": {
+            "thinking": {"open": "<think>", "close": "</think>"},
+            "content": {"open": "<answer>", "close": "</answer>"},
+            "tool_calls": {
+                "open_pattern": r"<call:(?P<name>\w+)>",
+                "close": "</call>",
+                "content": "json",
+                "repeats": True,
+                "transform": {
+                    "type": "function",
+                    "function": {"name": "{name}", "arguments": "{content}"},
+                },
+            },
+        },
+    }
+
+    @staticmethod
+    def _output():
+        return {
+            "text": (
+                "<think>Check the forecast.</think>"
+                '[{"name": "get_weather", "parameters": {"city": "Paris"}}]</call>'
+            ),
+            "meta_info": {
+                "prompt_tokens": 3,
+                "completion_tokens": 9,
+                "cached_tokens": 0,
+                "finish_reason": {"type": "stop", "matched": 7},
+            },
+        }
+
+    def _respond(self, stream):
+        serving = make_serving()
+        serving.default_chat_template_kwargs = None
+        serving.reasoning_parser = "response_template"
+        serving.tool_call_parser = "response_template"
+        serving._reasoning_detector = ResponseTemplateReasoningDetector(
+            response_template=self.TEMPLATE
+        )
+        # Always-on reasoning: the output grammar starts after the reasoning.
+        serving.template_manager.reasoning_config = ReasoningToggleConfig(
+            special_case="always"
+        )
+        tokenizer = serving.tokenizer_manager.tokenizer
+        tokenizer.response_template = self.TEMPLATE
+        tokenizer.encode.side_effect = lambda literal, **_: (
+            [7] if literal == "</call>" else [1, 2, 3]
+        )
+        tokenizer.decode.return_value = "<assistant>"
+
+        async def fake_generate(
+            request_id, request_prompt, adapted_request, sampling_params, context, **_
+        ):
+            context.append_output(self._output())
+            yield context
+
+        serving._generate_with_builtin_tools = fake_generate
+        request = ResponsesRequest(
+            model="x",
+            input="Weather?",
+            tool_choice="required",
+            tools=[
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                }
+            ],
+            stream=stream,
+            store=False,
+        )
+        rendered = MessageProcessingResult(
+            prompt="<assistant>",
+            prompt_ids=[1, 2, 3],
+            image_data=None,
+            audio_data=None,
+            video_data=None,
+            modalities=[],
+            stop=[],
+        )
+
+        async def respond():
+            response = await serving.create_responses(request)
+            if stream:
+                events = [event async for event in response]
+                return event_payloads(events)[-1]["response"]
+            return response.model_dump()
+
+        with patch.object(
+            serving, "_apply_conversation_template", return_value=rendered
+        ):
+            return asyncio.run(respond())
+
+    def test_required_tool_json_is_parsed_under_delimited_template(self):
+        """Required-tool JSON after the reasoning becomes a completed function
+        call, also when it ends on the tool closer that detokenization keeps."""
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                response = self._respond(stream)
+
+                self.assertEqual(response["status"], "completed")
+                self.assertEqual(
+                    [item["type"] for item in response["output"]],
+                    ["reasoning", "function_call"],
+                )
+                call = response["output"][1]
+                self.assertEqual(call["name"], "get_weather")
+                self.assertEqual(orjson.loads(call["arguments"]), {"city": "Paris"})
 
 
 class InputItemNormalizationTestCase(CustomTestCase):

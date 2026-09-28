@@ -17,8 +17,10 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 GPT_OSS_CALL_TOKEN = 200012
 
 
-def _trim(output, matched, no_stop_trim, *, gpt_oss=False):
-    stub = SimpleNamespace(is_tool_call_parser_gpt_oss=gpt_oss)
+def _trim(output, matched, no_stop_trim, *, gpt_oss=False, tool_close=()):
+    stub = SimpleNamespace(
+        is_tool_call_parser_gpt_oss=gpt_oss, tool_close_token_ids=frozenset(tool_close)
+    )
     finished_reason = None if matched is None else {"matched": matched}
     return DetokenizerManager.trim_matched_stop(
         stub, output, finished_reason, no_stop_trim
@@ -62,6 +64,10 @@ class TestTrimMatchedStop(unittest.TestCase):
             _trim([1, 2, GPT_OSS_CALL_TOKEN], GPT_OSS_CALL_TOKEN, False, gpt_oss=True),
             [1, 2, GPT_OSS_CALL_TOKEN],
         )
+
+    def test_token_tool_close_kept(self):
+        self.assertEqual(_trim([1, 2, 3], 3, False, tool_close=[3]), [1, 2, 3])
+        self.assertEqual(_trim([1, 2, 4], 4, False, tool_close=[3]), [1, 2])
 
 
 if __name__ == "__main__":

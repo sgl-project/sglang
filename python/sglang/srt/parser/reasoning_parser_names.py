@@ -37,4 +37,5 @@ REASONING_PARSER_NAMES = [
     "inkling",
     "cohere_command4",
     "gigachat35",
+    "response_template",
 ]

@@ -4047,6 +4047,33 @@ class TestJsonArrayParser(unittest.TestCase):
         self.assertEqual(len(result.calls), 0)
         self.assertEqual(result.normal_text, "")
 
+    def test_finish_streams_arguments_of_calls_completed_in_final_chunk(self):
+        """Calls that arrive whole in the last chunk still stream their
+        arguments at stream end, exactly once."""
+        text = (
+            '[{"name": "get_weather", "parameters": {"location": "Tokyo"}}, '
+            '{"name": "search", "parameters": {"query": "restaurants"}}]'
+        )
+        calls = self.detector.parse_streaming_increment(text, self.tools).calls
+        calls += self.detector.finish(self.tools).calls
+
+        streamed = {}
+        for call in calls:
+            entry = streamed.setdefault(call.tool_index, {"name": "", "arguments": ""})
+            entry["name"] += call.name or ""
+            entry["arguments"] += call.parameters or ""
+        self.assertEqual(
+            [
+                (e["name"], json.loads(e["arguments"]))
+                for _, e in sorted(streamed.items())
+            ],
+            [
+                ("get_weather", {"location": "Tokyo"}),
+                ("search", {"query": "restaurants"}),
+            ],
+        )
+        self.assertEqual(self.detector.finish(self.tools).calls, [])
+
     def test_braces_in_strings(self):
         """Test that JSON with } characters inside strings works correctly"""
         # Test case: JSON array with } inside string values - streamed across chunks
