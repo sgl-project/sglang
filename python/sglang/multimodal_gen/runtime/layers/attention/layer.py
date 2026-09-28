@@ -2094,7 +2094,7 @@ def _make_breakable_attention_forward(forward_method):
         out = forward_method(*args, **kwargs)
         return _BCGBoxedTupleOutput(out) if isinstance(out, tuple) else out
 
-    bcg_forward = eager_on_graph(True)(_forward_boxing_tuples)
+    bcg_forward = eager_on_graph(_forward_boxing_tuples)
 
     @functools.wraps(forward_method)
     def forward(self, *args, **kwargs):

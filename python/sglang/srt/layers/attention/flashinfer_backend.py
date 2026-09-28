@@ -36,15 +36,7 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
-from sglang.srt.model_executor.cuda_graph_config import (
-    Backend,
-    Phase,
-    check_cuda_graph_backend,
-)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-    is_in_tc_piecewise_cuda_graph,
-)
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
@@ -488,10 +480,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 model_runner.model_config.head_dim,
                 model_runner.model_config.v_head_dim,
             )
-            if (
-                head_dims in cutlass_supported_head_dims
-                and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-            ):
+            if head_dims in cutlass_supported_head_dims:
                 fmha_backend = "cutlass"
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
             self.workspace_buffer, "NHD", backend=fmha_backend
@@ -1006,11 +995,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged = False
                 extend_no_prefix = False
             else:
-                use_ragged = (
-                    not self.enable_deterministic
-                    and not is_in_tc_piecewise_cuda_graph()
-                    and not self.use_paged
-                )
+                use_ragged = (not self.enable_deterministic) and (not self.use_paged)
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
 
             # Process multi-item scoring in attention backend instead of ForwardBatch

@@ -86,8 +86,8 @@ class TestRadixLinearAttentionPadding(CustomTestCase):
         with (
             patch.object(
                 radix_linear_attention,
-                "get_tc_piecewise_forward_context",
-                return_value=None,
+                "is_in_prefill_graph",
+                return_value=False,
             ),
             patch.object(
                 radix_linear_attention,
@@ -126,8 +126,8 @@ class TestRadixLinearAttentionPadding(CustomTestCase):
         with (
             patch.object(
                 radix_linear_attention,
-                "get_tc_piecewise_forward_context",
-                return_value=None,
+                "is_in_prefill_graph",
+                return_value=False,
             ),
             patch.object(
                 radix_linear_attention,
@@ -165,8 +165,8 @@ class TestRadixLinearAttentionPadding(CustomTestCase):
         with (
             patch.object(
                 radix_linear_attention,
-                "get_tc_piecewise_forward_context",
-                return_value=None,
+                "is_in_prefill_graph",
+                return_value=False,
             ),
             patch.object(
                 radix_linear_attention,
@@ -201,8 +201,8 @@ class TestRadixLinearAttentionPadding(CustomTestCase):
                 with (
                     patch.object(
                         radix_linear_attention,
-                        "get_tc_piecewise_forward_context",
-                        return_value=context,
+                        "is_in_prefill_graph",
+                        return_value=True,
                     ),
                     patch.object(
                         radix_linear_attention,
@@ -210,12 +210,13 @@ class TestRadixLinearAttentionPadding(CustomTestCase):
                         return_value=_FakeAttentionBackend(),
                     ),
                 ):
-                    radix_linear_attention._unified_linear_attention_with_output_impl(
+                    radix_linear_attention._linear_attention_with_output_impl(
                         mixed_qkv=torch.zeros((padded_num_tokens, 8)),
                         a=torch.zeros((padded_num_tokens, 2)),
                         b=torch.zeros((padded_num_tokens, 2)),
                         output=output,
-                        layer_id=0,
+                        attention_layer=context.attention_layers[0],
+                        forward_batch=forward_batch,
                     )
 
                 torch.testing.assert_close(output[:, :3], torch.full((1, 3, 2, 4), 5.0))

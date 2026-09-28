@@ -263,7 +263,6 @@ class TestCudaDeviceMixin(CustomTestCase):
         base = CudaSRTPlatform()
         self.assertTrue(base.supports_fp8())
         self.assertTrue(base.support_cuda_graph())
-        self.assertTrue(base.support_piecewise_cuda_graph())
 
 
 class TestXpuDeviceMixin(CustomTestCase):
@@ -315,7 +314,6 @@ class TestXpuDeviceMixin(CustomTestCase):
         base = XpuSRTPlatform()
         self.assertFalse(base.supports_fp8())
         self.assertTrue(base.support_cuda_graph())
-        self.assertTrue(base.support_piecewise_cuda_graph())
 
 
 class TestNpuDeviceMixin(CustomTestCase):
@@ -446,7 +444,6 @@ class TestNpuDeviceMixin(CustomTestCase):
         base = NPUSRTPlatform()
         self.assertTrue(base.supports_fp8())
         self.assertTrue(base.support_cuda_graph())
-        self.assertFalse(base.support_piecewise_cuda_graph())
 
 
 class TestCpuDeviceMixin(CustomTestCase):
@@ -508,7 +505,6 @@ class TestCpuDeviceMixin(CustomTestCase):
         base = CpuSRTPlatform()
         self.assertFalse(base.supports_fp8())
         self.assertFalse(base.support_cuda_graph())
-        self.assertFalse(base.support_piecewise_cuda_graph())
         # CPU has no GPU to pin host memory to.
         self.assertFalse(base.is_pin_memory_available())
         self.assertFalse(base.is_pin_memory_available(device="cpu"))

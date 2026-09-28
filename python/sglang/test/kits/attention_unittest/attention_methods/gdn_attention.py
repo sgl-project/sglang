@@ -248,7 +248,7 @@ class MockGDNModelRunner(ModelRunner):
                     backend=(
                         Backend.DISABLED
                         if (disable_cuda_graph or disable_piecewise_cuda_graph)
-                        else Backend.TC_PIECEWISE
+                        else Backend.BREAKABLE
                     ),
                 ),
             ),

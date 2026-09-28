@@ -340,10 +340,6 @@ class StartupWeightLoadManager:
         basic_rules = (
             (not options.is_cuda_platform or options.device != "cuda", "CUDA only"),
             (not options.cuda_graph_enabled, "CUDA graph capture is disabled"),
-            (
-                options.prefill_cuda_graph_backend == Backend.TC_PIECEWISE,
-                "tc_piecewise prefill CUDA graphs are not supported",
-            ),
             (type(loader) is not DefaultModelLoader, "DefaultModelLoader only"),
             (
                 load_config.load_format

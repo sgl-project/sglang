@@ -232,15 +232,6 @@ class TestStartupWeightLoadSelector(CustomTestCase):
                 "CUDA graph capture is disabled",
             ),
             (
-                "tc_piecewise_prefill",
-                dict(
-                    options=_make_options(
-                        prefill_cuda_graph_backend=Backend.TC_PIECEWISE
-                    )
-                ),
-                "tc_piecewise prefill CUDA graphs are not supported",
-            ),
-            (
                 "pt_checkpoint",
                 dict(load_config=LoadConfig(load_format=LoadFormat.PT)),
                 "load format must be auto or safetensors",

@@ -509,16 +509,6 @@ direct_register_custom_op(
     fake_impl=_transformers_moe_forward_fake,
 )
 
-try:
-    from sglang.srt.compilation.compilation_config import SPLIT_OPS
-
-    _MOE_SPLIT_OP = "sglang.transformers_moe_forward"
-    if _MOE_SPLIT_OP not in SPLIT_OPS:
-        SPLIT_OPS.append(_MOE_SPLIT_OP)
-except ImportError:
-    pass
-
-
 _BASE_DYNAMIC_ARG_DIMS: dict[str, int] = {
     "input_ids": 0,
     "positions": 0,

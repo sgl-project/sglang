@@ -9,11 +9,8 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
 
 
-class AttentionAndMoeLayers(NamedTuple):
+class AttentionLayers(NamedTuple):
     attention_layers: list[Any]
-    moe_layers: list[Any]
-    moe_fusions: list[Any]
-    dsa_indexers: list[Any]
     mha_companion_layers: list[Any]
 
 
@@ -22,11 +19,8 @@ def _get_loop_num(hf_config: Any) -> int:
     return int(getattr(hf_config, "loop_num", getattr(hf_config, "num_loops", 1)) or 1)
 
 
-def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
+def compute_attention_layers(layer_model: Any) -> AttentionLayers:
     attention_layers: list[Any] = []
-    moe_layers: list[Any] = []
-    moe_fusions: list[Any] = []
-    dsa_indexers: list[Any] = []
     mha_companion_layers: list[Any] = []
 
     # Loop models (Nanbeige / IQuestLoopCoder) store one RadixAttention per loop
@@ -83,40 +77,12 @@ def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
             attention_layers.append(attn_layer)
             mha_companion_layers.append(mha_companion_layer)
 
-        moe_block = None
-        moe_fusion = None
-        if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts"):
-            moe_block = layer.mlp.experts
-            moe_fusion = layer.mlp
-        if hasattr(layer, "block_sparse_moe") and hasattr(
-            layer.block_sparse_moe, "experts"
-        ):
-            moe_block = layer.block_sparse_moe.experts
-            moe_fusion = layer.block_sparse_moe
-        if hasattr(layer, "moe") and hasattr(layer.moe, "experts"):
-            moe_block = layer.moe.experts
-            moe_fusion = layer.moe
-        # For NemotronH MoE layers using 'mixer' attribute
-        if hasattr(layer, "mixer") and hasattr(layer.mixer, "experts"):
-            moe_block = layer.mixer.experts
-            moe_fusion = layer.mixer
-        moe_layers.append(moe_block)
-        moe_fusions.append(moe_fusion)
-        # NSA indexers (None for layers without NSA)
-        dsa_indexer = None
-        if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "indexer"):
-            dsa_indexer = layer.self_attn.indexer
-        dsa_indexers.append(dsa_indexer)
-
     # Reorder so attention_layers[i] matches RadixAttention.layer_id.
     if has_loop_attn:
         attention_layers.sort(key=lambda x: x.layer_id)
 
-    return AttentionAndMoeLayers(
+    return AttentionLayers(
         attention_layers,
-        moe_layers,
-        moe_fusions,
-        dsa_indexers,
         mha_companion_layers,
     )
 

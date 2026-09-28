@@ -1,78 +1,52 @@
+"""The retained torch.compile entry point is independent of TCPCG."""
+
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
 
+from sglang.srt.compilation import torch_compile_decoration as decoration
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
-
-from sglang.srt.compilation.compile import (
-    _infer_dynamic_arg_dims_from_annotations,
-    _mark_dynamic_forward_batch,
-    _runtime_dynamic_dim_for_argument,
-)
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
-class _MropeModel:
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch,
+class Model(torch.nn.Module):
+    def forward(self, x):
+        return x + 2
+
+
+def test_disabled_compile_keeps_raw_forward():
+    model = Model()
+    with patch.object(torch, "compile") as compile_model:
+        with decoration.patch_model(
+            model, False, 4, SimpleNamespace(ca_comm=None)
+        ) as forward:
+            assert forward(torch.tensor(3)).item() == 5
+        compile_model.assert_not_called()
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_compile_restores_module_policy_and_communicator(raises):
+    model = Model()
+    communicator = object()
+    group = SimpleNamespace(ca_comm=communicator)
+    with (
+        patch.object(decoration, "_to_torch") as convert,
+        patch.object(
+            torch, "compile", side_effect=lambda forward, **kwargs: forward
+        ) as compile_model,
     ):
-        return input_ids, positions, forward_batch
-
-
-class _StringAnnotatedMropeModel:
-    def forward(
-        self,
-        input_ids: "torch.Tensor",
-        positions: "torch.Tensor",
-        forward_batch,
-    ):
-        return input_ids, positions, forward_batch
-
-
-def test_positions_marks_the_token_axis_dynamic_for_mrope_and_1d_rope():
-    dynamic_dims = _infer_dynamic_arg_dims_from_annotations(_MropeModel.forward)
-    string_dynamic_dims = _infer_dynamic_arg_dims_from_annotations(
-        _StringAnnotatedMropeModel.forward
-    )
-
-    assert dynamic_dims["input_ids"] == 0
-    assert dynamic_dims["positions"] == -1
-    assert string_dynamic_dims["positions"] == -1
-
-
-def test_runtime_dynamic_dim_uses_the_token_axis_for_mrope_metadata():
-    assert _runtime_dynamic_dim_for_argument("positions") == -1
-    assert _runtime_dynamic_dim_for_argument("position_ids") == -1
-    assert _runtime_dynamic_dim_for_argument("mrope_positions") == -1
-    assert _runtime_dynamic_dim_for_argument("input_ids") == 0
-
-
-def test_forward_batch_marks_token_and_batch_metadata_dynamic():
-    batch = SimpleNamespace(
-        input_embeds=torch.empty(8, 16),
-        seq_lens=torch.empty(2, dtype=torch.int64),
-        mrope_positions=torch.empty(3, 8, dtype=torch.int64),
-        scalar=torch.tensor(1),
-    )
-    marked = []
-
-    def record_mark_dynamic(value, dims):
-        marked.append((id(value), tuple(dims)))
-
-    with patch("torch._dynamo.maybe_mark_dynamic", side_effect=record_mark_dynamic):
-        _mark_dynamic_forward_batch(batch)
-
-    assert (id(batch.input_embeds), (0,)) in marked
-    assert (id(batch.seq_lens), (0,)) in marked
-    assert (id(batch.mrope_positions), (1,)) in marked
-    assert all(value_id != id(batch.scalar) for value_id, _ in marked)
-
-
-if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, "-v"]))
+        try:
+            with decoration.patch_model(model, True, 4, group) as forward:
+                assert forward(torch.tensor(3)).item() == 5
+                group.ca_comm = None
+                if raises:
+                    raise RuntimeError("forward failed")
+        except RuntimeError:
+            assert raises
+        assert group.ca_comm is communicator
+        assert convert.call_args_list[0].kwargs == {"reverse": False, "num_tokens": 4}
+        assert convert.call_args_list[1].kwargs == {"reverse": True, "num_tokens": 4}
+        compile_model.assert_called_once()

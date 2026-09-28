@@ -749,7 +749,7 @@ def _minimax_h3_attention_core_impl(
     return out
 
 
-_minimax_h3_attention_core_bcg = eager_on_graph(True)(_minimax_h3_attention_core_impl)
+_minimax_h3_attention_core_bcg = eager_on_graph(_minimax_h3_attention_core_impl)
 
 
 class MiniMaxH3Attention(nn.Module):
@@ -2269,7 +2269,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         self.release_mps_non_layer_weights("rope")
         return result
 
-    @eager_on_graph(True)
+    @eager_on_graph
     def _embed(
         self,
         *,

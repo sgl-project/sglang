@@ -43,7 +43,6 @@ def make_backend(mode, seq, req, *, fusion=True):
     backend.token_to_kv_pool = SimpleNamespace(slots_per_page=64)
     # Only attention-dispatch state is synthetic; every metadata kernel is real.
     backend._is_in_breakable_cuda_graph = lambda: False
-    backend._is_in_tc_piecewise_cuda_graph = lambda: False
     backend._get_device_sm = lambda: backend.device_sm_major * 10
     backend._is_blackwell = lambda: backend.device_sm_major == 10
     backend.dsa_topk_backend = DSATopKBackend.SGL_KERNEL

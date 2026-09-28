@@ -28,11 +28,6 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.model_executor.cuda_graph_config import (
-    Backend,
-    Phase,
-    check_cuda_graph_backend,
-)
 from sglang.srt.runtime_context import get_exec, get_parallel, publish_role
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -175,8 +170,6 @@ class SiluAndMul(BaseFusedOp):
         return out
 
     def forward_musa(self, x: torch.Tensor) -> torch.Tensor:
-        if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE):
-            return self.forward_native(x)
 
         if not hasattr(self, "_musa_swish_glu"):
             # XXX (MUSA): nn.SwishGLU seems to have better performance than silu_and_mul on MUSA, we can switch to it for now. We can consider implementing a silu_and_mul kernel for MUSA in the future if needed.

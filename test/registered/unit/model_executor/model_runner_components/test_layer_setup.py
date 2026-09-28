@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
-    compute_attention_and_moe_layers,
+    compute_attention_layers,
     resolve_layer_indices,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -16,7 +16,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
-class TestComputeAttentionAndMoeLayers(CustomTestCase):
+class TestComputeAttentionLayers(CustomTestCase):
     def test_deepseek_mla_registers_mha_companion(self):
         attn_mqa = SimpleNamespace()
         attn_mha = SimpleNamespace()
@@ -28,9 +28,7 @@ class TestComputeAttentionAndMoeLayers(CustomTestCase):
             ]
         )
 
-        attention_layers, _, _, _, mha_companion_layers = (
-            compute_attention_and_moe_layers(layer_model)
-        )
+        attention_layers, mha_companion_layers = compute_attention_layers(layer_model)
 
         self.assertEqual(attention_layers, [attn_mqa])
         self.assertEqual(mha_companion_layers, [attn_mha])
@@ -43,9 +41,7 @@ class TestComputeAttentionAndMoeLayers(CustomTestCase):
             + [SimpleNamespace(self_attn=SimpleNamespace(attn=local_attention))]
         )
 
-        attention_layers, _, _, _, mha_companion_layers = (
-            compute_attention_and_moe_layers(layer_model)
-        )
+        attention_layers, mha_companion_layers = compute_attention_layers(layer_model)
 
         self.assertEqual(attention_layers, [None, None, local_attention])
         self.assertEqual(mha_companion_layers, [None, None, None])

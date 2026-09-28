@@ -55,6 +55,7 @@ from sglang.srt.model_executor.forward_context import (
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
     is_in_breakable_cuda_graph,
 )
 from sglang.srt.runtime_context import get_device, get_exec
@@ -1512,10 +1513,6 @@ class IndexerKPool(MultiPlatformOp):
             is_in_breakable_cuda_graph()
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
-            from sglang.srt.layers.attention.dsa.kpool_prefill_cuda_graph import (
-                bcg_kpool_indexer_prefill_with_output,
-            )
-
             # K-pool prefill plans contain request-specific tensors and launch
             # counts. Like the ordinary DSA indexer, execute them eagerly and
             # bridge the result into a stable buffer for captured attention.
@@ -1527,9 +1524,7 @@ class IndexerKPool(MultiPlatformOp):
                 dtype=torch.int32,
                 device=x.device,
             )
-            bcg_kpool_indexer_prefill_with_output(
-                self, x, q_lora, positions, output, layer_id
-            )
+            self._eager_indexer(forward_batch, x, q_lora, positions, output, layer_id)
             return output if return_indices else None
         return self._forward_cuda_impl(
             x, q_lora, positions, forward_batch, layer_id, return_indices
@@ -1706,3 +1701,50 @@ class IndexerKPool(MultiPlatformOp):
                 "kpool indexer is only supported on CUDA and ROCm"
             )
         return topk_result
+
+    def _capture_stub_indexer(
+        self,
+        forward_batch: ForwardBatch,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        output: torch.Tensor,
+        layer_id: int,
+    ) -> None:
+        output.fill_(-1)
+
+    @eager_on_graph(capture_stub=_capture_stub_indexer)
+    def _eager_indexer(
+        self,
+        forward_batch: ForwardBatch,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        output: torch.Tensor,
+        layer_id: int,
+    ) -> None:
+        # Metadata, write counts and cache destinations change between requests.
+        # Resolve the live batch inside the eager break, never from capture args.
+        n = forward_batch.extend_num_tokens
+        if n is None or not 0 <= n <= x.shape[0]:
+            raise ValueError(f"Invalid pooled-indexer prefill token count: {n}")
+        if n > q_lora.shape[0] or n > positions.shape[0]:
+            raise ValueError("Pooled-indexer prefill inputs have inconsistent rows")
+        return_indices = output.shape[0] != 0
+        result = self._forward_cuda_impl(
+            x=x[:n],
+            q_lora=q_lora[:n],
+            positions=positions[:n],
+            forward_batch=forward_batch,
+            layer_id=layer_id,
+            return_indices=return_indices,
+        )
+        if not return_indices:
+            return
+        if result is None or result.shape != (n, output.shape[1]):
+            raise ValueError(
+                "Pooled-indexer prefill returned an unexpected top-k shape"
+            )
+        # The following captured attention segment reads this stable padded buffer.
+        output[:n].copy_(result)
+        output[n:].fill_(-1)

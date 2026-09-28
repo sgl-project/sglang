@@ -277,8 +277,6 @@ def execute_prefill_cp_bcg(
     assert cp_input is not None
     model = runner.model_runner.model
     with runner._prefill_forward_context(
-        static_forward_batch,
-        num_tokens=static_num_tokens,
         raw_num_tokens=raw_num_tokens,
     ):
         local_output = runner.backend.replay(

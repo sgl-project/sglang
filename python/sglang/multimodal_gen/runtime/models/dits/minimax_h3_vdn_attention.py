@@ -563,9 +563,7 @@ def _vdn_return_to_rows(
     return merged[0], linear_rows
 
 
-_hybrid_attention_core_bcg = eager_on_graph(True)(
-    _minimax_h3_hybrid_attention_core_impl
-)
+_hybrid_attention_core_bcg = eager_on_graph(_minimax_h3_hybrid_attention_core_impl)
 
 
 def prepare_hybrid_attention_metadata(

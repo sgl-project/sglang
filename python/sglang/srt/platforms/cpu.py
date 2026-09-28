@@ -123,7 +123,7 @@ class CpuDeviceMixin(DeviceMixin):
 class CpuSRTPlatform(CpuDeviceMixin, SRTPlatform):
     """Default in-tree CPU SRT platform.
 
-    supports_fp8 / support_cuda_graph / support_piecewise_cuda_graph keep the
+    supports_fp8 / support_cuda_graph keep the
     conservative SRTPlatform defaults (all False), so they are not repeated
     here. is_pin_memory_available is repeated for explicitness: CPU has no GPU
     to pin host memory to.

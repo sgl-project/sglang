@@ -76,11 +76,6 @@ from sglang.srt.layers.quantization.fp8_utils import (
     _use_aiter_bpreshuffle_gfx95,
     materialize_bpreshuffle_fp8_scale_tuple,
 )
-from sglang.srt.model_executor.cuda_graph_config import (
-    Backend,
-    Phase,
-    check_cuda_graph_backend,
-)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
     LoRABatchLayout,
@@ -325,16 +320,15 @@ class AttnTpContext:
         # cannot use scattered inputs.
         self.is_dsa = is_dsa
         self.allow_input_scattered = (
-            get_parallel().enable_attn_tp_input_scattered
+            (get_parallel().enable_attn_tp_input_scattered)
             and (_is_cuda or _is_npu)
-            and q_lora_rank is not None
+            and (q_lora_rank is not None)
             and (is_mhc or not is_dsa)
-            and get_parallel().tp_size > 1
-            and not is_dp_attention_enabled()
-            and get_moe_a2a_backend().is_none()
-            and not enable_moe_dense_fully_dp()
-            and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-            and get_spec().speculative_algorithm != "EAGLE3"
+            and (get_parallel().tp_size > 1)
+            and (not is_dp_attention_enabled())
+            and (get_moe_a2a_backend().is_none())
+            and (not enable_moe_dense_fully_dp())
+            and (get_spec().speculative_algorithm != "EAGLE3")
         )
         if get_parallel().enable_attn_tp_input_scattered:
             if not self.allow_input_scattered:

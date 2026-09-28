@@ -19,9 +19,6 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
     is_weak_contiguous,
 )
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-    is_in_tc_piecewise_cuda_graph,
-)
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
@@ -318,13 +315,7 @@ class CustomAllreduce:
                 # Could be warmup OR piecewise cuda graph split op execution.
                 # In piecewise cuda graph, split ops run eagerly outside the graph
                 # but _IS_CAPTURING is still True. We need to do real all-reduce.
-                if is_in_tc_piecewise_cuda_graph():
-                    # Split op execution - do real all-reduce
-                    return self._all_reduce_impl(input, registered=False)
-                else:
-                    # True warmup - mimic the allocation pattern since custom
-                    # allreduce is out-of-place.
-                    return torch.zeros_like(input)
+                return torch.zeros_like(input)
         else:
             return self._all_reduce_impl(input, registered=False)
 

@@ -489,24 +489,6 @@ def capture_prefill_graph(
     if model_runner.is_draft_worker and not force_for_draft_worker:
         return result(None)
 
-    # Skip prefill CG for EAGLE target on tc_piecewise when the fixed server
-    # capture ceiling is below FULL. EAGLE target prefill requests FULL, so a
-    # NULL or LAST graph is dead; capturing it can perturb FP4/TRTLLM-MoE
-    # state and corrupt decode replay (see #28386 and #28870). BCG and FullCG
-    # capture FULL for EAGLE targets in PrefillCudaGraphRunner.__init__, so
-    # they do not need this skip.
-    if (
-        model_runner.spec_algorithm.is_eagle()
-        and not model_runner.is_draft_worker
-        and get_server_return_hidden_states_mode() < CaptureHiddenMode.FULL
-        and check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-    ):
-        logger.info(
-            "Disable prefill CUDA graph for EAGLE target on tc_piecewise "
-            "to avoid FP4/MoE decode-replay corruption (#28386)."
-        )
-        return result(eager_runner)
-
     if (
         model_runner.lora_manager is not None
         and not model_runner.lora_manager.supports_prefill_cuda_graph
@@ -609,9 +591,6 @@ def capture_prefill_graph(
 
     (
         model_runner.attention_layers,
-        model_runner.moe_layers,
-        model_runner.moe_fusions,
-        model_runner.dsa_indexers,
         model_runner.mha_companion_layers,
     ) = model_runner.get_cuda_graph_layers(layer_model)
     (

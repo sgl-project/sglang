@@ -140,7 +140,7 @@ class TestVLMViTCudaGraph(CustomTestCase):
                 other_args=[
                     "--mm-attention-backend",
                     "fa3",
-                    "--cuda-graph-backend-prefill=tc_piecewise",
+                    "--cuda-graph-backend-prefill=breakable",
                     "--cuda-graph-max-bs-prefill",
                     "8192",
                     "--chunked-prefill-size",

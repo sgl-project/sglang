@@ -1,8 +1,8 @@
 """
-XPU graph tests: verifies decode full-graph and prefill tc_piecewise graph
+XPU graph tests: verifies decode full-graph and prefill breakable graph
 on Intel XPU produce valid outputs.
 
-  - TestXPUGraph : decode full-graph and prefill tc_piecewise graph enabled
+  - TestXPUGraph : decode full-graph and prefill breakable graph enabled
     together in a single bench_one_batch invocation.
 
 Usage:
@@ -38,13 +38,13 @@ _FULL_IO_ARGS = ["--input", "128", "--output", "16"]
 
 
 class TestXPUGraph(CustomTestCase):
-    """Decode full-graph + prefill tc_piecewise together."""
+    """Decode full-graph + prefill breakable together."""
 
     def test_full_graph_runs(self):
         args = [
             *_COMMON_ARGS,
             "--cuda-graph-config",
-            '{"decode":{"backend":"full"},"prefill":{"backend":"tc_piecewise","tc_compiler":"eager"}}',
+            '{"decode":{"backend":"full"},"prefill":{"backend":"breakable"}}',
             "--cuda-graph-bs-prefill",
             "64",
             "128",
@@ -60,7 +60,7 @@ class TestXPUGraph(CustomTestCase):
         self.assertGreater(
             prefill_latency,
             0,
-            "prefill latency must be > 0 with tc_piecewise XPU graph",
+            "prefill latency must be > 0 with breakable XPU graph",
         )
         self.assertGreater(
             decode_throughput, 0, "decode throughput must be > 0 with full XPU graph"

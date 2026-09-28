@@ -11,9 +11,6 @@ duration of each forward; callers that need a per-call override (PDmux
 per-stream backend, frozen-KV MTP draft loop, TBO per-child dispatch) use
 dataclasses.replace and wrap the override scope with forward_context().
 
-Distinct from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.TcPiecewiseForwardContext,
-which collects compilation-time refs for the piecewise CUDA graph backend.
-
 Concurrency: _current is a plain module-level global, not thread-local.
 This matches the global_server_args precedent and is safe because each
 forward runs synchronously on a single Python thread per worker process. If
@@ -38,6 +35,10 @@ class ForwardContext:
     write time — use dataclasses.replace for per-call overrides."""
 
     attn_backend: AttentionBackend
+    # Runner-owned graph policy; no module registries or hidden batch lookup.
+    prefill_graph: bool = False
+    full_graph: bool = False
+    raw_num_tokens: Optional[int] = None
 
 
 _current: Optional[ForwardContext] = None
@@ -82,3 +83,11 @@ def forward_context(ctx: ForwardContext):
         yield
     finally:
         set_forward_context(prev)
+
+
+def is_in_prefill_graph() -> bool:
+    return _current is not None and _current.prefill_graph
+
+
+def is_in_full_prefill_graph() -> bool:
+    return _current is not None and _current.full_graph
