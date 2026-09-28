@@ -615,7 +615,8 @@ class TreeComponent(ABC):
         Return None for no truncation opinion (use full length);
         return int >= 0 for effective cache length.
         - Full: no-op, returns None.
-        - SWA: sets insert_params.swa_evicted_seqlen on finished; returns None.
+        - SWA: copies its eviction cursor into insert_params for finished and
+          unfinished requests; may return a branching boundary.
         - Mamba: prepares mamba_value (finished from ping-pong buffer,
           unfinished fork from req); returns mamba_last_track_seqlen."""
         return None

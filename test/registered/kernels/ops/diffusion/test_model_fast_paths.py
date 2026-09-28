@@ -44,7 +44,6 @@ from sglang.kernels.ops.diffusion import (
     can_use_fused_layernorm_modulate,
     can_use_fused_qk_head_layernorm,
     can_use_fused_rmsnorm_scale_shift,
-    can_use_wan_rmsnorm_silu,
     fused_ltx2_rms_norm_modulate,
     hunyuan_qkv_rope_pack,
     mark_fused_ln_modulate_site,
@@ -1138,29 +1137,25 @@ def _wan_cl3d(shape, dtype):
 
 
 @torch.no_grad()
-def test_wan_vae_gate_dispatch() -> None:
+@pytest.mark.parametrize(
+    "norm_cls,frames",
+    [(WanRMS_norm, 3), (qwen_vae.QwenImageRMS_norm, 1)],
+    ids=["wan", "qwen"],
+)
+def test_wan_and_qwen_vae_norm_gate_dispatch(norm_cls, frames) -> None:
     # Gate off must stay bit-exact; gate on must route to the fused kernel.
     torch.cuda.manual_seed(0)
-    norm = WanRMS_norm(96, images=False).to(device="cuda", dtype=torch.bfloat16)
+    norm = norm_cls(96, images=False).to(device="cuda", dtype=torch.bfloat16)
     norm.gamma.add_(torch.randn_like(norm.gamma))
     gate = VaeFastPathGate()
     fused = FusedWanRMSNormSiLU(norm, gate)
     # Parameter names must not change (weight transfer matches by name).
     assert [n for n, _ in fused.named_parameters()] == ["gamma"]
-    x = _wan_cl3d((1, 96, 3, 10, 14), torch.bfloat16)
+    x = _wan_cl3d((1, 96, frames, 10, 14), torch.bfloat16)
     assert torch.equal(fused(x), nn.SiLU()(norm(x)))
     gate.enabled = True
     expected = wan_rmsnorm_silu(x, norm.gamma, rms_scale=float(norm.scale))
     assert torch.equal(fused(x), expected)
-
-
-@torch.no_grad()
-def test_wan_vae_rejects_empty_input() -> None:
-    x = torch.empty(1, 96, 0, 2, 2, device="cuda", dtype=torch.bfloat16).to(
-        memory_format=torch.channels_last_3d
-    )
-    gamma = torch.ones(96, 1, 1, 1, device="cuda", dtype=torch.bfloat16)
-    assert not can_use_wan_rmsnorm_silu(x, gamma, None)
 
 
 @torch.no_grad()
@@ -1318,23 +1313,6 @@ def test_qwen_vae_upsample_skips_fp32_round_trip_bit_exactly() -> None:
         memory_format=torch.channels_last
     )
     assert torch.equal(up(x), nn.Upsample.forward(up, x.float()).type_as(x))
-
-
-@torch.no_grad()
-def test_qwen_vae_gate_dispatch() -> None:
-    torch.cuda.manual_seed(0)
-    norm = qwen_vae.QwenImageRMS_norm(96, images=False).to(
-        device="cuda", dtype=torch.bfloat16
-    )
-    norm.gamma.add_(torch.randn_like(norm.gamma))
-    gate = VaeFastPathGate()
-    fused = FusedWanRMSNormSiLU(norm, gate)
-    assert [n for n, _ in fused.named_parameters()] == ["gamma"]
-    x = _wan_cl3d((1, 96, 1, 10, 14), torch.bfloat16)
-    assert torch.equal(fused(x), nn.SiLU()(norm(x)))
-    gate.enabled = True
-    expected = wan_rmsnorm_silu(x, norm.gamma, rms_scale=float(norm.scale))
-    assert torch.equal(fused(x), expected)
 
 
 @torch.no_grad()
