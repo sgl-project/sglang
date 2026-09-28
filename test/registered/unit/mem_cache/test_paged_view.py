@@ -30,7 +30,7 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.layout.page_major import (
+from sglang.srt.mem_cache.layout.paged_view import (
     paged_kv_view,
     paged_row_view,
     paged_view,

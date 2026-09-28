@@ -18,7 +18,7 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.layout.page_major import paged_row_view
+from sglang.srt.mem_cache.layout.paged_view import paged_row_view
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_sm100_supported, is_tokenspeed_mla_available
 from sglang.test.ci.ci_register import register_cuda_ci
