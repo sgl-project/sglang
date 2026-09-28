@@ -1780,21 +1780,35 @@ class KVWriteLoc:
     def for_batch(
         cls,
         forward_batch,
-        loc: Optional[torch.Tensor] = None,
         *,
         swa_loc: Optional[torch.Tensor] = None,
         full_loc: Optional[torch.Tensor] = None,
     ) -> KVWriteLoc:
-        """The batch's ``out_cache_loc`` as a write loc, marked physical once
-        ``rebind_write_loc`` has run. ``loc`` may narrow it, but must be
-        ``out_cache_loc`` or a view of it: the mark describes the batch's loc,
-        not any other tensor."""
+        """The batch's ``out_cache_loc`` as a write loc, carrying the batch's
+        physical mark. It wraps nothing else, because the mark describes that
+        tensor only; a loc produced separately states its own mark."""
         return cls(
-            forward_batch.out_cache_loc if loc is None else loc,
+            forward_batch.out_cache_loc,
             swa_loc,
             full_loc,
             physical=forward_batch.out_cache_loc_is_physical,
         )
+
+    @classmethod
+    def for_layer(
+        cls,
+        forward_batch,
+        layer,
+        *,
+        swa_loc: Optional[torch.Tensor] = None,
+        full_loc: Optional[torch.Tensor] = None,
+    ) -> KVWriteLoc:
+        """``layer``'s write loc: the batch's, or for a cross-attention layer
+        ``encoder_out_cache_loc``, which nothing translates and so is never
+        marked physical."""
+        if layer.is_cross_attention:
+            return cls(forward_batch.encoder_out_cache_loc, swa_loc, full_loc)
+        return cls.for_batch(forward_batch, swa_loc=swa_loc, full_loc=full_loc)
 
     def __post_init__(self):
         # swa_loc / full_loc are resolved once at metadata-init from the full
@@ -1955,7 +1969,7 @@ class KVCache(abc.ABC):
             return
         assert write_loc_is_physical(loc_info), (
             f"{where}: write loc is not marked physical. Hand the pool "
-            "KVWriteLoc.for_batch(forward_batch, ...) after "
+            "KVWriteLoc.for_batch(forward_batch) after "
             "KVIndexTranslator.rebind_write_loc, or KVWriteLoc(loc, physical=True) "
             "for ids translated separately."
         )

@@ -34,7 +34,6 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 )
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.mem_cache.layout.paged_view import paged_row_view
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_flashinfer_available
 
@@ -209,7 +208,7 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             assert k is not None and k_rope is not None
             self.token_to_kv_pool.set_mla_kv_buffer(
                 layer,
-                KVWriteLoc.for_batch(forward_batch, self._kv_write_loc(forward_batch)),
+                self._kv_write_loc(forward_batch),
                 k,
                 k_rope,
             )

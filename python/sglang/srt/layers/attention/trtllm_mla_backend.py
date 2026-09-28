@@ -784,15 +784,16 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         else:
             self._decode_kernel_loc = None
 
-    def _kv_write_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
+    def _kv_write_loc(self, forward_batch: ForwardBatch) -> KVWriteLoc:
         """The loc an unfused KV scatter must write at: the capture-stable
         buffer under a captured unified-pool decode, since the translate
         rebinds `out_cache_loc` to a fresh tensor the graph never recorded;
         the batch's own loc everywhere else.
         """
         if self._decode_kernel_loc is not None:
-            return self._decode_kernel_loc
-        return forward_batch.out_cache_loc
+            # Filled by `fill_capture_write_loc`, which translates it.
+            return KVWriteLoc(self._decode_kernel_loc, physical=True)
+        return KVWriteLoc.for_batch(forward_batch)
 
     def _resolve_fused_write_loc(
         self, forward_batch: ForwardBatch
@@ -1337,10 +1338,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     )
                 if query is None:
                     self.token_to_kv_pool.set_mla_kv_buffer(
-                        layer,
-                        KVWriteLoc.for_batch(forward_batch, self._decode_kernel_loc),
-                        k,
-                        k_rope,
+                        layer, self._kv_write_loc(forward_batch), k, k_rope
                     )
             else:
                 # eager (or static pool): out_cache_loc is kernel-facing.
@@ -1553,17 +1551,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             assert k is not None and k_rope is not None, (
                 "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
             )
-            if self._decode_kernel_loc is not None:
-                self.token_to_kv_pool.set_mla_kv_buffer(
-                    layer,
-                    KVWriteLoc.for_batch(forward_batch, self._decode_kernel_loc),
-                    k,
-                    k_rope,
-                )
-            else:
-                self.token_to_kv_pool.set_mla_kv_buffer(
-                    layer, KVWriteLoc.for_batch(forward_batch), k, k_rope
-                )
+            self.token_to_kv_pool.set_mla_kv_buffer(
+                layer, self._kv_write_loc(forward_batch), k, k_rope
+            )
 
         # TODO refactor to avoid code duplication
         # Prepare query tensor inline (already built when the fused fp8 path

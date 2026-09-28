@@ -437,7 +437,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         value_cache_full = value_cache_full.contiguous()
         get_token_to_kv_pool().set_kv_buffer(
             layer,
-            KVWriteLoc.for_batch(forward_batch, cache_loc, swa_loc=swa_loc),
+            KVWriteLoc.for_layer(forward_batch, layer, swa_loc=swa_loc),
             key_cache_full,
             value_cache_full,
             layer.k_scale,

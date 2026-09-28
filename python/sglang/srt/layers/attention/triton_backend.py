@@ -1553,7 +1553,11 @@ class TritonAttnBackend(AttentionBackend):
         # dcp_size) through the masked path so each rank only stores the tokens
         # it owns. Non-DCP keeps the original write loc and plain set_kv_buffer.
         if self.dcp_size > 1:
-            loc = forward_batch.out_cache_loc // self.dcp_size
+            # The rank-local slot of a physical loc is physical.
+            loc = KVWriteLoc(
+                forward_batch.out_cache_loc // self.dcp_size,
+                physical=forward_batch.out_cache_loc_is_physical,
+            )
             if (
                 forward_batch.positions is not None
                 and forward_batch.positions.numel() == loc.numel()

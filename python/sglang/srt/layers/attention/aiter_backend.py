@@ -3076,9 +3076,9 @@ class AiterAttnBackend(AttentionBackend):
                 if self.kv_cache_is_vectorized_5d:
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
-                        KVWriteLoc.for_batch(
+                        KVWriteLoc.for_layer(
                             forward_batch,
-                            cache_loc,
+                            layer,
                             swa_loc=self.forward_metadata.swa_out_cache_loc,
                         ),
                         k,
@@ -3124,14 +3124,14 @@ class AiterAttnBackend(AttentionBackend):
                         kv_lora_rank = v.shape[-1]
                         self.token_to_kv_pool.set_mla_kv_buffer(
                             layer,
-                            KVWriteLoc.for_batch(forward_batch, cache_loc),
+                            KVWriteLoc.for_layer(forward_batch, layer),
                             k[..., :kv_lora_rank],
                             k[..., kv_lora_rank:],
                         )
                     else:
                         self.token_to_kv_pool.set_kv_buffer(
                             layer,
-                            KVWriteLoc.for_batch(forward_batch, cache_loc),
+                            KVWriteLoc.for_layer(forward_batch, layer),
                             k,
                             v,
                         )
@@ -3156,9 +3156,9 @@ class AiterAttnBackend(AttentionBackend):
                 else:
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
-                        KVWriteLoc.for_batch(
+                        KVWriteLoc.for_layer(
                             forward_batch,
-                            cache_loc,
+                            layer,
                             swa_loc=self.forward_metadata.swa_out_cache_loc,
                         ),
                         k,
@@ -3983,7 +3983,6 @@ class AiterAttnBackend(AttentionBackend):
                     layer,
                     KVWriteLoc.for_batch(
                         forward_batch,
-                        forward_batch.out_cache_loc,
                         swa_loc=self.forward_metadata.swa_out_cache_loc,
                     ),
                     k,
@@ -4019,7 +4018,7 @@ class AiterAttnBackend(AttentionBackend):
                 # MLA pool has its own set_kv_buffer (no scale args).
                 self.token_to_kv_pool.set_kv_buffer(
                     layer,
-                    KVWriteLoc.for_batch(forward_batch, forward_batch.out_cache_loc),
+                    KVWriteLoc.for_batch(forward_batch),
                     k,
                     v,
                 )
@@ -4045,7 +4044,6 @@ class AiterAttnBackend(AttentionBackend):
                     layer,
                     KVWriteLoc.for_batch(
                         forward_batch,
-                        forward_batch.out_cache_loc,
                         swa_loc=self.forward_metadata.swa_out_cache_loc,
                     ),
                     k,

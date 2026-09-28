@@ -1454,7 +1454,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         **kwargs,
     ) -> torch.Tensor:
         """Run forward for decode using TRTLLM MHA kernel."""
-        cache_loc = forward_batch.out_cache_loc
 
         use_fused_fp8_path = self._should_use_fused_fp8_path(
             save_kv_cache, k, forward_batch
@@ -1476,7 +1475,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     layer,
                     KVWriteLoc.for_batch(
                         forward_batch,
-                        cache_loc,
                         swa_loc=self.forward_metadata.swa_out_cache_loc,
                     ),
                     k,
@@ -1556,7 +1554,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         save_kv_cache=True,
         **kwargs,
     ):
-        cache_loc = forward_batch.out_cache_loc
         cp_active = is_cp_active(forward_batch)
         uses_native_fp4 = self._forward_extend_uses_native_fp4(forward_batch)
         if uses_native_fp4 and cp_active:
@@ -1596,7 +1593,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                         layer,
                         KVWriteLoc.for_batch(
                             forward_batch,
-                            cache_loc,
                             swa_loc=self.forward_metadata.swa_out_cache_loc,
                         ),
                         k,

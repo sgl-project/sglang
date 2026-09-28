@@ -704,8 +704,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             assert q_rope is None
             assert k_rope is None
             return self.mha_chunk_kv_cache.forward(q, k, v, layer, forward_batch)
-
-        cache_loc = forward_batch.out_cache_loc
         logits_soft_cap = layer.logit_cap
         prefill_wrapper_paged = self.forward_metadata.prefill_wrapper
 
@@ -715,11 +713,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             if save_kv_cache:
                 if k_rope is not None:
                     self.token_to_kv_pool.set_mla_kv_buffer(
-                        layer, KVWriteLoc.for_batch(forward_batch, cache_loc), k, k_rope
+                        layer, KVWriteLoc.for_batch(forward_batch), k, k_rope
                     )
                 else:
                     self.token_to_kv_pool.set_kv_buffer(
-                        layer, KVWriteLoc.for_batch(forward_batch, cache_loc), k, v
+                        layer, KVWriteLoc.for_batch(forward_batch), k, v
                     )
         if q_rope is not None:
             q = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -781,7 +779,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
     ):
         decode_wrapper = self.forward_metadata.decode_wrapper
-        cache_loc = forward_batch.out_cache_loc
 
         if k is not None:
             assert v is not None
@@ -789,14 +786,14 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 if k_rope is not None:
                     self.token_to_kv_pool.set_mla_kv_buffer(
                         layer,
-                        KVWriteLoc.for_batch(forward_batch, cache_loc),
+                        KVWriteLoc.for_batch(forward_batch),
                         k,
                         k_rope,
                     )
                 else:
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
-                        KVWriteLoc.for_batch(forward_batch, cache_loc),
+                        KVWriteLoc.for_batch(forward_batch),
                         k,
                         v,
                     )
