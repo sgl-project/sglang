@@ -5,12 +5,31 @@ from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
     BENCHMARK_TOOL_DEFAULT,
 )
 from sglang.test.ascend.e2e.test_npu_multi_node_utils import NIC_NAME
+import sglang.test.ascend.e2e.test_npu_performance_utils as npu_perf_utils
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     DEEPSEEK_V4_PRO_0813_W4A8_MODEL_PATH, TestNpuPerfMultiNodePdMixTestCaseBase, AISBENCHMARK_DATASET_DEFAULT,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
 logger = logging.getLogger(__name__)
+
+# Metrics dict of the latest benchmark run. The runtime base class does not
+# expose metrics from run_throughput(), so intercept run_bench_serving (called
+# by run_throughput via the module global) to capture them for this file.
+LAST_METRICS = {}
+
+_orig_run_bench_serving = npu_perf_utils.run_bench_serving
+
+
+def _run_bench_serving_capture(**kwargs):
+    metrics = _orig_run_bench_serving(**kwargs)
+    LAST_METRICS.clear()
+    if metrics:
+        LAST_METRICS.update(metrics)
+    return metrics
+
+
+npu_perf_utils.run_bench_serving = _run_bench_serving_capture
 
 register_npu_ci(
     est_time=9600,
@@ -137,9 +156,9 @@ class TestNPUDeepSeekV4ProW4A88PIn128kOut1kPrefix90(
     def test_npu_deepseek_v4_pro_w4a8_8p_in128k_out1k_prefix90(self):
         """Run NPU perf test for DeepSeek-V4-Pro W4A8 16p in128k out1k prefix90."""
         self.run_throughput()
-        if self.last_metrics and self.last_metrics.get("mean_ttft") is not None:
+        if LAST_METRICS.get("mean_ttft") is not None:
             TTFT_RESULTS["radix_cache_disabled"] = float(
-                self.last_metrics["mean_ttft"]
+                LAST_METRICS["mean_ttft"]
             )
             logger.info(
                 "TTFT with radix-cache disabled: %s ms",
@@ -175,8 +194,7 @@ class TestNPUDeepSeekV4ProW4A88PIn128kOut1kPrefix90RadixCache(
         """Run NPU perf test with radix-cache enabled; TTFT must drop
         significantly compared with the radix-cache-disabled case."""
         self.run_throughput()
-        self.assertIsNotNone(self.last_metrics)
-        ttft_enabled = self.last_metrics.get("mean_ttft")
+        ttft_enabled = LAST_METRICS.get("mean_ttft")
         self.assertIsNotNone(ttft_enabled, "mean_ttft not found in bench_serving output")
         ttft_enabled = float(ttft_enabled)
         ttft_disabled = TTFT_RESULTS.get("radix_cache_disabled")
