@@ -11,6 +11,18 @@
 
 namespace sglang {
 
+// Tie handling of the radix top-k below:
+//   1. the last radix round fills the remaining slots with the LOWEST
+//      POSITIONS among the exactly-equal scores (bitmap + block prefix-sum)
+//      instead of atomic arrival order, so the selected SET is a pure function
+//      of (scores, length, topk) and equals a stable sort by
+//      (score desc, position asc);
+//   2. when a threshold bin holds more candidates than the 8192-entry smem
+//      candidate buffer, the next round re-scans the input (filtering by the
+//      accumulated key prefix) instead of working on an arrival-ordered
+//      subset, and the sub-bin histogram always counts every candidate, so the
+//      result stays exact.
+
 // `topk` is a *runtime* value (<= kMaxTopK), so one module serves every k. It
 // used to be baked in via -DSGL_TOPK, which built a separate module per k --
 // and because `kTopK` came from a macro rather than a template parameter, both
@@ -77,12 +89,23 @@ SGL_DEVICE void naive_transform(
   }
 }
 
+// Warp-inclusive prefix sum (all 32 lanes participate).
+SGL_DEVICE uint32_t warp_inclusive_sum(uint32_t v) {
+#pragma unroll
+  for (uint32_t d = 1; d < 32; d <<= 1) {
+    const uint32_t n = __shfl_up_sync(0xffffffffu, v, d);
+    if ((threadIdx.x & 31) >= d) v += n;
+  }
+  return v;
+}
+
 [[maybe_unused]]
 SGL_DEVICE void
 radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, const uint32_t length, const uint32_t topk) {
   constexpr uint32_t RADIX = 256;
   constexpr uint32_t BLOCK_SIZE = kTopKBlockSize;
   constexpr uint32_t SMEM_INPUT_SIZE = kSMEM / (2 * sizeof(int32_t));
+  constexpr uint32_t kBitmapBits = SMEM_INPUT_SIZE * 32;  // one candidate buffer reused as a position bitmap
 
   alignas(128) __shared__ uint32_t _s_histogram_buf[2][RADIX + 32];
   alignas(128) __shared__ uint32_t s_counter;
@@ -95,6 +118,12 @@ radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, const 
   const uint32_t tx = threadIdx.x;
   uint32_t remain_topk = topk;
   auto& s_histogram = _s_histogram_buf[0];
+
+  // The fp16 coarse bin and the accumulated fp32 key prefix of the surviving
+  // candidates (uniform across the block); used to re-derive the candidate set
+  // from the input when the smem candidate buffer overflowed.
+  uint32_t coarse_bin = 0;
+  uint32_t key_prefix = 0;
 
   const auto run_cumsum = [&] {
 #pragma unroll 8
@@ -130,6 +159,7 @@ radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, const 
   __syncthreads();
 
   const auto threshold_bin = s_threshold_bin_id;
+  coarse_bin = threshold_bin;
   remain_topk -= s_histogram[threshold_bin + 1];
   if (remain_topk == 0) {
     for (uint32_t idx = tx; idx < length; idx += BLOCK_SIZE) {
@@ -156,12 +186,13 @@ radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, const 
         output[pos] = idx;
       } else if (bin == threshold_bin) {
         const auto pos = ::atomicAdd(&s_num_input[0], 1);
+        const auto bin = convert_to_uint32(raw_input);
+        const auto sub_bin = (bin >> 24) & 0xFF;
         if (pos < SMEM_INPUT_SIZE) {
           [[likely]] s_input_idx[0][pos] = idx;
-          const auto bin = convert_to_uint32(raw_input);
-          const auto sub_bin = (bin >> 24) & 0xFF;
-          ::atomicAdd(&s_histogram[sub_bin], 1);
         }
+        // the histogram must cover every candidate, stored or not
+        ::atomicAdd(&s_histogram[sub_bin], 1);
       }
     }
     __syncthreads();
@@ -175,6 +206,28 @@ radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, const 
     // clip here to prevent overflow
     const auto raw_num_input = s_num_input[r_idx];
     const auto num_input = raw_num_input < SMEM_INPUT_SIZE ? raw_num_input : SMEM_INPUT_SIZE;
+    // When the candidate buffer overflowed, re-derive the candidate set from
+    // the input (coarse bin match + key prefix match) instead of the subset.
+    const bool rescan = raw_num_input > SMEM_INPUT_SIZE;
+    const auto offset = 24 - round * 8;
+
+    // Iterate the round's candidates as (idx, key32), exact in every case.
+    const auto for_each_candidate = [&](auto&& f) {
+      if (!rescan) {
+        for (uint32_t i = tx; i < num_input; i += BLOCK_SIZE) {
+          const auto idx = s_input_idx[r_idx][i];
+          f(idx, convert_to_uint32(input[idx]));
+        }
+      } else {
+        for (uint32_t idx = tx; idx < length; idx += BLOCK_SIZE) {
+          const float x = input[idx];
+          if (convert_to_uint8(x) != coarse_bin) continue;
+          const auto key = convert_to_uint32(x);
+          if (round > 0 && (key >> (32 - 8 * round)) != key_prefix) continue;
+          f(idx, key);
+        }
+      }
+    };
 
     run_cumsum();
     if (tx < RADIX && s_histogram[tx] > remain_topk && s_histogram[tx + 1] <= remain_topk) {
@@ -186,17 +239,18 @@ radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, const 
 
     const auto threshold_bin = s_threshold_bin_id;
     remain_topk -= s_histogram[threshold_bin + 1];
+    const uint32_t need = static_cast<uint32_t>(s_last_remain);  // uniform; == remain_topk here
+    // The rescan filter of THIS round uses the prefix of rounds < round;
+    // this round's threshold is appended after its candidate loops (below).
 
     if (remain_topk == 0) {
-      for (uint32_t i = tx; i < num_input; i += BLOCK_SIZE) {
-        const auto idx = s_input_idx[r_idx][i];
-        const auto offset = 24 - round * 8;
-        const auto bin = (convert_to_uint32(input[idx]) >> offset) & 0xFF;
+      for_each_candidate([&](uint32_t idx, uint32_t key) {
+        const auto bin = (key >> offset) & 0xFF;
         if (bin > threshold_bin) {
           const auto pos = ::atomicAdd(&s_counter, 1);
           output[pos] = idx;
         }
-      }
+      });
       __syncthreads();
       break;
     } else {
@@ -205,33 +259,81 @@ radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, const 
         s_histogram[tx] = 0;
       }
       __syncthreads();
-      for (uint32_t i = tx; i < num_input; i += BLOCK_SIZE) {
-        const auto idx = s_input_idx[r_idx][i];
-        const auto raw_input = input[idx];
-        const auto offset = 24 - round * 8;
-        const auto bin = (convert_to_uint32(raw_input) >> offset) & 0xFF;
+      if (round == 3) {
+        // (1) strictly-above candidates: the set is deterministic, order irrelevant
+        for_each_candidate([&](uint32_t idx, uint32_t key) {
+          if (((key >> offset) & 0xFF) > threshold_bin) {
+            const auto pos = ::atomicAdd(&s_counter, 1);
+            output[pos] = idx;
+          }
+        });
+        // (2) exactly-equal candidates (all 32 key bits match): fill the
+        // remaining `need` slots with the lowest positions, in position order.
+        uint32_t* bitmap = s_input_idx[r_idx ^ 1];    // free in the last round
+        uint32_t* s_warp_incl = _s_histogram_buf[0];  // [32] warp totals (inclusive)
+        uint32_t* s_warp_excl = _s_histogram_buf[1];  // [32] warp offsets (exclusive)
+        const uint32_t out_base = topk - need;
+        const uint32_t lane = tx & 31, warp = tx >> 5;
+        uint32_t carry = 0;
+        for (uint32_t chunk = 0; chunk < length; chunk += kBitmapBits) {
+          const uint32_t chunk_len = min(length - chunk, kBitmapBits);
+          const uint32_t nwords = (chunk_len + 31) >> 5;
+          __syncthreads();  // previous pass's readers of bitmap / s_warp_* are done
+          for (uint32_t w = tx; w < nwords; w += BLOCK_SIZE)
+            bitmap[w] = 0;
+          __syncthreads();
+          for_each_candidate([&](uint32_t idx, uint32_t key) {
+            if (((key >> offset) & 0xFF) == threshold_bin && idx >= chunk && idx < chunk + chunk_len) {
+              ::atomicOr(&bitmap[(idx - chunk) >> 5], 1u << (idx & 31));
+            }
+          });
+          __syncthreads();
+          for (uint32_t wb = 0; wb < nwords; wb += BLOCK_SIZE) {
+            const uint32_t w = wb + tx;
+            const uint32_t word = w < nwords ? bitmap[w] : 0u;
+            const uint32_t cnt = __popc(word);
+            const uint32_t incl = warp_inclusive_sum(cnt);
+            if (lane == 31) s_warp_incl[warp] = incl;
+            __syncthreads();
+            if (warp == 0) {
+              const uint32_t v = s_warp_incl[lane];
+              const uint32_t vi = warp_inclusive_sum(v);
+              s_warp_excl[lane] = vi - v;
+            }
+            __syncthreads();
+            const uint32_t pass_total = s_warp_excl[31] + s_warp_incl[31];
+            uint32_t r = carry + s_warp_excl[warp] + incl - cnt;
+            uint32_t wd = word;
+            while (wd != 0u && r < need) {
+              const uint32_t b = __ffs(wd) - 1u;
+              output[out_base + r] = static_cast<int32_t>(chunk + w * 32u + b);
+              ++r;
+              wd &= wd - 1u;
+            }
+            carry += pass_total;
+            __syncthreads();  // s_warp_* reused by the next pass
+          }
+        }
+        __syncthreads();
+        break;
+      }
+      for_each_candidate([&](uint32_t idx, uint32_t key) {
+        const auto bin = (key >> offset) & 0xFF;
         if (bin > threshold_bin) {
           const auto pos = ::atomicAdd(&s_counter, 1);
           output[pos] = idx;
         } else if (bin == threshold_bin) {
-          if (round == 3) {
-            const auto pos = ::atomicAdd(&s_last_remain, -1);
-            if (pos > 0) {
-              output[topk - pos] = idx;
-            }
-          } else {
-            const auto pos = ::atomicAdd(&s_num_input[r_idx ^ 1], 1);
-            if (pos < SMEM_INPUT_SIZE) {
-              /// NOTE: (dark) fuse the histogram computation here
-              [[likely]] s_input_idx[r_idx ^ 1][pos] = idx;
-              const auto bin = convert_to_uint32(raw_input);
-              const auto sub_bin = (bin >> (offset - 8)) & 0xFF;
-              ::atomicAdd(&s_histogram[sub_bin], 1);
-            }
+          const auto pos = ::atomicAdd(&s_num_input[r_idx ^ 1], 1);
+          const auto sub_bin = (key >> (offset - 8)) & 0xFF;
+          if (pos < SMEM_INPUT_SIZE) {
+            /// NOTE: (dark) fuse the histogram computation here
+            [[likely]] s_input_idx[r_idx ^ 1][pos] = idx;
           }
+          ::atomicAdd(&s_histogram[sub_bin], 1);
         }
-      }
+      });
       __syncthreads();
+      key_prefix = (key_prefix << 8) | threshold_bin;
     }
   }
 }

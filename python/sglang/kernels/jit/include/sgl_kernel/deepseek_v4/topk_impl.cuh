@@ -15,6 +15,11 @@
 ///
 /// Algorithm: fp16 coarse histogram -> threshold bin -> fp32-boundary collect ->
 /// exact radix tie-break.
+///
+/// Exactly-equal scores at the final threshold are resolved in position order
+/// (see radix_tie_select). Residual: when the threshold coarse bin holds more
+/// than kMaxNumTie (2048) candidates, the collect pass still keeps an
+/// arrival-ordered subset.
 
 #pragma once
 
@@ -324,6 +329,7 @@ struct TopKConfig {
     const auto warp_id = broadcast(tx / kWarpSize);
 
     bool active[kItems];
+    bool eq_final[kItems];  // exactly-equal key at the last round
     uint32_t key[kItems];
     uint32_t idx[kItems];
     uint32_t write_pos[kItems];
@@ -331,6 +337,7 @@ struct TopKConfig {
     for (uint32_t i = 0; i < kItems; ++i) {
       const auto t = tx + i * kBlockSize;
       active[i] = t < num_ties;
+      eq_final[i] = false;
       const auto tie = active[i] ? tie_buffer[t] : TieValue::invalid();
       key[i] = extract_exact_bin(tie.value);
       idx[i] = tie.idx;
@@ -391,12 +398,69 @@ struct TopKConfig {
         } else if (bin < threshold_bin) {
           active[i] = false;
         } else if (round == 3) {
-          write_pos[i] = topk - topk_remain + atomicAdd(&smem->counter_final, 1);
+          eq_final[i] = true;  // resolved below in position order
         }
         // my_bin == thr && round < 3: stay active for next round
       }
 
       if (round == 3 || topk_remain == 0) break;
+    }
+
+    // The candidates whose 32-bit key equals the final threshold are
+    // exactly-equal scores. The LOWEST `topk_remain` positions among them win
+    // (radix select on idx, ascending), so the output SET is a pure function of
+    // the scores and matches a stable sort by (score desc, position asc).
+    // `topk_remain` is block-uniform.
+    uint32_t need = topk_remain;
+    const uint32_t out_base = topk - topk_remain;
+    if (need > 0) {
+#pragma unroll
+      for (int round = 0; round < 4; round++) {
+        const uint32_t shift = 24 - round * 8;
+        const auto histogram = smem->histogram[round % 2];
+        if (tx < kRadixSize) histogram[tx] = 0;
+        __syncthreads();
+#pragma unroll
+        for (uint32_t i = 0; i < kItems; ++i) {
+          if (eq_final[i]) atomicAdd(&histogram[(idx[i] >> shift) & 0xFFu], 1);
+        }
+        __syncthreads();
+        uint32_t hist_val = 0;
+        uint32_t warp_inc = 0;
+        if (tx < kRadixSize) {
+          hist_val = histogram[tx];
+          warp_inc = warp::inclusive_sum(hist_val, lane_id);
+          if (lane_id == kWarpSize - 1) smem->warp_sum[warp_id] = warp_inc;
+        }
+        __syncthreads();
+        if (tx < kRadixSize) {
+          const auto inter = warp::reduce_sum(lane_id < warp_id ? smem->warp_sum[lane_id] : 0);
+          const auto below = inter + warp_inc - hist_val;  // elements in bins BELOW this one
+          if (below < need && below + hist_val >= need) {
+            smem->match = {tx, below, hist_val};
+          }
+        }
+        __syncthreads();
+        // `above_count` holds the count BELOW the bin here (ascending select).
+        const auto [thr, below_count, _] = smem->match;
+        need -= below_count;
+#pragma unroll
+        for (uint32_t i = 0; i < kItems; ++i) {
+          if (!eq_final[i]) continue;
+          const uint32_t b = (idx[i] >> shift) & 0xFFu;
+          if (b < thr) {
+            write_pos[i] = out_base + atomicAdd(&smem->counter_final, 1);
+            eq_final[i] = false;
+          } else if (b > thr) {
+            eq_final[i] = false;
+          }
+        }
+      }
+      // survivors share all 32 idx bits with the threshold, i.e. one element
+#pragma unroll
+      for (uint32_t i = 0; i < kItems; ++i) {
+        if (eq_final[i]) write_pos[i] = out_base + atomicAdd(&smem->counter_final, 1);
+      }
     }
 
 #pragma unroll
