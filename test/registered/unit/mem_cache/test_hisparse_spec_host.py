@@ -13,10 +13,6 @@
 # ==============================================================================
 import contextlib
 import unittest
-
-from sglang.test.ci.ci_register import register_cpu_ci
-
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 from types import SimpleNamespace
 
 import torch
@@ -24,6 +20,9 @@ import torch
 from sglang.srt.mem_cache.hisparse_spec_host import HiSparseSpecHostBackend
 from sglang.srt.mem_cache.hisparse_spec_lifecycle import CommitPlan
 from sglang.srt.mem_cache.hisparse_spec_state import SpecTxnKey
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class Event:

@@ -13,10 +13,6 @@
 # ==============================================================================
 import contextlib
 import unittest
-
-from sglang.test.ci.ci_register import register_cpu_ci
-
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -25,6 +21,9 @@ import torch
 from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.hisparse_spec_coordinator import HiSparseSpecCoordinator
 from sglang.srt.mem_cache.hisparse_spec_state import VerifyRow
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class Event:
