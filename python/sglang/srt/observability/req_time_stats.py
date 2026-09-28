@@ -690,30 +690,6 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         ts = ts or time.perf_counter()
         self.spec_verify_start_time = ts
 
-    def set_spec_verify_end_time(
-        self,
-        ts=None,
-        num_correct_drafts: int = 0,
-        # FIXME: backward-compat alias, remove in next release.
-        accepted_tokens: Optional[int] = None,
-    ):
-        if accepted_tokens is not None:
-            num_correct_drafts = accepted_tokens
-        ts = ts or time.perf_counter()
-
-        if self.trace_ctx.tracing_enable:
-            stage = RequestStage.SPEC_VERIFY
-            self.trace_slice(
-                stage,
-                self.spec_verify_start_time,
-                ts,
-                {
-                    "num_correct_drafts": num_correct_drafts,
-                    # FIXME: backward-compat alias, remove in next release.
-                    "accepted_tokens": num_correct_drafts,
-                },
-            )
-
     def set_run_batch_cpu_start_time(self, ts=None, attrs=None):
         ts = ts or time.perf_counter()
         self.run_batch_cpu_start_time = ts
