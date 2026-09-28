@@ -5,8 +5,10 @@ context length, GGUF detection, etc.) that don't require actual model files.
 """
 
 import inspect
+import json
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -40,6 +42,61 @@ register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 
 class TestGetProcessor(unittest.TestCase):
+    def test_applies_v5_bos_eos_fix_to_processor_tokenizer(self):
+        class ProcessorTokenizer:
+            chat_template = "template"
+
+            def __init__(self):
+                self._add_bos_token = False
+                self._add_eos_token = False
+                self.update_post_processor_calls = 0
+
+            @property
+            def add_bos_token(self):
+                return self._add_bos_token
+
+            @property
+            def add_eos_token(self):
+                return self._add_eos_token
+
+            def update_post_processor(self):
+                self.update_post_processor_calls += 1
+
+        with tempfile.TemporaryDirectory() as model_path:
+            Path(model_path, "tokenizer_config.json").write_text(
+                json.dumps(
+                    {
+                        "tokenizer_class": "GemmaTokenizer",
+                        "add_bos_token": True,
+                        "add_eos_token": False,
+                    }
+                )
+            )
+            config = SimpleNamespace(model_type="test_vlm", auto_map={})
+            tokenizer = ProcessorTokenizer()
+            loaded_processor = SimpleNamespace(tokenizer=tokenizer)
+            auto_config = MagicMock()
+            auto_config.from_pretrained.return_value = config
+            auto_processor = MagicMock()
+            auto_processor.from_pretrained.return_value = loaded_processor
+
+            with patch.multiple(
+                processor_utils,
+                AutoConfig=auto_config,
+                AutoProcessor=auto_processor,
+                _install_tokenizer_warnings_filter=MagicMock(),
+                patch_mistral_common_tokenizer=MagicMock(),
+                _fix_special_tokens_pattern=MagicMock(),
+                _fix_added_tokens_encoding=MagicMock(),
+                attach_additional_stop_token_ids=MagicMock(),
+            ):
+                processor = processor_utils.get_processor(model_path)
+
+        self.assertIs(processor, loaded_processor)
+        self.assertTrue(tokenizer.add_bos_token)
+        self.assertFalse(tokenizer.add_eos_token)
+        self.assertEqual(tokenizer.update_post_processor_calls, 1)
+
     def test_does_not_forward_backend_to_auto_processor(self):
         config = SimpleNamespace(model_type="test_vlm", auto_map={})
         loaded_processor = MagicMock()
