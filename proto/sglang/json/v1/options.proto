@@ -1,0 +1,107 @@
+// The JSON-fidelity option vocabulary: how a message, field, or oneof behaves
+// on the HTTP JSON wire, declared in the schema itself. The sglang-api-codegen
+// generator reads these options from the FileDescriptorSet and emits the serde
+// implementations; proto3's canonical JSON mapping is NOT used. Each option is
+// one generator template with its own unit tests.
+//
+// gRPC never sees these options: the protobuf wire format is untouched.
+
+syntax = "proto3";
+
+package sglang.json.v1;
+
+import "google/protobuf/descriptor.proto";
+
+// How a message treats unknown JSON keys on deserialization.
+enum UnknownFields {
+  // Silently dropped (the default): parity with endpoints that accept and
+  // ignore unported fields, where rejecting would break existing clients.
+  UNKNOWN_FIELDS_IGNORE = 0;
+  // A 400 with serde's field-level message: parity with Python constructors
+  // that TypeError on unexpected kwargs.
+  UNKNOWN_FIELDS_DENY = 1;
+}
+
+message MessageJson {
+  UnknownFields unknown_fields = 1;
+
+  // This message is a single-`repeated`-field carrier (TokenIds, StringList,
+  // ...): its JSON is the bare array, not an {items: [...]} object, wherever
+  // it appears.
+  bool bare_list = 2;
+
+  // This message is a positional tuple in JSON: its fields, in declaration
+  // order, form a bare array (e.g. a logprob entry's [logprob, token_id,
+  // text|null]). Optional members serialize as null.
+  bool tuple = 3;
+
+  // This single-field message is invisible in JSON: it serializes as its sole
+  // field's value (null when unset). Exists to give proto a presence wrapper
+  // for nullable LIST ELEMENTS (OptionalString, OptionalInt64).
+  bool transparent = 4;
+}
+
+message FieldJson {
+  // Explicit JSON null (and an absent key) yields the stated default instead
+  // of an error: parity with Python dataclasses whose __post_init__ maps None
+  // back to the default. Exactly one default_* must accompany it.
+  bool null_resets_default = 1;
+  optional double default_f64 = 2;
+  optional int64 default_i64 = 3;
+  optional bool default_bool = 4;
+  optional string default_string = 5;
+
+  // An ABSENT key yields the stated default, but an explicit JSON null clears
+  // the field to no-value (e.g. max_new_tokens: absent = 128, null = no
+  // limit). Mutually exclusive with null_resets_default.
+  bool null_is_none = 6;
+
+  // The key is always serialized, an unset value as an explicit null (e.g.
+  // reasoning_content in chat deltas: Python always emits the key).
+  bool emit_null_when_absent = 7;
+
+  // On a string (or repeated string) field: the string holds JSON text, and
+  // HTTP (de)serialization passes the VALUE through — integers, nesting, and
+  // element shapes intact (google.protobuf.Struct cannot do this: it coerces
+  // integers to doubles). gRPC carries the JSON text.
+  bool raw_json = 8;
+
+  // On a map<string, ...> field whose keys are numeric strings (Python
+  // parity, e.g. logit_bias token ids).
+  bool int_key_map = 9;
+}
+
+message OneofJson {
+  // The union is untagged in JSON: the value's shape picks the variant, and
+  // variant mismatch errors keep serde's field-level texts (never "data did
+  // not match any variant").
+  bool untagged = 1;
+
+  // On a oneof of exactly { T one; TList many; }: a JSON scalar deserializes
+  // as `one`, a JSON array as `many`; serialization flattens the same way.
+  bool one_or_many = 2;
+
+  // The union is internally tagged in JSON by this key (e.g. finish_reason's
+  // {"type": "stop", ...}); variant payload fields inline into the same
+  // object, with each variant's tag value being its field name.
+  string tag = 3;
+
+  // JSON input matching no variant is captured verbatim by the designated
+  // catch-all variant (a raw_json Struct member) and round-trips unchanged —
+  // the forward-compatibility escape hatch for values another component may
+  // extend (e.g. finish_reason).
+  bool unknown_variant_passthrough = 4;
+}
+
+extend google.protobuf.MessageOptions {
+  // Field numbers from the internal-use extension range (50000-99999).
+  MessageJson message_json = 50100;
+}
+
+extend google.protobuf.FieldOptions {
+  FieldJson field_json = 50100;
+}
+
+extend google.protobuf.OneofOptions {
+  OneofJson oneof_json = 50100;
+}

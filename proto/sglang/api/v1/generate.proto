@@ -1,0 +1,150 @@
+// The native `/generate` surface — the ground truth for
+// rust/sglang-server/src/message/request.rs's GenerateBody (request) and
+// api_core/frame.rs's frame shape (response). Unknown JSON keys on the
+// request are IGNORED: `deny_unknown_fields` broke real clients that send
+// Python-only `GenerateReqInput` fields (priority, extra_key, session_id,
+// ...), pinned by request.rs's unported-fields test.
+
+syntax = "proto3";
+
+package sglang.api.v1;
+
+import "sglang/api/v1/common.proto";
+import "sglang/api/v1/finish.proto";
+import "sglang/api/v1/sampling.proto";
+import "sglang/json/v1/options.proto";
+
+message GenerateRequest {
+  // (message_json).unknown_fields defaults to IGNORE — stated here as schema
+  // intent, load-bearing for client compat.
+
+  StringOrList rid = 1;
+  StringOrList text = 2;
+  TokenIdsOrList input_ids = 3;
+  optional bool stream = 4 [
+    (sglang.json.v1.field_json).null_resets_default = true,
+    (sglang.json.v1.field_json).default_bool = false
+  ];
+  // One set of params, or one per batch item. JSON errors keep serde's
+  // field-level texts (the hand-written SamplingParamsInput contract).
+  SamplingParamsOrList sampling_params = 5;
+  BoolOrList return_logprob = 6;
+  Int64OrList logprob_start_len = 7;
+  Int64OrList top_logprobs_num = 8;
+  TokenIdsOrList token_ids_logprob = 9;
+  BoolOrList return_hidden_states = 10;
+  optional bool return_text_in_logprobs = 11;
+  // PD bootstrap columns: a batch mixes bootstrapped and plain requests, so
+  // elements are individually nullable.
+  OptionalStringOrList bootstrap_host = 12;
+  OptionalInt64OrList bootstrap_port = 13;
+  OptionalInt64OrList bootstrap_room = 14;
+  OptionalStringOrList bootstrap_pair_key = 15;
+  OptionalInt64OrList decode_tp_size = 16;
+  optional int64 routed_dp_rank = 17;
+  optional int64 disagg_prefill_dp_rank = 18;
+  // Multimodal payloads pass through untyped (data URIs, URLs, file paths, or
+  // nested batch lists) to the MM pipeline, which owns their validation.
+  optional string image_data = 19 [(sglang.json.v1.field_json).raw_json = true];
+  optional string mm_hashes = 20 [(sglang.json.v1.field_json).raw_json = true];
+  optional string video_data = 21 [(sglang.json.v1.field_json).raw_json = true];
+  optional string audio_data = 22 [(sglang.json.v1.field_json).raw_json = true];
+}
+
+message SamplingParamsOrList {
+  oneof value {
+    option (sglang.json.v1.oneof_json).one_or_many = true;
+    SamplingParams one = 1;
+    SamplingParamsList many = 2;
+  }
+}
+
+message SamplingParamsList {
+  option (sglang.json.v1.message_json).bare_list = true;
+  repeated SamplingParams items = 1;
+}
+
+// One `[logprob, token_id, text|null]` entry (text present when
+// `return_text_in_logprobs`, decoded on the detok shard). The logprob slot is
+// optional: Python emits null for a position with no logprob (the first
+// prefill token; Rust maps the scheduler's NaN to the same null).
+message LogprobEntry {
+  option (sglang.json.v1.message_json).tuple = true;
+  optional double logprob = 1;
+  int64 token_id = 2;
+  optional string text = 3;
+}
+
+message LogprobEntries {
+  option (sglang.json.v1.message_json).bare_list = true;
+  repeated LogprobEntry entries = 1;
+}
+
+// One decode position's top-k alternatives.
+message TopLogprobRow {
+  option (sglang.json.v1.message_json).bare_list = true;
+  repeated LogprobEntry entries = 1;
+}
+
+// A position's row, or null: a position that recorded no alternatives is
+// null on the wire (Python parity), never [].
+message NullableTopLogprobs {
+  option (sglang.json.v1.message_json).transparent = true;
+  TopLogprobRow row = 1;
+}
+
+message HiddenStateRow {
+  option (sglang.json.v1.message_json).bare_list = true;
+  repeated double values = 1;
+}
+
+message GenerateMetaInfo {
+  // The client's rid, byte-for-byte (`Rid::client_facing`).
+  string id = 1;
+  uint32 prompt_tokens = 2;
+  uint64 completion_tokens = 3;
+  // Always present in JSON, null until a terminal frame.
+  FinishReason finish_reason = 4 [(sglang.json.v1.field_json).emit_null_when_absent = true];
+  // input+output token logprobs are set together, empty lists included: a PD
+  // decode node never receives input logprobs, but the PD router keys its
+  // merge of prefill's on the key's presence.
+  LogprobEntries output_token_logprobs = 5;
+  LogprobEntries input_token_logprobs = 6;
+  repeated NullableTopLogprobs output_top_logprobs = 7;
+  repeated NullableTopLogprobs input_top_logprobs = 8;
+  repeated NullableTopLogprobs output_token_ids_logprobs = 9;
+  repeated NullableTopLogprobs input_token_ids_logprobs = 10;
+  repeated HiddenStateRow hidden_states = 11;
+  // Seconds from normalized-request acceptance to the terminal output; only
+  // on the terminal frame.
+  optional double e2e_latency = 12;
+}
+
+message GenerateResponse {
+  // JSON key order is FIELD-NUMBER order: text, meta_info, then the
+  // conditionally-present output_ids and index — matching frame_value's
+  // insertion order byte-for-byte.
+  string text = 1;
+  GenerateMetaInfo meta_info = 2;
+  // Omitted while empty (a text-only frame).
+  TokenIds output_ids = 3;
+  // Batch position; only on batch responses/frames.
+  optional uint32 index = 4;
+}
+
+// One request's failure inside a Generate stream; carries its batch position
+// (the HTTP SSE shape puts `index` beside the error object the same way).
+message GenerateStreamError {
+  ErrorBody error = 1;
+  optional uint32 index = 2;
+}
+
+// One item of the gRPC Generate stream: a frame, or one request's failure
+// (the stream continues — other batch items may still be running). On HTTP
+// the same failure is an in-stream SSE error frame.
+message GenerateStreamItem {
+  oneof item {
+    GenerateResponse frame = 1;
+    GenerateStreamError error = 2;
+  }
+}
