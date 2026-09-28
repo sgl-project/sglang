@@ -3114,16 +3114,12 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator, *, owns_attention: b
 
 @contextmanager
 def patch_decode_context_parallel_group(dcp_group: Optional[GroupCoordinator]):
-    """Patch the decode context parallel group temporarily until this function ends.
+    """Patch the DCP group temporarily until this function ends.
 
     This method is for draft workers of speculative decoding, whose KV cache is
-    replicated rather than striped by token position and must not read the
-    target's DCP topology. ``None`` is the state of a process booted without
-    decode context parallelism, so a draft scoped to it takes no DCP path.
-
-    The widths derive from configuration at publish rather than from the group,
-    so they are restated here; swapping the group alone would leave every
-    ``dcp_enabled`` branch firing against a topology the draft does not have.
+    replicated rather than striped by token position; ``None`` is the state of a
+    process booted without decode context parallelism. The widths derive from
+    configuration at publish rather than from the group, so they are restated.
 
     Unlike the tp and pp patches this one nests: draft chain decode runs inside
     a draft forward, so an inner scope cannot know whether an outer one is open.

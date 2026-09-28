@@ -752,7 +752,9 @@ def draft_dcp_context():
     # A draft's KV cache is replicated across the target's decode-context ranks
     # rather than striped across them, so it takes no stripe of its own. Only
     # --speculative-dcp-size 1 says that; the validator rejects the rest.
-    assert get_spec().speculative_dcp_size == 1
+    assert get_spec().speculative_dcp_size == 1, (
+        "a draft wider than one rank needs a group of its own to patch in"
+    )
     with patch_decode_context_parallel_group(None):
         yield
 

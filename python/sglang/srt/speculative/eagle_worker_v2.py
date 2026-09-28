@@ -579,7 +579,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"num_tokens_per_req={self.topk}, bs={capture_bs}, "
                 f"avail mem={before_mem:.2f} GB",
             )
-            # Capture with DCP disabled to match draft replay.
+            # Capture at the draft's own width, which is what replay runs at.
             with draft_dcp_context():
                 self.cuda_graph_runner = Device2DraftCudaGraphRunner[
                     self.target_worker.device
@@ -740,7 +740,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             else contextlib.nullcontext()
         )
 
-        # This draft path runs outside ModelRunner.forward, so guard it here.
+        # This draft path runs outside ModelRunner.forward, which opens the scope.
         with canary_outside_ctx, draft_dcp_context():
             # Run draft
             if can_run_decode_cuda_graph:

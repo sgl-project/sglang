@@ -103,7 +103,7 @@ logger = logging.getLogger(__name__)
 
 
 def _eagle_draft_layers(kvc: KVCacheConfigurator) -> int:
-    """EAGLE/STANDALONE draft layer count for KV budgeting, replicated across DCP ranks."""
+    """Draft layers to budget for, in the target's per-layer terms."""
     if kvc.is_draft_worker or not (
         kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
     ):
@@ -115,8 +115,7 @@ def _eagle_draft_layers(kvc: KVCacheConfigurator) -> int:
 
 
 def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
-    """Bytes/token the DFLASH draft KV pool adds, 0 if none; replicated across DCP
-    ranks because the draft pool spans the widened virtual location space."""
+    """Bytes/token the DFLASH draft KV pool adds, 0 if none."""
     if kvc.is_draft_worker or not kvc.spec_algorithm.is_dflash_family():
         return 0
     cell_size = kvc.spec_aux_config.dflash_draft_cell_size_per_token
@@ -259,7 +258,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         num_layers=draft_num_layers,
                         allocate_all_layers=True,
                     )
-                    # The draft pool is replicated, not sharded, across DCP ranks.
                     self._cell_size += (
                         draft_kv_size + draft_indexer_size
                     ) * replicated_draft_pool_scale()
@@ -685,7 +683,6 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                     - self._draft_swa_layers_num
                     - self._draft_swa_full_layers_num
                 )
-                # The draft pool spans the widened loc space: replicated per DCP rank.
                 scale = replicated_draft_pool_scale()
                 self._draft_full_layers_num *= scale
                 self._draft_swa_layers_num *= scale
