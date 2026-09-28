@@ -3170,7 +3170,6 @@ class DeepseekV4AttnBackend(
         self,
         forward_batch: ForwardBatch,
         *,
-        num_qo_tokens: int,
         build_snapshot: bool = True,
     ) -> SharedReadEnds:
         # Hoisted breakable replays refill their SWA store slots at replay prep,
@@ -3182,10 +3181,8 @@ class DeepseekV4AttnBackend(
             and self.token_to_kv_pool.request_window is None
         ):
             build_snapshot = True
-            num_qo_tokens = forward_batch.out_cache_loc.shape[0]
         return super().resolve_prefill_shared_read_ends(
             forward_batch,
-            num_qo_tokens=num_qo_tokens,
             build_snapshot=build_snapshot,
         )
 
