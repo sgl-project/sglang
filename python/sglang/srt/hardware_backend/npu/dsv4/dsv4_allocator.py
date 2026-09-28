@@ -200,6 +200,18 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     ) -> None:
         table = req_to_token_pool.req_to_c128_sidecar
         page_ids = page_ids.to(device=table.device, dtype=table.dtype).view(-1)
+        # A stale page id installed here reaches the sparse-attention kernel's
+        # page table and faults with an opaque MTE out-of-range; validate at
+        # this cold install point (radix prefix install) instead.
+        num_pages = self.c128_attn_allocator.num_pages
+        bad = page_ids >= num_pages
+        if bool(bad.any()):
+            offending = page_ids[bad][:8].tolist()
+            raise RuntimeError(
+                f"c128 prefix pages out of range for req_pool_idx={req_pool_idx}: "
+                f"{offending} not in [0, {num_pages}); radix prefix install "
+                "received invalid page ids"
+            )
         old = table[req_pool_idx, : page_ids.numel()].clone()
         changed = old != page_ids
         self.release_c128_pages(old[changed])
