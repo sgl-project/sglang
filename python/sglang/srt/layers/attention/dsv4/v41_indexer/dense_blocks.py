@@ -26,7 +26,6 @@ from .types import (
     CandidateMetadata,
     DecodeInputs,
     PrefillInputs,
-    Selection,
     get_tail_row_indices,
 )
 
@@ -67,26 +66,24 @@ class DenseBlocksBackend:
         self.block_size = candidate_block_size
         self.use_deep_gemm_prefill = use_deep_gemm_prefill
 
-    def publish_prefill(self, inputs: PrefillInputs, out: Selection):
+    def publish_prefill(self, inputs: PrefillInputs):
         if self.use_deep_gemm_prefill:
-            return self._deep_gemm_publish_prefill(inputs, out)
-        return self._torch_publish_prefill(inputs, out)
+            return self._deep_gemm_publish_prefill(inputs)
+        return self._torch_publish_prefill(inputs)
 
     def consume_prefill(
         self,
         inputs: PrefillInputs,
         published: Optional[BlockIds],
-        out: Selection,
     ) -> None:
         if self.use_deep_gemm_prefill:
-            self._deep_gemm_consume_prefill(inputs, published, out)
+            self._deep_gemm_consume_prefill(inputs, published)
         else:
-            self._torch_consume_prefill(inputs, published, out)
+            self._torch_consume_prefill(inputs, published)
 
-    def publish_decode(self, inputs: DecodeInputs, out: Selection):
+    def publish_decode(self, inputs: DecodeInputs):
         d = decode_scores(
             inputs=inputs,
-            out=out,
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
         )
@@ -102,18 +99,16 @@ class DenseBlocksBackend:
         )
         k = min(inputs.indexer.index_topk, d.lmax)
         idx = d.scores.topk(k, dim=-1, sorted=False).indices
-        write_decode(out, d, idx)
+        write_decode(inputs, d, idx)
         return published
 
     def consume_decode(
         self,
         inputs: DecodeInputs,
         published: Optional[BlockIds],
-        out: Selection,
     ) -> None:
         d = decode_scores(
             inputs=inputs,
-            out=out,
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
         )
@@ -124,12 +119,12 @@ class DenseBlocksBackend:
         idx = topk_among_blocks(
             d.scores, d.lens, published.blocks, k, block_size=self.block_size
         )
-        write_decode(out, d, idx.masked_fill(idx < 0, d.lmax))
+        write_decode(inputs, d, idx.masked_fill(idx < 0, d.lmax))
 
     # ---------- DeepGEMM: flattened-K scores ----------
 
-    def _deep_gemm_publish_prefill(self, inputs: PrefillInputs, out: Selection):
-        out.reset()
+    def _deep_gemm_publish_prefill(self, inputs: PrefillInputs):
+        inputs.reset_outputs()
         data = get_deep_gemm_prefill_data(inputs, self.req_to_token)
         if data is None:
             return None
@@ -142,16 +137,15 @@ class DenseBlocksBackend:
             topk_blocks=self.topk_blocks,
             block_size=self.block_size,
         )
-        data.write_selection(selected=selected, out=out)
+        data.write_selection(selected, inputs)
         return BlockIds(blocks=blocks, rows_per_request=data.rows_per_request)
 
     def _deep_gemm_consume_prefill(
         self,
         inputs: PrefillInputs,
         published: Optional[BlockIds],
-        out: Selection,
     ) -> None:
-        out.reset()
+        inputs.reset_outputs()
         data = get_deep_gemm_prefill_data(inputs, self.req_to_token)
         if data is None:
             return
@@ -165,15 +159,14 @@ class DenseBlocksBackend:
             blocks=published.blocks,
             block_size=self.block_size,
         )
-        data.write_selection(selected=selected, out=out)
+        data.write_selection(selected, inputs)
 
     # ---------- torch: per-request scores ----------
 
-    def _torch_publish_prefill(self, inputs: PrefillInputs, out: Selection):
+    def _torch_publish_prefill(self, inputs: PrefillInputs):
         picked = []  # (query rows, their block ids) per scored chunk
         for request, chunks in prefill_requests(
             inputs=inputs,
-            out=out,
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
         ):
@@ -190,7 +183,7 @@ class DenseBlocksBackend:
                     )
                 )
                 idx = chunk.scores.topk(request.k, dim=-1, sorted=False).indices
-                write_prefill(out, request, chunk, idx)
+                write_prefill(inputs, request, chunk, idx)
         width = max((ids.shape[1] for _, ids in picked), default=0)
         blocks = torch.full(
             (inputs.positions.shape[0], width),
@@ -206,12 +199,10 @@ class DenseBlocksBackend:
         self,
         inputs: PrefillInputs,
         published: Optional[BlockIds],
-        out: Selection,
     ) -> None:
         assert published is not None
         for request, chunks in prefill_requests(
             inputs=inputs,
-            out=out,
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
         ):
@@ -223,7 +214,9 @@ class DenseBlocksBackend:
                     request.k,
                     block_size=self.block_size,
                 )
-                write_prefill(out, request, chunk, idx.masked_fill(idx < 0, request.lc))
+                write_prefill(
+                    inputs, request, chunk, idx.masked_fill(idx < 0, request.lc)
+                )
 
 
 def _publish_prefill_blocks(

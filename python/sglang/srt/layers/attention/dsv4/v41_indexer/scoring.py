@@ -13,11 +13,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer import fp4_index_logits_decod
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import index_q_rope_pack_weights
 from sglang.kernels.ops.attention.dsv4.index_logits import flat_index_logits_tiles
 
-from .types import (
-    DecodeInputs,
-    PrefillInputs,
-    Selection,
-)
+from .types import DecodeInputs, PrefillInputs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Indexer
@@ -57,18 +53,27 @@ class DeepGEMMPrefillData(msgspec.Struct, frozen=True):
             (self.num_rows, topk), -1, dtype=torch.int32
         )
 
-    def write_selection(self, selected: torch.Tensor, out: Selection) -> None:
+    def write_page_indices(self, inputs: PrefillInputs) -> None:
+        """The pool slots of the request-local ``inputs.out_raw_indices`` rows."""
+        if inputs.out_page_indices is None:
+            return
+        raw = inputs.out_raw_indices[: self.num_rows]
+        columns = (raw + self.request_starts[:, None]).clamp_min(0)
+        inputs.out_page_indices[: self.num_rows, : raw.shape[1]] = torch.where(
+            raw >= 0, self.k_slots[columns], -1
+        )
+
+    def write_selection(self, selected: torch.Tensor, inputs: PrefillInputs) -> None:
+        """Write flattened-K columns ``selected`` into the selection buffers."""
         num_tokens, topk = selected.shape
-        unselected = torch.iinfo(torch.int32).max
-        selected = selected.masked_fill(selected < 0, unselected).sort(dim=-1).values
-        chosen = selected != unselected
-        out.page_indices[:num_tokens, :topk] = torch.where(
-            chosen, self.k_slots[selected.clamp_max(self.k_slots.shape[0] - 1)], -1
-        ).to(torch.int32)
-        if out.raw_indices is not None:
-            out.raw_indices[:num_tokens, :topk] = torch.where(
-                chosen, selected - self.request_starts[:, None], -1
-            )
+        chosen = selected >= 0
+        if inputs.out_page_indices is not None:
+            inputs.out_page_indices[:num_tokens, :topk] = torch.where(
+                chosen, self.k_slots[selected.clamp_min(0)], -1
+            ).to(torch.int32)
+        inputs.out_raw_indices[:num_tokens, :topk] = torch.where(
+            chosen, selected - self.request_starts[:, None], -1
+        )
 
 
 def quantize_index_q(q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -220,22 +225,22 @@ def dense_prefill_topk(
     data: DeepGEMMPrefillData,
     kv: Tuple[torch.Tensor, torch.Tensor],
     *,
-    topk: int,
-) -> torch.Tensor:
-    """Flattened-K columns, ``-1`` padded, unordered."""
+    out: torch.Tensor,
+) -> None:
+    """Request-local compressed positions into ``out``, ``-1`` padded, unordered."""
     from sglang.kernels.ops.attention.dsv4 import topk_transform_ragged_v2
 
-    selected = data.empty_selection(topk)
+    # Score columns are request-relative, so a zero offset emits request-local positions.
+    zero_offsets = torch.zeros_like(data.request_starts)
     for tile, logits in score_tiles(data, kv, width_align=4):
         topk_transform_ragged_v2(
             logits,
             data.compress_lens[tile],
-            out_offsets=data.request_starts[tile],
-            out_indices=selected[tile],
+            out_offsets=zero_offsets[tile],
+            out_indices=out[tile],
         )
         # Free this tile's logits before the generator scores the next one.
         del logits
-    return selected
 
 
 # ---------- torch ----------
@@ -272,7 +277,6 @@ class DecodeScores(msgspec.Struct, frozen=True):
 def prefill_requests(
     *,
     inputs: PrefillInputs,
-    out: Selection,
     token_to_kv_pool: DeepSeekV4TokenToKVPool,
     req_to_token: torch.Tensor,
 ) -> Iterator[tuple[RequestScores, Iterator[ChunkScores]]]:
@@ -282,7 +286,7 @@ def prefill_requests(
     indexer = inputs.indexer
     req, pos = inputs.req_rows, inputs.positions
     assert req is not None, "the torch indexer needs the batch's rows"
-    out.reset()
+    inputs.reset_outputs()
     q = indexer.queries(inputs.q_lora, inputs.freqs_cis[pos])
     weights = indexer.head_weights(inputs.x)
     # A compressed position is visible once the query has passed its last token.
@@ -329,22 +333,24 @@ def _score_chunks(
 
 
 def write_prefill(
-    out: Selection, request: RequestScores, chunk: ChunkScores, idx: torch.Tensor
+    inputs: PrefillInputs,
+    request: RequestScores,
+    chunk: ChunkScores,
+    idx: torch.Tensor,
 ) -> None:
     k, lc = request.k, request.lc
     idx = idx.sort(dim=-1).values
     reach = idx < chunk.lens[:, None]
-    out.page_indices[chunk.tok, :k] = torch.where(
-        reach, request.slots[idx.clamp_max(lc - 1)], -1
-    ).to(torch.int32)
-    if out.raw_indices is not None:
-        out.raw_indices[chunk.tok, :k] = torch.where(reach, idx, -1).to(torch.int32)
+    if inputs.out_page_indices is not None:
+        inputs.out_page_indices[chunk.tok, :k] = torch.where(
+            reach, request.slots[idx.clamp_max(lc - 1)], -1
+        ).to(torch.int32)
+    inputs.out_raw_indices[chunk.tok, :k] = torch.where(reach, idx, -1).to(torch.int32)
 
 
 def decode_scores(
     *,
     inputs: DecodeInputs,
-    out: Selection,
     token_to_kv_pool: DeepSeekV4TokenToKVPool,
     req_to_token: torch.Tensor,
 ) -> Optional[DecodeScores]:
@@ -353,7 +359,7 @@ def decode_scores(
     ratio = inputs.compress_ratio
     indexer = inputs.indexer
     req, pos = inputs.req_rows, inputs.positions
-    out.reset()
+    inputs.reset_outputs()
     bs = req.shape[0]
     assert pos.shape[0] == bs, (
         f"decode expects one token per request, {pos.shape=} {bs=}"
@@ -380,12 +386,10 @@ def decode_scores(
     return DecodeScores(bs=bs, lmax=lmax, lens=lens, slots=slots, scores=scores)
 
 
-def write_decode(out: Selection, d: DecodeScores, idx: torch.Tensor) -> None:
+def write_decode(inputs: DecodeInputs, d: DecodeScores, idx: torch.Tensor) -> None:
     k = idx.shape[1]
     idx = idx.sort(dim=-1).values
     reach = idx < d.lens[:, None]
-    out.page_indices[: d.bs, :k] = torch.where(
+    inputs.out_page_indices[: d.bs, :k] = torch.where(
         reach, d.slots.gather(1, idx.clamp_max(d.lmax - 1)), -1
     ).to(torch.int32)
-    if out.raw_indices is not None:
-        out.raw_indices[: d.bs, :k] = torch.where(reach, idx, -1).to(torch.int32)

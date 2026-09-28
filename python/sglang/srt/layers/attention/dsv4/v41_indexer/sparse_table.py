@@ -43,7 +43,6 @@ from .types import (
     CandidateMetadata,
     DecodeInputs,
     PrefillInputs,
-    Selection,
     get_tail_row_indices,
 )
 
@@ -118,12 +117,11 @@ class SparseTableBackend:
         # captured graphs keep reading the buffers they saw
         self._retired_cached_row_ids: list = []
 
-    def publish_prefill(self, inputs: PrefillInputs, out: Selection):
-        out.reset()
+    def publish_prefill(self, inputs: PrefillInputs):
+        inputs.reset_outputs()
         data = get_deep_gemm_prefill_data(inputs, self.req_to_token)
         if data is None:
             return None
-        selected = data.empty_selection(inputs.indexer.index_topk)
         index_page_size = self.token_to_kv_pool.get_index_k_page_size(
             inputs.compress_ratio
         )
@@ -140,23 +138,21 @@ class SparseTableBackend:
             ).contiguous(),
             index_page_size=index_page_size,
             topk_blocks=self.topk_blocks,
-            out_positions=selected,
+            out_positions=inputs.out_raw_indices[: data.num_rows],
         )
-        data.write_selection(selected=selected, out=out)
+        data.write_page_indices(inputs)
         return table
 
     def consume_prefill(
         self,
         inputs: PrefillInputs,
         published: Optional[_SparsePrefillTable],
-        out: Selection,
     ) -> None:
-        out.reset()
+        inputs.reset_outputs()
         data = get_deep_gemm_prefill_data(inputs, self.req_to_token)
         if data is None:
             return
         assert published is not None
-        selected = data.empty_selection(inputs.indexer.index_topk)
         select_prefill_table(
             table=published,
             data=data,
@@ -167,16 +163,16 @@ class SparseTableBackend:
                     inputs.compress_ratio
                 ),
             ),
-            out_positions=selected,
+            out_positions=inputs.out_raw_indices[: data.num_rows],
         )
-        data.write_selection(selected=selected, out=out)
+        data.write_page_indices(inputs)
 
-    def publish_decode(self, inputs: DecodeInputs, out: Selection):
+    def publish_decode(self, inputs: DecodeInputs):
         data = get_deep_gemm_decode_data(inputs, self.token_to_kv_pool)
         metadata = inputs.paged_metadata
         seq_lens = metadata.compressed_seq_lens.reshape(-1)
         if isinstance(metadata.deep_gemm_metadata, list):
-            return self._publish_decode_chunked(inputs, data, seq_lens, out)
+            return self._publish_decode_chunked(inputs, data, seq_lens)
         logits = deep_gemm_fp4_paged_mqa_logits(
             (data.q_fp4, data.q_sf),
             data.k_cache,
@@ -195,10 +191,9 @@ class SparseTableBackend:
             logits,
             seq_lens,
             metadata.page_table,
-            out.page_indices,
+            inputs.out_page_indices,
             metadata.compressed_page_size,
             metadata.topk_metadata,
-            out_raw_indices=out.raw_indices,
         )
         # per row: block count for the block top-k, sparse-row length for the consumers
         with torch.cuda.stream(self.alt_stream):
@@ -237,7 +232,6 @@ class SparseTableBackend:
         inputs: DecodeInputs,
         data: DeepGEMMDecodeData,
         seq_lens: torch.Tensor,
-        out: Selection,
     ) -> _SparseTable:
         """On the current stream, so each chunk's logits are released before the next."""
         metadata = inputs.paged_metadata
@@ -259,8 +253,8 @@ class SparseTableBackend:
             topk_transform_paged_from_metadata(
                 logits,
                 metadata,
-                out.page_indices,
-                out.raw_indices,
+                inputs.out_page_indices,
+                None,
                 rows=rows,
                 topk_metadata=(
                     topk_plans[chunk_idx] if topk_plans is not None else None
@@ -304,7 +298,6 @@ class SparseTableBackend:
         self,
         inputs: DecodeInputs,
         published: Optional[_SparseTable],
-        out: Selection,
     ) -> None:
         assert published is not None
         data = get_deep_gemm_decode_data(inputs, self.token_to_kv_pool)
@@ -317,9 +310,8 @@ class SparseTableBackend:
             published.schedule,
             published.blocks.shape[1],
         )
-        assert out.raw_indices is None
         topk_transform_sparse(
-            logits, published.valid_lens, published.phys_blocks, out.page_indices
+            logits, published.valid_lens, published.phys_blocks, inputs.out_page_indices
         )
 
     def _get_request_ids(self, inputs: DecodeInputs, rows: int, device: torch.device):
@@ -382,8 +374,9 @@ def publish_prefill_table(
     topk_blocks: int,
     out_positions: torch.Tensor,
 ) -> _SparsePrefillTable:
-    """The source's own top-k into ``out_positions`` and the chunk's table, from one
-    pass over its dense scores; ``index_page_table`` is at ``index_page_size`` slots."""
+    """The source's own top-k into ``out_positions`` (request-local compressed
+    positions) and the chunk's table, from one pass over its dense scores;
+    ``index_page_table`` is at ``index_page_size`` slots."""
     rows = data.num_rows
     device = data.q_fp4.device
     nblocks, valid_lens = candidate_row_lens(data.compress_lens, topk_blocks)
@@ -395,7 +388,7 @@ def publish_prefill_table(
         topk_transform_ragged_v2(
             logits,
             lens,
-            out_offsets=data.request_starts[tile],
+            out_offsets=zero_offsets[tile],
             out_indices=out_positions[tile],
         )
         # keys past a row's block count stay unset; the top-k reads a row
@@ -446,4 +439,3 @@ def select_prefill_table(
     )
     # request-relative compressed positions, -1 padded
     topk_transform_sparse(logits, table.valid_lens, table.blocks, out_positions)
-    out_positions.add_(torch.where(out_positions >= 0, data.request_starts[:, None], 0))
