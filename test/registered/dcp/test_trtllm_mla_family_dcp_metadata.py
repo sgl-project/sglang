@@ -523,7 +523,6 @@ class TestFusedWriteLocTranslateCuda(CustomTestCase):
             for dcp_size, dcp_rank in ((1, 0), (2, 1), (4, 2)):
                 kw = dict(
                     page_size=page_size,
-                    stride=page_size * 3,
                     dcp_size=dcp_size,
                     dcp_rank=dcp_rank,
                 )
@@ -539,7 +538,7 @@ class TestFusedWriteLocTranslateCuda(CustomTestCase):
         """`out_width` past the batch must zero the tail in the same launch.
 
         This is what lets a backend hand in its whole capture-stable buffer:
-        a shorter replay leaves stale kernel-facing ids past the batch, and the
+        a shorter replay leaves stale physical ids past the batch, and the
         captured write kernel consumes the full buffer, so an uncleared tail
         scatters pad rows into live KV pages.
         """
@@ -551,13 +550,13 @@ class TestFusedWriteLocTranslateCuda(CustomTestCase):
         # Poison the whole buffer so an unwritten or uncleared cell is visible.
         buf = torch.full((width,), -999, dtype=torch.int64, device="cuda")
         write_loc_to_kernel_ids(
-            loc=loc, v2p=v2p, page_size=64, stride=64 * 2, out=buf, out_width=width
+            loc=loc, v2p=v2p, page_size=64, out=buf, out_width=width
         )
-        self.assertEqual(buf[:3].tolist(), [2 * 128, 5 * 128, 1 * 128])
+        self.assertEqual(buf[:3].tolist(), [2 * 64, 5 * 64, 1 * 64])
         self.assertEqual(buf[3:].tolist(), [0] * (width - 3))
 
         # And it must agree with the narrow call on the live prefix.
-        narrow = write_loc_to_kernel_ids(loc=loc, v2p=v2p, page_size=64, stride=64 * 2)
+        narrow = write_loc_to_kernel_ids(loc=loc, v2p=v2p, page_size=64)
         self.assertEqual(narrow.tolist(), buf[:3].tolist())
 
     def test_out_is_written_in_place(self):
@@ -568,11 +567,9 @@ class TestFusedWriteLocTranslateCuda(CustomTestCase):
         v2p = torch.tensor([2, 5, -1, 3], dtype=torch.int64, device="cuda")
         loc = torch.tensor([0, 64, 128, 192], dtype=torch.int64, device="cuda")
         dst = torch.full_like(loc, -7)
-        ret = write_loc_to_kernel_ids(
-            loc=loc, v2p=v2p, page_size=64, stride=64 * 2, out=dst
-        )
+        ret = write_loc_to_kernel_ids(loc=loc, v2p=v2p, page_size=64, out=dst)
         self.assertIs(ret, dst)
-        self.assertEqual(dst.tolist(), [2 * 128, 5 * 128, 0, 3 * 128])
+        self.assertEqual(dst.tolist(), [2 * 64, 5 * 64, 0, 3 * 64])
 
 
 class TestDcpDecodeLayout(CustomTestCase):

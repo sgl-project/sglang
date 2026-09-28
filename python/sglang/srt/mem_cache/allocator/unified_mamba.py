@@ -263,8 +263,8 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     @property
     def full_v2p_page_table(self) -> torch.Tensor:
         """Page-level virtual->physical table of the full sub-pool. Kernels that
-        build the MLA block table straight from req_to_token gather through this,
-        The kernel id is the physical token id; there is no per-page scale."""
+        build the MLA block table straight from req_to_token gather through this;
+        an entry is the physical page."""
         return self.full_attn_allocator.virtual_to_physical
 
     @property

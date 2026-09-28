@@ -3543,7 +3543,7 @@ class TestFusedWriteLocTranslate(unittest.TestCase):
     tombstoned-page cases are the ones that matter.
     """
 
-    def _reference(self, loc, v2p, page_size, stride, dcp_size, dcp_rank):
+    def _reference(self, loc, v2p, page_size, dcp_size, dcp_rank):
         out = []
         for raw in loc.tolist():
             if raw < 0 or (dcp_size > 1 and raw % dcp_size != dcp_rank):
@@ -3552,10 +3552,10 @@ class TestFusedWriteLocTranslate(unittest.TestCase):
             collapsed = raw // dcp_size
             page = collapsed // page_size
             offset = collapsed % page_size if page_size > 1 else 0
-            out.append(max(int(v2p[page]) * stride + offset, 0))
+            out.append(max(int(v2p[page]) * page_size + offset, 0))
         return out
 
-    def _check(self, *, page_size, multiplier, dcp_size, dcp_rank, device):
+    def _check(self, *, page_size, dcp_size, dcp_rank, device):
         from sglang.kernels.ops.memory.virtual_slot import write_loc_to_kernel_ids
 
         span = page_size * dcp_size
@@ -3571,19 +3571,15 @@ class TestFusedWriteLocTranslate(unittest.TestCase):
             device=device,
         )
         v2p[min(3, num_pages - 1)] = -1
-        stride = page_size * multiplier
 
         got = write_loc_to_kernel_ids(
             loc=loc,
             v2p=v2p,
             page_size=page_size,
-            stride=stride,
             dcp_size=dcp_size,
             dcp_rank=dcp_rank,
         )
-        want = self._reference(
-            loc.cpu(), v2p.cpu(), page_size, stride, dcp_size, dcp_rank
-        )
+        want = self._reference(loc.cpu(), v2p.cpu(), page_size, dcp_size, dcp_rank)
         self.assertEqual(got.tolist(), want, f"ps={page_size} dcp={dcp_size}")
         # `out=` must write in place and agree (the cuda-graph-stable path).
         dst = torch.full_like(loc, -7)
@@ -3591,7 +3587,6 @@ class TestFusedWriteLocTranslate(unittest.TestCase):
             loc=loc,
             v2p=v2p,
             page_size=page_size,
-            stride=stride,
             dcp_size=dcp_size,
             dcp_rank=dcp_rank,
             out=dst,
@@ -3604,7 +3599,6 @@ class TestFusedWriteLocTranslate(unittest.TestCase):
             for dcp_size, dcp_rank in ((1, 0), (2, 1), (4, 2)):
                 self._check(
                     page_size=page_size,
-                    multiplier=7,
                     dcp_size=dcp_size,
                     dcp_rank=dcp_rank,
                     device="cpu",

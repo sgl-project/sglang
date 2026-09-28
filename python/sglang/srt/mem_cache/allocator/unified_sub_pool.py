@@ -1090,7 +1090,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             loc=loc,
             v2p=self.virtual_to_physical,
             page_size=self.pool_page_size,
-            stride=self.pool_page_size,
             dcp_size=dcp_size,
             dcp_rank=dcp_rank,
             out=out,

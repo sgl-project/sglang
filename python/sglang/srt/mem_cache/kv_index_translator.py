@@ -13,15 +13,15 @@
 # ==============================================================================
 """Turns the KV ids stored in `req_to_token` into ids attention kernels can use.
 
-A KV slot can be named in three id spaces:
+A KV slot can be named in two id spaces:
 
   * **virtual** - what `req_to_token` stores. Keeps naming the same logical
     slot even after the pool moves data around.
-  * **physical** - where that slot sits in the pool right now.
-  * **kernel-facing** - what a kernel can index the per-layer K/V tensors
-    with. Under the token-major views, it is the same as physical id.
+  * **physical** - where that slot sits in the pool right now, which is also
+    what a kernel indexes the per-layer K/V views with ("kernel-facing" in
+    older names means the same id).
 
-All three coincide on a plain pool, so nothing here does any work there.
+The two coincide on a plain pool, so nothing here does any work there.
 
 Backends get a `KVIndexTable`, which answers "what do I gather from, and
 which row is mine?":
@@ -30,7 +30,7 @@ which row is mine?":
 
     plain pool : ids = req_to_token, row_ids = req_pool_indices (those very
                  objects - no copy, no kernel)
-    unified    : ids = a built array of kernel-facing ids,
+    unified    : ids = a built array of physical ids,
                  row_ids = arange(batch_size)
 
 Backends call their own copy a *page table* (fa3) or a *block table*
@@ -486,15 +486,15 @@ class KVIndexTranslator:
             return None
         return self._swa_write_loc_from_full(out_cache_loc)
 
-    def _swa_write_loc_unified(self, kernel_loc: torch.Tensor) -> torch.Tensor:
+    def _swa_write_loc_unified(self, full_loc: torch.Tensor) -> torch.Tensor:
         """Sliding-window write loc, derived pointwise from FULL-side physical
-        values (phase 2 of the write contract).
+        ids (phase 2 of the write contract).
         """
         ps = self.page_size
-        offset = kernel_loc % ps  # == virtual_token % page_size
+        offset = full_loc % ps  # == virtual_token % page_size
         # An unmapped physical page reads back as -1; clamp it rather than let
         # the gather wrap onto the v2p table's last element.
-        virt_page = self._full_p2v_table[kernel_loc // ps].clamp_(min=0)
+        virt_page = self._full_p2v_table[full_loc // ps].clamp_(min=0)
         return (self._swa_v2p_table[virt_page] * ps + offset).clamp_(min=0)
 
     # -- token-level translate surface (the mixin / local-attn consumers) ------

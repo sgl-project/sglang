@@ -96,8 +96,7 @@ def create_mla_kv_page_table_for_dcp(
     ``HAS_V2P`` picks the id space the emitted page number is in: the
     DCP-collapsed page IS physical on a static pool, and still VIRTUAL under
     the unified memory pool, where it takes one more gather through ``v2p_ptr``
-    to reach the per-layer views. No scale: under the token-major views a
-    physical page IS the kernel-facing page.
+    to the physical page the per-layer views are indexed by.
     """
     req = tl.program_id(0)
     page_block = tl.program_id(1)

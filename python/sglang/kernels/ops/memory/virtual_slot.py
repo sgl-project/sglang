@@ -200,20 +200,19 @@ WRITE_LOC_BLOCK = 512
 def write_loc_to_kernel_id_kernel(
     loc_ptr,  # in:  [N] int64 — WIDENED virtual token ids
     v2p_ptr,  # in:  [num_pages + 1] int64 — virtual->physical page table
-    out_ptr,  # out: [N] int64 — kernel-facing ids
+    out_ptr,  # out: [N] int64 — physical token ids
     N,  # runtime: live element count
     W,  # runtime: lanes to write; [N, W) get 0
-    stride,  # runtime: pool_page_size (a physical id IS the kernel id)
     PAGE_SIZE: tl.constexpr,
     DCP_SIZE: tl.constexpr,
     DCP_RANK: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """``kernel_id(t) = v2p[t // ps] * ps + t % ps``, clamped at 0.
+    """``physical(t) = v2p[t // ps] * ps + t % ps``, clamped at 0.
 
     Under DCP the incoming id is WIDENED: ``loc % dcp_size`` names its owner
     and ``loc // dcp_size`` is the row. Ids this rank does not own resolve to
-    kernel id 0, the padding sink every write kernel skips.
+    id 0, the padding sink every write kernel skips.
 
     Triton truncates ``//`` toward zero where torch floors it, so a negative
     loc is tested explicitly rather than left to the division; it resolves to
@@ -238,7 +237,7 @@ def write_loc_to_kernel_id_kernel(
     offset = loc % PAGE_SIZE if PAGE_SIZE > 1 else 0
     # `keep` already excludes negatives, so the gather index is in range.
     phys = tl.load(v2p_ptr + tl.where(keep, page, 0), mask=mask, other=0).to(tl.int64)
-    ids = tl.maximum(phys * stride + offset, 0)
+    ids = tl.maximum(phys * PAGE_SIZE + offset, 0)
     tl.store(out_ptr + offs, tl.where(keep, ids, 0), mask=in_range)
 
 
@@ -247,7 +246,6 @@ def write_loc_to_kernel_ids(
     loc: torch.Tensor,
     v2p: torch.Tensor,
     page_size: int,
-    stride: int,
     dcp_size: int = 1,
     dcp_rank: int = 0,
     out: Optional[torch.Tensor] = None,
@@ -303,7 +301,7 @@ def write_loc_to_kernel_ids(
             big = torch.div(big, dcp_size, rounding_mode="floor")
         page = torch.where(keep, torch.div(big, page_size, rounding_mode="floor"), 0)
         offset = big % page_size if page_size > 1 else 0
-        ids = (v2p[page] * stride + offset).clamp_(min=0)
+        ids = (v2p[page] * page_size + offset).clamp_(min=0)
         out[:N].copy_(torch.where(keep, ids, torch.zeros_like(ids)))
         if width > N:
             out[N:width].zero_()
@@ -315,7 +313,6 @@ def write_loc_to_kernel_ids(
         out,
         N,
         width,
-        stride,
         PAGE_SIZE=page_size,
         DCP_SIZE=dcp_size,
         DCP_RANK=dcp_rank,
