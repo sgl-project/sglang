@@ -119,7 +119,9 @@ def make_layer(ep_size=1, ep_rank=0, hidden=6144, intermediate=None, experts=256
 
 def invoke(method, dispatch, config):
     with (
-        patch.object(runner, "get_parallel", return_value=SimpleNamespace(tp_group=None)),
+        patch.object(
+            runner, "get_parallel", return_value=SimpleNamespace(tp_group=None)
+        ),
         patch.object(runner, "is_allocation_symmetric", return_value=False),
         patch.object(runner, "use_symmetric_memory", return_value=nullcontext()),
     ):

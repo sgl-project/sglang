@@ -29,7 +29,6 @@ from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.common import next_power_of_2
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.token_dispatcher.base import DispatchOutput
     from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
         FlashinferCombineInput,
         FlashinferDispatchOutput,
@@ -363,7 +362,7 @@ def _run_flashinfer_w4afp8(
     fused_moe, _ = _flashinfer_cutlass_fused_moe()
     with use_symmetric_memory(
         get_parallel().tp_group,
-        disabled=not symmetric_output or not is_allocation_symmetric()
+        disabled=not symmetric_output or not is_allocation_symmetric(),
     ):
         output = torch.empty_like(x)
     fused_moe(

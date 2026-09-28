@@ -320,7 +320,9 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
     ):
         self.moe_runner_config = moe_runner_config
         if self.use_flashinfer:
-            from sglang.srt.layers.moe.moe_runner import flashinfer_cutlass  # noqa: F401
+            from sglang.srt.layers.moe.moe_runner import (  # noqa: F401
+                flashinfer_cutlass,
+            )
             from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
             from sglang.srt.layers.moe.utils import MoeRunnerBackend
 
