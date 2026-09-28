@@ -47,15 +47,18 @@ FINAL_TOPK = TOKEN_TOPK + COMPRESS_RATIO - 1
 
 def test_fp8_chunk_pipeline_guard(monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda _device: "NVIDIA H20")
-    valid = [4096, 4096, torch.float8_e4m3fn, 256, 12, FINAL_TOPK]
+    valid = [8192, 2, torch.float8_e4m3fn, 256, 6, FINAL_TOPK]
     assert sparse_attn_module._use_fp8_chunk_pipeline(*valid)
 
+    tp1_shape = valid.copy()
+    tp1_shape[4] = 12
+    assert sparse_attn_module._use_fp8_chunk_pipeline(*tp1_shape)
+
     for index, value in [
-        (0, 4095),
-        (1, 64),
+        (0, 8191),
         (2, torch.bfloat16),
         (3, 128),
-        (4, 6),
+        (4, 3),
         (5, 2048),
     ]:
         invalid = valid.copy()
@@ -73,9 +76,9 @@ def test_h20_long_chunk_fp8_pipeline_matches_bf16_dot(monkeypatch):
     torch.manual_seed(42)
     device = torch.device("cuda")
     q_len, kv_len = 4096, 8192
-    q = torch.randn(q_len, 24, 256, dtype=torch.bfloat16, device=device)
+    q = torch.randn(q_len, 6, 256, dtype=torch.bfloat16, device=device)
     k, v = [
-        torch.randn(kv_len, 2, 256, dtype=torch.bfloat16, device=device).to(
+        torch.randn(kv_len, 1, 256, dtype=torch.bfloat16, device=device).to(
             torch.float8_e4m3fn
         )
         for _ in range(2)

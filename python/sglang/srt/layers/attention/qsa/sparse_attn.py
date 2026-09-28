@@ -28,18 +28,18 @@ def _get_best_config(total_q: int):
 
 def _use_fp8_chunk_pipeline(
     total_q: int,
-    max_q: int,
+    num_requests: int,
     kv_dtype: torch.dtype,
     head_dim: int,
     group_size: int,
     topk: int,
 ) -> bool:
     return (
-        total_q >= 4096
-        and max_q >= 4096
+        num_requests > 0
+        and total_q >= 4096 * num_requests
         and kv_dtype == torch.float8_e4m3fn
         and head_dim == 256
-        and group_size == 12
+        and group_size in (6, 12)
         and topk == 2051
         and "H20" in torch.cuda.get_device_name(0)
     )
@@ -309,7 +309,7 @@ def sparse_gqa_fwd_interface_triton_ck(q, k, v, indices, cu_q, cu_k, kv_lens, sc
     block_n, warps, stages = _get_best_config(total_q)
     use_fp8_pipeline = _use_fp8_chunk_pipeline(
         total_q,
-        max_q,
+        cu_q.shape[0] - 1,
         k.dtype,
         head_dim,
         group_size,
