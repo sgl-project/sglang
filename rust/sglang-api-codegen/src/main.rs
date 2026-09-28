@@ -6,8 +6,19 @@
 //! emits the serde implementations — proto3's canonical JSON mapping is NOT
 //! used; the options are the JSON contract.
 //!
-//! Run from anywhere in the workspace: `cargo run -p sglang-api-codegen`.
-//! Output is checked in; CI runs regen-and-diff.
+//! Regeneration is manual. From anywhere in the `rust/` workspace:
+//!
+//! ```text
+//! cargo run -p sglang-api-codegen
+//! ```
+//!
+//! `proto/sglang/api/v1/service.proto` is the single root: every API must be
+//! defined (or imported) there, and protoc's import closure supplies the rest
+//! of the package — a file the service does not reach is not part of the API
+//! and gets no generated code. The output under
+//! `sglang-api-types/src/generated/` is checked in, so commit it together
+//! with the .proto change. The vendored protoc (pinned by Cargo.lock) is used
+//! unless `PROTOC` is set, so the output is byte-stable across machines.
 
 mod emit;
 mod model;
@@ -20,24 +31,25 @@ fn main() {
     let out_dir = manifest_dir.join("../sglang-api-types/src/generated");
     std::fs::create_dir_all(&out_dir).expect("create generated dir");
 
-    if std::env::var_os("PROTOC").is_none() {
-        // Prefer the system protoc; fall back to the vendored one (the same
-        // pattern as sglang-grpc/build.rs).
-        if !Path::new("/usr/bin/protoc").exists() {
-            let vendored = protoc_bin_vendored::protoc_bin_path().expect("vendored protoc");
-            unsafe { std::env::set_var("PROTOC", vendored) };
-        }
+    // Vendored protoc first (same policy as sglang-grpc/build.rs): the
+    // checked-in output must not depend on whichever protoc a machine has.
+    // `PROTOC` still overrides for platforms the vendored crate lacks.
+    if std::env::var_os("PROTOC").is_none()
+        && let Ok(vendored) = protoc_bin_vendored::protoc_bin_path()
+    {
+        // SAFETY: nothing else is running yet; the generator is single-threaded.
+        unsafe { std::env::set_var("PROTOC", vendored) };
     }
 
-    let descriptor_path = out_dir.join("sglang.api.v1.descriptor.bin");
-    let files = [
-        "sglang/api/v1/common.proto",
-        "sglang/api/v1/sampling.proto",
-        "sglang/api/v1/finish.proto",
-        "sglang/api/v1/generate.proto",
-        "sglang/api/v1/service.proto",
-    ];
-    let file_paths: Vec<PathBuf> = files.iter().map(|f| proto_root.join(f)).collect();
+    // The descriptor set is only pass 2's input, not part of the crate; it is
+    // a protoc-version-dependent binary, so keep it out of the tree.
+    let scratch_dir = std::env::temp_dir().join("sglang-api-codegen");
+    std::fs::create_dir_all(&scratch_dir).expect("create scratch dir");
+    let descriptor_path = scratch_dir.join("sglang.api.v1.descriptor.bin");
+    // The service file is the API surface; everything it imports (the rest of
+    // sglang.api.v1 plus the sglang.json.v1 options) comes in transitively
+    // via the include path, in topological order, so the output is stable.
+    let file_paths = [proto_root.join("sglang/api/v1/service.proto")];
 
     // Pass 1: structs + tonic service (+ the descriptor set pass 2 reads).
     // Services land in their own file so lib.rs can gate them if ever needed.
