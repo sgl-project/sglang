@@ -1475,6 +1475,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 if any_failed:
                     raise RuntimeError(f"NIXL transfer encountered ERR room={room}")
 
+                # Clear with the decrement: the failure path below reads this
+                # flag, so a raise after this point must not uncount twice.
+                kv_chunk.staging_counted = False
                 self._staging_outstanding[room] -= 1
                 if self.enable_deferred_decode_kv_release:
                     # Handles all DONE => this room's writes landed; ack if it
@@ -1531,6 +1534,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     # decode's deferred release always runs out the full
                     # timeout (mooncake decrements + acks on its failure path).
                     if kv_chunk.staging_counted:
+                        kv_chunk.staging_counted = False
                         self._staging_outstanding[room] -= 1
                     if self.enable_deferred_decode_kv_release:
                         self._maybe_ack_drained_abort(room)
