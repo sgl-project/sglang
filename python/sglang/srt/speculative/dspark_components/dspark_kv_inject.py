@@ -70,6 +70,11 @@ class TargetHiddenKvInjector:
                 device=device, dtype=torch.int64, non_blocking=True
             )
 
+        translator = self.draft_model_runner.kv_index_translator
+        cache_loc = translator.translate_full_attn_ids(cache_loc)
+        if cache_loc_2d is not None:
+            cache_loc_2d = translator.translate_full_attn_ids(cache_loc_2d)
+
         pool = self.draft_model_runner.token_to_kv_pool
         if hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope"):
             if target_hidden_is_projected:

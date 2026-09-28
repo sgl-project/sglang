@@ -44,6 +44,7 @@ class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     dflash_target_layer_ids: Any = None
     # DFLASH draft KV bytes/token; None when unresolved.
     dflash_draft_cell_size_per_token: int | None = None
+    draft_model_config: Optional[ModelConfig] = None
 
 
 def resolve_spec_aux_hidden_state_config(
@@ -85,26 +86,26 @@ def _resolve_eagle_aux_hidden_state(
     ):
         return
 
-    draft_model_config = model_config
-    if get_spec().speculative_draft_model_path:
-        draft_model_config = ModelConfig.from_server_args(
-            server_args,
-            model_path=get_spec().speculative_draft_model_path,
-            model_revision=get_spec().speculative_draft_model_revision,
-            is_draft_model=True,
-        )
+    draft_path = get_spec().speculative_draft_model_path
+    draft_model_config = ModelConfig.from_server_args(
+        server_args,
+        model_path=draft_path,
+        model_revision=get_spec().speculative_draft_model_revision,
+        is_draft_model=True,
+    )
     num_nextn_predict_layers = draft_model_config.num_nextn_predict_layers
     if num_nextn_predict_layers is not None:
         config.eagle_draft_num_layers = int(num_nextn_predict_layers)
-    elif get_spec().speculative_draft_model_path:
+    elif draft_path is None:
+        return
+    else:
         config.eagle_draft_num_layers = int(
             max(
                 draft_model_config.num_hidden_layers,
                 draft_model_config.num_attention_layers,
             )
         )
-    else:
-        return
+    config.draft_model_config = draft_model_config
 
     if draft_model_config.is_hybrid_swa and not draft_model_config.is_deepseek_v4_arch:
         config.eagle_draft_swa_num_layers = len(
@@ -204,6 +205,7 @@ def _resolve_dflash_aux_hidden_state(
 
         config.dflash_use_aux_hidden_state = True
         config.dflash_draft_num_layers = int(draft_num_layers)
+        config.draft_model_config = draft_model_config
         config.dflash_target_layer_ids = target_layer_ids
         config.dflash_draft_cell_size_per_token = _resolve_dflash_draft_cell_size(
             draft_model_config=draft_model_config,

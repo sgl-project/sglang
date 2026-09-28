@@ -497,6 +497,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self._configure_qsa_mtp_index_share()
         self.tree_mask_mode = default_tree_mask_mode()
 
+        # Boot guard: every backend a draft forward reaches must carry its
+        # runner's translator or the index builders emit virtual ids.
+        translator = self.draft_runner.kv_index_translator
+        if translator.is_translating:
+            backends = [self.draft_attn_backend, self.draft_extend_attn_backend]
+            if self.draft_attn_backend is not None:
+                backends += self.draft_attn_backend.attn_backends
+            translator.bind_and_verify_backends(backends)
+
     def _configure_qsa_mtp_index_share(self) -> None:
         """Reuse the draft-extend QSA selection across the MTP decode steps;
         chain speculation only: with topk > 1 decode rows are not request-major."""

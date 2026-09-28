@@ -446,6 +446,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             return
         with draft_pp_context(), self._draft_context():
             self._draft_worker.init_attention_backends()
+        translator = self.draft_model_runner.kv_index_translator
+        if translator.is_translating:
+            translator.bind_and_verify_backends([self.draft_model_runner.attn_backend])
         self._target_hidden_projection_enabled = _configure_target_hidden_projection(
             target_model=self.target_worker.model_runner.model,
             draft_model=self.draft_model,
