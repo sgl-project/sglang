@@ -595,7 +595,8 @@ def test_fp4_paged_logits_replay(batch, ratio, width, masked):
     reason="Hopper paged indexer dispatch",
 )
 @pytest.mark.parametrize("ratio", [1, 2])
-def test_hopper_indexer_backends_replay(ratio):
+@pytest.mark.parametrize("compact", [False, True])
+def test_hopper_indexer_backends_replay(ratio, compact):
     from sglang.srt.layers.attention.dsv4.v41_indexer import scoring
     from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import (
         DenseBlocksBackend,
@@ -634,7 +635,10 @@ def test_hopper_indexer_backends_replay(ratio):
     )
     full = FullTopKIndexer(**kwargs, use_deep_gemm_decode=False)
     candidates = DenseBlocksBackend(
-        **kwargs, candidate_topk_blocks=4, candidate_block_size=8
+        **kwargs,
+        candidate_topk_blocks=4,
+        candidate_block_size=8,
+        use_triton_candidates=compact,
     )
     outputs = [
         SimpleNamespace(
@@ -662,6 +666,15 @@ def test_hopper_indexer_backends_replay(ratio):
         captured_masks.append(args[-1])
         return result
 
+    def record_candidates(*args, **kwargs):
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+            fp4_index_logits_candidates,
+        )
+
+        result = fp4_index_logits_candidates(*args, **kwargs)
+        captured_scores.append(result)
+        return result
+
     def run():
         full.topk_decode(decode_inputs[0])
         published = candidates.publish_decode(decode_inputs[1])
@@ -671,15 +684,25 @@ def test_hopper_indexer_backends_replay(ratio):
     for _ in range(3):
         run()
     graph = torch.cuda.CUDAGraph()
-    with patch.object(scoring, "fp4_index_logits_paged", side_effect=record_scores):
+    with (
+        patch.object(scoring, "fp4_index_logits_paged", side_effect=record_scores),
+        patch.object(
+            scoring, "fp4_index_logits_candidates", side_effect=record_candidates
+        ),
+    ):
         with torch.cuda.graph(graph):
             published = run()
     assert (
         len(captured_scores) == 3
-    )  # all three runtime entrypoints took the paged path
+    )  # Full/source stay dense; the consumer may use compact paged scoring.
     mask = published.decode_mask
     assert captured_masks[:2] == [None, None]
-    assert captured_masks[2] is mask
+    if compact:
+        assert mask is None
+        assert len(captured_masks) == 2
+        assert captured_scores[2].shape[1] == published.blocks.shape[1] * 8
+    else:
+        assert captured_masks[2] is mask
     for step, visible in enumerate([193, 0, 1, 7, 8, 9, 65, 193]):
         # -1 positions exercise zero-length padded rows, also for ratio 1.
         lens.copy_((visible - torch.arange(batch, device=q.device) % 6).clamp_min(0))
@@ -715,7 +738,8 @@ def test_hopper_indexer_backends_replay(ratio):
                     maxima.topk(min(4, nblocks)).values.sort().values,
                 )
             keep = torch.isin(torch.arange(width, device=q.device) // 8, blocks)
-            torch.testing.assert_close(mask[row, :width], keep)
+            if not compact:
+                torch.testing.assert_close(mask[row, :width], keep)
             consumer_scores[row].masked_fill_(~keep, -torch.inf)
             for out, scores in zip(
                 outputs, (source_scores, source_scores, consumer_scores)
