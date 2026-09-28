@@ -12,6 +12,11 @@ enum PoolJob {
         request: Box<TextRequest>,
         reply: oneshot::Sender<Result<TokenIdsRequest, Error>>,
     },
+    Detokenize {
+        token_ids: Vec<u32>,
+        skip_special_tokens: bool,
+        reply: oneshot::Sender<Result<String, Error>>,
+    },
     Stop,
 }
 
@@ -61,6 +66,14 @@ impl PooledTokenizer {
                                         tokenize_text_request(*request, tokenizer.as_ref());
                                     let _ = reply.send(result);
                                 }
+                                PoolJob::Detokenize {
+                                    token_ids,
+                                    skip_special_tokens,
+                                    reply,
+                                } => {
+                                    let result = tokenizer.decode(&token_ids, skip_special_tokens);
+                                    let _ = reply.send(result);
+                                }
                                 PoolJob::Stop => break,
                             }
                         }
@@ -83,6 +96,23 @@ impl PooledTokenizer {
         let (reply, result) = oneshot::channel();
         jobs.send_async(PoolJob::Tokenize {
             request: Box::new(request),
+            reply,
+        })
+        .await
+        .map_err(|_| Error::Unavailable)?;
+        result.await.map_err(|_| Error::WorkerDropped)?
+    }
+
+    pub(crate) async fn detokenize(
+        &self,
+        token_ids: Vec<u32>,
+        skip_special_tokens: bool,
+    ) -> Result<String, Error> {
+        let jobs = self.inner.jobs.clone();
+        let (reply, result) = oneshot::channel();
+        jobs.send_async(PoolJob::Detokenize {
+            token_ids,
+            skip_special_tokens,
             reply,
         })
         .await

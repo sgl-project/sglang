@@ -42,6 +42,14 @@ mod suite {
         ) -> Result<Vec<i32>, ProcessorError> {
             Ok(text.split_whitespace().map(|_| 7).collect())
         }
+
+        fn decode(&self, token_ids: &[u32], _skip: bool) -> Result<String, RendererError> {
+            Ok(token_ids
+                .iter()
+                .map(|_| "word")
+                .collect::<Vec<_>>()
+                .join(" "))
+        }
     }
 
     #[derive(Clone)]
@@ -514,6 +522,22 @@ mod suite {
         for app in renderer_test_apps() {
             let response = post_json(app, "/v1/chat/completions/render", body.clone()).await;
             assert_eq!(response.status(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn detokenize_is_served_by_the_renderer_in_every_mode() {
+        for path in ["/detokenize", "/v1/detokenize"] {
+            for app in renderer_test_apps() {
+                let response =
+                    post_request(app, path, &serde_json::json!({"tokens": [7, 7]})).await;
+                assert_eq!(response.status(), StatusCode::OK, "{path}");
+                let body: serde_json::Value = serde_json::from_slice(
+                    &to_bytes(response.into_body(), 64 * 1024).await.unwrap(),
+                )
+                .unwrap();
+                assert_eq!(body, serde_json::json!({"text": "word word"}), "{path}");
+            }
         }
     }
 
