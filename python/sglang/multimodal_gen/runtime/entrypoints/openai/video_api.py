@@ -27,6 +27,9 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
     generate_request_id,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.prompt_enhancement import (
+    maybe_enhance_prompt,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoGenerationsRequest,
     VideoListResponse,
@@ -465,6 +468,7 @@ async def create_video(
     request: Request,
     # multipart/form-data fields (optional; used only when content-type is multipart)
     prompt: Optional[str] = Form(None),
+    enhance_prompt: Optional[bool] = Form(None),
     input_reference: Optional[UploadFile] = File(None),
     reference_url: Optional[str] = Form(None),
     video_reference: Optional[UploadFile] = File(None),
@@ -607,6 +611,7 @@ async def create_video(
 
         req = VideoGenerationsRequest(
             prompt=prompt,
+            enhance_prompt=form_value("enhance_prompt", enhance_prompt) or False,
             input_reference=input_path,
             video_path=form_value("video_path", video_input_path),
             video_url=form_value("video_url", video_url),
@@ -730,10 +735,20 @@ async def create_video(
     logger.debug(f"Server received from create_video endpoint: req={req}")
 
     try:
+        image_path = _resolve_image_path(req, _resolve_video_path(req))
+        req.prompt = await maybe_enhance_prompt(
+            request,
+            req.prompt,
+            enabled=req.enhance_prompt,
+            task="video",
+            image_paths=[image_path] if image_path else None,
+        )
         sampling_params = _build_video_sampling_params(request_id, req)
-    except (ValueError, TypeError) as e:
+    except (asyncio.CancelledError, HTTPException, ValueError, TypeError) as e:
         for td in temp_dirs:
             shutil.rmtree(td, ignore_errors=True)
+        if isinstance(e, (asyncio.CancelledError, HTTPException)):
+            raise
         raise HTTPException(status_code=400, detail=str(e))
 
     batch: Req | None = None
@@ -766,6 +781,8 @@ async def create_video(
             sampling_params,
             server_args.served_model_name,
         )
+        if req.enhance_prompt:
+            job["revised_prompt"] = req.prompt
         job.update(sampling_params.project_video_queued_job_fields(batch))
         await VIDEO_STORE.upsert(request_id, job)
     except Exception as e:
