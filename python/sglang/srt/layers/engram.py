@@ -285,6 +285,15 @@ class EngramHasher(nn.Module):
                 device=input_ids.device,
             )
         mode = forward_batch.forward_mode
+        if mode.is_idle():
+            # A DP-attention rank with no requests is padded to the batch's token
+            # count under MAX_LEN padding: every row is padding, so hash nothing and
+            # commit nothing. The rows still join the lookup collective downstream.
+            return torch.zeros(
+                (num_tokens, self.primes.shape[0], self.offsets.shape[1]),
+                dtype=torch.int64,
+                device=input_ids.device,
+            )
         req_slots = forward_batch.req_pool_indices
         bs = req_slots.shape[0]
         device = input_ids.device
