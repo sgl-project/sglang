@@ -950,9 +950,9 @@ class EmbeddingCacheController:
         Returns: pending D2H handles; pass to wait_store_to_pool().
         """
         for tensor in tensors:
-            if tensor.device.type != "cuda":
+            if tensor.device.type not in ("cuda", "npu"):
                 raise ValueError(
-                    f"store_to_pool_async expects CUDA tensors, "
+                    f"store_to_pool_async expects CUDA or NPU tensors, "
                     f"got device={tensor.device}"
                 )
 
