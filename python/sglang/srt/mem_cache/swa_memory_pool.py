@@ -53,7 +53,10 @@ class SWAKVPool(BaseSWAKVPool):
         self.swa_layer_nums = len(swa_attention_layer_ids)
         self.full_layer_nums = len(full_attention_layer_ids)
         self.layer_num = self.full_layer_nums + self.swa_layer_nums
-        self.start_layer = 0
+        # PP stages keep global layer ids; HiCache load events count from the first.
+        self.start_layer = min(
+            [*swa_attention_layer_ids, *full_attention_layer_ids], default=0
+        )
         self.page_size = page_size
         self.layer_transfer_counter = None
 

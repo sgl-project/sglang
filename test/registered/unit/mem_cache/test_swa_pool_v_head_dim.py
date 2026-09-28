@@ -24,8 +24,12 @@ import unittest
 
 import torch
 
+from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+    _swa_layer_mappings,
+)
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -55,6 +59,56 @@ class TestSWAPoolVHeadDim(unittest.TestCase):
     def test_static_pool_reports_the_full_side_value_head_dim(self):
         pool = _swa_pool()
         self.assertEqual(pool.get_v_head_dim(), _FULL_V_HEAD_DIM)
+
+
+def _stage_pool(swa_ids, full_ids):
+    return SWAKVPool(
+        size=32,
+        size_swa=16,
+        page_size=1,
+        dtype=torch.float16,
+        head_num=2,
+        head_dim=8,
+        swa_attention_layer_ids=swa_ids,
+        full_attention_layer_ids=full_ids,
+        device=_DEV,
+        enable_memory_saver=False,
+    )
+
+
+class _RecordingCounter:
+    def __init__(self):
+        self.thresholds = []
+
+    def wait_until(self, threshold):
+        self.thresholds.append(threshold)
+
+
+class TestSWAPoolPipelineLayerOffset(CustomTestCase):
+    """On a later PP stage, the HiCache layer wait and transfer mapping must count
+    from the stage's first layer, not from 0."""
+
+    def test_second_stage_indexes_from_its_first_layer(self):
+        # Layers 2 (sliding) and 3 (full) of a four-layer model on stage 1.
+        pool = _stage_pool(swa_ids=[2], full_ids=[3])
+        self.assertEqual(pool.start_layer, 2)
+
+        full, swa = _swa_layer_mappings(pool, pool.start_layer)
+        self.assertEqual(swa, {0: 0})
+        self.assertEqual(full, {1: 0})
+
+        counter = _RecordingCounter()
+        pool.register_layer_transfer_counter(counter)
+        pool._wait_for_layer(2)
+        pool._wait_for_layer(3)
+        self.assertEqual(counter.thresholds, [0, 1])
+
+    def test_first_stage_is_unchanged(self):
+        pool = _stage_pool(swa_ids=[0], full_ids=[1])
+        self.assertEqual(pool.start_layer, 0)
+        full, swa = _swa_layer_mappings(pool, pool.start_layer)
+        self.assertEqual(swa, {0: 0})
+        self.assertEqual(full, {1: 0})
 
 
 if __name__ == "__main__":

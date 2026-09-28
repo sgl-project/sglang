@@ -1423,11 +1423,13 @@ class _MambaStrategy(StackStrategy):
         )
 
 
-def _swa_layer_mappings(kvcache) -> tuple[dict[int, int], dict[int, int]]:
-    full = {
-        gid: lid for gid, (lid, is_swa) in kvcache.layers_mapping.items() if not is_swa
-    }
-    swa = {gid: lid for gid, (lid, is_swa) in kvcache.layers_mapping.items() if is_swa}
+def _swa_layer_mappings(
+    kvcache, start_layer: int = 0
+) -> tuple[dict[int, int], dict[int, int]]:
+    full, swa = {}, {}
+    for gid, (lid, is_swa) in kvcache.layers_mapping.items():
+        # Transfers walk range(transfer_layer_num) from this PP stage's first layer.
+        (swa if is_swa else full)[gid - start_layer] = lid
     return full, swa
 
 
@@ -1458,7 +1460,9 @@ class _SwaStrategy(StackStrategy):
         model_name=None,
         enable_storage_metrics=False,
     ):
-        full_layer_mapping, swa_layer_mapping = _swa_layer_mappings(kvcache)
+        full_layer_mapping, swa_layer_mapping = _swa_layer_mappings(
+            kvcache, kvcache.start_layer
+        )
         host_pool_group, cache_controller = build_hybrid_swa_stack(
             params=params,
             full_kv_pool=kvcache.full_kv_pool,
