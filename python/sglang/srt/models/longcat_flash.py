@@ -37,8 +37,10 @@ from typing import Iterable, List, Optional, Tuple
 import torch
 from torch import nn
 
-from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32
-from sglang.kernels.ops.attention.dsv4.gemm import mark_hpc_bf16xfp32_gemm_enabled
+from sglang.kernels.ops.gemm.bf16_fp32 import (
+    linear_bf16_fp32,
+    mark_hpc_bf16xfp32_gemm_enabled,
+)
 from sglang.kernels.ops.moe.ep_moe_kernels import zero_experts_compute_triton
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs import LongcatFlashConfig
@@ -49,7 +51,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.communicator import LayerCommunicator, LayerFacts
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -88,9 +90,8 @@ from sglang.srt.model_loader.utils import (
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.runtime_context import get_parallel as _gp
 from sglang.srt.runtime_context import (
+    get_parallel,
     get_stream,
 )
 from sglang.srt.utils import (
@@ -136,23 +137,6 @@ _LONGCAT_FLASH_ROUTER_HPC_GEMM_MIN_M = {
     # LongCat-Flash-Lite-FP8: 3072 hidden size, 256 routed experts + 128 zero experts.
     (3072, 384): 128,
 }
-
-
-def _scmoe_align_rows(t, target):
-    """Align a [rows,H] tensor to `target` rows across the attn-tp group:
-    all_gather when target>rows (target==rows*attn_tp_size), or take this rank's
-    contiguous segment when target<rows."""
-    if t is None or t.shape[0] == target:
-        return t
-    from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor as _ag
-
-    cur = t.shape[0]
-    if target > cur:
-        out = t.new_empty((target, *t.shape[1:]))
-        _ag(out, t.contiguous())
-        return out
-    r = _gp().attn_tp_rank
-    return t[r * target : r * target + target].contiguous()
 
 
 class LongcatFlashMLP(nn.Module):
@@ -418,6 +402,7 @@ class LongcatFlashDecoderLayer(nn.Module):
                         if "mlps" in getattr(config, "disable_quant_module", [])
                         else quant_config
                     ),
+                    reduce_results=True,
                     prefix=add_prefix(f"mlps.{i}", prefix),
                 )
                 for i in range(2)
@@ -434,8 +419,8 @@ class LongcatFlashDecoderLayer(nn.Module):
         self.attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
 
-        self.mlp_layer_scatter_modes = [
-            LayerScatterModes.init_new(
+        self.mlp_layer_facts = [
+            LayerFacts.init_new(
                 layer_id=self.layer_id * 2 + i,
                 num_layers=config.num_hidden_layers,
                 is_layer_sparse=False,
@@ -447,15 +432,16 @@ class LongcatFlashDecoderLayer(nn.Module):
         ]
         self.mlp_layer_communicator = [
             LayerCommunicator(
-                layer_scatter_modes=self.mlp_layer_scatter_modes[i],
+                layer_facts=self.mlp_layer_facts[i],
                 input_layernorm=self.input_layernorm[i],
                 post_attention_layernorm=self.post_attention_layernorm[i],
                 qkv_latent_func=self.self_attn[i].prepare_qkv_latent,
+                allow_deferred_ffn_reduction=False,
             )
             for i in range(2)
         ]
 
-        self.moe_layer_scatter_modes = LayerScatterModes.init_new(
+        self.moe_layer_facts = LayerFacts.init_new(
             layer_id=self.layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=True,
@@ -464,7 +450,7 @@ class LongcatFlashDecoderLayer(nn.Module):
             is_next_layer_sparse=True,
         )
         self.moe_layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.moe_layer_scatter_modes,
+            layer_facts=self.moe_layer_facts,
             input_layernorm=self.input_layernorm[0],
             post_attention_layernorm=self.post_attention_layernorm[0],
             qkv_latent_func=self.self_attn[0].prepare_qkv_latent,
@@ -500,12 +486,8 @@ class LongcatFlashDecoderLayer(nn.Module):
         hidden_states, residual = self.moe_layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
-        moe_hidden_states = hidden_states.clone()
-        # The final gather adds its residual; the dense branch already carries it.
-        moe_residual = torch.zeros_like(residual)
-        moe_hidden_states = self.mlp(moe_hidden_states)
-        moe_hidden_states, moe_residual = self.moe_layer_communicator.postprocess_layer(
-            moe_hidden_states, moe_residual, forward_batch
+        moe_hidden_states = self.moe_layer_communicator.branch_output(
+            self.mlp(hidden_states.clone()), forward_batch
         )
 
         hidden_states, residual, prev_topk_indices = self.forward_mlp(
@@ -517,12 +499,13 @@ class LongcatFlashDecoderLayer(nn.Module):
             prev_topk_indices,
         )
 
-        # SCMOE_ATTN1_GATHER: reconcile mlp-branch (hidden/residual) with moe-branch
-        # (moe_hidden_states) row counts before the add, so residual tracks hidden.
-        _scmoe_tgt = moe_hidden_states.shape[0]
-        hidden_states = _scmoe_align_rows(hidden_states, _scmoe_tgt)
-        residual = _scmoe_align_rows(residual, _scmoe_tgt)
-        hidden_states = moe_hidden_states + hidden_states
+        hidden_states, residual = self.moe_layer_communicator.merge_branch(
+            moe_hidden_states,
+            hidden_states,
+            residual,
+            self.mlp_layer_communicator[1],
+            forward_batch,
+        )
         return hidden_states, residual, prev_topk_indices
 
     def forward_mlp(
@@ -534,25 +517,13 @@ class LongcatFlashDecoderLayer(nn.Module):
         zero_allocator,
         prev_topk_indices,
     ):
-        # SCMOE_ATTN1_GATHER: gather the dense-branch hidden(+residual) to full
-        # tokens before mlps[0] so its all_reduce is valid; slice back at the merge.
-        from sglang.srt.layers.moe.utils import get_moe_a2a_backend as _scmoe_gab
-
-        _scmoe_ats = self.attn_tp_size
-        _scmoe_do = (
-            not _scmoe_gab().is_none()
-            and _scmoe_ats > 1
-            and hidden_states.shape[0] != 0
-            and hidden_states.shape[0] * _scmoe_ats == positions.shape[0]
+        # first_mlp, on the input the MoE's boundary read
+        hidden_states, residual = self.mlp_layer_communicator[0].branch_input(
+            self.moe_layer_communicator, hidden_states, residual, forward_batch
         )
-        if _scmoe_do:
-            hidden_states = _scmoe_align_rows(hidden_states, positions.shape[0])
-            residual = _scmoe_align_rows(residual, positions.shape[0])
-
-        # first_mlp
-        hidden_states = self.mlps[0](hidden_states)
-        # TP all_reduce
-        hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        with self.mlp_layer_communicator[0].ffn_exit(forward_batch) as ffn_exit:
+            hidden_states = self.mlps[0](hidden_states)
+        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
 
         # second_attn
         hidden_states, residual = self.mlp_layer_communicator[1].prepare_attn(
@@ -575,13 +546,9 @@ class LongcatFlashDecoderLayer(nn.Module):
         hidden_states, residual = self.mlp_layer_communicator[1].prepare_mlp(
             hidden_states, residual, forward_batch
         )
-        hidden_states = self.mlps[1](hidden_states)
-        # TP all_reduce
-        hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-
-        hidden_states, residual = self.mlp_layer_communicator[1].postprocess_layer(
-            hidden_states, residual, forward_batch
-        )
+        with self.mlp_layer_communicator[1].ffn_exit(forward_batch) as ffn_exit:
+            hidden_states = self.mlps[1](hidden_states)
+        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
 
         return hidden_states, residual, prev_topk_indices
 
@@ -749,7 +716,6 @@ class LongcatFlashForCausalLM(nn.Module):
         )
 
     def post_load_weights(self, weight_names=None):
-
         # Perform post-processing after loading weights
         if weight_names is None:
             layer_ids = range(self.config.num_hidden_layers)
@@ -961,7 +927,6 @@ class LongcatFlashForCausalLM(nn.Module):
                     requant_weight_ue8m0_inplace(w[0], w[1], weight_block_size)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("gate_up_proj", "gate_proj", 0),

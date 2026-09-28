@@ -1,12 +1,24 @@
 import contextlib
 import types
 import unittest
+from functools import partial
 from unittest.mock import MagicMock, patch
 
 import torch
 
 from sglang.srt.layers import communicator as comm
-from sglang.srt.layers.communicator import LayerCommunicator, ScatterMode
+from sglang.srt.layers.communicator import (
+    LayerCommunicator,
+    Layout,
+    StageOutput,
+    SumGroup,
+    TokenAxis,
+)
+from sglang.srt.layers.communicator import boundary as comm_boundary
+from sglang.srt.layers.communicator import ops as comm_ops
+from sglang.srt.layers.communicator import (
+    sequence_parallel_layer_sides,
+)
 from sglang.srt.layers.moe import (
     can_merge_post_experts_all_reduce,
     deferred_post_experts_all_reduce,
@@ -15,15 +27,69 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
-def _fake_communicator(mlp_mode=ScatterMode.TP_ATTN_FULL):
+def sp_region_steps():
+    """The steps a layer runs while a LayerNorm SP region is active."""
+    return comm_boundary._select_boundary_steps(
+        sequence_parallel_layer_sides(
+            axis_sizes={
+                TokenAxis.ATTN_DP: 1,
+                TokenAxis.ATTN_CP: 1,
+                TokenAxis.ATTN_TP_SCATTER: 2,
+            }
+        )
+    )
+
+
+def _steps(*, ffn_output=None, returns_over_dp=False, ffn_sum_is_movable=True):
+    return comm.BoundarySteps(
+        attention=comm.StageEntry(
+            prepare=partial(
+                comm_ops._consumer_step,
+                step=partial(
+                    comm_ops._read_input,
+                    layer_input=None,
+                    enters_stack=False,
+                    read=comm.NORM_QUANT_READ,
+                    update=comm.ADD,
+                ),
+                carried_fusions=(),
+            ),
+            input_rows=comm.Layout(frozenset()),
+            input_move=comm.CommunicateSimpleFn._trivial,
+            handoff=comm_ops._hand_qkv_hook_its_input,
+        ),
+        ffn=comm.StageEntry(
+            prepare=partial(
+                comm_ops._read_input,
+                layer_input=None,
+                enters_stack=False,
+                read=comm.NORM_READ,
+                update=comm.ADD,
+            ),
+            input_rows=Layout(frozenset()),
+        ),
+        ffn_output=ffn_output or StageOutput(Layout(frozenset()), group=SumGroup.TP),
+        ffn_output_move=None
+        if returns_over_dp
+        else comm.CommunicateSummableTensorPairFn._trivial,
+        ffn_sum_is_movable=ffn_sum_is_movable,
+    )
+
+
+def _fake_communicator(ffn_sum_is_movable=True):
     communicator = LayerCommunicator.__new__(LayerCommunicator)
     communicator._speculative_algo = None
-    communicator.layer_scatter_modes = types.SimpleNamespace(mlp_mode=mlp_mode)
+    # An FFN gathered over MoE-CP or on each rank's own rows has no movable sum.
+    communicator._steps = _steps(ffn_sum_is_movable=ffn_sum_is_movable)
+    communicator._sp_steps = None
+    communicator._input_scattered_steps = None
+    communicator._cp_steps = None
     communicator.is_last_layer = False
     communicator._context = types.SimpleNamespace(tp_size=4)
     return communicator
@@ -246,16 +312,15 @@ class TestFuseMlpAllReduceGate(CustomTestCase):
         moe_ep_size,
         moe_tp_size,
         moe_dp_size=1,
-        mlp_mode=ScatterMode.TP_ATTN_FULL,
+        ffn_sum_is_movable=True,
     ):
         forward_batch = types.SimpleNamespace(
             input_ids=types.SimpleNamespace(shape=(8,))
         )
         with (
-            patch.object(comm, "is_enable_moe_cp_allgather", return_value=False),
-            patch.object(comm, "apply_flashinfer_allreduce_fusion", return_value=True),
-            patch.object(
-                comm,
+            patch_communicator("is_enable_moe_cp_allgather", return_value=False),
+            patch_communicator("apply_flashinfer_allreduce_fusion", return_value=True),
+            patch_communicator(
                 "get_attn_tp_context",
                 return_value=types.SimpleNamespace(input_scattered=False),
             ),
@@ -267,7 +332,7 @@ class TestFuseMlpAllReduceGate(CustomTestCase):
             ),
         ):
             return LayerCommunicator.should_fuse_mlp_allreduce_with_next_layer(
-                _fake_communicator(mlp_mode), forward_batch
+                _fake_communicator(ffn_sum_is_movable), forward_batch
             )
 
     def test_hybrid_ep_tp_fuses_when_mergeable(self):
@@ -285,14 +350,12 @@ class TestFuseMlpAllReduceGate(CustomTestCase):
     def test_pure_ep_still_fuses(self):
         self.assertTrue(self._should_fuse(moe_ep_size=4, moe_tp_size=1))
 
-    def test_moe_full_layer_does_not_fuse(self):
+    def test_a_layer_gathered_over_moe_cp_does_not_fuse(self):
         # Fusion skips postprocess_layer, which holds the CP scatter; a dense
-        # MOE_FULL layer (moe_dp_size == attn_cp_size) is not caught by the
-        # is_enable_moe_cp_allgather gate.
+        # layer gathered over the MoE-CP group (moe_dp_size == attn_cp_size) is
+        # not caught by the is_enable_moe_cp_allgather gate.
         self.assertFalse(
-            self._should_fuse(
-                moe_ep_size=1, moe_tp_size=4, mlp_mode=ScatterMode.MOE_FULL
-            )
+            self._should_fuse(moe_ep_size=1, moe_tp_size=4, ffn_sum_is_movable=False)
         )
 
 
@@ -320,41 +383,55 @@ class TestDeferFfnReduction(CustomTestCase):
         step=None,
         sp_active=False,
     ):
+        tp_group_object = object()
         communicator = _fake_communicator()
         communicator.is_last_layer = is_last_layer
-        communicator.should_use_reduce_scatter = lambda forward_batch: reduce_scatter
-        communicator._postprocess_scatters_to_local_tokens = scatters_to_local_tokens
-        communicator._sp_variant = object() if sp_active else None
-        communicator.allow_reduce_scatter = True
-        communicator.layer_scatter_modes.is_layer_sparse = True
+        communicator._sp_steps = sp_region_steps() if sp_active else None
+        communicator._input_scattered_steps = None
+        communicator._cp_steps = None
+        communicator._steps = _steps(
+            ffn_output=StageOutput(
+                Layout(frozenset()),
+                group=SumGroup.MOE_OUTPUT,
+                leaves_for_reduce_scatter=True,
+                leaves_for_reduce_scatterv=True,
+            ),
+            returns_over_dp=scatters_to_local_tokens,
+        )
         forward_batch = types.SimpleNamespace(
             input_ids=types.SimpleNamespace(shape=(batch_size,)),
             global_dp_buffer_len=global_tokens,
         )
         with (
-            patch.object(
-                comm, "_reduce_and_redistribute_output_step", return_value=step
+            patch_communicator(
+                "_reduce_and_redistribute_output_step", return_value=step
             ),
             get_forward().scoped(sp_active=sp_active),
-            patch.object(comm, "is_enable_moe_cp_allgather", return_value=False),
-            patch.object(comm, "apply_flashinfer_allreduce_fusion", return_value=fused),
-            patch.object(comm, "_use_aiter", False),
-            patch.object(
-                comm,
+            patch_communicator("is_enable_moe_cp_allgather", return_value=False),
+            patch_communicator("apply_flashinfer_allreduce_fusion", return_value=fused),
+            patch_communicator("_use_aiter", False),
+            patch_communicator(
                 "get_attn_tp_context",
                 return_value=types.SimpleNamespace(input_scattered=False),
             ),
-            patch.object(comm, "is_dp_attention_enabled", return_value=dp_attention),
+            patch_communicator("is_dp_attention_enabled", return_value=dp_attention),
+            patch_communicator(
+                "get_moe_a2a_backend",
+                return_value=types.SimpleNamespace(is_none=lambda: a2a_none),
+            ),
+            # What the MoE declares its skipped reduction leaves.
             patch.object(
-                comm,
+                moe_utils,
                 "get_moe_a2a_backend",
                 return_value=types.SimpleNamespace(is_none=lambda: a2a_none),
             ),
             patch.object(
-                comm, "post_experts_output_is_complete", return_value=output_complete
+                moe_utils,
+                "post_experts_output_is_complete",
+                return_value=output_complete,
             ),
             patch.object(
-                comm,
+                moe_utils,
                 "get_exec",
                 return_value=types.SimpleNamespace(
                     comm=types.SimpleNamespace(
@@ -363,23 +440,34 @@ class TestDeferFfnReduction(CustomTestCase):
                 ),
             ),
             patch.object(
-                comm.envs.SGLANG_SHARED_EXPERT_TP1,
+                moe_utils.envs.SGLANG_SHARED_EXPERT_TP1,
                 "get",
                 return_value=shared_expert_tp1,
             ),
             patch.object(
-                comm,
+                moe_utils,
                 "get_lora",
                 return_value=types.SimpleNamespace(enable_lora=lora),
-            ),
-            patch.object(
-                comm, "_deferred_reduction_runs_on_the_tp_group", return_value=tp_group
             ),
             get_parallel().override(
                 moe_ep_size=1, moe_tp_size=4, moe_dp_size=1, tp_size=4
             ),
+            patch.object(
+                moe_utils,
+                "get_parallel",
+                return_value=types.SimpleNamespace(
+                    moe_ep_size=1, moe_tp_size=4, tp_group=tp_group_object
+                ),
+            ),
+            patch.object(
+                moe_utils,
+                "post_experts_reduction_group",
+                return_value=tp_group_object if tp_group else object(),
+            ),
         ):
-            return communicator.should_defer_ffn_reduction(forward_batch)
+            return communicator._ffn_sum_moves_to_next_layer(
+                forward_batch, mlp_reduce_scatter=reduce_scatter, dp_step=step
+            )
 
     def test_defers_whether_or_not_the_fused_kernel_takes_the_batch(self):
         self.assertTrue(self._should_defer(fused=True))
@@ -418,10 +506,13 @@ class TestDeferFfnReductionUnderAttentionDp(CustomTestCase):
 
     def test_keeps_what_the_next_layer_input_cannot_run(self):
         for name, condition in (
-            ("reduce-scatter", dict(step=comm._reduce_and_redistribute_output_varlen)),
+            (
+                "reduce-scatter",
+                dict(step=comm_ops._reduce_and_redistribute_output_varlen),
+            ),
             (
                 "MAX_LEN reduce-scatter",
-                dict(step=comm._reduce_and_redistribute_output_max_len),
+                dict(step=comm_ops._reduce_and_redistribute_output_max_len),
             ),
             ("other postprocess", dict(scatters_to_local_tokens=False)),
             ("LayerNorm SP", dict(sp_active=True)),
@@ -431,8 +522,9 @@ class TestDeferFfnReductionUnderAttentionDp(CustomTestCase):
 
 
 class TestDeferredReductionGroup(CustomTestCase):
-    """The unfused completion runs on the same group object the FFN would have
-    reduced over, or the FFN keeps its reduction."""
+    """The MoE declares its skipped reduction one TP all-reduce only when it
+    runs on the same group object the FFN would have reduced over; otherwise
+    the FFN keeps its reduction."""
 
     def _runs_on_tp(
         self, *, moe_ep_size, moe_tp_size, ep_is_tp=True, moe_tp_is_tp=True
@@ -447,10 +539,29 @@ class TestDeferredReductionGroup(CustomTestCase):
             moe_tp_group=tp_group if moe_tp_is_tp else object(),
         )
         with (
-            patch.object(comm, "get_parallel", return_value=parallel),
             patch.object(moe_utils, "get_parallel", return_value=parallel),
+            patch.object(
+                moe_utils,
+                "get_moe_a2a_backend",
+                return_value=types.SimpleNamespace(is_none=lambda: True),
+            ),
+            patch.object(
+                moe_utils, "post_experts_output_is_complete", return_value=False
+            ),
+            patch.object(
+                moe_utils,
+                "get_exec",
+                return_value=types.SimpleNamespace(
+                    comm=types.SimpleNamespace(enable_quant_communications=False)
+                ),
+            ),
+            patch.object(
+                moe_utils,
+                "get_lora",
+                return_value=types.SimpleNamespace(enable_lora=False),
+            ),
         ):
-            return comm._deferred_reduction_runs_on_the_tp_group()
+            return moe_utils.post_experts_sum_is_one_all_reduce()
 
     def test_pure_tp_and_pure_ep_reduce_over_the_tp_group(self):
         self.assertTrue(self._runs_on_tp(moe_ep_size=1, moe_tp_size=4))

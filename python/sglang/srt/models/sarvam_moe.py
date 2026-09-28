@@ -21,7 +21,7 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
-    LayerScatterModes,
+    LayerFacts,
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.dp_attention import (
@@ -1047,7 +1047,7 @@ class SarvamMoEMLADecoderLayer(nn.Module):
         )
 
         self.attn_tp_size = get_parallel().attn_tp_size
-        self.layer_scatter_modes = LayerScatterModes.init_new(
+        self.layer_facts = LayerFacts.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
@@ -1055,7 +1055,7 @@ class SarvamMoEMLADecoderLayer(nn.Module):
             is_next_layer_sparse=is_next_layer_sparse,
         )
         self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
+            layer_facts=self.layer_facts,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             qkv_latent_func=self.self_attn.prepare_qkv_latent,
