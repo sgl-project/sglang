@@ -178,9 +178,9 @@ def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
     if req.skip_radix_cache_insert:
         return
 
-    if req.disagg_kv_sender is not None and req.disagg_kv_sender.is_source_pending():
-        # Radix insertion may free duplicate physical pages. Keep the existing
-        # prefix lock and private suffix; only advance chunked-prefill's mapping.
+    if req.disagg_kv_sender is not None and req.disagg_kv_sender.stages_source_async():
+        # Insertion may free pages a HOST gather still reads; only advance the
+        # mapping. Decide by config: gather state differs per TP rank.
         req.prefix_indices = tree_cache.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, : req.extend_range.end
         ].to(dtype=torch.int64, copy=True)

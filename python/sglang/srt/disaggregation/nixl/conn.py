@@ -716,7 +716,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             with self.host_staging.lock:
                 self.host_staging.fail_room(bootstrap_room)
-                super().update_status(bootstrap_room, status)
+            self.host_staging.drain_gathers(bootstrap_room)
+            super().update_status(bootstrap_room, status)
             return
         if handler is None:
             return super().update_status(bootstrap_room, status)
@@ -3338,6 +3339,9 @@ class NixlKVSender(CommonKVSender):
                 time.perf_counter() - self._transfer_start_time
             )
         return status
+
+    def stages_source_async(self) -> bool:
+        return self.kv_mgr.host_staging is not None
 
     def is_source_pending(self) -> bool:
         host = self.kv_mgr.host_staging

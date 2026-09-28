@@ -307,7 +307,7 @@ class Rig:
         m._num_slots_src = self.pages
         m.kv_buffer_tensors = m._staging_handler = None
         m._dcp_pack_buffers = []  # Per-token rows in both modes; no pack kernel.
-        nkv = len(self.src_kv)
+        nkv = len(self.src_kv) if prefill else len(self.dst_kv)
         state, comps = buffers[nkv:], []
         for _, items, _, _ in self.components:
             comps.append(state[: len(items)])
@@ -349,8 +349,13 @@ class Rig:
         h = m.host_staging = H.HostStaging.__new__(H.HostStaging)
         h.manager, h.capacity, h.slot_bytes = m, m.host_staging_bytes, slot_bytes
         h.lock, h.device = threading.Lock(), torch.device("cpu")
-        h.config = {"version": H.VERSION, "capacity": h.capacity}
-        h.queue, h.seqs, h.ready = deque(), defaultdict(int), {}
+        h.config = {
+            "version": H.VERSION,
+            "capacity": h.capacity,
+            "post_deadline_sec": H.POST_DEADLINE_S,
+            "write_deadline_sec": H.WRITE_DEADLINE_S,
+        }
+        h.queue, h.seqs, h.ready, h.failed_rooms = deque(), defaultdict(int), {}, set()
         h.slots, h.allocator, h.stream = [], None, Stream()
         if prefill:
             h.slots = [
@@ -739,12 +744,26 @@ class HostStagingTest(unittest.TestCase):
                 break
             time.sleep(0.001)
         host.progress()
-        rig.prefill.update_status(ROOM, KVPoll.Failed)
-        host.progress()
-        self.assertTrue(all(slot.part for slot in host.slots))  # Still written.
-        for slot in host.slots:
-            slot.copy_done.done = True
-        host.progress()
+        worker = threading.Thread(
+            target=rig.prefill.update_status, args=(ROOM, KVPoll.Failed)
+        )
+        worker.start()
+        try:
+            for _ in range(200):
+                if ROOM in host.failed_rooms:
+                    break
+                time.sleep(0.001)
+            self.assertIn(ROOM, host.failed_rooms)
+            self.assertNotEqual(rig.prefill.check_status(ROOM), KVPoll.Failed)
+            host.progress()
+            self.assertTrue(all(slot.part for slot in host.slots))
+        finally:
+            for slot in host.slots:
+                slot.copy_done.done = True
+            host.progress()
+            worker.join(timeout=2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(rig.prefill.check_status(ROOM), KVPoll.Failed)
         self.assertFalse(any(slot.part for slot in host.slots))
 
     def test_timeouts_before_and_after_posting(self):
@@ -817,6 +836,18 @@ class HostStagingTest(unittest.TestCase):
             time.sleep(0.001)
         self.assertTrue(rig.sender.is_source_pending())
 
+    def test_host_peer_must_use_same_writer_deadlines(self):
+        rig = Rig()
+        host = rig.prefill.host_staging
+        peer = NS(
+            host_staging_config=host.config.copy(),
+            staging_base_ptr=1,
+            staging_total_size=host.capacity,
+        )
+        self.assertFalse(host.config_mismatch(peer))
+        peer.host_staging_config["write_deadline_sec"] += 1
+        self.assertTrue(host.config_mismatch(peer))
+
     def test_ring_write_err_fails_the_room_not_the_worker(self):
         rig = Rig(count=4)
         rig.prefill.agent.manual = True
@@ -835,6 +866,28 @@ class HostStagingTest(unittest.TestCase):
             self.assertLess(time.monotonic(), deadline)
             rig.prefill.host_staging.progress()  # No fail-stop.
             time.sleep(0.01)
+
+    def test_unfinished_chunk_insert_skip_is_rank_invariant(self):
+        # Gather state differs per TP rank; the insert decision must not.
+        from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
+
+        tree = Mock()
+        tree.req_to_token_pool.req_to_token = torch.arange(8).reshape(1, 8)
+        for host, pending in ((None, False), (object(), False), (object(), True)):
+            sender = NixlKVSender.__new__(NixlKVSender)
+            sender.kv_mgr = NS(host_staging=host)
+            sender.is_source_pending = lambda pending=pending: pending
+            req = NS(
+                disagg_kv_sender=sender,
+                kv=NS(req_pool_idx=0),
+                get_fill_ids=lambda: [0] * 4,
+                prefix_indices=None,
+            )
+            tree.cache_unfinished_req.reset_mock()
+            maybe_cache_unfinished_req(req, tree)
+            self.assertEqual(tree.cache_unfinished_req.called, host is None)
+            if host is not None:
+                self.assertEqual(req.prefix_indices.tolist(), [0, 1, 2, 3])
 
     def test_write_errs_only_after_every_part_settled(self):
         write = H.HostWrite(2)
@@ -871,7 +924,7 @@ class CudaByteRanges(unittest.TestCase):
         back = torch.zeros_like(src)
         sizes = np.array([1, 4095, 4096, 70001, 300000], dtype=np.int64)
         offs = np.r_[0, np.cumsum(sizes)[:-1]]
-        rev = offs[::-1].copy()
+        rev = np.r_[0, np.cumsum(sizes[::-1])[:-1]][::-1].copy()
         for dst, s, o_dst, o_src in (
             (host, src, rev, offs),  # gather: device rows -> pinned slot
             (back, host, offs, rev),  # scatter: pinned ring -> device rows

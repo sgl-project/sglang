@@ -196,6 +196,10 @@ class BaseKVSender(ABC):
         """Whether asynchronous staging still owns this request's KV/aux storage."""
         return False
 
+    def stages_source_async(self) -> bool:
+        """Config-level is_source_pending(): the same on every rank."""
+        return False
+
     @abstractmethod
     def get_transfer_metric(self) -> KVTransferMetric:
         """Return backend-specific transfer metrics for this sender."""

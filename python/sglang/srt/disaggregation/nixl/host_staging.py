@@ -165,12 +165,18 @@ class HostStaging:
             raise ValueError("NIXL PD does not transfer FP4 KV scales yet")
         self.lock = threading.Lock()
         self.device = torch.device(f"cuda:{args.gpu_id}")
-        self.config = {"version": VERSION, "capacity": self.capacity}
+        self.config = {
+            "version": VERSION,
+            "capacity": self.capacity,
+            "post_deadline_sec": POST_DEADLINE_S,
+            "write_deadline_sec": WRITE_DEADLINE_S,
+        }
         self.slots, self.allocator = [], None
         # Prefill: queued parts FIFO, per-room seqs and producer events.
         self.queue = deque()
         self.seqs = defaultdict(int)
         self.ready = {}
+        self.failed_rooms = set()
         if manager.disaggregation_mode == DisaggregationMode.PREFILL:
             for _ in range(SLOT_COUNT):
                 buffer = StagingBuffer(
@@ -304,10 +310,14 @@ class HostStaging:
 
     def _failed(self, room) -> bool:
         # A cleared room is gone, not pending: treat it as failed.
-        return self.manager.request_status.get(room) in (None, KVPoll.Failed)
+        return room in self.failed_rooms or self.manager.request_status.get(room) in (
+            None,
+            KVPoll.Failed,
+        )
 
     def fail_room(self, room):
         """Drop a failed room's unposted parts. Caller holds self.lock."""
+        self.failed_rooms.add(room)
         for part in [p for p in self.queue if p.room == room]:
             self.queue.remove(part)
             part.write.settle()
@@ -322,8 +332,24 @@ class HostStaging:
                 for s in self.slots
             )
 
+    def drain_gathers(self, room):
+        if not self.gathering(room):
+            return
+        started = time.monotonic()
+        logger.info("Draining host staging gathers for room=%s", room)
+        while self.gathering(room):
+            if time.monotonic() - started >= POST_DEADLINE_S + WRITE_DEADLINE_S:
+                fail_stop(f"Host staging gather drain timed out for room {room}")
+            time.sleep(0.0005)
+        logger.info(
+            "Drained host staging gathers for room=%s in %.3fs",
+            room,
+            time.monotonic() - started,
+        )
+
     def forget_room(self, room):
         with self.lock:
+            self.failed_rooms.discard(room)
             self.ready.pop(room, None)
             for key in [k for k in self.seqs if k[0] == room]:
                 del self.seqs[key]
