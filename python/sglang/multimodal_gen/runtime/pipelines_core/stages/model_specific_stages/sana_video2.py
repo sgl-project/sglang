@@ -213,6 +213,7 @@ class SanaVideo2DenoisingStage(PipelineStage):
     def __init__(self, transformer):
         super().__init__()
         self.transformer = transformer
+        self._bcg_runner = None
 
     @property
     def role_affinity(self) -> RoleType:
@@ -236,19 +237,50 @@ class SanaVideo2DenoisingStage(PipelineStage):
             embeds = torch.cat([batch.negative_prompt_embeds[0], embeds])
             mask = torch.cat([batch.negative_attention_mask[0], mask])
         is_ti2v = batch.condition_image is not None
+        runner = None
+        if server_args.enable_breakable_cuda_graph:
+            runner = self._bcg_runner
+            if runner is None:
+                from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
+                    DiffusionBreakableCudaGraphRunner,
+                )
+
+                runner = DiffusionBreakableCudaGraphRunner(
+                    self.transformer, batch.latents.device
+                )
+                self._bcg_runner = runner
+        captured_warmup = False
 
         def predict(x, time):
+            nonlocal captured_warmup
             inputs = torch.cat([x, x]) if cfg else x
             if time.ndim == 0:
                 timestep = (time * 1000).expand(inputs.shape[0])
             else:
                 timestep = torch.cat([time, time]) if cfg else time
-            prediction = self.transformer(
+            call_kwargs = dict(
                 hidden_states=inputs,
                 timestep=timestep,
                 encoder_hidden_states=embeds,
                 encoder_attention_mask=mask,
             )
+            if runner is not None:
+                if batch.is_warmup and not captured_warmup:
+                    runner.capture(**call_kwargs)
+                    if is_ti2v:
+                        other_timestep = timestep.flatten(1)[:, -1]
+                    else:
+                        other_timestep = (
+                            timestep[:, None, None, None, None]
+                            .expand(-1, 1, inputs.shape[2], 1, 1)
+                            .clone()
+                        )
+                        other_timestep[:, :, 0] = 0
+                    runner.capture(**{**call_kwargs, "timestep": other_timestep})
+                    captured_warmup = True
+                prediction = runner(**call_kwargs)
+            else:
+                prediction = self.transformer(**call_kwargs)
             if not is_ti2v:
                 # Keep flow-to-noise conversion before CFG to preserve FP32 rounding.
                 sigma = time.reshape((1,) * x.ndim).to(inputs)

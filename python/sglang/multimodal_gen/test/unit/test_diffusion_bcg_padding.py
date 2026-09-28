@@ -62,6 +62,10 @@ class SanaVideoTransformer3DModel(torch.nn.Module):
     pass
 
 
+class SanaVideo2Transformer3DModel(torch.nn.Module):
+    pass
+
+
 class TestQualityFusionBCGCompatibility(unittest.TestCase):
     def setUp(self):
         self.stage = DenoisingStage.__new__(DenoisingStage)
@@ -207,6 +211,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.minimax_h3_model = MiniMaxH3DiTModel()
         self.zimage_model = ZImageTransformer2DModel()
         self.sana_video_model = SanaVideoTransformer3DModel()
+        self.sana_video2_model = SanaVideo2Transformer3DModel()
         self.other_model = OtherTransformer2DModel()
         self.flux_model = FluxTransformer2DModel()
 
@@ -613,6 +618,26 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         )
         self.assertIn(
             "SanaVideoPipelineConfig",
+            BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS,
+        )
+
+    def test_sana_video2_is_supported_and_keeps_its_fixed_prompt_shape(self):
+        kwargs = {
+            "encoder_hidden_states": torch.zeros(2, 300, 2304),
+            "encoder_attention_mask": torch.ones(2, 300, dtype=torch.long),
+        }
+        with self._patch_buckets(64, 128, 256, 512, 1024):
+            out = self.stage._bcg_pad_prompt_kwargs(
+                kwargs, current_model=self.sana_video2_model
+            )
+
+        self.assertIs(out, kwargs)
+        self.assertIn(
+            "efficient-large-model/sana-video_2.0_5b_720p",
+            BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS,
+        )
+        self.assertIn(
+            "SanaVideo2PipelineConfig",
             BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS,
         )
 
