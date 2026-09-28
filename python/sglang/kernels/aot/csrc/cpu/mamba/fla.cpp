@@ -1921,7 +1921,8 @@ std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>> chunk_kda_cpu(
     bool output_intermediate_states,
     const std::optional<at::Tensor>& track_state,
     const std::optional<at::Tensor>& track_chunk_idx,
-    double eps) {
+    double eps,
+    std::optional<double> scale) {
   TORCH_CHECK(query.dim() == 4, __func__, ": query must be [1, T, H, K]");
   TORCH_CHECK(key.dim() == 4, __func__, ": key must be [1, T, H, K]");
   TORCH_CHECK(value.dim() == 4, __func__, ": value must be [1, T, Hv, V]");
@@ -2030,7 +2031,7 @@ std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>> chunk_kda_cpu(
     dt_bias_ptr = dt_bias_f.data_ptr<float>();
   }
 
-  const float scale = 1.f / std::sqrt(static_cast<float>(D));
+  const float q_scale = scale.has_value() ? static_cast<float>(scale.value()) : 1.f / std::sqrt(static_cast<float>(D));
   AT_DISPATCH_REDUCED_FLOATING_TYPES(query.scalar_type(), "chunk_kda_cpu_prepare", [&] {
     if (D == 64) {
       prepare_qk_tensors<scalar_t, 64>(
@@ -2045,7 +2046,7 @@ std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>> chunk_kda_cpu(
           key.stride(1),
           key.stride(2),
           use_qk_l2norm_in_kernel,
-          scale,
+          q_scale,
           static_cast<float>(eps));
       prepare_value_tensor<scalar_t, 64>(
           v_prepared.data_ptr<float>(), value.data_ptr<scalar_t>(), T, Hv, value.stride(1), value.stride(2));
@@ -2072,7 +2073,7 @@ std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>> chunk_kda_cpu(
           key.stride(1),
           key.stride(2),
           use_qk_l2norm_in_kernel,
-          scale,
+          q_scale,
           static_cast<float>(eps));
       prepare_value_tensor<scalar_t, 128>(
           v_prepared.data_ptr<float>(), value.data_ptr<scalar_t>(), T, Hv, value.stride(1), value.stride(2));

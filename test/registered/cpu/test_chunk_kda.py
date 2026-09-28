@@ -107,7 +107,7 @@ def _reference(case: dict):
 
     q = q / torch.sqrt(torch.sum(q * q, dim=-1, keepdim=True) + 1e-6)
     k = k / torch.sqrt(torch.sum(k * k, dim=-1, keepdim=True) + 1e-6)
-    q = q * (case["head_dim"] ** -0.5)
+    q = q * case.get("scale", case["head_dim"] ** -0.5)
 
     state = case["initial_state"].clone()
     output = torch.empty_like(v)
@@ -234,12 +234,14 @@ def test_chunk_kda_cpu_wrapper_matches_extend_contract():
         beta_is_raw=False,
         use_pre_activated_gate=False,
     )
+    case["scale"] = 0.25
     result = chunk_kda_cpu(
         q=case["q"],
         k=case["k"],
         v=case["v"],
         g=case["g"],
         beta=case["beta"],
+        scale=case["scale"],
         initial_state=case["initial_state"],
         initial_state_indices=case["initial_state_indices"],
         use_qk_l2norm_in_kernel=True,
@@ -252,6 +254,8 @@ def test_chunk_kda_cpu_wrapper_matches_extend_contract():
         track_chunk_idx=case["track_chunk_idx"],
     )
     output, h = result
+    expected_out, _, _, _ = _reference(case)
+    torch.testing.assert_close(output.float(), expected_out.float(), atol=2e-2, rtol=2e-2)
     assert output.shape == case["v"].shape
     assert h.ndim == 5
     assert h.shape[1] == sum(math.ceil(seq_len / CHUNK_SIZE) for seq_len in case["lens"])
