@@ -81,7 +81,17 @@ def run_dense(inputs, *, publish_candidates, candidates):
             block_size=inputs["candidate_block_size"],
         )
         return selected, None
-    return scoring.dense_prefill_topk(data, inputs["kv"], topk=inputs["topk"]), None
+    # The plain top-k writes request-local positions into a -1 filled buffer;
+    # the checks compare flattened-K columns, as the CP paths return.
+    local = torch.full(
+        (data.compress_lens.shape[0], inputs["topk"]),
+        -1,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    scoring.dense_prefill_topk(data, inputs["kv"], out=local)
+    starts = data.request_starts[:, None]
+    return torch.where(local >= 0, local + starts, local), None
 
 
 def request_blocks(inputs, candidates):
