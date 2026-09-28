@@ -122,7 +122,7 @@ def test_ppu_flashkda_dispatches_to_platform_operator():
     assert kwargs["beta"].shape == (packed_tokens, num_heads)
     assert kwargs["beta"].dtype == torch.bfloat16
     assert kwargs["A_log"].shape == (num_heads,)
-    assert kwargs["dt_bias"].shape == (num_heads * head_dim,)
+    assert kwargs["dt_bias"].shape == (num_heads, head_dim)
     assert kwargs["cu_seqlens"].dtype == torch.int64
 
 
