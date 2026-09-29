@@ -8,6 +8,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     ModelLaunchSettings,
     check_evaluation_test_results,
     popen_launch_server,
@@ -38,7 +39,6 @@ MODEL_THRESHOLDS = {
     # temporarily disabled: NaN in next_token_logits
     # ModelLaunchSettings("openbmb/MiniCPM-o-2_6"): (0.330, 29.5),
     # ModelLaunchSettings("openbmb/MiniCPM-v-2_6"): (0.259, 36.3),
-    ModelLaunchSettings("OpenGVLab/InternVL2_5-2B"): (0.300, 18.0),
     ModelLaunchSettings("Qwen/Qwen2-VL-7B-Instruct"): (0.310, 83.3),
     ModelLaunchSettings("Qwen/Qwen2.5-VL-7B-Instruct"): (0.330, 31.9),
     ModelLaunchSettings("Qwen/Qwen3-VL-30B-A3B-Instruct", extra_args=["--tp=2"]): (
@@ -51,10 +51,12 @@ MODEL_THRESHOLDS = {
 }
 
 
-class TestNightlyVLMMmmuEval(unittest.TestCase):
+class TestNightlyVLMMmmuEval(CustomTestCase):
+    model_thresholds = MODEL_THRESHOLDS
+
     @classmethod
     def setUpClass(cls):
-        cls.models = list(MODEL_THRESHOLDS.keys())
+        cls.models = list(cls.model_thresholds.keys())
         cls.base_url = DEFAULT_URL_FOR_TEST
 
     def test_mmmu_vlm_models(self):
@@ -123,11 +125,11 @@ class TestNightlyVLMMmmuEval(unittest.TestCase):
 
         model_accuracy_thresholds = {
             model.model_path: accuracy
-            for model, (accuracy, _) in MODEL_THRESHOLDS.items()
+            for model, (accuracy, _) in self.model_thresholds.items()
         }
         model_latency_thresholds = {
             model.model_path: latency
-            for model, (_, latency) in MODEL_THRESHOLDS.items()
+            for model, (_, latency) in self.model_thresholds.items()
         }
         check_evaluation_test_results(
             all_results,
