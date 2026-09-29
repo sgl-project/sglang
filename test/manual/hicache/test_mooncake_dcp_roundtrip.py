@@ -7,6 +7,7 @@ both worker processes have zero-byte storage segments. No model weights needed.
 
 Add --controller to exercise four Gloo ranks and real controller workers against
 the same isolated native TCP service, including eviction and in-flight aborts.
+Use --hybrid for MLA plus TP-sharded recurrent checkpoint contracts.
 """
 
 import argparse
@@ -86,7 +87,7 @@ def worker(mode, address):
             store.store.close()
 
 
-def controller_worker(address):
+def controller_worker(address, hybrid=False):
     sys.path.insert(
         0, str(Path(__file__).resolve().parents[2] / "registered/unit/mem_cache")
     )
@@ -94,13 +95,21 @@ def controller_worker(address):
         from test_mooncake_dcp_storage_controller import run_workers
 
         with tempfile.TemporaryDirectory(prefix="mooncake-controller-") as directory:
-            reports = run_workers(directory, None, address=address)
-            assert all(len(rows) == 14 for rows in reports)
+            if hybrid:
+                from test_mooncake_dcp_hybrid_controller import CASES, _worker
+
+                reports = run_workers(
+                    directory, None, cases=CASES, address=address, worker=_worker
+                )
+                assert all(len(rows) == len(CASES) for rows in reports)
+            else:
+                reports = run_workers(directory, None, address=address)
+                assert all(len(rows) == 14 for rows in reports)
     finally:
         sys.path.pop(0)
 
 
-def run(controller=False):
+def run(controller=False, hybrid=False):
     from mooncake.store import MooncakeDistributedStore
 
     with socket.socket() as sock:
@@ -142,7 +151,14 @@ def run(controller=False):
                     )
                     == 0
                 )
-                for mode in ("controller",) if controller else ("write", "read"):
+                modes = (
+                    ("hybrid",)
+                    if hybrid
+                    else ("controller",)
+                    if controller
+                    else ("write", "read")
+                )
+                for mode in modes:
                     subprocess.run(
                         [
                             sys.executable,
@@ -156,7 +172,9 @@ def run(controller=False):
                         timeout=240,
                     )
                 print(
-                    "PASS native TCP controller: 14 scenarios on four Gloo ranks"
+                    "PASS native TCP hybrid: 10 scenarios on four Gloo ranks"
+                    if hybrid
+                    else "PASS native TCP controller: 14 scenarios on four Gloo ranks"
                     if controller
                     else "PASS fresh-process TCP restore: 12 cases, writer exited before reader"
                 )
@@ -175,13 +193,15 @@ def run(controller=False):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--worker", choices=("write", "read", "controller"))
+    parser.add_argument("--worker", choices=("write", "read", "controller", "hybrid"))
     parser.add_argument("--address")
-    parser.add_argument("--controller", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--controller", action="store_true")
+    mode.add_argument("--hybrid", action="store_true")
     args = parser.parse_args()
-    if args.worker == "controller":
-        controller_worker(args.address)
+    if args.worker in ("controller", "hybrid"):
+        controller_worker(args.address, args.worker == "hybrid")
     elif args.worker:
         worker(args.worker, args.address)
     else:
-        run(args.controller)
+        run(args.controller, args.hybrid)

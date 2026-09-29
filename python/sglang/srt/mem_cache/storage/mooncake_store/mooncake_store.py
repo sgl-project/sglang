@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PoolTransferResult,
+    get_mamba_pool_schema_fingerprint,
 )
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -633,6 +634,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     self.mha_suffix = [f"{rank}" for rank in target_ranks]
 
             self.registered_pools = {}
+            self._mamba_schema_fingerprint = None
 
             self.gb_per_page = None
             self.prefetch_pgs = []
@@ -751,6 +753,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # accessor, or ordinary KV-like host pools used as SWA side pools.
         for buf in self._iter_host_pool_buffers(host_pool):
             super().register_buffer(buf)
+        if host_pool_name == PoolName.MAMBA and self._dcp_namespace is not None:
+            self._mamba_schema_fingerprint = get_mamba_pool_schema_fingerprint(
+                host_pool
+            )
 
     def _tag_keys(self, keys: List[str]) -> List[str]:
         if self.config_prefix is None:
@@ -792,14 +798,19 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if pool_name == PoolName.KV:
             suffixes = [f"_{self.mla_suffix}_k"]
         elif pool_name == PoolName.MAMBA:
+            state_suffix = self.mha_suffix
+            if self._dcp_namespace is not None:
+                state_suffix = (
+                    f"{self.local_rank}_mamba_v1_{self._mamba_schema_fingerprint}"
+                )
             # Mamba stores one temporal object plus one object per conv state.
             # conv-only models have no ssm state; drop the 0-element temporal
             # object (mooncake rejects 0-size puts). get_page_buffer_meta drops
             # its temporal pointer under the same condition to stay aligned.
             conv_num = len(getattr(host_pool, "conv_buffer", None) or [])
-            suffixes = [f"_{self.mha_suffix}_conv_{i}" for i in range(conv_num)]
+            suffixes = [f"_{state_suffix}_conv_{i}" for i in range(conv_num)]
             if getattr(host_pool, "temporal_state_elem_size", 1) > 0:
-                suffixes = [f"_{self.mha_suffix}_temporal"] + suffixes
+                suffixes = [f"_{state_suffix}_temporal"] + suffixes
         elif pool_name == PoolName.DRAFT:
             # Draft pool's MLA/MHA layout is independent from the target
             # (e.g. EAGLE-MHA draft on top of an MLA target), so pick the
