@@ -292,10 +292,6 @@ def _bind_stage(declaration, norm, incoming, outgoing, **options):
             declaration.update.at_producer
             and TokenAxis.ATTN_CP
             in edge.produced.layout.sharded - edge.need.layout.sharded
-            and not (
-                getattr(declaration.update, "supports_moe_cp_gather", False)
-                and not _gathers_over_attention_cp()
-            )
         ):
             raise NotImplementedError("MHC with a gather over attention CP")
         handoff = None

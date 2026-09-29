@@ -169,7 +169,10 @@ class TestModelsWithExplicitDpCompletion(CustomTestCase):
         # These models own their DP exit instead of using StageBoundary.
         import __future__
 
-        for filename, method in (("deepseek_v4.py", "_run_moe_ffn_dp_sync"),):
+        for filename, method in (
+            ("deepseek_v4.py", "_run_moe_ffn_dp_sync"),
+            ("qwen4_exp.py", "_run_qwen4_exp_mlp"),
+        ):
             path = MODELS_DIR / filename
             node = next(
                 n
@@ -226,6 +229,8 @@ class TestModelsWithExplicitDpCompletion(CustomTestCase):
                     model = types.SimpleNamespace(
                         dsa_enable_prefill_cp=False,
                         config=types.SimpleNamespace(num_experts=4),
+                        _qwen4_exp_use_dp_moe_gather=lambda: True,
+                        _qwen4_exp_use_attn_tp_a2a_scatter=lambda: False,
                         mlp=lambda value, batch, **kwargs: reduce_moe_output(value),
                     )
                     batch = types.SimpleNamespace(

@@ -23,9 +23,13 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.dp_attention import (
+    attn_tp_all_gather,
     attn_tp_all_reduce,
     dp_gather_replicate,
     dp_scatter,
+    get_dp_global_num_tokens,
+    get_global_dp_buffer,
+    get_local_dp_buffer,
     is_allocation_symmetric,
     is_dp_attention_enabled,
 )
@@ -33,18 +37,10 @@ from sglang.srt.layers.hyperconnection import (
     GatedResidual,
     HyperConnectionConfig,
 )
-from sglang.srt.layers.layer_boundary import (
-    HandoffRows,
-    declare_attn,
-    declare_ffn,
-    get_attn_tp_context,
-    make_stages,
-)
-from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
-from sglang.srt.layers.layer_boundary.residual.gated import GatedResidualState
+from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.moe import get_moe_a2a_backend
+from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
@@ -76,7 +72,7 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     make_ple_file_prefetcher,
     make_ple_file_rss_trimmer,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.srt.utils import get_bool_env_var, is_hip, logger
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
@@ -1324,6 +1320,8 @@ class Qwen4ExpLayerExtensionMixin:
         for attr_name in (
             "input_layernorm",
             "post_attention_layernorm",
+            "attn_boundary",
+            "ffn_boundary",
         ):
             if hasattr(self, attr_name):
                 delattr(self, attr_name)
@@ -1362,29 +1360,6 @@ class Qwen4ExpLayerExtensionMixin:
             use_mix=True,
             use_combine=True,
         )
-        residual = GatedResidualState(
-            self.attn_hyper_connection, self.mlp_hyper_connection
-        ).layer_residual()
-        sparse = bool(config.num_experts)
-        ffn = declare_ffn(
-            sparse=sparse,
-            read=residual.ffn_read,
-            update=residual.ffn_update,
-            dense_tp_size=None if sparse else get_parallel().tp_size,
-            handoff_rows=HandoffRows.ATTENTION,
-        )
-        self.attn_boundary, self.ffn_boundary = make_stages(
-            (
-                declare_attn(
-                    read=residual.attention_read,
-                    update=residual.attention_update,
-                ),
-                None,
-            ),
-            (ffn, None),
-            previous=ffn if layer_id != 0 else None,
-            terminal=layer_id == config.num_hidden_layers - 1,
-        )
 
     def _prepare_qwen4_exp_attn(
         self,
@@ -1416,10 +1391,8 @@ class Qwen4ExpLayerExtensionMixin:
                     ple_query, forward_batch, ple_batch
                 )
 
-        # Qwen4 hands complete hyper-connection streams between layers. PLE
-        # updates that tensor before the attention boundary reads its input.
-        hidden_states = residual_batch.written(hidden_states, forward_batch)
-        return self.attn_boundary.prepare(hidden_states, forward_batch), None
+        hidden_states, residual = self.attn_hyper_connection.mix(hidden_states)
+        return hidden_states, residual
 
     def _prepare_qwen4_exp_mlp(
         self,
@@ -1427,21 +1400,70 @@ class Qwen4ExpLayerExtensionMixin:
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ):
-        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
-        return self.ffn_boundary.prepare(hidden_states, forward_batch), None
+        if not forward_batch.forward_mode.is_idle():
+            hidden_states = attn_tp_all_reduce(hidden_states)
+        hidden_states = self.attn_hyper_connection.combine(hidden_states, residual)
+        hidden_states, residual = self.mlp_hyper_connection.mix(hidden_states)
+        return hidden_states, residual
+
+    def _qwen4_exp_use_dp_moe_gather(self) -> bool:
+        return get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none()
+
+    def _qwen4_exp_use_attn_tp_a2a_scatter(self) -> bool:
+        return get_parallel().attn_tp_size > 1 and not get_moe_a2a_backend().is_none()
 
     def _run_qwen4_exp_mlp(
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
-            if not self.config.num_experts:
-                hidden_states = self.mlp(hidden_states)
-            elif hidden_states.shape[0] or not get_moe_a2a_backend().is_none():
-                # An idle all-to-all rank must still participate in MoE dispatch.
-                hidden_states = self.mlp(hidden_states, forward_batch)
-        return ffn_exit.finish(hidden_states)
+        if not self.config.num_experts:
+            return self.mlp(hidden_states)
+
+        use_dp_moe_gather = self._qwen4_exp_use_dp_moe_gather()
+        use_attn_tp_a2a_scatter = self._qwen4_exp_use_attn_tp_a2a_scatter()
+
+        if use_dp_moe_gather:
+            hidden_states, local_hidden_states = (
+                get_global_dp_buffer(get_parallel().tp_group),
+                hidden_states,
+            )
+            dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
+        elif hidden_states.shape[0] == 0 and get_moe_a2a_backend().is_none():
+            # Only safe to short-circuit an empty batch when the MoE holds no collective;
+            # under deepep an idle DP rank must still join dispatch/combine or peers hang.
+            return hidden_states
+
+        attn_tp_chunks = None
+        if use_attn_tp_a2a_scatter:
+            attn_tp_size = get_parallel().attn_tp_size
+            attn_tp_chunks = list(hidden_states.tensor_split(attn_tp_size))
+            hidden_states = attn_tp_chunks[get_parallel().attn_tp_rank].contiguous()
+
+        use_reduce_scatterv = use_dp_moe_gather and should_use_dp_reduce_scatterv()
+        with get_forward().scoped(mlp_reduce_scatter=use_reduce_scatterv):
+            hidden_states = self.mlp(hidden_states, forward_batch)
+
+        if use_dp_moe_gather:
+            hidden_states, global_hidden_states = (
+                get_local_dp_buffer(get_parallel().tp_group),
+                hidden_states,
+            )
+            if use_reduce_scatterv:
+                get_parallel().tp_group.reduce_scatterv(
+                    global_hidden_states,
+                    output=hidden_states,
+                    sizes=get_dp_global_num_tokens(),
+                )
+            else:
+                dp_scatter(hidden_states, global_hidden_states, forward_batch)
+        elif use_attn_tp_a2a_scatter:
+            assert attn_tp_chunks is not None
+            gathered = [torch.empty_like(t) for t in attn_tp_chunks]
+            attn_tp_all_gather(gathered, hidden_states.contiguous())
+            hidden_states = torch.cat(gathered)
+
+        return hidden_states
 
     def _postprocess_qwen4_exp_layer(
         self,
@@ -1449,6 +1471,7 @@ class Qwen4ExpLayerExtensionMixin:
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ):
+        hidden_states = self.mlp_hyper_connection.combine(hidden_states, residual)
         return hidden_states, None
 
 
@@ -1751,8 +1774,6 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 )
 
         _commit_ple_batch(ple_batch, forward_batch)
-
-        hidden_states = residual_batch.take_output(hidden_states, forward_batch)
 
         if not self.pp_group.is_last_rank:
             proxy_tensors = {"hidden_states": hidden_states}
