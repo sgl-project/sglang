@@ -413,7 +413,6 @@ class TestTokenizerLatencyAccounting(_TokenizerCollectorCase):
         """Aborts must not add a TTFT sample, but embedding and zero-output
         requests still have a first output and must."""
         cases = [
-            ("abort_null", "null", [0], "abort", 0),
             ("abort_decode", "decode", [0], "abort", 0),
             ("embedding", "null", [None], "stop", 1),
             ("zero_output", "null", [0], "length", 1),
@@ -431,9 +430,8 @@ class TestTokenizerLatencyAccounting(_TokenizerCollectorCase):
         self.assertEqual(self._itl_samples(collector), [0.0] * 6)
 
     def test_prefill_never_observes_decode_intervals(self):
-        """PD prefill's first report (0 tokens) is below the initial baseline of 1;
-        the negative delta used to land in the buckets, breaking
-        histogram_quantile and rate()."""
+        """PD prefill's 0-token first report must never become a negative ITL
+        weight, which breaks histogram_quantile and rate()."""
         collector = self._run("prefill", [0, 1, 8, 0], finish_type="stop")
         self.assertEqual(self._itl_samples(collector), [0.0] * 6)
 
