@@ -135,6 +135,7 @@ class SchedulerStats:
     num_prefill_inflight_queue_reqs: QueueCount = field(default_factory=QueueCount)
     num_decode_prealloc_queue_reqs: QueueCount = field(default_factory=QueueCount)
     num_decode_transfer_queue_reqs: QueueCount = field(default_factory=QueueCount)
+    num_decode_host_receive_queue_reqs: QueueCount = field(default_factory=QueueCount)
     kv_transfer_speed_gb_s: float = 0.0
     kv_transfer_latency_ms: float = 0.0
     pending_prealloc_token_usage: float = 0.0
@@ -518,6 +519,17 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             documentation="The number of requests in the decode transfer queue.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
+        )
+        self.num_decode_host_receive_queue_reqs = Gauge(
+            name="sglang:num_decode_host_receive_queue_reqs",
+            documentation="Requests in the decode transfer queue receiving into host memory or waiting for device admission.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.num_decode_host_receive_reqs = Counter(
+            name="sglang:num_decode_host_receive_reqs_total",
+            documentation="Total requests admitted to receive prefill KV in host memory.",
+            labelnames=labels.keys(),
         )
         self.kv_transfer_speed_gb_s = Histogram(
             name="sglang:kv_transfer_speed_gb_s",
@@ -1186,6 +1198,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
     def increment_transfer_failed_reqs(self) -> None:
         self.num_transfer_failed_reqs.labels(**self.labels).inc(1)
 
+    def increment_decode_host_receive_reqs(self) -> None:
+        self.num_decode_host_receive_reqs.labels(**self.labels).inc(1)
+
     def increment_prefill_retries(self, count: int) -> None:
         if count > 0:
             self.num_prefill_retries_total.labels(**self.labels).inc(count)
@@ -1413,6 +1428,10 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         )
         self._log_gauge_queue_count(
             self.num_decode_transfer_queue_reqs, stats.num_decode_transfer_queue_reqs
+        )
+        self._log_gauge_queue_count(
+            self.num_decode_host_receive_queue_reqs,
+            stats.num_decode_host_receive_queue_reqs,
         )
         self._log_gauge(
             self.pending_prealloc_token_usage, stats.pending_prealloc_token_usage

@@ -195,7 +195,10 @@ class Parallel(msgspec.Struct):
     ] = None
     enable_attn_tp_input_scattered: A[
         bool,
-        "Allow input of attention to be scattered when only using tensor parallelism, to reduce the computational load of operations such as qkv latent.",
+        Arg(
+            help="Allow input of attention to be scattered when only using tensor parallelism, to reduce the computational load of operations such as qkv latent.",
+            resolvable=True,
+        ),
     ] = False
     enable_shared_experts_attn_tp: A[
         bool,
