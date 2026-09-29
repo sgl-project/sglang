@@ -40,6 +40,31 @@ class _SwaCache(RadixCache):
 
 
 class TestSWAEvictionInterval(unittest.TestCase):
+    def test_exact_repeat_boundary_keeps_a_full_swa_window(self):
+        for window, seq_len in product((511, 512), (513, 1024, 1025)):
+            with self.subTest(window=window, seq_len=seq_len):
+                cache = _SwaCache()
+                cache.page_size = 64
+                cache.sliding_window_size = window
+                req = SimpleNamespace(kv=ReqKvInfo(req_pool_idx=0))
+
+                cache.evict_sliding_windows(req, seq_len - 1)
+
+                # An exact repeat matches all but its last token, rounded down
+                # to a page. That boundary still needs a full live SWA window.
+                match_boundary = (seq_len - 1) // cache.page_size * cache.page_size
+                evicted = req.kv.get_evicted_seqlen(ComponentType.SWA)
+                self.assertGreaterEqual(match_boundary - evicted, window)
+                self.assertLess(match_boundary - evicted, window + cache.page_size)
+                free = cache.token_to_kv_pool_allocator.free_swa_segment
+                if evicted:
+                    free.assert_called_once()
+                    self.assertTrue(
+                        torch.equal(free.call_args.args[0], torch.arange(evicted))
+                    )
+                else:
+                    free.assert_not_called()
+
     def test_scheduler_gates_on_request_cursor_before_protected_prefix(self):
         for (protected, shield), auxiliary in product(
             [(256, 0), (0, 249)], [False, True]
