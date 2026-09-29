@@ -16,9 +16,6 @@ class TestHybridFileRestore(FileHiCacheRestoreMixin, CustomTestCase):
     other_args = [
         "--attention-backend",
         "cutedsl_mla",
-        "--dcp-comm-backend",
-        "a2a",
-        "--dcp-replicate-q-proj",
         "--max-mamba-cache-size",
         "64",
     ]

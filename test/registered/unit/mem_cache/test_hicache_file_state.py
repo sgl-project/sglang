@@ -275,7 +275,7 @@ class TestFileRecurrentState(CustomTestCase):
                     reader.get(key, torch.empty(1, dtype=torch.uint8)),
                     torch.tensor([19], dtype=torch.uint8),
                 )
-                other = self.backend(replace(config, model=model + "-other"))
+                other = self.backend(replace(config, model_name=model + "-other"))
                 other.register_mem_host_pool_v2(target, PoolName.MAMBA)
                 self.assertEqual(
                     other.batch_exists_v2([key], [transfer]).kv_hit_pages, 0
