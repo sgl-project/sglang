@@ -23,7 +23,8 @@ export const Qwen3Deployment = () => {
       mi300x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi325x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi355x: { tp: 1, ep: 0, bf16: true, fp8: true },
-      xeon: { tp: 3, ep: 0, bf16: true, fp8: true }
+      xeon:   { tp: 3, ep: 0, bf16: true, fp8: true },
+      arc_b:  { tp: 4, ep: 0, bf16: true, fp8: true },
     },
     '32b': {
       baseName: '32B',
@@ -35,7 +36,8 @@ export const Qwen3Deployment = () => {
       mi300x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi325x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi355x: { tp: 1, ep: 0, bf16: true, fp8: true },
-      xeon: { tp: 6, ep: 0, bf16: true, fp8: true }
+      xeon:   { tp: 6, ep: 0, bf16: true, fp8: true },
+      arc_b:  { tp: 4, ep: 0, bf16: true, fp8: true }
     },
     '14b': {
       baseName: '14B',
@@ -112,7 +114,8 @@ export const Qwen3Deployment = () => {
         { id: 'mi300x', label: 'MI300X', default: false },
         { id: 'mi325x', label: 'MI325X', default: false },
         { id: 'mi355x', label: 'MI355X', default: false },
-        { id: 'xeon', label: 'XEON', default: false }
+        { id: 'xeon', label: 'XEON', default: false },
+        { id: 'arc_b', label: 'BMG', default: false },
       ]
     },
     modelsize: {
@@ -169,8 +172,26 @@ export const Qwen3Deployment = () => {
     const options = { ...baseOptions };
     const currentModelConfig = modelConfigs[values.modelsize];
 
+    if (values.hardware === 'arc_b') {
+      options.quantization = {
+        ...baseOptions.quantization,
+        items: baseOptions.quantization.items.map(item => ({
+          ...item,
+          disabled: item.id !== 'bf16'
+        }))
+      };
+
+      options.modelsize = {
+        ...baseOptions.modelsize,
+        items: baseOptions.modelsize.items.map(item => ({
+          ...item,
+          disabled: item.id !== '30b' && item.id !== '32b'
+        }))
+      };
+    }
+
     // If model doesn't have thinking variants, disable non-base category options
-    if (currentModelConfig && !currentModelConfig.hasThinkingVariants) {
+    if (values.hardware === 'arc_b' || (currentModelConfig && !currentModelConfig.hasThinkingVariants)) {
       options.category = {
         ...baseOptions.category,
         items: baseOptions.category.items.map(item => ({
@@ -220,6 +241,14 @@ export const Qwen3Deployment = () => {
     setValues(prev => {
       const newValues = { ...prev, [optionName]: value };
 
+      if (optionName === 'hardware' && value === 'arc_b') {
+        newValues.quantization = 'bf16';
+        if (newValues.modelsize !== '30b' && newValues.modelsize !== '32b') {
+          newValues.modelsize = '32b';
+        }
+        newValues.category = 'base';
+      }
+
       // Auto-switch to 'base' category for models without thinking variants
       if (optionName === 'modelsize') {
         const modelConfig = modelConfigs[value];
@@ -242,10 +271,10 @@ export const Qwen3Deployment = () => {
   // Generate command
   const generateCommand = () => {
     const { hardware, modelsize, quantization, category, reasoningParser, toolcall } = values;
-    const displayOptions = getDisplayOptions(values);
+    const effectiveQuantization = hardware === 'arc_b' ? 'bf16' : quantization;
 
     // Special error handling
-    const commandKey = `${hardware}-${modelsize}-${quantization}-${category}`;
+    const commandKey = `${hardware}-${modelsize}-${effectiveQuantization}-${category}`;
     if (commandKey === 'h100-235b-bf16-instruct' || commandKey === 'h100-235b-bf16-thinking') {
       return '# Error: Model is too large, cannot fit into 8*H100\n# Please use H200 (141GB) or select FP8 quantization';
     }
@@ -260,7 +289,7 @@ export const Qwen3Deployment = () => {
       return `# Error: Unknown hardware platform: ${hardware}`;
     }
 
-    const quantSuffix = quantization === 'fp8' ? '-FP8' : '';
+    const quantSuffix = effectiveQuantization === 'fp8' ? '-FP8' : '';
 
     // Build model name based on model category
     let modelName;
@@ -281,6 +310,8 @@ export const Qwen3Deployment = () => {
 
     if (hardware === 'xeon') {
       cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
+    } else if (hardware === 'arc_b') {
+      cmd += ` \\\n  --device xpu`;
     }
 
     if (hwConfig.tp > 1) {
@@ -288,7 +319,7 @@ export const Qwen3Deployment = () => {
     }
 
     let ep = hwConfig.ep;
-    if (quantization === 'fp8' && hwConfig.tp === 8) {
+    if (effectiveQuantization === 'fp8' && hwConfig.tp === 8) {
       ep = 2;
     }
 

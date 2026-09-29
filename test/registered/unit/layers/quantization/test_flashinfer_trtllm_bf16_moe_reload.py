@@ -403,6 +403,67 @@ class TestRepackRunsOnFailedUpdate(CustomTestCase):
 
         self.assertEqual(repacked, [model], "layout not re-derived on the error path")
 
+    def test_distributed_load_repacks_before_returning(self):
+        """A received bucket must regain kernel layout even if loading reports failure."""
+        for fail_after_copy in (False, True):
+            with self.subTest(fail_after_copy=fail_after_copy):
+                method = _make_method()
+                layer = _FakeMoELayer(method, seed=0)
+                new_weights = _FakeMoELayer(method, seed=1)
+                reference = _FakeMoELayer(method, seed=1)
+
+                class ReloadModel(_FakeModel):
+                    def load_weights(self, named_tensors):
+                        for name, tensor in named_tensors:
+                            param = getattr(self.layer, name)
+                            method.maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
+                                layer=self.layer,
+                                param=param,
+                                weight_name=f"model.layers.0.mlp.experts.{name}",
+                            )
+                            param.data.copy_(tensor)
+                        if fail_after_copy:
+                            raise RuntimeError("load failed mid-update")
+
+                model = ReloadModel(layer)
+                updater = self._make_updater(model)
+                with (
+                    _mock_flashinfer(),
+                    get_context().override_server_args(weight_cache_mode="off"),
+                    patch.object(
+                        weight_updater,
+                        "_unsupported_derived_weight_cache_error",
+                        autospec=True,
+                        return_value=None,
+                    ),
+                ):
+                    method.process_weights_after_loading(layer)
+                    method.process_weights_after_loading(reference)
+                    expected = {
+                        "w13_weight": reference.w13_weight.data.clone(),
+                        "w2_weight": layer.w2_weight.data.clone(),
+                    }
+                    pointers = {
+                        name: getattr(layer, name).data_ptr() for name in expected
+                    }
+                    updater.begin_weight_update()
+                    success, message = updater.load_weights_from_distributed(
+                        [("w13_weight", new_weights.w13_weight.data)]
+                    )
+                    self.assertEqual(success, not fail_after_copy)
+                    if fail_after_copy:
+                        self.assertIn("load failed mid-update", message)
+                    # Finalization must not hide a missing per-bucket repack.
+                    for name, want in expected.items():
+                        self.assertTrue(
+                            torch.equal(getattr(layer, name).data, want), name
+                        )
+                    updater.end_weight_update(run_post_load=True)
+                    for name, want in expected.items():
+                        param = getattr(layer, name)
+                        self.assertTrue(torch.equal(param.data, want), name)
+                        self.assertEqual(param.data_ptr(), pointers[name])
+
 
 if __name__ == "__main__":
     unittest.main()
