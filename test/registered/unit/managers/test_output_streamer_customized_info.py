@@ -1,13 +1,29 @@
+import dataclasses
+import pickle
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import numpy as np
+import torch
+
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.managers.io_struct import unwrap_from_pickle
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput, SamplingMaskStatus
+from sglang.srt.managers import io_struct
+from sglang.srt.managers.io_struct import (
+    msgpack_decode,
+    msgpack_encode,
+    unwrap_from_pickle,
+)
+from sglang.srt.managers.scheduler_components.batch_result_processor import (
+    SchedulerBatchResultProcessor,
+)
 from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
     _GenerationStreamAccumulator,
 )
+from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.weight_versions import (
     WeightVersionSpan,
@@ -27,6 +43,7 @@ class _FakeReq:
         customized_info=None,
         *,
         finished=False,
+        sampling_mask_rows=None,
     ):
         self.rid = rid
         self.http_worker_ipc = None
@@ -58,7 +75,8 @@ class _FakeReq:
         self.return_hidden_states = False
         self.return_routed_experts = False
         self.return_indexer_topk = False
-        self.return_sampling_mask = False
+        self.return_sampling_mask = sampling_mask_rows is not None
+        self.sampling_mask_rows = sampling_mask_rows
         self.mm_image_tokens = 0
         self.mm_audio_tokens = 0
         self.mm_video_tokens = 0
@@ -76,12 +94,13 @@ class _FakeReq:
         return False
 
 
-def _accumulator(current_weight_version="default"):
+def _accumulator(current_weight_version="default", return_sampling_mask=False):
     return _GenerationStreamAccumulator(
         return_logprob=False,
         return_hidden_states=False,
         return_routed_experts=False,
         return_indexer_topk=False,
+        return_sampling_mask=return_sampling_mask,
         spec_algorithm=SpeculativeAlgorithm.NONE,
         disaggregation_mode=DisaggregationMode.NULL,
         default_stream_interval=1,
@@ -367,6 +386,155 @@ class TestOutputStreamerWeightVersions(unittest.TestCase):
         payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
 
         self.assertIsNone(payload.weight_versions)
+
+
+_IPC_ROUND_TRIPS = {
+    "pickle": lambda payload: pickle.loads(
+        pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
+    ),
+    "msgpack": lambda payload: msgpack_decode(msgpack_encode(payload)),
+}
+
+
+class TestOutputStreamerSamplingMasks(unittest.TestCase):
+    def test_rows_stream_once_and_expand_to_response_lists(self):
+        """Queued rows cross either IPC codec once, in batch order, as per-token lists;
+        rows queued later never overwrite a chunk that is still referenced."""
+        for codec, round_trip in _IPC_ROUND_TRIPS.items():
+            with (
+                self.subTest(codec=codec),
+                patch.object(io_struct, "_USE_PICKLE_IPC", codec == "pickle"),
+            ):
+                selected_rows = SamplingMaskRows()
+                selected_rows.append(
+                    np.array([5, 3], np.int32), np.array([-0.5], np.float32)
+                )
+                selected_rows.append(
+                    np.array([7], np.int32), np.array([0.0], np.float32)
+                )
+                support_rows = SamplingMaskRows()
+                support_rows.append(
+                    np.array([9, 8], np.int32), np.array([-0.25, -1.5], np.float32)
+                )
+                support_rows.append(
+                    np.array([6], np.int32), np.array([0.0], np.float32)
+                )
+                selected = _FakeReq(
+                    "selected", array("q", [5, 7]), sampling_mask_rows=selected_rows
+                )
+                support = _FakeReq(
+                    "support", array("q", [9, 6]), sampling_mask_rows=support_rows
+                )
+                accumulator = _accumulator(return_sampling_mask=True)
+                for req in (selected, _FakeReq("plain", array("q", [1])), support):
+                    accumulator.accept(req=req)
+                payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+                masks = round_trip(payload).output_token_sampling_mask
+                self.assertEqual(
+                    masks[0].to_lists(support_logprobs=False),
+                    ([[5, 3], [7]], [-0.5, 0.0]),
+                )
+                self.assertIsNone(masks[1])
+                self.assertEqual(
+                    masks[2].to_lists(support_logprobs=True),
+                    ([[9, 8], [6]], [[-0.25, -1.5], [0.0]]),
+                )
+
+                selected.output_ids.append(4)
+                selected.sampling_mask_rows.append(
+                    np.array([4], np.int32), np.array([-2.0], np.float32)
+                )
+                self.assertEqual(
+                    payload.output_token_sampling_mask[0].to_lists(
+                        support_logprobs=False
+                    ),
+                    ([[5, 3], [7]], [-0.5, 0.0]),
+                )
+                accumulator = _accumulator(return_sampling_mask=True)
+                accumulator.accept(req=selected)
+                masks = round_trip(
+                    accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+                ).output_token_sampling_mask
+                self.assertEqual(
+                    masks[0].to_lists(support_logprobs=False), ([[4]], [-2.0])
+                )
+
+    def test_clients_receive_the_sampler_rows_unchanged(self):
+        """Across decode steps, stream emissions and either IPC codec, each request gets
+        the sampler's rows exactly as the tensor-to-list conversion defines them."""
+        processor = SchedulerBatchResultProcessor(
+            **{f.name: None for f in dataclasses.fields(SchedulerBatchResultProcessor)}
+        )
+        modes = ["selected", "support", None, "support", "selected"]
+        mask_reqs = [i for i, mode in enumerate(modes) if mode is not None]
+        support_reqs = [i for i in mask_reqs if modes[i] == "support"]
+        for codec, round_trip in _IPC_ROUND_TRIPS.items():
+            with (
+                self.subTest(codec=codec),
+                patch.object(io_struct, "_USE_PICKLE_IPC", codec == "pickle"),
+            ):
+                generator = torch.Generator().manual_seed(0)
+                reqs = []
+                for i, mode in enumerate(modes):
+                    rows = None if mode is None else SamplingMaskRows()
+                    req = _FakeReq(f"r{i}", array("q"), sampling_mask_rows=rows)
+                    req.sampling_logprobs_mode = mode
+                    reqs.append(req)
+                expected = [([], []) for _ in modes]
+                received = [([], []) for _ in modes]
+                for step in range(12):
+                    width = (1, 7, 64)[step % 3]
+                    lengths = torch.randint(
+                        1, width + 1, (len(mask_reqs),), generator=generator
+                    )
+                    token_ids = torch.randint(
+                        0, 1 << 20, (len(mask_reqs), width), generator=generator
+                    ).int()
+                    selected = torch.randn(len(mask_reqs), generator=generator)
+                    support = torch.randn(len(support_reqs), width, generator=generator)
+                    output = LogitsProcessorOutput(
+                        next_token_logits=None,
+                        sampling_mask_output=SimpleNamespace(
+                            token_ids=token_ids,
+                            lengths=lengths,
+                            selected_logprobs=selected,
+                            support_logprobs=support,
+                            statuses=torch.full(
+                                (len(mask_reqs),), SamplingMaskStatus.OK
+                            ),
+                        ),
+                    )
+                    SchedulerBatchResultProcessor.materialize_sampling_mask_output(
+                        reqs, output
+                    )
+                    for row, i in enumerate(mask_reqs):
+                        processor.add_sampling_mask_return_values(i, reqs[i], output)
+                        length = int(lengths[row])
+                        expected[i][0].append(token_ids[row, :length].tolist())
+                        if modes[i] == "support":
+                            support_row = support_reqs.index(i)
+                            expected[i][1].append(
+                                support[support_row, :length].tolist()
+                            )
+                        else:
+                            expected[i][1].append(float(selected[row]))
+                    if step in (0, 1, 5, 6, 11):
+                        accumulator = _accumulator(return_sampling_mask=True)
+                        for req in reqs:
+                            accumulator.accept(req=req)
+                        chunks = round_trip(
+                            accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+                        ).output_token_sampling_mask
+                        for i, chunk in enumerate(chunks):
+                            if modes[i] is None:
+                                self.assertIsNone(chunk)
+                                continue
+                            masks, logprobs = chunk.to_lists(
+                                support_logprobs=modes[i] == "support"
+                            )
+                            received[i][0].extend(masks)
+                            received[i][1].extend(logprobs)
+                self.assertEqual(received, expected)
 
 
 if __name__ == "__main__":
