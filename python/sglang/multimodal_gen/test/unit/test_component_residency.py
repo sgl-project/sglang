@@ -1,3 +1,4 @@
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -235,7 +236,7 @@ def test_request_tail_uses_dynamic_component_instance():
     )
     manager = ComponentResidencyManager(
         pipeline,
-        SimpleNamespace(enable_layerwise_nvtx_marker=False),
+        _server_args(),
     )
     strategy = Mock()
     strategy.prefetch_for_use.return_value = False
@@ -397,9 +398,9 @@ def test_warmup_hints_respect_explicit_residency(
     )
     parser = FlexibleArgumentParser()
     ServerArgs.add_cli_args(parser)
-    parsed, unknown = parser.parse_known_args(
-        ["--model-path", "/unused/model", "--performance-mode", "manual", *cli_args]
-    )
+    argv = ["--model-path", "/unused/model", "--performance-mode", "manual", *cli_args]
+    monkeypatch.setattr(sys, "argv", ["sglang", *argv])
+    parsed, unknown = parser.parse_known_args(argv)
     args = ServerArgs.from_cli_args(
         parsed,
         unknown,
