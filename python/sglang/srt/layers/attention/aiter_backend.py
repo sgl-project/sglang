@@ -1445,11 +1445,6 @@ class AiterAttnBackend(AttentionBackend):
         v: torch.Tensor,
         layer: RadixAttention,
     ):
-        """Whole-sequence asm prefill: causal, k/v cover every key in seq_lens.
-
-        The partition comes from init_forward_metadata, which built it with
-        need_lse False; this caller discards the LSE, so the two agree.
-        """
         out, _ = self._mla_fp8_prefill_attn_ps(
             q, k, v, layer, self.forward_metadata.prefill_ps_metadata
         )
@@ -1463,16 +1458,7 @@ class AiterAttnBackend(AttentionBackend):
         layer: RadixAttention,
         ps: MlaPrefillPsMetadata,
     ):
-        """Run the asm prefill over one work partition, returning (out, lse).
-
-        The partition is what makes this reusable: the chunked-prefix route
-        attends key sets that are not the whole sequence (extend-only for the
-        skip-prefix pass, one chunk for each prefix pass), and every kernel argument that
-        depends on the key set travels in `ps`.
-
-        final_lse is natural log, [total_q, nhead] fp32 -- straight out of
-        mla_reduce_v1, which is the base the chunked merge takes.
-        """
+        """Run the asm prefill over one work partition, returning (out, lse)."""
         total_q = q.shape[0]
         nhead = layer.tp_q_head_num
         v_head_dim = layer.v_head_dim
@@ -1547,11 +1533,6 @@ class AiterAttnBackend(AttentionBackend):
             final_lse,
         )
         if head_pad:
-            # Slicing the padded head axis leaves the kernel's stride behind, and
-            # merge_state reads its inputs as contiguous -- feeding it the view
-            # silently merges the wrong rows. Only models whose head count is
-            # outside _MLA_REDUCE_V1_HEADS pad at all, which is why this is
-            # invisible on a 16-head rank.
             output = output[:, : layer.tp_q_head_num, :].contiguous()
             if final_lse is not None:
                 final_lse = final_lse[:, : layer.tp_q_head_num].contiguous()
