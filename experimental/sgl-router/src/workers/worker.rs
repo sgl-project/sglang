@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// How long a prefill stays unroutable while `/server_info` has not reported its
-/// bootstrap port. Afterwards the router sends a null port, which the engine
-/// resolves to its own configured default.
+/// bootstrap port. Afterwards the router stops re-introspecting and sends a null
+/// port, which the engine resolves to its own configured default.
 pub const BOOTSTRAP_PORT_GRACE: Duration = Duration::from_secs(30);
 
 /// Which forwarding client the proxy uses for a worker.
