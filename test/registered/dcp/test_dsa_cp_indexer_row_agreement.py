@@ -240,8 +240,10 @@ class TestW2LocalTopk(CustomTestCase):
             seen["gathered"] = True
             return t
 
+        # The flag is a cached function now (merge blocker 8), so patch the
+        # function rather than a module global.
         with (
-            mock.patch.object(dsa_cp_module, "_enable_dsa_cp", True),
+            mock.patch.object(dsa_cp_module, "_dsa_cp_flag", lambda: True),
             mock.patch.object(_IndexerQueryShard, "gather", _fake_gather),
         ):
             out = shard.resolve(topk, sum(extend_lens), batch)
@@ -374,6 +376,60 @@ class TestW3EarlySlice(CustomTestCase):
             [15],
             "expected a bias to corrupt exactly the one rank that holds padding",
         )
+
+
+class TestFlagsAreReachable(CustomTestCase):
+    """Merge blocker 8: the feature flags were read at import.
+
+    ``_enable_dsa_cp = envs.SGLANG_NPU_ENABLE_DSA_CP.get()`` ran before any test
+    could set the variable, so the off path was unreachable from a test and the
+    on path was whatever the CI environment happened to have. Both are now cached
+    functions with an explicit reset, and this is what proves it.
+    """
+
+    def test_dsa_cp_flag_follows_the_environment_after_a_reset(self):
+        from sglang.srt.environ import envs
+
+        # MLAPO pinned off: with both set the flag deliberately raises, and
+        # that is a different test from this one.
+        try:
+            for value in (False, True):
+                with (
+                    envs.SGLANG_NPU_USE_MLAPO.override(False),
+                    envs.SGLANG_NPU_ENABLE_DSA_CP.override(value),
+                ):
+                    dsa_cp_module.reset_dsa_cp_flags()
+                    self.assertEqual(dsa_cp_module._dsa_cp_flag(), value)
+        finally:
+            dsa_cp_module.reset_dsa_cp_flags()
+
+    def test_indexer_shard_flag_follows_the_environment_after_a_reset(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.attention.dsa import dsa_npu_indexer
+
+        try:
+            for value in (False, True):
+                with envs.SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING.override(value):
+                    dsa_npu_indexer.reset_indexer_shard_flag()
+                    self.assertEqual(dsa_npu_indexer._shard_indexer_queries(), value)
+        finally:
+            dsa_npu_indexer.reset_indexer_shard_flag()
+
+    def test_the_flag_is_still_resolved_only_once_between_resets(self):
+        """Cached on purpose: it decides whether a module is built at load time."""
+        from sglang.srt.environ import envs
+
+        dsa_cp_module.reset_dsa_cp_flags()
+        with envs.SGLANG_NPU_USE_MLAPO.override(False):
+            with envs.SGLANG_NPU_ENABLE_DSA_CP.override(True):
+                first = dsa_cp_module._dsa_cp_flag()
+            with envs.SGLANG_NPU_ENABLE_DSA_CP.override(False):
+                self.assertEqual(
+                    dsa_cp_module._dsa_cp_flag(),
+                    first,
+                    "the flag changed mid-run without a reset",
+                )
+        dsa_cp_module.reset_dsa_cp_flags()
 
 
 if __name__ == "__main__":

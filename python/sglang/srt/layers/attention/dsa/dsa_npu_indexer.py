@@ -25,7 +25,22 @@ if is_npu():
     from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
 
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
-_shard_indexer_queries = envs.SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING.get()
+
+
+@lru_cache(maxsize=1)
+def _shard_indexer_queries() -> bool:
+    """``SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING``. Cached per process.
+
+    A function, not a module-level read, for the same reason as
+    ``dsa_cp._dsa_cp_flag``: an import-time read lands before any test can set
+    the variable. Tests call ``reset_indexer_shard_flag()``.
+    """
+    return envs.SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING.get()
+
+
+def reset_indexer_shard_flag() -> None:
+    """Re-read the flag. For tests; never call this while serving."""
+    _shard_indexer_queries.cache_clear()
 
 
 @lru_cache(maxsize=1)
@@ -318,7 +333,7 @@ class DSANPUIndexerMixin:
         )
         shard = (
             _get_indexer_query_shard(forward_batch, bs, layer_scatter_modes)
-            if is_prefill and _shard_indexer_queries and not uses_prefill_cp
+            if is_prefill and _shard_indexer_queries() and not uses_prefill_cp
             else None
         )
         q_sliced_early = shard is not None and self.rotary_emb.is_neox_style

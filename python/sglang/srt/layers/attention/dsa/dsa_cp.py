@@ -46,6 +46,7 @@ bound by a per-query top-k KV read, which falls by ``attn_tp_size`` when the
 queries do.
 """
 
+from functools import lru_cache
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
@@ -64,28 +65,47 @@ from sglang.srt.utils import is_npu, print_info_once
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-# Read once, at import: the flag decides whether the full-head RadixAttention
-# is built, which happens when the model is constructed.
-_enable_dsa_cp = envs.SGLANG_NPU_ENABLE_DSA_CP.get()
 
-if _enable_dsa_cp and envs.SGLANG_NPU_USE_MLAPO.get():
-    # The fused MLA preprocess writes the KV cache at a slot mapping DSA-CP has
-    # already sliced. DSA-CP defaults on, so it yields unless both were set.
-    if envs.SGLANG_NPU_ENABLE_DSA_CP.is_set():
-        raise ValueError(
-            "SGLANG_NPU_ENABLE_DSA_CP does not compose with "
-            "SGLANG_NPU_USE_MLAPO. The fused MLA preprocess writes the KV cache "
-            "itself, at a slot mapping DSA-CP has already sliced."
+@lru_cache(maxsize=1)
+def _dsa_cp_flag() -> bool:
+    """``SGLANG_NPU_ENABLE_DSA_CP``, resolved against MLAPO. Cached per process.
+
+    Not a module-level read. That ran at import, before any test could set the
+    variable, so no test could reach the off path -- and the conditional gates
+    this feature may grow will need exactly that. Still resolved once: the flag
+    decides whether the full-head RadixAttention is built, which happens at model
+    construction, so it must not change mid-run. Tests call
+    ``reset_dsa_cp_flags()``.
+    """
+    enabled = envs.SGLANG_NPU_ENABLE_DSA_CP.get()
+    if enabled and envs.SGLANG_NPU_USE_MLAPO.get():
+        # The fused MLA preprocess writes the KV cache at a slot mapping DSA-CP
+        # has already sliced. DSA-CP defaults on, so it yields unless both were
+        # set explicitly.
+        if envs.SGLANG_NPU_ENABLE_DSA_CP.is_set():
+            raise ValueError(
+                "SGLANG_NPU_ENABLE_DSA_CP does not compose with "
+                "SGLANG_NPU_USE_MLAPO. The fused MLA preprocess writes the KV "
+                "cache itself, at a slot mapping DSA-CP has already sliced."
+            )
+        enabled = False
+        print_info_once(
+            "DSA-CP is off because SGLANG_NPU_USE_MLAPO is on: the fused MLA "
+            "preprocess writes the KV cache at a slot mapping DSA-CP would have "
+            "sliced. Unset SGLANG_NPU_USE_MLAPO to get the sharded attention back"
         )
-    _enable_dsa_cp = False
-    print_info_once(
-        "DSA-CP is off because SGLANG_NPU_USE_MLAPO is on: the fused MLA "
-        "preprocess writes the KV cache at a slot mapping DSA-CP would have "
-        "sliced. Unset SGLANG_NPU_USE_MLAPO to get the sharded attention back"
-    )
+    return enabled
 
 
-_enable_dsa_cp_multi_request = envs.SGLANG_NPU_ENABLE_DSA_CP_MULTI_REQUEST.get()
+@lru_cache(maxsize=1)
+def _dsa_cp_multi_request_flag() -> bool:
+    return envs.SGLANG_NPU_ENABLE_DSA_CP_MULTI_REQUEST.get()
+
+
+def reset_dsa_cp_flags() -> None:
+    """Re-read the DSA-CP env flags. For tests; never call this while serving."""
+    _dsa_cp_flag.cache_clear()
+    _dsa_cp_multi_request_flag.cache_clear()
 
 
 def dsa_cp_multi_request_enabled() -> bool:
@@ -107,7 +127,7 @@ def dsa_cp_multi_request_enabled() -> bool:
     When on, this applies to single-request extends too, deliberately -- one
     convention rather than two, and it can be tested on an ordinary tail.
     """
-    return _enable_dsa_cp_multi_request
+    return _dsa_cp_multi_request_flag()
 
 
 class _Missing:
@@ -130,7 +150,7 @@ def dsa_cp_enabled() -> bool:
     module is dead weight registered with the attention backend. Harmless while
     the flag defaulted off; not something to discover by flipping the default.
     """
-    return _enable_dsa_cp and is_npu() and get_parallel().attn_tp_size > 1
+    return _dsa_cp_flag() and is_npu() and get_parallel().attn_tp_size > 1
 
 
 def get_dsa_cp_plan(
@@ -153,7 +173,7 @@ def get_dsa_cp_plan(
     Every refusal is logged once. The indexer-sharding bug this supersedes cost
     four weeks precisely because its refusal was silent.
     """
-    if not _enable_dsa_cp:
+    if not _dsa_cp_flag():
         return None
 
     cached = getattr(forward_batch, "npu_dsa_cp_plan", _MISSING)
@@ -211,7 +231,7 @@ def _build_dsa_cp_plan(
     )
     multi_request = sum(1 for n in extend_lens if n > 0) > 1
     # The lift applies only where the causal crop is not load-bearing.
-    lift_applies = _enable_dsa_cp_multi_request and dcp_crop_free_extend(
+    lift_applies = _dsa_cp_multi_request_flag() and dcp_crop_free_extend(
         forward_batch, index_topk
     )
     if not lift_applies and multi_request:
