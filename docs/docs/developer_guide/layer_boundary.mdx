@@ -267,14 +267,14 @@ Common errors and their usual cause:
 
 ```mermaid
 flowchart TD
-    D[Model stage declarations] --> C[Connections for supported batch variants]
-    C --> P[StagePlan: precomputed entry and exit paths]
-    P --> B[StageBoundary: model-facing interface]
-    F[ForwardBatch and runtime facts] --> B
-    S[ResidualStream: residual and pending contribution] <--> B
-    B --> I[prepare: complete, update, read, move]
-    I --> M[Model computation]
-    M --> O[finish or scoped exit]
+    D["Stage declarations"] --> C["Connections for each<br/>supported batch variant"]
+    C --> P["StagePlan<br/>precomputed entry<br/>and exit paths"]
+    P --> B["StageBoundary<br/>model-facing interface"]
+    F["ForwardBatch<br/>runtime facts"] --> B
+    S["ResidualStream<br/>residual and<br/>pending contribution"] <--> B
+    B --> I["prepare()<br/>complete, update,<br/>read, move"]
+    I --> M["Model computation"]
+    M --> O["finish() or<br/>scoped exit()"]
     O --> S
 ```
 
