@@ -34,6 +34,7 @@ def _component(*, slot):
     )
     comp.cache = SimpleNamespace(
         req_to_token_pool=pool,
+        page_size=64,
         enable_mamba_extra_buffer=True,
         evict_for_alloc=MagicMock(),
     )
