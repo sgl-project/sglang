@@ -12,6 +12,7 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
+from sglang.srt.entrypoints.request_headers import extract_routed_dp_rank
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.runtime_context import get_observability
@@ -267,24 +268,6 @@ class OpenAIServingBase(ABC):
         """
         if raw_request is None:
             return body_routed_dp_rank
-
-        header_value = raw_request.headers.get("x-data-parallel-rank")
-        if header_value is not None:
-            try:
-                header_dp_rank = int(header_value)
-                if (
-                    body_routed_dp_rank is not None
-                    and header_dp_rank != body_routed_dp_rank
-                ):
-                    logger.debug(
-                        f"X-Data-Parallel-Rank header ({header_dp_rank}) overrides "
-                        f"body routed_dp_rank ({body_routed_dp_rank})"
-                    )
-                return header_dp_rank
-            except ValueError:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Invalid X-Data-Parallel-Rank header: must be an integer, got '{header_value}'",
-                )
-
-        return body_routed_dp_rank
+        return extract_routed_dp_rank(
+            headers=raw_request.headers, body_routed_dp_rank=body_routed_dp_rank
+        )

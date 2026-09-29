@@ -577,6 +577,8 @@ class AnthropicServing:
             request_data["top_k"] = anthropic_request.top_k
         if anthropic_request.stop_sequences is not None:
             request_data["stop"] = anthropic_request.stop_sequences
+        if anthropic_request.routed_dp_rank is not None:
+            request_data["routed_dp_rank"] = anthropic_request.routed_dp_rank
 
         # Enable usage in stream so we can report it
         if anthropic_request.stream:
