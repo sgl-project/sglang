@@ -2,10 +2,12 @@
 
 import unittest
 from contextlib import ExitStack
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.moe import MoeRunnerBackend
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod, Fp8MoEMethod
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -38,6 +40,9 @@ def _make(moe, seed=1):
     method.is_fp4_expert = False
     method.block_fp8_as_mxfp8 = False
     method.is_checkpoint_fp8_serialized = True
+    if moe:
+        # The runner AITER-on configurations pick; the experts are shuffled only for it.
+        method.runner = SimpleNamespace(runner_backend=MoeRunnerBackend.AITER)
     layer = torch.nn.Module()
     shapes = (
         {"w13_weight": (2, 256, 256), "w2_weight": (2, 256, 128)}

@@ -1,6 +1,7 @@
 """gfx94x block-FP8 weights go through real weight-update sessions intact."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -60,6 +61,7 @@ def _copy_loader(param, loaded):
 
 
 def _model():
+    from sglang.srt.layers.moe import MoeRunnerBackend
     from sglang.srt.layers.quantization.fp8 import (
         Fp8Config,
         Fp8LinearMethod,
@@ -77,6 +79,11 @@ def _model():
             param.weight_loader = _copy_loader
             layer.register_parameter(name, param)
         layer.quant_method = method_cls(config)
+        if method_cls is Fp8MoEMethod:
+            # The runner AITER-on configurations pick; the experts are shuffled only for it.
+            layer.quant_method.runner = SimpleNamespace(
+                runner_backend=MoeRunnerBackend.AITER
+            )
         model.add_module(part, layer)
     return model
 
