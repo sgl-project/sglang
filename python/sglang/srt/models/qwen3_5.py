@@ -134,7 +134,7 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     is_xpu,
-    make_layers,
+    make_pp_layers,
     set_weight_attrs,
     use_intel_amx_backend,
 )
@@ -1691,11 +1691,9 @@ class Qwen3_5ForCausalLM(nn.Module):
                 is_nextn=is_nextn,
             )
 
-        self.layers, self._start_layer, self._end_layer = make_layers(
+        self.layers, self._start_layer, self._end_layer = make_pp_layers(
             config.num_hidden_layers,
             get_layer,
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=f"{prefix}.layers",
         )
 

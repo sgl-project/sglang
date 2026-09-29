@@ -124,7 +124,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_platform,
 )
-from sglang.srt.utils import is_hip, is_npu, make_layers
+from sglang.srt.utils import is_hip, is_npu, make_pp_layers
 from sglang.srt.utils.common import (
     BumpAllocator,
     add_prefix,
@@ -2867,7 +2867,7 @@ class KimiK3LinearModel(nn.Module):
         # Disable on HIP code path.
         self.alt_streams = None if _is_hip else [torch.cuda.Stream() for _ in range(3)]
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: KimiK3DecoderLayer(
                 layer_idx=idx,
@@ -2876,8 +2876,6 @@ class KimiK3LinearModel(nn.Module):
                 prefix=prefix,
                 alt_streams=self.alt_streams,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=f"{prefix}.layers",
         )
 
