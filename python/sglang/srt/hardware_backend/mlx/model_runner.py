@@ -66,6 +66,7 @@ from sglang.srt.hardware_backend.mlx.sampling import (
     GREEDY_PARAMS,
     MlxLazyLogprobs,
     MlxLogprobSpec,
+    MlxMinNewTokens,
     MlxSamplingParams,
     MlxStepLogprobs,
     all_greedy,
@@ -260,6 +261,7 @@ class MlxModelRunner:
         self._req_caches: dict[str, list[Any]] = {}
         self._req_token_ids: dict[str, list[int]] = {}
         self._req_sampling: dict[str, MlxSamplingParams] = {}
+        self._req_min_new_tokens: dict[str, MlxMinNewTokens] = {}
         # Reusable cache lists, for models without auxiliary layer state.
         self._cache_pool: list[list[Any]] = []
 
@@ -906,6 +908,11 @@ class MlxModelRunner:
         prefix_len = len(prefix_slot_ids)
         if req is not None:
             req.kv.mamba_last_track_seqlen = None
+        minimum = MlxMinNewTokens.from_req(req)
+        if minimum is not None:
+            self._req_min_new_tokens[req_id] = minimum
+        else:
+            self._req_min_new_tokens.pop(req_id, None)
         if self._enable_sampling:
             self._req_sampling[req_id] = (
                 MlxSamplingParams.from_req(
@@ -1175,17 +1182,25 @@ class MlxModelRunner:
         caches: list[list[Any]],
         edit_rows: mx.array | None = None,
         logprob_spec: MlxLogprobSpec | None = None,
+        logits_hook=None,
     ) -> tuple[mx.array, MlxLazyLogprobs | None]:
         """Pick one token per row of ``last_logits`` — lazily, inside the graph.
 
-        Greedy behavior (sampling disabled, or every row greedy with no logit
-        edits) is exactly the pre-sampling ``mx.argmax``.  ``edit_rows`` is the
+        Greedy behavior with no minimum-token constraint or logit edits is
+        exactly the pre-sampling ``mx.argmax``.  ``edit_rows`` is the
         worker's pre-combined additive [B, vocab] array (grammar mask +
         logit_bias), applied before token selection and logprobs, mirroring the
         CUDA ``ModelRunner._preprocess_logits`` order.  Positions for seeded
         rows come from the attention cache offsets; they are build-time Python
         ints, so this is chained-decode safe.
         """
+        last_logits = self._apply_min_new_tokens(last_logits, req_ids, caches)
+        if logits_hook is not None:
+            # Match CUDA: penalties, grammar/bias, custom processors, sanitize.
+            if edit_rows is not None:
+                last_logits = last_logits.astype(mx.float32) + edit_rows
+                edit_rows = None
+            last_logits = self._run_logits_hook(last_logits, logits_hook)
         if not self._enable_sampling:
             return mx.argmax(last_logits, axis=-1), None
         params = [self._req_sampling[rid] for rid in req_ids]
@@ -1221,6 +1236,27 @@ class MlxModelRunner:
             else None
         )
         return tokens, lazy_logprobs
+
+    def _apply_min_new_tokens(
+        self, logits: mx.array, req_ids: list[str], caches: list[list[Any]]
+    ) -> mx.array:
+        if not self._req_min_new_tokens:
+            return logits
+        rows, token_ids = [], []
+        for row, (rid, cache) in enumerate(zip(req_ids, caches)):
+            minimum = self._req_min_new_tokens.get(rid)
+            # Native offsets advance when building the graph. CPU output_ids
+            # may still lag behind a chained decode launch. The full prompt
+            # length also excludes discarded prefill chunks from the count.
+            if (
+                minimum is not None
+                and self._first_attention_cache(cache).offset < minimum.min_total_tokens
+            ):
+                rows.extend([row] * len(minimum.stop_token_ids))
+                token_ids.extend(minimum.stop_token_ids)
+        if not token_ids:
+            return logits
+        return logits.at[mx.array(rows), mx.array(token_ids)].add(-float("inf"))
 
     def _edited_logits(
         self, last_logits: mx.array, edit_rows: mx.array | None
@@ -1577,15 +1613,13 @@ class MlxModelRunner:
                 caches, batched_input, list(req_ids)
             )
 
-        if logits_hook is not None:
-            # CUDA edit order: grammar mask + logit_bias first, custom
-            # processors second, sanitization last (inside selection).
-            if edit_rows is not None:
-                last_logits = last_logits.astype(mx.float32) + edit_rows
-                edit_rows = None
-            last_logits = self._run_logits_hook(last_logits, logits_hook)
         lazy_tokens, lazy_logprobs = self._select_tokens_with_logprobs(
-            last_logits, list(req_ids), caches, edit_rows, logprob_spec
+            last_logits,
+            list(req_ids),
+            caches,
+            edit_rows,
+            logprob_spec,
+            logits_hook=logits_hook,
         )
         return MlxPendingDecode(
             lazy_tokens=lazy_tokens,
@@ -1593,7 +1627,7 @@ class MlxModelRunner:
             caches=caches,
             lazy_logprobs=lazy_logprobs,
             logprob_spec=logprob_spec,
-            edit_rows=edit_rows,
+            edit_rows=edit_rows if logits_hook is None else None,
         )
 
     def decode_batch_start_chained(
@@ -1685,6 +1719,7 @@ class MlxModelRunner:
 
         self._req_token_ids.pop(req_id, None)
         self._req_sampling.pop(req_id, None)
+        self._req_min_new_tokens.pop(req_id, None)
         cache = self._req_caches.pop(req_id, None)
         if cache is not None:
             self._release_cache(cache)
@@ -1695,6 +1730,7 @@ class MlxModelRunner:
         """Clear all request states."""
         self._req_token_ids.clear()
         self._req_sampling.clear()
+        self._req_min_new_tokens.clear()
         for cache in self._req_caches.values():
             self._release_cache(cache)
         self._req_caches.clear()
