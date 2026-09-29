@@ -19,7 +19,7 @@ from sglang.srt.utils.custom_op import register_custom_op
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sglang.kernels.ops.quantization.gptq_marlin import gptq_marlin_gemm
+    from sglang.kernels.ops.gemm.gptq_marlin import gptq_marlin_gemm
     from sglang.kernels.ops.quantization.gptq_marlin_repack import gptq_marlin_repack
 
 ScalarType, scalar_types = get_scalar_types()

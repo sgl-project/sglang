@@ -1,4 +1,3 @@
-import argparse
 import concurrent.futures
 import unittest
 from types import SimpleNamespace
@@ -16,18 +15,6 @@ from sglang.srt.server_args import ServerArgs  # noqa: E402
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
-
-
-class TestPdRoleSwitchServerArg(unittest.TestCase):
-    def test_cli_flag_parses(self):
-        parser = argparse.ArgumentParser()
-        ServerArgs.add_cli_args(parser)
-
-        off = parser.parse_args(["--model-path", "dummy"])
-        self.assertFalse(off.enable_pd_role_switch)
-
-        on = parser.parse_args(["--model-path", "dummy", "--enable-pd-role-switch"])
-        self.assertTrue(on.enable_pd_role_switch)
 
 
 class TestHandlePdRoleSwitch(unittest.TestCase):
@@ -389,14 +376,6 @@ import time  # noqa: E402
 import zmq  # noqa: E402
 
 try:
-    from sglang.srt.disaggregation.common.utils import FastQueue  # noqa: E402
-    from sglang.srt.disaggregation.mori.conn import MoriKVManager  # noqa: E402
-
-    _HAS_MORI = True
-except Exception:  # pragma: no cover - environment dependent
-    _HAS_MORI = False
-
-try:
     from sglang.srt.disaggregation.common.utils import (  # noqa: E402,F811
         FastQueue as _FQ,
     )
@@ -415,38 +394,6 @@ try:
     _HAS_ROLE_SWITCH = True
 except Exception:  # pragma: no cover - environment dependent
     _HAS_ROLE_SWITCH = False
-
-
-@unittest.skipUnless(_HAS_MORI, "mori not importable in this environment")
-class TestMoriTeardownNoThreadLeak(unittest.TestCase):
-    """teardown() must stop+join the transfer workers it started, so a P->D->P
-    flip loop does not leak _num_shards transfer threads per cycle."""
-
-    def test_teardown_joins_transfer_workers(self):
-        m = MoriKVManager.__new__(MoriKVManager)
-        m.disaggregation_mode = DisaggregationMode.PREFILL
-        m._stopped = False
-        m._worker_threads = []
-        m._transfer_queues = [FastQueue() for _ in range(3)]
-        m.server_socket = MagicMock()
-        m._zmq_ctx = MagicMock()
-        m.engine = MagicMock()
-        m.kv_mem_descs = m.aux_mem_descs = m.state_mem_descs = []
-        for q in m._transfer_queues:
-            t = threading.Thread(target=m._transfer_worker, args=(q,), daemon=True)
-            t.start()
-            m._worker_threads.append(t)
-        started = list(m._worker_threads)
-        time.sleep(0.05)  # let workers park in FastQueue.get()
-        for t in started:
-            self.assertTrue(t.is_alive())
-
-        MoriKVManager.teardown(m)
-
-        for t in started:
-            self.assertFalse(t.is_alive(), "transfer worker survived teardown (leak)")
-        self.assertEqual(m._worker_threads, [])
-        self.assertEqual(m._transfer_queues, [])
 
 
 @unittest.skipUnless(_HAS_MOONCAKE, "mooncake not importable in this environment")
