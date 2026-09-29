@@ -122,15 +122,17 @@ class RadixAttention(nn.Module):
             )
             if "k_rope" not in kwargs:
                 v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
-        breakable = is_in_breakable_cuda_graph()
-        full = is_in_full_prefill_graph()
+        breakable_cg = is_in_breakable_cuda_graph()
+        full_cg = is_in_full_prefill_graph()
         use_eager_attention = (
             self.use_prefill_attention_wrapper
             and forward_batch.forward_mode.is_extend()
-            and (breakable or full)
+            and (breakable_cg or full_cg)
         )
         # Sparse BCG already owns its backend-specific capture path.
-        if use_eager_attention and not (breakable and kwargs.get("idx_q") is not None):
+        if use_eager_attention and not (
+            breakable_cg and kwargs.get("idx_q") is not None
+        ):
             is_sparse = kwargs.get("idx_q") is not None
             output, idx_output = allocate_attention_outputs(
                 self, q, v, kwargs.get("idx_q")
