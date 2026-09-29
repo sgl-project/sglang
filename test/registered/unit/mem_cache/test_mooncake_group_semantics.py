@@ -139,6 +139,7 @@ class FakeHostKVCache:
         self.kv_buffer = torch.empty((1024,), dtype=torch.uint8)
         self.layout = "page_first"
         self.page_size = 1
+        self.logical_page_size = 1
 
     def get_ksize_per_token(self):
         return 1
@@ -166,6 +167,7 @@ class FakeHostKVCache:
 
 class FakeIndexerPool:
     page_size = 1
+    logical_page_size = 1
 
     def __init__(self):
         self.buffer = torch.empty((128,), dtype=torch.uint8)
@@ -179,6 +181,7 @@ class FakeIndexerPool:
 
 class FakeMultiBufferPool:
     page_size = 1
+    logical_page_size = 1
 
     def __init__(self):
         self.buffers = [
