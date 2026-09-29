@@ -570,9 +570,10 @@ elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
     python3 -m pip install "cuda-python>=13,<14" ; \
 fi
 
-# Install the latest available AI Dynamo prerelease from NVIDIA's package index.
+# Keep SGLang's pins and resolve inflect with Dynamo's typeguard dependency.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install --pre --extra-index-url https://pypi.nvidia.com/ ai-dynamo
+    python3 -m pip install -c /sgl-workspace/constraints.txt \
+        --pre --extra-index-url https://pypi.nvidia.com/ ai-dynamo inflect
 
 # Add yank script
 COPY --chown=root:root --chmod=755 docker/configs/yank /usr/local/bin/yank
