@@ -207,6 +207,7 @@ class Ernie4_5_VLMoeMoE(nn.Module):
 
             self.text_experts_topk = TopK(
                 top_k=config.moe_k,
+                layer_id=self.layer_id,
                 renormalize=True,
                 use_grouped_topk=False,
                 correction_bias=self.e_score_correction_bias[0],
@@ -238,6 +239,7 @@ class Ernie4_5_VLMoeMoE(nn.Module):
 
             self.vision_experts_topk = TopK(
                 top_k=config.moe_k,
+                layer_id=self.layer_id,
                 renormalize=True,
                 use_grouped_topk=False,
                 correction_bias=self.e_score_correction_bias[1],
