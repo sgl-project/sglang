@@ -2677,12 +2677,16 @@ class MHATokenToKVPool(KVCache):
     ) -> None:
         """Cast K/V to the cache dtype and scatter both in one launch.
 
-        Guard with :meth:`can_store_kv_fused_cast`.
+        Byte-identical to ``.to(self.dtype)`` wherever that cast is finite; where it
+        overflows to NaN, this may store the saturated fp8 maximum instead. Guard
+        with :meth:`can_store_kv_fused_cast`.
         """
         from sglang.kernels.ops.attention.utils import launch_reshape_and_cache_flash
 
-        # store_cache carries its own slot bound; this kernel does not.
         maybe_detect_oob(loc, 0, self.size + self.page_size, "store_kv_fused_cast")
+        maybe_detect_kernel_facing_loc(
+            loc, self.page_size, self.kernel_page_blocks, "store_kv_fused_cast"
+        )
         # The kernel indexes `loc` into a paged cache; unsqueeze(1) presents the flat
         # slot-indexed buffer as page-size 1.
         launch_reshape_and_cache_flash(
@@ -2694,6 +2698,8 @@ class MHATokenToKVPool(KVCache):
             # Padded rows target the reserved slot 0, which attention reads back;
             # skip it as the store_cache fallback does.
             reserved_skip_index=0,
+            # Match store_cache's physical slot bound.
+            size_limit=self.size + self.page_size,
         )
 
     def set_kv_buffer(
@@ -5479,16 +5485,12 @@ class MHATokenToKOnlyPool(KVCache):
         maybe_detect_oob(
             loc, 0, self.size + self.page_size, "set_k_buffer (MHA K-only)"
         )
-        if _has_dense_kv_rows(cache_k, self.head_num, self.head_dim, loc.numel()):
-            store_k_slots(
-                k_buffer,
-                _as_token_head_dim(cache_k, self.head_num, self.head_dim),
-                loc,
-            )
-        else:
-            # store_k_slots needs each token's (head, dim) block dense. This branch
-            # also wraps a negative slot rather than skipping it; loc has none here.
-            k_buffer[loc] = cache_k
+        if not _has_dense_kv_rows(cache_k, self.head_num, self.head_dim, loc.numel()):
+            # store_k_slots needs each token's (head, dim) block dense.
+            cache_k = cache_k.contiguous()
+        store_k_slots(
+            k_buffer, _as_token_head_dim(cache_k, self.head_num, self.head_dim), loc
+        )
 
     def get_value_buffer(self, layer_id: int) -> torch.Tensor:
         raise NotImplementedError("MHATokenToKOnlyPool does not allocate V")

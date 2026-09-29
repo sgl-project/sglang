@@ -295,17 +295,32 @@ class _NanEmptyTorch:
         return out.fill_(float("nan")) if out.is_floating_point() else out
 
 
+def _drop_filtered_routes(align):
+    """``moe_align_block_size`` that leaves -1 routes out of the sort entirely."""
+
+    def drop(topk_ids, block_size, num_experts):
+        sorted_ids, expert_ids, num_post = align(topk_ids, block_size, num_experts)
+        numel = topk_ids.numel()
+        filtered = topk_ids.flatten() < 0
+        route = sorted_ids.clamp(max=numel - 1).long()
+        dropped = (sorted_ids < numel) & filtered[route]
+        return sorted_ids.masked_fill(dropped, numel), expert_ids, num_post
+
+    return drop
+
+
 @requires_gfx950
 @pytest.mark.parametrize(
     "T,H,inter,E,top_k", [(8, 256, 512, 8, 2), (1, 512, 256, 16, 4)]
 )
 @pytest.mark.parametrize("no_combine", [False, True])
+@pytest.mark.parametrize("drop_filtered", [False, True])
 @torch.inference_mode()
 def test_mxfp8_native_moe_unclamped_matches_clamped(
-    monkeypatch, T, H, inter, E, top_k, no_combine
+    monkeypatch, T, H, inter, E, top_k, no_combine, drop_filtered
 ):
-    # Skipping the clamp also drops the grouped-GEMM zero-fill, which is only safe
-    # while every routed row is written; the NaN-filled torch.empty checks that.
+    # A -1 route must contribute an exact zero row on both paths, whether the align
+    # kernel sorts it into the filtered bucket or drops it from the sort.
     import sglang.kernels.ops.moe.mxfp8_moe_amd_gfx95 as mxfp8_moe
 
     torch.manual_seed(0)
@@ -319,16 +334,27 @@ def test_mxfp8_native_moe_unclamped_matches_clamped(
     logits = torch.randn(T, E, device=DEVICE, dtype=torch.float32)
     topk_weights, topk_ids = logits.softmax(dim=-1).topk(top_k, dim=-1)
     topk_ids = topk_ids.to(torch.int32)
+    topk_ids[::2, -1] = -1
+    if T > 1:
+        topk_ids[-1] = -1  # every route of one token filtered
     args = (x, w13_fp8, w13_scale, w2_fp8, w2_scale, topk_weights, topk_ids)
     kwargs = dict(alpha=alpha, beta=beta, limit=limit, no_combine=no_combine)
 
-    clamped = mxfp8_moe.fused_moe_mxfp8_native(*args, sanitize_topk_ids=True, **kwargs)
     monkeypatch.setattr(mxfp8_moe, "torch", _NanEmptyTorch())
+    if drop_filtered:
+        monkeypatch.setattr(
+            mxfp8_moe,
+            "moe_align_block_size",
+            _drop_filtered_routes(mxfp8_moe.moe_align_block_size),
+        )
+    clamped = mxfp8_moe.fused_moe_mxfp8_native(*args, sanitize_topk_ids=True, **kwargs)
     unclamped = mxfp8_moe.fused_moe_mxfp8_native(
         *args, sanitize_topk_ids=False, **kwargs
     )
 
     torch.testing.assert_close(unclamped, clamped, rtol=0, atol=0)
+    if no_combine:
+        assert torch.all(unclamped[topk_ids < 0] == 0)
 
 
 if __name__ == "__main__":

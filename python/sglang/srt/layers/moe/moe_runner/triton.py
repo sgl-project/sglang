@@ -137,6 +137,8 @@ class TritonRunnerCore(MoeRunnerCore):
             _fused_moe_kernel_sequence,
         )
 
+        # No weight count, unlike _topk_ids_may_be_nonlocal: filter_expert only
+        # zero-fills blocks whose expert id is -1, it never clamps ids.
         filter_expert = (
             self.config.num_experts is None
             or self.config.num_experts != self.config.num_local_experts

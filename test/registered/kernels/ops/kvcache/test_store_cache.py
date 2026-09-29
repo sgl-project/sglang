@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.memory_pool import (
     _as_token_head_dim,
     _has_dense_kv_rows,
 )
+from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=34, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -32,6 +33,13 @@ HIDDEN_DIMS = get_ci_test_range(
 CACHE_SIZE = 1024 * 1024
 DTYPE = torch.bfloat16
 DEVICE = "cuda"
+
+
+@pytest.fixture
+def async_assert_off(monkeypatch):
+    # Pool stores probe `loc` only when this is set (CI sets it); the in-kernel
+    # bounds must hold without it.
+    monkeypatch.setenv("SGLANG_ENABLE_ASYNC_ASSERT", "false")
 
 
 @pytest.mark.parametrize(
@@ -229,34 +237,43 @@ def test_store_k_slots_matches_advanced_indexing(
     torch.testing.assert_close(k_buffer, expected, rtol=0.0, atol=0.0)
 
 
-@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
-def test_store_k_slots_skips_negative_slots(index_dtype: torch.dtype) -> None:
-    head_num, head_dim = 4, 128
-    src = torch.randn((4, head_num, head_dim), dtype=DTYPE, device=DEVICE)
-    # A padded row may hold anything; NaN makes an erroneous write visible.
-    src[[0, 2]] = torch.nan
-    k_buffer = torch.randn(
-        (SMALL_CACHE, head_num, head_dim), dtype=DTYPE, device=DEVICE
-    )
-    before = k_buffer.clone()
-    loc = torch.tensor([-1, 7, -1, 9], dtype=index_dtype, device=DEVICE)
-
-    store_k_slots(k_buffer, src, loc)
-
-    torch.testing.assert_close(k_buffer[7], src[1], rtol=0.0, atol=0.0)
-    torch.testing.assert_close(k_buffer[9], src[3], rtol=0.0, atol=0.0)
-    # Everything else, including the rows the NaN sources would have hit, is intact.
-    untouched = torch.ones(SMALL_CACHE, dtype=torch.bool, device=DEVICE)
-    untouched[[7, 9]] = False
-    torch.testing.assert_close(
-        k_buffer[untouched], before[untouched], rtol=0.0, atol=0.0
-    )
-
-
 def _random_like_cache(shape: tuple, dtype: torch.dtype) -> torch.Tensor:
     if dtype == torch.uint8:
         return torch.randint(0, 256, shape, dtype=dtype, device=DEVICE)
     return torch.randn(shape, dtype=dtype, device=DEVICE)
+
+
+GUARD = 4
+# Slots outside [0, SMALL_CACHE) that stay inside _guarded's sentinel rows.
+OUT_OF_RANGE_SLOTS = [-1, -GUARD, SMALL_CACHE, SMALL_CACHE + GUARD - 1]
+
+
+def _guarded(shape: tuple, dtype: torch.dtype) -> tuple:
+    """``(backing, view)``: ``view`` has ``shape``, with GUARD sentinel rows around it.
+
+    An unchecked slot in ``[-GUARD, shape[0] + GUARD)`` lands in a sentinel row, so a
+    missing bound shows up as corruption rather than an illegal memory access.
+    """
+    backing = _random_like_cache((shape[0] + 2 * GUARD, *shape[1:]), dtype)
+    return backing, backing[GUARD : GUARD + shape[0]]
+
+
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_store_k_slots_skips_out_of_range_slots(index_dtype: torch.dtype) -> None:
+    head_num, head_dim = 4, 128
+    backing, k_buffer = _guarded((SMALL_CACHE, head_num, head_dim), DTYPE)
+    # The first and last slots are in range and must still be written.
+    in_range = [0, SMALL_CACHE - 1]
+    loc = torch.tensor(in_range + OUT_OF_RANGE_SLOTS, dtype=index_dtype, device=DEVICE)
+    src = torch.randn((loc.numel(), head_num, head_dim), dtype=DTYPE, device=DEVICE)
+    # A padded or stale row may hold anything; NaN makes an erroneous write visible.
+    src[len(in_range) :] = torch.nan
+    expected = backing.clone()
+    expected[[GUARD + slot for slot in in_range]] = src[: len(in_range)]
+
+    store_k_slots(k_buffer, src, loc)
+
+    torch.testing.assert_close(backing, expected, rtol=0.0, atol=0.0)
 
 
 # (index dtype, store dtype): the bf16 default and the fp8 index cache, whose
@@ -290,7 +307,7 @@ def test_k_only_pool_set_k_buffer_matches_advanced_indexing(
         cache_k = cache_k[::2]
     elif layout == "head_dim_sliced":
         cache_k = cache_k[..., :head_dim]
-    # Only the sliced source misses store_k_slots and takes the indexing fallback.
+    # Only the sliced source is not dense, so set_k_buffer copies it first.
     assert _has_dense_kv_rows(cache_k, head_num, head_dim, batch_size) == (
         layout != "head_dim_sliced"
     )
@@ -301,6 +318,35 @@ def test_k_only_pool_set_k_buffer_matches_advanced_indexing(
     MHATokenToKOnlyPool.set_k_buffer(pool, 0, loc, cache_k)
 
     torch.testing.assert_close(pool.k_buffer[0], expected, rtol=0.0, atol=0.0)
+
+
+@pytest.mark.parametrize("layout", ["contiguous", "head_dim_sliced"])
+def test_k_only_pool_set_k_buffer_skips_out_of_range_slots(
+    layout: str, async_assert_off
+) -> None:
+    head_num, head_dim = 1, 128
+    backing, k_buffer = _guarded((SMALL_CACHE, head_num, head_dim), DTYPE)
+    pool = SimpleNamespace(
+        dtype=DTYPE,
+        store_dtype=DTYPE,
+        head_num=head_num,
+        head_dim=head_dim,
+        size=SMALL_CACHE - 1,
+        page_size=1,
+        k_buffer=[k_buffer],
+    )
+    in_range = [0, SMALL_CACHE - 1]
+    loc = torch.tensor(in_range + OUT_OF_RANGE_SLOTS, device=DEVICE)
+    width = 2 * head_dim if layout == "head_dim_sliced" else head_dim
+    cache_k = torch.randn((loc.numel(), head_num, width), dtype=DTYPE, device=DEVICE)
+    cache_k[len(in_range) :] = torch.nan
+    cache_k = cache_k[..., :head_dim]
+    expected = backing.clone()
+    expected[[GUARD + slot for slot in in_range]] = cache_k[: len(in_range)]
+
+    MHATokenToKOnlyPool.set_k_buffer(pool, 0, loc, cache_k)
+
+    torch.testing.assert_close(backing, expected, rtol=0.0, atol=0.0)
 
 
 def test_store_k_slots_empty_loc_is_noop() -> None:
@@ -463,11 +509,11 @@ def test_as_token_head_dim_does_not_copy() -> None:
 class _PoolStub:
     """The pool state can_store_kv_fused_cast and store_kv_fused_cast read."""
 
-    def __init__(self, buffer_dims: int = 3):
+    def __init__(self, buffer_dims: int = 3, dtype: torch.dtype = torch.float8_e4m3fn):
         self.kv_cache_layout = "nhd"
         self.use_hnd = False
         self.is_quantized_kv_cache = False
-        self.dtype = torch.float8_e4m3fn
+        self.dtype = dtype
         self.store_dtype = torch.uint8
         self.head_num = GUARD_HEAD_NUM
         self.head_dim = GUARD_HEAD_DIM
@@ -483,6 +529,7 @@ class _PoolStub:
         self.v_buffer = [torch.zeros(shape, dtype=torch.uint8, device=DEVICE)]
         self.size = SMALL_CACHE - 1
         self.page_size = 1
+        self.kernel_page_blocks = 1
 
     def _get_key_buffer(self, layer_id: int) -> torch.Tensor:
         return self.k_buffer[layer_id].view(self.dtype)
@@ -539,12 +586,30 @@ def test_can_store_kv_fused_cast_rejects_hisparse_main_pool() -> None:
     k, v = _qkv_k_slice(8), _qkv_k_slice(8)
     assert MHATokenToKVPool.can_store_kv_fused_cast(_PoolStub(), 0, loc, k, v)
     assert not HiSparseMHAMainPool.can_store_kv_fused_cast(_PoolStub(), 0, loc, k, v)
+    with pytest.raises(NotImplementedError):
+        HiSparseMHAMainPool.store_kv_fused_cast(_PoolStub(), 0, loc, k, v)
 
 
+FP8_KV_DTYPES = [
+    torch.float8_e4m3fn,
+    pytest.param(
+        torch.float8_e4m3fnuz,
+        marks=pytest.mark.skipif(
+            not is_hip(), reason="float8_e4m3fnuz is the ROCm gfx942 KV-cache dtype"
+        ),
+    ),
+]
+
+
+def _fp8_isnan(raw: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    return raw.view(dtype).float().isnan()
+
+
+@pytest.mark.parametrize("dtype", FP8_KV_DTYPES)
 @pytest.mark.parametrize("layout", ["contiguous", "qkv_slice"])
-def test_store_kv_fused_cast_every_bf16_value(layout: str) -> None:
+def test_store_kv_fused_cast_every_bf16_value(layout: str, dtype: torch.dtype) -> None:
     # Byte-identical to `.to(fp8)` wherever that is finite. Where ATen overflows to
-    # NaN (|x| > 464, inf), Triton's cast saturates to +-448 on every backend.
+    # NaN, the cast saturates to the fp8 max; fnuz may keep NaN (gfx950 does for inf).
     values = torch.arange(-(2**15), 2**15, dtype=torch.int32, device=DEVICE)
     values = values.to(torch.int16).view(DTYPE)
     num_tokens = values.numel() // GUARD_ROW
@@ -557,15 +622,15 @@ def test_store_kv_fused_cast_every_bf16_value(layout: str) -> None:
     else:
         cache_k = k_rows.view(num_tokens, GUARD_HEAD_NUM, GUARD_HEAD_DIM)
         cache_v = v_rows.view(num_tokens, GUARD_HEAD_NUM, GUARD_HEAD_DIM)
-    pool = _PoolStub()
+    pool = _PoolStub(dtype=dtype)
     # Slot 0 is the reserved padding slot, which the store skips.
     loc = torch.randperm(SMALL_CACHE - 1, device=DEVICE)[:num_tokens] + 1
     before_k, before_v = pool.k_buffer[0].clone(), pool.v_buffer[0].clone()
 
     MHATokenToKVPool.store_kv_fused_cast(pool, 0, loc, cache_k, cache_v)
 
-    fp8_max = torch.finfo(pool.dtype).max
-    saturated = torch.tensor([fp8_max, -fp8_max], device=DEVICE).to(pool.dtype)
+    fp8_max = torch.finfo(dtype).max
+    saturated = torch.tensor([fp8_max, -fp8_max], device=DEVICE).to(dtype)
     pos_max, neg_max = saturated.view(torch.uint8).tolist()
     untouched = torch.ones(SMALL_CACHE, dtype=torch.bool, device=DEVICE)
     untouched[loc] = False
@@ -574,14 +639,18 @@ def test_store_kv_fused_cast_every_bf16_value(layout: str) -> None:
         (v_rows, pool.v_buffer[0], before_v),
     ):
         got = buffer[loc].view(num_tokens, GUARD_ROW)
-        aten = src.to(pool.dtype).view(torch.uint8)
+        aten = src.to(dtype).view(torch.uint8)
         src_nan = src.isnan()
-        aten_nan = (aten & 0x7F) == 0x7F
+        aten_nan = _fp8_isnan(aten, dtype)
+        got_nan = _fp8_isnan(got, dtype)
         torch.testing.assert_close(got[~aten_nan], aten[~aten_nan], rtol=0, atol=0)
         overflow = aten_nan & ~src_nan
         want = torch.where(src < 0, neg_max, pos_max).to(torch.uint8)
-        torch.testing.assert_close(got[overflow], want[overflow], rtol=0, atol=0)
-        assert torch.all((got[src_nan] & 0x7F) == 0x7F), "NaN must stay NaN"
+        overflow_ok = got == want
+        if dtype == torch.float8_e4m3fnuz:
+            overflow_ok |= got_nan
+        assert torch.all(overflow_ok[overflow]), "unexpected byte where .to() overflows"
+        assert torch.all(got_nan[src_nan]), "NaN must stay NaN"
         torch.testing.assert_close(
             buffer[untouched], before[untouched], rtol=0.0, atol=0.0
         )
@@ -607,6 +676,30 @@ def test_store_kv_fused_cast_skips_reserved_slot(index_dtype: torch.dtype) -> No
     torch.testing.assert_close(pool.v_buffer[0], expected_v, rtol=0.0, atol=0.0)
 
 
+def test_store_kv_fused_cast_skips_out_of_range_slots(async_assert_off) -> None:
+    pool = _PoolStub()
+    shape = tuple(pool.k_buffer[0].shape)
+    k_backing, pool.k_buffer[0] = _guarded(shape, torch.uint8)
+    v_backing, pool.v_buffer[0] = _guarded(shape, torch.uint8)
+    assert pool.size + pool.page_size == shape[0]
+    # Slot 0 is reserved, so slot 1 is the first one written.
+    in_range = [1, SMALL_CACHE - 1]
+    loc = torch.tensor(in_range + OUT_OF_RANGE_SLOTS, device=DEVICE)
+    rows = (loc.numel(), GUARD_HEAD_NUM, GUARD_HEAD_DIM)
+    cache_k = torch.randn(rows, dtype=DTYPE, device=DEVICE)
+    cache_v = torch.randn(rows, dtype=DTYPE, device=DEVICE)
+    expected_k, expected_v = k_backing.clone(), v_backing.clone()
+    for src, expected in ((cache_k, expected_k), (cache_v, expected_v)):
+        src[len(in_range) :] = torch.nan
+        written = src[: len(in_range)].to(pool.dtype).view(torch.uint8)
+        expected[[GUARD + slot for slot in in_range]] = written
+
+    MHATokenToKVPool.store_kv_fused_cast(pool, 0, loc, cache_k, cache_v)
+
+    torch.testing.assert_close(k_backing, expected_k, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(v_backing, expected_v, rtol=0.0, atol=0.0)
+
+
 def test_reshape_and_cache_flash_writes_slot_zero_by_default() -> None:
     # The AITER backend's fused KV write relies on the default skipping no slot.
     key = torch.randn((2, GUARD_HEAD_NUM, GUARD_HEAD_DIM), dtype=DTYPE, device=DEVICE)
@@ -619,6 +712,58 @@ def test_reshape_and_cache_flash_writes_slot_zero_by_default() -> None:
     launch_reshape_and_cache_flash(key, key, key_cache, value_cache, loc)
 
     torch.testing.assert_close(key_cache[[0, 5], 0], key, rtol=0.0, atol=0.0)
+
+
+@pytest.mark.parametrize("size_limit", [None, SMALL_CACHE])
+def test_reshape_and_cache_flash_writes_every_in_range_slot(size_limit) -> None:
+    # Neither the default (no bound) nor a bound at the cache's slot count may skip
+    # the first or last slot.
+    key = torch.randn((3, GUARD_HEAD_NUM, GUARD_HEAD_DIM), dtype=DTYPE, device=DEVICE)
+    key_cache = torch.zeros(
+        (SMALL_CACHE, 1, GUARD_HEAD_NUM, GUARD_HEAD_DIM), dtype=DTYPE, device=DEVICE
+    )
+    value_cache = torch.zeros_like(key_cache)
+    loc = torch.tensor([0, 5, SMALL_CACHE - 1], dtype=torch.int64, device=DEVICE)
+
+    launch_reshape_and_cache_flash(
+        key, key, key_cache, value_cache, loc, size_limit=size_limit
+    )
+
+    torch.testing.assert_close(key_cache[loc, 0], key, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(value_cache[loc, 0], key, rtol=0.0, atol=0.0)
+
+
+def test_reshape_and_cache_flash_size_limit_skips_out_of_range_slots() -> None:
+    shape = (SMALL_CACHE, 1, GUARD_HEAD_NUM, GUARD_HEAD_DIM)
+    k_backing, key_cache = _guarded(shape, DTYPE)
+    v_backing, value_cache = _guarded(shape, DTYPE)
+    in_range = [0, SMALL_CACHE - 1]
+    loc = torch.tensor(in_range + OUT_OF_RANGE_SLOTS, device=DEVICE)
+    key = torch.randn((loc.numel(), *shape[2:]), dtype=DTYPE, device=DEVICE)
+    key[len(in_range) :] = torch.nan
+    expected_k, expected_v = k_backing.clone(), v_backing.clone()
+    for expected in (expected_k, expected_v):
+        expected[[GUARD + slot for slot in in_range], 0] = key[: len(in_range)]
+
+    launch_reshape_and_cache_flash(
+        key, key, key_cache, value_cache, loc, size_limit=SMALL_CACHE
+    )
+
+    torch.testing.assert_close(k_backing, expected_k, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(v_backing, expected_v, rtol=0.0, atol=0.0)
+
+
+def test_reshape_and_cache_flash_rejects_size_limit_past_cache() -> None:
+    key = torch.randn((1, GUARD_HEAD_NUM, GUARD_HEAD_DIM), dtype=DTYPE, device=DEVICE)
+    key_cache = torch.zeros(
+        (SMALL_CACHE, 1, GUARD_HEAD_NUM, GUARD_HEAD_DIM), dtype=DTYPE, device=DEVICE
+    )
+    loc = torch.zeros(1, dtype=torch.int64, device=DEVICE)
+
+    with pytest.raises(AssertionError):
+        launch_reshape_and_cache_flash(
+            key, key, key_cache, key_cache.clone(), loc, size_limit=SMALL_CACHE + 1
+        )
 
 
 if __name__ == "__main__":

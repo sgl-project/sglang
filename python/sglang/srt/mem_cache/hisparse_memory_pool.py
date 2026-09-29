@@ -220,6 +220,12 @@ class HiSparseMHAMainPool(MHATokenToKVPool):
         # store_kv_fused_cast writes logical slots; only set_kv_buffer translates them.
         return False
 
+    def store_kv_fused_cast(self, *args, **kwargs) -> None:
+        raise NotImplementedError(
+            "HiSparseMHAMainPool.store_kv_fused_cast would write untranslated "
+            "logical slots; use set_kv_buffer"
+        )
+
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         raise NotImplementedError("HiSparseMHAMainPool does not support get_cpu_copy")
 

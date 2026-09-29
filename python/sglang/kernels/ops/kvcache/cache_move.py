@@ -131,6 +131,7 @@ def store_k_slots_kernel(
     loc_ptr,
     stride_dst_slot,
     stride_src_row,
+    size_limit,
     ROW_DIM: tl.constexpr,  # head_num * head_dim
     BLOCK: tl.constexpr,
 ):
@@ -143,9 +144,8 @@ def store_k_slots_kernel(
     pid_b = tl.program_id(1)
 
     loc = tl.load(loc_ptr + pid_n).to(tl.int64)
-    # Negative slot = skip, matching reshape_and_cache_flash. Note ATen advanced
-    # indexing would wrap instead, so a fallback caller is not equivalent here.
-    if loc < 0:
+    # Negative slots mark padded rows; stale positive slots may exceed the buffer.
+    if (loc < 0) | (loc >= size_limit):
         return
 
     off = pid_b * BLOCK + tl.arange(0, BLOCK)
@@ -157,9 +157,9 @@ def store_k_slots_kernel(
 def store_k_slots(k_buffer: torch.Tensor, src: torch.Tensor, loc: torch.Tensor) -> None:
     """Scatter ``src[i]`` into slot-major ``k_buffer[loc[i]]`` in place, one launch.
 
-    Negative ``loc`` entries are skipped; the caller bounds the rest, as nothing here
-    checks ``loc < k_buffer.shape[0]``. The trailing ``(head_num, head_dim)`` dims must
-    be contiguous, so the kernel can treat them as one flat axis.
+    ``loc`` entries outside ``[0, k_buffer.shape[0])`` are skipped. The trailing
+    ``(head_num, head_dim)`` dims must be contiguous, so the kernel can treat them as
+    one flat axis.
     """
     if loc.numel() == 0:
         return
@@ -198,6 +198,7 @@ def store_k_slots(k_buffer: torch.Tensor, src: torch.Tensor, loc: torch.Tensor) 
         loc,
         k_buffer.stride(0),
         src.stride(0),
+        k_buffer.shape[0],
         ROW_DIM=ROW_DIM,
         BLOCK=BLOCK,
         num_warps=4,
