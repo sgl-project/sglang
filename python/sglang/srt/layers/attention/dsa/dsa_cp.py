@@ -133,18 +133,28 @@ def dsa_cp_narrow_a2a_enabled() -> bool:
           off: 210,560 tokens, 18.69 GiB
           on : 164,992 tokens, 14.64 GiB      -> **4.05 GiB, 45,568 tokens**
 
-    Nearly double the live figure, because the caching allocator holds on to
-    transients. **That measurement predates the current gather.**
-    :func:`dsa_cp_attach_full_kv_b` used to gather ``w_kc`` into a plain buffer
-    and then allocate a *second* full copy to restore the loader's layout; it now
-    gathers in the physical layout and takes the logical view back, which costs
-    neither that copy nor the send copy -- roughly 12 MB per layer, ~0.9 GiB over
-    78. **The post-fix cost has not been re-measured**; expect a little over
-    3 GiB until it has been.
+    Nearly double the live figure, and **the cause is not yet known.** The first
+    guess was transient allocations: :func:`dsa_cp_attach_full_kv_b` used to
+    gather ``w_kc`` into a plain buffer and then build a *second* full copy to
+    restore the loader's layout. It now gathers in the physical layout and views
+    back, removing that copy and the send copy -- and the pool came back at
+    164,736 tokens, i.e. **unchanged**. The guess was wrong, for a reason the
+    source states plainly: ``get_available_gpu_memory`` calls
+    ``empty_device_cache`` before ``mem_get_info``, so freed transients were
+    never in the measurement. The single-allocation gather is still worth having
+    (it lowers peak memory *during* loading, where OOM risk is highest) but it
+    buys no pool.
 
-    Whatever it measures at, it is the reason this is opt-in: 3-4 GiB is a fifth
-    of the A3 dcp16 KV pool, on boxes where memory pressure presents as a
-    multi-minute stall rather than an OOM. Turn it on where the margin is known.
+    So ~1.9 GiB of live memory is unaccounted for. Candidates not yet
+    distinguished: collective buffers HCCL keeps for the new message shapes, and
+    allocator fragmentation from 156 mid-sized allocations interleaved with the
+    weight loads. The ``Load weight end ... mem usage=`` line brackets it --
+    compare it between a narrow-on and narrow-off launch and the gap either
+    falls inside weight loading or after it.
+
+    Whatever the cause, 4 GiB is the number to plan with: a fifth of the A3
+    dcp16 KV pool, on boxes where memory pressure presents as a multi-minute
+    stall rather than an OOM. Turn it on where the margin is known.
 
     The exchange is exact either way: ``npu_transpose_batchmatmul`` here is a
     per-head, per-row product, and the all-to-all is a permutation of
