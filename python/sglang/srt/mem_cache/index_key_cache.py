@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernels.ops.attention.dsa import index_buf_accessor
+from sglang.srt.utils.async_probe import maybe_detect_oob
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
@@ -48,12 +49,42 @@ class IndexKeyCache:
     def move(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> None:
         if tgt_loc.numel() == 0:
             return
-        tgt_loc_flat = tgt_loc.view(-1).long()
-        src_loc_flat = src_loc.view(-1).long()
+
+        # The buffer is PAGE-indexed (dim-0 is the page; a row is a block of fp8 keys
+        # then a block of fp32 scales -- see _buffer_shape), but tgt/src are per-TOKEN
+        # locations. Indexing dim-0 with them is correct only for page_size == 1, so map
+        # each token to its (page, offset) and move both sub-slices.
+        pool = self.pool
+        ps = pool.page_size
+        hd = pool.index_head_dim
+        sc = hd // pool.quant_block_size * 4  # scale bytes per token, as _buffer_shape
+        tgt = tgt_loc.reshape(-1).long()
+        src = src_loc.reshape(-1).long()
+        tgt_page, tgt_off = tgt // ps, tgt % ps
+        src_page, src_off = src // ps, src % ps
         for index_k in self.buffer:
-            if index_k.shape[0] == 0:
+            num_pages = index_k.shape[0]
+            if num_pages == 0:
                 continue
-            index_k[tgt_loc_flat] = index_k[src_loc_flat]
+            # Page-dim OOB probe, mirroring the token-dim check in
+            # MLATokenToKVPool.move_kv_cache: this buffer is page-indexed, so bound
+            # the derived page ids by num_pages.
+            maybe_detect_oob(
+                tgt_page, 0, num_pages, "move_kv_cache tgt_page (DSA index)"
+            )
+            maybe_detect_oob(
+                src_page, 0, num_pages, "move_kv_cache src_page (DSA index)"
+            )
+            row_stride = index_k.stride(0)
+            base = index_k.storage_offset()
+            fp8 = index_k.as_strided((num_pages, ps, hd), (row_stride, hd, 1), base)
+            scale = index_k.as_strided(
+                (num_pages, ps, sc), (row_stride, sc, 1), base + ps * hd
+            )
+            # RHS advanced-indexing gathers into a fresh tensor before the LHS write,
+            # so overlapping src/tgt token locations are safe.
+            fp8[tgt_page, tgt_off] = fp8[src_page, src_off]
+            scale[tgt_page, tgt_off] = scale[src_page, src_off]
 
     def get_local_buffer(self, layer_id: int) -> torch.Tensor:
         if self.pool.layer_transfer_counter is not None:
