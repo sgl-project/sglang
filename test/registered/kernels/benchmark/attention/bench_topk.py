@@ -1,10 +1,12 @@
 import torch
 
 from sglang.kernels.jit.benchmark import marker
+from sglang.kernels.ops.attention.dsv4.candidate_blocks import amax8_varlen
 from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_paged,
     topk_transform_paged_v2,
+    topk_transform_ragged_amax8,
     topk_transform_ragged_v2,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -140,6 +142,35 @@ def benchmark_ragged(seq_len: int, batch_size: int, k: int, provider: str):
     return marker.do_bench(fn, input_args=input_args, memory_args=input_args[:2])
 
 
+@marker.parametrize("seq_len", [512, 4096, 16384, 32768, 262144], [512, 16384, 262144])
+@marker.parametrize("batch_size", [1, 8, 32, 256, 2048], [1, 256])
+@marker.benchmark("provider", ["separate", "fused"])
+def benchmark_source(seq_len: int, batch_size: int, provider: str):
+    scores, seq_lens, _, out = _make_inputs(batch_size, seq_len, 512)
+    offsets = torch.arange(batch_size, dtype=torch.int32, device="cuda") * seq_len
+    keys = torch.empty(batch_size, seq_len // 8, device="cuda")
+
+    def fn(scores, seq_lens, offsets):
+        if provider == "fused":
+            topk_transform_ragged_amax8(
+                scores,
+                seq_lens,
+                out_offsets=offsets,
+                out_indices=out,
+                out_block_keys=keys,
+            )
+        else:
+            topk_transform_ragged_v2(
+                scores, seq_lens, out_offsets=offsets, out_indices=out
+            )
+            amax8_varlen(scores, seq_lens, out=keys)
+        return out, keys
+
+    input_args = (scores, seq_lens, offsets)
+    return marker.do_bench(fn, input_args=input_args, memory_args=input_args[:2])
+
+
 if __name__ == "__main__":
     benchmark_paged.run()
     benchmark_ragged.run()
+    benchmark_source.run()

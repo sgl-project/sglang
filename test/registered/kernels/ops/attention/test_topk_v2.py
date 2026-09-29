@@ -451,9 +451,17 @@ def test_source_topk_amax8_matches_separate_outputs(width, tied):
         }
     )
     rows, k = len(lengths), 512
-    storage = torch.randn(rows, width + 8, device="cuda")
     if tied:
-        storage.round_()
+        storage = torch.randn(rows, width + 8, device="cuda").round_()
+    else:
+        count = rows * (width + 8)
+        storage = (
+            torch.randperm(count, device="cuda")
+            .reshape(rows, width + 8)
+            .float()
+            .div_(count)
+            .sub_(0.5)
+        )
     scores = storage[:, :width]
     lens = torch.tensor(lengths, device="cuda", dtype=torch.int32)
     offsets = torch.arange(rows, device="cuda", dtype=torch.int32) * (width + 13)
