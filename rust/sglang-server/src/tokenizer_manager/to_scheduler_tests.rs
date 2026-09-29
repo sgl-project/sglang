@@ -780,7 +780,7 @@ fn mm_pool_gone_deregisters() {
     let Ok(ResponseItem::Error(err)) = rx.try_recv() else {
         panic!("expected a terminal error frame");
     };
-    assert_eq!(err.http_status(), 500, "{err}");
+    assert!(matches!(err, Error::Internal(_)), "{err}");
     assert!(err.to_string().contains("mm worker pool gone"), "{err}");
     assert!(matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { .. })));
     assert!(matches!(
@@ -1140,7 +1140,7 @@ fn mm_text_prompt_under_skip_tokenizer_init_is_a_400() {
     let Ok(ResponseItem::Error(err)) = rx.try_recv() else {
         panic!("expected a terminal error frame");
     };
-    assert_eq!(err.http_status(), 400, "{err}");
+    assert!(matches!(err, Error::Validation(_)), "{err}");
     assert!(err.to_string().contains("must provide input_ids"), "{err}");
     assert!(detok_rx.try_recv().is_err(), "rejected before registration");
     assert!(mm_rx.try_recv().is_err(), "never reaches the mm pool");

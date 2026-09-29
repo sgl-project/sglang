@@ -214,6 +214,7 @@ pub(crate) struct ServerInfo {
     pub(crate) max_context_length: u64,
     pub(crate) max_total_num_tokens: u64,
     pub(crate) version: String,
+    pub(crate) frontend: &'static str,
     pub(crate) internal_states: Vec<InternalState>,
 }
 
@@ -235,6 +236,8 @@ pub(crate) struct InternalState {
     pub(crate) avg_spec_accept_length: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) step_time_dict: Option<BTreeMap<u64, Vec<f64>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) rust_mm_transport: Option<BTreeMap<String, u64>>,
 }
 
 /// Public subset of scheduler memory metrics.

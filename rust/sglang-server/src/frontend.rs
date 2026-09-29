@@ -212,6 +212,7 @@ impl FrontendHandle {
             max_context_length: metadata.max_context_length,
             max_total_num_tokens: metadata.max_total_num_tokens,
             version: metadata.version.clone(),
+            frontend: "rust",
             internal_states: vec![internal_state],
         })
     }

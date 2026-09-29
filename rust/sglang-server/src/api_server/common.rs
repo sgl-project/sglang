@@ -238,6 +238,13 @@ mod tests {
 
         let internal_state = rmpv::Value::Map(vec![
             (
+                rmpv::Value::from("rust_mm_transport"),
+                rmpv::Value::Map(vec![(
+                    rmpv::Value::from("inline_features"),
+                    rmpv::Value::from(3),
+                )]),
+            ),
+            (
                 rmpv::Value::from("api_key"),
                 rmpv::Value::from("must-not-leak"),
             ),
@@ -282,6 +289,11 @@ mod tests {
         assert_eq!(body["max_context_length"], 4096);
         assert_eq!(body["max_total_num_tokens"], 8192);
         assert_eq!(body["version"], "1.2.3");
+        assert_eq!(body["frontend"], "rust");
+        assert_eq!(
+            body["internal_states"][0]["rust_mm_transport"]["inline_features"],
+            3
+        );
         assert_eq!(body["internal_states"][0]["last_gen_throughput"], 1.5);
         assert_eq!(
             body["internal_states"][0]["memory_usage"]["kvcache"],
