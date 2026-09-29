@@ -84,11 +84,28 @@ jobs:
           mkdir -p ${log_path}
           echo "Log path: ${log_path}"
 
+          overall_status=0
           for test_case in "${test_cases[@]}"; do
             tc_name=$(basename ${test_case} .py)
             echo "Running test case ${test_case}"
-            python -u ${sglang_source_path}/${test_case}
-            echo "Finished test case ${test_case}"
+            set -o pipefail
+            if python -u ${sglang_source_path}/${test_case} 2>&1 | tee /tmp/${tc_name}.log; then
+              echo "Finished test case ${test_case}"
+            else
+              echo "Test case ${test_case} FAILED"
+              overall_status=1
+            fi
+          done
+
+          # Print server-side error context for failed cases (step logs are not
+          # retrievable from the custom container runner, so surface key errors
+          # in the console output explicitly)
+          for test_case in "${test_cases[@]}"; do
+            tc_name=$(basename ${test_case} .py)
+            if [ "${overall_status}" -ne 0 ] && [ -f "/tmp/${tc_name}.log" ]; then
+              echo "===== error context: ${tc_name} ====="
+              grep -n -A 20 "Traceback (most recent call last)" /tmp/${tc_name}.log | head -n 120 || true
+            fi
           done
 
           plog_path="/root/ascend/log/debug/plog"
@@ -100,3 +117,5 @@ jobs:
             mkdir -p ${target_plog_path}
             cp ${plog_path}/* ${target_plog_path}
           fi
+
+          exit ${overall_status}
