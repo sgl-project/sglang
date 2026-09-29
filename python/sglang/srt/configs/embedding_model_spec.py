@@ -116,6 +116,12 @@ class EmbeddingModelSpec:
 
 
 _EMBEDDING_ARCHITECTURES = {
+    "ModernBertModel": (
+        "modernbert",
+        EmbeddingExecution.ENCODER_ONLY,
+        PoolingStrategy.CLS,
+    ),
+    "RobertaModel": ("roberta", EmbeddingExecution.ENCODER_ONLY, PoolingStrategy.CLS),
     "BertModel": ("bert", EmbeddingExecution.ENCODER_ONLY, PoolingStrategy.CLS),
     "CLIPModel": ("clip", EmbeddingExecution.MULTIMODAL, PoolingStrategy.LAST),
     "Contriever": (
@@ -266,6 +272,7 @@ def resolve_embedding_model_spec(
     *,
     is_embedding_requested: bool,
     is_embedding_gemma: bool,
+    model_type: str | None = None,
 ) -> EmbeddingModelSpec:
     """Resolve a conservative embedding capability description.
 
@@ -279,13 +286,33 @@ def resolve_embedding_model_spec(
     if is_embedding_gemma:
         return _embedding_gemma_spec()
 
-    if architecture_set & _CLASSIFICATION_ARCHITECTURES:
+    encoder_model = model_type in {
+        "bert",
+        "roberta",
+        "xlm-roberta",
+        "modernbert",
+        "distilbert",
+        "albert",
+        "electra",
+        "camembert",
+        "deberta",
+        "deberta-v2",
+        "nomic_bert",
+    } or any(
+        name.startswith(("Bert", "Roberta", "XLMRoberta", "ModernBert"))
+        for name in architecture_set
+    )
+    if architecture_set & _CLASSIFICATION_ARCHITECTURES or any(
+        name.endswith("ForSequenceClassification") for name in architecture_set
+    ):
         return EmbeddingModelSpec(
             family="sequence_classification",
             task=EmbeddingTask.CLASSIFY,
             execution=EmbeddingExecution.CLASSIFICATION,
-            attention=AttentionPattern.NONE,
-            pooling=PoolingStrategy.MODEL_DEFINED,
+            attention=AttentionPattern.BIDIRECTIONAL
+            if encoder_model
+            else AttentionPattern.CAUSAL,
+            pooling=PoolingStrategy.CLS if encoder_model else PoolingStrategy.LAST,
             normalize=False,
             postprocessor="model_defined",
             tokenizer_special_tokens="model_default",
@@ -294,13 +321,23 @@ def resolve_embedding_model_spec(
             supports_multimodal=False,
             requires_embedding_flag=False,
             auto_enable_embedding=False,
-            bidirectional_attention=False,
+            bidirectional_attention=encoder_model,
             bcg_prefill_policy=BCGPrefillPolicy.DEFAULT,
+            safe_disable_radix_cache=encoder_model,
+            safe_disable_chunked_prefill=encoder_model,
+            safe_disable_kv_cache=False,
         )
 
     for architecture, (family, execution, pooling) in _EMBEDDING_ARCHITECTURES.items():
         if architecture in architecture_set:
             return _native_embedding_spec(family, execution, pooling)
+
+    if encoder_model and is_embedding_requested:
+        return _native_embedding_spec(
+            model_type or "encoder",
+            EmbeddingExecution.ENCODER_ONLY,
+            PoolingStrategy.CLS,
+        )
 
     if is_embedding_requested:
         return EmbeddingModelSpec(

@@ -134,7 +134,7 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
             offsets,
             dtype=torch.int32,
             device="cpu",
-            pin_memory=True,
+            pin_memory=self.weight.device.type == "cuda",
         )
 
     def set_lora_info(
@@ -922,6 +922,8 @@ class ReplicatedLinearWithLoRA(BaseLayerWithLoRA):
                 device=B_buffer.device,
             )
 
+        self._output_offset_cpu = self._output_offset.cpu()
+
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         first_dim = self.first_output_dim
 
@@ -932,6 +934,7 @@ class ReplicatedLinearWithLoRA(BaseLayerWithLoRA):
                 x=lora_a_output,
                 weights=self.B_buffer,
                 output_offset=self._output_offset,
+                output_offset_cpu=self._output_offset_cpu,
                 base_output=base_output,
             )
             return lora_output

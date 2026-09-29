@@ -170,6 +170,9 @@ def _ceil_div(a: int, b: int) -> int:
 
 def _resolve_transformer_layer_model(model: torch.nn.Module) -> torch.nn.Module:
     """Find the module that owns decoder layers behind language/model wrappers."""
+    factory = getattr(model, "get_prefill_graph_model", None)
+    if factory is not None:
+        return factory()
     try:
         layer_model = resolve_language_model(model)
     except AttributeError:
@@ -417,6 +420,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             attn_tp_sharded_fn=self.model_runner.attn_tp_sequence_sharded,
             source=self.buffers,
         )
+
+        register_inputs = getattr(
+            self.model_runner.model, "register_prefill_graph_inputs", None
+        )
+        if register_inputs is not None:
+            register_inputs(self.buffer_registry)
 
         self.attention_layers = self.model_runner.attention_layers
         self.mha_companion_layers = self.model_runner.mha_companion_layers
@@ -1456,6 +1465,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 forward_mode=ForwardMode.EXTEND,
                 batch_size=bs,
                 input_ids=_slot("input_ids"),
+                token_type_ids=_slot("token_type_ids")
+                if registry.has_slot("token_type_ids")
+                else None,
                 input_embeds=(
                     _slot("input_embeds") if registry.has_slot("input_embeds") else None
                 ),
@@ -1797,6 +1809,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             forward_mode=pcg_forward_mode,
             batch_size=bs,
             input_ids=input_ids,
+            token_type_ids=_slot("token_type_ids")
+            if registry.has_slot("token_type_ids")
+            else None,
             input_embeds=input_embeds,
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens,

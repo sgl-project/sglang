@@ -439,6 +439,11 @@ class LoRAMemoryPool:
             - Standard: [num_loras, rank, hidden_dim]
             - MoE: [num_loras, num_experts, rank, hidden_dim]
         """
+        shape_resolver = getattr(base_model, "get_lora_buffer_shape", None)
+        if shape_resolver is not None:
+            return shape_resolver(
+                "A", module_name, layer_idx, max_lora_dim, self.max_loras_per_batch
+            )
         input_dim, _ = get_hidden_dim(
             module_name, self.base_hf_config, base_model, layer_idx
         )
@@ -542,6 +547,11 @@ class LoRAMemoryPool:
             - Standard: [num_loras, output_dim, rank]
             - MoE: [num_loras, num_experts, output_dim, rank]
         """
+        shape_resolver = getattr(base_model, "get_lora_buffer_shape", None)
+        if shape_resolver is not None:
+            return shape_resolver(
+                "B", module_name, layer_idx, max_lora_dim, self.max_loras_per_batch
+            )
         _, output_dim = get_hidden_dim(
             module_name, self.base_hf_config, base_model, layer_idx
         )

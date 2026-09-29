@@ -27,8 +27,14 @@ from transformers import PretrainedConfig
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.bailing_hybrid import is_bailing_multi_gate_enabled
-from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
+from sglang.srt.configs.embedding_model_spec import (
+    EmbeddingTask,
+    resolve_embedding_model_spec,
+)
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
+from sglang.srt.configs.transformers_task import (
+    resolve_transformers_task,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.runtime_context import get_platform
@@ -458,6 +464,7 @@ class ModelConfig:
         # Parse args
         self.model_path = model_path
         self.revision = revision
+        self.trust_remote_code = trust_remote_code
         self.quantization = quantization
         self.is_draft_model = is_draft_model
         self.is_draft_quantization_explicit = is_draft_quantization_explicit
@@ -501,7 +508,11 @@ class ModelConfig:
             self.hf_config.architectures,
             is_embedding_requested=bool(is_embedding),
             is_embedding_gemma=self.is_embedding_gemma,
+            model_type=self.hf_text_config.model_type,
         )
+        self.transformers_embedding_plan = None
+        if self.model_impl == ModelImpl.TRANSFORMERS:
+            resolve_transformers_task(self)
 
         rope_scaling = getattr(self.hf_text_config, "rope_parameters", None) or getattr(
             self.hf_text_config, "rope_scaling", {}
@@ -637,8 +648,9 @@ class ModelConfig:
             self.hf_text_config, "attention_chunk_size", None
         )
         self.sliding_window_size = self._get_sliding_window_size()
-        self.is_generation = not self.is_embedding_gemma and is_generation_model(
-            self.hf_config.architectures, is_embedding
+        self.is_generation = (
+            self.embedding_model_spec.task == EmbeddingTask.NONE
+            and is_generation_model(self.hf_config.architectures, is_embedding)
         )
         # The vision_config/audio_config attribute heuristic is only applied when
         # the transformers backend is explicitly requested. Some text-only models
@@ -802,7 +814,7 @@ class ModelConfig:
             enable_multimodal=cfg.enable_multimodal,
             dtype=cfg.dtype,
             quantization=quantization,
-            model_impl=cfg.model_impl,
+            model_impl=ModelImpl.AUTO if is_draft_model else cfg.model_impl,
             sampling_defaults=cfg.sampling_defaults,
             quantize_and_serve=cfg.quantize_and_serve,
             override_config_file=override_config_file,
@@ -1134,6 +1146,9 @@ class ModelConfig:
                 self.context_len = context_length
         else:
             self.context_len = derived_context_len
+            embedding_plan = self.transformers_embedding_plan
+            if embedding_plan is not None and embedding_plan.max_seq_length:
+                self.context_len = min(self.context_len, embedding_plan.max_seq_length)
 
         # Transfer context_len to HuggingFace config so models can access it
         self.hf_config.context_len = self.context_len
@@ -2169,8 +2184,12 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
     # 1. Check the model architecture
     # 2. check the `is_embedding` server args
 
+    if any(name.endswith("ForSequenceClassification") for name in model_architectures):
+        return False
     if (
-        "LlamaEmbeddingModel" in model_architectures
+        "ModernBertModel" in model_architectures
+        or "RobertaModel" in model_architectures
+        or "LlamaEmbeddingModel" in model_architectures
         or "MistralModel" in model_architectures
         or "LlamaForSequenceClassification" in model_architectures
         or "LlamaForSequenceClassificationWithNormal_Weights" in model_architectures

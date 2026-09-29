@@ -795,7 +795,10 @@ class LoRAManager:
 
         if target_modules and target_modules == {"all"}:
             self.target_modules = auto_detect_lora_target_modules(self.base_model)
-            self.target_modules.update(EMBEDDING_NAMES)
+            if hasattr(self.base_model, "get_lora_target_modules"):
+                self.target_modules = self.base_model.get_lora_target_modules("all")
+            else:
+                self.target_modules.update(EMBEDDING_NAMES)
             logger.info(
                 "CLI --lora-target-modules='all' resolved to %s "
                 "by inspecting the base model.",
@@ -803,7 +806,9 @@ class LoRAManager:
             )
             target_modules = self.target_modules
         elif target_modules:
-            self.target_modules = get_normalized_target_modules(target_modules)
+            self.target_modules = get_normalized_target_modules(
+                target_modules, self.base_model
+            )
         else:
             self.target_modules = set()
 
@@ -840,14 +845,14 @@ class LoRAManager:
 
             if not isinstance(config.target_modules, list):
                 raise ValueError(
-                    f"SGLang currently only supports inferring LoRA target modules when a list of "
+                    "SGLang currently only supports inferring LoRA target modules when a list of "
                     "suffixes is provided in `target_modules` field of PEFT config. Please explicitly "
                     "specify `--lora-target-modules` during server startup. You can specify `all` to "
                     "enable all support modules types. "
                 )
 
             adapter_target_modules = get_normalized_target_modules(
-                config.target_modules
+                config.target_modules, self.base_model
             )
 
             if target_modules is not None:
@@ -1028,6 +1033,14 @@ class LoRAManager:
     def set_lora_module(self, module_name, module):
         """Wrap any module (standard or MoE) with LoRA support."""
         lora_module = get_lora_layer(module, self.lora_backend)
+        if hasattr(self.base_model, "get_lora_target_modules"):
+            from sglang.srt.models.transformers.lora import adapt_transformers_lora
+
+            lora_module = adapt_transformers_lora(
+                lora_module,
+                embedding=isinstance(module, VocabParallelEmbedding)
+                and not isinstance(module, ParallelLMHead),
+            )
         replace_submodule(self.base_model, module_name, lora_module)
         return lora_module
 
@@ -1081,7 +1094,13 @@ class LoRAManager:
             # since VL models' should_apply_lora patterns only match language
             # model layers and would incorrectly skip these.
             # Handle embed_tokens
-            if "embed_tokens" in module_name and "embed_tokens" in self.target_modules:
+            is_transformers_embedding = (
+                hasattr(self.base_model, "get_lora_target_modules")
+                and module is self.base_model.model.get_input_embeddings()
+            )
+            if (
+                "embed_tokens" in module_name or is_transformers_embedding
+            ) and "embed_tokens" in self.target_modules:
                 if isinstance(module, VocabParallelEmbedding) and not isinstance(
                     module, BaseLayerWithLoRA
                 ):
@@ -1106,7 +1125,9 @@ class LoRAManager:
             ):
                 from sglang.srt.lora.layers import ReplicatedLinearWithLoRA
 
-                layer_id = get_layer_id(module_name)
+                layer_id = getattr(self.base_model, "get_lora_layer_id", get_layer_id)(
+                    module_name
+                )
                 if layer_id is None:
                     continue
                 lora_module = self.set_lora_module(module_name, module)
@@ -1117,12 +1138,13 @@ class LoRAManager:
                 continue
 
             # The module should be converted if it is included in target_names
-            parts = module_name.split(".")
-            if (
-                parts[-1] in self.target_modules
-                or ".".join(parts[-2:]) in self.target_modules
+            if any(
+                module_name == target or module_name.endswith("." + target)
+                for target in self.target_modules
             ):
-                layer_id = get_layer_id(module_name)
+                layer_id = getattr(self.base_model, "get_lora_layer_id", get_layer_id)(
+                    module_name
+                )
                 if layer_id is None:
                     continue
                 self.lora_modules[layer_id][module_name] = self.set_lora_module(
@@ -1133,7 +1155,9 @@ class LoRAManager:
             if isinstance(module, (FusedMoE, InklingBatchDenseMLP)) and all(
                 x in self.target_modules for x in ["gate_up_proj", "down_proj"]
             ):
-                layer_id = get_layer_id(module_name)
+                layer_id = getattr(self.base_model, "get_lora_layer_id", get_layer_id)(
+                    module_name
+                )
                 if layer_id is None:
                     if module_name.startswith("model.meta_mlp."):
                         raise ValueError(

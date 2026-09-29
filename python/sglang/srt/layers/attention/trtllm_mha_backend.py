@@ -1748,7 +1748,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 cum_seq_lens_kv=self.forward_metadata.cu_seqlens_k,
                 block_tables=page_table,
                 out_dtype=self.q_data_type,
-                mask_mode="causal",
+                mask_mode=(
+                    "padding"
+                    if layer.attn_type == AttentionType.ENCODER_ONLY
+                    else "causal"
+                ),
                 window_left=layer.sliding_window_size,
                 sinks=attention_sink,
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get()
@@ -1787,6 +1791,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     batch_size=cu_seqlens_q.shape[0] - 1,
                     cum_seq_lens_q=cu_seqlens_q,
                     cum_seq_lens_kv=cu_seqlens_kv,
+                    causal=layer.attn_type != AttentionType.ENCODER_ONLY,
                     window_left=layer.sliding_window_size,
                     sinks=attention_sink,
                     skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),

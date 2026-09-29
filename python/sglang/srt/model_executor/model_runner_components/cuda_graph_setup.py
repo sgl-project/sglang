@@ -508,6 +508,10 @@ def capture_prefill_graph(
         )
         return result(eager_runner)
 
+    if not getattr(model_runner.model, "_can_cuda_graph", True):
+        logger.info("Prefill CUDA graphs disabled by the model's capture contract")
+        return result(None if model_runner.is_draft_worker else eager_runner)
+
     if (
         model_runner.lora_manager is not None
         and not model_runner.lora_manager.supports_prefill_cuda_graph
@@ -521,13 +525,19 @@ def capture_prefill_graph(
 
     # Resolve the decoder once. Some VLM wrappers (for example Kimi-VL)
     # expose it as ``language_model`` rather than ``model``.
+    graph_model_factory = getattr(model_runner.model, "get_prefill_graph_model", None)
     try:
-        language_model = resolve_language_model(model_runner.model)
-    except AttributeError:
-        logger.warning(
-            "Disable prefill CUDA graph because the model is not a language model"
+        language_model = (
+            graph_model_factory()
+            if graph_model_factory is not None
+            else resolve_language_model(model_runner.model)
         )
-        return result(None)
+    except (AttributeError, ValueError) as error:
+        logger.warning(
+            "Disable prefill CUDA graph because the model has no compatible language graph boundary: %s",
+            error,
+        )
+        return result(eager_runner)
 
     # Disable prefill CUDA graph for non capture size
     if not get_exec().graph.cuda_graph_config.prefill.bs:
@@ -588,7 +598,7 @@ def capture_prefill_graph(
     # wrapper that exposes ``language_model`` unchanged: assigning it to
     # ``model`` would register a duplicate module alias and duplicate the
     # model's state-dict namespace.
-    if hasattr(model_runner.model, "model"):
+    if graph_model_factory is None and hasattr(model_runner.model, "model"):
         model_runner.model.model = language_model
 
     # Find the module that owns the decoder `layers`. Models wrap it at
@@ -674,7 +684,6 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
         memory_usage_gb=0,
         capture_time=0,
     )
-
     # A PD prefill server never replays the target-verify graph, and its pool
     # is built without the spec-verify scratch the capture would need.
     if (
@@ -693,6 +702,9 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
     ):
         return no_capture
     if model_runner.device == "cpu" and not get_flags().capture.enable_torch_compile:
+        return no_capture
+    if not getattr(model_runner.model, "_can_cuda_graph", True):
+        logger.info("Decode CUDA graphs disabled by the model's capture contract")
         return no_capture
 
     tic = time.perf_counter()

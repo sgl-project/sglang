@@ -107,10 +107,12 @@ def patch_model(
             # We found the custom allreduce is much faster than the built-in allreduce in torch,
             # even with ENABLE_INTRA_NODE_COMM=1.
             # tp_group.ca_comm = None
-            yield torch.compile(
+            compiled_forward = torch.compile(
                 torch.no_grad()(model.forward),
                 dynamic=False,
             )
+            wrap_context = getattr(model, "wrap_forward_context", None)
+            yield wrap_context(compiled_forward) if wrap_context else compiled_forward
         else:
             yield model.forward
     finally:

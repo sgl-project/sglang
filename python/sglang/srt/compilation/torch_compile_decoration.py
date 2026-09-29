@@ -53,13 +53,15 @@ def patch_model(
         if enable_compile:
             _to_torch(model, reverse=False, num_tokens=num_tokens)
             backup_ca_comm = tp_group.ca_comm
-            yield torch.compile(
+            compiled_forward = torch.compile(
                 torch.no_grad()(model.forward),
                 mode=os.environ.get(
                     "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
                 ),
                 dynamic=_is_hip and get_bool_env_var("SGLANG_TORCH_DYNAMIC_SHAPE"),
             )
+            wrap_context = getattr(model, "wrap_forward_context", None)
+            yield wrap_context(compiled_forward) if wrap_context else compiled_forward
         else:
             yield model.forward
     finally:

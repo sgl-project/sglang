@@ -289,7 +289,14 @@ def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_conf
         ):
             # trtllm_mha requires equal K/V row widths; fa4 carries
             # v_head_dim through.
-            if model_config.has_asymmetric_kv:
+            if (
+                model_config.has_asymmetric_kv
+                or 0 < model_config.head_dim < 64
+                or (
+                    model_config.embedding_model_spec.bidirectional_attention
+                    and model_config.sliding_window_size is not None
+                )
+            ):
                 return "fa4"
             return "trtllm_mha"
         elif get_platform().is_hip:
