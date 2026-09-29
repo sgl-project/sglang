@@ -168,7 +168,13 @@ def dsa_cp_narrow_a2a_enabled() -> bool:
     return _dsa_cp_narrow_a2a_flag() and dsa_cp_enabled()
 
 
-_narrow_a2a_totals = {"layers": 0, "tensor_bytes": 0, "allocated_bytes": 0}
+_narrow_a2a_totals = {
+    "layers": 0,
+    "tensor_bytes": 0,
+    "allocated_bytes": 0,
+    "reserved_bytes": 0,
+    "driver_bytes": 0,
+}
 
 
 def dsa_cp_attach_full_kv_b(self_attn) -> None:
@@ -203,13 +209,22 @@ def dsa_cp_attach_full_kv_b(self_attn) -> None:
 
     tp = get_parallel().attn_tp_size
     gathered_bytes = 0
-    # Diagnostic, cheap: the pool loses ~4.06 GiB against 2.13 GiB of tensor
+    # Diagnostic, cheap. The pool loses ~4.06 GiB against 2.13 GiB of tensor
     # bytes, and the "Load weight end" delta puts all of it inside weight
-    # loading. Reading the allocator directly says whether the excess is in
-    # OUR tensors (more, or bigger, than counted) or outside them (collective
-    # buffers, fragmentation). Two guesses have already been wrong; this
-    # measures instead.
-    allocated_before = torch.npu.memory_allocated() if hasattr(torch, "npu") else 0
+    # loading. The first reading answered half of that: the allocator sees
+    # exactly 2.13 GiB, ratio 1.00x, so the excess is NOT our tensors being
+    # bigger or more numerous than counted. It is memory the torch allocator
+    # never sees -- which is also why empty_device_cache does not give it back.
+    # These three numbers separate the two places that leaves:
+    #   reserved - allocated   the allocator's own pool growth: block rounding
+    #                          and fragmentation. Inside torch, recoverable.
+    #   driver   - reserved    everything else on the device -- HCCL's buffers
+    #                          for these collectives, runtime workspaces. Only
+    #                          gathering less, or into fewer buffers, moves it.
+    npu = getattr(torch, "npu", None)
+    allocated_before = npu.memory_allocated() if npu else 0
+    reserved_before = npu.memory_reserved() if npu else 0
+    free_before = npu.mem_get_info()[0] if npu else 0
     for name, w in (("w_kc", w_kc), ("w_vc", w_vc)):
         # Gather in the layout the tensor is PHYSICALLY in, then take the logical
         # view back.
@@ -242,10 +257,12 @@ def dsa_cp_attach_full_kv_b(self_attn) -> None:
         gathered_bytes += full.numel() * full.element_size()
     _narrow_a2a_totals["layers"] += 1
     _narrow_a2a_totals["tensor_bytes"] += gathered_bytes
-    if hasattr(torch, "npu"):
+    if npu:
         _narrow_a2a_totals["allocated_bytes"] += (
-            torch.npu.memory_allocated() - allocated_before
+            npu.memory_allocated() - allocated_before
         )
+        _narrow_a2a_totals["reserved_bytes"] += npu.memory_reserved() - reserved_before
+        _narrow_a2a_totals["driver_bytes"] += free_before - npu.mem_get_info()[0]
     print_info_once(
         "DSA-CP narrow all-to-all is ON: every rank holds the full w_kc and "
         f"w_vc, {gathered_bytes / (1 << 20):.1f} MB per layer, so the query can "
@@ -256,14 +273,19 @@ def dsa_cp_attach_full_kv_b(self_attn) -> None:
     # the way a single line at layer 0 can, since layer 0 has no total yet.
     if _narrow_a2a_totals["layers"] % 26 == 0:
         t = _narrow_a2a_totals
+        gib = 1 << 30
         logger.info(
             "DSA-CP narrow all-to-all: %d layers gathered, %.2f GiB of tensors, "
-            "%.2f GiB seen by the allocator (ratio %.2fx -- above 1.0 is memory "
-            "these tensors cost beyond their own bytes)",
+            "%.2f GiB allocated, %.2f GiB reserved, %.2f GiB taken off the "
+            "device (%.2fx the tensors). Reserved minus allocated is the "
+            "allocator's own rounding; device minus reserved is memory torch "
+            "never sees, and only gathering less can return it.",
             t["layers"],
-            t["tensor_bytes"] / (1 << 30),
-            t["allocated_bytes"] / (1 << 30),
-            (t["allocated_bytes"] / t["tensor_bytes"]) if t["tensor_bytes"] else 0.0,
+            t["tensor_bytes"] / gib,
+            t["allocated_bytes"] / gib,
+            t["reserved_bytes"] / gib,
+            t["driver_bytes"] / gib,
+            (t["driver_bytes"] / t["tensor_bytes"]) if t["tensor_bytes"] else 0.0,
         )
 
 
