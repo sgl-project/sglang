@@ -9,7 +9,10 @@ the consumer ``_gqa_share_sparse_decode_kernel`` contract.
 import pytest
 import torch
 
-from sglang.kernels.ops.attention.minimax_decode_topk import minimax_decode_topk
+from sglang.kernels.ops.attention.minimax_decode_topk import (
+    _jit_module,
+    minimax_decode_topk,
+)
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -157,13 +160,23 @@ def test_decode_topk_register_buckets(S):
 
 
 def test_decode_topk_rejects_over_cap():
-    """Above the largest bucket the kernel must raise, not silently truncate."""
+    """Above the largest bucket both the wrapper and the kernel must raise.
+
+    The CUDA launcher sends every row past 8192 blocks to the 16384 bucket, so the
+    kernel's own cap check is what keeps a direct caller from silently selecting
+    from the first 16384 blocks; the wrapper asserts the same bound first.
+    """
     block_size, topk = 128, 16
     S = 16385
     score = torch.randn(1, 1, S, dtype=torch.float32, device="cuda")
     seq_lens = torch.tensor([S * block_size], device="cuda", dtype=torch.int32)
-    with pytest.raises(Exception):
+    with pytest.raises(AssertionError, match="exceeds kMaxNumBlocks"):
         minimax_decode_topk(score, seq_lens, block_size, topk)
+    out = torch.empty(1, 1, topk, dtype=torch.int32, device="cuda")
+    with pytest.raises(RuntimeError, match="exceeds kMaxNumBlocks"):
+        _jit_module(seq_lens.dtype).minimax_decode_topk(
+            score, seq_lens, out, block_size, topk
+        )
 
 
 def test_decode_topk_out_param():
