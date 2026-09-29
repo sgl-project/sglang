@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import threading
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
-from queue import SimpleQueue
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -139,22 +139,16 @@ def test_generation_waits_for_capacity_before_forward(grouped):
     scheduler = Scheduler.__new__(Scheduler)
     scheduler._async_output_save = True
     scheduler._inflight_finalizes = deque([first, second])
-    scheduler._ready_replies = SimpleQueue()
-    scheduler._return_item_result = Mock()
     scheduler.server_args = SimpleNamespace(
         pipeline_config=SimpleNamespace(
             supports_sequential_multi_output_inference=lambda: False
         )
     )
     reqs = [_req() for _ in range(2 if grouped else 1)]
-    completed_output = OutputBatch()
 
     def forward(*args, **kwargs):
         assert first.done()
         assert not second.done()
-        scheduler._return_item_result.assert_called_once_with(
-            (b"first", reqs[0]), completed_output
-        )
         return OutputBatch()
 
     scheduler.worker = SimpleNamespace(
@@ -171,7 +165,6 @@ def test_generation_waits_for_capacity_before_forward(grouped):
             assert waiting in done
             assert not dispatch.done()
             scheduler.worker.execute_forward.assert_not_called()
-            scheduler._ready_replies.put(((b"first", reqs[0]), completed_output))
             first.set_result(None)
             result = dispatch.result(timeout=10)
             assert isinstance(result, OutputBatch if grouped else _DeferredOutput)
@@ -187,7 +180,6 @@ def test_generation_with_one_pending_finalize_still_overlaps():
     scheduler._async_output_save = True
     pending = Future()
     scheduler._inflight_finalizes = deque([pending])
-    scheduler._ready_replies = SimpleQueue()
     scheduler.server_args = SimpleNamespace(
         pipeline_config=SimpleNamespace(
             supports_sequential_multi_output_inference=lambda: False
@@ -206,3 +198,63 @@ def test_generation_with_one_pending_finalize_still_overlaps():
             scheduler.worker.execute_forward.assert_called_once()
         finally:
             pending.set_result(None)
+
+
+def _finalize_scheduler(replies):
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler._async_output_save = True
+    scheduler._inflight_finalizes = deque()
+    scheduler._finalize_executor = ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="sgl-diffusion-finalize"
+    )
+    scheduler._return_item_result = lambda item, batch: replies.append(
+        (threading.current_thread().name, item, batch)
+    )
+    return scheduler
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_deferred_reply_leaves_as_soon_as_finalize_finishes(fail):
+    # The event loop never runs here: the reply must not wait for it, since in
+    # serving it is busy with the next request's forward.
+    replies = []
+    scheduler = _finalize_scheduler(replies)
+    output = OutputBatch(output=torch.zeros(1))
+
+    def finalize():
+        if fail:
+            raise OSError("disk full")
+
+    item = (b"client", _req())
+    try:
+        scheduler._submit_deferred_reply(
+            item=item, deferred=_DeferredOutput(output_batch=output, finalize=finalize)
+        )
+        scheduler._inflight_finalizes[0].result(timeout=10)
+    finally:
+        scheduler._finalize_executor.shutdown(wait=True)
+
+    assert len(replies) == 1
+    thread_name, replied_item, batch = replies[0]
+    assert thread_name.startswith("sgl-diffusion-finalize")
+    assert replied_item is item and batch is output
+    if fail:
+        assert "disk full" in batch.error
+        assert batch.output is None
+    else:
+        assert batch.error is None
+
+
+def test_reply_send_holds_the_socket_lock():
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler._socket_lock = threading.Lock()
+    scheduler.server_args = SimpleNamespace(scheduler_endpoint="tcp://10.0.0.1:5555")
+    held = []
+    scheduler.receiver = SimpleNamespace(
+        send_multipart=lambda frames: held.append(scheduler._socket_lock.locked())
+    )
+
+    scheduler.return_result(OutputBatch(), identity=b"client")
+
+    assert held == [True]
+    assert not scheduler._socket_lock.locked()

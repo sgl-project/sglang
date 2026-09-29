@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import dataclasses
 import pickle
-import queue
+import threading
 import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -82,8 +82,8 @@ _MAX_INFLIGHT_FINALIZES = 2
 class _DeferredOutput(msgspec.Struct):
     """Forward result whose materialization and reply run off the event loop.
 
-    Never crosses the IPC boundary: the event loop unwraps it and replies with
-    the inner OutputBatch after finalize() has run on the finalize thread.
+    Never crosses the IPC boundary: the finalize thread runs finalize() and
+    then replies with the inner OutputBatch itself.
     """
 
     output_batch: OutputBatch
@@ -101,6 +101,9 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
     It listens for external requests via ZMQ and coordinates with other workers.
     This class does NOT manage worker processes.
     """
+
+    # instances built without __init__ (tests) still get a lock for the socket
+    _socket_lock = threading.Lock()
 
     def __init__(
         self,
@@ -203,7 +206,9 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         )
         self._finalize_executor: ThreadPoolExecutor | None = None
         self._inflight_finalizes: deque[Future] = deque()
-        self._ready_replies: queue.SimpleQueue = queue.SimpleQueue()
+        # The finalize thread replies on the event loop's ROUTER socket, and a
+        # zmq socket must never be used by two threads at once.
+        self._socket_lock = threading.Lock()
         if self._async_output_save:
             self._finalize_executor = ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="sgl-diffusion-finalize"
@@ -311,7 +316,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             # The single finalize worker completes futures in FIFO order.
             while len(self._inflight_finalizes) >= _MAX_INFLIGHT_FINALIZES:
                 self._inflight_finalizes.popleft().result()
-            self._flush_ready_replies()
+            self._reap_finalizes()
         if self.worker.is_sleeping():
             raise RuntimeError(
                 "Server is sleeping. Call resume_memory_occupation first."
@@ -777,8 +782,11 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 ):
                     payload = pickle.dumps(output_batch)
 
-                with self._record_return_stage(
-                    output_batch, "Scheduler.return_result.send"
+                with (
+                    self._record_return_stage(
+                        output_batch, "Scheduler.return_result.send"
+                    ),
+                    self._socket_lock,
                 ):
                     self.receiver.send_multipart([identity, b"", payload])
 
@@ -827,17 +835,21 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
     ) -> None:
         assert self._finalize_executor is not None
         future = self._finalize_executor.submit(
-            self._finalize_and_stage_reply, item=item, deferred=deferred
+            self._finalize_and_reply, item=item, deferred=deferred
         )
         self._inflight_finalizes.append(future)
 
-    def _finalize_and_stage_reply(
+    def _finalize_and_reply(
         self,
         *,
         item: tuple[bytes | None, Any],
         deferred: _DeferredOutput,
     ) -> None:
-        """Runs on the finalize thread; must never raise."""
+        """Runs on the finalize thread; must never raise.
+
+        Replies as soon as the output is saved instead of waiting for the event
+        loop, which may be inside the next request's forward for its whole length.
+        """
         try:
             deferred.finalize()
         except Exception as e:
@@ -846,29 +858,22 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             # never ship device tensors through the reply path
             deferred.output_batch.output = None
             deferred.output_batch.audio = None
-        self._ready_replies.put((item, deferred.output_batch))
+        try:
+            self._return_item_result(item, deferred.output_batch)
+        except zmq.ZMQError as e:
+            logger.error(f"ZMQ error sending deferred reply: {e}")
+        except Exception as e:
+            logger.error("Deferred reply failed: %s", e, exc_info=True)
 
-    def _flush_ready_replies(self) -> None:
-        if not self._async_output_save:
-            return
-        while True:
-            try:
-                item, output_batch = self._ready_replies.get_nowait()
-            except queue.Empty:
-                break
-            while self._inflight_finalizes and self._inflight_finalizes[0].done():
-                self._inflight_finalizes.popleft()
-            try:
-                self._return_item_result(item, output_batch)
-            except zmq.ZMQError as e:
-                logger.error(f"ZMQ error sending deferred reply: {e}")
+    def _reap_finalizes(self) -> None:
+        while self._inflight_finalizes and self._inflight_finalizes[0].done():
+            self._inflight_finalizes.popleft()
 
     def _drain_deferred_replies(self) -> None:
         if not self._async_output_save:
             return
         while self._inflight_finalizes:
             self._inflight_finalizes.popleft().result()
-        self._flush_ready_replies()
         if self._finalize_executor is not None:
             self._finalize_executor.shutdown(wait=True)
 
@@ -1235,13 +1240,15 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         if self.receiver is not None:
             try:
                 recv_reqs: list[tuple[bytes, Any]] = []
-                while len(recv_reqs) < _MAX_RECV_REQS_PER_POLL:
-                    try:
-                        # Accept valid REQ envelopes only, ignore malformed/probe frames.
-                        parts = self.receiver.recv_multipart(zmq.NOBLOCK)
-                    except zmq.Again:
-                        break
-
+                received: list[list[bytes]] = []
+                with self._socket_lock:
+                    while len(received) < _MAX_RECV_REQS_PER_POLL:
+                        try:
+                            received.append(self.receiver.recv_multipart(zmq.NOBLOCK))
+                        except zmq.Again:
+                            break
+                for parts in received:
+                    # Accept valid REQ envelopes only, ignore malformed/probe frames.
                     try:
                         identity, payload = parts[0], parts[-1]
                         reqs = pickle.loads(payload) if len(parts) > 2 else []
@@ -1298,7 +1305,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             logger.debug("Driver scheduler of dp replica %d listening", self.dp_replica)
 
         while self._running:
-            self._flush_ready_replies()
+            self._reap_finalizes()
 
             # Update queue depth for metrics
             if self._disagg_metrics:
@@ -1340,7 +1347,8 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     elapsed_ms = (time.monotonic() - oldest_ts) * 1000.0
                     remaining_ms = max(0, self._batching_delay_s * 1000.0 - elapsed_ms)
                     if remaining_ms > 0 and self.receiver is not None:
-                        self._poller.poll(timeout=remaining_ms)
+                        with self._socket_lock:
+                            self._poller.poll(timeout=remaining_ms)
                     elif remaining_ms > 0:
                         time.sleep(remaining_ms / 1000.0)
                 elif self._inflight_finalizes:
@@ -1348,7 +1356,8 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     # short GIL-holding ops waits a full switch interval, which
                     # turns a sub-second save into minutes. Yield instead.
                     if self.receiver is not None:
-                        self._poller.poll(timeout=1)
+                        with self._socket_lock:
+                            self._poller.poll(timeout=1)
                     else:
                         time.sleep(0.001)
                 continue

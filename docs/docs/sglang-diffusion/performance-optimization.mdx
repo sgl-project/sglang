@@ -141,9 +141,9 @@ saving.
 - Warmup requests, raw-frame responses, requests with `save_output=false`, and
   requests with `perf_dump_path` set or `SGLANG_DIFFUSION_STAGE_LOGGING=1` keep the
   synchronous path. This includes the frame-return path used by `/rollout/generate`.
-- Replies are sent by the scheduler after saving completes. If another forward
-  is running, a ready reply can wait for that forward to finish. Measure both
-  throughput and response latency, especially for long video generations.
+- Each reply is sent from the saving thread as soon as its output is saved,
+  even while the next request's forward is running. Measure both throughput and
+  response latency against the flag disabled.
 - Up to two pending finalizations retain request outputs in GPU memory. The
   scheduler waits for capacity before starting another forward; leave memory
   headroom for the pending outputs as well as inference.
