@@ -282,6 +282,7 @@ async fn forward_to_response_worker(
                 Some(metrics.first_byte_callback()),
                 Some(metrics.stream_end_callback(worker.url.clone())),
                 Some(expiration),
+                None,
             )
             .await
     } else {

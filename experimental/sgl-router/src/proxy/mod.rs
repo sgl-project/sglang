@@ -49,7 +49,7 @@ enum BreakerOutcome {
     /// A real fault (5xx other than backpressure) → `record_failure`: count
     /// toward opening.
     Failure,
-    /// Backpressure or router-side stream expiry →
+    /// Backpressure or a router-side stream expiry or abort →
     /// `record_backpressure`: never opens the breaker and, while Closed, leaves
     /// an in-progress failure streak intact — but still resolves a half-open
     /// probe so a recovered-but-busy worker isn't wedged shut.
@@ -85,13 +85,13 @@ fn breaker_outcome(status: reqwest::StatusCode) -> BreakerOutcome {
     }
 }
 
-/// Router-side expiry says nothing about worker health. Preserve the existing
+/// Router-side expiry or abort says nothing about worker health. Preserve the existing
 /// treatment of completed streams and client disconnects; upstream faults,
 /// idle timeouts, and pump panics remain failures.
 fn stream_breaker_outcome(end: sse::StreamEnd) -> BreakerOutcome {
     use sse::StreamEndReason;
     match end.reason {
-        StreamEndReason::Expired => BreakerOutcome::Neutral,
+        StreamEndReason::Expired | StreamEndReason::Aborted => BreakerOutcome::Neutral,
         StreamEndReason::Completed | StreamEndReason::ClientDisconnect => BreakerOutcome::Success,
         StreamEndReason::UpstreamError
         | StreamEndReason::IdleTimeout
@@ -314,6 +314,7 @@ impl Proxy {
         on_first_byte: Option<Box<dyn FnOnce() + Send + 'static>>,
         on_stream_end: Option<Box<dyn FnOnce(sse::StreamEnd) + Send + 'static>>,
         expiration: Option<CancellationToken>,
+        stream_abort: Option<CancellationToken>,
     ) -> Result<Response<Body>, ApiError> {
         let permit = breaker.acquire().ok_or_else(|| ApiError::BreakerOpen {
             worker: worker_url.to_string(),
@@ -410,6 +411,7 @@ impl Proxy {
             sse::StreamLimits {
                 idle_timeout: self.stream_idle_timeout,
                 expiration,
+                abort: stream_abort,
             },
         );
         let mut out = Response::new(body);
@@ -495,6 +497,7 @@ mod tests {
                 "/chat",
                 &headers,
                 Bytes::new(),
+                None,
                 None,
                 None,
                 None,
@@ -604,6 +607,7 @@ mod tests {
                 None,
                 None,
                 expiration,
+                None,
             )
             .await
             .unwrap();
@@ -838,6 +842,7 @@ mod tests {
                     "/v1/chat/completions",
                     &headers,
                     Bytes::from_static(b"{}"),
+                    None,
                     None,
                     None,
                     None,
