@@ -712,6 +712,7 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         single.normalize_batch_and_arguments()
 
         self.assertEqual(single.rid, ["single_0", "single_1", "single_2"])
+        self.assertEqual(single._parallel_sampling_parent_rid, "single")
         self.assertEqual(
             [single[i].rid for i in range(3)],
             ["single_0", "single_1", "single_2"],
