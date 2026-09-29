@@ -1600,15 +1600,17 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                         *self._kv_write_scales(layer),
                     )
 
+        is_decode_mode = (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        )
+
         q_scale = 1.0
         if uses_native_fp4:
             q = q.to(torch.float8_e4m3fn)
         elif (
             self.data_type == torch.float8_e4m3fn
-            and (
-                not self.is_xqa_impl
-                or not forward_batch.forward_mode.is_target_verify()
-            )
+            and (not self.is_xqa_impl or not is_decode_mode)
             and not use_fused_qkv
         ):
             q = q.to(torch.float8_e4m3fn)
@@ -1616,11 +1618,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
         else:
             q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
-
-        is_decode_mode = (
-            forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend_v2()
-        )
 
         if uses_native_fp4:
             kv_cache, kv_cache_block_scales = self._get_nvfp4_decode_kv_cache(layer)
@@ -1716,8 +1713,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             else:
                 mask = (
                     self._xqa_spec_dec_mask
-                    if forward_batch.forward_mode.is_target_verify()
-                    and self.forward_metadata.max_seq_len_q > 1
+                    if self.forward_metadata.max_seq_len_q > 1
                     else None
                 )
                 o = self._run_fixed_q_len_decode(
