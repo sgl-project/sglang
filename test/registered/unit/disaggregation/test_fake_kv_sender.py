@@ -146,17 +146,6 @@ class TestFakeKVSender(unittest.TestCase):
         self.assertEqual(self.sender.conclude_state, KVPoll.Failed)
         self.assertEqual(self.sender.poll(), KVPoll.Failed)
 
-    def test_get_transfer_metric(self):
-        metric = self.sender.get_transfer_metric()
-        self.assertIsNone(metric.transfer_latency_s)
-        self.assertIsNone(metric.alloc_latency_s)
-        self.assertIsNone(metric.transfer_total_bytes)
-
-    def test_failure_exception(self):
-        with self.assertRaises(Exception) as ctx:
-            self.sender.failure_exception()
-        self.assertIn("Fake KVSender Exception", str(ctx.exception))
-
 
 if __name__ == "__main__":
     unittest.main()

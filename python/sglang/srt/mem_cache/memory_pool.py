@@ -79,6 +79,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_float4_e2m1fn_x2,
+    is_gfx95_supported,
     is_hip,
     is_npu,
     is_xpu,
@@ -110,6 +111,7 @@ _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _cpu_has_amx_support = cpu_has_amx_support()
 _is_hip = is_hip()
+_is_gfx95_supported = is_gfx95_supported()
 _is_fp8_fnuz = is_fp8_fnuz()
 # `SGLANG_AITER_KV_CACHE_LAYOUT` is only meaningful on the ROCm AITER backend
 # (HIP + --enable-aiter / SGLANG_USE_AITER=1). On any other platform / backend
@@ -1034,7 +1036,7 @@ class MambaPool:
         (``write_pos[src] == 0``). Only ``temporal`` is copied, not the ring, so
         an un-flushed source would drop its last ``write_pos`` updates. Callers
         comply: COW copies radix checkpoints; ``cache_unfinished_req`` copies an
-        active slot only during prefill (ring empty); ``cache_finished_req``
+        active slot only during prefill (ring empty); ``insert_req``
         caps the donate to the last flush boundary. The dst cursor is reset to 0
         (the copied checkpoint has no pending ring entries).
         """
@@ -4315,30 +4317,6 @@ class HybridLinearKVPool(KVCache):
         layer_id = self._transfer_full_attention_id(layer_id)
         self.full_kv_pool.invalidate_index_buffer_for_layer(layer_id)
 
-    def get_index_k_continuous(
-        self,
-        layer_id: int,
-        seq_len: int,
-        page_indices: torch.Tensor,
-    ):
-        assert self.use_dsa, "get_index_k_continuous called when use_dsa is False"
-        self._wait_for_layer(layer_id)
-        layer_id = self._transfer_full_attention_id(layer_id)
-        return self.full_kv_pool.get_index_k_continuous(layer_id, seq_len, page_indices)
-
-    def get_index_k_scale_continuous(
-        self,
-        layer_id: int,
-        seq_len: int,
-        page_indices: torch.Tensor,
-    ):
-        assert self.use_dsa, "get_index_k_scale_continuous called when use_dsa is False"
-        self._wait_for_layer(layer_id)
-        layer_id = self._transfer_full_attention_id(layer_id)
-        return self.full_kv_pool.get_index_k_scale_continuous(
-            layer_id, seq_len, page_indices
-        )
-
     def get_index_k_scale_buffer(
         self,
         layer_id: int,
@@ -5144,24 +5122,6 @@ class DSATokenToKVPool(MLATokenToKVPool):
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         return self.index_key_cache.get_local_buffer(layer_id)
 
-    def get_index_k_continuous(
-        self,
-        layer_id: int,
-        seq_len: int,
-        page_indices: torch.Tensor,
-    ):
-        return self.index_key_cache.get_k_continuous(layer_id, seq_len, page_indices)
-
-    def get_index_k_scale_continuous(
-        self,
-        layer_id: int,
-        seq_len: int,
-        page_indices: torch.Tensor,
-    ):
-        return self.index_key_cache.get_k_scale_continuous(
-            layer_id, seq_len, page_indices
-        )
-
     def get_index_k_scale_buffer(
         self,
         layer_id: int,
@@ -5427,6 +5387,18 @@ class MHATokenToKOnlyPool(KVCache):
     def get_kv_size_bytes(self):
         k_size_bytes = sum(get_tensor_size_bytes(k) for k in self.k_buffer)
         return k_size_bytes, 0
+
+
+def get_minimax_sparse_index_dtype(
+    *, fp8_attn_gemm: bool, kv_cache_dtype: torch.dtype, model_dtype: torch.dtype
+) -> torch.dtype:
+    """Return the index-K cache dtype; the pool's cell-size estimate must match it."""
+    # fp8 attn-GEMM mode runs the indexer GEMMs in fp8 too; plain fp8 KV keeps bf16.
+    if fp8_attn_gemm:
+        return kv_cache_dtype
+    if _is_gfx95_supported and envs.SGLANG_OPT_MINIMAX_M3_FP8_INDEX_CACHE.get():
+        return torch.float8_e4m3fn
+    return model_dtype
 
 
 class MiniMaxSparseKVPool(KVCache):
