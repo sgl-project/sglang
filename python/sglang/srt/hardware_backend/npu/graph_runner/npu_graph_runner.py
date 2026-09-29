@@ -340,21 +340,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             is_deepseek_dsa(self.model_runner.model_config.hf_config)
             or is_deepseek_v4(self.model_runner.model_config.hf_config)
         ):
-            if self.mla_dcp_graph:
-                if forward_batch.forward_mode.is_target_verify():
-                    seq_lens_cpu = (
-                        forward_batch.seq_lens.cpu() + self.captured_req_width
-                    )
-                else:
-                    seq_lens_cpu = forward_batch.seq_lens.cpu()
-                parallel = get_parallel()
-                seq_lens_cpu = get_dcp_lens(
-                    seq_lens_cpu,
-                    parallel.dcp_size,
-                    parallel.dcp_rank,
-                )
-                seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
-            elif forward_batch.forward_mode.is_target_verify():
+            if forward_batch.forward_mode.is_target_verify() and not self.mla_dcp_graph:
                 _attn = self._replay_attn_backend()
                 _meta = getattr(_attn, "forward_metadata", None)
                 _meta_list = getattr(_meta, "seq_lens_cpu_list", None)
@@ -373,9 +359,15 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                     )
                     seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
             else:
-                seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
-                    self.bs - self.raw_bs
-                )
+                seq_lens_cpu = forward_batch.seq_lens.cpu()
+                if forward_batch.forward_mode.is_target_verify():
+                    seq_lens_cpu = seq_lens_cpu + self.captured_req_width
+                if self.mla_dcp_graph:
+                    parallel = get_parallel()
+                    seq_lens_cpu = get_dcp_lens(
+                        seq_lens_cpu, parallel.dcp_size, parallel.dcp_rank
+                    )
+                seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
             output = self.backend.replay_with_input_update(
                 graph_key,
                 seq_lens=seq_lens,

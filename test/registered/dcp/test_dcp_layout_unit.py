@@ -159,9 +159,28 @@ class TestGetDcpLens(CustomTestCase):
             patch("sglang.srt.layers.dcp.comm.use_symmetric_memory") as symmetric,
         ):
             nope, rope = all_gather_q_for_mla_decode(q_nope, q_rope)
-        symmetric.assert_called_once_with(group, disabled=True)
+        symmetric.assert_called_once_with(group, disabled=False)
         torch.testing.assert_close(nope, torch.cat([q_nope, q_nope + 100], dim=1))
         torch.testing.assert_close(rope, torch.cat([q_rope, q_rope + 100], dim=1))
+
+    def test_shared_mla_query_gather_disables_symmetric_memory_only_on_npu(self):
+        q = torch.zeros(2, 3, 4)
+        group = MagicMock()
+        group.all_gather.side_effect = lambda tensor, dim: tensor
+        for device_type in ("npu", "cuda", "cpu", "xpu", "hpu"):
+            # CPU-backed operations exercise dispatch without accelerator hardware.
+            query = SimpleNamespace(
+                device=SimpleNamespace(type=device_type),
+                transpose=q.transpose,
+                size=q.size,
+            )
+            with (
+                self.subTest(device_type=device_type),
+                rc.get_parallel().override(dcp_group=group),
+                patch("sglang.srt.layers.dcp.comm.use_symmetric_memory") as symmetric,
+            ):
+                all_gather_q_for_mla_decode(q, query)
+                symmetric.assert_called_once_with(group, disabled=device_type == "npu")
 
     def test_start_none_matches_owner_count(self):
         for n in DCP_SIZES:
@@ -212,7 +231,7 @@ class TestGetDcpLens(CustomTestCase):
         lens = torch.tensor(LENS, dtype=torch.int32)
         self.assertTrue(torch.equal(get_dcp_lens(lens, 1, 0), lens))
 
-    def test_metadata_planner_slices_prefix_indices_without_packed_kv(self):
+    def test_metadata_planner_uses_prefix_kernel_without_packed_kv(self):
         translator = KVIndexTranslator.__new__(KVIndexTranslator)
         translator.is_translating = False
         backend = SimpleNamespace(
@@ -222,7 +241,14 @@ class TestGetDcpLens(CustomTestCase):
         req_indices = torch.tensor([2, 0])
         extend_lens = torch.tensor([2, 3], dtype=torch.int32)
 
+        def cpu_prefix_kernel(table, reqs, starts, lens, cu_lens, out, stride):
+            for i in range(reqs.numel()):
+                out[cu_lens[i] : cu_lens[i] + lens[i]] = table[
+                    reqs[i], starts[i] : starts[i] + lens[i]
+                ]
+
         kernel = MagicMock()
+        kernel.__getitem__.return_value.side_effect = cpu_prefix_kernel
         for prefix_lengths in ([4, 8], [0, 4], [0, 0]):
             prefix_lens = torch.tensor(prefix_lengths, dtype=torch.int32)
             seq_lens = prefix_lens + extend_lens
@@ -230,6 +256,7 @@ class TestGetDcpLens(CustomTestCase):
                 [req_to_token[r, :n] for r, n in zip(req_indices, prefix_lengths)]
             )
             for rank in range(4):
+                kernel.reset_mock()
                 with (
                     self.subTest(prefix_lengths=prefix_lengths, rank=rank),
                     rc.get_parallel().override(
@@ -263,7 +290,8 @@ class TestGetDcpLens(CustomTestCase):
                     torch.testing.assert_close(
                         result.dcp_local_prefix_kv_indices, all_prefix[rank::4] // 4
                     )
-                    kernel.__getitem__.assert_not_called()
+                    kernel.__getitem__.assert_called_once_with((2,))
+                    kernel.__getitem__.return_value.assert_called_once()
                     packed.__getitem__.assert_not_called()
                     self.assertIsNone(result.dcp_kv_indptr)
                     self.assertIsNone(result.dcp_kv_indices)

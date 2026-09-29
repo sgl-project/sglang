@@ -47,41 +47,29 @@ def prepare_decode_context_parallel_metadata(
     if not parallel.dcp_enabled:
         return None
     backend = get_attn_backend()
-    if not backend.dcp_use_packed_kv:
-        # Restore the slice/cat prefix builder for the unpacked Ascend path.
-        # Keep the shared read-ID translation; only index construction changes.
-        prefix_parts = []
-        for batch_idx, prefix_len in enumerate(extend_prefix_lens_cpu):
-            prefix_len = int(prefix_len)
-            if prefix_len:
-                req_idx = int(req_pool_indices[batch_idx].item())
-                prefix_parts.append(req_to_token[req_idx, :prefix_len])
-        prefix_indices = (
-            torch.cat(prefix_parts).to(torch.int32)
-            if prefix_parts
-            else torch.empty(0, dtype=torch.int32, device=req_to_token.device)
-        )
-        return DecodeContextParallelMetadata(
-            dcp_local_prefix_kv_indices=backend.kv_index_translator.translate_dcp_read_ids(
-                prefix_indices[parallel.dcp_rank :: parallel.dcp_size]
-            ),
-        )
     # dcp_kv_buffer tokens' layout
     # [ rank0_r1.prefix_tokens, rank1_r1.prefix_tokens, ..., rank7_r1.prefix_tokens,
     #   ...,
     #   rank0_rn.prefix_tokens, rank1_rn.prefix_tokens, ..., rank7_rn.prefix_tokens,
     #   r1.extend_tokens, r2.extent_tokens, rn.extend_tokens ]
     extend_prefix_starts = torch.zeros(
-        len(seq_lens), dtype=torch.int32, device=get_device().device
+        len(seq_lens),
+        dtype=torch.int32,
+        device=get_device().device,
     )
     extend_cu_prefix_lens = torch.zeros(
-        len(seq_lens) + 1, dtype=torch.int32, device=get_device().device
+        len(seq_lens) + 1,
+        dtype=torch.int32,
+        device=get_device().device,
     )
     extend_cu_prefix_lens[1:] = torch.cumsum(extend_prefix_lens, dim=0)
     extend_cu_prefix_lens = extend_cu_prefix_lens[:-1]
-    extend_prefix_lens_sum = sum(extend_prefix_lens_cpu)
+    extend_prefix_lens_sum = sum([i for i in extend_prefix_lens_cpu])
+
     dcp_prefix_kv_indices = torch.empty(
-        extend_prefix_lens_sum, dtype=torch.int32, device=get_device().device
+        sum(extend_prefix_lens_cpu),
+        dtype=torch.int32,
+        device=get_device().device,
     )
     create_chunked_prefix_cache_kv_indices_fn[(len(seq_lens),)](
         req_to_token,
@@ -92,11 +80,12 @@ def prepare_decode_context_parallel_metadata(
         dcp_prefix_kv_indices,
         req_to_token.shape[1],
     )
-    # Prefix lengths are dcp_size-aligned (widened allocator page), so no nonzero().
-    # `get_mla_kv_buffer` is a read door with the caller-translates contract.
-    dcp_local_prefix_kv_indices = backend.kv_index_translator.translate_dcp_read_ids(
-        dcp_prefix_kv_indices[parallel.dcp_rank :: parallel.dcp_size]
-    )
+    if not backend.dcp_use_packed_kv:
+        return DecodeContextParallelMetadata(
+            dcp_local_prefix_kv_indices=backend.kv_index_translator.translate_dcp_read_ids(
+                dcp_prefix_kv_indices[parallel.dcp_rank :: parallel.dcp_size]
+            ),
+        )
     dcp_kv_indptr = torch.zeros(
         len(seq_lens) + 1,
         dtype=torch.int32,
@@ -127,6 +116,12 @@ def prepare_decode_context_parallel_metadata(
         dcp_kv_indices,
         extend_prefix_lens_sum,
         parallel.dcp_size,
+    )
+    # Prefix lengths are dcp_size-aligned (widened allocator page), so no nonzero().
+    # `get_mla_kv_buffer` is a read door with the caller-translates contract.
+    translator = get_attn_backend().kv_index_translator
+    dcp_local_prefix_kv_indices = translator.translate_dcp_read_ids(
+        dcp_prefix_kv_indices[parallel.dcp_rank :: parallel.dcp_size]
     )
     dcp_kv_buffer = torch.empty(
         (

@@ -20,6 +20,45 @@ def _npu_is_available() -> bool:
     return torch_npu is not None and hasattr(torch, "npu") and torch.npu.is_available()
 
 
+class TestDcpPageTableCapacityContract(unittest.TestCase):
+    def test_valid_decode_and_verify_lengths_fit_graph_and_request_tables(self):
+        # Mirror the allocation contract: graph rows cover context + verify;
+        # req_to_token has at least four additional token slots. CPU lengths
+        # can lead device lengths during overlap, but must not understate them.
+        for context in (1, 9, 127, 128, 129, 128000):
+            for window in (0, 1, 7):
+                graph_len = context + window
+                req_capacity = graph_len + 4
+                for size in (1, 2, 4, 8):
+                    for rank in range(size):
+                        for page_size in (4, 128):
+                            graph_local = graph_len // size + (rank < graph_len % size)
+                            graph_pages = max(
+                                1, (graph_local + page_size - 1) // page_size
+                            )
+                            for prefix in {0, 1, context // 2, context - 1, context}:
+                                length = prefix + window
+                                local_len = length // size + (rank < length % size)
+                                local_pages = (local_len + page_size - 1) // page_size
+                                for cpu_lead in (0, 1, window):
+                                    upper = length + cpu_lead
+                                    upper_local = upper // size + (rank < upper % size)
+                                    active_pages = min(
+                                        graph_pages,
+                                        max(
+                                            1,
+                                            (upper_local + page_size - 1) // page_size,
+                                        ),
+                                    )
+                                    self.assertLessEqual(local_pages, active_pages)
+                                if local_pages:
+                                    last_pos = (
+                                        rank + (local_pages - 1) * page_size * size
+                                    )
+                                    self.assertLess(last_pos, length)
+                                    self.assertLess(last_pos, req_capacity)
+
+
 @unittest.skipUnless(_npu_is_available(), "Ascend NPU is required")
 class TestNpuDcpCompactKernels(CustomTestCase):
     device = "npu"
@@ -227,7 +266,7 @@ class TestNpuDcpCompactKernels(CustomTestCase):
             reqs = torch.tensor([2, 0, 1])
             seq_lens = torch.tensor([2 * logical_page + 1, logical_page - 1, 0])
             for rank in range(dcp_size):
-                for width in (None, 5, 1):
+                for width in (None, 3, 5, 129):
                     with self.subTest(dcp_size=dcp_size, rank=rank, width=width):
                         table, local_lens = build_mla_dcp_local_block_tables(
                             req_to_token.to(self.device),
@@ -253,15 +292,15 @@ class TestNpuDcpCompactKernels(CustomTestCase):
                         torch.testing.assert_close(table.cpu(), expected)
                         torch.testing.assert_close(local_lens.cpu(), expected_lens)
 
-    def test_page_table_bounds_mask_rounded_graph_columns(self):
+    def test_page_table_at_request_capacity_with_verify_headroom(self):
         from sglang.srt.hardware_backend.npu.attention.dcp_metadata import (
             build_mla_dcp_local_block_tables,
         )
 
-        # A padded graph length can reach beyond the available request-table
-        # columns. Preserve the previous implementation's zero-filled tail.
+        # context=9, verify window=7: the request pool reserves at least
+        # context + window + 4 columns and the graph covers context + window.
         table, _ = build_mla_dcp_local_block_tables(
-            torch.arange(56, 65, device=self.device).view(1, 9),
+            torch.arange(56, 76, device=self.device).view(1, 20),
             torch.tensor([0], device=self.device),
             torch.tensor([16], device=self.device),
             4,
@@ -269,7 +308,7 @@ class TestNpuDcpCompactKernels(CustomTestCase):
             1,
             num_pages=3,
         )
-        self.assertEqual(table.cpu().tolist(), [[7, 0, 0]])
+        self.assertEqual(table.cpu().tolist(), [[7, 8, 0]])
 
     def test_empty_page_table_does_not_launch_zero_grid(self):
         from sglang.srt.hardware_backend.npu.attention.dcp_metadata import (
@@ -288,8 +327,11 @@ class TestNpuDcpCompactKernels(CustomTestCase):
         self.assertEqual(table.shape, (0, 1))
         self.assertEqual(lens.shape, (0,))
 
-    def test_shared_planner_uses_slice_cat_prefix_on_npu(self):
-        from unittest.mock import MagicMock, patch
+    def test_shared_planner_uses_triton_prefix_on_npu(self):
+        from unittest.mock import patch
+        from sglang.kernels.ops.kvcache.kv_indices import (
+            create_chunked_prefix_cache_kv_indices,
+        )
         from sglang.srt import runtime_context as rc
         from sglang.srt.layers.dcp.planner import (
             prepare_decode_context_parallel_metadata,
@@ -302,7 +344,6 @@ class TestNpuDcpCompactKernels(CustomTestCase):
             dcp_use_packed_kv=False, kv_index_translator=translator
         )
         table = torch.arange(40, 64, dtype=torch.int32, device=self.device).view(3, 8)
-        prefix_kernel = MagicMock()
         for prefixes in ([4, 8], [0, 4], [0, 0]):
             prefix_lens = torch.tensor(prefixes, dtype=torch.int32, device=self.device)
             extend_lens = torch.tensor([2, 3], dtype=torch.int32, device=self.device)
@@ -332,7 +373,7 @@ class TestNpuDcpCompactKernels(CustomTestCase):
                         kv_buffer_shape=torch.Size([32, 1]),
                         kv_cache_dtype=torch.bfloat16,
                         kv_cache_device=self.device,
-                        create_chunked_prefix_cache_kv_indices_fn=prefix_kernel,
+                        create_chunked_prefix_cache_kv_indices_fn=create_chunked_prefix_cache_kv_indices,
                     )
                     expected = torch.cat(
                         [table[2, : prefixes[0]], table[0, : prefixes[1]]]
@@ -341,30 +382,24 @@ class TestNpuDcpCompactKernels(CustomTestCase):
                         metadata.dcp_local_prefix_kv_indices, expected[rank::4] // 4
                     )
                     self.assertIsNone(metadata.dcp_kv_buffer)
-                    prefix_kernel.__getitem__.assert_not_called()
+                    self.assertIsNone(metadata.dcp_kv_indptr)
+                    self.assertIsNone(metadata.dcp_kv_indices)
 
-    def test_compact_buffers_survive_graph_replay(self):
+    def test_compact_internal_allocation_survives_graph_replay(self):
         """Real NPU graph kernels; local copy substitutes for HCCL transport."""
-        from sglang.srt.layers.dcp.comm import (
-            create_dcp_a2a_buffers,
-            dcp_a2a_lse_reduce,
-        )
+        from sglang.srt.layers.dcp.comm import dcp_a2a_lse_reduce
 
         output = torch.randn(2, 12, 16, dtype=torch.bfloat16, device=self.device)
         lse = torch.randn(2, 12, dtype=torch.float32, device=self.device)
         group = SimpleNamespace(
             world_size=2, all_to_all_single=lambda dst, src: dst.copy_(src)
         )
-        buffers = create_dcp_a2a_buffers(
-            2, 2, 6, 16, dtype=output.dtype, device=self.device
-        )
-        ptrs = {key: value.data_ptr() for key, value in buffers.items()}
         for _ in range(3):
-            dcp_a2a_lse_reduce(output, lse, group, cuda_graph_buffers=buffers)
+            dcp_a2a_lse_reduce(output, lse, group)
         torch.npu.synchronize()
         graph = torch.npu.NPUGraph()
         with torch.npu.graph(graph):
-            merged = dcp_a2a_lse_reduce(output, lse, group, cuda_graph_buffers=buffers)
+            merged = dcp_a2a_lse_reduce(output, lse, group)
         for empty_shard in (False, True, False):
             output.copy_(torch.randn_like(output))
             lse.copy_(torch.randn_like(lse))
@@ -373,9 +408,6 @@ class TestNpuDcpCompactKernels(CustomTestCase):
             graph.replay()
             eager = dcp_a2a_lse_reduce(output, lse, group)
             torch.testing.assert_close(merged, eager, atol=0, rtol=0)
-            self.assertEqual(
-                ptrs, {key: value.data_ptr() for key, value in buffers.items()}
-            )
 
     def test_pack_preserves_bf16_output_and_fp32_lse_bits(self):
         from sglang.kernels.ops.attention.dcp_kernels import dcp_pack_a2a_send

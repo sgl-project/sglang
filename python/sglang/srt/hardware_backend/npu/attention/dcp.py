@@ -15,9 +15,8 @@ def mask_empty_mla_dcp_shards_npu(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Represent an empty local KV shard as the online-softmax identity.
 
-    Graph padding rows deliberately have a zero local sequence length.  FIA is
-    still invoked for the fixed graph shape, so its undefined empty-row output
-    must not participate in the cross-rank LSE merge.
+    Short sequences can leave a rank with no local KV. FIA's undefined
+    empty-shard output must not participate in the cross-rank LSE merge.
     """
     num_rows = partial_output.shape[0]
     num_reqs = local_seq_lens.numel()
@@ -43,7 +42,6 @@ def mask_empty_mla_dcp_shards_npu(
 def merge_mla_dcp_output_npu(
     partial_output: torch.Tensor,
     partial_lse: torch.Tensor,
-    graph_buffers: dict[str, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Compactly exchange and merge DCP partial attention states.
 
@@ -72,16 +70,11 @@ def merge_mla_dcp_output_npu(
         # ambiguous empty LSE reshape and a zero-sized HCCL all-to-all.
         return partial_output.new_empty((0, local_heads, head_dim))
 
-    partial_lse = (
-        partial_lse.reshape(batch_size, total_heads, -1)[..., 0]
-        .to(torch.float32)
-        .contiguous()
-    )
+    partial_lse = partial_lse.squeeze(-1).to(torch.float32).contiguous()
     return dcp_a2a_lse_reduce(
         partial_output,
         partial_lse,
         parallel.dcp_group,
         is_lse_base_on_e=True,
-        cuda_graph_buffers=graph_buffers,
         comm_backend="a2a",
     )

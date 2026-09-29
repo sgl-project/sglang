@@ -626,10 +626,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Ascend MLA remaps virtual write locations inside NPUMLATokenToKVPool.
     dcp_kv_mask: Optional[torch.Tensor] = None
 
-    # Pointer-stable packed DCP communication buffers owned by an attention
-    # backend during graph capture/replay. Eager forwards leave this unset.
-    dcp_a2a_graph_buffers: Optional[Dict[str, torch.Tensor]] = None
-
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
 

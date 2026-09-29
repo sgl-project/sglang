@@ -2,9 +2,12 @@
 Unit tests for sglang.srt.hardware_backend.npu.attention.ascend_backend.
 """
 
+import ast
+import inspect
 import sys
 import unittest
 from dataclasses import fields, is_dataclass
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -36,7 +39,6 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     ForwardMetadata,
     ForwardMode,
     _expand_dsa_sparse_indices,
-    _normalize_mla_k_rope_cache,
     _reshape_kv_for_fia_nz,
 )
 from sglang.srt.hardware_backend.npu.attention.dcp import (
@@ -46,7 +48,6 @@ from sglang.srt.hardware_backend.npu.attention.dcp import (
 from sglang.srt.hardware_backend.npu.attention.dcp_metadata import (
     build_mla_dcp_mtp_mask,
 )
-from sglang.srt.layers.dcp.layout import get_dcp_lens
 
 
 class TestExpandDsaSparseIndices(unittest.TestCase):
@@ -122,21 +123,42 @@ class TestReshapeKvForFiaNz(unittest.TestCase):
 
 
 class TestNormalizeMlaKRoPECache(unittest.TestCase):
-    def test_dcp_token_major_cache_preserves_singleton_head(self):
-        cache = torch.randn(8192, 1, 64)
-        result = _normalize_mla_k_rope_cache(cache, 64)
-        self.assertEqual(result.shape, (8192, 1, 64))
-        self.assertEqual(result.data_ptr(), cache.data_ptr())
-
-    def test_paged_cache_flattens_block_and_page_only(self):
-        cache = torch.randn(2, 128, 1, 64)
-        result = _normalize_mla_k_rope_cache(cache, 64)
-        self.assertEqual(result.shape, (256, 1, 64))
-        self.assertTrue(torch.equal(result.flatten(), cache.flatten()))
-
-    def test_rejects_wrong_rope_dimension(self):
-        with self.assertRaisesRegex(RuntimeError, "Invalid MLA RoPE KV cache shape"):
-            _normalize_mla_k_rope_cache(torch.empty(8, 1, 32), 64)
+    def test_both_prefix_branches_preserve_token_and_head_layout(self):
+        # Exercise the actual inline expressions without invoking NPU attention.
+        tree = ast.parse(inspect.getsource(AscendAttnBackend))
+        forward_extend = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "forward_extend"
+        )
+        expressions = [
+            node.value
+            for node in ast.walk(forward_extend)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "k_rope_cached"
+                for target in node.targets
+            )
+        ]
+        self.assertEqual(len(expressions), 2)
+        caches = [
+            torch.randn(8192, 1, 64),
+            torch.randn(2, 128, 1, 64),
+            torch.randn(256, 1, 576)[..., -64:],  # DCP split view, non-contiguous.
+            torch.empty(0, 1, 64),
+        ]
+        for branch, expression in enumerate(expressions):
+            code = compile(ast.Expression(expression), "<prefix-reshape>", "eval")
+            for cache in caches:
+                with self.subTest(branch=branch, shape=cache.shape):
+                    result = eval(
+                        code,
+                        {"self": SimpleNamespace(qk_rope_head_dim=64)},
+                        {"k_rope_cached": cache},
+                    )
+                    self.assertEqual(result.shape, (cache.numel() // 64, 1, 64))
+                    self.assertTrue(torch.equal(result.flatten(), cache.flatten()))
+                    self.assertEqual(result.data_ptr(), cache.data_ptr())
 
 
 class TestNpuMlaDcpWrite(unittest.TestCase):
@@ -248,41 +270,111 @@ class TestNpuMlaDcpRead(unittest.TestCase):
 
 
 class TestNpuDcpMetadata(unittest.TestCase):
-    def test_graph_mtp_mask_keeps_fixed_shape_for_padding_row(self):
-        mask, local_lens = build_mla_dcp_mtp_mask(
+    def test_replay_lengths_share_zero_padding_with_non_dcp(self):
+        # Execute the actual runner's replay-update block without importing its
+        # distributed/model-loading dependencies in this CPU-only test.
+        runner_path = (
+            Path(inspect.getfile(AscendAttnBackend)).parent.parent
+            / "graph_runner/npu_graph_runner.py"
+        )
+        tree = ast.parse(runner_path.read_text())
+        update_block = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.If)
+            and any(
+                isinstance(stmt, ast.Assign)
+                and isinstance(stmt.value, ast.Call)
+                and isinstance(stmt.value.func, ast.Attribute)
+                and stmt.value.func.attr == "replay_with_input_update"
+                for stmt in node.body
+            )
+        )
+        code = compile(
+            ast.Module(body=[update_block], type_ignores=[]), str(runner_path), "exec"
+        )
+        for dcp in (False, True):
+            for mode in (ForwardMode.DECODE, ForwardMode.TARGET_VERIFY):
+                for raw_bs in (0, 1, 3, 4):
+                    for use_metadata in (False, True):
+                        lengths = torch.arange(raw_bs, dtype=torch.int64) + 5
+                        host_metadata = [17] * 4 if use_metadata else None
+                        runner = SimpleNamespace(
+                            mla_dcp_graph=dcp,
+                            bs=4,
+                            raw_bs=raw_bs,
+                            captured_req_width=7,
+                            model_runner=SimpleNamespace(
+                                model_config=SimpleNamespace(hf_config=None)
+                            ),
+                            backend=MagicMock(),
+                            _replay_attn_backend=lambda: SimpleNamespace(
+                                forward_metadata=SimpleNamespace(
+                                    seq_lens_cpu_list=host_metadata
+                                )
+                            ),
+                            _get_update_attr_name=lambda: "actual_seq_lengths_kv",
+                            _get_update_attr_type=lambda: [],
+                        )
+                        with self.subTest(
+                            dcp=dcp, mode=mode, raw_bs=raw_bs, use_metadata=use_metadata
+                        ):
+                            exec(
+                                code,
+                                dict(
+                                    self=runner,
+                                    graph_key=4,
+                                    forward_batch=SimpleNamespace(
+                                        forward_mode=mode, seq_lens=lengths
+                                    ),
+                                    is_deepseek_dsa=lambda _: False,
+                                    is_deepseek_v4=lambda _: False,
+                                    get_parallel=lambda: SimpleNamespace(
+                                        dcp_size=2, dcp_rank=1
+                                    ),
+                                    get_dcp_lens=lambda lens, size, rank: (
+                                        lens // size + (rank < lens % size)
+                                    ),
+                                ),
+                            )
+                            if not dcp and mode.is_target_verify() and use_metadata:
+                                expected = host_metadata
+                            else:
+                                expected = (
+                                    lengths + (7 if mode.is_target_verify() else 0)
+                                ).tolist()
+                                if dcp:
+                                    expected = [length // 2 for length in expected]
+                                expected += [0] * (4 - raw_bs)
+                            self.assertEqual(
+                                runner.backend.replay_with_input_update.call_args.kwargs[
+                                    "seq_lens"
+                                ],
+                                expected,
+                            )
+
+    def test_graph_mtp_mask_uses_same_window_for_padding_row(self):
+        mask = build_mla_dcp_mtp_mask(
             torch.tensor([5, 0]),
-            torch.tensor([3, 0]),
+            3,
             dcp_size=2,
             dcp_rank=1,
-            max_query_len=3,
             max_local_kv_len=8,
         )
 
         self.assertEqual(mask.shape, (2, 3, 8))
-        self.assertEqual(local_lens.tolist(), [4, 0])
-        self.assertTrue(mask[1].all())
+        self.assertTrue(mask[1, 0].all())
+        self.assertFalse(mask[1, 1:, 0].any())
+        self.assertTrue(mask[1, :, 1:].all())
 
     def test_mtp_mask_matches_global_causality(self):
         prefix_lens = torch.tensor([0, 3, 8], dtype=torch.int32)
-        query_lens = torch.tensor([4, 2, 3], dtype=torch.int32)
+        query_len = 4
         dcp_size = 3
 
         for rank in range(dcp_size):
-            mask, local_lens = build_mla_dcp_mtp_mask(
-                prefix_lens, query_lens, dcp_size, rank
-            )
-            expected_lens = get_dcp_lens(prefix_lens + query_lens, dcp_size, rank).to(
-                torch.int32
-            )
-            torch.testing.assert_close(local_lens, expected_lens)
-
-            for req_idx, (prefix_len, query_len, local_len) in enumerate(
-                zip(
-                    prefix_lens.tolist(),
-                    query_lens.tolist(),
-                    expected_lens.tolist(),
-                )
-            ):
+            mask = build_mla_dcp_mtp_mask(prefix_lens, query_len, dcp_size, rank)
+            for req_idx, prefix_len in enumerate(prefix_lens.tolist()):
                 local_positions = [
                     pos
                     for pos in range(prefix_len + query_len)
@@ -291,8 +383,7 @@ class TestNpuDcpMetadata(unittest.TestCase):
                 for query_idx in range(mask.shape[1]):
                     for local_idx in range(mask.shape[2]):
                         expected_masked = (
-                            query_idx >= query_len
-                            or local_idx >= local_len
+                            local_idx >= len(local_positions)
                             or local_positions[local_idx] > prefix_len + query_idx
                         )
                         self.assertEqual(
@@ -348,7 +439,6 @@ class TestForwardMetadata(unittest.TestCase):
             "actual_seq_lengths_q_pa_cpu",
             "actual_seq_lengths_kv",
             "dcp_mtp_attn_mask",
-            "dcp_a2a_graph_buffers",
             "swa_mask",
             "prefix_lens",
             "flatten_prefix_block_tables",
@@ -414,6 +504,38 @@ class TestForwardMetadata(unittest.TestCase):
             ],
         )
 
+    def test_swa_graph_buffers_preserve_original_capacity(self):
+        backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        backend.use_mla = False
+        backend.is_draft_worker = False
+        backend.page_size = 128
+        backend.device = "cpu"
+        backend.is_hybrid_swa = True
+        backend.use_sliding_window_kv_pool = False
+        for context_len, draft_tokens in (
+            (1000, None),
+            (1024, None),
+            (1000, 7),
+            (1024, 7),
+        ):
+            with self.subTest(context_len=context_len, draft_tokens=draft_tokens):
+                backend.max_context_len = context_len
+                backend.speculative_num_draft_tokens = draft_tokens
+                backend.init_cuda_graph_state(max_bs=2, max_num_tokens=16)
+                total = context_len + 127 + (draft_tokens or 0)
+                self.assertEqual(
+                    backend.graph_metadata["block_tables_swa"].shape,
+                    (2, total // 128),
+                )
+                mask = backend.graph_metadata["swa_mask"]
+                self.assertEqual(mask.shape, (2, 1, total))
+                self.assertEqual(mask.dtype, torch.bool)
+                self.assertTrue(mask.all())
+                torch.testing.assert_close(
+                    backend.graph_metadata["swa_indices"],
+                    torch.arange(total, dtype=torch.int32),
+                )
+
     def test_dspark_graph_metadata_is_fixed_shape_and_rank_local(self):
         backend = AscendAttnBackend.__new__(AscendAttnBackend)
         backend.use_mla = True
@@ -438,9 +560,9 @@ class TestForwardMetadata(unittest.TestCase):
                 "build_mla_dcp_local_block_tables",
                 return_value=(
                     torch.tensor([[7], [0]], dtype=torch.int32),
-                    torch.tensor([4, 0], dtype=torch.int32),
+                    torch.tensor([4, 1], dtype=torch.int32),
                 ),
-            ),
+            ) as build_local_tables,
         ):
             backend.init_cuda_graph_state(max_bs=2, max_num_tokens=6)
             metadata = backend._init_cuda_graph_metadata(
@@ -450,7 +572,6 @@ class TestForwardMetadata(unittest.TestCase):
             )
             seq_lens_ptr = metadata.seq_lens.data_ptr()
             mask_ptr = metadata.dcp_mtp_attn_mask.data_ptr()
-            send_ptr = metadata.dcp_a2a_graph_buffers["send_combined"].data_ptr()
             backend._apply_cuda_graph_metadata(
                 bs=2,
                 req_pool_indices=torch.tensor([0, 1]),
@@ -458,24 +579,36 @@ class TestForwardMetadata(unittest.TestCase):
                 seq_lens_cpu=torch.tensor([5, 0]),
                 forward_mode=ForwardMode.TARGET_VERIFY,
                 spec_info=None,
-                num_padding=1,
                 in_capture=True,
+            )
+            self.assertEqual(metadata.seq_lens_cpu_list, [4, 1])
+            # Like non-DCP, the verify window is added to every metadata row.
+            torch.testing.assert_close(
+                build_local_tables.call_args.args[2], torch.tensor([8, 3])
+            )
+            # Replay refreshes device metadata; the graph runner updates FIA's
+            # host lengths separately, without rebuilding this capture list.
+            build_local_tables.return_value = (
+                torch.tensor([[7], [0]], dtype=torch.int32),
+                torch.tensor([3, 1], dtype=torch.int32),
+            )
+            backend._apply_cuda_graph_metadata(
+                bs=2,
+                req_pool_indices=torch.tensor([0, 1]),
+                seq_lens=torch.tensor([3, 0]),
+                seq_lens_cpu=torch.tensor([3, 0]),
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                spec_info=None,
             )
 
         self.assertEqual(metadata.block_tables.shape, (2, 2))
-        self.assertEqual(metadata.seq_lens.tolist(), [4, 0])
-        self.assertEqual(metadata.seq_lens_cpu_list, [4, 0])
-        self.assertTrue(metadata.dcp_mtp_attn_mask[1].all())
+        self.assertEqual(metadata.seq_lens.tolist(), [3, 1])
+        self.assertEqual(metadata.seq_lens_cpu_list, [4, 1])
+        self.assertTrue(metadata.dcp_mtp_attn_mask[1, 0].all())
+        self.assertFalse(metadata.dcp_mtp_attn_mask[1, 1:, 0].any())
+        self.assertTrue(metadata.dcp_mtp_attn_mask[1, :, 1:].all())
         self.assertEqual(metadata.seq_lens.data_ptr(), seq_lens_ptr)
         self.assertEqual(metadata.dcp_mtp_attn_mask.data_ptr(), mask_ptr)
-        self.assertEqual(
-            metadata.dcp_a2a_graph_buffers["send_combined"].shape,
-            (2, 6, 4, 18),
-        )
-        self.assertEqual(
-            metadata.dcp_a2a_graph_buffers["send_combined"].data_ptr(),
-            send_ptr,
-        )
 
 
 class TestEmptyDcpTargetVerify(unittest.TestCase):
@@ -550,7 +683,7 @@ class TestEmptyDcpTargetVerify(unittest.TestCase):
         layer = SimpleNamespace(tp_q_head_num=8)
         forward_batch = SimpleNamespace(
             forward_mode=ForwardMode.TARGET_VERIFY,
-            num_token_non_padded_cpu=0,
+            global_num_token_non_padded_cpu=0,
             spec_info=SimpleNamespace(draft_token_num=8),
         )
 
@@ -568,6 +701,60 @@ class TestEmptyDcpTargetVerify(unittest.TestCase):
         self.assertEqual(output.shape, (0, 128))
         self.assertEqual(lse.shape, (0, 8, 1))
 
+    @patch(
+        "sglang.srt.hardware_backend.npu.attention.ascend_backend.is_fia_nz",
+        return_value=False,
+    )
+    def test_forward_mtp_preserves_padded_query_shape(self, _fia_nz):
+        backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        backend.use_mla = backend.use_fia = True
+        backend.is_draft_worker = False
+        backend.kv_lora_rank = 4
+        backend.qk_rope_head_dim = 2
+        backend.page_size = 4
+        backend.token_to_kv_pool = MagicMock()
+        backend.token_to_kv_pool.get_kv_buffer.return_value = (
+            torch.zeros(2, 1, 4, 4),
+            torch.zeros(2, 1, 4, 2),
+        )
+        backend.forward_metadata = SimpleNamespace(
+            block_tables=torch.zeros(2, 1, dtype=torch.int32),
+            seq_lens_cpu_int=None,
+            seq_lens_cpu_list=[8, 0],
+            seq_lens=torch.tensor([8, 0], dtype=torch.int32),
+            dcp_mtp_attn_mask=torch.ones(2, 8, 4, dtype=torch.bool),
+        )
+        expected = (torch.zeros(16, 12), torch.zeros(16, 3, 1))
+        backend._forward_mla_fia = MagicMock(return_value=expected)
+        layer = SimpleNamespace(
+            layer_id=0, tp_q_head_num=3, tp_k_head_num=1, tp_v_head_num=1
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            global_num_token_non_padded_cpu=8,
+            spec_info=SimpleNamespace(draft_token_num=8),
+        )
+        q = torch.zeros(16, 3, 4)
+        q_rope = torch.zeros(16, 3, 2)
+        with rc.get_parallel().override(dcp_enabled=True, dcp_size=2, dcp_rank=0):
+            output, lse = backend.forward_mtp(
+                q,
+                None,
+                None,
+                layer,
+                forward_batch,
+                save_kv_cache=False,
+                q_rope=q_rope,
+                return_softmax_lse=True,
+            )
+        call = backend._forward_mla_fia.call_args
+        self.assertIs(call.args[0], q)
+        self.assertEqual(call.kwargs["batch_size"], 2)
+        self.assertEqual(call.kwargs["actual_seq_lengths"], [8, 8])
+        torch.testing.assert_close(output, expected[0])
+        self.assertIs(lse, expected[1])
+        backend._forward_mla_fia.assert_called_once()
+
     def test_merge_returns_empty_local_heads_without_collective(self):
         partial_output = torch.empty((0, 8, 16))
         partial_lse = torch.empty((0, 8, 1))
@@ -584,10 +771,6 @@ class TestEmptyDcpTargetVerify(unittest.TestCase):
         expected = torch.randn(2, 4, 16, dtype=torch.bfloat16)
         compact_a2a.return_value = expected
         dcp_group = MagicMock()
-        graph_buffers = {
-            "send_combined": torch.empty(2, 2, 4, 18, dtype=torch.bfloat16),
-            "recv_combined": torch.empty(2, 2, 4, 18, dtype=torch.bfloat16),
-        }
 
         with rc.get_parallel().override(
             dcp_enabled=True,
@@ -595,11 +778,7 @@ class TestEmptyDcpTargetVerify(unittest.TestCase):
             dcp_rank=0,
             dcp_group=dcp_group,
         ):
-            output = merge_mla_dcp_output_npu(
-                partial_output,
-                partial_lse,
-                graph_buffers=graph_buffers,
-            )
+            output = merge_mla_dcp_output_npu(partial_output, partial_lse)
 
         self.assertIs(output, expected)
         args, kwargs = compact_a2a.call_args
@@ -608,7 +787,7 @@ class TestEmptyDcpTargetVerify(unittest.TestCase):
         self.assertEqual(args[1].dtype, torch.float32)
         self.assertIs(args[2], dcp_group)
         self.assertTrue(kwargs["is_lse_base_on_e"])
-        self.assertIs(kwargs["cuda_graph_buffers"], graph_buffers)
+        self.assertNotIn("cuda_graph_buffers", kwargs)
         self.assertEqual(kwargs["comm_backend"], "a2a")
 
 

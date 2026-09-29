@@ -352,11 +352,7 @@ def forward_mla_core_npu(
             m.num_local_heads * parallel.attn_dcp_size,
             m.kv_lora_rank,
         )
-        attn_output = merge_mla_dcp_output_npu(
-            attn_output,
-            attn_lse,
-            graph_buffers=getattr(forward_batch, "dcp_a2a_graph_buffers", None),
-        )
+        attn_output = merge_mla_dcp_output_npu(attn_output, attn_lse)
     else:
         attn_output = m.attn_mqa(
             q_nope_out,
