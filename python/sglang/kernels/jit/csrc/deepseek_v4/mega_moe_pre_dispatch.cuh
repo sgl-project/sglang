@@ -31,8 +31,11 @@ struct MegaMoEPreDispatchParams {
   int32_t* __restrict__ buf_x_sf;        // row-major int32 [P, G/4]
   int64_t* __restrict__ buf_topk_idx;    // [padded_max, top_k]
   float* __restrict__ buf_topk_weights;  // [padded_max, top_k]
+  int32_t* __restrict__ shared_x_sf;     // column-major, BLOCK_M-paged scales
 
   uint64_t buf_x_sf_stride_bytes;
+  uint64_t shared_x_sf_col_stride;
+  uint32_t shared_block_m;
   uint32_t num_tokens;
   uint32_t padded_max;
   uint32_t hidden;
@@ -44,7 +47,7 @@ struct MegaMoEPreDispatchParams {
 // kMultiChunk covers rows too wide for one chunk per thread. It is a template
 // parameter rather than a runtime check because this kernel is issue-bound: the
 // loop bookkeeping alone costs ~10% on the rows that fit a single chunk.
-template <uint32_t kGroupSize, bool kUsePDL, bool kMultiChunk>
+template <uint32_t kGroupSize, bool kUsePDL, bool kMultiChunk, bool kWriteSharedSF>
 __global__ __launch_bounds__(kMaxBlockThreads, 2) void  //
     mega_moe_pre_dispatch_kernel(const MegaMoEPreDispatchParams __grid_constant__ params) {
   using namespace device;
@@ -66,6 +69,12 @@ __global__ __launch_bounds__(kMaxBlockThreads, 2) void  //
     const uint32_t token_id = bid;
     const auto token_in = params.x + static_cast<uint64_t>(token_id) * params.hidden;
     const auto token_out = params.buf_x + static_cast<uint64_t>(token_id) * params.hidden;
+    uint32_t shared_row = 0;
+    if constexpr (kWriteSharedSF) {
+      const uint32_t m = token_id % params.shared_block_m;
+      shared_row = token_id / params.shared_block_m * ((params.shared_block_m + 127u) / 128u * 128u) + m / 128u * 128u +
+                   m % 32u * 4u + m % 128u / 32u;
+    }
 
     const auto quantize_chunk = [&](uint32_t chunk) {
       InputVec in_vec;
@@ -104,6 +113,11 @@ __global__ __launch_bounds__(kMaxBlockThreads, 2) void  //
       if (within_group_id == 0 && group_id < params.num_groups) {
         const uint64_t byte_off = static_cast<uint64_t>(token_id) * params.buf_x_sf_stride_bytes + group_id;
         reinterpret_cast<uint8_t*>(params.buf_x_sf)[byte_off] = static_cast<uint8_t>(ue8m0_exp);
+        if constexpr (kWriteSharedSF) {
+          const uint64_t off = shared_row + static_cast<uint64_t>(group_id / 4u) * params.shared_x_sf_col_stride;
+          reinterpret_cast<uint8_t*>(params.shared_x_sf)[off * sizeof(int32_t) + group_id % 4u] =
+              static_cast<uint8_t>(ue8m0_exp);
+        }
       }
     };
 
@@ -144,13 +158,13 @@ __global__ __launch_bounds__(kMaxBlockThreads, 2) void  //
 // ---- Host wrapper
 // ------------------------------------------------------------------------------------------------------------------------
 
-template <int64_t kGroupSize, bool kUsePDL>
+template <int64_t kGroupSize, bool kUsePDL, bool kWriteSharedSF>
 struct MegaMoEPreDispatchKernel {
   static_assert(kGroupSize == 32 || kGroupSize == 64 || kGroupSize == 128, "unsupported group_size");
   static constexpr auto kernel_one_chunk =
-      mega_moe_pre_dispatch_kernel<static_cast<uint32_t>(kGroupSize), kUsePDL, false>;
+      mega_moe_pre_dispatch_kernel<static_cast<uint32_t>(kGroupSize), kUsePDL, false, kWriteSharedSF>;
   static constexpr auto kernel_multi_chunk =
-      mega_moe_pre_dispatch_kernel<static_cast<uint32_t>(kGroupSize), kUsePDL, true>;
+      mega_moe_pre_dispatch_kernel<static_cast<uint32_t>(kGroupSize), kUsePDL, true, kWriteSharedSF>;
 
   static void
   run(const tvm::ffi::TensorView x,
@@ -159,7 +173,9 @@ struct MegaMoEPreDispatchKernel {
       const tvm::ffi::TensorView buf_x,
       const tvm::ffi::TensorView buf_x_sf,
       const tvm::ffi::TensorView buf_topk_idx,
-      const tvm::ffi::TensorView buf_topk_weights) {
+      const tvm::ffi::TensorView buf_topk_weights,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> shared_x_sf,
+      const int64_t shared_block_m) {
     using namespace host;
 
     auto device = SymbolicDevice{};
@@ -232,6 +248,21 @@ struct MegaMoEPreDispatchKernel {
         "hidden above 8192 must be a multiple of 256 so the tail quant chunks fill whole warps");
     RuntimeCheck(block_size >= top_k, "top_k must fit into one quant CTA");
 
+    int32_t* shared_sf_ptr = nullptr;
+    uint64_t shared_sf_stride = 0;
+    if constexpr (kWriteSharedSF) {
+      RuntimeCheck(kGroupSize == 32, "shared MegaMoE scales require group_size=32");
+      RuntimeCheck(shared_block_m > 0, "shared_block_m must be positive");
+      auto S = SymbolicSize{"shared_sf_rows"};
+      const auto sf = shared_x_sf.value();
+      TensorMatcher({S, G4}).with_strides({1, -1}).with_dtype<int32_t>().with_device(device).verify(sf);
+      const auto rows = (num_tokens + shared_block_m - 1) / shared_block_m * ((shared_block_m + 127) / 128 * 128);
+      RuntimeCheck(S.unwrap() >= rows, "shared scale buffer is too small for shared_block_m");
+      RuntimeCheck(sf.stride(1) >= S.unwrap(), "shared scale columns must not overlap");
+      shared_sf_ptr = static_cast<int32_t*>(sf.data_ptr());
+      shared_sf_stride = sf.stride(1);
+    }
+
     const auto pad_slots = (padded_max - num_tokens) * top_k;
     const uint32_t num_pad_blocks = pad_slots == 0 ? 0u : ((pad_slots + block_size - 1u) / block_size);
     const auto num_total_blocks = num_tokens + num_pad_blocks;
@@ -244,7 +275,10 @@ struct MegaMoEPreDispatchKernel {
         .buf_x_sf = static_cast<int32_t*>(buf_x_sf.data_ptr()),
         .buf_topk_idx = static_cast<int64_t*>(buf_topk_idx.data_ptr()),
         .buf_topk_weights = static_cast<float*>(buf_topk_weights.data_ptr()),
+        .shared_x_sf = shared_sf_ptr,
         .buf_x_sf_stride_bytes = buf_x_sf_stride_bytes,
+        .shared_x_sf_col_stride = shared_sf_stride,
+        .shared_block_m = static_cast<uint32_t>(shared_block_m),
         .num_tokens = num_tokens,
         .padded_max = padded_max,
         .hidden = hidden,

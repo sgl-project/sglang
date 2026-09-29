@@ -183,9 +183,8 @@ impl Runnable for DetokenizerWorker {
         tracing::debug!(shard = self.shard, "detokenizer worker started");
 
         // Plain `recv`: exits when the `DetokMsg` channel closes (every `Senders`
-        // clone gone). On shutdown that happens once the API runtime drop cancels
-        // in-flight handlers (their `AbortGuard`s release the last clones) and
-        // to-scheduler/from-scheduler exit — no shutdown signal needed here.
+        // clone gone). On shutdown that happens once to-scheduler/from-scheduler
+        // exit — frontend calls own only their abort sender, not detok channels.
         while let Ok(msg) = self.rx.recv() {
             match msg {
                 DetokMsg::Register {
@@ -396,12 +395,9 @@ fn handle_chunk(
             }
             let _ = st.fsm.apply(Event::Disconnect);
             // Abort ONLY when the sink is full. `Closed` means the handler future is
-            // already gone, so its `AbortGuard` has run: it aborted and released the
-            // rid. A second abort from here is unordered with respect to that
-            // release, so it lands after a resubmit of the same rid has registered
-            // and deregisters the NEW request — the cross-wiring the rid registry
-            // exists to prevent, reached through the one abort producer that
-            // bypasses the guard's ordering.
+            // already gone, so its `FrontendCall` has queued the abort; do not emit
+            // the same lifecycle event a second time. A full sink still has a live
+            // handler, so the detokenizer must initiate cleanup itself.
             if matches!(e, SinkError::Full) {
                 let _ = abort.send(AbortSource::Detok(rid.clone()));
             }

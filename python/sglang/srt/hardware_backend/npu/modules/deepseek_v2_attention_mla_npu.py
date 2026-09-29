@@ -15,7 +15,7 @@ from sglang.srt.layers.attention.dsa.dsa_npu_indexer import scattered_to_tp_attn
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
 )
-from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.runtime_context import get_disagg
 from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk

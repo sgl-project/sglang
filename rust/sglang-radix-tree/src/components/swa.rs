@@ -22,6 +22,8 @@ use crate::unified_tree_core::{
 pub struct SwaComponent {
     /// Sliding window size in tokens.
     sliding_window_size: usize,
+    /// Per-request rings are rebuilt by the request and do not gate tree reuse.
+    swa_req_ring: bool,
 }
 
 impl SwaComponent {
@@ -43,6 +45,7 @@ impl SwaComponent {
         );
         SwaComponent {
             sliding_window_size,
+            swa_req_ring: params.swa_req_ring,
         }
     }
 
@@ -204,18 +207,6 @@ impl SwaComponent {
             cur_id = cur.parent();
         }
         unbacked
-    }
-
-    fn next_host_unlocked_device_lru_node<K: ChildKeyType>(
-        tree_core: &UnifiedTreeCore<K>,
-        from: Option<NodeIdx_>,
-    ) -> Option<NodeIdx_> {
-        let lru = tree_core.device_lru_list(SWA);
-        let unlocked = |id: NodeIdx_| tree_core.arena.node(id).host_lock_ref(SWA) == 0;
-        match from {
-            Some(node_id) => lru.get_prev_where(node_id, unlocked),
-            None => lru.get_lru_where(unlocked),
-        }
     }
 }
 
@@ -392,13 +383,13 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
 
     fn create_match_validator(
         &self,
-        tree_core: &UnifiedTreeCore<K>,
+        _tree_core: &UnifiedTreeCore<K>,
         match_device_only: bool,
     ) -> Box<dyn FnMut(&UnifiedTreeCore<K>, NodeIdx_) -> bool> {
         let sliding_window_size = self.sliding_window_size;
-        // unified_kv never caches the SWA ring (per-request, not
-        // content-stable), so SWA bookkeeping must not gate the match here.
-        let swa_device_only_hicache = !tree_core.has_swa_host_pool && tree_core.enable_hicache;
+        // A per-request SWA ring is not stored in tree nodes. Its layout, not
+        // the presence of a host tier, determines whether tombstones gate reuse.
+        let swa_req_ring = self.swa_req_ring;
         let mut contiguous_len = usize::MAX;
         Box::new(move |tree_core: &UnifiedTreeCore<K>, node_id: NodeIdx_| {
             let node = tree_core.arena.node(node_id);
@@ -406,7 +397,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             // — load_back will restore SWA from host before use.
             if !node.has_device_value(SWA) && (match_device_only || !node.has_host_value(SWA)) {
                 contiguous_len = 0;
-                return swa_device_only_hicache && (node.backuped() || !node.evicted());
+                return swa_req_ring && (node.backuped() || !node.evicted());
             }
             contiguous_len = contiguous_len.saturating_add(node.key.atom_len());
             contiguous_len >= sliding_window_size
@@ -771,6 +762,13 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             tree_core.component_state(SWA).is_evict_device_ongoing,
             "Swa device eviction not started"
         );
+        assert!(
+            tree_core
+                .component_state(SWA)
+                .evict_device_pending_node
+                .is_none(),
+            "finish the pending internal SWA eviction before advancing"
+        );
         let mut cursor = tree_core.component_state(SWA).evict_device_cursor;
         // The cursor is re-validated (reset to LRU head) if the previous
         // node's eviction removed it.
@@ -779,15 +777,15 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 .device_lru_list(SWA)
                 .get_lru_no_lock(&tree_core.arena);
         }
-        let next = loop {
+        let next = 'step: {
             if tracker[&ct] >= tree_core.component_state(SWA).evict_device_request_cnt {
-                break None;
+                break 'step None;
             }
             let Some(x) = cursor else {
-                break None;
+                break 'step None;
             };
             if !tree_core.device_lru_list(SWA).in_list(Some(x)) {
-                break None;
+                break 'step None;
             }
             assert!(
                 tree_core.arena.has_device_value(x, SWA),
@@ -796,14 +794,35 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             cursor = tree_core
                 .device_lru_list(SWA)
                 .get_prev_no_lock(x, &tree_core.arena);
-            // A load-back pin means an in-flight DMA targets this node's slices.
-            if tree_core.arena.node(x).is_load_back_pending() {
-                continue;
-            }
+            // The SWA LRU filters its own transfer/request locks. A Full load
+            // pin can also cover an ancestor outside the loaded SWA window,
+            // whose separately restored SWA rows remain independently evictable.
             if tree_core.evictable_device_leaves.contains(x) {
-                break Some(x);
+                break 'step Some(x);
             }
-            // Internal nodes are tombstoned inline (no IO).
+            let node = tree_core.arena.node(x);
+            if tree_core.enable_hicache
+                && tree_core.is_write_back
+                && tree_core.has_swa_host_pool
+                && !node.has_host_value(SWA)
+                && !node.has_host_value(FULL)
+                && node.has_device_value(FULL)
+            {
+                // Backup may include several unbacked ancestors. Let the
+                // controller reserve that whole window outside the core lock.
+                let needed = self
+                    .collect_unbacked_swa_nodes_(tree_core, x)
+                    .iter()
+                    .map(|&idx| tree_core.arena.device_value(idx, SWA).numel())
+                    .sum();
+                if needed > 0 {
+                    let node_id = node.id;
+                    let state = tree_core.component_state_mut(SWA);
+                    state.evict_device_pending_node = Some(node_id);
+                    state.evict_device_pending_num_tokens = needed;
+                    break 'step None;
+                }
+            }
             tree_core.evict_component_and_detach_lru_(
                 x,
                 ct,
@@ -813,7 +832,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 Some(tracker),
             );
             tree_core.cascade_evict_(x, ct, tracker, device_frees, host_frees, EvictLayer::Device);
-            break None;
+            None
         };
         tree_core.component_state_mut(SWA).evict_device_cursor = cursor;
         next
@@ -821,41 +840,6 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
 
     fn evict_device_end(&self, tree_core: &mut UnifiedTreeCore<K>) {
         tree_core.set_evict_device_end(SWA);
-    }
-
-    fn reclaim_coexisting_host_values(
-        &self,
-        tree_core: &mut UnifiedTreeCore<K>,
-        num_tokens: usize,
-        tracker: &mut HashMap<ComponentType, usize>,
-        device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-    ) {
-        for spare_imminent_demotes in [true, false] {
-            if tracker[&SWA] >= num_tokens {
-                break;
-            }
-            let mut next = Self::next_host_unlocked_device_lru_node(tree_core, None);
-            while let Some(node_id) = next {
-                if tracker[&SWA] >= num_tokens {
-                    break;
-                }
-                next = Self::next_host_unlocked_device_lru_node(tree_core, Some(node_id));
-                if spare_imminent_demotes && tree_core.evictable_device_leaves.contains(node_id) {
-                    continue;
-                }
-                if !tree_core.can_reclaim_coexisting_host_value_(node_id, SWA) {
-                    continue;
-                }
-                tree_core.release_coexisting_host_value_(
-                    node_id,
-                    SWA,
-                    tracker,
-                    device_frees,
-                    host_frees,
-                );
-            }
-        }
     }
 
     /// Evict SWA host resources.
@@ -886,11 +870,8 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             let x_next = tree_core
                 .host_lru_list(SWA)
                 .get_prev_no_lock(cur, &tree_core.arena);
-            // A load-back pin means an in-flight DMA reads this node's host slices.
-            if tree_core.arena.node(cur).is_load_back_pending() {
-                x = x_next;
-                continue;
-            }
+            // The host LRU filters SWA's own locks. A Full load-back pin may
+            // cover an ancestor outside the SWA transfer window.
             if tree_core.evictable_host_leaves.contains(cur) {
                 tree_core.evict_host_leaf_(cur, tracker, device_frees, host_frees);
             } else {
