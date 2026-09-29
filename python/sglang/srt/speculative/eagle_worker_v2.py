@@ -1025,6 +1025,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
             dsa_topk_indices=prefill_dsa_topk,
+            cuda_graph_compatible=not (seed_from_extend and prefill_dsa_topk is None),
         )
 
     def _get_dsa_extend_topk_buf(self, num_tokens: int) -> torch.Tensor:
@@ -1194,6 +1195,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             next_draft_input.draft_probs = ret_draft_probs
         if self.seed_dsa_topk_from_draft_extend:
             next_draft_input.dsa_topk_indices = dsa_seed_topk_indices
+        next_draft_input.cuda_graph_compatible = not (
+            self.seed_dsa_topk_from_draft_extend and dsa_seed_topk_indices is None
+        )
 
 
 class EAGLEWorkerV2(BaseSpecWorker):
@@ -1511,7 +1515,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
         """Run draft, target, and draft-extend with each rank's local mode."""
         rank = get_parallel().attn_dp_rank
         target_local_only = len(batch.global_num_tokens) == 1
-        draft_local_only = target_local_only or self.draft_worker.draft_owns_attention
+        # The draft MoE A2A backend may gather differently from the target.
+        draft_local_only = (
+            target_local_only
+            if batch.draft_global_num_tokens is None
+            else len(batch.draft_global_num_tokens) == 1
+        ) or self.draft_worker.draft_owns_attention
         is_prefill = batch.forward_mode.is_extend()
         draft_batch = batch
         if is_prefill:
