@@ -653,7 +653,16 @@ class TestDcpStorage(unittest.TestCase):
         self.assertEqual([b._evictor._total_bytes for b in readers], [2, 2, 0, 0])
 
     def test_attachment_guards(self):
-        for case in ("backend", "non_mla", "dummy", "split", "scales", "extra_pool"):
+        for case in (
+            "backend",
+            "non_mla",
+            "dummy",
+            "split",
+            "scales",
+            "extra_pool",
+            "file",
+            "mooncake",
+        ):
             host = MLATokenToKVPoolHost.__new__(MLATokenToKVPoolHost)
             host.kv_buffer = None if case == "dummy" else object()
             host.layout = "page_first"
@@ -668,17 +677,28 @@ class TestDcpStorage(unittest.TestCase):
             cc.mem_pool_host = SimpleNamespace(
                 entries=[host] * (2 if case == "extra_pool" else 1)
             )
-            cc._stop_storage_threads = mock.Mock()
+            accepted = case in ("file", "mooncake")
+            cc._stop_storage_threads = mock.Mock(
+                side_effect=RuntimeError("past validation") if accepted else None
+            )
             with (
                 self.subTest(case=case),
                 mock.patch(
                     "sglang.srt.managers.cache_controller.get_parallel",
                     return_value=SimpleNamespace(attn_dcp_size=2),
                 ),
-                self.assertRaises(NotImplementedError),
+                self.assertRaisesRegex(RuntimeError, "previous detach")
+                if accepted
+                else self.assertRaises(NotImplementedError),
             ):
-                cc.attach_storage_backend("mooncake" if case == "backend" else "file")
-            cc._stop_storage_threads.assert_not_called()
+                cc.attach_storage_backend(
+                    "nixl"
+                    if case == "backend"
+                    else "mooncake"
+                    if case == "mooncake"
+                    else "file"
+                )
+            self.assertEqual(cc._stop_storage_threads.call_count, int(accepted))
             self.assertFalse(cc.enable_storage)
 
 

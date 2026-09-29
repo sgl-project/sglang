@@ -230,7 +230,7 @@ class TestDcpStoragePages(CustomTestCase):
                 physical_page(expected, 5).copy_(physical_page(source.kv_buffer, 3))
                 torch.testing.assert_close(target.kv_buffer, expected, rtol=0, atol=0)
 
-    def test_invalid_logical_starts_and_zero_copy_are_rejected(self):
+    def test_invalid_logical_starts_are_rejected(self):
         pool = _make_host_pool(1, dcp_size=2, layout="page_first")
         for index in (-128, 1, 64):
             with self.subTest(index=index), self.assertRaises(ValueError):
@@ -239,6 +239,42 @@ class TestDcpStoragePages(CustomTestCase):
                 pool.set_from_flat_data_page(index, pool.get_dummy_flat_data_page())
         with self.assertRaises(IndexError):
             pool.get_data_page(pool.logical_size)
+
+    def test_zero_copy_uses_physical_pages(self):
+        for layout in ("layer_first", "page_first", "page_first_direct"):
+            with self.subTest(layout=layout):
+                pool = _make_host_pool(
+                    1, dcp_size=2, layout=layout, dtype=torch.bfloat16
+                )
+                indices = torch.cat(
+                    [torch.arange(p * 128, (p + 1) * 128) for p in (3, 0)]
+                )
+                pointers, sizes = pool.get_page_buffer_meta(indices)
+                views = []
+                for page in (3, 0):
+                    if layout == "layer_first":
+                        views.extend(
+                            pool.kv_buffer[layer, page * 64 : (page + 1) * 64]
+                            for layer in range(2)
+                        )
+                    elif layout == "page_first":
+                        views.append(pool.kv_buffer[page * 64 : (page + 1) * 64])
+                    else:
+                        views.append(pool.kv_buffer[page])
+                self.assertEqual(pointers, [view.data_ptr() for view in views])
+                self.assertEqual(
+                    sizes, [view.numel() * view.element_size() for view in views]
+                )
+                self.assertEqual(sum(sizes), 2 * 64 * 2 * 12 * 2)
+
+    def test_zero_copy_rejects_invalid_pages_and_split_buffers(self):
+        pool = _make_host_pool(1, dcp_size=2, layout="page_first")
+        with self.assertRaises(AssertionError):
+            pool.get_page_buffer_meta(torch.arange(64))
+        for start in (-128, 1, 64, pool.logical_size):
+            with self.subTest(start=start), self.assertRaises((ValueError, IndexError)):
+                pool.get_page_buffer_meta(torch.arange(start, start + 128))
+        pool.layout = "page_first_kv_split"
         with self.assertRaises(NotImplementedError):
             pool.get_page_buffer_meta(torch.arange(128))
 
