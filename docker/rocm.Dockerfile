@@ -586,6 +586,12 @@ RUN git clone ${AITER_REPO} \
     git revert --no-edit --no-commit e708f6c15; \
  fi
 
+# ROCm/aiter#5195's .co with a mask assembled in between the q rows sharing a
+# tile, which the grouped dsv4 decode needs; bit-identical at max_seqlen_q=1.
+COPY --from=local_src \
+     /src/python/sglang/kernels/ops/attention/dsv4/asm/gfx950/mla_v4/mla_a8w8_qh64_qseqlen1_gqaratio64_nm.co \
+     /sgl-workspace/aiter/hsa/gfx950/mla_v4/
+
 # The pinned AITER revision uses std::optional in topk_per_row_kernels.cu without
 # including <optional>: ROCm/aiter#4702 removed the torch headers that previously
 # supplied it transitively. ROCm 7.0 therefore fails module_top_k_per_row, while
@@ -787,7 +793,7 @@ RUN echo "LC_ALL=en_US.UTF-8" >> /etc/environment
 
 RUN /bin/bash -lc 'set -euo pipefail; \
   echo "[TileLang] Building TileLang for ${GPU_ARCH}"; \
-  # System dependencies (NO llvm-dev to avoid llvm-config-16 shadowing)
+  # System dependencies
   apt-get update && apt-get install -y --no-install-recommends \
       build-essential git wget curl ca-certificates gnupg \
       libgtest-dev libgmock-dev \
@@ -816,30 +822,6 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   "$VENV_PIP" install --upgrade "setuptools>=77.0.3,<80" wheel "cmake==4.3.4" ninja scikit-build-core && \
   "$VENV_PIP" cache purge || true; \
   \
-  # Locate ROCm llvm-config; fallback to installing LLVM 18 if missing
-  LLVM_CONFIG_PATH=""; \
-  for p in /opt/rocm/llvm/bin/llvm-config /opt/rocm/llvm-*/bin/llvm-config /opt/rocm-*/llvm*/bin/llvm-config; do \
-    if [ -x "$p" ]; then LLVM_CONFIG_PATH="$p"; break; fi; \
-  done; \
-  if [ -z "$LLVM_CONFIG_PATH" ]; then \
-    echo "[TileLang] ROCm llvm-config not found; installing LLVM 18..."; \
-    curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o /etc/apt/keyrings/llvm.gpg; \
-    echo "deb [signed-by=/etc/apt/keyrings/llvm.gpg] http://apt.llvm.org/jammy/ llvm-toolchain-jammy-18 main" > /etc/apt/sources.list.d/llvm.list; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends llvm-18; \
-    rm -rf /var/lib/apt/lists/*; \
-    LLVM_CONFIG_PATH="$(command -v llvm-config-18)"; \
-    if [ -z "$LLVM_CONFIG_PATH" ]; then echo "ERROR: llvm-config-18 not found after install"; exit 1; fi; \
-  fi; \
-  echo "[TileLang] Using LLVM_CONFIG at: $LLVM_CONFIG_PATH"; \
-  export PATH="$(dirname "$LLVM_CONFIG_PATH"):/usr/local/bin:${PATH}"; \
-  export LLVM_CONFIG="$LLVM_CONFIG_PATH"; \
-  \
-  # Optional shim for tools that expect llvm-config-16
-  mkdir -p /usr/local/bin && \
-  printf "#!/usr/bin/env bash\nexec \"%s\" \"\$@\"\n" "$LLVM_CONFIG_PATH" > /usr/local/bin/llvm-config-16 && \
-  chmod +x /usr/local/bin/llvm-config-16; \
-  \
   # TVM Python bits need Cython + z3 before configure.
   # Pin z3-solver==4.15.4.0: 4.15.4.0 has a manylinux wheel; 4.15.5.0 has no wheel and builds from source (fails: C++20 <format> needs GCC 14+, image has GCC 11).
   "$VENV_PIP" install --no-cache-dir "cython>=0.29.36,<3.0" "apache-tvm-ffi @ git+https://github.com/apache/tvm-ffi.git@37d0485b2058885bf4e7a486f7d7b2174a8ac1ce" "z3-solver==4.15.4.0"; \
@@ -855,7 +837,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   else \
     export ROCM_PATH=/opt/rocm; \
   fi; \
-  export CMAKE_ARGS="-DUSE_CUDA=OFF -DUSE_ROCM=ON -DROCM_PATH=${ROCM_PATH} -DLLVM_CONFIG=${LLVM_CONFIG} -DSKBUILD_SABI_VERSION= ${CMAKE_ARGS:-}" && \
+  export CMAKE_ARGS="-DUSE_CUDA=OFF -DUSE_ROCM=ON -DROCM_PATH=${ROCM_PATH} -DSKBUILD_SABI_VERSION= ${CMAKE_ARGS:-}" && \
   "$VENV_PIP" install -e . -v --no-build-isolation --no-deps; \
   if [ -f pyproject.toml ]; then sed -i "/^[[:space:]]*\"torch/d" pyproject.toml || true; fi; \
   "$VENV_PIP" cache purge || true; \

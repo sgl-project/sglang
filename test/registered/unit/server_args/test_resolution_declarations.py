@@ -95,7 +95,6 @@ _REACHED_BY_SHAPES = frozenset(
         "flashinfer_allreduce_fusion_backend",
         "grammar_backend",
         "hicache_ratio",
-        "keep_mm_feature_on_device",
         "load_balance_method",
         "max_running_requests",
         "mem_fraction_static",
@@ -283,7 +282,9 @@ class TestResolutionDeclarations(CustomTestCase):
         from sglang.srt.runtime_context import publish, reset_context
 
         mapping = namespace_of(ServerArgs)
-        self.assertGreater(len(mapping), 400, "the namespace mapping collapsed")
+        self.assertEqual(
+            set(mapping), {field.name for field in msgspec.structs.fields(ServerArgs)}
+        )
 
         self.assertEqual(
             set(),
