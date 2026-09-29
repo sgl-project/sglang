@@ -105,6 +105,34 @@ class TestFp8MoeAiterShuffleFollowsRunner(unittest.TestCase):
             self.assertTrue(weight.is_shuffled)
         self.assertFalse(layer._aiter_gate_up_interleaved)
 
+    def test_non_fnuz_experts_for_the_triton_runner_are_not_shuffled(self):
+        loaded = _bytes(_moe(None)[1])
+        for runner_backend in (MoeRunnerBackend.TRITON, None):
+            with self.subTest(runner_backend=runner_backend):
+                self.shuffle.reset_mock()
+                layer = self._finalize(runner_backend, use_aiter=True, fnuz=False)
+                self.shuffle.assert_not_called()
+                for name in WEIGHTS:
+                    weight = getattr(layer, name)
+                    self.assertEqual(weight.dtype, torch.float8_e4m3fn)
+                    self.assertFalse(getattr(weight, "is_shuffled", False))
+                self._assert_same_bytes(layer, loaded)
+
+    def test_non_fnuz_experts_for_the_aiter_runner_are_shuffled(self):
+        _, loaded = _moe(None)
+        layer = self._finalize(MoeRunnerBackend.AITER, use_aiter=True, fnuz=False)
+        self.assertEqual(self.shuffle.call_count, 2)
+        for name in WEIGHTS:
+            weight = getattr(layer, name)
+            self.assertTrue(weight.is_shuffled)
+            torch.testing.assert_close(
+                weight.view(torch.uint8),
+                _shuffle(getattr(loaded, name), (16, 16)).view(torch.uint8),
+                rtol=0,
+                atol=0,
+            )
+        self.assertFalse(layer._aiter_gate_up_interleaved)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1987,16 +1987,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight.is_shuffled = True
                 layer._aiter_gate_up_interleaved = False
         elif _use_aiter:
-            # Pre-shuffle weights
-            t = shuffle_weight(layer.w13_weight, (16, 16))
-            layer.w13_weight.copy_(t)
-            del t
-            t = shuffle_weight(layer.w2_weight, (16, 16))
-            layer.w2_weight.copy_(t)
-            del t
-            layer.w13_weight.is_shuffled = True
-            layer.w2_weight.is_shuffled = True
-            layer._aiter_gate_up_interleaved = False
+            if runner_is_aiter:
+                # Pre-shuffle weights
+                t = shuffle_weight(layer.w13_weight, (16, 16))
+                layer.w13_weight.copy_(t)
+                del t
+                t = shuffle_weight(layer.w2_weight, (16, 16))
+                layer.w2_weight.copy_(t)
+                del t
+                layer.w13_weight.is_shuffled = True
+                layer.w2_weight.is_shuffled = True
+                layer._aiter_gate_up_interleaved = False
         elif _is_cpu:
             assert _is_cpu_amx_available, (
                 "Fp8MoEMethod on CPU requires that CPU has AMX support"
