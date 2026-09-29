@@ -49,7 +49,7 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
 
   m.def(
       "deepseek_v4_topk_transform_512(Tensor scores, Tensor seq_lens, Tensor page_table, Tensor! "
-      "page_indices, int page_size, Tensor!? raw_indices) -> ()");
+      "page_indices, int page_size, Tensor!? raw_indices, bool sort_output=False) -> ()");
   m.impl("deepseek_v4_topk_transform_512", torch::kCUDA, &deepseek_v4_topk_transform_512);
 
   m.def(
