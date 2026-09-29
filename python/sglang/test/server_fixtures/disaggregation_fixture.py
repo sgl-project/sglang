@@ -97,8 +97,8 @@ class PDDisaggregationServerBase(CustomTestCase):
         cls._ucx_net_devices_set = False
         if is_in_ci():
             cls.transfer_backend = ["--disaggregation-transfer-backend", "mooncake"]
+            _check_rdma_openable()
             ib_devices = get_rdma_devices_args()
-            _check_ib_devices_openable(ib_devices)
             cls.rdma_devices = ["--disaggregation-ib-device", ib_devices]
             cls._mc_gid_index_set = _maybe_set_roce_gid_index(ib_devices)
             cls._ucx_net_devices_set = _maybe_set_ucx_net_devices(ib_devices)
@@ -121,9 +121,7 @@ class PDDisaggregationServerBase(CustomTestCase):
         """`--disaggregation-ib-device` args for a server pinned to these GPUs."""
         if not is_in_ci():
             return cls.rdma_devices
-        ib_devices = get_rdma_devices_args(gpu_indices)
-        _check_ib_devices_openable(ib_devices)
-        return ["--disaggregation-ib-device", ib_devices]
+        return ["--disaggregation-ib-device", get_rdma_devices_args(gpu_indices)]
 
     # Subclasses can set these to customize server args
     extra_prefill_args = []
@@ -429,29 +427,15 @@ def _ibverbs_device_names() -> Optional[set]:
         lib.ibv_free_device_list(devices)
 
 
-def _check_ib_devices_openable(ib_devices: str) -> None:
-    """Fail fast when RDMA devices exist in sysfs but ibverbs cannot open them.
-
-    Mooncake then silently falls back to its TCP transport, and PD tests fail
-    minutes later with KV transfer errors under load instead of at setup.
-    """
-    present = [
-        d
-        for d in ib_devices.split(",")
-        if d and os.path.isdir(os.path.join(_IB_SYSFS, d))
-    ]
-    if not present:
+def _check_rdma_openable() -> None:
+    """Fail fast when sysfs lists RDMA devices but ibverbs can open none of them;
+    Mooncake then silently falls back to TCP and PD transfers fail under load."""
+    if not os.path.isdir(_IB_SYSFS) or not os.listdir(_IB_SYSFS):
         return
-    openable = _ibverbs_device_names()
-    if openable is None:
-        logger.warning("libibverbs is not loadable; skipping the RDMA device check")
-        return
-    missing = [d for d in present if d not in openable]
-    if missing:
+    if _ibverbs_device_names() == set():
         raise RuntimeError(
-            f"RDMA devices {missing} are listed in {_IB_SYSFS} but ibverbs can "
-            f"open only {sorted(openable)}; Mooncake would fall back to TCP. "
-            "Check that the runner container can access /dev/infiniband."
+            f"RDMA devices are listed in {_IB_SYSFS} but ibverbs can open none; "
+            "Mooncake would fall back to TCP. Check /dev/infiniband in the container."
         )
 
 
