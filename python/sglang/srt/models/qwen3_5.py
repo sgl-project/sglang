@@ -118,6 +118,7 @@ from sglang.srt.models.utils import (
 )
 from sglang.srt.runtime_context import (
     get_exec,
+    get_forward,
     get_lora,
     get_parallel,
     get_stream,
@@ -278,10 +279,6 @@ def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
 
 def _fp8_tuple_input(linear: nn.Module, num_tokens: int) -> bool:
     """Whether the producer hands ``linear`` a per-token FP8 (q, scale) pair (SGLANG_ROCM_SMALLM_FP8_PROJ)."""
-    # Bound here, not via the module import. Main dropped that import, and this
-    # branch never edits it, so a merge would leave the call below undefined.
-    from sglang.srt.runtime_context import get_forward
-
     scheme = getattr(linear, "scheme", None)
     return (
         _use_aiter

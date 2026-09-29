@@ -89,7 +89,7 @@ class TestSmallMFp8ProjGfx950(CustomTestCase):
             {"qscheme": "per_channel"}, {"qscheme": "per_channel", "is_dynamic": True}
         )
         fwd = types.SimpleNamespace(sp_active=False)
-        with patch("sglang.srt.runtime_context.get_forward", return_value=fwd):
+        with patch.object(qwen3_5, "get_forward", return_value=fwd):
             fp8_in = qwen3_5._fp8_tuple_input
             self.assertTrue(fp8_in(types.SimpleNamespace(scheme=scheme), 40))
             self.assertFalse(fp8_in(types.SimpleNamespace(scheme=scheme), 41))
