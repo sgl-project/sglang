@@ -39,13 +39,10 @@ from sglang.srt.layers.quantization.quark.utils import (
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import (
-    get_bool_env_var,
     get_device_capability,
     is_gfx95_supported,
     is_hip,
 )
-
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -450,8 +447,23 @@ class QuarkConfig(QuantizationConfig):
 
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
+        matched_config = self._find_matched_config(prefix, layer)
+
+        if isinstance(layer, FusedMoE) and self.shared_expert_needs_online_mxfp4():
+            # Checked here rather than in get_moe_scheme because block-FP8 MoE
+            # layers are dispatched to Fp8MoEMethod below and never reach it.
+            if not self._is_mx_fp4(
+                matched_config.get("weight"), matched_config.get("input_tensors")
+            ):
+                raise NotImplementedError(
+                    f"{prefix} does not use the W4A4 MXFP4 MoE scheme, which is "
+                    "the only one that can quantize a BF16 shared expert into the "
+                    "fused slot. Unset SGLANG_FUSE_SHARED_EXPERTS_ONLINE_MXFP4 to "
+                    "run this checkpoint with a standalone shared expert."
+                )
+
         block_fp8_config = self._get_block_fp8_config(
-            self._find_matched_config(prefix, layer), self.packed_modules_mapping
+            matched_config, self.packed_modules_mapping
         )
         if block_fp8_config is not None:
             if isinstance(layer, LinearBase):
@@ -1006,14 +1018,6 @@ class QuarkConfig(QuantizationConfig):
                 dequantization_config=self.dequantization_config,
                 quantize_shared_expert_online=self.shared_expert_needs_online_mxfp4(),
             )
-        if self.shared_expert_needs_online_mxfp4():
-            raise NotImplementedError(
-                f"{layer_name} does not use the W4A4 MXFP4 MoE scheme, which is "
-                "the only one that can quantize a BF16 shared expert into the "
-                "fused slot. Unset SGLANG_FUSE_SHARED_EXPERTS_ONLINE_MXFP4 to "
-                "run this checkpoint with a standalone shared expert."
-            )
-
         if self._is_mx_w4a8(weight_config, input_config):
             logger.info_once("Using Quark MXFP4-W/FP8-A MoE scheme")
             return QuarkW4A8MXFp4MoE(weight_config, input_config)
@@ -1073,7 +1077,8 @@ class QuarkConfig(QuantizationConfig):
         non-MXFP4 global spec conservatively disables fusion.
         """
         if not (
-            _use_aiter
+            envs.SGLANG_USE_AITER.get()
+            and is_hip()
             and is_gfx95_supported()
             and self.is_prequantized
             and envs.SGLANG_FUSE_SHARED_EXPERTS_ONLINE_MXFP4.get()
@@ -1107,6 +1112,8 @@ class QuarkConfig(QuantizationConfig):
         )
 
     def can_fuse_shared_expert(self) -> bool:
+        # An excluded shared-expert body cannot match the routed spec, so
+        # fusing it is only possible by quantizing it online.
         if self.shared_expert_excluded_from_quant():
             return self.shared_expert_online_mxfp4_supported()
 

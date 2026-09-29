@@ -117,7 +117,7 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             )
 
         if self.quantize_shared_expert_online:
-            logger.info_once(
+            logger.warning_once(
                 "Quantizing the BF16 shared expert to MXFP4 while loading so it can be fused "
                 "into the routed experts. Beware that this optimization may degrade prediction "
                 "quality - please validate your model accuracy. Unset "
@@ -224,14 +224,21 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             },
         )
 
+        if self.quantize_shared_expert_online and getattr(
+            layer, "_has_fused_shared", False
+        ):
+            if intermediate_size_per_partition % OCP_MX_BLOCK_SIZE:
+                raise ValueError(
+                    f"Quantizing the shared expert at load time needs an "
+                    f"intermediate size per partition that is a multiple of the "
+                    f"MX block size {OCP_MX_BLOCK_SIZE}, got "
+                    f"{intermediate_size_per_partition}. Otherwise a block of the "
+                    f"down projection would straddle a TP rank boundary and the "
+                    f"fused slot would not match an offline-quantized checkpoint."
+                )
+
         if self.is_checkpoint_mxfp4_serialized:
             weight_loader = original_weight_loader
-            if self.quantize_shared_expert_online and getattr(
-                layer, "_has_fused_shared", False
-            ):
-                weight_loader = self.get_online_shared_expert_weight_loader(
-                    layer, original_weight_loader
-                )
             weight_device = torch.get_default_device()
             weight_dtype = torch.uint8
         else:
@@ -623,91 +630,21 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
 
         return online_mxfp4_moe_weight_loader
 
-    def get_online_shared_expert_weight_loader(self, layer, original_weight_loader):
-        """Loader for an MXFP4 checkpoint whose shared-expert body is BF16.
+    def quantize_shared_expert(
+        self, loaded_weight: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantize an unquantized shared-expert projection to MXFP4.
 
-        The routed experts are serialized MXFP4 and load unchanged. Only the
-        fused shared slot arrives in higher precision, and it cannot be copied
-        into the packed FP4 buffers as it stands, so it is quantized here.
+        The whole tensor is quantized and the caller shards the packed result,
+        so every rank produces the bytes an offline-quantized checkpoint would
+        carry for its own shard.
         """
-
-        def online_shared_expert_weight_loader(
-            param: torch.nn.Parameter,
-            loaded_weight: torch.Tensor,
-            weight_name: str,
-            shard_id: str,
-            expert_id: int | None,
-        ):
-            if (
-                expert_id is None
-                or expert_id < layer._num_global_routed
-                or not loaded_weight.is_floating_point()
-            ):
-                original_weight_loader(
-                    param, loaded_weight, weight_name, shard_id, expert_id
-                )
-                return
-
-            if dynamic_mxfp4_quant is None:
-                raise NotImplementedError(
-                    "Fusing a BF16 shared expert into MXFP4 routed experts needs "
-                    "aiter's dynamic_mxfp4_quant, which is AMD ROCm only."
-                )
-
-            self._load_shared_expert_as_mxfp4(
-                layer,
-                loaded_weight,
-                shard_id,
-                expert_id - layer._num_global_routed + layer._num_local_routed,
+        if dynamic_mxfp4_quant is None:
+            raise NotImplementedError(
+                "Fusing an unquantized shared expert into MXFP4 routed experts "
+                "needs aiter's dynamic_mxfp4_quant, which is AMD ROCm only."
             )
-
-        return online_shared_expert_weight_loader
-
-    def _load_shared_expert_as_mxfp4(
-        self,
-        layer,
-        loaded_weight: torch.Tensor,
-        shard_id: str,
-        expert_id: int,
-    ) -> None:
-        """Quantize one shared-expert projection into its fused slot.
-
-        A rank only ever sees its own shard, so it can only reproduce the values
-        an offline-quantized checkpoint would carry if no MX block straddles a
-        rank boundary. MX blocks run along K: for gate/up K is the hidden size,
-        which TP leaves whole, and for down K is the intermediate size, which TP
-        does split -- but only at multiples of the block size.
-        """
-        if shard_id == "w2":
-            weight, scale = layer.w2_weight, layer.w2_weight_scale
-            shard_size = weight.shape[2] * 2 - layer.intermediate_pad
-            if shard_size % OCP_MX_BLOCK_SIZE:
-                raise ValueError(
-                    f"Shared-expert down projection shard of {shard_size} columns "
-                    f"is not a multiple of the MX block size {OCP_MX_BLOCK_SIZE}, "
-                    "so a block would straddle a TP rank boundary and the fused "
-                    "slot would not match an offline-quantized checkpoint."
-                )
-            source = loaded_weight.narrow(1, shard_size * layer.moe_tp_rank, shard_size)
-            row_start, row_stop = 0, weight.shape[1]
-        else:
-            weight, scale = layer.w13_weight, layer.w13_weight_scale
-            half = weight.shape[1] // 2
-            shard_size = half - layer.intermediate_pad
-            source = loaded_weight.narrow(0, shard_size * layer.moe_tp_rank, shard_size)
-            row_start = 0 if shard_id == "w1" else half
-            row_stop = row_start + half
-
-        qweight, qscale = dynamic_mxfp4_quant(source.to(layer._load_device))
-
-        weight.data[expert_id, row_start:row_stop].zero_()
-        scale.data[expert_id, row_start:row_stop].zero_()
-        weight.data[
-            expert_id, row_start : row_start + qweight.shape[0], : qweight.shape[1]
-        ] = qweight
-        scale.data[
-            expert_id, row_start : row_start + qscale.shape[0], : qscale.shape[1]
-        ] = qscale
+        return dynamic_mxfp4_quant(loaded_weight.to(torch.get_default_device()))
 
     def get_online_fp8_to_mxfp4_weight_loader(self, layer, original_weight_loader):
         """

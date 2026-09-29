@@ -10,7 +10,7 @@ import unittest
 from contextlib import contextmanager
 from copy import deepcopy
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -533,7 +533,8 @@ class TestSharedExpertOnlineMxfp4Gate(CustomTestCase):
     def _online_quant_available(use_aiter=True, gfx95=True, flag=True):
         """Pretend this is an aiter + gfx95 build with the opt-in flag set."""
         with (
-            patch.object(quark_config_mod, "_use_aiter", use_aiter),
+            envs.SGLANG_USE_AITER.override(use_aiter),
+            patch.object(quark_config_mod, "is_hip", return_value=True),
             patch.object(quark_config_mod, "is_gfx95_supported", return_value=gfx95),
             envs.SGLANG_FUSE_SHARED_EXPERTS_ONLINE_MXFP4.override(flag),
         ):
@@ -692,6 +693,10 @@ class TestSharedExpertOnlineMxfp4Gate(CustomTestCase):
         # can_fuse_shared_expert() answers once for the whole model off layer 0,
         # but the fused slot lives in every MoE layer. A later layer routed to a
         # different scheme must fail loudly, not serve corrupted weights.
+        # Checked in get_quant_method rather than get_moe_scheme: block-FP8 MoE
+        # layers are dispatched to Fp8MoEMethod and never reach the latter.
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
         config = self._config(
             exclude_layers=["model.layers.0.mlp.shared_expert.gate_proj"],
             layer_quant_config={"model.layers.3.mlp.experts": _FP8_MOE_SPEC},
@@ -699,7 +704,9 @@ class TestSharedExpertOnlineMxfp4Gate(CustomTestCase):
         with self._online_quant_available():
             self.assertTrue(config.shared_expert_needs_online_mxfp4())
             with self.assertRaisesRegex(NotImplementedError, "W4A4 MXFP4 MoE scheme"):
-                config.get_moe_scheme(torch.nn.Module(), "model.layers.3.mlp.experts")
+                config.get_quant_method(
+                    MagicMock(spec=FusedMoE), "model.layers.3.mlp.experts"
+                )
 
 
 if __name__ == "__main__":
