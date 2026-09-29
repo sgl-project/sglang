@@ -1196,6 +1196,33 @@ class DeepseekV4AttnBackend(
 
         self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
         self.is_draft_runner = model_runner.is_draft_worker
+        self.packed_prefill_policy = None
+        if (
+            envs.SGLANG_DSV41_PACKED_PREFILL.get()
+            and self.is_dsv41
+            and not self.is_draft_runner
+            and get_parallel().attn_cp_size == 1
+        ):
+            from sglang.srt.layers.attention.dsv4.packed_prefill import (
+                PackedPrefillPolicy,
+            )
+
+            self.packed_prefill_policy = PackedPrefillPolicy(
+                self.device,
+                mixed_min_rows=envs.SGLANG_DSV41_PACKED_PREFILL_MIXED_MIN_ROWS.get(),
+                swa_min_rows=envs.SGLANG_DSV41_PACKED_PREFILL_SWA_MIN_ROWS.get(),
+            )
+            if self.packed_prefill_policy.supported_gpu:
+                # Import the extension before inspecting its registered operators.
+                from sgl_kernel import flashmla_ops  # noqa: F401
+
+            if self.packed_prefill_policy.supported_gpu and not hasattr(
+                torch.ops.sgl_kernel, "packed_sparse_prefill_output"
+            ):
+                raise RuntimeError(
+                    "Packed prefill requires an SM100 sgl-kernel build with "
+                    "the FlashMLA packed prefill API. Rebuild sgl-kernel."
+                )
         self._verify_mask = None
         self.cuda_graph_swa_out_cache_loc: Optional[torch.Tensor] = None
 
@@ -3401,6 +3428,7 @@ class DeepseekV4AttnBackend(
                     )
                 return self._forward_prefill_sparse(
                     q=q,
+                    real_heads=layer.tp_q_head_num,
                     layer_id=layer_id,
                     compress_ratio=compress_ratio,
                     forward_batch=forward_batch,
@@ -3508,6 +3536,7 @@ class DeepseekV4AttnBackend(
     def _forward_prefill_sparse(
         self,
         q: torch.Tensor,
+        real_heads: int,
         layer_id: int,
         compress_ratio: Literal[0, 1, 2, 4, 128],
         forward_batch: ForwardBatch,
@@ -3572,6 +3601,25 @@ class DeepseekV4AttnBackend(
             layout=token_to_kv_pool.get_swa_key_layout(),
         )
         kv = workspace
+
+        if (
+            self.packed_prefill_policy is not None
+            and self.packed_prefill_policy.can_use(
+                q_flat,
+                combined_indices,
+                real_heads=real_heads,
+            )
+        ):
+            from sgl_kernel.flash_mla import flash_mla_packed_sparse_output
+
+            return flash_mla_packed_sparse_output(
+                q_flat[:, :16],
+                kv,
+                combined_indices,
+                combined_lens,
+                self.softmax_scale,
+                attn_sink[:16] if attn_sink is not None else None,
+            )
 
         o, _, _ = flash_mla_sparse_fwd(
             q=q_flat,

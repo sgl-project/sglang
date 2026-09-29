@@ -1,9 +1,9 @@
 # flash_mla
-# DeepSeek v4.1 kernels merged into the SGLang fork (sgl-project/FlashMLA@3e18517).
+# FlashMLA includes the 16-head BF16 packed sparse prefill API.
 FetchContent_Declare(
     repo-flashmla
-    URL      https://${GITHUB_ARTIFACTORY}/sgl-project/FlashMLA/archive/3e18517fb055a6c9608eef5a1f1347fb1a047bbd.tar.gz
-    URL_HASH SHA256=ab2af4657683a1bbaa707a2781a5e2c2792eba574ff36905f1832598e67fea79
+    URL      https://${GITHUB_ARTIFACTORY}/sgl-project/FlashMLA/archive/c15b6ec867c2cbd69c558b11941ee34e0abe8a66.tar.gz
+    URL_HASH SHA256=2bc38de3b7419125ffce3089683c27a0a51cb103ae6623183ed9dc6b7bc6910f
 )
 FetchContent_Populate(repo-flashmla)
 
@@ -132,6 +132,8 @@ if(FLASHMLA_ENABLE_SM100)
         ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu
 
         # sm100 sparse prefill.
+        ${repo-flashmla_SOURCE_DIR}/csrc/api/packed_sparse_prefill.cpp
+        ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/sparse/prepare_packed.cu
         ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/sparse/fwd/head64/instantiations/phase1_h64_k512.cu
         ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/sparse/fwd/head64/instantiations/phase1_h64_k576.cu
         ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k512.cu

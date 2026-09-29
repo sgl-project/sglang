@@ -97,7 +97,54 @@ static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::option
       num_splits);
 }
 
+#ifdef FLASHMLA_ENABLE_SM100
+// Native FlashMLA statistics use natural logs; SGLang's API uses log2.
+std::vector<at::Tensor> packed_sparse_attn_prefill_interface(
+    const at::Tensor&,
+    const at::Tensor&,
+    const at::Tensor&,
+    const at::Tensor&,
+    float,
+    const std::optional<at::Tensor>&);
+
+static std::vector<at::Tensor> sgl_packed_sparse_prefill(
+    const at::Tensor& q,
+    const at::Tensor& kv,
+    const at::Tensor& indices,
+    const at::Tensor& lengths,
+    double scale,
+    const std::optional<at::Tensor>& sink) {
+  auto result = packed_sparse_attn_prefill_interface(q, kv, indices, lengths, static_cast<float>(scale), sink);
+  result[1].mul_(1.4426950408889634);
+  result[2].mul_(1.4426950408889634);
+  return result;
+}
+
+static at::Tensor sgl_packed_sparse_prefill_output(
+    const at::Tensor& q,
+    const at::Tensor& kv,
+    const at::Tensor& indices,
+    const at::Tensor& lengths,
+    double scale,
+    const std::optional<at::Tensor>& sink) {
+  // The native output is independent of the auxiliary statistics' log base.
+  return packed_sparse_attn_prefill_interface(q, kv, indices, lengths, static_cast<float>(scale), sink)[0];
+}
+
+#endif
+
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+#ifdef FLASHMLA_ENABLE_SM100
+  m.def(
+      "packed_sparse_prefill_fwd(Tensor q, Tensor kv, Tensor indices, Tensor lengths, float scale, Tensor? sink=None) "
+      "-> Tensor[]");
+  m.impl("packed_sparse_prefill_fwd", torch::kCUDA, &sgl_packed_sparse_prefill);
+  m.def(
+      "packed_sparse_prefill_output(Tensor q, Tensor kv, Tensor indices, Tensor lengths, float scale, Tensor? "
+      "sink=None) "
+      "-> Tensor");
+  m.impl("packed_sparse_prefill_output", torch::kCUDA, &sgl_packed_sparse_prefill_output);
+#endif
   /*
    * From FlashMLA
    */
