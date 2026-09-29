@@ -2,6 +2,7 @@
 
 import math
 from contextlib import nullcontext
+from dataclasses import dataclass
 from typing import Any, Iterable, Optional, Set, Tuple, Union
 
 import msgspec
@@ -164,6 +165,50 @@ class _PLEBatch(msgspec.Struct, frozen=True):
     state_indices: torch.Tensor
     ngram_context: Optional[torch.Tensor]
     ngram_eos_token_id: Optional[int]
+
+
+@dataclass
+class _BreakablePLEBatch:
+    # eager_on_graph updates this reference; dynamic layouts stay outside graphs.
+    batch: Optional[_PLEBatch]
+
+
+@eager_on_graph(True)
+def _breakable_prepare_ple_batch(input_ids, *, ngram_size, ngram_eos_token_id):
+    return _BreakablePLEBatch(
+        batch=_prepare_ple_batch(
+            input_ids=input_ids,
+            forward_batch=get_tc_piecewise_forward_context().forward_batch,
+            ngram_size=ngram_size,
+            ngram_eos_token_id=ngram_eos_token_id,
+        )
+    )
+
+
+@eager_on_graph(True)
+def _breakable_ple_prefetch(ple, batch):
+    ple.start_prefetch(
+        batch=batch.batch,
+        forward_batch=get_tc_piecewise_forward_context().forward_batch,
+    )
+
+
+@eager_on_graph(True)
+def _breakable_ple_forward(ple, hidden_states, batch):
+    # PLE pads its output to the token bucket after applying the live layout.
+    return ple(
+        hidden_states=hidden_states,
+        forward_batch=get_tc_piecewise_forward_context().forward_batch,
+        batch=batch.batch,
+    )
+
+
+@eager_on_graph(True)
+def _breakable_commit_ple_batch(batch):
+    _commit_ple_batch(
+        batch=batch.batch,
+        forward_batch=get_tc_piecewise_forward_context().forward_batch,
+    )
 
 
 def _prepare_ple_batch(
@@ -1417,7 +1462,7 @@ class Qwen4ExpLayerExtensionMixin:
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
         *,
-        ple_batch: Optional[_PLEBatch],
+        ple_batch: Optional[Union[_PLEBatch, _BreakablePLEBatch]],
     ):
         hc_dim = self.hc_count * self.hidden_size
         if hidden_states.shape[-1] != hc_dim:
@@ -1427,7 +1472,14 @@ class Qwen4ExpLayerExtensionMixin:
             )
 
         if self.ple is not None:
-            if ple_batch is None:
+            if is_in_breakable_cuda_graph() and forward_batch.forward_mode.is_extend():
+                ple_query = (
+                    hidden_states if residual is None else hidden_states + residual
+                )
+                hidden_states = hidden_states + _breakable_ple_forward(
+                    ple=self.ple, hidden_states=ple_query, batch=ple_batch
+                )
+            elif ple_batch is None:
                 if not _get_ple_forward_mode(forward_batch).is_idle():
                     raise RuntimeError(
                         "non-idle Qwen4 PLE forward is missing its batch"
@@ -1816,23 +1868,37 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             # there is no separate residual at a PP boundary (hc_hidden_size contract).
             residual = None
 
-        ple_batch = (
-            _prepare_ple_batch(
-                input_ids,
-                forward_batch,
+        breakable_ple = (
+            self.has_ple
+            and is_in_breakable_cuda_graph()
+            and forward_batch.forward_mode.is_extend()
+        )
+        ple_batch = None
+        if breakable_ple:
+            ple_batch = _breakable_prepare_ple_batch(
+                input_ids=input_ids,
                 ngram_size=self.ple_ngram_size,
                 ngram_eos_token_id=self.ple_ngram_eos_token_id,
             )
-            if self.has_ple
-            else None
-        )
+        elif self.has_ple:
+            ple_batch = _prepare_ple_batch(
+                input_ids=input_ids,
+                forward_batch=forward_batch,
+                ngram_size=self.ple_ngram_size,
+                ngram_eos_token_id=self.ple_ngram_eos_token_id,
+            )
         aux_hidden_states = AuxHiddenStateList()
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             if i + 1 < self.end_layer:
                 next_ple = self.layers[i + 1].ple
                 if next_ple is not None:
-                    next_ple.start_prefetch(ple_batch, forward_batch)
+                    if breakable_ple:
+                        _breakable_ple_prefetch(ple=next_ple, batch=ple_batch)
+                    else:
+                        next_ple.start_prefetch(
+                            batch=ple_batch, forward_batch=forward_batch
+                        )
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 hidden_states, residual = layer(
                     positions=positions,
@@ -1847,7 +1913,10 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                     ),
                 )
 
-        _commit_ple_batch(ple_batch, forward_batch)
+        if breakable_ple:
+            _breakable_commit_ple_batch(batch=ple_batch)
+        else:
+            _commit_ple_batch(batch=ple_batch, forward_batch=forward_batch)
 
         if not self.pp_group.is_last_rank:
             proxy_tensors = {"hidden_states": hidden_states}

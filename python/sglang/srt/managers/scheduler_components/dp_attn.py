@@ -397,6 +397,10 @@ def _local_prefill_cuda_graph_vote(
         is_target_verify=mode.is_target_verify(),
         capture_hidden_mode=None,
         return_logprob=return_logprob,
+        contains_mm_inputs=any(
+            mm_input is not None and mm_input.contains_mm_input()
+            for mm_input in local_batch.multimodal_inputs or ()
+        ),
         lora_ineligible=prefill_graph_runner.enable_lora,
         is_mixed=mode == ForwardMode.MIXED,
         batch_max_context_len=(

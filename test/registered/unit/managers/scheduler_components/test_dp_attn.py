@@ -98,6 +98,7 @@ class TestDecodeToExtendConversionVote(CustomTestCase):
             batch_size=lambda: 2,
             return_logprob=False,
             has_grammar=False,
+            multimodal_inputs=None,
             reqs=[
                 SimpleNamespace(beam_group=Mock() if beam else None),
                 SimpleNamespace(beam_group=None),
@@ -147,6 +148,7 @@ class TestPrefillCudaGraphVote(CustomTestCase):
         batch = SimpleNamespace(
             forward_mode=mode,
             extend_num_tokens=4,
+            multimodal_inputs=None,
             input_embeds=None,
             replace_embeds=None,
             prefix_lens=[1, 1],

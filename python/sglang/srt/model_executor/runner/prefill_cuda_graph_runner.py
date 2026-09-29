@@ -52,6 +52,7 @@ import tqdm
 from sglang.kernels.ops.kvcache.kv_indices import (
     create_chunked_prefix_cache_kv_indices,
 )
+from sglang.srt.configs.model_config import is_qwen4_exp
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.bcg import (
@@ -1241,6 +1242,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         lora_ineligible: bool = False,
         is_mixed: bool = False,
         batch_max_context_len: Optional[int] = None,
+        contains_mm_inputs: bool = False,
     ) -> bool:
         """Rank-local replay eligibility: the single source of truth for
         ``can_run_graph`` (ForwardBatch, forward time) and the dp mlp-sync
@@ -1249,6 +1251,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         ``capture_hidden_mode=None`` when unknown at the call site (it is
         rank-uniform; forward-time-only checking cannot split the group).
         """
+        if (
+            contains_mm_inputs
+            and self.prefill_backend_name == Backend.BREAKABLE
+            and is_qwen4_exp(self.model_runner.model_config.hf_config)
+        ):
+            return False
         if self._is_full_backend and batch_size > self._capture_req_slots:
             return False
         # LoRA replays need prepare_lora_batch's static metadata. lora_manager
@@ -1303,15 +1311,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return True
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
-        if (
-            self.prefill_backend_name == Backend.BREAKABLE
-            and self.model_runner.model_config.hf_config.architectures[0]
-            == "Qwen4ExpForConditionalGeneration"
-            and forward_batch.mm_inputs is not None
-            and any(item is not None for item in forward_batch.mm_inputs)
-        ):
-            # Only the text-only QSA path is validated for this backend.
-            return False
         # DP check: group verdict from the schedule-time all-gather
         # (min-reduced votes; also requires every rank to hold tokens).
         if (
@@ -1340,6 +1339,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             is_target_verify=forward_batch.forward_mode.is_target_verify(),
             capture_hidden_mode=forward_batch.capture_hidden_mode,
             return_logprob=forward_batch.return_logprob,
+            contains_mm_inputs=forward_batch.contains_mm_inputs(),
             lora_ineligible=self.enable_lora
             and not (
                 self._capture_lora
