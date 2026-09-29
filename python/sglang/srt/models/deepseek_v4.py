@@ -3794,7 +3794,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             and forward_batch.dp_padding_mode.is_max_len()
             and get_parallel().tp_size == get_parallel().attn_dp_size
         )
-        mlp_reduce_scatter = _use_cp or _use_reduce_scatterv or _use_reduce_scatter
+        mlp_reduce_scatter = (
+            _use_cp
+            or _use_reduce_scatterv
+            or _use_reduce_scatter
+            or (_use_tp_moe_gather and should_use_dp_reduce_scatterv())
+        )
         # PoC (SGLANG_DP_SHARED_EXPERT_LOCAL): compute the replicated shared expert
         # on LOCAL hidden before the gather and add it back after the combine
         # (reduce_scatterv OR dp_scatter), instead of on the gathered global buffer.

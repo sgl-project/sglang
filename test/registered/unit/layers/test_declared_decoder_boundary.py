@@ -1,3 +1,7 @@
+from sglang.srt.layers.communicator.adapters import branch
+from sglang.srt.layers.communicator.construction import BatchVariant
+from sglang.test.boundary_fixtures import make_test_stages
+
 """The boundaries of an attention and an FFN, chosen from both sides'
 declarations. The FFN runs on the TP group (a dense MLP, or a MoE not
 dispatched per DP shard) or on each attention-TP rank's slice of its DP shard's
@@ -5,8 +9,7 @@ rows (a MoE dispatched per DP shard).
 
 The numeric checks run every rank of a DP x attention-TP world as a thread over
 fake collectives that wait for all members of their group, build the layers'
-communicators for real, and pass them layer facts that fail on any read of
-something else.
+boundaries through the production factories.
 """
 
 import itertools
@@ -17,32 +20,22 @@ from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import msgspec
 import torch
 
 from sglang.srt.layers import communicator as comm
 from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.communicator import (
-    ADD,
-    LayerCommunicator,
-    LayerFacts,
-    MHCLayerCommunicator,
     SumGroup,
     TokenAxis,
 )
 from sglang.srt.layers.communicator import boundary as comm_boundary
-from sglang.srt.layers.communicator import (
-    decoder_layer_sides,
-    input_scattered_layer_sides,
-)
-from sglang.srt.layers.communicator import layer as comm_layer
+from sglang.srt.layers.communicator import construction as comm_layer
+from sglang.srt.layers.communicator import exit as comm_exit
 from sglang.srt.layers.communicator import layout as comm_layout
 from sglang.srt.layers.communicator import ops as comm_ops
-from sglang.srt.layers.communicator import (
-    sequence_parallel_layer_sides,
-)
-from sglang.srt.layers.communicator.residual import batch as residual_batch
+from sglang.srt.layers.communicator.fusions.allreduce import complete_ffn_input
 from sglang.srt.layers.communicator.residual import mhc as mhc_module
+from sglang.srt.layers.communicator.residual.access import finish_layer_stack
 from sglang.srt.layers.communicator.residual.stream import OwedOutput
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.runtime_context import LoRABatchLayout
@@ -83,7 +76,14 @@ def parallel_of(*, attn_dp, attn_tp, attn_cp=1, **overrides):
 
 
 @contextmanager
-def planning(parallel, *, sp=False, a2a=False, dsa_cp=False):
+def planning(
+    parallel,
+    *,
+    sp=False,
+    a2a=False,
+    dsa_cp=False,
+    boundary_reduction="rs+rsv",
+):
     """What layer planning and communicator construction read, without the
     process-wide parallel state. ``parallel`` may be a callable, for a
     per-thread parallel state. ``dsa_cp``: the prefill CP is DSA's (MLA's is
@@ -120,7 +120,8 @@ def planning(parallel, *, sp=False, a2a=False, dsa_cp=False):
         patch_communicator(
             "get_exec",
             lambda: SimpleNamespace(
-                overlap=SimpleNamespace(enable_two_batch_overlap=False)
+                comm=SimpleNamespace(boundary_reduction=boundary_reduction),
+                overlap=SimpleNamespace(enable_two_batch_overlap=False),
             ),
         ),
     ):
@@ -145,49 +146,15 @@ class FusableNorm(Norm):
         raise AssertionError("not run here")
 
 
-class FactsOnly:
-    """Layer facts that fail on any read of something else: construction reads
-    only the layer facts."""
-
-    def __init__(self, **facts):
-        self.__dict__.update(facts)
-
-    def __getattr__(self, name):
-        raise AssertionError(f"read {name!r}, which is not a layer fact")
-
-
-def layer_facts(
+def layer_case(
     layer_id, num_layers, *, sparse=False, previous_sparse=False, next_sparse=False
 ):
-    return FactsOnly(
-        is_layer_sparse=sparse,
-        is_first_layer=layer_id == 0,
-        is_last_layer=layer_id == num_layers - 1,
-        is_previous_layer_sparse=None if layer_id == 0 else previous_sparse,
-        is_next_layer_sparse=next_sparse,
-    )
-
-
-def sides_of(
-    axis_sizes,
-    *,
-    sparse=False,
-    a2a=False,
-    previous_a2a=False,
-    last=False,
-    leaves_next=False,
-    leaves_rs=False,
-):
-    return decoder_layer_sides(
-        axis_sizes=axis_sizes,
-        ffn_on_local_rows=sparse and a2a,
-        previous_on_local_rows=previous_a2a,
-        is_last_layer=last,
-        attention_gathers_local_rows=False,
-        ffn_group=SumGroup.MOE_OUTPUT if sparse else SumGroup.TP,
-        leaves_for_next_layer=leaves_next,
-        leaves_for_reduce_scatter=leaves_rs,
-        leaves_for_reduce_scatterv=leaves_rs or sparse,
+    return dict(
+        sparse=sparse,
+        first=layer_id == 0,
+        last=layer_id == num_layers - 1,
+        previous_sparse=previous_sparse,
+        next_sparse=next_sparse,
     )
 
 
@@ -195,48 +162,32 @@ def build(
     facts,
     parallel,
     *,
-    cls=LayerCommunicator,
     sp=False,
     a2a=False,
     dsa_cp=False,
     **kwargs,
 ):
-    with planning(parallel, sp=sp, a2a=a2a, dsa_cp=dsa_cp):
-        return cls(
-            layer_facts=facts,
-            input_layernorm=Norm(),
-            post_attention_layernorm=Norm(),
+    with planning(
+        parallel,
+        sp=sp,
+        a2a=a2a,
+        dsa_cp=dsa_cp,
+        boundary_reduction=kwargs.pop("boundary_reduction", "rs+rsv"),
+    ):
+        return make_test_stages(
+            **facts,
+            attention_norm=Norm(),
+            ffn_norm=Norm(),
             **kwargs,
         )
 
 
-def planned_facts(
-    layer_id,
-    num_layers,
-    *,
-    sparse,
-    previous_sparse,
-    parallel,
-    a2a=False,
-    dsa_cp=False,
-):
-    with planning(parallel, a2a=a2a, dsa_cp=dsa_cp):
-        return LayerFacts.init_new(
-            layer_id=layer_id,
-            num_layers=num_layers,
-            is_layer_sparse=sparse,
-            is_previous_layer_sparse=previous_sparse,
-            is_next_layer_sparse=False,
-        )
-
-
 class TestWhichLayersUseDeclarations(CustomTestCase):
-    """The layer is the unit: all three boundary sides it owns follow the
-    declarations, or none do."""
+    """Production factories choose the input and output paths for each stage."""
 
     def declared(self, communicator):
         return getattr(
-            communicator._steps.ffn.prepare.keywords["step"], "func", None
+            communicator.ffn.plan._steps.ffn.prepare.keywords["step"], "func", None
         ) in (
             comm_ops._mlp_input_dp_partial,
             comm_ops._mlp_input_dp_replicate,
@@ -248,49 +199,46 @@ class TestWhichLayersUseDeclarations(CustomTestCase):
         parallel = parallel_of(attn_dp=2, attn_tp=2)
         for layer_id in range(3):
             with self.subTest(layer_id=layer_id):
-                communicator = build(layer_facts(layer_id, 3), parallel)
+                communicator = build(layer_case(layer_id, 3), parallel)
                 self.assertTrue(self.declared(communicator))
-                self.assertIsNone(communicator._steps.attention.input_move)
-                self.assertTrue(communicator._steps.returns_over_dp)
+                self.assertIsNone(communicator.attn.plan._steps.attention.input_move)
+                self.assertTrue(communicator.ffn.plan._steps.returns_over_dp)
 
     def test_plain_tp(self):
         for norm, fuses in ((Norm, False), (FusableNorm, True)):
             with self.subTest(norm=norm.__name__):
                 with planning(parallel_of(attn_dp=1, attn_tp=2)):
-                    communicator = LayerCommunicator(
-                        layer_facts=layer_facts(1, 3),
-                        input_layernorm=norm(),
-                        post_attention_layernorm=norm(),
+                    communicator = make_test_stages(
+                        **layer_case(1, 3), attention_norm=norm(), ffn_norm=norm()
                     )
                 self.assertIs(
-                    communicator._steps.ffn.prepare.keywords["step"].func,
+                    communicator.ffn.plan._steps.ffn.prepare.keywords["step"].func,
                     comm_ops._mlp_input_without_dp,
                 )
-                entry = (
-                    communicator._mlp_input_reduce_output_and_update_and_read_residual
-                )
-                self.assertEqual(
-                    communicator._steps.ffn.prepare.keywords["step"].keywords[
-                        "fusions"
-                    ],
-                    (entry,) if fuses else (),
-                )
+                entries = communicator.ffn.plan._steps.ffn.prepare.keywords[
+                    "step"
+                ].keywords["fusions"]
+                self.assertEqual(len(entries), int(fuses))
+                if fuses:
+                    self.assertIs(entries[0].func, complete_ffn_input)
+                    self.assertEqual(entries[0].args, (communicator.ffn.plan,))
                 self.assertIs(
-                    bool(communicator._steps.ffn.fused),
+                    bool(communicator.ffn.plan._steps.ffn.fused),
                     fuses,
                 )
-                self.assertFalse(communicator._steps.returns_over_dp)
+                self.assertFalse(communicator.ffn.plan._steps.returns_over_dp)
                 self.assertIs(
-                    communicator._steps.ffn_output_move,
+                    communicator.ffn.plan._steps.ffn_output_move,
                     comm.CommunicateSummableTensorPairFn._trivial,
                 )
         # One rank: the attention output is complete, only the norm is left.
         one_rank = parallel_of(attn_dp=1, attn_tp=1)
-        single = build(layer_facts(1, 3), one_rank)
+        single = build(layer_case(1, 3), one_rank)
         with planning(one_rank):
-            self.assertIsNotNone(single._declared_sides())
+            self.assertIsNotNone(single.attn.plan.variants)
         self.assertIs(
-            single._steps.ffn.prepare.keywords["step"].func, comm_ops._read_input
+            single.ffn.plan._steps.ffn.prepare.keywords["step"].func,
+            comm_ops._read_input,
         )
 
     def test_the_order_follows_the_attention_output(self):
@@ -301,12 +249,13 @@ class TestWhichLayersUseDeclarations(CustomTestCase):
         ):
             with self.subTest(attn_tp=attn_tp, force=force):
                 communicator = build(
-                    layer_facts(1, 3),
+                    layer_case(1, 3),
                     parallel_of(attn_dp=2, attn_tp=attn_tp),
                     force_layernorm_before_dp_gather=force,
                 )
                 self.assertIs(
-                    communicator._steps.ffn.prepare.keywords["step"].func, order
+                    communicator.ffn.plan._steps.ffn.prepare.keywords["step"].func,
+                    order,
                 )
 
     def test_a_dense_first_layer_before_sparse_ones(self):
@@ -315,17 +264,9 @@ class TestWhichLayersUseDeclarations(CustomTestCase):
             with self.subTest(a2a=a2a):
                 layers = [
                     build(
-                        planned_facts(
-                            i,
-                            4,
-                            sparse=sparse,
-                            previous_sparse=previous,
-                            parallel=parallel,
-                            a2a=a2a,
-                        ),
+                        layer_case(i, 4, sparse=sparse, previous_sparse=previous),
                         parallel,
                         a2a=a2a,
-                        allow_reduce_scatter=True,
                     )
                     for i, (sparse, previous) in enumerate(
                         ((False, False), (True, False), (True, True), (False, True))
@@ -333,7 +274,7 @@ class TestWhichLayersUseDeclarations(CustomTestCase):
                 ]
                 self.assertEqual([self.declared(layer) for layer in layers], [True] * 4)
                 if not a2a:
-                    moe = layers[1]._steps.ffn_output
+                    moe = layers[1].ffn.plan._steps.ffn_output
                     self.assertIs(moe.group, SumGroup.MOE_OUTPUT)
                     self.assertTrue(moe.leaves_for_reduce_scatterv)
                     continue
@@ -341,7 +282,7 @@ class TestWhichLayersUseDeclarations(CustomTestCase):
                 # dense layer; the next one takes it already sliced.
                 self.assertEqual(
                     [
-                        layers[i]._steps.ffn.prepare.keywords["step"].func
+                        layers[i].ffn.plan._steps.ffn.prepare.keywords["step"].func
                         for i in (1, 2)
                     ],
                     [comm_ops._mlp_input_scatter] * 2,
@@ -349,24 +290,24 @@ class TestWhichLayersUseDeclarations(CustomTestCase):
                 self.assertEqual(
                     [
                         layers[i]
-                        ._steps.ffn.prepare.keywords["step"]
+                        .ffn.plan._steps.ffn.prepare.keywords["step"]
                         .keywords["scatters_residual"]
                         for i in (1, 2)
                     ],
                     [True, False],
                 )
-                self.assertIsNone(layers[1]._steps.ffn_output.group)
+                self.assertIsNone(layers[1].ffn.plan._steps.ffn_output.group)
                 self.assertIs(
-                    layers[2]._steps.attention.input_move,
+                    layers[2].attn.plan._steps.attention.input_move,
                     comm.CommunicateSimpleFn._scattered_to_tp_attn_full,
                 )
                 self.assertIs(
-                    layers[3]._steps.ffn.prepare.keywords["step"].func,
+                    layers[3].ffn.plan._steps.ffn.prepare.keywords["step"].func,
                     comm_ops._mlp_input_dp_partial,
                 )
                 self.assertTrue(
                     layers[3]
-                    ._steps.ffn.prepare.keywords["step"]
+                    .ffn.plan._steps.ffn.prepare.keywords["step"]
                     .keywords["gathers_residual"]
                 )
 
@@ -375,7 +316,8 @@ class TestWhichLayersUseDeclarations(CustomTestCase):
         # an a2a MoE does, and owes no sum.
         parallel = parallel_of(attn_dp=2, attn_tp=2, moe_dense_tp_size=1)
         no_overlap = SimpleNamespace(
-            overlap=SimpleNamespace(enable_two_batch_overlap=False)
+            comm=SimpleNamespace(boundary_reduction="rs+rsv"),
+            overlap=SimpleNamespace(enable_two_batch_overlap=False),
         )
         for a2a in (False, True):
             with (
@@ -384,17 +326,9 @@ class TestWhichLayersUseDeclarations(CustomTestCase):
             ):
                 layers = [
                     build(
-                        planned_facts(
-                            i,
-                            4,
-                            sparse=sparse,
-                            previous_sparse=previous,
-                            parallel=parallel,
-                            a2a=a2a,
-                        ),
+                        layer_case(i, 4, sparse=sparse, previous_sparse=previous),
                         parallel,
                         a2a=a2a,
-                        allow_reduce_scatter=True,
                     )
                     for i, (sparse, previous) in enumerate(
                         ((False, False), (False, False), (True, False), (True, True))
@@ -403,84 +337,82 @@ class TestWhichLayersUseDeclarations(CustomTestCase):
                 self.assertEqual([self.declared(layer) for layer in layers], [True] * 4)
                 for dense in layers[:2]:
                     self.assertIs(
-                        dense._steps.ffn.prepare.keywords["step"].func,
+                        dense.ffn.plan._steps.ffn.prepare.keywords["step"].func,
                         comm_ops._mlp_input_scatter,
                     )
-                    self.assertIsNone(dense._steps.ffn_output.group)
+                    self.assertIsNone(dense.ffn.plan._steps.ffn_output.group)
                 for after_dense in layers[1:3]:
                     self.assertIs(
-                        after_dense._steps.attention.input_move,
+                        after_dense.attn.plan._steps.attention.input_move,
                         comm.CommunicateSimpleFn._scattered_to_tp_attn_full,
                     )
 
     def test_the_last_a2a_layer_folds_the_residual_back(self):
         parallel = parallel_of(attn_dp=2, attn_tp=2)
         last = build(
-            planned_facts(
-                3, 4, sparse=True, previous_sparse=True, parallel=parallel, a2a=True
-            ),
+            layer_case(3, 4, sparse=True, previous_sparse=True),
             parallel,
             a2a=True,
         )
         self.assertIs(
-            last._steps.ffn_output_move.func,
+            last.ffn.plan._steps.ffn_output_move.func,
             comm.CommunicateSummableTensorPairFn._gather,
         )
 
     def test_an_attention_that_gathers_its_slice_itself(self):
         parallel = parallel_of(attn_dp=2, attn_tp=2)
-        facts = planned_facts(
-            2, 4, sparse=True, previous_sparse=True, parallel=parallel, a2a=True
-        )
+        facts = layer_case(2, 4, sparse=True, previous_sparse=True)
         with patch_communicator("_use_ag_after_qlora", True):
             layer = build(facts, parallel, a2a=True)
-        self.assertIsNone(layer._steps.attention.input_move)
+        self.assertIsNone(layer.attn.plan._steps.attention.input_move)
 
     def test_cp_without_prefill_cp(self):
         """No batch shards its tokens, so no CP steps. Under attention DP the
         reduce-scatter back runs over the TP group, which spans the CP ranks,
         so the FFN completes its own sum; without attention DP it may leave it
         and input-scattered attention runs, as without CP."""
-        under_dp = build(
-            layer_facts(1, 3), parallel_of(attn_dp=2, attn_tp=1, attn_cp=2)
-        )
-        self.assertIsNone(under_dp._cp_steps)
-        self.assertFalse(under_dp._steps.ffn_output.leaves_for_next_layer)
-        self.assertFalse(under_dp._steps.ffn_output.leaves_for_reduce_scatterv)
+        under_dp = build(layer_case(1, 3), parallel_of(attn_dp=2, attn_tp=1, attn_cp=2))
+        self.assertIsNone(under_dp.ffn.plan._cp_steps)
+        self.assertFalse(under_dp.ffn.plan._steps.ffn_output.leaves_for_next_layer)
+        self.assertFalse(under_dp.ffn.plan._steps.ffn_output.leaves_for_reduce_scatterv)
         without_dp = build(
-            layer_facts(1, 3),
+            layer_case(1, 3),
             parallel_of(
                 attn_dp=1, attn_tp=2, attn_cp=2, enable_attn_tp_input_scattered=True
             ),
         )
-        self.assertTrue(without_dp._steps.ffn_output.leaves_for_next_layer)
-        self.assertIsNotNone(without_dp._input_scattered_steps)
-
-    def test_a_layer_without_the_previous_layer_s_facts_is_refused(self):
-        direct = LayerFacts()
-        with self.assertRaises(NotImplementedError):
-            build(direct, parallel_of(attn_dp=2, attn_tp=2))
+        self.assertTrue(without_dp.ffn.plan._steps.ffn_output.leaves_for_next_layer)
+        self.assertIsNotNone(without_dp.ffn.plan._input_scattered_steps)
 
 
 def build_mhc(
     facts, parallel, *, a2a=False, dsa_cp=False, two_batch_overlap=False, **kwargs
 ):
     overlap = SimpleNamespace(
-        overlap=SimpleNamespace(enable_two_batch_overlap=two_batch_overlap)
+        comm=SimpleNamespace(
+            boundary_reduction=kwargs.pop("boundary_reduction", "rs+rsv")
+        ),
+        overlap=SimpleNamespace(enable_two_batch_overlap=two_batch_overlap),
     )
     with (
         planning(parallel, a2a=a2a, dsa_cp=dsa_cp),
         patch_communicator("get_exec", lambda: overlap),
     ):
-        return MHCLayerCommunicator(
-            layer_facts=facts,
-            input_layernorm=Norm(),
-            post_attention_layernorm=Norm(),
+        mhc = mhc_module.MHCState(
+            is_last_layer=facts["last"],
             hc_mult=2,
             hc_attn_pre=lambda *a: None,
             hc_ffn_pre=lambda *a: None,
             **{"hc_post": lambda *a: None, **kwargs},
         )
+        stages = make_test_stages(
+            **facts,
+            attention_norm=Norm(),
+            ffn_norm=Norm(),
+            residual=mhc.layer_residual(),
+        )
+        stages.mhc = mhc
+        return stages
 
 
 class TestMhcOnTheDeclarations(CustomTestCase):
@@ -491,14 +423,14 @@ class TestMhcOnTheDeclarations(CustomTestCase):
         if step.func is comm_ops._consumer_step:
             step = step.keywords["step"]
         self.assertIs(step.func, func)
-        residual = communicator._residual
+        declaration = communicator.ffn.declaration
         if "read" in step.keywords:
             # The FFN input: the attention output's hc_post, then the FFN's read.
-            self.assertIs(step.keywords["read"], residual.ffn_read)
+            self.assertIs(step.keywords["read"], declaration.read)
             self.assertNotIn("update", step.keywords)
         else:
             # The FFN output's move: its hc_post.
-            self.assertIs(step.keywords["update"], residual.ffn_update)
+            self.assertIs(step.keywords["update"], declaration.update)
         for key, value in keywords.items():
             self.assertEqual(step.keywords[key], value, key)
 
@@ -525,25 +457,29 @@ class TestMhcOnTheDeclarations(CustomTestCase):
             ),
         ):
             with self.subTest(name):
-                communicator = build_mhc(layer_facts(1, 3), parallel)
+                communicator = build_mhc(layer_case(1, 3), parallel)
                 self.assert_step(
-                    communicator._steps.ffn.prepare, ffn_input, communicator
+                    communicator.ffn.plan._steps.ffn.prepare, ffn_input, communicator
                 )
-                self.assertIs(communicator._steps.ffn_output_move, output_move)
+                self.assertIs(communicator.ffn.plan._steps.ffn_output_move, output_move)
                 # The fused add + RMSNorm kernels do not write hc_post.
-                self.assertEqual(communicator._steps.ffn.fused, ())
+                self.assertEqual(communicator.ffn.plan._steps.ffn.fused, ())
                 self.assertEqual(
-                    communicator._steps.attention.prepare.keywords["carried_fusions"],
+                    communicator.attn.plan._steps.attention.prepare.keywords[
+                        "carried_fusions"
+                    ],
                     (),
                 )
 
     def test_the_move_back_over_dp_stays_with_the_layer(self):
         parallel = parallel_of(attn_dp=2, attn_tp=2)
-        communicator = build_mhc(layer_facts(1, 3), parallel, allow_reduce_scatter=True)
-        self.assertTrue(communicator._steps.returns_over_dp)
-        self.assertFalse(communicator._steps.ffn_output.leaves_for_next_layer)
+        communicator = build_mhc(layer_case(1, 3), parallel)
+        self.assertTrue(communicator.ffn.plan._steps.returns_over_dp)
+        self.assertFalse(communicator.ffn.plan._steps.ffn_output.leaves_for_next_layer)
         # The move back also writes the FFN output into the streams.
-        self.assertFalse(communicator._local_token_move_can_go_to_next_layer(None))
+        self.assertFalse(
+            communicator.ffn.plan.output._local_token_move_can_go_to_next_layer(None)
+        )
         max_len = SimpleNamespace(
             dp_padding_mode=SimpleNamespace(is_max_len=lambda: True),
             forward_mode=SimpleNamespace(is_context_parallel_extend=lambda: False),
@@ -554,9 +490,11 @@ class TestMhcOnTheDeclarations(CustomTestCase):
             patch_communicator("should_use_dp_reduce_scatterv", lambda: False),
             patch_communicator("can_use_dp_reduce_scatter", lambda: True),
         ):
-            step = communicator._postprocess_dp_step(max_len)
+            step = communicator.ffn.plan.output._postprocess_dp_step(max_len)
             self.assertTrue(
-                communicator._ffn_leaves_sum_to_reduce_scatter(max_len, step)
+                communicator.ffn.plan.output._ffn_leaves_sum_to_reduce_scatter(
+                    max_len, step
+                )
             )
 
     def test_the_exit_runs_the_move_back_over_dp_it_chose(self):
@@ -568,9 +506,8 @@ class TestMhcOnTheDeclarations(CustomTestCase):
             with self.subTest(name):
                 hc_post = MagicMock(side_effect=lambda h, r, h_res, h_post: h + r)
                 communicator = build_mhc(
-                    layer_facts(1, 3),
+                    layer_case(1, 3),
                     parallel,
-                    allow_reduce_scatter=True,
                     hc_post=hc_post,
                 )
                 communicator.mhc.h_res = communicator.mhc.h_post = torch.zeros(2)
@@ -580,7 +517,7 @@ class TestMhcOnTheDeclarations(CustomTestCase):
                         is_context_parallel_extend=lambda: False
                     ),
                 )
-                choose = MagicMock(wraps=comm_ops._reduce_and_redistribute_output_step)
+                choose = MagicMock(wraps=comm_exit._reduce_and_redistribute_output_step)
                 to_local_tokens = MagicMock(side_effect=lambda step, fb, h: h[:2])
                 with (
                     planning(parallel),
@@ -591,12 +528,13 @@ class TestMhcOnTheDeclarations(CustomTestCase):
                     patch_communicator("_reduce_and_redistribute_output_step", choose),
                     patch_communicator("_to_local_tokens", to_local_tokens),
                 ):
-                    stream = residual_batch.start(forward_batch)
-                    stream.write(torch.full((2, 4), 2.0))
-                    with communicator.ffn_exit(forward_batch) as ffn_exit:
+                    with communicator.ffn.plan.output.ffn_exit(
+                        forward_batch
+                    ) as ffn_exit:
                         self.assertTrue(ffn_exit.mlp_reduce_scatter)
-                    hidden, stream = ffn_exit.finish(torch.ones(4, 4), stream)
-                    hidden, residual = stream.input(hidden)
+                    hidden, residual = ffn_exit.finish(
+                        torch.ones(4, 4), torch.full((2, 4), 2.0)
+                    )
                 choose.assert_called_once()
                 to_local_tokens.assert_called_once()
                 self.assertIs(to_local_tokens.call_args.args[0], move)
@@ -608,14 +546,7 @@ class TestMhcOnTheDeclarations(CustomTestCase):
         parallel = parallel_of(attn_dp=2, attn_tp=2)
         layers = [
             build_mhc(
-                planned_facts(
-                    i,
-                    3,
-                    sparse=sparse,
-                    previous_sparse=previous,
-                    parallel=parallel,
-                    a2a=True,
-                ),
+                layer_case(i, 3, sparse=sparse, previous_sparse=previous),
                 parallel,
                 a2a=True,
             )
@@ -625,26 +556,27 @@ class TestMhcOnTheDeclarations(CustomTestCase):
         ]
         first_a2a, last = layers[1], layers[2]
         self.assert_step(
-            first_a2a._steps.ffn.prepare,
+            first_a2a.ffn.plan._steps.ffn.prepare,
             comm_ops._mlp_input_scatter,
             first_a2a,
             scatters_residual=True,
         )
         self.assert_step(
-            last._steps.ffn.prepare,
+            last.ffn.plan._steps.ffn.prepare,
             comm_ops._mlp_input_scatter,
             last,
             scatters_residual=False,
         )
         self.assert_step(
-            last._steps.ffn_output_move,
+            last.ffn.plan._steps.ffn_output_move,
             comm.CommunicateSummableTensorPairFn._gather,
             last,
         )
         state = first_a2a.mhc
         state.h_res, state.h_post = torch.arange(4.0), torch.arange(4.0) + 10
         context = SimpleNamespace(attn_tp_rank=1, attn_tp_size=2)
-        residual = state.residual_to_attn_tp_shard(torch.arange(4.0) + 20, context)
+        with patch_communicator("get_parallel", lambda: context):
+            residual = state.residual_to_attn_tp_shard(torch.arange(4.0) + 20)
         self.assertEqual(residual.tolist(), [22.0, 23.0])
         self.assertEqual(state.h_res.tolist(), [2.0, 3.0])
         self.assertEqual(state.h_post.tolist(), [12.0, 13.0])
@@ -655,10 +587,8 @@ class TestMhcOnTheDeclarations(CustomTestCase):
         )
         for layer_id in range(3):
             with self.subTest(layer_id=layer_id):
-                communicator = build_mhc(
-                    layer_facts(layer_id, 3), parallel, allow_reduce_scatter=True
-                )
-                steps = communicator._input_scattered_steps
+                communicator = build_mhc(layer_case(layer_id, 3), parallel)
+                steps = communicator.ffn.plan._input_scattered_steps
                 self.assert_step(
                     steps.ffn.prepare,
                     comm_ops._mlp_input_on_residual_shard,
@@ -673,22 +603,29 @@ class TestMhcOnTheDeclarations(CustomTestCase):
                 )
                 self.assertTrue(steps.ffn_output_move_completes_sum)
                 completes = build_mhc(
-                    layer_facts(layer_id, 3), parallel, allow_reduce_scatter=False
-                )._input_scattered_steps
+                    layer_case(layer_id, 3),
+                    parallel,
+                    boundary_reduction="ar",
+                ).ffn.plan._input_scattered_steps
                 self.assertFalse(completes.ffn_output_move.keywords["sums"])
                 self.assertFalse(completes.ffn_output_move_completes_sum)
                 # Only the first layer's input, the embedding's partial sum,
                 # is completed onto the slice.
                 self.assertIs(
-                    steps.attention.prepare.keywords["step"].keywords["layer_input"],
+                    communicator.attn.plan._input_scattered_steps.attention.prepare.keywords[
+                        "step"
+                    ].keywords["layer_input"],
                     comm.tp_reduce_scatter if layer_id == 0 else None,
                 )
-                self.assertIsNone(steps.attention.input_move)
-                self.assertIs(
-                    steps.attention.handoff, comm_ops._hand_scattered_input_to_attention
+                self.assertIsNone(
+                    communicator.attn.plan._input_scattered_steps.attention.input_move
                 )
                 self.assertIs(
-                    communicator._steps.ffn_output_move,
+                    communicator.attn.plan._input_scattered_steps.attention.handoff,
+                    comm_ops._hand_scattered_input_to_attention,
+                )
+                self.assertIs(
+                    communicator.ffn.plan._steps.ffn_output_move,
                     comm.CommunicateSummableTensorPairFn._trivial,
                 )
 
@@ -697,13 +634,15 @@ class TestMhcOnTheDeclarations(CustomTestCase):
         # rows: MHC writes its output into the streams, then gathers them.
         parallel = parallel_of(attn_dp=2, attn_tp=2, moe_dense_tp_size=1)
         communicator = build_mhc(
-            layer_facts(1, 3, next_sparse=True), parallel, two_batch_overlap=True
+            layer_case(1, 3, next_sparse=True), parallel, two_batch_overlap=True
         )
         self.assert_step(
-            communicator._steps.ffn.prepare, comm_ops._mlp_input_scatter, communicator
+            communicator.ffn.plan._steps.ffn.prepare,
+            comm_ops._mlp_input_scatter,
+            communicator,
         )
         self.assert_step(
-            communicator._steps.ffn_output_move,
+            communicator.ffn.plan._steps.ffn_output_move,
             comm.CommunicateSummableTensorPairFn._gather,
             communicator,
         )
@@ -714,7 +653,7 @@ class TestMhcOnTheDeclarations(CustomTestCase):
         for layer_id, contracted in ((1, False), (2, True)):
             with self.subTest(layer_id=layer_id):
                 communicator = build_mhc(
-                    layer_facts(layer_id, 3),
+                    layer_case(layer_id, 3),
                     parallel,
                     hc_post=lambda h, r, h_res, h_post: h + r,
                 )
@@ -728,7 +667,7 @@ class TestMhcOnTheDeclarations(CustomTestCase):
                         mhc_module, "hc_contract", lambda h, hc_mult: h.sum(-1)
                     ),
                 ):
-                    hidden, residual = communicator.postprocess_layer(
+                    hidden, residual = communicator.ffn.plan.output.postprocess_layer(
                         torch.ones(2, 4), torch.full((2, 4), 2.0), None
                     )
                 self.assertIsNone(residual)
@@ -745,30 +684,24 @@ class TestMhcOnTheDeclarations(CustomTestCase):
         parallel = parallel_of(
             attn_dp=1, attn_tp=1, attn_cp=2, enable_prefill_cp=True, moe_dense_tp_size=1
         )
-        facts = planned_facts(
-            1, 3, sparse=True, previous_sparse=False, parallel=parallel, dsa_cp=True
-        )
+        facts = layer_case(1, 3, sparse=True, previous_sparse=False)
         with self.assertRaises(NotImplementedError):
-            build_mhc(facts, parallel, dsa_cp=True, allow_reduce_scatter=True)
+            build_mhc(facts, parallel, dsa_cp=True)
         # A dense layer on every rank computes on its own shard: nothing moves.
-        facts = planned_facts(
-            1, 3, sparse=False, previous_sparse=False, parallel=parallel, dsa_cp=True
-        )
-        build_mhc(facts, parallel, dsa_cp=True, allow_reduce_scatter=True)
+        facts = layer_case(1, 3, sparse=False, previous_sparse=False)
+        build_mhc(facts, parallel, dsa_cp=True)
 
     def test_input_scattered_attention_under_attention_cp_is_rejected(self):
         scattered = dict(enable_attn_tp_input_scattered=True)
         parallel = parallel_of(attn_dp=1, attn_tp=2, attn_cp=2, **scattered)
         with self.assertRaisesRegex(NotImplementedError, "input-scattered"):
             build_mhc(
-                planned_facts(
-                    1, 3, sparse=False, previous_sparse=False, parallel=parallel
-                ),
+                layer_case(1, 3, sparse=False, previous_sparse=False),
                 parallel,
             )
         parallel = parallel_of(attn_dp=1, attn_tp=2, **scattered)
         build_mhc(
-            planned_facts(1, 3, sparse=False, previous_sparse=False, parallel=parallel),
+            layer_case(1, 3, sparse=False, previous_sparse=False),
             parallel,
         )
 
@@ -779,22 +712,20 @@ class TestMhcOnTheDeclarations(CustomTestCase):
                 parallel = parallel_of(
                     attn_dp=1, attn_tp=2, attn_cp=2, enable_prefill_cp=prefill_cp
                 )
-                facts = planned_facts(
-                    1, 3, sparse=True, previous_sparse=True, parallel=parallel
-                )
+                facts = layer_case(1, 3, sparse=True, previous_sparse=True)
                 with self.assertRaisesRegex(NotImplementedError, "MoE-CP group"):
                     build_mhc(facts, parallel)
         # A dense layer builds, and so does a MoE on its own CP shard (MoE DP = CP).
         parallel = parallel_of(attn_dp=1, attn_tp=2, attn_cp=2)
         build_mhc(
-            planned_facts(1, 3, sparse=False, previous_sparse=False, parallel=parallel),
+            layer_case(1, 3, sparse=False, previous_sparse=False),
             parallel,
         )
         parallel = parallel_of(
             attn_dp=1, attn_tp=2, attn_cp=2, moe_dp_size=2, moe_tp_size=2
         )
         build_mhc(
-            planned_facts(1, 3, sparse=True, previous_sparse=True, parallel=parallel),
+            layer_case(1, 3, sparse=True, previous_sparse=True),
             parallel,
         )
 
@@ -806,23 +737,22 @@ class TestTwoBatchOverlap(CustomTestCase):
 
     def layers(self, *, tbo):
         parallel = parallel_of(attn_dp=2, attn_tp=2, moe_dense_tp_size=1)
-        overlap = SimpleNamespace(overlap=SimpleNamespace(enable_two_batch_overlap=tbo))
+        overlap = SimpleNamespace(
+            comm=SimpleNamespace(boundary_reduction="rs+rsv"),
+            overlap=SimpleNamespace(enable_two_batch_overlap=tbo),
+        )
         layers = []
         with planning(parallel), patch_communicator("get_exec", lambda: overlap):
             for i, sparse in enumerate((False, False, True, True)):
-                facts = LayerFacts.init_new(
+                facts = layer_case(
                     layer_id=i,
                     num_layers=4,
-                    is_layer_sparse=sparse,
-                    is_previous_layer_sparse=i > 2,
-                    is_next_layer_sparse=i >= 1,
+                    sparse=sparse,
+                    previous_sparse=i > 2,
+                    next_sparse=i >= 1,
                 )
                 layers.append(
-                    LayerCommunicator(
-                        layer_facts=facts,
-                        input_layernorm=Norm(),
-                        post_attention_layernorm=Norm(),
-                    )
+                    make_test_stages(**facts, attention_norm=Norm(), ffn_norm=Norm())
                 )
         return layers
 
@@ -834,17 +764,19 @@ class TestTwoBatchOverlap(CustomTestCase):
             with self.subTest(two_batch_overlap=tbo):
                 first, before, after, last = self.layers(tbo=tbo)
                 for layer in (first, before, after, last):
-                    self.assertIsNotNone(layer._declared)
-                self.assertIs(first._steps.ffn_output_move, pair._trivial)
+                    self.assertIsNotNone(layer.attn.plan.variants)
+                self.assertIs(first.ffn.plan._steps.ffn_output_move, pair._trivial)
                 if gathered:
-                    self.assertIs(before._steps.ffn_output_move.func, pair._gather)
-                    self.assertEqual(after.input_rows, attention)
-                    self.assertIsNone(after._steps.attention.input_move)
-                else:
-                    self.assertIs(before._steps.ffn_output_move, pair._trivial)
-                    self.assertEqual(after.input_rows, local)
                     self.assertIs(
-                        after._steps.attention.input_move,
+                        before.ffn.plan._steps.ffn_output_move.func, pair._gather
+                    )
+                    self.assertEqual(after.attn.input_rows, attention)
+                    self.assertIsNone(after.attn.plan._steps.attention.input_move)
+                else:
+                    self.assertIs(before.ffn.plan._steps.ffn_output_move, pair._trivial)
+                    self.assertEqual(after.attn.input_rows, local)
+                    self.assertIs(
+                        after.attn.plan._steps.attention.input_move,
                         comm.CommunicateSimpleFn._scattered_to_tp_attn_full,
                     )
 
@@ -865,18 +797,17 @@ class TestTwoBatchOverlap(CustomTestCase):
 
     def build(self, facts, parallel, *, a2a, two_batch_overlap):
         overlap = SimpleNamespace(
-            overlap=SimpleNamespace(enable_two_batch_overlap=two_batch_overlap)
+            comm=SimpleNamespace(boundary_reduction="rs+rsv"),
+            overlap=SimpleNamespace(enable_two_batch_overlap=two_batch_overlap),
         )
         with (
             planning(parallel, a2a=a2a),
             patch_communicator("get_exec", lambda: overlap),
         ):
-            communicator = LayerCommunicator(
-                layer_facts=facts,
-                input_layernorm=Norm(),
-                post_attention_layernorm=Norm(),
+            communicator = make_test_stages(
+                **facts, attention_norm=Norm(), ffn_norm=Norm()
             )
-        communicator._publish_lora_layout = True
+        communicator.ffn.plan._publish_lora_layout = True
         return communicator
 
     def test_the_rows_are_the_mlp_mode_layout(self):
@@ -916,13 +847,8 @@ class TestTwoBatchOverlap(CustomTestCase):
                     attn_tp=attn_tp,
                     moe_dense_tp_size=1 if dense_fully_dp else None,
                 )
-                facts = planned_facts(
-                    layer_id,
-                    4,
-                    sparse=sparse,
-                    previous_sparse=previous_sparse,
-                    parallel=parallel,
-                    a2a=a2a,
+                facts = layer_case(
+                    layer_id, 4, sparse=sparse, previous_sparse=previous_sparse
                 )
                 communicator = self.build(
                     facts,
@@ -930,16 +856,25 @@ class TestTwoBatchOverlap(CustomTestCase):
                     a2a=a2a,
                     two_batch_overlap=two_batch_overlap,
                 )
-                steps = communicator._steps
+                steps = communicator.ffn.plan._steps
                 self.assertEqual(
-                    steps.ffn.input_rows, communicator._declared.ffn.input.layout
+                    steps.ffn.input_rows,
+                    communicator.ffn.plan.variants[
+                        BatchVariant.ORDINARY
+                    ].incoming.need.layout,
                 )
                 published = {}
                 with patch_communicator(
                     "get_forward",
                     lambda: SimpleNamespace(set=published.__setitem__),
                 ):
-                    communicator.publish_mlp_lora_layout(steps)
+                    from sglang.srt.layers.communicator.adapters.lora import (
+                        publish_ffn,
+                    )
+
+                    publish_ffn(
+                        communicator.ffn.plan._publish_lora_layout, steps.ffn.input_rows
+                    )
                 # LoRA admits attention DP only with attention TP 1, where the
                 # FFN takes every row unless it runs on each rank's own: a MoE
                 # dispatched by an a2a backend, or a dense MLP on every rank.
@@ -961,20 +896,12 @@ class TestTheAttentionOutputDecidesItsSum(CustomTestCase):
 
     def test_the_attention_output_owes_the_attention_tp_sum(self):
         for attn_tp in (1, 2):
-            sides = sides_of(
-                {
-                    TokenAxis.ATTN_DP: 2,
-                    TokenAxis.ATTN_CP: 1,
-                    TokenAxis.ATTN_TP_SCATTER: attn_tp,
-                }
-            )
-            owed = attn_tp > 1
-            self.assertIs(
-                sides.attention.output.group, SumGroup.ATTN_TP if owed else None
-            )
-            self.assertIs(sides.attention.output.always_leaves, owed)
-            self.assertIs(sides.ffn.output.group, SumGroup.TP)
-            self.assertFalse(sides.ffn.output.always_leaves)
+            stages = build(layer_case(1, 3), parallel_of(attn_dp=2, attn_tp=attn_tp))
+            produced = stages.attn.plan._steps.ffn_output
+            self.assertIs(produced.group, SumGroup.ATTN_TP if attn_tp > 1 else None)
+            self.assertIs(produced.always_leaves, attn_tp > 1)
+            self.assertIs(stages.ffn.plan._steps.ffn_output.group, SumGroup.TP)
+            self.assertFalse(stages.ffn.plan._steps.ffn_output.always_leaves)
 
     def run_steps(self, produced, *, force=False):
         sizes = {
@@ -982,12 +909,11 @@ class TestTheAttentionOutputDecidesItsSum(CustomTestCase):
             TokenAxis.ATTN_CP: 1,
             TokenAxis.ATTN_TP_SCATTER: 2,
         }
-        sides = sides_of(sizes)
         steps, _, _ = comm_boundary._select_input_steps(
             produced,
-            residual=sides.input_rows,
-            residual_to=sides.ffn_residual_rows,
-            need=sides.ffn.input,
+            residual=comm.Layout.sharded_over(TokenAxis.ATTN_DP, axis_sizes=sizes),
+            residual_to=comm.Layout.sharded_over(TokenAxis.ATTN_DP, axis_sizes=sizes),
+            need=comm.StageInput(comm.Layout(frozenset())),
             adds_plainly=True,
             fusions=(),
             force_layernorm_before_gather=force,
@@ -996,7 +922,6 @@ class TestTheAttentionOutputDecidesItsSum(CustomTestCase):
             enters_stack=False,
         )
         reduced = []
-        context = SimpleNamespace(attn_tp_size=2, attn_tp_rank=0)
         with (
             patch_communicator(
                 "attention_tensor_model_parallel_all_reduce",
@@ -1018,18 +943,11 @@ class TestTheAttentionOutputDecidesItsSum(CustomTestCase):
                 torch.full((1, HIDDEN), 3.0),
                 None,
                 Norm(),
-                context,
             )
         return len(reduced), hidden, residual
 
     def test_a_complete_output_is_not_summed_again(self):
-        layout = sides_of(
-            {
-                TokenAxis.ATTN_DP: 2,
-                TokenAxis.ATTN_CP: 1,
-                TokenAxis.ATTN_TP_SCATTER: 2,
-            }
-        ).input_rows
+        layout = comm.Layout(frozenset({TokenAxis.ATTN_DP}))
         complete = comm.StageOutput(layout)
         for force in (False, True):
             with self.subTest(force=force):
@@ -1039,13 +957,7 @@ class TestTheAttentionOutputDecidesItsSum(CustomTestCase):
                 torch.testing.assert_close(hidden, torch.full((1, HIDDEN), 20.0))
 
     def test_an_owed_output_is_summed_once(self):
-        layout = sides_of(
-            {
-                TokenAxis.ATTN_DP: 2,
-                TokenAxis.ATTN_CP: 1,
-                TokenAxis.ATTN_TP_SCATTER: 2,
-            }
-        ).input_rows
+        layout = comm.Layout(frozenset({TokenAxis.ATTN_DP}))
         owed = comm.StageOutput(layout, group=SumGroup.ATTN_TP, always_leaves=True)
         reductions, hidden, residual = self.run_steps(owed, force=True)
         self.assertEqual(reductions, 1)
@@ -1055,26 +967,14 @@ class TestTheAttentionOutputDecidesItsSum(CustomTestCase):
     def test_a_sum_left_only_for_some_batches_comes_with_the_value(self):
         # Like a mixer exit: the steps take the output as complete, and a value
         # that carries the sum is completed before them.
-        layout = sides_of(
-            {
-                TokenAxis.ATTN_DP: 2,
-                TokenAxis.ATTN_CP: 1,
-                TokenAxis.ATTN_TP_SCATTER: 2,
-            }
-        ).input_rows
+        layout = comm.Layout(frozenset({TokenAxis.ATTN_DP}))
         asked = comm.StageOutput(layout, group=SumGroup.ATTN_TP)
         reductions, hidden, residual = self.run_steps(asked)
         self.assertEqual(reductions, 0)
         torch.testing.assert_close(residual, torch.full((1, HIDDEN), 10.0))
 
     def test_declarations_the_steps_cannot_run_are_rejected(self):
-        layout = sides_of(
-            {
-                TokenAxis.ATTN_DP: 2,
-                TokenAxis.ATTN_CP: 1,
-                TokenAxis.ATTN_TP_SCATTER: 2,
-            }
-        ).input_rows
+        layout = comm.Layout(frozenset({TokenAxis.ATTN_DP}))
         for produced in (
             # Always leaves a sum over no group.
             comm.StageOutput(layout, always_leaves=True),
@@ -1100,18 +1000,17 @@ class TestFusedKernelsTakeOnlyTheStepsTheyComplete(CustomTestCase):
         )
 
     def select(self, *, attn_dp, fusions):
-        sides = sides_of(
-            {
-                TokenAxis.ATTN_DP: attn_dp,
-                TokenAxis.ATTN_CP: 1,
-                TokenAxis.ATTN_TP_SCATTER: 2,
-            }
-        )
+        sizes = {
+            TokenAxis.ATTN_DP: attn_dp,
+            TokenAxis.ATTN_CP: 1,
+            TokenAxis.ATTN_TP_SCATTER: 2,
+        }
+        attention = comm.Layout.sharded_over(TokenAxis.ATTN_DP, axis_sizes=sizes)
         steps, fused, _ = comm_boundary._select_input_steps(
-            sides.attention.output,
-            residual=sides.input_rows,
-            residual_to=sides.ffn_residual_rows,
-            need=sides.ffn.input,
+            comm.StageOutput(attention, group=SumGroup.ATTN_TP, always_leaves=True),
+            residual=comm.Layout.sharded_over(TokenAxis.ATTN_DP, axis_sizes=sizes),
+            residual_to=comm.Layout.sharded_over(TokenAxis.ATTN_DP, axis_sizes=sizes),
+            need=comm.StageInput(comm.Layout(frozenset())),
             adds_plainly=True,
             fusions=fusions,
             force_layernorm_before_gather=False,
@@ -1142,87 +1041,34 @@ class TestTheSequenceParallelRegion(CustomTestCase):
     take the layer's ordinary declared steps."""
 
     SIZES = {TokenAxis.ATTN_DP: 1, TokenAxis.ATTN_CP: 1, TokenAxis.ATTN_TP_SCATTER: 2}
-    SP_STEPS = comm.BoundarySteps(
-        attention=comm.StageEntry(
-            prepare=comm_ops._read_input,
-            input_rows=comm.Layout(frozenset({TokenAxis.ATTN_TP_SCATTER})),
-            handoff=comm_ops._hand_qkv_hook_its_input,
-        ),
-        ffn=comm.StageEntry(
-            prepare=comm_ops._read_input,
-            input_rows=comm.Layout(frozenset({TokenAxis.ATTN_TP_SCATTER})),
-        ),
-        ffn_output=sequence_parallel_layer_sides(axis_sizes=SIZES).ffn.output,
-        ffn_output_move=comm.CommunicateSummableTensorPairFn._trivial,
-        ffn_sum_is_movable=False,
-    )
-
-    def unbound(self, steps):
-        """``steps`` with the plain residual's binding taken off the FFN input
-        and the attention input, whose input owes nothing in the region."""
-        ffn = steps.ffn.prepare.keywords["step"]
-        attention = steps.attention.prepare.keywords["step"]
-        for step, read in ((ffn, comm.NORM_READ), (attention, comm.NORM_QUANT_READ)):
-            self.assertIsNone(step.keywords["layer_input"])
-            self.assertIs(step.keywords["read"], read)
-            self.assertNotIn("update", step.keywords)
-        replace = msgspec.structs.replace
-        return replace(
-            steps,
-            ffn=replace(steps.ffn, prepare=ffn.func),
-            attention=replace(steps.attention, prepare=attention.func),
-        )
-
-    def test_the_region_declarations_choose_local_steps(self):
-        for attn_tp in (2, 4):
-            with self.subTest(attn_tp=attn_tp):
-                sides = sequence_parallel_layer_sides(
-                    axis_sizes={
-                        TokenAxis.ATTN_DP: 1,
-                        TokenAxis.ATTN_CP: 1,
-                        TokenAxis.ATTN_TP_SCATTER: attn_tp,
-                    }
-                )
-                local = frozenset({TokenAxis.ATTN_TP_SCATTER})
-                self.assertEqual(sides.input_rows.sharded, local)
-                self.assertEqual(sides.attention.input.gathers_itself, local)
-                self.assertEqual(sides.ffn.input.gathers_itself, local)
-                self.assertIsNone(sides.attention.output.group)
-                self.assertIsNone(sides.ffn.output.group)
-                steps = self.unbound(comm_boundary._select_boundary_steps(sides))
-                self.assertEqual(
-                    (
-                        steps.attention.input_move,
-                        steps.ffn.prepare,
-                        steps.ffn_output_move,
-                    ),
-                    (
-                        self.SP_STEPS.attention.input_move,
-                        self.SP_STEPS.ffn.prepare,
-                        self.SP_STEPS.ffn_output_move,
-                    ),
-                )
 
     def test_a_layer_under_sp_takes_both_sets_of_steps(self):
         parallel = parallel_of(attn_dp=1, attn_tp=2)
         for layer_id in range(3):
             with self.subTest(layer_id=layer_id):
                 with planning(parallel, sp=True):
-                    communicator = LayerCommunicator(
-                        layer_facts=layer_facts(layer_id, 3),
-                        input_layernorm=Norm(),
-                        post_attention_layernorm=Norm(),
+                    communicator = make_test_stages(
+                        **layer_case(layer_id, 3),
+                        attention_norm=Norm(),
+                        ffn_norm=Norm(),
                     )
-                self.assertEqual(self.unbound(communicator._sp_steps), self.SP_STEPS)
+                for boundary in (communicator.attn, communicator.ffn):
+                    steps = boundary.plan._sp_steps
+                    entry = steps.attention or steps.ffn
+                    self.assertEqual(
+                        entry.input_rows.sharded, frozenset({TokenAxis.ATTN_TP_SCATTER})
+                    )
+                    self.assertIsNone(entry.input_move)
+                    self.assertIsNone(steps.ffn_output.group)
                 self.assertIs(
-                    communicator._steps.ffn.prepare.keywords["step"].func,
+                    communicator.ffn.plan._steps.ffn.prepare.keywords["step"].func,
                     comm_ops._mlp_input_without_dp,
                 )
 
     def test_what_the_ffn_exit_reads_comes_from_the_batch_s_steps(self):
         # Inside the region the FFN output is complete: no sum to move.
         parallel = parallel_of(attn_dp=1, attn_tp=2)
-        communicator = build(layer_facts(1, 3), parallel, sp=True)
+        communicator = build(layer_case(1, 3), parallel, sp=True)
         for active in (False, True):
             with (
                 self.subTest(sp_active=active),
@@ -1237,33 +1083,16 @@ class TestTheSequenceParallelRegion(CustomTestCase):
                 patch_communicator("is_dp_attention_enabled", lambda: False),
             ):
                 self.assertIs(
-                    communicator._ffn_sum_can_move_to_next_layer(None), not active
+                    communicator.ffn.plan.output._ffn_sum_can_move_to_next_layer(None),
+                    not active,
                 )
 
     def test_without_sp_there_is_no_region(self):
         with planning(parallel_of(attn_dp=1, attn_tp=2)):
-            communicator = LayerCommunicator(
-                layer_facts=layer_facts(1, 3),
-                input_layernorm=Norm(),
-                post_attention_layernorm=Norm(),
+            communicator = make_test_stages(
+                **layer_case(1, 3), attention_norm=Norm(), ffn_norm=Norm()
             )
-        self.assertIsNone(communicator._sp_steps)
-
-    def test_the_same_selector_chooses_a_layer_s_ordinary_steps(self):
-        # Under attention DP the FFN exit chooses the move back per batch.
-        kept = comm_boundary._select_boundary_steps(
-            sides_of(self.SIZES, leaves_next=True)
-        )
-        self.assertTrue(kept.ffn_output.leaves_for_next_layer)
-        self.assertTrue(kept.ffn_sum_is_movable)
-        self.assertIs(
-            kept.ffn_output_move, comm.CommunicateSummableTensorPairFn._trivial
-        )
-        returned = comm_boundary._select_boundary_steps(
-            sides_of({**self.SIZES, TokenAxis.ATTN_DP: 2})
-        )
-        self.assertTrue(returned.returns_over_dp)
-        self.assertIsNone(returned.ffn_output_move)
+        self.assertIsNone(communicator.ffn.plan._sp_steps)
 
 
 class TestInputScatteredAttention(CustomTestCase):
@@ -1277,19 +1106,22 @@ class TestInputScatteredAttention(CustomTestCase):
     def test_the_declarations_choose_the_steps(self):
         for hands_on in (False, True):
             with self.subTest(hands_on_partial=hands_on):
-                sides = input_scattered_layer_sides(
-                    axis_sizes=self.SIZES,
-                    ffn_group=SumGroup.TP,
-                    hands_on_partial=hands_on,
+                communicator = build(
+                    layer_case(1, 3),
+                    boundary_reduction="rs+rsv" if hands_on else "ar",
+                    parallel=parallel_of(
+                        attn_dp=1, attn_tp=2, enable_attn_tp_input_scattered=True
+                    ),
                 )
-                steps = comm_boundary._select_boundary_steps(sides)
+                steps = communicator.ffn.plan._input_scattered_steps
+                attention = communicator.attn.plan._input_scattered_steps.attention
                 self.assertIs(
-                    steps.attention.prepare.keywords["step"].keywords["layer_input"],
+                    attention.prepare.keywords["step"].keywords["layer_input"],
                     comm.tp_reduce_scatter,
                 )
-                self.assertIsNone(steps.attention.input_move)
+                self.assertIsNone(attention.input_move)
                 slice_ = comm.Layout(frozenset({TokenAxis.ATTN_TP_SCATTER}))
-                self.assertEqual(steps.attention.input_rows, slice_)
+                self.assertEqual(attention.input_rows, slice_)
                 self.assertEqual(steps.ffn.input_rows, comm.Layout(frozenset()))
                 self.assertIs(
                     steps.ffn.prepare.keywords["step"].func,
@@ -1351,11 +1183,13 @@ class TestInputScatteredAttention(CustomTestCase):
         hidden = torch.arange(4.0)[:, None].expand(4, HIDDEN).clone()
         residual = torch.ones(4, HIDDEN)
         context = SimpleNamespace(attn_tp_size=2, attn_tp_rank=1)
-        out, out_residual = step(hidden, residual, None, Norm(), context)
+        with patch_communicator("get_parallel", lambda: context):
+            out, out_residual = step(hidden, residual, None, Norm())
         torch.testing.assert_close(out_residual, hidden[2:] + 1)
         torch.testing.assert_close(out, 2 * (hidden[2:] + 1))
         # At the start of the layer stack the input is the residual.
-        out, out_residual = step(hidden, None, None, Norm(), context)
+        with patch_communicator("get_parallel", lambda: context):
+            out, out_residual = step(hidden, None, None, Norm())
         torch.testing.assert_close(out_residual, hidden[2:])
         torch.testing.assert_close(out, 2 * hidden[2:])
 
@@ -1374,18 +1208,19 @@ class TestInputScatteredAttention(CustomTestCase):
         ):
             with self.subTest(name):
                 communicator = build(
-                    layer_facts(1, 3, sparse=a2a, previous_sparse=a2a),
+                    layer_case(1, 3, sparse=a2a, previous_sparse=a2a),
                     parallel,
                     a2a=a2a,
-                    allow_reduce_scatter=True,
                 )
-                self.assertIs(communicator._input_scattered_steps is not None, expected)
+                self.assertIs(
+                    communicator.ffn.plan._input_scattered_steps is not None, expected
+                )
 
     def test_a_batch_runs_them_only_while_its_input_is_scattered(self):
         parallel = parallel_of(
             attn_dp=1, attn_tp=2, enable_attn_tp_input_scattered=True
         )
-        communicator = build(layer_facts(1, 3), parallel, allow_reduce_scatter=True)
+        communicator = build(layer_case(1, 3), parallel)
         for scattered in (False, True):
             with (
                 self.subTest(input_scattered=scattered),
@@ -1398,10 +1233,10 @@ class TestInputScatteredAttention(CustomTestCase):
                 ),
             ):
                 self.assertIs(
-                    communicator._batch_steps(None),
-                    communicator._input_scattered_steps
+                    communicator.ffn.plan._batch_steps(None),
+                    communicator.ffn.plan._input_scattered_steps
                     if scattered
-                    else communicator._steps,
+                    else communicator.ffn.plan._steps,
                 )
 
     def test_prepare_attn_completes_the_scattered_input(self):
@@ -1415,7 +1250,7 @@ class TestInputScatteredAttention(CustomTestCase):
         parallel = parallel_of(
             attn_dp=1, attn_tp=2, enable_attn_tp_input_scattered=True, tp_group=group
         )
-        communicator = build(layer_facts(1, 3), parallel, allow_reduce_scatter=True)
+        communicator = build(layer_case(1, 3), parallel)
         with (
             patch_communicator("get_parallel", lambda: parallel),
             patch_communicator(
@@ -1424,13 +1259,9 @@ class TestInputScatteredAttention(CustomTestCase):
             ),
             patch_communicator("get_forward", lambda: SimpleNamespace(sp_active=False)),
         ):
-            batch = SimpleNamespace(residual_stream=None)
-            stream = residual_batch.start(batch)
-            stream.write(torch.full((4, HIDDEN), 3.0))
-            contribution = stream.leave(
-                torch.ones(4, HIDDEN), ADD, declared_sum=SumGroup.TP
+            hidden, residual = communicator.attn._prepare_input(
+                torch.ones(4, HIDDEN), torch.full((4, HIDDEN), 3.0), None
             )
-            hidden, residual = communicator.prepare_attn(contribution, stream, batch)
         self.assertEqual(scattered, [4])
         # Norm: (2 * (h + r), h + r) on the slice, with h the completed sum.
         torch.testing.assert_close(residual.residual, torch.full((2, HIDDEN), 5.0))
@@ -1445,34 +1276,16 @@ class TestInputScatteredAttention(CustomTestCase):
             (2, True, False),
             (1, False, False),
         ):
-            with self.subTest(layer_id=layer_id, allow_reduce_scatter=allow):
+            with self.subTest(
+                layer_id=layer_id, boundary_reduction="rs+rsv" if allow else "ar"
+            ):
                 communicator = build(
-                    layer_facts(layer_id, 3), parallel, allow_reduce_scatter=allow
+                    layer_case(layer_id, 3),
+                    parallel,
+                    boundary_reduction="rs+rsv" if allow else "ar",
                 )
-                steps = communicator._input_scattered_steps
+                steps = communicator.ffn.plan._input_scattered_steps
                 self.assertIs(steps.ffn_output.leaves_for_reduce_scatter, hands_on)
-
-
-class TestOneRepresentation(CustomTestCase):
-    """Every layer runs from one BoundarySteps per batch, whichever entry chose
-    its steps: none keeps the steps as separate attributes."""
-
-    SEPARATE = (
-        "_communicate_simple_fn",
-        "_mlp_input",
-        "_communicate_summable_tensor_pair_fn",
-        "_ffn_output",
-        "_postprocess_scatters_to_local_tokens",
-        "_ffn_sum_is_movable",
-    )
-
-    def test_the_layer_holds_steps_only(self):
-        communicator = build(layer_facts(1, 3), parallel_of(attn_dp=2, attn_tp=2))
-        self.assertIsInstance(communicator._steps, comm.BoundarySteps)
-        for attribute in self.SEPARATE:
-            self.assertFalse(hasattr(communicator, attribute), attribute)
-        self.assertIs(communicator._batch_steps(None), communicator._steps)
-        self.assertTrue(communicator._steps.returns_over_dp)
 
 
 class TestTheAttentionInputHalf(CustomTestCase):
@@ -1482,10 +1295,8 @@ class TestTheAttentionInputHalf(CustomTestCase):
 
     def build_fusable(self, facts, parallel, **planning_kwargs):
         with planning(parallel, **planning_kwargs):
-            return LayerCommunicator(
-                layer_facts=facts,
-                input_layernorm=FusableNorm(),
-                post_attention_layernorm=Norm(),
+            return make_test_stages(
+                **facts, attention_norm=FusableNorm(), ffn_norm=Norm()
             )
 
     def test_every_variant_takes_the_layers_fused_entries(self):
@@ -1501,23 +1312,17 @@ class TestTheAttentionInputHalf(CustomTestCase):
         ):
             for layer_id in (0, 1):
                 with self.subTest(name, layer_id=layer_id):
-                    facts = planned_facts(
-                        layer_id,
-                        3,
-                        sparse=False,
-                        previous_sparse=False,
-                        parallel=parallel,
-                    )
+                    facts = layer_case(layer_id, 3, sparse=False, previous_sparse=False)
                     communicator = self.build_fusable(facts, parallel, **kwargs)
-                    fusions = communicator._attn_input_fusions
+                    fusions = communicator.attn.plan._carried_fusions
                     self.assertTrue(fusions)
                     variants = [
                         steps
                         for steps in (
-                            communicator._steps,
-                            communicator._sp_steps,
-                            communicator._input_scattered_steps,
-                            communicator._cp_steps,
+                            communicator.attn.plan._steps,
+                            communicator.attn.plan._sp_steps,
+                            communicator.attn.plan._input_scattered_steps,
+                            communicator.attn.plan._cp_steps,
                         )
                         if steps is not None
                     ]
@@ -1553,11 +1358,9 @@ class TestPrefillCP(CustomTestCase):
     def test_a_dsa_cp_extend_leaves_its_sum_to_the_reduce_scatter(self):
         # A MoE on the TP group, as under DSA interleave CP without a2a.
         parallel = self.dsa_parallel()
-        facts = planned_facts(
-            1, 3, sparse=True, previous_sparse=False, parallel=parallel, dsa_cp=True
-        )
-        communicator = build(facts, parallel, dsa_cp=True, allow_reduce_scatter=True)
-        cp, ordinary = communicator._cp_steps, communicator._steps
+        facts = layer_case(1, 3, sparse=True, previous_sparse=False)
+        communicator = build(facts, parallel, dsa_cp=True)
+        cp, ordinary = communicator.ffn.plan._cp_steps, communicator.ffn.plan._steps
         self.assertIs(
             cp.ffn.prepare.keywords["step"].func,
             comm_ops._mlp_input_gather_attention_cp,
@@ -1573,7 +1376,7 @@ class TestPrefillCP(CustomTestCase):
         self.assertTrue(cp.ffn_output.leaves_for_reduce_scatter)
         self.assertFalse(cp.ffn_output.leaves_for_next_layer)
         # The dense layer before it ran on the same shard: nothing to move.
-        self.assertIsNone(cp.attention.input_move)
+        self.assertIsNone(communicator.attn.plan._cp_steps.attention.input_move)
         # Other batches hold every token on each CP rank: the MoE sums itself.
         self.assertIs(ordinary.ffn.prepare.keywords["step"].func, comm_ops._read_input)
         self.assertIs(
@@ -1592,7 +1395,7 @@ class TestPrefillCP(CustomTestCase):
                     patch_communicator("_batch_shards_over_cp", lambda fb: shards),
                 ):
                     self.assertIs(
-                        communicator._ffn_leaves_sum_to_reduce_scatter(
+                        communicator.ffn.plan.output._ffn_leaves_sum_to_reduce_scatter(
                             SimpleNamespace(
                                 forward_mode=SimpleNamespace(
                                     is_context_parallel_extend=lambda: False
@@ -1628,11 +1431,9 @@ class TestPrefillCP(CustomTestCase):
 
     def test_dsa_cp_dense_layers_run_on_their_shard(self):
         parallel = self.dsa_parallel()
-        facts = planned_facts(
-            1, 3, sparse=False, previous_sparse=False, parallel=parallel, dsa_cp=True
-        )
-        communicator = build(facts, parallel, dsa_cp=True, allow_reduce_scatter=True)
-        for steps in (communicator._steps, communicator._cp_steps):
+        facts = layer_case(1, 3, sparse=False, previous_sparse=False)
+        communicator = build(facts, parallel, dsa_cp=True)
+        for steps in (communicator.ffn.plan._steps, communicator.ffn.plan._cp_steps):
             self.assertIs(steps.ffn.prepare.keywords["step"].func, comm_ops._read_input)
             self.assertIsNone(steps.ffn_output.group)
             self.assertIs(
@@ -1640,8 +1441,8 @@ class TestPrefillCP(CustomTestCase):
             )
 
     def test_a_cp_extend_gathers_over_cp_and_takes_its_chunk_back(self):
-        communicator = build(layer_facts(1, 3), self.cp_parallel())
-        cp = communicator._cp_steps
+        communicator = build(layer_case(1, 3), self.cp_parallel())
+        cp = communicator.ffn.plan._cp_steps
         self.assertIs(
             cp.ffn.prepare.keywords["step"].func, comm_ops._mlp_input_gather_moe_cp
         )
@@ -1658,11 +1459,11 @@ class TestPrefillCP(CustomTestCase):
         self.assertFalse(cp.ffn_output.leaves_for_next_layer)
         self.assertFalse(cp.ffn_output.leaves_for_reduce_scatter)
         self.assertIs(
-            communicator._steps.ffn.prepare.keywords["step"].func,
+            communicator.ffn.plan._steps.ffn.prepare.keywords["step"].func,
             comm_ops._mlp_input_without_dp,
         )
         self.assertIs(
-            communicator._steps.ffn_output_move,
+            communicator.ffn.plan._steps.ffn_output_move,
             comm.CommunicateSummableTensorPairFn._trivial,
         )
 
@@ -1670,11 +1471,10 @@ class TestPrefillCP(CustomTestCase):
         # MoE DP equal to CP: each CP rank's MoE runs on its own TP ranks.
         parallel = self.cp_parallel(moe_dp_size=2, moe_tp_size=2)
         communicator = build(
-            layer_facts(1, 3, sparse=True, previous_sparse=True),
+            layer_case(1, 3, sparse=True, previous_sparse=True),
             parallel,
-            allow_deferred_ffn_reduction=True,
         )
-        for steps in (communicator._cp_steps, communicator._steps):
+        for steps in (communicator.ffn.plan._cp_steps, communicator.ffn.plan._steps):
             # The attention's rows are the MoE's: nothing to gather or take back.
             self.assertIs(
                 steps.ffn.prepare.keywords["step"].func, comm_ops._mlp_input_without_dp
@@ -1683,45 +1483,34 @@ class TestPrefillCP(CustomTestCase):
                 steps.ffn_output_move, comm.CommunicateSummableTensorPairFn._trivial
             )
             self.assertTrue(steps.ffn_output.leaves_for_next_layer)
-        dense = build(layer_facts(1, 3), parallel, allow_deferred_ffn_reduction=True)
+        dense = build(layer_case(1, 3), parallel)
         self.assertIs(
-            dense._cp_steps.ffn.prepare.keywords["step"].func,
+            dense.ffn.plan._cp_steps.ffn.prepare.keywords["step"].func,
             comm_ops._mlp_input_gather_moe_cp,
         )
-        self.assertFalse(dense._cp_steps.ffn_output.leaves_for_next_layer)
+        self.assertFalse(dense.ffn.plan._cp_steps.ffn_output.leaves_for_next_layer)
 
     def test_the_fused_kernels_run_on_each_chunk(self):
         with planning(self.cp_parallel()):
-            communicator = LayerCommunicator(
-                layer_facts=layer_facts(1, 3),
-                input_layernorm=FusableNorm(),
-                post_attention_layernorm=FusableNorm(),
+            communicator = make_test_stages(
+                **layer_case(1, 3), attention_norm=FusableNorm(), ffn_norm=FusableNorm()
             )
-        chunk = communicator._cp_steps.ffn.prepare.keywords["step"].keywords["gather"]
-        self.assertEqual(
-            chunk.keywords["fusions"],
-            (communicator._mlp_input_reduce_output_and_update_and_read_residual,),
-        )
+        chunk = communicator.ffn.plan._cp_steps.ffn.prepare.keywords["step"].keywords[
+            "gather"
+        ]
+        self.assertEqual(len(chunk.keywords["fusions"]), 1)
+        self.assertIs(chunk.keywords["fusions"][0].func, complete_ffn_input)
+        self.assertEqual(chunk.keywords["fusions"][0].args, (communicator.ffn.plan,))
 
     def cp_outcome(self, parallel, *, sparse=True, a2a=False, dsa_cp=False):
         """A layer under attention CP: "cp steps" for the batches that shard
         their tokens, "ordinary" when no batch does, or "refused"."""
-        facts = planned_facts(
-            1,
-            3,
-            sparse=sparse,
-            previous_sparse=sparse,
-            parallel=parallel,
-            a2a=a2a,
-            dsa_cp=dsa_cp,
-        )
+        facts = layer_case(1, 3, sparse=sparse, previous_sparse=sparse)
         try:
-            layer = build(
-                facts, parallel, a2a=a2a, dsa_cp=dsa_cp, allow_reduce_scatter=True
-            )
+            layer = build(facts, parallel, a2a=a2a, dsa_cp=dsa_cp)
         except NotImplementedError:
             return "refused"
-        return "ordinary" if layer._cp_steps is None else "cp steps"
+        return "ordinary" if layer.ffn.plan._cp_steps is None else "cp steps"
 
     def test_which_cp_the_steps_cover(self):
         dp_cp = dict(attn_dp=2, attn_tp=1, attn_cp=2, enable_prefill_cp=True)
@@ -1797,8 +1586,8 @@ class TestPrefillCP(CustomTestCase):
 
     def test_under_attention_dp_one_dp_sum_gathers_both_axes(self):
         parallel = parallel_of(attn_dp=2, attn_tp=2, attn_cp=2, enable_prefill_cp=True)
-        communicator = build(layer_facts(1, 3), parallel)
-        cp, ordinary = communicator._cp_steps, communicator._steps
+        communicator = build(layer_case(1, 3), parallel)
+        cp, ordinary = communicator.ffn.plan._cp_steps, communicator.ffn.plan._steps
         self.assertIs(
             cp.ffn.prepare.keywords["step"].func, comm_ops._mlp_input_dp_partial
         )
@@ -1819,7 +1608,7 @@ class TestPrefillCP(CustomTestCase):
             self.assertFalse(steps.ffn_output.leaves_for_reduce_scatterv)
 
     def test_a_batch_runs_them_only_on_a_cp_extend(self):
-        communicator = build(layer_facts(1, 3), self.cp_parallel())
+        communicator = build(layer_case(1, 3), self.cp_parallel())
 
         def batch(cp_extend):
             return SimpleNamespace(
@@ -1832,12 +1621,12 @@ class TestPrefillCP(CustomTestCase):
             raise AssertionError("read for a batch that is not a CP extend")
 
         for fb, rows, expected in (
-            (batch(False), unread, communicator._steps),
-            (batch(True), lambda fb: None, communicator._steps),
-            (batch(True), lambda fb: [2, 1], communicator._cp_steps),
+            (batch(False), unread, communicator.ffn.plan._steps),
+            (batch(True), lambda fb: None, communicator.ffn.plan._steps),
+            (batch(True), lambda fb: [2, 1], communicator.ffn.plan._cp_steps),
         ):
             with (
-                self.subTest(expected=expected is communicator._cp_steps),
+                self.subTest(expected=expected is communicator.ffn.plan._cp_steps),
                 planning(self.cp_parallel()),
                 patch_communicator("moe_cp_gathered_rows", rows),
                 patch_communicator(
@@ -1848,7 +1637,7 @@ class TestPrefillCP(CustomTestCase):
                     lambda: SimpleNamespace(input_scattered=False),
                 ),
             ):
-                self.assertIs(communicator._batch_steps(fb), expected)
+                self.assertIs(communicator.ffn.plan._batch_steps(fb), expected)
 
 
 class TestBranchRows(CustomTestCase):
@@ -1874,11 +1663,11 @@ class TestBranchRows(CustomTestCase):
             ),
             patch_communicator("moe_cp_gathered_rows", lambda fb: [2, 1]),
         ):
-            return communicator._branch_rows(batch)
+            return communicator.ffn.plan._branch_rows(batch)
 
     def test_each_branch_declares_its_rows(self):
         parallel = parallel_of(attn_dp=2, attn_tp=2)
-        dense = build(layer_facts(2, 6), parallel)
+        dense = build(layer_case(2, 6), parallel)
         self.assertEqual(
             self.rows(dense, parallel), (self.full, self.attention, self.attention)
         )
@@ -1888,7 +1677,7 @@ class TestBranchRows(CustomTestCase):
         ):
             with self.subTest(a2a=a2a):
                 moe = build(
-                    layer_facts(1, 3, sparse=True, previous_sparse=True),
+                    layer_case(1, 3, sparse=True, previous_sparse=True),
                     parallel,
                     a2a=a2a,
                 )
@@ -1896,16 +1685,16 @@ class TestBranchRows(CustomTestCase):
 
     def test_a_batch_on_other_steps_has_no_branch_rows(self):
         parallel = parallel_of(attn_dp=1, attn_tp=2, attn_cp=2, enable_prefill_cp=True)
-        communicator = build(layer_facts(1, 3), parallel)
+        communicator = build(layer_case(1, 3), parallel)
         with self.assertRaises(NotImplementedError):
             self.rows(communicator, parallel, cp_extend=True)
 
     def test_branches_move_between_the_declared_rows(self):
         # An a2a MoE beside a dense FFN, under attention DP and TP.
         class Communicator(SimpleNamespace):
-            branch_input = LayerCommunicator.branch_input
-            branch_output = LayerCommunicator.branch_output
-            merge_branch = LayerCommunicator.merge_branch
+            branch_input = branch.branch_input
+            branch_output = branch.branch_output
+            merge_branch = branch.merge_branch
 
         moe = Communicator(_branch_rows=lambda fb: (self.local, self.local, self.local))
         dense = Communicator(
@@ -1918,9 +1707,7 @@ class TestBranchRows(CustomTestCase):
             return value
 
         with patch_communicator("move_rows", recorded):
-            dense.branch_input(
-                moe, "h0", "residual", SimpleNamespace(residual_stream=None)
-            )
+            dense.branch_input(moe, "h0", "residual", None)
             self.assertEqual(
                 moves,
                 [
@@ -2121,7 +1908,7 @@ def state():
 
 
 @contextmanager
-def running(*, reduce_scatterv, a2a=False):
+def running(*, reduce_scatterv, a2a=False, use_reduce_scatter=True):
     replaced = {
         "get_forward": lambda: state().flags,
         "attention_tensor_model_parallel_all_reduce": lambda x: (
@@ -2152,7 +1939,10 @@ def running(*, reduce_scatterv, a2a=False):
         "post_experts_reduction_group": lambda: state().parallel.tp_group,
         "get_lora": lambda: SimpleNamespace(enable_lora=False),
         "get_exec": lambda: SimpleNamespace(
-            comm=SimpleNamespace(enable_quant_communications=False)
+            comm=SimpleNamespace(
+                enable_quant_communications=False,
+                boundary_reduction="rs+rsv" if use_reduce_scatter else "ar",
+            )
         ),
         "get_attn_tp_context": lambda: SimpleNamespace(
             input_scattered=False, set_attn_inputs=lambda x: None
@@ -2201,14 +1991,9 @@ def dense_mlp(x, state):
 
 def moe(x, state):
     """A MoE block not dispatched per DP shard: 5 * x, reduced over the MoE
-    output's group unless a published flag asks it to leave the sum, or the
-    attention-DP reduce_scatterv takes it, as the MoE blocks do."""
+    output's group unless a published flag asks it to leave the sum."""
     partial_sum = 5 * x * WEIGHTS[state.parallel.tp_size][state.parallel.tp_rank]
-    if (
-        state.flags.fuse_mlp_allreduce
-        or state.flags.mlp_reduce_scatter
-        or comm_ops.should_use_dp_reduce_scatterv()
-    ):
+    if state.flags.fuse_mlp_allreduce or state.flags.mlp_reduce_scatter:
         return partial_sum
     return comm_layout.post_experts_reduction_group().all_reduce(partial_sum)
 
@@ -2234,7 +2019,7 @@ class TestTwoLayers(CustomTestCase):
         rows,
         padding,
         reduce_scatterv,
-        leaves,
+        use_reduce_scatter,
         sparse=(False, False),
         a2a=False,
     ):
@@ -2301,29 +2086,29 @@ class TestTwoLayers(CustomTestCase):
             batch = SimpleNamespace(**vars(forward_batch), residual_stream=None)
             s = states[rank]
             layers = [
-                LayerCommunicator(
-                    layer_facts=layer_facts(
-                        i,
-                        2,
-                        sparse=sparse[i],
-                        previous_sparse=i > 0 and sparse[i - 1],
+                make_test_stages(
+                    **layer_case(
+                        i, 2, sparse=sparse[i], previous_sparse=i > 0 and sparse[i - 1]
                     ),
-                    input_layernorm=Norm(),
-                    post_attention_layernorm=Norm(),
-                    allow_reduce_scatter=leaves,
-                    allow_deferred_ffn_reduction=leaves,
+                    attention_norm=Norm(),
+                    ffn_norm=Norm(),
                 )
                 for i in range(2)
             ]
             hidden = torch.zeros(s.local_rows, HIDDEN).double()
             hidden[: s.rows] = embeddings[s.dp]
-            residual = residual_batch.start(batch)
+            residual = None
             handed_on = []
             for layer_index, layer in enumerate(layers):
-                hidden, residual = layer.prepare_attn(hidden, residual, batch)
+                hidden, residual = layer.attn._prepare_input(hidden, residual, batch)
                 hidden = attention(hidden, s)
-                hidden, residual = layer.prepare_mlp(hidden, residual, batch)
-                with layer.ffn_exit(batch) as ffn_exit:
+                hidden = residual.leave(
+                    hidden,
+                    comm.ADD,
+                    declared_sum=layer.ffn.plan._batch_steps(batch).ffn.input_sum,
+                )
+                hidden, residual = layer.ffn._prepare_input(hidden, residual, batch)
+                with layer.ffn.plan.output.ffn_exit(batch) as ffn_exit:
                     if not sparse[layer_index]:
                         hidden = dense_mlp(hidden, s)
                     elif a2a:
@@ -2333,13 +2118,18 @@ class TestTwoLayers(CustomTestCase):
                         hidden = moe(hidden, s)
                 hidden, residual = ffn_exit.finish(hidden, residual)
                 handed_on.append(type(hidden))
-            hidden, residual = layers[-1].finish_layer_stack(hidden, residual, batch)
+            batch.residual_stream = residual
+            hidden, residual = finish_layer_stack(hidden, residual, batch)
             # The last a2a layer folds the residual into its output.
             if residual is not None:
                 residual = residual[: s.rows]
             return hidden[: s.rows], residual, handed_on
 
-        with running(reduce_scatterv=reduce_scatterv, a2a=a2a):
+        with running(
+            reduce_scatterv=reduce_scatterv,
+            a2a=a2a,
+            use_reduce_scatter=use_reduce_scatter,
+        ):
             results, errors = world.run(states, forward)
         for rank, error in enumerate(errors):
             if error is not None:
@@ -2357,7 +2147,10 @@ class TestTwoLayers(CustomTestCase):
         return results
 
     def test_rows_come_back_to_each_rank(self):
-        for (attn_dp, attn_tp), rows, padding, leaves, sparse in itertools.product(
+        for (
+            attn_dp,
+            attn_tp,
+        ), rows, padding, use_reduce_scatter, sparse in itertools.product(
             ((2, 2), (4, 1), (2, 1), (1, 2), (1, 4)),
             ("ragged", "idle"),
             ("sum_len", "max_len"),
@@ -2383,7 +2176,7 @@ class TestTwoLayers(CustomTestCase):
                     attn_tp=attn_tp,
                     rows=token_rows,
                     padding=padding,
-                    leaves=leaves,
+                    use_reduce_scatter=use_reduce_scatter,
                     reduce_scatterv=reduce_scatterv,
                     sparse=sparse,
                     a2a=a2a,
@@ -2394,25 +2187,26 @@ class TestTwoLayers(CustomTestCase):
                         rows=token_rows,
                         padding=padding,
                         reduce_scatterv=reduce_scatterv,
-                        leaves=leaves,
+                        use_reduce_scatter=use_reduce_scatter,
                         sparse=sparse,
                         a2a=a2a,
                     )
                     first_layer_hands_on = results[0][2][0]
-                    # A producer that may leave its sum leaves it for the next
-                    # layer's input; one that may not hands on a complete value.
+                    # Disabling optional RS still permits an ordinary AR at
+                    # the next boundary. The actual owed work travels with the value.
                     # Without attention DP an empty batch completes its own sum.
                     # A MoE dispatched per DP shard hands on a complete value.
                     # Otherwise the reduce-scatter back to this rank's tokens
                     # can be left to the next layer; the all-reduce only
                     # without an a2a backend.
                     has_tokens = attn_dp > 1 or sum(token_rows) > 0
-                    reduce_scatter_left = attn_dp > 1 and (
-                        padding == "max_len" or reduce_scatterv
+                    reduce_scatter_left = (
+                        use_reduce_scatter
+                        and attn_dp > 1
+                        and (padding == "max_len" or reduce_scatterv)
                     )
                     owes = (
-                        leaves
-                        and has_tokens
+                        has_tokens
                         and not (sparse[0] and a2a)
                         and (reduce_scatter_left or not a2a)
                     )
@@ -2427,7 +2221,11 @@ class TestTheFfnInputReduction(CustomTestCase):
     for a plain residual; MHC sums its streams in full precision."""
 
     def test_only_a_plain_residual_reduces_quantized(self):
-        exec_ = SimpleNamespace(comm=SimpleNamespace(enable_quant_communications=True))
+        exec_ = SimpleNamespace(
+            comm=SimpleNamespace(
+                enable_quant_communications=True, boundary_reduction="rs+rsv"
+            )
+        )
         batch = SimpleNamespace(
             forward_mode=SimpleNamespace(is_decode_or_idle=lambda: False)
         )
@@ -2454,91 +2252,12 @@ class TestTheFfnInputReduction(CustomTestCase):
                         torch.ones(2, HIDDEN),
                         batch,
                         None,
-                        SimpleNamespace(cache=None),
                         gathers_residual=False,
                         fusions=(),
                         read=read,
                         update=update,
                     )
                 self.assertEqual(calls, [reduction])
-
-
-class TestALayerThatIsOneStage(CustomTestCase):
-    """A layer that is one stage reads its input and writes its output into the
-    residual as its stage declares."""
-
-    SIZES = {TokenAxis.ATTN_DP: 1, TokenAxis.ATTN_CP: 1, TokenAxis.ATTN_TP_SCATTER: 2}
-
-    class ProbeRead:
-        norms_plainly = True
-
-        def __init__(self):
-            self.reads = 0
-
-        def read(self, residual, norm, quant_format="", post_residual_addition=None):
-            self.reads += 1
-            return residual + 100, residual
-
-        def update_and_read(
-            self,
-            update,
-            hidden_states,
-            residual,
-            norm,
-            quant_format="",
-            post_residual_addition=None,
-        ):
-            return self.read(update.update(hidden_states, residual), norm)
-
-    def _stage(self, read, update):
-        rows = comm.Layout.sharded_over(axis_sizes=self.SIZES)
-        return comm.LayerStage(
-            kind=comm.StageKind.FFN,
-            edges=comm.stage_edges(
-                previous=None,
-                stage=comm.StageDecl(
-                    comm.StageInput(rows, read=read),
-                    comm.StageOutput(rows, update=update),
-                ),
-                rows=rows,
-            ),
-        )
-
-    def test_its_steps_run_the_declared_read_and_update(self):
-        read, update = (
-            self.ProbeRead(),
-            SimpleNamespace(adds_plainly=True, can_defer_across_layers=True),
-        )
-        communicator = build(
-            layer_facts(1, 3),
-            parallel_of(attn_dp=1, attn_tp=2),
-            stage=self._stage(read, update),
-        )
-        into, out_of = communicator.stage_edges
-        self.assertIs(into.need.read, read)
-        self.assertIs(out_of.produced.update, update)
-        hidden, residual = torch.ones(2, HIDDEN), torch.full((2, HIDDEN), 3.0)
-        out, out_residual = communicator._steps.ffn.prepare(
-            hidden, residual, None, Norm(), None
-        )
-        self.assertEqual(read.reads, 1)
-        torch.testing.assert_close(out_residual, torch.full((2, HIDDEN), 4.0))
-        torch.testing.assert_close(out, torch.full((2, HIDDEN), 104.0))
-
-    def test_it_takes_no_residual_of_its_own(self):
-        own = comm.LayerResidual(
-            attention_read=self.ProbeRead(),
-            attention_update=comm.ADD,
-            ffn_read=comm.NORM_READ,
-            ffn_update=comm.ADD,
-        )
-        with self.assertRaises(ValueError):
-            build(
-                layer_facts(1, 3),
-                parallel_of(attn_dp=1, attn_tp=2),
-                stage=self._stage(comm.NORM_READ, comm.ADD),
-                residual=own,
-            )
 
 
 if __name__ == "__main__":

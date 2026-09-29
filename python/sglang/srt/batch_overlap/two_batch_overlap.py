@@ -15,7 +15,6 @@ from sglang.srt.batch_overlap.operations import (
 from sglang.srt.batch_overlap.operations_strategy import OperationsStrategy
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.communicator import (
-    CommunicateContext,
     Layout,
     tbo_split_moves,
 )
@@ -1022,14 +1021,12 @@ def _model_forward_tbo_split_inputs(
     zero_allocator: Optional[BumpAllocator],
     layer_input_rows: Layout,
 ) -> List[Dict]:
-    context = CommunicateContext.init_new()
     to_splitter, to_layer_input = tbo_split_moves(layer_input_rows)
 
     hidden_states, residual = to_splitter(
         hidden_states=hidden_states,
         residual=residual,
         forward_batch=forward_batch,
-        context=context,
     )
 
     inputs_arr = _model_forward_tbo_split_inputs_raw(
@@ -1045,7 +1042,6 @@ def _model_forward_tbo_split_inputs(
             hidden_states=hidden_states,
             residual=residual,
             forward_batch=forward_batch,
-            context=context,
         )
         return dict(
             hidden_states=hidden_states,

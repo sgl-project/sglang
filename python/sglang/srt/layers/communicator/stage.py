@@ -1,0 +1,329 @@
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+"""A stage's model-facing input and output boundary."""
+
+from typing import TYPE_CHECKING, Callable, Optional
+
+import torch
+
+from sglang.srt.layers import layernorm_sp
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStateAccumulator
+from sglang.srt.layers.communicator.adapters import branch
+from sglang.srt.layers.communicator.adapters.lora import (
+    publish_attention,
+    publish_ffn,
+)
+from sglang.srt.layers.communicator.boundary import (
+    BoundarySteps,
+    StageEntry,
+    StageKind,
+)
+from sglang.srt.layers.communicator.ops import CommunicateSimpleFn
+from sglang.srt.layers.communicator.residual.access import buffer, from_pp
+from sglang.srt.layers.communicator.residual.add_norm import (
+    ADD,
+)
+from sglang.srt.layers.communicator.residual.batch import current
+from sglang.srt.layers.communicator.residual.stream import DeclaredSum, ResidualStream
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.runtime_context import get_forward
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.communicator.construction import StagePlan
+    from sglang.srt.layers.communicator.factories import StageDeclaration
+
+
+class StageCommunicator:
+    """One stage of a layer, its attention or its FFN: the boundary into it,
+    run with the stage's norm on the steps the layer chose for the batch."""
+
+    def __init__(
+        self,
+        plan: "StagePlan",
+        kind: StageKind,
+        norm,
+        *,
+        declaration: Optional["StageDeclaration"] = None,
+    ):
+        self.plan = plan
+        self.kind = kind
+        self.norm = norm
+        self._declaration = declaration
+
+    @property
+    def declaration(self) -> "StageDeclaration":
+        """Immutable source contract for constructing another local sequence."""
+        if self._declaration is None:
+            raise RuntimeError("this boundary was constructed from raw layout edges")
+        return self._declaration
+
+    def entry(
+        self, forward_batch: ForwardBatch, steps: Optional[BoundarySteps] = None
+    ) -> StageEntry:
+        if steps is None:
+            steps = self.plan._batch_steps(forward_batch)
+        entry = steps.attention if self.kind is StageKind.ATTENTION else steps.ffn
+        if entry is None:
+            raise NotImplementedError(
+                f"a layer that is one stage has no {self.kind.name.lower()} stage"
+            )
+        return entry
+
+    def _prepare(
+        self,
+        hidden_states,
+        residual,
+        forward_batch: ForwardBatch,
+        steps: Optional[BoundarySteps] = None,
+        **call,
+    ):
+        """The stage's input and the residual, from the previous stage's output
+        (``call``: what the stage's read takes, e.g. the attention's
+        ``quant_format``)."""
+        entry = self.entry(forward_batch, steps)
+        stream = (
+            residual
+            if isinstance(residual, ResidualStream)
+            else ResidualStream(residual)
+        )
+        if not isinstance(residual, ResidualStream):
+            if residual is not None or entry.input_sum is not None:
+                hidden_states = stream.leave(
+                    hidden_states, call.get("update", ADD), declared_sum=entry.input_sum
+                )
+        elif (
+            stream.pending is None
+            and stream.residual is None
+            and entry.input_sum is not None
+        ):
+            hidden_states = stream.leave(
+                hidden_states, ADD, declared_sum=entry.input_sum
+            )
+        if stream.pending is not None:
+            call["update"] = stream.pending.update
+            call["pending"] = stream.pending
+        if stream.pending is None and stream.residual is not None:
+            call["written"] = True
+        hidden_states, residual = stream.input(hidden_states)
+        hidden_states, residual = entry.prepare(
+            hidden_states, residual, forward_batch, self.norm, **call
+        )
+        if entry.input_move is not None:
+            hidden_states = entry.input_move(
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+        if entry.handoff is not None:
+            hidden_states = entry.handoff(
+                hidden_states, forward_batch, self.plan.qkv_latent_func
+            )
+        stream.write(residual)
+        return hidden_states, stream
+
+    @property
+    def fusions(self):
+        return self.plan.fusions
+
+    @property
+    def input_rows(self):
+        return self.plan.input_rows
+
+    @property
+    def input_on_attention_tp_slices(self):
+        return self.plan.input_on_attention_tp_slices
+
+    def prepare(self, hidden_states, forward_batch, *, cache=None, **call):
+        if cache is not None:
+            call["cache"] = cache
+        prepare = (
+            self._prepare_attention
+            if self.kind is StageKind.ATTENTION
+            else self._prepare_input
+        )
+        hidden_states, forward_batch.residual_stream = prepare(
+            hidden_states, current(forward_batch), forward_batch, **call
+        )
+        return hidden_states
+
+    def finish(self, hidden_states, forward_batch):
+        """Hand this attention's actual contribution to the following stage."""
+        if self.kind is not StageKind.ATTENTION or not self.plan.fixed_output:
+            raise RuntimeError(
+                "use the stage exit scope for an FFN or single-stage mixer"
+            )
+        produced = self.plan.produced(self.kind, forward_batch)
+        return current(forward_batch).leave(
+            hidden_states,
+            produced.update,
+            declared_sum=produced.group if produced.always_leaves else None,
+        )
+
+    def exit(self, forward_batch):
+        result = (
+            self.plan.output.ffn_exit(forward_batch)
+            if self.kind is StageKind.FFN
+            else self.plan.output.mixer_exit(forward_batch)
+        )
+        result._stream = current(forward_batch)
+        return result
+
+    def from_pp(self, tensors, forward_batch, *, allow_missing_residual: bool = False):
+        hidden_states, residual = from_pp(
+            tensors,
+            residual_in_hidden=self.plan.residual_in_hidden,
+            allow_missing_residual=allow_missing_residual,
+        )
+        declared_sum = None
+        if forward_batch is not None:
+            steps = self.plan._batch_steps(forward_batch)
+            entry = steps.attention or steps.ffn
+            declared_sum = entry.input_sum
+        hidden_states, forward_batch.residual_stream = ResidualStream.arrive(
+            hidden_states, residual, ADD, declared_sum=declared_sum
+        )
+        return hidden_states
+
+    def snapshot(self, hidden_states, forward_batch):
+        return current(forward_batch).snapshot(hidden_states)
+
+    def capture_output(self, hidden_states, forward_batch, *, skip_empty=False):
+        stream = current(forward_batch)
+        if skip_empty:
+            storage = buffer(hidden_states)
+            if storage is not None and storage.shape[0] == 0:
+                return hidden_states, None
+        if stream.pending is None or not isinstance(stream.pending.owed, DeclaredSum):
+            hidden_states = stream.complete(hidden_states)
+        return hidden_states, stream.snapshot(hidden_states)
+
+    def postprocess(self, hidden_states, forward_batch):
+        hidden_states, stream = self.plan.output.postprocess_layer(
+            hidden_states, current(forward_batch), forward_batch
+        )
+        forward_batch.residual_stream = stream
+        return hidden_states
+
+    def branch_input(self, source, hidden_states, forward_batch):
+        hidden_states, stream = branch.branch_input(
+            self.plan,
+            source.plan,
+            hidden_states,
+            current(forward_batch),
+            forward_batch,
+        )
+        forward_batch.residual_stream = stream
+        return hidden_states
+
+    def branch_output(self, hidden_states, forward_batch):
+        return branch.branch_output(self.plan, hidden_states, forward_batch)
+
+    def merge_branch(self, contribution, hidden_states, source, forward_batch):
+        hidden_states, stream = branch.merge_branch(
+            self.plan,
+            contribution,
+            hidden_states,
+            current(forward_batch),
+            source.plan,
+            forward_batch,
+        )
+        forward_batch.residual_stream = stream
+        return hidden_states
+
+    def _prepare_input(self, hidden_states, residual, forward_batch, **call):
+        plan = self.plan
+        if self.kind is StageKind.ATTENTION:
+            publish_attention(plan._publish_lora_layout)
+            if plan._sp_steps is not None and plan.is_first_layer:
+                get_forward().set(
+                    "sp_active", layernorm_sp.runs_sp(forward_batch.forward_mode)
+                )
+                if get_forward().sp_active:
+                    hidden_states = layernorm_sp.sp_entry_scatter(hidden_states)
+        else:
+            publish_ffn(plan._publish_lora_layout, self.entry(forward_batch).input_rows)
+        return self._prepare(hidden_states, residual, forward_batch, **call)
+
+    def _prepare_attention(
+        self,
+        hidden_states: torch.Tensor,
+        stream: ResidualStream,
+        forward_batch: ForwardBatch,
+        captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+        quant_format: str = "",
+        capture_output: Optional[Callable] = None,
+    ):
+        # Aux consumers need a materialized output before the input norm.
+        # Complete communication here, preserving the existing add+norm kernel
+        # and its FP32 accumulation. Its residual result also supplies capture.
+        capture_before_read = capture_output is not None and (
+            (stream.residual is None and stream.pending is None)
+            or post_residual_addition is not None
+        )
+        if capture_output is not None:
+            hidden_states = stream.complete(hidden_states)
+            if capture_before_read:
+                # Embeddings precede enter; HF deepstack capture precedes the
+                # extra addition. Neither is the residual returned by the read.
+                value, previous = stream.finish(hidden_states)
+                if previous is None:
+                    capture_output(value)
+                else:
+                    capture_output(value + previous, owned=True)
+        hidden_states, stream = self._prepare_input(
+            hidden_states,
+            stream,
+            forward_batch,
+            quant_format=quant_format,
+            post_residual_addition=post_residual_addition,
+        )
+        entry = self.entry(forward_batch)
+        if capture_output is not None and not capture_before_read:
+            value = stream.residual
+            move = entry.capture_move
+            if move is not None:
+                value = move(value, forward_batch=forward_batch)
+            keeps_input = entry.capture_preserves_residual
+            capture_output(
+                value,
+                owned=entry.capture_move_allocates
+                or (
+                    move is None
+                    and keeps_input is not None
+                    and keeps_input(value, forward_batch)
+                ),
+            )
+        if captured_last_layer_outputs is not None:
+            residual_value = stream.residual
+            move = entry.input_move
+            gathered_last_layer_output = (
+                residual_value
+                if move is None
+                else move(
+                    hidden_states=residual_value,
+                    forward_batch=forward_batch,
+                )
+            )
+            # Input gathers allocate fresh DP buffers.
+            # Without a gather this is the mutable residual, so retention copies.
+            captured_last_layer_outputs.capture(
+                gathered_last_layer_output,
+                owned=move is CommunicateSimpleFn._scattered_to_tp_attn_full
+                or (
+                    move is None
+                    and entry.capture_preserves_residual is not None
+                    and entry.capture_preserves_residual(residual_value, forward_batch)
+                ),
+            )
+        return hidden_states, stream

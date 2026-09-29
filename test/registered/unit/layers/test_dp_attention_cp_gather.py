@@ -1,3 +1,5 @@
+from sglang.test.boundary_fixtures import make_test_stages
+
 """The dense-FFN gather and take-back under attention DP x CP x TP, rank by rank.
 
 Every rank builds its layer's communicator and runs its prepare_mlp and
@@ -15,7 +17,6 @@ import torch
 from sglang.srt.layers import communicator as comm
 from sglang.srt.layers import dp_attention, layernorm_sp
 from sglang.srt.layers.communicator import ops as comm_ops
-from sglang.srt.layers.communicator.residual.stream import ResidualStream
 from sglang.srt.layers.cp import base as cp_base
 from sglang.srt.layers.cp import padding as cp_padding
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
@@ -124,13 +125,6 @@ def cp_replicated(forward_mode, rows, seed):
     group.values *= CP_SIZE
     group.residuals *= CP_SIZE
     return group
-
-
-def prepare_mlp(communicator, hidden, residual, forward_batch):
-    forward_batch.residual_stream = ResidualStream(residual)
-    return communicator.prepare_mlp(
-        hidden, forward_batch.residual_stream, forward_batch
-    )
 
 
 class TestDpCpGather(CustomTestCase):
@@ -252,16 +246,23 @@ class TestDpCpGather(CustomTestCase):
                         if target[0] is comm
                         else patch.object(*target, value)
                     )
-                communicator = comm.LayerCommunicator(
-                    layer_facts=SimpleNamespace(
-                        is_first_layer=False,
-                        is_last_layer=False,
-                        is_layer_sparse=sparse,
-                        is_previous_layer_sparse=sparse,
-                        is_next_layer_sparse=False,
-                    ),
-                    input_layernorm=norm,
-                    post_attention_layernorm=norm,
+                stack.enter_context(
+                    patch_communicator(
+                        "get_exec",
+                        lambda: SimpleNamespace(
+                            comm=SimpleNamespace(boundary_reduction="rs+rsv"),
+                            overlap=SimpleNamespace(enable_two_batch_overlap=False),
+                        ),
+                    )
+                )
+                communicator = make_test_stages(
+                    first=False,
+                    last=False,
+                    sparse=sparse,
+                    previous_sparse=sparse,
+                    next_sparse=False,
+                    attention_norm=norm,
+                    ffn_norm=norm,
                     force_layernorm_before_dp_gather=force_layernorm_before_dp_gather,
                 )
                 yield SimpleNamespace(
@@ -281,13 +282,15 @@ class TestDpCpGather(CustomTestCase):
 
         def gather(rank, all_reduce):
             with as_rank(*rank, all_reduce) as r:
-                self.assertIsNotNone(r.communicator._cp_steps, "declared under CP")
+                self.assertIsNotNone(
+                    r.communicator.ffn.plan._cp_steps, "declared under CP"
+                )
                 if ffn_input is not None:
-                    steps = r.communicator._batch_steps(r.forward_batch)
+                    steps = r.communicator.ffn.plan._batch_steps(r.forward_batch)
                     self.assertIs(steps.ffn.prepare.keywords["step"].func, ffn_input)
                 hidden_states, residual = rank_inputs(*rank)
-                return prepare_mlp(
-                    r.communicator, hidden_states, residual, r.forward_batch
+                return r.communicator.ffn._prepare_input(
+                    hidden_states, residual, r.forward_batch
                 )
 
         # The all-reduce is a sum over every rank: record what each rank hands
@@ -327,8 +330,7 @@ class TestDpCpGather(CustomTestCase):
             torch.testing.assert_close(hidden_states, expected, rtol=0, atol=0)
             torch.testing.assert_close(residual.residual[:tokens], own, rtol=0, atol=0)
             with as_rank(*rank, None) as r:
-                r.forward_batch.residual_stream = residual
-                back, _ = r.communicator.postprocess_layer(
+                back, _ = r.communicator.ffn.plan.output.postprocess_layer(
                     3 * hidden_states, residual, r.forward_batch
                 )
             expected_back = torch.zeros(group.held_rows[cp], HIDDEN).double()

@@ -160,13 +160,10 @@ CASES = {
 
 
 def build(case, num_layers, layer_id, config=None, **kwargs):
-    """Construct one decoder layer with its submodules stubbed. Returns the
-    LayerCommunicator kwargs, the LayerFacts.init_new kwargs, and the
-    names of the stubbed submodules it built."""
+    """Construct a decoder with stubbed compute and inspect its stage declarations."""
     module_name, class_name, make_config, stubs, _ = CASES[case]
     module = import_model(module_name)
-    communicator = MagicMock()
-    facts = MagicMock()
+    communicator = MagicMock(return_value=(MagicMock(), MagicMock()))
     built = []
 
     def recording_stub(name):
@@ -176,7 +173,17 @@ def build(case, num_layers, layer_id, config=None, **kwargs):
 
         return make
 
-    patches = dict(LayerCommunicator=communicator, LayerFacts=facts)
+    from sglang.srt.layers.communicator import declare_attn, declare_ffn
+
+    if hasattr(module, "make_stages"):
+        patches = dict(
+            declare_attn=declare_attn,
+            declare_ffn=declare_ffn,
+            make_stages=communicator,
+        )
+    else:
+        facts = MagicMock()
+        patches = dict(LayerCommunicator=communicator, LayerFacts=facts)
     patches.update({name: recording_stub(name) for name in stubs})
     if hasattr(module, "get_parallel"):
         patches["get_parallel"] = lambda: PARALLEL
@@ -185,7 +192,29 @@ def build(case, num_layers, layer_id, config=None, **kwargs):
             config or make_config(num_layers), layer_id=layer_id, **kwargs
         )
     communicator.assert_called_once()
-    return communicator.call_args.kwargs, facts.init_new.call_args.kwargs, built
+    if not hasattr(module, "make_stages"):
+        passed = communicator.call_args.kwargs
+        planned = facts.init_new.call_args.kwargs
+        return (
+            passed,
+            {
+                "terminal": planned["layer_id"] == planned["num_layers"] - 1,
+                "enters_stack": planned["layer_id"] == 0,
+                "is_layer_sparse": planned["is_layer_sparse"],
+            },
+            built,
+        )
+    declaration = communicator.call_args.args[1][0]
+    sequence = communicator.call_args.kwargs
+    return (
+        {},
+        {
+            "terminal": sequence["terminal"],
+            "enters_stack": sequence["previous"] is None,
+            "is_layer_sparse": declaration.sparse,
+        },
+        built,
+    )
 
 
 def planned_as_last(case, num_layers, layer_id, **kwargs):
@@ -193,10 +222,10 @@ def planned_as_last(case, num_layers, layer_id, **kwargs):
     fact the communicator reads the last layer from."""
     passed, planned, _ = build(case, num_layers, layer_id, **kwargs)
     assert "is_last_layer" not in passed, "the plan is the only source"
-    return planned["layer_id"] == planned["num_layers"] - 1
+    return planned["terminal"]
 
 
-class TestLastLayerCommunicator(CustomTestCase):
+class TestTerminalStages(CustomTestCase):
     def test_only_the_last_layer_is_last(self):
         """With all-reduce fusion on, only the model's last layer is marked last,
         so its FFN all-reduce is never left to a next layer that does not exist."""
@@ -241,7 +270,8 @@ class TestLastLayerCommunicator(CustomTestCase):
             num_layers, layer_id = draft
             with self.subTest(case=case):
                 _, planned, _ = build(case, num_layers, layer_id, is_nextn=True)
-                self.assertEqual((planned["layer_id"], planned["num_layers"]), (0, 1))
+                self.assertTrue(planned["enters_stack"])
+                self.assertTrue(planned["terminal"])
 
     def test_bailing_draft_layer_builds_an_moe(self):
         """The Bailing V2 NextN checkpoint holds expert weights, so the NextN

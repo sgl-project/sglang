@@ -1,3 +1,5 @@
+from sglang.srt.layers.communicator.layer import FfnExit
+
 """A Step-3.5 dense layer must leave its all-reduce out when postprocess
 reduce-scatters its output; otherwise the output is summed twice. The layer's
 FFN exit publishes the decision while the MLP runs, then completes it."""
@@ -47,7 +49,7 @@ def dense_layer(*, reduce_scatter):
             complete=complete,
         ),
     )
-    communicator.ffn_exit = lambda fb: comm.FfnExit(communicator, fb)
+    communicator.ffn_exit = lambda fb: FfnExit(communicator, fb)
     object.__setattr__(layer, "layer_communicator", communicator)
     object.__setattr__(layer, "use_moe", False)
     object.__setattr__(layer, "mlp", mlp)

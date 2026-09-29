@@ -1456,36 +1456,26 @@ class SarvamMoEForCausalLM(BailingMoEForCausalLM):
         start, end = split_interval
 
         if start == 0:
+            residual_batch.start(forward_batch)
             if input_embeds is None:
                 forward_batch.hidden_states = self.model.word_embeddings(input_ids)
             else:
                 forward_batch.hidden_states = input_embeds
-            forward_batch.residual = residual_batch.start(forward_batch)
 
         for i in range(start, end):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.model.layers[i]
-                forward_batch.hidden_states, forward_batch.residual = layer(
-                    positions,
-                    forward_batch.hidden_states,
-                    forward_batch,
-                    forward_batch.residual,
+                forward_batch.hidden_states = layer(
+                    positions, forward_batch.hidden_states, forward_batch
                 )
 
         if end == self.model.config.num_hidden_layers:
-            forward_batch.hidden_states, forward_batch.residual = self.model.layers[
-                end - 1
-            ].layer_communicator.finish_layer_stack(
-                forward_batch.hidden_states, forward_batch.residual, forward_batch
+            forward_batch.hidden_states = residual_batch.finish(
+                forward_batch.hidden_states, forward_batch
             )
-            if forward_batch.residual is None:
-                hidden_states = self.model.norm(forward_batch.hidden_states)
-            else:
-                hidden_states, _ = self.model.norm(
-                    forward_batch.hidden_states, forward_batch.residual
-                )
-            forward_batch.residual = None
-            forward_batch.hidden_states = hidden_states
+            forward_batch.hidden_states = residual_batch.norm(
+                forward_batch.hidden_states, forward_batch, self.model.norm
+            )
 
             return self.logits_processor(
                 input_ids, forward_batch.hidden_states, self.lm_head, forward_batch

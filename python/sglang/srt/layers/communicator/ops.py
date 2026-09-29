@@ -38,7 +38,6 @@ from sglang.srt.layers.communicator.adapters.context_parallel import (
     dsa_cp_reduce_scatter_hidden_states,
 )
 from sglang.srt.layers.communicator.layout import (
-    CommunicateContext,
     Layout,
     SumGroup,
     TokenAxis,
@@ -56,7 +55,6 @@ from sglang.srt.layers.communicator.residual.stream import DeclaredSum
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
-    can_use_dp_reduce_scatter,
     dp_gather_partial,
     dp_gather_replicate,
     dp_reduce_scatter_tensor,
@@ -69,7 +67,6 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
     moe_cp_all_gather_into_tensor,
 )
-from sglang.srt.layers.moe import should_use_dp_reduce_scatterv
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
@@ -86,28 +83,30 @@ if _is_npu:
 def tp_reduce_scatter(
     hidden_states: torch.Tensor,
     residual: Optional[torch.Tensor],
-    context: "CommunicateContext",
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Module-level so MHC communicators can reuse it without a
-    ``LayerCommunicator`` instance."""
+    """Complete a TP sum onto each rank's token slice."""
+    parallel = get_parallel()
     if hidden_states.shape[0] == 0:
         return hidden_states, hidden_states
-    assert hidden_states.shape[0] % context.tp_size == 0, (
-        f"Expected total tokens {hidden_states.shape[0]} % tp_size {context.tp_size} to be 0"
+    assert hidden_states.shape[0] % parallel.tp_size == 0, (
+        f"Expected total tokens {hidden_states.shape[0]} % tp_size {parallel.tp_size} to be 0"
     )
-    local_tokens = hidden_states.shape[0] // context.tp_size
+    local_tokens = hidden_states.shape[0] // parallel.tp_size
     output = hidden_states.new_empty(local_tokens, *hidden_states.shape[1:])
-    get_parallel().tp_group.reduce_scatter_tensor(output, hidden_states)
+    parallel.tp_group.reduce_scatter_tensor(output, hidden_states)
     if residual is not None:
-        residual = residual.tensor_split(context.tp_size)[context.tp_rank]
+        residual = residual.tensor_split(parallel.tp_size)[parallel.tp_rank]
     return output, residual
 
 
-def tp_slice(hidden_states, residual, context):
+def tp_slice(hidden_states, residual):
     """The rows reduce-scatter would return, when the sum is already complete."""
-    hidden_states = hidden_states.tensor_split(context.tp_size)[context.tp_rank].clone()
+    parallel = get_parallel()
+    hidden_states = hidden_states.tensor_split(parallel.tp_size)[
+        parallel.tp_rank
+    ].clone()
     if residual is not None:
-        residual = residual.tensor_split(context.tp_size)[context.tp_rank]
+        residual = residual.tensor_split(parallel.tp_size)[parallel.tp_rank]
     return hidden_states, residual
 
 
@@ -116,7 +115,6 @@ class CommunicateSimpleFn:
     def _trivial(
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        context: CommunicateContext,
     ) -> torch.Tensor:
         return hidden_states
 
@@ -124,18 +122,18 @@ class CommunicateSimpleFn:
     def _scattered_to_tp_attn_full(
         hidden_states: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         forward_batch: ForwardBatch,
-        context: CommunicateContext,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        parallel = get_parallel()
         if isinstance(hidden_states, tuple):
             gathered_hidden_states = []
             for local_hidden_states in hidden_states:
                 with use_symmetric_memory(
-                    get_parallel().tp_group,
+                    parallel.tp_group,
                     disabled=not is_allocation_symmetric(),
                 ):
                     output = torch.empty(
                         (
-                            local_hidden_states.shape[0] * context.attn_tp_size,
+                            local_hidden_states.shape[0] * parallel.attn_tp_size,
                             *local_hidden_states.shape[1:],
                         ),
                         dtype=local_hidden_states.dtype,
@@ -152,10 +150,11 @@ class CommunicateSimpleFn:
 
 
 def _reduce_and_redistribute_output_to_attn_tp_shards(
-    hidden_states: torch.Tensor, context: CommunicateContext
+    hidden_states: torch.Tensor,
 ) -> torch.Tensor:
-    local_hidden_states = hidden_states.tensor_split(context.attn_tp_size)[
-        context.attn_tp_rank
+    parallel = get_parallel()
+    local_hidden_states = hidden_states.tensor_split(parallel.attn_tp_size)[
+        parallel.attn_tp_rank
     ]
     attn_tp_reduce_scatter_tensor(local_hidden_states, hidden_states)
     return local_hidden_states
@@ -250,8 +249,8 @@ def _mlp_input_without_dp(
     residual: torch.Tensor,
     forward_batch: ForwardBatch,
     layernorm: torch.nn.Module,
-    context: CommunicateContext,
     *,
+    cache=None,
     gathers_residual: bool,
     fusions: Tuple[Callable, ...],
     group: SumGroup = SumGroup.ATTN_TP,
@@ -274,8 +273,8 @@ def _mlp_input_without_dp(
         )
     elif group is SumGroup.TP:
         hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-    if _is_npu and context.cache is not None:
-        _ = prepare_weight_cache(hidden_states, context.cache)
+    if _is_npu and cache is not None:
+        _ = prepare_weight_cache(hidden_states, cache)
     return read.update_and_read(update, hidden_states, residual, layernorm)
 
 
@@ -284,8 +283,8 @@ def _mlp_input_dp_replicate(
     residual: torch.Tensor,
     forward_batch: ForwardBatch,
     layernorm: torch.nn.Module,
-    context: CommunicateContext,
     *,
+    cache=None,
     gathers_residual: bool,
     reduces_attention_tp: bool,
     places_cp_shards: bool = False,
@@ -324,8 +323,8 @@ def _mlp_input_dp_partial(
     residual: torch.Tensor,
     forward_batch: ForwardBatch,
     layernorm: torch.nn.Module,
-    context: CommunicateContext,
     *,
+    cache=None,
     gathers_residual: bool,
     places_cp_shards: bool = False,
     read: StageRead = NORM_READ,
@@ -336,7 +335,7 @@ def _mlp_input_dp_partial(
     shard of the DP group's tokens beside the others' in the group's slot."""
     if gathers_residual:
         residual = _redistribute_from_attn_tp_shards(residual)
-    if context.attn_tp_rank == 0:
+    if get_parallel().attn_tp_rank == 0:
         hidden_states += residual
     cp_shard_counts = _cp_shard_token_rows(forward_batch) if places_cp_shards else None
     hidden_states = _reduce_and_redistribute_output_to_dp(
@@ -395,7 +394,7 @@ def _tp_all_gather_scattered_rows(
 
 
 def _dispatch_consumer(
-    hidden_states, residual, forward_batch, norm, context, *, paths, update=ADD, **call
+    hidden_states, residual, forward_batch, norm, *, paths, update=ADD, **call
 ):
     if residual is None:
         # Enter/read-only paths do not execute an update.
@@ -405,9 +404,7 @@ def _dispatch_consumer(
             prepare = paths[update.adds_plainly]
         except KeyError:
             raise RuntimeError("producer update has no bound input path") from None
-    return prepare(
-        hidden_states, residual, forward_batch, norm, context, update=update, **call
-    )
+    return prepare(hidden_states, residual, forward_batch, norm, update=update, **call)
 
 
 def _consumer_step(
@@ -415,7 +412,6 @@ def _consumer_step(
     residual: Optional[torch.Tensor],
     forward_batch: ForwardBatch,
     norm: torch.nn.Module,
-    context: CommunicateContext,
     *,
     step: Callable,
     adds_plainly: bool,
@@ -473,9 +469,7 @@ def _consumer_step(
                 hidden_states = reduce_output(owed)
             else:
                 hidden_states = owed.partial
-    return step(
-        hidden_states, residual, forward_batch, norm, context, update=update, **call
-    )
+    return step(hidden_states, residual, forward_batch, norm, update=update, **call)
 
 
 def _read_input(
@@ -483,8 +477,8 @@ def _read_input(
     residual: Optional[torch.Tensor],
     forward_batch: ForwardBatch,
     norm: torch.nn.Module,
-    context: CommunicateContext,
     *,
+    cache=None,
     layer_input: Optional[Callable],
     enters_stack: bool,
     read: StageRead,
@@ -498,7 +492,7 @@ def _read_input(
     starts its residual from its input."""
     enters = residual is None and enters_stack
     if layer_input is not None:
-        hidden_states, residual = layer_input(hidden_states, residual, context)
+        hidden_states, residual = layer_input(hidden_states, residual)
     if enters:
         hidden_states, residual = read.enter(hidden_states), None
     if residual is None:
@@ -519,17 +513,15 @@ def _mlp_input_scatter(
     residual: torch.Tensor,
     forward_batch: ForwardBatch,
     layernorm: torch.nn.Module,
-    context: CommunicateContext,
     *,
+    cache=None,
     scatters_residual: bool,
     read: StageRead = NORM_READ,
     update: StageUpdate = ADD,
 ):
-    hidden_states = _reduce_and_redistribute_output_to_attn_tp_shards(
-        hidden_states, context
-    )
+    hidden_states = _reduce_and_redistribute_output_to_attn_tp_shards(hidden_states)
     if scatters_residual:
-        residual = update.residual_to_attn_tp_shard(residual, context)
+        residual = update.residual_to_attn_tp_shard(residual)
     return read.update_and_read(update, hidden_states, residual, layernorm)
 
 
@@ -538,15 +530,15 @@ def _mlp_input_slice(
     residual: Optional[torch.Tensor],
     forward_batch: ForwardBatch,
     layernorm: torch.nn.Module,
-    context: CommunicateContext,
     *,
+    cache=None,
     scatters_residual: bool,
     read: StageRead = NORM_READ,
     update: StageUpdate = ADD,
 ):
-    hidden_states = _redistribute_to_attn_tp_shards(hidden_states, context).clone()
+    hidden_states = _redistribute_to_attn_tp_shards(hidden_states).clone()
     if scatters_residual and residual is not None:
-        residual = update.residual_to_attn_tp_shard(residual, context)
+        residual = update.residual_to_attn_tp_shard(residual)
     return read.update_and_read(update, hidden_states, residual, layernorm)
 
 
@@ -555,8 +547,8 @@ def _mlp_input_on_residual_shard(
     residual: torch.Tensor,
     forward_batch: ForwardBatch,
     layernorm: torch.nn.Module,
-    context: CommunicateContext,
     *,
+    cache=None,
     reduces: bool = True,
     read: StageRead,
     update: StageUpdate,
@@ -565,11 +557,12 @@ def _mlp_input_on_residual_shard(
     rows: reduce-scatter the attention output onto the slice, which completes
     its sum, write it into the residual and read the FFN input there, then
     gather the input back into the attention output's rows."""
+    parallel = get_parallel()
     if hidden_states.shape[0] == 0:
         return hidden_states, hidden_states
-    shard = hidden_states.tensor_split(context.tp_size)[context.tp_rank]
+    shard = hidden_states.tensor_split(parallel.tp_size)[parallel.tp_rank]
     if reduces:
-        get_parallel().tp_group.reduce_scatter_tensor(shard, hidden_states)
+        parallel.tp_group.reduce_scatter_tensor(shard, hidden_states)
     else:
         shard = shard.clone()
     shard, residual = read.update_and_read(update, shard, residual, layernorm)
@@ -582,13 +575,13 @@ def _mlp_input_residual_into_sum(
     residual: torch.Tensor,
     forward_batch: ForwardBatch,
     layernorm: torch.nn.Module,
-    context: CommunicateContext,
     *,
+    cache=None,
     read: StageRead = NORM_READ,
     update: StageUpdate = ADD,
 ):
     return _tp_all_reduce_with_scattered_residual(
-        hidden_states, residual, layernorm, context, read
+        hidden_states, residual, layernorm, read
     )
 
 
@@ -596,13 +589,13 @@ def _tp_all_reduce_with_scattered_residual(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     layernorm: torch.nn.Module,
-    context: CommunicateContext,
     read: StageRead = NORM_READ,
 ):
+    parallel = get_parallel()
     if hidden_states.shape[0] == 0:
         return hidden_states, hidden_states
 
-    scattered_states = hidden_states.tensor_split(context.tp_size)[context.tp_rank]
+    scattered_states = hidden_states.tensor_split(parallel.tp_size)[parallel.tp_rank]
     scattered_states += residual
     residual = tensor_model_parallel_all_reduce(hidden_states)
     return read.read(residual, layernorm)
@@ -613,8 +606,8 @@ def _mlp_input_gather_attention_cp(
     residual: torch.Tensor,
     forward_batch: ForwardBatch,
     layernorm: torch.nn.Module,
-    context: CommunicateContext,
     *,
+    cache=None,
     gather: Callable,
     update: StageUpdate = ADD,
 ):
@@ -622,7 +615,7 @@ def _mlp_input_gather_attention_cp(
     equal length, over the attention-CP group. The residual stays on the
     shard."""
     hidden_states, residual = gather(
-        hidden_states, residual, forward_batch, layernorm, context, update=update
+        hidden_states, residual, forward_batch, layernorm, update=update, cache=cache
     )
     return dsa_cp_gather_hidden_states(hidden_states), residual
 
@@ -632,8 +625,8 @@ def _mlp_input_gather_moe_cp(
     residual: torch.Tensor,
     forward_batch: ForwardBatch,
     layernorm: torch.nn.Module,
-    context: CommunicateContext,
     *,
+    cache=None,
     gather: Callable,
     update: StageUpdate = ADD,
 ):
@@ -649,7 +642,7 @@ def _mlp_input_gather_moe_cp(
         return hidden_states, residual
 
     hidden_states, residual = gather(
-        hidden_states, residual, forward_batch, layernorm, context, update=update
+        hidden_states, residual, forward_batch, layernorm, update=update, cache=cache
     )
 
     rows = moe_cp_gathered_rows(forward_batch)
@@ -709,27 +702,6 @@ def _redistribute_output_from_moe_cp(
     ).contiguous()
 
 
-def _reduce_and_redistribute_output_step(
-    forward_batch: ForwardBatch,
-    *,
-    leaves_for_reduce_scatter: bool,
-    leaves_for_reduce_scatterv: bool,
-) -> Optional[Callable[[torch.Tensor, torch.Tensor, ForwardBatch], None]]:
-    """The reduce-scatter that brings an FFN output gathered over attention
-    DP back to this rank's tokens when the FFN leaves its sum to it (see
-    StageOutput); None when the FFN reduces the output and only a scatter
-    remains."""
-    if should_use_dp_reduce_scatterv() and leaves_for_reduce_scatterv:
-        return _reduce_and_redistribute_output_varlen
-    if (
-        leaves_for_reduce_scatter
-        and forward_batch.dp_padding_mode.is_max_len()
-        and can_use_dp_reduce_scatter()
-    ):
-        return _reduce_and_redistribute_output_max_len
-    return None
-
-
 def _to_local_tokens(
     step: Callable[[torch.Tensor, torch.Tensor, ForwardBatch], None],
     forward_batch: ForwardBatch,
@@ -756,38 +728,15 @@ class CommunicateSummableTensorPairFn:
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
-        context: CommunicateContext,
         **kwargs,
     ):
         return hidden_states, residual
-
-    @staticmethod
-    def _scatter_hidden_states(
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-        forward_batch: ForwardBatch,
-        context: CommunicateContext,
-        allow_reduce_scatter: bool = False,
-        is_layer_sparse: bool = False,
-    ):
-        step = (
-            _reduce_and_redistribute_output_step(
-                forward_batch,
-                leaves_for_reduce_scatter=allow_reduce_scatter,
-                # A MoE block leaves its sum to reduce_scatterv whenever it
-                # applies (should_skip_post_experts_all_reduce).
-                leaves_for_reduce_scatterv=allow_reduce_scatter or is_layer_sparse,
-            )
-            or _redistribute_output
-        )
-        return _to_local_tokens(step, forward_batch, hidden_states), residual
 
     @staticmethod
     def _gather(
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
-        context: CommunicateContext,
         update: StageUpdate = ADD,
         **kwargs,
     ):
@@ -799,7 +748,6 @@ class CommunicateSummableTensorPairFn:
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
-        context: CommunicateContext,
         *,
         sums: bool,
         gathers_back: bool,
@@ -810,17 +758,20 @@ class CommunicateSummableTensorPairFn:
         a reduce-scatter that also completes its sum when ``sums``, else this
         rank's slice of the complete output. With ``gathers_back`` it is
         written into the residual there and the full rows are gathered back."""
+        parallel = get_parallel()
         if sums:
-            hidden_states, _ = tp_reduce_scatter(hidden_states, None, context)
+            hidden_states, _ = tp_reduce_scatter(hidden_states, None)
         else:
-            hidden_states = hidden_states.tensor_split(context.tp_size)[context.tp_rank]
+            hidden_states = hidden_states.tensor_split(parallel.tp_size)[
+                parallel.tp_rank
+            ]
         if not gathers_back:
             return hidden_states, residual
         local_states = update.update(hidden_states, residual)
         hidden_states = local_states.new_empty(
-            local_states.shape[0] * context.tp_size, *local_states.shape[1:]
+            local_states.shape[0] * parallel.tp_size, *local_states.shape[1:]
         )
-        get_parallel().tp_group.all_gather_into_tensor(hidden_states, local_states)
+        parallel.tp_group.all_gather_into_tensor(hidden_states, local_states)
         return hidden_states, None
 
     @staticmethod
@@ -828,17 +779,15 @@ class CommunicateSummableTensorPairFn:
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
-        context: CommunicateContext,
     ):
         assert residual is None, "not yet handled residual!=None"
-        return _redistribute_to_attn_tp_shards(hidden_states, context), None
+        return _redistribute_to_attn_tp_shards(hidden_states), None
 
     @staticmethod
     def _take_back_attention_cp_shard(
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
-        context: CommunicateContext,
         **kwargs,
     ):
         """DSA and MLA CP: this rank's shard of a complete output gathered in
@@ -852,7 +801,6 @@ class CommunicateSummableTensorPairFn:
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
-        context: CommunicateContext,
         **kwargs,
     ):
         """DSA and MLA CP: sum the FFN output over the attention-CP group and
@@ -864,7 +812,6 @@ class CommunicateSummableTensorPairFn:
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
-        context: CommunicateContext,
         **kwargs,
     ):
         """This rank's CP shard of the rows the DP gather put in its DP group's
@@ -886,7 +833,6 @@ class CommunicateSummableTensorPairFn:
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
-        context: CommunicateContext,
         **kwargs,
     ):
         """Scatter MoE output back to TP_ATTN_FULL after MOE_FULL computation.
@@ -905,7 +851,7 @@ class CommunicateSummableTensorPairFn:
         if rows is not None:
             hidden_states = _redistribute_output_from_moe_cp(hidden_states, rows)
 
-        if context.attn_dp_size > 1:
+        if get_parallel().attn_dp_size > 1:
             hidden_states = _to_local_tokens(
                 _redistribute_output, forward_batch, hidden_states
             )

@@ -8,14 +8,40 @@ the name, not only into the package.
 import contextlib
 from unittest import mock
 
-from sglang.srt.layers import communicator
-from sglang.srt.layers.communicator import boundary, layer, layout, ops, output
+from sglang.srt.layers import communicator as communicator
+from sglang.srt.layers.communicator import (
+    boundary,
+    construction,
+    exit,
+    factories,
+    layer,
+    layout,
+    legacy_stage,
+    ops,
+    output,
+)
 from sglang.srt.layers.communicator import residual as residual_contract
-from sglang.srt.layers.communicator.adapters import attention
-from sglang.srt.layers.communicator.residual import access, add_norm, mhc
+from sglang.srt.layers.communicator import (
+    stage,
+)
+from sglang.srt.layers.communicator.adapters import attention, branch, lora
+from sglang.srt.layers.communicator.fusions import allreduce
+from sglang.srt.layers.communicator.residual import (
+    access,
+    add_norm,
+    batch,
+    mhc,
+    stream,
+)
 
 COMMUNICATOR_MODULES = (
+    layer,
+    legacy_stage,
     communicator,
+    allreduce,
+    exit,
+    branch,
+    lora,
     layout,
     output,
     attention,
@@ -25,7 +51,11 @@ COMMUNICATOR_MODULES = (
     mhc,
     ops,
     boundary,
-    layer,
+    construction,
+    factories,
+    stage,
+    batch,
+    stream,
 )
 
 

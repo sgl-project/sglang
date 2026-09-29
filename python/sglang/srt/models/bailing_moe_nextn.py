@@ -162,7 +162,7 @@ class BailingMoEModelNextN(nn.Module):
                 )
             )
 
-        residual = residual_batch.start(forward_batch)
+        residual_batch.start(forward_batch)
         if self.is_hybrid:
             device = input_ids.device
             zero_allocator = BumpAllocator(
@@ -172,26 +172,20 @@ class BailingMoEModelNextN(nn.Module):
                 dtype=torch.float32,
                 device=device,
             )
-            hidden_states, residual = self.decoder(
+            hidden_states = self.decoder(
                 hidden_states=hidden_states,
                 positions=positions,
                 forward_batch=forward_batch,
-                residual=residual,
                 zero_allocator=zero_allocator,
             )
         else:
-            hidden_states, residual = self.decoder(
-                positions, hidden_states, forward_batch, residual
-            )
+            hidden_states = self.decoder(positions, hidden_states, forward_batch)
 
-        hidden_states, residual = self.decoder.layer_communicator.finish_layer_stack(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states = residual_batch.finish(hidden_states, forward_batch)
         if not forward_batch.forward_mode.is_idle():
-            if residual is not None:
-                hidden_states, _ = self.final_layernorm(hidden_states, residual)
-            else:
-                hidden_states = self.final_layernorm(hidden_states)
+            hidden_states = residual_batch.norm(
+                hidden_states, forward_batch, self.final_layernorm
+            )
 
         return hidden_states
 

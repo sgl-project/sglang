@@ -101,14 +101,12 @@ def layer_stage(pattern: str, layer_idx: int) -> LayerStage:
     )
 
 
-def make_layer_communicator(
-    layer_norm: RMSNorm, *, pattern: str, layer_idx: int
-) -> LayerCommunicator:
+def make_stage_boundary(layer_norm: RMSNorm, *, pattern: str, layer_idx: int):
     """The communicator of a layer that is one stage: only its own norm, and
     boundaries built from the stages next to it in the pattern."""
     stage = layer_stage(pattern, layer_idx)
     for_attn = stage.kind is StageKind.ATTENTION
-    return LayerCommunicator(
+    boundaries = LayerCommunicator(
         layer_facts=LayerFacts(
             is_layer_sparse=pattern[layer_idx] == MOE,
             is_last_layer=layer_idx == len(pattern) - 1,
@@ -121,3 +119,5 @@ def make_layer_communicator(
         allow_reduce_scatter=not for_attn,
         stage=stage,
     )
+
+    return boundaries.attn if for_attn else boundaries.ffn

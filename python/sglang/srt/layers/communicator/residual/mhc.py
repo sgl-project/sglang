@@ -20,6 +20,7 @@ import torch
 
 from sglang.kernels.ops.layernorm.mhc import hc_contract, hc_expand
 from sglang.srt.layers.communicator.residual import LayerResidual
+from sglang.srt.runtime_context import get_parallel
 
 
 @dataclass
@@ -96,8 +97,9 @@ class MHCState:
         self.h_res = None
         self.h_post = None
 
-    def residual_to_attn_tp_shard(self, residual, context):
-        rank, size = context.attn_tp_rank, context.attn_tp_size
+    def residual_to_attn_tp_shard(self, residual):
+        parallel = get_parallel()
+        rank, size = parallel.attn_tp_rank, parallel.attn_tp_size
         self.h_res = self.h_res.tensor_split(size)[rank]
         self.h_post = self.h_post.tensor_split(size)[rank]
         return residual.tensor_split(size)[rank]
@@ -151,8 +153,8 @@ class _AttentionUpdate:
     def update(self, hidden_states, residual):
         return self.state.mlp_combine(hidden_states, residual)
 
-    def residual_to_attn_tp_shard(self, residual, context):
-        return self.state.residual_to_attn_tp_shard(residual, context)
+    def residual_to_attn_tp_shard(self, residual):
+        return self.state.residual_to_attn_tp_shard(residual)
 
     def residual_from_attn_tp_shards(self, residual):
         return self.state.residual_from_attn_tp_shards(residual)
@@ -198,8 +200,8 @@ class _FfnUpdate:
             hidden_states = hc_contract(hidden_states, self.state.hc_mult)
         return hidden_states
 
-    def residual_to_attn_tp_shard(self, residual, context):
-        return self.state.residual_to_attn_tp_shard(residual, context)
+    def residual_to_attn_tp_shard(self, residual):
+        return self.state.residual_to_attn_tp_shard(residual)
 
     def residual_from_attn_tp_shards(self, residual):
         return self.state.residual_from_attn_tp_shards(residual)

@@ -21,7 +21,6 @@ from typing import Callable
 import torch
 
 from sglang.srt.layers.communicator.layout import (
-    CommunicateContext,
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.dp_attention import (
@@ -182,7 +181,6 @@ def _redistribute_from_attn_tp_shards(tensor: torch.Tensor) -> torch.Tensor:
     return gathered
 
 
-def _redistribute_to_attn_tp_shards(
-    tensor: torch.Tensor, context: CommunicateContext
-) -> torch.Tensor:
-    return tensor.tensor_split(context.attn_tp_size)[context.attn_tp_rank]
+def _redistribute_to_attn_tp_shards(tensor: torch.Tensor) -> torch.Tensor:
+    parallel = get_parallel()
+    return tensor.tensor_split(parallel.attn_tp_size)[parallel.attn_tp_rank]

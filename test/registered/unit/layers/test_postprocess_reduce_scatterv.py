@@ -1,3 +1,5 @@
+from sglang.test.boundary_fixtures import stub_plan
+
 """Under DP attention with reduce_scatterv, postprocess sums a FULL-mode layer's
 output while scattering it back to the local tokens only when the FFN left its
 all-reduce out."""
@@ -12,11 +14,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.layers import communicator as comm
-from sglang.srt.layers.communicator import (
-    CommunicateSummableTensorPairFn,
-    LayerCommunicator,
-    LayerFacts,
-)
+from sglang.srt.layers.communicator import exit as comm_exit
 from sglang.srt.layers.communicator import ops as comm_ops
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.layers.moe.utils import (
@@ -76,7 +74,7 @@ def reduce_scatterv_applies():
         yield
 
 
-def postprocess_sums(*, allow_reduce_scatter, is_layer_sparse):
+def postprocess_sums(*, reduce_scatter, is_layer_sparse):
     calls = []
     parallel = types.SimpleNamespace(
         tp_size=2,
@@ -97,19 +95,19 @@ def postprocess_sums(*, allow_reduce_scatter, is_layer_sparse):
             "dp_scatter", side_effect=lambda *args: calls.append("dp_scatter")
         ),
     ):
-        CommunicateSummableTensorPairFn._scatter_hidden_states(
-            torch.zeros(2, 4),
-            None,
+        step = comm_exit._reduce_and_redistribute_output_step(
             forward_batch,
-            context=None,
-            allow_reduce_scatter=allow_reduce_scatter,
-            is_layer_sparse=is_layer_sparse,
+            leaves_for_reduce_scatter=reduce_scatter,
+            leaves_for_reduce_scatterv=reduce_scatter,
+        )
+        comm_ops._to_local_tokens(
+            step or comm_ops._redistribute_output, forward_batch, torch.zeros(2, 4)
         )
     assert len(calls) == 1, calls
     return calls[0] == "reduce_scatterv"
 
 
-def ffn_leaves_the_sum_out(*, allow_reduce_scatter, is_layer_sparse):
+def ffn_leaves_the_sum_out(*, reduce_scatter, is_layer_sparse):
     # A layer that allows reduce-scatter publishes mlp_reduce_scatter while
     # reduce_scatterv applies; a dense MLP reads only that flag.
     with (
@@ -133,7 +131,7 @@ def ffn_leaves_the_sum_out(*, allow_reduce_scatter, is_layer_sparse):
             "should_use_flashinfer_cutlass_moe_fp4_allgather",
             return_value=False,
         ),
-        get_forward().scoped(mlp_reduce_scatter=allow_reduce_scatter),
+        get_forward().scoped(mlp_reduce_scatter=reduce_scatter),
     ):
         if is_layer_sparse:
             return should_skip_post_experts_all_reduce(is_tp_path=True)
@@ -143,50 +141,41 @@ def ffn_leaves_the_sum_out(*, allow_reduce_scatter, is_layer_sparse):
 class TestPostprocessReduceScatterv(CustomTestCase):
     def test_sums_exactly_when_the_ffn_left_the_sum_out(self):
         for allow, sparse in itertools.product((False, True), repeat=2):
-            case = dict(allow_reduce_scatter=allow, is_layer_sparse=sparse)
+            case = dict(reduce_scatter=allow, is_layer_sparse=sparse)
             with self.subTest(**case):
                 self.assertEqual(
                     postprocess_sums(**case), ffn_leaves_the_sum_out(**case)
                 )
 
     def test_a_dense_layer_without_reduce_scatter_is_not_summed_again(self):
-        self.assertFalse(
-            postprocess_sums(allow_reduce_scatter=False, is_layer_sparse=False)
-        )
+        self.assertFalse(postprocess_sums(reduce_scatter=False, is_layer_sparse=False))
 
-    def test_layer_facts_record_whether_the_layer_is_sparse(self):
-        for sparse in (False, True):
-            with self.subTest(sparse=sparse):
-                facts = LayerFacts.init_new(
-                    layer_id=1,
-                    num_layers=4,
-                    is_layer_sparse=sparse,
-                    is_previous_layer_sparse=sparse,
-                    is_next_layer_sparse=sparse,
-                )
-            self.assertEqual(facts.is_layer_sparse, sparse)
+    def test_postprocess_only_scatters_a_complete_output(self):
+        # The operation-scheduled path supplies a complete output; postprocess
+        # only scatters it, even when the exit could choose reduce-scatter.
+        for step in (object(), None):
+            with self.subTest(reduce_scatter=step is not None):
+                communicator = stub_plan()
+                communicator._sp_steps = None
+                communicator._input_scattered_steps = None
+                communicator._cp_steps = None
+                communicator._steps = steps(ffn_output_move=None)
+                communicator.output._postprocess_dp_step = lambda forward_batch: step
+                with patch_communicator(
+                    "_to_local_tokens", side_effect=lambda s, fb, h: (s, h)
+                ):
+                    hidden_states, residual = communicator.output.postprocess_layer(
+                        "h", "r", "fb"
+                    )
+                self.assertEqual(hidden_states, (comm_ops._redistribute_output, "h"))
+                self.assertEqual(residual, "r")
 
-    def test_postprocess_passes_the_layer_sparsity(self):
-        seen = {}
-        communicator = LayerCommunicator.__new__(LayerCommunicator)
-        communicator._sp_steps = None
-        communicator._input_scattered_steps = None
-        communicator._cp_steps = None
-        communicator._context = None
-        communicator.allow_reduce_scatter = False
-        communicator.layer_facts = types.SimpleNamespace(is_layer_sparse=True)
-        communicator._steps = steps(
-            ffn_output_move=lambda **kwargs: seen.update(kwargs) or (None, None)
-        )
-        communicator.postprocess_layer(None, None, None)
-        self.assertIs(seen["is_layer_sparse"], True)
-
-    def test_postprocess_takes_the_output_back_with_the_exit_step(self):
+    def test_legacy_postprocess_takes_the_output_back_with_the_exit_step(self):
         # Under attention DP the base postprocess brings the FFN output back with
         # the step the FFN exit chooses.
         for step in (object(), None):
             with self.subTest(reduce_scatter=step is not None):
-                communicator = LayerCommunicator.__new__(LayerCommunicator)
+                communicator = comm.LayerCommunicator.__new__(comm.LayerCommunicator)
                 communicator._sp_steps = None
                 communicator._input_scattered_steps = None
                 communicator._cp_steps = None
@@ -216,18 +205,18 @@ class TestReduceAndRedistributeOutputStep(CustomTestCase):
             patch_communicator("should_use_dp_reduce_scatterv", return_value=varlen),
             patch_communicator("can_use_dp_reduce_scatter", return_value=tiles),
         ):
-            # A MoE block leaves its sum to reduce_scatterv whenever it applies.
-            return comm_ops._reduce_and_redistribute_output_step(
+            # Both dense and MoE producers follow the selected output step.
+            return comm_exit._reduce_and_redistribute_output_step(
                 forward_batch,
                 leaves_for_reduce_scatter=allow,
-                leaves_for_reduce_scatterv=allow or sparse,
+                leaves_for_reduce_scatterv=allow,
             )
 
     def test_every_condition(self):
         for varlen, max_len, tiles, allow, sparse in itertools.product(
             (False, True), repeat=5
         ):
-            if varlen and (allow or sparse):
+            if varlen and allow:
                 expected = comm_ops._reduce_and_redistribute_output_varlen
             elif allow and max_len and tiles:
                 expected = comm_ops._reduce_and_redistribute_output_max_len

@@ -91,7 +91,7 @@ class TestReduceMoeOutput(CustomTestCase):
         for flags, config in (
             ({"fuse_mlp_allreduce": True}, {}),
             ({"mlp_reduce_scatter": True}, {}),
-            ({}, {"reduce_scatterv": True}),
+            ({"mlp_reduce_scatter": True}, {"reduce_scatterv": True}),
         ):
             with self.subTest(flags=flags, config=config), moe_config(**config):
                 self.assertEqual(self.all_reduces(**flags)[0], 0)
@@ -138,14 +138,19 @@ class TestReplicatedMoeOutput(CustomTestCase):
         for flags, config in (
             ({"fuse_mlp_allreduce": True}, {}),
             ({"mlp_reduce_scatter": True}, {}),
-            ({}, {"reduce_scatterv": True}),
+            ({"mlp_reduce_scatter": True}, {"reduce_scatterv": True}),
         ):
             with self.subTest(flags=flags, config=config):
                 outputs = self.summed_over_two_ranks(flags=flags, **config)
                 torch.testing.assert_close(sum(outputs), torch.full((2, 3), 13.0))
 
     def test_every_rank_adds_it_to_a_reduced_or_complete_output(self):
-        for config in ({}, {"backend": "flashinfer"}, {"fp4_allgather": True}):
+        for config in (
+            {},
+            {"backend": "flashinfer"},
+            {"fp4_allgather": True},
+            {"reduce_scatterv": True},
+        ):
             with self.subTest(**config):
                 outputs = self.summed_over_two_ranks(**config)
                 torch.testing.assert_close(outputs[1], torch.full((2, 3), 12.0))
@@ -156,6 +161,102 @@ class TestReplicatedMoeOutput(CustomTestCase):
             get_forward().scoped(fuse_mlp_allreduce=True),
         ):
             self.assertTrue(should_add_replicated_moe_output())
+
+
+class TestModelsWithExplicitDpCompletion(CustomTestCase):
+    def test_direct_dp_exits_publish_their_selected_sum(self):
+        # Execute the real orchestration methods without constructing weights.
+        # These models own their DP exit instead of using StageCommunicator.
+        import __future__
+
+        for filename, method in (
+            ("deepseek_v4.py", "_run_moe_ffn_dp_sync"),
+            ("qwen4_exp.py", "_run_qwen4_exp_mlp"),
+        ):
+            path = MODELS_DIR / filename
+            node = next(
+                n
+                for n in ast.walk(ast.parse(path.read_text()))
+                if isinstance(n, ast.FunctionDef) and n.name == method
+            )
+            for use_rsv in (False, True):
+                with self.subTest(model=filename, reduce_scatterv=use_rsv):
+                    trace = []
+
+                    def rsv(value, *, output, sizes):
+                        trace.append("RSv")
+                        output.copy_(value[:2] * 2)
+
+                    def scatter(output, value, batch):
+                        trace.append("slice")
+                        output.copy_(value[:2])
+
+                    group = types.SimpleNamespace(reduce_scatterv=rsv)
+                    parallel = types.SimpleNamespace(
+                        attn_dp_size=2, attn_tp_size=1, tp_size=2, tp_group=group
+                    )
+                    namespace = dict(
+                        torch=torch,
+                        get_forward=get_forward,
+                        get_parallel=lambda: parallel,
+                        get_moe_a2a_backend=lambda: a2a(),
+                        should_use_dp_reduce_scatterv=lambda: use_rsv,
+                        is_dp_gatherv_active=lambda: False,
+                        envs=types.SimpleNamespace(
+                            SGLANG_DP_USE_REDUCE_SCATTER=types.SimpleNamespace(
+                                get=lambda: False
+                            )
+                        ),
+                        _SHARED_EXPERT_LOCAL=False,
+                        nullcontext=contextlib.nullcontext,
+                        get_global_dp_buffer=lambda g: torch.empty(4, 3),
+                        get_local_dp_buffer=lambda g: torch.empty(2, 3),
+                        get_dp_global_num_tokens=lambda: [2, 2],
+                        dp_gather_replicate=lambda output, value, batch: output.fill_(
+                            1
+                        ),
+                        dp_scatter=scatter,
+                    )
+                    exec(
+                        compile(
+                            ast.Module(body=[node], type_ignores=[]),
+                            str(path),
+                            "exec",
+                            flags=__future__.annotations.compiler_flag,
+                        ),
+                        namespace,
+                    )
+                    model = types.SimpleNamespace(
+                        dsa_enable_prefill_cp=False,
+                        config=types.SimpleNamespace(num_experts=4),
+                        _qwen4_exp_use_dp_moe_gather=lambda: True,
+                        _qwen4_exp_use_attn_tp_a2a_scatter=lambda: False,
+                        mlp=lambda value, batch, **kwargs: reduce_moe_output(value),
+                    )
+                    batch = types.SimpleNamespace(
+                        dp_padding_mode=types.SimpleNamespace(is_max_len=lambda: True)
+                    )
+                    kwargs = (
+                        dict(input_ids=None, input_ids_global=None)
+                        if filename == "deepseek_v4.py"
+                        else {}
+                    )
+                    with (
+                        moe_config(),
+                        get_forward().scoped(
+                            fuse_mlp_allreduce=False, mlp_reduce_scatter=False
+                        ),
+                        patch(
+                            "sglang.srt.distributed.communication_op.tensor_model_parallel_all_reduce",
+                            side_effect=lambda value: trace.append("AR") or value * 2,
+                        ),
+                    ):
+                        output = namespace[method](
+                            model, torch.ones(2, 3), batch, **kwargs
+                        )
+                        self.assertFalse(get_forward().mlp_reduce_scatter)
+                    self.assertEqual(trace, ["RSv"] if use_rsv else ["AR", "slice"])
+                    torch.testing.assert_close(output, torch.full((2, 3), 2.0))
 
 
 def reads_the_tp1_shared_expert_switch(tree):

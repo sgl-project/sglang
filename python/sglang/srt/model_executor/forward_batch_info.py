@@ -565,7 +565,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     dp_prefill_cuda_graph_max_prefix_len: int = 0
     global_forward_mode: Optional[ForwardMode] = None
 
-    # Owned only while this invocation executes its local decoder stack.
+    # Current layer-stack invocation; each TBO child owns a separate stream.
     residual_stream: Optional[ResidualStream] = None
 
     # For two-batch overlap

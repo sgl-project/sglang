@@ -1,4 +1,5 @@
 import unittest
+import weakref
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -8,7 +9,6 @@ from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.communicator import (
     BoundarySteps,
     EdgeDecl,
-    LayerCommunicator,
     Layout,
     StageEntry,
     StageInput,
@@ -16,7 +16,8 @@ from sglang.srt.layers.communicator import (
     SumGroup,
     make_boundary,
 )
-from sglang.srt.layers.communicator.layer import StageCommunicator
+from sglang.srt.layers.communicator.boundary import StageKind
+from sglang.srt.layers.communicator.construction import StageCommunicator
 from sglang.srt.layers.communicator.output import UnreducedOutput
 from sglang.srt.layers.communicator.residual.access import add_to_output
 from sglang.srt.layers.communicator.residual.add_norm import ADD
@@ -25,6 +26,7 @@ from sglang.srt.layers.communicator.residual.stream import (
     OwedOutput,
     ResidualStream,
 )
+from sglang.test.boundary_fixtures import stub_plan, stub_stage
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -63,16 +65,15 @@ class TestResidualStream(CustomTestCase):
             StageEntry(boundary.prepare, rows), None, StageOutput(rows), None, False
         )
         stage = StageCommunicator(
-            SimpleNamespace(input_layernorm=None, _context=None),
-            "attention",
-            "input_layernorm",
+            SimpleNamespace(norm=None),
+            StageKind.ATTENTION,
+            None,
         )
         value = torch.ones(2, 4)
-        batch = SimpleNamespace(residual_stream=ResidualStream())
-        hidden, stream = stage.prepare(value, batch.residual_stream, batch, steps)
+        hidden, stream = stage._prepare(value, ResidualStream(), None, steps)
         self.assertEqual(read.enters, 1)
         torch.testing.assert_close(hidden, value * 6)
-        hidden, stream = stage.prepare(stream.residual, stream, batch, steps)
+        hidden, stream = stage._prepare(stream.residual, stream, None, steps)
         self.assertEqual(read.enters, 1)
         torch.testing.assert_close(hidden, value * 6)
 
@@ -110,17 +111,16 @@ class TestResidualStream(CustomTestCase):
             StageEntry(boundary.prepare, rows), None, StageOutput(rows), None, False
         )
         stage = StageCommunicator(
-            SimpleNamespace(input_layernorm=None, _context=None),
-            "attention",
-            "input_layernorm",
+            SimpleNamespace(norm=None),
+            StageKind.ATTENTION,
+            None,
         )
         for increment in (2, 7):
             with self.subTest(increment=increment):
                 actual = Update(increment)
                 stream = ResidualStream(torch.full((2, 4), 3.0))
                 hidden = stream.leave(torch.ones(2, 4), actual)
-                batch = SimpleNamespace(residual_stream=stream)
-                result, stream = stage.prepare(hidden, stream, batch, steps)
+                result, stream = stage._prepare(hidden, stream, None, steps)
                 torch.testing.assert_close(
                     result, torch.full((2, 4), 2.0 * (4 + increment))
                 )
@@ -137,7 +137,6 @@ class TestResidualStream(CustomTestCase):
             boundary.prepare(
                 self.partial,
                 self.residual,
-                None,
                 None,
                 None,
                 update=SimpleNamespace(adds_plainly=False),
@@ -189,7 +188,6 @@ class TestResidualStream(CustomTestCase):
             self.residual,
             None,
             norm,
-            None,
             pending=stream.pending,
             update=stream.pending.update,
         )
@@ -207,7 +205,6 @@ class TestResidualStream(CustomTestCase):
             boundary.prepare(
                 self.partial,
                 self.residual,
-                None,
                 None,
                 None,
                 pending=stream.pending,
@@ -241,7 +238,7 @@ class TestResidualStream(CustomTestCase):
             self.stream.input(hidden.clone())
 
     def test_capture_and_compute_share_the_fused_read(self):
-        boundary = LayerCommunicator.__new__(LayerCommunicator)
+        boundary = stub_plan()
         events = []
         outputs = AuxHiddenStateList()
 
@@ -257,27 +254,28 @@ class TestResidualStream(CustomTestCase):
             events.append("capture")
             outputs.capture(value, owned=owned)
 
-        boundary.prepare_attn = Mock(side_effect=prepare)
-        boundary.attn = SimpleNamespace(
-            entry=lambda batch: SimpleNamespace(
-                capture_move=None,
-                capture_move_allocates=False,
-                capture_preserves_residual=None,
-            )
+        boundary.norm = None
+        stub_stage(boundary, StageKind.ATTENTION)._prepare_input = Mock(
+            side_effect=prepare
         )
-        output, stream = boundary.prepare_attn_and_capture_last_layer_outputs(
+        stub_stage(boundary, StageKind.ATTENTION).entry = lambda batch: SimpleNamespace(
+            capture_move=None,
+            capture_move_allocates=False,
+            capture_preserves_residual=None,
+        )
+        output, stream = stub_stage(boundary, StageKind.ATTENTION)._prepare_attention(
             self.hidden, self.stream, None, capture_output=capture
         )
         self.assertEqual(events, ["add_norm", "capture"])
         self.group.all_reduce.assert_called_once()
-        boundary.prepare_attn.assert_called_once()
+        stub_stage(boundary, StageKind.ATTENTION)._prepare_input.assert_called_once()
         torch.testing.assert_close(output, torch.full((2, 4), 15.0))
         torch.testing.assert_close(outputs[0], torch.full((2, 4), 5.0))
         stream.residual.zero_()
         torch.testing.assert_close(outputs[0], torch.full((2, 4), 5.0))
 
     def test_deepstack_capture_precedes_the_extra_addition(self):
-        boundary = LayerCommunicator.__new__(LayerCommunicator)
+        boundary = stub_plan()
         extra = torch.full_like(self.partial, 7.0)
         outputs = AuxHiddenStateList()
 
@@ -288,15 +286,16 @@ class TestResidualStream(CustomTestCase):
             stream.write(updated)
             return updated * 3, stream
 
-        boundary.prepare_attn = Mock(side_effect=prepare)
-        boundary.attn = SimpleNamespace(
-            entry=lambda batch: SimpleNamespace(
-                capture_move=None,
-                capture_move_allocates=False,
-                capture_preserves_residual=None,
-            )
+        boundary.norm = None
+        stub_stage(boundary, StageKind.ATTENTION)._prepare_input = Mock(
+            side_effect=prepare
         )
-        output, _ = boundary.prepare_attn_and_capture_last_layer_outputs(
+        stub_stage(boundary, StageKind.ATTENTION).entry = lambda batch: SimpleNamespace(
+            capture_move=None,
+            capture_move_allocates=False,
+            capture_preserves_residual=None,
+        )
+        output, _ = stub_stage(boundary, StageKind.ATTENTION)._prepare_attention(
             self.hidden,
             self.stream,
             None,
@@ -374,6 +373,82 @@ class TestResidualStream(CustomTestCase):
         self.assertEqual(completed.shape[0], 1)
         self.assertIs(stream.pending.value, completed)
         move.assert_called_once_with(self.partial)
+
+
+class TestBatchStageOwnership(CustomTestCase):
+    def test_terminal_norm_releases_layer_buffers(self):
+        from sglang.srt.layers.communicator.residual import batch
+
+        fb = SimpleNamespace(residual_stream=None)
+        batch.start(fb)
+        residual = torch.ones(2, 4)
+        contribution = torch.full_like(residual, 2)
+        refs = [weakref.ref(residual), weakref.ref(contribution)]
+        batch.current(fb).write(residual)
+        output = batch.current(fb).leave(contribution, ADD)
+        result = batch.norm(output, fb, lambda x, r: (x + r, r))
+        del output, residual, contribution
+        torch.testing.assert_close(result, torch.full((2, 4), 3.0))
+        self.assertTrue(all(ref() is None for ref in refs))
+        self.assertIsNone(fb.residual_stream)
+
+    def test_pp_export_transfers_buffer_ownership(self):
+        from sglang.srt.layers.communicator.residual import batch
+
+        fb = SimpleNamespace(residual_stream=None)
+        batch.start(fb)
+        residual = torch.ones(2, 4)
+        contribution = torch.full_like(residual, 2)
+        refs = [weakref.ref(residual), weakref.ref(contribution)]
+        batch.current(fb).write(residual)
+        output = batch.current(fb).leave(contribution, ADD)
+        proxy = batch.to_pp(output, fb)
+        del output, residual, contribution
+        self.assertTrue(all(ref() is not None for ref in refs))
+        self.assertIsNone(fb.residual_stream)
+        del proxy
+        self.assertTrue(all(ref() is None for ref in refs))
+
+    def test_interleaved_batches_keep_independent_streams(self):
+        from sglang.srt.layers.communicator.residual import batch
+
+        class Read:
+            norms_plainly = False
+
+            def enter(self, value):
+                return value
+
+            def read(self, value, norm, quant_format="", **kwargs):
+                return value * 2, value
+
+            def update_and_read(self, update, value, residual, norm, **kwargs):
+                updated = update.update(value, residual)
+                return updated * 2, updated
+
+        rows = Layout(frozenset())
+        boundary = make_boundary(
+            EdgeDecl(StageOutput(rows), StageInput(rows, read=Read()), rows, rows)
+        )
+        owner = stub_plan()
+        owner.norm = None
+        owner._steps = BoundarySteps(
+            None, StageEntry(boundary.prepare, rows), StageOutput(rows), None, False
+        )
+        owner._sp_steps = owner._input_scattered_steps = owner._cp_steps = None
+        stage = stub_stage(owner, StageKind.FFN)
+        a, b = SimpleNamespace(), SimpleNamespace()
+        batch.start(a)
+        batch.start(b)
+        first = stage.prepare(torch.ones(2, 4), a)
+        second = stage.prepare(torch.full((2, 4), 10.0), b)
+        first = batch.current(a).leave(first * 3, ADD)
+        second = batch.current(b).leave(second * 5, ADD)
+        torch.testing.assert_close(stage.prepare(first, a), torch.full((2, 4), 14.0))
+        torch.testing.assert_close(stage.prepare(second, b), torch.full((2, 4), 220.0))
+        self.assertIsNot(batch.current(a), batch.current(b))
+        batch.start(a)
+        self.assertIsNone(batch.current(a).pending)
+        self.assertIsNotNone(batch.current(b).residual)
 
 
 if __name__ == "__main__":

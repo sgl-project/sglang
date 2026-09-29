@@ -10,7 +10,6 @@ from sglang.srt.layers.communicator import (
     NORM_QUANT_READ,
     NORM_READ,
     Layout,
-    MixerExit,
     StageDecl,
     StageInput,
     StageOutput,
@@ -19,6 +18,7 @@ from sglang.srt.layers.communicator import (
     UnreducedOutput,
     stage_edges,
 )
+from sglang.srt.layers.communicator.layer import MixerExit
 from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
 from sglang.srt.models import nemotron_h_utils as utils
 from sglang.srt.runtime_context import get_parallel
@@ -164,11 +164,10 @@ class TestMixerExit(CustomTestCase):
                 )
                 communicator = SimpleNamespace(
                     _batch_steps=lambda batch: SimpleNamespace(ffn_output=produced),
-                    _context=SimpleNamespace(tp_size=2),
                     _ffn_sum_can_move_to_next_layer=MagicMock(return_value=movable),
                 )
                 hidden = torch.ones(2, 4)
-                with get_parallel().override(tp_group=tp_group):
+                with get_parallel().override(tp_group=tp_group, tp_size=2):
                     with MixerExit(communicator, None) as mixer_exit:
                         skipped = should_skip_mlp_all_reduce()
                     output = mixer_exit.finish(hidden)

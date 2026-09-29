@@ -42,8 +42,8 @@ from sglang.srt.layers.communicator.boundary import (
     sequence_parallel_layer_sides,
     with_residual,
 )
+from sglang.srt.layers.communicator.exit import _reduce_and_redistribute_output_step
 from sglang.srt.layers.communicator.layout import (
-    CommunicateContext,
     Layout,
     SumGroup,
     TokenAxis,
@@ -56,6 +56,7 @@ from sglang.srt.layers.communicator.layout import (
     sparse_moe_gathers_over_moe_cp,
     token_axis_sizes,
 )
+from sglang.srt.layers.communicator.legacy_stage import StageCommunicator
 from sglang.srt.layers.communicator.ops import (
     CommunicateSimpleFn,
     _all_reduce_then_to_local_tokens,
@@ -63,7 +64,6 @@ from sglang.srt.layers.communicator.ops import (
     _hand_scattered_input_to_attention,
     _mlp_input_without_dp,
     _redistribute_output,
-    _reduce_and_redistribute_output_step,
     _to_local_tokens,
     move_rows,
 )
@@ -189,79 +189,6 @@ def _can_defer_ffn_reduction(forward_batch: ForwardBatch, boundary=None) -> bool
     )
 
 
-class StageCommunicator:
-    """One stage of a layer, its attention or its FFN: the boundary into it,
-    run with the stage's norm on the steps the layer chose for the batch."""
-
-    def __init__(self, layer: "LayerCommunicator", name: str, norm_name: str):
-        self._layer = layer
-        self._name = name
-        self._norm_name = norm_name
-
-    @property
-    def norm(self) -> torch.nn.Module:
-        """The norm the stage reads its input with, one of the layer's."""
-        return getattr(self._layer, self._norm_name)
-
-    def entry(
-        self, forward_batch: ForwardBatch, steps: Optional[BoundarySteps] = None
-    ) -> StageEntry:
-        if steps is None:
-            steps = self._layer._batch_steps(forward_batch)
-        entry = getattr(steps, self._name)
-        if entry is None:
-            raise NotImplementedError(
-                f"a layer that is one stage has no {self._name} stage"
-            )
-        return entry
-
-    def prepare(
-        self,
-        hidden_states,
-        residual,
-        forward_batch: ForwardBatch,
-        steps: Optional[BoundarySteps] = None,
-        **call,
-    ):
-        """The stage's input and the residual, from the previous stage's output
-        (``call``: what the stage's read takes, e.g. the attention's
-        ``quant_format``)."""
-        entry = self.entry(forward_batch, steps)
-        context = self._layer._context
-        stream = residual_batch.current(forward_batch)
-        if residual is not stream:
-            raise RuntimeError("residual alias belongs to a different invocation")
-        if (
-            stream.pending is None
-            and stream.residual is None
-            and entry.input_sum is not None
-        ):
-            hidden_states = stream.leave(
-                hidden_states, ADD, declared_sum=entry.input_sum
-            )
-        if stream.pending is not None:
-            call["update"] = stream.pending.update
-            call["pending"] = stream.pending
-        if stream.pending is None and stream.residual is not None:
-            call["written"] = True
-        hidden_states, residual = stream.input(hidden_states)
-        hidden_states, residual = entry.prepare(
-            hidden_states, residual, forward_batch, self.norm, context, **call
-        )
-        if entry.input_move is not None:
-            hidden_states = entry.input_move(
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-                context=context,
-            )
-        if entry.handoff is not None:
-            hidden_states = entry.handoff(
-                hidden_states, forward_batch, self._layer.qkv_latent_func
-            )
-        stream.write(residual)
-        return hidden_states, stream
-
-
 class LayerFusions(Protocol):
     """The fused kernels a fusion backend gives a layer, bound to it and tried
     before the layer's own: at its attention input (each takes what the previous
@@ -336,10 +263,6 @@ class LayerCommunicator:
         self._residual = residual
         self.fusions = fusions
 
-        self._context = CommunicateContext.init_new()
-        self._context.force_layernorm_before_dp_gather = (
-            force_layernorm_before_dp_gather
-        )
         # The fused kernels every batch's attention input tries first.
         self._attn_input_fusions = self._select_attn_input_fusions()
         self._speculative_algo = SpeculativeAlgorithm.from_string(
@@ -799,7 +722,6 @@ class LayerCommunicator:
                 else move(
                     hidden_states=residual_value,
                     forward_batch=forward_batch,
-                    context=self._context,
                 )
             )
             keeps = self.attn.entry(forward_batch).capture_preserves_residual
@@ -850,7 +772,7 @@ class LayerCommunicator:
             )
             if get_forward().sp_active:
                 hidden_states = layernorm_sp.sp_entry_scatter(hidden_states)
-        return self.attn.prepare(
+        return self.attn._prepare(
             hidden_states,
             residual,
             forward_batch,
@@ -979,8 +901,6 @@ class LayerCommunicator:
     ):
         steps = self._batch_steps(forward_batch)
         self.publish_mlp_lora_layout(steps)
-        if cache is not None:
-            self._context.cache = cache
 
         if isinstance(residual, ResidualStream) and self.stage_edges is None:
             # The paired boundary records the attention contribution once.
@@ -989,12 +909,13 @@ class LayerCommunicator:
                 self._residual.attention_update,
                 declared_sum=steps.ffn.input_sum,
             )
-        return self.ffn.prepare(
+        return self.ffn._prepare(
             hidden_states,
             residual,
             forward_batch,
             steps,
             update=self._residual.attention_update,
+            cache=cache,
         )
 
     def maybe_prefetch_next_full_attention_kv(
@@ -1180,7 +1101,6 @@ class LayerCommunicator:
                 hidden_states=hidden_states,
                 residual=residual,
                 forward_batch=forward_batch,
-                context=self._context,
                 allow_reduce_scatter=self.allow_reduce_scatter,
                 is_layer_sparse=self.layer_facts.is_layer_sparse,
             )
@@ -1317,7 +1237,7 @@ class LayerCommunicator:
         input when no fused kernel takes it: when the next layer would run the
         same all-reduce the FFN itself would have."""
         return (
-            self._context.tp_size > 1
+            get_parallel().tp_size > 1
             and not self.is_last_layer
             and self._ffn_sum_can_move_to_next_layer(forward_batch)
             and _can_defer_ffn_reduction(forward_batch, self)
@@ -1361,15 +1281,23 @@ class MixerExit:
     its input), and when its output declaration permits deferring the sum. The
     consumer decides whether to fuse its completion with the input norm."""
 
-    __slots__ = ("skips_reduction", "_hands_on", "_scope", "_update", "_declared_sum")
+    __slots__ = (
+        "skips_reduction",
+        "_hands_on",
+        "_scope",
+        "_update",
+        "_declared_sum",
+        "_stream",
+    )
 
     def __init__(self, communicator: LayerCommunicator, forward_batch: ForwardBatch):
         produced = communicator._batch_steps(forward_batch).ffn_output
+        self._stream = None
         self._update = produced.update
         self._declared_sum = produced.group if produced.always_leaves else None
         self._hands_on = (
             produced.leaves_for_next_layer
-            and communicator._context.tp_size > 1
+            and get_parallel().tp_size > 1
             and not is_dp_attention_enabled()
             and communicator._ffn_sum_can_move_to_next_layer(forward_batch)
         )
@@ -1386,14 +1314,17 @@ class MixerExit:
     def finish(self, hidden_states: torch.Tensor, residual=None):
         """The mixer's output: its partial sum to the FFN stage after it, as a
         value that owes the sum to a mixer after it, or complete."""
+        if self._stream is not None:
+            residual = self._stream
         if self._hands_on:
             hidden_states = UnreducedOutput(
                 hidden_states, group=get_parallel().tp_group
             )
         if isinstance(residual, ResidualStream):
-            return residual.leave(
+            output = residual.leave(
                 hidden_states, self._update, declared_sum=self._declared_sum
-            ), residual
+            )
+            return output if self._stream is not None else (output, residual)
         return hidden_states
 
 
@@ -1412,9 +1343,11 @@ class FfnExit:
         "_update",
         "_declared_sum",
         "_scope",
+        "_stream",
     )
 
     def __init__(self, communicator: LayerCommunicator, forward_batch: ForwardBatch):
+        self._stream = None
         self.communicator = communicator
         self.forward_batch = forward_batch
         completion = communicator._select_ffn_completion(forward_batch)
@@ -1441,7 +1374,7 @@ class FfnExit:
         return self._scope.__exit__(*exc_info)
 
     def finish(
-        self, hidden_states: torch.Tensor, residual: torch.Tensor
+        self, hidden_states: torch.Tensor, residual: torch.Tensor = None
     ) -> Tuple[Union[torch.Tensor, UnreducedOutput], torch.Tensor]:
         """Leave the reduction to the next layer's input, or postprocess."""
         stream = residual_batch.current(self.forward_batch)
@@ -1452,9 +1385,10 @@ class FfnExit:
             assert self.defer_moe_finalize, "unrequested deferred MoE handoff"
         else:
             hidden_states, residual = self._complete(hidden_states, residual)
-        return self.communicator._leave_ffn_output(
+        result = self.communicator._leave_ffn_output(
             hidden_states, residual, stream, self._update, self._declared_sum
         )
+        return result[0] if self._stream is not None else result
 
 
 class MHCLayerCommunicator(LayerCommunicator):
@@ -1501,7 +1435,7 @@ class MHCLayerCommunicator(LayerCommunicator):
             residual=self.mhc.layer_residual(),
         )
         # MHC has not been run with input-scattered attention under attention CP.
-        if self._context.attn_cp_size > 1 and self._input_can_be_scattered():
+        if get_parallel().attn_cp_size > 1 and self._input_can_be_scattered():
             raise NotImplementedError(
                 "MHCLayerCommunicator with input-scattered attention under attention CP"
             )

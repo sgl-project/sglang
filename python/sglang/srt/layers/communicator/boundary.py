@@ -51,6 +51,7 @@ from sglang.srt.layers.communicator.ops import (
     tp_reduce_scatter,
     tp_slice,
 )
+from sglang.srt.layers.communicator.output import OutputTransform
 from sglang.srt.layers.communicator.residual import (
     LayerResidual,
     StageRead,
@@ -102,6 +103,7 @@ class StageOutput(msgspec.Struct, frozen=True):
     # How the producer's output is written into the residual. An arrival
     # description has no producer object; its edge declares capabilities only.
     update: Optional[StageUpdate] = ADD
+    transform: Optional[OutputTransform] = None
 
 
 class StageDecl(msgspec.Struct, frozen=True):
@@ -481,6 +483,7 @@ class FusedMlpInput(msgspec.Struct, frozen=True):
     # The group whose sum it completes.
     completes: SumGroup
     run: Callable[..., Optional[Tuple[torch.Tensor, torch.Tensor]]]
+    preserves_residual: Optional[Callable] = None
 
 
 def tbo_split_moves(layer_input_rows: Layout) -> Tuple[Callable, Callable]:
@@ -536,12 +539,12 @@ class StageEntry(msgspec.Struct, frozen=True):
 
     # Completes what the input owes, writes the previous stage's output into
     # the residual and reads this stage's input:
-    # (hidden_states, residual, forward_batch, norm, context, **call).
+    # (hidden_states, residual, forward_batch, norm, **call).
     prepare: Callable
     # The rows prepare hands the stage.
     input_rows: Layout
     # Moves the input onto the stage's rows after prepare, when prepare does
-    # not: (hidden_states, forward_batch, context) -> hidden_states.
+    # not: (hidden_states, forward_batch) -> hidden_states.
     input_move: Optional[Callable] = None
     # Hands the stage its input once it is on its rows:
     # (hidden_states, forward_batch, qkv_latent_func) -> hidden_states.
@@ -551,6 +554,7 @@ class StageEntry(msgspec.Struct, frozen=True):
     # Return the updated residual to the producer's rows for aux capture.
     capture_move: Optional[Callable] = None
     capture_move_allocates: bool = False
+    preserves_residual: Optional[Callable] = None
     capture_preserves_residual: Optional[Callable] = None
     input_sum: Optional[SumGroup] = None
 
@@ -619,6 +623,7 @@ class Boundary(msgspec.Struct, frozen=True):
     output_move: Optional[Callable] = None
     # Whether output_move also completes the sum the producer leaves.
     output_move_completes_sum: bool = False
+    preserves_residual: Optional[Callable] = None
 
     @property
     def input_rows(self) -> Layout:
@@ -682,6 +687,7 @@ def make_boundary(
         raise NotImplementedError("update capabilities require different input moves")
     return msgspec.structs.replace(
         first,
+        preserves_residual=None,
         prepare=partial(
             _dispatch_consumer,
             paths={capability: path.prepare for capability, path in paths.items()},
@@ -756,8 +762,24 @@ def _bind_consumer(
             cp_moves=cp_moves,
             enters_stack=False,
         )
+    preserves_residual = None
+    if (
+        edge.produced.always_leaves
+        and edge.produced.group is SumGroup.ATTN_TP
+        and isinstance(step, partial)
+        and step.func is _mlp_input_without_dp
+        and not step.keywords["gathers_residual"]
+    ):
+        selected = step.keywords["fusions"]
+        if selected:
+            # Only the first reachable candidate can certify ownership; an
+            # earlier custom candidate could otherwise mutate the residual.
+            preserves_residual = next(
+                f.preserves_residual for f in fusions if f.run == selected[0]
+            )
     return Boundary(
         edge,
+        preserves_residual=preserves_residual,
         prepare=partial(
             _consumer_step,
             step=step,
