@@ -100,8 +100,7 @@ class TestScaleExpandedRows(CustomTestCase):
         self._check(x, weights)
 
     def test_transposed_view(self):
-        # The column-major (non-unit-stride(1)) case is the whole reason this
-        # helper exists rather than x *= w[:, None] on a plain tensor.
+        # mul_ must update a non-contiguous (transposed) view in place.
         base = torch.randn(16, 40, device=DEVICE)
         x = base.t()  # [40, 16], stride(1) != 1
         self.assertNotEqual(x.stride(1), 1)

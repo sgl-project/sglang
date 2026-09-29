@@ -264,7 +264,7 @@ class _DeepEPv2Impl:
         """Build the ElasticBuffer now instead of lazily on the first dispatch.
 
         Avoids the ~2GB alloc + cross-rank NCCL barrier stalling the first request
-        on pure-prefill nodes (no decode CUDA-graph warmup to build it). Needs only
+        when decode CUDA-graph capture did not already build it. Needs only
         host-known config already on this impl; key-cached so dispatch reuses it.
         """
         self._get_buffer()
@@ -374,9 +374,7 @@ class _DeepEPv2Impl:
         if use_expand_layout:
             # Expanded combine uses handle metadata instead of recv_topk_idx.
             local_topk_ids = None
-            if not use_masked and recv_topk_weights.shape != (
-                recv_hidden_states.shape[0],
-            ):
+            if recv_topk_weights.shape != (recv_hidden_states.shape[0],):
                 raise ValueError(
                     "DeepEP v2 expanded activations and router weights must "
                     "have the same receive capacity"
@@ -400,11 +398,6 @@ class _DeepEPv2Impl:
         total_expanded = 0
         if use_masked:
             recv_capacity = recv_hidden_states.shape[0]
-            if recv_topk_weights.shape != (recv_capacity,):
-                raise ValueError(
-                    "DeepEP v2 expanded activations and router weights must "
-                    "have the same receive capacity"
-                )
             # expected_m is only a schedule hint; masked_m is the actual bound.
             ep_group_size = max(1, self.num_experts // self.num_local_experts)
             expected_m = max(

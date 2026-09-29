@@ -2608,9 +2608,10 @@ def scale_expanded_rows_(
 ) -> torch.Tensor:
     """In-place `x[r, :] *= row_weights[r]` for a 2D `x`, any strides.
 
-    deepep_v2 `do_expand=True` prefill weights the expanded rows here because
-    ElasticBuffer.combine ignores topk_weights in expand mode. `row_weights`
-    must be a 1-D `[rows]` tensor (what DeepEP hands back).
+    deepep_v2 `do_expand=True` prefill folds the router weights into the
+    down-proj input scale here, because ElasticBuffer.combine ignores
+    topk_weights in expand mode. `row_weights` must be a 1-D `[rows]` tensor
+    (what DeepEP hands back).
     """
     assert x.dim() == 2, f"expected 2D x, got {tuple(x.shape)}"
     rows, _ = x.shape
