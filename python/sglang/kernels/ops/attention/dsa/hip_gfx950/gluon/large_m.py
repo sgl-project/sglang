@@ -1,3 +1,5 @@
+"""Large-M gfx950 Gluon schedule for full indexer preparation."""
+
 import torch
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl

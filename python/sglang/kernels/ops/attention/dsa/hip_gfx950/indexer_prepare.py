@@ -64,9 +64,9 @@ def is_full_indexer_prepare_available() -> bool:
         ):
             getattr(obj, name)
 
-        package = __package__
-        import_module(f"{package}.indexer_prepare_m4")
-        import_module(f"{package}.indexer_prepare_m128")
+        package = f"{__package__}.gluon"
+        import_module(f"{package}.generic")
+        import_module(f"{package}.large_m")
     except Exception as exc:
         logger.info("ROCm full indexer prepare JIT is unavailable: %s", exc)
         return False
@@ -105,9 +105,9 @@ def full_indexer_prepare(
         return None
     if heads == 32 and hidden_size % 1024 == 0 and rows in (64, 96, 128):
         # The large-M schedule is specialized for 32 heads and these row counts.
-        from .indexer_prepare_m128 import indexer_prepare
+        from .gluon.large_m import indexer_prepare
     elif 1 <= rows <= MAX_FULL_INDEXER_PREPARE_ROWS:
-        from .indexer_prepare_m4 import indexer_prepare
+        from .gluon.generic import indexer_prepare
     else:
         return None
 

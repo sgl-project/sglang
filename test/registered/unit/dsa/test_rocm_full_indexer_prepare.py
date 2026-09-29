@@ -114,15 +114,15 @@ def test_full_indexer_prepare_dispatches_supported_decode_rows(monkeypatch):
         calls.append(("large", args[0].shape[0], kwargs))
         return "q", "weights"
 
-    package = "sglang.kernels.ops.attention.dsa.hip_gfx950"
+    package = "sglang.kernels.ops.attention.dsa.hip_gfx950.gluon"
     monkeypatch.setitem(
         sys.modules,
-        f"{package}.indexer_prepare_m4",
+        f"{package}.generic",
         SimpleNamespace(indexer_prepare=run_small),
     )
     monkeypatch.setitem(
         sys.modules,
-        f"{package}.indexer_prepare_m128",
+        f"{package}.large_m",
         SimpleNamespace(indexer_prepare=run_large),
     )
 

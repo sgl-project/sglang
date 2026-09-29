@@ -21,7 +21,7 @@ if _RUNNABLE:
             full_indexer_prepare,
             is_full_indexer_prepare_available,
         )
-        from sglang.kernels.ops.attention.dsa.hip_gfx950.indexer_prepare_m4 import (
+        from sglang.kernels.ops.attention.dsa.hip_gfx950.gluon.generic import (
             indexer_prepare as small_m_indexer_prepare,
         )
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import act_quant

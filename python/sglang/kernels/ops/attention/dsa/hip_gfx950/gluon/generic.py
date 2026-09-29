@@ -1,3 +1,5 @@
+"""Generic gfx950 Gluon schedule for full indexer preparation."""
+
 import torch
 import triton
 from triton.experimental import gluon
