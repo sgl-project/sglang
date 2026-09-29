@@ -30,6 +30,7 @@ from sglang.srt.managers.io_struct import (
 # Preserve the existing initialization import for downstream callers.
 from sglang.srt.managers.mm_schedule import (
     DataEmbeddingFunc,
+    _offload_items_to_host,
     get_embedding_and_mask,
 )
 from sglang.srt.managers.mm_schedule import (
@@ -498,6 +499,11 @@ def embed_mm_inputs(
                 extend_length=extend_seq_lens,
                 items_offset_list=items_offsets,
             )
+            # The current forward no longer needs any raw feature of this
+            # modality on the device: items in this chunk were encoded, hit
+            # the cache, or were deduplicated onto another item's encode, and
+            # items outside the chunk are not read again this forward.
+            _offload_items_to_host(items)
 
             if use_deepstack.get(modality, None) and embedding is not None:
                 embedding, deepstack_embedding = (
@@ -777,6 +783,7 @@ def general_mm_embed_routine(
                             feature.record_stream(stream)
                             mm_item.feature = feature.to("cpu", non_blocking=True)
                             offloaded = True
+                        del feature
                         if language_only:
                             precomputed = mm_item.precomputed_embeddings
                             if (
@@ -789,6 +796,7 @@ def general_mm_embed_routine(
                                     "cpu", non_blocking=True
                                 )
                                 offloaded = True
+                            del precomputed
                 if offloaded:
                     if mm_schedule.host_offload_event is None:
                         mm_schedule.host_offload_event = torch.cuda.Event()
