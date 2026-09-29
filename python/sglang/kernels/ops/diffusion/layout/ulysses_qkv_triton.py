@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["rows"])
 def _pack_qkv_destination_major_kernel(
     output_ptr,
     q_ptr,
