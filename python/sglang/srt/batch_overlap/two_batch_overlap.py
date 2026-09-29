@@ -17,9 +17,10 @@ from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.communicator import (
     CommunicateContext,
     Layout,
-    reduce_output,
     tbo_split_moves,
 )
+from sglang.srt.layers.communicator.residual.access import finish_layer_stack
+from sglang.srt.layers.communicator.residual.stream import ResidualStream
 from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
@@ -964,12 +965,25 @@ def _model_forward_tbo(
     operations_strategy: OperationsStrategy,
     layer_input_rows: Layout,
 ):
-    inputs["hidden_states"] = reduce_output(inputs["hidden_states"])
+    parent_batch = inputs["forward_batch"]
+    stream = inputs["residual"]
+    pending = stream.pending if isinstance(stream, ResidualStream) else None
+    inputs["hidden_states"], inputs["residual"] = finish_layer_stack(
+        inputs["hidden_states"], inputs["residual"], inputs["forward_batch"]
+    )
     inputs_arr = _model_forward_tbo_split_inputs(
         **inputs, layer_input_rows=layer_input_rows
     )
     original_hidden_states_len = inputs["hidden_states"].shape[0]
-    del inputs
+    if isinstance(stream, ResidualStream):
+        for part in inputs_arr:
+            part["hidden_states"], part["residual"] = ResidualStream.arrive(
+                part["hidden_states"],
+                part["residual"],
+                pending.update if pending is not None else None,
+            )
+            part["forward_batch"].residual_stream = part["residual"]
+    del inputs, stream, pending
 
     context = (
         empty_context()
@@ -986,7 +1000,13 @@ def _model_forward_tbo(
             delta_stages=[0, operations_strategy.tbo_delta_stages],
         )
 
-    return _model_forward_tbo_merge_outputs(*outputs_arr, original_hidden_states_len)
+    hidden_states, residual = _model_forward_tbo_merge_outputs(
+        *outputs_arr, original_hidden_states_len
+    )
+    parent_batch.residual_stream = (
+        residual if isinstance(residual, ResidualStream) else None
+    )
+    return hidden_states, residual
 
 
 def _model_forward_non_tbo(inputs, operations_strategy: OperationsStrategy):
@@ -1100,6 +1120,21 @@ def _model_forward_filter_inputs(
 
 
 def _model_forward_tbo_merge_outputs(output_a, output_b, original_len):
+    stream_a, stream_b = output_a["residual"], output_b["residual"]
+    has_stream = isinstance(stream_a, ResidualStream)
+    assert has_stream == isinstance(stream_b, ResidualStream)
+    update = None
+    if has_stream:
+        pending_a, pending_b = stream_a.pending, stream_b.pending
+        assert (pending_a is None) == (pending_b is None)
+        if pending_a is not None:
+            assert pending_a.update is pending_b.update
+            update = pending_a.update
+    for output in (output_a, output_b):
+        output["hidden_states"], output["residual"] = finish_layer_stack(
+            output["hidden_states"], output["residual"], output["forward_batch"]
+        )
+
     def _handle_key(name):
         value_a = output_a[name]
         value_b = output_b[name]
@@ -1117,7 +1152,12 @@ def _model_forward_tbo_merge_outputs(output_a, output_b, original_len):
         res[slice(s1, t1)] = value_b[: t1 - s1]
         return res
 
-    return _handle_key("hidden_states"), _handle_key("residual")
+    hidden, residual = _handle_key("hidden_states"), _handle_key("residual")
+    return (
+        ResidualStream.arrive(hidden, residual, update)
+        if has_stream
+        else (hidden, residual)
+    )
 
 
 # -------------------------------- Utilities and wrappers ---------------------------------------

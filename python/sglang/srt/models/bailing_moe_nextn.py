@@ -26,6 +26,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -161,7 +162,7 @@ class BailingMoEModelNextN(nn.Module):
                 )
             )
 
-        residual = None
+        residual = residual_batch.start(forward_batch)
         if self.is_hybrid:
             device = input_ids.device
             zero_allocator = BumpAllocator(

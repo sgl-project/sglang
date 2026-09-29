@@ -17,6 +17,7 @@ from sglang.srt.layers.communicator import (
     TokenAxis,
 )
 from sglang.srt.layers.communicator.ops import _consumer_step, _read_input
+from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.backend.triton_backend import (
@@ -253,12 +254,16 @@ def test_communicator_publishes_layout_at_each_transition(
                     update=ADD,
                 ),
                 carried_fusions=(),
+                adds_plainly=True,
             ),
             input_move=lambda hidden_states, **kwargs: hidden_states,
             handoff=lambda hidden_states, *args: hidden_states,
         ),
         ffn=SimpleNamespace(
-            prepare=lambda hidden_states, residual, *args: (hidden_states, residual),
+            prepare=lambda hidden_states, residual, *args, **kwargs: (
+                hidden_states,
+                residual,
+            ),
             input_rows=gathered if gathered_over_dp else local,
             input_move=None,
             handoff=None,
@@ -268,9 +273,13 @@ def test_communicator_publishes_layout_at_each_transition(
     hidden = torch.zeros(num_tokens, 4)
     with get_forward().scoped(lora_batch_layout=initial):
         for _ in range(2):
-            communicator.prepare_mlp(hidden, hidden, None)
+            batch = SimpleNamespace(residual_stream=None)
+            stream = residual_batch.start(batch)
+            stream.write(hidden)
+            communicator.prepare_mlp(hidden, stream, batch)
             assert get_forward().lora_batch_layout is expected_mlp
-            communicator.prepare_attn(hidden, None, None)
+            stream = residual_batch.start(batch)
+            communicator.prepare_attn(hidden, stream, batch)
             assert get_forward().lora_batch_layout is expected_attn
 
 

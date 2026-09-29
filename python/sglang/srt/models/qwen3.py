@@ -1,11 +1,13 @@
 # Adapted from qwen2.py
 import logging
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
 
 from sglang.srt.layers.communicator import LayerCommunicator, LayerFacts
+from sglang.srt.layers.communicator.residual import access as residual_access
+from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -446,6 +448,63 @@ class Qwen3Model(Qwen2Model):
             alt_stream=alt_stream,
         )
 
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[torch.Tensor, PPProxyTensors]:
+
+        if self.pp_group.is_first_rank:
+            if input_embeds is None:
+                hidden_states = self.embed_tokens(input_ids)
+            else:
+                hidden_states = input_embeds
+            residual = residual_batch.start(forward_batch)
+        else:
+            assert pp_proxy_tensors is not None
+            hidden_states, residual = self.layers[
+                self.start_layer
+            ].layer_communicator.from_pp(pp_proxy_tensors, forward_batch)
+
+        aux_hidden_states = []
+        for i in range(self.start_layer, self.end_layer):
+            if i in self.layers_to_capture:
+                aux_hidden_states.append(
+                    residual_access.snapshot(hidden_states, residual)
+                )
+            layer = self.layers[i]
+            hidden_states, residual = layer(
+                positions,
+                hidden_states,
+                forward_batch,
+                residual,
+            )
+
+        hidden_states, residual = residual_access.finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
+        if not self.pp_group.is_last_rank:
+            return PPProxyTensors(
+                {
+                    "hidden_states": hidden_states,
+                    "residual": residual,
+                }
+            )
+        else:
+            if hidden_states.shape[0] != 0:
+                if residual is None:
+                    hidden_states = self.norm(hidden_states)
+                else:
+                    hidden_states, _ = self.norm(hidden_states, residual)
+
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+
+        return hidden_states, aux_hidden_states
+
 
 class Qwen3ForCausalLM(nn.Module):
     # BitandBytes specific attributes
@@ -554,6 +613,7 @@ class Qwen3ForCausalLM(nn.Module):
         start, end = split_interval
         # embed
         if start == 0:
+            forward_batch.residual = residual_batch.start(forward_batch)
             if input_embeds is None:
                 forward_batch.hidden_states = self.model.embed_tokens(input_ids)
             else:
@@ -578,6 +638,7 @@ class Qwen3ForCausalLM(nn.Module):
             hidden_states, _ = self.model.norm(
                 forward_batch.hidden_states, forward_batch.residual
             )
+            forward_batch.residual = None
             forward_batch.hidden_states = hidden_states
             # logits process
             result = self.logits_processor(

@@ -23,6 +23,7 @@ from sglang.srt.layers.communicator.fusions.cutedsl import (
     prepare_cutedsl_fusion,
 )
 from sglang.srt.layers.communicator.ops import _consumer_step, _read_input
+from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.layers.flashinfer_mnnvl_cutedsl import (
     FlashInferMNNVLCuteDSLARFusion,
     _retargeted_config,
@@ -42,6 +43,12 @@ _MODULE = "sglang.srt.layers.communicator.fusions.cutedsl"
 _DECODE = SimpleNamespace(forward_mode=ForwardMode.DECODE, input_ids=torch.zeros(8))
 
 
+def _owned_input(hidden, residual, batch=_DECODE):
+    stream = residual_batch.start(batch)
+    stream.write(residual)
+    return stream.leave(hidden, ADD), stream, batch
+
+
 def _communicator():
     comm = LayerCommunicator.__new__(LayerCommunicator)
     comm.fusions = CuteDSLFusion()
@@ -57,6 +64,7 @@ def _communicator():
         attention=SimpleNamespace(
             prepare=partial(
                 _consumer_step,
+                adds_plainly=True,
                 step=partial(
                     _read_input,
                     layer_input=None,
@@ -130,7 +138,9 @@ def test_last_layer_consumes_but_does_not_skip_the_pending_all_reduce(eligible):
             lambda *a, **k: pytest.fail("fell through to the unfused path"),
         ),
     ):
-        out_hidden, _ = last.prepare_attn(hidden_states, torch.zeros(8, 8), _DECODE)
+        out_hidden, _ = last.prepare_attn(
+            *_owned_input(hidden_states, torch.zeros(8, 8))
+        )
 
     assert torch.equal(out_hidden, torch.ones(8, 8))
     defer, absorb, _ = last._ffn_exit_fusions
@@ -404,10 +414,10 @@ def test_a_handoff_the_kernel_does_not_take_is_completed_then_normed():
         patch.object(CuteDSLFusion, "_common_eligible", return_value=False),
     ):
         hidden, residual = comm.prepare_attn(
-            _handoff(finish), torch.full((2, 8), 2.0), _DECODE
+            *_owned_input(_handoff(finish), torch.full((2, 8), 2.0))
         )
     finish.assert_called_once_with()
-    torch.testing.assert_close(residual, torch.full((2, 8), 3.0))
+    torch.testing.assert_close(residual.residual, torch.full((2, 8), 3.0))
     torch.testing.assert_close(hidden, torch.full((2, 8), 6.0))
 
 
@@ -417,7 +427,7 @@ def test_the_layer_stack_hands_a_handoff_only_to_a_final_norm_that_takes_it():
         finish = MagicMock(return_value=torch.ones(2, 8))
         handoff = _handoff(finish)
         hidden, _ = comm.finish_layer_stack(
-            handoff, torch.zeros(2, 8), _DECODE, final_norm_takes_handoff=takes
+            *_owned_input(handoff, torch.zeros(2, 8)), final_norm_takes_handoff=takes
         )
         assert finish.call_count == completed
         assert (hidden is handoff) == takes

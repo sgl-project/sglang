@@ -18,6 +18,7 @@ import torch
 from torch import nn
 
 from sglang.srt.configs import NemotronHConfig
+from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear
@@ -304,6 +305,8 @@ class NemotronHMultiTokenPredictor(nn.Module):
         residual = None
 
         for i in range(self.pattern_len):
+            if residual is None:
+                residual = residual_batch.start(forward_batch)
             hidden_states, residual = self.layers[str(i)](
                 inputs_embeds=inputs_embeds,
                 hidden_states=hidden_states,

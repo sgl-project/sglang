@@ -32,6 +32,7 @@ from sglang.srt.layers.communicator import (
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
 )
+from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
@@ -1100,12 +1101,12 @@ class Glm5NextModel(nn.Module):
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
-            residual = None
+            residual = residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
             hidden_states, residual = self.layers[
                 self.start_layer
-            ].layer_communicator.from_pp(pp_proxy_tensors)
+            ].layer_communicator.from_pp(pp_proxy_tensors, forward_batch)
         device = hidden_states.device
         zero_allocator = BumpAllocator(
             buffer_size=total_num_layers * 2 * (2 if forward_batch.can_run_tbo else 1),

@@ -300,7 +300,7 @@ class TestLayerStackExit(CustomTestCase):
     def test_each_stack_ends_at_the_exit(self):
         problems = []
         for name, (forward, layers) in sorted(self.complete_census.subjects().items()):
-            exits = list(calls(forward, EXIT))
+            exits = list(calls(forward, EXIT)) + list(calls(forward, "take_output"))
             if not exits:
                 if delegates_to_super(forward):
                     continue
@@ -342,6 +342,9 @@ class TestLayerStackExit(CustomTestCase):
         forbidden = {
             "UnreducedOutput",
             "HandoffOutput",
+            "OwedOutput",
+            "Contribution",
+            "ResidualStream",
             "reduce_output",
             "layer_input_buffer",
         }
@@ -384,7 +387,9 @@ class TestLayerStackExit(CustomTestCase):
                 if any(calls(forward, "forward_split_prefill")):
                     continue  # delegates to the inherited implementation
                 with self.subTest(model=name, file=path.name):
-                    exits = list(calls(forward, EXIT))
+                    exits = list(calls(forward, EXIT)) + list(
+                        calls(forward, "take_output")
+                    )
                     self.assertEqual(len(exits), 1)
                     exit_call = exits[0]
                     self.assertFalse(inside_loop(forward, exit_call))
@@ -397,7 +402,18 @@ class TestLayerStackExit(CustomTestCase):
                         and item.test.left.id == "end"
                         and any(part is exit_call for part in ast.walk(item))
                     ]
-                    self.assertEqual(len(final_segments), 1)
+                    early_returns = [
+                        item
+                        for item in forward.body
+                        if isinstance(item, ast.If)
+                        and isinstance(item.test, ast.Compare)
+                        and isinstance(item.test.left, ast.Name)
+                        and item.test.left.id == "end"
+                        and any(isinstance(op, ast.NotEq) for op in item.test.ops)
+                        and any(isinstance(part, ast.Return) for part in item.body)
+                        and item.end_lineno < exit_call.lineno
+                    ]
+                    self.assertEqual(len(final_segments) + len(early_returns), 1)
                     for call in ast.walk(forward):
                         if isinstance(call, ast.Call) and is_final_norm(call):
                             self.assertLess(exit_call.lineno, call.lineno)

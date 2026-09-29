@@ -23,6 +23,7 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.communicator import LayerCommunicator, LayerFacts
+from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -471,7 +472,7 @@ class Step3TextModel(nn.Module):
         else:
             hidden_states = input_embeds
 
-        residual = None
+        residual = residual_batch.start(forward_batch)
         for i in range(len(self.layers)):
             layer = self.layers[i]
             hidden_states, residual = layer(

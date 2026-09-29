@@ -23,12 +23,12 @@ import torch
 from sglang.srt.layers import communicator as comm
 from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.communicator import (
+    ADD,
     LayerCommunicator,
     LayerFacts,
     MHCLayerCommunicator,
     SumGroup,
     TokenAxis,
-    UnreducedOutput,
 )
 from sglang.srt.layers.communicator import boundary as comm_boundary
 from sglang.srt.layers.communicator import (
@@ -41,7 +41,9 @@ from sglang.srt.layers.communicator import ops as comm_ops
 from sglang.srt.layers.communicator import (
     sequence_parallel_layer_sides,
 )
+from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.layers.communicator.residual import mhc as mhc_module
+from sglang.srt.layers.communicator.residual.stream import OwedOutput
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.runtime_context import LoRABatchLayout
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -495,7 +497,7 @@ class TestMhcOnTheDeclarations(CustomTestCase):
         if "read" in step.keywords:
             # The FFN input: the attention output's hc_post, then the FFN's read.
             self.assertIs(step.keywords["read"], residual.ffn_read)
-            self.assertIs(step.keywords["update"], residual.attention_update)
+            self.assertNotIn("update", step.keywords)
         else:
             # The FFN output's move: its hc_post.
             self.assertIs(step.keywords["update"], residual.ffn_update)
@@ -591,11 +593,12 @@ class TestMhcOnTheDeclarations(CustomTestCase):
                     patch_communicator("_reduce_and_redistribute_output_step", choose),
                     patch_communicator("_to_local_tokens", to_local_tokens),
                 ):
+                    stream = residual_batch.start(forward_batch)
+                    stream.write(torch.full((2, 4), 2.0))
                     with communicator.ffn_exit(forward_batch) as ffn_exit:
                         self.assertTrue(ffn_exit.mlp_reduce_scatter)
-                    hidden, residual = ffn_exit.finish(
-                        torch.ones(4, 4), torch.full((2, 4), 2.0)
-                    )
+                    hidden, stream = ffn_exit.finish(torch.ones(4, 4), stream)
+                    hidden, residual = stream.input(hidden)
                 choose.assert_called_once()
                 to_local_tokens.assert_called_once()
                 self.assertIs(to_local_tokens.call_args.args[0], move)
@@ -987,7 +990,7 @@ class TestTheAttentionOutputDecidesItsSum(CustomTestCase):
             residual=sides.input_rows,
             residual_to=sides.ffn_residual_rows,
             need=sides.ffn.input,
-            update=comm.ADD,
+            adds_plainly=True,
             fusions=(),
             force_layernorm_before_gather=force,
             residual_joins_sum=False,
@@ -1112,7 +1115,7 @@ class TestFusedKernelsTakeOnlyTheStepsTheyComplete(CustomTestCase):
             residual=sides.input_rows,
             residual_to=sides.ffn_residual_rows,
             need=sides.ffn.input,
-            update=comm.ADD,
+            adds_plainly=True,
             fusions=fusions,
             force_layernorm_before_gather=False,
             residual_joins_sum=False,
@@ -1192,7 +1195,7 @@ class TestTheSequenceParallelRegion(CustomTestCase):
         for step, read in ((ffn, comm.NORM_READ), (attention, comm.NORM_QUANT_READ)):
             self.assertIsNone(step.keywords["layer_input"])
             self.assertIs(step.keywords["read"], read)
-            self.assertIs(step.keywords["update"], comm.ADD)
+            self.assertNotIn("update", step.keywords)
         replace = msgspec.structs.replace
         return replace(
             steps,
@@ -1347,7 +1350,7 @@ class TestInputScatteredAttention(CustomTestCase):
                     residual=local,
                     residual_to=attention,
                     need=comm.StageInput(attention),
-                    update=comm.ADD,
+                    adds_plainly=True,
                     fusions=(),
                     force_layernorm_before_gather=False,
                     residual_joins_sum=joins,
@@ -1367,7 +1370,7 @@ class TestInputScatteredAttention(CustomTestCase):
             residual=attention,
             residual_to=local,
             need=comm.StageInput(local),
-            update=comm.ADD,
+            adds_plainly=True,
             fusions=(),
             force_layernorm_before_gather=False,
             residual_joins_sum=False,
@@ -1451,12 +1454,14 @@ class TestInputScatteredAttention(CustomTestCase):
             ),
             patch_communicator("get_forward", lambda: SimpleNamespace(sp_active=False)),
         ):
-            hidden, residual = communicator.prepare_attn(
-                torch.ones(4, HIDDEN), torch.full((4, HIDDEN), 3.0), None
-            )
+            batch = SimpleNamespace(residual_stream=None)
+            stream = residual_batch.start(batch)
+            stream.write(torch.full((4, HIDDEN), 3.0))
+            contribution = stream.leave(torch.ones(4, HIDDEN), ADD)
+            hidden, residual = communicator.prepare_attn(contribution, stream, batch)
         self.assertEqual(scattered, [4])
         # Norm: (2 * (h + r), h + r) on the slice, with h the completed sum.
-        torch.testing.assert_close(residual, torch.full((2, HIDDEN), 5.0))
+        torch.testing.assert_close(residual.residual, torch.full((2, HIDDEN), 5.0))
         torch.testing.assert_close(hidden, torch.full((2, HIDDEN), 10.0))
 
     def test_the_last_layer_completes_its_own_sum(self):
@@ -1942,7 +1947,9 @@ class TestBranchRows(CustomTestCase):
             return value
 
         with patch_communicator("move_rows", recorded):
-            dense.branch_input(moe, "h0", "residual", None)
+            dense.branch_input(
+                moe, "h0", "residual", SimpleNamespace(residual_stream=None)
+            )
             self.assertEqual(
                 moves,
                 [
@@ -2320,6 +2327,7 @@ class TestTwoLayers(CustomTestCase):
             )
 
         def forward(rank):
+            batch = SimpleNamespace(**vars(forward_batch), residual_stream=None)
             s = states[rank]
             layers = [
                 LayerCommunicator(
@@ -2338,13 +2346,13 @@ class TestTwoLayers(CustomTestCase):
             ]
             hidden = torch.zeros(s.local_rows, HIDDEN).double()
             hidden[: s.rows] = embeddings[s.dp]
-            residual = None
+            residual = residual_batch.start(batch)
             handed_on = []
             for layer_index, layer in enumerate(layers):
-                hidden, residual = layer.prepare_attn(hidden, residual, forward_batch)
+                hidden, residual = layer.prepare_attn(hidden, residual, batch)
                 hidden = attention(hidden, s)
-                hidden, residual = layer.prepare_mlp(hidden, residual, forward_batch)
-                with layer.ffn_exit(forward_batch) as ffn_exit:
+                hidden, residual = layer.prepare_mlp(hidden, residual, batch)
+                with layer.ffn_exit(batch) as ffn_exit:
                     if not sparse[layer_index]:
                         hidden = dense_mlp(hidden, s)
                     elif a2a:
@@ -2354,9 +2362,7 @@ class TestTwoLayers(CustomTestCase):
                         hidden = moe(hidden, s)
                 hidden, residual = ffn_exit.finish(hidden, residual)
                 handed_on.append(type(hidden))
-            hidden, residual = layers[-1].finish_layer_stack(
-                hidden, residual, forward_batch
-            )
+            hidden, residual = layers[-1].finish_layer_stack(hidden, residual, batch)
             # The last a2a layer folds the residual into its output.
             if residual is not None:
                 residual = residual[: s.rows]
@@ -2441,7 +2447,7 @@ class TestTwoLayers(CustomTestCase):
                     )
                     self.assertIs(
                         first_layer_hands_on,
-                        UnreducedOutput if owes else torch.Tensor,
+                        OwedOutput if owes else torch.Tensor,
                     )
 
 
@@ -2528,7 +2534,10 @@ class TestALayerThatIsOneStage(CustomTestCase):
         )
 
     def test_its_steps_run_the_declared_read_and_update(self):
-        read, update = self.ProbeRead(), SimpleNamespace(adds_plainly=True)
+        read, update = (
+            self.ProbeRead(),
+            SimpleNamespace(adds_plainly=True, can_defer_across_layers=True),
+        )
         communicator = build(
             layer_facts(1, 3),
             parallel_of(attn_dp=1, attn_tp=2),

@@ -5,6 +5,8 @@ from unittest.mock import Mock
 import torch
 from torch import nn
 
+from sglang.srt.layers.communicator import ADD
+from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models import nemotron_h_mtp
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
@@ -75,17 +77,22 @@ class TestNemotronMTPReduction(CustomTestCase):
                     partial = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
                     residual = torch.tensor([[7.0, 3.0], [5.0, 9.0]])
                     expected = partial * tp + residual
+                    batch = SimpleNamespace(
+                        forward_mode=ForwardMode.DECODE,
+                        input_ids=torch.zeros(2, dtype=torch.long),
+                        residual_stream=None,
+                    )
+                    stream = residual_batch.start(batch)
+                    stream.write(residual)
+                    partial = stream.leave(partial, ADD)
                     hidden, output_residual = layer(
                         inputs_embeds=torch.zeros_like(partial),
                         hidden_states=partial,
-                        residual=residual,
-                        forward_batch=SimpleNamespace(
-                            forward_mode=ForwardMode.DECODE,
-                            input_ids=torch.zeros(2, dtype=torch.long),
-                        ),
+                        residual=stream,
+                        forward_batch=batch,
                     )
                     torch.testing.assert_close(hidden, expected)
-                    torch.testing.assert_close(output_residual, expected)
+                    torch.testing.assert_close(output_residual.residual, expected)
                     self.assertEqual(reduce.call_count, int(tp > 1))
 
 

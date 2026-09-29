@@ -26,6 +26,7 @@ from sglang.srt.layers.communicator import (
     make_output_boundary,
 )
 from sglang.srt.layers.communicator import ops as comm_ops
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
@@ -324,7 +325,48 @@ class TestTheProducersUpdateChoosesTheOrder(CustomTestCase):
         other = make_boundary(self.edge(written)).prepare.keywords["step"]
         self.assertIs(other.func, comm_ops._mlp_input_dp_replicate)
         self.assertTrue(other.keywords["reduces_attention_tp"])
-        self.assertIs(other.keywords["update"], written)
+        self.assertNotIn("update", other.keywords)
+
+    def test_capabilities_prebind_both_orders_without_capturing_an_update(self):
+        edge = msgspec.structs.replace(
+            self.edge(None), update_capabilities=(True, False)
+        )
+        boundary = make_boundary(edge)
+        paths = boundary.prepare.keywords["paths"]
+        self.assertEqual(set(paths), {True, False})
+        self.assertIs(paths[True].keywords["step"].func, comm_ops._mlp_input_dp_partial)
+        self.assertIs(
+            paths[False].keywords["step"].func, comm_ops._mlp_input_dp_replicate
+        )
+        for path in paths.values():
+            self.assertNotIn("update", path.keywords["step"].keywords)
+
+    def test_actual_update_selects_a_prebound_path(self):
+        full = rows(sizes(tp=1))
+        edge = EdgeDecl(
+            StageOutput(full, update=None),
+            StageInput(full),
+            full,
+            full,
+            update_capabilities=(True, False),
+        )
+        boundary = make_boundary(edge)
+
+        def norm(value, residual=None):
+            return value if residual is None else (value + residual, value + residual)
+
+        for update, expected in ((comm.ADD, 4.0), (_WrittenIn(), 5.0)):
+            with self.subTest(plain=update.adds_plainly):
+                hidden, residual = boundary.prepare(
+                    torch.ones(2, 4),
+                    torch.full((2, 4), 3.0),
+                    None,
+                    norm,
+                    None,
+                    update=update,
+                )
+                torch.testing.assert_close(hidden, torch.full((2, 4), expected))
+                torch.testing.assert_close(residual, hidden)
 
     def test_fused_kernels_take_only_a_plain_add(self):
         full = rows(sizes(tp=2))
@@ -403,6 +445,27 @@ class TestTheProducersUpdateChoosesTheOrder(CustomTestCase):
         )
         with self.assertRaises(NotImplementedError):
             make_output_boundary(edge)
+
+    def test_cross_layer_update_requires_a_lifetime_guarantee(self):
+        local = Layout(frozenset())
+        stateful_update = SimpleNamespace(adds_plainly=False, at_producer=False)
+        edge = EdgeDecl(
+            StageOutput(local, update=stateful_update), StageInput(local), local, local
+        )
+        with self.assertRaisesRegex(NotImplementedError, "lifetime"):
+            make_output_boundary(edge)
+
+    def test_pipeline_cannot_reconstruct_a_non_add_update(self):
+        local = Layout(frozenset())
+        update = SimpleNamespace(
+            adds_plainly=False, at_producer=False, can_defer_across_layers=True
+        )
+        edge = EdgeDecl(
+            StageOutput(local, update=update), StageInput(local), local, local
+        )
+        with get_parallel().override(pp_size=2):
+            with self.assertRaisesRegex(NotImplementedError, "pipeline boundaries"):
+                make_output_boundary(edge)
 
 
 class ProbeRead:

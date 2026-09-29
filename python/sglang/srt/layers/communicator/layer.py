@@ -72,6 +72,7 @@ from sglang.srt.layers.communicator.output import (
     reduce_output,
 )
 from sglang.srt.layers.communicator.residual import LayerResidual
+from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.layers.communicator.residual.access import (
     add_to_output,
     buffer,
@@ -79,6 +80,7 @@ from sglang.srt.layers.communicator.residual.access import (
     fold,
     from_pp,
     snapshot,
+    written,
 )
 from sglang.srt.layers.communicator.residual.add_norm import (
     PLAIN_RESIDUAL,
@@ -87,6 +89,7 @@ from sglang.srt.layers.communicator.residual.add_norm import (
     apply_flashinfer_allreduce_fusion,
 )
 from sglang.srt.layers.communicator.residual.mhc import MHCState
+from sglang.srt.layers.communicator.residual.stream import ResidualStream
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     is_enable_moe_cp_allgather,
@@ -195,6 +198,15 @@ class StageCommunicator:
         ``quant_format``)."""
         entry = self.entry(forward_batch, steps)
         context = self._layer._context
+        stream = residual_batch.current(forward_batch)
+        if residual is not stream:
+            raise RuntimeError("residual alias belongs to a different invocation")
+        if stream is not None:
+            if stream.pending is not None:
+                call["update"] = stream.pending.update
+            if stream.pending is None and stream.residual is not None:
+                call["written"] = True
+            hidden_states, residual = stream.input(hidden_states)
         hidden_states, residual = entry.prepare(
             hidden_states, residual, forward_batch, self.norm, context, **call
         )
@@ -208,7 +220,8 @@ class StageCommunicator:
             hidden_states = entry.handoff(
                 hidden_states, forward_batch, self._layer.qkv_latent_func
             )
-        return hidden_states, residual
+        stream.write(residual)
+        return hidden_states, stream
 
 
 class LayerFusions(Protocol):
@@ -231,6 +244,7 @@ class LayerCommunicator:
     add_to_output = staticmethod(add_to_output)
     buffer = staticmethod(buffer)
     fold = staticmethod(fold)
+    written = staticmethod(written)
     finish_layer_stack = staticmethod(finish_layer_stack)
 
     # Communicators built without __init__ (e.g. test doubles) publish no LoRA
@@ -602,15 +616,24 @@ class LayerCommunicator:
             storage = buffer(hidden_states)
             if storage is not None and storage.shape[0] == 0:
                 return hidden_states, None
-        hidden_states = reduce_output(hidden_states)
+        hidden_states = (
+            residual.complete(hidden_states)
+            if isinstance(residual, ResidualStream)
+            else reduce_output(hidden_states)
+        )
         return hidden_states, self.snapshot(hidden_states, residual, at_input=at_input)
 
-    def from_pp(self, tensors, *, allow_missing_residual: bool = False):
-        return from_pp(
+    def from_pp(self, tensors, forward_batch, *, allow_missing_residual: bool = False):
+        hidden_states, residual = from_pp(
             tensors,
             residual_in_hidden=self._residual.ffn_update.at_producer,
             allow_missing_residual=allow_missing_residual,
         )
+        hidden_states, stream = ResidualStream.arrive(
+            hidden_states, residual, self._residual.ffn_update
+        )
+        forward_batch.residual_stream = stream
+        return hidden_states, stream
 
     def prepare_attn_and_capture_last_layer_outputs(
         self,
@@ -629,23 +652,26 @@ class LayerCommunicator:
             post_residual_addition=post_residual_addition,
         )
         if captured_last_layer_outputs is not None:
+            residual_value = residual.residual
             move = self.attn.entry(forward_batch).input_move
             gathered_last_layer_output = (
-                residual
+                residual_value
                 if move is None
                 else move(
-                    hidden_states=residual,
+                    hidden_states=residual_value,
                     forward_batch=forward_batch,
                     context=self._context,
                 )
             )
             if (
-                gathered_last_layer_output is residual
+                gathered_last_layer_output is residual_value
                 # An accumulator that copies on append already holds a snapshot.
                 and not getattr(captured_last_layer_outputs, "copies_on_append", False)
-                and not self._post_attn_residual_is_read_only(residual, forward_batch)
+                and not self._post_attn_residual_is_read_only(
+                    residual_value, forward_batch
+                )
             ):
-                gathered_last_layer_output = residual.clone()
+                gathered_last_layer_output = residual_value.clone()
             captured_last_layer_outputs.append(gathered_last_layer_output)
         return hidden_states, residual
 
@@ -836,7 +862,18 @@ class LayerCommunicator:
         if cache is not None:
             self._context.cache = cache
 
-        return self.ffn.prepare(hidden_states, residual, forward_batch, steps)
+        if isinstance(residual, ResidualStream) and self.stage_edges is None:
+            # The paired boundary records the attention contribution once.
+            hidden_states = residual.leave(
+                hidden_states, self._residual.attention_update
+            )
+        return self.ffn.prepare(
+            hidden_states,
+            residual,
+            forward_batch,
+            steps,
+            update=self._residual.attention_update,
+        )
 
     def maybe_prefetch_next_full_attention_kv(
         self,
@@ -851,12 +888,28 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        return self._complete_ffn_output_now(
+        stream = residual if isinstance(residual, ResidualStream) else None
+        hidden_states, residual = self._complete_ffn_output_now(
             hidden_states,
-            residual,
+            stream.residual if stream is not None else residual,
             forward_batch=forward_batch,
             dp_step=self._postprocess_dp_step(forward_batch),
         )
+        return self._leave_ffn_output(
+            hidden_states,
+            residual,
+            stream,
+            self._batch_steps(forward_batch).ffn_output.update,
+        )
+
+    @staticmethod
+    def _leave_ffn_output(hidden_states, residual, stream, update):
+        if stream is None:
+            return hidden_states, residual
+        stream.residual = residual
+        if update.at_producer:
+            return stream.write(hidden_states), stream
+        return stream.leave(hidden_states, update), stream
 
     def _local_token_move_can_go_to_next_layer(
         self, forward_batch: ForwardBatch
@@ -1037,10 +1090,15 @@ class LayerCommunicator:
         to the rows this FFN needs and its residual's rows."""
         rows, residual_rows, _ = source._branch_rows(forward_batch)
         to, residual_to, _ = self._branch_rows(forward_batch)
-        return (
-            move_rows(hidden_states, rows, to, forward_batch),
-            move_rows(residual, residual_rows, residual_to, forward_batch),
-        )
+        stream = residual if isinstance(residual, ResidualStream) else None
+        if stream is not None:
+            if stream.pending is not None:
+                raise RuntimeError("a branch must start from a prepared stage input")
+            residual = stream.residual
+        hidden_states = move_rows(hidden_states, rows, to, forward_batch)
+        residual = move_rows(residual, residual_rows, residual_to, forward_batch)
+        forward_batch.residual_stream = ResidualStream(residual)
+        return hidden_states, forward_batch.residual_stream
 
     def branch_output(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
@@ -1064,9 +1122,19 @@ class LayerCommunicator:
         this layer hands on."""
         _, _, rows = source._branch_rows(forward_batch)
         _, _, to = self._branch_rows(forward_batch)
+        stream = residual if isinstance(residual, ResidualStream) else None
+        update = None
+        if stream is not None:
+            stream.check(hidden_states)
+            update = stream.pending.update
+            hidden_states, residual = stream.finish(hidden_states)
         hidden_states = move_rows(hidden_states, rows, to, forward_batch)
         residual = move_rows(residual, rows, to, forward_batch)
-        return contribution + hidden_states, residual
+        output = contribution + hidden_states
+        if stream is not None:
+            stream.write(residual)
+            return stream.leave(output, update), stream
+        return output, residual
 
     def _select_ffn_exit_fusions(
         self,
@@ -1203,10 +1271,11 @@ class MixerExit:
     its input), and when it may leave it and the fused kernel takes it into the
     next input norm."""
 
-    __slots__ = ("skips_reduction", "_hands_on", "_scope")
+    __slots__ = ("skips_reduction", "_hands_on", "_scope", "_update")
 
     def __init__(self, communicator: LayerCommunicator, forward_batch: ForwardBatch):
         produced = communicator._batch_steps(forward_batch).ffn_output
+        self._update = produced.update
         self._hands_on = (
             produced.leaves_for_next_layer
             and communicator.should_fuse_mlp_allreduce_with_next_layer(forward_batch)
@@ -1221,13 +1290,15 @@ class MixerExit:
     def __exit__(self, *exc_info):
         return self._scope.__exit__(*exc_info)
 
-    def finish(
-        self, hidden_states: torch.Tensor
-    ) -> Union[torch.Tensor, UnreducedOutput]:
+    def finish(self, hidden_states: torch.Tensor, residual=None):
         """The mixer's output: its partial sum to the FFN stage after it, as a
         value that owes the sum to a mixer after it, or complete."""
         if self._hands_on:
-            return UnreducedOutput(hidden_states, group=get_parallel().tp_group)
+            hidden_states = UnreducedOutput(
+                hidden_states, group=get_parallel().tp_group
+            )
+        if isinstance(residual, ResidualStream):
+            return residual.leave(hidden_states, self._update), residual
         return hidden_states
 
 
@@ -1243,6 +1314,7 @@ class FfnExit:
         "fuse_mlp_allreduce",
         "mlp_reduce_scatter",
         "_complete",
+        "_update",
         "_scope",
     )
 
@@ -1254,6 +1326,7 @@ class FfnExit:
         self.fuse_mlp_allreduce = completion.fuse_mlp_allreduce
         self.mlp_reduce_scatter = completion.mlp_reduce_scatter
         self._complete = completion.complete
+        self._update = communicator._batch_steps(forward_batch).ffn_output.update
         self._scope = get_forward().scoped(
             fuse_mlp_allreduce=self.fuse_mlp_allreduce,
             mlp_reduce_scatter=self.mlp_reduce_scatter,
@@ -1271,11 +1344,17 @@ class FfnExit:
         self, hidden_states: torch.Tensor, residual: torch.Tensor
     ) -> Tuple[Union[torch.Tensor, UnreducedOutput], torch.Tensor]:
         """Leave the reduction to the next layer's input, or postprocess."""
+        stream = residual_batch.current(self.forward_batch)
+        if stream is not None:
+            residual = stream.residual
         if not isinstance(hidden_states, torch.Tensor):
             # A deferred MoE finalize handoff, consumed by the next prepare_attn.
             assert self.defer_moe_finalize, "unrequested deferred MoE handoff"
-            return hidden_states, residual
-        return self._complete(hidden_states, residual)
+        else:
+            hidden_states, residual = self._complete(hidden_states, residual)
+        return self.communicator._leave_ffn_output(
+            hidden_states, residual, stream, self._update
+        )
 
 
 class MHCLayerCommunicator(LayerCommunicator):

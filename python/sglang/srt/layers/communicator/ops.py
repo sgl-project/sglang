@@ -320,6 +320,7 @@ def _mlp_input_dp_partial(
     gathers_residual: bool,
     places_cp_shards: bool = False,
     read: StageRead = NORM_READ,
+    update: StageUpdate = ADD,
 ):
     """Attention DP: one rank adds the residual, the gather sums it, then read
     the input from the sum. With ``places_cp_shards`` each CP rank puts its
@@ -384,6 +385,22 @@ def _tp_all_gather_scattered_rows(
     return output
 
 
+def _dispatch_consumer(
+    hidden_states, residual, forward_batch, norm, context, *, paths, update=ADD, **call
+):
+    if residual is None:
+        # Enter/read-only paths do not execute an update.
+        prepare = paths[False]
+    else:
+        try:
+            prepare = paths[update.adds_plainly]
+        except KeyError:
+            raise RuntimeError("producer update has no bound input path") from None
+    return prepare(
+        hidden_states, residual, forward_batch, norm, context, update=update, **call
+    )
+
+
 def _consumer_step(
     hidden_states: Union[torch.Tensor, UnreducedOutput, HandoffOutput],
     residual: Optional[torch.Tensor],
@@ -392,8 +409,12 @@ def _consumer_step(
     context: CommunicateContext,
     *,
     step: Callable,
+    adds_plainly: bool,
     carried_fusions: Tuple[Callable, ...],
     owes_by_construction: bool = False,
+    written_step: Optional[Callable] = None,
+    written: bool = False,
+    update: StageUpdate = ADD,
     **call,
 ):
     """A boundary's half into a stage: complete what the value carries, a sum
@@ -404,6 +425,10 @@ def _consumer_step(
     that owes its sum by construction (``owes_by_construction``) is that sum's
     only carrier. ``call`` is what the stage's read takes (the attention's
     ``quant_format`` and ``post_residual_addition``)."""
+    if residual is not None and update.adds_plainly != adds_plainly:
+        raise RuntimeError("producer update does not match the boundary's capability")
+    if written and written_step is not None:
+        step = written_step
     if not isinstance(hidden_states, torch.Tensor):
         owed = hidden_states
         if residual is None:
@@ -429,7 +454,9 @@ def _consumer_step(
                 hidden_states = reduce_output(owed)
             else:
                 hidden_states = owed.partial
-    return step(hidden_states, residual, forward_batch, norm, context, **call)
+    return step(
+        hidden_states, residual, forward_batch, norm, context, update=update, **call
+    )
 
 
 def _read_input(
@@ -442,7 +469,7 @@ def _read_input(
     layer_input: Optional[Callable],
     enters_stack: bool,
     read: StageRead,
-    update: StageUpdate,
+    update: StageUpdate = ADD,
     quant_format: str = "",
     post_residual_addition: Optional[torch.Tensor] = None,
 ):
@@ -535,6 +562,7 @@ def _mlp_input_residual_into_sum(
     context: CommunicateContext,
     *,
     read: StageRead = NORM_READ,
+    update: StageUpdate = ADD,
 ):
     return _tp_all_reduce_with_scattered_residual(
         hidden_states, residual, layernorm, context, read
@@ -565,12 +593,13 @@ def _mlp_input_gather_attention_cp(
     context: CommunicateContext,
     *,
     gather: Callable,
+    update: StageUpdate = ADD,
 ):
     """DSA and MLA CP: complete this rank's shard, then gather the shards, of
     equal length, over the attention-CP group. The residual stays on the
     shard."""
     hidden_states, residual = gather(
-        hidden_states, residual, forward_batch, layernorm, context
+        hidden_states, residual, forward_batch, layernorm, context, update=update
     )
     return dsa_cp_gather_hidden_states(hidden_states), residual
 
@@ -583,6 +612,7 @@ def _mlp_input_gather_moe_cp(
     context: CommunicateContext,
     *,
     gather: Callable,
+    update: StageUpdate = ADD,
 ):
     """Gather for the FFN, then over the MoE-CP group so each rank holds all
     tokens of its MoE group (moe_dp_size < attn_cp_size). The residual stays at
@@ -596,7 +626,7 @@ def _mlp_input_gather_moe_cp(
         return hidden_states, residual
 
     hidden_states, residual = gather(
-        hidden_states, residual, forward_batch, layernorm, context
+        hidden_states, residual, forward_batch, layernorm, context, update=update
     )
 
     rows = moe_cp_gathered_rows(forward_batch)

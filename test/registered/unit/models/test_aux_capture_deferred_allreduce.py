@@ -108,15 +108,19 @@ class DeferringLayer(nn.Module):
         *args,
         **kwargs,
     ):
+        stream = forward_batch.residual_stream
+        assert residual is stream
+        hidden_states, residual = stream.input(hidden_states)
         hidden_states = comm.reduce_output(hidden_states)
         if residual is None:
             residual = hidden_states.clone()
         else:
             # later norms mutate the residual; captured snapshots must stay intact
             residual.add_(hidden_states)
+        stream.write(residual)
         with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
             partial = torch.full_like(hidden_states, 0.5)
-        hidden_states, residual = ffn_exit.finish(partial, residual)
+        hidden_states, residual = ffn_exit.finish(partial, stream)
         if self.return_topk:
             return hidden_states, residual, None
         return hidden_states, residual
@@ -241,26 +245,33 @@ class TestPipelineResidualReception(CustomTestCase):
         )
         streams = torch.randn(2, 4, 3)
         hidden, residual = comm_instance.from_pp(
-            PPProxyTensors({"hidden_states": streams})
+            PPProxyTensors({"hidden_states": streams}),
+            SimpleNamespace(residual_stream=None),
         )
         self.assertIs(hidden, streams)
-        self.assertIsNone(residual)
+        self.assertIsNone(residual.pending)
+        self.assertIs(residual.residual, hidden)
 
     def test_optional_residual_and_declared_partial_keep_the_wire_values(self):
         comm_instance = comm.LayerCommunicator.__new__(comm.LayerCommunicator)
         partial = torch.randn(2, 4)
         prior = torch.randn_like(partial)
         hidden, residual = comm_instance.from_pp(
-            PPProxyTensors({"hidden_states": partial, "residual": prior})
+            PPProxyTensors({"hidden_states": partial, "residual": prior}),
+            SimpleNamespace(residual_stream=None),
         )
         self.assertIs(hidden, partial)
-        self.assertIs(residual, prior)
+        self.assertIs(residual.residual, prior)
+        self.assertIs(residual.pending.value, partial)
         missing = PPProxyTensors({"hidden_states": partial})
         with self.assertRaises(KeyError):
-            comm_instance.from_pp(missing)
-        hidden, residual = comm_instance.from_pp(missing, allow_missing_residual=True)
+            comm_instance.from_pp(missing, SimpleNamespace(residual_stream=None))
+        hidden, residual = comm_instance.from_pp(
+            missing, SimpleNamespace(residual_stream=None), allow_missing_residual=True
+        )
         self.assertIs(hidden, partial)
-        self.assertIsNone(residual)
+        self.assertIsNone(residual.pending)
+        self.assertIs(residual.residual, hidden)
 
 
 if __name__ == "__main__":

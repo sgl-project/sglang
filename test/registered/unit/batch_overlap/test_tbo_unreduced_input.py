@@ -9,7 +9,8 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.batch_overlap import two_batch_overlap as tbo
-from sglang.srt.layers.communicator import Layout, UnreducedOutput
+from sglang.srt.layers.communicator import ADD, Layout, UnreducedOutput
+from sglang.srt.layers.communicator.residual.stream import ResidualStream
 from sglang.srt.utils import empty_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -18,6 +19,78 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestTboEntryReducesItsInput(CustomTestCase):
+    def test_each_microbatch_owns_its_contribution_and_merge_keeps_the_update(self):
+        group = SimpleNamespace(all_reduce=lambda x: x * 2)
+        residual = torch.ones(4, 3)
+        stream = ResidualStream(residual)
+        hidden = stream.leave(UnreducedOutput(torch.ones(4, 3), group=group), ADD)
+        parent_batch = SimpleNamespace(residual_stream=stream)
+        parts_seen = []
+
+        def split(hidden_states, residual, **kwargs):
+            return [
+                dict(
+                    hidden_states=hidden_states[a:b],
+                    residual=residual[a:b],
+                    forward_batch=SimpleNamespace(
+                        tbo_parent_token_range=(a, b), residual_stream=None
+                    ),
+                )
+                for a, b in ((0, 2), (2, 4))
+            ]
+
+        def execute(inputs_arr, **kwargs):
+            self.assertIsNone(parent_batch.residual_stream)
+            parts_seen.extend(inputs_arr)
+            self.assertIsNot(inputs_arr[0]["residual"], inputs_arr[1]["residual"])
+            for part in inputs_arr:
+                state = part["residual"]
+                self.assertIs(state, part["forward_batch"].residual_stream)
+                value = part["hidden_states"]
+                self.assertIsNot(state.pending, stream.pending)
+                self.assertIs(state.pending.update, ADD)
+                with self.assertRaises(RuntimeError):
+                    state.input(
+                        inputs_arr[1 if part is inputs_arr[0] else 0]["hidden_states"]
+                    )
+                value, old_residual = state.input(value)
+                torch.testing.assert_close(value, torch.full((2, 3), 2.0))
+                state.write(value + old_residual)
+                part["hidden_states"] = state.leave(value * 5, ADD)
+            return inputs_arr
+
+        with (
+            patch.object(tbo, "_model_forward_tbo_split_inputs", split),
+            patch.object(tbo, "execute_overlapped_operations", execute),
+            patch.object(
+                tbo.deep_gemm_wrapper,
+                "configure_deep_gemm_num_sms",
+                lambda _: empty_context(),
+            ),
+        ):
+            merged, output = tbo._model_forward_tbo(
+                inputs=dict(
+                    hidden_states=hidden,
+                    residual=stream,
+                    positions=None,
+                    forward_batch=parent_batch,
+                    zero_allocator=None,
+                ),
+                operations_strategy=SimpleNamespace(
+                    deep_gemm_num_sms=None, operations=[], tbo_delta_stages=0
+                ),
+                layer_input_rows=Layout(frozenset()),
+            )
+        self.assertEqual(len(parts_seen), 2)
+        self.assertIs(parent_batch.residual_stream, output)
+        self.assertTrue(
+            all(part["forward_batch"].residual_stream is None for part in parts_seen)
+        )
+        self.assertIs(output.pending.update, ADD)
+        self.assertIs(output.pending.value, merged)
+        torch.testing.assert_close(merged, torch.full((4, 3), 10.0))
+        torch.testing.assert_close(output.residual, torch.full((4, 3), 3.0))
+
     def test_split_and_merge_see_the_reduced_tensor(self):
         # Under attention DP the partial sum spans every DP rank's tokens; its
         # reduction also brings it back to this rank's three.
@@ -52,7 +125,7 @@ class TestTboEntryReducesItsInput(CustomTestCase):
                     hidden_states=hidden_states,
                     residual=torch.zeros(3, 4),
                     positions=None,
-                    forward_batch=None,
+                    forward_batch=SimpleNamespace(residual_stream=None),
                     zero_allocator=None,
                 ),
                 operations_strategy=SimpleNamespace(

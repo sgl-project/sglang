@@ -18,6 +18,7 @@ import torch
 from sglang.srt.layers import communicator as comm
 from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.communicator.adapters import context_parallel as dsa_cp
+from sglang.srt.layers.communicator.residual.stream import ResidualStream
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
@@ -59,6 +60,13 @@ class Flags:
 
 def group(name, ranks):
     return SimpleNamespace(name=name, ranks=list(ranks))
+
+
+def prepare_mlp(communicator, hidden, residual, forward_batch):
+    forward_batch.residual_stream = ResidualStream(residual)
+    return communicator.prepare_mlp(
+        hidden, forward_batch.residual_stream, forward_batch
+    )
 
 
 class TestAttentionCpBoundary(CustomTestCase):
@@ -200,15 +208,21 @@ class TestAttentionCpBoundary(CustomTestCase):
             with self.as_rank(
                 cp, dict(gather=record_gather(cp), reduce_scatter=unused)
             ):
-                self.build(allow_reduce_scatter).prepare_mlp(
-                    self.values[cp], self.residuals[cp], self.cp_extend()
+                prepare_mlp(
+                    self.build(allow_reduce_scatter),
+                    self.values[cp],
+                    self.residuals[cp],
+                    self.cp_extend(),
                 )
         gathered, residuals = {}, {}
         for cp in range(CP_SIZE):
             with self.as_rank(cp, dict(gather=fill_gather, reduce_scatter=unused)):
-                gathered[cp], residuals[cp] = self.build(
-                    allow_reduce_scatter
-                ).prepare_mlp(self.values[cp], self.residuals[cp], self.cp_extend())
+                gathered[cp], residuals[cp] = prepare_mlp(
+                    self.build(allow_reduce_scatter),
+                    self.values[cp],
+                    self.residuals[cp],
+                    self.cp_extend(),
+                )
         expected_rows = torch.cat(
             [self.values[cp] + self.residuals[cp] for cp in range(CP_SIZE)]
         )
@@ -245,10 +259,12 @@ class TestAttentionCpBoundary(CustomTestCase):
                     cp, dict(gather=fill_gather, reduce_scatter=reduce_scatter)
                 ) as rank:
                     communicator = self.build(allow_reduce_scatter)
-                    with communicator.ffn_exit(self.cp_extend()) as exit_:
+                    batch = self.cp_extend()
+                    batch.residual_stream = ResidualStream(residuals[cp].residual)
+                    with communicator.ffn_exit(batch) as exit_:
                         published[cp] = rank.flags.mlp_reduce_scatter
                         output = ffn_output(cp, leaves=published[cp])
-                    back[cp], _ = exit_.finish(output, residuals[cp])
+                    back[cp], _ = exit_.finish(output, batch.residual_stream)
         return published, back, reduced
 
     def test_the_reduce_scatter_completes_the_sum_the_moe_leaves(self):

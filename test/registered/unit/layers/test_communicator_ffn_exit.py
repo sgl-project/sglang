@@ -23,6 +23,7 @@ from sglang.srt.layers.communicator import (
     reduce_output,
     sequence_parallel_layer_sides,
 )
+from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.runtime_context import get_forward
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
@@ -130,6 +131,15 @@ def make_communicator(
     return communicator
 
 
+def finish_exit(ffn_exit, hidden, residual):
+    """Inspect the selected completion form inside a batch-owned stream."""
+    stream = residual_batch.start(ffn_exit.forward_batch)
+    stream.write(residual)
+    hidden, output_stream = ffn_exit.finish(hidden, stream)
+    assert output_stream is residual_batch.current(ffn_exit.forward_batch)
+    return output_stream.input(hidden)
+
+
 def published_flags():
     forward = get_forward()
     return forward.fuse_mlp_allreduce, forward.mlp_reduce_scatter
@@ -139,13 +149,13 @@ class TestFfnExit(CustomTestCase):
     def setUp(self):
         self.hidden_states = torch.ones(3, 4)
         self.residual = torch.zeros(3, 4)
-        self.forward_batch = object()
+        self.forward_batch = types.SimpleNamespace(residual_stream=None)
 
     def run_exit(self, communicator):
         with communicator.ffn_exit(self.forward_batch) as ffn_exit:
             seen = published_flags()
             hidden_states = self.hidden_states * 2
-        return seen, ffn_exit.finish(hidden_states, self.residual)
+        return seen, finish_exit(ffn_exit, hidden_states, self.residual)
 
     def test_reduction_left_to_next_layer_is_unreduced(self):
         communicator = make_communicator(fuse=True, reduce_scatter=False)
@@ -230,7 +240,7 @@ class TestFfnExit(CustomTestCase):
                     decide = communicator._ffn_sum_moves_to_next_layer
                     decide.return_value = not fuse
                     hidden_states = self.hidden_states * 2
-                hidden_states, _ = ffn_exit.finish(hidden_states, self.residual)
+                hidden_states, _ = finish_exit(ffn_exit, hidden_states, self.residual)
                 self.assertEqual(seen, (fuse, False))
                 self.assertEqual(isinstance(hidden_states, UnreducedOutput), fuse)
                 self.assertEqual(communicator._complete_ffn_output_now.called, not fuse)
@@ -286,13 +296,13 @@ class TestFfnExit(CustomTestCase):
             seen = published_flags() + (get_forward().defer_moe_finalize,)
         self.assertEqual(seen, (True, False, True))
         self.assertEqual(
-            ffn_exit.finish(handoff, self.residual), (handoff, self.residual)
+            finish_exit(ffn_exit, handoff, self.residual), (handoff, self.residual)
         )
         communicator._complete_ffn_output_now.assert_not_called()
         self.assertFalse(get_forward().defer_moe_finalize)
 
         # The MoE may decline per forward; a tensor then takes the fused exit.
-        hidden_states, _ = ffn_exit.finish(self.hidden_states * 2, self.residual)
+        hidden_states, _ = finish_exit(ffn_exit, self.hidden_states * 2, self.residual)
         self.assertIsInstance(hidden_states, UnreducedOutput)
 
 
@@ -306,9 +316,11 @@ class TestReduceOutput(CustomTestCase):
 
     def test_reduction_left_by_the_last_layer_runs_once(self):
         communicator = self.communicator(fuse=True)
-        with communicator.ffn_exit(object()) as ffn_exit:
+        with communicator.ffn_exit(
+            types.SimpleNamespace(residual_stream=None)
+        ) as ffn_exit:
             hidden_states = torch.ones(3, 4)
-        hidden_states, _ = ffn_exit.finish(hidden_states, torch.zeros(3, 4))
+        hidden_states, _ = finish_exit(ffn_exit, hidden_states, torch.zeros(3, 4))
 
         hidden_states = reduce_output(hidden_states)
         self.all_reduce.assert_called_once()
@@ -331,9 +343,11 @@ class TestReduceOutput(CustomTestCase):
 
     def test_complete_hidden_states_pass_through(self):
         communicator = self.communicator(fuse=False)
-        with communicator.ffn_exit(object()) as ffn_exit:
+        with communicator.ffn_exit(
+            types.SimpleNamespace(residual_stream=None)
+        ) as ffn_exit:
             hidden_states = torch.ones(3, 4)
-        hidden_states, _ = ffn_exit.finish(hidden_states, torch.zeros(3, 4))
+        hidden_states, _ = finish_exit(ffn_exit, hidden_states, torch.zeros(3, 4))
 
         self.assertIs(reduce_output(hidden_states), hidden_states)
         self.assertIsNone(reduce_output(None))
@@ -345,9 +359,11 @@ class TestReduceOutput(CustomTestCase):
                 self.all_reduce.reset_mock()
                 communicator = self.communicator(fuse=fuse)
                 residual = torch.zeros(3, 4)
-                with communicator.ffn_exit(object()) as ffn_exit:
+                with communicator.ffn_exit(
+                    types.SimpleNamespace(residual_stream=None)
+                ) as ffn_exit:
                     hidden_states = torch.ones(3, 4)
-                hidden_states, _ = ffn_exit.finish(hidden_states, residual)
+                hidden_states, _ = finish_exit(ffn_exit, hidden_states, residual)
 
                 hidden_states, residual_out = communicator.finish_layer_stack(
                     hidden_states, residual, object()

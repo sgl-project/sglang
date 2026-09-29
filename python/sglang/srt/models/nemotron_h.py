@@ -31,6 +31,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     Mamba2AttnBackend,
 )
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
+from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -478,7 +479,7 @@ class NemotronHAttnLikeDecoderLayer(nn.Module):
             hidden_states = self._forward_mixer(
                 hidden_states, forward_batch, mixer_exit.skips_reduction
             )
-        return mixer_exit.finish(hidden_states), residual
+        return mixer_exit.finish(hidden_states, residual)
 
 
 class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
@@ -732,12 +733,12 @@ class NemotronHModel(nn.Module):
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_tokens(input_ids)
-            residual = None
+            residual = residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
             hidden_states, residual = self.layers[
                 self.start_layer
-            ].layer_communicator.from_pp(pp_proxy_tensors)
+            ].layer_communicator.from_pp(pp_proxy_tensors, forward_batch)
 
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):

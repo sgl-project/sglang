@@ -37,6 +37,7 @@ from sglang.srt.layers.attention.vision import (
     VisionAttentionMetadata,
     prepare_vision_attention_metadata,
 )
+from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.layers.conv import Conv3dLayer
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -1204,12 +1205,12 @@ class Qwen3LLMModel(Qwen3Model):
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
-            residual = None
+            residual = residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
             hidden_states, residual = self.layers[
                 self.start_layer
-            ].layer_communicator.from_pp(pp_proxy_tensors)
+            ].layer_communicator.from_pp(pp_proxy_tensors, forward_batch)
 
         aux_hidden_states = []
         for layer_idx, layer in enumerate(

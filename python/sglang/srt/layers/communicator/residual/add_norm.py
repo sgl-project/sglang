@@ -267,6 +267,7 @@ class Add:
 
     adds_plainly = True
     at_producer = False
+    can_defer_across_layers = True
 
     def update(self, hidden_states, residual):
         hidden_states += residual
