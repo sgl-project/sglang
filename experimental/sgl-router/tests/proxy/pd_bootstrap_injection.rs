@@ -324,15 +324,9 @@ async fn pd_mode_bootstrap_port_matches_chosen_prefill_worker() {
     );
 }
 
-/// Pin Pattern B's "prefill failure is invisible to the client"
-/// contract: when the spawned prefill task gets a 5xx (or any other
-/// upstream error), the decode response still reaches the client
-/// unmodified. The router intentionally does not wire fail-fast here —
-/// the decode side will eventually hang on `bootstrap_room` and time
-/// out, but the chat handler itself doesn't propagate the prefill
-/// error. Matches llm-d / aibrix behaviour.
+/// A rejected prefill must override a decode response that cannot be valid without KV.
 #[tokio::test]
-async fn pd_mode_prefill_5xx_does_not_poison_decode_response() {
+async fn pd_mode_prefill_5xx_returns_bad_gateway() {
     let prefill = crate::common::mock_worker::MockWorker::start_returning_error(
         StatusCode::INTERNAL_SERVER_ERROR,
         json!({"error": "simulated prefill failure"}),
@@ -357,19 +351,9 @@ async fn pd_mode_prefill_5xx_does_not_poison_decode_response() {
     ]);
     let app = build_router(ctx);
 
-    // Client must see decode's 200 — the failing prefill is invisible.
     let res = app.oneshot(chat_request()).await.unwrap();
-    assert_eq!(
-        res.status(),
-        StatusCode::OK,
-        "decode response should reach the client even when prefill returned 5xx",
-    );
-
-    // Decode received its body (proves dual dispatch fired despite
-    // the prefill failure).
-    let decode_body = await_captured_body(&decode, Duration::from_secs(2), "decode").await;
-    let v = parse_body(&decode_body);
-    assert_eq!(bootstrap_port(&v), Some(8997));
+    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(res.headers()["x-router-error-code"], "prefill_failed");
 
     // Prefill also received its body — it just returned 5xx. The
     // bootstrap fields are present so the engine WOULD have honoured
@@ -396,7 +380,7 @@ fn streaming_chat_request() -> Request<Body> {
 }
 
 #[tokio::test]
-async fn pd_mode_disconnect_does_not_abort_either_worker() {
+async fn pd_mode_disconnect_aborts_decode_but_not_prefill() {
     let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let decode = crate::common::mock_worker::MockWorker::start_slow_stream(
         vec!["data: a\n\n", "data: b\n\n", "data: c\n\n"],
@@ -429,10 +413,20 @@ async fn pd_mode_disconnect_does_not_abort_either_worker() {
     assert!(data_stream.next().await.is_some());
     drop(data_stream);
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    for worker in [&prefill, &decode] {
-        assert!(worker.abort_log.lock().unwrap().is_empty());
-        let body = await_captured_body(worker, Duration::from_secs(2), "PD worker").await;
-        assert!(parse_body(&body).get("rid").is_none());
-    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while decode.abort_log.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(prefill.abort_log.lock().unwrap().is_empty());
+    let body = await_captured_body(&decode, Duration::from_secs(2), "decode").await;
+    let rid = parse_body(&body)["rid"].clone();
+    assert_eq!(
+        decode.abort_log.lock().unwrap()[0],
+        json!({"rid": rid, "abort_all": false})
+    );
 }
+
+mod reliability;

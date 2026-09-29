@@ -305,7 +305,8 @@ async fn pd_picks_both_groups_from_selected_bucket_and_shares_bootstrap() {
     let d: serde_json::Value =
         serde_json::from_slice(decode.captured.lock().unwrap().last_body.as_ref().unwrap())
             .unwrap();
-    assert!(p.get("rid").is_none() && d.get("rid").is_none());
+    assert!(p["rid"].is_string());
+    assert_eq!(p["rid"], d["rid"]);
     assert!(p["bootstrap_room"].is_number());
     assert_eq!(p["bootstrap_room"], d["bootstrap_room"]);
     let calls = policy.calls.lock().unwrap();
