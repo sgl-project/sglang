@@ -26,7 +26,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layer_boundary.layout import (
-    enable_moe_dense_fully_dp,
+    is_dense_ffn_fully_dp,
 )
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -107,7 +107,7 @@ class AttnTpContext:
             and get_parallel().tp_size > 1
             and not is_dp_attention_enabled()
             and get_moe_a2a_backend().is_none()
-            and not enable_moe_dense_fully_dp()
+            and not is_dense_ffn_fully_dp()
             and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
             and get_spec().speculative_algorithm != "EAGLE3"
         )

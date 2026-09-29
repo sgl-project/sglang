@@ -192,7 +192,7 @@ def test_cutedsl_entries_come_before_the_base_fused_kernel():
         comm.edges = {
             BatchVariant.ORDINARY: SimpleNamespace(
                 incoming=SimpleNamespace(
-                    residual=Layout(frozenset({TokenAxis.ATTN_TP_SCATTER}))
+                    residual=Layout(frozenset({TokenAxis.ATTN_TP}))
                 )
             )
         }
@@ -223,7 +223,7 @@ def test_the_fusion_runs_only_on_the_ffn_full_rows():
     ):
         for sharded, eligible in (
             (frozenset(), True),
-            (frozenset({TokenAxis.ATTN_TP_SCATTER}), False),
+            (frozenset({TokenAxis.ATTN_TP}), False),
         ):
             comm.path_for = lambda fb, rows=Layout(sharded): SimpleNamespace(
                 entry=SimpleNamespace(input_rows=rows)

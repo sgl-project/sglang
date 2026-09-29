@@ -34,10 +34,10 @@ from sglang.srt.layers.layer_boundary.layout import (
     Layout,
     SumGroup,
     TokenAxis,
-    _gathers_over_attention_cp,
-    _generic_prefill_cp_shards_tokens,
-    enable_moe_dense_fully_dp,
-    sparse_moe_gathers_over_moe_cp,
+    _cp_gathers_over_attn_cp,
+    _prefill_cp_shards_tokens,
+    is_dense_ffn_fully_dp,
+    moe_gathers_over_moe_cp,
     token_axis_sizes,
 )
 from sglang.srt.layers.layer_boundary.output import OutputTransform
@@ -53,7 +53,7 @@ from sglang.srt.runtime_context import get_exec, get_parallel
 
 def _active_variants():
     yield BatchVariant.ORDINARY
-    if _generic_prefill_cp_shards_tokens():
+    if _prefill_cp_shards_tokens():
         yield BatchVariant.CONTEXT_PARALLEL
     if _input_scattered_possible():
         yield BatchVariant.INPUT_SCATTERED
@@ -67,7 +67,7 @@ def _row_layouts(variant):
         TokenAxis.ATTN_DP, TokenAxis.ATTN_CP, axis_sizes=axes
     )
     local = Layout.sharded_over(
-        TokenAxis.ATTN_DP, TokenAxis.ATTN_CP, TokenAxis.ATTN_TP_SCATTER, axis_sizes=axes
+        TokenAxis.ATTN_DP, TokenAxis.ATTN_CP, TokenAxis.ATTN_TP, axis_sizes=axes
     )
     return axes, attention, local, Layout.sharded_over(axis_sizes=axes)
 
@@ -94,14 +94,12 @@ def _resolve_ffn(
     can_move_output = output_transform is None or output_transform.before_reduce_scatter
     use_reduce_scatter = strategy in ("rs", "rs+rsv") and can_move_output
     use_reduce_scatterv = strategy in ("rsv", "rs+rsv") and can_move_output
-    cp_shards = _generic_prefill_cp_shards_tokens()
+    cp_shards = _prefill_cp_shards_tokens()
     axes, attention, local, full = _row_layouts(variant)
     on_rank_rows = (
         is_moe_input_scattered_across_dp_ranks()
         if sparse
-        else (
-            enable_moe_dense_fully_dp() if dense_tp_size is None else dense_tp_size == 1
-        )
+        else (is_dense_ffn_fully_dp() if dense_tp_size is None else dense_tp_size == 1)
     )
     if parallel.attn_cp_size > 1 and sparse:
         _reject_unsupported_cp_moe(on_rank_rows, cp_shards)
@@ -109,7 +107,7 @@ def _resolve_ffn(
         sparse
         and parallel.attn_cp_size > 1
         and parallel.moe_dp_size == parallel.attn_cp_size
-        and not _gathers_over_attention_cp()
+        and not _cp_gathers_over_attn_cp()
     )
     group = SumGroup.MOE_OUTPUT if sparse else SumGroup.TP
     if variant is BatchVariant.SEQUENCE_PARALLEL:
@@ -117,7 +115,7 @@ def _resolve_ffn(
             StageContract(
                 InputContract(
                     full,
-                    gathered_by_compute=frozenset({TokenAxis.ATTN_TP_SCATTER}),
+                    gathered_by_compute=frozenset({TokenAxis.ATTN_TP}),
                     read=read,
                 ),
                 OutputContract(local, update=update, transform=output_transform),
@@ -202,7 +200,7 @@ class StageDeclaration:
             residual update, with an explicit reduction-order contract.
         reduction: Whether compute always leaves a partial sum, obeys the
             exit scope, or adds a replicated component after its own sum.
-        gathers_tp_input: Whether attention gathers TP-sharded input itself.
+        gathers_attn_tp_input: Whether attention gathers TP-sharded input itself.
         dense_tp_size: Dense FFN compute width: None uses the configured width,
             1 means local compute, and the full TP size means TP compute.
         exit_rows: Required FFN output rows at the layer or branch exit.
@@ -221,7 +219,7 @@ class StageDeclaration:
     terminal: bool = False
     output_transform: Optional[OutputTransform] = None
     reduction: ProducerReduction = ProducerReduction.EXIT_SCOPED
-    gathers_tp_input: bool = False
+    gathers_attn_tp_input: bool = False
     dense_tp_size: Optional[int] = None
     exit_rows: Optional[ExitRows] = None
     # Only declarations participate in construction, never executable stages.
@@ -268,7 +266,7 @@ def declare_attn(
     update=PLAIN_ADD,
     terminal=False,
     reduction=ProducerReduction.ALWAYS_PARTIAL,
-    gathers_tp_input=True,
+    gathers_attn_tp_input=True,
 ):
     """Declare attention or a mixer; construct its executable boundary later.
 
@@ -281,7 +279,7 @@ def declare_attn(
         reduction: ALWAYS_PARTIAL for an output projection that always skips reduction;
             EXIT_SCOPED for a mixer that follows its exit scope's reduction decision.
             TAIL_AFTER_SUM is rejected for attention stages.
-        gathers_tp_input: Whether compute gathers attention-TP input slices itself.
+        gathers_attn_tp_input: Whether compute gathers attention-TP input slices itself.
 
     Returns:
         A StageDeclaration with no norm, tensors or execution plan.
@@ -296,7 +294,7 @@ def declare_attn(
         prepared_from=prepared_from,
         terminal=terminal,
         reduction=reduction,
-        gathers_tp_input=gathers_tp_input,
+        gathers_attn_tp_input=gathers_attn_tp_input,
     )
 
 
@@ -309,7 +307,7 @@ def declare_ffn(
     update=PLAIN_ADD,
     terminal=False,
     output_transform=None,
-    next_sparse=False,
+    next_layer_sparse=False,
     dense_tp_size=None,
     reduction=ProducerReduction.EXIT_SCOPED,
     exit_rows=None,
@@ -324,7 +322,7 @@ def declare_ffn(
         update: Operation writing FFN output into the residual.
         terminal: Whether this stage ends the model's layer stack.
         output_transform: Optional contribution transform before residual update.
-        next_sparse: Whether the next decoder layer's FFN is sparse; used only
+        next_layer_sparse: Whether the next decoder layer's FFN is sparse; used only
             to derive the TBO exit rows when exit_rows is not supplied.
         dense_tp_size: Dense compute width: None for configuration, 1 for local
             compute, or the full TP size.
@@ -350,14 +348,14 @@ def declare_ffn(
         output_transform=output_transform,
         dense_tp_size=dense_tp_size,
         reduction=reduction,
-        exit_rows=exit_rows or tbo_exit_rows(sparse, next_sparse),
+        exit_rows=exit_rows or tbo_exit_rows(sparse, next_layer_sparse),
     )
 
 
 def _resolve_stage(stage, variant, following=None):
     axes, attention, local, full = _row_layouts(variant)
     if stage.update.applied_at_exit:
-        if stage.sparse and sparse_moe_gathers_over_moe_cp():
+        if stage.sparse and moe_gathers_over_moe_cp():
             raise NotImplementedError(
                 "MHC does not support a MoE gathered over the MoE-CP group"
             )
@@ -382,11 +380,11 @@ def _resolve_stage(stage, variant, following=None):
     sp = variant is BatchVariant.SEQUENCE_PARALLEL
     scattered = variant is BatchVariant.INPUT_SCATTERED
     gathers = (
-        frozenset({TokenAxis.ATTN_TP_SCATTER})
-        if stage.gathers_tp_input and (sp or scattered or _use_ag_after_qlora)
+        frozenset({TokenAxis.ATTN_TP})
+        if stage.gathers_attn_tp_input and (sp or scattered or _use_ag_after_qlora)
         else frozenset()
     )
-    owes = not sp and axes[TokenAxis.ATTN_TP_SCATTER] > 1
+    owes = not sp and axes[TokenAxis.ATTN_TP] > 1
     declaration = StageContract(
         InputContract(attention, gathered_by_compute=gathers, read=stage.read),
         OutputContract(
@@ -486,7 +484,7 @@ def _connect(producer, consumer, *, residual_from=None):
         decl, during, _ = _resolve_stage(after, variant)
         if after.kind is StageKind.ATTENTION:
             during = (
-                Layout(residual.sharded | {TokenAxis.ATTN_TP_SCATTER})
+                Layout(residual.sharded | {TokenAxis.ATTN_TP})
                 if variant is BatchVariant.INPUT_SCATTERED
                 and arrived.always_partial
                 and arrived.update is None

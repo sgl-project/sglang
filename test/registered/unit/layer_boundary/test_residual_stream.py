@@ -276,7 +276,7 @@ class TestResidualStream(CustomTestCase):
             self.hidden,
             self.stream,
             None,
-            capture_output=capture,
+            capture=capture,
         )
         self.assertEqual(events, ["add_norm", "capture"])
         self.group.all_reduce.assert_called_once()
@@ -313,7 +313,7 @@ class TestResidualStream(CustomTestCase):
             self.stream,
             None,
             post_residual_addition=extra,
-            capture_output=outputs.capture,
+            capture=outputs.capture,
         )
         torch.testing.assert_close(outputs[0], torch.full((2, 4), 5.0))
         torch.testing.assert_close(output, torch.full((2, 4), 36.0))
@@ -325,7 +325,7 @@ class TestResidualStream(CustomTestCase):
         from sglang.srt.layers.layer_boundary import TokenAxis
 
         full = Layout(frozenset())
-        local = Layout(frozenset({TokenAxis.ATTN_TP_SCATTER}))
+        local = Layout(frozenset({TokenAxis.ATTN_TP}))
         boundary = bind_entry(
             EdgeContract(OutputContract(full), InputContract(local), full, local)
         )
@@ -433,9 +433,9 @@ class TestBatchStageOwnership(CustomTestCase):
         residual = torch.ones(2, 4)
         contribution = torch.full_like(residual, 2)
         refs = [weakref.ref(residual), weakref.ref(contribution)]
-        batch.current(fb).write(residual)
-        output = batch.current(fb).record(contribution, PLAIN_ADD)
-        result = batch.norm(output, fb, lambda x, r: (x + r, r))
+        batch.stream_of(fb).write(residual)
+        output = batch.stream_of(fb).record(contribution, PLAIN_ADD)
+        result = batch.final_norm(output, fb, lambda x, r: (x + r, r))
         del output, residual, contribution
         torch.testing.assert_close(result, torch.full((2, 4), 3.0))
         self.assertTrue(all(ref() is None for ref in refs))
@@ -449,8 +449,8 @@ class TestBatchStageOwnership(CustomTestCase):
         residual = torch.ones(2, 4)
         contribution = torch.full_like(residual, 2)
         refs = [weakref.ref(residual), weakref.ref(contribution)]
-        batch.current(fb).write(residual)
-        output = batch.current(fb).record(contribution, PLAIN_ADD)
+        batch.stream_of(fb).write(residual)
+        output = batch.stream_of(fb).record(contribution, PLAIN_ADD)
         proxy = batch.to_pp(output, fb)
         del output, residual, contribution
         self.assertTrue(all(ref() is not None for ref in refs))
@@ -494,14 +494,14 @@ class TestBatchStageOwnership(CustomTestCase):
         batch.start(b)
         first = stage.prepare(torch.ones(2, 4), a)
         second = stage.prepare(torch.full((2, 4), 10.0), b)
-        first = batch.current(a).record(first * 3, PLAIN_ADD)
-        second = batch.current(b).record(second * 5, PLAIN_ADD)
+        first = batch.stream_of(a).record(first * 3, PLAIN_ADD)
+        second = batch.stream_of(b).record(second * 5, PLAIN_ADD)
         torch.testing.assert_close(stage.prepare(first, a), torch.full((2, 4), 14.0))
         torch.testing.assert_close(stage.prepare(second, b), torch.full((2, 4), 220.0))
-        self.assertIsNot(batch.current(a), batch.current(b))
+        self.assertIsNot(batch.stream_of(a), batch.stream_of(b))
         batch.start(a)
-        self.assertIsNone(batch.current(a).pending)
-        self.assertIsNotNone(batch.current(b).residual)
+        self.assertIsNone(batch.stream_of(a).pending)
+        self.assertIsNotNone(batch.stream_of(b).residual)
 
 
 if __name__ == "__main__":

@@ -215,7 +215,7 @@ class TestIndependentStageConstruction(CustomTestCase):
     def test_mixer_successor_comes_from_the_local_sequence(self):
         for following in (
             declare_attn(
-                reduction=ProducerReduction.EXIT_SCOPED, gathers_tp_input=False
+                reduction=ProducerReduction.EXIT_SCOPED, gathers_attn_tp_input=False
             ),
             declare_ffn(),
         ):
@@ -227,7 +227,7 @@ class TestIndependentStageConstruction(CustomTestCase):
                     (
                         declare_attn(
                             reduction=ProducerReduction.EXIT_SCOPED,
-                            gathers_tp_input=False,
+                            gathers_attn_tp_input=False,
                         ),
                         fixture.Norm(),
                     ),

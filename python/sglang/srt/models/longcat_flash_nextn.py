@@ -168,7 +168,7 @@ class LongcatFlashDenseDecoderLayer(nn.Module):
         self.attn_boundary, self.ffn_boundary = make_stages(
             (declare_attn(), self.input_layernorm),
             (
-                declare_ffn(sparse=False, next_sparse=False),
+                declare_ffn(sparse=False, next_layer_sparse=False),
                 self.post_attention_layernorm,
             ),
             previous=declare_ffn() if self.layer_id != 0 else None,
@@ -277,7 +277,7 @@ class LongcatFlashModelNextN(nn.Module):
         hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
 
         if not forward_batch.forward_mode.is_idle():
-            hidden_states = residual_batch.norm(
+            hidden_states = residual_batch.final_norm(
                 hidden_states, forward_batch, self.final_layernorm
             )
         return hidden_states

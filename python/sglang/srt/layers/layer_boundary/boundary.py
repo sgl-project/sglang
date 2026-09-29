@@ -30,7 +30,7 @@ from sglang.srt.layers.layer_boundary.layout import (
     Layout,
     SumGroup,
     TokenAxis,
-    _gathers_over_attention_cp,
+    _cp_gathers_over_attn_cp,
     _same_ranks,
     _sum_group,
     token_axis_sizes,
@@ -76,7 +76,7 @@ def tbo_split_moves(layer_input_rows: Layout) -> Tuple[Callable, Callable]:
 
     if layer_input_rows == attention:
         return keep_output, keep_output
-    if layer_input_rows.sharded - attention.sharded == {TokenAxis.ATTN_TP_SCATTER}:
+    if layer_input_rows.sharded - attention.sharded == {TokenAxis.ATTN_TP}:
         # Each rank's slice: write the residual in and gather over attention
         # TP, then take the slice of each half.
         return update_attn_tp_gather_output, attn_tp_slice_output
@@ -87,7 +87,7 @@ def _cp_moves() -> CpMoves:
     """DSA and MLA CP gather equal shards over the attention-CP group and can
     complete a sum over it. GQA prefill CP gathers blocks padded to the longest
     over the MoE-CP group and takes back only a complete output."""
-    if _gathers_over_attention_cp():
+    if _cp_gathers_over_attn_cp():
         return CpMoves(
             gather=_then_attn_cp_gather,
             take_back=attn_cp_take_back_output,
@@ -366,7 +366,7 @@ def _select_entry_step(
         # completes the attention-TP sum and slices in one collective; a
         # complete value is only sliced.
         if (
-            sliced != {TokenAxis.ATTN_TP_SCATTER}
+            sliced != {TokenAxis.ATTN_TP}
             or gathered
             or owes not in (None, SumGroup.ATTN_TP)
             or residual_to != need.layout
@@ -383,7 +383,7 @@ def _select_entry_step(
             ),
             None,
         )
-    if residual_to.sharded - produced.layout.sharded == {TokenAxis.ATTN_TP_SCATTER}:
+    if residual_to.sharded - produced.layout.sharded == {TokenAxis.ATTN_TP}:
         if residual == residual_to:
             # The residual stays on each rank's slice while the stage takes the
             # rows around it (MHC on an input-scattered batch).
@@ -402,8 +402,8 @@ def _select_entry_step(
         if (
             owes not in (None, SumGroup.TP)
             or residual.sharded
-            or TokenAxis.ATTN_TP_SCATTER not in need.gathered_by_compute
-            or residual_to.sharded != {TokenAxis.ATTN_TP_SCATTER}
+            or TokenAxis.ATTN_TP not in need.gathered_by_compute
+            or residual_to.sharded != {TokenAxis.ATTN_TP}
         ):
             raise NotImplementedError(f"{produced=} {residual=} {need=}")
         return (
@@ -431,7 +431,7 @@ def _select_entry_step(
             enters_stack=enters_stack,
         )
         return (partial(cp_moves.gather, gather=on_chunk), None)
-    if gathered == {TokenAxis.ATTN_TP_SCATTER}:
+    if gathered == {TokenAxis.ATTN_TP}:
         # A complete input on each rank's slice, gathered over attention TP
         # once it is read.
         if (
@@ -458,7 +458,7 @@ def _select_entry_step(
             {TokenAxis.ATTN_DP, TokenAxis.ATTN_CP},
         )
         or residual.sharded - residual_to.sharded
-        not in (frozenset(), {TokenAxis.ATTN_TP_SCATTER})
+        not in (frozenset(), {TokenAxis.ATTN_TP})
     ):
         raise NotImplementedError(f"{produced=} {residual=} {need=}")
     # A residual arriving on each rank's slice is gathered back first.
@@ -561,13 +561,13 @@ def _select_exit_move(
     if produced.layout == residual:
         if to == residual:
             return False, keep_output, False
-        if to.sharded == residual.sharded - {TokenAxis.ATTN_TP_SCATTER}:
+        if to.sharded == residual.sharded - {TokenAxis.ATTN_TP}:
             # Each rank's slice back to the attention's rows: write the output
             # into the residual, then gather over attention TP.
             return False, partial(update_attn_tp_gather_output, update=update), False
         raise NotImplementedError(f"{produced=} {residual=} {to=}")
     returned = residual.sharded - produced.layout.sharded
-    if returned == {TokenAxis.ATTN_TP_SCATTER} and to in (residual, produced.layout):
+    if returned == {TokenAxis.ATTN_TP} and to in (residual, produced.layout):
         # The residual stays on each rank's slice (MHC on an input-scattered
         # batch): a reduce-scatter onto the slice completes the sum the FFN
         # leaves; a complete output is only sliced.

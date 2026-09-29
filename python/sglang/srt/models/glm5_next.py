@@ -31,8 +31,8 @@ from sglang.srt.layers.layer_boundary import (
     MHCState,
     declare_attn,
     declare_ffn,
-    enable_moe_dense_fully_dp,
     get_attn_tp_context,
+    is_dense_ffn_fully_dp,
     make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import access as residual_access
@@ -740,7 +740,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 is_nextn=is_nextn,
             )
         else:
-            if enable_moe_dense_fully_dp():
+            if is_dense_ffn_fully_dp():
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
@@ -807,7 +807,7 @@ class Glm5NextDecoderLayer(nn.Module):
             (
                 declare_ffn(
                     sparse=self.is_layer_sparse,
-                    next_sparse=is_next_layer_sparse,
+                    next_layer_sparse=is_next_layer_sparse,
                     read=residual.ffn_readout,
                     update=residual.ffn_update,
                 ),
@@ -815,7 +815,7 @@ class Glm5NextDecoderLayer(nn.Module):
             ),
             previous=declare_ffn(
                 sparse=is_previous_layer_sparse,
-                next_sparse=self.is_layer_sparse,
+                next_layer_sparse=self.is_layer_sparse,
                 update=residual.ffn_update,
             )
             if layer_id != 0
@@ -931,7 +931,7 @@ class Glm5NextDecoderLayer(nn.Module):
         hidden_states_orig = residual_access.buffer(hidden_states)
 
         hidden_states = self.attn_boundary.prepare(
-            hidden_states, forward_batch, capture_output=capture_output
+            hidden_states, forward_batch, capture=capture_output
         )
 
         hidden_states = self.self_attn(
@@ -1191,7 +1191,7 @@ class Glm5NextModel(nn.Module):
         else:
             hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
             if not forward_batch.forward_mode.is_idle():
-                hidden_states = residual_batch.norm(
+                hidden_states = residual_batch.final_norm(
                     hidden_states, forward_batch, self.norm
                 )
 

@@ -379,12 +379,13 @@ class Step3TextDecoderLayer(nn.Module):
             (
                 declare_ffn(
                     sparse=self.is_layer_sparse,
-                    next_sparse=self.is_next_layer_sparse,
+                    next_layer_sparse=self.is_next_layer_sparse,
                 ),
                 self.post_attention_layernorm,
             ),
             previous=declare_ffn(
-                sparse=self.is_previous_layer_sparse, next_sparse=self.is_layer_sparse
+                sparse=self.is_previous_layer_sparse,
+                next_layer_sparse=self.is_layer_sparse,
             )
             if layer_id != 0
             else None,
@@ -481,7 +482,9 @@ class Step3TextModel(nn.Module):
         hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
 
         if hidden_states.shape[0] != 0:
-            hidden_states = residual_batch.norm(hidden_states, forward_batch, self.norm)
+            hidden_states = residual_batch.final_norm(
+                hidden_states, forward_batch, self.norm
+            )
         return hidden_states
 
 

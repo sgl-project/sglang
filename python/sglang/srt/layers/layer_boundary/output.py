@@ -61,7 +61,7 @@ class UnreducedOutput(msgspec.Struct, frozen=True):
 class DeferredFinalize(msgspec.Struct, frozen=True):
     """A layer output that still owes work only its producer knows how to do (a
     MoE's finalize and sum), left for the next layer's input or for a terminal
-    norm that accepts it (residual_batch.norm(finalize_norm=...)). A fused kernel
+    norm that accepts it (residual_batch.final_norm(finalize_norm=...)). A fused kernel
     there may do that work together with its own; anything else passes it
     through complete_owed(), which calls ``complete()``."""
 

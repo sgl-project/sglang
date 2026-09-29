@@ -40,7 +40,7 @@ class TestAuxStorage(CustomTestCase):
         from sglang.test.communicator_patch import patch_communicator
 
         full = Layout(frozenset())
-        sharded = Layout(frozenset({TokenAxis.ATTN_TP_SCATTER}))
+        sharded = Layout(frozenset({TokenAxis.ATTN_TP}))
         source = torch.ones(2, 3)
         for rows, target, owns in ((sharded, full, True), (full, sharded, False)):
             edge = SimpleNamespace(
@@ -111,9 +111,9 @@ class TestAuxStorage(CustomTestCase):
                 stage = self.boundary(stream)
                 outputs = AuxHiddenStatePacker(1)
                 kwargs = (
-                    {"capture_output": outputs.capture}
+                    {"capture": outputs.capture}
                     if callback
-                    else {"captured_last_layer_outputs": outputs}
+                    else {"capture_gathered": outputs}
                 )
                 with patch.object(
                     torch.Tensor, "clone", side_effect=AssertionError("extra clone")
@@ -170,9 +170,7 @@ class TestAuxStorage(CustomTestCase):
         with patch.object(
             torch.Tensor, "clone", side_effect=AssertionError("extra clone")
         ):
-            prepare_attention(
-                stage, hidden, stream, None, capture_output=outputs.capture
-            )
+            prepare_attention(stage, hidden, stream, None, capture=outputs.capture)
         torch.testing.assert_close(outputs.finalize(), torch.full((2, 3), 4.0))
 
 
@@ -256,9 +254,9 @@ class TestBoundCaptureOwnership(CustomTestCase):
                 predicate is not None and predicate(hidden, fb), enabled and not custom
             )
             kwargs = (
-                {"capture_output": outputs.capture}
+                {"capture": outputs.capture}
                 if callback
-                else {"captured_last_layer_outputs": outputs}
+                else {"capture_gathered": outputs}
             )
             if enabled and not custom:
                 # Only capture is forbidden from cloning. The real FlashInfer

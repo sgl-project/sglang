@@ -75,8 +75,8 @@ from sglang.srt.layers.flashinfer_comm_fusion import uses_cutedsl_ar_fusion
 from sglang.srt.layers.layer_boundary import (
     declare_attn,
     declare_ffn,
-    enable_moe_dense_fully_dp,
     get_attn_tp_context,
+    is_dense_ffn_fully_dp,
     make_stages,
 )
 from sglang.srt.layers.layer_boundary.adapters.context_parallel import (
@@ -2599,7 +2599,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 is_nextn=is_nextn,
             )
         else:
-            if enable_moe_dense_fully_dp():
+            if is_dense_ffn_fully_dp():
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
@@ -2656,14 +2656,15 @@ class DeepseekV2DecoderLayer(nn.Module):
             (
                 declare_ffn(
                     sparse=self.is_layer_sparse,
-                    next_sparse=self._stage_next_sparse,
+                    next_layer_sparse=self._stage_next_sparse,
                     output_transform=output,
                 ),
                 post_attention_layernorm,
                 {"fusions": fusions},
             ),
             previous=declare_ffn(
-                sparse=self._stage_previous_sparse, next_sparse=self.is_layer_sparse
+                sparse=self._stage_previous_sparse,
+                next_layer_sparse=self.is_layer_sparse,
             )
             if not self._stage_enters_stack
             else None,
@@ -2726,7 +2727,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
-            captured_last_layer_outputs=captured_last_layer_outputs,
+            capture_gathered=captured_last_layer_outputs,
             quant_format=self._resolve_gfx95_quant_format(),
         )
 
@@ -3156,7 +3157,7 @@ class DeepseekV2Model(nn.Module):
         else:
             hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
             if not forward_batch.forward_mode.is_idle():
-                hidden_states = residual_batch.norm(
+                hidden_states = residual_batch.final_norm(
                     hidden_states, forward_batch, self.norm
                 )
 

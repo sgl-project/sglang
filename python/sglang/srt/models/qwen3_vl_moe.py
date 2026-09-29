@@ -159,7 +159,7 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
         else:
             hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
             if hidden_states.shape[0] != 0:
-                hidden_states = residual_batch.norm(
+                hidden_states = residual_batch.final_norm(
                     hidden_states,
                     forward_batch,
                     self.norm,

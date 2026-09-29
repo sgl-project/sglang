@@ -23,7 +23,7 @@ class TestLongcatShortcut(CustomTestCase):
         tp, rows = 2, 4
         # The MoE runs on each attention-TP rank's slice; the last layer hands on
         # the attention's rows, where the dense branch ends.
-        local = comm.Layout(frozenset({comm.TokenAxis.ATTN_TP_SCATTER}))
+        local = comm.Layout(frozenset({comm.TokenAxis.ATTN_TP}))
         attention = comm.Layout(frozenset())
 
         class Communicator(SimpleNamespace):

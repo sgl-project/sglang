@@ -33,7 +33,7 @@ def sizes(*, dp=1, cp=1, tp=1):
     return {
         TokenAxis.ATTN_DP: dp,
         TokenAxis.ATTN_CP: cp,
-        TokenAxis.ATTN_TP_SCATTER: tp,
+        TokenAxis.ATTN_TP: tp,
     }
 
 
@@ -381,7 +381,7 @@ class TestTheConsumerRunsItsDeclaredRead(CustomTestCase):
         axis_sizes = sizes(dp=dp, tp=2)
         attention = rows(axis_sizes, TokenAxis.ATTN_DP)
         residual = (
-            rows(axis_sizes, TokenAxis.ATTN_DP, TokenAxis.ATTN_TP_SCATTER)
+            rows(axis_sizes, TokenAxis.ATTN_DP, TokenAxis.ATTN_TP)
             if residual_joins_sum
             else attention
         )

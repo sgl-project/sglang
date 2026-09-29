@@ -234,7 +234,7 @@ class CuteDSLFusion:
     def ffn_input_fusions(self, plan) -> tuple:
         parallel = get_parallel()
         if (
-            TokenAxis.ATTN_TP_SCATTER not in plan.incoming_residual_rows.sharded
+            TokenAxis.ATTN_TP not in plan.incoming_residual_rows.sharded
             # The workspace sums over TP, which is then the attention-TP group.
             and parallel.attn_tp_size == parallel.tp_size
             and _fused_norm_gamma(plan.norm) is not None
@@ -350,8 +350,7 @@ class CuteDSLFusion:
             and get_moe_a2a_backend().is_none()
             and parallel.tp_size > 1
             # The FFN runs on the full rows, not each rank's own slice.
-            and TokenAxis.ATTN_TP_SCATTER
-            not in plan.fused_input_rows(forward_batch).sharded
+            and TokenAxis.ATTN_TP not in plan.fused_input_rows(forward_batch).sharded
         )
 
 
@@ -375,7 +374,7 @@ def install_cutedsl_fusion(
     Every entry of ``layers`` carries ``attn_boundary`` and ``ffn_boundary``.
     terminal_finalize lets the last layer hand its finalize to the final norm;
     the model must then pass the returned service as
-    residual_batch.norm(finalize_norm=...).
+    residual_batch.final_norm(finalize_norm=...).
     """
     if get_flags().moe.in_speculative_scope:
         # A draft shares the target's process, which holds one workspace.

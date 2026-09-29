@@ -54,7 +54,7 @@ def sizes(*, dp=1, tp=1):
     return {
         TokenAxis.ATTN_DP: dp,
         TokenAxis.ATTN_CP: 1,
-        TokenAxis.ATTN_TP_SCATTER: tp,
+        TokenAxis.ATTN_TP: tp,
     }
 
 
@@ -86,8 +86,8 @@ def stages(pattern, *, dp=1, tp=1, a2a=False):
         patch_communicator("get_parallel", return_value=parallel),
         patch.object(utils, "get_parallel", return_value=parallel),
         patch_communicator("is_moe_input_scattered_across_dp_ranks", return_value=a2a),
-        patch_communicator("enable_moe_dense_fully_dp", return_value=False),
-        patch_communicator("_generic_prefill_cp_shards_tokens", return_value=False),
+        patch_communicator("is_dense_ffn_fully_dp", return_value=False),
+        patch_communicator("_prefill_cp_shards_tokens", return_value=False),
     ):
         return [layer_stage(pattern, i) for i in range(len(pattern))]
 

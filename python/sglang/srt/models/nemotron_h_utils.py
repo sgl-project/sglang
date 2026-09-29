@@ -27,7 +27,7 @@ def _declaration(pattern: str, layer_idx: int):
         return declare_attn(
             read=NormQuantReadout(reads_before_dp_gather=True),
             reduction=ProducerReduction.EXIT_SCOPED,
-            gathers_tp_input=False,
+            gathers_attn_tp_input=False,
         )
     return declare_ffn(
         sparse=pattern[layer_idx] == MOE,

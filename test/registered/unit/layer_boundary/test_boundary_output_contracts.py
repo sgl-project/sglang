@@ -209,9 +209,9 @@ class TestBoundaryIntegrations(unittest.TestCase):
         for cls in (Qwen3DecoderLayer, Llama4DecoderLayer):
             captures = []
 
-            def prepare(hidden, fb, capture_output=None, **kwargs):
-                if capture_output is not None:
-                    capture_output(hidden)
+            def prepare(hidden, fb, capture=None, **kwargs):
+                if capture is not None:
+                    capture(hidden)
                 return hidden
 
             output = SimpleNamespace(finish=lambda hidden: hidden)

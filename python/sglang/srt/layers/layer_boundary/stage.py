@@ -35,7 +35,7 @@ from sglang.srt.layers.layer_boundary.residual.access import buffer, from_pp
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
     PLAIN_ADD,
 )
-from sglang.srt.layers.layer_boundary.residual.batch import current
+from sglang.srt.layers.layer_boundary.residual.batch import stream_of
 from sglang.srt.layers.layer_boundary.residual.stream import DeclaredSum, ResidualStream
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_forward
@@ -143,9 +143,11 @@ class StageBoundary:
             forward_batch: Batch owning the stream and selecting the prepared path.
             cache: FFN-only NPU weight cache prefetched on the FFN input path.
             **call: Attention-only read/adapter options: quant_format,
-                post_residual_addition, captured_last_layer_outputs and capture_output.
-                FFN stages do not accept these options. A capture callback is
-                called as capture_output(value, owned=bool): owned=True means
+                post_residual_addition, capture_gathered and capture. FFN
+                stages do not accept these options. capture is a callback on
+                the producer's rows; capture_gathered is a collector on the
+                attention's compute-input rows. A capture callback is
+                called as capture(value, owned=bool): owned=True means
                 value is fresh storage it may keep, and owned=False means it
                 must copy before retaining.
 
@@ -161,7 +163,7 @@ class StageBoundary:
             else self._prepare_input
         )
         hidden_states, forward_batch.residual_stream = prepare(
-            hidden_states, current(forward_batch), forward_batch, **call
+            hidden_states, stream_of(forward_batch), forward_batch, **call
         )
         return hidden_states
 
@@ -172,7 +174,7 @@ class StageBoundary:
                 "use the stage exit scope for an FFN or single-stage mixer"
             )
         produced = self.plan.produced(forward_batch)
-        return current(forward_batch).record(
+        return stream_of(forward_batch).record(
             hidden_states,
             produced.update,
             declared_sum=produced.group if produced.always_partial else None,
@@ -191,10 +193,10 @@ class StageBoundary:
             using the same decision rather than selecting a second path.
         """
         result = (
-            self.plan.output.ffn_exit(forward_batch, stream=current(forward_batch))
+            self.plan.output.ffn_exit(forward_batch, stream=stream_of(forward_batch))
             if self.kind is StageKind.FFN
             else self.plan.output.mixer_exit(
-                forward_batch, stream=current(forward_batch)
+                forward_batch, stream=stream_of(forward_batch)
             )
         )
         return result
@@ -227,7 +229,7 @@ class StageBoundary:
         return hidden_states
 
     def snapshot(self, hidden_states, forward_batch):
-        return current(forward_batch).snapshot(hidden_states)
+        return stream_of(forward_batch).snapshot(hidden_states)
 
     def capture_output(self, hidden_states, forward_batch, *, skip_empty=False):
         """Capture an output while preserving the caller's reduction timing.
@@ -242,7 +244,7 @@ class StageBoundary:
             contribution; a declared sum is reduced only on the snapshot copy.
             Always use updated_handle afterwards. Plain residual updates are required.
         """
-        stream = current(forward_batch)
+        stream = stream_of(forward_batch)
         if skip_empty:
             storage = buffer(hidden_states)
             if storage is not None and storage.shape[0] == 0:
@@ -256,7 +258,7 @@ class StageBoundary:
         (the operation-scheduled TBO path) onto the rows the layer hands on;
         it chooses no reduction step."""
         return self.plan.output.finish_complete_output(
-            hidden_states, current(forward_batch), forward_batch
+            hidden_states, stream_of(forward_batch), forward_batch
         )
 
     def branch_input(self, source, hidden_states, forward_batch):
@@ -264,7 +266,7 @@ class StageBoundary:
             self.plan,
             source.plan,
             hidden_states,
-            current(forward_batch),
+            stream_of(forward_batch),
             forward_batch,
         )
         forward_batch.residual_stream = stream
@@ -278,7 +280,7 @@ class StageBoundary:
             self.plan,
             contribution,
             hidden_states,
-            current(forward_batch),
+            stream_of(forward_batch),
             source.plan,
             forward_batch,
         )
@@ -309,28 +311,28 @@ class StageBoundary:
         hidden_states: torch.Tensor,
         stream: ResidualStream,
         forward_batch: ForwardBatch,
-        captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
+        capture_gathered: Optional[AuxHiddenStateAccumulator] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
         quant_format: str = "",
-        capture_output: Optional[Callable] = None,
+        capture: Optional[Callable] = None,
     ):
         # Aux consumers need a materialized output before the input norm.
         # Complete communication here, preserving the existing add+norm kernel
         # and its FP32 accumulation. Its residual result also supplies capture.
-        capture_before_read = capture_output is not None and (
+        capture_before_read = capture is not None and (
             (stream.residual is None and stream.pending is None)
             or post_residual_addition is not None
         )
-        if capture_output is not None:
+        if capture is not None:
             hidden_states = stream.complete(hidden_states)
             if capture_before_read:
                 # Embeddings precede enter; HF deepstack capture precedes the
                 # extra addition. Neither is the residual returned by the read.
                 value, previous = stream.export(hidden_states)
                 if previous is None:
-                    capture_output(value)
+                    capture(value)
                 else:
-                    capture_output(value + previous, owned=True)
+                    capture(value + previous, owned=True)
         hidden_states, stream = self._prepare_input(
             hidden_states,
             stream,
@@ -339,13 +341,13 @@ class StageBoundary:
             post_residual_addition=post_residual_addition,
         )
         entry = self.entry(forward_batch)
-        if capture_output is not None and not capture_before_read:
+        if capture is not None and not capture_before_read:
             value = stream.residual
             move = entry.capture_move
             if move is not None:
                 value = move(value, forward_batch=forward_batch)
             keeps_input = entry.capture_preserves_residual
-            capture_output(
+            capture(
                 value,
                 owned=entry.capture_move_allocates
                 or (
@@ -354,7 +356,7 @@ class StageBoundary:
                     and keeps_input(value, forward_batch)
                 ),
             )
-        if captured_last_layer_outputs is not None:
+        if capture_gathered is not None:
             residual_value = stream.residual
             move = entry.input_move
             gathered_last_layer_output = (
@@ -367,7 +369,7 @@ class StageBoundary:
             )
             # Input gathers allocate fresh DP buffers (see attn_tp_gather_input).
             # Without a gather this is the mutable residual, so retention copies.
-            captured_last_layer_outputs.capture(
+            capture_gathered.capture(
                 gathered_last_layer_output,
                 owned=move is attn_tp_gather_input
                 or (

@@ -87,7 +87,7 @@ def export_output(
 ) -> Tuple[Union[torch.Tensor, DeferredFinalize], Optional[torch.Tensor]]:
     """Complete what this layer left for a next layer, for callers that carry
     an explicit residual tensor or merge TBO microbatches. Stage-boundary
-    decoders use residual_batch.norm(), to_pp() or take_output() instead:
+    decoders use residual_batch.final_norm(), to_pp() or take_output() instead:
     to_pp() keeps a declared partial sum for the receiving from_pp(), which
     this helper would complete early. A final norm that does a producer's
     handoff together with its own work (``final_norm_takes_handoff``)
@@ -103,7 +103,7 @@ def export_output(
     return complete_owed(hidden_states), residual
 
 
-def final_norm_pair(hidden_states, residual, norm, capture_output=None, **read_kwargs):
+def final_norm_pair(hidden_states, residual, norm, capture=None, **read_kwargs):
     """The final norm and an optional capture of the same updated residual.
 
     Keep add and norm together: normalizing a separately rounded residual is
@@ -111,12 +111,12 @@ def final_norm_pair(hidden_states, residual, norm, capture_output=None, **read_k
     capture callback owns retention of the borrowed residual storage.
     """
     if residual is None:
-        if capture_output is not None:
-            capture_output(hidden_states)
+        if capture is not None:
+            capture(hidden_states)
         return norm(hidden_states)
     hidden_states, residual = norm(hidden_states, residual, **read_kwargs)
-    if capture_output is not None:
-        capture_output(residual)
+    if capture is not None:
+        capture(residual)
     return hidden_states
 
 

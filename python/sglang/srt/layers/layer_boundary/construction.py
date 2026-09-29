@@ -41,9 +41,9 @@ from sglang.srt.layers.layer_boundary.fusions.allreduce import (
 from sglang.srt.layers.layer_boundary.layout import (
     TokenAxis,
     _batch_shards_over_cp,
-    _gathers_over_attention_cp,
-    _generic_prefill_cp_shards_tokens,
-    enable_moe_dense_fully_dp,
+    _cp_gathers_over_attn_cp,
+    _prefill_cp_shards_tokens,
+    is_dense_ffn_fully_dp,
 )
 from sglang.srt.layers.layer_boundary.prepare import (
     _attn_input_default,
@@ -71,7 +71,7 @@ def _reject_unsupported_cp_moe(moe_on_local_rows: bool, cp_shards: bool) -> None
     ranks under DSA or MLA CP; and under attention DP, one on the TP group
     whose data-parallel groups are the CP ranks."""
     parallel = get_parallel()
-    gqa = not _gathers_over_attention_cp()
+    gqa = not _cp_gathers_over_attn_cp()
     if moe_on_local_rows:
         if cp_shards and gqa and parallel.attn_dp_size > 1:
             raise NotImplementedError(
@@ -100,9 +100,9 @@ def _input_scattered_possible() -> bool:
         parallel.enable_attn_tp_input_scattered
         and parallel.tp_size > 1
         and parallel.attn_dp_size == 1
-        and not _generic_prefill_cp_shards_tokens()
+        and not _prefill_cp_shards_tokens()
         and get_moe_a2a_backend().is_none()
-        and not enable_moe_dense_fully_dp()
+        and not is_dense_ffn_fully_dp()
     )
 
 
@@ -234,7 +234,7 @@ class StagePlan:
 
     @property
     def input_on_attn_tp_slices(self):
-        return TokenAxis.ATTN_TP_SCATTER in self.incoming_residual_rows.sharded
+        return TokenAxis.ATTN_TP in self.incoming_residual_rows.sharded
 
     def variant_for(self, forward_batch):
         # The batch determines its rows; missing paths must not change them.

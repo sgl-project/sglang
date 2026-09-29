@@ -270,7 +270,7 @@ class TestDpCpGather(CustomTestCase):
                     last=False,
                     sparse=sparse,
                     previous_sparse=sparse,
-                    next_sparse=False,
+                    next_layer_sparse=False,
                     attention_norm=norm,
                     ffn_norm=norm,
                     residual=PLAIN_RESIDUAL_OPS._replace(ffn_readout=read),

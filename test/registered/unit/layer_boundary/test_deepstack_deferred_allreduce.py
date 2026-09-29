@@ -58,7 +58,7 @@ class DeferringLayer(nn.Module):
 
 class DeferringStageLayer(DeferringLayer):
     def forward(self, positions=None, hidden_states=None, forward_batch=None, **kwargs):
-        stream = residual_batch.current(forward_batch)
+        stream = residual_batch.stream_of(forward_batch)
         hidden_states, residual = stream.export(hidden_states)
         residual = hidden_states if residual is None else hidden_states + residual
         stream.write(residual)

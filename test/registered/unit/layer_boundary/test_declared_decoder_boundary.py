@@ -167,14 +167,19 @@ class FusableNorm(Norm):
 
 
 def layer_case(
-    layer_id, num_layers, *, sparse=False, previous_sparse=False, next_sparse=False
+    layer_id,
+    num_layers,
+    *,
+    sparse=False,
+    previous_sparse=False,
+    next_layer_sparse=False,
 ):
     return dict(
         sparse=sparse,
         first=layer_id == 0,
         last=layer_id == num_layers - 1,
         previous_sparse=previous_sparse,
-        next_sparse=next_sparse,
+        next_layer_sparse=next_layer_sparse,
     )
 
 
@@ -517,7 +522,7 @@ class TestMhcOnTheDeclarations(CustomTestCase):
         # rows: MHC writes its output into the streams, then gathers them.
         parallel = parallel_of(attn_dp=2, attn_tp=2, moe_dense_tp_size=1)
         communicator = build_mhc(
-            layer_case(1, 3, next_sparse=True), parallel, two_batch_overlap=True
+            layer_case(1, 3, next_layer_sparse=True), parallel, two_batch_overlap=True
         )
         self.assert_step(
             communicator.ffn.plan.paths.get(BatchVariant.ORDINARY).entry.prepare,
@@ -638,7 +643,7 @@ class TestTwoBatchOverlap(CustomTestCase):
                     num_layers=4,
                     sparse=sparse,
                     previous_sparse=i > 2,
-                    next_sparse=i >= 1,
+                    next_layer_sparse=i >= 1,
                 )
                 layers.append(
                     make_test_stages(**facts, attention_norm=Norm(), ffn_norm=Norm())
@@ -647,7 +652,7 @@ class TestTwoBatchOverlap(CustomTestCase):
 
     def test_the_dense_layer_before_the_split_hands_on_the_attention_rows(self):
         attention = comm.Layout(frozenset({TokenAxis.ATTN_DP}))
-        local = comm.Layout(frozenset({TokenAxis.ATTN_DP, TokenAxis.ATTN_TP_SCATTER}))
+        local = comm.Layout(frozenset({TokenAxis.ATTN_DP, TokenAxis.ATTN_TP}))
         for tbo, gathered in ((True, True), (False, False)):
             with self.subTest(two_batch_overlap=tbo):
                 first, before, after, last = self.layers(tbo=tbo)
@@ -692,7 +697,7 @@ class TestTwoBatchOverlap(CustomTestCase):
                 (keep_output, keep_output),
             )
             self.assertEqual(
-                comm.tbo_split_moves(comm.Layout(dp | {TokenAxis.ATTN_TP_SCATTER})),
+                comm.tbo_split_moves(comm.Layout(dp | {TokenAxis.ATTN_TP})),
                 (update_attn_tp_gather_output, attn_tp_slice_output),
             )
             with self.assertRaises(NotImplementedError):
@@ -721,7 +726,7 @@ class TestTheAttentionOutputDecidesItsSum(CustomTestCase):
         sizes = {
             TokenAxis.ATTN_DP: 2,
             TokenAxis.ATTN_CP: 1,
-            TokenAxis.ATTN_TP_SCATTER: 2,
+            TokenAxis.ATTN_TP: 2,
         }
         steps, _ = comm_boundary._select_entry_step(
             produced,
@@ -803,7 +808,7 @@ class TestFusedKernelsTakeOnlyTheStepsTheyComplete(CustomTestCase):
         sizes = {
             TokenAxis.ATTN_DP: attn_dp,
             TokenAxis.ATTN_CP: 1,
-            TokenAxis.ATTN_TP_SCATTER: 2,
+            TokenAxis.ATTN_TP: 2,
         }
         attention = comm.Layout.sharded_over(TokenAxis.ATTN_DP, axis_sizes=sizes)
         steps, _ = comm_boundary._select_entry_step(
@@ -839,7 +844,7 @@ class TestTheSequenceParallelRegion(CustomTestCase):
     themselves, so every boundary stays on this rank's slice. Other batches
     take the layer's ordinary declared steps."""
 
-    SIZES = {TokenAxis.ATTN_DP: 1, TokenAxis.ATTN_CP: 1, TokenAxis.ATTN_TP_SCATTER: 2}
+    SIZES = {TokenAxis.ATTN_DP: 1, TokenAxis.ATTN_CP: 1, TokenAxis.ATTN_TP: 2}
 
     def test_what_the_ffn_exit_reads_comes_from_the_batch_s_steps(self):
         # Inside the region the FFN output is complete: no sum to move.
@@ -877,7 +882,7 @@ class TestInputScatteredAttention(CustomTestCase):
     partial that a reduce-scatter completes onto each rank's slice, and the
     residual comes back to every row inside the attention output's sum."""
 
-    SIZES = {TokenAxis.ATTN_DP: 1, TokenAxis.ATTN_CP: 1, TokenAxis.ATTN_TP_SCATTER: 2}
+    SIZES = {TokenAxis.ATTN_DP: 1, TokenAxis.ATTN_CP: 1, TokenAxis.ATTN_TP: 2}
 
     def test_the_order_of_a_residual_on_the_slice_is_declared(self):
         # The same layouts take two orders: with a scattered input the residual
@@ -885,7 +890,7 @@ class TestInputScatteredAttention(CustomTestCase):
         # gathered first.
         sizes = self.SIZES
         attention = comm.Layout.sharded_over(axis_sizes=sizes)
-        local = comm.Layout(frozenset({TokenAxis.ATTN_TP_SCATTER}))
+        local = comm.Layout(frozenset({TokenAxis.ATTN_TP}))
         owed = comm.OutputContract(
             attention, group=SumGroup.ATTN_TP, always_partial=True
         )
@@ -912,7 +917,7 @@ class TestInputScatteredAttention(CustomTestCase):
         # layer stack, takes a complete input.
         sizes = self.SIZES
         attention = comm.Layout.sharded_over(axis_sizes=sizes)
-        local = comm.Layout(frozenset({TokenAxis.ATTN_TP_SCATTER}))
+        local = comm.Layout(frozenset({TokenAxis.ATTN_TP}))
         step, _ = comm_boundary._select_entry_step(
             comm.OutputContract(attention),
             residual=attention,
@@ -1404,7 +1409,7 @@ class TestBranchRows(CustomTestCase):
     of its residual while the FFN runs and of what it hands on, and a complete
     value moves between them."""
 
-    local = comm.Layout(frozenset({TokenAxis.ATTN_DP, TokenAxis.ATTN_TP_SCATTER}))
+    local = comm.Layout(frozenset({TokenAxis.ATTN_DP, TokenAxis.ATTN_TP}))
     attention = comm.Layout(frozenset({TokenAxis.ATTN_DP}))
     full = comm.Layout(frozenset())
 
@@ -1491,7 +1496,7 @@ class TestBranchRows(CustomTestCase):
                     )
             cp = comm.Layout(frozenset({TokenAxis.ATTN_CP}))
             for rows, to in (
-                (comm.Layout(frozenset({TokenAxis.ATTN_TP_SCATTER})), self.attention),
+                (comm.Layout(frozenset({TokenAxis.ATTN_TP})), self.attention),
                 (cp, self.full),
             ):
                 with (

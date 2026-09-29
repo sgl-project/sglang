@@ -198,13 +198,13 @@ def move_rows(
     gathered, cut = rows.sharded - to.sharded, to.sharded - rows.sharded
     if (gathered and cut) or TokenAxis.ATTN_CP in gathered | cut:
         raise NotImplementedError(f"{rows=} {to=}")
-    if TokenAxis.ATTN_TP_SCATTER in gathered:
+    if TokenAxis.ATTN_TP in gathered:
         hidden_states = attn_tp_gather(hidden_states)
     if TokenAxis.ATTN_DP in gathered:
         hidden_states = dp_gather(hidden_states, forward_batch)
     if TokenAxis.ATTN_DP in cut:
         hidden_states = to_dp_local(_dp_scatter_step, forward_batch, hidden_states)
-    if TokenAxis.ATTN_TP_SCATTER in cut:
+    if TokenAxis.ATTN_TP in cut:
         parallel = get_parallel()
         hidden_states = hidden_states.tensor_split(parallel.attn_tp_size)[
             parallel.attn_tp_rank

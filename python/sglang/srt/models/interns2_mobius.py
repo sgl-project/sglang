@@ -504,11 +504,11 @@ class InternS2MobiusLinearDecoderLayer(_InternS2MobiusDecoderMixin, nn.Module):
             (
                 declare_ffn(
                     sparse=True,
-                    next_sparse=True,
+                    next_layer_sparse=True,
                 ),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn(sparse=True, next_sparse=True)
+            previous=declare_ffn(sparse=True, next_layer_sparse=True)
             if layer_id != 0
             else None,
             terminal=layer_id == config.num_hidden_layers - 1,
@@ -524,7 +524,7 @@ class InternS2MobiusLinearDecoderLayer(_InternS2MobiusDecoderMixin, nn.Module):
         hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
-            captured_last_layer_outputs=kwargs.get("captured_last_layer_outputs"),
+            capture_gathered=kwargs.get("captured_last_layer_outputs"),
         )
         if not forward_batch.forward_mode.is_idle():
             hidden_states = self.linear_attn(hidden_states, forward_batch)
@@ -636,11 +636,11 @@ class InternS2MobiusAttentionDecoderLayer(
             (
                 declare_ffn(
                     sparse=True,
-                    next_sparse=True,
+                    next_layer_sparse=True,
                 ),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn(sparse=True, next_sparse=True)
+            previous=declare_ffn(sparse=True, next_layer_sparse=True)
             if layer_id != 0
             else None,
             terminal=layer_id == config.num_hidden_layers - 1,
@@ -660,7 +660,7 @@ class InternS2MobiusAttentionDecoderLayer(
         hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
-            captured_last_layer_outputs=captured_last_layer_outputs,
+            capture_gathered=captured_last_layer_outputs,
         )
         if not forward_batch.forward_mode.is_idle():
             hidden_states = self.self_attention(
@@ -794,7 +794,9 @@ class InternS2MobiusForCausalLM(Qwen3_5ForCausalLM):
         hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
 
         if hidden_states.shape[0] != 0:
-            hidden_states = residual_batch.norm(hidden_states, forward_batch, self.norm)
+            hidden_states = residual_batch.final_norm(
+                hidden_states, forward_batch, self.norm
+            )
         return (
             hidden_states
             if not aux_hidden_states

@@ -954,7 +954,7 @@ def model_forward_stages(
     if not enable_tbo:
         return execute_operations(inputs, strategy.operations)["hidden_states"]
 
-    stream = residual_batch.current(forward_batch)
+    stream = residual_batch.stream_of(forward_batch)
     pending = stream.pending
     hidden_states, residual = stream.export(hidden_states)
     inputs["hidden_states"] = hidden_states
@@ -987,7 +987,7 @@ def model_forward_stages(
             delta_stages=[0, strategy.tbo_delta_stages],
         )
     for output in outputs:
-        output["residual"] = residual_batch.current(output["forward_batch"])
+        output["residual"] = residual_batch.stream_of(output["forward_batch"])
     hidden_states, forward_batch.residual_stream = _model_forward_tbo_merge_outputs(
         *outputs, original_len
     )

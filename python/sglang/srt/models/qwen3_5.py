@@ -1112,13 +1112,13 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             (
                 declare_ffn(
                     sparse=is_layer_sparse,
-                    next_sparse=is_next_layer_sparse,
+                    next_layer_sparse=is_next_layer_sparse,
                 ),
                 self.post_attention_layernorm,
                 {"fusions": boundary_fusions},
             ),
             previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_sparse=is_layer_sparse
+                sparse=is_previous_layer_sparse, next_layer_sparse=is_layer_sparse
             )
             if layer_id != 0
             else None,
@@ -1135,7 +1135,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
-            captured_last_layer_outputs=kwargs.get("captured_last_layer_outputs", None),
+            capture_gathered=kwargs.get("captured_last_layer_outputs", None),
         )
 
         # fused AR+quant hands down a (fp8, scale) / (bf16, fp8, scale) tuple
@@ -1318,13 +1318,13 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             (
                 declare_ffn(
                     sparse=is_layer_sparse,
-                    next_sparse=is_next_layer_sparse,
+                    next_layer_sparse=is_next_layer_sparse,
                 ),
                 self.post_attention_layernorm,
                 {"fusions": boundary_fusions},
             ),
             previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_sparse=is_layer_sparse
+                sparse=is_previous_layer_sparse, next_layer_sparse=is_layer_sparse
             )
             if layer_id != 0
             else None,
@@ -1539,7 +1539,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
-            captured_last_layer_outputs=captured_last_layer_outputs,
+            capture_gathered=captured_last_layer_outputs,
         )
 
         # fused AR+quant hands down a (fp8, scale) / (bf16, fp8, scale) tuple
@@ -1846,7 +1846,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         if not self.pp_group.is_last_rank:
             return residual_batch.to_pp(hidden_states, forward_batch)
 
-        hidden_states = residual_batch.norm(
+        hidden_states = residual_batch.final_norm(
             hidden_states,
             forward_batch,
             self.norm,

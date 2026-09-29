@@ -21,7 +21,7 @@ def make_test_stages(
     last=False,
     sparse=False,
     previous_sparse=False,
-    next_sparse=False,
+    next_layer_sparse=False,
     residual=PLAIN_RESIDUAL_OPS,
     output=None,
     **options,
@@ -30,13 +30,13 @@ def make_test_stages(
         None
         if first
         else declare_ffn(
-            sparse=previous_sparse, next_sparse=sparse, update=residual.ffn_update
+            sparse=previous_sparse, next_layer_sparse=sparse, update=residual.ffn_update
         )
     )
     attention = declare_attn(read=residual.attn_readout, update=residual.attn_update)
     ffn = declare_ffn(
         sparse=sparse,
-        next_sparse=next_sparse,
+        next_layer_sparse=next_layer_sparse,
         read=residual.ffn_readout,
         update=residual.ffn_update,
         output_transform=output,
@@ -93,7 +93,7 @@ def sp_region_steps():
     )
     from sglang.srt.layers.layer_boundary.prepare import _attn_input_default
 
-    rows = Layout(frozenset({TokenAxis.ATTN_TP_SCATTER}))
+    rows = Layout(frozenset({TokenAxis.ATTN_TP}))
     output = OutputContract(rows)
 
     def entry(read, attn_input_adapter=None):
