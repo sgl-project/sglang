@@ -15,13 +15,14 @@
 declarations."""
 
 from functools import partial
-from typing import Callable, Optional, Tuple
+from typing import Callable, NamedTuple, Optional, Tuple
 
 import msgspec
 
 from sglang.srt.layers.layer_boundary.contracts import (
     CpMoves,
     EdgeContract,
+    EntryPath,
     FfnInputFusion,
     InputContract,
     OutputContract,
@@ -100,53 +101,36 @@ def _cp_moves() -> CpMoves:
     )
 
 
-class EdgeBinding(msgspec.Struct, frozen=True):
-    """The steps one layer runs at one boundary, chosen from both sides'
-    declarations. A layer runs the consumer's half of a boundary into one of
-    its stages, and the producer's half of the boundary after its last stage;
-    the neighbouring layer runs the other half of that one."""
+class ExitMove(NamedTuple):
+    """The producer's half of a boundary, which a layer runs after its last
+    stage; the neighbouring layer runs the consumer's half."""
 
-    edge: EdgeContract
-    # The consumer's half: completing what the input owes, the add and the
-    # norm, and the moves onto the rows it needs that come before the read.
-    prepare: Optional[Callable] = None
-    # The move onto the consumer's rows after prepare; None when there is none.
-    input_move: Optional[Callable] = None
-    # The producer's half: the postprocess that moves the output onto the rows
-    # the layer hands on; None when it goes back over attention DP, whose step
-    # the FFN exit and postprocess choose per batch.
+    # Moves the output onto the rows the layer hands on; None when it goes
+    # back over attention DP, whose step the FFN exit and finish choose per
+    # batch.
     output_move: Optional[Callable] = None
     # Whether output_move also completes the sum the producer leaves.
     output_move_completes_sum: bool = False
     returns_over_dp: bool = False
-    preserves_residual: Optional[Callable] = None
-
-    @property
-    def input_rows(self) -> Layout:
-        """The rows the consumer is handed: what it needs, still sharded over
-        the axes it gathers itself as the rows its input is read on are."""
-        return input_rows(self.edge)
-
-    @property
-    def capture_move_allocates(self) -> bool:
-        """Returning through a gather allocates; returning through a cut aliases."""
-        return bool(self.edge.residual_to.sharded - self.edge.produced.layout.sharded)
-
-    @property
-    def capture_move(self) -> Optional[Callable]:
-        if self.edge.residual_to == self.edge.produced.layout:
-            return None
-        return partial(
-            move_rows, rows=self.edge.residual_to, to=self.edge.produced.layout
-        )
 
 
 def input_rows(edge: EdgeContract) -> Layout:
-    """Consumer rows, retaining the axes it gathers inside its computation."""
+    """The rows the consumer is handed: what it needs, still sharded over the
+    axes it gathers itself as the rows its input is read on are."""
     return Layout(
         edge.need.layout.sharded
         | (edge.residual_to.sharded & edge.need.gathered_by_compute)
     )
+
+
+def _capture_move(edge: EdgeContract) -> Tuple[Optional[Callable], bool]:
+    """The move of the updated residual back onto the producer's rows for aux
+    capture, and whether it allocates: returning through a gather allocates;
+    returning through a cut aliases."""
+    if edge.residual_to == edge.produced.layout:
+        return None, False
+    move = partial(move_rows, rows=edge.residual_to, to=edge.produced.layout)
+    return move, bool(edge.residual_to.sharded - edge.produced.layout.sharded)
 
 
 def bind_entry(
@@ -156,7 +140,8 @@ def bind_entry(
     carried_fusions: Tuple[Callable, ...] = (),
     cp_moves: Optional[CpMoves] = None,
     enters_stack: bool = False,
-) -> EdgeBinding:
+    attn_input_adapter: Optional[Callable] = None,
+) -> EntryPath:
     """Bind the consumer half of an edge at construction time.
 
     Args:
@@ -165,9 +150,10 @@ def bind_entry(
         carried_fusions: Ordered candidates accepting dynamically carried work.
         cp_moves: Context-parallel strategy operations for this edge, if needed.
         enters_stack: Whether the read must initialize the stack's residual.
+        attn_input_adapter: Hands an attention its input once it is on its rows.
 
     Returns:
-        A Boundary whose prepare accepts the actual update from the stream.
+        An EntryPath whose prepare accepts the actual update from the stream.
         Multiple update capabilities select among preconstructed paths; a single
         capability needs no runtime dispatcher.
     """
@@ -184,6 +170,7 @@ def bind_entry(
             carried_fusions=carried_fusions,
             cp_moves=cp_moves,
             enters_stack=enters_stack,
+            attn_input_adapter=attn_input_adapter,
         )
         for capability in capabilities
     }
@@ -210,7 +197,8 @@ def _bind_entry_path(
     carried_fusions: Tuple[Callable, ...] = (),
     cp_moves: Optional[CpMoves] = None,
     enters_stack: bool = False,
-) -> EdgeBinding:
+    attn_input_adapter: Optional[Callable] = None,
+) -> EntryPath:
     """The consumer's half of ``edge``, chosen from the edge's declarations and
     the producer's update: what a value carries for a batch (a sum or a handoff
     its producer left) is completed first, trying ``carried_fusions``; a sum
@@ -277,23 +265,29 @@ def _bind_entry_path(
             preserves_residual = next(
                 f.preserves_residual for f in fusions if f.run == selected[0]
             )
-    return EdgeBinding(
-        edge,
-        preserves_residual=preserves_residual,
+    declared_sum = edge.produced.group if edge.produced.always_partial else None
+    capture_move, capture_move_allocates = _capture_move(edge)
+    return EntryPath(
         prepare=partial(
             _run_entry,
             step=step,
             is_plain_add=is_plain_add,
             carried_fusions=carried_fusions if plain else (),
-            expected_sum=edge.produced.group if edge.produced.always_partial else None,
+            expected_sum=declared_sum,
             completed_step=completed_step,
             written_step=written_step,
         ),
+        input_rows=input_rows(edge),
         input_move=input_move,
+        attn_input_adapter=attn_input_adapter,
+        capture_move=capture_move,
+        capture_move_allocates=capture_move_allocates,
+        declared_sum=declared_sum,
+        preserves_residual=preserves_residual,
     )
 
 
-def bind_exit(edge: EdgeContract, *, cp_moves: Optional[CpMoves] = None) -> EdgeBinding:
+def bind_exit(edge: EdgeContract, *, cp_moves: Optional[CpMoves] = None) -> ExitMove:
     """Bind the producer half of a layer or branch exit.
 
     Args:
@@ -303,7 +297,7 @@ def bind_exit(edge: EdgeContract, *, cp_moves: Optional[CpMoves] = None) -> Edge
         cp_moves: Context-parallel return operations, when the edge needs them.
 
     Returns:
-        A Boundary with fixed transport or a marker for batch-dependent DP
+        An ExitMove with fixed transport or a marker for batch-dependent DP
         transport. The receiver binds its read independently.
     """
     update = edge.produced.update
@@ -324,11 +318,10 @@ def bind_exit(edge: EdgeContract, *, cp_moves: Optional[CpMoves] = None) -> Edge
         to=edge.residual_to,
         cp_moves=cp_moves,
     )
-    return EdgeBinding(
-        edge,
+    return ExitMove(
         output_move=output_move,
-        returns_over_dp=returns_over_dp,
         output_move_completes_sum=completes_sum,
+        returns_over_dp=returns_over_dp,
     )
 
 

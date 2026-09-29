@@ -35,7 +35,7 @@ class TestAuxStorage(CustomTestCase):
             backend._copy_output_to_buffer(source, tuple(buffers), 2)
 
     def test_capture_move_owns_gather_but_not_slice(self):
-        from sglang.srt.layers.layer_boundary.boundary import EdgeBinding
+        from sglang.srt.layers.layer_boundary.boundary import _capture_move
         from sglang.srt.layers.layer_boundary.layout import Layout, TokenAxis
         from sglang.test.communicator_patch import patch_communicator
 
@@ -46,8 +46,8 @@ class TestAuxStorage(CustomTestCase):
             edge = SimpleNamespace(
                 residual_to=rows, produced=SimpleNamespace(layout=target)
             )
-            boundary = EdgeBinding(edge=edge, prepare=None)
-            self.assertEqual(boundary.capture_move_allocates, owns)
+            capture_move, allocates = _capture_move(edge)
+            self.assertEqual(allocates, owns)
             with (
                 patch_communicator(
                     "attn_tp_gather",
@@ -58,16 +58,16 @@ class TestAuxStorage(CustomTestCase):
                     return_value=SimpleNamespace(attn_tp_size=2, attn_tp_rank=0),
                 ),
             ):
-                value = boundary.capture_move(source, forward_batch=None)
+                value = capture_move(source, forward_batch=None)
             outputs = AuxHiddenStateList()
             if owns:
                 with patch.object(
                     torch.Tensor, "clone", side_effect=AssertionError("extra clone")
                 ):
-                    outputs.capture(value, owned=boundary.capture_move_allocates)
+                    outputs.capture(value, owned=allocates)
                 self.assertIs(outputs[0], value)
             else:
-                outputs.capture(value, owned=boundary.capture_move_allocates)
+                outputs.capture(value, owned=allocates)
                 self.assertIsNot(outputs[0], value)
 
     def test_list_snapshots_borrowed_views_and_reused_buffers(self):

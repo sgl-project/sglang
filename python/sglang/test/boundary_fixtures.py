@@ -83,7 +83,6 @@ def sp_region_steps():
     from sglang.srt.layers.layer_boundary import (
         NORM_QUANT_READOUT,
         EdgeContract,
-        EntryPath,
         InputContract,
         Layout,
         OutputContract,
@@ -97,10 +96,10 @@ def sp_region_steps():
     output = OutputContract(rows)
 
     def entry(read, attn_input_adapter=None):
-        selected = bind_entry(
-            EdgeContract(output, InputContract(rows, read=read), rows, rows)
+        return bind_entry(
+            EdgeContract(output, InputContract(rows, read=read), rows, rows),
+            attn_input_adapter=attn_input_adapter,
         )
-        return EntryPath(selected.prepare, rows, attn_input_adapter=attn_input_adapter)
 
     return StagePath(
         entry(NORM_QUANT_READOUT, _attn_input_default), output, keep_output
