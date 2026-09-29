@@ -357,7 +357,11 @@ def declare_ffn(
 def _resolve(stage, variant, following=None):
     axes, attention, local, full = _rows(variant)
     if stage.update.at_producer:
-        if stage.sparse and sparse_moe_gathers_over_moe_cp():
+        if (
+            stage.sparse
+            and sparse_moe_gathers_over_moe_cp()
+            and not getattr(stage.update, "supports_moe_cp_gather", False)
+        ):
             raise NotImplementedError(
                 "MHC does not support a MoE gathered over the MoE-CP group"
             )

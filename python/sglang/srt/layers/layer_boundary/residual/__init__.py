@@ -34,6 +34,11 @@ class StageUpdate(Protocol):
 
     The shard conversion methods must move any update-associated state together
     with the residual. Nonlinear updates must not claim adds_plainly.
+
+    Producer-written updates may optionally set supports_moe_cp_gather=True
+    when their auxiliary state stays on local residual rows while the FFN
+    input is gathered. The boundary returns the FFN output to those rows
+    before applying the update. Other producer-written updates remain gated.
     """
 
     # A plain add, which one rank may run before the sum it adds into

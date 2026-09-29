@@ -443,9 +443,11 @@ def _mlp_input_gather_moe_cp(
     #   so no rank hits this path while others proceed to the allgather.
     # - During decode: moe_cp allgather is skipped (guarded by is_context_parallel_extend).
     # - CUDA graph warmup: not applicable when --cuda-graph-backend-prefill=disabled is used.
-    if hidden_states.shape[0] == 0:
+    if hidden_states.shape[0] == 0 and update.adds_plainly:
         return hidden_states, residual
 
+    # Stateful nonlinear reads must still initialize their FFN residual state
+    # on empty batches, even though there are no rows to communicate.
     hidden_states, residual = gather(
         hidden_states, residual, forward_batch, layernorm, update=update, cache=cache
     )
