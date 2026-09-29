@@ -72,6 +72,11 @@ impl ErrorEventScanner {
     }
 }
 
+/// Whether a buffered SSE body carries an error event.
+pub fn has_error_event(body: &[u8]) -> bool {
+    ErrorEventScanner::default().feed(body)
+}
+
 /// Bounds on a streaming response beyond what the upstream stream itself provides.
 #[derive(Debug, Clone, Default)]
 pub struct StreamLimits {
