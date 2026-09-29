@@ -147,6 +147,12 @@ def summarize(lines) -> dict[str, object]:
         "min_cgroup_headroom_gib": _to_gib(
             _min_numeric(samples, "cgroup_memory_headroom_bytes")
         ),
+        "max_cgroup_memory_used_pct": _max_numeric(
+            samples, "cgroup_memory_used_pct"
+        ),
+        "max_cgroup_memory_peak_gib": _to_gib(
+            _max_numeric(samples, "cgroup_memory_peak_bytes")
+        ),
         "min_effective_headroom_gib": _to_gib(
             _min_numeric(samples, "effective_host_memory_headroom_bytes")
         ),

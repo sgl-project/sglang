@@ -50,6 +50,13 @@ def _read_proc_value(path: str, key: str) -> str | None:
     return None
 
 
+def _read_lines(path: Path) -> list[str]:
+    try:
+        return path.read_text().splitlines()
+    except OSError:
+        return []
+
+
 def _read_int(path: Path) -> int | None:
     try:
         value = path.read_text().strip()
@@ -274,7 +281,9 @@ def _host_and_cgroup_snapshot() -> dict[str, object]:
         "cgroup_memory_used_pct": _percent(current, hard_limit),
         "cgroup_memory_effective_limit_bytes": limit,
         "cgroup_memory_effective_used_pct": _percent(current, limit),
-        "cgroup_memory_peak_bytes": _read_int(cgroup / "memory.peak"),
+        "cgroup_memory_peak_bytes": _read_int(cgroup / "memory.peak")
+        if limit_kind != "memory.limit_in_bytes"
+        else _read_int(cgroup / "memory.max_usage_in_bytes"),
         "cgroup_memory_high_bytes": _read_int(cgroup / "memory.high"),
         "cgroup_memory_limit_path": str(cgroup) if limit is not None else None,
         "cgroup_memory_limit_kind": limit_kind,
@@ -312,6 +321,7 @@ def _memory_snapshot() -> dict[str, object]:
         "cgroup_memory_peak": _read_cgroup_value("memory.peak"),
         "mem_available": _read_proc_value("/proc/meminfo", "MemAvailable"),
         "process_rss": _read_proc_value("/proc/self/status", "VmRSS"),
+        "process_rss_peak": _read_proc_value("/proc/self/status", "VmHWM"),
         "process_locked": _read_proc_value("/proc/self/status", "VmLck"),
         "ci_run_id": os.environ.get("GITHUB_RUN_ID"),
         "ci_job": os.environ.get("GITHUB_JOB"),
@@ -357,6 +367,12 @@ def log_npu_host_baseline(event: str) -> None:
         snapshot = _host_and_cgroup_snapshot()
     except Exception as exc:  # noqa: BLE001
         snapshot = {"host_memory_stats_error": repr(exc)}
+    cgroup_mounts = [
+        line
+        for line in _read_lines(Path("/proc/self/mountinfo"))
+        if " - cgroup2 " in line
+        or (" - cgroup " in line and "memory" in line.split(" - ", 1)[1])
+    ]
     logger.warning(
         "NPU host baseline: %s",
         {
@@ -368,6 +384,8 @@ def log_npu_host_baseline(event: str) -> None:
             "runner_name": os.environ.get("RUNNER_NAME"),
             "container_hostname": os.environ.get("HOSTNAME"),
             "host_boot_id_hash": _boot_id_hash(),
+            "cgroup_memberships": _read_lines(Path("/proc/self/cgroup")),
+            "cgroup_memory_mounts": cgroup_mounts,
         }
         | snapshot,
     )
@@ -519,3 +537,10 @@ def trace_npu_pinned_host_allocation(
                 | {"elapsed_seconds": round(time.monotonic() - started, 3)}
                 | _memory_snapshot(),
             )
+
+
+if __name__ == "__main__":
+    import sys
+
+    logging.basicConfig(level=logging.WARNING)
+    log_npu_host_baseline(sys.argv[1] if len(sys.argv) > 1 else "manual")

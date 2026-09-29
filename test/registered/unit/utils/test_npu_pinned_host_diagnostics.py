@@ -151,6 +151,32 @@ class TestNpuPinnedHostDiagnostics(unittest.TestCase):
             (800, 1000, root, "memory.limit_in_bytes"),
         )
 
+    def test_cgroup_v1_snapshot_reports_peak_and_failures(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "memory.usage_in_bytes").write_text("400\n")
+            (root / "memory.limit_in_bytes").write_text("1000\n")
+            (root / "memory.max_usage_in_bytes").write_text("900\n")
+            (root / "memory.failcnt").write_text("3\n")
+            with (
+                mock.patch.object(
+                    diagnostics,
+                    "_cgroup_v2_memory",
+                    return_value=(None, None, root, None),
+                ),
+                mock.patch.object(
+                    diagnostics, "_cgroup_v1_mount", return_value=(root, root)
+                ),
+                mock.patch.object(diagnostics, "_meminfo_bytes", return_value=2000),
+                mock.patch.object(diagnostics, "_numa_node_memory", return_value={}),
+                mock.patch.object(diagnostics, "_numa_bind_policies", return_value=[]),
+            ):
+                snapshot = diagnostics._host_and_cgroup_snapshot()
+
+        self.assertEqual(snapshot["cgroup_memory_peak_bytes"], 900)
+        self.assertEqual(snapshot["cgroup_memory_failcnt"], 3)
+        self.assertEqual(snapshot["cgroup_memory_used_pct"], 40.0)
+
     def test_monitor_compares_loading_and_runtime_allocator_peaks(self):
         loading = {
             "pinned_active_peak_bytes": 100,

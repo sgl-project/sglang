@@ -46,6 +46,10 @@ on:
         description: 'Run the test suite with --nightly (collects nightly-registered tests) and --continue-on-error'
         type: boolean
         default: false
+      continue_on_error:
+        description: 'Continue running other registered test files after a failure.'
+        type: string
+        default: 'false'
       use_coverage_runner:
         description: 'If true, delegate test execution to scripts/ci/npu/precise-test/run_tests_with_coverage.sh instead of running via run_suite.py directly'
         type: boolean
@@ -54,6 +58,10 @@ on:
         description: 'If true, upload the test logs as a GitHub Actions artifact (only enabled by pr-test-npu)'
         type: boolean
         default: false
+      diagnostic_test_file:
+        description: 'Optional registered/npu/... path relative to test/; run only this file and emit host-memory baselines.'
+        type: string
+        default: ''
       github-token:
         description: 'GitHub token for API calls'
         type: string
@@ -89,6 +97,12 @@ jobs:
       - name: Mark repository safe
         run: |
           git config --system --add safe.directory ${GITHUB_WORKSPACE}
+
+      - name: Host memory before dependency install
+        if: inputs.diagnostic_test_file != ''
+        run: |
+          git rev-parse HEAD
+          python3 python/sglang/srt/utils/npu_pinned_host_diagnostics.py before_dependency_install
 
       - name: Check PR test health
         uses: actions/github-script@v8
@@ -236,11 +250,18 @@ jobs:
           apt-get install -y libssl-dev
           pip install sglang_router
 
+      - name: Host memory after dependency install
+        if: inputs.diagnostic_test_file != ''
+        run: |
+          python3 python/sglang/srt/utils/npu_pinned_host_diagnostics.py after_dependency_install
+          python3 -c 'import sglang.srt.utils.npu_pinned_host_diagnostics as d; print("diagnostic_module_path:", d.__file__)'
+
       - name: Run test
         timeout-minutes: ${{ fromJson(inputs.run_timeout_minutes) }}
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
           TEST_LOG_DIR: /tmp/test-logs
+          DIAGNOSTIC_TEST_FILE: ${{ inputs.diagnostic_test_file }}
         shell: bash
         run: |
           # Fail fast on any command error, undefined variable, or pipe failure.
@@ -290,6 +311,17 @@ jobs:
           # unchanged for the default (false) path.
           LOG_FILE="${TEST_LOG_DIR}/${{ inputs.self_name }}-part${{ matrix.partition }}.log"
 
+          if [[ -n "${DIAGNOSTIC_TEST_FILE}" ]]; then
+            case "${DIAGNOSTIC_TEST_FILE}" in
+              registered/npu/*.py) ;;
+              *) echo "Invalid diagnostic test file: ${DIAGNOSTIC_TEST_FILE}" >&2; exit 1 ;;
+            esac
+            test -f "${DIAGNOSTIC_TEST_FILE}"
+            echo "Running diagnostic test file: ${DIAGNOSTIC_TEST_FILE}"
+            python3 -u "${DIAGNOSTIC_TEST_FILE}" 2>&1 | tee "${LOG_FILE}"
+            exit 0
+          fi
+
           if [[ "${{ inputs.use_coverage_runner }}" == "true" ]]; then
             pip install coverage==7.8.*
             python3 ../scripts/ci/npu/precise-test/list_tests.py --hw npu --suite ${{ inputs.self_name }} \
@@ -309,6 +341,10 @@ jobs:
             --auto-partition-size ${{ fromJson(inputs.partitions).size }} \
             ${{ inputs.timeout_per_file && format('--timeout-per-file {0}', inputs.timeout_per_file) || '' }} \
             $NIGHTLY_FLAG $CONTINUE_ON_ERROR_FLAG 2>&1 | tee "${LOG_FILE}"
+
+      - name: Host memory after test
+        if: always() && inputs.diagnostic_test_file != ''
+        run: python3 python/sglang/srt/utils/npu_pinned_host_diagnostics.py after_test
 
       - name: Upload test logs
         if: always() && inputs.use_coverage_runner != true && inputs.upload_test_logs == true
