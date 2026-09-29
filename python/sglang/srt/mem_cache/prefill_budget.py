@@ -15,7 +15,8 @@
 The scheduler supplies token demand and its chunk/decode limits. These objects
 account for admitted but not yet allocated work and query live cache capacity:
 locking a prefix or preempting a request must affect the next admission check.
-They neither select requests nor mutate the prefix cache or allocator.
+Selection checks do not mutate cache state. Shared-pool load preparation
+realizes the selected reservation before a host transfer pins device rows.
 """
 
 from typing import Optional
@@ -71,6 +72,18 @@ class PrefillBudget:
 
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
+
+    def prepare_load_back(
+        self,
+        *,
+        full_tokens: int,
+        extend_input_len: int,
+        max_new_tokens: int,
+        swa_host_hit_length: int,
+        chunk_limit: int | None,
+    ) -> bool:
+        """Prepare pools whose admission depends on movable shared space."""
+        return True
 
     def _available_and_evictable(self):
         evictable = (
@@ -320,6 +333,36 @@ class SharedSWAPrefillBudget(SWAPrefillBudget):
             else self.tree_cache.swa_evictable_size(),
             empty_pool=empty_pool,
             require_token_slack=empty_pool,
+        )
+
+    def prepare_load_back(
+        self,
+        *,
+        full_tokens: int,
+        extend_input_len: int,
+        max_new_tokens: int,
+        swa_host_hit_length: int,
+        chunk_limit: int | None,
+    ) -> bool:
+        # H2D pins both bands. Realize the selected joint budget while their
+        # holes can still be compacted, including pending prefill/decode demand.
+        full_tokens = int(self.ceil_paged_tokens(full_tokens + self.total_offset))
+        swa_tokens = int(
+            self.ceil_paged_tokens(
+                self.swa_tokens(
+                    extend_input_len,
+                    max_new_tokens,
+                    chunk_limit=chunk_limit,
+                    swa_host_hit_length=swa_host_hit_length,
+                )
+                + self.swa_offset
+            )
+        )
+        return (
+            self.allocator.reclaim_for_prealloc(
+                self.tree_cache, full_tokens, swa_tokens
+            )
+            is None
         )
 
     def _joint_chunk_cap(self, *, max_chunk_tokens, chunk_limit, swa_host_hit_length=0):

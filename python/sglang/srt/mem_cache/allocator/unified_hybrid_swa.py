@@ -1226,7 +1226,10 @@ class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
             return
         full_reclaim, swa_reclaim = reclaim_plan
         if full_reclaim or swa_reclaim:
-            tree_cache.evict_for_alloc(
+            # The shared-byte plan returns cumulative eviction quotas.
+            # Per-component capacity targets can count the same shared bytes
+            # independently and stop before the joint allocation fits.
+            tree_cache.evict(
                 EvictParams(num_tokens=full_reclaim, swa_num_tokens=swa_reclaim)
             )
         # A zero-reclaim plan can still depend on compaction before allocation.

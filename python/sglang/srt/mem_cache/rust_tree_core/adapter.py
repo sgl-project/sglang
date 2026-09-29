@@ -330,7 +330,6 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             )
 
         self._page_size = params.page_size
-        self.swa_write_back_eviction_barrier_enabled = False
         self._swa_backup_index_mapper: Optional[
             Callable[[torch.Tensor], torch.Tensor]
         ] = None
@@ -680,7 +679,6 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         self._binding.set_hicache_enabled()
 
     def enable_swa_write_back_eviction_barrier(self) -> None:
-        self.swa_write_back_eviction_barrier_enabled = True
         self._binding.enable_swa_write_back_eviction_barrier()
 
     def set_host_memory_buffer_only(self) -> None:

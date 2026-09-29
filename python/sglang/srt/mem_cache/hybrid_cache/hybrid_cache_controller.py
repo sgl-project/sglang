@@ -259,6 +259,11 @@ class HybridCacheController(BaseHiCacheController):
         self._stop_pp_prefetch_thread()
         super()._stop_storage_threads()
 
+    @staticmethod
+    def supports_page_envelope_host(storage_backend: str | None) -> bool:
+        """Only opt in backends whose FULL object is the complete shared page."""
+        return storage_backend is None or storage_backend == "mori"
+
     def attach_storage_backend(
         self,
         storage_backend: str,
@@ -267,17 +272,13 @@ class HybridCacheController(BaseHiCacheController):
         storage_backend_extra_config: Optional[dict] = None,
         host_pools: Optional[list[PoolEntry]] = None,
     ):
-        if (
-            self.host_memory_mode == "buffer_only"
-            and storage_backend == "mooncake"
-            and isinstance(self.storage_host_pool, UnifiedPageEnvelopeHostPool)
-        ):
+        if isinstance(
+            self.storage_host_pool, UnifiedPageEnvelopeHostPool
+        ) and not self.supports_page_envelope_host(storage_backend):
             # A runtime backend switch cannot replace the existing host arena.
-            # Reject before creating storage threads or distributed groups.
             raise ValueError(
-                "Mooncake buffer_only requires separate K/V host pools. "
-                "Restart with --hicache-storage-backend mooncake to select "
-                "compatible host pools."
+                f"Storage backend {storage_backend!r} requires separate host pools. "
+                "Restart with this backend selected to create compatible host pools."
             )
         enable_pp_ticket = (
             self.host_memory_mode == "buffer_only"

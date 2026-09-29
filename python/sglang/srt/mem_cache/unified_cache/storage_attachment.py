@@ -14,9 +14,11 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Optional
 
+from sglang.srt.mem_cache.buffer_mode.pipeline import validate_buffer_only_stack
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_STORAGE,
     StorageMetricsCollector,
@@ -90,10 +92,6 @@ class StorageAttachment:
                 "policies updated.",
             )
 
-        # Apply policies before the controller attach, so the storage threads
-        # observe the new values as soon as they start.
-        self._apply_policies(hicache_storage_prefetch_policy, hicache_write_policy)
-
         logger.info(f"Attaching HiCache storage backend: {storage_backend}")
         try:
             (
@@ -113,8 +111,23 @@ class StorageAttachment:
                 f"'{storage_backend_extra_config_json}': {e}",
             )
 
+        original_policies = (
+            cache.prefetch_stop_policy,
+            controller.write_policy,
+            cache.write_through_threshold,
+            cache.is_write_back,
+        )
         try:
             prefetch_threshold = self.resolve_prefetch_threshold(prefetch_threshold)
+            if cache.host_memory_mode == "buffer_only":
+                validate_buffer_only_stack(
+                    sidecar_pool_specs=cache.sidecar_pool_specs,
+                    host_pool_group=cache.host_pool_group,
+                    swa_component=cache.components.get(ComponentType.SWA),
+                    storage_prefetch_threshold=prefetch_threshold,
+                )
+            # New workers must see the requested policy from their first operation.
+            self._apply_policies(hicache_storage_prefetch_policy, hicache_write_policy)
             controller.attach_storage_backend(
                 storage_backend=storage_backend,
                 prefetch_threshold=prefetch_threshold,
@@ -123,6 +136,12 @@ class StorageAttachment:
                 host_pools=controller.mem_pool_host.entries,
             )
         except Exception as e:
+            (
+                cache.prefetch_stop_policy,
+                controller.write_policy,
+                cache.write_through_threshold,
+                cache.is_write_back,
+            ) = original_policies
             logger.exception(
                 f"Failed to attach storage backend '{storage_backend}': {e}"
             )

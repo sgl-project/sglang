@@ -472,6 +472,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 sidecar_pool_specs=self.sidecar_pool_specs,
                 host_pool_group=self.host_pool_group,
                 swa_component=swa,
+                storage_prefetch_threshold=storage_prefetch_threshold,
             )
             self.buffer_pipeline = BufferModePipeline(
                 cache=self,
@@ -1452,13 +1453,10 @@ class UnifiedRadixCache(BasePrefixCache):
         self, req: Req
     ) -> tuple[torch.Tensor, list[PoolTransfer]]:
         num_tokens = req.seqlen - 1
-        full_virtual_indices = self.req_to_token_pool.req_to_token[
+        full_indices = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, :num_tokens
         ].to(torch.int64)
-        full_virtual_indices = self._pad_retraction_indices(
-            full_virtual_indices, self.page_size
-        )
-        full_device_indices = full_virtual_indices
+        full_indices = self._pad_retraction_indices(full_indices, self.page_size)
 
         component_transfers: dict[ComponentType, list[PoolTransfer]] = {}
         if self.supports_swa():
@@ -1485,7 +1483,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             ]
 
-        kv_transfer = PoolTransfer(name=PoolName.KV, device_indices=full_device_indices)
+        kv_transfer = PoolTransfer(name=PoolName.KV, device_indices=full_indices)
         extra_transfers = [
             transfer
             for transfers in component_transfers.values()
@@ -1496,11 +1494,8 @@ class UnifiedRadixCache(BasePrefixCache):
             kv_transfer,
             component_transfers,
         )
-        for transfer in sidecar_transfers:
-            if transfer.name in (PoolName.DRAFT, PoolName.DRAFT_INDEXER):
-                transfer.device_indices = full_virtual_indices
         extra_transfers.extend(sidecar_transfers)
-        return full_device_indices, extra_transfers
+        return full_indices, extra_transfers
 
     def _reclaim_retraction_host(self, num_tokens: int) -> int:
         if self.disable:
@@ -2580,6 +2575,17 @@ class UnifiedRadixCache(BasePrefixCache):
                 unfulfilled, reason
             )
 
+    def _settle_storage_prefetch_hit(
+        self, request: CacheRequestHandle, credited_tokens: int
+    ) -> None:
+        """At buffer-mode admission, hit tokens not credited to storage were
+        covered by the device's joint match; the rest resolve at the fill ack."""
+        remaining = self._storage_prefetch_hit_remaining_by_reqid.get(request)
+        if remaining is not None:
+            self._resolve_storage_prefetch_tokens(
+                request, remaining - credited_tokens, reason="device_covered"
+            )
+
     def finish_storage_prefetch_admission(
         self, request: CacheRequestHandle, fulfilled_tokens: int, reason: Optional[str]
     ) -> None:
@@ -2803,9 +2809,7 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         self.ongoing_prefetch[request] = info
         self.cache_controller.trim_prefetch_full_head(operation, trim_tokens)
-        self._resolve_storage_prefetch_tokens(
-            request, trim_tokens, reason="device_covered"
-        )
+        # Label at admission: resident FULL unlocked by fetched aux is storage.
         return info, hit_tokens - trim_tokens, original_hit_tokens
 
     def revoke_pending_prefetch(self, request: CacheRequestHandle) -> None:
@@ -2998,19 +3002,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     )
                 )
                 cc.prefetch_tokens_occupied += operation.buffer_host_occupied_units
-            try:
-                cc.prefetch_buffer.put(operation)
-            except Exception:
-                cc.free_prefetch_host_buffers(operation, host_indices)
-                operation.host_indices = None
-                if buffer_mode:
-                    cc.prefetch_tokens_occupied -= operation.buffer_host_occupied_units
-                    operation.buffer_host_occupied_units = None
-                    self.buffer_pipeline.pop_prefix_ctx(request)
-                    self.buffer_pipeline.release_anchor_lock(request)
-                self.ongoing_prefetch.pop(request, None)
-                operation.mark_terminate()
-                raise
+            cc.prefetch_buffer.put(operation)
             return True
 
         def _drain_and_alloc_storage_hit():
