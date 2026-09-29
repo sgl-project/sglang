@@ -1,6 +1,6 @@
 """Regression for DFLASH aux-hidden capture on mHC models.
 
-GLM-5.3-Flash runs with mhc=True. MHCLayerCommunicator folds the residual
+GLM-5.3-Flash runs with mhc=True. Its MHC boundary folds the residual
 into the widened hidden state and returns residual=None, so CUDA-graph
 capture used to crash on `hidden_states + residual`. DFLASH also has to
 contract that widened state back to the draft hidden size; skipping the
@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 
+from sglang.srt.layers.communicator.residual.stream import ResidualStream
 from sglang.srt.models.glm5_next import Glm5NextModel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -29,7 +30,8 @@ class TestGlm5NextDflashCapture(CustomTestCase):
 
         hidden_states = torch.arange(24, dtype=torch.float32).reshape(2, 12)
 
-        actual = model._prepare_aux_hidden_state(hidden_states, None)
+        captured = ResidualStream().snapshot(hidden_states)
+        actual = model._prepare_aux_hidden_state(captured)
         expected = hidden_states.unflatten(-1, (4, -1)).mean(dim=-2)
 
         torch.testing.assert_close(actual, expected)

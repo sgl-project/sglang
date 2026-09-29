@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
@@ -10,6 +11,8 @@ from sglang.kernels.ops.attention.linear.kda_nvidia_prefill import (
 from sglang.kernels.ops.attention.linear.kda_ptx_prefill import (
     chunk_kda_fwd as ptx_chunk_kda_fwd,
 )
+from sglang.srt.layers.attention.linear.kernels.kda_ptx import PtxKDAKernel
+from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -79,6 +82,45 @@ def _reference(q, k, v, gate, beta, a_log, dt_bias, state, fused_qk_norm):
 
 
 class TestKdaPrefill(CustomTestCase):
+    @torch.inference_mode()
+    def test_ptx_padded_raw_beta(self):
+        """Raw beta must match Triton, including final state after neutral padding."""
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (
+            10,
+            3,
+        ):
+            self.skipTest("PTX KDA prefill requires GB300")
+        q, k, v, gate, beta, a_log, dt_bias, state = _inputs(2, seq_len=1025)
+        state.fill_(0.1)
+        actual_state = state.clone()
+        inputs = dict(
+            q=q,
+            k=k,
+            v=v,
+            g=gate,
+            beta=beta,
+            cache_indices=torch.zeros(1, device="cuda", dtype=torch.int32),
+            query_start_loc=torch.tensor([0, 1025], device="cuda", dtype=torch.int32),
+            A_log=a_log,
+            dt_bias=dt_bias,
+            lower_bound=-5.0,
+            beta_is_raw=True,
+            extend_seq_lens_cpu=[1025],
+        )
+        kernel = PtxKDAKernel()
+        with patch.object(
+            kernel._triton,
+            "extend",
+            side_effect=AssertionError("PTX unexpectedly fell back to Triton"),
+        ):
+            actual = kernel.extend(**inputs, ssm_states=actual_state)
+        # Triton may mutate inputs, so run the reference last.
+        expected = TritonKDAKernel().extend(**inputs, ssm_states=state)
+        torch.testing.assert_close(
+            actual.float(), expected.float(), rtol=2e-2, atol=3e-2
+        )
+        torch.testing.assert_close(actual_state, state, rtol=2e-2, atol=3e-2)
+
     @torch.inference_mode()
     def test_nvidia_prefill(self):
         if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:

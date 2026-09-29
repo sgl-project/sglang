@@ -608,6 +608,17 @@ def device_stream_context(stream):
     return torch.get_device_module(stream.device).stream(stream)
 
 
+def is_device_stream_capturing(device: torch.device) -> bool:
+    """Whether ``device``'s current stream is mid graph capture (False if unsupported)."""
+    # Every platform answering support_cuda_graph() already calls
+    # device_module.is_current_stream_capturing() during capture, so it cannot be missing.
+    if device.type != current_platform.device_type:
+        return False
+    if not current_platform.support_cuda_graph():
+        return False
+    return torch.get_device_module(device).is_current_stream_capturing()
+
+
 def get_amdgpu_memory_capacity():
     try:
         # Run rocm-smi and capture the output
@@ -1268,6 +1279,13 @@ class Range(NamedTuple):
     @property
     def length(self) -> int:
         return self.end - self.start
+
+
+def assert_int64_array(values: array, name: str) -> None:
+    """Require a signed int64 array suitable for zero-copy tensor views."""
+    assert (
+        isinstance(values, array) and values.typecode == "q" and values.itemsize == 8
+    ), f"{name} must be array('q') with 8-byte items"
 
 
 def flatten_arrays_to_pinned_cpu(parts: List[array[int]], pin: bool) -> torch.Tensor:
@@ -1932,7 +1950,7 @@ def _load_image(
                 )
     try:
         image = Image.open(BytesIO(image_bytes))
-    except OSError as e:
+    except (OSError, SyntaxError) as e:
         raise ValueError(f"Could not decode image: {e}") from e
     return _fully_load_pil_image(image)
 
@@ -1941,7 +1959,7 @@ def _fully_load_pil_image(image: Image.Image) -> Image.Image:
     """Force PIL's lazy decode while malformed input is still request-local."""
     try:
         image.load()
-    except OSError as e:
+    except (OSError, SyntaxError) as e:
         raise ValueError(f"Could not decode image: {e}") from e
     return image
 
@@ -2120,8 +2138,25 @@ def encode_video(video_path, frame_count_limit=None):
     return frames
 
 
+def configure_hf_hub_logger():
+    """Route Hugging Face Hub messages through the application's logger once."""
+    from huggingface_hub.utils import logging as hf_logging
+
+    # CLI model detection can contact Hub before configure_logger runs.
+    # basicConfig leaves any existing application logging setup intact.
+    logging.basicConfig(format="[%(asctime)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    hub_logger = hf_logging.get_logger()
+    for handler in hub_logger.handlers[:]:
+        # Hub installs a plain StreamHandler and also propagates to the root.
+        # Keep file handlers and custom handler subclasses intact.
+        if type(handler) is logging.StreamHandler:
+            hub_logger.removeHandler(handler)
+    hf_logging.enable_propagation()
+
+
 def suppress_noisy_warnings():
     """Suppress known noisy warnings from third-party libraries."""
+    configure_hf_hub_logger()
     warnings.filterwarnings(
         "ignore", category=UserWarning, message="The given NumPy array is not writable"
     )
@@ -2372,7 +2407,7 @@ def monkey_patch_p2p_access_check():
 
     setattr(tgt, "gpu_p2p_access_check", lambda *arg, **kwargs: True)
 
-    # Suppress the warnings from this delete function when using sglang.bench_one_batch
+    # Suppress the warnings from this delete function when using sglang.benchmark.one_batch
     from sglang.srt.distributed.device_communicators.custom_all_reduce import (
         CustomAllreduce,
     )
@@ -2434,6 +2469,8 @@ def configure_logger(server_args, prefix: str = ""):
         datefmt="%Y-%m-%d %H:%M:%S",
         force=True,
     )
+
+    configure_hf_hub_logger()
 
     # Suppress noisy httpx/httpcore loggers in every process that calls
     # configure_logger (main, scheduler, detokenizer). Spawned subprocesses
@@ -2925,18 +2962,14 @@ def direct_register_custom_op(
         raise error
 
 
-def set_gpu_proc_affinity(
-    pp_size: int,
-    tp_size: int,
-    nnodes: int,
-    gpu_id: int,
-):
+def set_gpu_proc_affinity(gpu_id: int):
     # current process
     pid = os.getpid()
     p = psutil.Process(pid)
 
-    nnodes_per_tp_group = max(nnodes // pp_size, 1)
-    tp_size_per_node = tp_size // nnodes_per_tp_group
+    parallel = get_parallel()
+    nnodes_per_tp_group = max(parallel.nnodes // parallel.pp_size, 1)
+    tp_size_per_node = parallel.tp_size // nnodes_per_tp_group
 
     # total physical cores
     total_pcores = psutil.cpu_count(logical=False)
@@ -3925,11 +3958,16 @@ class Withable(Generic[T]):
             self._value = None
 
 
-def require_mlp_tp_gather():
+def require_mlp_tp_gather(*, moe_a2a_backend=None):
     """
     Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
     """
-    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+    from sglang.srt.layers.moe.utils import MoeA2ABackend, get_moe_a2a_backend
+
+    if moe_a2a_backend is None:
+        moe_a2a_backend = get_moe_a2a_backend()
+    elif not isinstance(moe_a2a_backend, MoeA2ABackend):
+        moe_a2a_backend = MoeA2ABackend(moe_a2a_backend)
 
     # elastic-EP scale-up rewrites dp_size on the published config
     if get_parallel().enable_dp_attention:
@@ -3947,9 +3985,9 @@ def require_mlp_tp_gather():
             return True
         elif not get_parallel().enable_dp_lm_head:
             return True
-        elif get_moe_a2a_backend().is_none():
+        elif moe_a2a_backend.is_none():
             return True
-        elif get_moe_a2a_backend().is_flashinfer():
+        elif moe_a2a_backend.is_flashinfer():
             # FlashInfer MoE A2A needs a rank-invariant, DP-synchronized per-rank
             # token count: MoeAlltoAll uses fixed-geometry buffers and the decode
             # cuda-graph bucket must be identical across EP ranks, otherwise ranks
@@ -3959,7 +3997,7 @@ def require_mlp_tp_gather():
             # reuse this flag's DP-sync bookkeeping (uniform global_num_tokens +
             # max-based graph bucket). See #30432 re: the misleading flag name.
             return True
-        elif get_moe_a2a_backend().is_mori() and get_bool_env_var(
+        elif moe_a2a_backend.is_mori() and get_bool_env_var(
             "SGLANG_MORI_RECV_BOUND", "false"
         ):
             # Same bookkeeping, for the same reason. Bounding mori's receive

@@ -72,6 +72,7 @@ fn build_app_context(
             fused: None,
             eligibility: None,
             sampling_overrides: Default::default(),
+            default_chat_template_kwargs: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],
@@ -204,6 +205,7 @@ fn build_cache_ctx_with_affinity(
             query_timeout_ms: 100,
             query_max_inflight: 32,
         }),
+        ..Default::default()
     });
     context.prefix_index = Some(prefix_index);
     context.block_size_oracle.try_set(1).unwrap();

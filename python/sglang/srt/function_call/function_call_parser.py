@@ -23,6 +23,7 @@ from sglang.srt.function_call.deepseekv41_detector import DeepSeekV41Detector
 from sglang.srt.function_call.dots_detector import DotsToolDetector
 from sglang.srt.function_call.gemma4_detector import Gemma4Detector
 from sglang.srt.function_call.gigachat3_detector import GigaChat3Detector
+from sglang.srt.function_call.gigachat35_detector import GigaChat35Detector
 from sglang.srt.function_call.glm4_moe_detector import (
     Glm4MoeDetector,
     GlmSpecialTokenConfig,
@@ -34,6 +35,7 @@ from sglang.srt.function_call.hermes_detector import HermesDetector
 from sglang.srt.function_call.hunyuan_detector import HunyuanDetector
 from sglang.srt.function_call.inkling_detector import InklingDetector
 from sglang.srt.function_call.internlm_detector import InternlmDetector
+from sglang.srt.function_call.iquest_q1_detector import IQuestQ1Detector
 from sglang.srt.function_call.k2_v3_detector import K2V3Detector
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.kimik3_detector import KimiK3Detector
@@ -109,11 +111,15 @@ class FunctionCallParser:
         "hermes": HermesDetector,
         "hunyuan": HunyuanDetector,
         "gigachat3": GigaChat3Detector,
+        "gigachat35": GigaChat35Detector,
         "gemma4": Gemma4Detector,
         "inkling": InklingDetector,
+        "iquest_q1": IQuestQ1Detector,
     }
 
-    def __init__(self, tools: List[Tool], tool_call_parser: str, tokenizer=None):
+    def __init__(
+        self, tools: List[Tool], tool_call_parser: str, tokenizer=None, tool_choice=None
+    ):
         detector_class = self.ToolCallParserEnum.get(tool_call_parser)
         if detector_class:
             kwargs = {}
@@ -129,9 +135,19 @@ class FunctionCallParser:
             detector.use_full_assistant_constraint = not any(
                 tool.function.strict for tool in tools
             )
-        self.detector = detector
+        if isinstance(tool_choice, dict):
+            tool_choice = ToolChoice(function={"name": tool_choice["name"]})
+        self._required_tool_parser = detector.get_required_tool_parser(tool_choice)
+        self.detector = self._required_tool_parser or detector
         self.tools = tools
         self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
+
+    def owns_tool_format(self) -> bool:
+        return (
+            self._required_tool_parser is not None
+            or self.detector.supports_structural_tag()
+            or self.detector.parses_required_natively()
+        )
 
     def has_tool_call(self, text: str) -> bool:
         """
@@ -285,7 +301,7 @@ class FunctionCallParser:
         try:
             if (
                 isinstance(self.detector, Glm47MoeDetector)
-                and self.detector.use_full_assistant_constraint
+                and self.detector.parses_required_natively()
             ):
                 functions = (
                     [
@@ -354,6 +370,14 @@ class FunctionCallParser:
             if (
                 tool_choice == "required" or isinstance(tool_choice, ToolChoice)
             ) and not self.detector.parses_required_natively():
+                required_parser = self.detector.get_required_tool_parser(tool_choice)
+                if required_parser is not None:
+                    return (
+                        "json_schema",
+                        required_parser.get_json_schema_constraint(
+                            self.tools, tool_choice, parallel_tool_calls
+                        ),
+                    )
                 json_schema = get_json_schema_constraint(
                     self.tools, tool_choice, parallel_tool_calls=parallel_tool_calls
                 )
