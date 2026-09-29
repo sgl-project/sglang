@@ -15,6 +15,12 @@ the same forward pass. The GLM-5.2-FP8 nightly covers only gfx950.
 MI300X (192 GB x 8) holds the ~700 GB FP8 weights with room for KV cache; the
 BF16 checkpoint does not fit single-node here, which is why this tests FP8.
 
+Measured on the full GSM8K split: 0.9735 on rocm724 (4332 s wall clock) and
+0.9704 on rocm720 (4565 s). Weight load took 2892 s and 3016 s, most of it
+waiting on the first download into the pool's shared cache. HF snapshot
+aca966e4e02791568aa6a4ced368624b3d897f42, runs 36505808540 and 36505823619.
+Both sit inside the cookbook's CUDA range of 97.12-97.73%.
+
 Eval harness: sgl-eval's gsm8k through run_sgl_eval, rather than the legacy
 few-shot scorer that run_combined_tests routes gsm8k to, because GLM-5.3's
 chat template forces thinking on and the legacy scorer reads the last number
@@ -39,9 +45,9 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-# Register for AMD CI - MI30x GLM-5.3 accuracy test. gfx942 loads and decodes
-# more slowly than gfx950, and this pool's shared cache has taken over an hour
-# to load a 328 GB checkpoint; 9000 s covers the ~700 GB load plus the eval.
+# Register for AMD CI - MI30x GLM-5.3 accuracy test. Measured 4332 s on
+# rocm724 and 4565 s on rocm720 against a cold shared cache; 9000 s leaves
+# room for a slower download of the ~700 GB checkpoint.
 register_amd_ci(
     est_time=9000,
     suite="nightly-amd-accuracy-8-gpu-glm53",
