@@ -11,6 +11,7 @@ strides specialized; with channels a multiple of 16 those stay in one class
 at every resolution.
 """
 
+import sys
 from contextlib import contextmanager
 
 import pytest
@@ -180,3 +181,7 @@ def test_scale_shift_batch_size_compiles_nothing():
         _scale_shift(64, batch=2)
         torch.cuda.synchronize()
     assert compiled == []
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
