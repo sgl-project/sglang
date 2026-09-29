@@ -43,10 +43,13 @@ def _manager() -> TokenizerManager:
     manager = TokenizerManager.__new__(TokenizerManager)
     manager.elastic_worker_count = 4
     manager.elastic_instance_id = "runtime-1"
+    manager.elastic_initial_ep_size = 4
+    manager.elastic_allocation_width = 4
+    manager.elastic_max_committed_ep_size = 4
     manager.elastic_operation_id = None
     manager.elastic_operation_target = None
     manager.elastic_operation_succeeded = None
-    manager.elastic_expected_joining_member_ids = []
+    manager.elastic_expected_joining_allocation_ids = []
     manager.elastic_pending_ep_size = None
     manager.elastic_scale_phase = "idle"
     manager.elastic_last_error = None
@@ -56,7 +59,7 @@ def _manager() -> TokenizerManager:
     manager.elastic_joining_rank_offset = None
     manager.elastic_joining_rank_count = 0
     manager.elastic_ready_rank_count = 0
-    manager.elastic_joining_member_ids = []
+    manager.elastic_joining_allocation_ids = []
     manager._elastic_scale_lock = asyncio.Lock()
     manager.auto_create_handle_loop = MagicMock()
     manager.scale_elastic_ep_communicator = AsyncMock(
@@ -83,7 +86,7 @@ class TestElasticEPLifecycle(unittest.IsolatedAsyncioTestCase):
             new_ep_size=8,
             operation_id="grow-1",
             expected_instance_id="runtime-1",
-            expected_joining_member_ids=["pod-uid-5"],
+            expected_joining_allocation_ids=["pod-uid-5"],
         )
 
         first = await manager.scale_elastic_ep(request)
@@ -114,7 +117,7 @@ class TestElasticEPLifecycle(unittest.IsolatedAsyncioTestCase):
             new_ep_size=8,
             operation_id="grow-1",
             expected_instance_id="runtime-1",
-            expected_joining_member_ids=["pod-uid-5"],
+            expected_joining_allocation_ids=["pod-uid-5"],
         )
 
         with self.assertRaisesRegex(TimeoutError, "response lost"):
@@ -268,7 +271,7 @@ class TestElasticEPLifecycle(unittest.IsolatedAsyncioTestCase):
             ScaleElasticEPReqInput(
                 new_ep_size=8,
                 operation_id="grow-1",
-                expected_joining_member_ids=["pod-uid-5"],
+                expected_joining_allocation_ids=["pod-uid-5"],
             )
         )
 
@@ -282,18 +285,21 @@ class TestElasticEPLifecycle(unittest.IsolatedAsyncioTestCase):
                 joining_rank_offset=4,
                 joining_rank_count=4,
                 ready_rank_count=4,
-                joining_member_ids=["pod-uid-5"],
+                joining_allocation_ids=["pod-uid-5"],
             )
         )
 
         status = manager.get_elastic_ep_state()
         self.assertEqual(status["instance_id"], "runtime-1")
+        self.assertEqual(status["initial_ep_size"], 4)
+        self.assertEqual(status["allocation_width"], 4)
+        self.assertEqual(status["max_committed_ep_size"], 4)
         self.assertEqual(status["operation_id"], "grow-1")
         self.assertEqual(status["scale_phase"], "cohort_ready")
         self.assertEqual(status["joining_rank_offset"], 4)
         self.assertEqual(status["joining_rank_count"], 4)
         self.assertEqual(status["ready_rank_count"], 4)
-        self.assertEqual(status["joining_member_ids"], ["pod-uid-5"])
+        self.assertEqual(status["joining_allocation_ids"], ["pod-uid-5"])
 
     async def test_completed_operation_remains_retryable(self):
         manager = _manager()
@@ -318,6 +324,7 @@ class TestElasticEPLifecycle(unittest.IsolatedAsyncioTestCase):
         status = manager.get_elastic_ep_state()
         self.assertTrue(status["operation_succeeded"])
         self.assertEqual(status["target_ep_size"], 8)
+        self.assertEqual(status["max_committed_ep_size"], 8)
         manager.scale_elastic_ep_communicator.assert_awaited_once()
 
     async def test_recovery_failure_does_not_overwrite_completed_operation(self):
@@ -377,7 +384,7 @@ class TestElasticEPCohortBinding(unittest.TestCase):
         self.assertEqual(cohort.operation_id, "grow-1")
         self.assertEqual(cohort.rank_offset, 4)
         self.assertEqual(cohort.ready_rank_count, 4)
-        self.assertEqual(cohort.member_id, "pod-uid-5")
+        self.assertEqual(cohort.allocation_id, "pod-uid-5")
         self.assertEqual(stored_cohort, cohort)
 
     def test_stale_cohort_does_not_poison_next_operation(self):
@@ -416,7 +423,7 @@ class TestElasticEPCohortBinding(unittest.TestCase):
                 get_scale_cohort(4, "runtime-2", "grow-1"), new_runtime_cohort
             )
 
-    def test_unexpected_member_is_rejected(self):
+    def test_unexpected_allocation_is_rejected(self):
         store = _Store()
         with patch(
             "sglang.srt.elastic_ep.elastic_ep.get_global_tcp_store",
@@ -445,14 +452,14 @@ class TestElasticEPSchedulerIdempotency(unittest.TestCase):
             runtime_instance_id="runtime-1",
             operation_id="grow-1",
             operation_target_ep_size=8,
-            operation_expected_joining_member_ids=["pod-uid-5"],
+            operation_expected_joining_allocation_ids=["pod-uid-5"],
         )
         scheduler = Scheduler.__new__(Scheduler)
         request = ScaleElasticEPReqInput(
             new_ep_size=8,
             operation_id="grow-1",
             runtime_instance_id="runtime-1",
-            expected_joining_member_ids=["pod-uid-5"],
+            expected_joining_allocation_ids=["pod-uid-5"],
             submission_id="submission-2",
         )
 
@@ -482,7 +489,7 @@ class TestElasticEPSchedulerIdempotency(unittest.TestCase):
             runtime_instance_id="runtime-1",
             operation_id="grow-1",
             operation_target_ep_size=8,
-            operation_expected_joining_member_ids=[],
+            operation_expected_joining_allocation_ids=[],
         )
         scheduler = Scheduler.__new__(Scheduler)
         request = ScaleElasticEPReqInput(
@@ -504,6 +511,118 @@ class TestElasticEPSchedulerIdempotency(unittest.TestCase):
         self.assertTrue(result.conflict)
         self.assertIn("already targets EP size 8", result.message)
 
+    def test_multi_allocation_world_accepts_one_allocation_growth(self):
+        state = ElasticEPState(
+            active_ranks=None,
+            last_active_ranks=None,
+            active_ranks_cpu=None,
+            effective_ep_size=8,
+        )
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.tp_worker = MagicMock(model_runner=MagicMock(eplb_manager=None))
+        request = ScaleElasticEPReqInput(
+            new_ep_size=12,
+            operation_id="grow-1",
+            runtime_instance_id="runtime-1",
+            expected_joining_allocation_ids=["pod-uid-2"],
+        )
+
+        with (
+            patch.object(ElasticEPStateManager, "_instance", state),
+            patch.object(
+                ElasticEPStateManager,
+                "request_scale",
+                return_value=True,
+            ) as request_scale,
+            patch.object(
+                ElasticEPStateManager,
+                "get_pending_ep_size",
+                return_value=12,
+            ),
+            patch.object(
+                ElasticEPStateManager,
+                "get_scale_phase",
+                return_value="waiting_for_cohort",
+            ),
+            patch(
+                "sglang.srt.managers.scheduler.get_parallel",
+                return_value=MagicMock(
+                    max_world_size=16,
+                    tp_size=8,
+                    nnodes=2,
+                    elastic_ep_allocation_width=4,
+                ),
+            ),
+        ):
+            result = scheduler.handle_scale_elastic_ep(request)
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.pending_ep_size, 12)
+        request_scale.assert_called_once_with(
+            12,
+            "runtime-1",
+            "grow-1",
+            ["pod-uid-2"],
+        )
+
+    def test_multi_allocation_world_rejects_two_allocation_growth(self):
+        state = ElasticEPState(
+            active_ranks=None,
+            last_active_ranks=None,
+            active_ranks_cpu=None,
+            effective_ep_size=8,
+        )
+        scheduler = Scheduler.__new__(Scheduler)
+        request = ScaleElasticEPReqInput(
+            new_ep_size=16,
+            operation_id="grow-1",
+            runtime_instance_id="runtime-1",
+            expected_joining_allocation_ids=["pod-uid-2"],
+        )
+
+        with (
+            patch.object(ElasticEPStateManager, "_instance", state),
+            patch(
+                "sglang.srt.managers.scheduler.get_parallel",
+                return_value=MagicMock(
+                    max_world_size=16,
+                    tp_size=8,
+                    nnodes=2,
+                    elastic_ep_allocation_width=4,
+                ),
+            ),
+        ):
+            result = scheduler.handle_scale_elastic_ep(request)
+
+        self.assertFalse(result.success)
+        self.assertTrue(result.terminal)
+        self.assertIn("exactly one joining allocation", result.message)
+        self.assertIn("local rank width (4), got 8", result.message)
+        self.assertIsNone(state.operation_id)
+
+    def test_initial_participant_rejects_inconsistent_allocation_width(self):
+        state = ElasticEPState(
+            active_ranks=None,
+            last_active_ranks=None,
+            active_ranks_cpu=None,
+            effective_ep_size=8,
+            original_ep_size=8,
+        )
+
+        with (
+            patch(
+                "sglang.srt.elastic_ep.elastic_ep.get_parallel",
+                return_value=MagicMock(
+                    elastic_ep_runtime_instance_id=None,
+                    elastic_ep_allocation_width=4,
+                    tp_size=8,
+                    nnodes=4,
+                ),
+            ),
+            self.assertRaisesRegex(RuntimeError, "inconsistent local allocation width"),
+        ):
+            ElasticEPStateManager._publish_initial_runtime_topology(state)
+
     def test_recovery_failure_preserves_completed_operation_result(self):
         state = ElasticEPState(
             active_ranks=None,
@@ -515,7 +634,7 @@ class TestElasticEPSchedulerIdempotency(unittest.TestCase):
             runtime_instance_id="runtime-1",
             operation_id="grow-1",
             operation_target_ep_size=8,
-            operation_expected_joining_member_ids=[],
+            operation_expected_joining_allocation_ids=[],
         )
         scheduler = Scheduler.__new__(Scheduler)
         request = ScaleElasticEPReqInput(

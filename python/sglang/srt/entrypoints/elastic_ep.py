@@ -63,22 +63,23 @@ async def scale_elastic_ep(raw_request: Request):
             status_code=HTTPStatus.BAD_REQUEST,
         )
 
-    expected_joining_member_ids = body.get("expected_joining_member_ids")
-    if expected_joining_member_ids is not None and (
-        not isinstance(expected_joining_member_ids, list)
-        or len(expected_joining_member_ids) != 1
+    expected_joining_allocation_ids = body.get("expected_joining_allocation_ids")
+    if expected_joining_allocation_ids is not None and (
+        not isinstance(expected_joining_allocation_ids, list)
+        or len(expected_joining_allocation_ids) != 1
         or any(
-            not isinstance(member_id, str)
-            or not member_id.strip()
-            or len(member_id) > 256
-            for member_id in expected_joining_member_ids
+            not isinstance(allocation_id, str)
+            or not allocation_id.strip()
+            or len(allocation_id) > 256
+            for allocation_id in expected_joining_allocation_ids
         )
-        or len(set(expected_joining_member_ids)) != len(expected_joining_member_ids)
+        or len(set(expected_joining_allocation_ids))
+        != len(expected_joining_allocation_ids)
     ):
         return ORJSONResponse(
             {
                 "error": (
-                    "expected_joining_member_ids must contain exactly one "
+                    "expected_joining_allocation_ids must contain exactly one "
                     "non-empty string of at most 256 characters"
                 )
             },
@@ -99,7 +100,7 @@ async def scale_elastic_ep(raw_request: Request):
             new_ep_size=new_ep_size,
             operation_id=operation_id,
             expected_instance_id=expected_instance_id,
-            expected_joining_member_ids=expected_joining_member_ids,
+            expected_joining_allocation_ids=expected_joining_allocation_ids,
         )
     )
 
