@@ -22,3 +22,7 @@ class TestAiterDraftExtendMetadata(CustomTestCase):
         self.assertTrue(torch.equal(padded[: idx.shape[0]], idx))
         self.assertTrue(torch.all(padded[idx.shape[0] :] == idx[0]))
         self.assertEqual(ab._pad_mha_prefill_kv_indices(idx[:0]).numel(), 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
