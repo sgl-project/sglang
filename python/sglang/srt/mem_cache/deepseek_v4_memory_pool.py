@@ -173,6 +173,11 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
     family pool; the V4.1 layouts exist only in SM100 / SM103 FlashMLA."""
     mode = envs.SGLANG_DSV4_KV_LAYOUT.get().lower()
     option = envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT.get().lower()
+    if get_exec().kernel.dsv4_attn_backend == "trtllm":
+        assert mode in ("auto", "v4") and option in ("auto", "fp8"), (
+            "trtllm uses uniform FP8 pools, not the packed V4.1 KV layouts"
+        )
+        return KVLayout.V4, None
     if mode == "v4":
         return KVLayout.V4, None if option == "auto" else option
     assert mode in ("v41", "auto"), f"unknown SGLANG_DSV4_KV_LAYOUT={mode!r}"
