@@ -86,6 +86,11 @@ class Contribution(msgspec.Struct):
         self.value, self.owed = value, None
         return value
 
+    def release(self):
+        """Drop the tensors of a contribution its consumer has taken."""
+        self.value = None
+        self.owed = None
+
 
 class OwedOutput(msgspec.Struct, frozen=True):
     """Opaque model-facing handle. Only its boundary may read the contribution."""
@@ -105,7 +110,8 @@ class ResidualStream:
             field separately records incomplete reduction/finalize work.
 
     The states are initial (both None), written (residual only), and pending.
-    Prepare consumes pending once and writes the resulting residual. Completing
+    Prepare consumes pending once and writes the resulting residual, which
+    releases the consumed contribution's tensors. Completing
     communication for capture leaves the update pending. Layouts and batch-path
     selection live on the bound stage, not on tensor values.
     """
@@ -136,6 +142,10 @@ class ResidualStream:
         return stream.leave(hidden, update, declared_sum=declared_sum), stream
 
     def write(self, residual):
+        if self.pending is not None:
+            # The written residual consumes the pending contribution. Handles
+            # to it are now stale and must not keep its tensors alive.
+            self.pending.release()
         self.residual = residual
         self.pending = None
         return residual
