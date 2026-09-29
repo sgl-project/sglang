@@ -50,6 +50,10 @@ Chunked prefill does not yield just because decode has not admitted the request.
 Completed requests retain their KV in the existing optimistic-prefill inflight
 queue until decode supplies destination indices; readiness alone never starts
 a KV write.
+After a successful transfer, prefill clears the room's readiness and transfer
+state before notifying decode of success. Retraction recovery can then reuse
+the same bootstrap room. This notification waits for worker and scheduler
+cleanup; failure and cancellation records remain until their timeout expires.
 Retries remain eligible for prefill after the optimistic attempt budget is
 exhausted and remain subject to the existing cancellation and timeout handling.
 

@@ -7,6 +7,7 @@ import logging
 import threading
 import time
 from collections import defaultdict
+from contextlib import nullcontext
 from typing import Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -625,6 +626,10 @@ class CommonKVManager(BaseKVManager):
         if targets is None:
             targets = self._room_notify_targets(bootstrap_room)
         self.update_status(bootstrap_room, status)
+        if status == KVPoll.Success and self.deferred_bootstrap is not None:
+            # Success permits decode to reuse the room after true retraction.
+            # Publish it from sender.clear(), after worker and scheduler cleanup.
+            return status
         self.send_kv_status_message(
             targets=targets,
             bootstrap_room=bootstrap_room,
@@ -970,8 +975,18 @@ class CommonKVManager(BaseKVManager):
         the rebootstrap ``/generate`` failed rather than reporting a spurious
         ``AbortReq``.
         """
-        kv_receiver.abort()
-        self.record_failure(kv_receiver.bootstrap_room, reason)
+        with kv_receiver._lifecycle_lock:
+            if self.defer_decode_allocation and (
+                not kv_receiver._owns_bootstrap_room
+                or kv_receiver.conclude_state == KVPoll.Success
+                or self.request_status.get(kv_receiver.bootstrap_room) == KVPoll.Success
+            ):
+                # The HTTP response can arrive after KV transfer has succeeded.
+                # Serialize errors with polling/retirement so an old callback
+                # cannot leave a failure record for a reused room.
+                return
+            kv_receiver.abort()
+            self.record_failure(kv_receiver.bootstrap_room, reason)
 
     def _run_prefill_recompute(
         self, kv_receiver: CommonKVReceiver, prefill_url: str, payload: dict
@@ -1806,15 +1821,17 @@ class CommonKVSender(BaseKVSender):
         return KVPoll.Failed
 
     def clear(self) -> None:
+        notification = None
         if self.kv_mgr.deferred_bootstrap is not None:
             if not self._owns_bootstrap_room:
                 return
             notification = self.kv_mgr.deferred_bootstrap.close(
-                self.bootstrap_room, self
+                self.bootstrap_room,
+                self,
+                success=self.kv_mgr.request_status.get(self.bootstrap_room)
+                == KVPoll.Success,
             )
             self._owns_bootstrap_room = False
-            if self.kv_mgr.request_status.get(self.bootstrap_room) != KVPoll.Success:
-                self.kv_mgr._notify_bootstrap(self.bootstrap_room, notification)
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "req_to_decode_prefix_len"):
             self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
@@ -1830,8 +1847,18 @@ class CommonKVSender(BaseKVSender):
                 self.kv_mgr._deferred_ack_fanout_snapshots.pop(
                     self.bootstrap_room, None
                 )
+        if notification is not None:
+            endpoint, failed = notification
+            self.kv_mgr.send_kv_status_message(
+                targets=[endpoint],
+                bootstrap_room=self.bootstrap_room,
+                status=KVPoll.Failed if failed else KVPoll.Success,
+                failure_reason="Prefill bootstrap failed" if failed else None,
+            )
 
     def abort(self):
+        if self.kv_mgr.deferred_bootstrap is not None and not self._owns_bootstrap_room:
+            return
         self.kv_mgr.record_failure(
             self.bootstrap_room,
             "Aborted by AbortReq.",
@@ -1843,6 +1870,7 @@ class CommonKVSender(BaseKVSender):
 class CommonKVReceiver(BaseKVReceiver):
     _prefill_wait_start: Optional[float] = None
     _owns_bootstrap_room: bool = True
+    _lifecycle_lock = nullcontext()
 
     _ctx = zmq.Context()
     _ctx.set(zmq.MAX_SOCKETS, envs.SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS.get())
@@ -1859,6 +1887,8 @@ class CommonKVReceiver(BaseKVReceiver):
         self.bootstrap_room = bootstrap_room
         self.bootstrap_addr = bootstrap_addr
         self.kv_mgr = mgr
+        if mgr.defer_decode_allocation:
+            self._lifecycle_lock = threading.RLock()
         self.conclude_state: Optional[KVPoll] = None
         self.require_staging: bool = False
         self.init_time: Optional[float] = None
@@ -1951,6 +1981,10 @@ class CommonKVReceiver(BaseKVReceiver):
             self.abort()
 
     def poll(self) -> KVPoll:
+        with self._lifecycle_lock:
+            return self._poll()
+
+    def _poll(self) -> KVPoll:
         if self.conclude_state is not None:
             return self.conclude_state
         status = self.kv_mgr.check_status(self.bootstrap_room)
@@ -2202,6 +2236,10 @@ class CommonKVReceiver(BaseKVReceiver):
         return KVPoll.Failed
 
     def clear(self) -> None:
+        with self._lifecycle_lock:
+            self._clear()
+
+    def _clear(self) -> None:
         if not self._owns_bootstrap_room:
             return
         if (

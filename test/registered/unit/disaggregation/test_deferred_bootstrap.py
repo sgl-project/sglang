@@ -63,7 +63,8 @@ class TestDeferredBootstrap(unittest.TestCase):
         self.table.open(1, self.owner)
         self.table.complete(1, self.owner)
         self.assertEqual(self.table.register(1, self.endpoint), (self.endpoint, False))
-        self.assertEqual(self.table.register(1, self.endpoint), (self.endpoint, False))
+        self.assertIsNone(self.table.register(1, self.endpoint))
+        self.assertIsNone(self.table.complete(1, self.owner))
         other = ("other", 9999)
         self.assertEqual(self.table.register(1, other), (other, True))
         self.assertEqual(self.table.rooms[1].endpoint, self.endpoint)
@@ -73,6 +74,38 @@ class TestDeferredBootstrap(unittest.TestCase):
         self.table.close(1, self.owner)
         self.assertEqual(self.table.register(1, self.endpoint), (self.endpoint, True))
         self.assertIsNone(self.table.complete(1, self.owner))
+
+    def test_success_resets_room_for_either_arrival_order(self):
+        for receiver_first in (True, False):
+            with self.subTest(receiver_first=receiver_first):
+                self.table.open(1, self.owner)
+                self.table.register(1, self.endpoint)
+                self.table.complete(1, self.owner)
+                self.assertEqual(
+                    self.table.close(1, self.owner, success=True),
+                    (self.endpoint, False),
+                )
+                self.assertNotIn(1, self.table.rooms)
+                new_owner = object()
+                if receiver_first:
+                    self.assertIsNone(self.table.register(1, self.endpoint))
+                state = self.table.open(1, new_owner)
+                self.assertFalse(state.ready)
+                self.assertFalse(state.failed)
+                if not receiver_first:
+                    self.assertIsNone(self.table.register(1, self.endpoint))
+                # A repeated cleanup from the retired sender cannot close this one.
+                self.assertIsNone(self.table.close(1, self.owner, success=True))
+                self.assertEqual(
+                    self.table.complete(1, new_owner), (self.endpoint, False)
+                )
+                self.table.close(1, new_owner, success=True)
+
+    def test_success_cannot_reset_cancelled_room(self):
+        self.table.open(1, self.owner)
+        self.table.fail(1)
+        self.table.close(1, self.owner, success=True)
+        self.assertEqual(self.table.register(1, self.endpoint), (self.endpoint, True))
 
     def test_expire_unmatched_and_terminal_rooms_not_active_sources(self):
         with patch(

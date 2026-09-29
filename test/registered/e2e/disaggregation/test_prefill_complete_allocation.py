@@ -268,13 +268,16 @@ class TestPrefillCompleteAllocation(_PrefillCompleteServer):
                 timeout=90,
             ) as response:
                 response.raise_for_status()
-                retracted = False
+                retractions = 0
                 final = None
                 for line in response.iter_lines():
                     if not line.startswith(b"data: ") or line == b"data: [DONE]":
                         continue
                     final = json.loads(line[6:])
-                    if not retracted and final["meta_info"]["completion_tokens"] > 0:
+                    if (
+                        retractions < 3
+                        and final["meta_info"]["completion_tokens"] > retractions * 32
+                    ):
                         requests.post(
                             self.decode_url + "/pause_generation",
                             json={"mode": "retract"},
@@ -292,9 +295,10 @@ class TestPrefillCompleteAllocation(_PrefillCompleteServer):
                             timeout=15,
                         ).raise_for_status()
                         paused = False
-                        retracted = True
+                        retractions += 1
                 self.assertIsNotNone(final)
-                self.assertGreater(final["meta_info"]["num_retractions"], 0, final)
+                self.assertEqual(retractions, 3)
+                self.assertGreaterEqual(final["meta_info"]["num_retractions"], 3, final)
                 self.assertEqual(final["meta_info"]["completion_tokens"], 256, final)
                 self.assertEqual(final["text"], reference["text"])
                 self.assertEqual(

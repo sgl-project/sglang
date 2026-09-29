@@ -4,6 +4,7 @@ import threading
 import time
 import unittest
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
@@ -221,24 +222,46 @@ class TestAllocationIntegration(CustomTestCase):
         self.assertEqual(sender.poll(), KVPoll.Failed)
         self.assertEqual(recv(), metadata)
 
-    def test_late_old_room_status_does_not_admit_rebootstrap(self):
-        original, receiver = self.sender(), self.receiver()
-        self.flush()
-        original.mark_prefill_complete()
-        self.flush()
-        self.prefill.update_status(1, KVPoll.Success)
-        self.decode.update_status(1, KVPoll.Success)
-        original.clear()
-        receiver.clear()
-        recompute, new_receiver = self.sender(room=2), self.receiver(room=2)
-        self.flush()
-        self.decode.apply_prefill_status(
-            bootstrap_room=1, status=KVPoll.WaitingForInput, prefill_rank=0
-        )
-        self.assertEqual(new_receiver.poll(), KVPoll.Bootstrapping)
-        recompute.mark_prefill_complete()
-        self.flush()
-        self.assertEqual(new_receiver.poll(), KVPoll.WaitingForInput)
+    def test_repeated_transfers_reuse_room_after_success_cleanup(self):
+        retired = []
+        for receiver_first in (True, False, True):
+            with self.subTest(receiver_first=receiver_first, iteration=len(retired)):
+                if receiver_first:
+                    receiver = self.receiver()
+                    self.flush()
+                    sender = self.sender()
+                else:
+                    sender, receiver = self.sender(), self.receiver()
+                    self.flush()
+                self.assertEqual(receiver.poll(), KVPoll.Bootstrapping)
+                for old_sender, old_receiver in retired:
+                    old_sender.clear()
+                    old_sender.abort()
+                    old_receiver.clear()
+                    self.decode._fail_prefill_recompute(old_receiver, "late HTTP error")
+                self.assertEqual(sender.poll(), KVPoll.Bootstrapping)
+                self.assertNotIn(1, self.decode.failure_records)
+                sender.mark_prefill_complete()
+                self.flush()
+                self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
+                # Duplicate control registration must not enqueue another ready
+                # message that could outlive the transfer's completion.
+                self.prefill._handle_bootstrap_message(
+                    [b"BOOTSTRAP", b"1", b"decode", b"2"]
+                )
+                self.assertEqual(list(self.wire), [])
+                self.prefill.conclude_transfer(bootstrap_room=1, status=KVPoll.Success)
+                self.flush()
+                self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
+                self.assertEqual(sender.poll(), KVPoll.Success)
+                sender.clear()
+                self.flush()
+                self.assertEqual(receiver.poll(), KVPoll.Success)
+                receiver.clear()
+                self.assertNotIn(1, self.prefill.deferred_bootstrap.rooms)
+                self.assertNotIn(1, self.prefill.request_status)
+                self.assertEqual(list(self.wire), [])
+                retired.append((sender, receiver))
 
     def test_completion_before_receiver_uses_same_bootstrap(self):
         sender = self.sender()
@@ -588,14 +611,171 @@ class TestAllocationIntegration(CustomTestCase):
         self.assertEqual(sender.poll(), KVPoll.Failed)
         self.assertNotIn(1, self.decode.request_status)
 
-    def test_success_clear_does_not_emit_failure(self):
+    def test_success_is_sent_once_after_all_sender_state_is_cleared(self):
         sender, receiver = self.sender(), self.receiver()
         self.flush()
-        self.prefill.update_status(1, KVPoll.Success)
-        self.decode.update_status(1, KVPoll.Success)
+        sender.mark_prefill_complete()
+        self.flush()
+        self.prefill.conclude_transfer(bootstrap_room=1, status=KVPoll.Success)
+        self.assertEqual(sender.poll(), KVPoll.Success)
+        self.prefill.req_to_decode_prefix_len[1] = 0
+        self.prefill.transfer_infos[1] = {}
+        send = self.prefill.send_kv_status_message
+        next_transfer = []
+
+        def success(**kwargs):
+            self.assertEqual(kwargs["status"], KVPoll.Success)
+            for table in (
+                self.prefill.deferred_bootstrap.rooms,
+                self.prefill.request_status,
+                self.prefill.req_to_decode_prefix_len,
+                self.prefill.transfer_infos,
+            ):
+                self.assertNotIn(1, table)
+            send(**kwargs)
+            self.flush()
+            self.assertEqual(receiver.poll(), KVPoll.Success)
+            receiver.clear()
+            # Resume immediately, before the old clear() call even returns.
+            new_sender, new_receiver = self.sender(), self.receiver()
+            self.flush()
+            next_transfer.extend((new_sender, new_receiver))
+
+        self.prefill.send_kv_status_message = Mock(side_effect=success)
         sender.clear()
-        receiver.clear()
+        sender.clear()
+        self.prefill.send_kv_status_message.assert_called_once()
+        new_sender, new_receiver = next_transfer
+        self.assertIs(self.prefill.deferred_bootstrap.rooms[1].owner, new_sender)
+        self.assertEqual(new_receiver.poll(), KVPoll.Bootstrapping)
         self.assertEqual(list(self.wire), [])
+
+    def test_worker_cleanup_finishes_before_sender_can_report_success(self):
+        sender, receiver = self.sender(), self.receiver()
+        self.flush()
+        sender.mark_prefill_complete()
+        self.flush()
+        mgr = self.prefill
+        mgr._staging_outstanding = defaultdict(int)
+        mgr.session_lock = threading.Lock()
+        mgr.failed_sessions = set()
+        mgr.enable_deferred_decode_kv_release = True
+        mgr.decode_kv_args_table = {
+            "session": SimpleNamespace(requires_dcp_relayout=False, dst_aux_ptrs=[])
+        }
+        mgr._get_dsa_cache_transfer_skip_flags = Mock(return_value=(False, False))
+        mgr.send_aux = Mock(return_value=0)
+        mgr.transfer_infos[1] = {
+            "session": SimpleNamespace(
+                is_dummy=False,
+                mooncake_session_id="session",
+                dst_kv_indices=[],
+                dst_device_kv_indices=None,
+                endpoint="decode",
+                dst_port=2,
+                room=1,
+                required_dst_info_num=1,
+            )
+        }
+        cleanup_observed = []
+
+        def during_cleanup(room, default=None):
+            # The worker has finished writes and decremented its counter, but
+            # is still deleting room-indexed state. Force a scheduler poll here.
+            self.assertEqual(mgr._staging_outstanding[room], 0)
+            self.assertEqual(sender.poll(), KVPoll.Transferring)
+            self.flush()
+            self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
+            cleanup_observed.append(room)
+
+        mgr.req_to_decode_prefix_len = SimpleNamespace(pop=during_cleanup)
+        chunk = SimpleNamespace(
+            room=1,
+            staging_counted=False,
+            index_slice=slice(0, 0),
+            prefill_kv_indices=[],
+            is_last_chunk=True,
+            state_indices=None,
+            prefill_aux_index=0,
+        )
+        mgr.transfer_worker(Mock(get=Mock(side_effect=[chunk, None])), None)
+        self.assertEqual(cleanup_observed, [1])
+        self.assertNotIn(1, mgr._staging_outstanding)
+        self.assertEqual(sender.poll(), KVPoll.Success)
+        self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
+        mgr.req_to_decode_prefix_len = {}
+        sender.clear()
+        self.flush()
+        self.assertEqual(receiver.poll(), KVPoll.Success)
+
+    def test_early_transfer_success_does_not_wait_for_sender_cleanup(self):
+        override = get_context().override_server_args(
+            disaggregation_decode_allocation_policy="early"
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        self.prefill.defer_decode_allocation = self.decode.defer_decode_allocation = (
+            False
+        )
+        self.prefill.deferred_bootstrap = None
+        sender, receiver = self.sender(), self.receiver(policy="early")
+        self.prefill.conclude_transfer(
+            bootstrap_room=1, status=KVPoll.Success, targets=[("decode", 2)]
+        )
+        self.flush()
+        self.assertEqual(receiver.poll(), KVPoll.Success)
+        self.assertIn(1, self.prefill.request_status)
+        self.assertEqual(sender.poll(), KVPoll.Success)
+
+    def test_recompute_http_error_after_success_before_retirement_is_ignored(self):
+        sender, receiver = self.sender(), self.receiver()
+        self.flush()
+        sender.mark_prefill_complete()
+        self.flush()
+        self.prefill.conclude_transfer(bootstrap_room=1, status=KVPoll.Success)
+        self.assertEqual(sender.poll(), KVPoll.Success)
+        sender.clear()
+        self.flush()
+        # Success is in the status table, but the scheduler has not polled it.
+        self.assertIsNone(receiver.conclude_state)
+        self.decode._fail_prefill_recompute(receiver, "late HTTP timeout")
+        self.assertEqual(receiver.poll(), KVPoll.Success)
+        self.assertNotIn(1, self.decode.failure_records)
+
+    def test_receiver_retirement_waits_for_recompute_error_callback(self):
+        receiver = self.receiver()
+        error_started = threading.Event()
+        finish_error = threading.Event()
+        retirement_started = threading.Event()
+        record_failure = self.decode.record_failure
+
+        def delayed_failure(room, reason):
+            error_started.set()
+            if not finish_error.wait(timeout=5):
+                raise TimeoutError("test did not release the error callback")
+            record_failure(room, reason)
+
+        def retire():
+            retirement_started.set()
+            receiver.clear()
+
+        self.decode.record_failure = delayed_failure
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            error = executor.submit(
+                self.decode._fail_prefill_recompute, receiver, "HTTP error"
+            )
+            try:
+                self.assertTrue(error_started.wait(timeout=5))
+                retirement = executor.submit(retire)
+                self.assertTrue(retirement_started.wait(timeout=5))
+                with self.assertRaises(TimeoutError):
+                    retirement.result(timeout=0.05)
+            finally:
+                finish_error.set()
+            error.result(timeout=5)
+            retirement.result(timeout=5)
+        self.assertFalse(receiver._owns_bootstrap_room)
+        self.assertEqual(self.decode.failure_records[1], "HTTP error")
 
     def test_slow_status_delivery_does_not_hold_bootstrap_lock(self):
         sender, receiver = self.sender(), self.receiver()
@@ -696,21 +876,7 @@ class TestAllocationIntegration(CustomTestCase):
         queue.kv_manager.submit_prefill_recompute.assert_not_called()
         self.assertFalse(entry.waiting_for_input)
 
-    def test_reusing_completed_room_rejects_recomputed_prefill(self):
-        sender, receiver = self.sender(), self.receiver()
-        self.flush()
-        sender.mark_prefill_complete()
-        self.flush()
-        self.prefill.update_status(1, KVPoll.Success)
-        self.decode.update_status(1, KVPoll.Success)
-        sender.clear()
-        receiver.clear()
-        # True retraction can resume before the old room's tombstone expires.
-        # Reusing that room cannot distinguish recompute from a late sender.
-        recompute = self.sender(room=1)
-        self.assertEqual(recompute.poll(), KVPoll.Failed)
-
-    def test_rebootstrap_gets_fresh_room_but_keeps_prefill_rank(self):
+    def test_rebootstrap_keeps_room_and_prefill_rank(self):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue._check_if_req_exceed_kv_capacity = Mock(return_value=False)
         queue.queue = []
@@ -727,15 +893,12 @@ class TestAllocationIntegration(CustomTestCase):
             prefill_info_table={"prefill:8998": SimpleNamespace(dp_size=4)}
         )
         queue.add(req, is_rebootstrap=True)
-        first = req.bootstrap_room
-        self.assertNotEqual(first, 1)
-        self.assertGreaterEqual(first, 0)
-        self.assertLess(first, 1 << 63)
+        self.assertEqual(req.bootstrap_room, 1)
         queue._init_receiver.assert_called_once_with(
             queue._create_receiver_and_enqueue.return_value, 3
         )
         queue.add(req, is_rebootstrap=True)
-        self.assertNotEqual(req.bootstrap_room, first)
+        self.assertEqual(req.bootstrap_room, 1)
         self.assertEqual(req.disagg_prefill_dp_rank, 3)
 
     def test_receiver_clear_preserves_failure_reason(self):

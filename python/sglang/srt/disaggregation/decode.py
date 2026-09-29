@@ -23,7 +23,6 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
-import uuid
 from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass
@@ -768,21 +767,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             req.retraction_mb_id = None
             self.retracted_queue.append(req)
         else:
-            if (
-                is_rebootstrap
-                and get_disagg().disaggregation_decode_allocation_policy
-                == "prefill_complete"
-            ):
-                # Only upstream's true-retraction recovery reaches this branch:
-                # its old KV was discarded and must be recomputed. Ordinary
-                # bootstrap and optimistic-prefill retries keep their room.
-                # Recompute must not reuse readiness or a closed-room tombstone
-                # from the previous transfer. _init_receiver saved
-                # the actual prefill DP rank, so changing the room cannot
-                # reroute follow_bootstrap_room requests to another worker.
-                # This policy requires attention TP1/CP1/PP1; wider groups would
-                # need to agree on the new room before creating their receivers.
-                req.bootstrap_room = uuid.uuid4().int & ((1 << 63) - 1)
             decode_req = self._create_receiver_and_enqueue(
                 req, is_rebootstrap=is_rebootstrap
             )

@@ -19,6 +19,7 @@ class BootstrapRoom:
     owner: object | None = None
     endpoint: tuple[str, int] | None = None
     ready: bool = False
+    ready_notified: bool = False
     failed: bool = False
     expires_at: float = 0.0
 
@@ -45,8 +46,15 @@ class DeferredBootstrap:
 
     @staticmethod
     def _notification(state: BootstrapRoom) -> BootstrapNotification:
-        if state.endpoint is not None and (state.ready or state.failed):
-            return state.endpoint, state.failed
+        if state.endpoint is not None:
+            if state.failed:
+                return state.endpoint, True
+            if state.ready and not state.ready_notified:
+                # One readiness message per transfer. Decode must consume it
+                # before publishing destinations, so none can trail Success
+                # and accidentally admit the next transfer using this room.
+                state.ready_notified = True
+                return state.endpoint, False
         return None
 
     def open(self, room: int, owner: object) -> BootstrapRoom | None:
@@ -83,11 +91,18 @@ class DeferredBootstrap:
             state.failed = True
             return self._notification(state)
 
-    def close(self, room: int, owner: object) -> BootstrapNotification:
+    def close(
+        self, room: int, owner: object, *, success: bool = False
+    ) -> BootstrapNotification:
         with self.lock:
             state = self.rooms.get(room)
             if state is None or state.owner is not owner:
                 return None
+            if success and not state.failed:
+                # The caller clears transport state before sending Success.
+                # Only then can decode reuse this room for recomputation.
+                del self.rooms[room]
+                return (state.endpoint, False) if state.endpoint is not None else None
             state.owner = None
             already_failed = state.failed
             state.failed = True
