@@ -608,6 +608,15 @@ def test_dup_up3d_add_bitwise(dtype, c_in, c_out, t, h, w, ft, fs, drop):
     assert out.stride() == ref.stride()
     assert torch.equal(out, ref)
 
+    # With the producing conv's bias folded in: aten rounds the bias add to
+    # the storage dtype before the residual add.
+    bias = torch.randn(c_out, device=DEVICE, dtype=dtype)
+    ref_b = (main + bias.view(1, -1, 1, 1, 1)) + dup
+    out_b = dup_up3d_add(main, src, ft, fs, repeats, drop, bias)
+    assert out_b is not None and out_b.stride() == ref_b.stride()
+    assert torch.equal(out_b, ref_b)
+    assert dup_up3d_add(main, src, ft, fs, repeats, drop, bias[: c_out - 1]) is None
+
 
 @torch.no_grad()
 @pytest.mark.parametrize("pads_temporal_only", [False, True])

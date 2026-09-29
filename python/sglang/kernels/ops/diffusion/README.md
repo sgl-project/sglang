@@ -118,6 +118,8 @@ Several norms look interchangeable and are not. Start here.
 | `triton_group_norm_silu` / `apply_group_norm_silu` | Triton | close | NCHW-contiguous, any channels-per-group, always applies SiLU |
 | `group_norm_silu_4d` / `group_norm_silu_rows` | Triton | close | **channels_last only**; power-of-two `C <= 2048`; optional SiLU. This is what lets a VAE decoder run channels_last end-to-end with no `nchwToNhwc` |
 | `wan_rmsnorm_silu` | Triton | close | dense `channels_last_3d` 5D (`stride(C) == 1`), Wan VAE channel-first RMSNorm + SiLU |
+| `channel_rmsnorm_finish_silu` | JIT CUDA | bit-exact: keeps the aten fp32 `norm(dim=1)` reduction and fuses the pointwise finish (`max(norm, 1e-12)`, divide, scale, gamma, `+0.0`) with SiLU | Qwen-Image 2.1 VAE, contiguous NCHW/NCDHW bf16, spatial `% 8 == 0` |
+| `channel_rmsnorm_silu_nhwc` | JIT CUDA | close (own fp32 reduction over C in a lane group sized from C; optional fused conv bias with aten rounding) | Qwen-Image 2.1 VAE under `quality=extra-high`/`high`; dense channels_last, even `C <= 2048` |
 | `rmsnorm_scale` / `rmsnorm_tanh_residual` | Triton | bf16-native statistics | Z-Image (matches its own reference exactly), Ideogram 4 (gated) |
 | `zimage_qk_rmsnorm_native` | Triton | bit-exact | Z-Image per-head QK RMSNorm |
 | `fused_qk_head_layernorm` | Triton | bit-exact | per-head LN on q/k, `dim_head % 4 == 0`, `<= 128` |
@@ -127,6 +129,7 @@ Several norms look interchangeable and are not. Start here.
 
 | Entry point | Backend | Contract | Applies to |
 |---|---|---|---|
+| `bias_residual_add` | JIT CUDA | bit-exact `(y + bias[c]) + h` with aten's per-op bf16 rounding, for a conv that skipped its bias pass | channels_last-dense (`C % 8 == 0`) or NCHW/NCDHW contiguous (spatial `% 8 == 0`) bf16; `h` shares `y`'s layout (Qwen-Image 2.1 VAE residual blocks) |
 | `residual_gate_add` | KDA (JIT CUDA) | bit-exact `residual + update * gate` | contiguous tensors, or a transposed-dense `[B, tokens, hidden]` residual/output with contiguous update and row-broadcast gate (SANA-Video) |
 
 The transposed-dense path uses a shared-memory tile to read the update in

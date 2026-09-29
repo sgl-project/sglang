@@ -850,6 +850,9 @@ class CudaPlatformBase(Platform):
                 maybe_optimize_autoencoder_kl,
                 maybe_optimize_flux2_vae,
             )
+            from sglang.multimodal_gen.runtime.models.vaes.qwen_image21_vae_cuda_opt import (
+                maybe_optimize_qwen_image21_vae,
+            )
             from sglang.multimodal_gen.runtime.models.vaes.wan_vae_cuda_opt import (
                 maybe_optimize_qwen_image_vae,
                 maybe_optimize_wan_vae,
@@ -859,6 +862,7 @@ class CudaPlatformBase(Platform):
             vae = maybe_optimize_autoencoder_kl(vae)
             vae = maybe_optimize_wan_vae(vae)
             vae = maybe_optimize_qwen_image_vae(vae)
+            vae = maybe_optimize_qwen_image21_vae(vae)
         except Exception:
             logger.warning(
                 "Failed to apply CUDA VAE optimizations; using the unmodified VAE.",
