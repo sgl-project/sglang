@@ -13,7 +13,12 @@ ARG SG_LANG_REPO=https://github.com/sgl-project/sglang.git
 ARG SG_LANG_BRANCH=main
 
 ARG SG_LANG_KERNEL_REPO=https://github.com/sgl-project/sgl-kernel-xpu.git
+# Branch, tag or commit SHA; only used when SG_LANG_KERNEL_SOURCE=source.
 ARG SG_LANG_KERNEL_BRANCH=main
+# wheel: prebuilt sglang-kernel-xpu pinned in pyproject_xpu.toml; source: build SG_LANG_KERNEL_BRANCH.
+ARG SG_LANG_KERNEL_SOURCE=wheel
+# AOT target for source builds (bmg | cri); set explicitly since no GPU is visible during docker build.
+ARG SG_LANG_KERNEL_TARGET=bmg
 
 USER root
 
@@ -83,6 +88,22 @@ RUN echo "Cloning ${SG_LANG_BRANCH} from ${SG_LANG_REPO}" && \
     cp pyproject_xpu.toml pyproject.toml && \
     pip install --no-cache-dir ".[dev,diffusion]" --extra-index-url https://download.pytorch.org/whl/xpu && \
     pip install --no-cache-dir --no-deps xgrammar==0.1.33
+
+# Optionally replace the prebuilt kernel wheel with a source build. --no-build-isolation
+# so CMake finds the installed torch; build/ is removed to keep the image small.
+RUN if [ "${SG_LANG_KERNEL_SOURCE}" = "source" ]; then \
+        echo "Building sgl-kernel-xpu ${SG_LANG_KERNEL_BRANCH} from ${SG_LANG_KERNEL_REPO} for ${SG_LANG_KERNEL_TARGET}" && \
+        git clone ${SG_LANG_KERNEL_REPO} sgl-kernel-xpu && \
+        git -C sgl-kernel-xpu checkout ${SG_LANG_KERNEL_BRANCH} && \
+        git -C sgl-kernel-xpu log -1 --format='sgl-kernel-xpu commit: %H %s' && \
+        pip install --no-cache-dir "scikit-build-core>=0.10" wheel cmake ninja && \
+        pip install -v --no-cache-dir --no-build-isolation --no-deps --force-reinstall \
+            --config-settings=cmake.define.DPCPP_SYCL_TARGET=${SG_LANG_KERNEL_TARGET} \
+            ./sgl-kernel-xpu && \
+        rm -rf sgl-kernel-xpu/build; \
+    elif [ "${SG_LANG_KERNEL_SOURCE}" != "wheel" ]; then \
+        echo "Invalid SG_LANG_KERNEL_SOURCE=${SG_LANG_KERNEL_SOURCE} (expected wheel or source)" && exit 1; \
+    fi
 
 # Install torch_memory_saver for release/resume_memory_occupation ("memory saver").
 # XPU ships no prebuilt wheel: it is built from source against the local oneAPI +
