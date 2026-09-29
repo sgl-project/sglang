@@ -1509,6 +1509,13 @@ class PrefillAdder:
                 return AddReqResult.OTHER
             max_new_tokens = 0
         elif chunk_tokens_limit is not None and chunk_fit_tokens > chunk_tokens_limit:
+            # Readout positions index the whole prompt, so a prompt that fits one
+            # chunk waits for a batch with room rather than being split.
+            if (
+                req.token_indices_to_pool is not None
+                and chunk_fit_tokens <= get_schedule().chunked_prefill_size
+            ):
+                return AddReqResult.OTHER
             if (
                 has_chunked_req
                 and get_schedule().schedule_policy == "shortest-prefill-first"
