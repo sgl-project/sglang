@@ -223,6 +223,7 @@ def _should_use_masked_standard_layout(
         raise ValueError(
             "SGLANG_DEEPGEMM_STANDARD_LAYOUT must be one of: auto, masked, compact"
         )
+
     if mode != "auto":
         return mode == "masked"
 
@@ -334,6 +335,31 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
         return None, None
 
 
+def _w4a4_requested(quant_info: DeepGemmMoeQuantInfo) -> bool:
+    """Whether the caller asked for W4A4: the switch is on and the experts are FP4.
+
+    Split out of `_use_deepgemm_w4a4` so the call sites that only need "was W4A4
+    asked for?" (the layout guard, the probe wiring) do not trip its activation
+    check - that one belongs to the paths which actually quantize.
+    """
+    return envs.SGLANG_USE_DEEPGEMM_W4A4.get() and quant_info.is_fp4_experts
+
+
+def _use_deepgemm_w4a4(
+    quant_info: DeepGemmMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> bool:
+    if not _w4a4_requested(quant_info):
+        return False
+    if runner_config.activation != "silu" or not runner_config.is_gated:
+        raise ValueError(
+            "SGLANG_USE_DEEPGEMM_W4A4 only supports gated SiLU with FP4 experts, "
+            f"got activation={runner_config.activation!r}, "
+            f"is_gated={runner_config.is_gated}"
+        )
+    return True
+
+
 class DeepGemmRunnerCore(MoeRunnerCore):
     def __init__(self, config: MoeRunnerConfig):
         super().__init__(config)
@@ -429,11 +455,32 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 (0, K), device=hidden_states_device, dtype=torch.bfloat16
             )
 
-        recipe_a, recipe_b = quant_info.scale_recipes(
-            activation_block_size=runner_input.activation_scale_block_size,
-            hidden_size=K,
-            activation_scale_width=hidden_states_scale.shape[-1],
-        )
+        # int8 hidden states are exclusively packed e2m1 on this path; an
+        # ordinary FP8 contiguous input must not switch recipes just because the
+        # global flag is set, so W4A4 is selected from the input layout rather
+        # than from the flag alone.
+        use_w4a4 = hidden_states.dtype == torch.int8
+        if use_w4a4:
+            if not _use_deepgemm_w4a4(quant_info, self.config):
+                raise ValueError("Packed MXFP4 input requires W4A4 with FP4 experts")
+            if (
+                K <= 0
+                or K % 128 != 0
+                or N <= 0
+                or N % 256 != 0
+                or hidden_states.shape != (all_tokens, K // 2)
+                or hidden_states_scale is None
+                or hidden_states_scale.dtype != torch.int32
+                or hidden_states_scale.shape != (all_tokens, K // 128)
+            ):
+                raise ValueError("Invalid packed MXFP4 input/scale or gateup shape")
+            recipe_a, recipe_b = ((1, 32), (1, 32))
+        else:
+            recipe_a, recipe_b = quant_info.scale_recipes(
+                activation_block_size=runner_input.activation_scale_block_size,
+                hidden_size=K,
+                activation_scale_width=hidden_states_scale.shape[-1],
+            )
 
         w13_weight_fp8 = (
             quant_info.w13_weight,
@@ -448,6 +495,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         )
         if (
             deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES
+            and not use_w4a4
             and not runner_input.hidden_states_scale_tma_aligned
         ):
             hidden_states_scale = tma_align_input_scale(hidden_states_scale)
@@ -467,7 +515,17 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
-        if self.config.activation == "situ":
+        if use_w4a4:
+            # Fused SiLU-mul + (1, 32) e2m1 quantization (hardware cvt).
+            from sglang.kernels.ops.quantization.mxfp4_group_quant import (
+                silu_mul_quant_mxfp4,
+            )
+
+            down_input_fp8, down_input_scale = silu_mul_quant_mxfp4(
+                gateup_output, self.swiglu_limit
+            )
+            del gateup_output
+        elif self.config.activation == "situ":
             situ_beta = self.config.gemm1_alpha
             situ_linear_beta = self.config.gemm1_clamp_limit
             assert situ_beta is not None and situ_linear_beta is not None
@@ -602,14 +660,19 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 device=hidden_states_device,
                 dtype=torch.bfloat16,
             )
-        if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
+        if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES and not use_w4a4:
             down_input_scale = tma_align_input_scale(down_input_scale)
 
-        # The down activation is quantized here, independently of dispatch.
-        recipe_a_down, _ = quant_info.scale_recipes(
-            activation_block_size=scale_block_size,
-            hidden_size=down_input_fp8.shape[-1],
-            activation_scale_width=down_input_scale.shape[-1],
+        # The down activation is quantized here, independently of dispatch; on
+        # W4A4 it is packed e2m1 with group-32 ue8m0 scales, like the gateup one.
+        recipe_a_down = (
+            (1, 32)
+            if use_w4a4
+            else quant_info.scale_recipes(
+                activation_block_size=scale_block_size,
+                hidden_size=down_input_fp8.shape[-1],
+                activation_scale_width=down_input_scale.shape[-1],
+            )[0]
         )
         deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
             (down_input_fp8, down_input_scale),
@@ -731,11 +794,30 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         use_mxfp8 = quant_info.use_mxfp8
         scale_block_size = quant_info.block_shape[1] if quant_info.block_shape else 128
 
-        recipe_a, recipe_b = quant_info.scale_recipes(
-            activation_block_size=runner_input.activation_scale_block_size,
-            hidden_size=hidden_states.shape[-1],
-            activation_scale_width=hidden_states_scale.shape[-1],
-        )
+        # int8 hidden states are exclusively packed e2m1 on this path, exactly as
+        # on the contiguous one; select from the layout rather than the flag.
+        use_w4a4 = hidden_states.dtype == torch.int8
+        if use_w4a4:
+            if not _use_deepgemm_w4a4(quant_info, self.config):
+                raise ValueError("Packed MXFP4 input requires W4A4 with FP4 experts")
+            # The packed K extent is half the logical one, and the group-32 ue8m0
+            # words are already in the MN-major layout, so only the recipe differs
+            # from the fp8 masked path.
+            if (
+                hidden_states.shape[-1] % 64 != 0
+                or hidden_states_scale is None
+                or hidden_states_scale.dtype != torch.int32
+                or hidden_states_scale.shape[:2] != hidden_states.shape[:2]
+                or hidden_states_scale.shape[-1] != hidden_states.shape[-1] // 64
+            ):
+                raise ValueError("Invalid packed MXFP4 masked input/scale")
+            recipe_a, recipe_b = (1, 32), (1, 32)
+        else:
+            recipe_a, recipe_b = quant_info.scale_recipes(
+                activation_block_size=runner_input.activation_scale_block_size,
+                hidden_size=hidden_states.shape[-1],
+                activation_scale_width=hidden_states_scale.shape[-1],
+            )
 
         # GroupGemm-0
         if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
@@ -747,7 +829,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 hidden_states_scale = _cast_to_e8m0_with_rounding_up(
                     hidden_states_scale
                 )
-        elif deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
+        elif deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES and not use_w4a4:
             hidden_states_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
                 hidden_states_scale
             )
@@ -798,6 +880,27 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 beta=self.config.gemm1_alpha,
                 linear_beta=self.config.gemm1_clamp_limit,
             )
+        elif use_w4a4:
+            # Masked twin of the contiguous path's silu_mul_quant_mxfp4: it walks
+            # the (expert, token) slots `masked_m` declares instead of the padded
+            # (E, m_max) rectangle, so the padding rows are never touched.
+            from sglang.kernels.ops.quantization.mxfp4_group_quant import (
+                silu_mul_quant_mxfp4_masked,
+            )
+
+            # The swizzled mega-moe layout is rejected up front, in
+            # _use_deepgemm_w4a4, so this branch can assume a plain [gate | up].
+            topk_ids_rs = running_state.get("topk_ids")
+            assert topk_ids_rs is not None, (
+                "the masked W4A4 activation needs running_state['topk_ids']"
+            )
+            down_input, down_input_scale = silu_mul_quant_mxfp4_masked(
+                gateup_output,
+                masked_m,
+                topk=self.config.top_k,
+                num_real_tokens=topk_ids_rs.shape[0],
+                swiglu_limit=swiglu_limit_arg,
+            )
         else:
             topk_ids_rs = running_state.get("topk_ids")
             num_real_tokens = (
@@ -842,15 +945,20 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     down_input_scale
                 )
             )
-        elif deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
+        elif deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES and not use_w4a4:
             down_input_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
                 down_input_scale
             )
 
-        recipe_a_down, _ = quant_info.scale_recipes(
-            activation_block_size=scale_block_size,
-            hidden_size=down_input.shape[-1],
-            activation_scale_width=down_input_scale.shape[-1],
+        # As on the contiguous path: W4A4's down activation is packed e2m1.
+        recipe_a_down = (
+            (1, 32)
+            if use_w4a4
+            else quant_info.scale_recipes(
+                activation_block_size=scale_block_size,
+                hidden_size=down_input.shape[-1],
+                activation_scale_width=down_input_scale.shape[-1],
+            )[0]
         )
         with use_symmetric_memory(
             get_parallel().tp_group, disabled=not is_allocation_symmetric()
@@ -1011,11 +1119,17 @@ def pre_permute_standard_to_deep_gemm(
         deep_gemm_sm120.allows_masked_standard_layout()
         and _should_use_masked_standard_layout(runner_config, quant_info, hidden_states)
     ):
-        output_dtype = (
-            torch.bfloat16
-            if quant_info.w13_weight.dtype == torch.bfloat16
-            else torch.float8_e4m3fn
-        )
+        if quant_info.w13_weight.dtype == torch.bfloat16:
+            output_dtype = torch.bfloat16
+        else:
+            # W4A4 swaps the activation to packed e2m1 in the same padded
+            # (E, m_max, ...) layout, at half the K extent and with int32
+            # group-32 ue8m0 words (`moe_ep_deepgemm_preprocess`).
+            output_dtype = (
+                torch.int8
+                if _use_deepgemm_w4a4(quant_info, runner_config)
+                else torch.float8_e4m3fn
+            )
         masked_m, _, src2dst, hidden_states, hidden_states_scale = (
             moe_ep_deepgemm_preprocess(
                 topk_ids,
@@ -1053,8 +1167,12 @@ def pre_permute_standard_to_deep_gemm(
             use_masked_gemm=True,
             masked_m=masked_m,
             expected_m=expected_m,
+            # W4A4's packed e2m1 activation carries one ue8m0 scale per 32
+            # elements along K; the fp8 paths keep the block_shape-derived group.
             activation_scale_block_size=(
-                quant_info.block_shape[1] if quant_info.block_shape else 128
+                32
+                if output_dtype == torch.int8
+                else (quant_info.block_shape[1] if quant_info.block_shape else 128)
             ),
         )
 
@@ -1100,6 +1218,97 @@ def pre_permute_standard_to_deep_gemm(
             (all_tokens, 1), device=hidden_states_device, dtype=torch.float32
         )
     else:
+        use_w4a4 = _use_deepgemm_w4a4(quant_info, runner_config)
+        if use_w4a4:
+            # (T, K // 2) int8 packed e2m1 + (T, K // 128) int32 packed ue8m0
+            # (mn-major). Per-token scale word count (K // 128) matches the fp8
+            # path, so ep_scatter's scale copy works unchanged with
+            # hidden_size = K // 2 and quant_block_size = 64.
+            # `zeros`, not `empty` (like the fp8 branch below): the compact
+            # layout pads each expert's segment up to 128, and the scatter
+            # writes a scale only for rows a slot actually lands on, so a
+            # padded row would hold a garbage byte, which decodes as a
+            # bogus ue8m0 scale in the GEMM.
+            packed_input = torch.zeros(
+                (all_tokens, k // 2), device=hidden_states_device, dtype=torch.int8
+            )
+            scale_words = k // 128
+            packed_input_scale = torch.zeros(
+                (scale_words, triton.cdiv(all_tokens, 4) * 4),
+                device=hidden_states_device,
+                dtype=torch.int32,
+            ).transpose(0, 1)[:all_tokens, :]
+            expert_start_loc = torch.empty(
+                num_experts, device=hidden_states_device, dtype=torch.int32
+            )
+            m_indices = torch.empty(
+                all_tokens, device=hidden_states_device, dtype=torch.int32
+            )
+            src2dst = torch.empty_like(topk_ids, dtype=torch.int32)
+            if envs.SGLANG_USE_DEEPGEMM_W4A4_FUSED_SCATTER.get():
+                from sglang.kernels.ops.moe.ep_moe_kernels import ep_scatter_quant_mxfp4
+
+                ep_scatter_quant_mxfp4(
+                    hidden_states,
+                    topk_ids,
+                    tokens_per_expert,
+                    valid_tokens_per_expert,
+                    expert_start_loc,
+                    packed_input,
+                    packed_input_scale,
+                    m_indices,
+                    src2dst,
+                    expert_alignment=block_e,
+                    expert_start=expert_start,
+                )
+            else:
+                from sglang.kernels.ops.quantization.mxfp4_group_quant import (
+                    quant_mxfp4_group32_v2,
+                )
+
+                packed_input_source, packed_input_source_scale = quant_mxfp4_group32_v2(
+                    hidden_states
+                )
+                ep_scatter(
+                    packed_input_source,
+                    packed_input_source_scale,
+                    topk_ids,
+                    tokens_per_expert,
+                    valid_tokens_per_expert,
+                    expert_start_loc,
+                    packed_input,
+                    packed_input_scale,
+                    m_indices,
+                    src2dst,
+                    scale_ue8m0=False,
+                    quant_block_size=64,
+                    expert_alignment=block_e,
+                    expert_start=expert_start,
+                )
+            if runner_config.inplace:
+                dispose_tensor(hidden_states_ref)
+            running_state["topk_ids"] = topk_ids
+            running_state["topk_weights"] = topk_weights
+            running_state["hidden_states_shape"] = hidden_states_shape
+            running_state["hidden_states_dtype"] = hidden_states_dtype
+            running_state["hidden_states_device"] = hidden_states_device
+            running_state["src2dst"] = src2dst
+            running_state["all_tokens"] = all_tokens
+            # The compact layout was padded with this block_e; the grouped GEMM
+            # has to be told, or it reads the buffer with DeepGEMM's default
+            # (128) alignment. The generic compact path below publishes the same
+            # key.
+            running_state["contiguous_layout_alignment"] = block_e
+            return DeepGemmRunnerInput(
+                hidden_states=packed_input,
+                hidden_states_scale=packed_input_scale,
+                use_masked_gemm=False,
+                m_indices=m_indices,
+                # The packed e2m1 activation carries one ue8m0 scale per 32
+                # elements along K, not the block_shape the fp8 paths use.
+                activation_scale_block_size=32,
+            )
+
         from sglang.kernels.ops.quantization.fp8_kernel import (
             sglang_per_token_group_quant_fp8,
         )
@@ -1129,6 +1338,13 @@ def pre_permute_standard_to_deep_gemm(
         if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
             scale_width = ceil_div(scale_width, 4)
         if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            # `zeros`, not `empty`, and not create_per_token_group_quant_fp8_output_scale
+            # (which allocates with `empty`): shape-wise this is that helper's
+            # MN-major twin -- the same (scale_words, all_tokens) storage
+            # transposed into the view the GEMM reads -- but the compact layout
+            # pads the last expert's segment up to `all_tokens` and ep_scatter
+            # writes a scale only for rows a slot actually lands on, so a padded
+            # row would hold a garbage byte, which decodes as a NaN ue8m0 scale.
             packed_input_scale = torch.zeros(
                 (scale_width, all_tokens),
                 device=hidden_states_device,
