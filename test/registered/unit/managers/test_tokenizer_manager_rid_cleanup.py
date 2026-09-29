@@ -11,9 +11,11 @@ Covers:
   - _init_req_state rejects duplicate rids
   - Resubmission succeeds after cleanup
   - Handler failures clean up pending and dispatched requests
+  - _handle_batch_output takes non-streaming first_token_time from the scheduler
 """
 
 import asyncio
+import time
 import unittest
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
@@ -29,6 +31,7 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
     AbortReq,
     BatchStrOutput,
     GenerateReqInput,
+    wrap_as_pickle,
 )
 from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
     ReqState,
@@ -36,6 +39,7 @@ from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
 )
 from sglang.srt.observability.req_time_stats import (  # noqa: E402
     APIServerReqTimeStats,
+    SchedulerReqTimeStats,
 )
 from sglang.srt.runtime_context import get_context
 
@@ -497,6 +501,39 @@ class TestRequestTpotGating(CustomTestCase):
                     self.assertGreater(tpot, 0.0)
                 else:
                     self.assertIsNone(tpot)
+
+
+class TestNonStreamingFirstTokenTime(CustomTestCase):
+    def _run(self, *, stream: bool, prefill_finished_time: float):
+        tm = _make_tokenizer_manager(self)
+        rid = "ttft_rid"
+        state = _make_req_state(rid)
+        state.obj.stream = stream
+        state.time_stats.created_time = time.perf_counter() - 1.0
+        tm.rid_to_state[rid] = state
+        sched_stats = SchedulerReqTimeStats(
+            enable_metrics=True, prefill_finished_time=prefill_finished_time
+        )
+        batch_output = _make_batch_str_output(rid, finished_reason=_NOT_FINISHED)
+        batch_output.time_stats = wrap_as_pickle([sched_stats])
+        arrival = time.perf_counter()
+        asyncio.run(tm._handle_batch_output(batch_output))
+        return state.time_stats, arrival
+
+    def test_non_streaming_uses_scheduler_time(self):
+        produced = time.perf_counter() - 0.5
+        stats, arrival = self._run(stream=False, prefill_finished_time=produced)
+        self.assertAlmostEqual(stats.first_token_time, produced, delta=1e-3)
+        self.assertGreaterEqual(stats.last_time, arrival)
+
+    def test_streaming_uses_arrival_time(self):
+        produced = time.perf_counter() - 0.5
+        stats, arrival = self._run(stream=True, prefill_finished_time=produced)
+        self.assertGreaterEqual(stats.first_token_time, arrival)
+
+    def test_falls_back_to_arrival_without_scheduler_time(self):
+        stats, arrival = self._run(stream=False, prefill_finished_time=0.0)
+        self.assertGreaterEqual(stats.first_token_time, arrival)
 
 
 class TestInitReqStateDuplicateDetection(CustomTestCase):
