@@ -22,8 +22,7 @@ fn engine() -> Arc<Worker> {
         url: "http://w".into(),
         mode: Stage::Plain,
         model_ids: vec![ModelId("m".into())],
-        bootstrap_port: None,
-        version_group: None,
+        ..Default::default()
     }))
 }
 

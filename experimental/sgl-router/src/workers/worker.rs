@@ -347,8 +347,7 @@ mod tests {
             url: "http://x".into(),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("m".into())],
-            bootstrap_port: None,
-            version_group: None,
+            ..Default::default()
         });
         assert_eq!(w.router_inflight_load(), 0);
         let g = w.load_guard();
@@ -396,8 +395,7 @@ mod tests {
                 url: "http://x".into(),
                 mode: m,
                 model_ids: vec![],
-                bootstrap_port: None,
-                version_group: None,
+                ..Default::default()
             });
             assert_eq!(w.mode(), m);
         }
@@ -410,8 +408,7 @@ mod tests {
             url: "http://x".into(),
             mode: WorkerMode::Prefill,
             model_ids: vec![],
-            bootstrap_port: None,
-            version_group: None,
+            ..Default::default()
         });
         assert_eq!(w.mode(), WorkerMode::Prefill);
         w.set_mode(WorkerMode::Decode);
@@ -427,8 +424,7 @@ mod tests {
             url: "http://x".into(),
             mode: WorkerMode::Plain,
             model_ids: vec![],
-            bootstrap_port: None,
-            version_group: None,
+            ..Default::default()
         };
         // `new` takes the always-safe default; the resolved protocol reaches a
         // worker only through the constructor the registry uses.
@@ -447,7 +443,7 @@ mod tests {
             mode: WorkerMode::Prefill,
             model_ids: vec![ModelId("m".into())],
             bootstrap_port: Some(8997),
-            version_group: None,
+            ..Default::default()
         });
         assert_eq!(w.bootstrap_port(), Some(8997));
     }
@@ -459,8 +455,7 @@ mod tests {
             url: "http://10.0.0.1:30000".into(),
             mode: WorkerMode::Plain,
             model_ids: vec![],
-            bootstrap_port: None,
-            version_group: None,
+            ..Default::default()
         });
         assert_eq!(w.bootstrap_port(), None);
     }
@@ -473,8 +468,7 @@ mod tests {
                 url: "http://10.0.0.1:30000".into(),
                 mode: WorkerMode::Prefill,
                 model_ids: models.iter().map(|m| ModelId((*m).into())).collect(),
-                bootstrap_port: None,
-                version_group: None,
+                ..Default::default()
             })
         };
         let model_less = prefill(&[]);
@@ -498,7 +492,7 @@ mod tests {
             mode: WorkerMode::Prefill,
             model_ids: vec![],
             bootstrap_port: Some(8997),
-            version_group: None,
+            ..Default::default()
         });
         assert_eq!(w.bootstrap_host(), "10.0.0.1");
     }
@@ -511,7 +505,7 @@ mod tests {
             mode: WorkerMode::Prefill,
             model_ids: vec![],
             bootstrap_port: Some(8997),
-            version_group: None,
+            ..Default::default()
         });
         assert_eq!(w.bootstrap_host(), "prefill-0.svc.cluster.local");
     }
@@ -528,7 +522,7 @@ mod tests {
             mode: WorkerMode::Prefill,
             model_ids: vec![],
             bootstrap_port: Some(8997),
-            version_group: None,
+            ..Default::default()
         });
         assert_eq!(w.bootstrap_host(), "localhost");
     }
@@ -539,8 +533,7 @@ mod tests {
             url: "http://x".into(),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("m".into())],
-            bootstrap_port: None,
-            version_group: None,
+            ..Default::default()
         })
     }
 

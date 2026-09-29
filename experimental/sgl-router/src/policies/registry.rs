@@ -347,7 +347,7 @@ mod tests {
             mode,
             model_ids: vec![ModelId(model.into())],
             bootstrap_port: (mode == WorkerMode::Prefill).then_some(8997),
-            version_group: None,
+            ..Default::default()
         }
     }
 
@@ -625,8 +625,7 @@ mod tests {
             url: url.into(),
             mode,
             model_ids: vec![ModelId(model.into())],
-            bootstrap_port: None,
-            version_group: None,
+            ..Default::default()
         }
     }
 

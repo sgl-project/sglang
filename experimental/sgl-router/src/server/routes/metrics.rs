@@ -497,8 +497,7 @@ mod tests {
                 url: "http://p0:30000".into(),
                 mode: WorkerMode::Prefill,
                 model_ids: vec![ModelId("m".into())],
-                bootstrap_port: None,
-                version_group: None,
+                ..Default::default()
             })
             .unwrap();
         let app = crate::server::app::build_router(ctx.clone());

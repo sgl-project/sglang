@@ -13,8 +13,7 @@ fn worker(id: &str) -> Arc<Worker> {
         url: format!("http://{id}"),
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId("m".into())],
-        bootstrap_port: None,
-        version_group: None,
+        ..Default::default()
     }))
 }
 

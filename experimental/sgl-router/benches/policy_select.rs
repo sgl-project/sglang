@@ -25,8 +25,7 @@ fn workers(n: usize, model: &str) -> Vec<Arc<Worker>> {
                 url: format!("http://w{i}:30000"),
                 mode: WorkerMode::Plain,
                 model_ids: vec![ModelId(model.into())],
-                bootstrap_port: None,
-                version_group: None,
+                ..Default::default()
             })
             .expect("test workers are unmixed");
     }

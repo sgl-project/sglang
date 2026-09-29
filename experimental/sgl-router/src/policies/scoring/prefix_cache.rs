@@ -132,8 +132,7 @@ mod tests {
             url: url.into(),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("tiny".into())],
-            bootstrap_port: None,
-            version_group: None,
+            ..Default::default()
         }))
     }
 

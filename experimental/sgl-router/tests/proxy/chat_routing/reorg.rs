@@ -110,7 +110,7 @@ fn context(workers: &[(&str, Stage, &MockWorker)], buckets: Vec<Bucket>) -> Arc<
                 mode,
                 model_ids: vec![ModelId("tiny".into())],
                 bootstrap_port: Some(8998),
-                version_group: None,
+                ..Default::default()
             })
             .unwrap();
     }
@@ -763,8 +763,7 @@ async fn portless_prefill_is_not_dispatched_until_bootstrap_is_resolved() {
             url: prefill.url.clone(),
             mode: Stage::Prefill,
             model_ids: vec![ModelId("tiny".into())],
-            bootstrap_port: None,
-            version_group: None,
+            ..Default::default()
         };
         ctx.registry.add(spec.clone()).unwrap();
         let app = build_router(ctx.clone());

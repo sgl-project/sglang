@@ -34,8 +34,7 @@ fn engine() -> Arc<Worker> {
         url: URL.into(),
         mode: Stage::Plain,
         model_ids: vec![ModelId("m".into())],
-        bootstrap_port: None,
-        version_group: None,
+        ..Default::default()
     }))
 }
 
@@ -77,8 +76,7 @@ async fn selected_load_reaches_admission_and_next_pick_reads_fresh_state() {
         url: "http://other".into(),
         mode: Stage::Plain,
         model_ids: vec![ModelId("m".into())],
-        bootstrap_port: None,
-        version_group: None,
+        ..Default::default()
     }));
     // These old-format reports lack native pressure metrics, so selection uses
     // local active counts for both candidates and chooses the second engine.

@@ -14,7 +14,7 @@ fn pd_ctx(prefill: &str, decode: &str, reorg: bool) -> Arc<AppContext> {
         mode,
         model_ids: vec![ModelId("tiny".into())],
         bootstrap_port: Some(8997),
-        version_group: None,
+        ..Default::default()
     };
     let mut ctx = build_ctx(vec![
         spec("p", prefill, WorkerMode::Prefill),

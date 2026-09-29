@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 /// Opaque worker identifier. Wraps a string so callsites can't confuse it
 /// with other string types (e.g. `ModelId`).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct WorkerId(pub String);
 
 impl std::fmt::Display for WorkerId {
@@ -27,9 +27,10 @@ impl std::fmt::Display for ModelId {
 /// Prefill/Decode/Plain role of a worker.
 ///
 /// Serialises as `"plain"`, `"prefill"`, `"decode"` (snake_case).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerMode {
+    #[default]
     Plain,
     Prefill,
     Decode,
@@ -55,7 +56,7 @@ pub enum WorkerMode {
 /// with a decode worker whose `version_group` is equal, so two engine
 /// versions rolled out side by side never exchange KV. `None` is its own
 /// group, which keeps unlabeled deployments pairing freely.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerSpec {
     pub id: WorkerId,
     pub url: String,
@@ -103,8 +104,7 @@ mod tests {
             url: "http://10.0.0.1:30000".into(),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("qwen".into())],
-            bootstrap_port: None,
-            version_group: None,
+            ..Default::default()
         };
         let s = serde_json::to_string(&w).unwrap();
         let d: WorkerSpec = serde_json::from_str(&s).unwrap();
@@ -119,7 +119,7 @@ mod tests {
             mode: WorkerMode::Prefill,
             model_ids: vec![ModelId("qwen".into())],
             bootstrap_port: Some(8997),
-            version_group: None,
+            ..Default::default()
         };
         let s = serde_json::to_string(&w).unwrap();
         assert!(s.contains("\"bootstrap_port\":8997"));
@@ -160,8 +160,7 @@ mod tests {
             url: "http://x:30000".into(),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("m1".into())],
-            bootstrap_port: None,
-            version_group: None,
+            ..Default::default()
         });
         let s = serde_json::to_string(&e).unwrap();
         let d: DiscoveryEvent = serde_json::from_str(&s).unwrap();

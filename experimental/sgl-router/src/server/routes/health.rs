@@ -168,8 +168,7 @@ mod tests {
                     url: format!("http://{mode:?}:30000"),
                     mode,
                     model_ids: vec![ModelId(ctx.config.model.id.clone())],
-                    bootstrap_port: None,
-                    version_group: None,
+                    ..Default::default()
                 })
                 .unwrap();
         }
@@ -189,8 +188,7 @@ mod tests {
                     url: "http://test:30000".into(),
                     mode: WorkerMode::Plain,
                     model_ids: vec![ModelId(ctx.config.model.id.clone())],
-                    bootstrap_port: None,
-                    version_group: None,
+                    ..Default::default()
                 })
                 .expect("test worker accepted");
         }
