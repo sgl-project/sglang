@@ -1,9 +1,10 @@
 """Native Beam serving on the deterministic fixture across parallel layouts.
 
-Prefill, cached decode and every parallel layout (TP2, TP2 with EP2, PP2, TP4)
-are compared against the eager BF16 oracle and, teacher-forced, against the TP1
-run. Layouts needing more GPUs than present are skipped. Single-GPU precision
-cases live in test/registered/e2e/models/test_beam_numerics.py.
+Prefill, cached decode and every parallel layout (TP2, TP2 with EP2, PP2, TP4,
+attention DP over TP2/TP4) are compared against the eager BF16 oracle and,
+teacher-forced, against the TP1 run. Layouts needing more GPUs than present
+are skipped. Single-GPU precision cases live in
+test/registered/e2e/models/test_beam_numerics.py.
 """
 
 import tempfile
@@ -45,6 +46,20 @@ PARALLEL_LAYOUTS = (
     ("pp2", dict(pp_size=2)),
     ("pp2_graphs", dict(pp_size=2, disable_cuda_graph=False)),
     ("tp4", dict(tp_size=4)),
+    # With EP2, TP == DP == EP reduce-scatters the MoE output instead of
+    # dp_scatter; DP2 x TP4 keeps attention TP2 inside each DP rank.
+    ("dp2_tp2", dict(tp_size=2, dp_size=2, enable_dp_attention=True)),
+    (
+        "dp2_tp2_ep2_dp_lm_head",
+        dict(
+            tp_size=2,
+            dp_size=2,
+            ep_size=2,
+            enable_dp_attention=True,
+            enable_dp_lm_head=True,
+        ),
+    ),
+    ("dp2_tp4", dict(tp_size=4, dp_size=2, enable_dp_attention=True)),
 )
 
 
