@@ -517,7 +517,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         if (
             allocate_all_layers
             or kvc.server_args.enable_hisparse
-            or not _should_elide_dsa_index_k(is_draft_worker=kvc.is_draft_worker)
+            or not _should_elide_dsa_index_k(
+                is_draft_worker=kvc.is_draft_worker,
+                allow_disaggregation=_is_npu,
+            )
         ):
             num_indexer_layers = num_layers
         else:

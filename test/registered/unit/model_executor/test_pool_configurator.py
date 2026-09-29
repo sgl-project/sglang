@@ -955,13 +955,13 @@ class TestDSAIndexerAllocationPolicy(CustomTestCase):
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
         return_value=576,
     )
-    def test_npu_bf16_compacts_indexers_only_outside_pd(
+    def test_npu_bf16_compacts_indexers_with_and_without_pd(
         self,
         _mock_calculate_mla_kv_cache_dim,
     ):
-        """Pre-arch35 NPU stays dense in PD but compacts standalone pools."""
+        """NPU prices only producer-layer indexers in standalone and PD."""
         num_layers = 6
-        for disaggregation_mode, indexer_layers in (("null", 3), ("prefill", 6)):
+        for disaggregation_mode, indexer_layers in (("null", 3), ("prefill", 3)):
             with self.subTest(disaggregation_mode=disaggregation_mode):
                 mr = _make_model_runner(
                     self,
