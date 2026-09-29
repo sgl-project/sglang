@@ -124,6 +124,33 @@ class TestNpuPinnedHostDiagnostics(unittest.TestCase):
             (700, 900, root, "memory.high"),
         )
 
+    def test_cgroup_v1_memory_controller_at_nondefault_mount(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "custom-memory-mount"
+            child = root / "worker"
+            child.mkdir(parents=True)
+            (root / "memory.usage_in_bytes").write_text("800\n")
+            (root / "memory.limit_in_bytes").write_text("1000\n")
+            (child / "memory.usage_in_bytes").write_text("100\n")
+            (child / "memory.limit_in_bytes").write_text("500\n")
+            cgroup_file = Path(directory) / "cgroup"
+            cgroup_file.write_text("3:memory:/worker\n")
+            mountinfo_file = Path(directory) / "mountinfo"
+            mountinfo_file.write_text(
+                f"23 1 0:22 / {root} rw - cgroup cgroup rw,memory\n"
+            )
+
+            located = diagnostics._cgroup_v1_mount(cgroup_file, mountinfo_file)
+            self.assertEqual(located, (child, root))
+            current, limit, limiting_group, limit_kind = (
+                diagnostics._cgroup_v1_memory(*located)
+            )
+
+        self.assertEqual(
+            (current, limit, limiting_group, limit_kind),
+            (800, 1000, root, "memory.limit_in_bytes"),
+        )
+
     def test_monitor_compares_loading_and_runtime_allocator_peaks(self):
         loading = {
             "pinned_active_peak_bytes": 100,

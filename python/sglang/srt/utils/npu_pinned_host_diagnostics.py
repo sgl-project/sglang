@@ -16,7 +16,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from functools import lru_cache
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +56,10 @@ def _read_int(path: Path) -> int | None:
         return None if value == "max" else int(value)
     except (OSError, ValueError):
         return None
+
+
+def _unescape_mount_path(value: str) -> str:
+    return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), value)
 
 
 def _percent(used: int | None, limit: int | None) -> float | None:
@@ -106,6 +110,68 @@ def _cgroup_v2_memory(
                     selected = (current, limit, directory, limit_name)
                     smallest_headroom = headroom
         if directory == root:
+            break
+        directory = directory.parent
+    return selected
+
+
+def _cgroup_v1_mount(
+    cgroup_file: Path = Path("/proc/self/cgroup"),
+    mountinfo_file: Path = Path("/proc/self/mountinfo"),
+) -> tuple[Path, Path] | None:
+    """Find the memory controller mount and this process's directory in it."""
+    try:
+        membership = next(
+            PurePosixPath(path)
+            for _, controllers, path in (
+                line.split(":", 2) for line in cgroup_file.read_text().splitlines()
+            )
+            if "memory" in controllers.split(",")
+        )
+        mounts = mountinfo_file.read_text().splitlines()
+    except (OSError, StopIteration, ValueError):
+        return None
+
+    for line in mounts:
+        try:
+            before, after = line.split(" - ", 1)
+            filesystem, _, options = after.split()[:3]
+            if filesystem != "cgroup" or "memory" not in options.split(","):
+                continue
+            fields = before.split()
+            mount_root = PurePosixPath(_unescape_mount_path(fields[3]))
+            mount = Path(_unescape_mount_path(fields[4]))
+            if membership.is_relative_to(mount_root):
+                relative = membership.relative_to(mount_root)
+            elif mount_root != PurePosixPath("/"):
+                # Private cgroup namespaces may report a path relative to the
+                # mount root while mountinfo still shows the host-side path.
+                relative = membership.relative_to("/")
+            else:
+                continue
+            directory = mount / relative
+            if (directory / "memory.usage_in_bytes").exists():
+                return directory, mount
+        except (IndexError, ValueError):
+            continue
+    return None
+
+
+def _cgroup_v1_memory(
+    directory: Path, mount: Path
+) -> tuple[int | None, int | None, Path, str | None]:
+    """Select the tightest memory limit across the v1 cgroup ancestry."""
+    selected = (_read_int(directory / "memory.usage_in_bytes"), None, directory, None)
+    smallest_headroom: int | None = None
+    while True:
+        current = _read_int(directory / "memory.usage_in_bytes")
+        limit = _read_int(directory / "memory.limit_in_bytes")
+        if limit is not None and limit < 1 << 60 and current is not None:
+            headroom = limit - current
+            if smallest_headroom is None or headroom < smallest_headroom:
+                selected = (current, limit, directory, "memory.limit_in_bytes")
+                smallest_headroom = headroom
+        if directory == mount:
             break
         directory = directory.parent
     return selected
@@ -175,13 +241,9 @@ def _host_and_cgroup_snapshot() -> dict[str, object]:
     cgroup = Path("/sys/fs/cgroup")
     current, limit, cgroup, limit_kind = _cgroup_v2_memory(cgroup)
     if current is None and limit is None:
-        # Common cgroup v1 mount; omit percentages when the mount is unavailable.
-        cgroup = cgroup / "memory"
-        current = _read_int(cgroup / "memory.usage_in_bytes")
-        limit = _read_int(cgroup / "memory.limit_in_bytes")
-        if limit is not None and limit >= 1 << 60:
-            limit = None
-        limit_kind = "memory.limit_in_bytes" if limit is not None else None
+        located = _cgroup_v1_mount()
+        cgroup, mount = located or (cgroup / "memory", cgroup / "memory")
+        current, limit, cgroup, limit_kind = _cgroup_v1_memory(cgroup, mount)
     hard_limit = (
         limit
         if limit_kind == "memory.limit_in_bytes"
@@ -219,6 +281,7 @@ def _host_and_cgroup_snapshot() -> dict[str, object]:
         "cgroup_memory_events": {
             key: cgroup_events.get(key) for key in ("high", "max", "oom", "oom_kill")
         },
+        "cgroup_memory_failcnt": _read_int(cgroup / "memory.failcnt"),
         "cgroup_memory_anon_bytes": cgroup_stat.get("anon"),
         "cgroup_memory_file_bytes": cgroup_stat.get("file"),
         "cgroup_memory_unevictable_bytes": cgroup_stat.get("unevictable"),

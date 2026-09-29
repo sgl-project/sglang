@@ -98,6 +98,11 @@ def summarize(lines) -> dict[str, object]:
         values = [event[key] for event in events if isinstance(event.get(key), int)]
         if len(values) > 1:
             event_delta[key] = max(values) - min(values)
+    v1_failcnt = [
+        record["cgroup_memory_failcnt"]
+        for record in samples
+        if isinstance(record.get("cgroup_memory_failcnt"), int)
+    ]
 
     auto_size = [record for marker, record in parsed if marker == "auto_size"]
     for record in auto_size:
@@ -158,6 +163,7 @@ def summarize(lines) -> dict[str, object]:
                     "cgroup_memory_limit_kind",
                     "cgroup_memory_limit_path",
                     "cgroup_memory_events",
+                    "cgroup_memory_failcnt",
                     "numa_node_memory",
                     "numa_bind_policies",
                 )
@@ -182,6 +188,9 @@ def summarize(lines) -> dict[str, object]:
             }
         ),
         "cgroup_event_delta": event_delta,
+        "cgroup_v1_failcnt_delta": (
+            max(v1_failcnt) - min(v1_failcnt) if len(v1_failcnt) > 1 else None
+        ),
         "pinned_allocation_failures": sum(
             marker == "NPU pinned host allocation failed: " for marker, _ in parsed
         ),
