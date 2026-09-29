@@ -80,7 +80,7 @@ _is_cuda = is_cuda()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 
-if _is_cuda or _is_xpu:
+if _is_cuda:
     from sglang.kernels.ops.attention.fused_qknorm_rope import (
         can_use_fused_qk_norm_rope,
         fused_qk_norm_rope,
@@ -576,12 +576,17 @@ class Qwen3MoeAttention(nn.Module):
         self.use_fused_qk_norm_rope = (
             get_exec().kernel.enable_fused_qk_norm_rope
             and self.compatible_with_fused_qk_norm_rope
-            and (_is_cuda or _is_xpu)
-            and can_use_fused_qk_norm_rope(
-                self.head_dim,
-                self.rotary_emb.is_neox_style,
-                torch.bfloat16,
-                _yarn_factor != 1.0,
+            and (
+                _is_xpu
+                or (
+                    _is_cuda
+                    and can_use_fused_qk_norm_rope(
+                        self.head_dim,
+                        self.rotary_emb.is_neox_style,
+                        torch.bfloat16,
+                        _yarn_factor != 1.0,
+                    )
+                )
             )
         )
         self.use_fused_qk_norm_rope_cpu = (
