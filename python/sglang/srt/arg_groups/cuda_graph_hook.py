@@ -331,6 +331,12 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
                 and not model_config_of(
                     server_args
                 ).is_multimodal_breakable_cuda_graph_supported
+                # Qwen4Exp supports breakable prefill for text-only batches.
+                and not (
+                    cfg.enable_multimodal is not True
+                    and model_config_of(server_args).hf_config.architectures[0]
+                    == "Qwen4ExpForConditionalGeneration"
+                )
             ),
         ),
     ]
