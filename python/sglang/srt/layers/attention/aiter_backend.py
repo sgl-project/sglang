@@ -2858,21 +2858,16 @@ class AiterAttnBackend(AttentionBackend):
     def init_mha_chunk_metadata(
         self, forward_batch: ForwardBatch, disable_flashinfer_ragged: bool = False
     ) -> None:
-        """Build the chunked-prefix route's asm work partitions, once per forward.
+        """Build the chunked-prefix route's PS metadata, once per forward.
 
-        The route's two attentions each attend a key set that is not the whole
-        sequence, and init_forward_metadata's partition describes only the whole
-        sequence. Everything else the route needs already sits on ForwardBatch.
+        Its attentions each attend a subset of the sequence, while
+        init_forward_metadata's PS metadata covers the whole sequence.
         """
-        # The one-shot core calls this hook too, with num_prefix_chunks pinned
-        # to 0. That route attends the whole assembled sequence and uses
-        # init_forward_metadata's partition, so building anything here would be
-        # per-forward work nobody reads.
+        # The one-shot core calls this hook too, with num_prefix_chunks 0.
         if not forward_batch.num_prefix_chunks or not self.use_fp8_prefill_attn:
             return
 
-        # Queries are the in-hand extend tokens in both passes -- only the keys
-        # differ -- so every partition shares this qo_indptr.
+        # Both passes query the extend tokens, so they share qo_indptr.
         extend_lens_cpu = torch.tensor(
             forward_batch.extend_seq_lens_cpu, dtype=torch.int32
         )
@@ -2898,9 +2893,8 @@ class AiterAttnBackend(AttentionBackend):
         metadatas: list[Optional[MlaPrefillPsMetadata]] = []
         for i in range(forward_batch.num_prefix_chunks):
             chunk_lens_cpu = forward_batch.prefix_chunk_seq_lens_cpu[i].to(torch.int32)
-            # A request with no keys in this chunk leaves an empty kv range,
-            # which the work partition has no shape for; those chunks take the
-            # varlen fallback in _forward_extend_prefix_chunk.
+            # An empty kv range has no PS metadata shape.
+            # _forward_extend_prefix_chunk falls back to varlen there.
             if forward_batch.prefix_chunk_has_zero_kv[i]:
                 metadatas.append(None)
                 continue
@@ -2961,9 +2955,8 @@ class AiterAttnBackend(AttentionBackend):
             need_lse=need_lse,
         )
         if exact_partial_count:
-            # One D2H sync per partition, in a host-side builder that already
-            # pays several inside get_ps_metadata_v1, and once per forward
-            # rather than per layer.
+            # One D2H sync per PS metadata, once per forward rather than per
+            # layer. get_ps_metadata_v1 already pays several.
             num_partial_tiles = int(reduce_indptr[-1].item())
             if need_lse:
                 assert num_partial_tiles > 0, (
@@ -2986,8 +2979,7 @@ class AiterAttnBackend(AttentionBackend):
             qo_indptr=qo_indptr,
             kv_indptr=kv_indptr,
             # The k/v handed to the kernel are contiguous and in key order, so
-            # the page table is the identity -- same as the whole-sequence
-            # partition's arange over seq_lens_sum.
+            # the page table is the identity.
             kv_indices=torch.arange(
                 num_kv_tokens, device=self.device, dtype=torch.int32
             ),
