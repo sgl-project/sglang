@@ -4,7 +4,7 @@ import threading
 import time
 import unittest
 from collections import defaultdict, deque
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 from sglang.srt.arg_groups.overrides import resolving_view
@@ -68,6 +68,10 @@ class TestAllocationConfiguration(CustomTestCase):
             {"attn_cp_size": 2},
             {"dcp_size": 2},
             {"enable_hisparse": True},
+            {
+                "disaggregation_mode": "decode",
+                "disaggregation_decode_host_receive_threshold": 0.5,
+            },
             {"enable_pdmux": True},
             {"enable_pd_role_switch": True},
             {"language_only": True},
@@ -425,7 +429,9 @@ class TestAllocationIntegration(CustomTestCase):
             enable_lora=False,
             metrics_reporter=SimpleNamespace(enable_metrics=False),
         )
-        # This is the first admission resource checked after waiting_for_input.
+        queue.req_to_metadata_buffer_idx_allocator = SimpleNamespace(
+            available_size=Mock(return_value=1)
+        )
         queue.req_to_token_pool = SimpleNamespace(available_size=Mock(return_value=0))
         with patch(
             "sglang.srt.disaggregation.decode.poll_and_all_reduce",
@@ -434,11 +440,13 @@ class TestAllocationIntegration(CustomTestCase):
             self.assertEqual(queue.pop_preallocated(), ([], []))
             self.flush()
             self.assertFalse(entry.waiting_for_input)
+            queue.req_to_metadata_buffer_idx_allocator.available_size.assert_not_called()
             queue.req_to_token_pool.available_size.assert_not_called()
             sender.mark_prefill_complete()
             self.flush()
             self.assertEqual(queue.pop_preallocated(), ([], []))
         self.assertTrue(entry.waiting_for_input)
+        queue.req_to_metadata_buffer_idx_allocator.available_size.assert_called_once()
         queue.req_to_token_pool.available_size.assert_called_once()
         self.assertEqual(queue.queue, [entry])
 
@@ -505,6 +513,10 @@ class TestAllocationIntegration(CustomTestCase):
                             has_bootstrapped_waiting_req=Mock(return_value=True),
                             optimistic_release_and_requeue=Mock(),
                         )
+                        scheduler.cache_unfinished_disagg_prefill = MethodType(
+                            SchedulerDisaggregationPrefillMixin.cache_unfinished_disagg_prefill,
+                            scheduler,
+                        )
                         running = SimpleNamespace(batch_is_full=True)
                         with patch(
                             "sglang.srt.disaggregation.prefill.maybe_cache_unfinished_req"
@@ -538,8 +550,10 @@ class TestAllocationIntegration(CustomTestCase):
             disagg_kv_sender=sender,
             pending_bootstrap=True,
             prefill_attempt_count=1,
+            skip_radix_cache_insert=False,
         )
         scheduler = SchedulerDisaggregationPrefillMixin()
+        scheduler.tree_cache = Mock()
         scheduler.scheduler_stage_metrics = None
         scheduler.disagg_prefill_inflight_queue = [req]
         scheduler.attn_cp_cpu_group = scheduler.attn_tp_cpu_group = object()
@@ -612,6 +626,48 @@ class TestAllocationIntegration(CustomTestCase):
         self.assertEqual(dispatched, [(receiver, {"rid": "resume"})])
         self.assertFalse(entry.waiting_for_input)
         self.assertEqual(req.disagg_prefill_dp_rank, 0)
+
+    def test_rebootstrap_dispatches_once_across_init_and_metadata(self):
+        for policy in ("early", "prefill_complete"):
+            with self.subTest(policy=policy):
+                override = get_context().override_server_args(
+                    disaggregation_decode_allocation_policy=policy
+                )
+                override.install()
+                try:
+                    receiver = Mock(conclude_state=None)
+                    req = SimpleNamespace(
+                        build_rebootstrap_payload=lambda: {"rid": "resume"},
+                        time_stats=Mock(),
+                    )
+                    entry = DecodeRequest(
+                        req=req, kv_receiver=receiver, is_rebootstrap=True
+                    )
+                    queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+                    queue.kv_manager = Mock()
+                    queue.req_to_metadata_buffer_idx_allocator = Mock()
+                    queue._transfer_page_indices = Mock(return_value=[0])
+                    queue.transfer_queue = SimpleNamespace(enable_staging=False)
+                    queue._num_published_destinations = 0
+                    events = Mock()
+                    events.attach_mock(receiver.send_metadata, "metadata")
+                    events.attach_mock(
+                        queue.kv_manager.submit_prefill_recompute, "recompute"
+                    )
+                    queue._init_receiver(entry, 0)
+                    queue._send_kv_metadata(entry, [0], 1)
+                    queue.kv_manager.submit_prefill_recompute.assert_called_once_with(
+                        receiver, {"rid": "resume"}
+                    )
+                    self.assertEqual(
+                        [event[0] for event in events.mock_calls],
+                        ["metadata", "recompute"]
+                        if policy == "early"
+                        else ["recompute", "metadata"],
+                    )
+                    self.assertEqual(queue._num_published_destinations, 1)
+                finally:
+                    override.restore()
 
     def test_normal_bootstrap_keeps_room_without_dispatching_recompute(self):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)

@@ -13,10 +13,10 @@ from sglang.srt.distributed.communication_op import (  # noqa
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.parallel_state import (
-    get_tensor_model_parallel_group,
     graph_capture,
     initialize_model_parallel,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase, publish_build_topology
 
@@ -100,7 +100,7 @@ class TestCustomAllReduce(CustomTestCase):
         )
         publish_build_topology(tp_size=world_size, world_rank=rank)
         initialize_model_parallel()
-        group = get_tensor_model_parallel_group().device_group
+        group = get_parallel().tp_group.device_group
 
         # Set global server args to avoid "Global server args is not set yet!" error
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
@@ -164,7 +164,7 @@ class TestCustomAllReduce(CustomTestCase):
         )
         publish_build_topology(tp_size=world_size, world_rank=rank)
         initialize_model_parallel()
-        group = get_tensor_model_parallel_group().device_group
+        group = get_parallel().tp_group.device_group
 
         # Set global server args to avoid "Global server args is not set yet!" error
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
