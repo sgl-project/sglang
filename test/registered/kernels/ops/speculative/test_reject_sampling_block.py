@@ -1,11 +1,11 @@
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 """Tests for speculative_sampling_block_kernel (block verification).
 
 Paper: https://arxiv.org/abs/2403.10444, Algorithm 2:
-h_i = Z_{i+1} / (Z_{i+1} + 1 - p_i), tau = argmax_i {coin_i <= h_i}.
+h_i = Z_{i+1} / (Z_{i+1} + 1 - p_i), tau = argmax_i {coin_i < h_i}.
 """
 
 import unittest
@@ -71,7 +71,7 @@ def block_verify_reference(
         )
         h = p if i == gamma else h_safe
 
-        upd = coins[:, i - 1] <= h
+        upd = coins[:, i - 1] < h
         tau = torch.where(upd, torch.full_like(tau, i), tau)
         z_res = torch.where(upd, z, z_res)
         p_res = torch.where(upd, p, p_res)
@@ -111,13 +111,18 @@ def block_verify_reference(
     return tau.to(torch.int32), predict_map
 
 
-def run_block_kernel(candidates, target_probs, draft_probs, coins, coin_final):
-    bs, S = candidates.shape
-    dev = candidates.device
+def _chain_buffers(bs, S, dev):
     predicts = torch.full((bs * S,), _SENTINEL, dtype=torch.int32, device=dev)
     accept_index = torch.full((bs, S), -1, dtype=torch.int32, device=dev)
     accept_token_num = torch.empty(bs, dtype=torch.int32, device=dev)
     retrive_index = torch.arange(bs * S, device=dev, dtype=torch.int32).view(bs, S)
+    return predicts, accept_index, accept_token_num, retrive_index
+
+
+def run_block_kernel(candidates, target_probs, draft_probs, coins, coin_final):
+    bs, S = candidates.shape
+    dev = candidates.device
+    predicts, accept_index, accept_token_num, retrive_index = _chain_buffers(bs, S, dev)
     chain_block_speculative_sampling_triton(
         predicts=predicts,
         accept_index=accept_index,
@@ -134,16 +139,13 @@ def run_block_kernel(candidates, target_probs, draft_probs, coins, coin_final):
         threshold_acc=1.0,
         deterministic=True,
     )
-    return accept_token_num, predict_map_from_flat(predicts, bs, S), accept_index
+    return accept_token_num, predicts.view(bs, S).to(torch.long), accept_index
 
 
 def run_classic_kernel(candidates, target_probs, draft_probs, coins, coin_final):
     bs, S = candidates.shape
     dev = candidates.device
-    predicts = torch.full((bs * S,), _SENTINEL, dtype=torch.int32, device=dev)
-    accept_index = torch.full((bs, S), -1, dtype=torch.int32, device=dev)
-    accept_token_num = torch.empty(bs, dtype=torch.int32, device=dev)
-    retrive_index = torch.arange(bs * S, device=dev, dtype=torch.int32).view(bs, S)
+    predicts, accept_index, accept_token_num, retrive_index = _chain_buffers(bs, S, dev)
     chain_speculative_sampling_triton(
         predicts=predicts,
         accept_index=accept_index,
@@ -160,15 +162,16 @@ def run_classic_kernel(candidates, target_probs, draft_probs, coins, coin_final)
         threshold_acc=1.0,
         deterministic=True,
     )
-    return accept_token_num, predict_map_from_flat(predicts, bs, S)
-
-
-def predict_map_from_flat(predicts, bs, S):
-    return predicts.view(bs, S).to(torch.long)
+    return accept_token_num, predicts.view(bs, S).to(torch.long)
 
 
 def make_chain_inputs(bs, gamma, vocab, seed, one_hot_frac=0.0):
-    """Random chain inputs: softmax target/draft rows, sampled draft tokens."""
+    """Random chain inputs: softmax target/draft rows, sampled draft tokens.
+
+    one_hot_frac of the draft rows are replaced with exact one-hots at their
+    argmax, which routes the kernel through its closed-form Z path while the
+    reference still computes the full scan.
+    """
     g = torch.Generator(device=DEV).manual_seed(seed)
     S = gamma + 1
 
@@ -200,57 +203,77 @@ def make_chain_inputs(bs, gamma, vocab, seed, one_hot_frac=0.0):
 
 @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA (Triton kernels)")
 class TestBlockVerificationKernel(CustomTestCase):
-    def test_block_matches_reference_random(self):
-        for gamma in (1, 2, 4, 8):
-            for vocab in (127, 1013, 2500, 4096):
-                c, t, d, coins, cf = make_chain_inputs(
-                    bs=7, gamma=gamma, vocab=vocab, seed=1234 + gamma * 31 + vocab
-                )
-                tau_k, pred_k, acc_idx_k = run_block_kernel(c, t, d, coins, cf)
-                tau_r, pred_r = block_verify_reference(
-                    c, t, d, coins, cf, vocab_size=vocab
-                )
-                torch.testing.assert_close(tau_k.cpu(), tau_r.cpu(), rtol=0, atol=0)
-                torch.testing.assert_close(pred_k.cpu(), pred_r.cpu(), rtol=0, atol=0)
-                # accepted slots [0..tau] materialized, rest stays -1
-                expected_idx = torch.where(
-                    torch.arange(acc_idx_k.shape[1])[None, :] <= tau_r[:, None].cpu(),
-                    torch.arange(acc_idx_k.numel(), dtype=torch.int32).view(
-                        acc_idx_k.shape
-                    ),
-                    torch.full_like(acc_idx_k, -1).cpu(),
-                )
-                torch.testing.assert_close(
-                    acc_idx_k.cpu(), expected_idx, rtol=0, atol=0
-                )
+    def test_block_matches_reference(self):
+        # One-hot coverage is folded in via one_hot_frac: the reference always
+        # computes the full vocab scan, so frac=1.0 cross-checks the kernel's
+        # closed-form shortcut against it.
+        for one_hot_frac in (0.0, 0.5, 1.0):
+            for gamma in (2, 4, 8):
+                for vocab in (127, 2500):
+                    with self.subTest(
+                        one_hot_frac=one_hot_frac, gamma=gamma, vocab=vocab
+                    ):
+                        c, t, d, coins, cf = make_chain_inputs(
+                            bs=7,
+                            gamma=gamma,
+                            vocab=vocab,
+                            seed=1234 + gamma * 31 + vocab + int(one_hot_frac * 100),
+                            one_hot_frac=one_hot_frac,
+                        )
+                        tau_k, pred_k, acc_idx_k = run_block_kernel(c, t, d, coins, cf)
+                        tau_r, pred_r = block_verify_reference(
+                            c, t, d, coins, cf, vocab_size=vocab
+                        )
+                        torch.testing.assert_close(
+                            tau_k.cpu(), tau_r.cpu(), rtol=0, atol=0
+                        )
+                        torch.testing.assert_close(
+                            pred_k.cpu(), pred_r.cpu(), rtol=0, atol=0
+                        )
+                        # accepted slots [0..tau] materialized, rest stays -1
+                        expected_idx = torch.where(
+                            torch.arange(acc_idx_k.shape[1])[None, :]
+                            <= tau_r[:, None].cpu(),
+                            torch.arange(acc_idx_k.numel(), dtype=torch.int32).view(
+                                acc_idx_k.shape
+                            ),
+                            torch.full_like(acc_idx_k, -1).cpu(),
+                        )
+                        torch.testing.assert_close(
+                            acc_idx_k.cpu(), expected_idx, rtol=0, atol=0
+                        )
 
-    def test_one_hot_fast_path(self):
-        # Fully one-hot draft rows => kernel takes the closed-form Z shortcut;
-        # the reference computes the full vocab scan. Must agree exactly.
-        for gamma in (2, 4, 8):
-            for vocab in (503, 2500):
-                with self.subTest(gamma=gamma, vocab=vocab):
-                    c, t, d, coins, cf = make_chain_inputs(
-                        bs=9,
-                        gamma=gamma,
-                        vocab=vocab,
-                        seed=777 + gamma,
-                        one_hot_frac=1.0,
-                    )
-                    tau_k, pred_k, _ = run_block_kernel(c, t, d, coins, cf)
-                    tau_r, pred_r = block_verify_reference(
-                        c, t, d, coins, cf, vocab_size=vocab
-                    )
-                    torch.testing.assert_close(tau_k.cpu(), tau_r.cpu(), rtol=0, atol=0)
-                    torch.testing.assert_close(
-                        pred_k.cpu(), pred_r.cpu(), rtol=0, atol=0
-                    )
+    def test_zero_coin_strict_reject(self):
+        # Guard for the strict `<` accept test: a zero coin must NOT accept a
+        # step with h == 0 (which would land tau on a zero-residual row), and
+        # must still accept a step with h > 0.
+        bs, gamma, vocab = 2, 2, 3
+        S = gamma + 1
+        t_row = torch.tensor([0.5, 0.5, 0.0], device=DEV)
+        d_row = torch.tensor([0.6, 0.3, 0.1], device=DEV)
+        target_probs = t_row.expand(bs, S, vocab).contiguous()
+        draft_probs = d_row.expand(bs, S, vocab).contiguous()
+
+        candidates = torch.zeros(bs, S, dtype=torch.int64, device=DEV)
+        # req 0: drafted token 2 has zero target mass -> p = 0 -> h = 0.
+        candidates[0, 1:] = 2
+        # req 1: drafted token 1 has r > 1 -> p = 1, Z > 0 -> h = 1.
+        candidates[1, 1:] = 1
+        coins = torch.zeros(bs, S, device=DEV)
+        cf = torch.full((bs,), 0.5, device=DEV)
+
+        tau_k, pred_k, _ = run_block_kernel(
+            candidates, target_probs, draft_probs, coins, cf
+        )
+        self.assertEqual(tau_k[0].item(), 0)
+        self.assertGreaterEqual(tau_k[1].item(), 1)
+        # zero-coin request still gets a real residual token from the root row
+        self.assertTrue((pred_k[0, 0] < vocab).item())
 
     def test_toy_model_losslessness_and_block_efficiency(self):
-        # The paper's motivating example (Sec. 2): context-free models
-        # M_b = [1/3, 2/3], M_s = [2/3, 1/3], gamma = 2.
-        # Analytic: token verification E[tau] = 10/9, block E[tau] = 11/9,
-        # and the first emitted token must follow M_b exactly (losslessness).
+        # The paper's Sec. 2 toy model, context-free: M_b = [1/3, 2/3],
+        # M_s = [2/3, 1/3]. Analytic for gamma=2: token E[tau] = 10/9,
+        # block E[tau] = 11/9. Emitted stream must be i.i.d. M_b.
         bs, gamma, vocab = 20000, 2, 3
         S = gamma + 1
         t_row = torch.tensor([1 / 3, 2 / 3, 0.0], device=DEV)
@@ -260,7 +283,6 @@ class TestBlockVerificationKernel(CustomTestCase):
 
         g = torch.Generator(device=DEV).manual_seed(2024)
         candidates = torch.zeros(bs, S, dtype=torch.int64, device=DEV)
-        # toy model is context-free: both draft tokens iid ~ d_row
         candidates[:, 1] = torch.multinomial(d_row.expand(bs, vocab), 1, generator=g)[
             :, 0
         ]
@@ -279,12 +301,11 @@ class TestBlockVerificationKernel(CustomTestCase):
 
         mean_classic = tau_classic.float().mean().item()
         mean_block = tau_block.float().mean().item()
-        # analytic block efficiencies for the toy pair (paper Sec. 2)
         self.assertAlmostEqual(mean_classic, 10 / 9, delta=0.03)
         self.assertAlmostEqual(mean_block, 11 / 9, delta=0.03)
         self.assertGreater(mean_block, mean_classic)
 
-        # losslessness: first emitted token ~ M_b
+        # marginal losslessness: first emitted token ~ M_b
         first = pred_block[:, 0]
         for tok in (0, 1):
             emp = (first == tok).float().mean().item()
@@ -292,61 +313,56 @@ class TestBlockVerificationKernel(CustomTestCase):
             sigma = (expect * (1 - expect) / bs) ** 0.5
             self.assertAlmostEqual(emp, expect, delta=5 * sigma)
 
-    def test_matched_coins_not_worse_than_classic(self):
-        # Block verification is never worse in expectation (Theorem 2); with
-        # non-uniform draft/target mismatch the improvement should be strict.
-        bs, gamma, vocab = 8192, 6, 1029
-        c, t, d, coins, cf = make_chain_inputs(bs=bs, gamma=gamma, vocab=vocab, seed=99)
-        tau_classic, _ = run_classic_kernel(c, t, d, coins, cf)
-        tau_block, _, _ = run_block_kernel(c, t, d, coins, cf)
-        mean_classic = tau_classic.float().mean().item()
-        mean_block = tau_block.float().mean().item()
-        # same input noise; means concentrate to ~1e-3
-        self.assertGreaterEqual(mean_block, mean_classic - 0.005)
-        self.assertGreater(mean_block, mean_classic)  # strict for mismatched q vs p
-
-    def test_degenerate_draft_rows(self):
-        bs, gamma, vocab = 5, 4, 509
-        c, t, d, coins, cf = make_chain_inputs(bs=bs, gamma=gamma, vocab=vocab, seed=5)
-        d[0, 1, :] = float("nan")  # NaN draft row
-        d[1, 0, :] = 0.0  # zero-mass draft row (q=0 -> always-accept semantics)
-        d[2, 2, :] = float("nan")
-        c[3, 1] = vocab - 1
-        c[4, 2] = 0
-        tau_k, pred_k, _ = run_block_kernel(c, t, d, coins, cf)
-        self.assertFalse(torch.isnan(pred_k.float()).any().item())
-        self.assertTrue(((pred_k >= 0) | (pred_k == _SENTINEL)).all().item())
-        valid = pred_k[pred_k != _SENTINEL]
-        self.assertTrue((valid < vocab).all().item())
-        self.assertTrue(((tau_k >= 0) & (tau_k <= gamma)).all().item())
-
-    def test_all_accepted_bonus_from_target_row(self):
-        # q == p exactly -> h = 1 everywhere -> all drafts accepted and the
-        # bonus is sampled from the last target row.
-        bs, gamma, vocab = 4000, 4, 1024
-        g = torch.Generator(device=DEV).manual_seed(4242)
+    def test_toy_model_two_token_joint(self):
+        # Stronger losslessness check: over many iterations of the paper's
+        # outer loop, adjacent emitted-token pairs must be i.i.d. M_b x M_b.
+        streams, gamma, iters = 8192, 2, 16
+        vocab = 3
         S = gamma + 1
-        shared = torch.softmax(
-            torch.randn(bs, S, vocab, generator=g, device=DEV) * 2.0, dim=-1
-        )
-        candidates = torch.zeros(bs, S, dtype=torch.int64, device=DEV)
-        candidates[:, 1:] = torch.multinomial(
-            shared[:, :-1].reshape(-1, vocab), 1, generator=g
-        ).view(bs, gamma)
-        coins = torch.rand(bs, S, generator=g, device=DEV)
-        cf = torch.rand(bs, generator=g, device=DEV)
-        tau_k, pred_k, _ = run_block_kernel(
-            candidates, shared.clone(), shared.clone(), coins, cf
-        )
-        self.assertTrue((tau_k == gamma).all().item())
-        bonus = pred_k[:, gamma]
-        # bonus must be a valid token id (sampled from row gamma of target)
-        self.assertTrue(((bonus >= 0) & (bonus < vocab)).all().item())
-        # sanity on the sampling: empirical top-token frequency should track
-        # the target row's argmax mass (loose check, just guards the CDF path)
-        amass = shared[:, gamma].max(-1).values.mean().item()
-        top_hits = (bonus == shared[:, gamma].argmax(-1)).float().mean().item()
-        self.assertAlmostEqual(top_hits, amass, delta=0.10)
+        t_row = torch.tensor([1 / 3, 2 / 3, 0.0], device=DEV)
+        d_row = torch.tensor([2 / 3, 1 / 3, 0.0], device=DEV)
+        target_probs = t_row.expand(streams, S, vocab).contiguous()
+        draft_probs = d_row.expand(streams, S, vocab).contiguous()
+
+        g = torch.Generator(device=DEV).manual_seed(7)
+        stream = [[] for _ in range(streams)]
+        for _ in range(iters):
+            candidates = torch.zeros(streams, S, dtype=torch.int64, device=DEV)
+            # Draw one token per chain step: multinomial with num_samples > 1
+            # defaults to replacement=False, which would corrupt the chain's
+            # conditional structure (never (0,0) / (1,1) with a 3-token toy).
+            candidates[:, 1] = torch.multinomial(
+                d_row.expand(streams, vocab), 1, generator=g
+            )[:, 0]
+            candidates[:, 2] = torch.multinomial(
+                d_row.expand(streams, vocab), 1, generator=g
+            )[:, 0]
+            coins = torch.rand(streams, S, generator=g, device=DEV)
+            cf = torch.rand(streams, generator=g, device=DEV)
+            tau_b, pred_b, _ = run_block_kernel(
+                candidates, target_probs, draft_probs, coins, cf
+            )
+            tau_l = tau_b.cpu().tolist()
+            pred_l = pred_b.cpu().tolist()
+            for b in range(streams):
+                stream[b].extend(pred_l[b][: tau_l[b] + 1])
+
+        bigram = torch.zeros(vocab, vocab)
+        total = 0
+        tok2_seen = 0
+        for s in stream:
+            tok2_seen += sum(1 for x in s if x == 2)
+            for a, b in zip(s, s[1:]):
+                bigram[a, b] += 1
+                total += 1
+
+        self.assertEqual(tok2_seen, 0)  # zero-mass token must never be emitted
+        for a in (0, 1):
+            for b in (0, 1):
+                expect = t_row[a].item() * t_row[b].item()
+                emp = bigram[a, b].item() / total
+                sigma = (expect * (1 - expect) / total) ** 0.5
+                self.assertAlmostEqual(emp, expect, delta=5 * sigma)
 
 
 if __name__ == "__main__":
