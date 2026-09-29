@@ -51,6 +51,18 @@ def unpack_gptq_qweight(qweight: torch.Tensor) -> torch.Tensor:
     return codes.reshape(-1, n)  # [K, N]
 
 
+def unpack_compressed_tensors_qweight(weight_packed: torch.Tensor) -> torch.Tensor:
+    """``[N, K // 8]`` int32 packed along K -> ``[N, K]`` codes in ``[0, 15]``.
+
+    ``pack_quantized`` uses natural nibble order, unlike AWQ's interleave.
+    """
+    n = weight_packed.shape[0]
+    shifts = _nibble_shifts(weight_packed.device)  # [8]
+    # [N, K // 8, 8]; sub-index i selects k = col * 8 + i
+    codes = (weight_packed.unsqueeze(-1) >> shifts.view(1, 1, 8)) & 0xF
+    return codes.reshape(n, -1)  # [N, K]
+
+
 def unpack_gptq_qzeros(qzeros: torch.Tensor) -> torch.Tensor:
     """``[K // gs, N // 8]`` int32 packed along N -> ``[K // gs, N]`` codes."""
     rows = qzeros.shape[0]
