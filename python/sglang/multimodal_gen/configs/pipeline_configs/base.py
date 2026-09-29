@@ -306,6 +306,11 @@ class PipelineConfig:
             f"supported tasks: {[task.name for task in candidates]}"
         )
 
+    def should_enable_vae_tiling(self, latents: torch.Tensor) -> bool:
+        """Return whether VAE tiling should be enabled for this decode."""
+        del latents
+        return self.vae_tiling
+
     def validate_server_args(self, server_args: Any) -> None:
         """Validate model-owned constraints after server args are normalized."""
 

@@ -358,6 +358,19 @@ def test_latent_pack_decode_contract():
     )
 
 
+def test_vae_tiling_defaults_to_enabled_and_is_still_overridable():
+    # Benchmarking showed no measurable perf/memory cost from VAE tiling at
+    # 256/512px, and full-frame decode hangs on gfx1151 from 896px upward, so
+    # Qwen-Image 2.1 tiles unconditionally by default (no platform/resolution
+    # threshold). --vae-tiling false still opts out explicitly.
+    latents = torch.zeros(1, 4, 1, 56, 56)
+    assert QwenImage21PipelineConfig().vae_tiling
+    assert QwenImage21PipelineConfig().should_enable_vae_tiling(latents)
+    assert not QwenImage21PipelineConfig(vae_tiling=False).should_enable_vae_tiling(
+        latents
+    )
+
+
 def test_default_image_output_format_preserves_rgba():
     assert QwenImage21SamplingParams.default_image_output_format() == "png"
     assert _resolve_image_output_format(None, QwenImage21SamplingParams) == "png"

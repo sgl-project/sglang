@@ -18,7 +18,7 @@ class QwenImage21PipelineConfig(ImagePipelineConfig):
     task_type: ModelTaskType = ModelTaskType.TI2I
     should_use_guidance: bool = False
     enable_autocast: bool = False
-    vae_tiling: bool = False
+    vae_tiling: bool = True
     vae_sp: bool = False
     vae_precision: str = "bf16"
     generator_device: str = "cpu"
