@@ -56,8 +56,6 @@ jobs:
           
           pip install websocket-client websockets uvicorn==0.49.0
           # copy required file from our daily cache
-          cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
-          cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
 
           echo "scaling_governor performance num: \
             $(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | grep performance | wc -l)"
