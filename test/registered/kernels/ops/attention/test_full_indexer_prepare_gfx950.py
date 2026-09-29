@@ -1,4 +1,4 @@
-"""Correctness and graph-capture coverage for gfx950 indexer preparation."""
+"""Correctness, graph replay, and performance tests for the gfx950 kernel."""
 
 import unittest
 
@@ -99,7 +99,7 @@ def _decode_cache_row(cache: torch.Tensor, slot: int) -> torch.Tensor:
 @unittest.skipUnless(
     _RUNNABLE, "requires HIP gfx950 and Triton >= 3.5 with Gluon CDNA4 support"
 )
-class TestROCmFullIndexerPrepare(CustomTestCase):
+class TestFullIndexerPrepareGfx950(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         torch.manual_seed(7)

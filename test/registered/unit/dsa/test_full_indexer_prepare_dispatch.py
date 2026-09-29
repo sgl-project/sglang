@@ -1,3 +1,5 @@
+"""CPU tests for full-indexer eligibility and kernel dispatch."""
+
 import sys
 from types import SimpleNamespace
 
