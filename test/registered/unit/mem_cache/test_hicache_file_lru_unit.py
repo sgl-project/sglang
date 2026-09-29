@@ -250,7 +250,11 @@ class TestScanExistingFiles(HiCacheFileLRUTestBase):
         d = tempfile.mkdtemp(prefix="hicache_seed_", dir=self.tmpdir)
         cfg = _make_config(
             model="seedmodel",
-            extra_config={"max_size": "1000", "min_free_space": "0"},
+            extra_config={
+                "max_size": "120",
+                "min_free_space": "0",
+                "eviction_ratio": 1,
+            },
         )
         # Files must end with the expected suffix for the rank/model.
         suffix = f"_seedmodel_0_1"
@@ -270,6 +274,17 @@ class TestScanExistingFiles(HiCacheFileLRUTestBase):
         keys = list(b._evictor._lru.keys())
         self.assertEqual(keys[0], f"old{suffix}")
         self.assertEqual(keys[1], f"new{suffix}")
+
+        # Adding a side-pool namespace must merge mtimes with the KV index.
+        state_path = os.path.join(d, "checkpoint_state.bin")
+        with open(state_path, "wb") as f:
+            f.write(b"s" * 40)
+        os.utime(state_path, (old_t - 100, old_t - 100))
+        b._evictor.add_owned_suffix("_state")
+        self.assertFalse(os.path.exists(state_path))
+        self.assertTrue(os.path.exists(old_path))
+        self.assertTrue(os.path.exists(new_path))
+        self.assertEqual(b._evictor._total_bytes, 120)
 
 
 class TestCPSuffix(HiCacheFileLRUTestBase):
