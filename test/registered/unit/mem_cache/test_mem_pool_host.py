@@ -431,7 +431,7 @@ class TestHostPoolGroup(CustomTestCase):
 
 
 class TestDSAIndexerPoolDecl(CustomTestCase):
-    """The declaration is the single source of indexer host bytes; the mirror
+    """The declaration is the single source of indexer host bytes. The mirror
     must not re-derive them."""
 
     def _stub(self):
@@ -492,7 +492,7 @@ class TestDSAIndexerPoolDecl(CustomTestCase):
         )
 
     def test_mirror_is_compact_over_layers_that_own_index_buffers(self):
-        """Shared-topk layers have 0-row device buffers; mirroring or
+        """Shared-topk layers have 0-row device buffers. Mirroring or
         transferring them dereferences a null pointer. The mirror must cover
         only the declared layers and translate packed-draft layer ids
         relative to that compact count."""

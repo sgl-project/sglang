@@ -10,28 +10,40 @@ from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.pool_host.host_pool_decl import HostPoolDecl
 
 
-class LayerBinding(msgspec.Struct, frozen=True, kw_only=True):
-    """Transfer layer (what the controller iterates) to device pool layer.
-
-    Compact host layer indices stay inside the host pool; packed draft
-    remapping stays inside the controller.
-    """
-
-    transfer_to_device: dict[int, int]
-    # Exclusive upper bound; transfer IDs may contain holes.
-    transfer_layer_id_max: int
-
-
-class HostPoolBuildConfig(msgspec.Struct, frozen=True, kw_only=True):
-    """A declaration bound to one stack: what the assembler builds an entry from."""
+class HostPoolConfig(msgspec.Struct, frozen=True, kw_only=True):
+    """Validated device owners and transfer layers for one host pool."""
 
     decl: HostPoolDecl
-    layer_binding: LayerBinding
+    layer_mapping: dict[int, int]
+    # Exclusive upper bound, including packed draft tails.
+    transfer_layer_id_max: int
     # Draft pools whose same-named buffers are appended as tail layers, in depth order.
     packed_draft_device_pools: tuple[Any, ...] = ()
 
 
-def validate_packed_draft_pools(
+class HostPoolGroupConfig(msgspec.Struct, frozen=True, kw_only=True):
+    """Validated host pools and their shared transfer granularity."""
+
+    # Original-token slots moved together. Individual buffers may use fewer rows.
+    transfer_page_size: int
+    # Dependency order with the unique primary KV root first.
+    pools: tuple[HostPoolConfig, ...]
+
+
+def with_packed_draft_layer_mapping(
+    layer_mapping: dict[int, int],
+    *,
+    transfer_layer_start: int,
+    target_device_layer_num: int,
+    draft_layer_num: int,
+) -> dict[int, int]:
+    return layer_mapping | {
+        transfer_layer_start + depth: target_device_layer_num + depth
+        for depth in range(draft_layer_num)
+    }
+
+
+def _validate_packed_draft_pools(
     *, target_decls: tuple[HostPoolDecl, ...], draft_pools: tuple[Any, ...]
 ) -> tuple[tuple[HostPoolDecl, ...], ...]:
     """Collect draft declarations once and check they can be appended to target host
@@ -94,6 +106,14 @@ def _find_pool_decl(*, decls: tuple[HostPoolDecl, ...], name: PoolName) -> HostP
 def _validate_and_order_decls(
     decls: tuple[HostPoolDecl, ...],
 ) -> tuple[HostPoolDecl, ...]:
+    names = [decl.pool_name for decl in decls]
+    if len(set(names)) != len(names):
+        raise ValueError(f"duplicate host pool names: {names}")
+    root = layout_root(decls)
+    if not root.is_primary or root.pool_name != PoolName.KV:
+        raise ValueError(
+            f"expected the layout root to be the primary KV pool, got {root.pool_name}"
+        )
     for decl in decls:
         if not decl.is_layout_root and (
             decl.host_pool_builder is None or decl.storage_info is None
@@ -107,14 +127,34 @@ def _validate_and_order_decls(
             or any(layer < 0 or layer >= decl.device_pool.layer_num for layer in owned)
         ):
             raise ValueError(f"{decl.pool_name}: invalid owned_device_layers {owned}")
+        if decl.is_primary:
+            continue
+        if decl.indices_from_pool != root.pool_name:
+            raise ValueError(
+                f"{decl.pool_name}.indices_from_pool must be {root.pool_name}, "
+                f"got {decl.indices_from_pool}"
+            )
+        if decl.is_layout_root:
+            continue
+        if decl.layout_source == decl.pool_name:
+            raise ValueError(f"{decl.pool_name}.layout_source must name another pool")
+        if decl.layout_source not in names:
+            raise ValueError(
+                f"{decl.pool_name} references undeclared pool {decl.layout_source}"
+            )
+    # Topologically sort by layout_source so dependencies are built first.
     ordered = []
     pending = list(decls)
     built = set()
     while pending:
-        ready = [d for d in pending if d.is_layout_root or d.layout_source in built]
+        ready = [
+            decl
+            for decl in pending
+            if decl.is_layout_root or decl.layout_source in built
+        ]
         if not ready:
             raise ValueError(
-                f"cyclic layout_source dependencies: {[d.pool_name for d in pending]}"
+                f"cyclic layout_source dependencies: {[decl.pool_name for decl in pending]}"
             )
         for decl in ready:
             ordered.append(decl)
@@ -123,66 +163,47 @@ def _validate_and_order_decls(
     return tuple(ordered)
 
 
-def prepare_host_pool_configs(
+def prepare_host_pool_config(
     *,
     decls: tuple[HostPoolDecl, ...],
     full_layer_mapping: dict[int, int],
     transfer_layer_id_max: int,
-    packed_draft_decls: tuple[tuple[HostPoolDecl, ...], ...] = (),
-) -> tuple[HostPoolBuildConfig, ...]:
-    """Bind declarations to a stack: the primary KV pool is the one layout root
-    that anchors the others' capacity, and every sidecar takes its indices from
-    it (HostPoolGroup resolves no chains).
+    transfer_page_size: int,
+    packed_draft_device_pools: tuple[Any, ...] = (),
+) -> HostPoolGroupConfig:
+    """Validate declarations and buffers, then append packed draft transfer layers.
 
-    ``packed_draft_decls`` have passed validate_packed_draft_pools; each config
-    carries the draft objects that own its same-named buffers."""
-    names = [d.pool_name for d in decls]
-    if len(set(names)) != len(names):
-        raise ValueError(f"duplicate host pool names: {names}")
-    root = layout_root(decls)
-    if not root.is_primary or root.pool_name != PoolName.KV:
-        raise ValueError(
-            f"expected the layout root to be the primary KV pool, got {root.pool_name}"
-        )
-    for d in decls:
-        if d.is_primary:
-            continue
-        if d.indices_from_pool != root.pool_name:
-            raise ValueError(
-                f"{d.pool_name}.indices_from_pool must be {root.pool_name}, "
-                f"got {d.indices_from_pool}"
-            )
-        if d.is_layout_root:
-            continue
-        if d.layout_source == d.pool_name:
-            raise ValueError(f"{d.pool_name}.layout_source must name another pool")
-        if d.layout_source not in names:
-            raise ValueError(
-                f"{d.pool_name} references undeclared pool {d.layout_source}"
-            )
+    The input mapping and limit describe target layers only. No host memory is
+    allocated here. config.pools are in host construction order.
+    """
     decls = _validate_and_order_decls(decls)
+    root = decls[0]
     target_layers = root.device_pool.layer_num
-    device_layer_limit = target_layers + len(packed_draft_decls)
     for transfer_id, device_id in full_layer_mapping.items():
         if not 0 <= transfer_id < transfer_layer_id_max:
             raise ValueError(
                 f"transfer layer {transfer_id} outside [0, {transfer_layer_id_max})"
             )
-        if not 0 <= device_id < device_layer_limit:
-            raise ValueError(
-                f"device layer {device_id} outside [0, {device_layer_limit})"
-            )
-    return tuple(
-        HostPoolBuildConfig(
+        if not 0 <= device_id < target_layers:
+            raise ValueError(f"device layer {device_id} outside [0, {target_layers})")
+    packed_draft_decls = _validate_packed_draft_pools(
+        target_decls=decls, draft_pools=packed_draft_device_pools
+    )
+    mapping = with_packed_draft_layer_mapping(
+        full_layer_mapping,
+        transfer_layer_start=transfer_layer_id_max,
+        target_device_layer_num=target_layers,
+        draft_layer_num=len(packed_draft_decls),
+    )
+    configs = tuple(
+        HostPoolConfig(
             decl=d,
-            layer_binding=LayerBinding(
-                transfer_to_device=_filter_owned_layer_mapping(
-                    mapping=full_layer_mapping,
-                    owned_device_layers=d.owned_device_layers,
-                    target_layer_num=root.device_pool.layer_num,
-                ),
-                transfer_layer_id_max=transfer_layer_id_max,
+            layer_mapping=_filter_owned_layer_mapping(
+                mapping=mapping,
+                owned_device_layers=d.owned_device_layers,
+                target_layer_num=target_layers,
             ),
+            transfer_layer_id_max=transfer_layer_id_max + len(packed_draft_decls),
             packed_draft_device_pools=tuple(
                 _find_pool_decl(decls=decls_of_draft, name=d.pool_name).device_pool
                 for decls_of_draft in packed_draft_decls
@@ -190,6 +211,17 @@ def prepare_host_pool_configs(
         )
         for d in decls
     )
+    check_packed_kv_rows(
+        kv_pool=root.device_pool,
+        drafts=configs[0].packed_draft_device_pools,
+    )
+    for config in configs[1:]:
+        config.decl.host_pool_builder.validate(
+            decl=config.decl,
+            transfer_page_size=transfer_page_size,
+            packed_draft_device_pools=config.packed_draft_device_pools,
+        )
+    return HostPoolGroupConfig(transfer_page_size=transfer_page_size, pools=configs)
 
 
 def _filter_owned_layer_mapping(
@@ -206,3 +238,33 @@ def _filter_owned_layer_mapping(
     return {
         t: dev for t, dev in mapping.items() if dev >= target_layer_num or dev in owned
     }
+
+
+def is_mla_pool(pool: Any) -> bool:
+    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+    return isinstance(pool, MLATokenToKVPool)
+
+
+def _kv_row_signature(pool: Any, *, use_mla: bool) -> tuple:
+    if use_mla:
+        return (pool.kv_cache_dim, pool.store_dtype)
+    return (pool.head_num, pool.head_dim, pool.v_head_dim, pool.store_dtype)
+
+
+def check_packed_kv_rows(
+    *, kv_pool: Any, drafts: tuple[Any, ...], use_mla: Optional[bool] = None
+):
+    """Packed draft KV layers share the target's host row, so their device
+    rows must have the same shape and dtype."""
+    if not drafts:
+        return
+    if use_mla is None:
+        use_mla = is_mla_pool(kv_pool)
+    target = _kv_row_signature(kv_pool, use_mla=use_mla)
+    for draft in drafts:
+        row = _kv_row_signature(draft, use_mla=use_mla)
+        if row != target:
+            raise ValueError(
+                f"packed draft KV row {row} differs from target KV row {target}"
+            )

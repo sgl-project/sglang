@@ -1878,7 +1878,7 @@ class KVCache(abc.ABC):
         index keys in subclasses. Not a description of the whole model: buffers
         owned elsewhere (e.g. Mamba state in req_to_token_pool) are declared by
         their owner or assembled by the existing strategy paths."""
-        # pool_host imports this module; resolve the declaration types lazily.
+        # pool_host imports this module. Resolve the declaration types lazily.
         from sglang.srt.mem_cache.pool_host.host_pool_decl import make_kv_pool_decl
 
         return (make_kv_pool_decl(self),)
@@ -5006,7 +5006,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         return not self.skip_topk_layers[local_layer_idx]
 
     def host_pool_decls(self):
-        # pool_host imports this module; resolve the mirror side lazily.
+        # pool_host imports this module. Resolve the mirror side lazily.
         from sglang.srt.mem_cache.pool_host.dsa import make_dsa_indexer_pool_decl
 
         kv_decls = super().host_pool_decls()

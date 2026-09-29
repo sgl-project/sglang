@@ -1,7 +1,7 @@
 """Declarations of the host pools a device pool needs HiCache to keep.
 
-A device pool declares them (``HostPoolDecl``) through ``host_pool_decls()``;
-the assembler (hybrid_pool_assembler) binds each declaration to transfer layers
+A device pool declares them (``HostPoolDecl``) through ``host_pool_decls()``.
+The assembler (hybrid_pool_assembler) binds each declaration to transfer layers
 and builds one entry per declaration. This module holds only the declaration
 types and their basic constructors.
 """
@@ -23,7 +23,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 class HostPoolStorageInfo(msgspec.Struct, frozen=True, kw_only=True):
     """Bytes one host pool stores per token per layer, and their dtype.
 
-    Two equal values mean equal byte counts and dtype only; page geometry,
+    Two equal values mean equal byte counts and dtype only. Page geometry,
     scale placement and kernel layout are checked by the host pool builder.
     """
 
@@ -43,7 +43,8 @@ class HostPoolBuilder(Protocol):
         self,
         *,
         decl: HostPoolDecl,
-        page_size: int,
+        # Original-token slots, not the number of physical rows in this pool.
+        transfer_page_size: int,
         packed_draft_device_pools: tuple[Any, ...],
     ) -> None: ...
 
@@ -74,7 +75,7 @@ class HostPoolDecl(msgspec.Struct, frozen=True, kw_only=True):
     storage_info: Optional[HostPoolStorageInfo]
     host_pool_builder: Optional[HostPoolBuilder]
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
-    # Local device layers that own buffers for this pool; None means every
+    # Local device layers that own buffers for this pool. None means every
     # layer. Layers outside it get no host layer and no transfer.
     owned_device_layers: Optional[tuple[int, ...]] = None
 
@@ -99,7 +100,7 @@ class HostPoolDecl(msgspec.Struct, frozen=True, kw_only=True):
 
 
 def make_kv_pool_decl(pool: Any) -> HostPoolDecl:
-    """The primary KV pool every device pool declares; the assembler builds its
+    """The primary KV pool every device pool declares. The assembler builds its
     host pool, so no storage info is declared here."""
     return HostPoolDecl(
         pool_name=PoolName.KV,

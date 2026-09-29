@@ -65,7 +65,7 @@ class DSAIndexerHostPoolBuilder:
         self,
         *,
         decl: HostPoolDecl,
-        page_size: int,
+        transfer_page_size: int,
         packed_draft_device_pools: tuple[DSATokenToKVPool, ...],
     ) -> None:
         target = decl.device_pool
@@ -111,7 +111,7 @@ def make_dsa_indexer_pool_decl(
             dtype=DSATokenToKVPool.index_k_with_scale_buffer_dtype,
         ),
         host_pool_builder=DSAIndexerHostPoolBuilder(),
-        # Shared-topk layers own a 0-row placeholder buffer; they get no host
+        # Shared-topk layers own a 0-row placeholder buffer. They get no host
         # layer and must not reach the transfer kernels.
         owned_device_layers=tuple(
             i for i, skip in enumerate(pool.skip_topk_layers) if not skip

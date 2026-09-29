@@ -10,6 +10,9 @@ import torch
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
+from sglang.srt.mem_cache.hybrid_cache.host_pool_config import (
+    prepare_host_pool_config,
+)
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     StackBuildResult,
     _check_declared_pools_present,
@@ -21,11 +24,9 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _require_single_row_dsv4_swa_pages,
     _split_hicache_size,
     _SwaStrategy,
-    assemble_host_pools_from_decls,
     build_full_draft_pools,
+    build_host_pool_group,
     build_hybrid_swa_group,
-    prepare_host_pool_configs,
-    validate_packed_draft_pools,
 )
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
 from sglang.srt.mem_cache.pool_host import dsa as pool_host_dsa
@@ -255,7 +256,7 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
 
     def test_full_builder_registers_separate_dsa_draft_indexer(self):
         """The separate-draft DSA branch must build its indexer mirror from a
-        DRAFT_INDEXER decl; a constructor change that skips this call site
+        DRAFT_INDEXER decl. A constructor change that skips this call site
         breaks only here, not on the target path."""
         draft_kv_pool = object.__new__(DSATokenToKVPool)
         draft_kv_pool.layer_num = 1
@@ -399,8 +400,8 @@ def _target_params(drafts=(), page_size=64):
 
 
 # Mirror geometry for the 4096-token stubs at page 64 and host ratio 2:
-# 8256 host tokens (2 x 4096 plus one reserve page) = 129 pages; the MLA row is
-# kv_cache_dim 576 x bf16 = 1152 B per layer; the DSA index row is 132 B per
+# 8256 host tokens (2 x 4096 plus one reserve page) = 129 pages. The MLA row is
+# kv_cache_dim 576 x bf16 = 1152 B per layer. The DSA index row is 132 B per
 # token, 8448 B per page, per layer.
 _HOST_SIZE, _HOST_PAGES, _KV_ROW, _INDEX_ROW, _INDEX_PAGE = 8256, 129, 1152, 132, 8448
 
@@ -430,7 +431,7 @@ class TestDeclaredStackStructure(CustomTestCase):
     order, anchor, device owners, layer mapper over every transfer layer,
     packed drafts, mirror geometry, controller arguments, sidecars."""
 
-    def _run(self, *, pool, drafts, full_layer_mapping):
+    def _run(self, *, pool, drafts, full_layer_mapping, page_size=64):
         from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
         real_indexer_host = pool_host_dsa.DSAIndexerPoolHost
@@ -444,7 +445,7 @@ class TestDeclaredStackStructure(CustomTestCase):
                 layout="page_first",
                 pin_memory=False,
                 is_dummy=True,
-                override_kv_cache_dim=kwargs["override_kv_cache_dim"],
+                override_kv_cache_dim=kwargs["kv_pool"].kv_cache_dim,
                 mtp_draft_device_pools=kwargs["mtp_draft_device_pools"],
             )
 
@@ -460,38 +461,27 @@ class TestDeclaredStackStructure(CustomTestCase):
                 is_dummy=True,
             )
 
-        controller = MagicMock()
         with (
             patch.object(hybrid_pool_assembler, "build_kv_host_pool", dummy_kv_host),
             patch.object(pool_host_dsa, "DSAIndexerPoolHost", dummy_indexer_host),
-            patch.object(hybrid_pool_assembler, "HybridCacheController", controller),
             patch.object(
                 hybrid_pool_assembler, "_get_allocator_type", return_value="default"
             ),
-            patch.object(
-                hybrid_pool_assembler,
-                "get_memory",
-                return_value=SimpleNamespace(
-                    hicache_write_policy="write_through",
-                    hicache_io_backend="kernel",
-                    hicache_host_memory_mode="cache",
-                ),
-            ),
         ):
-            stack = assemble_host_pools_from_decls(
-                params=_target_params(drafts),
+            config = prepare_host_pool_config(
                 decls=pool.host_pool_decls(),
                 full_layer_mapping=dict(full_layer_mapping),
-                load_cache_event=None,
-                storage_backend=None,
-                use_mla=True,
-                override_kv_cache_dim=pool.kv_cache_dim,
+                transfer_layer_id_max=max(full_layer_mapping) + 1,
+                transfer_page_size=page_size,
+                packed_draft_device_pools=drafts,
             )
-        (call,) = controller.call_args_list
-        # target transfer layers exclude packed tail layers
-        self.assertEqual(call.args[2], 64)
-        self.assertEqual(call.kwargs["transfer_layer_id_max"], len(full_layer_mapping))
-        return stack
+            group = build_host_pool_group(config=config)
+        return SimpleNamespace(
+            host_pool_group=group,
+            sidecars=[
+                c.decl.sidecar_spec() for c in config.pools if not c.decl.is_primary
+            ],
+        )
 
     def test_dsa_target(self):
         pool = _dsa_pool_stub(layer_num=3)
@@ -508,6 +498,16 @@ class TestDeclaredStackStructure(CustomTestCase):
             stack.sidecars,
             [pool_host_dsa.make_dsa_indexer_pool_decl(pool).sidecar_spec()],
         )
+
+    def test_group_uses_prepared_page_size(self):
+        pool = _dsa_pool_stub(layer_num=1)
+        stack = self._run(
+            pool=pool, drafts=(), full_layer_mapping={0: 0}, page_size=128
+        )
+        for entry in stack.host_pool_group.entries:
+            self.assertEqual(entry.host_pool.page_size, 128)
+        indexer = stack.host_pool_group.get_pool(PoolName.INDEXER)
+        self.assertEqual(indexer.indexer_page_stride_size, 128 * _INDEX_ROW)
 
     def test_dsa_target_with_packed_draft(self):
         pool = _dsa_pool_stub(layer_num=3)
@@ -532,8 +532,47 @@ class TestDeclaredStackStructure(CustomTestCase):
             ],
         )
 
+    def test_strategy_keeps_target_controller_range_with_packed_draft(self):
+        pool = _dsa_pool_stub(layer_num=3)
+        draft = _dsa_pool_stub(layer_num=1)
+        stack = self._run(
+            pool=pool, drafts=(draft,), full_layer_mapping={0: 0, 1: 1, 2: 2}
+        )
+        with (
+            patch.object(
+                hybrid_pool_assembler,
+                "build_host_pool_group",
+                return_value=stack.host_pool_group,
+            ) as build,
+            patch.object(hybrid_pool_assembler, "HybridCacheController") as controller,
+            patch.object(
+                hybrid_pool_assembler,
+                "get_memory",
+                return_value=SimpleNamespace(
+                    hicache_write_policy="write_through",
+                    hicache_io_backend="kernel",
+                    hicache_host_memory_mode="cache",
+                ),
+            ),
+        ):
+            result = _DsaStrategy().build(
+                cache=None,
+                kvcache=pool,
+                params=_target_params((draft,)),
+                server_args=None,
+                load_cache_event=None,
+            )
+        self.assertEqual(controller.call_args.kwargs["transfer_layer_id_max"], 3)
+        self.assertEqual(controller.call_args.args[2], 64)
+        for config in build.call_args.kwargs["config"].pools:
+            self.assertEqual(config.transfer_layer_id_max, 4)
+            self.assertEqual(config.layer_mapping, {0: 0, 1: 1, 2: 2, 3: 3})
+            self.assertEqual(config.packed_draft_device_pools, (draft,))
+        self.assertIs(result.host_pool_group, stack.host_pool_group)
+        self.assertEqual(result.sidecars, stack.sidecars)
+
     def test_dsa_target_layer_sharded(self):
-        # rank 0 of 2 owns local layers 0 and 1 of 3; the permuted stage mapping
+        # rank 0 of 2 owns local layers 0 and 1 of 3. The permuted stage mapping
         # is passed through untouched and the host_pools hold only the owned layers.
         pool = _dsa_pool_stub(layer_num=3, shard=(0, 2))
         stack = self._run(pool=pool, drafts=(), full_layer_mapping={0: 1, 1: 2, 2: 0})
@@ -584,8 +623,12 @@ class TestPackedDraftPairing(CustomTestCase):
         no_index = _dsa_pool_stub(layer_num=1)
         no_index.index_key_cache = SimpleNamespace(buffer=[])
         with self.assertRaisesRegex(ValueError, "draft counterpart"):
-            validate_packed_draft_pools(
-                target_decls=target.host_pool_decls(), draft_pools=(no_index,)
+            prepare_host_pool_config(
+                decls=target.host_pool_decls(),
+                full_layer_mapping={i: i for i in range(target.layer_num)},
+                transfer_layer_id_max=target.layer_num,
+                transfer_page_size=64,
+                packed_draft_device_pools=(no_index,),
             )
 
     def test_draft_with_empty_index_layers_is_rejected(self):
@@ -595,14 +638,22 @@ class TestPackedDraftPairing(CustomTestCase):
         shared.skip_topk_layers = [True]
         shared.index_key_cache = SimpleNamespace(buffer=[object()])
         with self.assertRaisesRegex(ValueError, "draft counterpart"):
-            validate_packed_draft_pools(
-                target_decls=target.host_pool_decls(), draft_pools=(shared,)
+            prepare_host_pool_config(
+                decls=target.host_pool_decls(),
+                full_layer_mapping={i: i for i in range(target.layer_num)},
+                transfer_layer_id_max=target.layer_num,
+                transfer_page_size=64,
+                packed_draft_device_pools=(shared,),
             )
         partial = _dsa_pool_stub(layer_num=2)
         partial.skip_topk_layers = [False, True]
         with self.assertRaisesRegex(ValueError, "owns buffers on 1 of 2"):
-            validate_packed_draft_pools(
-                target_decls=target.host_pool_decls(), draft_pools=(partial,)
+            prepare_host_pool_config(
+                decls=target.host_pool_decls(),
+                full_layer_mapping={i: i for i in range(target.layer_num)},
+                transfer_layer_id_max=target.layer_num,
+                transfer_page_size=64,
+                packed_draft_device_pools=(partial,),
             )
 
     def test_storage_info_mismatch_is_rejected(self):
@@ -610,8 +661,12 @@ class TestPackedDraftPairing(CustomTestCase):
         wide = _dsa_pool_stub(layer_num=1)
         wide.index_head_dim = 256
         with self.assertRaisesRegex(ValueError, "storage"):
-            validate_packed_draft_pools(
-                target_decls=target.host_pool_decls(), draft_pools=(wide,)
+            prepare_host_pool_config(
+                decls=target.host_pool_decls(),
+                full_layer_mapping={i: i for i in range(target.layer_num)},
+                transfer_layer_id_max=target.layer_num,
+                transfer_page_size=64,
+                packed_draft_device_pools=(wide,),
             )
 
     def test_pool_with_only_shared_topk_layers_declares_kv_only(self):
@@ -653,7 +708,6 @@ class TestKvHostPoolRow(CustomTestCase):
             hybrid_pool_assembler.build_kv_host_pool(
                 kv_pool=pool,
                 page_size=64,
-                use_mla=True,
                 mtp_draft_device_pools=drafts,
             )
         return seen
@@ -677,10 +731,11 @@ class TestDeclaredPoolPlanning(CustomTestCase):
     planner must reject self-references and sidecar chains up front."""
 
     def _prepare(self, decls):
-        return prepare_host_pool_configs(
+        return prepare_host_pool_config(
             decls=decls,
             full_layer_mapping={0: 0},
             transfer_layer_id_max=1,
+            transfer_page_size=64,
         )
 
     def test_rejects_self_referencing_index_source(self):
@@ -711,9 +766,9 @@ class TestDeclaredPoolPlanning(CustomTestCase):
             self._prepare((swa_primary, follower))
 
     def test_accepts_dsa_declaration(self):
-        configs = self._prepare(_dsa_pool_stub(layer_num=1).host_pool_decls())
+        config = self._prepare(_dsa_pool_stub(layer_num=1).host_pool_decls())
         self.assertEqual(
-            [c.decl.pool_name for c in configs], [PoolName.KV, PoolName.INDEXER]
+            [c.decl.pool_name for c in config.pools], [PoolName.KV, PoolName.INDEXER]
         )
 
 
@@ -741,13 +796,35 @@ class TestHostPoolPreflight(CustomTestCase):
                 patch.object(hybrid_pool_assembler, "build_kv_host_pool") as allocate,
             ):
                 with self.assertRaisesRegex(ValueError, error):
-                    assemble_host_pools_from_decls(
-                        params=_target_params(),
+                    config = prepare_host_pool_config(
                         decls=decls,
                         full_layer_mapping={0: 0, 1: 1},
+                        transfer_layer_id_max=2,
+                        transfer_page_size=64,
+                    )
+                    build_host_pool_group(config=config)
+                allocate.assert_not_called()
+
+    def test_incompatible_packed_buffers_fail_before_allocation(self):
+        target = _dsa_pool_stub(layer_num=2)
+        bad_kv = _dsa_pool_stub(layer_num=1)
+        bad_kv.store_dtype = torch.float8_e4m3fn
+        bad_index = _dsa_pool_stub(layer_num=1)
+        # Same 132 bytes per row, different key/scale format.
+        bad_index.index_head_dim = 132
+        bad_index.quant_block_size = 256
+        for draft, error in ((bad_kv, "KV row"), (bad_index, "index key format")):
+            with (
+                self.subTest(error=error),
+                patch.object(hybrid_pool_assembler, "build_kv_host_pool") as allocate,
+            ):
+                with self.assertRaisesRegex(ValueError, error):
+                    _DsaStrategy().build(
+                        cache=None,
+                        kvcache=target,
+                        params=_target_params((draft,)),
+                        server_args=None,
                         load_cache_event=None,
-                        storage_backend=None,
-                        use_mla=True,
                     )
                 allocate.assert_not_called()
 
@@ -756,18 +833,18 @@ class TestHostPoolPreflight(CustomTestCase):
         draft = _dsa_pool_stub(layer_num=1)
         draft.host_pool_decls = MagicMock(wraps=draft.host_pool_decls)
         decls = target.host_pool_decls()
-        drafts = validate_packed_draft_pools(target_decls=decls, draft_pools=(draft,))
-        configs = prepare_host_pool_configs(
+        target_mapping = {0: 0, 4: 1}
+        config = prepare_host_pool_config(
             decls=decls,
-            full_layer_mapping={0: 0, 4: 1, 5: 2},
-            transfer_layer_id_max=6,
-            packed_draft_decls=drafts,
+            full_layer_mapping=target_mapping,
+            transfer_layer_id_max=5,
+            transfer_page_size=64,
+            packed_draft_device_pools=(draft,),
         )
+        self.assertEqual(target_mapping, {0: 0, 4: 1})
         draft.host_pool_decls.assert_called_once()
-        self.assertIs(configs[1].packed_draft_device_pools[0], draft)
-        self.assertEqual(
-            configs[1].layer_binding.transfer_to_device, {0: 0, 4: 1, 5: 2}
-        )
+        self.assertIs(config.pools[1].packed_draft_device_pools[0], draft)
+        self.assertEqual(config.pools[1].layer_mapping, {0: 0, 4: 1, 5: 2})
 
     def test_packed_draft_rejects_duplicate_pool_names(self):
         target = _dsa_pool_stub(layer_num=2)
@@ -775,24 +852,34 @@ class TestHostPoolPreflight(CustomTestCase):
         declarations = draft.host_pool_decls()
         draft.host_pool_decls = lambda: (*declarations, declarations[1])
         with self.assertRaisesRegex(ValueError, "duplicate"):
-            validate_packed_draft_pools(
-                target_decls=target.host_pool_decls(), draft_pools=(draft,)
+            prepare_host_pool_config(
+                decls=target.host_pool_decls(),
+                full_layer_mapping={i: i for i in range(target.layer_num)},
+                transfer_layer_id_max=target.layer_num,
+                transfer_page_size=64,
+                packed_draft_device_pools=(draft,),
             )
 
     def test_transfer_range_is_not_the_number_of_entries(self):
         decls = _dsa_pool_stub(layer_num=2).host_pool_decls()
         with self.assertRaisesRegex(ValueError, "transfer layer 4"):
-            prepare_host_pool_configs(
-                decls=decls, full_layer_mapping={0: 0, 4: 1}, transfer_layer_id_max=2
+            prepare_host_pool_config(
+                decls=decls,
+                full_layer_mapping={0: 0, 4: 1},
+                transfer_layer_id_max=2,
+                transfer_page_size=64,
             )
 
     def test_build_order_resolves_dependencies_before_allocation(self):
         kv, indexer = _dsa_pool_stub(layer_num=1).host_pool_decls()
-        configs = prepare_host_pool_configs(
-            decls=(indexer, kv), full_layer_mapping={0: 0}, transfer_layer_id_max=1
+        config = prepare_host_pool_config(
+            decls=(indexer, kv),
+            full_layer_mapping={0: 0},
+            transfer_layer_id_max=1,
+            transfer_page_size=64,
         )
         self.assertEqual(
-            [c.decl.pool_name for c in configs], [PoolName.KV, PoolName.INDEXER]
+            [c.decl.pool_name for c in config.pools], [PoolName.KV, PoolName.INDEXER]
         )
 
 
