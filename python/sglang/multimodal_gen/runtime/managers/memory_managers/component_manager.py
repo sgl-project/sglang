@@ -10,6 +10,7 @@ from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     COMPONENT_OFFLOAD,
     LAYERWISE_OFFLOAD,
+    SNAPSHOT_OFFLOAD,
     ComponentResidencyError,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
@@ -17,7 +18,11 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_
     ComponentResidencyStrategy,
     LayerwiseOffloadStrategy,
     ResidentStrategy,
+    SnapshotOffloadStrategy,
     is_fsdp_managed_module,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+    HostPinBudget,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     is_layerwise_offloaded_module,
@@ -44,6 +49,12 @@ class ComponentUse:
     target_dtype: torch.dtype | None = None
     keep_ready_after_warmup: bool = False
     start_at_stage_entry: bool = True
+    # Layerwise components release their resident set when the use ends, which
+    # is right for a DiT (one use spans every denoise step) and buys nothing for
+    # a component used once per forward. Set this when something that knows the
+    # pipeline's per-phase headroom has decided the room is better spent holding
+    # the set until this component runs again.
+    retain_resident_layers: bool = False
 
 
 @dataclass(slots=True)
@@ -87,6 +98,8 @@ def build_component_residency_strategy(
     component_name: str,
     module: nn.Module,
     server_args: ServerArgs,
+    *,
+    pin_budget: HostPinBudget | None = None,
 ) -> ComponentResidencyStrategy:
     residency_mode = server_args.residency_mode(component_name)
     if is_layerwise_offloaded_module(module):
@@ -96,11 +109,16 @@ def build_component_residency_strategy(
             f"Component {component_name!r} resolved to layerwise-offload, but its "
             "loaded module did not enable layerwise offload"
         )
-    if residency_mode == COMPONENT_OFFLOAD and is_fsdp_managed_module(module):
+    if residency_mode in (
+        COMPONENT_OFFLOAD,
+        SNAPSHOT_OFFLOAD,
+    ) and is_fsdp_managed_module(module):
         raise ComponentResidencyError(
-            f"Component {component_name!r} resolved to component-offload, but it "
+            f"Component {component_name!r} resolved to {residency_mode}, but it "
             "was loaded as an FSDP-managed module"
         )
+    if residency_mode == SNAPSHOT_OFFLOAD:
+        return SnapshotOffloadStrategy(pin_budget=pin_budget)
     if (
         not current_platform.is_mps()
         and not is_fsdp_managed_module(module)
@@ -119,6 +137,7 @@ class ComponentResidencyManager:
         self.pipeline = pipeline
         self.server_args = server_args
         self.state = ResidencyState()
+        self._host_pin_budget: HostPinBudget | None = None
         self._stage_names_by_id: dict[int, str] = {}
         self._stage_uses_by_index: list[tuple[ComponentUse, ...]] = []
         self._ordered_uses: tuple[ComponentUse, ...] = ()
@@ -146,9 +165,17 @@ class ComponentResidencyManager:
         self._warmup_phase_peaks: dict[str, WarmupPhasePeak] = {}
         self._completed_warmup_phase_peaks: dict[str, WarmupPhasePeak] = {}
 
+    @property
+    def host_pin_budget(self) -> HostPinBudget:
+        # measure headroom after loading, when the first offload path needs it
+        if self._host_pin_budget is None:
+            self._host_pin_budget = HostPinBudget()
+        return self._host_pin_budget
+
     def refresh_pipeline(self, pipeline: ComponentResidencyPipeline) -> None:
         custom_strategies = dict(pipeline.component_residency_strategies)
         if pipeline is not self.pipeline:
+            self._host_pin_budget = None
             self._remove_nvtx_hooks()
             self._strategy_cache.clear()
             self._active_use = None
@@ -222,16 +249,24 @@ class ComponentResidencyManager:
         no declared ``ComponentUse`` would otherwise be accepted but never
         moved to the device before a forward pass.
         """
-        if not isinstance(self.server_args, ServerArgs):
+        if (
+            not isinstance(self.server_args, ServerArgs)
+            or not self.server_args.component_residency
+        ):
             return
 
-        declared_components = {use.component_name for use in self._ordered_uses}
+        # sequential multi-output execution runs subsets of the full pipeline
+        declared_components = {
+            use.component_name
+            for name, stage in self.pipeline._stage_name_mapping.items()
+            for use in stage.component_uses(self.server_args, name)
+        }
         unmanaged_components = sorted(
             component_name
             for component_name, module in self.pipeline.modules.items()
             if isinstance(module, nn.Module)
             and self.server_args.explicit_residency_mode(component_name)
-            in (COMPONENT_OFFLOAD, LAYERWISE_OFFLOAD)
+            in (COMPONENT_OFFLOAD, SNAPSHOT_OFFLOAD, LAYERWISE_OFFLOAD)
             and component_name not in declared_components
         )
         if unmanaged_components:
@@ -420,6 +455,14 @@ class ComponentResidencyManager:
     def ensure_ready(self, use: ComponentUse, module: nn.Module | None = None) -> None:
         """Prepare a shared component and wait without making it the active use."""
         self._prepare_forward_use(use, module=module)
+
+    def finish_unused_component(
+        self, use: ComponentUse, module: nn.Module | None = None
+    ) -> None:
+        """Release retained weights when conditioning reuse skips their use."""
+        if self._active_use is not None and self._same_use(self._active_use, use):
+            return
+        self._finish_use(use, module=module, keep_on_warmup=False, force=True)
 
     def remove_nvtx_hooks_for_module(self, module: nn.Module | None) -> None:
         """Detach NVTX hooks before a component object is deleted or replaced."""
@@ -821,6 +864,13 @@ class ComponentResidencyManager:
                 component_name,
                 module,
                 self.server_args,
+                pin_budget=(
+                    self.host_pin_budget
+                    if self.server_args.residency_mode(component_name)
+                    == SNAPSHOT_OFFLOAD
+                    and self.server_args.pin_cpu_memory
+                    else None
+                ),
             )
         else:
             strategy = custom_strategy
@@ -926,6 +976,7 @@ class ComponentResidencyManager:
             current_platform.is_cuda()
             or current_platform.is_rocm()
             or current_platform.is_npu()
+            or current_platform.is_xpu()
         )
         return is_supported_platform and current_platform.is_device_type(
             self._module_device(module)

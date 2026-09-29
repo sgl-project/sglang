@@ -25,6 +25,9 @@ MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL = (
 DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY = (
     "_sglang_defer_cuda_ipc_feature_reconstruction"
 )
+BORROW_CUDA_IPC_FEATURE_KEY = "_sglang_borrow_cuda_ipc_feature"
+CUDA_IPC_FEATURE_COPY_EVENT_KEY = "_sglang_cuda_ipc_feature_copy_event"
+RETAINED_CUDA_IPC_FEATURE_PROXY_KEY = "_sglang_retained_cuda_ipc_feature_proxy"
 
 
 def get_mm_feature_pool_size_per_worker(
@@ -233,6 +236,9 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
         # Keep uncached mappings alive until the work enqueued on the consumer
         # stream has completed.
         self._pool_storage = None
+        self._borrowed_storage = None
+        self._borrowed_base_address = None
+        self._borrowed_device_id = None
 
     def _reconstruct_from_ipc_extra(
         self, ipc_extra, *, use_cache: bool, rebuild_device_idx: int
@@ -321,9 +327,53 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
             )
         self._retain_storage_until_stream_completes(storage, device_id)
 
+    def borrow_on_target_device(
+        self, rebuild_device_idx: int
+    ) -> Optional[torch.Tensor]:
+        """Return a zero-copy view whose lease remains owned by this proxy."""
+        ipc_extra = self.proxy_state["ipc_extra"]
+        if not ipc_extra["use_pool_handle_cache"] or self._consumer_acknowledged:
+            return None
+
+        with torch.cuda.device(rebuild_device_idx):
+            slice_tensor, storage = self._open_pool_slice(rebuild_device_idx)
+            base_address = storage.data_ptr()
+            self._wait_until_ready(base_address, rebuild_device_idx)
+            borrowed = slice_tensor.view(ipc_extra["recons_dtype"]).reshape(
+                ipc_extra["recons_shape"]
+            )
+
+        self._borrowed_storage = storage
+        self._borrowed_base_address = base_address
+        self._borrowed_device_id = rebuild_device_idx
+        return borrowed
+
+    def release_borrowed_on_current_stream(
+        self, consumer_count: int = 1, consumer_rank: Optional[int] = None
+    ) -> None:
+        """Release a borrowed view after all current-stream reads are enqueued."""
+        storage = getattr(self, "_borrowed_storage", None)
+        if storage is None:
+            return
+        device_id = self._borrowed_device_id
+        with torch.cuda.device(device_id):
+            self._acknowledge_on_stream(
+                self._borrowed_base_address,
+                device_id,
+                consumer_count,
+                consumer_rank,
+            )
+        self._retain_storage_until_stream_completes(storage, device_id)
+        self._borrowed_storage = None
+        self._borrowed_base_address = None
+        self._borrowed_device_id = None
+
     def release_without_reconstruction(self, consumer_count: int = 1) -> None:
         """Release a pool slice when its request abandons this proxy."""
-        self.acknowledge_consumption(consumer_count)
+        if getattr(self, "_borrowed_storage", None) is not None:
+            self.release_borrowed_on_current_stream(consumer_count)
+        else:
+            self.acknowledge_consumption(consumer_count)
 
     def reconstruct_on_target_device(
         self,

@@ -12,12 +12,11 @@ though the runtime is split into separate folders.
 The files are split by runtime responsibility. For a new model, read the
 request path first:
 
-1. `registry.py` chooses the model family, sampling params, and pipeline config.
-2. `configs/pipeline_configs/{model}.py` defines model-specific denoising and
+1. `configs/pipeline_configs/{model}.py` defines model-specific denoising and
    decoding behavior.
-3. `runtime/pipelines/{model}.py` wires modules into stages.
-4. `runtime/pipelines_core/stages/` runs the shared stage logic.
-5. `runtime/models/` contains native model components only when the architecture
+2. `runtime/pipelines/{model}.py` wires modules into stages.
+3. `runtime/pipelines_core/stages/` runs the shared stage logic.
+4. `runtime/models/` contains native model components only when the architecture
    cannot be reused.
 
 That is the dependency direction. Avoid making a model PR that requires readers
@@ -32,6 +31,30 @@ includes cache managers, graph runners, process-group transport, request
 utilities, and common action-policy helpers. Model packages may call these
 helpers. Keep ownership in shared runtime folders unless the code is truly
 architecture-specific.
+
+## Place helpers with their owners
+
+Use the narrowest existing owner before adding a utility module:
+
+| Scope | Location |
+| --- | --- |
+| Used by one file, or specific to one operation | A private helper in the consuming file; inline short one-off expressions |
+| Shared within a domain | A purpose-named module in that domain, such as `runtime/realtime/video.py` or `runtime/layers/attention/mask_strategy.py` |
+| Shared across domains, without model or pipeline semantics | An existing focused module under `runtime/utils/`, such as `argparse.py`, `process.py`, or `precision.py` |
+
+Do not create a top-level `utils/` package or grow a catch-all `utils.py` or
+`common.py`. Split large mixed-responsibility files along ownership boundaries,
+not arbitrary line counts. A helper folder is warranted only when several
+cohesive modules need it, not for a single function or hypothetical reuse.
+
+Model code must not import pipeline stages. Put contracts shared by models and
+stages in a lower-level domain module; for example, realtime cache keys belong
+under `runtime/realtime/`. Keep GPU initialization, monkey patches, and model
+loading out of generic utility imports.
+
+When moving internal helpers, update all callers, tests, and cookbook examples
+together. Preserve documented registration and serving entry points; do not
+add re-export chains just to retain obsolete internal utility paths.
 
 ## Out-of-Tree Models and Pipelines
 
@@ -100,7 +123,6 @@ behavior.
 
 | Area | Add or edit when | Typical file |
 | --- | --- | --- |
-| Registry | Always, unless extending an already registered family | `python/sglang/multimodal_gen/registry.py` |
 | Runtime parameters | The request schema differs from existing models | `configs/sample/{model}.py` |
 | Pipeline config | Denoising, decoding, precision, position encoding, or CFG hooks differ | `configs/pipeline_configs/{model}.py` |
 | Pipeline wiring | The model needs a new stage layout or module list | `runtime/pipelines/{model}.py` |
@@ -113,11 +135,10 @@ behavior.
 
 For a new native architecture, the common minimum is:
 
-1. `registry.py`
-2. `configs/sample/{model}.py`
-3. `configs/pipeline_configs/{model}.py`
-4. `runtime/pipelines/{model}.py`
-5. `runtime/models/dits/{model}.py`
+1. `configs/sample/{model}.py`
+2. `configs/pipeline_configs/{model}.py`
+3. `runtime/pipelines/{model}.py`
+4. `runtime/models/dits/{model}.py`
 
 Every extra file should map to model behavior that existing code cannot express
 clearly.
@@ -144,6 +165,28 @@ Use the model's Diffusers pipeline, official implementation, or
 
 If the new model is close to Flux, Qwen-Image, GLM-Image, Wan, HunyuanVideo, or
 LTX, extend that implementation before starting from an empty file.
+
+## Conditioning reuse
+
+Use the native `TextEncoder` / `ImageEncoder` base classes (or `EncoderTensorParallelMixin`) and call encoders through `encoder(...)`. This preserves the shared conditioning cache, module hooks, and encoder TP/folding group. A replicated custom encoder can use `ConditioningEncoderMixin`; do not apply it to a module with hidden mutable state or random sampling in `forward()`.
+
+The standard `TextEncodingStage` caches postprocessed embeddings, conditioning masks, sequence lengths, and pooled outputs instead of unused intermediate hidden states. Keep its postprocessing deterministic. When adding a stage-level `cached_encoder_call`, place deterministic preprocessing and component preparation inside the compute callback and give the stage a `namespace`. The namespace avoids a duplicate full encoder entry while preserving nested vision-method caches. Declare conditional component uses with `start_at_stage_entry=False`, so the executor cannot load weights before checking the cache. Keep calling `encoder(...)` inside the callback to preserve hooks and parallel-group handling. After retrieving the conditioning, call `finish_unused_declared_component()` to release weights retained by warmup or the previous request when no encoder use began; an active use remains owned by the residency manager. Batch-DP retains per-copy caches. A gathered group result may skip encoding and the output gather only after hit consensus across the whole replica; a miss keeps every rank in the normal gather path.
+
+For a custom VAE, apply `cached_vae_encode` only to the deterministic encode method returning a tensor or posterior. Keep posterior sampling, normalization, initial noise, scheduler state, and request-specific KV dictionaries outside that boundary. Unsupported outputs bypass caching; explicitly register a tensor-only posterior container with `register_conditioning_container` when needed. Never register an autoregressive cache or a session object as a posterior container.
+
+For integrated models without a separate encoder, use `cached_conditioning` on a pure conditioning method, as in Cosmos3's understanding pathway or SenseNova-U1's reference-image features. Every rank in the current encoder TP group must enter that method together. Do not decorate the noisy-image or denoising path.
+
+Prefer these function boundaries to whole-stage deduplication. A stage may also write per-request metadata, advance RNG state, release materials, or execute collectives; these actions must still run for each request. The executor gives each grouped or batched stage a temporary device-result scope, using the same keys and invalidation as the cross-request cache. Use `share_in_group=True` only for consumed tensors that remain read-only across requests; containers are copied. Other outputs get private tensor snapshots with a bounded temporary budget. The scope ends at stage exit, including exceptions, and remains available with `--disable-conditioning-cache`.
+
+Wrap negative encoding in `prefer_conditioning_cache()` to prioritize reusable conditioning. At a consumed `cached_encoder_call` boundary with a stage namespace and `share_in_group=True`, this keeps a private device snapshot across requests, including library encoders and gathered batch-DP results. Hits skip encoder preparation and postprocessing, with the same rank consensus and invalidation as CPU entries. Device and CPU entries share one byte and entry budget; raw intermediate encoder states remain on the CPU. Avoid adding a separate model-owned negative cache.
+
+Do not put `Req`, scheduler instances, sampled latents, or session state into a cross-request cache. Keep model-specific grouped execution for parallel work distribution and material ownership. Preserve batch shapes and padding when matching batched encoder calls; per-row regrouping needs separate numerical validation.
+
+The common `TextEncodingStage` retains stage deduplication to avoid repeated tokenization and stage bookkeeping. If you override its `forward`, declare a complete stage-output contract or set `deduplicated_output_fields = ()` and use conditioning-result reuse. Do not inherit the common stage's output list when your stage also writes model-specific metadata. Keep request-local containers independent even when their tensors are shared.
+
+Test cache-on versus cache-off with identical seeds, changed prompts/masks/reference pixels (including alpha), downstream in-place mutations, changed weights, and rank-local eviction under supported parallel groups. Also exercise grouped requests through the executor with a zero or undersized cache budget: check encoder call counts, per-request metadata, output ownership, and group cleanup on failure. Include the new model in the [conditioning cache coverage](/docs/sglang-diffusion/caching-acceleration#coverage-and-limits).
+
+Preserve existing grouped-request encoding reuse when cross-request caching is unavailable. Use `cross_request=False` for boundaries that support only group-local reuse, such as library fallback encoders and gathered batch-DP outputs. FSDP scopes allow consumed-output group reuse while bypassing nested encoder caches. A boundary containing collectives needs hit consensus across every participating rank, including FSDP shards and encoder DP copies; an encoder TP group alone may be insufficient. Test these bypass paths and single-rank invalidation before removing stage deduplication.
 
 ## Choose a Pipeline Shape
 
@@ -475,19 +518,27 @@ native integration contract.
 
 ### 6. Registry
 
-Register the family once the sampling params and pipeline config exist.
+Define a `register()` function in `configs/pipeline_configs/{model}.py`. The
+runtime auto-discovers it on startup and calls it to register the sampling
+params and pipeline config.
 
 ```python
-register_configs(
-    model_family="my_model",
-    sampling_param_cls=MyModelSamplingParams,
-    pipeline_config_cls=MyModelPipelineConfig,
-    hf_model_paths=["org/my-model"],
-)
+# python/sglang/multimodal_gen/configs/pipeline_configs/my_model.py
+def register():
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=MyModelSamplingParams,
+        pipeline_config_cls=MyModelPipelineConfig,
+        hf_model_paths=["org/my-model"],
+        model_detectors=[lambda hf_id: "my-model" in hf_id.lower()],
+    )
 ```
 
-The pipeline file is discovered through its `EntryClass`; do not add a second
-pipeline registry unless the existing registry requires it.
+`model_detectors` matches a model path or `model_index.json` `_class_name` when
+the Hugging Face path varies; see `wan.py` or `qwen_image21.py` for real
+examples. The pipeline file is discovered through its `EntryClass`; do not add
+a second pipeline registry unless the existing registry requires it.
 
 ## Verify the Port
 
@@ -530,3 +581,69 @@ Common failure points:
 - [ ] Verified image or video quality against a reference output.
 - [ ] Completed the distributed and memory integration checks above.
 - [ ] Tested CFG parallelism and distributed serving paths when they apply.
+
+
+## Declare multiple task types
+
+Keep `PipelineConfig.task_type` as the default task. To let one configured
+pipeline serve several tasks, declare its capabilities as a class variable:
+
+```python
+from dataclasses import dataclass
+from typing import ClassVar
+
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
+
+
+@dataclass
+class MultiTaskPipelineConfig(PipelineConfig):
+    task_type: ModelTaskType = ModelTaskType.T2V
+    supported_task_types: ClassVar[tuple[ModelTaskType, ...]] = (
+        ModelTaskType.T2I,
+        ModelTaskType.I2I,
+        ModelTaskType.T2V,
+        ModelTaskType.I2V,
+    )
+```
+
+The declaration must be nonempty, contain no duplicates, and include the
+configured default. Existing pipelines that omit it retain the singleton
+`(task_type,)`. Override `get_supported_task_types()` if capabilities depend
+on the loaded checkpoint or configuration, preserving these invariants.
+Flat CLI/Python `task_type` arguments select the request. To change the
+configured default, use `pipeline_config={"task_type": ModelTaskType.I2V}`
+(or its serialized configuration), choosing a supported task.
+
+Capabilities describe implemented execution paths; declaring a task does not
+load additional components or implement conditioning and decoding for it.
+
+Requests carry `SamplingParams.task_type`, accepting an enum or its name
+(case-insensitive). Admission resolves it to an enum and derives the output
+`data_type`. Explicit tasks must belong to the supported set and match the
+HTTP endpoint's output type. Without an explicit task, admission filters by
+output type and conditioning inputs, prefers a compatible default, then
+selects a unique compatible alternative. Python/CLI requests also prefer the
+default's output type among alternatives. Ambiguous requests must specify
+`task_type`. No request changes the shared configuration.
+
+Use the admitted `batch.task_type` in model stages when behavior depends on
+the request. Shared stages use `get_request_task_type(batch, pipeline_config)`
+to preserve compatibility with direct callers that have no resolved task.
+Audit model-specific frame adjustment, reference loading, latent construction,
+and decoding for assumptions about the server default. Declare the union of
+components used by all supported tasks in stage residency metadata. Synthetic
+warmup uses the default task; provide the pipeline's warmup hook when that task
+needs model-specific reference inputs. Dynamic batching compares the admitted
+task along with the other sampling fields.
+
+`I2I` and `I2V` require image input; `T2I` and `T2V` reject it. Existing `TI2I`
+and `TI2V` retain optional image conditioning. `V2V` and `F2V` require video
+input; `F2V` denotes video-prefix conditioning. Models own the details of
+prefix length and temporal alignment. Pipelines with explicit capabilities
+reject video input for tasks that do not accept it; legacy singleton pipelines
+retain their model-owned video checks.
+
+See [request task selection](/docs/sglang-diffusion/api/openai_api#select-a-request-task)
+for the HTTP interface. Test task selection, invalid inputs, discovery,
+serialization, batching, and alternating tasks on one running server.

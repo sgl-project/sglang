@@ -117,6 +117,17 @@ _OWNER_SITES = {
         "free_member_rows",
         "kv_allocated_len",
     ): 1,
+    # A completed dLLM canvas is discarded while the context and slot stay owned.
+    (
+        "dllm/mixin/scheduler.py",
+        "SchedulerDllmMixin._stash_dllm_context",
+        "kv_committed_len",
+    ): 1,
+    (
+        "dllm/mixin/scheduler.py",
+        "SchedulerDllmMixin._stash_dllm_context",
+        "kv_allocated_len",
+    ): 1,
     # streaming session tail trimming
     (_SS, "StreamingSession._free_tail", "kv_committed_len"): 1,
     (_SS, "StreamingSession._free_tail", "kv_allocated_len"): 1,

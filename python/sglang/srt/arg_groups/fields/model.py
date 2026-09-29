@@ -1,15 +1,7 @@
-"""Config fields of the ``model`` namespace.
-
-One class per namespace. The class *is* the namespace: a field declared here
-lands in the ``model`` bag, which is what ``get_model()`` returns, so a reader
-spells it exactly as before. ``ServerArgs`` composes these classes, so the
-record stays one flat object -- the split moves where declarations live, not
-how config is shaped at runtime.
-"""
+"""Config fields of the ``model`` namespace."""
 
 from __future__ import annotations
 
-import dataclasses
 from typing import (
     Dict,
     List,
@@ -17,6 +9,8 @@ from typing import (
     Optional,
     Union,
 )
+
+import msgspec
 
 from sglang.srt.arg_groups.arg_utils import (
     A,
@@ -34,8 +28,7 @@ from sglang.srt.utils.common import (
 )
 
 
-@dataclasses.dataclass
-class Model:
+class Model(msgspec.Struct):
     """Namespace ``model``."""
 
     _NS_PATH = "model"
@@ -214,7 +207,6 @@ class Model:
                 "bfloat16",
                 "nvfp4",
                 "fp4_mx_block16",
-                "fp4_e2m1",
             ],
             resolvable=True,
         ),

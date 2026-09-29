@@ -14,8 +14,10 @@ the cap is read directly from whichever cgroup version is mounted.
 """
 
 import os
+import weakref
 
 import psutil
+import torch
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -152,6 +154,16 @@ def cgroup_memory_limit_bytes(
     return None
 
 
+def physical_host_memory_available_bytes() -> int:
+    """What the machine itself can still give: kernel available under any cgroup cap."""
+    available = int(psutil.virtual_memory().available)
+    capped = cgroup_memory_limit_bytes()
+    if capped is None:
+        return available
+    limit, usage = capped
+    return min(available, max(0, limit - usage))
+
+
 def host_memory_available_bytes() -> int:
     """Bytes this process can still commit without hitting a wall.
 
@@ -173,13 +185,7 @@ def host_memory_available_bytes() -> int:
         except OSError:
             pass
         return max(0, int(forced_gib * GIB_BYTES) - own_anonymous)
-
-    available = int(psutil.virtual_memory().available)
-    capped = cgroup_memory_limit_bytes()
-    if capped is None:
-        return available
-    limit, usage = capped
-    return min(available, max(0, limit - usage))
+    return physical_host_memory_available_bytes()
 
 
 def shared_pool_available_bytes() -> int:
@@ -207,6 +213,19 @@ def host_copies_are_redundant() -> bool:
     that has one, whatever the free-memory reading says.
     """
     return current_platform.device_shares_host_memory()
+
+
+def page_cache_cannot_hold(mapped_bytes: int) -> bool:
+    """Whether the kernel's page cache cannot keep a mapping of this size.
+
+    Read against the machine, not the test-only forced view: a mapping the
+    cache holds is re-read from memory however small the pretend host is.
+    """
+    if mapped_bytes <= 0:
+        return False
+    return (
+        mapped_bytes >= physical_host_memory_available_bytes() - HOST_COPY_RESERVE_BYTES
+    )
 
 
 def host_copies_would_not_fit(weight_bytes: int) -> bool:
@@ -282,6 +301,14 @@ class HostPinBudget:
             self.available_bytes / GIB_BYTES,
         )
         return False
+
+    def release(self, weight_bytes: int) -> None:
+        """Return an allowance when its pinned storage is no longer owned."""
+        self.committed_bytes -= weight_bytes
+
+    def track_storage(self, storage: torch.UntypedStorage) -> None:
+        """Tie an already booked allowance to the storage's last owner."""
+        weakref.finalize(storage, self.release, storage.nbytes())
 
 
 def pin_benefit_bytes(*, weight_bytes: int, uses_per_request: int) -> int:

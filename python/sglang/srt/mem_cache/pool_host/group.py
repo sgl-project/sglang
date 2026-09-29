@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.pool_host.base import HostKVCache, shared_host_layout_domains
 
 
 @dataclass
@@ -22,6 +25,10 @@ class PoolEntry:
     device_evict_fn: Callable[[int], Any] | None = None
     device_alloc_fn: Callable[[int], Any] | None = None
     device_free_fn: Callable[[Any], Any] | None = None
+    # Bind rows to the anchor's virtual IDs when pools share an ID space.
+    # Return buffer indices, or None if allocation fails. Rollback through
+    # device_free_fn takes the anchor's virtual IDs, not the returned indices.
+    device_indices_from_anchor_fn: Callable[[Any], Any] | None = None
     packed_draft_device_pools: tuple[Any, ...] = ()
 
 
@@ -71,6 +78,90 @@ class HostPoolGroup:
     def get_pool(self, name: PoolName):
         return self.get_entry(name).host_pool
 
+    @contextmanager
+    def layout_lease(self):
+        domains = shared_host_layout_domains(entry.host_pool for entry in self.entries)
+        for domain in domains:
+            domain.acquire_layout()
+        try:
+            yield
+        finally:
+            for domain in reversed(domains):
+                domain.release_layout()
+
+    def get_page_buffer_element_size(self, split_factor: int = 1):
+        anchor_pool = self.anchor_entry.host_pool
+        if (
+            not isinstance(anchor_pool, HostKVCache)
+            or anchor_pool.shared_allocation_domain is None
+        ):
+            return anchor_pool.get_page_buffer_element_size(split_factor)
+
+        element_sizes = set()
+        for entry in self.entries:
+            element_size = entry.host_pool.get_page_buffer_element_size(split_factor)
+            if element_size is None:
+                return None
+            element_sizes.add(element_size)
+        return element_sizes.pop() if len(element_sizes) == 1 else None
+
+    def get_contiguous_buf_infos(self):
+        """Return (device_buffers, host_buffers), each (ptrs, sizes, item_sizes)."""
+        host_by_device_ptr = {}
+        device_infos = ([], [], [])
+        for entry in self.entries:
+            host = entry.host_pool
+            pools = (entry.device_pool, *entry.packed_draft_device_pools)
+            for pool in pools:
+                dense_mha = (
+                    type(pool) is MHATokenToKVPool
+                    and pool.kv_cache_layout == "nhd"
+                    and pool.v_head_dim == pool.head_dim
+                )
+                if (
+                    not dense_mha
+                    or pool.layer_shard_enabled
+                    or pool.page_size != self.page_size
+                ):
+                    raise ValueError(
+                        "Host receive requires dense NHD MHA target and "
+                        "draft KV with matching page sizes"
+                    )
+                for combined, values in zip(
+                    device_infos, pool.get_contiguous_buf_infos(), strict=True
+                ):
+                    combined.extend(values)
+
+            # Packed MHA stores target/draft K followed by target/draft V,
+            # while the wire lists target K/V followed by draft K/V. Associate
+            # each host view with its device buffer before applying wire order.
+            device_buffers = [b for p in pools for b in p.k_buffer] + [
+                b for p in pools for b in p.v_buffer
+            ]
+            for device_buffer, host_buffer in zip(
+                device_buffers, host.host_kv_data_refs, strict=True
+            ):
+                if (
+                    not host_buffer.is_contiguous()
+                    or host_buffer.shape[1:] != device_buffer.shape[1:]
+                ):
+                    raise ValueError(
+                        "KV transfer requires matching contiguous per-layer "
+                        "device and host buffers"
+                    )
+                host_by_device_ptr[device_buffer.data_ptr()] = (
+                    host_buffer.data_ptr(),
+                    host_buffer.nbytes,
+                    host.token_stride_size * self.page_size,
+                )
+        infos = [host_by_device_ptr[ptr] for ptr in device_infos[0]]
+        host_infos = (
+            [info[0] for info in infos],
+            [info[1] for info in infos],
+            [info[2] for info in infos],
+        )
+        return device_infos, host_infos
+
     def alloc(
         self,
         need_size: int,
@@ -112,7 +203,9 @@ class HostPoolGroup:
                 self.free(indices, pool=transfer.name)
                 transfer.host_indices = None
 
-        for transfer in transfers:
+        # Reclaiming one pool can evict another's slots. Keep allocation order
+        # identical across TP ranks even when transfers come from a Rust HashMap.
+        for transfer in sorted(transfers, key=lambda transfer: transfer.name):
             if transfer.indices_from_pool is not None:
                 derived_transfers.append(transfer)
                 continue
@@ -135,7 +228,8 @@ class HostPoolGroup:
         for transfer in derived_transfers:
             if transfer.indices_from_pool == self.anchor_entry.name:
                 transfer.host_indices = primary_host_indices
-                transfer.device_indices = primary_device_indices
+                if transfer.device_indices is None:
+                    transfer.device_indices = primary_device_indices
                 continue
 
             source = next(
@@ -151,7 +245,8 @@ class HostPoolGroup:
                 rollback()
                 return None
             transfer.host_indices = source.host_indices
-            transfer.device_indices = source.device_indices
+            if transfer.device_indices is None:
+                transfer.device_indices = source.device_indices
         return transfers
 
     def release_transfers(self, transfers: list[PoolTransfer] | None) -> int:
@@ -166,6 +261,31 @@ class HostPoolGroup:
                 continue
             released += self.free(transfer.host_indices, pool=transfer.name)
         return released
+
+    @property
+    def kv_buffer(self):
+        return self.anchor_entry.host_pool.kv_buffer
+
+    @property
+    def v_buffer(self):
+        return getattr(self.anchor_entry.host_pool, "v_buffer", None)
+
+    @property
+    def index_k_buffer(self):
+        return getattr(self.anchor_entry.host_pool, "index_k_buffer", None)
+
+    @property
+    def index_k_scale_buffer(self):
+        # Delegate to the anchor pool so NpuMemcacheStore sees the same
+        # buffer set as get_page_buffer_meta (which also delegates), keeping
+        # the per-page component-key count consistent (k, v, index_k, scale).
+        return getattr(self.anchor_entry.host_pool, "index_k_scale_buffer", None)
+
+    @property
+    def dsa_kv_cache_store_fp8(self):
+        # Delegate so the L3 store skips the dead v component exactly when
+        # get_page_buffer_meta (which also delegates) skips it.
+        return getattr(self.anchor_entry.host_pool, "dsa_kv_cache_store_fp8", False)
 
     @property
     def size_per_token(self):

@@ -14,20 +14,21 @@ from transformers import PretrainedConfig
 
 from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.distributed import (
-    get_pp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.communicator import (
-    LayerCommunicator,
-    LayerScatterModes,
-    enable_moe_dense_fully_dp,
-)
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.layer_boundary import (
+    declare_attn,
+    declare_ffn,
+    enable_moe_dense_fully_dp,
+    make_stages,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -36,7 +37,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
-from sglang.srt.layers.moe import should_skip_post_experts_all_reduce
+from sglang.srt.layers.moe import reduce_moe_output
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
@@ -63,7 +64,6 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha imp
 from sglang.srt.runtime_context import (
     attention_backends,
     get_exec,
-    get_forward,
     get_memory,
     get_model,
     get_parallel,
@@ -115,7 +115,7 @@ class AttnForwardMethod(IntEnum):
 
 
 SEPARATE_ROPE_BACKENDS = frozenset(
-    ["fa3", "flashinfer", "dsa", "nsa", "cutlass_mla", "trtllm_mla"]
+    ["fa3", "flashinfer", "dsa", "nsa", "trtllm_mla"]
     # "nsa" is a deprecated alias for "dsa"
 )
 CONCAT_ROPE_BACKENDS = frozenset(["flashmla", "triton"])
@@ -370,10 +370,7 @@ class SarvamMoESparseMoeBlock(nn.Module):
                 final_hidden_states = final_hidden_states * self.routed_scaling_factor
         current_stream.wait_stream(self.alt_stream)
         final_hidden_states = final_hidden_states + shared_out
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        final_hidden_states = reduce_moe_output(final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_dim)
 
     def forward_normal(
@@ -408,10 +405,7 @@ class SarvamMoESparseMoeBlock(nn.Module):
         elif self.routed_scaling_factor != 1.0:
             final_hidden_states = final_hidden_states * self.routed_scaling_factor
 
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        final_hidden_states = reduce_moe_output(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -1055,20 +1049,26 @@ class SarvamMoEMLADecoderLayer(nn.Module):
         )
 
         self.attn_tp_size = get_parallel().attn_tp_size
-        self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
-            is_layer_sparse=self.is_layer_sparse,
-            is_previous_layer_sparse=is_previous_layer_sparse,
-            is_next_layer_sparse=is_next_layer_sparse,
-        )
-        self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-            qkv_latent_func=self.self_attn.prepare_qkv_latent,
-            allow_reduce_scatter=True,
-            is_last_layer=(layer_id == config.num_hidden_layers - 1),
+
+        self.attn_boundary, self.ffn_boundary = make_stages(
+            (
+                declare_attn(),
+                self.input_layernorm,
+                {"qkv_latent_func": self.self_attn.prepare_qkv_latent},
+            ),
+            (
+                declare_ffn(
+                    sparse=self.is_layer_sparse,
+                    next_sparse=is_next_layer_sparse,
+                ),
+                self.post_attention_layernorm,
+            ),
+            previous=declare_ffn(
+                sparse=is_previous_layer_sparse, next_sparse=self.is_layer_sparse
+            )
+            if layer_id != 0
+            else None,
+            terminal=layer_id == config.num_hidden_layers - 1,
         )
 
     def forward(
@@ -1076,47 +1076,27 @@ class SarvamMoEMLADecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
-        )
+    ) -> torch.Tensor:
+        hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
-        fuse_mlp_allreduce = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-        with get_forward().scoped(
-            fuse_mlp_allreduce=fuse_mlp_allreduce,
-            mlp_reduce_scatter=mlp_reduce_scatter,
-        ):
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             hidden_states = self.mlp(hidden_states, forward_batch)
         if (
             not self.is_layer_sparse
             and self.attn_tp_size > 1
-            and not mlp_reduce_scatter
-            and not fuse_mlp_allreduce
+            and not ffn_exit.mlp_reduce_scatter
+            and not ffn_exit.fuse_mlp_allreduce
         ):
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-        if fuse_mlp_allreduce:
-            hidden_states._sglang_needs_allreduce_fusion = True
-        else:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
-        return hidden_states, residual
+        hidden_states = ffn_exit.finish(hidden_states)
+        return hidden_states
 
 
 class SarvamMLAModel(nn.Module):
@@ -1130,7 +1110,7 @@ class SarvamMLAModel(nn.Module):
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.alt_stream = get_stream("alt") if _is_cuda else None
 
         if self.pp_group.is_first_rank:
@@ -1176,28 +1156,23 @@ class SarvamMLAModel(nn.Module):
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
-            residual = None
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
 
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
-            hidden_states, residual = layer(
-                positions, hidden_states, forward_batch, residual
-            )
+            hidden_states = layer(positions, hidden_states, forward_batch)
 
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+            return residual_batch.to_pp(hidden_states, forward_batch)
+        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
 
         if hidden_states.shape[0] != 0:
-            if residual is None:
-                hidden_states = self.norm(hidden_states)
-            else:
-                hidden_states, _ = self.norm(hidden_states, residual)
+            hidden_states = residual_batch.norm(hidden_states, forward_batch, self.norm)
 
         return hidden_states
 
@@ -1211,7 +1186,7 @@ class SarvamMLAForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self._remap_config(config)
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         self.model = SarvamMLAModel(config, quant_config, add_prefix("model", prefix))
@@ -1283,30 +1258,26 @@ class SarvamMLAForCausalLM(nn.Module):
     ) -> Optional[LogitsProcessorOutput]:
         start, end = split_interval
         if start == 0:
+            residual_batch.start(forward_batch)
             if input_embeds is None:
                 forward_batch.hidden_states = self.model.embed_tokens(input_ids)
             else:
                 forward_batch.hidden_states = input_embeds
-            forward_batch.residual = None
 
         for i in range(start, end):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.model.layers[i]
-                forward_batch.hidden_states, forward_batch.residual = layer(
-                    positions,
-                    forward_batch.hidden_states,
-                    forward_batch,
-                    forward_batch.residual,
+                forward_batch.hidden_states = layer(
+                    positions, forward_batch.hidden_states, forward_batch
                 )
 
         if end == self.model.config.num_hidden_layers:
-            if forward_batch.residual is None:
-                hidden_states = self.model.norm(forward_batch.hidden_states)
-            else:
-                hidden_states, _ = self.model.norm(
-                    forward_batch.hidden_states, forward_batch.residual
-                )
-            forward_batch.hidden_states = hidden_states
+            forward_batch.hidden_states = residual_batch.complete_output(
+                forward_batch.hidden_states, forward_batch
+            )
+            forward_batch.hidden_states = residual_batch.norm(
+                forward_batch.hidden_states, forward_batch, self.model.norm
+            )
             return self.logits_processor(
                 input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
             )
@@ -1466,30 +1437,26 @@ class SarvamMoEForCausalLM(BailingMoEForCausalLM):
         start, end = split_interval
 
         if start == 0:
+            residual_batch.start(forward_batch)
             if input_embeds is None:
                 forward_batch.hidden_states = self.model.word_embeddings(input_ids)
             else:
                 forward_batch.hidden_states = input_embeds
-            forward_batch.residual = None
 
         for i in range(start, end):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.model.layers[i]
-                forward_batch.hidden_states, forward_batch.residual = layer(
-                    positions,
-                    forward_batch.hidden_states,
-                    forward_batch,
-                    forward_batch.residual,
+                forward_batch.hidden_states = layer(
+                    positions, forward_batch.hidden_states, forward_batch
                 )
 
         if end == self.model.config.num_hidden_layers:
-            if forward_batch.residual is None:
-                hidden_states = self.model.norm(forward_batch.hidden_states)
-            else:
-                hidden_states, _ = self.model.norm(
-                    forward_batch.hidden_states, forward_batch.residual
-                )
-            forward_batch.hidden_states = hidden_states
+            forward_batch.hidden_states = residual_batch.complete_output(
+                forward_batch.hidden_states, forward_batch
+            )
+            forward_batch.hidden_states = residual_batch.norm(
+                forward_batch.hidden_states, forward_batch, self.model.norm
+            )
 
             return self.logits_processor(
                 input_ids, forward_batch.hidden_states, self.lm_head, forward_batch

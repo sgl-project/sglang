@@ -42,6 +42,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_cuda,
+    is_gfx95_supported,
     is_hip,
     is_npu,
     is_xpu,
@@ -132,11 +133,68 @@ _BF16_SPLITK_TUNED_TACTICS = {
     (16, 2560, 8192): (64, 16, 2, 11),
     (24, 2560, 8192): (64, 32, 2, 9),
     (32, 2560, 8192): (64, 32, 2, 9),
+    # Qwen4-Exp TP4 decode shapes, measured on B300 (sm103) under CUDA graph replay;
+    # unlisted (m, n, k) keep the CuTe DSL/cuBLAS path.
+    (1, 320, 2560): (64, 8, 4, 11),
+    (1, 512, 2560): (64, 8, 4, 11),
+    (1, 640, 2560): (64, 8, 4, 10),
+    (1, 2560, 1536): (64, 8, 2, 6),
+    (1, 2560, 2560): (64, 8, 2, 6),
+    (1, 3584, 2560): (64, 8, 2, 6),
+    (1, 4096, 2560): (64, 8, 2, 6),
+    (1, 4120, 2560): (64, 8, 2, 6),
+    (2, 320, 2560): (64, 8, 4, 10),
+    (2, 512, 2560): (64, 8, 4, 11),
+    (2, 640, 2560): (64, 8, 4, 11),
+    (2, 2560, 1536): (64, 8, 2, 6),
+    (2, 2560, 2560): (64, 8, 2, 6),
+    (2, 3584, 2560): (64, 8, 2, 6),
+    (2, 4096, 2560): (64, 8, 2, 6),
+    (2, 4120, 2560): (64, 8, 2, 6),
+    (3, 320, 2560): (64, 8, 4, 10),
+    (3, 512, 2560): (64, 8, 4, 10),
+    (3, 640, 2560): (64, 8, 4, 10),
+    (3, 2560, 1536): (64, 8, 2, 6),
+    (3, 2560, 2560): (64, 8, 2, 6),
+    (3, 3584, 2560): (64, 8, 2, 6),
+    (3, 4096, 2560): (64, 8, 2, 6),
+    (3, 4120, 2560): (64, 8, 2, 6),
+    (4, 320, 2560): (64, 8, 4, 12),
+    (4, 512, 2560): (64, 8, 4, 10),
+    (4, 640, 2560): (64, 8, 4, 11),
+    (4, 2560, 1536): (64, 8, 2, 6),
+    (4, 2560, 2560): (64, 8, 2, 6),
+    (4, 3584, 2560): (64, 8, 2, 6),
+    (4, 4096, 2560): (64, 8, 2, 6),
+    (4, 4120, 2560): (64, 8, 2, 6),
+    (8, 320, 2560): (64, 8, 4, 11),
+    (8, 512, 2560): (64, 8, 4, 10),
+    (8, 640, 2560): (64, 8, 4, 11),
+    (8, 2560, 1536): (64, 8, 2, 10),
+    (8, 2560, 2560): (64, 8, 2, 6),
+    (8, 3584, 2560): (64, 8, 2, 6),
+    (8, 4096, 2560): (64, 8, 2, 6),
+    (8, 4120, 2560): (64, 8, 2, 6),
 }
 
 
 def use_bf16_splitk_gemm(m: int, n: int, k: int) -> bool:
     return (m, n, k) in _BF16_SPLITK_TUNED_TACTICS
+
+
+def precompile_splitk_tactics() -> bool:
+    """JIT-compile every tuned tactic through the real dispatch,
+    so CUDA graph capture never hits a cold kernel."""
+    if not _enable_bf16_splitk_gemm:
+        return False
+    device = torch.cuda.current_device()
+    for m, n, k in _BF16_SPLITK_TUNED_TACTICS:
+        x = torch.zeros(m, k, dtype=torch.bfloat16, device=device)
+        weight = torch.zeros(n, k, dtype=torch.bfloat16, device=device)
+        out = torch.empty(m, n, dtype=torch.bfloat16, device=device)
+        _bf16_splitk_gemm_out(x, weight, None, out)
+    torch.cuda.synchronize()
+    return True
 
 
 def should_enable_bf16_splitk_gemm(backend: Bf16GemmBackend) -> bool:
@@ -223,11 +281,12 @@ def _bf16_gemm_dispatch_fake(
     return x.new_empty((*x.shape[:-1], weight.shape[0]))
 
 
-def _bf16_splitk_gemm(
-    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
+def _bf16_splitk_gemm_out(
+    x_2d: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    out: torch.Tensor,
 ) -> torch.Tensor:
-    x_2d = x.view(-1, x.shape[-1])
-    out = torch.empty((x_2d.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
     m, n, k = x_2d.shape[0], weight.shape[0], weight.shape[1]
     if bias is None and _prefer_direct(m, n, k):
         tactic = _direct_default_tactic(m, n, k)
@@ -242,6 +301,15 @@ def _bf16_splitk_gemm(
             True,
             tactic,
         )
+    return out
+
+
+def _bf16_splitk_gemm(
+    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
+) -> torch.Tensor:
+    x_2d = x.view(-1, x.shape[-1])
+    out = torch.empty((x_2d.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
+    _bf16_splitk_gemm_out(x_2d, weight, bias, out)
     return out.view(*x.shape[:-1], weight.shape[0])
 
 
@@ -460,6 +528,22 @@ class UnquantizedLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         """Run an inference-only BF16 linear into caller-owned storage."""
         if (
+            _enable_bf16_splitk_gemm
+            and bias is None
+            and x.is_cuda
+            and x.ndim == 2
+            and x.dtype == torch.bfloat16
+            and layer.weight.dtype == torch.bfloat16
+            and output.dtype == torch.bfloat16
+            and output.is_contiguous()
+            and output.shape == (x.shape[0], layer.weight.shape[0])
+            and not layer.weight.requires_grad
+            and use_bf16_splitk_gemm(
+                x.shape[0], layer.weight.shape[0], layer.weight.shape[1]
+            )
+        ):
+            return _bf16_splitk_gemm_out(x, layer.weight, None, output)
+        if (
             get_bf16_gemm_backend().is_cutedsl()
             and x.is_cuda
             and x.ndim == 2
@@ -677,6 +761,17 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         ):
             layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
 
+        if self.use_flashinfer_cutlass:
+            from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+                materialize_swiglu_params_for_cutlass,
+            )
+
+            layer._cutlass_swiglu_params = materialize_swiglu_params_for_cutlass(
+                layer.moe_runner_config,
+                int(layer.num_local_experts),
+                layer.w13_weight.device,
+            )
+
         # Reorder rows of W1 for fused gated activation
         if self.use_flashinfer_trtllm_moe:
             # The cached indices are GPU tensors. Colocated weight offloading
@@ -853,10 +948,32 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
 
         param.data = param.data.reshape(expected_shape)
 
-    def _aiter_ck_moe_supported(self, layer) -> bool:
+    def _aiter_ck_moe_unsupported_reason(self, layer) -> Optional[str]:
         # aiter CK fused-MoE requires intermediate_size_per_partition to be 128-aligned
         # (GemmSpec=Default; otherwise CK raises "not support this GEMM problem").
-        return layer.intermediate_size_per_partition % 128 == 0
+        if layer.intermediate_size_per_partition % 128 != 0:
+            return (
+                "intermediate_size_per_partition="
+                f"{layer.intermediate_size_per_partition} is not 128-aligned"
+            )
+
+        if not is_gfx95_supported():
+            return None
+
+        cfg = layer.moe_runner_config
+        wants_swiglu_oai = (
+            cfg.gemm1_alpha is not None or cfg.gemm1_clamp_limit is not None
+        )
+        if wants_swiglu_oai:
+            return (
+                f"activation={cfg.activation} with gemm1_alpha={cfg.gemm1_alpha} / "
+                f"gemm1_clamp_limit={cfg.gemm1_clamp_limit} (SwiGLU-OAI) is not "
+                "implemented by the aiter CK bf16 fused-MoE kernels"
+            )
+        return None
+
+    def _aiter_ck_moe_supported(self, layer) -> bool:
+        return self._aiter_ck_moe_unsupported_reason(layer) is None
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -885,7 +1002,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             backend = MoeRunnerBackend.TRITON
         self.runner = MoeRunner(backend, moe_runner_config)
 
-        # aiter CK fused-MoE only supports 128-aligned shapes; otherwise use triton.
+        # aiter CK fused-MoE only supports some shapes / activations; else use triton.
         self._aiter_runner: Optional[MoeRunner] = None
         if (
             _use_aiter
@@ -895,20 +1012,19 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             )
             and get_moe_a2a_backend().supports_aiter()
         ):
-            if self._aiter_ck_moe_supported(layer):
+            reason = self._aiter_ck_moe_unsupported_reason(layer)
+            if reason is None:
                 self._aiter_runner = MoeRunner(
                     MoeRunnerBackend.AITER, moe_runner_config
                 )
             elif get_moe_runner_backend().is_aiter():
                 raise ValueError(
-                    "moe_runner_backend=aiter is not supported for "
-                    f"intermediate_size_per_partition={layer.intermediate_size_per_partition}; "
+                    f"moe_runner_backend=aiter is not supported: {reason}; "
                     "use --moe-runner-backend triton."
                 )
             else:
                 logger.warning_once(
-                    "aiter CK fused-MoE does not support "
-                    f"intermediate_size_per_partition={layer.intermediate_size_per_partition}; "
+                    f"aiter CK fused-MoE does not support this layer: {reason}; "
                     "using triton MoE runner."
                 )
 
@@ -980,11 +1096,15 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 FlashInferCutlassMoeQuantInfo,
             )
 
+            swiglu_alpha, swiglu_beta, swiglu_limit = layer._cutlass_swiglu_params
             quant_info = FlashInferCutlassMoeQuantInfo(
                 quant_type="bf16",
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
                 output_dtype=x.dtype,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
+                swiglu_limit=swiglu_limit,
                 moe_ep_size=layer.moe_ep_size,
                 moe_ep_rank=layer.moe_ep_rank,
                 moe_tp_size=layer.moe_tp_size,
@@ -1008,12 +1128,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             if self._aiter_runner is not None:
                 from sglang.srt.layers.moe.moe_runner.aiter import (
                     AiterMoeQuantInfo,
+                    aiter_swiglu_oai_limit,
                 )
 
                 quant_info = AiterMoeQuantInfo(
                     w13_weight=layer.w13_weight,
                     w2_weight=layer.w2_weight,
                     expert_mask=layer.dispatcher.expert_mask_gpu,
+                    swiglu_limit=aiter_swiglu_oai_limit(self.moe_runner_config) or 0.0,
                 )
                 return self._aiter_runner.run(dispatch_output, quant_info)
 

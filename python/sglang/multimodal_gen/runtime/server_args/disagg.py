@@ -6,11 +6,11 @@ from __future__ import annotations
 from typing import ClassVar, Literal
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.utils.argparse import FlexibleArgumentParser
 from sglang.multimodal_gen.runtime.utils.common import (
     format_tcp_endpoint,
     parse_tcp_host_port,
 )
-from sglang.multimodal_gen.utils import FlexibleArgumentParser
 
 
 class DisaggServerArgsMixin:
