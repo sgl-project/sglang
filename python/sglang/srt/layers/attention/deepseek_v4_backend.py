@@ -2803,6 +2803,22 @@ class DeepseekV4AttnBackend(
             self._low_ratio_compress_fused(
                 layer, x, req, pos, draft_len=self.speculative_num_draft_tokens
             )
+        elif (
+            layer.compressor.use_fused_compress
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and forward_batch.extend_start_loc is not None
+        ):
+            # DP padding extends extend_seq_lens but not extend_start_loc, whose
+            # length is the request count; padded rows belong to no request.
+            start_loc = forward_batch.extend_start_loc
+            seq_lens = forward_batch.extend_seq_lens[: start_loc.shape[0]]
+            self._low_ratio_compress_fused(
+                layer,
+                x,
+                req,
+                pos,
+                extend_offsets=(start_loc.to(torch.int32), seq_lens.to(torch.int32)),
+            )
         else:
             self._low_ratio_compress_torch(
                 layer,
@@ -2872,13 +2888,18 @@ class DeepseekV4AttnBackend(
             fuse_index_store=is_sm100_or_newer(),
         )
 
-    def _low_ratio_compress_fused(self, layer, x, req, pos, *, draft_len=1) -> None:
+    def _low_ratio_compress_fused(
+        self, layer, x, req, pos, *, draft_len=1, extend_offsets=None
+    ) -> None:
+        """Decode or target-verify; an extend batch passes ``extend_offsets``, the int32
+        (first row, row count) of each request."""
         from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import (
             index_k_norm_rope_pack_store,
         )
         from sglang.kernels.ops.attention.dsv4.low_ratio_compress import (
             c1_decode_norm_rope_store,
             c2_decode_norm_rope_store,
+            c2_prefill_norm_rope_store,
         )
 
         pool = self.token_to_kv_pool
@@ -2911,7 +2932,7 @@ class DeepseekV4AttnBackend(
             # CompressStatePool stores each request's pending pairs in a position ring.
             # KVAndScore rows use | kv | score |, addressed as req * ring_size + pos % ring_size.
             state = pool.get_attention_compress_states(layer_id)
-            latent = c2_decode_norm_rope_store(
+            args = (
                 compressor.project_fused(x),
                 state.kv_score_buffer.kv_score,
                 compressor.norm.weight.data,
@@ -2921,11 +2942,23 @@ class DeepseekV4AttnBackend(
                 compressor.norm.eps,
                 freqs_cis,
                 kv_cache,
-                page_size=page_size,
-                ring_size=state.ring_size,
-                draft_len=draft_len,
-                layout=kv_layout,
             )
+            if extend_offsets is None:
+                latent = c2_decode_norm_rope_store(
+                    *args,
+                    page_size=page_size,
+                    ring_size=state.ring_size,
+                    draft_len=draft_len,
+                    layout=kv_layout,
+                )
+            else:
+                latent = c2_prefill_norm_rope_store(
+                    *args,
+                    *extend_offsets,
+                    page_size=page_size,
+                    ring_size=state.ring_size,
+                    layout=kv_layout,
+                )
             out_loc = core.c2_out_loc
 
         indexer = layer.indexer
