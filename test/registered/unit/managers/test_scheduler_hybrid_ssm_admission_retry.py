@@ -28,6 +28,11 @@ class _RefusingAdder:
         self.can_run_list = []
         self.new_chunked_req = None
         self.rem_mamba_slots = None
+        self.rem_chunk_tokens = 4096
+        self.page_size = 1
+
+    def budget_state(self):
+        return AddReqResult.CONTINUE
 
     def chunk_budget_exhausted(self):
         return False
@@ -60,6 +65,7 @@ def _scheduler(*, is_hybrid_ssm: bool) -> Scheduler:
     s = Scheduler.__new__(Scheduler)
     s.grammar_manager = MagicMock()
     s.grammar_manager.has_waiting_grammars.return_value = False
+    s.enable_lmcache = False
     s.enable_hierarchical_cache = False
     s.enable_hicache_storage = False
     s.enable_unified_cache_external_linker = False
@@ -68,6 +74,7 @@ def _scheduler(*, is_hybrid_ssm: bool) -> Scheduler:
     s.is_hybrid_ssm = is_hybrid_ssm
     s.tree_cache = SimpleNamespace(
         supports_mamba=lambda: True,
+        buffer_pipeline=None,
         req_to_token_pool=SimpleNamespace(),
     )
     s.waiting_queue = [_req()]
