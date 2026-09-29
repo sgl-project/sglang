@@ -112,6 +112,9 @@ class ExitMove(NamedTuple):
     # Whether output_move also completes the sum the producer leaves.
     output_move_completes_sum: bool = False
     returns_over_dp: bool = False
+    # When output_move completes the sum: the move of an output compute has
+    # already reduced onto the same rows.
+    complete_output_move: Optional[Callable] = None
 
 
 def input_rows(edge: EdgeContract) -> Layout:
@@ -312,16 +315,11 @@ def bind_exit(edge: EdgeContract, *, cp_moves: Optional[CpMoves] = None) -> Exit
             )
     if edge.need.layout != edge.residual_to:
         raise NotImplementedError(f"{edge=}")
-    returns_over_dp, output_move, completes_sum = _select_exit_move(
+    return _select_exit_move(
         edge.produced,
         residual=edge.residual,
         to=edge.residual_to,
         cp_moves=cp_moves,
-    )
-    return ExitMove(
-        output_move=output_move,
-        output_move_completes_sum=completes_sum,
-        returns_over_dp=returns_over_dp,
     )
 
 
@@ -543,37 +541,50 @@ def _select_exit_move(
     residual: Layout,
     to: Layout,
     cp_moves: Optional[CpMoves] = None,
-) -> Tuple[bool, Optional[Callable], bool]:
-    """How the FFN output reaches the rows the layer hands on: whether it goes
-    back by undoing the attention-DP gather (the FFN exit and postprocess run
-    that step), or else the postprocess that moves it, None when there is none
-    to choose here; and whether that move also completes the sum the FFN
-    leaves."""
+) -> ExitMove:
+    """How the FFN output reaches the rows the layer hands on: by undoing the
+    attention-DP gather (the FFN exit and finish run that step), or else the
+    move that takes it there, None when there is none to choose here; whether
+    that move also completes the sum the FFN leaves, and if so the move for an
+    output compute already reduced."""
 
     update = produced.update
     if produced.layout == residual:
         if to == residual:
-            return False, keep_output, False
+            return ExitMove(keep_output)
         if to.sharded == residual.sharded - {TokenAxis.ATTN_TP}:
             # Each rank's slice back to the attention's rows: write the output
             # into the residual, then gather over attention TP.
-            return False, partial(update_attn_tp_gather_output, update=update), False
+            return ExitMove(partial(update_attn_tp_gather_output, update=update))
         raise NotImplementedError(f"{produced=} {residual=} {to=}")
     returned = residual.sharded - produced.layout.sharded
     if returned == {TokenAxis.ATTN_TP} and to in (residual, produced.layout):
         # The residual stays on each rank's slice (MHC on an input-scattered
         # batch): a reduce-scatter onto the slice completes the sum the FFN
         # leaves; a complete output is only sliced.
-        sums = produced.may_reduce_scatter
-        return (
-            False,
+        if not produced.may_reduce_scatter:
+            return ExitMove(
+                partial(
+                    residual_slice_output,
+                    sums=False,
+                    gathers_back=to != residual,
+                    update=update,
+                )
+            )
+        return ExitMove(
             partial(
                 residual_slice_output,
-                sums=sums,
+                sums=True,
                 gathers_back=to != residual,
                 update=update,
             ),
-            sums,
+            output_move_completes_sum=True,
+            complete_output_move=partial(
+                residual_slice_output,
+                sums=False,
+                gathers_back=to != residual,
+                update=update,
+            ),
         )
     if to != residual or not produced.layout.sharded <= residual.sharded:
         raise NotImplementedError(f"{produced=} {residual=} {to=}")
@@ -582,17 +593,21 @@ def _select_exit_move(
             raise NotImplementedError(f"{produced=} {residual=} {to=}")
         if not produced.may_reduce_scatter:
             # A complete output: this rank's block of it, nothing summed.
-            return False, cp_moves.take_back, False
+            return ExitMove(cp_moves.take_back)
         # The FFN leaves its sum: only a take-back that sums over the same
         # ranks completes it.
         if cp_moves.reduce_scatter is None or not _same_ranks(
             _sum_group(produced.group), cp_moves.reduce_scatter_group()
         ):
             raise NotImplementedError(f"{produced=} {residual=} {to=}")
-        return False, cp_moves.reduce_scatter, True
+        return ExitMove(
+            cp_moves.reduce_scatter,
+            output_move_completes_sum=True,
+            complete_output_move=cp_moves.take_back,
+        )
     if returned == {TokenAxis.ATTN_DP, TokenAxis.ATTN_CP}:
         # This rank's CP shard, from where the DP gather put it.
-        return False, dp_cp_take_back_output, False
+        return ExitMove(dp_cp_take_back_output)
     if returned != {TokenAxis.ATTN_DP}:
         raise NotImplementedError(f"{produced=} {residual=} {to=}")
-    return True, None, False
+    return ExitMove(returns_over_dp=True)

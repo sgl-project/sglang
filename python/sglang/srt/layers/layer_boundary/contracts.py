@@ -236,6 +236,8 @@ class StagePath(msgspec.Struct, frozen=True):
             batch by the attention-DP exit path.
         output_move_completes_sum: Whether that move also reduces the output.
         returns_over_dp: Whether output uses batch-dependent attention-DP transport.
+        complete_output_move: The move for an output compute already reduced,
+            run instead of an output_move that also reduces it.
     """
 
     entry: EntryPath
@@ -245,6 +247,7 @@ class StagePath(msgspec.Struct, frozen=True):
     output_move_completes_sum: bool = False
 
     returns_over_dp: bool = False
+    complete_output_move: Optional[Callable] = None
 
 
 class StageKind(Enum):
