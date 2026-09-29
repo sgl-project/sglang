@@ -4,9 +4,11 @@ from unittest import mock
 from sglang.srt.environ import envs
 from sglang.srt.models.deepseek_common.amd import deepseek_v4_fused_mhc
 from sglang.srt.runtime_context import override_platform
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+# backend-specific: the numerical class runs the gfx950 fused mHC kernels
+register_amd_ci(est_time=10, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
 
 
 class TestAmdFusedMhcCrossLayerGating(unittest.TestCase):
@@ -287,11 +289,15 @@ class TestAmdFusedMhcNormFusedHandling(unittest.TestCase):
         # (norm_fused=False) -- the Triton fused post+pre contract.
         normed = object()
         layer.input_layernorm.return_value = normed
+        layer._input_norm = lambda *a, **k: DeepseekV4DecoderLayer._input_norm(
+            layer, *a, **k
+        )
         layer.self_attn.maybe_use_decode_attn_tp.side_effect = _StopForward
 
         # Force the non-aiter (torch layernorm) branch deterministically so the
         # test does not depend on the runner arch and needs no real tensors.
         with (
+            mock.patch.object(deepseek_v4, "_is_hip", False),
             mock.patch.object(deepseek_v4, "_use_aiter", False),
             mock.patch.object(deepseek_v4, "_is_gfx95_supported", False),
             mock.patch(
@@ -359,7 +365,11 @@ class TestAmdFusedMhcNumerical(unittest.TestCase):
         res = (torch.randn(m, hc_mult, hidden, device=dev) * 0.02).bfloat16()
         post = torch.randn(m, hc_mult, device=dev) * 0.02
         comb = torch.randn(m, hc_mult, hc_mult, device=dev) * 0.02
-        fn = (torch.randn(hc_mult3, hc_mult * hidden, device=dev) * 0.02).bfloat16()
+        # AITER reads fn as FP32; a BF16 allocation would be read out of bounds.
+        fn = (
+            torch.randn(hc_mult3, hc_mult * hidden, device=dev, dtype=torch.float32)
+            * 0.02
+        )
         scl = torch.ones(hc_mult3, device=dev)
         base = torch.zeros(hc_mult3, device=dev)
         nw = torch.ones(hidden, device=dev).bfloat16()

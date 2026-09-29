@@ -92,7 +92,7 @@ class ExecFeatures(msgspec.Struct):
     enable_encoder_swa_bounded_replay: A[
         bool,
         "DeepSeek-V4.1 encoder SWA bounded replay: cache Main KV and Indexer keys only, "
-        "rebuild request-owned SWA windows on prefix hits. Experimental; CUDA only.",
+        "rebuild request-owned SWA windows on prefix hits. Experimental; CUDA and ROCm.",
     ] = False
     enable_decoder_swa_bounded_replay: A[
         bool,
