@@ -85,7 +85,9 @@ pub fn build_pipeline(
 ) -> Result<Box<dyn crate::pipeline::MmFamilyProcessor>, String> {
     match spec {
         PipelineSpec::QwenVl(spec) => Ok(Box::new(crate::qwen_vl::QwenVlProcessor::new(spec)?)),
-        PipelineSpec::InternVl(spec) => Ok(Box::new(crate::internvl::InternVlProcessor::new(spec)?)),
+        PipelineSpec::InternVl(spec) => {
+            Ok(Box::new(crate::internvl::InternVlProcessor::new(spec)?))
+        }
     }
 }
 

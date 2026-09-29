@@ -1,15 +1,11 @@
 //! InternVL family server-pipeline image processor.
 //!
-//! Matches the image path of the Python `InternVLProcessor`
-//! (`python/sglang/srt/multimodal/processors/internvl.py`): choose a tile grid
-//! from the aspect ratio, resize and split into tiles, append an optional
-//! thumbnail, normalize each tile, and expand each image slot into
+//! Mirrors the Python `InternVLProcessor` image path
+//! (`python/sglang/srt/multimodal/processors/internvl.py`): pick a tile grid
+//! from the aspect ratio, normalize once, float-bicubic resize with
+//! `torch.nn.functional.interpolate` semantics, split into tiles, append an
+//! optional thumbnail, and expand each image slot into
 //! `<img> + <IMG_CONTEXT>*N + </img>`.
-//!
-//! The Python processor normalizes the float tensor before its bicubic resize;
-//! this version resizes the u8 buffer first and normalizes the tiles after, so
-//! bit-exact parity would need a float resize path. `aux` is empty until the
-//! sglang-server MM worker is wired for InternVL.
 
 use crate::common::resize;
 use crate::pipeline::{
@@ -52,6 +48,13 @@ pub struct InternVlProcessor {
 
 impl InternVlProcessor {
     pub fn new(spec: InternVlSpec) -> Result<Self, String> {
+        if spec.image_token_id < 0
+            || spec.img_context_token_id < 0
+            || spec.img_start_token_id < 0
+            || spec.img_end_token_id < 0
+        {
+            return Err("intern_vl spec: token ids must be non-negative".into());
+        }
         if spec.image_size == 0 || spec.num_image_token == 0 || spec.max_num == 0 {
             return Err("intern_vl spec: sizes must be positive".into());
         }
@@ -104,24 +107,23 @@ impl InternVlProcessor {
         best
     }
 
-    /// Normalize one HWC u8 tile into a CHW f32 tile: `(v/255 - mean)/std`.
-    fn normalize_tile(&self, tile: &[u8]) -> Tile {
-        let size = self.spec.image_size as usize;
-        let mut out = vec![0.0f32; 3 * size * size];
+    /// Normalize the decoded HWC u8 image into a CHW float tensor with the
+    /// same `(v / 255 - mean) / std` transform as the Python processor.
+    fn normalize_image(&self, rgb: &[u8], h: usize, w: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; 3 * h * w];
         let inv255 = 1.0f32 / 255.0;
-        for p in 0..size * size {
+        for p in 0..h * w {
             for c in 0..3 {
-                let raw = tile[p * 3 + c] as f32 * inv255;
-                out[c * size * size + p] =
-                    (raw - self.spec.image_mean[c]) / self.spec.image_std[c];
+                let raw = rgb[p * 3 + c] as f32 * inv255;
+                out[c * h * w + p] = (raw - self.spec.image_mean[c]) / self.spec.image_std[c];
             }
         }
         out
     }
 
-    /// Port of the Python `dynamic_preprocess` tile pipeline, working on the
-    /// decoded HWC u8 image. Returns one normalized CHW tile per patch; the
-    /// thumbnail, when used, is appended last.
+    /// Port of the Python `dynamic_preprocess` tile pipeline: normalize once,
+    /// float-bicubic resize to the target grid, then crop the tiles and
+    /// optional thumbnail. Returns one CHW f32 tile per patch, thumbnail last.
     fn dynamic_preprocess(&self, rgb: &[u8], h: usize, w: usize) -> Result<Vec<Tile>, String> {
         if h == 0 || w == 0 {
             return Err("intern_vl: empty image".into());
@@ -132,37 +134,26 @@ impl InternVlProcessor {
         let target_h = rows as usize * size;
         let target_w = cols as usize * size;
         let blocks = (rows * cols) as usize;
+        let normalized = self.normalize_image(rgb, h, w);
 
-        let resized = resize::resize_rgb(
-            rgb,
-            h,
-            w,
-            target_h,
-            target_w,
-            resize::Resample::Pil(resize::Filter::Bicubic),
-        );
+        let resized = resize::resize_normalized_bicubic(&normalized, h, w, target_h, target_w);
         let mut tiles = Vec::with_capacity(blocks + usize::from(self.spec.use_thumbnail));
         for b in 0..blocks {
             let x0 = (b % cols as usize) * size;
             let y0 = (b / cols as usize) * size;
-            let mut tile = vec![0u8; 3 * size * size];
-            for ty in 0..size {
-                let src = ((y0 + ty) * target_w + x0) * 3;
-                let dst = ty * size * 3;
-                tile[dst..dst + size * 3].copy_from_slice(&resized[src..src + size * 3]);
+            let mut tile = vec![0.0f32; 3 * size * size];
+            for c in 0..3 {
+                for ty in 0..size {
+                    let src = c * target_h * target_w + (y0 + ty) * target_w + x0;
+                    let dst = c * size * size + ty * size;
+                    tile[dst..dst + size].copy_from_slice(&resized[src..src + size]);
+                }
             }
-            tiles.push(self.normalize_tile(&tile));
+            tiles.push(tile);
         }
         if self.spec.use_thumbnail && blocks > 1 {
-            let thumb = resize::resize_rgb(
-                rgb,
-                h,
-                w,
-                size,
-                size,
-                resize::Resample::Pil(resize::Filter::Bicubic),
-            );
-            tiles.push(self.normalize_tile(&thumb));
+            let thumb = resize::resize_normalized_bicubic(&normalized, h, w, size, size);
+            tiles.push(thumb);
         }
         Ok(tiles)
     }
@@ -200,12 +191,14 @@ impl MmFamilyProcessor for InternVlProcessor {
             let num_tiles = match items.get(item) {
                 Some(Geometry::Tiles(n)) => *n,
                 Some(_) => {
-                    return Err(format!("intern_vl: media item {item} has non-tiles geometry"))
+                    return Err(format!(
+                        "intern_vl: media item {item} has non-tiles geometry"
+                    ));
                 }
                 None => {
                     return Err(format!(
                         "intern_vl: prompt has more image placeholders than media items"
-                    ))
+                    ));
                 }
             };
             let repeat = self.spec.num_image_token as usize * num_tiles as usize;
@@ -231,6 +224,51 @@ impl MmFamilyProcessor for InternVlProcessor {
         Ok(TokenLayout { segments })
     }
 }
+
+#[cfg(feature = "python")]
+mod python {
+    use numpy::{IntoPyArray, PyArray1};
+    use pyo3::exceptions::PyValueError;
+    use pyo3::prelude::*;
+
+    use super::*;
+
+    /// Run the native InternVL image path on encoded bytes and return the
+    /// flattened float tiles with `(tile_count, tile_edge)` for reshaping.
+    #[pyfunction]
+    fn preprocess<'py>(
+        py: Python<'py>,
+        data: Vec<u8>,
+        spec_json: &str,
+    ) -> PyResult<(Bound<'py, PyArray1<f32>>, usize, usize)> {
+        let processor =
+            InternVlProcessor::from_spec_json(spec_json).map_err(PyValueError::new_err)?;
+        let size = processor.spec.image_size as usize;
+        let out = py
+            .detach(move || {
+                let (rgb, height, width) = crate::common::decode_rgb(&data)?;
+                processor.process_item(&DecodedMedia::Image { rgb, height, width })
+            })
+            .map_err(PyValueError::new_err)?;
+        let Geometry::Tiles(tiles) = out.geometry else {
+            return Err(PyValueError::new_err("intern_vl: expected tiles geometry"));
+        };
+        let TensorData::F32(pixel_values) = out.feature.data else {
+            return Err(PyValueError::new_err("intern_vl: expected f32 feature"));
+        };
+        Ok((pixel_values.into_pyarray(py), tiles as usize, size))
+    }
+
+    pub fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {
+        let m = PyModule::new(parent.py(), "internvl")?;
+        m.add_function(wrap_pyfunction!(preprocess, &m)?)?;
+        parent.add_submodule(&m)?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "python")]
+pub use python::register;
 
 #[cfg(test)]
 mod tests {

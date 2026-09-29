@@ -25,5 +25,6 @@ fn _multimodal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     inkling::register(m)?;
     dsv41::register(m)?;
     qwen_vl::register(m)?;
+    internvl::register(m)?;
     Ok(())
 }

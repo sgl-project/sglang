@@ -28,18 +28,27 @@ class RustMmSpec(msgspec.Struct, frozen=True, kw_only=True):
     family: str
     feature_shm: bool
     image_token_id: int
-    patch_size: int
-    merge_size: int
-    temporal_patch_size: int
-    min_pixels: int
-    max_pixels: int
     image_mean: Tuple[float, ...]
     image_std: Tuple[float, ...]
-    # Which HF processor the Rust resize must reproduce bit-exactly.
-    resample: str
     vision_start_token_id: Optional[int]
     vision_end_token_id: Optional[int]
     video_token_id: Optional[int]
+    # Qwen-VL family only; unused by InternVL.
+    patch_size: Optional[int] = None
+    merge_size: Optional[int] = None
+    temporal_patch_size: Optional[int] = None
+    min_pixels: Optional[int] = None
+    max_pixels: Optional[int] = None
+    # Qwen-VL resampler; InternVL leaves it unset.
+    resample: Optional[str] = None
+    # InternVL family only; unused by Qwen-VL.
+    image_size: Optional[int] = None
+    num_image_token: Optional[int] = None
+    max_num: Optional[int] = None
+    use_thumbnail: Optional[bool] = None
+    img_context_token_id: Optional[int] = None
+    img_start_token_id: Optional[int] = None
+    img_end_token_id: Optional[int] = None
 
     # Used by the drain adapter only; every other field goes to Rust.
     DRAIN_ONLY = ("vision_start_token_id", "vision_end_token_id", "video_token_id")
@@ -67,10 +76,10 @@ class RustMmFamily(msgspec.Struct, frozen=True, kw_only=True):
     # "module:Class". Compared by identity, so an
     # SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE override still disables the Rust path.
     mm_processor: str
-    # Model types whose image-only M-RoPE matches the family's fast path.
+    # Model types served by the family's Rust preprocessing path.
     model_types: FrozenSet[str]
-    # HF image processors the Rust resize reproduces bit-exactly, each mapped
-    # to the `resample` the Rust pipeline must use (see `RustMmSpec.resample`).
+    # Qwen-VL HF image processors the Rust resize reproduces bit-exactly,
+    # mapped to the `resample` the Rust pipeline must use. Empty for InternVL.
     image_processors: Dict[str, str]
 
     def serves(self, mm_processor_cls: Any, model_type: Optional[str]) -> bool:
@@ -98,6 +107,12 @@ RUST_MM_FAMILIES: Tuple[RustMmFamily, ...] = (
             "Qwen2VLImageProcessorFast": "aten_u8",
             "Qwen2VLImageProcessorPil": "pil",
         },
+    ),
+    RustMmFamily(
+        name="intern_vl",
+        mm_processor="sglang.srt.multimodal.processors.internvl:InternVLProcessor",
+        model_types=frozenset(("internvl_chat",)),
+        image_processors={},
     ),
 )
 
@@ -254,6 +269,8 @@ class RustMmProcessor:
         )
         if family is None:
             return None
+        if family.name == "intern_vl":
+            return self._resolve_intern_vl_spec(family)
         image_processor = getattr(self._processor, "image_processor", None)
         resample = family.image_processors.get(type(image_processor).__name__)
         if resample is None:
@@ -304,6 +321,63 @@ class RustMmProcessor:
         logger.info("rust server: Rust MM pipeline enabled (family=%s)", family.name)
         return spec
 
+    def _resolve_intern_vl_spec(self, family: RustMmFamily) -> Optional[RustMmSpec]:
+        """Resolve the InternVL pipeline params from the same HF fields the
+        Python ``InternVLProcessor`` uses, plus the boundary/context token ids
+        from its tokenizer. Image inputs run in Rust; video frames stay on the
+        Python path."""
+        from sglang.srt.multimodal.processors.internvl import InternVLProcessor
+
+        hf_config = self.model_config.hf_config
+        try:
+            vision = hf_config.vision_config
+            image_size = getattr(hf_config, "force_image_size", None) or vision.image_size
+            if isinstance(image_size, list):
+                image_size = image_size[0]
+            patch_size = vision.patch_size
+            if isinstance(patch_size, list):
+                patch_size = patch_size[0]
+            num_image_token = int(
+                (image_size // patch_size) ** 2 * (hf_config.downsample_ratio**2)
+            )
+        except AttributeError:
+            return None
+
+        tokenizer = getattr(self._processor, "tokenizer", None) or self._processor
+        try:
+            img_context_token_id = tokenizer.convert_tokens_to_ids(
+                InternVLProcessor.IMG_CONTEXT
+            )
+            img_start_token_id = tokenizer.convert_tokens_to_ids(
+                InternVLProcessor.IMG_START
+            )
+            img_end_token_id = tokenizer.convert_tokens_to_ids(
+                InternVLProcessor.IMG_END
+            )
+        except AttributeError:
+            return None
+
+        spec = RustMmSpec(
+            family=family.name,
+            feature_shm=self._use_feature_shm(),
+            # <image> is collapsed onto IMG_CONTEXT before Rust sees the prompt.
+            image_token_id=img_context_token_id,
+            image_mean=tuple(float(x) for x in InternVLProcessor.IMAGENET_MEAN),
+            image_std=tuple(float(x) for x in InternVLProcessor.IMAGENET_STD),
+            vision_start_token_id=img_start_token_id,
+            vision_end_token_id=img_end_token_id,
+            video_token_id=None,
+            image_size=image_size,
+            num_image_token=num_image_token,
+            max_num=InternVLProcessor.IMAGE_MAX_NUM,
+            use_thumbnail=True,
+            img_context_token_id=img_context_token_id,
+            img_start_token_id=img_start_token_id,
+            img_end_token_id=img_end_token_id,
+        )
+        logger.info("rust server: Rust MM pipeline enabled (family=%s)", family.name)
+        return spec
+
     def _use_feature_shm(self) -> bool:
         """Whether to park feature buffers in POSIX shm rather than inline.
 
@@ -336,11 +410,12 @@ class RustMmProcessor:
         resize, patchify, token expansion and M-RoPE all ran in Rust.
 
         The buffers are ``mm.feature.{i}`` per item (shaped ``[rows,
-        feature_dim]`` f32, inline or shm), ``mm.mrope`` (``[3, seq_len]``
-        int64), and ``mm.meta``, a msgpack sidecar decoding to ``{"items":
-        [{"modality", "hash", "offsets", "model_specific_data"}, ...],
-        "token_ids", "mrope_delta"}`` with the items in buffer order. External
-        model packages receive the same layout and wrap it their own way.
+        feature_dim]`` f32, inline or shm), ``mm.meta``, a msgpack sidecar
+        decoding to ``{"items": [{"modality", "hash", "offsets",
+        "model_specific_data"}, ...], "token_ids", "mrope_delta"}`` with the
+        items in buffer order, and ``mm.mrope`` (``[3, seq_len]`` int64) only
+        for families with M-RoPE. External model packages receive the same
+        layout and wrap it their own way.
 
         Runs on the scheduler loop, so it must stay copy-free *and* hash-free:
         the inline numpy arrays own the Rust buffers, ``torch.from_numpy`` just
@@ -366,7 +441,11 @@ class RustMmProcessor:
             meta = msgspec.msgpack.decode(memoryview(buffers["mm.meta"]))
             items = [
                 RustMmProcessor._wrap_item(
-                    index=index, item=item, buffers=buffers, stubs=stubs
+                    index=index,
+                    item=item,
+                    buffers=buffers,
+                    stubs=stubs,
+                    family=spec.family,
                 )
                 for index, item in enumerate(meta["items"])
             ]
@@ -379,9 +458,15 @@ class RustMmProcessor:
                 im_start_id=spec.vision_start_token_id,
                 im_end_id=spec.vision_end_token_id,
                 video_token_id=spec.video_token_id,
-                mrope_positions=torch.from_numpy(buffers["mm.mrope"]),
-                mrope_position_delta=torch.tensor(
-                    [[meta["mrope_delta"]]], dtype=torch.long
+                mrope_positions=(
+                    torch.from_numpy(buffers["mm.mrope"])
+                    if "mm.mrope" in buffers
+                    else None
+                ),
+                mrope_position_delta=(
+                    torch.tensor([[meta["mrope_delta"]]], dtype=torch.long)
+                    if meta.get("mrope_delta") is not None
+                    else None
                 ),
             )
         except BaseException:
@@ -391,7 +476,7 @@ class RustMmProcessor:
         return output
 
     @staticmethod
-    def _wrap_item(*, index: int, item: dict, buffers, stubs: list):
+    def _wrap_item(*, index: int, item: dict, buffers, stubs: list, family: str):
         import numpy as np
         import torch
 
@@ -420,6 +505,13 @@ class RustMmProcessor:
             )
             stubs.append(stub)
             feature = stub
+        if family == "intern_vl":
+            return MultimodalDataItem(
+                modality=_MODALITIES[item["modality"]],
+                feature=feature,
+                hash=item["hash"],
+                offsets=[tuple(span) for span in item["offsets"]],
+            )
         t, h, w = item["model_specific_data"]["image_grid_thw"]
         return MultimodalDataItem(
             modality=_MODALITIES[item["modality"]],
