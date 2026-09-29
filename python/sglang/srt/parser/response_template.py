@@ -484,7 +484,7 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
         adapter = ResponseTemplateStreamAdapter(self._template, prefix=self._prefix)
         return any(
             event["type"] == "region_open" and event.get("field") == _TOOL_FIELD
-            for event in adapter.feed(text)
+            for event in adapter.parse(text)
         )
 
     def _to_tool_call_item(

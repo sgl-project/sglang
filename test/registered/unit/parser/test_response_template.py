@@ -751,6 +751,17 @@ class TestResponseTemplateAdapters(CustomTestCase):
         self.assertEqual(result.normal_text, "hello")
         self.assertEqual([call.name for call in result.calls], ["get_weather"])
 
+    def test_call_cut_off_after_its_opener_is_detected(self):
+        detector = ResponseTemplateToolDetector(
+            response_template=GEMMA4_RESPONSE_TEMPLATE,
+        )
+        opener = TOOL_CALL.split("{", 1)[0]
+
+        self.assertTrue(detector.has_tool_call(opener))
+        result = detector.detect_and_parse(opener, [_tool()])
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(result.calls, [])
+
     def test_streaming_malformed_call_is_dropped_before_emission(self):
         detector = ResponseTemplateToolDetector(
             response_template=GEMMA4_RESPONSE_TEMPLATE,
