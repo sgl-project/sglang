@@ -258,7 +258,6 @@ class Glm4MoeAttention(nn.Module):
         self.rope_theta = rope_theta
         self.use_qk_norm = use_qk_norm
         self.max_position_embeddings = max_position_embeddings
-        self.tp_rank = get_parallel().tp_rank
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -431,7 +430,6 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         nn.Module.__init__(self)
         self.top_k = config.num_experts_per_tok
         self.tp_size = get_parallel().tp_size
-        self.moe_ep_size = get_parallel().moe_ep_size
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
         self.num_fused_shared_experts = (
@@ -1141,7 +1139,6 @@ class Glm4MoeForCausalLM(nn.Module):
         nn.Module.__init__(self)
         self.pp_group = get_parallel().pp_group
         self.config = config
-        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.num_fused_shared_experts = 0
         self.determine_num_fused_shared_experts()

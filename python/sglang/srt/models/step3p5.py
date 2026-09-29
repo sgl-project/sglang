@@ -349,7 +349,6 @@ class Step3p5Attention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        self.tp_size = get_parallel().tp_size
         self.total_num_heads = num_heads
         attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
@@ -372,7 +371,6 @@ class Step3p5Attention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-        self.tp_rank = get_parallel().tp_rank
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=rms_norm_eps)
 

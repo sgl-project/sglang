@@ -209,7 +209,6 @@ class GptOssSparseMoeBlock(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.tp_size = get_parallel().tp_size
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
         self.activation = config.hidden_act
@@ -408,7 +407,6 @@ class GptOssAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-        self.tp_rank = get_parallel().tp_rank
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -562,9 +560,6 @@ class GptOssDecoderLayer(nn.Module):
         )
 
         self.layer_id = layer_id
-
-        self.attn_tp_size = get_parallel().attn_tp_size
-        self.attn_tp_rank = get_parallel().attn_tp_rank
 
         # GptOss all layers are sparse
         self.is_layer_sparse = True

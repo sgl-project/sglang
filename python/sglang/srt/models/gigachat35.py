@@ -598,7 +598,6 @@ class GigaChat35ForCausalLM(DeepseekV2WeightLoaderMixin, nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.pp_group = get_parallel().pp_group
-        self.tp_size = get_parallel().tp_size
         self.num_fused_shared_experts = 0
 
         self.model = GigaChat35Model(
