@@ -233,11 +233,13 @@ impl Worker {
         self.bootstrap_port
     }
 
-    /// Continue `prev`'s identity on re-registration: its first-seen time, breaker,
-    /// and load counters, which in-flight guards still hold.
+    /// Continue `prev`'s identity on re-registration: its first-seen time, load
+    /// counters (which in-flight guards still hold), and breaker unless its config changed.
     pub(crate) fn inherit(&mut self, prev: &Worker) {
         self.registered_at = prev.registered_at;
-        self.breaker = Arc::clone(&prev.breaker);
+        if prev.breaker.config() == self.breaker.config() {
+            self.breaker = Arc::clone(&prev.breaker);
+        }
         self.active_requests = Arc::clone(&prev.active_requests);
         self.slots = Arc::clone(&prev.slots);
     }

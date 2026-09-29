@@ -295,6 +295,23 @@ mod tests {
     }
 
     #[test]
+    fn upsert_adopts_a_changed_breaker_config() {
+        let r = WorkerRegistry::default();
+        let cb = CircuitBreakerConfig {
+            cool_down: std::time::Duration::from_secs(60),
+            ..Default::default()
+        };
+        r.add(spec("p", WorkerMode::Prefill, &[])).unwrap();
+        r.add_with_cb(
+            spec("p", WorkerMode::Prefill, &["m"]),
+            Some(cb.clone()),
+            WireProtocol::default(),
+        )
+        .unwrap();
+        assert_eq!(r.get(&WorkerId("p".into())).unwrap().breaker.config(), &cb);
+    }
+
+    #[test]
     fn all_is_empty_for_fresh_registry() {
         assert!(WorkerRegistry::default().all().is_empty());
     }
