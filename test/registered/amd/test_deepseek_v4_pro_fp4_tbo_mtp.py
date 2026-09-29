@@ -93,7 +93,7 @@ class TestDeepseekV4ProFp4TboMTP(CustomTestCase):
             "4",
             "--max-running-requests",
             "512",
-            "--cuda-graph-max-bs",
+            "--cuda-graph-max-bs-decode",
             "512",
             "--page-size",
             "256",
@@ -130,7 +130,7 @@ class TestDeepseekV4ProFp4TboMTP(CustomTestCase):
             num_questions=1319,
             parallel=512,
             max_new_tokens=512,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)

@@ -4,6 +4,8 @@ import unittest
 from contextlib import ExitStack
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.environ import envs
 from sglang.srt.utils.numa_utils import (
     _handle_numa_bind_failure,
@@ -12,6 +14,7 @@ from sglang.srt.utils.numa_utils import (
     _numactl_cpu_mem_args,
     _probe_numactl_args,
     _query_numa_node_for_gpu,
+    _read_pci_numa_node,
     _strip_memory_args,
     configure_subprocess,
     get_numa_node_if_available,
@@ -20,15 +23,16 @@ from sglang.srt.utils.numa_utils import (
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
-register_cuda_ci(est_time=10, stage="base-c", runner_config="4-gpu-gb300")
-register_cuda_ci(est_time=10, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=7, stage="base-c", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=6, stage="base-c", runner_config="4-gpu-b200")
 
 
 class TestIsNumaAvailable(unittest.TestCase):
     """Tests for _is_numa_available on both NUMA and non-NUMA systems."""
 
+    @patch("sglang.srt.utils.numa_utils._is_xpu", False)
     @patch("sglang.srt.utils.numa_utils._is_cuda", False)
-    def test_returns_false_when_not_cuda(self):
+    def test_returns_false_when_not_cuda_or_xpu(self):
         self.assertFalse(_is_numa_available())
 
     @patch("sglang.srt.utils.numa_utils._is_cuda", True)
@@ -65,6 +69,9 @@ class TestIsNumaAvailable(unittest.TestCase):
         mock_isdir.assert_called_with("/sys/devices/system/node/node1")
 
 
+# Pin _is_xpu=False so these cases still reach the mocked pynvml on a real XPU
+# host, where _query_numa_node_for_gpu short-circuits into the XPU sysfs branch.
+@patch("sglang.srt.utils.numa_utils._is_xpu", False)
 class TestQueryNumaNodeForGpu(unittest.TestCase):
     """Tests for _query_numa_node_for_gpu with mocked pynvml."""
 
@@ -302,18 +309,20 @@ class TestGraceBlackwellNumaTopology(unittest.TestCase):
     "Requires 4-GPU B200 hardware",
 )
 class TestB200NumaTopology(unittest.TestCase):
-    """Hardware test validating expected NUMA topology on 4-GPU B200."""
+    """Hardware test for the 4-GPU B200 NUMA mapping; layout is BIOS-dependent."""
 
     def test_gpu_numa_mapping(self):
         self.assertEqual(_gpu_count, 4)
-        numa_nodes = {
-            _query_single_numa_node_for_gpu(gpu_id) for gpu_id in range(_gpu_count)
-        }
-        self.assertEqual(
-            len(numa_nodes),
-            1,
-            f"Expected all visible 4-GPU B200 devices on one NUMA node, got {numa_nodes}",
-        )
+        for gpu_id in range(_gpu_count):
+            # Not NVML: the index mapping under test must not validate itself.
+            props = torch.cuda.get_device_properties(gpu_id)
+            pci_address = f"{props.pci_domain_id:04x}:{props.pci_bus_id:02x}:{props.pci_device_id:02x}.0"
+            self.assertIn(
+                _read_pci_numa_node(pci_address)[0],
+                _query_numa_node_for_gpu(gpu_id),
+                f"GPU {gpu_id} ({pci_address}): NVML memory affinity omits the "
+                f"sysfs numa_node",
+            )
 
 
 class TestNumaBindIntersection(unittest.TestCase):

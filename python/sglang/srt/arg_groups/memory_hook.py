@@ -17,13 +17,34 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
+from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils.common import get_device_memory_capacity
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_PP_PREFILL_CUDA_GRAPH_MAX_TOKENS = 8192
 
 
-def handle_gpu_memory_settings(server_args: Any, gpu_mem):
+def handle_offload_compatibility(server_args: Any) -> None:
+    """Flag-only check; re-run after the model overrides fill in the PLE default."""
+    cfg = resolving_view(server_args)
+    if cfg.ple_offload_embedding and (
+        cfg.cpu_offload_gb > 0 or cfg.offload_group_size > 0
+    ):
+        raise ValueError(
+            "--ple-offload-embedding cannot be combined with "
+            "--cpu-offload-gb or --offload-group-size: generic layer offload "
+            "would stage the pinned PLE embedding back to the device."
+        )
+
+    if cfg.ple_offload_backend == "file" and cfg.ple_offload_embedding is False:
+        raise ValueError(
+            "--ple-offload-backend file requires --ple-offload-embedding: "
+            "the file-backed table is the offloaded table."
+        )
+
+
+def handle_gpu_memory_settings(server_args: Any):
     """
     Configure GPU memory-dependent settings including
     chunked_prefill_size, cuda_graph_config[decode].max_bs, and mem_fraction_static.
@@ -54,6 +75,7 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
     )
 
     cfg = resolving_view(server_args)
+    gpu_mem = get_device_memory_capacity(cfg.device)
     # A copy, so an earlier declaration keeps the value it recorded.
     cuda_graph_config = copy.deepcopy(cfg.cuda_graph_config)
     decode_cuda_graph_config = cuda_graph_config.decode
@@ -77,18 +99,21 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
                 decode_cuda_graph_config.max_bs = 8
         elif gpu_mem < 35 * 1024:
             # A10, 4090, 5090
-            # (chunked_prefill_size 2k, max_bs 24 if tp < 4 else 80)
+            # (chunked_prefill_size 4k, max_bs 48 if tp < 4 else 160)
+            # 32GB Blackwell (RTX 5090) can hold decode cuda graphs well past
+            # bs=24; the previous cap forced eager decode at bs>=32 and
+            # collapsed high-concurrency throughput vs vLLM.
             if cfg.chunked_prefill_size is None:
                 declare_resolution(
                     server_args,
                     "_handle_gpu_memory_settings",
-                    chunked_prefill_size=2048,
+                    chunked_prefill_size=4096,
                 )
             if decode_cuda_graph_config.max_bs is None:
                 if cfg.tp_size < 4:
-                    decode_cuda_graph_config.max_bs = 24
+                    decode_cuda_graph_config.max_bs = 48
                 else:
-                    decode_cuda_graph_config.max_bs = 80
+                    decode_cuda_graph_config.max_bs = 160
         elif gpu_mem < 60 * 1024:
             # A100 (40GB), L40,
             # (chunked_prefill_size 4k, max_bs 32 if tp < 4 else 160)
@@ -153,10 +178,17 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
         if decode_cuda_graph_config.max_bs is None:
             decode_cuda_graph_config.max_bs = 160
 
+    from sglang.srt.arg_groups.model_overrides.qwen3_vl import (
+        expand_multimodal_decode_graph_to_running_limit,
+    )
+
+    expand_multimodal_decode_graph_to_running_limit(
+        server_args, decode_cuda_graph_config, gpu_mem
+    )
+
     # ------------------------------------------------------------------
     # CUDA graph batch-size materialization
     # ------------------------------------------------------------------
-
     if cfg.device != "cpu":
         if decode_cuda_graph_config.bs is None:
             decode_cuda_graph_config.bs = generate_decode_cuda_graph_batch_sizes(
@@ -276,6 +308,11 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
                 reserved_mem = max(reserved_mem, 10 * 1024)
             # Reserve headroom for DeepEP all-to-all buffers on top of the floor.
             reserved_mem += reserve_for_deepep_a2a_mb(server_args)
+            # XPU: oneDNN allocates scratch space for matmul when
+            # M is not a power-of-2-aligned value (e.g. M=2100).  Reserve extra
+            # headroom so non-aligned prefill lengths don't hit OOM.
+            if get_platform().is_xpu:
+                reserved_mem += 2 * 1024
 
         mem_fraction_static = (
             round((gpu_mem - reserved_mem) / gpu_mem, 3)

@@ -1,9 +1,14 @@
+import gc
+import os
+import pickle
+import sys
 import unittest
 from array import array
+from multiprocessing import shared_memory
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import torch
 import torch.distributed
@@ -19,7 +24,10 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
     MMInputsProcessError,
     TokenizedEmbeddingReqInput,
 )
-from sglang.srt.managers.mm_utils import ShmPointerMMData  # noqa: E402
+from sglang.srt.managers.mm_utils import (  # noqa: E402
+    ShmPointerMMData,
+    wrap_shm_features,
+)
 from sglang.srt.managers.schedule_batch import (  # noqa: E402
     Modality,
     MultimodalDataItem,
@@ -32,8 +40,9 @@ from sglang.srt.managers.scheduler import (  # noqa: E402
 from sglang.srt.managers.scheduler_components.request_receiver import (  # noqa: E402
     SchedulerRequestReceiver,
 )
+from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=33, suite="base-a-test-cpu")
 
 
 class _CloneFailure:
@@ -42,17 +51,14 @@ class _CloneFailure:
 
 
 class _Handle:
-    def __init__(self, *, fail_unlink: bool = False):
+    def __init__(self):
         self.closed = False
         self.unlinked = False
-        self.fail_unlink = fail_unlink
 
     def close(self):
         self.closed = True
 
     def unlink(self):
-        if self.fail_unlink:
-            raise PermissionError("unlink denied")
         self.unlinked = True
 
 
@@ -69,15 +75,7 @@ def _failed_pointer() -> ShmPointerMMData:
 
 
 def _successful_pointer() -> ShmPointerMMData:
-    pointer = object.__new__(ShmPointerMMData)
-    pointer.shm_name = "unused"
-    pointer.shape = torch.Size([1])
-    pointer.dtype = torch.float32
-    pointer.precomputed_hash = None
-    pointer._shm_handle = _Handle()
-    pointer.tensor = torch.ones(1)
-    pointer._materialization_error = None
-    return pointer
+    return pickle.loads(pickle.dumps(ShmPointerMMData(torch.ones(1))))
 
 
 def _request(feature, rid: str = "vlm-request") -> TokenizedEmbeddingReqInput:
@@ -89,11 +87,11 @@ def _request(feature, rid: str = "vlm-request") -> TokenizedEmbeddingReqInput:
             mm_items=[MultimodalDataItem(modality=Modality.IMAGE, feature=feature)]
         ),
         token_type_ids=None,
-        sampling_params=MagicMock(),
+        sampling_params=SamplingParams(max_new_tokens=1),
     )
 
 
-def _receiver(tp_size: int = 1) -> SchedulerRequestReceiver:
+def _receiver() -> SchedulerRequestReceiver:
     group = SimpleNamespace(rank=0, ranks=[0], cpu_group=object())
     return SchedulerRequestReceiver(
         recv_from_tokenizer=None,
@@ -101,14 +99,6 @@ def _receiver(tp_size: int = 1) -> SchedulerRequestReceiver:
         recv_skipper=None,
         input_blocker=None,
         mm_receiver=None,
-        ps=SimpleNamespace(
-            pp_rank=0,
-            tp_size=tp_size,
-            attn_tp_rank=0,
-            attn_cp_rank=0,
-            attn_tp_size=1,
-            attn_cp_size=1,
-        ),
         tp_group=group,
         tp_cpu_group=group,
         attn_tp_group=group,
@@ -133,8 +123,8 @@ def _run_consensus_rank(rank: int, world_size: int, init_file: str) -> None:
     )
     try:
         req = _request(_failed_pointer() if rank == 1 else _successful_pointer())
-        parallel = SimpleNamespace(enable_dp_attention=False)
-        receiver = _receiver(tp_size=world_size)
+        parallel = SimpleNamespace(enable_dp_attention=False, tp_size=world_size)
+        receiver = _receiver()
         object.__setattr__(receiver, "tp_cpu_group", torch.distributed.group.WORLD)
         with (
             patch(
@@ -157,8 +147,150 @@ def _run_consensus_rank(rank: int, world_size: int, init_file: str) -> None:
         torch.distributed.destroy_process_group()
 
 
+def _run_image_receiver(rank, init_file, pipe):
+    torch.set_num_threads(1)
+    torch.distributed.init_process_group(
+        backend="gloo", init_method=Path(init_file).as_uri(), rank=rank, world_size=2
+    )
+    try:
+        receiver = _receiver()
+        object.__setattr__(receiver, "tp_cpu_group", torch.distributed.group.WORLD)
+        torch.distributed.barrier()
+        torch.distributed.all_reduce(torch.zeros(1))
+        initial_fds = len(os.listdir("/proc/self/fd"))
+        held = None
+        pipe.send("ready")
+        with (
+            patch(
+                "sglang.srt.managers.mm_utils._get_is_default_transport",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.managers.mm_utils.get_serving",
+                return_value=SimpleNamespace(skip_tokenizer_init=False),
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.request_receiver.get_parallel",
+                return_value=SimpleNamespace(enable_dp_attention=False, tp_size=2),
+            ),
+        ):
+            for base in [30, 90]:
+                req = pickle.loads(pipe.recv_bytes())
+                receiver._finalize_shm_features([req])
+                features = [item.feature for item in req.mm_inputs.mm_items]
+                assert len(features) == 7
+                assert all(torch.all(t == base + i) for i, t in enumerate(features))
+                assert [item.hash for item in req.mm_inputs.mm_items] == list(
+                    range(100, 107)
+                )
+                if held is None:
+                    held = features[1][::2, ::2, :]
+                assert torch.all(held == 31)
+                # Copy-on-write must preserve the old clone's rank isolation.
+                if rank == 0:
+                    features[0].zero_()
+                torch.distributed.barrier()
+                assert torch.all(features[0] == (0 if rank == 0 else base))
+                del features, req
+                pipe.send("exact")
+        del held
+        gc.collect()
+        assert len(os.listdir("/proc/self/fd")) <= initial_fds
+    finally:
+        pipe.close()
+        torch.distributed.destroy_process_group()
+
+
+class TestShmStorageOwnership(unittest.TestCase):
+    def test_private_mappings_preserve_dtype_pixels_and_views(self):
+        for dtype in [torch.uint8, torch.float32, torch.bfloat16]:
+            with self.subTest(dtype=dtype):
+                source = torch.arange(3 * 13 * 19).to(dtype).reshape(3, 13, 19)
+                wire = pickle.dumps(ShmPointerMMData(source))
+                first, second = pickle.loads(wire), pickle.loads(wire)
+                left, right = first.materialize(), second.materialize()
+                self.assertEqual(left.dtype, dtype)
+                self.assertTrue(torch.equal(left, source))
+                view = right[:, ::2, ::2]
+                left.zero_()
+                self.assertTrue(torch.equal(right, source))
+                del left, right, first, second
+                gc.collect()
+                self.assertTrue(torch.equal(view, source[:, ::2, ::2]))
+
+    @unittest.skipUnless(sys.platform == "linux", "requires Linux fd accounting")
+    def test_seven_input_images_across_two_ranks_and_successive_requests(self):
+        torch.set_num_threads(1)
+        ctx = torch.multiprocessing.get_context("spawn")
+        pipes = [ctx.Pipe() for _ in range(2)]
+        processes = []
+        allocated = []
+        with TemporaryDirectory() as directory:
+            try:
+                for rank, (parent, child) in enumerate(pipes):
+                    proc = ctx.Process(
+                        target=_run_image_receiver,
+                        args=(rank, str(Path(directory) / "gloo-init"), child),
+                    )
+                    proc.start()
+                    child.close()
+                    processes.append(proc)
+                for parent, _ in pipes:
+                    self.assertTrue(parent.poll(120))
+                    self.assertEqual(parent.recv(), "ready")
+                for base in [30, 90]:
+                    pixels = [
+                        torch.full((641 + i, 643, 3), base + i, dtype=torch.uint8)
+                        for i in range(7)
+                    ]
+                    req = _request(None)
+                    req.mm_inputs.mm_items = [
+                        MultimodalDataItem(
+                            modality=Modality.IMAGE, feature=pixel, hash=100 + i
+                        )
+                        for i, pixel in enumerate(pixels)
+                    ]
+                    with (
+                        patch(
+                            "sglang.srt.managers.mm_utils._get_is_default_transport",
+                            return_value=False,
+                        ),
+                        patch(
+                            "sglang.srt.managers.mm_utils.get_serving",
+                            return_value=SimpleNamespace(skip_tokenizer_init=False),
+                        ),
+                    ):
+                        wrap_shm_features(req)
+                    names = [item.feature.shm_name for item in req.mm_inputs.mm_items]
+                    allocated.extend(item.feature for item in req.mm_inputs.mm_items)
+                    wire = pickle.dumps(req)
+                    self.assertLess(len(wire), 8192)
+                    for pixel in pixels:
+                        pixel.zero_()
+                    for parent, _ in pipes:
+                        parent.send_bytes(wire)
+                    for parent, _ in pipes:
+                        self.assertTrue(parent.poll(120))
+                        self.assertEqual(parent.recv(), "exact")
+                    for name in names:
+                        with self.assertRaises(FileNotFoundError):
+                            shared_memory.SharedMemory(name=name)
+                for proc in processes:
+                    proc.join(30)
+                    self.assertEqual(proc.exitcode, 0)
+            finally:
+                for proc in processes:
+                    if proc.is_alive():
+                        proc.terminate()
+                        proc.join(30)
+                for parent, _ in pipes:
+                    parent.close()
+                for pointer in allocated:
+                    pointer.close_and_unlink()
+
+
 class TestShmPointerFailureCleanup(unittest.TestCase):
-    def test_clone_failure_still_unlinks_and_closes(self):
+    def test_nonlinux_clone_failure_still_unlinks_and_closes(self):
         pointer = object.__new__(ShmPointerMMData)
         handle = _Handle()
         pointer.shm_name = "unused"
@@ -166,7 +298,10 @@ class TestShmPointerFailureCleanup(unittest.TestCase):
         pointer.tensor = _CloneFailure()
         pointer._materialization_error = None
 
-        with self.assertRaisesRegex(RuntimeError, "clone failed"):
+        with (
+            patch("sglang.srt.managers.mm_utils.sys.platform", "darwin"),
+            self.assertRaisesRegex(RuntimeError, "clone failed"),
+        ):
             pointer.materialize()
 
         self.assertTrue(handle.unlinked)
@@ -192,18 +327,38 @@ class TestShmPointerFailureCleanup(unittest.TestCase):
                 pointer.materialize()
 
     def test_cleanup_error_does_not_escape_the_request_boundary(self):
-        pointer = object.__new__(ShmPointerMMData)
-        handle = _Handle(fail_unlink=True)
-        pointer.shm_name = "unused"
-        pointer._shm_handle = handle
-        pointer.tensor = torch.ones(1)
-        pointer._materialization_error = None
+        pointer = _successful_pointer()
+        name, handle = pointer.shm_name, pointer._shm_handle
+        try:
+            with (
+                patch.object(
+                    handle, "unlink", side_effect=PermissionError("unlink denied")
+                ),
+                self.assertLogs("sglang.utils", level="WARNING"),
+            ):
+                result = pointer.materialize()
+            self.assertTrue(torch.equal(result, torch.ones(1)))
+            self.assertEqual(handle._fd, -1)
+        finally:
+            segment = shared_memory.SharedMemory(name=name)
+            segment.unlink()
+            segment.close()
 
-        with self.assertLogs("sglang.utils", level="WARNING"):
-            result = pointer.materialize()
-
-        self.assertTrue(torch.equal(result, torch.ones(1)))
-        self.assertTrue(handle.closed)
+    @unittest.skipUnless(sys.platform == "linux", "requires Linux private mappings")
+    def test_mapping_failure_still_releases_the_segment(self):
+        pointer = _successful_pointer()
+        name, handle = pointer.shm_name, pointer._shm_handle
+        with (
+            patch(
+                "sglang.srt.managers.mm_utils.mmap.mmap",
+                side_effect=OSError("map failed"),
+            ),
+            self.assertRaisesRegex(OSError, "map failed"),
+        ):
+            pointer.materialize()
+        self.assertEqual(handle._fd, -1)
+        with self.assertRaises(FileNotFoundError):
+            shared_memory.SharedMemory(name=name)
 
 
 class TestShmRequestFailureConsensus(unittest.TestCase):
@@ -219,7 +374,7 @@ class TestShmRequestFailureConsensus(unittest.TestCase):
 
     def test_local_materialization_failure_becomes_request_error(self):
         req = _request(_failed_pointer())
-        parallel = SimpleNamespace(enable_dp_attention=False)
+        parallel = SimpleNamespace(enable_dp_attention=False, tp_size=1)
 
         with (
             patch(
@@ -243,7 +398,7 @@ class TestShmRequestFailureConsensus(unittest.TestCase):
 
     def test_peer_failure_rejects_the_local_request(self):
         req = _request(torch.zeros(1))
-        parallel = SimpleNamespace(enable_dp_attention=False)
+        parallel = SimpleNamespace(enable_dp_attention=False, tp_size=2)
 
         def inject_peer_failure(mask, **kwargs):
             mask.fill_(1)
@@ -266,7 +421,7 @@ class TestShmRequestFailureConsensus(unittest.TestCase):
                 side_effect=inject_peer_failure,
             ) as all_reduce,
         ):
-            _receiver(tp_size=2)._finalize_shm_features([req])
+            _receiver()._finalize_shm_features([req])
 
         all_reduce.assert_called_once()
         self.assertIsInstance(req.mm_inputs, MMInputsProcessError)
@@ -275,7 +430,7 @@ class TestShmRequestFailureConsensus(unittest.TestCase):
         failed_req = _request(torch.zeros(1), rid="failed")
         healthy_req = _request(torch.zeros(1), rid="healthy")
         batch = BatchTokenizedEmbeddingReqInput(batch=[failed_req, healthy_req])
-        parallel = SimpleNamespace(enable_dp_attention=False)
+        parallel = SimpleNamespace(enable_dp_attention=False, tp_size=1)
 
         def materialize(req):
             if req.rid == "failed":

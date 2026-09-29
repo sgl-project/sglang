@@ -16,6 +16,7 @@ from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.diffusion import (
     can_use_modulate_scale_shift_cuda,
     can_use_residual_gate_add_cuda,
+    can_use_rmsnorm_scale_shift_per_token,
     fuse_layernorm_scale_shift_gate_select01_kernel,
     fuse_residual_layernorm_scale_shift_gate_select01_kernel,
     fuse_scale_shift_kernel,
@@ -25,6 +26,7 @@ from sglang.kernels.ops.diffusion import (
     norm_infer,
     residual_gate_add,
     residual_gate_add_cuda,
+    rmsnorm_scale_shift_per_token,
     timestep_embedding,
     try_fused_scaled_residual_add_exact,
 )
@@ -144,6 +146,15 @@ GATE_CASES = [
 ]
 
 
+# LingBot per-token gates are [B, S, 1]: one scalar per token, broadcast
+# along the hidden dimension.
+PER_TOKEN_GATE_CASES = [
+    ((1, 2560, 512), (1, 2560, 1)),
+    ((1, 17, 65), (1, 17, 1)),
+    ((2, 33, 128), (2, 33, 1)),
+]
+
+
 def _assert_gate_add(out, ref):
     if ref.dtype == torch.float32:
         # fp32 has no rounding boundary to reproduce; the kernel keeps the
@@ -153,21 +164,25 @@ def _assert_gate_add(out, ref):
         assert torch.equal(out, ref)
 
 
-@pytest.mark.parametrize("residual_shape,gate_shape", GATE_CASES)
+@pytest.mark.parametrize("residual_shape,gate_shape", GATE_CASES + PER_TOKEN_GATE_CASES)
 def test_residual_gate_add_matches_torch(residual_shape, gate_shape):
     residual = torch.randn(residual_shape, device=DEVICE, dtype=torch.bfloat16)
     update = torch.randn_like(residual)
     gate = torch.randn(gate_shape, device=DEVICE, dtype=torch.bfloat16)
 
+    assert can_use_residual_gate_add_cuda(residual, update, gate)
     ref = residual + update * gate
     _assert_gate_add(residual_gate_add_cuda(residual, update, gate), ref)
     assert torch.equal(residual_gate_add(residual, update, gate), ref)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("gate_shape", [(1, 1, 64), (1, 9, 64)])
-def test_residual_gate_add_dtypes(dtype, gate_shape):
-    residual = torch.randn((1, 9, 64), device=DEVICE, dtype=dtype)
+@pytest.mark.parametrize(
+    "shape,gate_shape",
+    [((1, 9, 64), (1, 1, 64)), ((1, 9, 64), (1, 9, 64)), PER_TOKEN_GATE_CASES[0]],
+)
+def test_residual_gate_add_dtypes(dtype, shape, gate_shape):
+    residual = torch.randn(shape, device=DEVICE, dtype=dtype)
     update = torch.randn_like(residual)
     gate = torch.randn(gate_shape, device=DEVICE, dtype=dtype)
     _assert_gate_add(
@@ -215,10 +230,12 @@ def test_residual_gate_add_transposed_storage_offsets():
     assert torch.equal(out, residual + update * gate)
 
 
-def test_residual_gate_add_transposed_torch_compile_fullgraph():
-    residual = torch.randn((1, 128, 32), device=DEVICE, dtype=torch.bfloat16).transpose(
-        1, 2
-    )
+@pytest.mark.parametrize("transposed", [False, True])
+def test_residual_gate_add_torch_compile_fullgraph(transposed):
+    shape = (1, 128, 32) if transposed else (1, 32, 128)
+    residual = torch.randn(shape, device=DEVICE, dtype=torch.bfloat16)
+    if transposed:
+        residual = residual.transpose(1, 2)
     update = torch.randn_like(residual, memory_format=torch.contiguous_format)
     gate = torch.randn((1, 1, 128), device=DEVICE, dtype=torch.bfloat16)
     compiled = torch.compile(residual_gate_add, fullgraph=True)
@@ -274,14 +291,6 @@ def test_residual_gate_add_guards_and_eager_fallback():
         residual_gate_add(batched, batched_update, batched_gate),
         batched + batched_update * batched_gate,
     )
-
-
-def test_residual_gate_add_torch_compile_fullgraph():
-    residual = torch.randn((1, 32, 128), device=DEVICE, dtype=torch.bfloat16)
-    update = torch.randn_like(residual)
-    gate = torch.randn((1, 1, 128), device=DEVICE, dtype=torch.bfloat16)
-    compiled = torch.compile(residual_gate_add, fullgraph=True)
-    assert torch.equal(compiled(residual, update, gate), residual + update * gate)
 
 
 @torch.no_grad()
@@ -524,3 +533,59 @@ def test_timestep_embedding_matches_diffusers(
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+# ---------------------------------------------------------------------------
+# fused RMSNorm + per-token adaLN scale/shift (quality-gated, LingBot)
+# ---------------------------------------------------------------------------
+
+
+def _eager_lingbot_norm_modulate(x, weight, scale, shift, eps):
+    xf = x.to(torch.float32)
+    var = xf.pow(2).mean(-1, keepdim=True)
+    xf = xf * torch.rsqrt(var + eps)
+    normed = (weight.to(torch.float32) * xf).to(x.dtype)
+    return (normed * (1.0 + scale.to(torch.float32)) + shift.to(torch.float32)).to(
+        x.dtype
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("shape", [(1, 4813, 2048), (1, 2560, 512), (2, 33, 128)])
+def test_rmsnorm_scale_shift_per_token_matches_eager(shape, dtype):
+    B, S, H = shape
+    x = torch.randn(shape, device=DEVICE, dtype=dtype)
+    weight = torch.randn(H, device=DEVICE, dtype=torch.float32)
+    # scale/shift are non-contiguous chunk views of the [B, S, 6D] modulation,
+    # matching the LingBot adaLN layout the kernel is built for.
+    mod = torch.randn((B, S, 6 * H), device=DEVICE, dtype=torch.float32)
+    shift, scale = mod.chunk(6, dim=-1)[0], mod.chunk(6, dim=-1)[1]
+    eps = 1e-6
+
+    assert can_use_rmsnorm_scale_shift_per_token(x, weight, scale, shift)
+    ref = _eager_lingbot_norm_modulate(x, weight, scale, shift, eps)
+    out = rmsnorm_scale_shift_per_token(x, weight, scale, shift, eps)
+    assert out.dtype == x.dtype and out.shape == x.shape
+    # Not bit-exact (single fp32 pass); assert bf16/fp16 rounding tolerance.
+    torch.testing.assert_close(out, ref, atol=0.13, rtol=0.02)
+
+
+def test_rmsnorm_scale_shift_per_token_guards():
+    B, S, H = 1, 64, 128
+    x = torch.randn((B, S, H), device=DEVICE, dtype=torch.bfloat16)
+    weight = torch.randn(H, device=DEVICE, dtype=torch.float32)
+    scale = torch.randn((B, S, H), device=DEVICE, dtype=torch.float32)
+    shift = torch.randn((B, S, H), device=DEVICE, dtype=torch.float32)
+    assert can_use_rmsnorm_scale_shift_per_token(x, weight, scale, shift)
+
+    assert not can_use_rmsnorm_scale_shift_per_token(
+        x.cpu(), weight, scale, shift
+    )  # not on device
+    assert not can_use_rmsnorm_scale_shift_per_token(
+        x, weight, scale, shift[:, :, ::2]
+    )  # strided rows (stride(2) != 1)
+    assert not can_use_rmsnorm_scale_shift_per_token(
+        x, weight, scale.float(), shift.double()
+    )  # mismatched scale/shift dtype
+    assert not can_use_rmsnorm_scale_shift_per_token(
+        x, weight[:-1], scale, shift
+    )  # weight size mismatch

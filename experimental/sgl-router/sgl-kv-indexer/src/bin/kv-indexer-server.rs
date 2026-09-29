@@ -6,13 +6,15 @@ use std::sync::Arc;
 use std::{env, io};
 
 use sgl_kv_indexer::{
-    server_builder, shutdown_signal, stamp_arrival, InMemoryKvIndexerBackend, KvIndexerBackend,
-    KvIndexerService, DEFAULT_PREFIX_QUERY_MAX_INFLIGHT, MAX_CONCURRENT_STREAMS,
+    server_builder_with_max_concurrent_streams, shutdown_signal, stamp_arrival,
+    InMemoryKvIndexerBackend, KvIndexerBackend, KvIndexerService,
+    DEFAULT_PREFIX_QUERY_MAX_INFLIGHT, MAX_CONCURRENT_STREAMS,
 };
 use tonic::service::interceptor::InterceptedService;
 use tracing::info;
 
 const PREFIX_QUERY_MAX_INFLIGHT_ENV: &str = "KV_INDEXER_PREFIX_QUERY_MAX_INFLIGHT";
+const MAX_CONCURRENT_STREAMS_ENV: &str = "KV_INDEXER_MAX_CONCURRENT_STREAMS";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -26,6 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .unwrap_or_else(|_| "[::1]:50051".to_string())
         .parse::<SocketAddr>()?;
     let prefix_query_max_inflight = prefix_query_max_inflight_from_env()?;
+    let max_concurrent_streams = max_concurrent_streams_from_env()?;
 
     let backend: Arc<dyn KvIndexerBackend> = Arc::new(InMemoryKvIndexerBackend::new());
     // The interceptor timestamps each request before its own task is queued,
@@ -39,10 +42,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!(
         %addr,
         prefix_query_max_inflight,
-        max_concurrent_streams = MAX_CONCURRENT_STREAMS,
+        max_concurrent_streams,
         "starting single-server in-memory SGLang KV Indexer"
     );
-    server_builder()
+    server_builder_with_max_concurrent_streams(max_concurrent_streams)
         .add_service(service)
         .serve_with_shutdown(addr, shutdown_signal())
         .await?;
@@ -77,6 +80,33 @@ fn parse_prefix_query_max_inflight(raw: &str) -> io::Result<usize> {
     Ok(value)
 }
 
+fn max_concurrent_streams_from_env() -> io::Result<u32> {
+    match env::var(MAX_CONCURRENT_STREAMS_ENV) {
+        Ok(raw) => parse_max_concurrent_streams(&raw),
+        Err(env::VarError::NotPresent) => Ok(MAX_CONCURRENT_STREAMS),
+        Err(env::VarError::NotUnicode(_)) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{MAX_CONCURRENT_STREAMS_ENV} must be valid UTF-8"),
+        )),
+    }
+}
+
+fn parse_max_concurrent_streams(raw: &str) -> io::Result<u32> {
+    let value = raw.parse::<u32>().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{MAX_CONCURRENT_STREAMS_ENV} must be a positive integer, got {raw:?}"),
+        )
+    })?;
+    if value == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{MAX_CONCURRENT_STREAMS_ENV} must be greater than zero"),
+        ));
+    }
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,5 +120,17 @@ mod tests {
     fn rejects_invalid_prefix_query_limit() {
         assert!(parse_prefix_query_max_inflight("0").is_err());
         assert!(parse_prefix_query_max_inflight("many").is_err());
+    }
+
+    #[test]
+    fn parses_positive_stream_limit() {
+        assert_eq!(parse_max_concurrent_streams("512").unwrap(), 512);
+    }
+
+    #[test]
+    fn rejects_invalid_stream_limit() {
+        assert!(parse_max_concurrent_streams("0").is_err());
+        assert!(parse_max_concurrent_streams("many").is_err());
+        assert!(parse_max_concurrent_streams("4294967296").is_err());
     }
 }

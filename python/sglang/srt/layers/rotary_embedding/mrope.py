@@ -14,6 +14,7 @@ from sglang.kernels.ops.attention.rotary_triton import (
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.rotary_embedding.yarn import (
+    _extend_yarn_cache,
     yarn_find_correction_range,
     yarn_get_mscale_simple,
     yarn_linear_ramp_mask,
@@ -39,7 +40,10 @@ if _is_npu:
     import torch_npu
 
 if _is_xpu:
-    from sgl_kernel import multimodal_rotary_embedding
+    try:
+        from sgl_kernel import multimodal_rotary_embedding
+    except ImportError:
+        multimodal_rotary_embedding = None
 
 from sglang.kernels.ops.attention.mrope import apply_interleaved_rope_triton
 
@@ -247,6 +251,8 @@ class MRotaryEmbedding(RotaryEmbedding):
         fused_set_kv_buffer_arg=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert positions.ndim == 1 or positions.ndim == 2
+        if query.shape[0] == 0:
+            return query, key
         self._match_cos_sin_cache_dtype(query)
         if positions.ndim == 2 and self.mrope_section:
             return self.forward_triton(positions, query, key)
@@ -309,7 +315,11 @@ class MRotaryEmbedding(RotaryEmbedding):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert positions.ndim in (1, 2)
         self._match_cos_sin_cache_dtype(query)
-        if positions.ndim == 2 and self.mrope_section:
+        if (
+            multimodal_rotary_embedding is not None
+            and positions.ndim == 2
+            and self.mrope_section
+        ):
             multimodal_rotary_embedding(
                 query,
                 key,
@@ -478,6 +488,14 @@ class YaRNScalingMRotaryEmbedding(MRotaryEmbedding):
             + inv_freq_extrapolation * inv_freq_mask
         )
         return inv_freq
+
+    def _ensure_cos_sin_cache_length(self, needed_max_pos: int):
+        self.cos_sin_cache, _ = _extend_yarn_cache(
+            cache=self.cos_sin_cache,
+            compute_inv_freq=lambda: self._compute_inv_freq(self.scaling_factor),
+            mscale=self.mscale,
+            needed_max_pos=needed_max_pos,
+        )
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         inv_freq = self._compute_inv_freq(self.scaling_factor)

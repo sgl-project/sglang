@@ -15,8 +15,13 @@ _ALIGNMENT = 32
 
 
 def _blackwell_or_newer(device: torch.device) -> bool:
+    # ROCm reports a capability derived from the gfx number, so gfx1250 comes
+    # back as (12, 5) and clears a bare major >= 10 test. The kernel is PTX, so
+    # require a CUDA build like rope/qwen_qkv_epilogue_jit.py does.
     return (
-        torch.cuda.is_available() and torch.cuda.get_device_capability(device)[0] >= 10
+        torch.version.cuda is not None
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_capability(device)[0] >= 10
     )
 
 

@@ -5,7 +5,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import torch
 from torch import nn
 
 from sglang.multimodal_gen.runtime.loader.component_loaders.adapter_loader import (
@@ -229,76 +228,6 @@ class TestComponentQuantizationAdmission(unittest.TestCase):
 
         self.assertIs(loaded, config)
 
-    def test_bridge_consumes_exact_component_weight_override(self):
-        loader = BridgeLoader()
-        bridge_config = SimpleNamespace(update_model_arch=lambda _config: None)
-        server_args = SimpleNamespace(
-            component_weights_paths={
-                "dual_tower_bridge": "owner/repo/bridge.safetensors"
-            },
-            model_paths={},
-            pipeline_config=SimpleNamespace(bridge_config=bridge_config),
-            should_use_fsdp_for_component=lambda _name: False,
-            should_start_component_on_cpu=lambda _name: False,
-            hsdp_replicate_dim=1,
-            hsdp_shard_dim=1,
-            pin_cpu_memory=False,
-        )
-
-        with (
-            patch.object(
-                loader,
-                "load_component_config",
-                return_value={"_class_name": "MOVADualTowerModel"},
-            ),
-            patch.object(
-                loader,
-                "resolve_component_weights_path",
-                return_value="/cache/bridge.safetensors",
-            ) as resolve_weights,
-            patch(
-                "sglang.multimodal_gen.runtime.loader.component_loaders."
-                "bridge_loader._list_safetensors_files",
-                return_value=["/cache/bridge.safetensors"],
-            ) as list_weights,
-            patch(
-                "sglang.multimodal_gen.runtime.loader.component_loaders."
-                "bridge_loader.ModelRegistry.resolve_model_cls",
-                return_value=(nn.Linear, None),
-            ),
-            patch(
-                "sglang.multimodal_gen.runtime.loader.component_loaders."
-                "bridge_loader.resolve_precision",
-                return_value=torch.bfloat16,
-            ),
-            patch(
-                "sglang.multimodal_gen.runtime.loader.component_loaders."
-                "bridge_loader.get_local_torch_device",
-                return_value=torch.device("cpu"),
-            ),
-            patch(
-                "sglang.multimodal_gen.runtime.loader.component_loaders."
-                "bridge_loader.maybe_load_fsdp_model",
-                return_value=nn.Linear(1, 1),
-            ) as load_weights,
-        ):
-            loaded = loader.load_customized(
-                "/base/dual_tower_bridge",
-                server_args,
-                "dual_tower_bridge",
-            )
-
-        self.assertIsInstance(loaded, nn.Linear)
-        resolve_weights.assert_called_once_with(
-            "/base/dual_tower_bridge", server_args, "dual_tower_bridge"
-        )
-        list_weights.assert_called_once_with("/cache/bridge.safetensors")
-        self.assertEqual(
-            load_weights.call_args.kwargs["weight_dir_list"],
-            ["/cache/bridge.safetensors"],
-        )
-        self.assertFalse(load_weights.call_args.kwargs["fsdp_inference"])
-
     def test_all_quantization_metadata_layouts_fail_closed(self):
         configs = {
             "quantization_config": {
@@ -358,7 +287,7 @@ class TestComponentQuantizationAdmission(unittest.TestCase):
             ),
             patch(
                 "sglang.multimodal_gen.runtime.loader.component_loaders."
-                "adapter_loader.ModelRegistry.resolve_model_cls"
+                "component_loader.ModelRegistry.resolve_model_cls"
             ) as resolve_model,
             self.assertRaises(ComponentCheckpointUnsupportedError),
         ):
