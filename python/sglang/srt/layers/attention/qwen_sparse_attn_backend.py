@@ -44,6 +44,9 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
@@ -1483,7 +1486,12 @@ class QwenSparseAttnBackend(AttentionBackend):
         k_buffer = pool.get_key_buffer(layer.layer_id)
         v_buffer = pool.get_value_buffer(layer.layer_id)
         req_to_token = self.req_to_token_pool.req_to_token
-        req_indices = forward_batch.req_pool_indices.tolist()
+        if is_in_breakable_cuda_graph():
+            # The current batch's slot table is refreshed outside capture.
+            req_to_token = self._resolve_metadata(forward_batch).token_slot_table
+            req_indices = range(len(sequence_lens))
+        else:
+            req_indices = forward_batch.req_pool_indices.tolist()
         k_parts = [
             k_buffer.index_select(
                 0, req_to_token[req_indices[i], : sequence_lens[i]].long()
