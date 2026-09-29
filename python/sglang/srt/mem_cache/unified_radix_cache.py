@@ -204,7 +204,11 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         # The TreeCore owns the tree member-var state (structure, LRUs, sizes,
         # evictable leaves) and drives the components' tree-level hooks.
-        self._tree_core_backend = envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get()
+        self._tree_core_backend = (
+            params.tree_core_backend
+            if params.tree_core_backend is not None
+            else envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get()
+        )
         self.tree_core = create_tree_core(
             name=self._tree_core_backend,
             params=params,
@@ -971,18 +975,15 @@ class UnifiedRadixCache(BasePrefixCache):
         for comp in self._components_tuple:
             comp.cleanup_after_caching_req(req, is_finished=True)
 
-    @rank_consensus(same_params=["req.rid", "owned_kv_len"])
-    def cache_finished_req(self, req: Req, *, owned_kv_len: int, **kwargs) -> None:
+    @rank_consensus(same_params=["req.rid", "up_to"])
+    def insert_req(self, req: Req, *, up_to: int, **kwargs) -> None:
         if self.disable:
-            self.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(req, is_finished=True)
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:owned_kv_len]
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, :owned_kv_len
-        ]
+        token_ids = (req.origin_input_ids + req.output_ids)[:up_to]
+        kv_indices = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :up_to]
 
         insert_params = InsertParams(
             prev_prefix_len=req.kv.cache_protected_len,
@@ -1056,30 +1057,22 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             )
 
-        # Free the unaligned tail and the deferred truncation tail; after a
-        # rotation decline nothing was inserted, so everything past the
-        # protected prefix goes.
+        # Everything past the inserted key goes back to the caller, the
+        # protected prefix never does. After a rotation decline nothing was
+        # inserted.
         free_from = (
-            # min(): the protected prefix can already run past a truncated
-            # cache_len, and free_kv_row takes ascending ranges only.
             min(req.kv.cache_protected_len, len(kv_indices))
             if result.rotation_tail_declined
             else page_aligned_len
         )
-        ranges = [(free_from, len(kv_indices))]
-        if tail_free_start is not None:
-            if free_from < len(kv_indices) and tail_free_start <= len(kv_indices):
-                # The two halves touch at the truncation boundary and share
-                # that page; free the union as one range.
-                ranges[0] = (free_from, len(kv_indices_full))
-            else:
-                ranges.append((tail_free_start, len(kv_indices_full)))
-        self.free_kv_row(req.kv, ranges)
-
-        self.unpin(req)
-
-        if result is not None and result.last_device_node is not None:
-            req.last_node = result.last_device_node
+        if tail_free_start is not None and tail_free_start > len(kv_indices):
+            # Truncated below the protected prefix: only an untracked mamba
+            # request gets here, with an empty key, and owns nothing before it.
+            assert free_from == len(kv_indices), (
+                f"{free_from=} {len(kv_indices)=} {req.kv.cache_protected_len=}"
+            )
+            free_from = tail_free_start
+        req.kv.cache_protected_len = free_from
 
         # cleanup
         for comp in self._components_tuple:
@@ -1093,7 +1086,9 @@ class UnifiedRadixCache(BasePrefixCache):
             if req.finished_reason is not None and not isinstance(
                 req.finished_reason, FINISH_ABORT
             ):
-                self.session_refs.register_session_ref(req)
+                self.session_refs.register_session_ref(
+                    req, leaf=result.last_device_node
+                )
 
     @rank_consensus(same_params=["req.rid", "chunked"])
     def advance_unpublished_req(self, req: Req, chunked: bool = False) -> None:
@@ -1217,7 +1212,7 @@ class UnifiedRadixCache(BasePrefixCache):
             # gather contract forbids -- keep the request entirely on its own
             # pages: no dedup free, no rebind, no protection change. The insert
             # declined before its walk, so nothing was freed underneath us. The
-            # final cache_finished_req releases everything past the protected
+            # release_kv_cache releases everything past the protected
             # prefix.
             req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
             for comp in self._components_tuple:

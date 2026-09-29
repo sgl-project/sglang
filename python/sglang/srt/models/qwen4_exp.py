@@ -640,7 +640,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
     ) -> torch.Tensor:
         contexts = contexts.to(torch.long)
         if self.enable_ple_fusion and decode_sized:
-            from sglang.kernels.ops.qwen4_ple import (
+            from sglang.kernels.ops.embeddings.qwen4_ngram import (
                 can_fuse_qwen4_ngram_hash,
                 fused_qwen4_ngram_hash,
             )
@@ -1020,7 +1020,7 @@ class Qwen4ExpPLELayer(nn.Module):
         if batch.use_decode_fast_path:
             # With row_width=1 the padded/transpose path is x.unsqueeze(-1),
             # and each state boundary is a one-column shift; conv and SiLU stay native.
-            from sglang.kernels.ops.qwen4_ple import (
+            from sglang.kernels.ops.mamba.qwen4_short_conv import (
                 can_fuse_qwen4_short_conv_state,
                 fused_qwen4_short_conv_state,
             )
@@ -1236,7 +1236,7 @@ class Qwen4ExpPLELayer(nn.Module):
         query = hidden_states.reshape(token_count, hc_count, hidden_size)
         key_normed = self._apply_ple_norm(self.norm_key, key)
         query_normed = self._apply_ple_norm(self.norm_query, query)
-        from sglang.kernels.ops.qwen4_ple import (
+        from sglang.kernels.ops.elementwise.qwen4_gate import (
             can_fuse_qwen4_gate_reduce,
             fused_qwen4_gate_reduce,
         )
@@ -1253,7 +1253,7 @@ class Qwen4ExpPLELayer(nn.Module):
             gate = gate / math.sqrt(hidden_size)
             fused_gate_value = False
             if batch.use_decode_fast_path:
-                from sglang.kernels.ops.qwen4_ple import (
+                from sglang.kernels.ops.elementwise.qwen4_gate import (
                     can_fuse_qwen4_gate_value,
                     fused_qwen4_gate_value,
                 )
@@ -1269,7 +1269,7 @@ class Qwen4ExpPLELayer(nn.Module):
         gated_value = gated_value.flatten(-2)
         gated_value_normed = gated_value_normed.flatten(-2)
         if self.ple_embedding.enable_ple_fusion and batch.mode.is_target_verify():
-            from sglang.kernels.ops.qwen4_ple import (
+            from sglang.kernels.ops.mamba.qwen4_short_conv import (
                 can_fuse_qwen4_verify_conv,
                 fused_qwen4_verify_conv,
             )
