@@ -33,8 +33,8 @@ This integration is particularly valuable for production deployments involving l
 
 ### Decode context parallelism (DCP)
 
-Mooncake L3 supports DCP for MLA models with one materialized host KV pool
-using `layer_first`, `page_first`, or `page_first_direct`. GQA/MHA, extra
+Mooncake L3 supports DCP for one materialized MLA KV pool and optional KDA
+state, using `layer_first`, `page_first`, or `page_first_direct`. GQA/MHA, other
 host pools, split KV buffers, and separate KV scale buffers are not supported
 with DCP.
 
