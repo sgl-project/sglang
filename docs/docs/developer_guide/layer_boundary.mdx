@@ -62,7 +62,7 @@ A declaration states how its compute cooperates with the boundary's reduction de
 | Written | Residual, no pending contribution | Read input without applying another update |
 | Pending | Contribution, optionally an existing residual | Complete owed work, apply the producer update, then read |
 
-The model keeps the tensor or handle that each boundary call returns, and passes exactly that value to the next call. Rebinding a layer's output out of place, or passing another microbatch's output, raises an error instead of applying the wrong pending work.
+The model keeps the tensor or handle that each boundary call returns, and passes exactly that value to the next call. Rebinding a layer's output to a different object, or passing another microbatch's output, raises an error instead of applying the wrong pending work. The check compares object identity, so an in-place change to a complete tensor is not detected; do not modify layer outputs in place, and add extra contributions through `add_to_output()`.
 
 Communication completion and residual update are distinct steps. The `residual.batch` helpers expose them:
 
@@ -171,7 +171,7 @@ This example uses Qwen3's compute member name `mlp`; boundary construction does 
 Compute cooperates through the flags the scope publishes on `get_forward()`:
 
 - `FfnExit` publishes `fuse_mlp_allreduce` (skip the output all-reduce), `mlp_reduce_scatter` (leave the sum to the boundary's reduce-scatter), and `defer_moe_finalize` (a MoE may return a `HandoffOutput`).
-- `MixerExit` publishes `fuse_mlp_allreduce` and exposes the same decision as `skips_reduction`. It never defers under attention DP.
+- `MixerExit` publishes `fuse_mlp_allreduce` and exposes the same decision as `skips_reduction`. Before an FFN, the mixer always leaves its attention-TP sum to the FFN's input, including under attention DP. Before another mixer it may defer the sum to that mixer's input, but never under attention DP.
 
 `RowParallelLinear` and the MoE output reduction honour these flags automatically; a custom reduction reads them from the exit object. Returning a handoff while `defer_moe_finalize` is false fails in `finish()`.
 
@@ -197,7 +197,7 @@ hidden_states = residual_batch.norm(
 
 This is a non-pipeline stack fragment. Pipeline reception uses the first boundary's `from_pp(tensors, forward_batch)` to reconstruct a stream; the sender uses `residual_batch.to_pp()`. Dynamic completion work is resolved before transport. By default, `to_pp()` preserves a statically declared partial sum for the receiver's incoming contract to reconstruct and complete. Do not call `complete_output()` before that handoff: it would complete a sum that the receiver still expects to perform.
 
-A terminal FFN normally completes its output before the final norm. The exception is a MoE finalize handoff. When the stage's fusion provider can defer the finalize at the terminal layer (for CuteDSL, `install_cutedsl_fusion(..., terminal_finalize=True)`), the exit may leave a `HandoffOutput` for the final norm. Pass the handle straight to `residual_batch.norm(hidden_states, forward_batch, self.norm, handoff_norm=service)`, where `service` is the object `install_cutedsl_fusion()` returned; its `finalize(handoff, residual, gamma)` fuses finalize, all-reduce, residual add, and norm. The fused path reads `layernorm.gemma_weight`, so it currently expects a `GemmaRMSNorm` final norm. Without `handoff_norm`, `norm()` completes the handoff unfused. Calling `complete_output()` first runs the producer's unfused finalize, `snapshot()` raises on a handoff, and `norm()` rejects `capture_output` together with a handoff. See `python/sglang/srt/models/qwen3_5.py`.
+A terminal FFN normally completes its output before the final norm. The exception is a MoE finalize handoff. When the stage's fusion provider can defer the finalize at the terminal layer (for CuteDSL, `install_cutedsl_fusion(..., terminal_finalize=True)`), the exit may leave a `HandoffOutput` for the final norm. Pass the handle straight to `residual_batch.norm(hidden_states, forward_batch, self.norm, handoff_norm=service)`, where `service` is the object `install_cutedsl_fusion()` returned; its `finalize(handoff, residual, gamma)` fuses finalize, all-reduce, residual add, and norm. The fused path reads `layernorm.gemma_weight`, so it currently expects a `GemmaRMSNorm` final norm. Without `handoff_norm`, `norm()` first completes the handoff unfused, and `capture_output` is then allowed. With `handoff_norm`, `norm()` rejects `capture_output` when a handoff arrives. Calling `complete_output()` first runs the producer's unfused finalize, and `snapshot()` raises on a handoff. See `python/sglang/srt/models/qwen3_5.py`.
 
 `model_forward_stages()` in `python/sglang/srt/batch_overlap/two_batch_overlap.py` gives each TBO microbatch its own stream: it splits with `ResidualStream.arrive()` and merges the results afterwards. Do not share one mutable stream between interleaved microbatches or hold an `exit()` scope open across a TBO yield point.
 
@@ -254,7 +254,7 @@ Common errors and their usual cause:
 | Error | Usual cause |
 | --- | --- |
 | `start the layer stack before entering a stage` | The forward path, a split-prefill segment, or an MTP head skipped `residual_batch.start()` |
-| `output does not belong to this residual stream; change layer outputs through boundary accessors` | The model rebound or modified a layer output, or passed another microbatch's output |
+| `output does not belong to this residual stream; change layer outputs through boundary accessors` | The model replaced a layer's output object (for example rebinding it to a new tensor) or passed another microbatch's output. This check compares identity and does not detect in-place changes |
 | `write the residual update before taking the final output` | `take_output()` ran while a contribution was still pending; fold or norm it first |
 | `no stage boundary path for the active <VARIANT> batch` | The active batch variant (CP, input-scattered, sequence parallel) is not supported by this stage; add a server-argument check that rejects the configuration |
 | `a prepared branch must enter through branch_input, not prepare` | A `prepared_from` stage was entered with `prepare()` |
@@ -267,14 +267,16 @@ Common errors and their usual cause:
 
 ```mermaid
 flowchart TD
-    D["Stage declarations"] --> C["Connections for each<br/>supported batch variant"]
-    C --> P["StagePlan<br/>precomputed entry<br/>and exit paths"]
-    P --> B["StageBoundary<br/>model-facing interface"]
+    D["Stage<br/>declarations"] --> C["Connections<br/>per batch<br/>variant"]
+    C --> P["StagePlan<br/>entry and<br/>exit paths"]
+    P --> B["StageBoundary"]
     F["ForwardBatch<br/>runtime facts"] --> B
-    S["ResidualStream<br/>residual and<br/>pending contribution"] <--> B
-    B --> I["prepare()<br/>complete, update,<br/>read, move"]
-    I --> M["Model computation"]
-    M --> O["finish() or<br/>scoped exit()"]
+    S["ResidualStream<br/>residual and<br/>pending work"] <--> B
+    B --> I["prepare()<br/>complete,<br/>update, read,<br/>move rows"]
+    I -->|"FFN or mixer"| X["exit()<br/>choose<br/>completion,<br/>publish flags"]
+    X --> M["Model<br/>computation"]
+    I -->|"PARTIAL"| M
+    M --> O["finish()<br/>record the<br/>contribution"]
     O --> S
 ```
 
