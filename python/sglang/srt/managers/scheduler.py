@@ -4201,6 +4201,9 @@ class Scheduler(
         if (kv_full_retract_flag := not batch.check_decode_mem()) or (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
+            if self.decode_offload_manager is not None:
+                # Pending offload copies may still read the device KV that retraction frees.
+                self.decode_offload_manager.drain_before_retraction()
             old_available_tokens = self.token_to_kv_pool_allocator.available_size()
             old_ratio = self.new_token_ratio_tracker.current
             mamba_allocator = getattr(
@@ -5280,6 +5283,9 @@ class Scheduler(
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.metrics_reporter.step_time_dict
 
+        if self.rust_server is not None:
+            ret["rust_mm_transport"] = self.rust_server.mm_transport_stats()
+
         if self.spec_algorithm.is_dspark() and self.draft_worker is not None:
             info_record = self.draft_worker.dump_info_records()
             if info_record is not None:
@@ -5538,21 +5544,10 @@ class Scheduler(
                         # Keep the host destination alive until prefill stops writing.
                         prepare_abort(decode_req.req, "Aborted by AbortReq.")
                         continue
-                    receiver = decode_req.kv_receiver
-                    receiver.abort()
-                    # Arm drain-ack accounting once the ABORT is sent, so acks
-                    # arriving before this req is deferred (e.g. during the next
-                    # forward step) are captured. A fresh set also drops stale acks
-                    # from a prior request that reused this bootstrap_room. A
-                    # redundant abort only re-wipes -- holds longer, never releases
-                    # early -- so no transition guard is needed.
-                    if (
-                        receiver.kv_mgr.enable_deferred_decode_kv_release
-                        and receiver.abort_notified
-                    ):
-                        receiver.kv_mgr.register_deferred_abort_room(
-                            decode_req.req.bootstrap_room
-                        )
+                    # The receiver arms drain-ack accounting before sending the
+                    # ABORT (see CommonKVReceiver._send_abort_notification), so
+                    # an ack racing back is never dropped.
+                    decode_req.kv_receiver.abort()
 
             # Abort requests whose KV is already backed up for retraction.
             if self.disagg_decode_prealloc_queue.retracted_queue:
@@ -5633,6 +5628,10 @@ class Scheduler(
         self.last_batch = None
         self.cur_batch_for_debug = None
 
+        if self.decode_offload_manager is not None:
+            # Pending offload copies may still read the device KV that retraction frees,
+            # and the paused decode loop never drains them.
+            self.decode_offload_manager.drain_before_retraction()
         if retract_reqs:
             # Decode-side retract always rebootstraps (recomputes the KV from
             # the prefill), so skip the device->host KV offload that release_req

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
-from sglang.test.scripted_runtime.context.radix import _node_lock_ref, resolve_node
+from sglang.test.scripted_runtime.context.radix import get_node_lock_ref
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -16,7 +16,7 @@ class ScriptedReqHandle:
     context: ScriptedContext
 
     @property
-    def req(self) -> Optional[Req]:
+    def req(self) -> Req | None:
         return self.context.find_req_by_rid(self.rid)
 
     @property
@@ -53,10 +53,7 @@ class ScriptedReqHandle:
         if req is None:
             return 0
         tree_cache = self.context.scheduler.tree_cache
-        node = resolve_node(tree_cache, req.last_node)
-        if node is None:
-            return 0
         if tree_cache.is_root(req.last_node):
             # The root's lock_ref is a permanent sentinel, never a req's lock.
             return 0
-        return _node_lock_ref(node)
+        return get_node_lock_ref(tree_cache, req.last_node)

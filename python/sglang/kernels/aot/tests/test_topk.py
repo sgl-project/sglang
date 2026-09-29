@@ -292,6 +292,51 @@ def test_deepseek_v4_topk_transform(bs: int, c4_len: int) -> None:
     )
 
 
+@pytest.mark.skipif(
+    torch.version.hip is None,
+    reason="deepseek_v4_topk_transform_512 is only built on ROCm",
+)
+@pytest.mark.parametrize("with_raw", [False, True])
+@torch.inference_mode()
+def test_deepseek_v4_topk_transform_sorted_output(with_raw: bool) -> None:
+    """sort_output orders each row ascending (by raw position when given), -1 padding last,
+    without changing the selected set, also for rows shorter than topk."""
+    from sgl_kernel import deepseek_v4_topk_transform_512
+
+    torch.manual_seed(7)
+    topk, page_size, width = 512, 64, 5000
+    lens = [0, 1, topk - 1, topk, topk + 1, 3000, width]
+    bs = len(lens)
+    scores = torch.randn(bs, width, dtype=torch.float32, device="cuda")
+    seq_lens = torch.tensor(lens, dtype=torch.int32, device="cuda")
+    num_pages = (width + page_size - 1) // page_size
+    page_table = torch.stack(
+        [torch.randperm(4 * num_pages, device="cuda")[:num_pages] for _ in range(bs)]
+    ).int()
+
+    outs = []
+    for sort_output in (False, True):
+        page = torch.empty(bs, topk, dtype=torch.int32, device="cuda")
+        raw = torch.empty_like(page) if with_raw else None
+        deepseek_v4_topk_transform_512(
+            scores, seq_lens, page_table, page, page_size, raw, sort_output=sort_output
+        )
+        outs.append((page, raw))
+    (page, raw), (page_sorted, raw_sorted) = outs
+    for b in range(bs):
+        key = (raw if with_raw else page)[b]
+        chosen = key[key >= 0].sort().values
+        padding = torch.full(
+            (topk - chosen.numel(),), -1, dtype=torch.int32, device="cuda"
+        )
+        assert torch.equal(
+            (raw_sorted if with_raw else page_sorted)[b], torch.cat([chosen, padding])
+        )
+        if with_raw:  # each slot still travels with its raw position
+            pairs = sorted(zip(page[b].tolist(), raw[b].tolist()))
+            assert pairs == sorted(zip(page_sorted[b].tolist(), raw_sorted[b].tolist()))
+
+
 def _make_scores(kind: str, bs: int, width: int, seed: int) -> torch.Tensor:
     """Score distributions that stress the coarse stage of a histogram top-k.
 
