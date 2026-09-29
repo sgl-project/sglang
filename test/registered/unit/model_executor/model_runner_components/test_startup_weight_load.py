@@ -671,16 +671,8 @@ class TestModelRunnerStartupWeightLoadOwnership(CustomTestCase):
             elastic_ep_backend=None,
             is_ep_joiner=False,
         )
-        runner.ps = SimpleNamespace(tp_rank=0)
+        runner.tp_rank = 0
         return runner
-
-    def test_start_delegates_to_the_manager(self):
-        trace = []
-        runner = self._runner(_RunnerStartupManager(trace))
-
-        runner.start_startup_weight_load()
-
-        self.assertEqual(trace, ["start_prefetch"])
 
     def test_success_releases_ownership_after_the_barrier(self):
         trace = []

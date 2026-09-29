@@ -84,7 +84,7 @@ def _stub(
     stub._max_mamba_cache_size = max_mamba_cache_size
     stub._disable_radix_cache = disable_radix_cache
     stub.max_total_num_tokens = max_total_num_tokens
-    stub.ps = SimpleNamespace(attn_dp_size=dp_size)
+    stub.attn_dp_size = dp_size
     return stub
 
 
@@ -94,7 +94,7 @@ def _hybrid_stub_for_initialize(
     """A stub carrying what the real initialize() reads (hybrid path)."""
     stub = MlxModelRunnerStub.__new__(MlxModelRunnerStub)
     stub._mlx_pool_size = pool
-    stub.ps = SimpleNamespace(attn_dp_size=1)
+    stub.attn_dp_size = 1
     stub.device = "cpu"  # read by init_ngram_embedding_manager
     # Evaluated as a call argument in init_ngram_embedding_manager before
     # the use_ngram_embedding short-circuit; never read.
