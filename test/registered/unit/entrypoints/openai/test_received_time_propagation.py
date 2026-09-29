@@ -158,8 +158,14 @@ class ReceivedTimePropagationTest(CustomTestCase):
 
         captured = {}
 
-        async def fake_generate(request_id, request_prompt, adapted_request,
-                                sampling_params, context, **kwargs):
+        async def fake_generate(
+            request_id,
+            request_prompt,
+            adapted_request,
+            sampling_params,
+            context,
+            **kwargs,
+        ):
             captured["received_time"] = adapted_request.received_time
             context.append_output(
                 {
