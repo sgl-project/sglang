@@ -57,6 +57,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     NPUCompressedTensorsW4A16Int4DynamicMoE,
     NPUCompressedTensorsW8A8Int8,
     NPUCompressedTensorsW8A8Int8DynamicMoE,
+    XPUCompressedTensorsWNA16,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
     check_equal_or_regex_match,
@@ -699,7 +700,10 @@ class CompressedTensorsConfig(QuantizationConfig):
                 quant_format == CompressionFormat.pack_quantized.value
                 and weight_quant.num_bits in WNA16_SUPPORTED_BITS
             ):
-                return CompressedTensorsWNA16(
+                scheme_cls = (
+                    XPUCompressedTensorsWNA16 if _is_xpu else CompressedTensorsWNA16
+                )
+                return scheme_cls(
                     num_bits=weight_quant.num_bits,
                     strategy=weight_quant.strategy,
                     group_size=weight_quant.group_size,
@@ -988,7 +992,9 @@ class CompressedTensorsConfig(QuantizationConfig):
         # (e.g. fp8 needs ada lovelace)
         # Note: NPU devices do not support min_capability function
         if _is_xpu:
-            if not isinstance(scheme, CompressedTensorsW8A8Fp8):
+            if not isinstance(
+                scheme, (CompressedTensorsW8A8Fp8, XPUCompressedTensorsWNA16)
+            ):
                 raise RuntimeError(
                     f"{scheme.__class__.__name__} is not supported on XPU "
                     "(no XPU kernel implementation)."
