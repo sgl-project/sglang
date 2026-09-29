@@ -431,9 +431,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.draft_model_runner = bundle.draft_model_runner
         self._draft_sampler = None
         self.draft_model = bundle.draft_model
-        # Context-scanning KDA drafts keep one running state per request slot;
-        # the request pools do not exist yet, so the pool is sized lazily on the
-        # first context append (see _advance_kda_context).
+        # Request pools determine the scan-state capacity before graph warmup.
         self._has_scan_kda = bool(
             getattr(self.draft_model, "has_scan_kda_layers", False)
         )
@@ -643,6 +641,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     def init_cuda_graphs(self):
+        if self._has_scan_kda and not self._kda_state_ready:
+            self._init_kda_context_state()
         with (
             draft_pp_context(),
             self.draft_tp_context(

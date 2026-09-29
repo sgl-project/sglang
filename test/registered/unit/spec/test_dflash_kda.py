@@ -1,6 +1,7 @@
 """Tests for context-scanning KDA draft attention (``linear_attn_config.context_state: scan``)."""
 
-from types import SimpleNamespace
+from contextlib import nullcontext
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -10,6 +11,7 @@ from sglang.srt.models.dflash import (
     DFlashKDAAttention,
     reference_dflash_kda,
 )
+from sglang.srt.speculative import dflash_worker_v2
 from sglang.srt.speculative.dflash_utils import parse_dflash_kda_config
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -24,6 +26,7 @@ def _config(
     hidden=HIDDEN,
     heads=HEADS,
     head_dim=HEAD_DIM,
+    parallel_mode="single",
     **dflash_overrides,
 ):
     dflash_config = {
@@ -44,6 +47,7 @@ def _config(
             "gate_lower_bound": -5.0,
             "backend": "fla",
             "context_state": context_state,
+            "parallel_mode": parallel_mode,
         },
     )
 
@@ -105,6 +109,138 @@ def test_context_state_parses_and_validates():
     assert parse_dflash_kda_config(cfg).context_state == "reset"
     with pytest.raises(ValueError, match="context_state"):
         parse_dflash_kda_config(_config("sliding"))
+
+
+def test_parallel_mode_requires_explicit_replication(monkeypatch):
+    cfg = _config()
+    del cfg.linear_attn_config["parallel_mode"]
+    assert parse_dflash_kda_config(cfg).parallel_mode == "single"
+    monkeypatch.setattr(
+        "sglang.srt.models.dflash.get_parallel", lambda: SimpleNamespace(tp_size=8)
+    )
+    with pytest.raises(ValueError, match="parallel_mode='replicated'"):
+        DFlashKDAAttention(cfg, layer_id=0)
+    with pytest.raises(ValueError, match="parallel_mode"):
+        parse_dflash_kda_config(_config(parallel_mode="sharded"))
+
+
+@pytest.mark.parametrize("tp_size", [2, 8, 16])
+@pytest.mark.parametrize("policy", ["reset", "scan"])
+@torch.no_grad()
+def test_replicated_kda_loads_full_weights_and_matches_tp1(
+    monkeypatch, tp_size, policy
+):
+    monkeypatch.setattr(
+        "sglang.srt.models.dflash.get_parallel", lambda: SimpleNamespace(tp_size=1)
+    )
+    reference = _attention(policy)
+    monkeypatch.setattr(
+        "sglang.srt.models.dflash.get_parallel",
+        lambda: SimpleNamespace(tp_size=tp_size),
+    )
+    replica = _attention(policy, parallel_mode="replicated")
+    for parameter in replica.parameters():
+        parameter.zero_()
+    model = DFlashDraftModel.__new__(DFlashDraftModel)
+    torch.nn.Module.__init__(model)
+    model.projector_type = "linear"
+    layer = torch.nn.Module()
+    layer.self_attn = replica
+    model.layers = torch.nn.ModuleList([layer])
+    model.load_weights(
+        (f"layers.0.self_attn.{name}", weight.clone())
+        for name, weight in reference.state_dict().items()
+    )
+    for name, weight in reference.state_dict().items():
+        torch.testing.assert_close(replica.state_dict()[name], weight, rtol=0, atol=0)
+
+    context = torch.randn(7, HIDDEN)
+    block = torch.randn(BLOCK, HIDDEN)
+    slots = torch.tensor([2])
+    if policy == "scan":
+        for attention in (reference, replica):
+            attention.advance_context_state(
+                slots, context, torch.tensor([7]), torch.tensor([True])
+            )
+        torch.testing.assert_close(replica._ctx_state, reference._ctx_state)
+        torch.testing.assert_close(replica._ctx_tail, reference._ctx_tail)
+    batch = SimpleNamespace(req_pool_indices=slots)
+    expected = reference(None, block, batch)
+    actual = replica(None, block, batch)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("capture", [False, True])
+@torch.no_grad()
+def test_worker_allocates_scan_state_before_graph_warmup(tp1, monkeypatch, capture):
+    monkeypatch.setattr(dflash_worker_v2, "draft_pp_context", nullcontext)
+    monkeypatch.setattr(dflash_worker_v2, "is_cuda", lambda: False)
+    monkeypatch.setattr(
+        dflash_worker_v2,
+        "get_parallel",
+        lambda: SimpleNamespace(enable_dp_attention=False),
+    )
+    monkeypatch.setattr(
+        dflash_worker_v2,
+        "get_exec",
+        lambda: SimpleNamespace(
+            graph=SimpleNamespace(
+                cuda_graph_config=SimpleNamespace(
+                    decode=SimpleNamespace(
+                        backend="full" if capture else dflash_worker_v2.Backend.DISABLED
+                    )
+                )
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        dflash_worker_v2,
+        "current_platform",
+        SimpleNamespace(is_out_of_tree=lambda: False),
+    )
+    attention = DFlashKDAAttention(_config(), layer_id=0).eval()
+    model = DFlashDraftModel.__new__(DFlashDraftModel)
+    torch.nn.Module.__init__(model)
+    layer = torch.nn.Module()
+    layer.self_attn = attention
+    model.layers = torch.nn.ModuleList([layer])
+    runner = SimpleNamespace(
+        req_to_token_pool=SimpleNamespace(size=4),
+        device=torch.device("cpu"),
+        tp_rank=0,
+        tp_group=None,
+        capture_tail_hooks=[],
+    )
+    worker = SimpleNamespace(
+        _has_scan_kda=True,
+        _kda_state_ready=False,
+        draft_model=model,
+        draft_model_runner=runner,
+        model_runner=runner,
+        draft_tp_context=lambda *args, **kwargs: nullcontext(),
+        draft_owns_attention=False,
+        _maybe_build_draft_sampler=lambda: None,
+    )
+    worker._init_kda_context_state = MethodType(
+        DFlashWorkerV2._init_kda_context_state, worker
+    )
+    warmups = []
+
+    def warmup(*, capture_decode_cuda_graph):
+        assert worker._kda_state_ready
+        assert capture_decode_cuda_graph is capture
+        assert attention._ctx_state.shape[0] == 5
+        attention(
+            None,
+            torch.zeros(BLOCK, HIDDEN),
+            SimpleNamespace(req_pool_indices=torch.tensor([0])),
+        )
+        warmups.append(attention._ctx_state.data_ptr())
+
+    worker._draft_worker = SimpleNamespace(init_cuda_graphs=warmup)
+    DFlashWorkerV2.init_cuda_graphs(worker)
+    DFlashWorkerV2.init_cuda_graphs(worker)
+    assert len(warmups) == 2 and warmups[0] == warmups[1]
 
 
 def test_reset_policy_keeps_block_local_behaviour(tp1):
@@ -233,6 +369,41 @@ def test_draft_model_iterates_scan_layers_only():
 CUDA_DIMS = dict(
     hidden=64, heads=2, head_dim=128
 )  # Triton kernels need kernel-sized heads
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.no_grad()
+def test_scan_cuda_graph_reads_updated_state_without_committing_proposals(tp1):
+    attention = _attention("scan", device="cuda", **CUDA_DIMS)
+    context = torch.randn(1, 70, CUDA_DIMS["hidden"], device="cuda")
+    block = torch.randn(1, BLOCK, CUDA_DIMS["hidden"], device="cuda")
+    slots = torch.tensor([1], device="cuda")
+    batch = SimpleNamespace(req_pool_indices=slots)
+    attention.advance_context_state(
+        slots, context[0], torch.tensor([70]), torch.tensor([True])
+    )
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            attention(None, block[0], batch)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = attention(None, block[0], batch)
+    for append in (False, True):
+        if append:
+            rows = torch.randn(1, 5, CUDA_DIMS["hidden"], device="cuda")
+            attention.advance_context_state(slots, rows[0], torch.tensor([5]))
+            context = torch.cat((context, rows), dim=1)
+        state = attention._ctx_state.clone()
+        tail = attention._ctx_tail.clone()
+        graph.replay()
+        torch.testing.assert_close(
+            output, _oracle(attention, context, block), rtol=2e-3, atol=2e-3
+        )
+        torch.testing.assert_close(attention._ctx_state, state, rtol=0, atol=0)
+        torch.testing.assert_close(attention._ctx_tail, tail, rtol=0, atol=0)
 
 
 def _reference_state_after(attention, context):

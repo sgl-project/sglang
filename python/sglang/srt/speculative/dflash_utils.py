@@ -548,6 +548,7 @@ class DFlashKDAConfig:
     #: (block-local KDA), ``scan`` = the state after the target context strictly
     #: before the block, kept per request and advanced with every verified slice.
     context_state: str = "reset"
+    parallel_mode: str = "single"
 
     @property
     def projection_size(self) -> int:
@@ -666,6 +667,13 @@ def parse_dflash_kda_config(draft_hf_config: Any) -> Optional[DFlashKDAConfig]:
             f"{list(_DFLASH_KDA_CONTEXT_STATES)}, got {context_state!r}."
         )
 
+    parallel_mode = str(raw_config.get("parallel_mode", "single")).lower()
+    if parallel_mode not in ("single", "replicated"):
+        raise ValueError(
+            "DFLASH KDA linear_attn_config.parallel_mode must be 'single' or "
+            f"'replicated', got {parallel_mode!r}."
+        )
+
     return DFlashKDAConfig(
         head_dim=int(head_dim),
         num_heads=int(num_heads),
@@ -673,6 +681,7 @@ def parse_dflash_kda_config(draft_hf_config: Any) -> Optional[DFlashKDAConfig]:
         use_full_rank_gate=use_full_rank_gate,
         gate_lower_bound=gate_lower_bound,
         context_state=context_state,
+        parallel_mode=parallel_mode,
     )
 
 

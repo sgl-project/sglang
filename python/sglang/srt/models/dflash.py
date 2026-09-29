@@ -561,11 +561,15 @@ class DFlashKDAAttention(nn.Module):
     ) -> None:
         super().__init__()
         del layer_id, prefix
+        spec = parse_dflash_kda_config(config)
+        if spec is None:
+            raise ValueError("DFlashKDAAttention requires a KDA draft config.")
         tp_size = int(get_parallel().tp_size)
-        if tp_size != 1:
+        if tp_size < 1 or (tp_size != 1 and spec.parallel_mode != "replicated"):
             raise ValueError(
-                "DFLASH KDA draft attention currently requires tp_size=1, "
-                f"got tp_size={tp_size}. Run one independent draft server per GPU."
+                "DFLASH KDA draft attention requires tp_size=1 unless "
+                "linear_attn_config.parallel_mode='replicated'; "
+                f"got tp_size={tp_size}."
             )
         if quant_config is not None:
             raise ValueError(
@@ -573,9 +577,6 @@ class DFlashKDAAttention(nn.Module):
                 "draft weights."
             )
 
-        spec = parse_dflash_kda_config(config)
-        if spec is None:
-            raise ValueError("DFlashKDAAttention requires a KDA draft config.")
         self.kda_config: DFlashKDAConfig = spec
         self.hidden_size = int(config.hidden_size)
         self.head_dim = spec.head_dim
@@ -586,6 +587,7 @@ class DFlashKDAAttention(nn.Module):
         self.lower_bound = spec.gate_lower_bound
         projection_size = spec.projection_size
 
+        # Replicated KDA consumes full hidden rows; surrounding GQA/MLP stays TP.
         self.q_proj = nn.Linear(self.hidden_size, projection_size, bias=False)
         self.k_proj = nn.Linear(self.hidden_size, projection_size, bias=False)
         self.v_proj = nn.Linear(self.hidden_size, projection_size, bias=False)
