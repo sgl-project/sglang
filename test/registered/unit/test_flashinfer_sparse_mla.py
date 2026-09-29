@@ -16,6 +16,7 @@ from sglang.srt.layers.attention.dsa.dsa_backend_kpool import (
 from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache import kv_cache_configurator
+from sglang.srt.mem_cache.prefill_budget import PrefillBudget
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
@@ -283,12 +284,16 @@ class TestFlashInferSparseMLARunnerCapacity(unittest.TestCase):
                 self.assertGreaterEqual(capacity, 32768 + 4 * 6)
 
     def test_ignore_eos_last_prompt_can_overshoot_prefill_budget(self):
+        allocator = SimpleNamespace(available_size=lambda: 450560, page_size=64)
+        allocator.create_prefill_budget = lambda cache, **kwargs: PrefillBudget(
+            allocator, cache, **kwargs
+        )
         adder = PrefillAdder(
             page_size=64,
             tree_cache=SimpleNamespace(
                 disable=True, supports_mamba=lambda: False, evictable_size=lambda: 0
             ),
-            token_to_kv_pool_allocator=SimpleNamespace(available_size=lambda: 450560),
+            token_to_kv_pool_allocator=allocator,
             running_batch=None,
             new_token_ratio=1.0,
             rem_input_tokens=16384,
