@@ -1,7 +1,6 @@
 import logging
 from array import array
 from contextlib import nullcontext
-from functools import partial
 from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -393,7 +392,6 @@ class Glm5NextLinearAttention(nn.Module):
         super().__init__()
         head_shard_size = get_parallel().attn_tp_size
         head_shard_rank = get_parallel().attn_tp_rank
-        _head_shard_rank_getter = partial(getattr, get_parallel(), "attn_tp_rank")
 
         self.hidden_size = hidden_size
         self.config = config
@@ -532,7 +530,7 @@ class Glm5NextLinearAttention(nn.Module):
 
         set_weight_attrs(
             self.dt_bias,
-            {"weight_loader": sharded_weight_loader(0, _head_shard_rank_getter)},
+            {"weight_loader": sharded_weight_loader(0)},
         )
 
         self.qkv_conv1d = MergedColumnParallelLinear(
@@ -553,7 +551,7 @@ class Glm5NextLinearAttention(nn.Module):
         )
         set_weight_attrs(
             self.A_log,
-            {"weight_loader": sharded_weight_loader(2, _head_shard_rank_getter)},
+            {"weight_loader": sharded_weight_loader(2)},
         )
 
         self.o_norm = FusedRMSNormGated(

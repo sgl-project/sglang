@@ -829,7 +829,6 @@ class ZayaAttention(nn.Module):
         # divisible by tp_size; the KV-replicated GQA-TP variant (tp_size >
         # num_k_heads) is intentionally rejected with a clear error message
         # because both per-K-head paths assume each rank holds whole K heads.
-        self.tp_rank = get_parallel().tp_rank
         self.tp_size = get_parallel().tp_size
         # The head split, the ``o_proj`` RowParallel all-reduce, and the
         # RadixAttention KV cache are all organized on the *global* TP group,
@@ -873,8 +872,6 @@ class ZayaAttention(nn.Module):
             layer_id=layer_id,
             quant_config=quant_config,
             prefix=add_prefix("qkv", prefix),
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
         )
 
         # RowParallel o_proj: per-rank input is the rank's q heads, full
@@ -887,8 +884,6 @@ class ZayaAttention(nn.Module):
             reduce_results=True,
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
         )
 
         rope_theta = float(getattr(config, "rope_theta", 1_000_000.0))
