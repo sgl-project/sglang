@@ -7,8 +7,9 @@ listed at the end.
 
 ## Principles
 
-1. **Order compatible buckets by token length first.** `BucketResolver` returns
-   all matching buckets, smallest capacity first, without inspecting workers or policies.
+1. **Filter buckets by token length, then order preferences.** `BucketResolver`
+   returns all compatible buckets, applying optional SLO preferences before
+   capacity/rank/ID ordering, without inspecting workers or policies.
 2. **The bucket owns plain versus PD engine selection.** `Bucket::pick_engines`
    calls its one plain group or both prefill and decode groups, returning a
    complete selection. Both PD engines come from that same bucket.
@@ -79,7 +80,7 @@ tier executor, or separate selection framework is required.
 
 ## 2. Responsibilities and request flow
 
-`BucketResolver::resolve(input_tokens, expected_peak_tokens)` returns an ordered
+`BucketResolver::resolve(input_tokens, expected_peak_tokens, ttft_ms, tokens_per_second)` returns an ordered
 list of compatible bucket references (possibly empty), or an invalid-signal error.
 It does not receive a stage or a load view, resolve live engines, or invoke policies.
 The handler iterates this list until a bucket supplies the complete engine selection.
@@ -136,11 +137,10 @@ chooses its implementation:
 - `ChatRouting::Reorg(HashMap<ModelId, BucketResolver>)` uses the new bucket and
   policy interfaces, with explicit model-specific resolvers.
 
-Callers set this field before building the router. A missing model in the reorg
-map returns 404, without falling back to legacy routing. This PR adds the
-programmatic configuration switch; CLI/configuration factory construction and
-the remaining production policies remain follow-ups. Power-of-two is implemented
-for explicit attachments; the default serving path remains legacy.
+`--chat-routing reorg` constructs default plain/PD buckets using the existing
+`--policy` and tuning flags. Programmatic callers can still install explicit
+resolvers. A missing model returns 404 without falling back to legacy routing.
+The default serving path remains legacy.
 
 Both implementations reuse request preparation (including sampling validation
 and tokenization), forwarding, streaming, middleware, and the 32 MiB body limit.
@@ -153,9 +153,10 @@ the existing body-size estimate when tokenization is unavailable.
 2. Keep buckets whose inclusive input-token range contains the input length.
 3. Check the bucket context capacity against input plus requested output when
    known, or against input length when the output budget is unknown.
-4. Sort by ascending input capacity (the lesser of the input upper bound and
-   context capacity). Unbounded capacities sort last. Break ties by ascending
-   bucket rank, then ID, and return the entire ordered list.
+4. Apply enabled SLO preferences to complete buckets. Count unmet preferences
+   equally, then sort by ascending input capacity (the lesser of the input upper
+   bound and context capacity), rank, and ID. Unbounded capacities sort last.
+   Return the entire ordered list, retaining nonpreferred buckets for fallback.
 5. The handler calls each bucket's `pick_engines` until one supplies its complete
    selection. A failed PD attempt never contributes an engine to a later pair.
 
@@ -172,7 +173,29 @@ bucket, both groups share this one request-length decision. Policy fallback on
 a cache/affinity miss stays within that group's candidates. There is no second
 pass with relaxed admission and no post-policy substitution.
 
-SLO ordering, cache lookup, global session modes, and sticky policies are follow-ups. Their
+### Optional SLO ordering
+
+`Bucket` has optional `ttft_ms` and `tokens_per_second` estimates. The resolver
+has independent `ttft_slo` and `tps_slo` preferences: `Disabled` (default),
+`SloFirst` (matching first), and `BestEffort` (nonmatching first). The handler
+parses `x-sgl-ttft-slo-ms` and `x-sgl-tps-slo` only when their preference is enabled;
+invalid enabled headers return 400 before dispatch. Disabled headers are ignored.
+SLO targets belong to bucket resolution, not the engine policy's `PickRequest`.
+
+Absent targets are neutral. A bucket matches TTFT when its positive estimate is
+at most the target, and throughput when its finite positive estimate is at least
+the target. Missing or invalid estimates do not match a supplied target. Enabled
+TTFT targets must be positive; throughput targets must be finite and positive.
+
+Each unmet preference adds one ordering penalty. With both preferences set to
+`SloFirst`, a bucket matching both comes before one matching either, followed by
+buckets matching neither. Capacity/rank/ID breaks ties within these tiers. The
+same logic applies to plain and PD buckets, and a PD bucket always supplies both
+engines. TTFT and throughput preferences never independently resolve P/D groups.
+Length constraints are applied first and admission rejection still advances to
+the next complete bucket, including a bucket outside the preferred SLO tier.
+
+Global session modes and sticky policies are follow-ups. Their
 integration must preserve bucket-first selection and the same-bucket PD rule.
 Cross-bucket affinity probing is not part of this interface. Session/routing
 keys still pass through `PickRequest` for policies operating inside the selected
@@ -222,24 +245,35 @@ no HTTP body, bucket resolver, state handles, snapshots, or backend configuratio
 Admission evaluates acceptance. It does not rank engines, choose replacements,
 change buckets, or mutate affinity.
 
-| Check | Acceptance rule |
-| --- | --- |
-| `AllowAll` | Add no acceptance constraint |
-| `CapacityAdmission` | Projected running requests and KV tokens fit reported capacity |
-| `PendingPrefillAdmission` | Waiting uncached tokens plus incoming uncached work fit the budget |
-| `InFlightLimitAdmission` | Router-local in-flight requests are below the limit |
-| `QueueLimitAdmission` | Engine-reported waiting requests are below the limit |
-| `AllOfAdmission` | Every attached check allows the request |
+An admission policy is a set of per-engine caps, `AdmissionLimits`. Each cap
+is optional; an unset cap is not checked, and the default admits everything.
+A cap admits while the engine's current metric is below it. Request size is
+not part of admission: buckets already select by input length and context
+capacity, and admission only observes load without reserving it.
 
-`EngineAdmission::check(engine, request, load)` checks one engine and returns
-`Allow`, `Reject(reason)`, or an error for invalid inputs. Policies attach the
-checker directly as `Arc<dyn EngineAdmission>`. There is no placement setting,
-filtering wrapper, or before/after API; each policy decides where checking
-belongs in its selection algorithm. The `load` argument is an
-`Option<&EngineReportedWorkerLoad>` retained by the policy for this engine, including
-request counts, token usage, capacity, and the report timestamp. `None` means
-no usable observation, never zero load; each check defines its missing-data
-behavior. Other required state handles belong to the checker.
+| Limit | Engine metric |
+| --- | --- |
+| `max_running_requests` | Reported running requests |
+| `max_waiting_requests` | Reported waiting requests |
+| `max_kv_tokens` | Reported total KV tokens |
+| `max_pending_prefill_tokens` | Reported waiting uncached tokens |
+| `max_inflight_requests` | Router-local in-flight requests |
+
+```json
+{"max_running_requests": 64, "max_kv_tokens": 1048576, "max_inflight_requests": 64}
+```
+
+Limits are absolute caps; they do not default to capacities reported by the
+engine. Unknown fields are rejected during deserialization.
+
+The policy reads the selected engine's `EngineMetrics` from the load snapshot
+it already captured for selection plus the live in-flight counter and calls
+`EngineAdmission::check(engine, metrics)`, which returns `Allow`,
+`Reject(limit name)`, or an error. Reported
+metrics are `None` without a fresh, complete report, never zero, and such
+limits fail open; the in-flight count is always known. Policies attach the
+checker as `Arc<dyn EngineAdmission>` and decide where checking belongs in
+their selection algorithm; there is no placement setting or filtering wrapper.
 
 Power-of-two first selects an engine, then calls admission exactly once on that
 engine. A rejection returns `AdmissionRejected` to the bucket loop; it does not
@@ -257,26 +291,20 @@ lacks a fresh, complete native report with valid capacity, both are compared by
 router-local active requests instead. Basic reports from older publishers are
 still passed to admission when fresh, but do not supply native pressure metrics.
 
-Prepare the signals needed by admission before checking. A pending-prefill check
-uses per-engine uncached work when a prefix is known, and full input otherwise.
-Decode capacity uses the expected peak sequence length when available, including
-on a cache hit. Power-of-two retains the selected engine's load record from
-selection and passes it to admission without another snapshot. A single candidate
-still has its load read for admission, even though selection needs no comparison.
-Neither the bucket nor HTTP handler supplies observations. Concrete load-aware
-acceptance rules and additional cache-specific admission signals remain follow-up
-work. Synchronous checks do not fetch telemetry over the network themselves.
+Power-of-two retains the selected engine's load record from selection and
+passes it to admission without another snapshot. A single candidate still has
+its load read for admission, even though selection needs no comparison.
+Neither the bucket nor HTTP handler supplies observations. Synchronous checks
+do not fetch telemetry over the network themselves.
 
-`AllowAll` is the default for new explicit policy attachments. It leaves health,
-role, membership, and policy preferences in force. Migrated configurations must
-retain their existing capacity and configured budget checks; see compatibility
-below. Each check defines its missing-data behavior. Unknown load is not zero;
-the existing capacity and pending-prefill checks allow requests without a fresh,
-complete native report.
+`AdmissionLimits::default()` is the default for new explicit policy attachments.
+It leaves health, role, membership, and policy preferences in force. Migrated
+configurations must retain their existing capacity and configured budget checks;
+see compatibility below.
 
-The cache policy's `worker_queue_limit` is a **soft preference**, not
-`QueueLimitAdmission`. Saturation handling can reconsider a queued engine, but
-cannot bypass attached hard admission.
+The cache policy's `worker_queue_limit` is a **soft preference**;
+`max_waiting_requests` is a hard rejection. Saturation handling can reconsider
+a queued engine, but cannot bypass attached hard admission.
 
 Admission checks observe capacity; they do not reserve it. Concurrent requests
 may pass against the same observation. Strict reservations would require a
@@ -298,21 +326,23 @@ Session assignments are scoped by model, bucket ID, stage, and session key.
 `SessionAwarePolicy::new(store, engine_load)` receives shared state; the caller
 owns the store's idle timeout and eviction task. Missing or empty session keys
 use power-of-two without creating assignments. A new or out-of-group binding
-uses power-of-two with `AllowAll`, then the session policy checks its selected
-engine before binding. A concurrent live assignment wins, but is checked before
-returning it; rejection ends that attempt without rewriting the binding or
-retrying another engine. Existing bindings are reused regardless of pressure
-when admitted. Session policies can be attached independently to each role.
-Programmatic reorg callers configure `model.affinity.session_id_header` for HTTP
-header extraction; this does not enable legacy global modes or backup escape.
+uses power-of-two with `AdmissionLimits::default()`, then the session policy
+checks its selected engine before binding. A concurrent live assignment wins,
+but is checked before returning it; rejection ends that attempt without
+rewriting the binding or retrying another engine. Existing bindings are reused
+regardless of pressure when admitted. Session policies can be attached
+independently to each role. Programmatic reorg callers configure
+`model.affinity.session_id_header` for HTTP header extraction; this does not
+enable legacy global modes or backup escape.
 
 Session and sticky policies do not create assignments for missing keys. A
 binding outside the candidates cannot win. A missing binding may invoke policy
 fallback within the group; hard admission rejection remains an error.
 
 Sticky fallback supports `round_robin`, `random`, `power_of_two`, and `load_based`,
-with round-robin as the default. Nested fallbacks use `AllowAll`; the owning
-policy explicitly checks the engine returned by its fallback.
+with round-robin as the default. Nested fallbacks use
+`AdmissionLimits::default()`; the owning policy explicitly checks the engine
+returned by its fallback.
 
 ### Cache-aware behavior
 
@@ -432,12 +462,12 @@ buckets:
           worker_ids: [P1, P2]
           policy:
             type: cache_aware
-            admission: {type: capacity}
+            admission: {max_running_requests: 64, max_kv_tokens: 1048576}
         decode:
           worker_ids: [D1, D2]
           policy:
             type: power_of_two
-            admission: {type: capacity}
+            admission: {max_running_requests: 64, max_kv_tokens: 1048576}
 
   - id: long-context
     rank: 20
@@ -449,12 +479,12 @@ buckets:
           worker_ids: [P3, P4]
           policy:
             type: cache_aware
-            admission: {type: capacity}
+            admission: {max_running_requests: 64, max_kv_tokens: 1048576}
         decode:
           worker_ids: [D3, D4]
           policy:
             type: power_of_two
-            admission: {type: capacity}
+            admission: {max_running_requests: 64, max_kv_tokens: 1048576}
 ```
 
 A request with 4k input tokens and a 16k expected peak cannot fit the short
@@ -483,8 +513,8 @@ do not accept and ignore them.
 - Keep `load_based` as the CLI name for `LeastLoadPolicy`.
 - Preserve explicit engine membership and context constraints. Bucket-level
   ranges and ordering replace independent per-stage selection.
-  Restore existing SLO behavior in the separate SLO PR before serving switchover;
-  legacy routing continues to support SLOs during this skeleton-only phase.
+  SLO preferences order whole buckets; deployment configuration remains explicit
+  until the production configuration factory and serving switchover are ready.
 - Preserve cache-provider selection, endpoint validation, query timeout and
   concurrency limits, and unavailable-backend fallback.
 - Preserve cache thresholds and tuning: the 1,024-token default minimum hit,
@@ -492,13 +522,13 @@ do not accept and ignore them.
   queue limit, and saturation floor.
 - Preserve session and sticky headers, idle timeouts, eviction cadence, and the
   four sticky fallback choices. Global modes need a bucket-first migration design.
-- Translate `--filter overloaded` and `--max-in-flight` into
-  `InFlightLimitAdmission`, composed with other checks through `AllOfAdmission`.
+- Map `--filter overloaded` and `--max-in-flight` to `max_inflight_requests`;
+  the existing router-local counter remains the source.
 - Preserve configured capacity, pending-prefill, and in-flight checks, including
   their missing-report behavior. Power-of-two applies admission to its selected
   engine; other policies explicitly place checks in their selection logic.
-  Other paths use `AllowAll` unless a check is configured. Never silently discard
-  a configured budget.
+  Other paths use `AdmissionLimits::default()` unless a check is configured.
+  Never silently discard a configured budget.
 
 Listener and shutdown configuration, discovery, worker health and circuit
 breakers, tokenizer loading, request timeouts, sampling overrides, and logging
@@ -551,14 +581,16 @@ This PR adds the side-by-side interfaces in `src/buckets_reorg.rs` and
 
 Implemented here:
 
-- `BucketResolver::resolve` returns all length-compatible buckets in capacity/rank/ID order.
+- `BucketResolver::resolve` returns all length-compatible buckets in optional
+  SLO-preference tiers, with capacity/rank/ID order within each tier.
 - `Bucket::pick_engines` owns plain/PD orchestration and stage-specific policy
   requests; `BucketRequest` carries prepared facts and `BucketPick` retains picks.
 - `Bucket` owns input limits, context capacity, rank, and plain-or-PD groups.
 - `EngineGroup::pick` owns live candidate filtering, policy invocation, and
   exact candidate validation, without cross-bucket fallback.
 - `Policy::pick`, within-group fallback interface, per-engine `EngineAdmission::check`,
-  and `AllowAll`. Power-of-two samples two distinct engines, compares stage pressure,
+  and `AdmissionLimits` over running, waiting, KV, pending-prefill and in-flight
+  metrics. Power-of-two samples two distinct engines, compares stage pressure,
   and checks its selected engine with no replacement on rejection.
 - Policy-owned load dependency and local observations. Power-of-two passes the
   selected engine's load record directly to admission, without another snapshot.
@@ -568,7 +600,19 @@ Implemented here:
   dispatches only after one complete selection. Exhaustion retains admission reasons.
 - `AppContext::chat_routing` configures legacy versus reorg routing on the same
   endpoint and carries the reorg model-resolver map.
-
+- Optional bucket TTFT/throughput estimates and preferences, with enabled-header
+  parsing and whole-bucket fallback in the shared chat route.
+- `CacheAwarePolicy` reads local radix-tree or remote indexer prefixes, intersects
+  exact worker URLs with the current group, applies hit thresholds and candidate
+  bounds, and preserves the soft queue gate, saturation pin and pressure guard.
+- `PrefixMemo` shares lookup results (including misses and unavailable backends)
+  across bucket attempts for one prepared request. Entries are keyed by the shared
+  `Arc<CacheSource>` so different index namespaces remain independent. Each pick
+  reruns its own candidate filtering and admission after obtaining a fresh snapshot.
+- Cache selection checks bounded candidates explicitly; hard rejection cannot
+  become a cold fallback or bypass admission through saturation pinning. A miss
+  defaults to power-of-two within the group's soft queue tier, then the cache
+  policy checks its fallback winner. Cache policies require plain/prefill groups.
 - `SessionAwarePolicy` reuses admitted model/bucket/role-scoped bindings from a
   shared `AffinityStore`, falling back to power-of-two for new or keyless sessions.
   Assignments follow admission; concurrent binding winners are rechecked.
@@ -576,17 +620,15 @@ Implemented here:
   The caller owns expiry and sweeper lifecycle. A binding may remain after a
   later PD group fails, because it records placement rather than dispatch.
 
-Follow-up order: cache-aware selection (#40366), concrete admission (#40271),
-then bucket SLO ordering, remaining policies, and production configuration.
+Follow-up work includes remaining selection policies and explicit bucket configuration.
 
 Not yet implemented in the reorg path:
 
-- Other concrete policies and capacity/in-flight admission checks.
-- SLO estimates, targets, and bucket preference ordering.
-- CLI/configuration parsing, validation, and model-specific construction.
-  The YAML above is illustrative; reorg resolvers are installed in code.
+- Other concrete selection policies.
+- Explicit bucket configuration from the CLI. The YAML above remains illustrative;
+  `--chat-routing reorg` builds default plain/PD buckets from existing policy flags.
 - Global session modes and sticky routing-key affinity.
-- Prefix memoization and cache-aware selection.
+- Power-of-k cache-miss fallback configuration and cache decision metrics.
 - Shared load interpretation, dispatch correction, and policy-specific
   dispatch-timestamp requirements.
 - PD compatibility filtering, retry integration, and legacy-route switchover.

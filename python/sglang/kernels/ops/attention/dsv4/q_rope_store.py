@@ -5,11 +5,19 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.srt.utils import is_hip
 
 
 @triton.jit
 def _q_rope_store(
-    X, Y, F, POS, SX: tl.constexpr, SY: tl.constexpr, USE_GDC: tl.constexpr = False
+    X,
+    Y,
+    F,
+    POS,
+    SX: tl.constexpr,
+    SY: tl.constexpr,
+    IS_HIP: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
 ):
     row, head = tl.program_id(0), tl.program_id(1)
     r = tl.arange(0, 512)
@@ -22,7 +30,11 @@ def _q_rope_store(
     sin = tl.load(F + position * 64 + (r - 448) // 2 * 2 + 1, r >= 448, 0)
     # Match the operation order of deepseek_rope_kernel before BF16 rounding.
     even = tl.fma(value, cos, -partner * sin)
-    odd = tl.fma(partner, sin, value * cos)
+    if IS_HIP:
+        # Match AMD flat RoPE: round the sine product before the cosine FMA.
+        odd = tl.fma(value, cos, partner * sin)
+    else:
+        odd = tl.fma(partner, sin, value * cos)
     rotated = tl.where((r & 1) == 0, even, odd)
     tl.store(Y + row * SY + head * 512 + r, tl.where(r >= 448, rotated, value))
     if USE_GDC:
@@ -40,6 +52,7 @@ def _q_rope_store_prefill(
     SX: tl.constexpr,
     SY: tl.constexpr,
     BLOCK_HEADS: tl.constexpr,
+    IS_HIP: tl.constexpr,
 ):
     # Keep token count dynamic to avoid compiling every prefill batch length.
     heads = tl.program_id(0) * BLOCK_HEADS + tl.arange(0, BLOCK_HEADS)
@@ -56,7 +69,11 @@ def _q_rope_store_prefill(
     sin = tl.load(F + freq_offset + 1, rope_mask, 0)
     # Keep the same arithmetic and BF16 rounding as the decode kernel.
     even = tl.fma(value, cos, -partner * sin)
-    odd = tl.fma(partner, sin, value * cos)
+    if IS_HIP:
+        # Match AMD flat RoPE: round the sine product before the cosine FMA.
+        odd = tl.fma(value, cos, partner * sin)
+    else:
+        odd = tl.fma(partner, sin, value * cos)
     rotated = tl.where((r[None, :] & 1) == 0, even, odd)
     y_offset = row[:, None].to(tl.int64) * SY + head[:, None] * 512 + r[None, :]
     tl.store(
@@ -91,6 +108,7 @@ def q_rope_store(
             q.stride(0),
             output.stride(0),
             BLOCK_HEADS=4,
+            IS_HIP=is_hip(),
             num_warps=4,
         )
         return
@@ -102,6 +120,7 @@ def q_rope_store(
         positions,
         q.stride(0),
         output.stride(0),
+        IS_HIP=is_hip(),
         num_warps=4,
         **pdl_kwargs,
     )
