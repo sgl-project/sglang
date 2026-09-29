@@ -224,7 +224,6 @@ class Gemma4MoE(nn.Module):
         self.layer_id = layer_id
         self.hidden_size = hidden_size
         self.num_experts = config.num_experts
-        self.tp_size = get_parallel().tp_size
 
         # Per-expert output scale folded into routing weights so that
         # MoE's fused kernel computes: Σ_e (expert_e * w_e * scale_e)

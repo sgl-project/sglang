@@ -174,7 +174,6 @@ class NemotronHMoE(nn.Module):
     ) -> None:
         super().__init__()
 
-        self.tp_size = get_parallel().tp_size
         self.routed_scaling_factor = config.routed_scaling_factor
         self.device_module = torch.get_device_module()
 

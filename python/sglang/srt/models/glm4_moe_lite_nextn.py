@@ -142,7 +142,6 @@ class Glm4MoeLiteForCausalLMNextN(Glm4MoeLiteForCausalLM):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
-        self.tp_size = get_parallel().tp_size
         if is_npu() and get_spec().speculative_draft_model_quantization is None:
             quant_config = None
         self.quant_config = quant_config

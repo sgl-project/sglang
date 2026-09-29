@@ -219,7 +219,6 @@ class BailingMoeForCausalLMNextN(nn.Module):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
-        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.num_fused_shared_experts = 0
         is_bailing_moe_v3 = _is_bailing_moe_v3_config(config)

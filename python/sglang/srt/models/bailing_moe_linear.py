@@ -246,7 +246,6 @@ class BailingMoE(nn.Module):
         self.layer_id = layer_id
 
         self.tp_size = get_parallel().tp_size
-        self.tp_rank = get_parallel().tp_rank
 
         self.top_k = config.num_experts_per_tok
         self.norm_expert_prob = getattr(config, "norm_topk_prob", False)

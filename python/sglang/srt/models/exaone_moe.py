@@ -134,7 +134,6 @@ class ExaoneMoESparseMoEBlock(nn.Module):
     ):
         super().__init__()
         self.tp_size = get_parallel().tp_size
-        self.moe_ep_size = get_parallel().moe_ep_size
         self.layer_id = layer_id
         self.routed_scaling_factor = config.routed_scaling_factor
         self.alt_stream = alt_stream
@@ -200,7 +199,6 @@ class ExaoneMoESparseMoEBlock(nn.Module):
             )
 
         if get_moe_a2a_backend().is_deepep():
-            self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
                 config.num_experts + get_exec().moe.ep_num_redundant_experts
             )
@@ -450,8 +448,6 @@ class ExaoneMoEDecoderLayer(nn.Module):
         attention_bias = getattr(config, "attention_bias", False) or getattr(
             config, "bias", False
         )
-        self.attn_tp_size = get_parallel().attn_tp_size
-        self.attn_tp_rank = get_parallel().attn_tp_rank
 
         self.self_attn = ExaoneMoEAttention(
             config=config,

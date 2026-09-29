@@ -391,7 +391,6 @@ class Glm5NextLinearAttention(nn.Module):
         **kwargs,
     ) -> None:
         super().__init__()
-        self.tp_size = get_parallel().tp_size
         head_shard_size = get_parallel().attn_tp_size
         head_shard_rank = get_parallel().attn_tp_rank
         _head_shard_rank_getter = partial(getattr, get_parallel(), "attn_tp_rank")
@@ -1237,7 +1236,6 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
         self.pp_group = get_parallel().pp_group
         self.config = text_config
-        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.use_dsa = is_deepseek_dsa(text_config)
         self.num_fused_shared_experts = 0
