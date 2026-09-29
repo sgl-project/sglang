@@ -12,8 +12,10 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
     GTensor,
+    _to_raw,
 )
 from flydsl._mlir.dialects import llvm
+from flydsl._mlir.dialects import vector as mlir_vector
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 

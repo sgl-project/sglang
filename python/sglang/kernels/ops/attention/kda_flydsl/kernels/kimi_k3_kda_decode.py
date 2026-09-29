@@ -8,7 +8,8 @@ import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from aiter.ops.flydsl.kernels.tensor_shim import GTensor
+from aiter.ops.flydsl.kernels.tensor_shim import GTensor, _to_raw
+from flydsl._mlir.dialects import vector as mlir_vector
 from flydsl.expr import range_constexpr
 from flydsl.expr.typing import T
 
