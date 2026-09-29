@@ -189,7 +189,7 @@ class PrefillBootstrapQueue:
         self.scheduler = scheduler
         self.scheduler_stage_metrics = scheduler_stage_metrics
         self.max_total_num_tokens = (
-            self.scheduler.tp_worker.model_runner.effective_max_total_num_tokens
+            self.scheduler.tp_worker.model_runner.effective_logical_max_total_num_tokens
         )
         self.transfer_backend = transfer_backend
         if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
@@ -666,6 +666,9 @@ class SchedulerDisaggregationPrefillMixin:
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
         while True:
+            if self.gracefully_exit:
+                break
+
             # Receive requests
             self.ingest_requests()
             if self._engine_paused:
@@ -706,6 +709,9 @@ class SchedulerDisaggregationPrefillMixin:
         self.result_queue = deque()
 
         while True:
+            if self.gracefully_exit:
+                break
+
             # Receive requests
             self.ingest_requests()
             if self._engine_paused:

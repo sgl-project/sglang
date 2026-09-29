@@ -155,15 +155,17 @@ def get_token_ids_logprobs_raw(
     if stage == LogprobStage.DECODE:
         for i, token_ids in enumerate(token_ids_logprobs_list):
             if token_ids is None:
-                vals.append([])
-                idxs.append([])
+                # The CPU copy expects a tensor in every entry under no_copy_to_cpu.
+                # A new empty one does not keep the full logprobs alive like a view.
+                row = logprobs.new_empty((0,))
+                token_ids = []
             else:
                 token_ids_tensor = torch.tensor(
                     token_ids, dtype=torch.long, pin_memory=pin_memory
                 ).to(logprobs.device, non_blocking=True)
                 row = logprobs[i, token_ids_tensor]
-                vals.append(row if no_copy_to_cpu else row.tolist())
-                idxs.append(token_ids)
+            vals.append(row if no_copy_to_cpu else row.tolist())
+            idxs.append(token_ids)
     else:  # prefill
         pt = 0
         for i, (token_ids, pruned_len) in enumerate(

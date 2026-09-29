@@ -17,6 +17,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
     get_forward,
+    get_lora,
     get_model,
     get_parallel,
     get_server_args,
@@ -558,7 +559,12 @@ def draft_model_build_scope():
     original_scope = moe.in_speculative_scope
     try:
         moe.in_speculative_scope = True
-        yield
+        # Boundaries capture this resolved preference while the draft builds.
+        # Restoring it cannot change an already constructed target plan.
+        with get_exec().comm.override(
+            boundary_reduction=get_spec().speculative_boundary_reduction
+        ):
+            yield
     finally:
         moe.in_speculative_scope = original_scope
         moe.disable_shared_experts_fusion = original_fusion
@@ -758,10 +764,8 @@ def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
 
     Pass ``is_tp_path=True`` for the TP all-reduce, ``False`` for the EP one.
     """
-    return (
-        should_skip_mlp_all_reduce()
-        or should_use_dp_reduce_scatterv()
-        or post_experts_output_is_complete(is_tp_path=is_tp_path)
+    return should_skip_mlp_all_reduce() or post_experts_output_is_complete(
+        is_tp_path=is_tp_path
     )
 
 
@@ -777,6 +781,20 @@ def reduce_moe_output(hidden_states: torch.Tensor) -> torch.Tensor:
     ):
         return tensor_model_parallel_all_reduce(hidden_states)
     return hidden_states
+
+
+def should_add_replicated_moe_output() -> bool:
+    """Whether this rank adds an output every TP rank holds in full, such as a
+    shared expert replicated with tp_size=1, to its MoE output.
+
+    Call it after the MoE block's own reduction. When a later step still sums
+    the output over TP, only TP rank 0 adds it, so the sum counts it once.
+    """
+    parallel = get_parallel()
+    summed_later = should_skip_post_experts_all_reduce(
+        is_tp_path=True
+    ) and not post_experts_output_is_complete(is_tp_path=True)
+    return not (parallel.tp_size > 1 and summed_later and parallel.tp_rank != 0)
 
 
 def can_merge_post_experts_all_reduce() -> bool:
@@ -824,23 +842,45 @@ def post_experts_all_reduce(hidden_states: torch.Tensor) -> torch.Tensor:
     return hidden_states
 
 
+def post_experts_reduction_group():
+    """The group one all-reduce of an MoE output runs over: TP when the EP and
+    MoE-TP reductions merge, otherwise EP, otherwise MoE-TP. The same group
+    ``resolve_fusion_group`` builds the fused workspace on."""
+    parallel = get_parallel()
+    if can_merge_post_experts_all_reduce():
+        return parallel.tp_group
+    if parallel.moe_ep_size > 1:
+        return parallel.moe_ep_group
+    return parallel.moe_tp_group
+
+
+def post_experts_sum_is_one_all_reduce() -> bool:
+    """Whether the sum an FFN leaves out when it skips its post-experts (or
+    down-projection) all-reduce is one full-precision all-reduce over the TP
+    group itself, on a plain partial sum: the all-reduce a later step can run
+    instead. Not when the combine already summed the output, the reduction is
+    quantized, a replicated shared expert is added after it, LoRA-B runs on
+    the unreduced activations, or the EP and MoE-TP sums run in two steps or
+    over another group."""
+    parallel = get_parallel()
+    return (
+        get_moe_a2a_backend().is_none()
+        and not post_experts_output_is_complete(is_tp_path=True)
+        and not get_exec().comm.enable_quant_communications
+        and not envs.SGLANG_SHARED_EXPERT_TP1.get()
+        and not get_lora().enable_lora
+        # Some MoE blocks reduce EP and MoE-TP in two steps instead of merging.
+        and not (parallel.moe_ep_size > 1 and parallel.moe_tp_size > 1)
+        and post_experts_reduction_group() is parallel.tp_group
+    )
+
+
 def deferred_post_experts_all_reduce(hidden_states: torch.Tensor) -> torch.Tensor:
     """Run the post-experts reduction that was deferred to allreduce fusion.
 
-    Called when the fused residual+LN kernel cannot service the shape. Reduces
-    over the same group ``resolve_fusion_group`` builds the workspace on.
+    Called when the fused residual+LN kernel cannot service the shape.
     """
-    from sglang.srt.distributed.communication_op import (
-        moe_expert_parallel_all_reduce,
-        moe_tensor_model_parallel_all_reduce,
-        tensor_model_parallel_all_reduce,
-    )
-
-    if can_merge_post_experts_all_reduce():
-        return tensor_model_parallel_all_reduce(hidden_states)
-    if get_parallel().moe_ep_size > 1:
-        return moe_expert_parallel_all_reduce(hidden_states)
-    return moe_tensor_model_parallel_all_reduce(hidden_states)
+    return post_experts_reduction_group().all_reduce(hidden_states)
 
 
 @contextmanager
