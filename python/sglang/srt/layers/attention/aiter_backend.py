@@ -89,7 +89,9 @@ from sglang.srt.layers.attention.aiter_mla_paged import (
     PagedMlaMetadata,
     log_paged_mla_capability,
     paged_mla_decode,
+    paged_mla_prefill,
     prefer_paged_mla_decode,
+    prefer_paged_mla_prefill,
 )
 from sglang.srt.layers.attention.aiter_utils import (
     forward_decode_vectorized_5d,
@@ -333,6 +335,7 @@ class AiterAttnBackend(AttentionBackend):
 
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.use_paged_mla_decode = False
+        self.use_paged_mla_prefill = False
 
         self.dcp_world_size = get_parallel().attn_dcp_size
 
@@ -577,14 +580,20 @@ class AiterAttnBackend(AttentionBackend):
                     intra_batch_mode = False
                 log_mla_gluon_capability(logger)
 
-            # gfx1250 has no usable ASM MLA decode: the kernels want
-            # seg-packed fp8 KV (SGLang's pool is token-major) and return
-            # non-finite output at 64 and 128 query heads. Route decode through
-            # aiter's paged kernels instead, which read the pool as-is.
+            # gfx1250 has no usable ASM MLA: the kernels want seg-packed fp8 KV
+            # (SGLang's pool is token-major) and decode returns non-finite
+            # output at 64 and 128 query heads. Route both decode and absorbed
+            # extend through aiter's Gluon kernels, which read the pool as-is.
             self.use_paged_mla_decode = (
                 self.dcp_world_size <= 1
                 and self.num_draft_tokens is None
                 and prefer_paged_mla_decode(
+                    page_size=self.page_size,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                )
+            )
+            self.use_paged_mla_prefill = self.dcp_world_size <= 1 and (
+                prefer_paged_mla_prefill(
                     page_size=self.page_size,
                     kv_cache_dtype=self.kv_cache_dtype,
                 )
@@ -1430,6 +1439,41 @@ class AiterAttnBackend(AttentionBackend):
             num_kv_splits=num_kv_splits,
         )
 
+    def _forward_extend_paged_mla(
+        self, q: torch.Tensor, layer: RadixAttention, k_descale
+    ) -> torch.Tensor:
+        """Absorbed MLA extend through the aiter Gluon prefill kernel.
+
+        Returns the flat ``[num_tokens, H * v_head_dim]`` the absorbed path
+        expects, matching the ASM ``mla_prefill_fwd`` branch below.
+        """
+        if self.head_pad_mode == "zero":
+            q_in = self._zero_pad_mla_q_heads(q, layer)
+            num_head_out = self.num_head_padded
+        else:
+            q_in = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+            num_head_out = layer.tp_q_head_num
+
+        o = torch.empty(
+            (q_in.shape[0], num_head_out, layer.v_head_dim),
+            dtype=torch.bfloat16,
+            device=q.device,
+        )
+        paged_mla_prefill(
+            q=q_in,
+            k_buffer=self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            out=o,
+            meta=self.forward_metadata.paged_mla,
+            max_seqlen_kv=self.forward_metadata.max_kv_len,
+            page_size=self.page_size,
+            qk_head_dim=layer.qk_head_dim,
+            v_head_dim=layer.v_head_dim,
+            sm_scale=layer.scaling,
+        )
+        if self.head_pad_mode == "zero":
+            o = o[:, : layer.tp_q_head_num, :].contiguous()
+        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
     def _get_dcp_graph_max_local_kv_len(self) -> int:
         """Static upper bound on this rank's shard, ceil(max_context_len / W)."""
         w = max(self.dcp_world_size, 1)
@@ -2144,6 +2188,18 @@ class AiterAttnBackend(AttentionBackend):
                         total_s, device=self.device, dtype=torch.int32
                     )
 
+                if self.use_paged_mla_prefill and bs > 0:
+                    # seq_lens is the full prefix + extend length, which is what
+                    # the kernel needs; qo_indptr already spans the new tokens
+                    # only, so it doubles as cu_seqlens_q.
+                    paged_mla = self._build_paged_mla_metadata(
+                        forward_batch.seq_lens,
+                        forward_batch.req_pool_indices,
+                        qo_indptr,
+                        bs,
+                        self.mla_indices_updater_prefill.max_kv_len,
+                    )
+
                 self.forward_metadata = ForwardMetadata(
                     self.mla_indices_updater_prefill.kv_indptr,
                     self.mla_indices_updater_prefill.kv_indices,
@@ -2158,6 +2214,7 @@ class AiterAttnBackend(AttentionBackend):
                     reduce_final_map=reduce_final_map,
                     reduce_partial_map=reduce_partial_map,
                     fp8_prefill_kv_indices=fp8_prefill_kv_indices,
+                    paged_mla=paged_mla,
                 )
             else:
                 self.indices_updater_prefill.update(
@@ -3233,6 +3290,12 @@ class AiterAttnBackend(AttentionBackend):
                         softmax_scale=layer.scaling,
                         causal=True,
                     )
+                if self.forward_metadata.paged_mla is not None:
+                    # Must come before the ragged branches: they cap head_dim at
+                    # 256 while the absorbed latent Q is 576 wide, so they can
+                    # not serve the no-prefix chunk of an absorbed extend. The
+                    # Gluon kernel handles prefix and no-prefix alike.
+                    return self._forward_extend_paged_mla(q, layer, k_descale)
                 if kv_indices.shape[0] == 0 or extend_no_prefix:
                     if self.use_fp8_prefill_attn and self.head_pad_mode != "zero":
                         output = self.mla_fp8_prefill_attn(

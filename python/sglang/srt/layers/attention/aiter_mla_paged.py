@@ -9,14 +9,16 @@ has to be repacked; the cache is bf16.
 
 Only gfx1250 routes here. gfx942 and gfx950 have tuned ASM MLA paths already;
 gfx1250 has none that work, its decode kernels wanting seg-packed fp8 KV and
-returning non-finite output at 64 and 128 query heads.
+returning non-finite output at 64 and 128 query heads, its MHA extend wedging
+the HSA queue partway through a chunked prefill.
 
 Decode additionally requires an aiter carrying the ``NUM_SEGMENTS_PER_SEQ == 1``
 fix in ``_mla_decode_fwd_kernel_non_pipelined``: without it the kernel writes
 its softmax max/expsum through pointers the host aliased onto the output
 buffer, corrupting the result whenever the batch is large enough to drive the
 segment count to 1 (roughly batch > CU_count/2). ``_probe_ok`` checks for it at
-runtime because the corruption is otherwise silent.
+runtime because the corruption is otherwise silent. Prefill has no segments and
+is unaffected.
 """
 
 from __future__ import annotations
@@ -81,6 +83,18 @@ def _decode_fn():
     return mla_decode_fwd
 
 
+@functools.lru_cache(maxsize=1)
+def _prefill_fn():
+    if not _routed_here():
+        return None
+    try:
+        from aiter.ops.triton.attention.mla import mla_prefill_fwd
+    except ImportError as exc:
+        logger.info("aiter paged MLA prefill import error: %s", exc)
+        return None
+    return mla_prefill_fwd
+
+
 def _probe_ok(mla_decode_fwd) -> bool:
     """One batch large enough to force NUM_SEGMENTS_PER_SEQ == 1, checked
     against a torch reference. Costs one compile, once per process."""
@@ -121,8 +135,9 @@ def log_paged_mla_capability(log: logging.Logger | None = None) -> None:
     if not (is_hip() and is_gfx1250_supported()):
         return
     (log or logger).info(
-        "aiter paged MLA decode: %s",
+        "aiter paged MLA: decode %s, prefill %s",
         "enabled" if _decode_fn() is not None else "disabled",
+        "enabled" if _prefill_fn() is not None else "disabled",
     )
 
 
@@ -132,6 +147,10 @@ def _shape_supported(page_size: int, kv_cache_dtype: torch.dtype) -> bool:
 
 def prefer_paged_mla_decode(*, page_size: int, kv_cache_dtype: torch.dtype) -> bool:
     return _shape_supported(page_size, kv_cache_dtype) and _decode_fn() is not None
+
+
+def prefer_paged_mla_prefill(*, page_size: int, kv_cache_dtype: torch.dtype) -> bool:
+    return _shape_supported(page_size, kv_cache_dtype) and _prefill_fn() is not None
 
 
 def _run(
@@ -168,3 +187,12 @@ def _run(
 def paged_mla_decode(**kwargs) -> torch.Tensor:
     """Decode fused Q ``[num_tokens, H, qk_head_dim]`` into ``out``."""
     return _run(_decode_fn(), **kwargs)
+
+
+def paged_mla_prefill(**kwargs) -> torch.Tensor:
+    """Absorbed MLA extend: ragged Q attending the paged prefix plus itself.
+
+    The kernel derives each query's causal bound from ``seq_lens`` minus its
+    own query length, so a no-prefix chunk works the same as a cached one.
+    """
+    return _run(_prefill_fn(), **kwargs)
