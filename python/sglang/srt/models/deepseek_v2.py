@@ -62,6 +62,9 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
 from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
+from sglang.srt.layers.attention.dsa.utils import (
+    maybe_prefetch_next_full_attention_kv,
+)
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
@@ -78,9 +81,6 @@ from sglang.srt.layers.layer_boundary import (
     get_attn_tp_context,
     is_dense_ffn_fully_dp,
     make_stages,
-)
-from sglang.srt.layers.layer_boundary.adapters.context_parallel import (
-    maybe_prefetch_next_full_attention_kv,
 )
 from sglang.srt.layers.layer_boundary.residual import access as residual_access
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
