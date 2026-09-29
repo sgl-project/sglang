@@ -48,7 +48,7 @@ import shutil
 import unittest
 import unittest.mock
 from array import array
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from types import SimpleNamespace
 
 import torch
@@ -338,12 +338,14 @@ def _build_mtp_pool(kvc, *, capacity=128, is_dsa_model=False, is_dsv4_model=Fals
 class TestMTPKVShardConfig(CustomTestCase):
     def setUp(self):
         super().setUp()
-        self.enterContext(
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(
             get_context().override_server_args(
                 page_size=16, chunked_prefill_size=1024, enable_multi_layer_eagle=False
             )
         )
-        self.enterContext(
+        stack.enter_context(
             get_parallel().override(
                 tp_size=2, attn_tp_size=2, moe_tp_size=2, attn_dcp_size=1
             )
