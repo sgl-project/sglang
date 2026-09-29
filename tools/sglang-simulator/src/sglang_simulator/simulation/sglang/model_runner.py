@@ -192,6 +192,10 @@ class C_KVCacheConfiguratorHook(BaseHook):
                         lower = middle
                     else:
                         upper = middle
+                if self.mambaish_config is not None:
+                    # Publish Mamba state capacity before resolving request limits.
+                    # Keep the explicit KV budget, not the helper's remainder.
+                    self._handle_max_mamba_cache(upper / (1 << 30))
                 return upper
 
             model = ConfigManager.get_model_info()
