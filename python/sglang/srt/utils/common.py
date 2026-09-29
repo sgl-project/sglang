@@ -957,6 +957,39 @@ def is_mnnvl_fabric_device() -> bool:
     return any(tag in name for tag in ("GB200", "GB300"))
 
 
+def fi_a2a_platform_blocker(
+    *, dcp_size: int, tp_size: int, pp_size: int, nnodes: int
+) -> Optional[str]:
+    """Why this host cannot run the fused fi_a2a DCP reduce, or None if it can.
+
+    Runs at argument resolution: no CUDA context and no flashinfer import.
+    """
+    if not get_platform().is_sm100:
+        return "requires a Blackwell (SM100-family) GPU"
+    if not is_mnnvl_fabric_device():
+        tp_size_per_node = tp_size // max(nnodes // pp_size, 1)
+        if tp_size_per_node % dcp_size != 0:
+            return (
+                "requires the DCP group inside one NVLink domain (MNNVL fabric or "
+                f"one node); dcp_size={dcp_size} does not divide the "
+                f"{tp_size_per_node} TP ranks per node (tp_size={tp_size}, "
+                f"pp_size={pp_size}, nnodes={nnodes})"
+            )
+    # torch 2.14 is the first release whose symmetric memory exposes the NCCL
+    # device communicator and window offsets the fused kernel is built on.
+    if torch_release < (2, 14):
+        return (
+            "requires torch>=2.14 (NCCL device communicator in torch symmetric "
+            f"memory); found torch {torch.__version__}"
+        )
+    if not _flashinfer_has_fused_dcp_reduce():
+        return (
+            "requires a FlashInfer build that provides "
+            "flashinfer.comm.decode_cp_a2a_lse_reduce"
+        )
+    return None
+
+
 def is_fi_a2a_supported(
     *, dcp_size: int, tp_size: int, pp_size: int, nnodes: int
 ) -> bool:
@@ -966,6 +999,18 @@ def is_fi_a2a_supported(
         return True
     tp_size_per_node = tp_size // max(nnodes // pp_size, 1)
     return tp_size_per_node % dcp_size == 0
+
+
+@lru_cache(maxsize=1)
+def _flashinfer_has_fused_dcp_reduce() -> bool:
+    # A top-level find_spec locates the package without importing it.
+    spec = find_spec("flashinfer")
+    if spec is None or spec.submodule_search_locations is None:
+        return False
+    return any(
+        os.path.isfile(os.path.join(path, "comm", "dcp_lse_reduce.py"))
+        for path in spec.submodule_search_locations
+    )
 
 
 @lru_cache(maxsize=1)

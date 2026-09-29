@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from sglang.srt.arg_groups import model_override_base
@@ -66,8 +67,8 @@ from sglang.srt.runtime_context import (
     get_platform,
 )
 from sglang.srt.utils.common import (
+    fi_a2a_platform_blocker,
     get_quantization_config,
-    is_fi_a2a_supported,
     is_gfx95_supported,
     xpu_has_xmx_support,
 )
@@ -1309,6 +1310,39 @@ def _data_parallelism_defaults(view: Any) -> dict:
     return {}
 
 
+def fi_a2a_blocker(view: Any) -> Optional[str]:
+    """Why --dcp-comm-backend fi_a2a cannot run with this configuration, or None."""
+    reason = fi_a2a_platform_blocker(
+        dcp_size=view.dcp_size,
+        tp_size=view.tp_size,
+        pp_size=view.pp_size,
+        nnodes=view.nnodes,
+    )
+    if reason is not None:
+        return reason
+    if not use_mla_backend(view):
+        return "applies only to MLA models (the MHA DCP reduction ignores it)"
+    if view.enable_pdmux:
+        return (
+            "does not support --enable-pdmux (every captured stream group would "
+            "need its own fused-reduce workspace)"
+        )
+    if view.enable_torch_symm_mem:
+        return (
+            "cannot be combined with --enable-torch-symm-mem (fi_a2a moves torch "
+            "symmetric memory to the NCCL backend, which that all-reduce cannot use)"
+        )
+    if envs.SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.get() and view.pp_size > 1:
+        return (
+            "cannot be combined with SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP at "
+            "--pp-size > 1 (its decode warmup runs on a third CUDA stream)"
+        )
+    # The fused workspace is an NCCL symmetric window, which needs cuMem memory.
+    if os.environ.get("NCCL_CUMEM_ENABLE") == "0":
+        return "needs cuMem-backed NCCL memory, but NCCL_CUMEM_ENABLE=0 is exported"
+    return None
+
+
 @register_post_process
 def _dcp_comm_backend_default(view: Any) -> dict:
     if view.dcp_comm_backend is not None:
@@ -1316,21 +1350,18 @@ def _dcp_comm_backend_default(view: Any) -> dict:
     if view.dcp_size <= 1:
         return {"dcp_comm_backend": "ag_rs"}
     platform = get_platform()
-    if is_fi_a2a_supported(
-        dcp_size=view.dcp_size,
-        tp_size=view.tp_size,
-        pp_size=view.pp_size,
-        nnodes=view.nnodes,
-    ):
+    blocker = fi_a2a_blocker(view)
+    if blocker is None:
         backend = "fi_a2a"
     elif platform.is_cuda or platform.is_hip:
         backend = "a2a"
     else:
         backend = "ag_rs"
     logger.info(
-        "DCP (dcp_size=%d) selects communication backend %r.",
+        "DCP (dcp_size=%d) selects communication backend %r%s.",
         view.dcp_size,
         backend,
+        f" (fi_a2a {blocker})" if blocker is not None and platform.is_cuda else "",
     )
     return {"dcp_comm_backend": backend}
 
