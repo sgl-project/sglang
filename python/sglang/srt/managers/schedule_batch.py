@@ -2115,11 +2115,17 @@ class Req(ReqDllmMixin):
             if self.bootstrap_room is not None
             else ""
         )
+        input_len = len(self.origin_input_ids)
+        hit_rate = self.cached_tokens / input_len
         prefix = (
             f"ReqTimeStats("
             f"rid={self.rid}{bootstrap_info}, "
             f"input_len={len(self.origin_input_ids)}, "
             f"cached_input_len={self.cached_tokens}, "
+            f"hit_rate={hit_rate:.3f}, "
+            f"device={self.cached_tokens_device}, "
+            f"host={self.cached_tokens_host}, "
+            f"storage={self.cached_tokens_storage}, "
             f"output_len={len(self.output_ids)}, "
             f"attempts={self.prefill_attempt_count}, "
             f"type={self.time_stats.disagg_mode_str()})"
