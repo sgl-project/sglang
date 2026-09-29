@@ -995,12 +995,20 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
+    def _storage_page_index(self, index: int) -> int:
+        if self.dcp_size == 1:
+            return index
+        index = int(index)
+        if index < 0 or index % self.logical_page_size != 0:
+            raise ValueError(
+                "DCP L3 page start must be a nonnegative logical page boundary."
+            )
+        if index + self.logical_page_size > self.logical_size:
+            raise IndexError("DCP L3 page is outside the host pool.")
+        return index // self.dcp_size
+
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
-        assert self.dcp_size == 1, (
-            "HiCache L3 storage paths are not yet DCP-aware (per-rank shards "
-            "need dcp_rank-scoped keys); --hicache-storage-backend with "
-            "--dcp-size > 1 should have been rejected at server start."
-        )
+        index = self._storage_page_index(index)
         if self.layout == "layer_first":
             data_page = self.kv_buffer[:, index : index + self.page_size, :, :]
         elif self.layout == "page_first":
@@ -1028,6 +1036,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         ).flatten()
 
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+        index = self._storage_page_index(index)
         if self.layout == "layer_first":
             self.kv_buffer[:, index : index + self.page_size, :, :] = data_page.reshape(
                 self.layer_num,
@@ -1058,6 +1067,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         """
         meta data for zero copy
         """
+        if self.dcp_size > 1:
+            raise NotImplementedError("DCP L3 zero-copy storage is not supported.")
         assert len(indices) % self.page_size == 0
         ptr_list = []
         kv_buffer_data_ptr = self.kv_buffer.data_ptr()
