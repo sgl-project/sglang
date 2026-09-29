@@ -359,6 +359,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     resolve_image_processor_backend,
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
+from sglang.srt.utils.npu_pinned_host_diagnostics import PinnedHostMemoryMonitor
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_versions import (
@@ -6060,6 +6061,8 @@ def run_scheduler_process(
         display_dp_rank=display_dp_rank,
         display_moe_ep_rank=display_moe_ep_rank,
     )
+    host_memory_monitor = PinnedHostMemoryMonitor(enabled=_is_npu)
+    host_memory_monitor.start()
     parent_process = psutil.Process().parent()
 
     # Set up tracing
@@ -6080,6 +6083,7 @@ def run_scheduler_process(
     scheduler = None
     try:
         scheduler = Scheduler(server_args, port_args)
+        host_memory_monitor.mark_runtime()
 
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
@@ -6099,6 +6103,7 @@ def run_scheduler_process(
             except Exception:
                 pass
     finally:
+        host_memory_monitor.stop()
         if scheduler is not None:
             # FPM has a background ZMQ publisher thread that needs explicit
             # teardown to flush queued metrics and close the socket cleanly.

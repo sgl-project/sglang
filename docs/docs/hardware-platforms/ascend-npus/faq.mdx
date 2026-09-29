@@ -317,11 +317,33 @@ export SGLANG_NPU_PINNED_HOST_DEBUG=1
 The flag is off by default. It records a before/after snapshot for large
 HiCache Host pool allocations and samples the smaller `async_d2h` and
 `prepare_mlp_sync_batch` allocations once every 30 seconds per call site.
-Failures are always logged. Each record includes the PID, rank environment
-identifiers when set, requested
-bytes (when known), allocator active and reserved bytes, process RSS, physical
-`MemAvailable`, and cgroup v2 `memory.current` / `memory.max` when available.
-The flag only adds diagnostics; it does not change the allocation or copy path.
+Failures are always logged. Each scheduler process also emits
+`NPU pinned host monitor` every 5 seconds, beginning before model loading,
+marking `runtime_start` after initialization, and ending when the request loop
+stops. These records include the PID, phase (`loading` or `runtime`), allocator
+active/reserved bytes and native peaks, process RSS, physical Host memory
+total/available/used percent, and the limiting visible cgroup memory usage,
+limit, headroom, and used percent. A `memory.max` value of `max` produces a null
+cgroup percentage; the physical Host percentage remains available. The
+monitor checks visible cgroup ancestors and reports the one with the least
+headroom. Cgroup usage includes all processes and charged file cache, while
+the allocator counters are per process. `torch.npu.memory_stats()` measures
+NPU device allocations and is not used for pinned Host statistics. The flag
+only adds diagnostics; it does not change the allocation or copy path.
+`pinned_reserved_pct_of_cgroup_limit` shows one rank's share of the container
+limit; do not add the per-rank cgroup usage percentages because they share the
+same cgroup.
+
+Compare `loading_pinned_active_peak_bytes` and
+`loading_pinned_reserved_peak_bytes` at `runtime_start` with later
+`pinned_active_peak_bytes` and `pinned_reserved_peak_bytes`.
+`active_peak_phase` / `reserved_peak_phase` becomes `runtime` only if a higher
+native allocator peak occurs after initialization. `loading_or_equal` means
+the runtime did not exceed the loading peak. To inspect the timeline:
+
+```bash
+rg 'NPU pinned host monitor|NPU pinned host allocation failed' /tmp/hicache-mla-30gb-full.log
+```
 
 Compare the records from **all ranks**, not only the rank that reports the
 error. A large gap between `pinned_reserved_bytes` and `pinned_active_bytes`
