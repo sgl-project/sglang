@@ -24,9 +24,9 @@ from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
 from sglang.srt.entrypoints.systemone.serving import (
     SystemOneServing,
     _answer,
-    _choice_confidence,
-    _score_confidence,
     _view,
+    choice_confidence,
+    score_confidence,
 )
 from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
 from sglang.srt.parser.template_detection import (
@@ -859,7 +859,7 @@ class TestSystemOne(unittest.IsolatedAsyncioTestCase):
             team["choice"], max(team["probabilities"], key=team["probabilities"].get)
         )
         self.assertAlmostEqual(
-            team["confidence"], _choice_confidence(list(team["probabilities"].values()))
+            team["confidence"], choice_confidence(list(team["probabilities"].values()))
         )
 
         mood = body["answers"]["mood"]
@@ -961,18 +961,18 @@ class TestSystemOne(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(answers["mood"].score, math.fsum([0, 0.3, 0.6]))
         self.assertAlmostEqual(answers["team"].confidence, 0.0)
         self.assertAlmostEqual(
-            answers["mood"].confidence, _score_confidence([1 / 3] * 3)
+            answers["mood"].confidence, score_confidence([1 / 3] * 3)
         )
 
     def test_confidence_matches_the_published_formulas(self):
         # Documented examples, a uniform choice, a split score, and one candidate.
-        self.assertAlmostEqual(_score_confidence([0, 0.14, 0.86, 0, 0]), 1 - 0.14 / 1.2)
-        self.assertAlmostEqual(_score_confidence([0, 0, 0.48, 0.52]), 0.52)
-        self.assertEqual(_score_confidence([0.5, 0, 0, 0, 0.5]), 0.0)
-        self.assertAlmostEqual(_choice_confidence([0.25] * 4), 0.0)
-        self.assertAlmostEqual(_choice_confidence([0.1, 0.9]), 0.8)
-        self.assertEqual(_choice_confidence([1.0]), 1.0)
-        self.assertEqual(_score_confidence([1.0]), 1.0)
+        self.assertAlmostEqual(score_confidence([0, 0.14, 0.86, 0, 0]), 1 - 0.14 / 1.2)
+        self.assertAlmostEqual(score_confidence([0, 0, 0.48, 0.52]), 0.52)
+        self.assertEqual(score_confidence([0.5, 0, 0, 0, 0.5]), 0.0)
+        self.assertAlmostEqual(choice_confidence([0.25] * 4), 0.0)
+        self.assertAlmostEqual(choice_confidence([0.1, 0.9]), 0.8)
+        self.assertEqual(choice_confidence([1.0]), 1.0)
+        self.assertEqual(score_confidence([1.0]), 1.0)
 
     async def test_options_beyond_26_get_two_letter_labels(self):
         manager = ScoringManager(self.tokenizer)
@@ -1098,6 +1098,7 @@ class TestSystemOne(unittest.IsolatedAsyncioTestCase):
             return SimpleNamespace(
                 url=SimpleNamespace(path=root_path + path),
                 scope={"root_path": root_path},
+                headers={},
             )
 
         for root_path in ["", "/prefix"]:
