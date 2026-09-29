@@ -368,7 +368,6 @@ class BeamDecoderLayer(nn.Module):
     ):
         super().__init__()
         self.layer_id = layer_id
-        self.residual_scale_in_fp32 = config.residual_scale_in_fp32
         self.rms_norm_eps = config.rms_norm_eps
         self.sandwich_residual_norm = BeamSandwichResidualRMSNormOp()
         attn_depth = 2 * (layer_id + 1)
@@ -457,7 +456,7 @@ class BeamDecoderLayer(nn.Module):
             self.pre_feedforward_layernorm.weight,
             self.rms_norm_eps,
             self.attn_residual_scales,
-            self.residual_scale_in_fp32,
+            False,  # combine_in_fp32: `forward` combines in the activation dtype.
         )
         mlp = self.mlp(normed)
         return self.sandwich_residual_norm(
@@ -467,7 +466,7 @@ class BeamDecoderLayer(nn.Module):
             next_norm_weight,
             self.rms_norm_eps,
             self.mlp_residual_scales,
-            self.residual_scale_in_fp32,
+            False,  # combine_in_fp32: `forward` combines in the activation dtype.
         )
 
 

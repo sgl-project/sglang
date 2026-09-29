@@ -139,9 +139,16 @@ def test_beam_sandwich_residual_rmsnorm(dtype, rows, combine_in_fp32):
             next_norm = RMSNorm(5120, eps=1e-6).cuda().to(dtype)
             post_norm.weight.data.copy_(post)
             next_norm.weight.data.copy_(nxt)
-            serving_combined = depth_scaled_residual(
-                post_norm(branch), residual, (0.25, 0.968), combine_in_fp32
-            )
+            if combine_in_fp32:
+                # Beam's `forward` has no FP32 combine on `dev`; this is the
+                # legacy serving arithmetic the kernel branch reproduces.
+                serving_combined = (
+                    post_norm(branch).float() * 0.25 + residual.float() * 0.968
+                ).to(dtype)
+            else:
+                serving_combined = depth_scaled_residual(
+                    post_norm(branch), residual, (0.25, 0.968)
+                )
             assert (combined != serving_combined).float().mean().item() < 2e-3
             torch.testing.assert_close(
                 combined, serving_combined, atol=1e-6, rtol=2**-7
