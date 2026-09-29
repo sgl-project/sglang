@@ -115,13 +115,19 @@ def to_pp(hidden_states, forward_batch, *, preserve_declared=True):
             partial sum unreduced for the receiver's from_pp to complete; pass
             False only when the receiver does not declare that sum.
 
-    Runtime-selected completion work is finished before transport.
+    Runtime-selected completion work is finished before transport. A stream
+    the producer already wrote (MHC writes its streams at the FFN exit) has no
+    separate residual and is sent as hidden_states alone; the receiver's
+    from_pp reconstructs it as written.
     """
     hidden_states, residual = stream_of(forward_batch).export(
         hidden_states, preserve_declared=preserve_declared
     )
     forward_batch.residual_stream = None
-    return PPProxyTensors({"hidden_states": hidden_states, "residual": residual})
+    tensors = {"hidden_states": hidden_states}
+    if residual is not None:
+        tensors["residual"] = residual
+    return PPProxyTensors(tensors)
 
 
 def snapshot(hidden_states, forward_batch):
