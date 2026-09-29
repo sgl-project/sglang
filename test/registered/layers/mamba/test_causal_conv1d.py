@@ -319,6 +319,112 @@ def test_causal_conv1d_update_with_batch_gather(
     assert torch.allclose(out[:batch_size], out_ref, rtol=rtol, atol=atol)
 
 
+def _dedup_conv_window(slots, steps, dim, width, dtype, device):
+    """MambaPool's linear-chain intermediate conv-window layout.
+
+    One [dim, steps + width - 2] buffer per slot, viewed as overlapping per-step
+    windows [slots, steps, dim, width - 1]: step t's window is buf[:, t : t + width - 1].
+    """
+    phys = torch.randn(slots, dim, steps + width - 2, device=device, dtype=dtype)
+    view = phys.as_strided(
+        (slots, steps, dim, width - 1),
+        (phys.stride(0), phys.stride(2), phys.stride(1), phys.stride(2)),
+    )
+    return phys, view
+
+
+@pytest.mark.parametrize("itype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("width", [2, 3, 4])
+# 16 is the DFlash / MTP verify width; 3 runs inside a pool sized for 5 draft
+# tokens (only the first seqlen steps are written).
+@pytest.mark.parametrize("seqlen, extra_steps", [(1, 0), (3, 2), (16, 0)])
+def test_causal_conv1d_update_dedup_window_matches_dense(
+    seqlen, extra_steps, width, itype
+):
+    """Linear-chain verify into the deduplicated window layout stores the shared
+    per-slot buffer as one tile. It must be bit-identical to the per-token window
+    stores, which the dense (non-overlapping) layout still uses."""
+    device = get_device()
+    torch.manual_seed(0)
+    # A partial last channel tile, 5 requests and 2 padded rows.
+    dim, batch, padding = 2048 + 16, 5, 2
+    slots = 4 * batch
+    # (batch, dim, seqlen) with dim contiguous, as the GDN verify passes it.
+    x = torch.randn(batch + padding, seqlen, dim, device=device, dtype=itype).transpose(
+        1, 2
+    )
+    weight = torch.randn(dim, width, device=device, dtype=itype)
+    bias = torch.randn(dim, device=device, dtype=itype)
+    conv_state = torch.randn(slots, dim, width - 1, device=device, dtype=itype)
+    state_indices = torch.randperm(slots)[:batch].to(device=device, dtype=torch.int32)
+    inter_indices = torch.randperm(slots)[:batch].to(device=device, dtype=torch.int32)
+    pad = torch.full((padding,), PAD_SLOT_ID, dtype=torch.int32, device=device)
+    state_indices = torch.cat([state_indices, pad])
+    inter_indices = torch.cat([inter_indices, inter_indices[:padding]])
+    # The pool may be sized for more draft tokens than this verify uses.
+    steps = seqlen + extra_steps
+    phys, dedup = _dedup_conv_window(slots, steps, dim, width, itype, device)
+    dense = torch.randn(slots, steps, dim, width - 1, device=device, dtype=itype)
+    phys_before = phys.clone()
+
+    def run(conv_state_, window):
+        return causal_conv1d_update(
+            x,
+            conv_state_,
+            weight,
+            bias,
+            activation="silu",
+            conv_state_indices=state_indices,
+            intermediate_conv_window=window,
+            intermediate_state_indices=inter_indices,
+            pad_slot_id=PAD_SLOT_ID,
+        )
+
+    state_dense = conv_state.clone()
+    out_dense = run(state_dense, dense)
+    state_dedup = conv_state.clone()
+    out_dedup = run(state_dedup, dedup)
+
+    assert torch.equal(out_dedup[:batch], out_dense[:batch])
+    assert torch.equal(state_dedup, state_dense)
+    rows = inter_indices[:batch].long()
+    assert torch.equal(dedup[rows, :seqlen], dense[rows, :seqlen])
+    # Nothing outside the verified slots' first seqlen + width - 2 columns moves.
+    written = torch.zeros_like(phys, dtype=torch.bool)
+    written[rows, :, : seqlen + width - 2] = True
+    assert torch.equal(phys[~written], phys_before[~written])
+
+
+def test_causal_conv1d_update_dedup_window_gate():
+    from sglang.kernels.ops.mamba.causal_conv1d_triton import _use_dedup_window_store
+
+    device = get_device()
+    slots, steps, dim, width = 4, 16, 64, 4
+    _, dedup = _dedup_conv_window(slots, steps, dim, width, torch.bfloat16, device)
+    dense = torch.zeros(slots, steps, dim, width - 1, device=device)
+    indices = torch.zeros(2, dtype=torch.int32, device=device)
+    kwargs = dict(
+        conv_state_indices=indices,
+        num_accept_tokens=None,
+        retrieve_next_token=None,
+        width=width,
+        seqlen=steps,
+    )
+    assert _use_dedup_window_store(dedup, **kwargs)
+    assert not _use_dedup_window_store(dense, **kwargs)
+    assert not _use_dedup_window_store(None, **kwargs)
+    # Tree verify, fused accept and a missing slot map keep the per-token stores.
+    for override in (
+        dict(retrieve_next_token=indices),
+        dict(num_accept_tokens=indices),
+        dict(conv_state_indices=None),
+    ):
+        assert not _use_dedup_window_store(dedup, **{**kwargs, **override})
+    # The per-token path stores at most three window columns.
+    _, dedup5 = _dedup_conv_window(slots, steps, dim, 5, torch.bfloat16, device)
+    assert not _use_dedup_window_store(dedup5, **{**kwargs, "width": 5})
+
+
 @pytest.mark.parametrize("itype", [torch.bfloat16])
 @pytest.mark.parametrize("silu_activation", [True])
 @pytest.mark.parametrize("has_bias", [True])
