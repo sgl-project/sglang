@@ -139,7 +139,14 @@ _TRUE_LENS = object()
 
 
 def _run(
-    block, inputs, *, return_intermediate_states=False, kernel=None, seq_lens=_TRUE_LENS
+    block,
+    inputs,
+    *,
+    return_intermediate_states=False,
+    kernel=None,
+    seq_lens=_TRUE_LENS,
+    track_state=None,
+    track_chunk_idx=None,
 ):
     """Run extend with SGLANG_KDA_EXTEND_BLOCK_TOKENS=block on a fresh pool
     copy. ``kernel`` replaces kda_triton.chunk_kda for the call; ``seq_lens``
@@ -167,6 +174,8 @@ def _run(
             lower_bound=-5.0,
             extend_seq_lens_cpu=seq_lens,
             return_intermediate_states=return_intermediate_states,
+            track_state=track_state,
+            track_chunk_idx=track_chunk_idx,
         )
     if return_intermediate_states:
         o, h = out
@@ -178,6 +187,45 @@ def _run(
 
 
 class _Checks:
+    def checkTrackSnapshots(self, device, *, kernel=None, pool_dtype=torch.float32):
+        # The serving regression used a 2110-token suffix and saved the state
+        # at token 2048. Also cover a late checkpoint in a second block, whole
+        # sequences grouped after a split, and an untracked row.
+        lens = [128, 2110, 33, 97, 4002, 128]
+        slots = [7, 2, 6, 1, 4, -1]
+        inputs = (
+            _int_inputs(lens, slots, pool_dtype=pool_dtype)
+            if device == "cpu"
+            else _inputs(lens, slots, pool_dtype=pool_dtype, device=device)
+        )
+        chunks = torch.tensor([1, 32, -1, 1, 61, 1], dtype=torch.int32, device=device)
+        shape = (len(lens), *inputs["pool"].shape[1:])
+        reference = torch.full(shape, torch.nan, dtype=torch.float32, device=device)
+        blocked = torch.full_like(reference, torch.nan)
+        _run(
+            0,
+            inputs,
+            kernel=kernel,
+            return_intermediate_states=True,
+            track_state=reference,
+            track_chunk_idx=chunks,
+        )
+        _run(
+            BLOCK,
+            inputs,
+            kernel=kernel,
+            return_intermediate_states=True,
+            track_state=blocked,
+            track_chunk_idx=chunks,
+        )
+        self.assertTrue(torch.isnan(reference[2]).all())
+        self.assertTrue(torch.isnan(blocked[2]).all())
+        active = [0, 1, 3, 4, 5]
+        self.assertTrue(torch.isfinite(reference[active]).all())
+        self.assertTrue(torch.isfinite(blocked[active]).all())
+        self.assertSame(blocked[active], reference[active], "fp32 track snapshots")
+        self.assertEqual(chunks.tolist(), [1, 32, -1, 1, 61, 1])
+
     def assertSame(self, got, want, what):
         self.assertEqual(tuple(got.shape), tuple(want.shape), what)
         self.assertEqual(got.dtype, want.dtype, what)
@@ -252,6 +300,11 @@ class TestKdaExtendBlocked(CustomTestCase, _Checks):
 
     def test_blocked_matches_unblocked(self):
         self._compare(_inputs(SEQ_LENS, SLOT_INDICES), BLOCK, CALLS)
+
+    def test_track_snapshots_match_unblocked(self):
+        for dtype in (torch.float32, torch.bfloat16):
+            with self.subTest(pool_dtype=dtype):
+                self.checkTrackSnapshots("cuda", pool_dtype=dtype)
 
     def test_blocked_matches_unblocked_intermediate_states(self):
         self._compare(
@@ -365,6 +418,8 @@ class _FakeChunkKda:
         initial_state,
         initial_state_indices,
         output_intermediate_states=False,
+        track_state=None,
+        track_chunk_idx=None,
         **kwargs,
     ):
         cu = cu_seqlens.tolist()
@@ -390,6 +445,8 @@ class _FakeChunkKda:
             for c in range(s, e, CHUNK):
                 chunk = v[0, c : min(c + CHUNK, e)].float()
                 hs.append(state.clone())
+                if track_state is not None and (c - s) // CHUNK == track_chunk_idx[n]:
+                    track_state[n].copy_(state)
                 v[0, c : min(c + CHUNK, e)] = (2 * chunk + state[..., 0]).to(v.dtype)
                 state = state + chunk.sum(0)[..., None]
             if e > s and indices[n] >= 0:
@@ -418,6 +475,13 @@ def _int_inputs(seq_lens, slot_indices, *, pool_dtype=torch.float32):
 
 class TestKdaExtendBlockedPlan(CustomTestCase, _Checks):
     """CPU: call plan, metadata fallback and state carry with a fake kernel."""
+
+    def test_track_snapshots_match_unblocked(self):
+        for dtype in (torch.float32, torch.bfloat16):
+            with self.subTest(pool_dtype=dtype):
+                self.checkTrackSnapshots(
+                    "cpu", kernel=_FakeChunkKda(), pool_dtype=dtype
+                )
 
     def test_block_rounding(self):
         # Unset (0, the default) or anything below the 64-token chunk
