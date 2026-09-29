@@ -10,7 +10,12 @@ use tokio::process::Command;
 /// parallel tests never receive, so none of them can take it before the router
 /// binds it or answer this test's polls in its place.
 fn free_low_port() -> u16 {
-    (20_000..32_000)
+    let ephemeral_start = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+        .ok()
+        .and_then(|range| range.split_whitespace().next()?.parse().ok())
+        .unwrap_or(32_768);
+    (1024..ephemeral_start)
+        .rev()
         .find(|&port| std::net::TcpListener::bind(("127.0.0.1", port)).is_ok())
         .expect("a free port below the ephemeral range")
 }
