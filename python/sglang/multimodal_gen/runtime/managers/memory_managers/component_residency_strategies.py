@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from itertools import chain
 from typing import TYPE_CHECKING
 
 import torch
@@ -71,9 +72,7 @@ def _module_ready_on_local_device(
     return dtype is None or tensor.dtype == dtype
 
 
-def _cpu_module_nbytes(
-    module: nn.Module, *, dtype: torch.dtype | None = None
-) -> int:
+def _cpu_module_nbytes(module: nn.Module, *, dtype: torch.dtype | None = None) -> int:
     """Bytes the host tensors would occupy after an optional device cast.
 
     ``module.to(device, dtype=...)`` only casts floating-point tensors, so
@@ -240,8 +239,11 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
         state: ResidencyState,
     ) -> None:
         self.wait_for_use(module, use, state)
-        tensor = _module_reference_tensor(module)
-        if tensor is not None and tensor.device.type != "cpu":
+        # a failed H2D may leave children on device while the first parameter is on CPU
+        if any(
+            tensor.device.type != "cpu"
+            for tensor in chain(module.parameters(), module.buffers())
+        ):
             # A non-blocking device->host move lands in pinned host memory the
             # size of the component. On a shared pool that pins a second copy
             # of the weights next to the device copy still being read from
@@ -262,20 +264,29 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
         preferred: bool,
     ) -> None:
         if preferred and state.batch_is_warmup:
-            # Return reserved blocks from earlier non-intensive releases (e.g. VAE)
-            # before sizing the optional warmup preload against driver-free memory.
-            _empty_device_cache()
+            if _module_ready_on_local_device(module, dtype=use.target_dtype):
+                self.wait_for_use(module, use, state)
+                return
+            required_bytes = _cpu_module_nbytes(module, dtype=use.target_dtype)
             free_bytes = _device_free_bytes()
+            if free_bytes is not None and required_bytes > (
+                free_bytes - _WARMUP_PRELOAD_MARGIN_BYTES
+            ):
+                # reclaim unused allocator blocks only when driver-free memory is short
+                _empty_device_cache()
+                free_bytes = _device_free_bytes()
+            preload_failed = False
             try:
-                if free_bytes is None or _cpu_module_nbytes(
-                    module, dtype=use.target_dtype
-                ) <= (free_bytes - _WARMUP_PRELOAD_MARGIN_BYTES):
+                if free_bytes is None or required_bytes <= (
+                    free_bytes - _WARMUP_PRELOAD_MARGIN_BYTES
+                ):
                     self.prepare_for_use(module, use, state)
                     self.wait_for_use(module, use, state)
                     return
             except RuntimeError as error:
                 if not _is_out_of_memory_error(error):
                     raise
+                preload_failed = True
             # Warmup preload is optional; the next request loads it on demand.
             logger.warning(
                 "Warmup could not keep %s resident after request finalization; "
@@ -283,7 +294,8 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
                 use.component_name,
             )
             self.finish_use(module, use, state)
-            _empty_device_cache()
+            if preload_failed:
+                _empty_device_cache()
             return
         self.finish_use(module, use, state)
 
