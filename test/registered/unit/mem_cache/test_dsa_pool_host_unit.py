@@ -144,6 +144,96 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
                 ].cpu()
                 self.assertTrue(torch.equal(got_kv, expected_kv))
 
+    @unittest.skipIf(is_hip(), "DSA k-pool radix pages are CUDA-only.")
+    def test_kpool_host_page_spans_scattered_device_pages(self):
+        """A DSA k-pool radix page (4 x 64 tokens) backed up from scattered device
+        pages must round-trip per device page and read back as one storage page."""
+        device_page_size, pages_per_page, layer_num = 64, 4, 2
+        host_page_size = device_page_size * pages_per_page
+        device_pool = DSATokenToKVPool(
+            size=device_page_size * 12,
+            page_size=device_page_size,
+            kv_lora_rank=128,
+            dtype=torch.bfloat16,
+            qk_rope_head_dim=32,
+            layer_num=layer_num,
+            device="cuda",
+            enable_memory_saver=False,
+            kv_cache_dim=576,
+            index_head_dim=128,
+        )
+        original_alloc = ALLOC_MEMORY_FUNCS["cuda"]
+        ALLOC_MEMORY_FUNCS["cuda"] = alloc_with_pin_memory
+        try:
+            mla_host = MLATokenToKVPoolHost(
+                device_pool=device_pool,
+                host_to_device_ratio=2.0,
+                host_size=0,
+                page_size=host_page_size,
+                layout="page_first",
+                pin_memory=True,
+                device="cpu",
+                allocator_type="default",
+                override_kv_cache_dim=device_pool.kv_cache_dim,
+            )
+            indexer_host = DSAIndexerPoolHost(
+                device_pool=device_pool,
+                anchor_host=mla_host,
+                layout="page_first",
+                pin_memory=True,
+                device="cpu",
+                allocator_type="default",
+            )
+        finally:
+            ALLOC_MEMORY_FUNCS["cuda"] = original_alloc
+        for layer_id in range(layer_num):
+            buf = device_pool.index_k_with_scale_buffer[layer_id]
+            data = torch.arange(buf.numel(), device="cuda", dtype=torch.int64)
+            buf.copy_(((data + 7 * layer_id) % 251).to(torch.uint8).view_as(buf))
+
+        src_pages = torch.tensor([9, 2, 6, 4], device="cuda", dtype=torch.int64)
+        host_indices = torch.arange(host_page_size, host_page_size * 2)
+        indexer_host.backup_from_device_all_layer(
+            device_pool,
+            host_indices,
+            self._token_indices_for_pages(src_pages, device_page_size, "cuda"),
+            "kernel",
+        )
+
+        expected = torch.stack(
+            [
+                torch.stack(
+                    [
+                        device_pool.index_k_with_scale_buffer[layer_id][page].cpu()
+                        for layer_id in range(layer_num)
+                    ]
+                )
+                for page in src_pages.tolist()
+            ]
+        ).flatten()
+        data_page = indexer_host.get_data_page(host_page_size)
+        self.assertTrue(torch.equal(data_page, expected))
+        ptrs, sizes = indexer_host.get_page_buffer_meta(host_indices)
+        self.assertEqual(ptrs, [data_page.data_ptr()])
+        self.assertEqual(sizes, [expected.numel()])
+
+        indexer_host.set_from_flat_data_page(0, data_page.clone())
+        dst_pages = torch.tensor([1, 8, 3, 11], device="cuda", dtype=torch.int64)
+        for layer_id in range(layer_num):
+            indexer_host.load_to_device_per_layer(
+                device_pool,
+                torch.arange(host_page_size, device="cuda"),
+                self._token_indices_for_pages(dst_pages, device_page_size, "cuda"),
+                layer_id,
+                "kernel",
+            )
+        buffers = device_pool.index_k_with_scale_buffer
+        for src, dst in zip(src_pages.tolist(), dst_pages.tolist()):
+            for layer_id in range(layer_num):
+                self.assertTrue(
+                    torch.equal(buffers[layer_id][dst], buffers[layer_id][src])
+                )
+
     @unittest.skipIf(
         is_hip(),
         '`io_backend="kernel"` path in MLATokenToKVPoolHost.backup_from_device_all_layer '

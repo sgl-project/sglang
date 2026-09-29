@@ -440,7 +440,9 @@ class StreamingSession(BasePrefixCache):
                 and slot.kv.req_pool_idx in active_pool_idxs
             )
             if slot.kv.holds_kv and not in_batch:
-                allocated = ceil_align(slot.kv.kv_allocated_len, self.page_size)
+                allocated = ceil_align(
+                    slot.kv.kv_allocated_len, self.token_to_kv_pool_allocator.page_size
+                )
                 total += allocated - slot.kv.cache_protected_len
         return total
 
@@ -457,7 +459,9 @@ class StreamingSession(BasePrefixCache):
                 and slot.kv.req_pool_idx in active_pool_idxs
             )
             if slot.kv.holds_kv and not in_batch:
-                allocated = ceil_align(slot.kv.kv_allocated_len, self.page_size)
+                allocated = ceil_align(
+                    slot.kv.kv_allocated_len, self.token_to_kv_pool_allocator.page_size
+                )
                 total += allocated - max(
                     slot.kv.cache_protected_len,
                     slot.kv.get_evicted_seqlen(ComponentType.SWA),
@@ -548,8 +552,9 @@ class StreamingSession(BasePrefixCache):
         if end <= target:
             return
         start = target
-        if self.page_size > 1:
-            start = ceil_align(start, self.page_size)
+        kv_page_size = self.token_to_kv_pool_allocator.page_size
+        if kv_page_size > 1:
+            start = ceil_align(start, kv_page_size)
         self.free_kv_row(kv, [(start, end)])
 
     # -- Pass-through methods --

@@ -33,7 +33,11 @@ from sglang.srt.configs.hybrid_arch import (
     linear_attn_model_spec,
     mamba2_config,
 )
-from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
+from sglang.srt.configs.model_config import (
+    ModelImpl,
+    get_dsa_index_kpool,
+    is_deepseek_dsa,
+)
 from sglang.srt.environ import envs
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
@@ -345,18 +349,25 @@ def build_kv_cache(
     if model_config.is_multimodal and uses_transformers_backend:
         effective_chunked_prefill_size = None
 
+    # When dcp enabled, kv_pool_allocator.page_size is page_size * dcp_size.
+    # TreeCache.page_size should keep the same as allocator.page_size to
+    # avoid kv page eviction conflicts.
+    tree_page_size = (
+        page_size
+        if not get_parallel().dcp_enabled
+        else token_to_kv_pool_allocator.page_size
+    )
+    if is_dsa and get_dsa_index_kpool(model_config.hf_config) > 1:
+        # DSA k-pool packs the pooled index keys of index_kpool consecutive
+        # pages into the first page of the group, so the radix tree must share
+        # and dedup whole groups, never a page whose group partners differ.
+        tree_page_size *= get_dsa_index_kpool(model_config.hf_config)
+
     params = CacheInitParams(
         disable=disable_radix_cache,
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-        # When dcp enabled, kv_pool_allocator.page_size is page_size * dcp_size.
-        # TreeCache.page_size should keep the same as allocator.page_size to
-        # avoid kv page eviction conflicts.
-        page_size=(
-            page_size
-            if not get_parallel().dcp_enabled
-            else token_to_kv_pool_allocator.page_size
-        ),
+        page_size=tree_page_size,
         is_eagle=spec_algorithm.is_eagle(),
         tp_cache_group=(
             attn_tp_cpu_group if get_parallel().enable_dp_attention else tp_cpu_group

@@ -65,6 +65,13 @@ class DSAIndexerPoolHost(HostKVCache):
         self._is_dummy = is_dummy
         self.device_pool = device_pool
         self.page_size = anchor_host.page_size
+        # The device index buffer is paged at the physical page, while a DSA
+        # k-pool radix page spans several; transfers run per physical page.
+        self.indexer_page_size = device_pool.page_size
+        assert self.page_size % self.indexer_page_size == 0, (
+            f"{self.page_size=} must be a multiple of {self.indexer_page_size=}"
+        )
+        self.indexer_pages_per_page = self.page_size // self.indexer_page_size
         self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
@@ -87,10 +94,14 @@ class DSAIndexerPoolHost(HostKVCache):
         self.page_num = anchor_host.page_num
 
         self.indexer_page_stride_size = (
-            self.indexer_size_per_token * self.page_size * self.indexer_dtype.itemsize
+            self.indexer_size_per_token
+            * self.indexer_page_size
+            * self.indexer_dtype.itemsize
         )
         self.indexer_layout_dim = self.indexer_page_stride_size * self.layer_num
-        self.indexer_page_num = (self.size + self.page_size + 1) // self.page_size
+        self.indexer_page_num = (
+            self.size + self.indexer_page_size + 1
+        ) // self.indexer_page_size
         self.size_per_token = (
             self.indexer_size_per_token * self.layer_num * self.indexer_dtype.itemsize
         )
@@ -221,15 +232,17 @@ class DSAIndexerPoolHost(HostKVCache):
     def _get_indexer_page_indices(self, host_indices, device_indices):
         if host_indices.numel() == 0:
             return host_indices, device_indices
-        if host_indices.numel() % self.page_size != 0:
+        if host_indices.numel() % self.indexer_page_size != 0:
             raise ValueError(
                 "Index buffer transfer expects page-aligned indices for DSA."
             )
         host_page_indices = (
-            host_indices.reshape(-1, self.page_size)[:, 0] // self.page_size
+            host_indices.reshape(-1, self.indexer_page_size)[:, 0]
+            // self.indexer_page_size
         )
         device_page_indices = (
-            device_indices.reshape(-1, self.page_size)[:, 0] // self.page_size
+            device_indices.reshape(-1, self.indexer_page_size)[:, 0]
+            // self.indexer_page_size
         )
         return host_page_indices, device_page_indices
 
@@ -438,11 +451,12 @@ class DSAIndexerPoolHost(HostKVCache):
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
-        page_idx = int(index) // self.page_size
+        page_idx = int(index) // self.indexer_page_size
+        page_end = page_idx + self.indexer_pages_per_page
         if self.layout == "layer_first":
-            data_page = self.index_k_with_scale_buffer[:, page_idx : page_idx + 1, :]
+            data_page = self.index_k_with_scale_buffer[:, page_idx:page_end, :]
         elif self.layout in ["page_first", "page_first_direct"]:
-            data_page = self.index_k_with_scale_buffer[page_idx : page_idx + 1, :, :, :]
+            data_page = self.index_k_with_scale_buffer[page_idx:page_end, :, :, :]
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         if flat:
@@ -451,26 +465,28 @@ class DSAIndexerPoolHost(HostKVCache):
 
     def get_dummy_flat_data_page(self) -> torch.Tensor:
         return torch.zeros(
-            (self.layer_num, self.indexer_page_stride_size),
+            (
+                self.layer_num * self.indexer_pages_per_page,
+                self.indexer_page_stride_size,
+            ),
             dtype=self.indexer_dtype,
             device=self.device,
             pin_memory=self.pin_memory,
         ).flatten()
 
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
-        page_idx = int(index) // self.page_size
+        page_idx = int(index) // self.indexer_page_size
+        page_end = page_idx + self.indexer_pages_per_page
         if self.layout == "layer_first":
-            self.index_k_with_scale_buffer[:, page_idx : page_idx + 1, :] = (
-                data_page.reshape(
-                    self.layer_num,
-                    1,
-                    self.indexer_page_stride_size,
-                )
+            self.index_k_with_scale_buffer[:, page_idx:page_end, :] = data_page.reshape(
+                self.layer_num,
+                self.indexer_pages_per_page,
+                self.indexer_page_stride_size,
             )
         elif self.layout in ["page_first", "page_first_direct"]:
-            self.index_k_with_scale_buffer[page_idx : page_idx + 1, :, :, :] = (
+            self.index_k_with_scale_buffer[page_idx:page_end, :, :, :] = (
                 data_page.reshape(
-                    1,
+                    self.indexer_pages_per_page,
                     self.layer_num,
                     1,
                     self.indexer_page_stride_size,
@@ -491,9 +507,11 @@ class DSAIndexerPoolHost(HostKVCache):
         )
         base_ptr = self.index_k_with_scale_buffer.data_ptr()
         for i in range(0, len(indices), self.page_size):
-            page_index = int(indices[i]) // self.page_size
+            page_index = int(indices[i]) // self.indexer_page_size
             ptr_list.append(base_ptr + page_index * page_stride_bytes)
-        return ptr_list, [page_stride_bytes] * len(ptr_list)
+        return ptr_list, [page_stride_bytes * self.indexer_pages_per_page] * len(
+            ptr_list
+        )
 
     def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
         if self.layout not in ["page_first", "page_first_direct"]:

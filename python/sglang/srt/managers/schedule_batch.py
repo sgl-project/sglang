@@ -3039,9 +3039,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         prefix_len = len(req.prefix_indices)
         seq_end = prefix_len + req.extend_range.length
-        if get_parallel().dcp_enabled:
-            # DCP widens radix pages beyond scheduler chunk boundaries. Pick an
-            # absolute page depth only when the kernel produced an h snapshot.
+        if (
+            get_parallel().dcp_enabled
+            or self.tree_cache.page_size != self.token_to_kv_pool_allocator.page_size
+        ):
+            # DCP and DSA k-pool widen radix pages beyond scheduler chunk
+            # boundaries. Pick an absolute page depth only when the kernel
+            # produced an h snapshot.
             mamba_track_seqlen_aligned = (seq_end // checkpoint_grid) * checkpoint_grid
             mask = (
                 mamba_track_seqlen_aligned > prefix_len
