@@ -235,9 +235,13 @@ class WeightCacheDaemon:
         initialize_model_parallel()
 
         # Initialize DP attention state (required by some models like Qwen3 MoE)
-        from sglang.srt.layers.dp_attention import initialize_dp_attention
+        from sglang.srt.layers.dp_attention import (
+            init_dp_gathered_buffer,
+            initialize_dp_attention,
+        )
 
-        initialize_dp_attention(server_args, model_config)
+        initialize_dp_attention(server_args)
+        init_dp_gathered_buffer(model_config)
 
         logger.info(
             f"[WeightCacheDaemon gpu={self.gpu_id} tp_rank={self.tp_rank}] "

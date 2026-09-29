@@ -645,7 +645,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # The model deferred f_b only after publishing static fallback
             # weights. Materialize the original gate before entering the
             # unchanged conv + packed-KDA fallback chain.
-            from sglang.kernels.ops.kimi_k3 import kimi_k3_tiny_gemm
+            from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm
 
             if fused_static is None:
                 raise RuntimeError("K3 deferred f_b is missing fallback weights")
@@ -1544,7 +1544,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         replayssm_g: Optional[torch.Tensor] = None,
         replayssm_beta: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        from sglang.kernels.ops.kimi_k3.kda_decode_mtp import (
+        from sglang.kernels.ops.attention.kda_decode_mtp import (
             fused_kda_decode_mtp_dspark,
         )
 
