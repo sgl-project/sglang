@@ -9,6 +9,7 @@ from sglang.srt.utils import is_gfx95_supported, is_hip, is_sm90_supported
 
 _is_hip = is_hip()
 _is_gfx95 = is_gfx95_supported()
+_is_sm90 = is_sm90_supported()
 
 
 def _select_recurrent_launch_config(
@@ -39,11 +40,13 @@ def _select_recurrent_launch_config(
         and 0 < n <= 64
         and k == 128
         and v == 128
-        and is_sm90_supported()
+        and _is_sm90
     ):
         # One-warp programs over 32-column value tiles leave most SM90 SMs idle
         # at small verify batches. Value columns are independent and the K
         # reduction stays within a program, so the narrower tile is bit-identical.
+        # target_verify is only set for the dense intermediate-state cache; the
+        # ReplaySSM ring verify (cache_ring) keeps the default launch.
         return 4, 1
     return min(triton.next_power_of_2(v), 32), 1
 

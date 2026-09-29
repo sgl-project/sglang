@@ -256,12 +256,21 @@ def test_sm90_verify_launch_config_is_narrow():
 @pytest.mark.parametrize("N", [1, 3, 16, 64])
 @pytest.mark.parametrize("T", [4, 16])
 @pytest.mark.parametrize("H,HV", [(16, 32), (4, 16)])
-def test_sm90_verify_launch_is_bit_exact(N: int, T: int, H: int, HV: int, monkeypatch):
+@pytest.mark.parametrize("tree", [False, True])
+def test_sm90_verify_launch_is_bit_exact(
+    N: int, T: int, H: int, HV: int, tree: bool, monkeypatch
+):
     """The tuned SM90 verify launch matches the BV=32 launch bit for bit."""
     K = V = 128
     A_log, dt_bias, a, b, q, k, v, state, indices, cu_seqlens = _make_tensors(
         N, T, H, HV, K, V
     )
+    retrieve_parent_token = None
+    if tree:
+        # Random draft tree: token i > 0 reads the cached state of an earlier token.
+        steps = torch.arange(T, device="cuda")
+        retrieve_parent_token = (torch.rand(N, T, device="cuda") * steps).long()
+        retrieve_parent_token[:, 0] = -1
 
     def run(launch_config):
         monkeypatch.setattr(
@@ -283,6 +292,7 @@ def test_sm90_verify_launch_is_bit_exact(N: int, T: int, H: int, HV: int, monkey
             intermediate_states_buffer=buffer,
             intermediate_state_indices=indices,
             cache_steps=T,
+            retrieve_parent_token=retrieve_parent_token,
         )
         return out, buffer
 
