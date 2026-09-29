@@ -7,6 +7,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
+from contextlib import ExitStack, contextmanager
 from typing import Any, Callable, Dict, List, Optional
 
 import torch
@@ -30,6 +31,28 @@ from sglang.srt.utils.common import temp_set_env
 
 logger = logging.getLogger(__name__)
 _nvfp4_weight_quantization_lock = threading.Lock()
+_nvfp4_weight_quantization_users = 0
+_nvfp4_weight_quantization_env = ExitStack()
+
+
+@contextmanager
+def _nvfp4_weight_quantization_scope():
+    """Share the exact-math override across concurrent weight quantizers."""
+    global _nvfp4_weight_quantization_users
+    with _nvfp4_weight_quantization_lock:
+        if _nvfp4_weight_quantization_users == 0:
+            _nvfp4_weight_quantization_env.enter_context(
+                temp_set_env(FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1")
+            )
+        _nvfp4_weight_quantization_users += 1
+    # Quantizer work runs outside the lock.
+    try:
+        yield
+    finally:
+        with _nvfp4_weight_quantization_lock:
+            _nvfp4_weight_quantization_users -= 1
+            if _nvfp4_weight_quantization_users == 0:
+                _nvfp4_weight_quantization_env.close()
 
 
 class NvFp4OnlineConfig(ModelOptQuantConfig):
@@ -292,11 +315,7 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
                 device=weight.device, dtype=torch.float32
             )
         # FlashInfer still uses an environment flag for exact FP4 math.
-        # Serialize the scope so parallel weight loaders restore it correctly.
-        with (
-            _nvfp4_weight_quantization_lock,
-            temp_set_env(FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1"),
-        ):
+        with _nvfp4_weight_quantization_scope():
             fp4_weight, weight_sf = nvfp4_quantize(
                 weight.contiguous(),
                 1.0 / weight_scale_2,
