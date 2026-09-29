@@ -15,7 +15,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVReceiver,
     MooncakeKVSender,
 )
-from sglang.srt.distributed import get_pp_group
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.network import get_local_ip_auto
 
 logger = logging.getLogger(__name__)
@@ -130,7 +130,7 @@ class AscendKVManager(MooncakeKVManager):
         else:
             sliced_dst_kv_ptrs = []
             start_layer = self.kv_args.prefill_start_layer
-            transfer_draft_kv = get_pp_group().is_last_rank and draft_kv_layers
+            transfer_draft_kv = get_parallel().pp_group.is_last_rank and draft_kv_layers
             if transfer_draft_kv:
                 end_layer = start_layer + src_layers - draft_kv_layers
             else:
@@ -174,6 +174,22 @@ class AscendKVManager(MooncakeKVManager):
         self._validate_envelope_kv_layout(
             dst_kv_ptrs, dst_kv_item_len, dst_attn_tp_size
         )
+        # Hybrid MLA prefill stages expose PP-local entries, while a PP=1
+        # decode peer registers all model layers. Pair only this layout by
+        # global layer id; every other Ascend layout keeps the legacy path.
+        if self.is_hybrid_mla_backend and self.pp_size > 1:
+            return self._send_kvcache_generic(
+                mooncake_session_id=mooncake_session_id,
+                src_data_ptrs=self.kv_args.kv_data_ptrs,
+                dst_data_ptrs=dst_kv_ptrs,
+                item_lens=self.kv_args.kv_item_lens,
+                prefill_data_indices=prefill_kv_indices,
+                dst_data_indices=dst_kv_indices,
+                executor=executor,
+                src_layer_ids=self.kv_args.kv_layer_ids,
+                dst_layer_ids=dst_layer_ids,
+            )
+
         # Group by indices
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
             prefill_kv_indices, dst_kv_indices

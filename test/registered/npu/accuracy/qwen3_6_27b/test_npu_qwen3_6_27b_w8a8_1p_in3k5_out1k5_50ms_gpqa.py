@@ -86,9 +86,10 @@ class TestNPUQwen3_6_27B_1P_In3k5_Out1k5_gpqa(TestNpuAccuracyTestCaseBase):
     envs = QWEN3_6_27B_3K5_1K5_ENVS
     other_args = QWEN3_6_27B_3K5_1K5_OTHER_ARGS
     accuracy = 0.878
+    max_retries = 1
     datasets = ["gpqa_diamond"]
     few_shot_num = 0
-    eval_batch_size = 8
+    eval_batch_size = 16
     generation_config = {
         "max_tokens": 81920,
         "temperature": 1.0,

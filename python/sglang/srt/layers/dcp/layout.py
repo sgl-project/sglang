@@ -41,6 +41,19 @@ def get_dcp_lens(
     return torch.clamp((remaining + dcp_size - 1) // dcp_size, min=0)
 
 
+def maybe_dcp_kernel_indices(
+    indices: torch.Tensor, dcp_size: int, dcp_rank: int
+) -> torch.Tensor:
+    """Widened logical slots -> this rank's physical rows.
+
+    Owner rule: slot % dcp_size == dcp_rank, row = slot // dcp_size. The run
+    starts page-aligned, so a strided view selects the owned slots without a mask.
+    """
+    if dcp_size == 1:
+        return indices
+    return indices[dcp_rank::dcp_size] // dcp_size
+
+
 def filter_dcp_local_kv_indices(kv_indices: torch.Tensor):
     """Keep this rank's share of a read-index tensor, still WIDENED.
 
