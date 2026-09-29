@@ -256,7 +256,7 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
     worker = SimpleNamespace(
         block_size=8,
         selector=object(),
-        model_runner=SimpleNamespace(tp_group=SimpleNamespace(rank_in_group=0)),
+        _target_tp_rank=0,
         ps=SimpleNamespace(tp_rank=0),
         draft_model=SimpleNamespace(lm_head=None),
         device="cpu",

@@ -366,7 +366,7 @@ class TpModelWorker(BaseTpWorker):
             # the set of ranks holding a draft worker. The draft worker is
             # constructed with pp_rank=0, so derive the caller's global rank
             # from the TP group rather than tp_size * pp_rank + tp_rank.
-            tp_group = self.model_runner.tp_group
+            tp_group = get_parallel().tp_group
             self.random_seed = broadcast_pyobj(
                 [get_device().random_seed],
                 tp_group.ranks[tp_group.rank_in_group],
