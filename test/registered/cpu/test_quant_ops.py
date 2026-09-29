@@ -16,6 +16,38 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="stage-a-test-cpu-intel")
 
 
+def _reference_w8a8_int8_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    dequant_weight = weight.float() * weight_scale.float().view(-1, 1)
+    out = x.float().matmul(dequant_weight.t())
+    if bias is not None:
+        out = out + bias.float()
+    return out.to(x.dtype)
+
+
+def _requantize_tensor_scale_int8(
+    weight: torch.Tensor, weight_scale: torch.Tensor, logical_widths: list[int]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    max_w_scale = weight_scale.max()
+    int8_info = torch.iinfo(torch.int8)
+    requantized_weight = weight.clone()
+    start = 0
+    for idx, logical_width in enumerate(logical_widths):
+        end = start + logical_width
+        weight_dq = weight[start:end, :].float() * weight_scale[idx]
+        requantized_weight[start:end, :] = torch.clamp(
+            torch.round(weight_dq / max_w_scale),
+            int8_info.min,
+            int8_info.max,
+        ).to(torch.int8)
+        start = end
+    return requantized_weight, max_w_scale.expand(weight.size(0)).clone()
+
+
 class TestCPUQuantOps(CustomTestCase):
     def test_per_token_quant_int8_python_dispatch_cpu(self):
         """Public CPU dispatch keeps the CUDA dtype and scale-shape contract."""
@@ -37,10 +69,11 @@ class TestCPUQuantOps(CustomTestCase):
         "Compressed-tensors W8A8 INT8 CPU path requires the Intel AMX backend.",
     )
     def test_compressed_tensors_w8a8_int8_cpu(self):
-        x = torch.randn(3, 64, dtype=torch.bfloat16)
-        weight = torch.randint(-16, 16, (64, 64), dtype=torch.int8)
-        weight_scale = torch.rand(64, dtype=torch.float32) / 16
-        bias = torch.randn(64, dtype=torch.float32) / 10
+        x = torch.linspace(-0.8, 0.9, steps=3 * 64, dtype=torch.float32).reshape(3, 64)
+        x = x.to(torch.bfloat16)
+        weight = (torch.arange(64 * 64).reshape(64, 64) % 33 - 16).to(torch.int8)
+        weight_scale = torch.linspace(0.005, 0.02, steps=64, dtype=torch.float32)
+        bias = torch.linspace(-0.1, 0.1, steps=64, dtype=torch.float32)
         layer = SimpleNamespace(
             weight=torch.nn.Parameter(weight, requires_grad=False),
             weight_scale=torch.nn.Parameter(weight_scale, requires_grad=False),
@@ -50,11 +83,38 @@ class TestCPUQuantOps(CustomTestCase):
         self.assertTrue(layer.use_intel_amx_backend)
 
         out = scheme.apply_weights(layer, x, bias)
-        ref = torch.ops.sgl_kernel.int8_scaled_mm_with_quant(
-            x, layer.weight, layer.weight_scale, bias, x.dtype, True
-        )
+        ref = _reference_w8a8_int8_linear(x, weight, weight_scale, bias)
 
-        torch.testing.assert_close(out, ref)
+        torch.testing.assert_close(out, ref, atol=0.12, rtol=0.05)
+
+    @unittest.skipUnless(
+        cpu_has_amx_support(),
+        "Compressed-tensors W8A8 INT8 CPU path requires the Intel AMX backend.",
+    )
+    def test_compressed_tensors_w8a8_int8_cpu_tensor_scales(self):
+        x = torch.linspace(-0.7, 0.8, steps=3 * 64, dtype=torch.float32).reshape(3, 64)
+        x = x.to(torch.bfloat16)
+        weight = (torch.arange(64 * 64).reshape(64, 64) % 41 - 20).to(torch.int8)
+        weight_scale = torch.tensor([0.01, 0.04], dtype=torch.float32)
+        bias = torch.linspace(-0.05, 0.05, steps=64, dtype=torch.float32)
+        logical_widths = [32, 32]
+        ref_weight, ref_weight_scale = _requantize_tensor_scale_int8(
+            weight, weight_scale, logical_widths
+        )
+        layer = SimpleNamespace(
+            weight=torch.nn.Parameter(weight, requires_grad=False),
+            weight_scale=torch.nn.Parameter(weight_scale, requires_grad=False),
+            logical_widths=logical_widths,
+        )
+        scheme = CompressedTensorsW8A8Int8(QuantizationStrategy.TENSOR, False, True)
+        scheme.process_weights_after_loading(layer)
+        self.assertTrue(layer.use_intel_amx_backend)
+        self.assertEqual(layer.weight_scale.numel(), weight.size(0))
+
+        out = scheme.apply_weights(layer, x, bias)
+        ref = _reference_w8a8_int8_linear(x, ref_weight, ref_weight_scale, bias)
+
+        torch.testing.assert_close(out, ref, atol=0.16, rtol=0.06)
 
     def test_compressed_tensors_w8a8_int8_cpu_rejects_unpacked_weight(self):
         """Unsupported CPU dimensions fail before using the packed AMX contract."""
