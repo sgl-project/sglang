@@ -1,5 +1,7 @@
 """Unit tests for decision model checkpoints on /v1/decisions, /v1/jev, and /v1/systemone."""
 
+import base64
+import io
 import math
 import unittest
 from types import SimpleNamespace
@@ -9,6 +11,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import ORJSONResponse
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
+from PIL import Image
 from transformers import AutoTokenizer
 
 from sglang.srt.entrypoints.decision.families.intern import (
@@ -16,7 +19,13 @@ from sglang.srt.entrypoints.decision.families.intern import (
     compile_decision,
 )
 from sglang.srt.entrypoints.decision.serving import DecisionModelServing
-from sglang.srt.runtime_context import publish, restore_context, snapshot_context
+from sglang.srt.managers.tokenizer_manager import resolve_readout_anchor
+from sglang.srt.runtime_context import (
+    get_schedule,
+    publish,
+    restore_context,
+    snapshot_context,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -25,6 +34,8 @@ register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 TOKENIZER = "internlm/Intern-Decision-0.8B"
 ROUTES = ("/v1/decisions", "/v1/jev", "/v1/systemone")
 NOUL = {"u": {"type": "noul"}}
+# Image tokens one image expands to in the stand-in for the Qwen-VL processor.
+IMAGE_TOKENS = 16
 
 QUESTIONS = {
     "zeta": {"type": "noul", "instructions": "Urgent?"},
@@ -66,10 +77,23 @@ def _manager(tokenizer, rows, **server_args):
     requests = []
 
     async def generate_request(request, raw_request):
-        requests.append(request)
-        ids = request.token_ids_logprob
-        readouts = [[(lp, i, None) for lp, i in zip(row, ids)] for row in rows]
-        yield {"meta_info": {"input_token_ids_logprobs": readouts}}
+        ids = request.input_ids
+        if request.image_data:
+            # Expand each image placeholder as the Qwen-VL processor does.
+            pad = tokenizer.convert_tokens_to_ids("<|image_pad|>")
+            ids = []
+            for token in tokenizer.encode(request.text, add_special_tokens=False):
+                ids += [token] * (IMAGE_TOKENS if token == pad else 1)
+        request.token_indices_to_pool = resolve_readout_anchor(
+            input_ids=ids,
+            anchor=request.readout_anchor,
+            chunked_prefill_size=get_schedule().chunked_prefill_size,
+        )
+        requests.append((request, ids))
+        labels = request.token_ids_logprob
+        readouts = [[(lp, i, None) for lp, i in zip(row, labels)] for row in rows]
+        meta = {"input_token_ids_logprobs": readouts, "prompt_tokens": len(ids)}
+        yield {"meta_info": meta}
 
     return SimpleNamespace(
         server_args=server_args,
@@ -90,6 +114,12 @@ async def _handled_by(request, raw_request):
 
 def _logs(*ps):
     return [math.log(p) for p in ps]
+
+
+def _png(color):
+    buffer = io.BytesIO()
+    Image.new("RGB", (8, 8), color).save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode()
 
 
 class TestDecisionModels(unittest.TestCase):
@@ -178,9 +208,8 @@ class TestDecisionModels(unittest.TestCase):
     def test_readout_is_one_position_before_each_marker_in_field_order(self):
         client, manager = self._client(rows=[[0.0, 0.0]] * len(QUESTIONS))
         client.post("/v1/decisions", json={"state": STATE, "questions": QUESTIONS})
-        (request,) = manager.requests
+        ((request, ids),) = manager.requests
         marker = self.tokenizer.convert_tokens_to_ids("<decision>")
-        ids = request.input_ids
         markers = [i for i, token in enumerate(ids) if token == marker]
         self.assertEqual(request.token_indices_to_pool, [m - 1 for m in markers])
         keys = [self.tokenizer.decode(ids[:m]).rsplit("\n", 1)[-1] for m in markers]
@@ -188,6 +217,49 @@ class TestDecisionModels(unittest.TestCase):
         symbols = self.tokenizer.convert_tokens_to_ids(["A", "B"])
         self.assertEqual(request.token_ids_logprob, symbols)
         self.assertEqual(request.sampling_params, {"max_new_tokens": 0})
+
+    def test_image_readout_resolves_on_the_expanded_prompt(self):
+        client, manager = self._client(rows=[[0.0, 0.0]] * 2)
+        images = [_png("red"), "data:image/png;base64," + _png("blue")]
+        body = {"state": {}, "questions": {"a": NOUL["u"], "b": NOUL["u"]}}
+        response = client.post("/v1/jev", json={**body, "images": images})
+        self.assertEqual(response.status_code, 200, response.text)
+        ((request, ids),) = manager.requests
+        self.assertIsNone(request.input_ids)
+        self.assertEqual(len(request.image_data), 2)
+        # Both images come, numbered, before the user text, as the official layout.
+        user = request.text.split("<|im_start|>user\n", 1)[1]
+        self.assertRegex(user, r"^Picture 1: <\|vision_start\|><\|image_pad\|>")
+        self.assertIn("Picture 2: ", user.split("Return one answer")[0])
+        marker = self.tokenizer.convert_tokens_to_ids("<decision>")
+        markers = [i for i, token in enumerate(ids) if token == marker]
+        self.assertEqual(request.token_indices_to_pool, [m - 1 for m in markers])
+        text_only = self.tokenizer.encode(request.text, add_special_tokens=False)
+        shift = 2 * (IMAGE_TOKENS - 1)
+        self.assertEqual(markers[0] - text_only.index(marker), shift)
+        self.assertEqual(response.json()["usage"]["input_tokens"], len(ids))
+
+    def test_invalid_images_are_422(self):
+        client, _ = self._client()
+        request = {"state": {}, "questions": NOUL}
+        cases = [
+            ([_png("red")] * 9, ["body", "images"]),
+            ([_png("red"), "not-base64!"], ["body", "images", 1]),
+            (["data:text/plain;base64," + _png("red")], ["body", "images", 0]),
+            ([base64.b64encode(b"not an image").decode()], ["body", "images", 0]),
+            (["/etc/passwd"], ["body", "images", 0]),
+        ]
+        for images, loc in cases:
+            with self.subTest(loc=loc):
+                response = client.post("/v1/jev", json={**request, "images": images})
+                self.assertEqual(response.status_code, 422, response.text)
+                self.assertEqual(response.json()["detail"][0]["loc"], loc)
+        # A literal image placeholder would take an attached image's slot.
+        conflict = {"state": {"note": "see <image>"}, "questions": NOUL}
+        response = client.post("/v1/jev", json={**conflict, "images": [_png("red")]})
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("image placeholder", response.json()["detail"][0]["msg"])
+        self.assertEqual(client.post("/v1/jev", json=conflict).status_code, 200)
 
     def test_answers_follow_the_typesafe_shapes(self):
         questions = {
@@ -232,7 +304,6 @@ class TestDecisionModels(unittest.TestCase):
         long_state = {"state": {"text": "word " * 400}}
         cases = [
             ({}, {"chat_template": "chatml"}, 400),
-            ({"images": ["/x.png"]}, {}, 400),
             (long_state, {"chunked_prefill_size": 256}, 400),
             ({"thinking": {"enabled": True}}, {}, 422),
         ]

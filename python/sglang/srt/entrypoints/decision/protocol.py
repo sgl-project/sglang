@@ -1,9 +1,14 @@
 """Jev (TypeSafe System One) request and response models, served for decision model checkpoints."""
 
+import binascii
+import io
 import math
 from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 
+import pybase64
+from PIL import Image, UnidentifiedImageError
 from pydantic import (
+    AfterValidator,
     BaseModel,
     ConfigDict,
     Discriminator,
@@ -15,6 +20,7 @@ from pydantic import (
 from sglang.srt.entrypoints.openai.protocol import DecisionRequest
 
 MAX_QUESTIONS = 16
+MAX_IMAGES = 8
 # The System One maximum; a family refuses more options than it has answer symbols.
 MAX_OPTIONS = 255
 
@@ -63,10 +69,29 @@ JevQuestion = Annotated[
 ]
 
 
+def _image_data_url(value: str) -> str:
+    """A data URL of the decoded image; paths and remote URLs are never loaded."""
+    payload = value
+    if value.startswith("data:"):
+        header, _, payload = value.partition(",")
+        if not header.startswith("data:image/") or not header.endswith(";base64"):
+            raise ValueError("an image data URL must be data:image/<type>;base64,...")
+    try:
+        data = pybase64.b64decode(payload, validate=True)
+        Image.open(io.BytesIO(data)).verify()
+    except (binascii.Error, ValueError, UnidentifiedImageError, OSError) as e:
+        raise ValueError(f"not base64 image data: {e}") from e
+    return "data:image/*;base64," + payload
+
+
+JevImage = Annotated[str, AfterValidator(_image_data_url)]
+
+
 class JevRequest(BaseModel):
     state: Any
     questions: Dict[str, JevQuestion] = Field(min_length=1, max_length=MAX_QUESTIONS)
-    images: Optional[List[Any]] = None
+    # Base64 image bytes or data URLs, in prompt order.
+    images: Optional[List[JevImage]] = Field(default=None, max_length=MAX_IMAGES)
     # Divides the candidate logits, softmax(log p / T); argmax is unchanged.
     temperature: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
     thinking: Optional[Dict[str, Any]] = None
