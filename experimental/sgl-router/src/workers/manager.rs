@@ -393,7 +393,9 @@ fn reconcile_unresolved_workers(
     pending: &mut HashMap<WorkerId, JoinHandle<()>>,
 ) {
     for worker in registry.all() {
-        if !worker.model_ids.is_empty() {
+        if !(worker.model_ids.is_empty()
+            || worker.mode() == WorkerMode::Prefill && worker.bootstrap_port().is_none())
+        {
             continue;
         }
         let id = worker.id.clone();
@@ -405,14 +407,13 @@ fn reconcile_unresolved_workers(
         let registry_t = registry.clone();
         let introspector_t = introspector.clone();
         let worker_url = worker.url.clone();
-        // Rebuild a discovery-shaped spec: empty `model_ids` so `register_one`
-        // re-resolves them; current mode + bootstrap_port as the seed
-        // (`register_one` re-applies any `/server_info` override).
+        // Preserve any resolved model while retrying a missing prefill port.
+        // The worker stays registered but cannot receive requests until ready.
         let spec = WorkerSpec {
             id: id.clone(),
             url: worker_url.clone(),
             mode: worker.mode(),
-            model_ids: Vec::new(),
+            model_ids: worker.model_ids.clone(),
             bootstrap_port: worker.bootstrap_port(),
         };
         // `debug!` not `info!`: this fires every interval for each
@@ -422,13 +423,12 @@ fn reconcile_unresolved_workers(
         tracing::debug!(
             worker_id = %id,
             worker_url = %worker_url,
-            "reconcile: re-introspecting worker that registered without model_ids",
+            "reconcile: re-introspecting worker with unresolved model or prefill bootstrap port",
         );
         let cfg_t = cfg.clone();
         let kv_index_t = kv_index.clone();
-        // Safe to go back through the registry upsert only because this worker
-        // is in no model pool: the fresh `Worker` it builds discards a breaker
-        // and load counters that a model-less worker has never accumulated.
+        // Neither model-less nor portless prefill workers can receive traffic,
+        // so replacing their unroutable registry entry is safe.
         let handle = tokio::spawn(async move {
             register_one(spec, registry_t, cfg_t, kv_index_t, introspector_t).await;
         });
@@ -1227,6 +1227,66 @@ mod tests {
 
         drop(tx);
         let _ = manager_handle.await;
+    }
+
+    #[tokio::test]
+    async fn reconcile_repairs_portless_prefill_with_known_model() {
+        use crate::policies::registry::PdPoolResolver;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::time::timeout;
+
+        let ready = Arc::new(AtomicBool::new(false));
+        let (url, _shutdown) = spawn_switchable_worker(
+            json!({"served_model_name": "m", "disaggregation_mode": "prefill",
+                   "disaggregation_bootstrap_port": 8997}),
+            ready.clone(),
+        )
+        .await;
+        let registry = Arc::new(WorkerRegistry::default());
+        let model = ModelId("m".into());
+        let id = WorkerId("warming-prefill".into());
+        let (tx, rx) = mpsc::channel(8);
+        let manager = tokio::spawn(run_with_introspector_and_reconcile(
+            rx,
+            registry.clone(),
+            None,
+            None,
+            None,
+            fast_introspector(),
+            Duration::from_millis(50),
+        ));
+        tx.send(DiscoveryEvent::Added(WorkerSpec {
+            id: id.clone(),
+            url,
+            mode: WorkerMode::Prefill,
+            model_ids: vec![model.clone()],
+            bootstrap_port: None,
+        }))
+        .await
+        .unwrap();
+        timeout(Duration::from_secs(3), async {
+            while registry.get(&id).is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(registry.workers_for(&model).len(), 1);
+        assert!(registry.healthy_workers_for(&model).is_empty());
+        assert!(PdPoolResolver::new(registry.clone())
+            .prefill_candidates(&model)
+            .is_err());
+        ready.store(true, Ordering::SeqCst);
+        timeout(Duration::from_secs(3), async {
+            while registry.get(&id).unwrap().bootstrap_port() != Some(8997) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(registry.healthy_workers_for(&model).len(), 1);
+        drop(tx);
+        manager.await.unwrap();
     }
 
     /// A worker that registers with empty `model_ids` because

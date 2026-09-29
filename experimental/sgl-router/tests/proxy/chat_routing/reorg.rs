@@ -722,3 +722,45 @@ async fn default_pd_groups_apply_configured_inflight_admission() {
         );
     }
 }
+
+#[tokio::test]
+async fn portless_prefill_is_not_dispatched_until_bootstrap_is_resolved() {
+    let prefill = MockWorker::start(vec![]).await;
+    let decode = MockWorker::start(vec![]).await;
+    let policy = Arc::new(FirstPolicy::default());
+    let ctx = context(
+        &[
+            ("p", Stage::Prefill, &prefill),
+            ("d", Stage::Decode, &decode),
+        ],
+        vec![Bucket::new(
+            "pd",
+            BucketGroups::Pd {
+                prefill: group("p", policy.clone()),
+                decode: group("d", policy.clone()),
+            },
+        )],
+    );
+    let mut spec = WorkerSpec {
+        id: WorkerId("p".into()),
+        url: prefill.url.clone(),
+        mode: Stage::Prefill,
+        model_ids: vec![ModelId("tiny".into())],
+        bootstrap_port: None,
+    };
+    ctx.registry.add(spec.clone()).unwrap();
+    let app = build_router(ctx.clone());
+    let response = app.clone().oneshot(request(body("hello"))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(policy.calls.lock().unwrap().is_empty());
+    assert!(prefill.captured.lock().unwrap().last_body.is_none());
+    assert!(decode.captured.lock().unwrap().last_body.is_none());
+    spec.bootstrap_port = Some(8997);
+    ctx.registry.add(spec).unwrap();
+    let response = app.oneshot(request(body("hello"))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let d: serde_json::Value =
+        serde_json::from_slice(decode.captured.lock().unwrap().last_body.as_ref().unwrap())
+            .unwrap();
+    assert_eq!(d["bootstrap_port"], 8997);
+}

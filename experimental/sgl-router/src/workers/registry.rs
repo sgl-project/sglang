@@ -168,6 +168,7 @@ impl WorkerRegistry {
             .unwrap_or_default()
     }
 
+    /// Workers eligible for selection, including bootstrap readiness for prefill.
     pub fn healthy_workers_for(&self, model: &ModelId) -> Vec<Arc<Worker>> {
         // Use `would_allow` (non-mutating) for filtering — `allow()` would
         // claim a half-open probe slot for every enumerated candidate,
@@ -176,6 +177,7 @@ impl WorkerRegistry {
         // [`crate::proxy`].
         self.workers_for(model)
             .into_iter()
+            .filter(|w| w.mode() != WorkerMode::Prefill || w.bootstrap_port().is_some())
             .filter(|w| w.breaker.would_allow())
             .collect()
     }

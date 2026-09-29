@@ -88,7 +88,7 @@ fn spec(id: &str, mode: Stage, model: &str) -> WorkerSpec {
         url: format!("http://{id}"),
         mode,
         model_ids: vec![ModelId(model.into())],
-        bootstrap_port: None,
+        bootstrap_port: (mode == Stage::Prefill).then_some(8997),
     }
 }
 
