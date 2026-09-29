@@ -26,6 +26,7 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
+from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.layer_boundary import (
     PLAIN_RESIDUAL,
     MHCState,
@@ -35,7 +36,6 @@ from sglang.srt.layers.layer_boundary import (
     get_attn_tp_context,
     make_stages,
 )
-from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.layer_boundary.residual import access as residual_access
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
