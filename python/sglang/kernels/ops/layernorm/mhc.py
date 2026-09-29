@@ -27,6 +27,23 @@ if _is_hip:
         hc_mix_reduce_sinkhorn_vec,
     )
 
+from sglang.srt.model_executor.runner_utils.capture_owner import (
+    retain_full_cuda_graph_owner,
+)
+
+
+@torch.compiler.disable
+def _retain_mhc_capture_owners(*tensors: torch.Tensor) -> None:
+    """Retain scratch tensors whose addresses a full graph capture records.
+
+    No-op outside an active full-graph capture scope. The compiler-disable
+    boundary keeps the retention side effect out of any enclosing Dynamo
+    graph, which would otherwise trace it away.
+    """
+    for tensor in tensors:
+        retain_full_cuda_graph_owner(tensor)
+
+
 logger = logging.getLogger(__name__)
 
 _AITER_MHC_RUNTIME_DISABLED = False
@@ -1163,6 +1180,7 @@ def mhc_pre(
         gemm_out_sqrsum = torch.empty(
             n_splits, num_tokens, dtype=torch.float32, device=residual.device
         )
+        _retain_mhc_capture_owners(gemm_out_mul, gemm_out_sqrsum)
 
         from sglang.srt.layers.deep_gemm_wrapper.entrypoint import tf32_hc_prenorm_gemm
 
@@ -1204,6 +1222,7 @@ def mhc_pre(
             partial_sqrsum = torch.empty(
                 n_splits_pre, num_tokens, dtype=torch.float32, device=residual.device
             )
+            _retain_mhc_capture_owners(partial_out, partial_sqrsum)
             kernel_0(
                 residual_flat.view(num_tokens, hc_hidden_size),
                 fn_flat,
@@ -1226,6 +1245,7 @@ def mhc_pre(
             gemm_out_sqrsum = torch.empty(
                 n_splits, num_tokens, dtype=torch.float32, device=residual.device
             )
+            _retain_mhc_capture_owners(gemm_out_mul, gemm_out_sqrsum)
             assert n_splits == 1, (
                 "The simple TileLang version gemm_sqrsum doesn't support split-k"
             )
@@ -1252,6 +1272,10 @@ def mhc_pre(
         )
         if not norm_weight_bf.is_contiguous():
             norm_weight_bf = norm_weight_bf.contiguous()
+        if norm_weight_bf is not norm_weight:
+            # Only a converted or contiguous copy has a dying owner; the
+            # caller's own parameter tensor outlives the graph already.
+            _retain_mhc_capture_owners(norm_weight_bf)
         mhc_pre_big_fuse_with_norm_tilelang(
             gemm_out_mul,
             gemm_out_sqrsum,
@@ -1738,6 +1762,7 @@ def mhc_fused_post_pre(
     if num_tokens <= fma_token_threshold:
         # Small-batch path: one TileLang launch computes hc_post, the bf16
         # residual write, GEMM partials, and the RMS square-sum partials.
+        _retain_mhc_capture_owners(gemm_out_mul, gemm_out_sqrsum)
         mhc_fused_post_pre_fma_tilelang(
             comb_res_mix.view(num_tokens, hc_mult, hc_mult),
             residual_flat,
@@ -1769,6 +1794,7 @@ def mhc_fused_post_pre(
         if _use_deep_gemm_hc_prenorm():
             import deep_gemm
 
+            _retain_mhc_capture_owners(gemm_out_mul, gemm_out_sqrsum)
             deep_gemm.tf32_hc_prenorm_gemm(
                 residual_cur.view(num_tokens, hc_hidden_size),
                 fn,
@@ -1785,6 +1811,7 @@ def mhc_fused_post_pre(
             gemm_out_sqrsum_1d = torch.empty(
                 num_tokens, dtype=torch.float32, device=residual.device
             )
+            _retain_mhc_capture_owners(gemm_out_mul_2d, gemm_out_sqrsum_1d)
             _mhc_pre_gemm_sqrsum_dispatch()(
                 residual_cur.view(num_tokens, hc_hidden_size),
                 fn,
@@ -1833,6 +1860,10 @@ def mhc_fused_post_pre(
         )
         if not norm_weight_bf.is_contiguous():
             norm_weight_bf = norm_weight_bf.contiguous()
+        if norm_weight_bf is not norm_weight:
+            # Only a converted or contiguous copy has a dying owner; the
+            # caller's own parameter tensor outlives the graph already.
+            _retain_mhc_capture_owners(norm_weight_bf)
         mhc_pre_big_fuse_with_norm_tilelang(
             gemm_out_mul,
             gemm_out_sqrsum,
