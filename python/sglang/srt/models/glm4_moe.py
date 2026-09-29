@@ -60,6 +60,8 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
+    get_moe_runner_backend,
+    reduce_moe_output,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
@@ -1301,6 +1303,15 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
     hf_to_sglang_mapper = WeightsMapper()
 
     _NEXTN_SPEC_WEIGHT_NAMES = ("shared_head.norm", "eh_proj", "enorm", "hnorm")
+
+    def determine_num_fused_shared_experts(self):
+        # The Gluon draft kernel keeps the BF16 shared expert native. Pin the
+        # model-level loader decision as well as the layer-level decision so
+        # the checkpoint remap cannot append it to the routed expert bank.
+        if get_moe_runner_backend().is_gluon():
+            self.num_fused_shared_experts = 0
+        else:
+            super().determine_num_fused_shared_experts()
 
     @classmethod
     def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
