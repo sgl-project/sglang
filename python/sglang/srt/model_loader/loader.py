@@ -328,6 +328,28 @@ def _modules_with_quant_method(model: nn.Module):
             yield module, quant_method
 
 
+def _raise_if_weights_outside_state_dict(model: nn.Module) -> None:
+    # MXFP4 with triton_kernels moves the expert weights into kernel wrappers
+    # held by the quant method, so model.state_dict() no longer has them.
+    from sglang.srt.layers.quantization import mxfp4
+
+    for name, module in model.named_modules():
+        quant_method = getattr(module, "quant_method", None)
+        if (
+            isinstance(quant_method, mxfp4.Mxfp4MoEMethod)
+            and quant_method.use_triton_kernels
+            # process_weights_after_loading returns before the triton_kernels
+            # branch for these, and the weights stay layer Parameters.
+            and not (quant_method.use_mega_moe or mxfp4._use_aiter)
+        ):
+            raise NotImplementedError(
+                f"State-dict checkpoints (sharded_state, presharded, remote) cannot "
+                f"round-trip MXFP4 MoE weights with the triton_kernels MoE runner "
+                f"backend ({name}): the expert weights live outside the module "
+                f"state_dict, so they would be saved and loaded as empty (see #34448)."
+            )
+
+
 class BaseModelLoader(ABC):
     """Base class for model loaders."""
 
@@ -1788,6 +1810,7 @@ class ShardedStateLoader(BaseModelLoader):
                     quant_method = getattr(module, "quant_method", None)
                     if quant_method is not None:
                         quant_method.process_weights_after_loading(module)
+            _raise_if_weights_outside_state_dict(model)
             rank = get_parallel().tp_rank
             pattern = os.path.join(
                 local_model_path,
@@ -1839,6 +1862,7 @@ class ShardedStateLoader(BaseModelLoader):
     ) -> None:
         from safetensors.torch import save_file
 
+        _raise_if_weights_outside_state_dict(model)
         if pattern is None:
             pattern = ShardedStateLoader.DEFAULT_PATTERN
         rank = get_parallel().tp_rank
@@ -2273,6 +2297,7 @@ class PreshardedModelLoader(DefaultModelLoader):
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = _initialize_model(model_config, self.load_config, quant_config)
+            _raise_if_weights_outside_state_dict(model)
             self.load_weights_and_postprocess(
                 model,
                 self._get_all_weights(model_config, model),
@@ -2630,6 +2655,7 @@ class PreshardedModelLoader(DefaultModelLoader):
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = _initialize_model(model_config, self.load_config, quant_config)
+            _raise_if_weights_outside_state_dict(model)
 
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
@@ -3550,6 +3576,7 @@ class RemoteModelLoader(BaseModelLoader):
         model_path: str,
         url: str,
     ) -> None:
+        _raise_if_weights_outside_state_dict(model)
         with create_remote_connector(url) as client:
             assert get_connector_type(client) == ConnectorType.KV
             model_name = parse_model_name(url)
@@ -3578,6 +3605,7 @@ class RemoteModelLoader(BaseModelLoader):
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
                 quant_method.process_weights_after_loading(module)
+        _raise_if_weights_outside_state_dict(model)
         weights_iterator = self._get_weights_iterator_kv(client)
         state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
         for key, tensor in weights_iterator:
