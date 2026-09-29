@@ -19,7 +19,6 @@ register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-l
 register_amd_ci(est_time=90, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 _DEVICE = "cuda"
-_OUTPUT_RTOL = 2 * torch.finfo(torch.bfloat16).eps
 
 _CASES = [
     (1, 4, 4, 4, 128, 128, 4, False, None, False, 1),
@@ -69,14 +68,6 @@ def _make_ring_buffers(H, HV, K, V):
         "g": torch.randn(slots, HV, _RING_LEN, K, device=_DEVICE, dtype=torch.float32),
         "beta": torch.randn(slots, HV, _RING_LEN, device=_DEVICE, dtype=torch.float32),
     }
-
-
-def _assert_output_matches_reference(actual, reference):
-    # The tuned multi-warp fused reduction can cross a BF16 rounding boundary
-    # relative to the one-warp reference. Non-reduction cache checks stay exact.
-    torch.testing.assert_close(
-        actual.float(), reference.float(), rtol=_OUTPUT_RTOL, atol=1e-6
-    )
 
 
 def _make_inputs(
@@ -248,7 +239,8 @@ def _compare_case(case, num_warps=None, use_ring=False, weight_dtype=torch.bfloa
 
     o_ref_v = o_ref.reshape(B, T, HV, V)[valid_rows]
     o_fus_v = o_fus.reshape(B, T, HV, V)[valid_rows]
-    _assert_output_matches_reference(o_fus_v, o_ref_v)
+    # One bf16 ulp: the fused and reference tiles reduce K in different orders.
+    torch.testing.assert_close(o_fus_v, o_ref_v, rtol=2**-7, atol=1e-7)
     # conv_state is read-only in verify; the commit scatter advances it.
     assert torch.equal(inp["conv_pool"], conv_fus)
     assert torch.equal(win_ref[valid_rows], win_fus[valid_rows])
