@@ -132,6 +132,7 @@ class SchedulerWeightUpdaterManager:
     # replicated on every TP rank, so a rejected call returns on all ranks before any barrier
     _session: Optional[_WeightUpdateSession] = None
     _weight_update_requires_post_load: bool = False
+    _m2n_update_groups: Set[str] = field(default_factory=set)
     _lora_stash: Dict[str, Dict[str, torch.Tensor]] = field(default_factory=dict)
     _lora_applied_names: Dict[str, frozenset] = field(default_factory=dict)
 
@@ -232,6 +233,8 @@ class SchedulerWeightUpdaterManager:
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         """Initialize the online model parameter update group."""
         success, message = self.tp_worker.init_weights_update_group(recv_req)
+        if success and recv_req.m2n_manifest is not None:
+            self._m2n_update_groups.add(recv_req.group_name)
         return InitWeightsUpdateGroupReqOutput(success=success, message=message)
 
     def destroy_weights_update_group(
@@ -240,6 +243,11 @@ class SchedulerWeightUpdaterManager:
     ):
         """Destroy the online model parameter update group."""
         success, message = self.tp_worker.destroy_weights_update_group(recv_req)
+        if recv_req.group_name in self._m2n_update_groups:
+            # Teardown retires every PP group, but may fail partway through.
+            self._m2n_update_groups = set(
+                self.tp_worker.model_runner.weight_updater._m2n_receivers
+            )
         return DestroyWeightsUpdateGroupReqOutput(success=success, message=message)
 
     def _select_runners(self, selector: str = "all") -> List[Tuple[str, Any]]:

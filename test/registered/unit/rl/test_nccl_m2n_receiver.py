@@ -742,3 +742,7 @@ def test_fp8_rejects_incompatible_formats_without_replacing_storage(
     for name, parameter in model.named_parameters():
         assert parameter.data_ptr() == buffers[name].data_ptr()
         assert parameter.stride() == buffers[name].stride()
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
