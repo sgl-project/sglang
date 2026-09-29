@@ -278,35 +278,44 @@ class HostKVCache(abc.ABC):
                     _cuda_host_unregister(buf)
         self.kv_buffer = None
 
-    def _init_device_row_stride(self, device_buffers: Iterable[torch.Tensor]) -> None:
-        """Bytes between consecutive token rows of the device KV buffers.
+    # Bytes between strided device KV rows; None (the default, and what a pool
+    # built without `_init_device_row_stride` keeps) means packed rows.
+    _strided_device_row_bytes: Optional[int] = None
 
-        A packed buffer steps rows by the row width (`token_stride_size`); a
-        strided per-layer view -- the unified pool's token-major entries --
-        steps them by its own `stride(0)`. Device-side addresses in the
-        transfer kernels must use this.
+    def _init_device_row_stride(self, device_buffers: Iterable[torch.Tensor]) -> None:
+        """Record the row stride of strided device KV buffers.
+
+        A strided per-layer view -- the unified pool's token-major entries --
+        steps its rows by `stride(0)` rather than by the row width, and the
+        device-side addresses in the transfer kernels must follow it.
         """
-        strides = set()
-        for buf in device_buffers:
-            if buf.is_contiguous():
-                strides.add(self.token_stride_size)
-            else:
-                assert buf.stride(-1) == 1, (
-                    f"HiCache needs packed device rows; got strides {buf.stride()}"
-                )
-                strides.add(buf.stride(0) * buf.element_size())
-        if len(strides) > 1:
+        buffers = list(device_buffers)
+        strides = {
+            buf.stride(0) * buf.element_size()
+            for buf in buffers
+            if not buf.is_contiguous()
+        }
+        if not strides:
+            return
+        if len(strides) > 1 or any(buf.is_contiguous() for buf in buffers):
             raise NotImplementedError(
-                f"HiCache: device KV buffers step rows by different strides "
-                f"{sorted(strides)} B"
+                "HiCache: the device KV buffers do not share one row stride "
+                f"(strided rows {sorted(strides)} B, mixed with packed ones)"
             )
-        self.device_row_stride_bytes = (
-            strides.pop() if strides else self.token_stride_size
-        )
+        for buf in buffers:
+            assert buf.stride(-1) == 1, (
+                f"HiCache needs packed device rows; got strides {buf.stride()}"
+            )
+        self._strided_device_row_bytes = strides.pop()
 
     @property
     def device_rows_packed(self) -> bool:
-        return self.device_row_stride_bytes == self.token_stride_size
+        return self._strided_device_row_bytes is None
+
+    @property
+    def device_row_stride_bytes(self) -> int:
+        """Bytes between consecutive device KV rows."""
+        return self._strided_device_row_bytes or self.token_stride_size
 
     def _require_packed_device_rows(self, kernel: str) -> None:
         if not self.device_rows_packed:
