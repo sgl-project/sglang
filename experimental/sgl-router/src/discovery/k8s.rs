@@ -94,7 +94,8 @@ fn version_group(es: &EndpointSlice, label: Option<&str>) -> Option<String> {
         .and_then(|labels| labels.get(label))
         .cloned();
     if group.is_none() {
-        tracing::warn!(
+        // Debug, not warn: this runs on every Apply for the slice.
+        tracing::debug!(
             slice = es.metadata.name.as_deref().unwrap_or(""),
             label,
             "k8s discovery: EndpointSlice has no PD version group label; its workers pair only with other unlabeled workers"

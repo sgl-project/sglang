@@ -59,7 +59,8 @@ copies it from its Service, so each (role, version) needs its own labeled
 Service. Prefill workers whose group has no healthy decode worker are skipped,
 and `/readyz` needs at least one group that has both roles. Workers without the
 label form one more group. Both legacy and `--chat-routing reorg` enforce these
-constraints. Reorg also requires the compatible pair to belong to the same bucket.
+constraints. Reorg also requires the compatible pair to belong to the same bucket,
+and tries another group when every decode in the chosen group is full.
 
 ```bash
 sgl-router --model-id qwen3 --chat-routing reorg --policy power_of_two --service-discovery \

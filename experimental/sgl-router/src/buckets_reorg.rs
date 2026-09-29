@@ -98,6 +98,13 @@ impl EngineGroup {
     }
 }
 
+/// Whether a decode in `decoders` shares `prefill`'s version group and can receive its KV.
+fn has_peer(prefill: &Worker, decoders: &[Arc<Worker>]) -> bool {
+    decoders
+        .iter()
+        .any(|d| d.version_group() == prefill.version_group())
+}
+
 /// A bucket serves a request on one plain engine or on its own P/D groups.
 #[derive(Debug)]
 pub enum BucketGroups {
@@ -200,11 +207,7 @@ impl Bucket {
                 prefill
                     .members(workers, model, Stage::Prefill)
                     .iter()
-                    .any(|p| {
-                        decoders
-                            .iter()
-                            .any(|d| d.version_group() == p.version_group())
-                    })
+                    .any(|p| has_peer(p, &decoders))
             }
         }
     }
@@ -228,27 +231,38 @@ impl Bucket {
                 None,
             ),
             BucketGroups::Pd { prefill, decode } => {
-                let mut decoders = decode.members(workers, request.model, Stage::Decode);
+                let decoders = decode.members(workers, request.model, Stage::Decode);
                 let mut prefills = prefill.members(workers, request.model, Stage::Prefill);
                 if prefills.is_empty() {
                     return Err((Stage::Prefill, PickError::NoCandidates));
                 }
-                prefills.retain(|p| {
-                    decoders
+                prefills.retain(|p| has_peer(p, &decoders));
+                let mut failure = (Stage::Decode, PickError::NoCandidates);
+                // A version group whose decodes all refuse leaves other groups eligible.
+                loop {
+                    if prefills.is_empty() {
+                        return Err(failure);
+                    }
+                    let prefill = self
+                        .pick_from_group(prefill, Stage::Prefill, prefills.clone(), request)
+                        .await?;
+                    let group = prefill.engine.version_group().map(str::to_owned);
+                    let peers = decoders
                         .iter()
-                        .any(|d| d.version_group() == p.version_group())
-                });
-                if prefills.is_empty() {
-                    return Err((Stage::Decode, PickError::NoCandidates));
+                        .filter(|d| d.version_group() == group.as_deref())
+                        .cloned()
+                        .collect();
+                    match self
+                        .pick_from_group(decode, Stage::Decode, peers, request)
+                        .await
+                    {
+                        Ok(decode) => break (prefill, Some(decode)),
+                        Err(error) => {
+                            prefills.retain(|p| p.version_group() != group.as_deref());
+                            failure = error;
+                        }
+                    }
                 }
-                let prefill = self
-                    .pick_from_group(prefill, Stage::Prefill, prefills, request)
-                    .await?;
-                decoders.retain(|d| d.version_group() == prefill.engine.version_group());
-                let decode = self
-                    .pick_from_group(decode, Stage::Decode, decoders, request)
-                    .await?;
-                (prefill, Some(decode))
             }
         };
         Ok(BucketPick { prefill, decode })

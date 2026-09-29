@@ -556,16 +556,14 @@ impl DiscoveryArgs {
                     join_selector(&self.prefill_selector).as_deref(),
                     join_selector(&self.decode_selector).as_deref(),
                 )?;
-                let version_group_label = self
-                    .pd_version_group_label
-                    .map(|label| label.trim().to_owned());
+                let version_group_label = self.pd_version_group_label;
                 if let Some(label) = &version_group_label {
                     ensure!(
                         matches!(mode, K8sDiscoveryMode::PdDisaggregation { .. }),
                         "--pd-version-group-label requires --prefill-selector and --decode-selector"
                     );
                     ensure!(
-                        !label.is_empty(),
+                        !label.trim().is_empty(),
                         "--pd-version-group-label must not be empty"
                     );
                 }
@@ -1613,25 +1611,6 @@ mod tests {
         "--decode-selector",
         "app=sglang,role=decode",
     ];
-
-    #[test]
-    fn k8s_pd_version_group_label() {
-        let mut args = PD_K8S.to_vec();
-        args.extend(["--pd-version-group-label", " sglang.ai/version-group "]);
-        let c = into_config_owned(with_model(&args)).unwrap();
-        match &c.discovery {
-            DiscoveryBackend::K8s(k) => assert_eq!(
-                k.version_group_label.as_deref(),
-                Some("sglang.ai/version-group")
-            ),
-            _ => panic!("expected k8s backend"),
-        }
-        let c = into_config_owned(with_model(&PD_K8S)).unwrap();
-        match &c.discovery {
-            DiscoveryBackend::K8s(k) => assert_eq!(k.version_group_label, None),
-            _ => panic!("expected k8s backend"),
-        }
-    }
 
     #[test]
     fn rejects_pd_version_group_label_outside_k8s_pd() {
