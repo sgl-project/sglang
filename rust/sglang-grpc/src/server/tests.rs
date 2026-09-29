@@ -105,16 +105,19 @@ async fn follower_metadata_server_exposes_only_server_info_and_shuts_down() {
         }]
     })
     .to_string();
-    // No Python interpreter, RuntimeHandle, tokenizer, or PyBridge is created.
-    let mut handle = crate::start_server_thread(
-        runtime,
-        listener,
-        super::ServerMode::Metadata(super::MetadataService {
-            server_info_json: server_info_json.clone(),
-        }),
-    )
-    .unwrap();
-    assert!(handle.is_alive());
+    // Exercise the metadata service without the Python-facing startup wrapper,
+    // which requires libpython when linked into a standalone test executable.
+    let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+    let server_shutdown = shutdown.clone();
+    let service = super::MetadataService {
+        server_info_json: server_info_json.clone(),
+    };
+    let handle = std::thread::spawn(move || {
+        runtime
+            .block_on(super::serve_grpc(listener, service, server_shutdown, None))
+            .unwrap();
+    });
+    assert!(!handle.is_finished());
 
     let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
         .unwrap()
@@ -160,14 +163,13 @@ async fn follower_metadata_server_exposes_only_server_info_and_shuts_down() {
         assert_eq!(result.unwrap_err().code(), Code::Unimplemented, "{method}");
     }
     drop(client);
-    // Keep the client's runtime driving connection teardown while the server
-    // joins its own thread during graceful shutdown.
+    // Keep the client's runtime driving connection teardown while joining the
+    // server thread during graceful shutdown.
+    shutdown.notify_one();
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
         tokio::task::spawn_blocking(move || {
-            handle.shutdown();
-            assert!(!handle.is_alive());
-            handle.shutdown(); // Existing handle shutdown remains idempotent.
+            handle.join().unwrap();
         }),
     )
     .await
