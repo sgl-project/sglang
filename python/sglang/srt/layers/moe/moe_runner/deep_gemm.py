@@ -1912,9 +1912,9 @@ def post_permute_deep_gemm_to_deepep_v2(
         ):
             # Expanded combine does not consume top-k weights;
             # skip when fold-into-scale already applied them before down_proj.
-            hidden_states = hidden_states * topk_weights.to(
-                hidden_states.dtype
-            ).unsqueeze(-1)
+            # In-place with fp32 weights rounds once; casting the weights to
+            # bf16 first costs measurable accuracy.
+            hidden_states.mul_(topk_weights.unsqueeze(-1))
         return DeepEPv2CombineInput(hidden_states, None)
 
     hidden_states = runner_output.hidden_states
