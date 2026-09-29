@@ -43,7 +43,6 @@ from sglang.kernels.ops.layernorm.mhc_post_split_h import mhc_post_split_h
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
 )
-from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -428,7 +427,6 @@ _wo_a_fp8_mxscale_fused_invrope = None
 _wo_a_weight_scale_to_e8m0 = None
 _hip = None
 if _is_hip:
-    from sglang.srt.layers.attention.hip_flash_mla import resolve_hip_flashmla_backend
     from sglang.srt.models.deepseek_common.amd import deepseek_v4_hip as _hip
     from sglang.srt.models.deepseek_common.amd.deepseek_v4_wo_a_fp8 import (
         apply_wo_a_fp8_mxscale,
@@ -477,8 +475,7 @@ def _apply_wo_a_bf16_matmul(
             (is_decode and o.shape[0] == 1 and o.is_contiguous())
             or (is_target_verify and 2 <= o.shape[0] <= 384)
         )
-        and not is_batch_invariant_mode_enabled()
-        and not get_exec().deterministic.enable_deterministic_inference
+        and _hip.wo_a_split_k_allowed()
     )
     if (
         (
@@ -529,7 +526,8 @@ def _apply_wo_a_bf16_matmul(
                 o.transpose(0, 1), wo_a.transpose(1, 2), out=result.transpose(0, 1)
             )
         return result
-    if is_decode and hip_fast_path:
+    # the 16-row decode kernels also serve V4.1's target-verify rows
+    if (is_decode or is_target_verify) and hip_fast_path:
         y = _hip.wo_a_fp8_grid_matmul(o, wo_a, fp8_grid)
         if y is not None:
             return y
@@ -866,9 +864,6 @@ class MqaAttentionBase(nn.Module):
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
         self._attn_sink_local: Optional[torch.Tensor] = None
-        # gfx950: whether wo_b consumes the fp8-grid operand wo_a emits; resolved on
-        # first use, once the weights are loaded
-        self._wo_b_fp8_grid_operand: Optional[bool] = None
         if fuse:
             self.wqkv_a = ReplicatedLinear(
                 self.hidden_size,
@@ -1223,13 +1218,8 @@ class MQALayer(MqaAttentionBase):
             and self.wo_a.weight.shape == (self.n_local_groups * self.o_lora_rank, 4096)
             and (self.n_local_groups, self.o_lora_rank) == (2, 1024)
         )
-        # gfx950 32-block route: q_norm also emits the fp8-grid operand of wq_b, and
-        # resolves on first use whether wq_b consumes native MXFP8
-        self.fused_rmsnorm_fake_quant = (
-            _is_hip and _hip.fused_rmsnorm_fake_quant_eligible(quant_config)
-        )
-        self._wq_b_native_consumer_checked = False
-        self._wq_b_native_consumer = False
+        if _is_hip:
+            _hip.init_mqa_layer(self, quant_config)
 
         # KV cache write is always fused into the K kernel
         # (`_compute_kv_to_cache`), so the legacy "overlap store cache" flag
@@ -2031,17 +2021,13 @@ class MQALayer(MqaAttentionBase):
                 q_out.copy_(q)
         else:
             q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
-            fuse_q_rope = _is_gfx95_supported and _hip.fuses_q_rope_into_k_store(
-                self, q_out, unified=unified, use_cp=use_cp
-            )
-            if fuse_q_rope:
-                # the K store launch below ropes the query heads
-                q = _hip.wq_b_unroped(self, q_for_wqb)
+            if _is_hip:
+                q, q_lora, fuse_q_rope = _hip.compute_q_b(
+                    self, q_lora, q_for_wqb, positions, q_out, unified, use_cp
+                )
             else:
                 q = self._compute_q_b(q_for_wqb, positions, q_out)
-            if _is_hip and q_for_wqb is not q_lora:
-                # the indexer's wq_b would re-round onto the same grid, so hand it the fused operand
-                q_lora = q_for_wqb
+                fuse_q_rope = False
             if unified:
                 # unified_kv prefill: keep bf16 kv; the backend writes
                 # the ring AFTER attention (2-source path).
@@ -2388,21 +2374,19 @@ class MQALayer(MqaAttentionBase):
         # its normal causally-indexed store from attn_k = kv.
         attn_k = kv if kv is not None else q
 
-        inv_rope = None
-        if (
-            _is_hip
-            and not unified
-            and _is_gfx95_supported
-            and resolve_hip_flashmla_backend() == "aiter_sparse"
-        ):
-            # the aiter kernel applies the inverse RoPE itself; the else-branch below keeps it
-            inv_rope = _hip.attention_inv_rope(
+        # HIP: the attention kernel may apply the inverse RoPE itself; the else-branch below keeps it
+        inv_rope = (
+            _hip.attention_inv_rope(
                 self,
                 positions,
                 forward_batch,
+                unified,
                 wo_a_applies_inv_rope=self.wo_a_fp8
                 and _wo_a_fp8_mxscale_fused_invrope is not None,
             )
+            if _is_hip
+            else None
+        )
         if unified:
             # only the HIP radix backend takes these; passing them always would
             # leave non-ROCm depending on the **_ in its forward() to drop them, and
@@ -2591,25 +2575,15 @@ class MQALayer(MqaAttentionBase):
                         wo_a = wo_a_weight.view(
                             self.n_local_groups, self.o_lora_rank, -1
                         )
-                        # ROCm V4.1: the 16-row decode kernels also serve target-verify rows
                         o = _apply_wo_a_bf16_matmul(
                             o,
                             wo_a,
-                            is_decode=(
-                                forward_batch.forward_mode.is_decode()
-                                or (
-                                    _is_hip
-                                    and self.is_dsv41
-                                    and forward_batch.forward_mode.is_target_verify()
-                                )
-                            ),
+                            is_decode=forward_batch.forward_mode.is_decode(),
                             is_target_verify=forward_batch.forward_mode.is_target_verify(),
                             is_prefill=forward_batch.forward_mode.is_extend_without_speculative(),
                             fast_path=self.is_dsv41,
                             fuse_mxfp8_quant=fuse_mxfp8_quant,
-                            fp8_grid=_is_hip
-                            and self.is_dsv41
-                            and _hip.wo_b_takes_fp8_grid(self),
+                            fp8_grid=_is_hip and _hip.wo_a_emits_fp8_grid(self),
                         )
                 else:
                     o = _apply_gguf_grouped_wo_a(
@@ -2633,10 +2607,6 @@ class MQALayer(MqaAttentionBase):
             mhc.start_stats_before_all_reduce()
             o = attn_tp_all_reduce(o)
         elif mhc is not None and _is_hip:
-            # a lazily recorded state still needs its stats before the fused kernel reads them
-            mhc.materialize_stats()
-            if mhc.stats_stream is not None:
-                torch.cuda.current_stream().wait_stream(mhc.stats_stream)
             _hip.apply_attention_mhc(o, mhc)
         elif mhc is not None:
             from sglang.kernels.ops.communication.all_reduce_mhc import (
@@ -2788,21 +2758,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.hc_pre_from_prev_sublayer = config.hc_pre_from_prev_sublayer
         if self.hc_pre_from_prev_sublayer:
             self.use_fused_mhc_post_pre = False
-        # gfx950: input_layernorm also emits the pre-quantized operand of the dense
-        # projections, and resolves on first use whether wqkv_a consumes native MXFP8
-        self.fused_rmsnorm_fp8_quant = (
-            _is_hip and _hip.fused_rmsnorm_fp8_quant_eligible(quant_config)
-        )
-        self.fused_rmsnorm_fake_quant = (
-            _is_hip and _hip.fused_rmsnorm_fake_quant_eligible(quant_config)
-        )
-        self._wqkv_a_native_consumer_checked = False
-        self._wqkv_a_native_consumer = False
-        # gfx950: hc_post, pre-collapse and mixing stats in one launch; the kernel only
-        # supports hc_mult 4
-        self.hc_boundary_fused = (
-            _is_gfx95_supported and self.hc_pre_from_prev_sublayer and self.hc_mult == 4
-        )
+        if _is_hip:
+            _hip.init_decoder_layer(self, quant_config)
         self.engram = None
         if engram_layout is not None and layer_id in engram_layout.layer_ids:
             self.engram = Engram(
@@ -3102,21 +3059,10 @@ class DeepseekV4DecoderLayer(nn.Module):
         ):
             return mhc_post_split_h(x, residual, post, comb)
 
-        if (
-            _is_hip
-            and _is_gfx95_supported
-            and self.config.model_type == "deepseek_v41"
-            and 768 <= x.shape[0] <= 4096
-            and x.shape[1] == 5120
-            and residual.shape == (x.shape[0], 4, 5120)
-            and post.shape == (x.shape[0], 4)
-            and comb.shape == (x.shape[0], 4, 4)
-            and x.dtype == residual.dtype == torch.bfloat16
-            and post.dtype == comb.dtype == torch.float32
-            and all(t.is_contiguous() for t in (x, residual, post, comb))
-        ):
-            # Ordinary stores preserve locality for the following mHC reader.
-            return mhc_post_split_h(x, residual, post, comb, block_size=2048)
+        if _is_hip:
+            y = _hip.hc_post(self, x, residual, post, comb)
+            if y is not None:
+                return y
 
         if envs.SGLANG_OPT_USE_FLASHINFER_MHC.get():
             from flashinfer.mhc import mhc_post

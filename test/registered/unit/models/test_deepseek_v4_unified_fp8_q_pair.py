@@ -118,7 +118,8 @@ class _Harness(deepseek_v4.MQALayer):
 
 _NO_HIP_GLUE = SimpleNamespace(
     skip_head_pad=lambda attn: False,
-    wo_b_takes_fp8_grid=lambda attn: False,
+    attention_inv_rope=lambda *args, **kwargs: None,
+    wo_a_emits_fp8_grid=lambda attn: False,
     wo_a_fp8_grid_matmul=lambda o, wo_a, fp8_grid: None,
 )
 

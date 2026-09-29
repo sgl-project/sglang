@@ -542,6 +542,10 @@ def moe_mhc_fusion(layer, residual, coefficients, forward_batch):
 
 
 def apply_attention_mhc(x: torch.Tensor, state: MhcPostFusion) -> None:
+    # a lazily recorded state still needs its stats before the fused kernel reads them
+    state.materialize_stats()
+    if state.stats_stream is not None:
+        torch.cuda.current_stream().wait_stream(state.stats_stream)
     state.output = all_reduce_mhc_post(
         x, state.residual, state.post, state.comb, get_parallel().attn_tp_group.ca_comm
     )

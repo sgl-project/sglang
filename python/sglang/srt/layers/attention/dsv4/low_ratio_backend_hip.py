@@ -30,6 +30,9 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     prepare_fp4_decode_workspace,
     prepare_fp4_prefill_workspace,
 )
+from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope_hip import (
+    index_k_norm_rope_pack_store_split,
+)
 from sglang.kernels.ops.gemm.router_gemv_hip import rocm_router_gemv_split_k
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     _as_int_list,
@@ -588,3 +591,21 @@ def _request_groups(
         tok += t_len
     groups.append((req_lo, len(extend_lens_cpu), tok_lo, tok))
     return groups
+
+
+def store_index_k_split(
+    pool, layer, indexer, latent, freqs_cis, pos, out_loc, layer_id: int
+) -> None:
+    """The c1 / c2 decode index-K store into ROCm's split pools: payload and scales in
+    two buffers, where CUDA packs one fused [.., 68]-byte row."""
+    index_k_norm_rope_pack_store_split(
+        indexer.forward_wk(latent),
+        indexer.k_norm.weight.data,
+        indexer.k_norm.eps,
+        freqs_cis,
+        pos,
+        out_loc,
+        pool.get_index_k_fp4_payload_buffer(layer_id),
+        pool.get_index_k_fp4_scale_buffer(layer_id),
+        ratio=layer.compress_ratio,
+    )

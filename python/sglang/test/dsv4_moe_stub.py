@@ -20,6 +20,12 @@ def make_dsv4_moe_stub(
         def __call__(self, x, *args, **kwargs):
             return x * (rank + 1)
 
+    class Gate:
+        rocm_router_max_tokens = -1  # the ROCm split-K router never serves it
+
+        def __call__(self, x, *args, **kwargs):
+            return x
+
     class Moe(DeepseekV2MoE):
         def __init__(self):
             torch.nn.Module.__init__(self)
@@ -34,6 +40,7 @@ def make_dsv4_moe_stub(
             self.num_fused_shared_experts = 0
             self.routed_scaling_factor = 1.0
             self.experts = Experts()
+            self.gate = Gate()
             self.alt_stream = torch.cuda.Stream()
             self.topk = lambda *a, **kw: SimpleNamespace(
                 format=TopKOutputFormat.STANDARD
@@ -44,9 +51,6 @@ def make_dsv4_moe_stub(
 
         def _should_quant_routed_input_mxfp8(self, x):
             return False
-
-        def _forward_gate(self, x, *args, **kwargs):
-            return x, None
 
         def _forward_shared_experts(self, x, *args, **kwargs):
             return x * 0.5
