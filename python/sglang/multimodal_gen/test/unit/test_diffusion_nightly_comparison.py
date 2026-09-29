@@ -1,5 +1,8 @@
 import importlib.util
+import io
 from pathlib import Path
+
+from PIL import Image
 
 REPO_ROOT = Path(__file__).resolve().parents[5]
 
@@ -41,6 +44,31 @@ def test_sglang_launch_is_exactly_the_recipe():
     assert "--warmup-resolutions" not in command
     assert "--warmup-num-frames" not in command
     assert command[-4:] == ["--warmup-mode", "server", "--tp-size", "2"]
+
+
+def test_requests_of_a_run_never_repeat_an_input(monkeypatch):
+    # sglang reuses the encodings of inputs it has seen, so a repeated prompt
+    # or image would time that reuse instead of the encoders
+    buffer = io.BytesIO()
+    Image.new("RGB", (1024, 704), (200, 100, 50)).save(buffer, format="PNG")
+    monkeypatch.setattr(runner, "_cached_ref_image", buffer.getvalue())
+    monkeypatch.setattr(runner, "_ref_image_variants", {})
+    case = {"prompt": "Make the cat wear a red hat"}
+
+    requests = [runner._request_case(case, index) for index in range(10)]
+    prompts = [request["prompt"] for request in requests]
+    downscaled = [
+        Image.open(
+            io.BytesIO(runner._get_ref_image_variant({}, request["input_variant"]))
+        )
+        .resize((256, 176), Image.BICUBIC)
+        .tobytes()
+        for request in requests
+    ]
+
+    assert len(set(prompts)) == len(set(downscaled)) == 10
+    assert len({len(prompt) for prompt in prompts}) == 1
+    assert case == {"prompt": "Make the cat wear a red hat"}
 
 
 class _FakeResponse:

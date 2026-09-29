@@ -72,6 +72,7 @@ INSTALLABLE_FRAMEWORKS = {"vllm-omni", "lightx2v"}
 # Cached reference image (downloaded once)
 _cached_ref_image: bytes | None = None
 _cached_ref_image_path: str | None = None
+_ref_image_variants: dict[int, bytes] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -343,9 +344,31 @@ def _get_ref_image_bytes(config: dict) -> bytes:
     return _cached_ref_image
 
 
-def _get_ref_image_b64(config: dict) -> str:
+def _get_ref_image_variant(config: dict, variant: int | None) -> bytes:
+    """The reference image, or a copy with a corner patch unique to `variant`.
+
+    sglang reuses the VAE and vision encodings of an image it has already seen,
+    so requests that repeat one image would time that reuse instead of the
+    encoders. The patch is large enough to survive the server's resize.
+    """
+    data = _get_ref_image_bytes(config)
+    if variant is None:
+        return data
+    if variant not in _ref_image_variants:
+        from PIL import Image
+
+        image = Image.open(io.BytesIO(data)).convert("RGB")
+        level = 8 + 24 * variant
+        image.paste((level, level, level), (0, 0, 8, 8))
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        _ref_image_variants[variant] = buffer.getvalue()
+    return _ref_image_variants[variant]
+
+
+def _get_ref_image_b64(config: dict, variant: int | None = None) -> str:
     """Get reference image as base64 string."""
-    return base64.b64encode(_get_ref_image_bytes(config)).decode("utf-8")
+    return base64.b64encode(_get_ref_image_variant(config, variant)).decode("utf-8")
 
 
 def _get_ref_image_path(config: dict) -> str:
@@ -518,7 +541,7 @@ def send_image_conditioned_request_sglang(
 ) -> float:
     """Send an image-conditioned request (edit/I2V/TI2V) via SGLang multipart API."""
     task = case["task"]
-    ref_bytes = _get_ref_image_bytes(config)
+    ref_bytes = _get_ref_image_variant(config, case.get("input_variant"))
 
     # Build multipart form — field name depends on endpoint:
     # image edits use "image", video (I2V/TI2V) uses "input_reference"
@@ -598,7 +621,7 @@ def send_request_vllm_omni(base_url: str, case: dict, config: dict) -> float:
     # Build message content (text or text+image)
     content: list[dict] | str = case["prompt"]
     if case.get("reference_image"):
-        ref_b64 = _get_ref_image_b64(config)
+        ref_b64 = _get_ref_image_b64(config, case.get("input_variant"))
         content = [
             {
                 "type": "image_url",
@@ -699,6 +722,24 @@ def send_request_lightx2v(base_url: str, case: dict, config: dict) -> float:
 # ---------------------------------------------------------------------------
 # Unified request dispatcher
 # ---------------------------------------------------------------------------
+
+
+def _request_case(case: dict, request_index: int) -> dict:
+    """The case with inputs that no earlier request of the run has used.
+
+    A benchmark draws distinct prompts, and sglang reuses the encodings of
+    inputs it has seen. A one-digit tag keeps the prompt's token count, and so
+    every shape, the same across requests.
+    """
+    if not 0 <= request_index <= 9:
+        raise ValueError(
+            f"request {request_index} of a case: one-digit input tags cover 10"
+        )
+    return {
+        **case,
+        "prompt": f"{case['prompt']} (take {request_index})",
+        "input_variant": request_index,
+    }
 
 
 def send_request(
@@ -864,7 +905,11 @@ def run_single(
                 if os.path.exists(first_dump_path):
                     os.remove(first_dump_path)
             latency = send_request(
-                base_url, case, framework, config, perf_dump_path=first_dump_path
+                base_url,
+                _request_case(case, warmup_index),
+                framework,
+                config,
+                perf_dump_path=first_dump_path,
             )
             if warmup_index == 0:
                 result["first_request_latency_s"] = round(latency, 3)
@@ -899,7 +944,11 @@ def run_single(
                 f"{measurement_repeats}..."
             )
             latency = send_request(
-                base_url, case, framework, config, perf_dump_path=perf_dump_path
+                base_url,
+                _request_case(case, warmup_requests + sample_index),
+                framework,
+                config,
+                perf_dump_path=perf_dump_path,
             )
             latency_samples.append(round(latency, 3))
 
