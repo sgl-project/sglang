@@ -602,7 +602,7 @@ class TestAbortArmsTrackerBeforeSend(CustomTestCase):
         self.assertNotIn(500, mgr._deferred_abort_ack_tracker)
 
     def test_opted_out_backend_does_not_arm(self):
-        # Backends without a drain ack (mori) send the ABORT but must not arm:
+        # Backends without a drain ack send the ABORT but must not arm:
         # nothing would ever clean the tracker up.
         mgr = self._make_decode_manager(enabled=False)
         recv, armed_at_send = self._abort_receiver(mgr, init_time=123.0)
@@ -914,14 +914,15 @@ class TestBackendOptIn(CustomTestCase):
         self.assertTrue(envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get())
 
     def test_backends_that_ack_opt_in(self):
-        # Ascend inherits Mooncake's threads, so it opts in too.
+        # Ascend inherits Mooncake's threads, so it opts in too. Mori's opt-in
+        # is asserted in test_mori_deferred_kv_release.py, which stubs mori.
         for cls in (MooncakeKVManager, NixlKVManager):
             with self.subTest(backend=cls.__name__):
                 self.assertTrue(cls.supports_deferred_decode_kv_release)
 
     def test_backends_without_a_drain_ack_stay_opted_out(self):
-        # Inheriting CommonKVManager is not enough: mori marks the room Failed
-        # without acking.
+        # Inheriting CommonKVManager is not enough: a backend must send the
+        # drain ack itself before it may opt in.
         self.assertFalse(BaseKVManager.supports_deferred_decode_kv_release)
         self.assertFalse(CommonKVManager.supports_deferred_decode_kv_release)
 

@@ -314,6 +314,8 @@ class MoriKVManager(CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
     # Implements teardown() below, so runtime PD role switching is supported.
     supports_role_switch = True
+    # The ABORT ack is held until the transfer worker or drainer quiesces the room.
+    supports_deferred_decode_kv_release = True
 
     # The bootstrap socket carries several message kinds, so the status message
     # is tagged. Mori has always shipped the failure reason with it.

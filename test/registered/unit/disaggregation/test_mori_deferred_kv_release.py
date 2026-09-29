@@ -391,5 +391,11 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
         manager._mark_transfer_quiescent.assert_called_once_with(chunk)
 
 
+class TestMoriBackendOptIn(CustomTestCase):
+    def test_mori_opts_into_deferred_release(self):
+        # Mori sends the drain ack itself, so the default-on env var applies.
+        self.assertTrue(MoriKVManager.supports_deferred_decode_kv_release)
+
+
 if __name__ == "__main__":
     unittest.main()
