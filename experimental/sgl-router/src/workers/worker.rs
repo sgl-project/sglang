@@ -8,9 +8,10 @@ use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// How long a prefill stays unroutable while `/server_info` has not reported its
-/// bootstrap port. Afterwards the router stops re-introspecting and sends a null
-/// port, which the engine resolves to its own configured default.
+/// How long a prefill stays unroutable, after joining its model pool, while
+/// `/server_info` has not reported its bootstrap port. Afterwards the router sends
+/// a null port, which the engine resolves to its own configured default, and keeps
+/// re-introspecting at the reconcile interval in case a port is reported later.
 pub const BOOTSTRAP_PORT_GRACE: Duration = Duration::from_secs(30);
 
 /// Which forwarding client the proxy uses for a worker.
@@ -184,8 +185,9 @@ pub struct Worker {
     /// decode and plain). Set via `--disaggregation-bootstrap-port` at
     /// worker startup; carried from `WorkerSpec`.
     bootstrap_port: Option<u16>,
-    /// First registration of this ID; see [`Self::awaiting_bootstrap_port`].
-    pub(crate) registered_at: Instant,
+    /// When this worker joined its current model pools, starting the grace of
+    /// [`Self::awaiting_bootstrap_port`]. Tokio's clock so tests can advance it.
+    pub(crate) pooled_at: tokio::time::Instant,
 }
 
 impl Worker {
@@ -219,7 +221,7 @@ impl Worker {
             slots,
             bootstrap_host,
             bootstrap_port: spec.bootstrap_port,
-            registered_at: Instant::now(),
+            pooled_at: tokio::time::Instant::now(),
         }
     }
 
@@ -233,10 +235,13 @@ impl Worker {
         self.bootstrap_port
     }
 
-    /// Continue `prev`'s identity on re-registration: its first-seen time, load
-    /// counters (which in-flight guards still hold), and breaker unless its config changed.
+    /// Continue `prev`'s identity on re-registration: its load counters (which
+    /// in-flight guards still hold), its breaker unless the config changed, and its
+    /// grace clock unless it joined a new pool.
     pub(crate) fn inherit(&mut self, prev: &Worker) {
-        self.registered_at = prev.registered_at;
+        if (&prev.model_ids, prev.mode()) == (&self.model_ids, self.mode()) {
+            self.pooled_at = prev.pooled_at;
+        }
         if prev.breaker.config() == self.breaker.config() {
             self.breaker = Arc::clone(&prev.breaker);
         }
@@ -244,11 +249,14 @@ impl Worker {
         self.slots = Arc::clone(&prev.slots);
     }
 
-    /// A prefill whose bootstrap port is still unknown within [`BOOTSTRAP_PORT_GRACE`].
+    /// A prefill whose bootstrap port `/server_info` has not reported.
+    pub fn lacks_bootstrap_port(&self) -> bool {
+        self.mode() == WorkerMode::Prefill && self.bootstrap_port.is_none()
+    }
+
+    /// A portless prefill still within [`BOOTSTRAP_PORT_GRACE`], and so unroutable.
     pub fn awaiting_bootstrap_port(&self) -> bool {
-        self.mode() == WorkerMode::Prefill
-            && self.bootstrap_port.is_none()
-            && self.registered_at.elapsed() < BOOTSTRAP_PORT_GRACE
+        self.lacks_bootstrap_port() && self.pooled_at.elapsed() < BOOTSTRAP_PORT_GRACE
     }
 
     /// Returns the current [`WorkerMode`] of this worker.
@@ -440,18 +448,28 @@ mod tests {
         assert_eq!(w.bootstrap_port(), None);
     }
 
-    #[test]
-    fn portless_prefill_awaits_port_only_during_grace() {
-        let mut w = Worker::new(WorkerSpec {
-            id: WorkerId("p".into()),
-            url: "http://10.0.0.1:30000".into(),
-            mode: WorkerMode::Prefill,
-            model_ids: vec![],
-            bootstrap_port: None,
-        });
-        assert!(w.awaiting_bootstrap_port());
-        w.registered_at -= BOOTSTRAP_PORT_GRACE;
-        assert!(!w.awaiting_bootstrap_port());
+    #[tokio::test(start_paused = true)]
+    async fn portless_prefill_grace_runs_from_joining_its_pool() {
+        let prefill = |models: &[&str]| {
+            Worker::new(WorkerSpec {
+                id: WorkerId("p".into()),
+                url: "http://10.0.0.1:30000".into(),
+                mode: WorkerMode::Prefill,
+                model_ids: models.iter().map(|m| ModelId((*m).into())).collect(),
+                bootstrap_port: None,
+            })
+        };
+        let model_less = prefill(&[]);
+        tokio::time::advance(BOOTSTRAP_PORT_GRACE).await;
+        assert!(!model_less.awaiting_bootstrap_port());
+        let mut pooled = prefill(&["m"]);
+        pooled.inherit(&model_less);
+        assert!(pooled.awaiting_bootstrap_port());
+        tokio::time::advance(BOOTSTRAP_PORT_GRACE).await;
+        let mut repaired = prefill(&["m"]);
+        repaired.inherit(&pooled);
+        assert!(!repaired.awaiting_bootstrap_port());
+        assert!(repaired.lacks_bootstrap_port());
     }
 
     #[test]
