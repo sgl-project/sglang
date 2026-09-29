@@ -535,9 +535,13 @@ class HiCacheController:
         primary: HostKVCache, entries: Optional[List[PoolEntry]]
     ):
         from sglang.srt.mem_cache.memory_pool import MLATokenToKVPoolFP4
+        from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
         from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
-        message = "HiCache L3 with DCP requires one materialized MLA host pool."
+        message = (
+            "HiCache L3 with DCP requires one materialized MLA host pool "
+            "and at most one materialized Mamba state pool."
+        )
         if (
             not isinstance(primary, MLATokenToKVPoolHost)
             or primary.kv_buffer is None
@@ -554,12 +558,29 @@ class HiCacheController:
             )
         if entries is None:
             return
-        if (
-            len(entries) != 1
-            or entries[0].name != PoolName.KV
-            or entries[0].host_pool is not primary
-            or entries[0].packed_draft_device_pools
-        ):
+        if len(entries) not in (1, 2):
+            raise NotImplementedError(message)
+        if any(entry.packed_draft_device_pools for entry in entries):
+            raise NotImplementedError(message)
+        seen = set()
+        for entry in entries:
+            name = entry.name
+            if name in seen:
+                raise NotImplementedError(message)
+            seen.add(name)
+            if name == PoolName.KV and entry.host_pool is primary:
+                continue
+            if (
+                name != PoolName.MAMBA
+                or not isinstance(entry.host_pool, MambaPoolHost)
+                or entry.host_pool.layout not in ("page_first", "page_first_direct")
+                or entry.packed_draft_device_pools
+            ):
+                raise NotImplementedError(message)
+            buffers = entry.host_pool.get_hybrid_pool_buffer()
+            if not buffers or any(b is None or b.numel() == 0 for b in buffers):
+                raise NotImplementedError(message)
+        if PoolName.KV not in seen:
             raise NotImplementedError(message)
 
     def attach_storage_backend(
@@ -634,6 +655,7 @@ class HiCacheController:
                 )
             else:
                 # Budget speculative prefetch at half the host pool, leaving the rest for the write-back staging path.
+                # Budgets count logical slots, like prefetch occupancy and the allocator.
                 self.prefetch_capacity_limit = int(
                     0.5 * self.mem_pool_host.logical_size
                 )
@@ -1366,14 +1388,16 @@ class HiCacheController:
             except Empty:
                 continue
 
-    def _sync_prefetch_hit_query(self, operation, storage_hit_count: int) -> int:
+    def _sync_prefetch_hit_query(
+        self, operation, storage_hit_count: int, sync_groups=None
+    ) -> int:
         """Rank-reduce a hit query (MIN) so every rank agrees on the usable
         prefix. Runs for every operation, hit or miss."""
         hit_count = torch.tensor(storage_hit_count, dtype=torch.int)
         self._all_reduce(
             hit_count,
             torch.distributed.ReduceOp.MIN,
-            self.prefetch_hits_sync_groups,
+            self.prefetch_hits_sync_groups if sync_groups is None else sync_groups,
         )
         return int(hit_count.item())
 

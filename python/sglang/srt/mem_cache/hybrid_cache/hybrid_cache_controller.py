@@ -357,8 +357,9 @@ class HybridCacheController(BaseHiCacheController):
         if not isinstance(self.mem_pool_host, HostPoolGroup):
             raise TypeError("Dynamic HiCache sidecars require HostPoolGroup.")
         if self.enable_storage and self.storage_config.dcp_size > 1:
-            raise NotImplementedError(
-                "HiCache L3 with DCP requires one materialized MLA host pool."
+            self._validate_dcp_storage_pools(
+                self.mem_pool_host.anchor_entry.host_pool,
+                [*self.mem_pool_host.entries, entry],
             )
         self.mem_pool_host.add_entry(entry)
         if not entry.is_primary_index_anchor:
@@ -1119,9 +1120,9 @@ class HybridCacheController(BaseHiCacheController):
             for group in self.prefetch_hits_sync_groups
             if set(torch.distributed.get_process_group_ranks(group)) != pp_group_ranks
         ]
-        hit_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
-        self._all_reduce(hit_tensor, torch.distributed.ReduceOp.MIN, local_groups)
-        storage_hit_count = int(hit_tensor.item())
+        storage_hit_count = self._sync_prefetch_hit_query(
+            operation, storage_hit_count, local_groups
+        )
         storage_hit_count -= storage_hit_count % self.page_size
         if storage_hit_count < self.prefetch_threshold:
             with self.pp_prefetch_state_lock:
@@ -1375,20 +1376,15 @@ class HybridCacheController(BaseHiCacheController):
         )
         operation.all_hash_values = hash_value
 
-        if operation.assume_stored:
-            # A prior hit on a suffix of this span proved it stored, and writes
-            # are prefix-covered, so re-querying only adds a round trip. Nothing
-            # is verified now, so no pool gets a verdict to learn from.
-            kv_hit_pages = len(hash_value)
-            operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
-            operation.query_pool_hit_pages = {}
-            return hash_value, kv_hit_pages * self.page_size
-
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None,
             extra_info={"pp_rank": pp_rank} if pp_rank is not None else None,
         )
-        if operation.pool_transfers:
+        if operation.assume_stored:
+            # The hint proves this span's endpoint. A shorter trailing-state
+            # checkpoint still needs its own evidence (see candidates below).
+            hit_result = PoolTransferResult(len(hash_value), {})
+        elif operation.pool_transfers:
             hit_result = self.storage_backend.batch_exists_v2(
                 hash_value, operation.pool_transfers, extra_info
             )
@@ -1400,44 +1396,85 @@ class HybridCacheController(BaseHiCacheController):
 
         kv_hit_pages = hit_result.kv_hit_pages
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
-        # Each pool's own boundary (the KV pool's where the backend reports
-        # it, else the folded cut); the beliefs heal pool by pool. A pool the
-        # backend did not report carries no verdict.
-        pool_hits = hit_result.extra_pool_hit_pages
-        operation.query_pool_hit_pages = {
-            PoolName.KV: pool_hits.get(PoolName.KV, kv_hit_pages)
-        }
-        for transfer in operation.pool_transfers or ():
-            if transfer.name in pool_hits:
-                operation.query_pool_hit_pages[transfer.name] = pool_hits[transfer.name]
+        operation.query_pool_hit_pages = {}
+        if not operation.assume_stored:
+            # Each pool's own boundary (the KV pool's where the backend reports
+            # it, else the folded cut); the beliefs heal pool by pool. A pool the
+            # backend did not report carries no verdict.
+            pool_hits = hit_result.extra_pool_hit_pages
+            operation.query_pool_hit_pages = {
+                PoolName.KV: pool_hits.get(PoolName.KV, kv_hit_pages)
+            }
+            for transfer in operation.pool_transfers or ():
+                if transfer.name in pool_hits:
+                    operation.query_pool_hit_pages[transfer.name] = pool_hits[transfer.name]
+        if operation.pool_transfers:
+            candidates = hit_result.restorable_prefix_pages
+            if candidates is None:
+                trailing = any(
+                    transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES
+                    for transfer in operation.pool_transfers
+                )
+                # Legacy backends may report only the longest usable prefix.
+                # ALL_PAGES proves every shorter prefix; trailing state does not.
+                candidates = (
+                    [kv_hit_pages] if trailing else list(range(1, kv_hit_pages + 1))
+                )
+            candidates = {p for p in candidates if 0 < p <= kv_hit_pages}
+            previous = operation.pool_storage_result.restorable_prefix_pages
+            if previous is not None:
+                # PP0 can query multiple stages on the same TP rank before the
+                # collective. Those stages must also share the chosen endpoint.
+                candidates.intersection_update(previous)
+            operation.pool_storage_result.restorable_prefix_pages = sorted(candidates)
 
         return (
             hash_value[:kv_hit_pages],
             kv_hit_pages * self.page_size,
         )
 
-    def _sync_prefetch_hit_query(self, operation, storage_hit_count: int) -> int:
-        """One MIN collective for the folded hit count and every pool's own
-        boundary, so per-pool beliefs stay rank-identical. A pool omitted
-        by any rank heals from the folded cut without learning presence."""
+    def _sync_prefetch_hit_query(
+        self, operation, storage_hit_count: int, sync_groups=None
+    ) -> int:
+        # MIN of longest hits can select a missing recurrent checkpoint. Reduce
+        # endpoint availability alongside upstream's per-pool belief boundaries.
         pools = list(PoolName)
         local = operation.query_pool_hit_pages
+        num_pages = len(operation.token_ids) // self.page_size
+        max_pages = min(num_pages, storage_hit_count // self.page_size)
+        mask = [0] * (num_pages + 1)
+        candidates = operation.pool_storage_result.restorable_prefix_pages
+        if candidates is None:
+            # No trailing pool (or no assigned PP stages): all prefixes qualify.
+            candidates = range(1, max_pages + 1)
+        if not operation.is_terminated():
+            for pages in candidates:
+                if 0 < pages <= max_pages:
+                    mask[pages] = 1
         packed = torch.tensor(
-            [storage_hit_count] + [local.get(pool, _NO_POOL_VERDICT) for pool in pools],
+            [storage_hit_count]
+            + [local.get(pool, _NO_POOL_VERDICT) for pool in pools]
+            + mask,
             dtype=torch.int,
         )
         self._all_reduce(
             packed,
             torch.distributed.ReduceOp.MIN,
-            self.prefetch_hits_sync_groups,
+            self.prefetch_hits_sync_groups if sync_groups is None else sync_groups,
         )
         reduced = packed.tolist()
+        offset = 1 + len(pools)
         operation.query_pool_hit_pages = {
             pool: pages
-            for pool, pages in zip(pools, reduced[1:], strict=True)
+            for pool, pages in zip(pools, reduced[1:offset], strict=True)
             if pages != _NO_POOL_VERDICT
         }
-        return int(reduced[0])
+        limit = reduced[0] // self.page_size
+        common = [p for p, available in enumerate(reduced[offset:]) if available and p <= limit]
+        pages = common[-1] if common else 0
+        operation.pool_storage_result.restorable_prefix_pages = common
+        operation.pool_storage_result.kv_hit_pages = pages
+        return pages * self.page_size
 
     def _move_pool_indices(
         self, host_pool, host_indices, device_indices, *, write_back_jit: bool

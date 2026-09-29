@@ -1,10 +1,12 @@
 """Startup and runtime support boundaries for DCP storage."""
 
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest import mock
 
 from test_hicache_dcp_host_pool import _make_host_pool
+from test_mooncake_dcp_storage import _mamba_pool
 
 from sglang.srt.arg_groups.hicache_hook import (
     resolve_hicache_dcp_compatibility,
@@ -52,6 +54,85 @@ class TestDcpStorageGuards(CustomTestCase):
                     self.assertRaisesRegex(NotImplementedError, "aggregated serving"),
                 ):
                     resolve_hicache_dcp_compatibility(_args(disaggregation_mode=role))
+
+    def test_materialized_mamba_registration_preserves_independent_slot_pool(self):
+        pool = _make_host_pool(0, dcp_size=2, layout="page_first")
+        state = _mamba_pool()
+        self.addCleanup(pool.destroy)
+        self.addCleanup(state.destroy)
+        anchor = PoolEntry(
+            PoolName.KV,
+            pool,
+            pool.device_pool,
+            lambda x: x,
+            is_primary_index_anchor=True,
+        )
+        sidecar = PoolEntry(PoolName.MAMBA, state, state.device_pool, lambda x: x)
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.mem_pool_host = HostPoolGroup([anchor])
+        controller.enable_storage = True
+        controller.storage_config = SimpleNamespace(dcp_size=2)
+        controller.storage_backend = mock.Mock()
+        controller.extra_host_mem_release_queues = {}
+        available = pool.available_size()
+        controller.register_host_pool_entry(sidecar)
+        self.assertIs(controller.mem_pool_host.anchor_entry, anchor)
+        self.assertIs(controller.mem_pool_host.get_pool(PoolName.MAMBA), state)
+        slots = controller.mem_pool_host.alloc(1, pool=PoolName.MAMBA)
+        self.assertEqual(len(slots), 1)
+        self.assertEqual(pool.available_size(), available)
+        controller.mem_pool_host.free(slots, pool=PoolName.MAMBA)
+        self.assertIn(PoolName.MAMBA, controller.extra_host_mem_release_queues)
+
+    def test_mamba_label_cannot_register_a_token_pool_as_state(self):
+        pool = _make_host_pool(0, dcp_size=2, layout="page_first")
+        self.addCleanup(pool.destroy)
+        anchor = PoolEntry(
+            PoolName.KV,
+            pool,
+            pool.device_pool,
+            lambda x: x,
+            is_primary_index_anchor=True,
+        )
+        disguised = PoolEntry(PoolName.MAMBA, pool, pool.device_pool, lambda x: x)
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.mem_pool_host = HostPoolGroup([anchor])
+        controller.enable_storage = True
+        controller.storage_config = SimpleNamespace(dcp_size=2)
+        controller.extra_host_mem_release_queues = {}
+        with self.assertRaisesRegex(NotImplementedError, "materialized Mamba"):
+            controller.register_host_pool_entry(disguised)
+        self.assertEqual(controller.mem_pool_host.entries, [anchor])
+        self.assertEqual(controller.extra_host_mem_release_queues, {})
+
+    def test_mamba_registration_cannot_enable_packed_draft_storage(self):
+        pool = _make_host_pool(0, dcp_size=2, layout="page_first")
+        state = _mamba_pool()
+        self.addCleanup(pool.destroy)
+        self.addCleanup(state.destroy)
+        anchor = PoolEntry(
+            PoolName.KV,
+            pool,
+            pool.device_pool,
+            lambda x: x,
+            is_primary_index_anchor=True,
+        )
+        sidecar = PoolEntry(PoolName.MAMBA, state, state.device_pool, lambda x: x)
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.mem_pool_host = HostPoolGroup([anchor])
+        # Model a draft packed into the primary pool: it is not a separate
+        # entry, so checking only the sidecar would accidentally admit it.
+        controller.mem_pool_host.entries[0] = replace(
+            anchor, packed_draft_device_pools=(pool.device_pool,)
+        )
+        controller.enable_storage = True
+        controller.storage_config = SimpleNamespace(dcp_size=2)
+        controller.extra_host_mem_release_queues = {}
+        controller.storage_backend = mock.Mock()
+        with self.assertRaisesRegex(NotImplementedError, "materialized Mamba"):
+            controller.register_host_pool_entry(sidecar)
+        self.assertEqual(len(controller.mem_pool_host.entries), 1)
+        self.assertEqual(controller.extra_host_mem_release_queues, {})
 
     def test_dynamic_sidecar_cannot_bypass_single_pool_storage_guard(self):
         for dcp in (1, 2):
