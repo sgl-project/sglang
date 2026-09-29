@@ -83,7 +83,18 @@ general DCP and model-specific attention-backend restrictions still apply.
 Use `--hicache-host-memory-mode cache`; DCP L3 rejects `buffer_only` and
 speculative decoding. DSPARK with DCP remains supported at L1/L2 without L3.
 
-Use aggregated serving; P/D is not supported with DCP L3.
+In P/D deployments, keep persisted cache namespaces role-local when the roles
+use different layouts. Use separate file directories or Mooncake
+`extra_backend_tag` values. Live P-to-D transfer remains responsible for moving
+the request's KV and current recurrent state; L3 does not convert the stored
+objects between the roles' topologies. Decode-side radix reuse requires
+`--disaggregation-decode-enable-radix-cache`.
+For decode with DCP L3, also set
+`--hicache-storage-prefetch-policy wait_complete`. The default `timeout` and
+`best_effort` policies can stop before fulfilling the prefix promised to
+prefill, so startup and runtime attachment reject them on decode. Prefill and
+aggregated servers may use all three policies. Decode KV offload
+(`--disaggregation-decode-enable-offload-kvcache`) is not supported with DCP L3.
 
 DCP keys include shard and layout identity. Recurrent file keys also preserve
 TP ownership independently of MLA replication, including when long filenames

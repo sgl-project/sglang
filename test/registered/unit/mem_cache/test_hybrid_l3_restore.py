@@ -22,6 +22,10 @@ from test_unified_radix_cache_unittest import (
     build_fixture,
 )
 
+from sglang.srt.disaggregation.decode_hicache_mixin import (
+    DecodeHiCacheTransferMixin,
+    DecodePrefixMatch,
+)
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
@@ -220,6 +224,80 @@ class TestHybridL3Restore(CustomTestCase):
             self.assertEqual(match.host_hit_length, 0)
             self.assertEqual(len(match.device_indices), 0)
             self.assertNotIn(handle, cache.ongoing_prefetch)
+
+    @parameterized.expand(["python", "rust"])
+    def test_decode_restore_preserves_already_received_live_state(self, tree_backend):
+        """An older L3 checkpoint must not overwrite P's newer live state."""
+        with tempfile.TemporaryDirectory() as directory:
+            page = 128
+            self.cfg = CacheConfig(
+                page_size=page,
+                components=(ComponentType.FULL, ComponentType.MAMBA),
+                enable_mamba_extra_buffer=True,
+                num_layers=2,
+                full_attention_layer_ids=(0,),
+                kv_size=page * 16,
+                max_context_len=page * 8,
+            )
+            writer, wa, wp = self._fixture(directory, tree_backend)
+            tokens = list(range(4 * page + 1))
+            req = self._request(writer, wa, wp, tokens, "writer")
+            _, depth, old_state = self._forward_snapshot(writer, wp, req)
+            self._fill_full_kv(
+                wa, wp.req_to_token[req.kv.req_pool_idx, :depth], marker=7
+            )
+            writer.cache_unfinished_req(req)
+            self._backup_node(writer, req.last_node)
+            self._write_path_to_l3(writer, req.last_node)
+            self._flush_l3_backups(writer)
+            reader, ra, rp = self._fixture(directory, tree_backend)
+            live = self._request(reader, ra, rp, tokens, "decode")
+            reader.prefetch_from_storage(
+                live.cache_request_handle,
+                reader.root_node_handle(),
+                array("q", tokens[:depth]),
+                None,
+                None,
+            )
+            self._run_prefetch_to_completion(reader, live.cache_request_handle)
+            # The transfer boundary has already delivered the state at the
+            # full prompt length. Local prefix DMA is allowed to complete later.
+            buffers = (
+                rp.mamba_pool.mamba_cache.temporal,
+                *rp.mamba_pool.mamba_cache.conv,
+            )
+            for buffer in buffers:
+                buffer[:, live.kv.mamba_pool_idx] = -17
+            incoming = [b[:, live.kv.mamba_pool_idx].clone() for b in buffers]
+            match = reader.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", tokens[:depth])))
+            )
+            pm = DecodePrefixMatch(
+                prefix_indices=match.device_indices,
+                l2_host_hit_length=depth,
+                l3_storage_hit_length=0,
+                last_device_node=reader.root_node_handle(),
+                last_host_node=match.last_host_node,
+            )
+            dr = SimpleNamespace(req=live, prefix_match=pm)
+            harness = SimpleNamespace(tree_cache=reader)
+            self.assertTrue(
+                DecodeHiCacheTransferMixin._try_hicache_queue_load_back(harness, dr)
+            )
+            self.assertGreaterEqual(reader.ready_to_load_host_cache(), 0)
+            for ack in list(reader.cache_controller.ack_load_queue):
+                ack.finish_event.synchronize()
+            reader.loading_check()
+            canonical = reader.tree_core.get_component_device_value(
+                dr.hicache_restored_node, ComponentType.MAMBA
+            )[0]
+            for buffer, old, new in zip(buffers, old_state, incoming):
+                torch.testing.assert_close(buffer[:, canonical], old, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    buffer[:, live.kv.mamba_pool_idx], new, rtol=0, atol=0
+                )
+            reader.cache_controller._stop_storage_threads()
+            writer.cache_controller._stop_storage_threads()
 
     def _seed_two_checkpoints(self, prod, pa, pp, *, page):
         oracles = {}

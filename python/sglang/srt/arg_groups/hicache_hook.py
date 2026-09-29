@@ -154,8 +154,6 @@ def validate_hicache_dcp_storage(
     cfg = resolving_view(server_args)
     if cfg.dcp_size <= 1:
         return
-    if cfg.disaggregation_mode != "null":
-        raise NotImplementedError("HiCache L3 with DCP requires aggregated serving.")
     if not use_mla_backend(server_args):
         raise NotImplementedError("HiCache L3 with DCP requires MLA.")
     if cfg.hicache_host_memory_mode == "buffer_only":
@@ -165,6 +163,22 @@ def validate_hicache_dcp_storage(
         raise NotImplementedError(
             "HiCache L3 with DCP does not support speculative draft storage."
         )
+    if cfg.disaggregation_mode == "decode":
+        if cfg.disaggregation_decode_enable_offload_kvcache:
+            raise NotImplementedError(
+                "HiCache L3 with DCP does not support decode offload."
+            )
+        # Decode promises the probed L3 span to prefill before the read completes.
+        policy = (
+            cfg.hicache_storage_prefetch_policy
+            if prefetch_policy is None
+            else prefetch_policy
+        )
+        if policy != "wait_complete":
+            raise NotImplementedError(
+                "Decode HiCache L3 with DCP requires "
+                "--hicache-storage-prefetch-policy wait_complete."
+            )
     if (storage_backend or cfg.hicache_storage_backend) not in ("file", "mooncake"):
         raise NotImplementedError(
             "HiCache L3 with DCP requires file or Mooncake storage."
