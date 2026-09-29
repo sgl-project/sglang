@@ -272,8 +272,19 @@ class Schedule(msgspec.Struct):
             "Useful when each admission is disproportionately expensive, e.g. "
             "speculative decoding with a separate draft prefill pass. An "
             "explicit value always wins, capped by max-running-requests "
-            "(1 disables). When unset, DFlash workloads auto-enable the "
-            "formula; other workloads stay disabled. Not supported with "
-            "pipeline parallelism."
+            "(1 disables). When unset, DFlash workloads scale the formula "
+            "from active request demand; other workloads stay disabled. Not "
+            "supported with pipeline parallelism; bypassed when priority "
+            "preemption is enabled."
+        ),
+    ] = None
+
+    min_free_slots_max_delay_passes: A[
+        Optional[int],
+        (
+            "Maximum scheduler passes to delay replacement prefills. When "
+            "unset, the limit follows the observed running-request target; "
+            "0 disables waiting. Only applies when the min-free-slots delay "
+            "is explicitly or automatically enabled."
         ),
     ] = None
