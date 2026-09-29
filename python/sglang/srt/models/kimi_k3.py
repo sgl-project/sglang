@@ -3109,7 +3109,14 @@ class KimiK3LinearForCausalLM(nn.Module):
                 }
                 quant_config.update_packed_modules_mapping({"model": model_mapping})
             else:
-                quant_config.update_packed_modules_mapping(self.packed_modules_mapping)
+                # The loader seeded this mapping from the outer model class;
+                # replacing it would drop those entries.
+                quant_config.update_packed_modules_mapping(
+                    {
+                        **(quant_config.packed_modules_mapping or {}),
+                        **self.packed_modules_mapping,
+                    }
+                )
         self.model = KimiK3LinearModel(
             config, quant_config, prefix=maybe_prefix(prefix, "model")
         )

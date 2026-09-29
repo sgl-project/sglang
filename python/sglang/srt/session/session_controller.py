@@ -423,7 +423,7 @@ class SessionController:
             # An in-flight request is still decoding on this session's KV
             # memory. Freeing now would corrupt the scheduler. Mark the
             # session for deferred cleanup: the request keeps its session
-            # reference so cache_finished_req takes the streaming path,
+            # reference so release_kv_cache takes the streaming path,
             # and we schedule release_session for after it completes.
             session.close_on_finish = True
             logger.info(
