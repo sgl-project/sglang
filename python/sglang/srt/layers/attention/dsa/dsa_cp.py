@@ -560,6 +560,46 @@ def dsa_cp_slice(x: torch.Tensor, plan: DsaCpPlan) -> torch.Tensor:
     return torch.cat([sliced, pad], dim=0)
 
 
+def _log_first_a2a_device_cost(before: int) -> None:
+    """Say, once, what the first DSA-CP all-to-all took off the device.
+
+    The weight gather measured a **fixed** ~1.95 GiB that the torch allocator
+    never sees: 2.89 GiB of device for 0.91 GiB of tensors with one weight
+    gathered, 4.05 GiB for 2.13 GiB with two, and between layer 52 and 78 the
+    device grew 0.32 GiB against 0.30 GiB of tensors. A one-time cost, paid on
+    the attention-TP group's first collective, and the sizes of what is being
+    gathered barely move it.
+
+    That raises the question this answers. The narrow all-to-all makes the
+    group's first collective happen during **weight loading**, so the KV pool
+    is sized after it and pays for it. The wide path's first collective is this
+    all-to-all, at the **first forward** -- after the pool is already sized. If
+    the number below matches, the wide path is paying the same memory out of
+    whatever margin was left over, and the narrow path does not cost it so much
+    as make it visible. If it does not, the cost is genuinely the gather's.
+
+    Either answer matters beyond this feature: memory the pool sizing cannot
+    see is what makes a box run out of room at a mem-fraction that looked safe.
+    """
+    npu = getattr(torch, "npu", None)
+    if npu is None:
+        return
+    after = npu.mem_get_info()[0]
+    logger.info(
+        "DSA-CP first all-to-all on the attention-TP group: device free "
+        "%.2f -> %.2f GiB, %.2f GiB taken, of which the torch allocator "
+        "accounts for %.2f GiB. The rest is the collective's own buffers, and "
+        "it is charged here only because the KV pool was sized before it.",
+        before / (1 << 30),
+        after / (1 << 30),
+        (before - after) / (1 << 30),
+        npu.memory_reserved() / (1 << 30),
+    )
+
+
+_first_a2a_logged = False
+
+
 def dsa_cp_redistribute_heads(x: torch.Tensor, plan: DsaCpPlan) -> torch.Tensor:
     """``[num_tokens, h, d]`` -> ``[rows, h * tp_size, d]``, by all-to-all.
 
@@ -591,7 +631,14 @@ def dsa_cp_redistribute_heads(x: torch.Tensor, plan: DsaCpPlan) -> torch.Tensor:
     # npu_transpose_batchmatmul and view() refuses that.
     send = x.reshape(tp, plan.rows, h, d).contiguous()
     recv = torch.empty_like(send)
+    global _first_a2a_logged
+    npu = getattr(torch, "npu", None)
+    measure = npu is not None and not _first_a2a_logged
+    before = npu.mem_get_info()[0] if measure else 0
     parallel.attn_tp_group.all_to_all_single(recv, send)
+    if measure:
+        _first_a2a_logged = True
+        _log_first_a2a_device_cost(before)
     return recv.permute(1, 0, 2, 3).reshape(plan.rows, tp * h, d)
 
 
