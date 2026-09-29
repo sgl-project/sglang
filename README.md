@@ -4,9 +4,24 @@
 <img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="SGLang" width="400">
 </p>
 
-SGLang is an open-source framework for fast inference with large language and multimodal models. It is built for agentic workloads, RL rollouts, and large-scale model serving. Prefix caching reuses shared context across multi-turn requests, continuous batching improves throughput, and distributed inference scales from a single GPU to large clusters.
+<p align="center">
+  <a href="https://pypi.org/project/sglang/"><img src="https://img.shields.io/pypi/v/sglang?style=flat&amp;label=PyPI&amp;labelColor=555555&amp;color=orange" alt="PyPI version"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-green?style=flat&amp;labelColor=555555" alt="License: Apache 2.0"></a>
+  <a href="https://pypistats.org/packages/sglang"><img src="https://img.shields.io/pypi/dm/sglang?style=flat&amp;label=Downloads&amp;labelColor=555555&amp;color=blue" alt="PyPI downloads per month"></a>
+  <a href="https://deepwiki.com/sgl-project/sglang"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"></a>
+</p>
 
-👋 New here? Start with the example below, explore [sglang.io](https://www.sglang.io/), or find a recipe for your model in the [Cookbook](https://cookbook.sglang.io/). Join our [Slack](https://slack.sglang.io/) for development and discussion. Want to meet the people building SGLang? Come join a meetup, workshop, or office hour. You can find us at [SGLang Events](https://www.sglang.io/events).
+<p align="center">
+  <a href="https://docs.sglang.io/">Docs</a> |
+  <a href="https://cookbook.sglang.io/">Cookbook</a> |
+  <a href="https://www.sglang.io/">Website</a> |
+  <a href="https://lmsys.org/blog/">Blog</a> |
+  <a href="https://slack.sglang.io/">Slack</a>
+</p>
+
+SGLang is an open-source inference framework for LLMs and multimodal models, optimized for agentic workloads, RL rollouts, and large-scale serving.
+
+👋 Get started below, or meet the community at [SGLang Events](https://www.sglang.io/events), including meetups, developer meetings, workshops, and office hours.
 
 ## Install and Quick Start
 
@@ -27,10 +42,11 @@ docker pull lmsysorg/sglang:latest
 Start a container shell:
 
 ```bash
+HF_CACHE_DIR="$HOME/.cache/huggingface"
 docker run -it --gpus all \
   --shm-size 32g \
   -p 30000:30000 \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  -v "$HF_CACHE_DIR:/root/.cache/huggingface" \
   --ipc=host \
   lmsysorg/sglang:latest bash
 ```
