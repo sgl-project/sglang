@@ -300,21 +300,35 @@ position in the scheduler loop. Start the server with either
 empty rather than reporting a scheduler-loop interval under a forward-pass
 name.
 
-All three series are exported from a single canonical scheduler rank
-(attention TP rank 0 on the final pipeline stage), matching the rank the
-forward-pass metrics publisher uses, so no rank fan-out occurs and the queries
-below can aggregate over `le` without a `pp_rank` selector — with `--pp-size`
-set, stages other than the last contribute nothing rather than N samples per
-step. `sglang:schedule_to_result_latency_seconds` samples every engine step.
-The two forward-pass series inherit the publisher's device-timer drain
-semantics: a step whose forward produced no completed device interval is
-skipped, and if the next batch's forward completes before the drain point its
-time is folded into the current sample. Rates stay meaningful; an exact
-one-sample-per-step count does not. This holds
-under `--enable-metrics-for-all-schedulers` too: that flag widens the other
-scheduler metrics to every rank, but these three stay on the canonical rank so
-that one sample still means one engine step. Deployments without pipeline
-parallelism are unaffected.
+Each batch is sampled by exactly one scheduler rank: attention TP rank 0 and
+attention CP rank 0 on the final pipeline stage, the same rank predicate the
+forward-pass metrics publisher uses. The other TP, CP and PP ranks run the same
+batch and export nothing, so the queries below can aggregate over `le` without
+a `tp_rank` or `pp_rank` selector; with `--pp-size` set, stages other than the
+last stay silent rather than adding N samples per step. This holds under
+`--enable-metrics-for-all-schedulers` too: that flag widens the other scheduler
+metrics to every rank, but these three stay on the one rank so that one sample
+still means one batch.
+
+With `--enable-dp-attention`, each attention DP group runs its own batch, so
+each group exports its own samples under its `dp_rank` label, and one engine
+step yields one sample per `dp_rank`.
+
+`sglang:schedule_to_result_latency_seconds` samples every engine step, on
+unified, pipeline-parallel and PD-disaggregated schedulers. A forward-pass
+sample is the device time of exactly the forward segments that batch's own
+launch recorded, summed when one batch launches several (for example
+speculative draft and verify). Under overlap the next batch's forward may
+already have finished when this batch's result is processed; it is left for
+the next batch's sample rather than folded into this one. A step is skipped
+only when it launched no timed forward segment (for example a
+disaggregated-decode placeholder batch), or, defensively, when one of its
+segments has not completed by result processing; the metric never waits on the
+device to find out.
+
+None of the three series is exported with `--enable-pdmux`: PD multiplexing
+runs decode and split prefill concurrently on separate streams, so one batch's
+forward time cannot be separated from the other's.
 
 To check that the metrics are exposed:
 
@@ -332,6 +346,13 @@ equals one visible token interval" only approximate.
 `sglang:forward_pass_duration_seconds` is the scheduler-side share of an engine
 step. A gap that widens while forward duration stays flat points at scheduling
 or launch cost, not at the model.
+
+With DP attention the attention DP ranks run each forward in lockstep, so a
+prefill on one rank can stretch a step that carries only decode requests on
+another. That step is recorded on the decode rank as `phase="decode_only"` with
+`co_scheduled_prefill_bucket="0"`, because the labels describe the rank's own
+batch. A `decode_only` tail that tracks prefill on peer ranks is cross-rank
+interference, not a slow decode.
 
 ### PromQL examples
 
@@ -386,10 +407,14 @@ sum by (co_scheduled_prefill_bucket) (
 )
 ```
 
-For engine-step throughput, count the series that samples every step:
+For engine-step throughput, count the series that samples every step. Keep
+`dp_rank` in the grouping, since with DP attention every `dp_rank` samples each
+step:
 
 ```promql
-sum(rate(sglang:schedule_to_result_latency_seconds_count[5m]))
+sum by (dp_rank) (
+  rate(sglang:schedule_to_result_latency_seconds_count[5m])
+)
 ```
 
 Engine-step p99 including scheduling and launch, to compare against the

@@ -809,8 +809,8 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             name="sglang:forward_pass_duration_seconds",
             documentation=(
                 "Histogram of the device-measured duration of a single model "
-                "forward pass in seconds. Bounded by the batch's own forward, "
-                "so it never includes scheduler or launch work."
+                "forward pass in seconds. Bounded by this batch's own forward "
+                "segments; excludes the next batch's scheduling and launch."
             ),
             labelnames=list(labels.keys())
             + ["phase", "prefill_tokens_bucket", "decode_reqs_bucket"],

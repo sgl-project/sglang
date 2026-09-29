@@ -6,18 +6,25 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 import math
 import types
 import unittest
+from collections import deque
 from functools import partial
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import prometheus_client
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     PrefillStats,
     SchedulerMetricsReporter,
     _CacheHitRateWindow,
 )
+from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils.device_timer import DeviceTimer
 from sglang.test.test_utils import CustomTestCase, enter_scope
 
 
@@ -110,26 +117,41 @@ class _CollectingMetricsCollector:
 class _FakeDeviceTimer:
     """CPU stand-in for the CUDA-event device timer.
 
-    `record` queues the device time of one forward segment; `_report` hands the
-    queued values to every registered reporter, which is what the real timer
-    does once the segment's end event completes.
+    `record` starts one forward segment with the given device time; `_report`
+    hands completed segments to every reporter in start order and stops at the
+    first one still running, as the real timer does with its end events.
     """
 
     def __init__(self, reporter):
         self._reporters = [reporter]
-        self._pending = []
+        self._segments = deque()
+        self.num_started = 0
 
     def add_reporter(self, reporter):
         self._reporters.append(reporter)
 
-    def record(self, seconds, category="decode"):
-        self._pending.append((seconds, category))
+    def record(self, seconds, category="decode", done=True):
+        self._segments.append([seconds, category, done])
+        self.num_started += 1
+
+    def complete_all(self):
+        for segment in self._segments:
+            segment[2] = True
 
     def _report(self):
-        pending, self._pending = self._pending, []
-        for seconds, category in pending:
+        while self._segments and self._segments[0][2]:
+            seconds, category, _ = self._segments.popleft()
             for reporter in self._reporters:
                 reporter(t=seconds, category=category)
+
+
+def _launch(reporter, batch, *segment_seconds, done=True):
+    """Launch `batch` the way `Scheduler.run_batch` brackets its forward."""
+    begin = reporter.forward_timer_ordinal()
+    for seconds in segment_seconds:
+        reporter.forward_pass_device_timer.record(seconds, done=done)
+    reporter.stamp_forward_timer_span(batch, begin)
+    return batch
 
 
 def _make_reporter(
@@ -202,6 +224,7 @@ class TestForwardPassMetrics(unittest.TestCase):
             prefill_stats=None,
             seq_lens_cpu=[],
             fpm_start_time=100.0,
+            forward_timer_span=None,
         )
         defaults.update(overrides)
         return types.SimpleNamespace(**defaults)
@@ -308,7 +331,7 @@ class TestForwardPassMetrics(unittest.TestCase):
             fpm_start_time=fpm_start_time,
         )
 
-    def _make_device_timed_reporter(self, metrics_collector):
+    def _make_device_timed_reporter(self, metrics_collector, **reporter_kwargs):
         """Build a reporter whose forward timing comes from a fake device timer."""
         self.scheduler.enable_fpm = False
         with (
@@ -326,6 +349,7 @@ class TestForwardPassMetrics(unittest.TestCase):
                 self.scheduler,
                 metrics_collector=metrics_collector,
                 current_scheduler_metrics_enabled=True,
+                **reporter_kwargs,
             )
 
     def test_schedule_to_result_observation_does_not_require_fpm(self):
@@ -366,9 +390,10 @@ class TestForwardPassMetrics(unittest.TestCase):
         def run_step(next_batch_overhead: float) -> _CollectingMetricsCollector:
             metrics_collector = _CollectingMetricsCollector()
             reporter = self._make_device_timed_reporter(metrics_collector)
-            batch = self._make_mixed_batch(fpm_start_time=100.0)
             # Batch n's own forward: 10 ms on device.
-            reporter.forward_pass_device_timer.record(0.010)
+            batch = _launch(
+                reporter, self._make_mixed_batch(fpm_start_time=100.0), 0.010
+            )
             # The loop then picks and launches batch n+1 before popping n's
             # result off the queue, which is what the extra overhead stands for.
             with patch(
@@ -432,8 +457,7 @@ class TestForwardPassMetrics(unittest.TestCase):
 
         self.reporter.forward_pass_device_timer.add_reporter(_fpm_reporter)
 
-        batch = self._make_mixed_batch()
-        self.reporter.forward_pass_device_timer.record(0.012)
+        batch = _launch(self.reporter, self._make_mixed_batch(), 0.012)
 
         with patch(
             "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic",
@@ -451,76 +475,365 @@ class TestForwardPassMetrics(unittest.TestCase):
         # ... and FPM saw the same interval from the same drain.
         self.assertAlmostEqual(self.scheduler._fpm_gpu_time_acc, 0.012, places=6)
 
-    def test_forward_pass_device_time_is_not_carried_into_the_next_batch(self):
+    def test_forward_pass_device_time_is_never_borrowed_across_batches(self):
+        """A batch exports the sum of its own segments once all have completed.
+
+        Speculative decoding launches several segments per batch. A batch with
+        a segment still running, or with no timed segment, exports no duration;
+        it does not take another batch's time, and a segment that completes
+        late is not charged to the batch processed after it.
+        """
         metrics_collector = _CollectingMetricsCollector()
         reporter = self._make_device_timed_reporter(metrics_collector)
+        timer = reporter.forward_pass_device_timer
 
-        reporter.forward_pass_device_timer.record(0.010)
-        with patch(
-            "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic",
-            return_value=100.020,
-        ):
-            reporter.observe_forward_pass_interference(self._make_mixed_batch())
-        # Second step: the device timer reported nothing new, so no forward
-        # duration is exported and the first step's time is not reused.
-        with patch(
-            "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic",
-            return_value=100.030,
-        ):
-            reporter.observe_forward_pass_interference(self._make_mixed_batch())
+        first = _launch(reporter, self._make_mixed_batch(), 0.004, 0.006)
+        reporter.observe_forward_pass_interference(first)
+        # Second segment still running on the device when its result is processed.
+        late = self._make_mixed_batch()
+        begin = reporter.forward_timer_ordinal()
+        timer.record(0.100)
+        timer.record(0.500, done=False)
+        reporter.stamp_forward_timer_span(late, begin)
+        reporter.observe_forward_pass_interference(late)
+        timer.complete_all()
+        # Went through run_batch but launched no timed segment.
+        untimed = _launch(reporter, self._make_mixed_batch())
+        reporter.observe_forward_pass_interference(untimed)
+        last = _launch(reporter, self._make_mixed_batch(), 0.020)
+        reporter.observe_forward_pass_interference(last)
+        # Never launched, e.g. a disaggregated-decode placeholder.
+        reporter.observe_forward_pass_interference(self._make_mixed_batch())
 
-        self.assertEqual(len(metrics_collector.forward_pass_interference), 1)
-        self.assertEqual(len(metrics_collector.schedule_to_result), 2)
+        durations = [
+            o["duration_seconds"] for o in metrics_collector.forward_pass_interference
+        ]
+        self.assertEqual(len(durations), 2)
+        self.assertAlmostEqual(durations[0], 0.010)
+        self.assertAlmostEqual(durations[1], 0.020)
+        self.assertEqual(len(metrics_collector.schedule_to_result), 5)
+
+    def test_real_device_timer_ordinals_match_reported_segments(self):
+        """`run_batch` stamps spans from `DeviceTimer.num_started` while the
+        reporter numbers segments by counting reports; the two must agree on
+        the real timer, not only on the fake one.
+        """
+        clock = {"ms": 0.0}
+
+        class _CpuEvent:
+            def __init__(self, enable_timing=False):
+                self.ms = None
+
+            def record(self):
+                self.ms = clock["ms"]
+
+            def query(self):
+                return True
+
+            def elapsed_time(self, end_event):
+                return end_event.ms - self.ms
+
+        metrics_collector = _CollectingMetricsCollector()
+        with patch(
+            "sglang.srt.managers.scheduler_components.metrics_reporter.ENABLE_METRICS_DEVICE_TIMER",
+            True,
+        ):
+            reporter = _make_reporter(
+                self,
+                self.scheduler,
+                metrics_collector=metrics_collector,
+                current_scheduler_metrics_enabled=True,
+            )
+        timer = reporter.forward_pass_device_timer
+        self.assertIs(type(timer), DeviceTimer)
+
+        def launch(*segment_ms):
+            batch = self._make_mixed_batch()
+            begin = reporter.forward_timer_ordinal()
+            for ms in segment_ms:
+                with timer.wrap(metadata={"category": "decode"}):
+                    clock["ms"] += ms
+            reporter.stamp_forward_timer_span(batch, begin)
+            return batch
+
+        with patch("sglang.srt.utils.device_timer.torch.cuda.Event", _CpuEvent):
+            # Overlap order: n+1 launches before n's result is processed.
+            first = launch(4.0, 6.0)
+            second = launch(30.0)
+            reporter.observe_forward_pass_interference(first)
+            reporter.observe_forward_pass_interference(second)
+
+        durations = [
+            o["duration_seconds"] for o in metrics_collector.forward_pass_interference
+        ]
+        self.assertEqual(len(durations), 2)
+        self.assertAlmostEqual(durations[0], 0.010)
+        self.assertAlmostEqual(durations[1], 0.030)
+
+    def test_forward_pass_composition_does_not_need_seq_lens_cpu(self):
+        """Decode requests are counted from the batch, not from `seq_lens_cpu`,
+        which spec-v2 overlap may leave as None. A decode batch that DP
+        attention runs as a 1-token extend still counts as decode.
+        """
+        metrics_collector = _CollectingMetricsCollector()
+        self.reporter = _make_reporter(
+            self,
+            self.scheduler,
+            metrics_collector=metrics_collector,
+            current_scheduler_metrics_enabled=True,
+        )
+        reqs = [_FakeReq(8, output_len=3), _FakeReq(5, output_len=1)]
+        spec_v2_decode = self._make_batch(reqs=reqs, seq_lens_cpu=None)
+        dp_converted_decode = self._make_batch(
+            forward_mode=_FakeForwardMode(is_extend=True),
+            reqs=reqs,
+            decoding_reqs=reqs,
+            seq_lens_cpu=None,
+        )
+
+        for batch in (spec_v2_decode, dp_converted_decode):
+            self.reporter.observe_forward_pass_interference(batch)
+
+        self.assertEqual(
+            [
+                (o["phase"], o["prefill_tokens"], o["decode_reqs"])
+                for o in metrics_collector.schedule_to_result
+            ],
+            [("decode_only", 0, 2)] * 2,
+        )
+
+    def _drive_event_loop(self, event_loop, *, disable_overlap):
+        """Run three decode batches through a real scheduler loop.
+
+        The real `Scheduler.run_batch` brackets each forward, and the model
+        worker records the segment the model runner's device-timer wrap would.
+        Every forward has finished on the device before any result is
+        processed. Returns the launch/process order (by forward iteration) and
+        the exported forward durations in result-processing order.
+
+        `run_batch` takes its non-overlap branch even for the overlap loop: the
+        span is stamped after both branches, and the loop order is what differs.
+        """
+        metrics_collector = _CollectingMetricsCollector()
+        reporter = self._make_device_timed_reporter(metrics_collector)
+        device_seconds = iter([0.010, 0.030, 0.020])
+        events = []
+
+        def forward_batch_generation(batch, **_kwargs):
+            events.append(("launch", batch.forward_iter))
+            reporter.forward_pass_device_timer.record(next(device_seconds))
+            return GenerationBatchResult()
+
+        def process_batch_result(batch, _result):
+            events.append(("process", batch.forward_iter))
+            reporter.observe_forward_pass_interference(batch)
+
+        schedule = [
+            ScheduleBatch(
+                reqs=[],
+                forward_mode=ForwardMode.DECODE,
+                spec_algorithm=SpeculativeAlgorithm.NONE,
+                seq_lens_cpu=[8],
+            )
+            for _ in range(3)
+        ] + [None]
+
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.gracefully_exit = False
+        scheduler._engine_paused = False
+        scheduler._sched_idled = False
+        scheduler.forward_ct = 0
+        scheduler.is_generation = True
+        scheduler.enable_overlap = False
+        scheduler.enable_pdmux = False
+        scheduler.enable_unified_memory = False
+        scheduler.enable_dp_attention = False
+        scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
+        scheduler.scheduler_stage_metrics = None
+        scheduler.scripted_scheduler_hook = None
+        scheduler.forward_sleep_time = None
+        scheduler.profiler_manager = types.SimpleNamespace(
+            _profile_batch_predicate=Mock()
+        )
+        scheduler.future_map = None
+        scheduler.model_worker = types.SimpleNamespace(
+            forward_batch_generation=forward_batch_generation
+        )
+        scheduler.update_cache_from_scheduler = Mock()
+        scheduler._copy_auxiliary_output_to_cpu = Mock()
+        scheduler.metrics_reporter = types.SimpleNamespace(
+            record_scheduler_active=Mock(),
+            forward_timer_ordinal=reporter.forward_timer_ordinal,
+            stamp_forward_timer_span=reporter.stamp_forward_timer_span,
+        )
+        scheduler.running_batch = None
+        scheduler.last_batch = None
+        scheduler.ingest_requests = Mock(
+            side_effect=[None] * len(schedule) + [StopIteration]
+        )
+        scheduler.get_next_batch_to_run = Mock(
+            side_effect=[
+                types.SimpleNamespace(running_batch=None, batch_to_run=batch)
+                for batch in schedule
+            ]
+        )
+        scheduler.is_disable_overlap_for_batch = lambda batch, last_batch: (
+            disable_overlap and batch is not None and last_batch is not None
+        )
+        scheduler._apply_war_barrier = Mock()
+        scheduler.launch_batch_sample_if_needed = Mock()
+        scheduler.on_idle = Mock()
+        scheduler.process_batch_result = process_batch_result
+
+        with (
+            patch("sglang.srt.managers.scheduler.resolve_forward_inputs"),
+            self.assertRaises(StopIteration),
+        ):
+            event_loop(scheduler)
+
+        durations = [
+            o["duration_seconds"] for o in metrics_collector.forward_pass_interference
+        ]
+        return events, durations
+
+    def test_forward_duration_is_attributed_to_its_own_batch_in_every_loop(self):
+        """On the steady-state overlap branch `event_loop_overlap` launches n+1
+        before it processes n. If n+1's forward has already finished by then,
+        draining the device timer at n's result would charge n+1's forward to
+        n. Each sample must be its own batch's forward on that branch, on the
+        disable-overlap branch (n is processed before n+1 launches), and in
+        the normal loop.
+        """
+        sequential = [
+            ("launch", 1),
+            ("process", 1),
+            ("launch", 2),
+            ("process", 2),
+            ("launch", 3),
+            ("process", 3),
+        ]
+        cases = [
+            (
+                "overlap",
+                Scheduler.event_loop_overlap,
+                False,
+                [
+                    ("launch", 1),
+                    ("launch", 2),
+                    ("process", 1),
+                    ("launch", 3),
+                    ("process", 2),
+                    ("process", 3),
+                ],
+            ),
+            ("overlap_disabled", Scheduler.event_loop_overlap, True, sequential),
+            ("normal", Scheduler.event_loop_normal, False, sequential),
+        ]
+        for name, event_loop, disable_overlap, expected_order in cases:
+            with self.subTest(name):
+                events, durations = self._drive_event_loop(
+                    event_loop, disable_overlap=disable_overlap
+                )
+                self.assertEqual(events, expected_order)
+                self.assertEqual(durations, [0.010, 0.030, 0.020])
 
     def test_forward_pass_metrics_emit_from_one_canonical_pp_rank(self):
-        """One logical engine step must produce exactly one sample.
+        """One batch must produce exactly one sample.
 
-        FPM already gates to attention TP rank 0 on the final PP stage; the
-        Prometheus series follow the same rank, otherwise every stage of a
-        pp_size=N deployment exports its own stage-local timing under the same
-        series name.
+        The attention TP, CP and PP ranks of a batch all run it. FPM and the
+        Prometheus series both gate to attention TP and CP rank 0 on the final
+        PP stage; otherwise every one of those ranks exports its own timing of
+        the same batch under the same series name.
         """
         cases = [
-            # pp_rank, pp_size, attn_tp_rank, emits
-            (0, 1, 0, True),  # no pipeline parallelism: unchanged
-            (0, 2, 0, False),  # earlier PP stage stays silent
-            (1, 2, 0, True),  # final PP stage is the canonical rank
-            (1, 2, 1, False),  # non-zero attention TP rank stays silent
-            (2, 4, 0, False),
-            (3, 4, 0, True),
+            # pp_rank, pp_size, attn_tp_rank, attn_cp_rank, emits
+            (0, 1, 0, 0, True),  # no pipeline parallelism: unchanged
+            (0, 2, 0, 0, False),  # earlier PP stage stays silent
+            (1, 2, 0, 0, True),  # final PP stage is the canonical rank
+            (1, 2, 1, 0, False),  # non-zero attention TP rank stays silent
+            (1, 2, 0, 1, False),  # non-zero attention CP rank stays silent
+            (2, 4, 0, 0, False),
+            (3, 4, 0, 0, True),
         ]
-        for pp_rank, pp_size, attn_tp_rank, emits in cases:
+        for pp_rank, pp_size, attn_tp_rank, attn_cp_rank, emits in cases:
             with (
-                self.subTest(pp_rank=pp_rank, pp_size=pp_size, attn_tp=attn_tp_rank),
+                self.subTest(
+                    pp_rank=pp_rank,
+                    pp_size=pp_size,
+                    attn_tp=attn_tp_rank,
+                    attn_cp=attn_cp_rank,
+                ),
                 get_parallel().override(
                     pp_rank=pp_rank,
                     pp_size=pp_size,
-                    tp_rank=attn_tp_rank,
-                    tp_size=2,
+                    tp_rank=attn_cp_rank * 2 + attn_tp_rank,
+                    tp_size=4,
                     attn_tp_rank=attn_tp_rank,
                     attn_tp_size=2,
-                    moe_tp_size=2,
+                    attn_cp_rank=attn_cp_rank,
+                    attn_cp_size=2,
+                    moe_tp_size=4,
                 ),
             ):
                 metrics_collector = _CollectingMetricsCollector()
-                reporter = _make_reporter(
-                    self,
-                    self.scheduler,
-                    metrics_collector=metrics_collector,
-                    current_scheduler_metrics_enabled=True,
-                    is_stats_logging_rank=attn_tp_rank == 0,
+                reporter = self._make_device_timed_reporter(
+                    metrics_collector, is_stats_logging_rank=attn_tp_rank == 0
                 )
+                batch = _launch(reporter, self._make_mixed_batch(), 0.010)
                 with patch(
                     "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic",
                     return_value=100.075,
                 ):
-                    reporter.observe_forward_pass_interference(self._make_mixed_batch())
+                    reporter.observe_forward_pass_interference(batch)
 
-                observed = len(metrics_collector.forward_pass_interference) + len(
-                    metrics_collector.schedule_to_result
+                expected = 1 if emits else 0
+                self.assertEqual(
+                    len(metrics_collector.forward_pass_interference), expected
                 )
-                self.assertEqual(observed, 1 if emits else 0)
+                self.assertEqual(len(metrics_collector.schedule_to_result), expected)
                 self.assertEqual(reporter.forward_pass_metrics_enabled, emits)
+
+    def test_forward_pass_metrics_are_off_under_pdmux(self):
+        """PD multiplexing runs decode and split prefill concurrently on one
+        device timer, so a batch's own forward time is not attributable."""
+        with get_context().override_server_args(enable_pdmux=True):
+            reporter = self._make_device_timed_reporter(_CollectingMetricsCollector())
+        self.assertFalse(reporter.forward_pass_metrics_enabled)
+
+    def test_disaggregated_batch_selectors_stamp_schedule_start(self):
+        """schedule_to_result is sampled only from batches stamped with their
+        selection start, so the PD-disaggregation selectors must stamp it too.
+        """
+        running = ScheduleBatch(reqs=[_FakeReq(4)])
+        prefill = ScheduleBatch(reqs=[_FakeReq(4)])
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.scheduler_stage_metrics = None
+        scheduler.get_new_prebuilt_batch = Mock(return_value=None)
+        scheduler.update_running_batch = lambda batch: batch
+        scheduler.dp_attn_adapter = types.SimpleNamespace(
+            maybe_prepare_mlp_sync_batch=lambda batch: batch
+        )
+        scheduler.process_pending_chunked_abort = Mock()
+        scheduler._process_hicache_events = Mock()
+        scheduler.resolve_waiting_queue_bootstrap = Mock()
+        scheduler.process_prefill_chunk = Mock()
+        scheduler.get_new_batch_prefill = Mock(
+            return_value=types.SimpleNamespace(
+                batch_to_run=prefill, running_batch=running
+            )
+        )
+
+        selectors = [
+            ("decode", lambda: scheduler.get_next_disagg_decode_batch_to_run(running)),
+            (
+                "prefill",
+                lambda: scheduler.get_next_disagg_prefill_batch_to_run(running, None),
+            ),
+        ]
+        for name, select in selectors:
+            with self.subTest(name), patch("time.monotonic", return_value=42.0):
+                self.assertEqual(select().batch_to_run.fpm_start_time, 42.0)
 
     def test_disagg_prefill_queued_metrics_include_compute_waiting_queue(self):
         self.scheduler.disaggregation_mode = DisaggregationMode.PREFILL

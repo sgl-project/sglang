@@ -200,6 +200,39 @@ class _ForwardOccupancyLogWindow(msgspec.Struct):
         )
 
 
+def _is_forward_pass_metrics_rank() -> bool:
+    """Attention TP and CP rank 0 on the final PP stage: one sample per batch.
+
+    The TP, CP and PP ranks of an attention DP group all run the same batch.
+    Shared by the FPM publisher and the Prometheus forward-pass series so the
+    two cannot drift onto different ranks.
+    """
+    parallel = get_parallel()
+    return (
+        parallel.attn_tp_rank == 0
+        and parallel.attn_cp_rank == 0
+        and parallel.pp_rank == parallel.pp_size - 1
+    )
+
+
+def _forward_pass_composition(batch: ScheduleBatch) -> Tuple[int, int]:
+    """Scheduled prefill tokens and decode requests of one forward pass.
+
+    Constant time, and independent of `seq_lens_cpu`, which spec-v2 overlap
+    may leave as None.
+    """
+    mode = batch.forward_mode
+    if mode.is_decode():
+        return 0, len(batch.reqs)
+    if not mode.is_extend():
+        return 0, 0
+    stats = batch.prefill_stats
+    prefill_tokens = stats.log_input_tokens if stats is not None else 0
+    # Set on mixed batches, and on decode batches that DP attention runs as
+    # 1-token extends (those have no prefill_stats).
+    return prefill_tokens, len(batch.decoding_reqs or [])
+
+
 def _forward_pass_phase(prefill_tokens: int, decode_reqs: int) -> str:
     """Label the scheduling composition of one forward pass."""
     if prefill_tokens > 0 and decode_reqs > 0:
@@ -227,17 +260,15 @@ class SchedulerMetricsReporter:
         self.current_scheduler_metrics_enabled = (
             self.metrics_collector_context.current_scheduler_metrics_enabled
         )
-        # Per-forward-pass Prometheus series are emitted from the same single
-        # canonical rank FPM uses (attention TP rank 0 on the final PP stage),
-        # so one logical engine step contributes exactly one sample. Without the
-        # PP condition every stage of a pp_size=N deployment exports its own
-        # stage-local timing under the same series, and queries that aggregate
-        # over pp_rank silently blend partial-stage timings and inflate the
-        # sample count N-fold. pp_size == 1 is unaffected.
+        # Without the rank condition every PP stage and CP rank exports its own
+        # sample of the same batch under the same series, and queries that
+        # aggregate over those labels blend them and inflate the sample count.
+        # PD multiplexing runs decode and split prefill concurrently on one
+        # device timer, so a batch's forward time cannot be isolated there.
         self.forward_pass_metrics_enabled = (
             self.current_scheduler_metrics_enabled
-            and self.is_stats_logging_rank
-            and get_parallel().pp_rank == get_parallel().pp_size - 1
+            and _is_forward_pass_metrics_rank()
+            and not get_disagg().enable_pdmux
         )
         self.enable_kv_cache_events = (
             self.metrics_collector_context.enable_kv_cache_events
@@ -361,8 +392,7 @@ class SchedulerMetricsReporter:
         self.scheduler.enable_fpm = False
         if (
             get_observability().enable_forward_pass_metrics
-            and get_parallel().attn_tp_rank == 0
-            and get_parallel().pp_rank == get_parallel().pp_size - 1
+            and _is_forward_pass_metrics_rank()
         ):
             from sglang.srt.observability.forward_pass_metrics import (
                 _FpmPublisherThread,
@@ -418,10 +448,16 @@ class SchedulerMetricsReporter:
         processes n's result, so any wall interval ending at result processing
         carries n+1's scheduling and launch work.
 
+        Completed segments are kept with their start ordinal and claimed by the
+        batch whose `run_batch` launched them, not drained in bulk: under
+        overlap n+1's forward can already have finished when n's result is
+        processed, and a bulk drain would charge it to n.
+
         Must run after `_init_fpm`, which installs the timer when FPM is on but
         the metrics device timer env flag is not.
         """
-        self._forward_pass_gpu_time_acc = 0.0
+        self._forward_pass_device_segments: deque = deque()
+        self._forward_pass_num_reported = 0
         self._forward_pass_uses_device_timer = False
         if not self.forward_pass_metrics_enabled:
             return
@@ -429,24 +465,56 @@ class SchedulerMetricsReporter:
             return
 
         def _forward_pass_prometheus_reporter(t, **_kwargs):
-            self._forward_pass_gpu_time_acc += t
+            # The timer reports segments in start order, so the call count is
+            # the segment's ordinal.
+            self._forward_pass_device_segments.append(
+                (self._forward_pass_num_reported, t)
+            )
+            self._forward_pass_num_reported += 1
 
         self.forward_pass_device_timer.add_reporter(_forward_pass_prometheus_reporter)
         self._forward_pass_uses_device_timer = True
 
-    def _take_forward_pass_device_time(self) -> Optional[float]:
-        """Drain and return the device time this batch's forward pass took.
+    def forward_timer_ordinal(self) -> Optional[int]:
+        """Ordinal of the next device-timed forward segment, or None if untimed."""
+        if not self._forward_pass_uses_device_timer:
+            return None
+        return self.forward_pass_device_timer.num_started
 
-        Returns None when no device-timed forward is available; the caller then
-        exports no forward duration at all rather than substituting a
-        scheduler-loop interval that would carry the next batch's work.
+    def stamp_forward_timer_span(
+        self, batch: ScheduleBatch, begin: Optional[int]
+    ) -> None:
+        """Record the device-timer segments `run_batch` launched for `batch`."""
+        if begin is not None:
+            batch.forward_timer_span = (
+                begin,
+                self.forward_pass_device_timer.num_started,
+            )
+
+    def _take_forward_pass_device_time(self, batch: ScheduleBatch) -> Optional[float]:
+        """Return the device time of this batch's own forward segments.
+
+        Segments launched after this batch stay queued for the batch that owns
+        them; unclaimed earlier ones are dropped. Returns None unless every
+        segment in the batch's span has completed, so a partial or borrowed
+        interval is never exported. Never waits on the device.
         """
         if not self._forward_pass_uses_device_timer:
             return None
         self.forward_pass_device_timer._report()
-        elapsed = self._forward_pass_gpu_time_acc
-        self._forward_pass_gpu_time_acc = 0.0
-        if elapsed <= 0.0:
+        span = batch.forward_timer_span
+        if span is None:
+            return None
+        begin, end = span
+        segments = self._forward_pass_device_segments
+        claimed = 0
+        elapsed = 0.0
+        while segments and segments[0][0] < end:
+            ordinal, seconds = segments.popleft()
+            if ordinal >= begin:
+                claimed += 1
+                elapsed += seconds
+        if claimed == 0 or claimed != end - begin:
             return None
         return elapsed
 
@@ -1213,9 +1281,11 @@ class SchedulerMetricsReporter:
         them is forward time:
 
         * forward pass duration (and its decode-side view, decode step latency)
-          is the device-timed duration of *this* batch's forward. It stays
-          bounded by that forward on both `event_loop_overlap` branches, so it
-          answers "did co-scheduled prefill stretch the model step".
+          is the device-timed duration of *this* batch's forward segments, as
+          stamped by `run_batch`. It stays bounded by that forward on both
+          `event_loop_overlap` branches even when the next batch's forward has
+          already completed, so it answers "did co-scheduled prefill stretch
+          the model step".
         * schedule-to-result latency runs from the start of this batch's
           scheduling decision to the end of its result processing. Under
           overlap that span also covers the next batch's scheduling and launch,
@@ -1225,9 +1295,9 @@ class SchedulerMetricsReporter:
         if not self.forward_pass_metrics_enabled:
             return
 
-        # Drain unconditionally once the timer is subscribed: device time left
-        # in the accumulator would be charged to the next batch's sample.
-        forward_seconds = self._take_forward_pass_device_time()
+        # Claim unconditionally once the timer is subscribed so the segment
+        # queue stays bounded even without a collector.
+        forward_seconds = self._take_forward_pass_device_time(batch)
         if self.metrics_collector is None:
             return
 
@@ -1239,9 +1309,7 @@ class SchedulerMetricsReporter:
         if forward_seconds is None and schedule_to_result_seconds is None:
             return
 
-        scheduled_requests = self._build_scheduled_request_metrics(batch)
-        prefill_tokens = scheduled_requests.sum_prefill_tokens
-        decode_reqs = scheduled_requests.num_decode_requests
+        prefill_tokens, decode_reqs = _forward_pass_composition(batch)
         phase = _forward_pass_phase(prefill_tokens, decode_reqs)
 
         if forward_seconds is not None:

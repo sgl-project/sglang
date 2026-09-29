@@ -22,6 +22,10 @@ class DeviceTimer:
         self._intervals: Deque[_TimingInterval] = deque()
         self._reporters: List[Callable] = [reporter]
         self._in_wrap = False
+        # Counted by DeviceTimer.wrap only. Intervals are reported in start
+        # order, so for a reporter added before the first wrap this is also the
+        # ordinal of the next segment it sees.
+        self.num_started = 0
 
     def add_reporter(self, reporter: Callable):
         self._reporters.append(reporter)
@@ -33,6 +37,7 @@ class DeviceTimer:
         assert not self._in_wrap, "DeviceTimer.wrap is not re-entrant"
         interval = _TimingInterval.create()
         self._intervals.append(interval)
+        self.num_started += 1
         self._in_wrap = True
         try:
             yield
