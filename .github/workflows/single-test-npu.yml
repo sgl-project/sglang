@@ -4,6 +4,7 @@ name: Single Test (NPU)
 on:
   pull_request:
     branches:
+      - main
       - testcases
       - testcases-260813
     paths:
