@@ -13,9 +13,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
-from sglang.srt.distributed import (
-    tensor_model_parallel_all_reduce,
-)
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.activation import SiluAndMul
@@ -1038,7 +1035,6 @@ class SarvamMoEMLADecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
-                reduce_results=False,
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
             )
@@ -1047,8 +1043,6 @@ class SarvamMoEMLADecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-
-        self.attn_tp_size = get_parallel().attn_tp_size
 
         self.attn_boundary, self.ffn_boundary = make_stages(
             (
@@ -1088,13 +1082,6 @@ class SarvamMoEMLADecoderLayer(nn.Module):
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             hidden_states = self.mlp(hidden_states, forward_batch)
-        if (
-            not self.is_layer_sparse
-            and self.attn_tp_size > 1
-            and not ffn_exit.mlp_reduce_scatter
-            and not ffn_exit.fuse_mlp_allreduce
-        ):
-            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         hidden_states = ffn_exit.finish(hidden_states)
         return hidden_states
 
