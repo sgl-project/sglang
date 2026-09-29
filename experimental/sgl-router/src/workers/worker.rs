@@ -6,7 +6,12 @@ use crate::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// How long a prefill stays unroutable while `/server_info` has not reported its
+/// bootstrap port. Afterwards the router sends a null port, which the engine
+/// resolves to its own configured default.
+pub const BOOTSTRAP_PORT_GRACE: Duration = Duration::from_secs(30);
 
 /// Which forwarding client the proxy uses for a worker.
 ///
@@ -179,6 +184,8 @@ pub struct Worker {
     /// decode and plain). Set via `--disaggregation-bootstrap-port` at
     /// worker startup; carried from `WorkerSpec`.
     bootstrap_port: Option<u16>,
+    /// First registration of this ID; upserts inherit it (see [`Self::awaiting_bootstrap_port`]).
+    pub(crate) registered_at: Instant,
 }
 
 impl Worker {
@@ -212,6 +219,7 @@ impl Worker {
             slots,
             bootstrap_host,
             bootstrap_port: spec.bootstrap_port,
+            registered_at: Instant::now(),
         }
     }
 
@@ -223,6 +231,13 @@ impl Worker {
     /// SGLang bootstrap server port. `None` for decode / plain workers.
     pub fn bootstrap_port(&self) -> Option<u16> {
         self.bootstrap_port
+    }
+
+    /// A prefill whose bootstrap port is still unknown within [`BOOTSTRAP_PORT_GRACE`].
+    pub fn awaiting_bootstrap_port(&self) -> bool {
+        self.mode() == WorkerMode::Prefill
+            && self.bootstrap_port.is_none()
+            && self.registered_at.elapsed() < BOOTSTRAP_PORT_GRACE
     }
 
     /// Returns the current [`WorkerMode`] of this worker.
@@ -412,6 +427,20 @@ mod tests {
             bootstrap_port: None,
         });
         assert_eq!(w.bootstrap_port(), None);
+    }
+
+    #[test]
+    fn portless_prefill_awaits_port_only_during_grace() {
+        let mut w = Worker::new(WorkerSpec {
+            id: WorkerId("p".into()),
+            url: "http://10.0.0.1:30000".into(),
+            mode: WorkerMode::Prefill,
+            model_ids: vec![],
+            bootstrap_port: None,
+        });
+        assert!(w.awaiting_bootstrap_port());
+        w.registered_at -= BOOTSTRAP_PORT_GRACE;
+        assert!(!w.awaiting_bootstrap_port());
     }
 
     #[test]

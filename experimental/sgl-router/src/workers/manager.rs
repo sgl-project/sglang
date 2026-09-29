@@ -393,9 +393,7 @@ fn reconcile_unresolved_workers(
     pending: &mut HashMap<WorkerId, JoinHandle<()>>,
 ) {
     for worker in registry.all() {
-        if !(worker.model_ids.is_empty()
-            || worker.mode() == WorkerMode::Prefill && worker.bootstrap_port().is_none())
-        {
+        if !(worker.model_ids.is_empty() || worker.awaiting_bootstrap_port()) {
             continue;
         }
         let id = worker.id.clone();
@@ -407,8 +405,8 @@ fn reconcile_unresolved_workers(
         let registry_t = registry.clone();
         let introspector_t = introspector.clone();
         let worker_url = worker.url.clone();
-        // Preserve any resolved model while retrying a missing prefill port.
-        // The worker stays registered but cannot receive requests until ready.
+        // Preserve any resolved model while retrying a missing prefill port; the
+        // worker is unroutable until the port arrives or its grace expires.
         let spec = WorkerSpec {
             id: id.clone(),
             url: worker_url.clone(),

@@ -123,7 +123,12 @@ impl WorkerRegistry {
                 }
             }
         }
-        let w = Arc::new(Worker::with_cb_config(spec, cb, protocol));
+        let mut w = Worker::with_cb_config(spec, cb, protocol);
+        // Keep the first-seen time so reconcile upserts cannot extend the bootstrap-port grace.
+        if let Some(prev) = self.by_id.get(&w.id) {
+            w.registered_at = prev.registered_at;
+        }
+        let w = Arc::new(w);
         let id = w.id.clone();
         self.remove_locked(&id);
         for m in &w.model_ids {
@@ -168,7 +173,7 @@ impl WorkerRegistry {
             .unwrap_or_default()
     }
 
-    /// Workers eligible for selection, including bootstrap readiness for prefill.
+    /// Workers eligible for selection; excludes prefills still awaiting a bootstrap port.
     pub fn healthy_workers_for(&self, model: &ModelId) -> Vec<Arc<Worker>> {
         // Use `would_allow` (non-mutating) for filtering — `allow()` would
         // claim a half-open probe slot for every enumerated candidate,
@@ -177,7 +182,7 @@ impl WorkerRegistry {
         // [`crate::proxy`].
         self.workers_for(model)
             .into_iter()
-            .filter(|w| w.mode() != WorkerMode::Prefill || w.bootstrap_port().is_some())
+            .filter(|w| !w.awaiting_bootstrap_port())
             .filter(|w| w.breaker.would_allow())
             .collect()
     }
@@ -272,6 +277,16 @@ mod tests {
         let mut ids: Vec<String> = r.all().into_iter().map(|w| w.id.0.clone()).collect();
         ids.sort();
         assert_eq!(ids, vec!["d", "p", "w1"]);
+    }
+
+    #[test]
+    fn upsert_keeps_registration_time() {
+        let r = WorkerRegistry::default();
+        let id = WorkerId("p".into());
+        r.add(spec("p", WorkerMode::Prefill, &["m"])).unwrap();
+        let first = r.get(&id).unwrap().registered_at;
+        r.add(spec("p", WorkerMode::Prefill, &["m"])).unwrap();
+        assert_eq!(r.get(&id).unwrap().registered_at, first);
     }
 
     #[test]
