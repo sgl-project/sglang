@@ -501,8 +501,6 @@ class IpcModelLoader(BaseModelLoader):
 
         try:
             # Build engine's config fingerprint
-            from sglang.srt.layers.dp_attention import get_moe_cp_size
-
             parallel = get_parallel()
             tp_size = parallel.tp_size
             tp_rank = parallel.tp_rank
@@ -511,7 +509,9 @@ class IpcModelLoader(BaseModelLoader):
             pp_rank = parallel.pp_rank
 
             ep_size = parallel.moe_ep_size
-            moe_dp_size = get_moe_cp_size()
+            # The configured width, as the daemon states it: the MoE
+            # communicator is wider when it aliases attention CP.
+            moe_dp_size = parallel.moe_dp_size
             moe_dp_rank = parallel.moe_dp_rank
             moe_ep_rank = parallel.moe_ep_rank
 
