@@ -56,11 +56,13 @@ pass `--pd-version-group-label <key>`. The router then pairs a prefill worker
 only with a decode worker that has the same value for that label, so KV is never
 transferred across versions. The label is read from the EndpointSlice, which
 copies it from its Service, so each (role, version) needs its own labeled
-Service. Prefill workers whose group has no healthy decode worker are skipped,
-and `/readyz` needs at least one group that has both roles. Workers without the
-label form one more group. Both legacy and `--chat-routing reorg` enforce these
-constraints. Reorg also requires the compatible pair to belong to the same bucket,
-and tries another group when every decode in the chosen group is full.
+Service; workers without the label, or with an empty value, form one more group.
+When no decode in a group can take a request (none healthy, all full, or no
+decode bucket fits) the request falls back to another group; it is never paired
+across groups. `sgl_router_pd_version_group_fallback_total` counts groups passed
+over because their decodes were full or did not fit. `/readyz` needs at least
+one group that has both roles (with `--chat-routing reorg`, within one bucket).
+Legacy and reorg routing both enforce these rules.
 
 ```bash
 sgl-router --model-id qwen3 --chat-routing reorg --policy power_of_two --service-discovery \
