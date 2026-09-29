@@ -3522,12 +3522,9 @@ def _configure_uvicorn_access_log_filter(
 
 
 def build_server_info(server_args, scheduler_info: Dict[str, Any]) -> Dict[str, Any]:
-    """Build startup metadata shared by HTTP and native gRPC servers.
+    """Build server metadata shared by HTTP and native gRPC.
 
-    Scheduler readiness supplies ``kv_event_sources`` for actual node-local
-    publishers. The legacy ``kv_events`` descriptor remains global; consumers
-    must not use it to infer node-local ownership. Callers add transport-specific
-    fields and serialize the result.
+    Callers add transport-specific fields and serialize the result.
     """
     result = server_args.resolved_dict()
     result["launch_command"] = server_args.launch_command
