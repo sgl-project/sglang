@@ -391,6 +391,39 @@ class GroupCoordinator:
                 )
         return input_
 
+    def reduce_scatter(
+        self, input_: torch.Tensor, output: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Sum across the group and keep this rank's slice of dim 0.
+
+        Dim 0 must divide by the group size; rank ``r`` receives rows
+        ``[r * n, (r + 1) * n)`` of the sum, ``n = input_.shape[0] // world``,
+        into ``output`` when one is given.
+        """
+        world_size = self.world_size
+        if world_size == 1:
+            return input_
+        if input_.shape[0] % world_size:
+            raise ValueError(
+                f"reduce_scatter needs dim 0 ({input_.shape[0]}) divisible by "
+                f"the group size ({world_size})"
+            )
+        if output is None:
+            output = input_.new_empty(
+                (input_.shape[0] // world_size, *input_.shape[1:])
+            )
+        torch.distributed.reduce_scatter_tensor(output, input_, group=self.device_group)
+        return output
+
+    def all_gather_into(self, output: torch.Tensor, input_: torch.Tensor) -> None:
+        """Every rank's ``input_`` concatenated along dim 0 into ``output``."""
+        if self.world_size == 1:
+            output.copy_(input_)
+            return
+        torch.distributed.all_gather_into_tensor(
+            output, input_, group=self.device_group
+        )
+
     def all_gather(
         self, input_: torch.Tensor, dim: int = 0, separate_tensors: bool = False
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
