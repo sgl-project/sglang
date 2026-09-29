@@ -10,6 +10,8 @@ from sglang.test.test_utils import CustomTestCase, enter_override, maybe_stub_sg
 
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
+import asyncio
+import gc
 import json
 import re
 import tempfile
@@ -54,7 +56,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 # Every spec resolve_chat_encoding_spec can return; pinned by the guard below.
-_ALL_CHAT_ENCODING_SPECS = ("dsv4", "dsv32", "inkling", "kimi_k3")
+_ALL_CHAT_ENCODING_SPECS = ("dsv41", "dsv4", "dsv32", "inkling", "kimi_k3")
 
 
 def _spec_result(index):
@@ -227,10 +229,10 @@ class TestChatTemplateCache(CustomTestCase):
 
     def test_cache_hit_reuses_render_encode_and_returns_an_owned_id_list(self):
         first = self._render()
-        first[1].append(99)
+        first[0].append(99)
         second = self._render()
 
-        self.assertEqual(second, ("rendered", [11, 12], "decoded"))
+        self.assertEqual(second, ([11, 12], "decoded"))
         self.tokenizer_manager.tokenizer.apply_chat_template.assert_called_once()
         self.tokenizer_manager.tokenizer.encode.assert_called_once()
         self.tokenizer_manager.tokenizer.decode.assert_called_once()
@@ -270,13 +272,20 @@ class TestChatTemplateCache(CustomTestCase):
         self.tokenizer_manager.tokenizer.decode.assert_not_called()
 
 
-class ServingChatTestCase(unittest.TestCase):
+class ServingChatTestCase(CustomTestCase):
     # ------------- common fixtures -------------
     def setUp(self):
         # The serving layer reads its config from the bags, so the fixture has
         # to publish one rather than hang the values off a mock manager.
         reset_context()
         self.addCleanup(reset_context)
+        # Tests drive coroutines through get_or_create_event_loop(), which
+        # creates a fresh loop per call and leaves the previous one unclosed.
+        # Finalize those loops here, between tests: if the cyclic GC collects
+        # one mid-import, its ResourceWarning imports tracemalloc while the
+        # outer import still holds the module-lock bookkeeping, which raises
+        # KeyError from importlib._bootstrap on Python < 3.12.
+        self.addCleanup(self._close_event_loops)
         publish(
             ServerArgs(
                 model_path="dummy",
@@ -292,6 +301,7 @@ class ServingChatTestCase(unittest.TestCase):
         self.tm = _MockTokenizerManager()
         self.template_manager = _MockTemplateManager()
         self.chat = OpenAIServingChat(self.tm, self.template_manager)
+        self.tm.tokenizer.reset_mock()
 
         # frequently reused requests
         self.basic_req = ChatCompletionRequest(
@@ -312,6 +322,17 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.fastapi_request = Mock(spec=Request)
         self.fastapi_request.headers = {}
+
+    @staticmethod
+    def _close_event_loops():
+        try:
+            loop = asyncio.get_event_loop_policy().get_event_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None and not loop.is_closed():
+            loop.close()
+        asyncio.set_event_loop(None)
+        gc.collect()
 
     @staticmethod
     def _render_tool_results_in_call_order(messages, **kwargs):
@@ -589,11 +610,13 @@ class ServingChatTestCase(unittest.TestCase):
             )
 
             self.basic_req.return_sampling_mask = True
+            self.basic_req.sampling_logprobs_mode = "support"
             self.basic_req.return_meta_info = True
             adapted, processed = self.chat._convert_to_internal_request(self.basic_req)
             self.assertIsInstance(adapted, GenerateReqInput)
             self.assertFalse(adapted.stream)
             self.assertTrue(adapted.return_sampling_mask)
+            self.assertEqual(adapted.sampling_logprobs_mode, "support")
             self.assertEqual(adapted.session_id, "session-1")
             self.assertEqual(processed, self.basic_req)
 
@@ -2024,6 +2047,150 @@ class ServingChatTestCase(unittest.TestCase):
         )
         self.assertEqual(finish_reason["type"], "tool_calls")
 
+    def test_iquest_release_tool_modes_through_streaming_serving(self):
+        self.chat.tool_call_parser = "iquest_q1"
+        self.chat.reasoning_parser = "iquest_q1"
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "run",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"code": {"type": "string"}},
+                        "required": ["code"],
+                    },
+                },
+            }
+        ]
+        named = ToolChoice(function=ToolChoiceFuncName(name="run"))
+        payloads = (
+            (
+                "auto",
+                "before<iquest_tool_call>run<arg_key>code</arg_key>"
+                "<arg_value>你好</arg_value></iquest_tool_call>after",
+                "beforeafter",
+            ),
+            ("required", '[{"name":"run","parameters":{"code":"你好"}}]', ""),
+            (named, '{ "code": "你好" }', ""),
+        )
+        for choice, payload, expected_content in payloads:
+            for thinking in (True, False):
+                wire = ("work</think>" if thinking else "") + payload
+                for finish in ("stop", "length"):
+                    for size in (1,):
+                        with self.subTest(
+                            choice=choice, thinking=thinking, finish=finish, size=size
+                        ):
+                            req = ChatCompletionRequest(
+                                model="x",
+                                messages=[{"role": "user", "content": "run"}],
+                                input_ids=[1],
+                                tools=tools,
+                                tool_choice=choice,
+                                chat_template_kwargs={"thinking": thinking},
+                                stream=True,
+                            )
+                            processed = self.chat._process_messages(req, False)
+                            self.assertFalse(req.skip_special_tokens)
+                            constraint = processed.tool_call_constraint
+                            if choice == "auto":
+                                self.assertIsNone(constraint)
+                            else:
+                                self.assertEqual(constraint[0], "json_schema")
+                                self.assertEqual(
+                                    constraint[1]["type"],
+                                    "object" if choice == named else "array",
+                                )
+
+                            async def generate():
+                                for end in range(size, len(wire) + size, size):
+                                    yield {
+                                        "text": wire[:end],
+                                        "meta_info": {
+                                            "id": "chatcmpl-iquest-release",
+                                            "prompt_tokens": 1,
+                                            "completion_tokens": min(end, len(wire)),
+                                            "finish_reason": (
+                                                {"type": finish, "matched": None}
+                                                if end >= len(wire)
+                                                else None
+                                            ),
+                                        },
+                                        "index": 0,
+                                    }
+
+                            self.tm.generate_request.return_value = generate()
+                            chunks = self._parse_chunks(
+                                self._run_chat_stream(None, req)
+                            )
+                            self.assertFalse(any("error" in chunk for chunk in chunks))
+                            choices = [
+                                c for chunk in chunks for c in chunk.get("choices", [])
+                            ]
+                            deltas = [c.get("delta", {}) for c in choices]
+                            self.assertEqual(
+                                "".join(d.get("content") or "" for d in deltas),
+                                expected_content,
+                            )
+                            self.assertEqual(
+                                "".join(
+                                    d.get("reasoning_content") or "" for d in deltas
+                                ),
+                                "work" if thinking else "",
+                            )
+                            calls = [
+                                c for d in deltas for c in (d.get("tool_calls") or [])
+                            ]
+                            self.assertEqual(
+                                [
+                                    c["function"]["name"]
+                                    for c in calls
+                                    if c["function"].get("name")
+                                ],
+                                ["run"],
+                            )
+                            self.assertTrue(all(c["index"] == 0 for c in calls))
+                            self.assertEqual(
+                                json.loads(
+                                    "".join(
+                                        c["function"].get("arguments") or ""
+                                        for c in calls
+                                    )
+                                ),
+                                {"code": "你好"},
+                            )
+                            self.assertEqual(
+                                [
+                                    c["finish_reason"]
+                                    for c in choices
+                                    if c.get("finish_reason")
+                                ],
+                                ["tool_calls" if finish == "stop" else finish],
+                            )
+
+    def test_iquest_named_tool_rejects_invalid_arguments(self):
+        self.chat.tool_call_parser = "iquest_q1"
+        choice = ToolChoice(function=ToolChoiceFuncName(name="run"))
+        for payload, finish in (
+            ('{"code":', {"type": "length", "length": 16}),
+            ("42", {"type": "stop", "matched": "stop-marker"}),
+        ):
+            with self.subTest(payload=payload):
+                calls, text, finish_reason = self.chat._process_tool_calls(
+                    text=payload,
+                    tools=ChatCompletionRequest(
+                        model="test",
+                        messages=[],
+                        tools=[{"type": "function", "function": {"name": "run"}}],
+                    ).tools,
+                    finish_reason=dict(finish),
+                    tool_choice=choice,
+                )
+                self.assertIsNone(calls)
+                self.assertEqual(text, payload)
+                self.assertEqual(finish_reason, finish)
+
     def test_required_tool_choice_skips_json_fallback_for_native_parser(self):
         """A structural-tag parser owns the output format, so a missing tool
         call must not be pushed through the json_schema array fallback."""
@@ -2677,8 +2844,9 @@ class ServingChatTestCase(unittest.TestCase):
                         "status_code": err_code,
                         "message": err_msg,
                     },
-                    "output_token_logprobs": None,
-                    "output_top_logprobs": None,
+                    "output_token_logprobs": [],
+                    "output_token_logprobs_length": 0,
+                    "output_top_logprobs": [],
                 },
                 "index": 0,
             }
@@ -2691,6 +2859,8 @@ class ServingChatTestCase(unittest.TestCase):
             temperature=0.7,
             max_tokens=100,
             stream=True,
+            logprobs=True,
+            top_logprobs=5,
         )
 
         with patch(
@@ -2929,6 +3099,31 @@ class ServingChatTestCase(unittest.TestCase):
         ):
             chunks.append(chunk)
         return chunks
+
+    def test_streaming_top_logprobs_follow_each_token_in_chunk(self):
+        """Each token of a multi-token streaming chunk keeps its own alternatives."""
+        content = {
+            "meta_info": {
+                "output_token_logprobs": [
+                    (-0.1, 1, "a"),
+                    (-0.2, 2, "b"),
+                    (-0.3, 3, "c"),
+                ],
+                "output_top_logprobs": [
+                    [(-0.1, 1, "a"), (-2.0, 9, "x")],
+                    [(-0.2, 2, "b"), (-3.0, 8, "y")],
+                    [(-0.3, 3, "c"), (-4.0, 7, "z")],
+                ],
+            },
+        }
+        choice_logprobs = self.chat._process_streaming_logprobs(content, 1, 3)
+        tokens = [entry.token for entry in choice_logprobs.content]
+        alternatives = [
+            [top.token for top in entry.top_logprobs]
+            for entry in choice_logprobs.content
+        ]
+        self.assertEqual(tokens, ["b", "c"])
+        self.assertEqual(alternatives, [["b", "y"], ["c", "z"]])
 
     def test_streaming_logprobs_attached_with_reasoning_parser(self):
         """Logprobs must ride on the reasoning chunk when a reasoning parser is active."""
@@ -4589,6 +4784,47 @@ class InklingReasoningEffortTest(unittest.TestCase):
             prompt_ids[-1],
             INKLING_SPECIAL_TOKEN_IDS["<|content_model_end_sampling|>"],
         )
+
+
+class TestRequestChatTemplateTrustGate(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        self.chat = OpenAIServingChat(_MockTokenizerManager(), _MockTemplateManager())
+
+    def _request(self, **kwargs):
+        return ChatCompletionRequest(
+            model="test-model", messages=[{"role": "user", "content": "hi"}], **kwargs
+        )
+
+    def test_rejected_by_default(self):
+        for template in ("{{ messages }}", "", None):
+            with self.subTest(template=template):
+                error = self.chat._validate_request(
+                    self._request(chat_template_kwargs={"chat_template": template})
+                )
+                self.assertIn("--trust-request-chat-template", error)
+
+    def test_allowed_when_trusted(self):
+        with get_context().override_server_args(trust_request_chat_template=True):
+            self.assertIsNone(
+                self.chat._validate_request(
+                    self._request(
+                        chat_template_kwargs={"chat_template": "{{ messages }}"}
+                    )
+                )
+            )
+
+    def test_other_kwargs_unchanged(self):
+        for kwargs in (None, {}, {"enable_thinking": False}, {"chat_templates": "x"}):
+            with self.subTest(kwargs=kwargs):
+                self.assertIsNone(
+                    self.chat._validate_request(
+                        self._request(chat_template_kwargs=kwargs)
+                    )
+                )
 
 
 if __name__ == "__main__":

@@ -179,7 +179,8 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         kvcache.end_layer = 4
         kvcache.swa_page_size = 2
         kvcache.swa_kv_pool = SimpleNamespace(
-            kv_buffer=[torch.zeros((8, 3), dtype=torch.uint8) for _ in range(3)]
+            page_size=2,
+            kv_buffer=[torch.zeros((8, 3), dtype=torch.uint8) for _ in range(3)],
         )
         kvcache.c4_kv_pool = SimpleNamespace(
             kv_buffer=[torch.zeros((8, 5), dtype=torch.uint8) for _ in range(2)],

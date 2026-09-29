@@ -270,8 +270,9 @@ class ServingCompletionTestCase(unittest.TestCase):
                         "status_code": err_code,
                         "message": err_msg,
                     },
-                    "output_token_logprobs": None,
-                    "output_top_logprobs": None,
+                    "output_token_logprobs": [],
+                    "output_token_logprobs_length": 0,
+                    "output_top_logprobs": [],
                 },
                 "index": 0,
             }
@@ -283,6 +284,7 @@ class ServingCompletionTestCase(unittest.TestCase):
             prompt="Hello world",
             max_tokens=100,
             stream=True,
+            logprobs=5,
         )
 
         adapted_request, _ = self.sc._convert_to_internal_request(req)
@@ -317,6 +319,100 @@ class ServingCompletionTestCase(unittest.TestCase):
         # Check that there is an error chunk and a DONE chunk, and possibly a role chunk
         self.assertGreaterEqual(len(chunks), 2)
         self.assertIn("error", chunks[0])
+
+    def test_echo_with_zero_logprobs_streaming(self):
+        """logprobs=0 requests token logprobs without top-logprobs, so the
+        scheduler never fills the top-logprob keys. The echo branch must not
+        assume they are present."""
+
+        async def _mock_generate(*args, **kwargs):
+            yield {
+                "text": "Hello world",
+                "meta_info": {
+                    "id": "cmpl-test",
+                    "prompt_tokens": 2,
+                    "completion_tokens": 2,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop"},
+                    # top_logprobs_num == 0, so no input/output top-logprob keys.
+                    "input_token_logprobs": [],
+                    "output_token_logprobs": [
+                        (-0.1, 3, "Hello"),
+                        (-0.2, 4, " world"),
+                    ],
+                    "output_token_logprobs_length": 2,
+                },
+                "index": 0,
+            }
+
+        self.sc.tokenizer_manager.generate_request = _mock_generate
+
+        req = CompletionRequest(
+            model="x",
+            prompt="Hi",
+            max_tokens=100,
+            stream=True,
+            echo=True,
+            logprobs=0,
+        )
+        adapted_request, _ = self.sc._convert_to_internal_request(req)
+
+        async def run_stream():
+            return [
+                chunk
+                async for chunk in self.sc._generate_completion_stream(
+                    adapted_request, req, self.fastapi_request
+                )
+            ]
+
+        loop = get_or_create_event_loop()
+        chunks = loop.run_until_complete(run_stream())
+
+        # Assert on the payload, not just termination: a regression that
+        # silently drops logprobs still produces a well-formed stream.
+        self.assertNotIn("error", chunks[0])
+        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+
+        choice = json.loads(chunks[0][len("data: ") :])["choices"][0]
+        self.assertTrue(choice["text"].startswith("Hi"))
+        logprobs = choice["logprobs"]
+        # logprobs=0 asks for token logprobs but no top-logprobs, and the echoed
+        # prompt contributes none because input logprobs were never requested.
+        self.assertEqual(logprobs["tokens"], ["Hello", " world"])
+        self.assertEqual(logprobs["token_logprobs"], [-0.1, -0.2])
+        self.assertEqual(logprobs["top_logprobs"], [])
+
+    def test_echo_with_zero_logprobs_non_streaming(self):
+        """Same contract on the non-streaming path."""
+        req = CompletionRequest(
+            model="x",
+            prompt="Hi",
+            max_tokens=100,
+            echo=True,
+            logprobs=0,
+        )
+        ret = [
+            {
+                "text": " world",
+                "meta_info": {
+                    "id": "cmpl-test",
+                    "prompt_tokens": 2,
+                    "completion_tokens": 1,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop"},
+                    "weight_version": "v1",
+                    "input_token_logprobs": [],
+                    "output_token_logprobs": [(-0.1, 3, " world")],
+                    "output_token_logprobs_length": 1,
+                },
+            }
+        ]
+
+        response = self.sc._build_completion_response(req, ret, 1234567890)
+
+        self.assertEqual(len(response.choices), 1)
+        self.assertEqual(response.choices[0].logprobs.token_logprobs, [-0.1])
+        self.assertEqual(response.choices[0].logprobs.top_logprobs, [])
 
     def test_streaming_token_ids_deltas_cover_output_exactly(self):
         req = CompletionRequest(

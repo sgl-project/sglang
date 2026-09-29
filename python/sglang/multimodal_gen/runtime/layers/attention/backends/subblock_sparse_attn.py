@@ -21,10 +21,9 @@ individual keys of the defaults below::
 Requirements inherited from the kernels: compute capability 9.0 (Hopper) or
 10.0/12.0 (Blackwell), bf16, head_dim 128. Hopper uses SGLang's CuTe-DSL SM90
 block-sparse FlashAttention kernel by default; ``compute_mode="sage_fp8"``
-selects its native SageAttention2 INT8-QK/FP8-PV kernel. The mode name is stable
-across architectures, so future SM100/SM120 implementations can use their own
-Sage FP8 arithmetic without changing server configuration. B200 and SM120
-devices currently use FlashInfer's architecture-specific blk64 BF16 kernels.
+selects native SageAttention2 on SM90 and FlashInfer's CuTe-DSL Sage kernel
+on SM120, both using INT8 QK and FP8 PV. SM100 uses the BF16 kernel because
+its Sage path does not support SubBlock's variable counts and partial blocks.
 Inside the DiT, unsupported calls run dense instead; unsupported GPU
 architectures are rejected.
 
@@ -108,6 +107,13 @@ DEFAULT_COMPUTE_MODE = "bf16"
 # ``blocks.<idx>.attn`` is a DiT layer; ``token_refiner.blocks.<idx>.attn`` and
 # anything else is not and stays dense.
 _DIT_LAYER_PREFIX = re.compile(r"^blocks\.(\d+)\.")
+
+
+def _sage_key_block_size() -> int:
+    # Resolve on the worker's current device, after device initialization.
+    if torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0):
+        return SUBBLOCK_SPARSE_BLOCK_SIZE
+    return SAGE_FP8_SM90_KEY_BLOCK_SIZE
 
 
 def _dit_layer_index(prefix: str) -> int | None:
@@ -233,6 +239,50 @@ def _sm100_sparse_attention(
     return out[0] if isinstance(out, tuple) else out
 
 
+@functools.lru_cache(maxsize=1)
+def _load_sm120_sage_ops():
+    try:
+        from flashinfer.cute_dsl.sparse.bsa_attn_sm120 import (
+            bsa_attn_sm120_blk64_sage_fwd,
+        )
+        from flashinfer.cute_dsl.sparse.bsa_utils.sage_quant_sm120 import (
+            quantize_sage_qkv_sm120,
+        )
+    except (ImportError, OSError) as exc:
+        raise ImportError(
+            "SM120 SubBlock sage_fp8 requires FlashInfer with the CuTe-DSL "
+            "SM120 Sage backend and quantize_sage_qkv_sm120."
+        ) from exc
+    return quantize_sage_qkv_sm120, bsa_attn_sm120_blk64_sage_fwd
+
+
+def _sm120_sage_fp8_sparse_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q2k_block_index: torch.Tensor,
+    topk: int,
+    softmax_scale: float,
+    block_counts: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Quantize BSHD activations online and execute a Q64 x K64 Sage plan."""
+    quantize, attention = _load_sm120_sage_ops()
+    q_hnd, k_hnd, v_hnd = (x.transpose(1, 2).contiguous() for x in (q, k, v))
+    quantized = quantize(q_hnd, k_hnd, v_hnd)
+    out = attention(
+        *quantized,
+        q2k_block_index.contiguous(),
+        topk,
+        block_sizes=_cached_block_sizes(k.shape[1], k.device),
+        q2k_block_nums=(
+            block_counts.contiguous() if block_counts is not None else None
+        ),
+        softmax_scale=softmax_scale,
+        backend="cute_dsl",
+    )
+    return out.transpose(1, 2).contiguous()
+
+
 def _sm120_sparse_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -273,16 +323,13 @@ def _get_subblock_sparse_attention_runner(
     if capability == (10, 0):
         if compute_mode != "bf16":
             raise RuntimeError(
-                f"SubBlock compute_mode={compute_mode!r} currently targets SM90; "
-                "the SM100 FlashInfer Sage adapter is not wired in SGLang yet."
+                "SM100 FlashInfer Sage does not support SubBlock variable block "
+                "counts and partial blocks; use compute_mode='bf16'."
             )
         return _sm100_sparse_attention
     if capability == (12, 0):
-        if compute_mode != "bf16":
-            raise RuntimeError(
-                f"SubBlock compute_mode={compute_mode!r} currently targets SM90; "
-                "the SM120 FlashInfer Sage adapter is not wired in SGLang yet."
-            )
+        if compute_mode == "sage_fp8":
+            return _sm120_sage_fp8_sparse_attention
         return _sm120_sparse_attention
     raise RuntimeError(
         "SubBlock sparse attention supports compute capability 9.0, 10.0, or 12.0; "
@@ -378,9 +425,10 @@ class SubBlockSparseSchedule(msgspec.Struct, frozen=True):
 
         config = get_global_server_args().attention_backend_config or {}
         compute_mode = str(config.get("compute_mode", DEFAULT_COMPUTE_MODE))
-        # Hopper's native kernel consumes 128-token K blocks. Eight sub-blocks
-        # preserve the default router's 16-token key pooling cells.
-        default_n_k = 8 if compute_mode == "sage_fp8" else DEFAULT_N_K
+        # Use 16-token pooling cells for both K128 (SM90) and K64 (SM120).
+        default_n_k = (
+            _sage_key_block_size() // 16 if compute_mode == "sage_fp8" else DEFAULT_N_K
+        )
         schedule = SubBlockSparseSchedule(
             sparsity=float(config.get("sparsity", DEFAULT_SPARSITY)),
             skip_first_steps=int(
@@ -453,7 +501,7 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
                 n_k=self.schedule.n_k,
                 n_q=self.schedule.n_q,
                 block_size_k=(
-                    SAGE_FP8_SM90_KEY_BLOCK_SIZE
+                    _sage_key_block_size()
                     if self.schedule.compute_mode == "sage_fp8"
                     else SUBBLOCK_SPARSE_BLOCK_SIZE
                 ),

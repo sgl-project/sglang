@@ -98,8 +98,8 @@ class TestWaterfillEPLB(CustomTestCase):
         self.assertTrue(torch.equal(processed_ids, torch.tensor([[0, 34, 270, 271]])))
         self.assertTrue(torch.equal(recorder_ids, torch.tensor([[0, 33, 263]])))
 
-    def test_topk_recorder_ids_match_dispatch_ids_without_per_rank_shared_slots(self):
-        topk_ids = torch.tensor([[0, 33, 263, 256]], dtype=torch.int32)
+    def test_topk_recorder_ids_exclude_global_fused_shared_slot(self):
+        topk_ids = torch.tensor([[0, 33, 200, 256]], dtype=torch.int32)
         topk_weights = torch.ones_like(topk_ids, dtype=torch.float32)
         topk_config = TopKConfig(
             top_k=4,
@@ -107,7 +107,7 @@ class TestWaterfillEPLB(CustomTestCase):
             routed_scaling_factor=1.0,
         )
         dispatch_info = SimpleNamespace(
-            num_physical_experts=264, ep_dispatch_algorithm="static"
+            num_physical_experts=256, ep_dispatch_algorithm="static"
         )
 
         def fake_eplb_postprocess(
@@ -136,8 +136,8 @@ class TestWaterfillEPLB(CustomTestCase):
                 expert_location_dispatch_info=dispatch_info,
             )
 
-        self.assertTrue(torch.equal(processed_ids, torch.tensor([[1, 34, 264, 257]])))
-        self.assertTrue(torch.equal(recorder_ids, processed_ids))
+        self.assertTrue(torch.equal(processed_ids, torch.tensor([[1, 34, 201, 256]])))
+        self.assertTrue(torch.equal(recorder_ids, torch.tensor([[1, 34, 201]])))
 
 
 if __name__ == "__main__":
