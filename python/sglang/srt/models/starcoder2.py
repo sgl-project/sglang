@@ -29,7 +29,6 @@ import torch
 from torch import nn
 from transformers import Starcoder2Config
 
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -234,7 +233,7 @@ class Starcoder2Model(nn.Module):
             prefix=f"{prefix}.embed_tokens",
         )
 
-        pp_group = get_pp_group()
+        pp_group = get_parallel().pp_group
         pp_size = pp_group.world_size
         pp_rank = pp_group.rank
         self.start_layer = pp_rank * config.num_hidden_layers // pp_size

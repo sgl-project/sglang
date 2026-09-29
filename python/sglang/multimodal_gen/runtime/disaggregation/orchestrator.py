@@ -37,6 +37,7 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
     encode_transfer_msg,
     is_transfer_message,
 )
+from sglang.multimodal_gen.runtime.observability.metrics import init_metrics
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     OutputBatch,
     Req,
@@ -62,6 +63,7 @@ def _deserialize_request_metrics(data: dict | None) -> RequestMetrics | None:
 
     metrics = RequestMetrics(request_id=data["request_id"])
     metrics.stages = data.get("stages", {})
+    metrics.denoising_stages = set(data.get("denoising_stages", ()))
     metrics.steps = data.get("steps", [])
     metrics.total_duration_ms = data.get("total_duration_ms", 0.0)
     for name, snapshot in data.get("memory_snapshots", {}).items():
@@ -173,7 +175,11 @@ class DiffusionServer:
         self._num_decoders = len(decoder_work_endpoints)
         self._timeout_s = timeout_s
 
-        self._tracker = RequestTracker()
+        self._tracker = RequestTracker(
+            init_metrics(server_args, role="server")
+            if server_args is not None
+            else None
+        )
         self._dispatcher = PoolDispatcher(
             num_encoders=max(1, self._num_encoders),
             num_denoisers=self._num_denoisers,
@@ -476,7 +482,9 @@ class DiffusionServer:
             request_id = f"ds-{time.monotonic()}"
 
         try:
-            self._tracker.submit(request_id)
+            self._tracker.submit(
+                request_id, is_warmup=isinstance(req, Req) and req.is_warmup
+            )
         except ValueError:
             logger.warning("DiffusionServer: duplicate request_id %s", request_id)
             return

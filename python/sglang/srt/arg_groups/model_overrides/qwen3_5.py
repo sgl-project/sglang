@@ -1,7 +1,4 @@
-"""Config-time override declarations for qwen3_5.
-
-Architectures: InternS2MobiusForConditionalGeneration, InternS2PreviewForConditionalGeneration, Qwen3NextForCausalLM, Qwen3_5ForConditionalGeneration, Qwen3_5MoeForConditionalGeneration.
-"""
+"""Config-time override declarations for qwen3_5."""
 
 from typing import Any
 
@@ -39,9 +36,7 @@ def _qwen3_5_hybrid_overrides(server_args: Any, hf_config: Any) -> dict:
         use_mla_backend=use_mla_backend(server_args),
         model_config=model_config_of(server_args),
     )
-    # The mamba radix-cache pass runs before this dispatch: read the
-    # declared strategy through the view (the legacy branch observed the
-    # already-written field here).
+    # The Mamba radix-cache pass has already resolved the strategy.
     if default_attn_backend == "trtllm_mha" and not (
         not mamba_extra_buffer_of(resolved_view(server_args))
         and not cfg.disable_radix_cache

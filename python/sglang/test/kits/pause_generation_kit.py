@@ -20,6 +20,7 @@ class PauseResumeInPlaceMixin:
     pause_num_requests: int = 32
     pause_max_new_tokens: int = 512
     pause_duration: float = 5
+    pause_ignore_eos: bool = False
     pause_generate_url: str = ""
     pause_target_urls: list = []
 
@@ -36,6 +37,7 @@ class PauseResumeInPlaceMixin:
                     "sampling_params": {
                         "temperature": 0.8,
                         "max_new_tokens": self.pause_max_new_tokens,
+                        "ignore_eos": self.pause_ignore_eos,
                     },
                 },
                 timeout=_REQUEST_TIMEOUT,

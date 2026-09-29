@@ -23,7 +23,6 @@ _HAS_MLX = importlib.util.find_spec("mlx") is not None
 _SKIP_REASON = "requires mlx"
 
 if _HAS_MLX:
-    from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.hardware_backend.mlx.model_runner_stub import (
         MLX_AUX_STATE_SIZE_MAX_RUNNING_REQUESTS_RATIO as RATIO,
     )
@@ -62,7 +61,7 @@ def _stub_for_initialize(
     stub = MlxModelRunnerStub.__new__(MlxModelRunnerStub)
     stub._mlx_pool_size = pool_size
     stub.device = "cpu"
-    stub.ps = ParallelState.trivial(dp_size=dp_size, attn_dp_size=attn_dp_size)
+    stub.attn_dp_size = attn_dp_size
     stub.server_args = server_args
     stub.model_config = SimpleNamespace(
         is_hybrid_swa=False,
@@ -73,6 +72,8 @@ def _stub_for_initialize(
         num_attention_layers=1,
         context_len=64,
         use_ngram_embedding=False,
+        ngram_embedding_n=0,
+        use_engram=False,
     )
     return stub
 

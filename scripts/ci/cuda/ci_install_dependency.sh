@@ -2,7 +2,7 @@
 # Install dependencies for CUDA CI jobs.
 #
 # CU_VERSION (default: cu130) controls PyTorch index URL, FlashInfer JIT cache
-# index, and nvrtc variant selection.
+# index, and the sglang wheel index. CUDA 13 only.
 set -euxo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,12 +32,24 @@ mark_step_done() {
 
 configure_environment() {
     # CU_VERSION controls PyTorch index URL, FlashInfer JIT cache index, and
-    # nvrtc variant selection (cu12 vs cu13).
+    # the sglang wheel index. Only CUDA 13 lanes exist: PyTorch 2.14 publishes
+    # no CUDA 12 wheels for the cu129 index the retired cu12 lane used.
     CU_VERSION="${CU_VERSION:-cu130}"
     CU_STRIP="${CU_VERSION#cu}"
-    CU_MAJOR="${CU_STRIP:0:2}"
+    case "${CU_STRIP}" in
+        13*) ;;
+        *) echo "FATAL: unsupported CU_VERSION=${CU_VERSION}; only CUDA 13 is supported"; exit 1 ;;
+    esac
 
     OPTIONAL_DEPS="${1:-}"
+    if [ "$OPTIONAL_DEPS" = "diffusion" ]; then
+        export SGLANG_BUILD_RUST_EXTS=none
+        export SGLANG_RUST_BUILD_MODE=never
+        if [ -n "${GITHUB_ENV:-}" ]; then
+            echo "SGLANG_BUILD_RUST_EXTS=none" >> "$GITHUB_ENV"
+            echo "SGLANG_RUST_BUILD_MODE=never" >> "$GITHUB_ENV"
+        fi
+    fi
 
     # Whether to create a uv venv (set USE_VENV=1). Default: 0.
     USE_VENV="${USE_VENV:-0}"
@@ -271,6 +283,12 @@ clean_site_packages() {
         rm -rf "$SITE_PACKAGES/sglang"
     fi
 
+    # diffusion does not use the SRT Rust extensions
+    if [ "$OPTIONAL_DEPS" = "diffusion" ]; then
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
+
     # Install protoc + Rust toolchain (needed by setuptools-rust, e.g. the native gRPC extension)
     bash "${SCRIPT_DIR}/../utils/install_rust_protoc.sh"
     export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:${PATH}"
@@ -291,7 +309,7 @@ clean_site_packages() {
 
 setup_cargo_cache() {
     if [ "${SGLANG_BUILD_RUST_EXTS:-}" = "none" ]; then
-        echo "Using prebuilt Rust extensions; skipping Cargo target setup"
+        echo "Rust extension compilation disabled; skipping Cargo target setup"
         mark_step_done "${FUNCNAME[0]}"
         return
     fi
@@ -365,11 +383,6 @@ remove_stale_cuda12_nvidia_wheels() {
     local -a INSTALLED_NVIDIA_WHEELS=()
     local -a NVIDIA_WHEELS_TO_RESTORE=()
     local -a STALE_CUDA12_NVIDIA_WHEELS=()
-
-    if [ "$CU_MAJOR" != "13" ]; then
-        mark_step_done "${FUNCNAME[0]}"
-        return
-    fi
 
     mapfile -t INSTALLED_NVIDIA_WHEELS < <(
         python3 -m pip list --format=freeze | sed -n '/^nvidia-.*==/p'
@@ -455,38 +468,31 @@ install_pytorch_stack() {
         fi
     done
 
+    # A cancelled install can leave dist-info without files, which uv then skips.
+    REINSTALL_ARGS=$(python3 -c '
+import importlib.metadata as md
+for name in ("torch", "torchaudio", "torchvision", "torchcodec", "triton"):
+    try:
+        dist = md.distribution(name)
+    except md.PackageNotFoundError:
+        continue
+    if not all(dist.locate_file(f).exists() for f in dist.files or []):
+        print("--reinstall-package", name)
+')
+
     $PIP_CMD install \
         "${PYTORCH_SPECS[@]}" \
+        $REINSTALL_ARGS \
         --index-url "https://download.pytorch.org/whl/${CU_VERSION}"
 
     mark_step_done "${FUNCNAME[0]}"
 }
 
-install_cuda12_deepep_wheel() {
-    if [ "$CU_MAJOR" = "13" ]; then
-        echo "CUDA 13 uses the public sgl-deep-ep wheel declared in python/pyproject.toml"
+require_prebuilt_rust_exts() {
+    if [ "$OPTIONAL_DEPS" = "diffusion" ]; then
         mark_step_done "${FUNCNAME[0]}"
         return
     fi
-
-    local version
-    version=$(grep -Po -m1 '"sgl-deep-ep==\K[^"]+' python/pyproject.toml || true)
-    if [ -z "$version" ]; then
-        echo "ERROR: python/pyproject.toml must pin sgl-deep-ep"
-        exit 1
-    fi
-
-    # CUDA 12 wheels intentionally live only on the SGLang wheel index. Their
-    # local version satisfies the public-version pyproject pin, so the later
-    # editable SGLang install keeps this CUDA-matched wheel.
-    $PIP_CMD install "sgl-deep-ep==${version}+${CU_VERSION}" \
-        --index-url "https://docs.sglang.ai/whl/${CU_VERSION}/" \
-        --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
-
-    mark_step_done "${FUNCNAME[0]}"
-}
-
-require_prebuilt_rust_exts() {
     # Stages whose download succeeded set this to none. Runs before
     # setup_pip_toolchain uninstalls sglang, so clearing it here still reaches
     # install_sglang below - setup.py reads it from the environment at build time.
@@ -551,14 +557,10 @@ install_sglang() {
 }
 
 install_nccl() {
-    if [ "$CU_MAJOR" = "13" ]; then
-        # PyTorch pins 2.29.7, so this override must run after every command
-        # that resolves Python dependencies (including lmms-eval).
-        $PIP_CMD install "nvidia-nccl-cu13==2.30.7" \
-            --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
-    else
-        echo "CUDA ${CU_MAJOR} does not require the NCCL Gin wheel"
-    fi
+    # PyTorch pins 2.29.7, so this override must run after every command
+    # that resolves Python dependencies (including lmms-eval).
+    $PIP_CMD install "nvidia-nccl-cu13==2.30.7" \
+        --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
 
     mark_step_done "${FUNCNAME[0]}"
 }
@@ -628,8 +630,8 @@ install_sglang_kernel() {
 
     if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" != "true" ]; then
         # The PyPI default wheel tracks one CUDA version (currently cu130); other
-        # runners (e.g. h20 / cu129) need the +${CU_VERSION}-tagged wheel from the
-        # sglang index, linked against the right libnvrtc.
+        # runners need the +${CU_VERSION}-tagged wheel from the sglang index,
+        # linked against the right libnvrtc.
         SGL_KERNEL_WANTED="${SGL_KERNEL_VERSION_FROM_SRT}+${CU_VERSION}"
         if installed_wheel_ok sglang-kernel "${SGL_KERNEL_WANTED}" reject-local; then
             echo "sglang-kernel==${SGL_KERNEL_WANTED} already installed, keeping it"
@@ -640,18 +642,11 @@ install_sglang_kernel() {
         echo "CUSTOM_BUILD_SGL_KERNEL=true: keeping freshly built sgl-kernel wheel."
     fi
     SGL_DEEP_GEMM_VERSION=$(grep -Po -m1 '(?<=sgl-deep-gemm==)[0-9A-Za-z\.\-]+' python/pyproject.toml)
-    if [ "$CU_MAJOR" = "13" ]; then
-        SGL_DEEP_GEMM_WANTED="${SGL_DEEP_GEMM_VERSION}"
-    else
-        SGL_DEEP_GEMM_WANTED="${SGL_DEEP_GEMM_VERSION}+cu129"
-    fi
     # No reject-local: nothing builds sgl-deep-gemm locally.
-    if installed_wheel_ok sgl-deep-gemm "${SGL_DEEP_GEMM_WANTED}"; then
-        echo "sgl-deep-gemm==${SGL_DEEP_GEMM_WANTED} already installed, keeping it"
-    elif [ "$CU_MAJOR" = "13" ]; then
-        $PIP_CMD install "sgl-deep-gemm==${SGL_DEEP_GEMM_VERSION}" --force-reinstall $PIP_INSTALL_SUFFIX
+    if installed_wheel_ok sgl-deep-gemm "${SGL_DEEP_GEMM_VERSION}"; then
+        echo "sgl-deep-gemm==${SGL_DEEP_GEMM_VERSION} already installed, keeping it"
     else
-        $PIP_CMD install "https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl" --force-reinstall $PIP_INSTALL_SUFFIX
+        $PIP_CMD install "sgl-deep-gemm==${SGL_DEEP_GEMM_VERSION}" --force-reinstall $PIP_INSTALL_SUFFIX
     fi
 
     mark_step_done "${FUNCNAME[0]}"
@@ -739,17 +734,10 @@ stabilize_flashinfer_jit_paths() {
 install_extra_deps() {
     MOONCAKE_VERSION="0.3.13"
     NIXL_VERSION="1.3.0"
-    if [ "$CU_MAJOR" = "13" ]; then
-        MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
-        MOONCAKE_STALE_PKG="mooncake-transfer-engine"
-        NIXL_BIN_NAME="nixl-cu13"
-        EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc"
-    else
-        MOONCAKE_PKG="mooncake-transfer-engine==${MOONCAKE_VERSION}"
-        MOONCAKE_STALE_PKG="mooncake-transfer-engine-cuda13"
-        NIXL_BIN_NAME="nixl-cu12"
-        EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc-cu12"
-    fi
+    MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
+    MOONCAKE_STALE_PKG="mooncake-transfer-engine"
+    NIXL_BIN_NAME="nixl-cu13"
+    EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc"
     # Both variants own the same mooncake/ package files and bin/ scripts
     # (mooncake_master, etc.). Uninstalling the stale variant deletes shared
     # files that the live variant's RECORD still references, so we force a
@@ -760,6 +748,8 @@ install_extra_deps() {
         $PIP_CMD install ${MOONCAKE_PKG} --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
     fi
     $PIP_CMD install ${MOONCAKE_PKG} ${EXTRA_NVIDIA_SPECS} py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
+
+    $PIP_CMD install "helion==1.4.0" $PIP_INSTALL_SUFFIX
 
     NIXL_INSTALLED=$(pip show nixl 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
     NIXL_BIN_INSTALLED=$(pip show "${NIXL_BIN_NAME}" 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
@@ -828,24 +818,22 @@ verify_imports() {
 
     # One process; torch/cutlass do not import sglang, so the find_spec check
     # still runs ahead of any sglang import.
-    SGLANG_EXPECTED_INIT="${REPO_ROOT}/python/sglang/__init__.py" python3 -c '
+    SGLANG_CI_OPTIONAL_DEPS="$OPTIONAL_DEPS" SGLANG_EXPECTED_INIT="${REPO_ROOT}/python/sglang/__init__.py" python3 -c '
 import ctypes
 import importlib.metadata
 import os
-import sys
 
-if sys.argv[1] == "13":
-    if importlib.metadata.version("nvidia-nccl-cu13") != "2.30.7":
-        raise SystemExit("nvidia-nccl-cu13 was changed after the final CI override")
-    nccl = ctypes.CDLL("libnccl.so.2")
-    nccl_version = ctypes.c_int()
-    status = nccl.ncclGetVersion(ctypes.byref(nccl_version))
-    if status != 0 or nccl_version.value != 23007:
-        raise SystemExit(
-            f"expected NCCL runtime 2.30.7, got status={status}, "
-            f"raw_version={nccl_version.value}"
-        )
-    print("NCCL package and runtime versions are 2.30.7")
+if importlib.metadata.version("nvidia-nccl-cu13") != "2.30.7":
+    raise SystemExit("nvidia-nccl-cu13 was changed after the final CI override")
+nccl = ctypes.CDLL("libnccl.so.2")
+nccl_version = ctypes.c_int()
+status = nccl.ncclGetVersion(ctypes.byref(nccl_version))
+if status != 0 or nccl_version.value != 23007:
+    raise SystemExit(
+        f"expected NCCL runtime 2.30.7, got status={status}, "
+        f"raw_version={nccl_version.value}"
+    )
+print("NCCL package and runtime versions are 2.30.7")
 
 import torch
 print(torch.version.cuda)
@@ -873,14 +861,15 @@ print(f"sglang resolves to {spec.origin}")
 # Import, not find_spec: the finders locate an extension without dlopening it,
 # so a .so that cannot load passes find_spec and only fails inside some suite.
 import importlib
-for mod in ("server", "grpc", "multimodal"):
-    name = f"sglang.srt.rust_extensions._{mod}"
-    try:
-        importlib.import_module(name)
-    except Exception as exc:
-        raise SystemExit(f"{name} is present but does not load: {exc!r}")
-    print(f"{name} loads")
-' "$CU_MAJOR"
+if os.environ["SGLANG_CI_OPTIONAL_DEPS"] != "diffusion":
+    for mod in ("server", "grpc", "multimodal"):
+        name = f"sglang.srt.rust_extensions._{mod}"
+        try:
+            importlib.import_module(name)
+        except Exception as exc:
+            raise SystemExit(f"{name} is present but does not load: {exc!r}")
+        print(f"{name} loads")
+'
 
     mark_step_done "${FUNCNAME[0]}"
 }
@@ -902,7 +891,6 @@ main() {
     remove_stale_cuda12_nvidia_wheels
     uninstall_stale_flashinfer
     install_pytorch_stack
-    install_cuda12_deepep_wheel
     setup_cargo_cache
     install_sglang
     release_cargo_cache_lock

@@ -38,6 +38,7 @@ from sglang.srt.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import publish_build_topology
 
 register_cuda_ci(est_time=18, stage="base-b", runner_config="2-gpu-large")
 
@@ -212,6 +213,13 @@ def _worker_main(local_rank: int, world_size: int):
     set_global_server_args_for_scheduler(
         ServerArgs(
             model_path="dummy",
+            # Match the tp/ep width initialize_model_parallel is about to
+            # build below -- get_parallel()'s derived widths (attn_tp_size,
+            # moe_ep_size, ...) are projected from this at publish time, and
+            # nothing here should leave that projection reflecting a width
+            # this process never actually runs at.
+            tp_size=world_size,
+            ep_size=world_size,
         )
     )
 
@@ -231,10 +239,10 @@ def _worker_main(local_rank: int, world_size: int):
     init_distributed_environment(
         world_size=world_size, rank=local_rank, local_rank=local_rank
     )
-    initialize_model_parallel(
-        tensor_model_parallel_size=world_size,
-        expert_model_parallel_size=world_size,
+    publish_build_topology(
+        tp_size=world_size, ep_size=world_size, world_rank=local_rank
     )
+    initialize_model_parallel()
 
     from sglang.srt.eplb.lplb_solver import clear_global_lplb_solvers
 
