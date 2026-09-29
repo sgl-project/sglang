@@ -375,6 +375,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.mamba_track_enabled = self._is_mamba_track_enabled()
 
         # --- buffers ---------------------------------------------------
+        self._qwen_bcg_mtp_embeddings = None
         # `hidden_size` here sizes only the multimodal `input_embeds` buffer,
         # which `general_mm_embed_routine` copies the merged text+media
         # embeddings into. A model whose merge happens above the embedding width
@@ -802,12 +803,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         if embeds_name in kwargs:
                             kwargs[embeds_name] = None
                             break
-                return self.layer_model.forward(
+                output = self.layer_model.forward(
                     input_ids,
                     positions,
                     forward_batch,
                     **kwargs,
                 )
+                return self._pack_qwen_bcg_hc_output(output)
             # tc_piecewise: compile/capture the outer model.forward path.
             pp_kwargs = self.model_runner._pp_kwargs(pp_proxy_tensors)
             return self.model_runner.model.forward(
@@ -1301,6 +1303,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return True
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
+        if (
+            self.prefill_backend_name == Backend.BREAKABLE
+            and self.model_runner.model_config.hf_config.architectures[0]
+            == "Qwen4ExpForConditionalGeneration"
+            and forward_batch.mm_inputs is not None
+            and any(item is not None for item in forward_batch.mm_inputs)
+        ):
+            # Only the text-only QSA path is validated for this backend.
+            return False
         # DP check: group verdict from the schedule-time all-gather
         # (min-reduced votes; also requires every rank to hold tokens).
         if (
@@ -1994,6 +2005,37 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             : ie.shape[0]
         ].copy_(ie)
 
+    def _qwen_bcg_has_target_hc_sidechannel(self):
+        return (
+            isinstance(self.backend, BreakableCudaGraphBackend)
+            and not self.model_runner.is_draft_worker
+            and self.model_runner.model_config.hf_config.architectures[0]
+            == "Qwen4ExpForConditionalGeneration"
+        )
+
+    def _pack_qwen_bcg_hc_output(self, output):
+        if self._qwen_bcg_has_target_hc_sidechannel():
+            # Replay cannot repeat the model's Python assignment of HC state.
+            return output, self.layer_model.last_hc_hidden_states
+        return output
+
+    def _restore_qwen_bcg_hc_output(self, output):
+        if self._qwen_bcg_has_target_hc_sidechannel():
+            output, self.layer_model.last_hc_hidden_states = output
+        return output
+
+    def _pad_qwen_bcg_mtp_embeddings(self, live, raw_num_tokens, static_num_tokens):
+        if raw_num_tokens == static_num_tokens:
+            return live
+        buf = self._qwen_bcg_mtp_embeddings
+        if buf is None:
+            buf = live.new_empty((max(self.capture_num_tokens), live.shape[1]))
+            self._qwen_bcg_mtp_embeddings = buf
+        view = buf[:static_num_tokens]
+        view[:raw_num_tokens].copy_(live)
+        view[raw_num_tokens:].zero_()
+        return view
+
     def _execute_body_capture(
         self,
         forward_batch: ForwardBatch,
@@ -2022,6 +2064,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             ):
                 self._fill_input_embeds_slot(args, layer_kwargs, static_num_tokens)
             hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
+            hs = self._restore_qwen_bcg_hc_output(hs)
             return _slice_output_rows(hs, raw_num_tokens) if full_path else hs
 
         original_layer_forward = self.layer_model.forward
@@ -2044,6 +2087,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             # MTP consumes the target model's live multimodal embeddings in its
             # eager wrapper before the captured transformer body is replayed.
             tail_batch.mm_input_embeds = forward_batch.mm_input_embeds
+            if (
+                tail_batch.mm_input_embeds is not None
+                and isinstance(self.backend, BreakableCudaGraphBackend)
+                and self.model_runner.is_draft_worker
+                and self.model_runner.model_config.hf_config.architectures[0]
+                == "Qwen4ExpForCausalLMMTP"
+            ):
+                tail_batch.mm_input_embeds = self._pad_qwen_bcg_mtp_embeddings(
+                    tail_batch.mm_input_embeds, raw_num_tokens, static_num_tokens
+                )
         model_kwargs = kwargs
         if self._use_draft_input_embeds:
             # Draft forwards that accept `input_embeds` (all current EAGLE
