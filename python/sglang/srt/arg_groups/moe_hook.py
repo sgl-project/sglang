@@ -552,7 +552,7 @@ def validate_deepep_v2_speculative_draft(server_args: Any) -> None:
 def required_deepep_v2_prefill_tokens_per_rank(server_args: Any) -> int:
     """Largest prefill dispatch on one rank, after topology and model sharding."""
     view = resolved_view(server_args)
-    tokens = max_prefill_buffer_tokens(server_args) or (view.max_prefill_tokens or 0)
+    ceiling = max_prefill_buffer_tokens(server_args) or (view.max_prefill_tokens or 0)
     # A per-DP chunk is scattered across tp_size // attn_dp_size ranks before
     # dispatch, so that is the per-EP-rank divisor (pure TP scatters across all).
     attn_dp_size, _ = derive_attention_widths(
@@ -562,11 +562,11 @@ def required_deepep_v2_prefill_tokens_per_rank(server_args: Any) -> int:
         enable_dp_attention=view.enable_dp_attention,
     )
     scatter_ranks = max(1, view.tp_size // attn_dp_size)
-    tokens = -(-tokens // scatter_ranks)
     return model_deepep_v2_prefill_dispatch_tokens(
         hf_config=model_config_of(server_args).hf_config,
         cfg=view,
-        default_tokens=tokens,
+        ceiling=ceiling,
+        default_tokens=-(-ceiling // scatter_ranks),
     )
 
 
