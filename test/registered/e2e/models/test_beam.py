@@ -75,7 +75,7 @@ class TestBeamNative(CustomTestCase):
 
     def test_prefill_cached_decode_and_parallel_layouts(self):
         tp1_results = {}
-        for layout, parallel in PARALLEL_LAYOUTS:
+        for index, (layout, parallel) in enumerate(PARALLEL_LAYOUTS):
             gpus = parallel.get("tp_size", 1) * parallel.get("pp_size", 1)
             if gpus > torch.cuda.device_count():
                 print(f"{layout}: skipped, needs {gpus} GPUs", flush=True)
@@ -92,6 +92,9 @@ class TestBeamNative(CustomTestCase):
                 chunked_prefill_size=-1,
                 max_total_tokens=4096,
                 mem_fraction_static=0.2,
+                # Attention-DP engines bind TCP ports derived from `port`, and
+                # shutdown leaves them bound in this process.
+                port=30000 + 100 * index,
             )
             kwargs.update(parallel)
             engine = sgl.Engine(**kwargs)
