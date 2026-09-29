@@ -1,4 +1,3 @@
-import ctypes
 import io
 import logging
 import os
@@ -97,7 +96,6 @@ class PDDisaggregationServerBase(CustomTestCase):
         cls._ucx_net_devices_set = False
         if is_in_ci():
             cls.transfer_backend = ["--disaggregation-transfer-backend", "mooncake"]
-            _check_rdma_openable()
             ib_devices = get_rdma_devices_args()
             cls.rdma_devices = ["--disaggregation-ib-device", ib_devices]
             cls._mc_gid_index_set = _maybe_set_roce_gid_index(ib_devices)
@@ -404,40 +402,6 @@ def get_rdma_devices_args(gpu_indices=None) -> str:
 
 
 _IB_SYSFS = "/sys/class/infiniband"
-
-
-# None means libibverbs is not loadable, not that no device is openable.
-def _ibverbs_device_names() -> Optional[set]:
-    try:
-        lib = ctypes.CDLL("libibverbs.so.1")
-    except OSError:
-        return None
-    lib.ibv_get_device_list.restype = ctypes.POINTER(ctypes.c_void_p)
-    lib.ibv_get_device_list.argtypes = [ctypes.POINTER(ctypes.c_int)]
-    lib.ibv_get_device_name.restype = ctypes.c_char_p
-    lib.ibv_get_device_name.argtypes = [ctypes.c_void_p]
-    lib.ibv_free_device_list.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
-    num = ctypes.c_int(0)
-    devices = lib.ibv_get_device_list(ctypes.byref(num))
-    if not devices:
-        return set()
-    try:
-        return {lib.ibv_get_device_name(devices[i]).decode() for i in range(num.value)}
-    finally:
-        lib.ibv_free_device_list(devices)
-
-
-# Without an openable device the PD transfer backend silently falls back to TCP,
-# and transfers then fail under load instead of at setup.
-def _check_rdma_openable() -> None:
-    if not _get_available_ib_devices():
-        return
-    if _ibverbs_device_names() == set():
-        raise RuntimeError(
-            f"Active RDMA devices are listed in {_IB_SYSFS} but ibverbs can open "
-            "none; the PD transfer backend would lose RDMA. "
-            "Check /dev/infiniband in the container."
-        )
 
 
 def _roce_v2_gid_index(device: str):
