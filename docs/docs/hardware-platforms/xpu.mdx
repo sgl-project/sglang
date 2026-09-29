@@ -49,7 +49,7 @@ cd python
 cp pyproject_xpu.toml pyproject.toml
 # Install SGLang dependent libs, and build SGLang main package
 pip install --upgrade pip setuptools
-pip install -v . --extra-index-url https://download.pytorch.org/whl/xpu
+pip install -v ".[dev,diffusion]" --extra-index-url https://download.pytorch.org/whl/xpu
 ```
 
 ### Install Using Docker
