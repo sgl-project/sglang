@@ -466,18 +466,22 @@ class FalconH1ForCausalLM(nn.Module):
         self.model = FalconH1Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            org_num_embeddings=config.vocab_size,
+            prefix=add_prefix("lm_head", prefix),
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
+        )
         if config.tie_word_embeddings:
-            self.lm_head = self.model.embed_tokens
+            # Share storage with the token embedding. Module.float() rewrites
+            # parameters in place, so calling it on this head would upcast the
+            # embedding and feed fp32 activations into a bf16 RMSNorm.
+            self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
+            config.enable_lm_head_fp32 = True
         else:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=quant_config,
-                org_num_embeddings=config.vocab_size,
-                prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=get_parallel().enable_dp_lm_head,
-            )
-        self.lm_head = self.lm_head.float()
+            self.lm_head = self.lm_head.float()
         self.lm_head_multiplier = config.lm_head_multiplier
         self.logits_processor = LogitsProcessor(
             config, logit_scale=self.lm_head_multiplier
@@ -553,6 +557,10 @@ class FalconH1ForCausalLM(nn.Module):
             else:
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
+                    continue
+                # Tied head shares embed_tokens.weight; the checkpoint has no
+                # separate lm_head, and named_parameters only yields it once.
+                if self.config.tie_word_embeddings and "lm_head.weight" in name:
                     continue
                 # if is_pp_missing_parameter(name, self):
                 #     continue
