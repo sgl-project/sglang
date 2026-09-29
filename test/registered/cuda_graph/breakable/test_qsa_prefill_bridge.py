@@ -1,14 +1,13 @@
-"""QSA-specific metadata and MTP side channels across breakable prefill replay."""
-
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
+import torch.nn.functional as F
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
@@ -18,6 +17,9 @@ from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend impor
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     BreakableCUDAGraph,
     BreakableCUDAGraphCapture,
+)
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    breakable_cuda_graph as bcg,
 )
 from sglang.srt.models import qwen4_exp
 from sglang.srt.models.qwen4_exp_mtp import Qwen4ExpForCausalLMMTP
@@ -184,6 +186,114 @@ class TestQSAPrefillBridge(unittest.TestCase):
         torch.testing.assert_close(actual, layer.model.embed_tokens(ids))
         self.assertEqual(actual.shape[0], 128)
         self.assertEqual(output.hidden_states.shape[0], 122)
+
+
+def make_batch(lengths):
+    return ForwardBatch(
+        forward_mode=ForwardMode.EXTEND,
+        batch_size=len(lengths),
+        input_ids=torch.arange(1, 9),
+        req_pool_indices=torch.arange(1, len(lengths) + 1),
+        seq_lens=torch.tensor(lengths),
+        seq_lens_sum=sum(lengths),
+        out_cache_loc=torch.arange(1, 9),
+        extend_seq_lens=torch.tensor(lengths),
+        extend_seq_lens_cpu=lengths,
+        extend_prefix_lens_cpu=[0] * len(lengths),
+    )
+
+
+class TestPLEPrefillLayout(unittest.TestCase):
+    def test_ple_live_layout_and_state_at_layer_two(self):
+        context = SimpleNamespace(forward_batch=make_batch([8]))
+        history = torch.zeros((3, 2), dtype=torch.long)
+        conv_state = torch.zeros((3, 1, 9))
+        pool = SimpleNamespace(
+            get_mamba_indices=lambda indices: indices,
+            get_ngram_context=lambda indices: history[indices],
+            set_ngram_context=lambda indices, values: history.index_copy_(
+                0, indices, values
+            ),
+            short_conv_layer_cache=lambda layer_id: conv_state,
+        )
+        layouts = []
+
+        class PLE:
+            layer_id = 2
+            conv_channels = 1
+            short_conv_dilation = 3
+            short_conv_state_len = 9
+            conv1d = SimpleNamespace(weight=torch.ones((1, 1, 4)))
+
+            def start_prefetch(self, *, batch, forward_batch):
+                self.prefetched = batch
+
+            def __call__(self, *, hidden_states, forward_batch, batch):
+                assert self.prefetched is batch
+                layouts.append(batch.state_indices[batch.req_indices].tolist())
+                output = qwen4_exp.Qwen4ExpPLELayer._short_conv(
+                    self=self,
+                    x=hidden_states[: batch.processed_tokens],
+                    forward_batch=forward_batch,
+                    batch=batch,
+                )
+                return qwen4_exp._pad_token_rows(
+                    x=output, total_tokens=batch.physical_tokens
+                )
+
+        ple = PLE()
+        capture = SimpleNamespace(
+            _end_current_segment=Mock(),
+            _begin_new_segment=Mock(),
+            _barrier_fn=None,
+            cuda_graph=SimpleNamespace(_break_fns=[]),
+        )
+        hidden = torch.arange(1, 9, dtype=torch.float32).view(8, 1)
+        with (
+            patch.object(qwen4_exp, "get_req_to_token_pool", return_value=pool),
+            patch.object(
+                qwen4_exp, "get_tc_piecewise_forward_context", return_value=context
+            ),
+        ):
+            token = bcg._current_capture_var.set(capture)
+            try:
+                batch = qwen4_exp._breakable_prepare_ple_batch(
+                    input_ids=context.forward_batch.input_ids,
+                    ngram_size=3,
+                    ngram_eos_token_id=0,
+                )
+                qwen4_exp._breakable_ple_prefetch(ple=ple, batch=batch)
+                output = qwen4_exp._breakable_ple_forward(
+                    ple=ple, hidden_states=hidden, batch=batch
+                )
+                qwen4_exp._breakable_commit_ple_batch(batch=batch)
+            finally:
+                bcg._current_capture_var.reset(token)
+            self.assertEqual(layouts[-1], [1] * 8)
+            context.forward_batch = make_batch([4, 4])
+            history.zero_()
+            conv_state.zero_()
+            conv_state[1].fill_(10)
+            conv_state[2].fill_(20)
+            reference_inputs = torch.cat(
+                (conv_state[1:], hidden.view(2, 4, 1).transpose(1, 2)), dim=-1
+            )
+            expected = (
+                F.silu(
+                    F.conv1d(
+                        input=reference_inputs, weight=ple.conv1d.weight, dilation=3
+                    )
+                )
+                .transpose(1, 2)
+                .reshape(8, 1)
+            )
+            for replay in capture.cuda_graph._break_fns:
+                replay()
+            self.assertEqual(layouts[-1], [1] * 4 + [2] * 4)
+            torch.testing.assert_close(output, expected)
+            torch.testing.assert_close(history[1:], torch.tensor([[3, 4], [7, 8]]))
+            torch.testing.assert_close(conv_state[1, 0, -4:], hidden[:4, 0])
+            torch.testing.assert_close(conv_state[2, 0, -4:], hidden[4:, 0])
 
 
 if __name__ == "__main__":
