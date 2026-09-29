@@ -14,7 +14,6 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.dsa.dsa_cp import (
     dsa_cp_narrow_a2a_enabled,
-    dsa_cp_narrow_a2a_output_enabled,
     dsa_cp_redistribute_heads,
     dsa_cp_restore_tokens,
     dsa_cp_slice,
@@ -390,30 +389,18 @@ def _apply_interleaved_rope_with_half_output(rotary_emb, positions, q_pe, k_pe):
 
 
 def _dsa_cp_narrow_plan(m: "DeepseekV2AttentionMLA", forward_batch):
-    """This forward's DSA-CP plan when the inbound leg is narrowed, else None.
+    """This forward's DSA-CP plan when the narrow exchange applies, else None.
 
     The exchange moves to before the ``w_kc`` absorb, so one all-to-all carries
     the 256-wide query instead of two carrying the absorbed latent and its rope
-    half. Needs the full ``w_kc``; when the weight loader's gather declined, the
-    attribute is absent and this returns None, putting the layer back on the
-    wide path with no other change.
+    half, and the head output goes through ``w_vc`` before the return leg.
+    Needs the full weights; when the loader's gather declined, the attributes
+    are absent and this returns None, putting the layer back on the wide path
+    with no other change.
     """
     if not dsa_cp_narrow_a2a_enabled():
         return None
-    if getattr(m, "w_kc_full", None) is None:
-        return None
-    return get_dsa_cp_plan(forward_batch)
-
-
-def _dsa_cp_narrow_return_plan(m: "DeepseekV2AttentionMLA", forward_batch):
-    """This forward's plan when the return leg is narrowed, else None.
-
-    Independent of the inbound leg: the rank holds every head for its own rows
-    after the inbound exchange whichever width that exchange used.
-    """
-    if not dsa_cp_narrow_a2a_output_enabled():
-        return None
-    if getattr(m, "w_vc_full", None) is None:
+    if getattr(m, "w_kc_full", None) is None or getattr(m, "w_vc_full", None) is None:
         return None
     return get_dsa_cp_plan(forward_batch)
 
@@ -845,10 +832,6 @@ def forward_dsa_core_npu(
             dsa_cp_plan is not None
             and _dsa_cp_narrow_plan(m, forward_batch) is not None
         )
-        narrow_return = (
-            dsa_cp_plan is not None
-            and _dsa_cp_narrow_return_plan(m, forward_batch) is not None
-        )
         if dsa_cp_plan is not None:
             # DSA-CP: swap "my heads for every token" for "every head for my
             # tokens", which divides the per-query top-k KV read. k_nope/k_pe
@@ -893,7 +876,7 @@ def forward_dsa_core_npu(
         )
         if dsa_cp_plan is not None:
             attn_output = attn_output.reshape(dsa_cp_plan.rows, -1, m.kv_lora_rank)
-            if narrow_return:
+            if narrow_a2a:
                 # Take the head output down to v_head_dim BEFORE the return leg.
                 # w_vc_full, not w_vc: this rank holds every head right now.
                 attn_output = torch_npu.npu_transpose_batchmatmul(

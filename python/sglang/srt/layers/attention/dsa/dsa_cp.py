@@ -107,20 +107,6 @@ def _dsa_cp_narrow_a2a_flag() -> bool:
     return envs.SGLANG_NPU_ENABLE_DSA_CP_NARROW_A2A.get()
 
 
-@lru_cache(maxsize=1)
-def _dsa_cp_narrow_a2a_output_flag() -> bool:
-    return envs.SGLANG_NPU_ENABLE_DSA_CP_NARROW_A2A_OUTPUT.get()
-
-
-def dsa_cp_narrow_a2a_output_enabled() -> bool:
-    """Whether to narrow the return leg: apply ``w_vc`` before the exchange back.
-
-    Independent of :func:`dsa_cp_narrow_a2a_enabled`; either leg runs alone.
-    Needs the full ``w_vc``, 16 MB per layer.
-    """
-    return _dsa_cp_narrow_a2a_output_flag() and dsa_cp_enabled()
-
-
 def dsa_cp_narrow_a2a_enabled() -> bool:
     """Whether to exchange the query before the ``w_kc`` absorb, not after it.
 
@@ -128,9 +114,8 @@ def dsa_cp_narrow_a2a_enabled() -> bool:
     carries the 512-wide absorbed latent in and the 512-wide attention output
     back. Both are linear functions of narrower tensors beside them: q is 256
     wide out of ``q_b_proj`` (``qk_nope`` 192 + rope 64) and the head output is
-    ``v_head_dim`` 256. Exchanging on the narrow side moves 768 values per
-    row-head instead of 1088, in two collectives instead of three, and 512 with
-    the return leg as well.
+    ``v_head_dim`` 256. Exchanging on the narrow side moves 512 values per
+    row-head instead of 1088, in two collectives instead of three.
 
     Exact either way: ``npu_transpose_batchmatmul`` is a per-head, per-row
     product and the all-to-all only permutes (token, head) pairs, so absorbing
@@ -152,25 +137,19 @@ def dsa_cp_attach_full_kv_b(self_attn) -> None:
 
     Called once per layer from the weight loader, after it has split
     ``kv_b_proj`` and applied the NPU layout; the loader itself does not change.
-    Each leg of the narrow all-to-all absorbs after the exchange, so it needs
+    Both legs of the narrow all-to-all absorb after the exchange, so they need
     the weights of the head the rank ends up holding rather than the head it was
-    assigned. Only the enabled legs are gathered, and nothing at all when both
-    are off. Declines on non-bf16 weights: the quantized layouts carry scale
-    tensors that would have to be gathered with them.
+    assigned. Does nothing when the feature is off. Declines on non-bf16
+    weights: the quantized layouts carry scale tensors that would have to be
+    gathered with them.
     """
-    if not getattr(self_attn, "use_dsa", False):
+    if not dsa_cp_narrow_a2a_enabled() or not getattr(self_attn, "use_dsa", False):
         return
     w_kc = getattr(self_attn, "w_kc", None)
     w_vc = getattr(self_attn, "w_vc", None)
     if w_kc is None or w_vc is None:
         return
-    wanted = []
-    if dsa_cp_narrow_a2a_enabled():
-        wanted.append(("w_kc", w_kc))
-    if dsa_cp_narrow_a2a_output_enabled():
-        wanted.append(("w_vc", w_vc))
-    if not wanted:
-        return
+    wanted = [("w_kc", w_kc), ("w_vc", w_vc)]
     not_bf16 = [(n, w.dtype) for n, w in wanted if w.dtype != torch.bfloat16]
     if not_bf16:
         print_info_once(
@@ -198,11 +177,9 @@ def dsa_cp_attach_full_kv_b(self_attn) -> None:
             full = full.transpose(1, 2)
         setattr(self_attn, f"{name}_full", full)
         gathered_bytes += full.numel() * full.element_size()
-    legs = {"w_kc": "input leg", "w_vc": "output leg"}
     print_info_once(
-        "DSA-CP narrow all-to-all is ON ("
-        + ", ".join(legs[n] for n, _ in wanted)
-        + f"), {gathered_bytes / (1 << 20):.1f} MB per layer"
+        "DSA-CP narrow all-to-all is ON: every rank holds the full w_kc and "
+        f"w_vc, {gathered_bytes / (1 << 20):.1f} MB per layer"
     )
 
 
@@ -211,7 +188,6 @@ def reset_dsa_cp_flags() -> None:
     _dsa_cp_flag.cache_clear()
     _dsa_cp_multi_request_flag.cache_clear()
     _dsa_cp_narrow_a2a_flag.cache_clear()
-    _dsa_cp_narrow_a2a_output_flag.cache_clear()
 
 
 def dsa_cp_multi_request_enabled() -> bool:

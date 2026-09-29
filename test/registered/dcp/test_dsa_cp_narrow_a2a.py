@@ -16,9 +16,9 @@ head it was assigned -- which is what the full weights buy, and what a
 plausible implementation gets wrong. One test is the negative case, showing
 that reusing the local slice after the swap really is wrong.
 
-The rest pins which weights each mode gathers. That is invisible to any test
-of results -- both modes compute the same answer -- and shows up only as KV
-pool, 12 MB per layer for the inbound leg and 16 for the return.
+The rest pins that the loader gathers both weights when the flag is on and
+neither when it is off, which no test of results can see -- both paths compute
+the same answer -- and which costs 28 MB per layer.
 
 Usage:
     python -m pytest test_dsa_cp_narrow_a2a.py -v
@@ -197,17 +197,18 @@ class TestGatheredWeightLayout(CustomTestCase):
         self.assertEqual(gathered.stride()[1:], local.stride()[1:])
 
 
-class TestOnlyTheEnabledLegsAreGathered(CustomTestCase):
-    """Which weights the loader gathers has to follow which legs are narrowed.
+class TestTheGatherFollowsTheFlag(CustomTestCase):
+    """What the loader gathers is invisible to any test of results.
 
-    Gathering one that nothing reads is invisible -- everything still computes
-    the right answer -- and costs 1.2 GiB of KV pool at 78 layers and tp16.
+    Both paths compute the same answer, so gathering the weights when the
+    feature is off, or failing to when it is on, shows up only as KV pool --
+    28 MB per layer, 2.13 GiB over 78 layers at tp16.
     """
 
     TP = 4
     HEADS, NOPE, LORA, VDIM = 2, 6, 5, 4
 
-    def _attach(self, narrow_input=True, narrow_output=False):
+    def _attach(self, narrow):
         from sglang.srt.layers.attention.dsa import dsa_cp as dsa_cp_module
 
         class _Attn:
@@ -232,10 +233,7 @@ class TestOnlyTheEnabledLegsAreGathered(CustomTestCase):
         parallel.attn_tp_size = self.TP
         with (
             mock.patch.object(
-                dsa_cp_module, "dsa_cp_narrow_a2a_enabled", lambda: narrow_input
-            ),
-            mock.patch.object(
-                dsa_cp_module, "dsa_cp_narrow_a2a_output_enabled", lambda: narrow_output
+                dsa_cp_module, "dsa_cp_narrow_a2a_enabled", lambda: narrow
             ),
             mock.patch.object(dsa_cp_module, "get_parallel", lambda: parallel),
             mock.patch(
@@ -246,42 +244,24 @@ class TestOnlyTheEnabledLegsAreGathered(CustomTestCase):
             dsa_cp_module.dsa_cp_attach_full_kv_b(attn)
         return attn, calls
 
-    def test_input_only_leaves_w_vc_alone(self):
-        attn, calls = self._attach(narrow_output=False)
-        self.assertEqual(len(calls), 1, "input-only must gather exactly one weight")
-        self.assertIsNotNone(getattr(attn, "w_kc_full", None))
-        self.assertIsNone(
-            getattr(attn, "w_vc_full", None),
-            "w_vc gathered although the return leg is wide: 16 MB per layer",
-        )
+    def test_on_gathers_both_weights(self):
+        attn, calls = self._attach(narrow=True)
+        self.assertEqual(len(calls), 2)
         self.assertEqual(
             attn.w_kc_full.shape, (self.HEADS * self.TP, self.NOPE, self.LORA)
         )
-
-    def test_both_legs_gather_both_weights(self):
-        attn, calls = self._attach(narrow_input=True, narrow_output=True)
-        self.assertEqual(len(calls), 2)
         self.assertEqual(
             attn.w_vc_full.shape, (self.HEADS * self.TP, self.LORA, self.VDIM)
         )
 
-    def test_output_only_leaves_w_kc_alone(self):
-        """The return leg runs without the inbound one, paying only for w_vc."""
-        attn, calls = self._attach(narrow_input=False, narrow_output=True)
-        self.assertEqual(len(calls), 1)
-        self.assertIsNone(getattr(attn, "w_kc_full", None))
-        self.assertEqual(
-            attn.w_vc_full.shape, (self.HEADS * self.TP, self.LORA, self.VDIM)
-        )
-
-    def test_neither_leg_gathers_nothing(self):
-        attn, calls = self._attach(narrow_input=False, narrow_output=False)
+    def test_off_gathers_nothing(self):
+        attn, calls = self._attach(narrow=False)
         self.assertEqual(calls, [])
         self.assertIsNone(getattr(attn, "w_kc_full", None))
         self.assertIsNone(getattr(attn, "w_vc_full", None))
 
     def test_the_gathered_w_kc_keeps_the_loader_stride_pattern(self):
-        attn, _ = self._attach(narrow_output=False)
+        attn, _ = self._attach(narrow=True)
         self.assertFalse(
             attn.w_kc_full.is_contiguous(),
             "the batched matmul is tuned for the transposed layout; a "
@@ -289,33 +269,16 @@ class TestOnlyTheEnabledLegsAreGathered(CustomTestCase):
         )
         self.assertEqual(attn.w_kc_full.stride()[1:], attn.w_kc.stride()[1:])
 
-    def test_the_return_leg_still_needs_dsa_cp_itself(self):
-        """Independent of the inbound leg, but not of DSA-CP itself: both legs
-        rearrange DSA-CP's own exchange, so with it off there is nothing to
-        rearrange and the gathered weights would be pure cost."""
+    def test_it_still_needs_dsa_cp_itself(self):
+        """The narrow exchange rearranges DSA-CP's own exchange, so with DSA-CP
+        off there is nothing to rearrange and the weights would be pure cost."""
         from sglang.srt.layers.attention.dsa import dsa_cp as dsa_cp_module
 
         with (
-            mock.patch.object(
-                dsa_cp_module, "_dsa_cp_narrow_a2a_output_flag", lambda: True
-            ),
+            mock.patch.object(dsa_cp_module, "_dsa_cp_narrow_a2a_flag", lambda: True),
             mock.patch.object(dsa_cp_module, "dsa_cp_enabled", lambda: False),
         ):
-            self.assertFalse(dsa_cp_module.dsa_cp_narrow_a2a_output_enabled())
-
-        with (
-            mock.patch.object(
-                dsa_cp_module, "_dsa_cp_narrow_a2a_output_flag", lambda: True
-            ),
-            mock.patch.object(dsa_cp_module, "dsa_cp_enabled", lambda: True),
-            mock.patch.object(
-                dsa_cp_module, "dsa_cp_narrow_a2a_enabled", lambda: False
-            ),
-        ):
-            self.assertTrue(
-                dsa_cp_module.dsa_cp_narrow_a2a_output_enabled(),
-                "the return leg must not need the inbound leg",
-            )
+            self.assertFalse(dsa_cp_module.dsa_cp_narrow_a2a_enabled())
 
 
 if __name__ == "__main__":

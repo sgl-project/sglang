@@ -987,18 +987,18 @@ class Envs:
     # full per-request KV lengths and dropping the operator's causal crop.
     # Only engages where every request's prefix reaches index_topk.
     SGLANG_NPU_ENABLE_DSA_CP_MULTI_REQUEST = EnvBool(True)
-    # DSA-CP inbound leg: exchange the query BEFORE the w_kc absorb, so one
-    # all-to-all carries the 256-wide q instead of two carrying the absorbed
-    # latent and its rope half. Costs the full w_kc, 12 MB per layer. Bitwise
-    # identical; on its own its effect on wall time is under the run-to-run
-    # floor at tp16.
+    # DSA-CP: exchange the query BEFORE the w_kc absorb and take the head output
+    # through w_vc BEFORE the return leg, so the wire carries 256-wide tensors
+    # instead of the 512-wide latent, in two collectives instead of three. Needs
+    # the full w_kc and w_vc on every rank, 28 MB per layer. Bitwise identical.
+    # At tp16 it is 3.7-7.8% faster at 6007 tokens and 3-4.5% at 16007, but
+    # 8-13% SLOWER below 3000, and it costs 4.06 GiB of KV pool -- 2.13 GiB of
+    # weights plus 2 x HCCL_BUFFSIZE, which HCCL charges the attention-TP
+    # communicator on its first sizeable collective. Hence off by default. See
+    # DSA_CP_HANDOFF_2026-09-24.md section 8; the legs were separately
+    # switchable while that was being measured and neither is worth running
+    # alone.
     SGLANG_NPU_ENABLE_DSA_CP_NARROW_A2A = EnvBool(False)
-    # DSA-CP return leg, independent of the one above: apply w_vc before the
-    # head output goes back on the wire. Costs the full w_vc, 16 MB per layer.
-    # Both legs at tp16 are 3.7-7.8% faster at 6007 tokens and 3-4.5% at 16007,
-    # but 8-13% SLOWER below 3000, which is why neither defaults on. See
-    # DSA_CP_HANDOFF_2026-09-24.md section 8.
-    SGLANG_NPU_ENABLE_DSA_CP_NARROW_A2A_OUTPUT = EnvBool(False)
     # DCP extend on NPU: log each extend forward's peak device memory, per rank.
     SGLANG_DEBUG_NPU_DCP_EXTEND_MEMORY = EnvBool(False)
     # DCP extend on NPU: gathered rows per prefix-gather collective, which caps
