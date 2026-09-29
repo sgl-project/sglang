@@ -6,8 +6,8 @@ import torch
 from sglang.srt.layers.moe.fused_moe_triton.layer import (
     _validate_gluon_quant_method,
 )
-from sglang.srt.layers.moe.gluon_backend import GluonMoeBackend
 from sglang.srt.layers.moe.gluon_backend import (
+    GluonMoeBackend,
     bind_gluon_moe_backend,
     forward_gluon_moe,
     prepare_gluon_moe_weights,
