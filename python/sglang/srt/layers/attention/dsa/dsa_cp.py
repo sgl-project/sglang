@@ -215,6 +215,7 @@ _narrow_a2a_totals = {
     "allocated_bytes": 0,
     "reserved_bytes": 0,
     "driver_bytes": 0,
+    "sync_bytes": 0,
 }
 
 
@@ -319,7 +320,19 @@ def dsa_cp_attach_full_kv_b(self_attn) -> None:
             npu.memory_allocated() - allocated_before
         )
         _narrow_a2a_totals["reserved_bytes"] += npu.memory_reserved() - reserved_before
-        _narrow_a2a_totals["driver_bytes"] += free_before - npu.mem_get_info()[0]
+        free_after = npu.mem_get_info()[0]
+        _narrow_a2a_totals["driver_bytes"] += free_before - free_after
+        # Then wait for the collectives and look again. The KV pool is sized
+        # right after weight loading, from the driver's free-memory figure, and
+        # neither get_available_gpu_memory nor empty_device_cache synchronizes
+        # on the NPU path. If a collective's workspace is still outstanding when
+        # that reading is taken, the pool is sized against memory that is about
+        # to come back -- and the evidence says something of that shape is
+        # happening: the pool loses 1.92 GiB more than these tensors weigh, at
+        # three different gather sizes, and at the first forward that 1.92 GiB
+        # is sitting FREE rather than held by anything.
+        npu.synchronize()
+        _narrow_a2a_totals["sync_bytes"] += npu.mem_get_info()[0] - free_after
     # Names the legs, because the two modes differ only in speed and in this
     # number, and a log read weeks later has to say which one ran.
     legs = {
@@ -340,15 +353,17 @@ def dsa_cp_attach_full_kv_b(self_attn) -> None:
         logger.info(
             "DSA-CP narrow all-to-all: %d layers gathered, %.2f GiB of tensors, "
             "%.2f GiB allocated, %.2f GiB reserved, %.2f GiB taken off the "
-            "device (%.2fx the tensors). Reserved minus allocated is the "
-            "allocator's own rounding; device minus reserved is memory torch "
-            "never sees, and only gathering less can return it.",
+            "device (%.2fx the tensors), %.2f GiB of which came back on "
+            "synchronize. The last figure is the one that matters: memory still "
+            "outstanding when the KV pool is sized is memory the pool does not "
+            "get, even though nothing ends up holding it.",
             t["layers"],
             t["tensor_bytes"] / gib,
             t["allocated_bytes"] / gib,
             t["reserved_bytes"] / gib,
             t["driver_bytes"] / gib,
             (t["driver_bytes"] / t["tensor_bytes"]) if t["tensor_bytes"] else 0.0,
+            t["sync_bytes"] / gib,
         )
 
 
@@ -588,9 +603,9 @@ def _log_first_a2a_device_cost(before: int) -> None:
     after = npu.mem_get_info()[0]
     logger.info(
         "DSA-CP first all-to-all on the attention-TP group: device free "
-        "%.2f -> %.2f GiB, %.2f GiB taken, of which the torch allocator "
-        "accounts for %.2f GiB. The rest is the collective's own buffers, and "
-        "it is charged here only because the KV pool was sized before it.",
+        "%.2f -> %.2f GiB, %.2f GiB taken. Torch has %.2f GiB reserved in "
+        "total at this point (not a delta). Anything taken here is charged "
+        "after the KV pool was already sized.",
         before / (1 << 30),
         after / (1 << 30),
         (before - after) / (1 << 30),
