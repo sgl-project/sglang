@@ -573,8 +573,8 @@ class Envs:
 
     # Attention (aiter, ROCm): route NEXTN/EAGLE draft_extend through aiter
     # unified_attention instead of mha_batch_prefill. On by default for non-MLA
-    # topk<=1 even when prefill/target verify stay on CK; set 0 for the CK
-    # fallback. Target verify still requires SGLANG_USE_AITER_UNIFIED_ATTN.
+    # topk<=1 even when prefill/target verify keep their default kernels; set 0
+    # for the CK fallback. Target verify still requires SGLANG_USE_AITER_UNIFIED_ATTN.
     SGLANG_AITER_UNIFIED_DRAFT_EXTEND = EnvBool(True)
     # Attention (aiter, ROCm): hand chunked prefill the page-level KV view so
     # gfx950 fp8 hd256 takes aiter's paged-varlen asm kernel. That kernel is

@@ -467,10 +467,10 @@ class AiterAttnBackend(AttentionBackend):
             and self.topk == 1
             and get_bool_env_var("SGLANG_AITER_UNIFIED_VERIFY", "1")
         )
-        # Draft-extend only (prefill/target verify keep their kernels). topk > 1
-        # is a tree mask unified_attention's causal flag cannot represent, so it
-        # stays on CK. Read the eagle topk from spec config, not self.topk, which
-        # the registry leaves unset.
+        # Draft-extend only (prefill/target verify keep their kernels). Read the
+        # eagle topk from the spec config: the registry builds this backend with the
+        # default topk=1, so self.topk is 1 even when the server runs topk > 1.
+        # topk > 1 stays on the CK path.
         draft_extend_topk = get_spec().speculative_eagle_topk
         self._use_unified_draft_extend = (
             not self.use_mla
