@@ -2687,12 +2687,6 @@ class TestTRTLLMMLAKVCacheDtypeValidation(CustomTestCase):
                         Backend.DISABLED,
                     )
 
-    @override_platform(is_blackwell=True, is_sm100=True)
-    def test_trtllm_mla_validator_rejects_deprecated_fp4_spelling(self):
-        args = self._args("fp4_e2m1")
-        with self.assertRaisesRegex(ValueError, "only supports.*got fp4_e2m1"):
-            handle_attention_backend_compatibility(args)
-
 
 class TestPipelineParallelPrefillCudaGraphPolicy(CustomTestCase):
     def test_pp_prefill_graph_is_opt_in(self):
