@@ -89,3 +89,41 @@ def seed_mamba_boundary(boundary_len: Optional[int], chunk: int) -> Optional[int
         )
         return None
     return boundary_len
+
+
+def reseed_mamba_boundary_after_match(
+    boundary: Optional[int],
+    prefix_indices_len: int,
+    matched_branching_seqlen: Optional[int],
+) -> Optional[int]:
+    """The mamba branching seqlen a request should carry after a prefix match.
+
+    ``Req.__init__`` seeds ``mamba_branching_seqlen`` from the fixed
+    system-prefix boundary so the first (cold) request tracks the shared
+    boundary state during prefill. But ``init_next_round_input`` overwrites the
+    field with the match result unconditionally — on an empty tree the match
+    returns None and the seed dies, so the request tracks to its prompt tail
+    instead of the boundary; the finish-time donate then stores that tail state
+    under the boundary-capped key (``cap_mamba_donate_len``), silently poisoning
+    the shared node for every later warm request.
+
+    Re-derive the field after the match instead:
+
+    - match found a branching point (mamba state evicted / full KV ahead of the
+      mamba boundary): keep it — the re-track path is the correct cold recovery;
+    - matched prefix already covers the boundary: warm request, None is correct
+      (``is_system_prefix_warm``);
+    - otherwise (first warm-up pass, match returned None): restore the seed so
+      prefill tracks the boundary state.
+
+    Takes primitives to stay free of import cycles; the caller passes
+    ``req.system_prefix_boundary``, ``len(req.prefix_indices)`` and the
+    match-returned ``mamba_branching_seqlen``.
+    """
+    if boundary is None or boundary <= 0:
+        return matched_branching_seqlen
+    if matched_branching_seqlen is not None:
+        return matched_branching_seqlen
+    if prefix_indices_len >= boundary:
+        return None
+    return boundary
