@@ -105,3 +105,23 @@ def resolve_pp_proxy_dspark_hidden_size(
     if isinstance(model, _SupportsDSparkPPProxy):
         return model.get_pp_proxy_dspark_hidden_size()
     return 0
+
+
+@runtime_checkable
+class _SupportsPackedAuxHiddenStates(Protocol):
+    def get_aux_hidden_states_width(self) -> int: ...
+
+
+def resolve_aux_hidden_states_width(
+    *, model: Any, spec_algorithm: Any, is_draft_worker: bool
+) -> int:
+    """Width of the packed aux output a decode graph runner shares across sizes.
+
+    Sharing is safe only when the spec worker consumes the target hidden
+    states before the next target forward, which the DFlash family does.
+    """
+    if not spec_algorithm.is_dflash_family() or is_draft_worker:
+        return 0
+    if isinstance(model, _SupportsPackedAuxHiddenStates):
+        return model.get_aux_hidden_states_width()
+    return 0

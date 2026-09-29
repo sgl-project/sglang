@@ -54,7 +54,6 @@ from sglang.srt.layers.attention.graph_variants import (
     create_attention_graph_variants,
     create_dsv41_candidate_graph_variants,
 )
-from sglang.srt.layers.aux_hidden_states import SupportsSharedAuxHiddenStates
 from sglang.srt.layers.cp.utils import is_mla_cp_enabled
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -384,12 +383,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.require_gathered_buffer:
             assert self.require_mlp_tp_gather or self.require_attn_tp_gather
 
-        # One packed aux output per stream, aliased by every graph size. Safe
-        # because DFlash consumes target hidden states into draft KV before
-        # the next target forward on the same stream.
-        self._aux_hidden_states_width = self._resolve_aux_hidden_states_width()
-        self._aux_hidden_states_buffers: dict[Optional[int], torch.Tensor] = {}
-
         # --- buffers ---------------------------------------------------
         logits_buffer_rows = self._next_token_logits_buffer_capacity_rows(
             self.max_num_token
@@ -427,6 +420,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             pp_proxy_dspark_hidden_size=(
                 self.model_runner.get_pp_proxy_dspark_hidden_size()
             ),
+            aux_hidden_states_width=self.model_runner.get_aux_hidden_states_width(),
         )
         self.buffers.share_buffers()
         # FB-shared slot registry adopting DecodeInputBuffers storage (same
@@ -480,33 +474,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             raise Exception(
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
-
-    def _resolve_aux_hidden_states_width(self) -> int:
-        model = self.model_runner.model
-        if (
-            not isinstance(model, SupportsSharedAuxHiddenStates)
-            or not self.model_runner.spec_algorithm.is_dflash_family()
-            or self.model_runner.is_draft_worker
-            or self.pp_size > 1
-        ):
-            return 0
-        return model.get_packed_aux_hidden_size()
-
-    def _aux_hidden_states_buffer(
-        self, stream_idx: Optional[int], num_tokens: int
-    ) -> Optional[torch.Tensor]:
-        if self._aux_hidden_states_width == 0:
-            return None
-        buffer = self._aux_hidden_states_buffers.get(stream_idx)
-        if buffer is None:
-            buffer = torch.empty(
-                (self.max_num_token, self._aux_hidden_states_width),
-                dtype=self.model_runner.model_config.dtype,
-                device=self.device,
-            )
-            self._aux_hidden_states_buffers[stream_idx] = buffer
-        assert num_tokens <= buffer.shape[0]
-        return buffer[:num_tokens]
 
     def _next_token_logits_buffer_capacity_rows(self, max_num_tokens: int) -> int:
         """Rows reserved for the largest shared logits output."""
@@ -915,6 +882,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         mrope_positions = _slot("mrope_positions")
         next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
+        aux_hidden_states_buffer = (
+            buffers.aux_hidden_states[:num_tokens]
+            if buffers.aux_hidden_states is not None
+            else None
+        )
         rids_int = buffers.rids_int[:bs] if buffers.rids_int is not None else None
         bootstrap_room_ids_int = (
             buffers.bootstrap_room_ids_int[:bs]
@@ -995,6 +967,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
             next_token_logits_buffer=next_token_logits_buffer,
+            aux_hidden_states_buffer=aux_hidden_states_buffer,
             orig_seq_lens=seq_lens,
             out_cache_loc=out_cache_loc,
             seq_lens_sum=seq_lens.sum().item(),
@@ -1172,9 +1145,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         forward_batch, attn_backend, pp_proxy_tensors = self.capture_prepare(
             bs, stream_idx=stream_idx, num_tokens=num_tokens
-        )
-        forward_batch.aux_hidden_states_buffer = self._aux_hidden_states_buffer(
-            stream_idx, num_tokens
         )
 
         # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
