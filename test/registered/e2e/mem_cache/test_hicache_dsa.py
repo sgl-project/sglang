@@ -173,7 +173,8 @@ def test_dsa_transfer_bytes(layout, backend, mode):
             group = assembled.host_pool_group
             controller = object.__new__(HybridCacheController)
             controller.mem_pool_host = group
-            controller.page_size, controller.layer_num = 64, target.layer_num
+            controller.page_size = 64
+            controller.transfer_layer_id_max = target.layer_num
             controller.device, controller.io_backend = "cuda", backend
             controller.write_queue, controller.load_queue = [], []
             controller.start_writing = lambda: None
@@ -285,7 +286,7 @@ def test_dsa_transfer_bytes(layout, backend, mode):
         op = controller.load_queue.pop()
         completion = engine.submit_host_to_device(
             controller._l2_load_transfers(*controller._move_op_indices(op)),
-            layer_num=target.layer_num,
+            transfer_layer_id_max=target.layer_num,
         )
         completion.finish_event.synchronize()
         for pool in (target, *drafts):
