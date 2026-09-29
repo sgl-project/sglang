@@ -35,7 +35,7 @@ def _get_oot_speculative_cache_locs_fn() -> Callable[..., torch.Tensor] | None:
     return current_platform.get_speculative_cache_locs_fn()
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["BS"])
 def assign_draft_cache_locs_contiguous(
     req_pool_indices,
     req_to_token,
@@ -46,7 +46,7 @@ def assign_draft_cache_locs_contiguous(
     speculative_num_steps: tl.constexpr,
     positions=None,
     mrope=None,
-    BS: tl.constexpr = 0,
+    BS=0,
     WRITE_POSITIONS: tl.constexpr = False,
     WRITE_MROPE: tl.constexpr = False,
 ):

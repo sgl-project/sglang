@@ -91,7 +91,7 @@ def fill_accept_out_cache_loc_func(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["BS", "PREDICT_SIZE"])
 def _verify_commit_outputs_kernel(
     predict,
     accept_index,
@@ -99,8 +99,8 @@ def _verify_commit_outputs_kernel(
     seq_lens,
     new_seq_lens,
     bonus,
-    BS: tl.constexpr,
-    PREDICT_SIZE: tl.constexpr,
+    BS,
+    PREDICT_SIZE,
     PREDICT_STRIDE: tl.constexpr,
     INDEX_STRIDE_0: tl.constexpr,
     INDEX_STRIDE_1: tl.constexpr,
@@ -208,15 +208,15 @@ def prepare_verify_commit_outputs(
     return new_seq_lens, bonus
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["BS", "TOKENS"])
 def _draft_extend_inputs_kernel(
     accept_lens,
     predict,
     correct,
     select,
     ids,
-    BS: tl.constexpr,
-    TOKENS: tl.constexpr,
+    BS,
+    TOKENS,
     WIDTH: tl.constexpr,
     ACCEPT_STRIDE: tl.constexpr,
     PREDICT_STRIDE: tl.constexpr,
@@ -254,13 +254,13 @@ def prepare_draft_extend_inputs(accept_lens, predict, num_draft_tokens):
     return correct, select, ids
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["BS"])
 def _prepare_draft_extend_lengths_kernel(
     seq_lens,
     prefix_lens,
     extend_lens,
     post_lens,
-    BS: tl.constexpr,
+    BS,
     STRIDE: tl.constexpr,
     WIDTH: tl.constexpr,
     FRONT: tl.constexpr,
@@ -352,7 +352,7 @@ def prepare_draft_extend_layout(seq_lens, num_draft_tokens, with_mrope):
     return prefix, extend, post, (positions, starts, mrope)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["BS"])
 def _build_chain_tree_kernel(
     bonus,
     draft,
@@ -361,7 +361,7 @@ def _build_chain_tree_kernel(
     positions,
     retrieve,
     tokens,
-    BS: tl.constexpr,
+    BS,
     WIDTH: tl.constexpr,
     BONUS_STRIDE: tl.constexpr,
     DRAFT_ROW: tl.constexpr,

@@ -3,7 +3,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 from sglang.kernels.ops.speculative.eagle import (
     prepare_draft_extend_inputs,
@@ -345,3 +345,101 @@ def test_combined_verify_commit_metadata(bs, width, interval):
             torch.testing.assert_close(tracking, ref, rtol=0, atol=0)
         else:
             assert tracking is None
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ["cache", "commit", "commit_basic", "inputs", "lengths", "layout", "tree"],
+)
+def test_dynamic_batch_reuses_kernel(operation, monkeypatch):
+    """Changing request counts must not create new eager preparation variants."""
+    from collections import defaultdict
+
+    from sglang.kernels.ops.speculative import cache_locs, eagle
+
+    kernels = {
+        "cache": cache_locs.assign_draft_cache_locs_contiguous,
+        "commit": eagle._verify_commit_outputs_kernel,
+        "commit_basic": eagle._verify_commit_outputs_kernel,
+        "inputs": eagle._draft_extend_inputs_kernel,
+        "lengths": eagle._prepare_draft_extend_lengths_kernel,
+        "layout": eagle._prepare_draft_extend_lengths_kernel,
+        "tree": eagle._build_chain_tree_kernel,
+    }
+    kernel = kernels[operation]
+    monkeypatch.setattr(kernel, "device_caches", defaultdict(kernel.create_binder))
+    cache = kernel.device_caches[torch.cuda.current_device()][0]
+    width = 4
+    max_bs = 257
+    requests = torch.arange(max_bs, device="cuda")
+    seq = torch.full((max_bs,), 17, device="cuda", dtype=torch.int64)
+    accepted = torch.full((max_bs,), 3, device="cuda", dtype=torch.int32)
+    predict = torch.arange(max_bs * width + 3, device="cuda", dtype=torch.int32)
+    indices = torch.arange(max_bs * width, device="cuda").reshape(max_bs, width)
+    draft = torch.arange(max_bs * (width - 1), device="cuda").reshape(max_bs, width - 1)
+    table = torch.arange(max_bs * 64, device="cuda", dtype=torch.int32).reshape(
+        max_bs, 64
+    )
+    sizes = [1, 2, 15, 16, 17, 31, 32, 33, 127, 128, 129, 257, 257]
+    for i, bs in enumerate(sizes):
+        token_count = bs * width + (3 if i == len(sizes) - 1 else 0)
+        if operation == "cache":
+            locations = torch.empty((bs * 3,), device="cuda", dtype=torch.int64)
+            positions = torch.empty_like(seq[:bs])
+            mrope = torch.empty((3, bs), device="cuda", dtype=torch.int64)
+            kernel[(bs,)](
+                requests[:bs],
+                table,
+                seq[:bs],
+                locations,
+                64,
+                1,
+                3,
+                positions=positions,
+                mrope=mrope,
+                BS=bs,
+                WRITE_POSITIONS=True,
+                WRITE_MROPE=True,
+            )
+            torch.testing.assert_close(positions, seq[:bs], rtol=0, atol=0)
+            torch.testing.assert_close(
+                mrope, seq[:bs][None, :].expand(3, -1), rtol=0, atol=0
+            )
+        elif operation in ("commit", "commit_basic"):
+            out = eagle.prepare_verify_commit_outputs(
+                predict[:token_count],
+                indices[:bs],
+                accepted[:bs],
+                seq[:bs],
+                num_draft_tokens=width if operation == "commit" else 0,
+                mamba_track_interval=16 if operation == "commit" else 0,
+            )
+            torch.testing.assert_close(out[0], seq[:bs] + accepted[:bs], rtol=0, atol=0)
+        elif operation == "inputs":
+            out = eagle.prepare_draft_extend_inputs(
+                accepted[:bs], predict[:token_count], width
+            )
+            torch.testing.assert_close(
+                out[2], predict[:token_count].long(), rtol=0, atol=0
+            )
+        elif operation == "lengths":
+            eagle.prepare_draft_extend_lengths(seq[:bs], width, 3)
+        elif operation == "layout":
+            eagle.prepare_draft_extend_layout(seq[:bs], width, True)
+        else:
+            eagle.build_chain_tree(
+                predict[:bs],
+                draft[:bs],
+                seq[:bs],
+                req_pool_indices=requests[:bs],
+                req_to_token=table,
+                with_mrope=True,
+            )
+        torch.cuda.synchronize()
+        assert len(cache) == 1, (operation, bs, token_count, len(cache))
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))
