@@ -24,7 +24,7 @@ from typing import Optional
 
 import torch
 
-from sglang.kernels.ops.moe.kpool_topk_transform import (
+from sglang.kernels.ops.attention.dsa.kpool_topk_transform import (
     fast_kpool_topk_transform_fused,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
