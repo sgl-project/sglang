@@ -15,7 +15,11 @@ from sglang.srt.layers.quantization.base_config import (  # noqa: E501
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+from sglang.srt.layers.quantization.fp8 import (
+    Fp8Config,
+    Fp8LinearMethod,
+    Fp8MoEMethod,
+)
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.quark.schemes import (
     QuarkLinearScheme,
@@ -375,6 +379,46 @@ class QuarkConfig(QuantizationConfig):
                 expanded.append(name.removeprefix("language_model."))
         self.exclude_layers = list(dict.fromkeys(expanded))
 
+        layer_quant_config = self.quant_config.get("layer_quant_config")
+        if layer_quant_config:
+            self.quant_config["layer_quant_config"] = hf_to_sglang_mapper.apply_dict(
+                layer_quant_config
+            )
+
+        if self.kv_cache_group:
+            self.kv_cache_group = hf_to_sglang_mapper.apply_list(self.kv_cache_group)
+
+    @staticmethod
+    def _get_block_fp8_config(
+        layer_quant_config: Optional[dict[str, Any]],
+        packed_modules_mapping: dict[str, list[str]],
+    ) -> Optional[Fp8Config]:
+        if layer_quant_config is None:
+            return None
+
+        weight_config = layer_quant_config.get("weight") or {}
+        input_config = layer_quant_config.get("input_tensors") or {}
+        block_size = weight_config.get("block_size")
+        if not (
+            not layer_quant_config.get("output_tensors")
+            and not layer_quant_config.get("bias")
+            and weight_config.get("dtype") in {"fp8_e4m3", "fp8_e4m3fn"}
+            and weight_config.get("qscheme") == "per_block"
+            and weight_config.get("is_dynamic") is False
+            and isinstance(block_size, list)
+            and len(block_size) == 2
+            and input_config.get("dtype") in {"fp8_e4m3", "fp8_e4m3fn"}
+            and input_config.get("is_dynamic") is True
+        ):
+            return None
+
+        return Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            weight_block_size=block_size,
+            packed_modules_mapping=packed_modules_mapping,
+        )
+
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
@@ -396,6 +440,17 @@ class QuarkConfig(QuantizationConfig):
                 return QuarkKVCacheMethod(self)
             return None
 
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+        block_fp8_config = self._get_block_fp8_config(
+            self._find_matched_config(prefix, layer), self.packed_modules_mapping
+        )
+        if block_fp8_config is not None:
+            if isinstance(layer, LinearBase):
+                return Fp8LinearMethod(block_fp8_config)
+            if isinstance(layer, FusedMoE):
+                return Fp8MoEMethod(block_fp8_config)
+
         if isinstance(layer, LinearBase):
             scheme = self.get_linear_scheme(layer=layer, layer_name=prefix)
             layer.scheme = scheme
@@ -405,8 +460,6 @@ class QuarkConfig(QuantizationConfig):
         if isinstance(layer, RadixAttention):
             self._online_quantized_layers.add(prefix)
             return QuarkKVCacheMethod(self)
-
-        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
         if isinstance(layer, FusedMoE):
             self._online_quantized_layers.add(prefix)
@@ -816,6 +869,17 @@ class QuarkConfig(QuantizationConfig):
                 if fnmatch.fnmatch(layer_name, name_pattern):
                     return layer_quant_config[name_pattern]
 
+            # entries may name experts individually, so they resolve the fused module
+            if layer_name.endswith(".experts"):
+                expert_prefix = layer_name + "."
+                expert_entries = {
+                    name[len(expert_prefix) :]: cfg
+                    for name, cfg in layer_quant_config.items()
+                    if name.startswith(expert_prefix)
+                }
+                if expert_entries:
+                    return self._fused_expert_config(layer_name, expert_entries)
+
             layer_type = type(module).__name__
             layer_type_quant_config = cast(
                 dict[str, Any], self.quant_config.get("layer_type_quant_config")
@@ -827,6 +891,44 @@ class QuarkConfig(QuantizationConfig):
                 dict[str, Any], self.quant_config.get("global_quant_config")
             )
             return global_quant_config
+
+    @staticmethod
+    def _fused_expert_config(
+        layer_name: str, entries: dict[str, dict[str, Any]]
+    ) -> dict[str, Any]:
+        projections_by_expert: dict[int, set[str]] = {}
+        for suffix in entries:
+            index, _, projection = suffix.partition(".")
+            if not index.isdigit() or not projection:
+                raise ValueError(
+                    f"Found a per-expert entry {suffix!r} in {layer_name} that is "
+                    "not <expert index>.<projection>."
+                )
+            projections_by_expert.setdefault(int(index), set()).add(projection)
+
+        # one fused module spans the bank, so a gap below the highest pinned index raises
+        pinned = projections_by_expert.keys()
+        missing = sorted(set(range(max(pinned) + 1)) - pinned)
+        if missing:
+            raise ValueError(
+                f"Found per-expert entries in {layer_name} that skip experts "
+                f"{missing[:4]}. SGLang requires all to use the same scheme."
+            )
+
+        projections = next(iter(projections_by_expert.values()))
+        if any(p != projections for p in projections_by_expert.values()):
+            raise ValueError(
+                f"Found different projections pinned per expert in {layer_name}. "
+                "SGLang requires all to use the same scheme."
+            )
+
+        configs = list(entries.values())
+        if not all(deep_compare(cfg, configs[0]) for cfg in configs):
+            raise ValueError(
+                f"Found different quantization configurations among the experts "
+                f"of {layer_name}. SGLang requires all to use the same scheme."
+            )
+        return configs[0]
 
     def _get_scheme_from_config(self, config: dict[str, Any]) -> "QuarkLinearScheme":
         if config.get("output_tensors") or config.get("bias"):

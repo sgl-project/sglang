@@ -15,8 +15,8 @@
 
 use crate::config::DEFAULT_MIN_LOAD_CHOICES;
 use crate::policies::admission::{compare_prefill_pressure, queue_gate_admits};
-use crate::policies::engine_load::EngineLoadSnapshot;
 use crate::policies::{Policy, ProposalKind, SelectionContext, SelectionProposal};
+use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
 use crate::workers::Worker;
 use rand::seq::index::sample;
 use rand::Rng;
@@ -81,7 +81,7 @@ impl Policy for PowerOfTwoChoicesPolicy {
 
 pub(crate) fn select_k_with_snapshot(
     workers: &[Arc<Worker>],
-    snapshot: Option<&EngineLoadSnapshot>,
+    snapshot: Option<&EngineReportedLoadSnapshot>,
     choices: usize,
     queue_limit: Option<u64>,
 ) -> Option<Arc<Worker>> {
@@ -95,7 +95,7 @@ pub(crate) fn select_k_with_snapshot(
 /// a queueing worker while an unqueued one exists.
 fn sample_pool<'w>(
     workers: &'w [Arc<Worker>],
-    snapshot: Option<&EngineLoadSnapshot>,
+    snapshot: Option<&EngineReportedLoadSnapshot>,
     queue_limit: Option<u64>,
 ) -> Cow<'w, [Arc<Worker>]> {
     // Without a limit there is nothing to gate on, and without a snapshot
@@ -138,7 +138,7 @@ fn sample_pool<'w>(
 /// unwinding whichever request task was selecting at the time.
 fn best_two_of_sample(
     pool: &[Arc<Worker>],
-    snapshot: Option<&EngineLoadSnapshot>,
+    snapshot: Option<&EngineReportedLoadSnapshot>,
     choices: usize,
 ) -> Option<(Arc<Worker>, Option<Arc<Worker>>)> {
     let len = pool.len();
@@ -186,7 +186,7 @@ fn best_two_of_sample(
 mod tests {
     use super::*;
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-    use crate::policies::engine_load::NativeCacheWorkerLoad;
+    use crate::state::load_monitor::engine_reported_load::EngineReportedSchedulingLoad;
     use std::time::Instant;
 
     fn worker(id: &str) -> Arc<Worker> {
@@ -202,15 +202,15 @@ mod tests {
     /// Snapshot keyed on waiting depth; `waiting` sets both the queue-gate
     /// reading (`num_waiting_reqs`) and the pressure ordering
     /// (`num_waiting_uncached_tokens`), so one knob drives both.
-    fn snapshot(entries: &[(&Arc<Worker>, u64)]) -> EngineLoadSnapshot {
-        EngineLoadSnapshot::from_native_cache_workers(
+    fn snapshot(entries: &[(&Arc<Worker>, u64)]) -> EngineReportedLoadSnapshot {
+        EngineReportedLoadSnapshot::from_native_cache_workers(
             7,
             entries
                 .iter()
                 .map(|(worker, waiting)| {
                     (
                         worker.url.clone(),
-                        NativeCacheWorkerLoad {
+                        EngineReportedSchedulingLoad {
                             num_running_reqs: 0,
                             num_waiting_reqs: *waiting,
                             num_waiting_uncached_tokens: *waiting,
@@ -234,8 +234,8 @@ mod tests {
     /// `compare_prefill_pressure` intransitive: a slow worker with a shallow
     /// queue loses to a fast worker with a deep one on the estimate, while
     /// both are ordered against an estimate-less worker on waiting tokens.
-    fn mixed_estimate_snapshot(workers: &[Arc<Worker>]) -> EngineLoadSnapshot {
-        EngineLoadSnapshot::from_native_cache_workers(
+    fn mixed_estimate_snapshot(workers: &[Arc<Worker>]) -> EngineReportedLoadSnapshot {
+        EngineReportedLoadSnapshot::from_native_cache_workers(
             11,
             workers
                 .iter()
@@ -244,7 +244,7 @@ mod tests {
                     let waiting = (index as u64 * 7) % 13;
                     (
                         worker.url.clone(),
-                        NativeCacheWorkerLoad {
+                        EngineReportedSchedulingLoad {
                             num_running_reqs: 0,
                             num_waiting_reqs: 0,
                             num_waiting_uncached_tokens: waiting,

@@ -21,7 +21,7 @@ from typing import Any, Dict, Optional
 import ray
 
 from sglang.srt.arg_groups.overrides import declare_resolution
-from sglang.srt.runtime_context import SpawnRanks, publish, spawn_world_rank
+from sglang.srt.runtime_context import SpawnRanks, get_device, publish, spawn_world_rank
 from sglang.srt.server_args import PortArgs, ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -41,9 +41,6 @@ class SchedulerActor:
         port_args: PortArgs,
         gpu_id: int,
         tp_rank: int,
-        attn_cp_rank: int,
-        moe_dp_rank: int,
-        moe_ep_rank: int,
         pp_rank: int,
         dp_rank: Optional[int],
         dist_init_addr: Optional[str] = None,
@@ -93,20 +90,12 @@ class SchedulerActor:
                     server_args, tp_rank=tp_rank, pp_rank=pp_rank
                 ),
                 dp_rank=dp_rank,
+                gpu_id=actual_gpu_id,
             ),
         )
 
         # Configure worker (logging, process title, etc.)
-        configure_scheduler_process(
-            server_args,
-            actual_gpu_id,
-            tp_rank,
-            attn_cp_rank,
-            moe_dp_rank,
-            moe_ep_rank,
-            pp_rank,
-            dp_rank,
-        )
+        configure_scheduler_process(server_args, actual_gpu_id)
 
         # Ray actors can't use the numactl subprocess-wrapping approach
         # (SGLANG_NUMA_BIND_V2's normal path), so bind in-process via libnuma.
@@ -124,13 +113,6 @@ class SchedulerActor:
         self.scheduler = Scheduler(
             server_args=server_args,
             port_args=port_args,
-            gpu_id=actual_gpu_id,
-            tp_rank=tp_rank,
-            moe_ep_rank=moe_ep_rank,
-            pp_rank=pp_rank,
-            attn_cp_rank=attn_cp_rank,
-            moe_dp_rank=moe_dp_rank,
-            dp_rank=dp_rank,
         )
 
         self._tp_rank = tp_rank
@@ -146,7 +128,7 @@ class SchedulerActor:
             import torch
 
             # Need to set the GPU id for the event loop for nccl to work
-            torch.cuda.set_device(self.scheduler.ps.gpu_id)
+            torch.cuda.set_device(get_device().gpu_id)
             self.scheduler.run_event_loop()
         except Exception as e:
             logger.error(f"Scheduler PP{self._pp_rank} TP{self._tp_rank} crashed: {e}")

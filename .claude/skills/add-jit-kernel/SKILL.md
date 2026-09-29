@@ -1,9 +1,13 @@
 ---
 name: add-jit-kernel
-description: Step-by-step tutorial for adding a new lightweight JIT CUDA kernel to sglang's jit_kernel module
+description: Step-by-step tutorial for adding a new lightweight JIT CUDA kernel to sglang.kernels JIT infrastructure and public operator groups
 ---
 
 # Tutorial: Adding a New JIT Kernel to SGLang
+
+Apply [kernel-organization](../kernel-organization/SKILL.md) for the public
+operator namespace, logical grouping, lazy registry metadata, and test placement.
+The implementation tutorial below does not replace that API contract.
 
 This tutorial walks through adding a simple element-wise scale operation as a JIT kernel. We'll implement `scale(x, factor) = x * factor` to demonstrate the complete workflow.
 
@@ -497,6 +501,32 @@ def scale(src: torch.Tensor, factor: float, out: torch.Tensor | None = None) -> 
 
 ---
 
+## Register the public entry point (required)
+
+Add metadata in `python/sglang/kernels/ops/elementwise/__init__.py` so the
+operator appears in the registry without importing its implementation:
+
+```python
+from sglang.kernels.registry import register_kernel
+from sglang.kernels.spec import CapabilityRequirement, KernelBackend, KernelSpec
+
+register_kernel(
+    KernelSpec(
+        op="elementwise.scale",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.elementwise.scale:scale",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+```
+
+Record the devices the implementation actually supports; the CUDA-only scale
+example above does not imply that every JIT kernel is CUDA-only. Runtime and
+correctness tests import `scale` from `sglang.kernels.ops.elementwise.scale`.
+Do not import the implementation eagerly in the group initializer. When an
+existing `BaseFusedOp` owns the operation, add the implementation there instead
+of registering a second conflicting op/backend pair.
+
 ## Step 3 (optional): Tune JIT build flags
 
 If your kernel uses some math functions like `expf` or `sinf`, consider enabling `--use_fast_math` for better performance (with a potential precision tradeoff):
@@ -611,6 +641,8 @@ if __name__ == "__main__":
 
 Benchmarks are `bench_*.py` files under `test/registered/kernels/benchmark/<group>/`. They are picked up by the same `run_suite.py` machinery as unit tests. Register them for **`base-b-kernel-benchmark-test-1-gpu-large`** (PR JIT benchmark job: `python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-test-1-gpu-large`).
 
+Every benchmark must account for L2 cache reuse — see [`rules/kernel-benchmark.md`](../../rules/kernel-benchmark.md).
+
 Benchmarks use the project's own `marker` framework (in `python/sglang/kernels/jit/benchmark/marker.py`) — **do not** use `triton.testing.perf_report` / `triton.testing.do_bench` directly. The marker framework provides (public names: `benchmark`, `parametrize`, `do_bench`, `skip`, `BenchResult`, `BenchSkip`):
 
 - **`@marker.benchmark(line_arg, line_vals, *, unit="us")`** — the **innermost** decorator (bottom of the stack, directly above `def benchmark`). Declares the column axis: each value in `line_vals` becomes a result column, and `line_arg` is the parameter name passed into the benchmark function. `unit` is one of `"us" | "ms" | "s"`.
@@ -619,7 +651,7 @@ Benchmarks use the project's own `marker` framework (in `python/sglang/kernels/j
   - `memory_args`: defaults to `"all"` (footprint derived from all input args/kwargs). Pass an explicit tuple of tensors (e.g. `(k, v, indices)`) to count only the inputs the kernel actually touches.
   - `memory_output`: defaults to `"out"` — re-runs `fn` once to capture its **returned** tensor and counts it. For in-place kernels (which return `None`), pass the written tensors explicitly (e.g. `memory_output=(k, v)`); the re-run is then skipped. Set to `None` to count no output.
   - Together `memory_args` + `memory_output` give the GB/s column; with both defaults a function `out = f(src)` already reports `bytes(src) + bytes(out)`.
-  - `graph_clone_args` / `graph_clone_kwargs`: which inputs to clone per CUDA-graph iteration to defeat L2 cache reuse. Defaults to `"all"` — pass an iterable of indices/keys to limit to the *read* args (writes don't need cloning).
+  - `graph_clone_args` / `graph_clone_kwargs`: which inputs to clone per CUDA-graph iteration to defeat L2 cache reuse. Defaults to `"all"`; if you narrow it, keep every read, in-place, and output tensor.
   - `use_cuda_graph=False` for kernels that can't be captured.
   - `metrics=(0.5, "avg")` controls reported quantiles (the first metric becomes the table latency column).
   - `disable_log_bandwidth` (defaults from `SGLANG_JIT_BENCHMARK_DISABLE_LOG_BANDWIDTH=1`) skips the bandwidth column entirely.
@@ -724,7 +756,7 @@ cd test && python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-test-1
 - `python/sglang/kernels/jit/include/sgl_kernel/cta.cuh` — `cta::reduce_max`
 - `python/sglang/kernels/jit/include/sgl_kernel/atomic.cuh` — `atomic::max`
 - `python/sglang/kernels/jit/include/sgl_kernel/runtime.cuh` — occupancy / SM count helpers
-- `python/sglang/kernels/jit/csrc/add_constant.cuh` — minimal runnable reference
+- `python/sglang/kernels/jit/csrc/elementwise/add_constant.cuh` — minimal runnable reference
 - `python/sglang/kernels/jit/csrc/elementwise/rmsnorm.cuh` — real example using `TensorMatcher` + `LaunchKernel` + `tile::Memory`
 - `python/sglang/kernels/jit/csrc/elementwise/qknorm.cuh` — real example using `runtime::get_blocks_per_sm` + persistent kernel pattern
 - `python/sglang/kernels/jit/benchmark/marker.py` — `benchmark`, `parametrize`, `do_bench`, `BenchResult`
