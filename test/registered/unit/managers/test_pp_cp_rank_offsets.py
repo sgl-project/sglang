@@ -59,9 +59,7 @@ def _make_receiver() -> SchedulerRequestReceiver:
         mm_receiver=None,
         tp_group=tp_group,
         tp_cpu_group=tp_group,
-        attn_tp_group=attn_tp_group,
         attn_tp_cpu_group=attn_tp_group,
-        attn_cp_group=attn_cp_group,
         attn_cp_cpu_group=attn_cp_group,
         world_group=world_group,
         server_args=SimpleNamespace(
