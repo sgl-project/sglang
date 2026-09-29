@@ -76,6 +76,8 @@ POSITIONAL_FIELD_ORDER = (
     "tp_size",
     "dcp_size",
     "pp_size",
+    "pp_virtual_stages",
+    "pp_vpp_max_inflight",
     "pp_max_micro_batch_size",
     "pp_async_batch_depth",
     "dp_size",

@@ -82,6 +82,7 @@ def _batch(req):
         spec_info=None,
         prefill_stats=None,
         dp_cooperation_info=None,
+        disagg_prefill_chunk_end_by_rid=None,
     )
 
 
@@ -151,6 +152,50 @@ def test_aborted_middle_result_waits_for_inflight_chunk(release_kv_cache):
     scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
 
 
+def test_middle_chunk_uses_batch_scoped_transfer_boundary():
+    scheduler = _Scheduler()
+    scheduler.enable_overlap = True
+    req = _Req(inflight_middle_chunks=1)
+    req.to_finish = None
+    req.pending_bootstrap = False
+    req.extend_range = SimpleNamespace(end=100)
+    req.tmp_end_idx = 100
+    scheduler.chunked_req = req
+    batch = _batch(req)
+    batch.disagg_prefill_chunk_end_by_rid = {req.rid: 50}
+
+    scheduler.process_batch_result_disagg_prefill(batch, _result())
+
+    scheduler.send_kv_chunk.assert_called_once_with(
+        req,
+        last_chunk=False,
+        end_idx=50,
+    )
+
+
+@patch(
+    "sglang.srt.disaggregation.prefill.get_parallel",
+    return_value=SimpleNamespace(pp_virtual_stages=2),
+)
+@patch(
+    "sglang.srt.disaggregation.prefill.envs."
+    "SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get",
+    return_value=True,
+)
+def test_vpp_skips_cached_prefix_early_send(_early_send_enabled, _get_parallel):
+    scheduler = _Scheduler()
+    scheduler.enable_staging = False
+    req = _Req(inflight_middle_chunks=1)
+    req.pending_bootstrap = False
+    req.prefix_indices = torch.arange(4096)
+    req.host_hit_length = 0
+    req.start_send_idx = 0
+
+    scheduler.maybe_send_cached_prefix_chunk(req)
+
+    scheduler.send_kv_chunk.assert_not_called()
+
+
 @patch("sglang.srt.disaggregation.prefill.release_kv_cache")
 def test_delayed_result_ignores_already_retired_request(release_kv_cache):
     scheduler = _Scheduler()
@@ -175,6 +220,46 @@ def test_sender_abort_failure_does_not_skip_local_cleanup(release_kv_cache):
     scheduler.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(7)
     scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
     assert req.finished()
+
+
+@patch(
+    "sglang.srt.disaggregation.prefill.get_parallel",
+    return_value=SimpleNamespace(tp_rank=0),
+)
+@patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
+def test_bootstrap_failure_defers_release_until_all_chunks_retire(
+    release_kv_cache, _get_parallel
+):
+    scheduler = _Scheduler()
+    scheduler.clear_pending_chunk_send = Mock()
+    scheduler.metrics_reporter.enable_metrics = False
+    req = _Req(inflight_middle_chunks=2)
+    req.bootstrap_room = 42
+    req.extend_range = SimpleNamespace(end=50)
+    req.time_stats.trace_ctx = Mock()
+
+    scheduler.handle_bootstrap_failure(req)
+
+    assert req.finished()
+    assert req.inflight_middle_chunks == 2
+    release_kv_cache.assert_not_called()
+    scheduler.req_to_metadata_buffer_idx_allocator.free.assert_not_called()
+
+    scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
+
+    assert req.inflight_middle_chunks == 1
+    release_kv_cache.assert_not_called()
+
+    scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
+
+    assert req.inflight_middle_chunks == 0
+    release_kv_cache.assert_called_once_with(
+        req,
+        scheduler.tree_cache,
+        is_insert=False,
+    )
+    scheduler.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(7)
+    scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
 
 
 @patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)

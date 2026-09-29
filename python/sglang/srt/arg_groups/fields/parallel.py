@@ -63,6 +63,21 @@ class Parallel(msgspec.Struct):
             aliases=["--pipeline-parallel-size"],
         ),
     ] = 1
+    pp_virtual_stages: A[
+        int,
+        "The number of interleaved logical pipeline stages hosted by each physical pipeline rank.",
+    ] = 1
+    pp_vpp_prefill_burst_size: A[
+        int,
+        "The preferred number of first-pass VPP Prefill tasks to run before "
+        "draining the same number of second-pass tasks. Values greater than 1 "
+        "enable soft burst scheduling and expand the VPP inflight window.",
+    ] = 1
+    pp_vpp_max_inflight: A[
+        Optional[int],
+        "The maximum number of inflight VPP microbatches. None preserves the "
+        "window implied by PP size and the VPP prefill burst size.",
+    ] = None
     pp_max_micro_batch_size: A[
         Optional[int], "The maximum micro batch size in pipeline parallelism."
     ] = None

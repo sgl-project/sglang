@@ -1542,6 +1542,53 @@ def make_layers(
     return modules, start_layer, end_layer
 
 
+def make_layers_from_ids(
+    num_hidden_layers: int,
+    layer_ids: Sequence[int],
+    layer_fn: LayerFn,
+    prefix: str = "",
+    return_tuple: bool = False,
+    offloader_kwargs: Optional[Dict[str, Any]] = None,
+) -> torch.nn.ModuleList:
+    from sglang.srt.layers.utils import PPMissingLayer
+    from sglang.srt.utils.offloader import get_offloader
+
+    owned = tuple(layer_ids)
+    if owned != tuple(sorted(set(owned))):
+        raise ValueError("pipeline layer IDs must be sorted and unique")
+    if any(layer_id < 0 or layer_id >= num_hidden_layers for layer_id in owned):
+        raise ValueError("pipeline layer ID is outside the model")
+
+    modules = [
+        PPMissingLayer(return_tuple=return_tuple) for _ in range(num_hidden_layers)
+    ]
+    wrapped = get_offloader().wrap_modules(
+        (layer_fn(idx=idx, prefix=add_prefix(idx, prefix)) for idx in owned),
+        **(offloader_kwargs or {}),
+    )
+    for layer_id, layer in zip(owned, wrapped):
+        modules[layer_id] = layer
+    return torch.nn.ModuleList(modules)
+
+
+def make_layers_non_pp(
+    num_hidden_layers: int,
+    layer_fn: LayerFn,
+    prefix: str = "",
+) -> torch.nn.ModuleList:
+    from sglang.srt.utils.offloader import get_offloader
+
+    layers = torch.nn.ModuleList(
+        get_offloader().wrap_modules(
+            (
+                layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
+                for idx in range(num_hidden_layers)
+            )
+        )
+    )
+    return layers
+
+
 def set_random_seed(seed: int) -> None:
     """Set the random seed for all libraries."""
     random.seed(seed)

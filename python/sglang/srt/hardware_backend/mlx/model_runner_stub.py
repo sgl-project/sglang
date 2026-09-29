@@ -256,6 +256,7 @@ class MlxModelRunnerStub(ModelRunner):
             start_layer=0,
             end_layer=model_num_layers,
             num_effective_layers=model_num_layers,
+            layer_ids=tuple(range(model_num_layers)),
         )
 
         # KV cache dtype

@@ -840,6 +840,7 @@ def test_dsv4_process_weights_humming_matches_flashinfer_direct():
     from types import SimpleNamespace
 
     import sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe as ds_mod
+    from sglang.srt.environ import envs
     from sglang.srt.runtime_context import get_context
 
     num_experts, hidden, inter = 4, 256, 256
@@ -863,7 +864,8 @@ def test_dsv4_process_weights_humming_matches_flashinfer_direct():
     layer.w13_weight_scale_inv = torch.nn.Parameter(w31_s.clone(), requires_grad=False)
     layer.w2_weight_scale_inv = torch.nn.Parameter(w2_s.clone(), requires_grad=False)
     layer.num_local_experts = num_experts
-    method.process_weights_after_loading(layer)
+    with envs.SGLANG_FLASHINFER_MXFP4_PREPROCESS_EXPERT_CHUNK_SIZE.override(2):
+        method.process_weights_after_loading(layer)
 
     ref_w13, ref_w13_s, ref_w13_residual = preprocess_humming(
         w31.view(torch.uint8), w31_s.view(torch.uint8)
