@@ -126,20 +126,13 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
     # Top level, not a per-family handler: those do not all run for every
     # algorithm, so checks parked inside one are skipped for the others.
     if server_args.speculative_use_block_verification:
-        # EAGLE/EAGLE3 reach block verification through rejection sampling;
-        # DSPARK through its internal sampling-accept kernel.
-        if server_args.speculative_algorithm in ("EAGLE", "EAGLE3"):
-            if not server_args.speculative_use_rejection_sampling:
-                raise ValueError(
-                    "--speculative-use-block-verification with "
-                    f"speculative_algorithm={server_args.speculative_algorithm} "
-                    "requires --speculative-use-rejection-sampling."
-                )
-        elif server_args.speculative_algorithm != "DSPARK":
+        # Chain accept kernels exist only for these families: EAGLE/EAGLE3 via
+        # rejection sampling, DSPARK via its internal sampling accept.
+        if server_args.speculative_algorithm not in ("EAGLE", "EAGLE3", "DSPARK"):
             raise NotImplementedError(
                 "--speculative-use-block-verification is only supported for "
-                "EAGLE / EAGLE3 (with --speculative-use-rejection-sampling) "
-                "and DSPARK, not "
+                "EAGLE / EAGLE3 / NEXTN (with "
+                "--speculative-use-rejection-sampling) and DSPARK, not "
                 f"speculative_algorithm={server_args.speculative_algorithm}."
             )
         logger.info(
@@ -832,6 +825,15 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         logger.info(
             "Rejection sampling is enabled for speculative decoding "
             "(speculative_use_rejection_sampling=True)."
+        )
+
+    if (
+        server_args.speculative_use_block_verification
+        and not server_args.speculative_use_rejection_sampling
+    ):
+        raise ValueError(
+            "--speculative-use-block-verification is only supported for "
+            "EAGLE / EAGLE3 / NEXTN with --speculative-use-rejection-sampling."
         )
 
     if (

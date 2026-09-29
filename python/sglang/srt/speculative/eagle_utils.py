@@ -768,10 +768,10 @@ def eagle_sample(
             chain_speculative_sampling_triton,
         )
 
+        # The hook guarantees block verification implies rejection sampling,
+        # so draft_probs selection below keys off use_rejection_sampling only.
         use_rejection_sampling = get_spec().speculative_use_rejection_sampling
         use_block_verification = get_spec().speculative_use_block_verification
-        # Hook guarantees block implies rejection sampling; join defensively.
-        use_sampling_accept = use_rejection_sampling or use_block_verification
 
         if use_block_verification:
             sampling_fn = chain_block_speculative_sampling_triton
@@ -815,12 +815,12 @@ def eagle_sample(
             target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
             draft_probs = (
                 verify_input.draft_probs
-                if use_sampling_accept
+                if use_rejection_sampling
                 else torch.zeros_like(target_probs)
             )
             # Defense-in-depth behind the spec_hook startup allowlist: validate
             # the actual kernel inputs before the Triton kernel.
-            if use_sampling_accept and (
+            if use_rejection_sampling and (
                 draft_probs is None or draft_probs.shape[-1] != target_probs.shape[-1]
             ):
                 raise ValueError(
