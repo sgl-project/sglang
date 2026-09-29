@@ -288,6 +288,13 @@ class BaseKVReceiver(ABC):
         """
         pass
 
+    def ensure_abort_notified(self, *, force_arm: bool = False) -> None:
+        """
+        Notify the prefill ranks of an abort exactly once. No-op by default:
+        receivers with no remote peer have no in-flight writes to drain.
+        """
+        pass
+
 
 class BaseKVBootstrapServer(ABC):
     @abstractmethod
