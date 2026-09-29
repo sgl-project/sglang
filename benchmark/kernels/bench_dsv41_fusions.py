@@ -106,13 +106,7 @@ def main():
             candidate = partial(rmsnorm_mxfp8, x, weight, 1e-6)
             baseline = candidate if rows <= 8 else partial(norm_quantize, x, weight)
             records.append(
-                measure(
-                    "rmsnorm_quantize",
-                    rows,
-                    width,
-                    baseline,
-                    candidate,
-                )
+                measure("rmsnorm_quantize", rows, width, baseline, candidate)
             )
         x = torch.randn(rows, 20480, device="cuda", dtype=torch.bfloat16)
         pre = torch.randn(rows, 4, device="cuda", dtype=torch.float32)

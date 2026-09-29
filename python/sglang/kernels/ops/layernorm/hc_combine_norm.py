@@ -112,24 +112,6 @@ def _hc_combine_norm_mxfp8_kernel(
     )
 
 
-def _parts_for(k: int) -> int:
-    # Row splits: recomputing the statistic beats running 6 CTAs on 148 SMs.
-    parts = 4
-    while parts > 1 and (k % (parts * 32)):
-        parts //= 2
-    return parts
-
-
-def _allocate_mxfp8(m, k, device):
-    q = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=device)
-    s = torch.zeros(
-        ((k // 32 + 3) // 4) * 512 * triton.cdiv(m, 128),
-        dtype=torch.uint8,
-        device=device,
-    )
-    return q, s
-
-
 def hc_combine_norm_mxfp8(
     x: torch.Tensor, pre: torch.Tensor, weight: torch.Tensor, eps: float
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -137,12 +119,15 @@ def hc_combine_norm_mxfp8(
     assert 0 < m <= 512
     k = x.shape[1] // 4
     y = torch.empty((m, k), dtype=x.dtype, device=x.device)
-    q, s = _allocate_mxfp8(m, k, x.device)
-    parts = _parts_for(k)
-    if m > 48:
-        parts = 1
-    elif m > 8:
-        parts = min(parts, 2)
+    q = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=x.device)
+    s = torch.zeros(
+        triton.cdiv(k // 32, 4) * 512 * triton.cdiv(m, 128),
+        dtype=torch.uint8,
+        device=x.device,
+    )
+    parts = 4 if m <= 8 else (2 if m <= 48 else 1)
+    while parts > 1 and k % (parts * 32):
+        parts //= 2
     _hc_combine_norm_mxfp8_kernel[(m, parts)](
         x,
         pre,

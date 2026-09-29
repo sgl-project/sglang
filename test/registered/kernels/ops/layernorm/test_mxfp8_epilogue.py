@@ -1,6 +1,7 @@
 """MXFP8 epilogues stay bitwise identical to FlashInfer's standalone quantizer."""
 
 import sys
+from functools import partial
 
 import flashinfer
 import pytest
@@ -106,18 +107,27 @@ def test_dynamic_graph(m, stride):
 
 @pytest.mark.parametrize("m", [1, 128, 129, 512])
 @pytest.mark.parametrize("k", [32, 64, 96, 160, 5120])
-def test_partial_scale_group_padding(m, k):
-    x = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
+@pytest.mark.parametrize("producer", ["rmsnorm", "hc_combine_norm"])
+def test_partial_scale_group_padding(m, k, producer):
+    from sglang.kernels.ops.layernorm.hc_combine_norm import hc_combine_norm_mxfp8
+
+    streams = STREAMS if producer == "hc_combine_norm" else 1
+    x = torch.randn(m, streams * k, device=DEVICE, dtype=torch.bfloat16)
     w = torch.randn(k, device=DEVICE, dtype=torch.bfloat16)
-    rmsnorm_mxfp8(x, w, 1e-6)
+    run = partial(rmsnorm_mxfp8, x, w, 1e-6)
+    if producer == "hc_combine_norm":
+        pre = torch.zeros(m, STREAMS, device=DEVICE, dtype=torch.float32)
+        pre[:, 0] = 1
+        run = partial(hc_combine_norm_mxfp8, x, pre, w, 1e-6)
+    run()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        got = rmsnorm_mxfp8(x, w, 1e-6)
+        got = run()
     for _ in range(2):
         x.normal_()
         got[2].fill_(255)
         graph.replay()
-        assert_norm_quantization(x, w, got)
+        assert_norm_quantization(x[:, :k], w, got)
 
 
 @pytest.mark.parametrize("m", [9, 128, 129, 384, 512])
@@ -143,26 +153,6 @@ def test_fused_scales_with_gemm_consumer(m, k):
         replayed = consume(q, sf)
     graph.replay()
     torch.testing.assert_close(replayed, expected, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("m", [1, 128, 129, 512])
-@pytest.mark.parametrize("k", [32, 64, 96, 160, 5120])
-def test_hc_partial_scale_group_padding(m, k):
-    from sglang.kernels.ops.layernorm.hc_combine_norm import hc_combine_norm_mxfp8
-
-    x = torch.randn(m, STREAMS * k, device=DEVICE, dtype=torch.bfloat16)
-    pre = torch.zeros(m, STREAMS, device=DEVICE, dtype=torch.float32)
-    pre[:, 0] = 1
-    weight = torch.randn(k, device=DEVICE, dtype=torch.bfloat16)
-    hc_combine_norm_mxfp8(x, pre, weight, 1e-6)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        outputs = hc_combine_norm_mxfp8(x, pre, weight, 1e-6)
-    for _ in range(2):
-        x.normal_()
-        outputs[2].fill_(255)
-        graph.replay()
-        assert_norm_quantization(x[:, :k], weight, outputs)
 
 
 if __name__ == "__main__":

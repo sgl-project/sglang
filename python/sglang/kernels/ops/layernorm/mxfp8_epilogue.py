@@ -25,7 +25,7 @@ def mxfp8_epilogue(
 ):
     # Stores only groups in [g_lo, g_hi) so a row can be split across CTAs.
     GP: tl.constexpr = BLOCK // 32
-    SCALE_TILE_SIZE: tl.constexpr = ((GROUPS + 3) // 4) * 512
+    SCALE_TILE_SIZE: tl.constexpr = tl.cdiv(GROUPS, 4) * 512
     g = tl.arange(0, GP)
     gmask = (g < GROUPS) & (g >= g_lo) & (g < g_hi)
     e = tl.arange(0, 32)
@@ -68,22 +68,11 @@ def _rmsnorm_mxfp8_kernel(
         tl.store(Y + row * K + h, y, h < K)
         mxfp8_epilogue(y, row, Q, S, K, BLOCK, GROUPS, 0, GROUPS)
     else:
-        SCALE_TILE_SIZE: tl.constexpr = ((GROUPS + 3) // 4) * 512
-        SCALE_TILES: tl.constexpr = (M + 127) // 128
-        offset = (row - M) * 512 + tl.arange(0, 512)
-        tile_offset = offset % SCALE_TILE_SIZE
-        scale_row = (
-            (offset // SCALE_TILE_SIZE) * 128
-            + ((tile_offset // 4) % 4) * 32
-            + ((tile_offset // 16) % 32)
-        )
-        scale_group = (tile_offset // 512) * 4 + tile_offset % 4
-        tl.store(
-            S + offset,
-            0,
-            (offset < SCALE_TILE_SIZE * SCALE_TILES)
-            & ((scale_row >= M) | (scale_group >= GROUPS)),
-        )
+        block = row - M
+        i = tl.arange(0, 512)
+        scale_row = (block // tl.cdiv(GROUPS, 4)) * 128 + (i // 4 % 4) * 32 + i // 16
+        scale_group = (block % tl.cdiv(GROUPS, 4)) * 4 + i % 4
+        tl.store(S + block * 512 + i, 0, (scale_row >= M) | (scale_group >= GROUPS))
 
 
 def rmsnorm_mxfp8(
@@ -96,11 +85,11 @@ def rmsnorm_mxfp8(
     y = torch.empty_like(x, memory_format=torch.contiguous_format)
     q = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=x.device)
     s = torch.empty(
-        ((k // 32 + 3) // 4) * 512 * triton.cdiv(m, 128),
+        triton.cdiv(k // 32, 4) * 512 * triton.cdiv(m, 128),
         dtype=torch.uint8,
         device=x.device,
     )
-    _rmsnorm_mxfp8_kernel[(m + triton.cdiv(s.numel(), 512),)](
+    _rmsnorm_mxfp8_kernel[(m + s.numel() // 512,)](
         x,
         weight,
         y,
