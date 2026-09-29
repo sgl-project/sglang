@@ -353,8 +353,13 @@ class XPUAttentionBackend(AttentionBackend):
                         metadata, metadata_expand
                     )
 
-        elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
-            include_draft_extend_v2=True
+        # DLLM_EXTEND is excluded from is_extend_or_..._mixed(); on XPU it runs
+        # eager (not via CUDA graph), so build extend metadata for it here too.
+        elif (
+            forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
+                include_draft_extend_v2=True
+            )
+            or forward_batch.forward_mode.is_dllm_extend()
         ):
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
             metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
