@@ -76,8 +76,8 @@ class DeferringLayer(nn.Module):
                         comm_ops._read_input,
                         layer_input=None,
                         enters_stack=False,
-                        read=comm.NORM_QUANT_READ,
-                        update=comm.ADD,
+                        read=comm.NORM_QUANT_READOUT,
+                        update=comm.PLAIN_ADD,
                     ),
                     carried_fusions=(),
                 ),
@@ -200,7 +200,7 @@ class TestAuxCaptureDeferredAllreduce(CustomTestCase):
         partial = torch.empty(0, 4)
         batch = SimpleNamespace(residual_stream=ResidualStream(partial))
         owed = batch.residual_stream.leave(
-            comm.UnreducedOutput(partial, group=GROUP), comm.ADD
+            comm.UnreducedOutput(partial, group=GROUP), comm.PLAIN_ADD
         )
         with patch.object(GROUP, "all_reduce") as reduce:
             hidden, captured = stub_stage(boundary, StageKind.ATTENTION).capture_output(
@@ -405,7 +405,7 @@ class TestPipelineResidualReception(CustomTestCase):
         stage = stub_stage(comm_instance, StageKind.ATTENTION)
         stage.declaration = replace(
             stage.declaration,
-            previous=declare_ffn(update=SimpleNamespace(at_producer=True)),
+            previous=declare_ffn(update=SimpleNamespace(applied_at_exit=True)),
         )
         hidden = stage.from_pp(PPProxyTensors({"hidden_states": streams}), batch)
         residual = batch.residual_stream

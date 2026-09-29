@@ -60,7 +60,10 @@ from sglang.srt.layers.layer_boundary import (
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 
 # Layers - Others
-from sglang.srt.layers.layer_boundary.residual.add_norm import Fp8Input, NormQuantRead
+from sglang.srt.layers.layer_boundary.residual.add_norm import (
+    Fp8Input,
+    NormQuantReadout,
+)
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 
 # Layers - Linear
@@ -1097,7 +1100,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         self.attn_boundary, self.ffn_boundary = make_stages(
             (
                 declare_attn(
-                    read=NormQuantRead(
+                    read=NormQuantReadout(
                         fp8_input=Fp8Input.TUPLE_AND_BF16 if accepts_fp8_input else None
                     )
                 ),
@@ -1303,7 +1306,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.attn_boundary, self.ffn_boundary = make_stages(
             (
                 declare_attn(
-                    read=NormQuantRead(
+                    read=NormQuantReadout(
                         fp8_input=Fp8Input.TUPLE if accepts_fp8_input else None
                     )
                 ),

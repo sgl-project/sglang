@@ -8,7 +8,7 @@ import torch
 
 from sglang.srt.layers import layer_boundary as comm
 from sglang.srt.layers.layer_boundary import (
-    ADD,
+    PLAIN_ADD,
     EdgeDecl,
     FusedMlpInput,
     Layout,
@@ -183,16 +183,16 @@ class _WrittenIn:
     """An update that is not a plain add: the output is written into the
     residual only once its sum is complete."""
 
-    adds_plainly = False
-    at_producer = False
+    is_plain_add = False
+    applied_at_exit = False
 
     def update(self, hidden_states, residual):
         return 2 * hidden_states + residual
 
-    def residual_to_attn_tp_shard(self, residual):
+    def slice_residual_attn_tp(self, residual):
         return residual
 
-    def residual_from_attn_tp_shards(self, residual):
+    def gather_residual_attn_tp(self, residual):
         return residual
 
 
@@ -214,7 +214,7 @@ class TestTheProducersUpdateChoosesTheOrder(CustomTestCase):
         )
 
     def test_the_dp_gather_order(self):
-        plain = make_boundary(self.edge(comm.ADD)).prepare.keywords["step"]
+        plain = make_boundary(self.edge(comm.PLAIN_ADD)).prepare.keywords["step"]
         self.assertIs(plain.func, comm_ops._mlp_input_dp_partial)
         written = _WrittenIn()
         other = make_boundary(self.edge(written)).prepare.keywords["step"]
@@ -250,8 +250,8 @@ class TestTheProducersUpdateChoosesTheOrder(CustomTestCase):
         def norm(value, residual=None):
             return value if residual is None else (value + residual, value + residual)
 
-        for update, expected in ((comm.ADD, 4.0), (_WrittenIn(), 5.0)):
-            with self.subTest(plain=update.adds_plainly):
+        for update, expected in ((comm.PLAIN_ADD, 4.0), (_WrittenIn(), 5.0)):
+            with self.subTest(plain=update.is_plain_add):
                 hidden, residual = boundary.prepare(
                     torch.ones(2, 4),
                     torch.full((2, 4), 3.0),
@@ -266,8 +266,8 @@ class TestTheProducersUpdateChoosesTheOrder(CustomTestCase):
         full = rows(sizes(tp=2))
         fused = comm.FusedMlpInput(completes=SumGroup.ATTN_TP, run=MagicMock())
         carried = MagicMock()
-        for update, offered in ((comm.ADD, True), (_WrittenIn(), False)):
-            with self.subTest(adds_plainly=offered):
+        for update, offered in ((comm.PLAIN_ADD, True), (_WrittenIn(), False)):
+            with self.subTest(is_plain_add=offered):
                 edge = EdgeDecl(
                     produced=StageOutput(
                         full, group=SumGroup.ATTN_TP, always_leaves=True, update=update
@@ -318,7 +318,7 @@ class TestTheProducersUpdateChoosesTheOrder(CustomTestCase):
 
     def test_cross_layer_update_requires_a_lifetime_guarantee(self):
         local = Layout(frozenset())
-        stateful_update = SimpleNamespace(adds_plainly=False, at_producer=False)
+        stateful_update = SimpleNamespace(is_plain_add=False, applied_at_exit=False)
         edge = EdgeDecl(
             StageOutput(local, update=stateful_update), StageInput(local), local, local
         )
@@ -328,7 +328,7 @@ class TestTheProducersUpdateChoosesTheOrder(CustomTestCase):
     def test_pipeline_cannot_reconstruct_a_non_add_update(self):
         local = Layout(frozenset())
         update = SimpleNamespace(
-            adds_plainly=False, at_producer=False, can_defer_across_layers=True
+            is_plain_add=False, applied_at_exit=False, outlives_layer=True
         )
         edge = EdgeDecl(
             StageOutput(local, update=update), StageInput(local), local, local
@@ -339,15 +339,15 @@ class TestTheProducersUpdateChoosesTheOrder(CustomTestCase):
 
 
 class ProbeRead:
-    before_gather = False
+    reads_before_dp_gather = False
     """A read that marks what it reads: the input is the residual plus 100.
-    ``norms_plainly`` says whether it may stand in for a norm."""
+    ``is_plain_norm`` says whether it may stand in for a norm."""
 
-    def __init__(self, norms_plainly):
-        self.norms_plainly = norms_plainly
+    def __init__(self, is_plain_norm):
+        self.is_plain_norm = is_plain_norm
         self.reads = 0
 
-    def enter(self, hidden_states):
+    def init_residual(self, hidden_states):
         return hidden_states
 
     def read(self, residual, norm, quant_format="", post_residual_addition=None):
@@ -384,7 +384,10 @@ class TestTheConsumerRunsItsDeclaredRead(CustomTestCase):
         boundary = make_boundary(
             EdgeDecl(
                 produced=StageOutput(
-                    attention, group=SumGroup.ATTN_TP, always_leaves=True, update=ADD
+                    attention,
+                    group=SumGroup.ATTN_TP,
+                    always_leaves=True,
+                    update=PLAIN_ADD,
                 ),
                 need=StageInput(need, read=read),
                 residual=residual,
@@ -398,7 +401,7 @@ class TestTheConsumerRunsItsDeclaredRead(CustomTestCase):
         ].keywords.get("fusions", ())
 
     def test_the_dp_partial_reads_the_gathered_sum_with_the_declared_read(self):
-        read = ProbeRead(norms_plainly=True)
+        read = ProbeRead(is_plain_norm=True)
         step, _ = self._ffn_input(read, dp=2)
         self.assertIs(step.func, comm_ops._mlp_input_dp_partial)
         hidden, residual = torch.ones(2, 4), torch.full((2, 4), 3.0)
@@ -417,11 +420,11 @@ class TestTheConsumerRunsItsDeclaredRead(CustomTestCase):
         self.assertIs(out_residual, residual)
 
     def test_a_read_that_changes_the_residual_replicates_instead(self):
-        step, _ = self._ffn_input(ProbeRead(norms_plainly=False), dp=2)
+        step, _ = self._ffn_input(ProbeRead(is_plain_norm=False), dp=2)
         self.assertIs(step.func, comm_ops._mlp_input_dp_replicate)
 
     def test_the_residual_joined_sum_is_read_with_the_declared_read(self):
-        read = ProbeRead(norms_plainly=True)
+        read = ProbeRead(is_plain_norm=True)
         step, _ = self._ffn_input(read, residual_joins_sum=True)
         self.assertIs(step.func, comm_ops._mlp_input_residual_into_sum)
         hidden, residual = torch.ones(4, 4), torch.full((2, 4), 3.0)
@@ -442,13 +445,13 @@ class TestTheConsumerRunsItsDeclaredRead(CustomTestCase):
 
     def test_a_fused_kernel_runs_only_for_a_read_that_leaves_the_residual(self):
         fused = FusedMlpInput(completes=SumGroup.ATTN_TP, run=MagicMock())
-        for norms_plainly in (True, False):
-            with self.subTest(norms_plainly=norms_plainly):
+        for is_plain_norm in (True, False):
+            with self.subTest(is_plain_norm=is_plain_norm):
                 step, tried = self._ffn_input(
-                    ProbeRead(norms_plainly), fusions=(fused,)
+                    ProbeRead(is_plain_norm), fusions=(fused,)
                 )
                 self.assertIs(step.func, comm_ops._mlp_input_without_dp)
-                expected = (fused.run,) if norms_plainly else ()
+                expected = (fused.run,) if is_plain_norm else ()
                 self.assertEqual(tried, expected)
                 self.assertEqual(step.keywords["fusions"], expected)
 
@@ -456,9 +459,9 @@ class TestTheConsumerRunsItsDeclaredRead(CustomTestCase):
         axis_sizes = sizes(tp=2)
         attention = rows(axis_sizes)
         kernel = MagicMock()
-        for norms_plainly in (True, False):
-            with self.subTest(norms_plainly=norms_plainly):
-                read = ProbeRead(norms_plainly)
+        for is_plain_norm in (True, False):
+            with self.subTest(is_plain_norm=is_plain_norm):
+                read = ProbeRead(is_plain_norm)
                 edge = EdgeDecl(
                     produced=StageOutput(
                         attention, group=SumGroup.TP, leaves_for_next_layer=True
@@ -471,7 +474,7 @@ class TestTheConsumerRunsItsDeclaredRead(CustomTestCase):
                 self.assertIs(boundary.prepare.keywords["step"].keywords["read"], read)
                 self.assertEqual(
                     boundary.prepare.keywords["carried_fusions"],
-                    (kernel,) if norms_plainly else (),
+                    (kernel,) if is_plain_norm else (),
                 )
 
 

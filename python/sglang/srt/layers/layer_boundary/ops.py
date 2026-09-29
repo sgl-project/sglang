@@ -53,8 +53,8 @@ from sglang.srt.layers.layer_boundary.layout import (
     _cp_shard_token_rows,
     moe_cp_gathered_rows,
 )
-from sglang.srt.layers.layer_boundary.residual import StageUpdate
-from sglang.srt.layers.layer_boundary.residual.add_norm import ADD
+from sglang.srt.layers.layer_boundary.residual import ResidualUpdate
+from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_exec, get_parallel
 
@@ -303,7 +303,7 @@ def update_and_gather(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     forward_batch: ForwardBatch,
-    update: StageUpdate = ADD,
+    update: ResidualUpdate = PLAIN_ADD,
     **kwargs,
 ):
     hidden_states = update.update(hidden_states, residual)
@@ -317,7 +317,7 @@ def output_on_residual_shard(
     *,
     sums: bool,
     gathers_back: bool,
-    update: StageUpdate,
+    update: ResidualUpdate,
     **kwargs,
 ):
     """Bring the FFN output onto the slice of the rows the residual is on:

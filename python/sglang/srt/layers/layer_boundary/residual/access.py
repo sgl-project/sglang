@@ -59,7 +59,7 @@ def fold(hidden_states, residual):
     The following stage receives it with no outstanding residual addition."""
     stream = residual if isinstance(residual, ResidualStream) else None
     if stream is not None:
-        if stream.pending is not None and not stream.pending.update.adds_plainly:
+        if stream.pending is not None and not stream.pending.update.is_plain_add:
             raise NotImplementedError("fold requires a plain residual update")
         hidden_states, residual = stream.finish(hidden_states)
     hidden_states = reduce_output(hidden_states)

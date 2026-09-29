@@ -9,7 +9,7 @@ from sglang.srt.layers.layer_boundary.factories import (
     make_stages,
 )
 from sglang.srt.layers.layer_boundary.ops import identity_output
-from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_RESIDUAL
+from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_RESIDUAL_OPS
 from sglang.srt.layers.layer_boundary.stage import StageBoundary
 
 
@@ -22,7 +22,7 @@ def make_test_stages(
     sparse=False,
     previous_sparse=False,
     next_sparse=False,
-    residual=PLAIN_RESIDUAL,
+    residual=PLAIN_RESIDUAL_OPS,
     output=None,
     **options,
 ):
@@ -33,13 +33,11 @@ def make_test_stages(
             sparse=previous_sparse, next_sparse=sparse, update=residual.ffn_update
         )
     )
-    attention = declare_attn(
-        read=residual.attention_read, update=residual.attention_update
-    )
+    attention = declare_attn(read=residual.attn_readout, update=residual.attn_update)
     ffn = declare_ffn(
         sparse=sparse,
         next_sparse=next_sparse,
-        read=residual.ffn_read,
+        read=residual.ffn_readout,
         update=residual.ffn_update,
         output_transform=output,
     )
@@ -83,7 +81,7 @@ def stub_stage(plan, kind):
 def sp_region_steps():
     """Local SP rows with no owed sum, for tests of activation and exits."""
     from sglang.srt.layers.layer_boundary import (
-        NORM_QUANT_READ,
+        NORM_QUANT_READOUT,
         EdgeDecl,
         Layout,
         StageEntry,
@@ -105,7 +103,7 @@ def sp_region_steps():
         return StageEntry(selected.prepare, rows, handoff=handoff)
 
     return StageSteps(
-        entry(NORM_QUANT_READ, _hand_qkv_hook_its_input), output, identity_output
+        entry(NORM_QUANT_READOUT, _hand_qkv_hook_its_input), output, identity_output
     )
 
 
@@ -120,7 +118,7 @@ def prepare_attention(stage, hidden, residual, forward_batch, *args, **call):
 
 
 def prepare_raw(stage, method, hidden, residual, forward_batch, *args, **call):
-    from sglang.srt.layers.layer_boundary.residual.add_norm import ADD
+    from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
     from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 
     if not isinstance(residual, ResidualStream):
@@ -128,7 +126,7 @@ def prepare_raw(stage, method, hidden, residual, forward_batch, *args, **call):
         if residual is not None:
             hidden = stream.leave(
                 hidden,
-                call.get("update", ADD),
+                call.get("update", PLAIN_ADD),
                 declared_sum=stage.entry(forward_batch).input_sum,
             )
     else:

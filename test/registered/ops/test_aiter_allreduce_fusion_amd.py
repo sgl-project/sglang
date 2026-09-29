@@ -386,7 +386,7 @@ class TestAiterAllreduceFusionGate(CustomTestCase):
         hidden = torch.ones(8, 32)
         owed = UnreducedOutput(hidden, group=group if matching_group else object())
         with (
-            patch_communicator("apply_flashinfer_allreduce_fusion", return_value=False),
+            patch_communicator("flashinfer_ar_fusion_applies", return_value=False),
             patch_communicator("post_experts_reduction_group", return_value=group),
             patch_communicator("_use_aiter", use_aiter),
             get_parallel().override(tp_size=tp_world_size),

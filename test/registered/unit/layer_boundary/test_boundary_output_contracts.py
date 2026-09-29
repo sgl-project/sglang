@@ -9,7 +9,7 @@ import test_declared_decoder_boundary as fixture
 import torch
 
 from sglang.srt.layers.layer_boundary import (
-    ADD,
+    PLAIN_ADD,
     ProducerReduction,
     declare_attn,
     declare_ffn,
@@ -67,7 +67,7 @@ class TestBoundaryIntegrations(unittest.TestCase):
         ]
         fb = SimpleNamespace(residual_stream=ResidualStream(torch.full((4, 4), 3.0)))
         hidden = fb.residual_stream.leave(
-            torch.ones(4, 4), ADD, declared_sum=SumGroup.TP
+            torch.ones(4, 4), PLAIN_ADD, declared_sum=SumGroup.TP
         )
         wire = batch.to_pp(hidden, fb)
         self.assertIsNone(fb.residual_stream)
@@ -101,7 +101,7 @@ class TestBoundaryIntegrations(unittest.TestCase):
                 fb,
                 fixture.Norm(),
                 pending=fb.residual_stream.pending,
-                update=ADD,
+                update=PLAIN_ADD,
             )
         self.assertEqual(reductions, ["RS"])
         torch.testing.assert_close(output, torch.full((2, 4), 10.0))
@@ -191,11 +191,9 @@ class TestBoundaryIntegrations(unittest.TestCase):
                         exits, "post_experts_reduction_group", return_value=group
                     ),
                     patch.object(
-                        exits, "apply_flashinfer_allreduce_fusion", return_value=enabled
+                        exits, "flashinfer_ar_fusion_applies", return_value=enabled
                     ),
-                    patch.object(
-                        exits, "apply_aiter_all_reduce_fusion", return_value=False
-                    ),
+                    patch.object(exits, "aiter_ar_fusion_applies", return_value=False),
                 ):
                     self.assertEqual(
                         exits._can_defer_ffn_reduction(fb), enabled and (lora or shared)

@@ -45,8 +45,8 @@ from sglang.srt.layers.layer_boundary.output import (
     UnreducedOutput,
 )
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
-    apply_aiter_all_reduce_fusion,
-    apply_flashinfer_allreduce_fusion,
+    aiter_ar_fusion_applies,
+    flashinfer_ar_fusion_applies,
 )
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.layers.moe import (
@@ -119,7 +119,7 @@ class OutputBoundary:
     @staticmethod
     def _leave_ffn_output(hidden_states, residual, stream, update, declared_sum=None):
         stream.residual = residual
-        if update.at_producer:
+        if update.applied_at_exit:
             return stream.write(hidden_states)
         return stream.leave(hidden_states, update, declared_sum=declared_sum)
 
@@ -139,7 +139,7 @@ class OutputBoundary:
         """Whether the next layer's input can run this layer's move of its FFN
         output back to this rank's tokens: the base postprocess scatter, when
         the next layer's input also writes the output into the residual."""
-        return steps.returns_over_dp and not steps.output.update.at_producer
+        return steps.returns_over_dp and not steps.output.update.applied_at_exit
 
     def _postprocess_dp_step(
         self, forward_batch: ForwardBatch, steps
@@ -267,7 +267,7 @@ class OutputBoundary:
                 forward_batch=forward_batch,
             )
         update = steps.output.update
-        if residual is not None and update.at_producer:
+        if residual is not None and update.applied_at_exit:
             hidden_states = update.update(hidden_states, residual)
             residual = None
         return hidden_states, residual
@@ -371,13 +371,11 @@ def _can_defer_ffn_reduction(forward_batch: ForwardBatch, boundary=None) -> bool
         and boundary.fusions.can_defer_all_reduce(boundary, forward_batch)
     ):
         return True
-    if apply_flashinfer_allreduce_fusion(forward_batch.input_ids.shape[0]):
+    if flashinfer_ar_fusion_applies(forward_batch.input_ids.shape[0]):
         return True
     # Aiter also checks width and bytes, so use the actual residual storage.
     residual = forward_batch.residual_stream.residual
-    return residual is not None and apply_aiter_all_reduce_fusion(
-        residual, forward_batch
-    )
+    return residual is not None and aiter_ar_fusion_applies(residual, forward_batch)
 
 
 class FfnCompletion(msgspec.Struct, frozen=True):

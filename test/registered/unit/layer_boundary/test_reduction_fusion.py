@@ -42,8 +42,8 @@ def _steps(*, output=None, returns_over_dp=False, ffn_sum_is_movable=True):
                     comm_ops._read_input,
                     layer_input=None,
                     enters_stack=False,
-                    read=comm.NORM_QUANT_READ,
-                    update=comm.ADD,
+                    read=comm.NORM_QUANT_READOUT,
+                    update=comm.PLAIN_ADD,
                 ),
                 carried_fusions=(),
             ),
@@ -298,7 +298,7 @@ class TestFuseMlpAllReduceGate(CustomTestCase):
         )
         with (
             patch_communicator("is_enable_moe_cp_allgather", return_value=False),
-            patch_communicator("apply_flashinfer_allreduce_fusion", return_value=True),
+            patch_communicator("flashinfer_ar_fusion_applies", return_value=True),
             patch_communicator(
                 "get_attn_tp_context",
                 return_value=types.SimpleNamespace(input_scattered=False),
@@ -395,7 +395,7 @@ class TestDeferFfnReduction(CustomTestCase):
             ),
             get_forward().scoped(sp_active=sp_active),
             patch_communicator("is_enable_moe_cp_allgather", return_value=False),
-            patch_communicator("apply_flashinfer_allreduce_fusion", return_value=fused),
+            patch_communicator("flashinfer_ar_fusion_applies", return_value=fused),
             patch_communicator("_use_aiter", False),
             patch_communicator(
                 "post_experts_reduction_group",

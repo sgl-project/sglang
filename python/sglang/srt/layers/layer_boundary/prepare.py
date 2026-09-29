@@ -49,8 +49,8 @@ from sglang.srt.layers.layer_boundary.output import (
     UnreducedOutput,
     reduce_output,
 )
-from sglang.srt.layers.layer_boundary.residual import StageRead, StageUpdate
-from sglang.srt.layers.layer_boundary.residual.add_norm import ADD, NORM_READ
+from sglang.srt.layers.layer_boundary.residual import ResidualReadout, ResidualUpdate
+from sglang.srt.layers.layer_boundary.residual.add_norm import NORM_READOUT, PLAIN_ADD
 from sglang.srt.layers.layer_boundary.residual.stream import DeclaredSum
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_parallel
@@ -84,14 +84,14 @@ def _mlp_input_without_dp(
     gathers_residual: bool,
     fusions: Tuple[Callable, ...],
     group: SumGroup = SumGroup.ATTN_TP,
-    read: StageRead = NORM_READ,
-    update: StageUpdate = ADD,
+    read: ResidualReadout = NORM_READOUT,
+    update: ResidualUpdate = PLAIN_ADD,
 ):
     """Complete the sum the input owes over ``group`` on the rows it is on,
     unless one of ``fusions`` does it with the residual add and the norm, then
     write it into the residual and read the input."""
     if gathers_residual:
-        residual = update.residual_from_attn_tp_shards(residual)
+        residual = update.gather_residual_attn_tp(residual)
     for fused in fusions:
         result = fused(hidden_states, residual, forward_batch)
         if result is not None:
@@ -99,7 +99,7 @@ def _mlp_input_without_dp(
     if group is SumGroup.ATTN_TP:
         # MHC sums its streams in full precision.
         hidden_states = _mlp_input_reduce_output(
-            hidden_states, forward_batch, may_quantize=update.adds_plainly
+            hidden_states, forward_batch, may_quantize=update.is_plain_add
         )
     elif group is SumGroup.TP:
         hidden_states = tensor_model_parallel_all_reduce(hidden_states)
@@ -118,15 +118,15 @@ def _mlp_input_dp_replicate(
     gathers_residual: bool,
     reduces_attention_tp: bool,
     places_cp_shards: bool = False,
-    read: StageRead = NORM_READ,
-    update: StageUpdate = ADD,
+    read: ResidualReadout = NORM_READOUT,
+    update: ResidualUpdate = PLAIN_ADD,
 ):
     """Attention DP: complete the attention-TP sum if it is owed, write the
     output into the residual and read the FFN input locally, then gather. With
     ``places_cp_shards`` each CP rank puts its shard of the DP group's tokens
     beside the others' in the group's slot."""
     if gathers_residual:
-        residual = update.residual_from_attn_tp_shards(residual)
+        residual = update.gather_residual_attn_tp(residual)
     if hidden_states.shape[0] != 0:
         if reduces_attention_tp:
             hidden_states = attention_tensor_model_parallel_all_reduce(hidden_states)
@@ -157,8 +157,8 @@ def _mlp_input_dp_partial(
     cache=None,
     gathers_residual: bool,
     places_cp_shards: bool = False,
-    read: StageRead = NORM_READ,
-    update: StageUpdate = ADD,
+    read: ResidualReadout = NORM_READOUT,
+    update: ResidualUpdate = PLAIN_ADD,
 ):
     """Attention DP: one rank adds the residual, the gather sums it, then read
     the input from the sum. With ``places_cp_shards`` each CP rank puts its
@@ -214,15 +214,15 @@ def _hand_scattered_input_to_attention(
 
 
 def _dispatch_consumer(
-    hidden_states, residual, forward_batch, norm, *, paths, update=ADD, **call
+    hidden_states, residual, forward_batch, norm, *, paths, update=PLAIN_ADD, **call
 ):
     if residual is None:
         # A missing residual cannot join a partial sum. The non-plain path
-        # performs enter/read without that optimization.
+        # performs init_residual/read without that optimization.
         prepare = paths[False]
     else:
         try:
-            prepare = paths[update.adds_plainly]
+            prepare = paths[update.is_plain_add]
         except KeyError:
             raise RuntimeError("producer update has no bound input path") from None
     return prepare(hidden_states, residual, forward_batch, norm, update=update, **call)
@@ -235,14 +235,14 @@ def _consumer_step(
     norm: torch.nn.Module,
     *,
     step: Callable,
-    adds_plainly: bool,
+    is_plain_add: bool,
     carried_fusions: Tuple[Callable, ...],
     expected_sum: Optional[SumGroup] = None,
     completed_step: Optional[Callable] = None,
     pending=None,
     written_step: Optional[Callable] = None,
     written: bool = False,
-    update: StageUpdate = ADD,
+    update: ResidualUpdate = PLAIN_ADD,
     **call,
 ):
     """A boundary's half into a stage: complete what the value carries, a sum
@@ -253,7 +253,7 @@ def _consumer_step(
     whose declared sum is already completed uses ``completed_step`` instead;
     a pending declared sum must match ``expected_sum``. ``call`` is what the stage's read takes (the attention's
     ``quant_format`` and ``post_residual_addition``)."""
-    if residual is not None and update.adds_plainly != adds_plainly:
+    if residual is not None and update.is_plain_add != is_plain_add:
         raise RuntimeError("producer update does not match the boundary's capability")
     if pending is not None:
         if isinstance(pending.owed, DeclaredSum):
@@ -302,8 +302,8 @@ def _read_input(
     cache=None,
     layer_input: Optional[Callable],
     enters_stack: bool,
-    read: StageRead,
-    update: StageUpdate = ADD,
+    read: ResidualReadout,
+    update: ResidualUpdate = PLAIN_ADD,
     quant_format: str = "",
     post_residual_addition: Optional[torch.Tensor] = None,
 ):
@@ -315,7 +315,7 @@ def _read_input(
     if layer_input is not None:
         hidden_states, residual = layer_input(hidden_states, residual)
     if enters:
-        hidden_states, residual = read.enter(hidden_states), None
+        hidden_states, residual = read.init_residual(hidden_states), None
     if residual is None:
         # The previous layer already wrote its output into the residual.
         return read.read(hidden_states, norm, quant_format)
@@ -337,12 +337,12 @@ def _mlp_input_scatter(
     *,
     cache=None,
     scatters_residual: bool,
-    read: StageRead = NORM_READ,
-    update: StageUpdate = ADD,
+    read: ResidualReadout = NORM_READOUT,
+    update: ResidualUpdate = PLAIN_ADD,
 ):
     hidden_states = _reduce_and_redistribute_output_to_attn_tp_shards(hidden_states)
     if scatters_residual:
-        residual = update.residual_to_attn_tp_shard(residual)
+        residual = update.slice_residual_attn_tp(residual)
     return read.update_and_read(update, hidden_states, residual, layernorm)
 
 
@@ -354,12 +354,12 @@ def _mlp_input_slice(
     *,
     cache=None,
     scatters_residual: bool,
-    read: StageRead = NORM_READ,
-    update: StageUpdate = ADD,
+    read: ResidualReadout = NORM_READOUT,
+    update: ResidualUpdate = PLAIN_ADD,
 ):
     hidden_states = _redistribute_to_attn_tp_shards(hidden_states).clone()
     if scatters_residual and residual is not None:
-        residual = update.residual_to_attn_tp_shard(residual)
+        residual = update.slice_residual_attn_tp(residual)
     return read.update_and_read(update, hidden_states, residual, layernorm)
 
 
@@ -371,8 +371,8 @@ def _mlp_input_on_residual_shard(
     *,
     cache=None,
     reduces: bool = True,
-    read: StageRead,
-    update: StageUpdate,
+    read: ResidualReadout,
+    update: ResidualUpdate,
 ):
     """The residual stays on each rank's slice while the FFN takes the full
     rows: reduce-scatter the attention output onto the slice, which completes
@@ -398,8 +398,8 @@ def _mlp_input_residual_into_sum(
     layernorm: torch.nn.Module,
     *,
     cache=None,
-    read: StageRead = NORM_READ,
-    update: StageUpdate = ADD,
+    read: ResidualReadout = NORM_READOUT,
+    update: ResidualUpdate = PLAIN_ADD,
 ):
     return _tp_all_reduce_with_scattered_residual(
         hidden_states, residual, layernorm, read
@@ -414,7 +414,7 @@ def _mlp_input_gather_attention_cp(
     *,
     cache=None,
     gather: Callable,
-    update: StageUpdate = ADD,
+    update: ResidualUpdate = PLAIN_ADD,
 ):
     """DSA and MLA CP: complete this rank's shard, then gather the shards, of
     equal length, over the attention-CP group. The residual stays on the
@@ -433,7 +433,7 @@ def _mlp_input_gather_moe_cp(
     *,
     cache=None,
     gather: Callable,
-    update: StageUpdate = ADD,
+    update: ResidualUpdate = PLAIN_ADD,
 ):
     """Gather for the FFN, then over the MoE-CP group so each rank holds all
     tokens of its MoE group (moe_dp_size < attn_cp_size). The residual stays on
@@ -463,7 +463,7 @@ def _tp_all_reduce_with_scattered_residual(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     layernorm: torch.nn.Module,
-    read: StageRead = NORM_READ,
+    read: ResidualReadout = NORM_READOUT,
 ):
     parallel = get_parallel()
     if hidden_states.shape[0] == 0:

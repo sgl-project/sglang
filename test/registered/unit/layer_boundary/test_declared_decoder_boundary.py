@@ -46,7 +46,10 @@ from sglang.srt.layers.layer_boundary.ops import (
 )
 from sglang.srt.layers.layer_boundary.residual import mhc as mhc_module
 from sglang.srt.layers.layer_boundary.residual.access import finish_layer_stack
-from sglang.srt.layers.layer_boundary.residual.add_norm import NORM_READ, PLAIN_RESIDUAL
+from sglang.srt.layers.layer_boundary.residual.add_norm import (
+    NORM_READOUT,
+    PLAIN_RESIDUAL_OPS,
+)
 from sglang.srt.layers.layer_boundary.residual.stream import OwedOutput, ResidualStream
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -212,8 +215,8 @@ class TestStageLayoutSelection(CustomTestCase):
                 communicator = build(
                     layer_case(1, 3),
                     parallel_of(attn_dp=2, attn_tp=attn_tp),
-                    residual=PLAIN_RESIDUAL._replace(
-                        ffn_read=replace(NORM_READ, before_gather=force)
+                    residual=PLAIN_RESIDUAL_OPS._replace(
+                        ffn_readout=replace(NORM_READOUT, reads_before_dp_gather=force)
                     ),
                 )
                 self.assertIs(
@@ -301,7 +304,7 @@ def build_mhc(
             **facts,
             attention_norm=Norm(),
             ffn_norm=Norm(),
-            residual=mhc.layer_residual(),
+            residual=mhc.residual_ops(),
         )
         stages.mhc = mhc
         return stages
@@ -454,7 +457,7 @@ class TestMhcOnTheDeclarations(CustomTestCase):
         state.h_res, state.h_post = torch.arange(4.0), torch.arange(4.0) + 10
         context = SimpleNamespace(attn_tp_rank=1, attn_tp_size=2)
         with patch_communicator("get_parallel", lambda: context):
-            residual = state.residual_to_attn_tp_shard(torch.arange(4.0) + 20)
+            residual = state.slice_residual_attn_tp(torch.arange(4.0) + 20)
         self.assertEqual(residual.tolist(), [22.0, 23.0])
         self.assertEqual(state.h_res.tolist(), [2.0, 3.0])
         self.assertEqual(state.h_post.tolist(), [12.0, 13.0])
@@ -727,9 +730,10 @@ class TestTheAttentionOutputDecidesItsSum(CustomTestCase):
             residual=comm.Layout.sharded_over(TokenAxis.ATTN_DP, axis_sizes=sizes),
             residual_to=comm.Layout.sharded_over(TokenAxis.ATTN_DP, axis_sizes=sizes),
             need=comm.StageInput(
-                comm.Layout(frozenset()), read=replace(NORM_READ, before_gather=force)
+                comm.Layout(frozenset()),
+                read=replace(NORM_READOUT, reads_before_dp_gather=force),
             ),
-            adds_plainly=True,
+            is_plain_add=True,
             fusions=(),
             residual_joins_sum=False,
             cp_moves=None,
@@ -811,7 +815,7 @@ class TestFusedKernelsTakeOnlyTheStepsTheyComplete(CustomTestCase):
             residual=comm.Layout.sharded_over(TokenAxis.ATTN_DP, axis_sizes=sizes),
             residual_to=comm.Layout.sharded_over(TokenAxis.ATTN_DP, axis_sizes=sizes),
             need=comm.StageInput(comm.Layout(frozenset())),
-            adds_plainly=True,
+            is_plain_add=True,
             fusions=fusions,
             residual_joins_sum=False,
             cp_moves=None,
@@ -897,7 +901,7 @@ class TestInputScatteredAttention(CustomTestCase):
                     residual=local,
                     residual_to=attention,
                     need=comm.StageInput(attention),
-                    adds_plainly=True,
+                    is_plain_add=True,
                     fusions=(),
                     residual_joins_sum=joins,
                     cp_moves=None,
@@ -916,7 +920,7 @@ class TestInputScatteredAttention(CustomTestCase):
             residual=attention,
             residual_to=local,
             need=comm.StageInput(local),
-            adds_plainly=True,
+            is_plain_add=True,
             fusions=(),
             residual_joins_sum=False,
             cp_moves=None,
@@ -1437,7 +1441,7 @@ class TestBranchRows(CustomTestCase):
             self.assertEqual(moves, [("shortcut", self.local, self.local)])
             moves.clear()
             stream = ResidualStream("residual")
-            hidden = stream.leave(2, comm.ADD)
+            hidden = stream.leave(2, comm.PLAIN_ADD)
             merged = moe.merge_branch(1, hidden, stream, dense, None)
             self.assertEqual(
                 moves,
@@ -1655,7 +1659,7 @@ def running(*, reduce_scatterv, a2a=False, use_reduce_scatter=True):
         "should_use_dp_reduce_scatterv": lambda: reduce_scatterv,
         "can_use_dp_reduce_scatter": lambda: True,
         "is_dp_attention_enabled": lambda: state().parallel.attn_dp_size > 1,
-        "apply_flashinfer_allreduce_fusion": lambda n: False,
+        "flashinfer_ar_fusion_applies": lambda n: False,
         "post_experts_output_is_complete": lambda **kw: False,
         "post_experts_reduction_group": lambda: state().parallel.tp_group,
         "get_lora": lambda: SimpleNamespace(enable_lora=False),
@@ -1826,7 +1830,7 @@ class TestTwoLayers(CustomTestCase):
                 hidden = attention(hidden, s)
                 hidden = residual.leave(
                     hidden,
-                    comm.ADD,
+                    comm.PLAIN_ADD,
                     declared_sum=layer.ffn.plan._batch_steps(
                         forward_batch
                     ).entry.input_sum,
@@ -1956,9 +1960,9 @@ class TestTheFfnInputReduction(CustomTestCase):
         batch = SimpleNamespace(
             forward_mode=SimpleNamespace(is_decode_or_idle=lambda: False)
         )
-        for adds_plainly, reduction in ((True, "quant"), (False, "full")):
-            with self.subTest(adds_plainly=adds_plainly):
-                update = SimpleNamespace(adds_plainly=adds_plainly)
+        for is_plain_add, reduction in ((True, "quant"), (False, "full")):
+            with self.subTest(is_plain_add=is_plain_add):
+                update = SimpleNamespace(is_plain_add=is_plain_add)
                 read = SimpleNamespace(
                     update_and_read=lambda update, h, r, norm: (h, r)
                 )

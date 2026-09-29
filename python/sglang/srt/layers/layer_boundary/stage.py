@@ -33,7 +33,7 @@ from sglang.srt.layers.layer_boundary.contracts import (
 from sglang.srt.layers.layer_boundary.ops import gather_attention_tp
 from sglang.srt.layers.layer_boundary.residual.access import buffer, from_pp
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
-    ADD,
+    PLAIN_ADD,
 )
 from sglang.srt.layers.layer_boundary.residual.batch import current
 from sglang.srt.layers.layer_boundary.residual.stream import DeclaredSum, ResidualStream
@@ -99,7 +99,7 @@ class StageBoundary:
             and entry.input_sum is not None
         ):
             hidden_states = stream.leave(
-                hidden_states, ADD, declared_sum=entry.input_sum
+                hidden_states, PLAIN_ADD, declared_sum=entry.input_sum
             )
         if stream.pending is not None:
             call["update"] = stream.pending.update
@@ -216,13 +216,13 @@ class StageBoundary:
             tensors,
             residual_in_hidden=(
                 self.declaration.previous is not None
-                and self.declaration.previous.update.at_producer
+                and self.declaration.previous.update.applied_at_exit
             ),
             allow_missing_residual=allow_missing_residual,
         )
         declared_sum = self.entry(forward_batch).input_sum
         hidden_states, forward_batch.residual_stream = ResidualStream.arrive(
-            hidden_states, residual, ADD, declared_sum=declared_sum
+            hidden_states, residual, PLAIN_ADD, declared_sum=declared_sum
         )
         return hidden_states
 

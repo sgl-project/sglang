@@ -60,7 +60,7 @@ class TestLongcatShortcut(CustomTestCase):
 
         def dense_branch(*args):
             stream = ResidualStream(torch.full((rows, 3), 11.0))
-            hidden = stream.leave(torch.full((rows, 3), 3.0), comm.ADD)
+            hidden = stream.leave(torch.full((rows, 3), 3.0), comm.PLAIN_ADD)
             batch.residual_stream = stream
             return hidden, None
 

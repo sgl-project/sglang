@@ -174,11 +174,11 @@ def make_boundary(
     if not capabilities:
         if edge.produced.update is None:
             raise ValueError("an arrival must declare its update capabilities")
-        capabilities = (edge.produced.update.adds_plainly,)
+        capabilities = (edge.produced.update.is_plain_add,)
     paths = {
         capability: _bind_consumer(
             edge,
-            adds_plainly=capability,
+            is_plain_add=capability,
             fusions=fusions,
             carried_fusions=carried_fusions,
             cp_moves=cp_moves,
@@ -204,7 +204,7 @@ def make_boundary(
 def _bind_consumer(
     edge: EdgeDecl,
     *,
-    adds_plainly: bool,
+    is_plain_add: bool,
     fusions: Tuple["FusedMlpInput", ...] = (),
     carried_fusions: Tuple[Callable, ...] = (),
     cp_moves: Optional[CpMoves] = None,
@@ -221,13 +221,13 @@ def _bind_consumer(
     first stage. The steps read only this edge's declarations, never what the
     producer chose for a batch."""
     # A fused kernel runs the add and the norm itself.
-    plain = adds_plainly and edge.need.read.norms_plainly
+    plain = is_plain_add and edge.need.read.is_plain_norm
     step, input_move = _select_input_steps(
         edge.produced,
         residual=edge.residual,
         residual_to=edge.residual_to,
         need=edge.need,
-        adds_plainly=adds_plainly,
+        is_plain_add=is_plain_add,
         fusions=fusions if plain else (),
         residual_joins_sum=edge.residual_joins_sum,
         cp_moves=cp_moves,
@@ -240,7 +240,7 @@ def _bind_consumer(
             residual=edge.residual,
             residual_to=edge.residual_to,
             need=edge.need,
-            adds_plainly=adds_plainly,
+            is_plain_add=is_plain_add,
             fusions=(),
             residual_joins_sum=False,
             cp_moves=cp_moves,
@@ -255,7 +255,7 @@ def _bind_consumer(
             residual=edge.residual,
             residual_to=edge.residual_to,
             need=edge.need,
-            adds_plainly=adds_plainly,
+            is_plain_add=is_plain_add,
             fusions=fusions if plain else (),
             residual_joins_sum=edge.residual_joins_sum,
             cp_moves=cp_moves,
@@ -282,7 +282,7 @@ def _bind_consumer(
         prepare=partial(
             _consumer_step,
             step=step,
-            adds_plainly=adds_plainly,
+            is_plain_add=is_plain_add,
             carried_fusions=carried_fusions if plain else (),
             expected_sum=edge.produced.group if edge.produced.always_leaves else None,
             completed_step=completed_step,
@@ -308,12 +308,12 @@ def make_output_boundary(
         transport. The receiver binds its read independently.
     """
     update = edge.produced.update
-    if not getattr(update, "at_producer", False):
-        if not getattr(update, "can_defer_across_layers", False):
+    if not getattr(update, "applied_at_exit", False):
+        if not getattr(update, "outlives_layer", False):
             raise NotImplementedError(
                 "a deferred update must guarantee its lifetime across layers"
             )
-        if not update.adds_plainly and get_parallel().pp_size > 1:
+        if not update.is_plain_add and get_parallel().pp_size > 1:
             raise NotImplementedError(
                 "pipeline boundaries require a plain add or a producer-written residual"
             )
@@ -339,7 +339,7 @@ def _select_input_steps(
     residual: Layout,
     residual_to: Layout,
     need: StageInput,
-    adds_plainly: bool,
+    is_plain_add: bool,
     fusions: Tuple[FusedMlpInput, ...],
     residual_joins_sum: bool,
     cp_moves: Optional[CpMoves],
@@ -421,7 +421,7 @@ def _select_input_steps(
             residual=residual,
             residual_to=residual_to,
             need=StageInput(produced.layout, read=read),
-            adds_plainly=adds_plainly,
+            is_plain_add=is_plain_add,
             fusions=fusions,
             residual_joins_sum=residual_joins_sum,
             cp_moves=cp_moves,
@@ -485,7 +485,7 @@ def _select_input_steps(
         if gathers_residual and residual_joins_sum:
             # Each rank adds its slice of the residual into its share of the
             # sum, so the all-reduce also brings the residual back to every row.
-            if owes is not SumGroup.ATTN_TP or not adds_plainly:
+            if owes is not SumGroup.ATTN_TP or not is_plain_add:
                 raise NotImplementedError(f"{produced=} {residual=} {need=}")
             return (partial(_mlp_input_residual_into_sum, read=read), None)
         # A sum over TP completes only on rows every TP rank holds: the TP group
@@ -516,9 +516,9 @@ def _select_input_steps(
     places_cp_shards = TokenAxis.ATTN_CP in gathered
     if (
         owes_attention_tp
-        and not read.before_gather
-        and adds_plainly
-        and read.norms_plainly
+        and not read.reads_before_dp_gather
+        and is_plain_add
+        and read.is_plain_norm
     ):
         return (
             partial(

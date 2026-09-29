@@ -22,7 +22,10 @@ from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.layers.layer_boundary import prepare as comm_ops
 from sglang.srt.layers.layer_boundary.contracts import BatchVariant
-from sglang.srt.layers.layer_boundary.residual.add_norm import NORM_READ, PLAIN_RESIDUAL
+from sglang.srt.layers.layer_boundary.residual.add_norm import (
+    NORM_READOUT,
+    PLAIN_RESIDUAL_OPS,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.boundary_fixtures import (
     make_test_stages,
@@ -143,7 +146,7 @@ class TestDpCpGather(CustomTestCase):
         padding=DpPaddingMode.SUM_LEN,
         norm=layernorm,
         norm_rows=lambda rows: rows,
-        read=NORM_READ,
+        read=NORM_READOUT,
         ffn_input=None,
         sparse=False,
     ):
@@ -270,7 +273,7 @@ class TestDpCpGather(CustomTestCase):
                     next_sparse=False,
                     attention_norm=norm,
                     ffn_norm=norm,
-                    residual=PLAIN_RESIDUAL._replace(ffn_read=read),
+                    residual=PLAIN_RESIDUAL_OPS._replace(ffn_readout=read),
                 )
                 yield SimpleNamespace(
                     communicator=communicator,
@@ -410,7 +413,7 @@ class TestDpCpGather(CustomTestCase):
             attn_tp_size=2,
             norm=rms_norm,
             norm_rows=rms_rows,
-            read=replace(NORM_READ, before_gather=True),
+            read=replace(NORM_READOUT, reads_before_dp_gather=True),
             ffn_input=comm_ops._mlp_input_dp_replicate,
         )
 

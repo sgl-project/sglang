@@ -289,7 +289,7 @@ def _bind_stage(declaration, norm, incoming, outgoing, **options):
     variants = {}
     for variant, edge in incoming.entries.items():
         if (
-            declaration.update.at_producer
+            declaration.update.applied_at_exit
             and TokenAxis.ATTN_CP
             in edge.produced.layout.sharded - edge.need.layout.sharded
         ):
@@ -299,7 +299,7 @@ def _bind_stage(declaration, norm, incoming, outgoing, **options):
             handoff = (
                 _hand_scattered_input_to_attention
                 if variant is BatchVariant.INPUT_SCATTERED
-                and not declaration.update.adds_plainly
+                and not declaration.update.is_plain_add
                 else _hand_qkv_hook_its_input
             )
         moves = _cp_moves() if variant is BatchVariant.CONTEXT_PARALLEL else None

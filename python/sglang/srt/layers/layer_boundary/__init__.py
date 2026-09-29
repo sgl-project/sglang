@@ -64,13 +64,13 @@ from sglang.srt.layers.layer_boundary.output import (
     UnreducedOutput,
     reduce_output,
 )
-from sglang.srt.layers.layer_boundary.residual import LayerResidual
+from sglang.srt.layers.layer_boundary.residual import LayerResidualOps
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
-    ADD,
     FUSE_ALLREDUCE_MAX_BATCH_SIZE,
-    NORM_QUANT_READ,
-    NORM_READ,
-    PLAIN_RESIDUAL,
+    NORM_QUANT_READOUT,
+    NORM_READOUT,
+    PLAIN_ADD,
+    PLAIN_RESIDUAL_OPS,
 )
 from sglang.srt.layers.layer_boundary.residual.mhc import (
     MHCState,
@@ -82,7 +82,7 @@ __all__ = [
     "make_attn_stage",
     "make_ffn_stage",
     "make_stages",
-    "ADD",
+    "PLAIN_ADD",
     "AttentionInputs",
     "StageSteps",
     "EdgeDecl",
@@ -93,13 +93,13 @@ __all__ = [
     "FfnExit",
     "FusedMlpInput",
     "HandoffOutput",
-    "LayerResidual",
+    "LayerResidualOps",
     "Layout",
     "MHCState",
     "MixerExit",
-    "NORM_QUANT_READ",
-    "NORM_READ",
-    "PLAIN_RESIDUAL",
+    "NORM_QUANT_READOUT",
+    "NORM_READOUT",
+    "PLAIN_RESIDUAL_OPS",
     "StageDecl",
     "StageEntry",
     "StageInput",

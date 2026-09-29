@@ -182,7 +182,7 @@ class TestBoundCaptureOwnership(CustomTestCase):
 
         from sglang.srt.layers import layernorm
         from sglang.srt.layers.layer_boundary import (
-            ADD,
+            PLAIN_ADD,
             FusedMlpInput,
             SumGroup,
             declare_attn,
@@ -224,15 +224,13 @@ class TestBoundCaptureOwnership(CustomTestCase):
             forward_mode=ForwardMode.DECODE,
             residual_stream=ResidualStream(torch.full((2, 4), 2.0)),
         )
-        hidden = fb.residual_stream.leave(torch.full((2, 4), 3.0), ADD)
+        hidden = fb.residual_stream.leave(torch.full((2, 4), 3.0), PLAIN_ADD)
         outputs = AuxHiddenStateList()
         with (
             fixture.planning(parallel),
             patch_communicator("_use_aiter", False),
-            patch_communicator("apply_aiter_all_reduce_fusion", return_value=False),
-            patch_communicator(
-                "apply_flashinfer_allreduce_fusion", return_value=enabled
-            ),
+            patch_communicator("aiter_ar_fusion_applies", return_value=False),
+            patch_communicator("flashinfer_ar_fusion_applies", return_value=enabled),
             patch_communicator(
                 "attention_tensor_model_parallel_all_reduce",
                 side_effect=lambda x: x * 2,

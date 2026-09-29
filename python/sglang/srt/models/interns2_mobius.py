@@ -21,7 +21,10 @@ from sglang.srt.layers.layer_boundary import (
     make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
-from sglang.srt.layers.layer_boundary.residual.add_norm import Fp8Input, NormQuantRead
+from sglang.srt.layers.layer_boundary.residual.add_norm import (
+    Fp8Input,
+    NormQuantReadout,
+)
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -492,7 +495,7 @@ class InternS2MobiusLinearDecoderLayer(_InternS2MobiusDecoderMixin, nn.Module):
         self.attn_boundary, self.ffn_boundary = make_stages(
             (
                 declare_attn(
-                    read=NormQuantRead(
+                    read=NormQuantReadout(
                         fp8_input=Fp8Input.TUPLE_AND_BF16 if accepts_fp8_input else None
                     )
                 ),
@@ -624,7 +627,7 @@ class InternS2MobiusAttentionDecoderLayer(
         self.attn_boundary, self.ffn_boundary = make_stages(
             (
                 declare_attn(
-                    read=NormQuantRead(
+                    read=NormQuantReadout(
                         fp8_input=Fp8Input.TUPLE if accepts_fp8_input else None
                     )
                 ),

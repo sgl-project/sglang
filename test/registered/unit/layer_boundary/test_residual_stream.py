@@ -19,7 +19,7 @@ from sglang.srt.layers.layer_boundary import (
 from sglang.srt.layers.layer_boundary.contracts import BatchVariant, StageKind
 from sglang.srt.layers.layer_boundary.output import UnreducedOutput
 from sglang.srt.layers.layer_boundary.residual.access import add_to_output
-from sglang.srt.layers.layer_boundary.residual.add_norm import ADD
+from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
 from sglang.srt.layers.layer_boundary.residual.stream import (
     DeclaredSum,
     OwedOutput,
@@ -41,15 +41,15 @@ class TestResidualStream(CustomTestCase):
         self.partial = torch.ones(2, 4)
         self.stream = ResidualStream(self.residual)
         self.hidden = self.stream.leave(
-            UnreducedOutput(self.partial, group=self.group), ADD
+            UnreducedOutput(self.partial, group=self.group), PLAIN_ADD
         )
 
     def test_written_input_does_not_repeat_first_stage_initialization(self):
         class Read:
-            norms_plainly = False
+            is_plain_norm = False
             enters = 0
 
-            def enter(self, value):
+            def init_residual(self, value):
                 self.enters += 1
                 return value * 3
 
@@ -77,8 +77,8 @@ class TestResidualStream(CustomTestCase):
 
     def test_consumer_executes_the_carried_update_not_the_bound_producers(self):
         class Update:
-            adds_plainly = False
-            at_producer = False
+            is_plain_add = False
+            applied_at_exit = False
 
             def __init__(self, increment):
                 self.increment = increment
@@ -89,7 +89,7 @@ class TestResidualStream(CustomTestCase):
                 return value + residual + self.increment
 
         class Read:
-            norms_plainly = False
+            is_plain_norm = False
 
             def update_and_read(self, update, value, residual, norm, **kwargs):
                 residual = update.update(value, residual)
@@ -134,12 +134,12 @@ class TestResidualStream(CustomTestCase):
                 self.residual,
                 None,
                 None,
-                update=SimpleNamespace(adds_plainly=False),
+                update=SimpleNamespace(is_plain_add=False),
             )
 
     def test_declared_sum_snapshot_and_pipeline_handoff_preserve_the_partial(self):
         stream = ResidualStream(self.residual)
-        hidden = stream.leave(self.partial, ADD, declared_sum=SumGroup.TP)
+        hidden = stream.leave(self.partial, PLAIN_ADD, declared_sum=SumGroup.TP)
         self.assertIsInstance(hidden, OwedOutput)
         with patch(
             "sglang.srt.layers.layer_boundary.residual.stream._sum_group",
@@ -152,7 +152,7 @@ class TestResidualStream(CustomTestCase):
         self.assertIs(wire, self.partial)
         self.assertIsInstance(stream.pending.owed, DeclaredSum)
         received, rebuilt = ResidualStream.arrive(
-            wire, residual, ADD, declared_sum=SumGroup.TP
+            wire, residual, PLAIN_ADD, declared_sum=SumGroup.TP
         )
         self.assertIsInstance(received, OwedOutput)
         self.assertIs(rebuilt.pending.owed.group, SumGroup.TP)
@@ -168,7 +168,7 @@ class TestResidualStream(CustomTestCase):
             )
         )
         stream = ResidualStream(self.residual)
-        hidden = stream.leave(self.partial, ADD, declared_sum=SumGroup.TP)
+        hidden = stream.leave(self.partial, PLAIN_ADD, declared_sum=SumGroup.TP)
         with patch(
             "sglang.srt.layers.layer_boundary.residual.stream._sum_group",
             return_value=self.group,
@@ -195,7 +195,7 @@ class TestResidualStream(CustomTestCase):
             EdgeDecl(StageOutput(rows), StageInput(rows), rows, rows)
         )
         stream = ResidualStream(self.residual)
-        stream.leave(self.partial, ADD, declared_sum=SumGroup.TP)
+        stream.leave(self.partial, PLAIN_ADD, declared_sum=SumGroup.TP)
         with self.assertRaisesRegex(RuntimeError, "sum does not match"):
             boundary.prepare(
                 self.partial,
@@ -203,11 +203,11 @@ class TestResidualStream(CustomTestCase):
                 None,
                 None,
                 pending=stream.pending,
-                update=ADD,
+                update=PLAIN_ADD,
             )
 
     def test_snapshot_rejects_stateful_update_without_touching_main_state(self):
-        update = SimpleNamespace(adds_plainly=False, update=Mock())
+        update = SimpleNamespace(is_plain_add=False, update=Mock())
         stream = ResidualStream(self.residual)
         hidden = stream.leave(UnreducedOutput(self.partial, group=self.group), update)
         with self.assertRaisesRegex(NotImplementedError, "plain residual update"):
@@ -234,7 +234,7 @@ class TestResidualStream(CustomTestCase):
         self.assertIs(self.stream.complete(hidden), hidden)
         self.group.all_reduce.assert_called_once()
         self.assertIs(self.stream.pending.value, hidden)
-        self.assertIs(self.stream.pending.update, ADD)
+        self.assertIs(self.stream.pending.update, PLAIN_ADD)
         self.assertIsNone(self.stream.pending.owed)
         self.assertIs(self.stream.residual, self.residual)
         torch.testing.assert_close(hidden, torch.full((2, 4), 2.0))
@@ -363,11 +363,11 @@ class TestResidualStream(CustomTestCase):
 
     def test_handles_cannot_cross_microbatches_or_be_reused_after_take(self):
         other = ResidualStream(self.residual.clone())
-        other.leave(UnreducedOutput(self.partial.clone(), group=self.group), ADD)
+        other.leave(UnreducedOutput(self.partial.clone(), group=self.group), PLAIN_ADD)
         with self.assertRaises(RuntimeError):
             other.input(self.hidden)
         with self.assertRaises(RuntimeError):
-            self.stream.leave(torch.zeros_like(self.partial), ADD)
+            self.stream.leave(torch.zeros_like(self.partial), PLAIN_ADD)
         self.stream.write(self.residual)
         with self.assertRaises(RuntimeError):
             self.stream.input(self.hidden)
@@ -377,7 +377,7 @@ class TestResidualStream(CustomTestCase):
         move = Mock(side_effect=lambda value: value[:1])
         stream = ResidualStream(self.residual[:1])
         hidden = stream.leave(
-            UnreducedOutput(self.partial, reduce_and_redistribute=move), ADD
+            UnreducedOutput(self.partial, reduce_and_redistribute=move), PLAIN_ADD
         )
         self.assertIsInstance(hidden, OwedOutput)
         completed = stream.complete(hidden)
@@ -387,7 +387,7 @@ class TestResidualStream(CustomTestCase):
 
     def test_prepare_releases_the_consumed_contribution(self):
         class Read:
-            norms_plainly = True
+            is_plain_norm = True
 
             def update_and_read(self, update, value, residual, norm, **kwargs):
                 residual = update.update(value, residual)
@@ -408,7 +408,7 @@ class TestResidualStream(CustomTestCase):
         # The deferred DP completion: sum, then this rank's rows.
         hidden = stream.leave(
             UnreducedOutput(partial, reduce_and_redistribute=lambda x: x[:2] * 2),
-            ADD,
+            PLAIN_ADD,
         )
         del partial
         result, stream = stage._prepare(hidden, stream, None, steps)
@@ -430,7 +430,7 @@ class TestBatchStageOwnership(CustomTestCase):
         contribution = torch.full_like(residual, 2)
         refs = [weakref.ref(residual), weakref.ref(contribution)]
         batch.current(fb).write(residual)
-        output = batch.current(fb).leave(contribution, ADD)
+        output = batch.current(fb).leave(contribution, PLAIN_ADD)
         result = batch.norm(output, fb, lambda x, r: (x + r, r))
         del output, residual, contribution
         torch.testing.assert_close(result, torch.full((2, 4), 3.0))
@@ -446,7 +446,7 @@ class TestBatchStageOwnership(CustomTestCase):
         contribution = torch.full_like(residual, 2)
         refs = [weakref.ref(residual), weakref.ref(contribution)]
         batch.current(fb).write(residual)
-        output = batch.current(fb).leave(contribution, ADD)
+        output = batch.current(fb).leave(contribution, PLAIN_ADD)
         proxy = batch.to_pp(output, fb)
         del output, residual, contribution
         self.assertTrue(all(ref() is not None for ref in refs))
@@ -458,9 +458,9 @@ class TestBatchStageOwnership(CustomTestCase):
         from sglang.srt.layers.layer_boundary.residual import batch
 
         class Read:
-            norms_plainly = False
+            is_plain_norm = False
 
-            def enter(self, value):
+            def init_residual(self, value):
                 return value
 
             def read(self, value, norm, quant_format="", **kwargs):
@@ -488,8 +488,8 @@ class TestBatchStageOwnership(CustomTestCase):
         batch.start(b)
         first = stage.prepare(torch.ones(2, 4), a)
         second = stage.prepare(torch.full((2, 4), 10.0), b)
-        first = batch.current(a).leave(first * 3, ADD)
-        second = batch.current(b).leave(second * 5, ADD)
+        first = batch.current(a).leave(first * 3, PLAIN_ADD)
+        second = batch.current(b).leave(second * 5, PLAIN_ADD)
         torch.testing.assert_close(stage.prepare(first, a), torch.full((2, 4), 14.0))
         torch.testing.assert_close(stage.prepare(second, b), torch.full((2, 4), 220.0))
         self.assertIsNot(batch.current(a), batch.current(b))

@@ -23,11 +23,11 @@ from sglang.srt.layers.layer_boundary.contracts import FusedMlpInput
 from sglang.srt.layers.layer_boundary.layout import SumGroup
 from sglang.srt.layers.layer_boundary.output import UnreducedOutput
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
-    NORM_QUANT_READ,
+    NORM_QUANT_READOUT,
     Fp8Input,
-    NormQuantRead,
-    apply_aiter_all_reduce_fusion,
-    apply_flashinfer_allreduce_fusion,
+    NormQuantReadout,
+    aiter_ar_fusion_applies,
+    flashinfer_ar_fusion_applies,
 )
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.moe import post_experts_reduction_group
@@ -38,7 +38,7 @@ from sglang.srt.utils import get_bool_env_var, is_hip
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 
-def attention_fusions(plan, read=NORM_QUANT_READ) -> Tuple[Callable, ...]:
+def attention_fusions(plan, read=NORM_QUANT_READOUT) -> Tuple[Callable, ...]:
     """The fused kernels that complete what the previous layer left together
     with the residual update and the input norm, in the order they are tried.
     Each takes (owed, residual, forward_batch, post_residual_addition) and
@@ -49,7 +49,7 @@ def attention_fusions(plan, read=NORM_QUANT_READ) -> Tuple[Callable, ...]:
     if not hasattr(plan.norm, "forward_with_allreduce_fusion"):
         return given
     fuses_quant = (
-        isinstance(read, NormQuantRead)
+        isinstance(read, NormQuantReadout)
         and read.fp8_input is not None
         and _use_aiter
         and not get_bool_env_var("SGLANG_DISABLE_FUSED_AR_QUANT", default="false")
@@ -91,8 +91,8 @@ def complete_attention_input(
         return None
     hidden_states = owed.partial
     if not (
-        apply_aiter_all_reduce_fusion(hidden_states, forward_batch)
-        or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
+        aiter_ar_fusion_applies(hidden_states, forward_batch)
+        or flashinfer_ar_fusion_applies(hidden_states.shape[0])
     ):
         return None
     if fuses_quant:
@@ -143,7 +143,7 @@ def flashinfer_preserves_residual(value, forward_batch):
     return (
         not _use_aiter
         and get_parallel().attn_tp_size > 1
-        and apply_flashinfer_allreduce_fusion(value.shape[0])
+        and flashinfer_ar_fusion_applies(value.shape[0])
     )
 
 
@@ -156,8 +156,8 @@ def complete_ffn_input(
     """The attention-TP all-reduce, residual add and norm in one aiter or
     flashinfer kernel; None when neither takes the batch."""
     if not (
-        apply_aiter_all_reduce_fusion(hidden_states, forward_batch)
-        or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
+        aiter_ar_fusion_applies(hidden_states, forward_batch)
+        or flashinfer_ar_fusion_applies(hidden_states.shape[0])
     ):
         return None
     return plan.norm.forward_with_allreduce_fusion(

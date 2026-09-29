@@ -22,8 +22,8 @@ import torch
 from sglang.srt.distributed import GroupCoordinator
 from sglang.srt.layers.layer_boundary.layout import Layout, SumGroup, TokenAxis
 from sglang.srt.layers.layer_boundary.output import OutputTransform
-from sglang.srt.layers.layer_boundary.residual import StageRead, StageUpdate
-from sglang.srt.layers.layer_boundary.residual.add_norm import ADD, NORM_READ
+from sglang.srt.layers.layer_boundary.residual import ResidualReadout, ResidualUpdate
+from sglang.srt.layers.layer_boundary.residual.add_norm import NORM_READOUT, PLAIN_ADD
 
 
 class ProducerReduction(Enum):
@@ -71,7 +71,7 @@ class StageInput(msgspec.Struct, frozen=True):
     # sharded over them.
     gathers_itself: FrozenSet[TokenAxis] = frozenset()
     # How the consumer reads its input from the residual.
-    read: StageRead = NORM_READ
+    read: ResidualReadout = NORM_READOUT
 
 
 class StageOutput(msgspec.Struct, frozen=True):
@@ -109,7 +109,7 @@ class StageOutput(msgspec.Struct, frozen=True):
     leaves_for_reduce_scatterv: bool = False
     # How the producer's output is written into the residual. An arrival
     # description has no producer object; its edge declares capabilities only.
-    update: Optional[StageUpdate] = ADD
+    update: Optional[ResidualUpdate] = PLAIN_ADD
     transform: Optional[OutputTransform] = None
 
 
@@ -135,7 +135,7 @@ class EdgeDecl(msgspec.Struct, frozen=True):
         residual_to: Residual layout after the boundary.
         residual_joins_sum: Whether one rank may add the residual into a partial
             before reduction; valid only for an eligible plain-add update.
-        update_capabilities: Allowed values of StageUpdate.adds_plainly for
+        update_capabilities: Allowed values of ResidualUpdate.is_plain_add for
             arriving contributions. Empty means use produced.update's capability.
             The actual update object travels with the residual stream.
     """

@@ -11,8 +11,8 @@ import torch
 
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.layers.layer_boundary import (
-    ADD,
-    NORM_QUANT_READ,
+    NORM_QUANT_READOUT,
+    PLAIN_ADD,
     Layout,
     StageKind,
     TokenAxis,
@@ -249,11 +249,11 @@ def test_communicator_publishes_layout_at_each_transition(
                 _read_input,
                 layer_input=None,
                 enters_stack=False,
-                read=NORM_QUANT_READ,
-                update=ADD,
+                read=NORM_QUANT_READOUT,
+                update=PLAIN_ADD,
             ),
             carried_fusions=(),
-            adds_plainly=True,
+            is_plain_add=True,
         ),
         input_move=lambda hidden_states, **kwargs: hidden_states,
         handoff=lambda hidden_states, *args: hidden_states,

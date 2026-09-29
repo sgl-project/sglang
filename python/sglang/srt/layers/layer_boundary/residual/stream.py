@@ -21,7 +21,7 @@ import torch
 from sglang.srt.distributed import GroupCoordinator
 from sglang.srt.layers.layer_boundary.layout import SumGroup, _sum_group
 from sglang.srt.layers.layer_boundary.output import HandoffOutput, UnreducedOutput
-from sglang.srt.layers.layer_boundary.residual import StageUpdate
+from sglang.srt.layers.layer_boundary.residual import ResidualUpdate
 
 
 class CarriedSum(msgspec.Struct, frozen=True):
@@ -63,7 +63,7 @@ class Contribution(msgspec.Struct):
     """
 
     value: Optional[torch.Tensor]
-    update: StageUpdate
+    update: ResidualUpdate
     owed: Union[CarriedSum, DeclaredSum, HandoffOutput, None] = None
 
     def for_boundary(self):
@@ -207,7 +207,7 @@ class ResidualStream:
         if self.pending is not None:
             return self.pending.for_boundary(), self.residual
         # An initialized, written stream needs read only. An uninitialized
-        # stream still uses the first stage's enter operation.
+        # stream still uses the first stage's init_residual.
         return hidden, None
 
     def complete(self, hidden):
@@ -219,7 +219,7 @@ class ResidualStream:
         pending = self.pending
         if pending is None:
             return hidden.clone()
-        if not pending.update.adds_plainly:
+        if not pending.update.is_plain_add:
             raise NotImplementedError("snapshot requires a plain residual update")
         if pending.owed is None:
             value = pending.value

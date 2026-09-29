@@ -41,11 +41,11 @@ from sglang.srt.layers.layer_boundary.layout import (
     token_axis_sizes,
 )
 from sglang.srt.layers.layer_boundary.output import OutputTransform
-from sglang.srt.layers.layer_boundary.residual import StageRead, StageUpdate
+from sglang.srt.layers.layer_boundary.residual import ResidualReadout, ResidualUpdate
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
-    ADD,
-    NORM_QUANT_READ,
-    NORM_READ,
+    NORM_QUANT_READOUT,
+    NORM_READOUT,
+    PLAIN_ADD,
 )
 from sglang.srt.layers.moe import is_moe_input_scattered_across_dp_ranks
 from sglang.srt.runtime_context import get_exec, get_parallel
@@ -78,8 +78,8 @@ def _ffn_decl(
     sparse,
     terminal=False,
     output_transform=None,
-    read=NORM_READ,
-    update=ADD,
+    read=NORM_READOUT,
+    update=PLAIN_ADD,
     dense_tp_size=None,
     reduction=ProducerReduction.SCOPED,
 ):
@@ -126,7 +126,7 @@ def _ffn_decl(
             local,
         )
     if variant is BatchVariant.INPUT_SCATTERED:
-        scattered_residual = update.at_producer
+        scattered_residual = update.applied_at_exit
         residual = local if scattered_residual else attention
         returned = local if scattered_residual and not terminal else attention
         return (
@@ -166,8 +166,8 @@ def _ffn_decl(
             group=group,
             leaves_for_next_layer=may_leave
             and not terminal
-            and not update.at_producer
-            and update.can_defer_across_layers
+            and not update.applied_at_exit
+            and update.outlives_layer
             and output_transform is None
             and reduction is ProducerReduction.SCOPED,
             leaves_for_reduce_scatter=use_reduce_scatter and may_scatter,
@@ -215,8 +215,8 @@ class StageDeclaration:
     """
 
     kind: StageKind
-    read: StageRead
-    update: StageUpdate
+    read: ResidualReadout
+    update: ResidualUpdate
     sparse: bool = False
     terminal: bool = False
     output_transform: Optional[OutputTransform] = None
@@ -264,8 +264,8 @@ def declare_attn(
     *,
     previous: Optional[StageDeclaration] = None,
     prepared_from: Optional[StageDeclaration] = None,
-    read=NORM_QUANT_READ,
-    update=ADD,
+    read=NORM_QUANT_READOUT,
+    update=PLAIN_ADD,
     terminal=False,
     reduction=ProducerReduction.PARTIAL,
     gathers_tp_input=True,
@@ -305,8 +305,8 @@ def declare_ffn(
     previous: Optional[StageDeclaration] = None,
     prepared_from: Optional[StageDeclaration] = None,
     sparse=False,
-    read=NORM_READ,
-    update=ADD,
+    read=NORM_READOUT,
+    update=PLAIN_ADD,
     terminal=False,
     output_transform=None,
     next_sparse=False,
@@ -356,7 +356,7 @@ def declare_ffn(
 
 def _resolve(stage, variant, following=None):
     axes, attention, local, full = _rows(variant)
-    if stage.update.at_producer:
+    if stage.update.applied_at_exit:
         if stage.sparse and sparse_moe_gathers_over_moe_cp():
             raise NotImplementedError(
                 "MHC does not support a MoE gathered over the MoE-CP group"
@@ -460,7 +460,7 @@ def _connect(producer, consumer, *, residual_from=None):
             else:
                 owes = (
                     variant is BatchVariant.INPUT_SCATTERED
-                    and not before.update.at_producer
+                    and not before.update.applied_at_exit
                 )
                 carries = (
                     (
@@ -481,7 +481,7 @@ def _connect(producer, consumer, *, residual_from=None):
                     else False,
                     update=None,
                 )
-                residual, capabilities = returned, (before.update.adds_plainly,)
+                residual, capabilities = returned, (before.update.is_plain_add,)
         if after is None:
             continue
         decl, during, _ = _resolve(after, variant)
@@ -503,7 +503,7 @@ def _connect(producer, consumer, *, residual_from=None):
         joins = (
             variant is BatchVariant.INPUT_SCATTERED
             and arrived.update is not None
-            and arrived.update.adds_plainly
+            and arrived.update.is_plain_add
             and after.kind is StageKind.FFN
         )
         edge = EdgeDecl(

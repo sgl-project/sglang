@@ -12,8 +12,8 @@ from sglang.srt.layers.flashinfer_mnnvl_cutedsl import (
     _with_early_finalize_shared_load,
 )
 from sglang.srt.layers.layer_boundary import (
-    ADD,
-    NORM_QUANT_READ,
+    NORM_QUANT_READOUT,
+    PLAIN_ADD,
     Layout,
     StageKind,
     SumGroup,
@@ -65,13 +65,13 @@ def _communicator():
         entry=SimpleNamespace(
             prepare=partial(
                 _consumer_step,
-                adds_plainly=True,
+                is_plain_add=True,
                 step=partial(
                     _read_input,
                     layer_input=None,
                     enters_stack=False,
-                    read=NORM_QUANT_READ,
-                    update=ADD,
+                    read=NORM_QUANT_READOUT,
+                    update=PLAIN_ADD,
                 ),
                 carried_fusions=comm._attn_input_fusions,
             ),
@@ -596,9 +596,7 @@ class TestDeferredLoraAllReduce(unittest.TestCase):
                     exits, "get_parallel", return_value=SimpleNamespace(tp_group=group)
                 ),
                 patch.object(exits, "post_experts_reduction_group", return_value=group),
-                patch.object(
-                    exits, "apply_flashinfer_allreduce_fusion", return_value=False
-                ),
+                patch.object(exits, "flashinfer_ar_fusion_applies", return_value=False),
                 patch.object(
                     provider, "can_defer_all_reduce", return_value=eligible
                 ) as gate,
