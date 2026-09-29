@@ -77,7 +77,7 @@ def speculative_sampling_block_kernel(
     Per-request kernel over a linear (topk=1) chain of gamma = NUM_SLOTS - 1
     drafted tokens; same tensor contract as speculative_sampling_classic_kernel.
     Accepts via h_i = Z_{i+1} / (Z_{i+1} + 1 - p_i) with cumulative prefix
-    ratio p_i and residual mass Z_{i+1}; tau = argmax_i{coin_i <= h_i}
+    ratio p_i and residual mass Z_{i+1}; tau = argmax_i{coin_i < h_i}
     (no early stop), then resamples from the p_tau-scaled residual.
     One-hot draft rows use Z_{i+1} = p_i * (1 - M_b(X_{i+1})) in closed form.
     """
@@ -158,7 +158,10 @@ def speculative_sampling_block_kernel(
         h = tl.where(step == NUM_SLOTS - 1, p, h_safe)
 
         coin = tl.load(uni_ptr_base + (step - 1) * stride_uni_s)
-        if coin <= h:
+        # Strict `<` (matches the classic kernel): with `<=` a zero coin would
+        # accept a step with h == 0 (p == 0 or Z == 0), landing tau on a
+        # zero-residual step whose correction token falls back to VOCAB_SIZE-1.
+        if coin < h:
             tau = step
             z_res = z
             p_res = p
