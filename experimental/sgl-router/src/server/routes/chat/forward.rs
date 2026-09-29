@@ -129,10 +129,7 @@ pub(super) async fn forward_chat_request(
     );
     let dispatch = async {
         match prefill_task {
-            Some((task, prefill)) => {
-                let (result, prefill_blamed) = forward_pd(task, response).await;
-                (result, prefill_blamed.then_some(prefill))
-            }
+            Some((task, prefill)) => forward_pd(task, prefill, response).await,
             None => (response.await, None),
         }
     };
@@ -230,46 +227,47 @@ fn spawn_prefill_request(
 /// Client errors and backpressure pass through; only a prefill fault becomes
 /// `prefill_failed`.
 async fn prefill_failure(result: Result<Response<Body>, ApiError>) -> PrefillFailure {
-    let response = match result {
-        Ok(response) if response.status().is_success() => response,
+    let status = match result {
+        // A streaming prefill reports a late failure as a 200 carrying an SSE error event.
+        Ok(response) if response.status().is_success() => {
+            let status = response.status();
+            match axum::body::to_bytes(response.into_body(), usize::MAX).await {
+                Ok(body) if !sse::has_error_event(&body) => return None,
+                _ => status,
+            }
+        }
         Ok(response)
             if matches!(
                 outcome_from_status(response.status().as_u16()),
                 RequestOutcome::Error
             ) =>
         {
-            return Some(Err(ApiError::PrefillFailed {
-                status: Some(response.status()),
-            }));
+            response.status()
         }
         result => return Some(result),
     };
-    // A streaming prefill reports a late failure as a 200 carrying an SSE error event.
-    let status = response.status();
-    match axum::body::to_bytes(response.into_body(), usize::MAX).await {
-        Ok(body) if !sse::has_error_event(&body) => None,
-        _ => Some(Err(ApiError::PrefillFailed {
-            status: Some(status),
-        })),
-    }
+    Some(Err(ApiError::PrefillFailed {
+        status: Some(status),
+    }))
 }
 
 /// Returns decode's response as soon as decode answers, unless prefill fails
-/// first; the flag reports that prefill's failure was returned instead.
+/// first; then prefill's failure is returned along with the blamed prefill.
 async fn forward_pd(
-    prefill: tokio::task::JoinHandle<PrefillFailure>,
+    task: tokio::task::JoinHandle<PrefillFailure>,
+    prefill: Arc<Worker>,
     decode: impl std::future::Future<Output = Result<Response<Body>, ApiError>>,
-) -> (Result<Response<Body>, ApiError>, bool) {
+) -> (Result<Response<Body>, ApiError>, Option<Arc<Worker>>) {
     let mut decode = std::pin::pin!(decode);
     tokio::select! {
         biased;
-        failure = prefill => match failure {
-            Ok(None) => (decode.await, false),
-            Ok(Some(failure)) => (failure, true),
-            Err(_) => (Err(ApiError::PrefillFailed { status: None }), true),
+        failure = task => match failure {
+            Ok(None) => (decode.await, None),
+            Ok(Some(failure)) => (failure, Some(prefill)),
+            Err(_) => (Err(ApiError::PrefillFailed { status: None }), Some(prefill)),
         },
         // Dropping the handle leaves prefill running.
-        response = &mut decode => (response, false),
+        response = &mut decode => (response, None),
     }
 }
 
