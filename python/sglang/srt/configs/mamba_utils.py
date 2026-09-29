@@ -156,6 +156,19 @@ class BaseLinearStateParams(ABC):
                 )
         return per_layer * len(self.layers)
 
+    def replayssm_fold_ring_bytes_per_req(self, record_len: int) -> int:
+        """GDN fold-every-commit window bytes across all layers: raw v and
+        pre-norm k in the activation dtype, fp32 scalar gate and beta."""
+        hv, v_dim, k_dim = self.shape.temporal
+        h_k = self.shape.num_k_heads_per_tp
+        conv_b = self.dtype.conv.itemsize
+        per_layer = (
+            hv * record_len * v_dim * conv_b  # rawv
+            + h_k * record_len * k_dim * conv_b  # rawk
+            + 2 * hv * record_len * 4  # g, beta
+        )
+        return per_layer * len(self.layers)
+
     @property
     def is_kda(self) -> bool:
         """KDA per-K-channel gate vs GDN/Mamba2 per-head scalar gate. Selects

@@ -43,8 +43,9 @@ def _select_recurrent_launch_config(
         and _is_sm90
     ):
         # BV=4 and n <= 64 measured on H100/H200. SM90 only: Blackwell is faster
-        # with narrow tiles but not bit-identical to BV=32. Only the dense
-        # intermediate-state verify sets target_verify; cache_ring keeps BV=32.
+        # with narrow tiles but not bit-identical to BV=32. Both target verify
+        # forms set target_verify: dense intermediate states and the ReplaySSM
+        # ring-write (rawv is stored per value column; rawk/g/beta by i_v == 0).
         return 4, 1
     return min(triton.next_power_of_2(v), 32), 1
 
@@ -444,7 +445,13 @@ def fused_sigmoid_gating_delta_rule_update(
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
     BV, num_warps = _select_recurrent_launch_config(
-        N, H, HV, K, V, is_kda, target_verify=intermediate_states_buffer is not None
+        N,
+        H,
+        HV,
+        K,
+        V,
+        is_kda,
+        target_verify=intermediate_states_buffer is not None or cache_ring,
     )
     BK = triton.next_power_of_2(K)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)

@@ -1090,6 +1090,7 @@ class KVCacheConfigurator:
                     or self.hybrid_kda_config is not None
                 )
             ),
+            replayssm_spec_fold_gdn=self._gdn_replayssm_spec_fold(),
         )
         return req_to_token_pool
 
@@ -1122,18 +1123,7 @@ class KVCacheConfigurator:
         max_num_reqs: int,
         extra_max_context_len: int,
     ) -> ReqToTokenPool:
-        # DSPARK/DFLASH commit routes through the backend fold (KDA-only); a
-        # non-KDA model there would scatter a None intermediate_ssm and crash.
-        _algo = (get_spec().speculative_algorithm or "").upper()
-        if (
-            get_exec().mamba.enable_linear_replayssm_spec
-            and _algo in ("DSPARK", "DFLASH")
-            and self.hybrid_kda_config is None
-        ):
-            raise ValueError(
-                "--enable-linear-replayssm-spec with DSPARK/DFLASH requires a KDA "
-                "model; got a non-KDA model."
-            )
+        replayssm_spec_fold_gdn = self._gdn_replayssm_spec_fold()
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
             mamba_size=get_schedule().max_mamba_cache_size,
@@ -1171,8 +1161,41 @@ class KVCacheConfigurator:
                     or self.hybrid_kda_config is not None
                 )
             ),
+            replayssm_spec_fold_gdn=replayssm_spec_fold_gdn,
         )
         return req_to_token_pool
+
+    def _gdn_replayssm_spec_fold(self) -> bool:
+        """Whether GDN spec verify uses fold-every-commit (DSPARK/DFLASH).
+
+        Those workers commit through update_mamba_state_after_mtp_verify, which
+        folds the accepted window into ``temporal``; the compact-replay cursors
+        used by the generic spec_utils commit are not driven there. KDA folds
+        on that path already, so any other model would scatter a None
+        ``intermediate_ssm`` and is rejected.
+        """
+        from sglang.srt.speculative.ragged_verify import (
+            RaggedVerifyMode,
+            read_ragged_verify_mode,
+        )
+
+        if not get_exec().mamba.enable_linear_replayssm_spec:
+            return False
+        algo = (get_spec().speculative_algorithm or "").upper()
+        if algo not in ("DSPARK", "DFLASH") or self.hybrid_kda_config is not None:
+            return False
+        if self.hybrid_gdn_config is None:
+            raise ValueError(
+                "--enable-linear-replayssm-spec with DSPARK/DFLASH requires a KDA "
+                "or GDN model."
+            )
+        if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
+            # The GDN ring-write verify kernels do not take the ragged layout.
+            raise ValueError(
+                "--enable-linear-replayssm-spec with DSPARK/DFLASH on a GDN model "
+                "requires SGLANG_RAGGED_VERIFY_MODE=static."
+            )
+        return True
 
     def _build_default_req_pool(
         self,
@@ -2436,7 +2459,16 @@ class KVCacheConfigurator:
         replayssm_active = get_exec().mamba.enable_linear_replayssm_spec and (
             self.hybrid_gdn_config is not None or self.hybrid_kda_config is not None
         )
-        if replayssm_active:
+        gdn_fold = replayssm_active and self._gdn_replayssm_spec_fold()
+        if gdn_fold:
+            # Fold-every-commit window: raw v / k + gate + beta, one verify
+            # window per mamba slot (the rings are indexed by slot).
+            replayssm_ring_per_req = (
+                config.mamba2_cache_params.replayssm_fold_ring_bytes_per_req(
+                    record_len=max_speculative_num_draft_tokens()
+                )
+            )
+        elif replayssm_active:
             record_len = get_exec().mamba.linear_replayssm_cache_len
             replayssm_ring_per_req = (
                 config.mamba2_cache_params.replayssm_ring_bytes_per_req(
@@ -2446,7 +2478,7 @@ class KVCacheConfigurator:
         else:
             replayssm_ring_per_req = 0
         replayssm_ring_per_req = int(replayssm_ring_per_req * pp_layer_scale)
-        if replayssm_active and self.hybrid_kda_config is None:
+        if replayssm_active and self.hybrid_kda_config is None and not gdn_fold:
             replay_req_slots = (
                 get_schedule().max_running_requests // self.attn_dp_size + 1
             )

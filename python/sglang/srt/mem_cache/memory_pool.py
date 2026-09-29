@@ -544,6 +544,7 @@ class MambaPool:
         linear_replayssm_cache_len: int = 16,
         envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        replayssm_spec_fold_gdn: bool = False,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -566,8 +567,12 @@ class MambaPool:
         # fold-every-commit for KDA. The shared g allocation gates on
         # `_replayssm_on`.
         self.enable_linear_replayssm_spec = enable_linear_replayssm_spec
+        # GDN folds every commit too when the caller commits through
+        # update_mamba_state_after_mtp_verify (DSPARK/DFLASH), which has no
+        # compact-replay cursor path (replayssm_spec_fold_gdn).
         self.replayssm_spec_fold = bool(
-            enable_linear_replayssm_spec and cache_params.is_kda
+            enable_linear_replayssm_spec
+            and (cache_params.is_kda or replayssm_spec_fold_gdn)
         )
         _replayssm_on = enable_linear_replayssm or enable_linear_replayssm_spec
 
@@ -659,9 +664,13 @@ class MambaPool:
                 L = linear_replayssm_cache_len
                 # GDN speculative replay is request-lifetime scratch. Size it by
                 # active requests instead of every persistent radix-cache slot.
+                # The fold rings are indexed by mamba slot (like the checkpoint),
+                # so they follow the pool size.
                 num_slots = (
                     spec_state_size + 1
-                    if enable_linear_replayssm_spec and not cache_params.is_kda
+                    if enable_linear_replayssm_spec
+                    and not cache_params.is_kda
+                    and not self.replayssm_spec_fold
                     else size + 1
                 )
                 # Decode records follow the SSM dtype. Spec-verify compact d/k
@@ -707,9 +716,12 @@ class MambaPool:
                     dtype=torch.float32,
                     device=device,
                 )
-                # KDA still uses raw-input fold-every-commit. GDN materializes
-                # its compact d/k/g history directly and needs no duplicate ring.
-                if enable_linear_replayssm_spec and cache_params.is_kda:
+                # KDA, and GDN under DSPARK/DFLASH, use raw-input fold-every-commit.
+                # GDN compact replay materializes its d/k/g history directly and
+                # needs no duplicate ring.
+                if enable_linear_replayssm_spec and (
+                    cache_params.is_kda or self.replayssm_spec_fold
+                ):
                     if cache_params.is_kda or not self.replayssm_spec_fold:
                         # Backstop for the KDA ring invariants; this pool is
                         # sized with the final adaptive-aware draft maximum.
@@ -1251,6 +1263,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         short_conv_state_shape: Optional[Tuple[int, int]] = None,
         ngram_context_len: int = 0,
         ngram_eos_token_id: int = 0,
+        replayssm_spec_fold_gdn: bool = False,
     ):
         super().__init__(
             size=size,
@@ -1283,6 +1296,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             short_conv_state_shape=short_conv_state_shape,
             ngram_context_len=ngram_context_len,
             ngram_eos_token_id=ngram_eos_token_id,
+            replayssm_spec_fold_gdn=replayssm_spec_fold_gdn,
         )
 
     def _init_mamba_pool(
@@ -1303,6 +1317,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         short_conv_state_shape: Optional[Tuple[int, int]] = None,
         ngram_context_len: int = 0,
         ngram_eos_token_id: int = 0,
+        replayssm_spec_fold_gdn: bool = False,
     ):
         self.mamba_pool = self.mamba_pool_cls(
             size=mamba_size,
@@ -1317,6 +1332,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
+            replayssm_spec_fold_gdn=replayssm_spec_fold_gdn,
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,

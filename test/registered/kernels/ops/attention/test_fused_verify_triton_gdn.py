@@ -304,6 +304,69 @@ def test_sm90_verify_launch_is_bit_exact(
     assert torch.equal(states_tuned, states_default)
 
 
+@_requires_sm90
+@pytest.mark.skipif(not KERNELS_AVAILABLE, reason="Kernels not available")
+@pytest.mark.parametrize("N", [1, 3, 16, 64])
+@pytest.mark.parametrize("T", [4, 16])
+@pytest.mark.parametrize("H,HV", [(16, 32), (4, 16)])
+def test_sm90_ring_verify_launch_is_bit_exact(
+    N: int, T: int, H: int, HV: int, monkeypatch
+):
+    """The ReplaySSM ring-writing verify takes the tuned SM90 launch, and its
+    output and rings match the BV=32 launch bit for bit."""
+    K = V = 128
+    A_log, dt_bias, a, b, q, k, v, state, indices, cu_seqlens = _make_tensors(
+        N, T, H, HV, K, V
+    )
+    target_verify = []
+
+    def tuned(*args, **kwargs):
+        target_verify.append(kwargs.get("target_verify"))
+        return _select_recurrent_launch_config(*args, **kwargs)
+
+    def run(launch_config):
+        monkeypatch.setattr(
+            recurrent_module, "_select_recurrent_launch_config", launch_config
+        )
+        rings = {
+            "rawv": torch.zeros(N, HV, T, V, dtype=torch.bfloat16, device="cuda"),
+            "rawk": torch.zeros(N, H, T, K, dtype=torch.bfloat16, device="cuda"),
+            "g": torch.zeros(N, HV, T, dtype=torch.float32, device="cuda"),
+            "beta": torch.zeros(N, HV, T, dtype=torch.float32, device="cuda"),
+        }
+        out = fused_sigmoid_gating_delta_rule_update(
+            A_log=A_log,
+            dt_bias=dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            a=a,
+            b=b,
+            initial_state_source=state.clone(),
+            initial_state_indices=indices,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=True,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+            is_kda=False,
+            disable_state_update=True,
+            cache_ring=True,
+            replayssm_rawv=rings["rawv"],
+            replayssm_rawk=rings["rawk"],
+            replayssm_g=rings["g"],
+            replayssm_beta=rings["beta"],
+        )
+        return out, rings
+
+    out_tuned, rings_tuned = run(tuned)
+    out_default, rings_default = run(lambda *args, **kwargs: (32, 1))
+
+    assert target_verify == [True]
+    assert torch.equal(out_tuned, out_default)
+    for name in rings_tuned:
+        assert torch.equal(rings_tuned[name], rings_default[name]), name
+
+
 @pytest.mark.skipif(not KERNELS_AVAILABLE, reason="Kernels not available")
 @pytest.mark.parametrize("N", [1, 16, 128])
 def test_mtp_single_step_decode(N: int):

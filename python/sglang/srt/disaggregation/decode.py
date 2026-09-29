@@ -281,6 +281,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         short_conv_state_shape: Optional[Tuple[int, int]] = None,
         ngram_context_len: int = 0,
         ngram_eos_token_id: int = 0,
+        replayssm_spec_fold_gdn: bool = False,
     ):
         DecodeReqToTokenPool.__init__(
             self,
@@ -332,6 +333,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             short_conv_state_shape=short_conv_state_shape,
             ngram_context_len=ngram_context_len,
             ngram_eos_token_id=ngram_eos_token_id,
+            replayssm_spec_fold_gdn=replayssm_spec_fold_gdn,
         )
 
     def clear(self):
