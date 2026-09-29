@@ -19,7 +19,7 @@ Correctness-sensitive cases stay on Triton:
 Single-sequence token counts that are not a multiple of the kernel's 64-token
 chunk are padded up to a bucket (1k/2k/4k/8k/16k/32k) in a persistent staging
 buffer, which bounds the resident workspace set. Pad rows are state-neutral:
-k/v/beta zero => no rank-1 update; raw gate -1000 => transformed decay of
+k/v zero => no rank-1 update, even with beta sigmoid; raw gate -1000 => decay of
 exactly 1. Multi-sequence batches go through the kernel's own varlen grid
 (real cu_seqlens, no padding), so their shapes are whatever the scheduler
 produces and each distinct shape can retain another workspace.
@@ -327,6 +327,7 @@ class PtxKDAKernel(LinearAttnKernelBase):
                 dt_bias=self._flat_param(dt_bias),
                 return_intermediate_states=return_intermediate_states,
                 use_qk_l2norm_in_kernel=True,
+                use_beta_sigmoid_in_kernel=kwargs.get("beta_is_raw", False),
             )
             out, final_state, h = result[0], result[1], result[10]
             ssm_states.index_copy_(0, slot, final_state.to(ssm_states.dtype))
