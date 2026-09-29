@@ -499,6 +499,16 @@ class TestGemma4RequestValidation(unittest.TestCase):
         scheduler = SimpleNamespace(dllm_config=None)
         self.assertIsNone(SchedulerDllmMixin.validate_dllm_request(scheduler, object()))
 
+    def test_algorithms_without_logprobs_reject_return_logprob(self):
+        # The base default: no dLLM result path fills logprobs, so a request
+        # asking for them would stream empty arrays.
+        for algorithm in ("LowConfidence", "JointThreshold"):
+            with self.subTest(algorithm=algorithm):
+                error = self._validate(algorithm=algorithm, return_logprob=True)
+                self.assertIn("return_logprob", error)
+                self.assertIn(algorithm, error)
+                self.assertIsNone(self._validate(algorithm=algorithm))
+
     def test_greedy_temperature_is_accepted_after_normalization(self):
         params = SamplingParams(temperature=0)
         self.assertEqual(params.temperature, 1.0)

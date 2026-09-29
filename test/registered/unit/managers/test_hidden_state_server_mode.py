@@ -79,8 +79,9 @@ class TestHiddenStateServerMode(CustomTestCase):
 
 
 class TestDllmRequestValidation(CustomTestCase):
-    """dLLM has no input-logprob stage, so the server would answer a
-    return_logprob request with empty arrays. Refuse it instead."""
+    """Whether a dLLM server can return logprobs is the algorithm's call
+    (`DllmAlgorithm.validate_request`, run by the scheduler), so the tokenizer
+    must not refuse it for every algorithm up front."""
 
     @staticmethod
     def _make_request(return_logprob):
@@ -90,16 +91,14 @@ class TestDllmRequestValidation(CustomTestCase):
             return_logprob=return_logprob,
         )
 
-    def test_dllm_server_rejects_return_logprob(self):
+    def test_dllm_server_leaves_logprobs_to_the_algorithm(self):
         manager = _make_tokenizer_manager(self, dllm_algorithm="LowConfidence")
 
-        with self.assertRaisesRegex(ValueError, "return_logprob is not supported"):
-            manager._validate_one_request(self._make_request(True), [1, 2, 3])
-
-    def test_dllm_server_accepts_a_request_without_logprobs(self):
-        manager = _make_tokenizer_manager(self, dllm_algorithm="LowConfidence")
-
-        manager._validate_one_request(self._make_request(False), [1, 2, 3])
+        for return_logprob in (False, True):
+            with self.subTest(return_logprob=return_logprob):
+                manager._validate_one_request(
+                    self._make_request(return_logprob), [1, 2, 3]
+                )
 
     def test_non_dllm_server_still_accepts_return_logprob(self):
         manager = _make_tokenizer_manager(self, dllm_algorithm=None)
