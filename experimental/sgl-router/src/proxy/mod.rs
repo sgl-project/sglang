@@ -411,7 +411,7 @@ impl Proxy {
             sse::StreamLimits {
                 idle_timeout: self.stream_idle_timeout,
                 expiration,
-                abort: stream_abort,
+                abort: stream_abort.filter(|_| status.is_success()),
             },
         );
         let mut out = Response::new(body);
