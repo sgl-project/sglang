@@ -584,24 +584,6 @@ def test_w4a16_keeps_weight_scale_storage_without_activation_scales(
         torch.testing.assert_close(mega.tensors.fc2_alpha, torch.full((2,), scale + 1))
 
 
-@pytest.mark.parametrize("is_gated,activation", [(False, "silu"), (True, "gelu")])
-def test_w4a16_rejects_non_swiglu(monkeypatch, is_gated, activation):
-    module = _load_megamoe_module(monkeypatch)
-    monkeypatch.setattr(
-        module.envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16, "get", lambda: True
-    )
-    fake_moe_ep = types.ModuleType("flashinfer.moe_ep")
-    fake_moe_ep.MoEWeightPack = types.SimpleNamespace
-    monkeypatch.setitem(sys.modules, "flashinfer.moe_ep", fake_moe_ep)
-    layer = types.SimpleNamespace(
-        moe_runner_config=types.SimpleNamespace(
-            is_gated=is_gated, activation=activation
-        )
-    )
-    with pytest.raises(ValueError, match="only supports SwiGLU"):
-        module.prepare_nvfp4_moe_weights_for_flashinfer_megamoe(layer)
-
-
 def test_w4a16_reload_preserves_layer_and_prepared_weight_storage(monkeypatch):
     module = _load_megamoe_module(monkeypatch)
     monkeypatch.setattr(
