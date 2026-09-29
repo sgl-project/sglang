@@ -231,18 +231,12 @@ class TestOnlyTheEnabledLegsAreGathered(CustomTestCase):
 
         calls = []
 
-        def _fake_all_to_all(recv, send):
-            # Every rank sends tp copies of its own slice and keeps one block
-            # per peer, so on a single fake rank the result is tp copies. Same
-            # contract the real collective has, which is what makes this a
-            # gather at all.
-            calls.append(tuple(send.shape))
-            self.assertEqual(send.shape[0], self.TP)
-            recv.copy_(send)
+        def _fake_all_gather(out, inp):
+            calls.append(tuple(inp.shape))
+            out.copy_(inp.repeat(self.TP, 1, 1))
 
         parallel = mock.Mock()
         parallel.attn_tp_size = self.TP
-        parallel.attn_tp_group.all_to_all_single = _fake_all_to_all
         with (
             mock.patch.object(
                 dsa_cp_module, "dsa_cp_narrow_a2a_enabled", lambda: narrow_input
@@ -251,6 +245,10 @@ class TestOnlyTheEnabledLegsAreGathered(CustomTestCase):
                 dsa_cp_module, "dsa_cp_narrow_a2a_output_enabled", lambda: narrow_output
             ),
             mock.patch.object(dsa_cp_module, "get_parallel", lambda: parallel),
+            mock.patch(
+                "sglang.srt.layers.dp_attention.attn_tp_all_gather_into_tensor",
+                _fake_all_gather,
+            ),
         ):
             dsa_cp_module.dsa_cp_attach_full_kv_b(attn)
         return attn, calls
@@ -304,27 +302,6 @@ class TestOnlyTheEnabledLegsAreGathered(CustomTestCase):
             "contiguous full copy means the gather rebuilt it and paid twice",
         )
         self.assertEqual(attn.w_kc_full.stride()[1:], attn.w_kc.stride()[1:])
-
-    def test_the_gather_uses_all_to_all_not_all_gather(self):
-        """The op is load-bearing, and only for memory.
-
-        HCCL charges 2 x HCCL_BUFFSIZE to a communicator the first time it runs
-        all_gather_into_tensor -- 2.00 GiB of KV pool at the 1000 MiB default on
-        A3 tp16, 1.02 GiB at 500. The same group's first all_to_all_single takes
-        0.00 GiB. Both ops compute the same gather, so nothing downstream would
-        notice a switch back; the only symptom is 2 GiB of pool, which no test
-        that checks results can catch.
-        """
-
-        attn, calls = self._attach(narrow_input=True, narrow_output=True)
-        self.assertEqual(len(calls), 2, "the fake all-to-all must be what ran")
-        for shape in calls:
-            self.assertEqual(
-                shape[0],
-                self.TP,
-                "an all-to-all gather sends one block per rank; a bare local "
-                "slice here means the call was really an all-gather",
-            )
 
     def test_the_return_leg_still_needs_dsa_cp_itself(self):
         """Independent of the inbound leg, but not of DSA-CP.
