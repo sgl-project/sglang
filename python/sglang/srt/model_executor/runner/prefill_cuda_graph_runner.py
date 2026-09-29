@@ -400,10 +400,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             source=self.buffers,
         )
 
-        self.mha_companion_layers = self.model_runner.mha_companion_layers
-        self.has_mha_companion_layers = any(
-            layer is not None for layer in self.mha_companion_layers
-        )
+        self.has_mha_companion_layers = self.model_runner.has_mha_companion_layers
 
         self.dp_size = get_parallel().dp_size
         self.require_mlp_tp_gather = require_mlp_tp_gather()

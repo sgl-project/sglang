@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, NamedTuple, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import msgspec
 from torch import nn
@@ -9,24 +9,15 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
 
 
-class AttentionLayers(NamedTuple):
-    attention_layers: list[Any]
-    mha_companion_layers: list[Any]
-
-
 def _get_loop_num(hf_config: Any) -> int:
     # Nanbeige uses num_loops; IQuestLoopCoder uses loop_num.
     return int(getattr(hf_config, "loop_num", getattr(hf_config, "num_loops", 1)) or 1)
 
 
-def compute_attention_layers(layer_model: Any) -> AttentionLayers:
-    attention_layers: list[Any] = []
-    mha_companion_layers: list[Any] = []
-
-    # Loop models (Nanbeige / IQuestLoopCoder) store one RadixAttention per loop
-    # in a ModuleList. Prefill CUDA graph indexes by layer_id, so expand and
-    # reorder to a dense [0..N) list.
-    has_loop_attn = False
+def compute_attention_layer_info(layer_model: Any) -> tuple[int, bool]:
+    """Count supported attention layers and detect MHA companions for graph gates."""
+    attention_layer_count = 0
+    has_mha_companion_layers = False
 
     layers = layer_model.layers
     if isinstance(layers, nn.ModuleDict):
@@ -63,28 +54,19 @@ def compute_attention_layers(layer_model: Any) -> AttentionLayers:
             if hasattr(layer.mixer, "attn"):
                 attn_layer = layer.mixer.attn
             elif hasattr(layer, "_forward_mamba"):
-                # Mamba layer with split op support - store the layer itself
+                # Mamba layer with graph support
                 attn_layer = layer
 
         if isinstance(attn_layer, nn.ModuleList):
-            attention_layers.extend(attn_layer)
-            mha_companion_layers.extend([mha_companion_layer] * len(attn_layer))
-            has_loop_attn = True
-        else:
-            # Keep these lists aligned with global layer ids. Pipeline-parallel
-            # models retain placeholders outside the local stage, while real
-            # attention modules use their global layer_id during graph replay.
-            attention_layers.append(attn_layer)
-            mha_companion_layers.append(mha_companion_layer)
+            # Loop models have one attention module for each execution of a block.
+            attention_layer_count += sum(attn is not None for attn in attn_layer)
+            if len(attn_layer) and mha_companion_layer is not None:
+                has_mha_companion_layers = True
+        elif attn_layer is not None:
+            attention_layer_count += 1
+            has_mha_companion_layers |= mha_companion_layer is not None
 
-    # Reorder so attention_layers[i] matches RadixAttention.layer_id.
-    if has_loop_attn:
-        attention_layers.sort(key=lambda x: x.layer_id)
-
-    return AttentionLayers(
-        attention_layers,
-        mha_companion_layers,
-    )
+    return attention_layer_count, has_mha_companion_layers
 
 
 class _PPLayerRange(msgspec.Struct, frozen=True, kw_only=True):
