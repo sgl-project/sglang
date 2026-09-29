@@ -42,11 +42,9 @@ def _select_recurrent_launch_config(
         and v == 128
         and _is_sm90
     ):
-        # One-warp programs over 32-column value tiles leave most SM90 SMs idle
-        # at small verify batches. Value columns are independent and the K
-        # reduction stays within a program, so the narrower tile is bit-identical.
-        # target_verify is only set for the dense intermediate-state cache; the
-        # ReplaySSM ring verify (cache_ring) keeps the default launch.
+        # BV=4 and n <= 64 measured on H100/H200. SM90 only: Blackwell is faster
+        # with narrow tiles but not bit-identical to BV=32. Only the dense
+        # intermediate-state verify sets target_verify; cache_ring keeps BV=32.
         return 4, 1
     return min(triton.next_power_of_2(v), 32), 1
 
