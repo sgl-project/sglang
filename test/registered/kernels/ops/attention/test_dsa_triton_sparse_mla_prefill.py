@@ -235,7 +235,7 @@ class TestDSATritonPrefillBackendAdapter(CustomTestCase):
     argument marshalling but cannot catch a wrong result or a wrong output
     contract. This runs it for real and checks both: the values against an fp32
     reference, and the shape against what the sibling `_forward_flashmla_sparse`
-    returns to the same caller — `[num_tokens, num_heads, v_head_dim]`. Returning
+    returns to the same caller, `[num_tokens, num_heads, v_head_dim]`. Returning
     a different rank here would corrupt every downstream projection.
     """
 

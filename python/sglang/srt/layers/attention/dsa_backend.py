@@ -350,14 +350,6 @@ def _validate_triton_sparse_mla_backend(
     union: int,
     index_kpool: int,
 ) -> None:
-    """Capability check for ``--dsa-prefill-backend triton_sparse_mla``.
-
-    The kernel is CUDA-only (Triton ``tl.dot`` on bf16 with a tile table tuned
-    for SM90/SM120). Heads are padded into a 16-row mma tile rather than into
-    the grid, so any count up to ``_TRITON_SPARSE_MLA_MAX_HEADS`` works; the
-    union tile is ``num_q_heads * union`` rows and must be a power of two in
-    [16, 32] (``tl.arange`` needs a power of two, ``tl.dot`` needs M >= 16).
-    """
     if _is_hip:
         raise ValueError(
             "triton_sparse_mla is a CUDA prefill backend; on ROCm use the "
@@ -384,6 +376,8 @@ def _validate_triton_sparse_mla_backend(
     if union not in (0, 2, 4):
         raise ValueError(f"--dsa-triton-union must be 0, 2 or 4; got {union}.")
     if union:
+        # tl.arange needs a power of two and tl.dot needs M >= 16; the tuned
+        # union tiles stop at 32 rows.
         rows = num_q_heads * union
         if rows < 16 or rows > 32 or rows & (rows - 1):
             raise ValueError(
@@ -395,9 +389,9 @@ def _validate_triton_sparse_mla_backend(
 
 
 def _resolve_dsa_triton_union(*, union: int, deterministic: bool) -> int:
-    """Union shares one gathered index set across G neighbouring tokens, so a
-    token's output depends on which tokens share its group and on the T % G
-    tail. That breaks the batch invariance deterministic inference promises."""
+    # Union makes a token's output depend on which tokens share its group and
+    # on the T % G tail, which breaks the batch invariance deterministic
+    # inference promises.
     if union and deterministic:
         logger.warning(
             "--dsa-triton-union %d is disabled under "
@@ -3005,12 +2999,6 @@ class DeepseekSparseAttnBackend(
         sm_scale: float,
         topk_length: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Fused Triton sparse-MLA prefill.
-
-        Unlike ``flashmla_sparse`` this kernel does not pad the head dim to 64 /
-        128; it pads into a 16-row mma tile instead, so the ``num_heads`` the
-        model actually has after TP is the work it does.
-        """
         from sglang.kernels.ops.attention.dsa.triton_sparse_mla_prefill import (
             sparse_mla_prefill,
         )

@@ -93,7 +93,6 @@ def _nsa_prefill_kernel(
     idx_ptr,
     len_ptr,
     o_ptr,
-    scale_ptr,  # FP8 only: [s_qk = qs*ks, s_k = ks] fp32; unused when not FP8
     sm_scale,
     topk,
     H: tl.constexpr,
@@ -101,9 +100,6 @@ def _nsa_prefill_kernel(
     D_QK: tl.constexpr,
     D_V: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    FP8: tl.constexpr,
-    MATH_BF16: tl.constexpr,  # with FP8: cast tiles to bf16 after load (halve L1/L2
-    # gather bytes, keep the SM90-fast bf16 mma path)
     IDX64: tl.constexpr,  # int64 row addressing only when the KV pool can overflow
     # int32*D_QK (rows > ~3.7M); the int32 path keeps the gather loop on IMAD.
 ):
@@ -112,15 +108,6 @@ def _nsa_prefill_kernel(
     # t=29128 and the output offset from t=32768, wrapping to another token.
     t64 = t.to(tl.int64)
     D_TAIL: tl.constexpr = D_QK - D_V
-
-    if FP8:
-        # inputs pre-scaled by 448/amax in the wrapper; undo inside the math:
-        # qk_real = qk_fp8 * qs*ks/448^2 ; pv_real = pv_fp8 * ks/448^2 (P carries x448)
-        qk_scale = sm_scale * tl.load(scale_ptr) / (448.0 * 448.0)
-        out_scale = tl.load(scale_ptr + 1) / (448.0 * 448.0)
-    else:
-        qk_scale = sm_scale
-        out_scale = 1.0
 
     h = tl.arange(0, BLOCK_H)
     hmask = h < H
@@ -134,9 +121,6 @@ def _nsa_prefill_kernel(
     q_tail = tl.load(
         qb + h[:, None] * D_QK + (D_V + dt)[None, :], mask=hmask[:, None], other=0.0
     )
-    if FP8 and MATH_BF16:
-        q_main = q_main.to(tl.bfloat16)
-        q_tail = q_tail.to(tl.bfloat16)
 
     m_i = tl.full([BLOCK_H], -float("inf"), tl.float32)
     l_i = tl.zeros([BLOCK_H], tl.float32)
@@ -154,12 +138,9 @@ def _nsa_prefill_kernel(
         kb = kv_ptr + row[:, None] * D_QK
         kv_main = tl.load(kb + dv[None, :], mask=valid[:, None], other=0.0)
         kv_tail = tl.load(kb + (D_V + dt)[None, :], mask=valid[:, None], other=0.0)
-        if FP8 and MATH_BF16:
-            kv_main = kv_main.to(tl.bfloat16)
-            kv_tail = kv_tail.to(tl.bfloat16)
 
         qk = tl.dot(q_main, tl.trans(kv_main))
-        qk = tl.dot(q_tail, tl.trans(kv_tail), qk) * qk_scale
+        qk = tl.dot(q_tail, tl.trans(kv_tail), qk) * sm_scale
         qk = tl.where(valid[None, :], qk, -float("inf"))
 
         m_new = tl.maximum(m_i, tl.max(qk, axis=1))
@@ -167,15 +148,11 @@ def _nsa_prefill_kernel(
         alpha = tl.exp(m_i - m_safe)
         p = tl.exp(qk - m_safe[:, None])
         l_i = l_i * alpha + tl.sum(p, axis=1)
-        if FP8:
-            p_q = (p * 448.0).to(kv_main.dtype)
-        else:
-            p_q = p.to(kv_main.dtype)
-        acc = acc * alpha[:, None] + tl.dot(p_q, kv_main)
+        acc = acc * alpha[:, None] + tl.dot(p.to(kv_main.dtype), kv_main)
         m_i = m_new
 
     l_safe = tl.where(l_i == 0.0, 1.0, l_i)
-    acc = acc * (out_scale / l_safe[:, None])
+    acc = acc * (1.0 / l_safe[:, None])
     tl.store(
         o_ptr + t64 * H * D_V + h[:, None] * D_V + dv[None, :],
         acc.to(o_ptr.dtype.element_ty),
@@ -187,8 +164,9 @@ def _nsa_prefill_kernel(
 # Union path: G adjacent tokens share one gathered KV set. Per group, the G*K
 # selected rows are sorted and deduplicated on the device, and an ownership bit
 # per unique row lets the kernel below restore each token's own softmax
-# support. The cost is O(G*K) per group whatever the KV span, so nothing here
-# depends on the index range, reads back to the host, or persists across calls.
+# support. The cost is O(G*K*log K) per group whatever the KV span, so
+# nothing here depends on the index range, reads back to the host, or
+# persists across calls.
 # ---------------------------------------------------------------------------
 
 
@@ -338,7 +316,7 @@ def _nsa_prefill_union_kernel(
     )
 
 
-def _union_path(q, kv, indices, sm_scale, d_v, out, G, union_config=None):
+def _union_path(*, q, kv, indices, sm_scale, d_v, out, G, union_config):
     """Returns True if handled; tail rows (T % G) go through the per-token path."""
     T, h, d_qk = q.shape
     K = indices.shape[-1]
@@ -353,7 +331,7 @@ def _union_path(q, kv, indices, sm_scale, d_v, out, G, union_config=None):
     if T_main == 0:
         return False
     NG = T_main // G
-    uidx, ubits, ulen = _union_dedup(indices[:T_main], G)
+    uidx, ubits, ulen = _union_dedup(idx_main=indices[:T_main], G=G)
     U_CAP = G * K
     if union_config is not None:
         bn, warps, stages = union_config
@@ -399,7 +377,7 @@ def _union_path(q, kv, indices, sm_scale, d_v, out, G, union_config=None):
             sm_scale,
             d_v,
             out=out[T_main:],
-            union=False,
+            union=0,
         )
     return True
 
@@ -526,15 +504,19 @@ def sparse_mla_prefill(
         out = torch.empty(T, h, d_v, dtype=torch.bfloat16, device=q.device)
 
     if union in (2, 4) and _union_path(
-        q, kv, indices, sm_scale, d_v, out, union, union_config
+        q=q,
+        kv=kv,
+        indices=indices,
+        sm_scale=sm_scale,
+        d_v=d_v,
+        out=out,
+        G=union,
+        union_config=union_config,
     ):
         return out
 
     if topk_length is None:
         topk_length = _topk_length(indices, topk)
-
-    q_in, kv_in = q, kv
-    scales = torch.ones(2, dtype=torch.float32, device=q.device)
 
     bn, warps, stages = config or _config(q.device)
     # int32 gather addressing unless the pool could overflow int32 element offsets
@@ -549,12 +531,11 @@ def sparse_mla_prefill(
     for bn_try, ns_try in _tile_candidates("base", h, 0, q.device, bn, stages):
         try:
             _nsa_prefill_kernel[(T,)](
-                q_in,
-                kv_in,
+                q,
+                kv,
                 indices,
                 topk_length,
                 out,
-                scales,
                 sm_scale,
                 topk,
                 H=h,
@@ -564,8 +545,6 @@ def sparse_mla_prefill(
                 BLOCK_N=bn_try,
                 num_warps=warps,
                 num_stages=ns_try,
-                FP8=False,
-                MATH_BF16=False,
                 IDX64=idx64,
             )
         except triton.runtime.errors.OutOfResources:
