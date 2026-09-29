@@ -4,6 +4,10 @@ import torch
 import torch_npu
 from sgl_kernel_npu.norm.fused_split_qk_norm import fused_split_qk_norm
 
+import sglang.srt.layers.dcp.comm as dcp_comm
+import sglang.srt.layers.dcp.layout as dcp_layout
+import sglang.srt.model_executor.forward_context as forward_context
+import sglang.srt.runtime_context as runtime_context
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     NPUFusedMLAPreprocess,
@@ -15,17 +19,9 @@ from sglang.srt.layers.attention.dsa.dsa_npu_indexer import scattered_to_tp_attn
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
 )
-from sglang.srt.layers.communicator import get_attn_tp_context
-from sglang.srt.layers.dcp.comm import (
-    all_gather_q_for_mla_decode,
-    cp_lse_ag_out_rs_mla_npu,
-)
-from sglang.srt.layers.dcp.layout import remap_dcp_sparse_indices
-from sglang.srt.model_executor.forward_context import (
-    get_attn_backend,
-    get_token_to_kv_pool,
-)
-from sglang.srt.runtime_context import get_disagg, get_parallel
+from sglang.srt.layers.layer_boundary import get_attn_tp_context
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.runtime_context import get_disagg
 from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk
 
 if TYPE_CHECKING:
@@ -38,8 +34,8 @@ _is_npu_arch35 = is_npu_arch35()
 
 def _use_dsa_dcp_partial_attention(forward_batch: "ForwardBatch") -> bool:
     return (
-        get_parallel().dcp_enabled
-        and not get_attn_backend().is_draft_worker
+        runtime_context.get_parallel().dcp_enabled
+        and not forward_context.get_attn_backend().is_draft_worker
         and not dsa_use_prefill_cp(forward_batch)
         and not forward_batch.forward_mode.is_idle()
     )
@@ -509,18 +505,18 @@ def forward_dsa_prepare_npu(
         # only when a fresh global top-k is produced so shared-index layers do
         # not repeat the same DCP partitioning work.
         if _use_dsa_dcp_partial_attention(forward_batch):
-            parallel = get_parallel()
-            topk_indices = remap_dcp_sparse_indices(
+            parallel = runtime_context.get_parallel()
+            topk_indices = dcp_layout.remap_dcp_sparse_indices(
                 topk_indices,
                 parallel.attn_dcp_size,
                 parallel.attn_dcp_rank,
-                interleave_size=get_attn_backend().page_size,
+                interleave_size=forward_context.get_attn_backend().page_size,
             )
     else:
         topk_indices = prev_topk_indices
 
     if _use_dsa_dcp_partial_attention(forward_batch):
-        q_nope_out, q_pe = all_gather_q_for_mla_decode(q_nope_out, q_pe)
+        q_nope_out, q_pe = dcp_comm.all_gather_q_for_mla_decode(q_nope_out, q_pe)
 
     topk_indices = maybe_capture_indexer_topk(m.layer_id, topk_indices)
 
@@ -569,11 +565,11 @@ def forward_dsa_core_npu(
         attn_output, lse = attn_output
         attn_output = attn_output.view(
             -1,
-            m.num_local_heads * get_parallel().attn_dcp_size,
+            m.num_local_heads * runtime_context.get_parallel().attn_dcp_size,
             m.kv_lora_rank,
         )
-        attn_output = cp_lse_ag_out_rs_mla_npu(
-            attn_output, lse, get_parallel().dcp_group
+        attn_output = dcp_comm.cp_lse_ag_out_rs_mla_npu(
+            attn_output, lse, runtime_context.get_parallel().dcp_group
         )
     attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
 
