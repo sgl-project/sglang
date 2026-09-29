@@ -8,8 +8,6 @@ import asyncio
 import json
 import logging
 import time
-
-from sglang.srt.observability.req_time_stats import monotonic_time
 from contextlib import AsyncExitStack
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, AsyncIterator, Optional, Union
@@ -86,6 +84,7 @@ from sglang.srt.entrypoints.openai.utils import to_openai_style_logprobs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.runtime_context import get_disagg, get_serving
 from sglang.srt.sampling.sampling_params import (
