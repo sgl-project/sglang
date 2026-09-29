@@ -406,8 +406,8 @@ def get_rdma_devices_args(gpu_indices=None) -> str:
 _IB_SYSFS = "/sys/class/infiniband"
 
 
+# None means libibverbs is not loadable, not that no device is openable.
 def _ibverbs_device_names() -> Optional[set]:
-    """Device names libibverbs can open, or None if libibverbs is not loadable."""
     try:
         lib = ctypes.CDLL("libibverbs.so.1")
     except OSError:
@@ -427,15 +427,16 @@ def _ibverbs_device_names() -> Optional[set]:
         lib.ibv_free_device_list(devices)
 
 
+# Without an openable device the PD transfer backend silently falls back to TCP,
+# and transfers then fail under load instead of at setup.
 def _check_rdma_openable() -> None:
-    """Fail fast when sysfs lists RDMA devices but ibverbs can open none of them;
-    Mooncake then silently falls back to TCP and PD transfers fail under load."""
-    if not os.path.isdir(_IB_SYSFS) or not os.listdir(_IB_SYSFS):
+    if not _get_available_ib_devices():
         return
     if _ibverbs_device_names() == set():
         raise RuntimeError(
-            f"RDMA devices are listed in {_IB_SYSFS} but ibverbs can open none; "
-            "Mooncake would fall back to TCP. Check /dev/infiniband in the container."
+            f"Active RDMA devices are listed in {_IB_SYSFS} but ibverbs can open "
+            "none; the PD transfer backend would lose RDMA. "
+            "Check /dev/infiniband in the container."
         )
 
 
