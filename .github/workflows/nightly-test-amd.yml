@@ -2014,7 +2014,10 @@ jobs:
         timeout-minutes: 360
         run: |
           > github_summary.md  # Clear summary file
-          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test             -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md"             python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-glm53 --nightly --timeout-per-file 18000 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-glm53 --nightly --timeout-per-file 18000 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -2052,7 +2055,10 @@ jobs:
         timeout-minutes: 180
         run: |
           > github_summary.md  # Clear summary file
-          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test             -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md"             python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-glm53 --nightly --timeout-per-file 9000 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-glm53 --nightly --timeout-per-file 9000 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
