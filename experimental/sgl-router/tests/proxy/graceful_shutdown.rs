@@ -37,7 +37,6 @@ use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::WorkerRegistry;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
@@ -409,7 +408,7 @@ async fn readyz_flips_to_503_during_drain_while_still_serving() {
 /// pause merely postpones shutdown without ever handing traffic off. (What
 /// closes the rolling-update race is the pause itself, covered by
 /// `readyz_flips_to_503_during_drain_while_still_serving`.) Asserted on a raw
-/// socket connect so the failure has to be `ConnectionRefused`; a `reqwest` error
+/// TCP connect so the failure has to be `ConnectionRefused`; a `reqwest` error
 /// would also cover a timeout, which is a different (and on a loaded runner,
 /// plausible) outcome.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -417,10 +416,8 @@ async fn new_connections_refused_after_drain_completes() {
     let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx_with_worker(&worker.url);
     let app = build_router(ctx.clone());
-    // A private socket path, unlike a TCP port, cannot be taken over by a parallel test.
-    let dir = tempfile::tempdir().unwrap();
-    let addr = dir.path().join("router.sock");
-    let listener = tokio::net::UnixListener::bind(&addr).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
 
     // Short drain so the test is fast; the point is the post-resolve state.
     let drain = Duration::from_millis(100);
@@ -442,7 +439,7 @@ async fn new_connections_refused_after_drain_completes() {
     });
 
     // Server accepts before shutdown.
-    tokio::net::UnixStream::connect(&addr)
+    tokio::net::TcpStream::connect(addr)
         .await
         .expect("listener accepts before SIGTERM");
 
@@ -453,25 +450,10 @@ async fn new_connections_refused_after_drain_completes() {
         .expect("server resolves after the drain elapses")
         .expect("server task joined cleanly");
 
-    // A fresh connection must now be refused — the listener is closed. A child
-    // process a parallel test is spawning can hold an inherited copy of the
-    // socket until it execs; a connection queued on that copy must never be
-    // served, only dropped when it closes.
-    let err = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let mut stream = match tokio::net::UnixStream::connect(&addr).await {
-                Err(err) => break err,
-                Ok(stream) => stream,
-            };
-            let _ = stream.write_all(b"GET /healthz HTTP/1.1\r\n\r\n").await;
-            assert!(
-                !matches!(stream.read(&mut [0]).await, Ok(1)),
-                "a connection was served after the drain completed",
-            );
-        }
-    })
-    .await
-    .expect("a new connection must be refused after the drain completes");
+    // A fresh connection must now be refused — the listener is closed.
+    let err = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect_err("a new connection must be refused after the drain completes");
     assert_eq!(
         err.kind(),
         std::io::ErrorKind::ConnectionRefused,

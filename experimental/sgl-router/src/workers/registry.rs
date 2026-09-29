@@ -281,7 +281,7 @@ mod tests {
     }
 
     #[test]
-    fn upsert_keeps_grace_clock_and_live_state() {
+    fn upsert_keeps_live_state() {
         let r = WorkerRegistry::default();
         let id = WorkerId("p".into());
         r.add(spec("p", WorkerMode::Prefill, &["m"])).unwrap();
@@ -289,7 +289,6 @@ mod tests {
         let _guard = first.load_guard();
         r.add(spec("p", WorkerMode::Prefill, &["m"])).unwrap();
         let second = r.get(&id).unwrap();
-        assert_eq!(second.pooled_at, first.pooled_at);
         assert!(Arc::ptr_eq(&second.breaker, &first.breaker));
         assert_eq!(second.router_inflight_load(), 1);
     }

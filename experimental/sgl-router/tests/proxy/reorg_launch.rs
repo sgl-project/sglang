@@ -6,20 +6,6 @@ use serde_json::json;
 use std::{process::Stdio, time::Duration};
 use tokio::process::Command;
 
-/// A free port below the ephemeral range, which the `127.0.0.1:0` listeners of
-/// parallel tests never receive, so none of them can take it before the router
-/// binds it or answer this test's polls in its place.
-fn free_low_port() -> u16 {
-    let ephemeral_start = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
-        .ok()
-        .and_then(|range| range.split_whitespace().next()?.parse().ok())
-        .unwrap_or(32_768);
-    (1024..ephemeral_start)
-        .rev()
-        .find(|&port| std::net::TcpListener::bind(("127.0.0.1", port)).is_ok())
-        .expect("a free port below the ephemeral range")
-}
-
 #[tokio::test]
 async fn existing_policy_flags_launch_reorg_routing() {
     let worker = MockWorker::start(vec![]).await;
@@ -28,7 +14,11 @@ async fn existing_policy_flags_launch_reorg_routing() {
         .build()
         .unwrap();
     for policy in ["power_of_two", "cache_aware", "session_aware"] {
-        let port = free_low_port();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
         let mut process = Command::new(env!("CARGO_BIN_EXE_sgl-router"))
             .args([
                 "--model-id",

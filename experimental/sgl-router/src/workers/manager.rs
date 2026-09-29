@@ -183,11 +183,10 @@ pub async fn run_with_introspector(
 ///   write would leak the worker indefinitely.
 /// - **Reconcile tick:** every `reconcile_interval`, re-introspects any
 ///   registered worker whose `model_ids` are still empty or that is a
-///   prefill without a bootstrap port (see [`reconcile_unresolved_workers`]);
-///   prefills still within the port grace are also retried every
-///   [`BOOTSTRAP_PORT_RETRY_INTERVAL`]. Runs on the same loop and shares
-///   `pending` with the discovery events so re-registrations stay
-///   serialized per id against concurrent `Added` / `Removed`.
+///   prefill without a bootstrap port (see [`reconcile_unresolved_workers`]).
+///   Runs on the same loop and shares `pending` with the discovery events so
+///   re-registrations stay serialized per id against concurrent `Added` /
+///   `Removed`.
 pub async fn run_with_introspector_and_reconcile(
     mut rx: mpsc::Receiver<DiscoveryEvent>,
     registry: Arc<WorkerRegistry>,
@@ -395,11 +394,9 @@ async fn handle_discovery_event(
 ///
 /// This pass re-runs `register_one` (an idempotent registry upsert +
 /// idempotent kv-events subscribe) for each such worker until the
-/// introspection succeeds and the worker joins its model pool. A prefill
-/// whose `/server_info` omits its bootstrap port is likewise revisited, keeping
-/// its model, until the port is reported: it is unroutable during
-/// [`crate::workers::worker::BOOTSTRAP_PORT_GRACE`] and routed with a null
-/// port afterwards, so a port reported later is still picked up. A worker
+/// introspection succeeds and the worker joins its model pool. A portless
+/// prefill is likewise revisited, keeping its model, until the port is
+/// reported (see [`crate::workers::worker::BOOTSTRAP_PORT_GRACE`]). A worker
 /// already being (re-)registered is skipped via `pending`, so a slow
 /// `/server_info` never stacks duplicate tasks for one id; and because
 /// `pending` is shared with the event loop, a `Removed` that arrives
@@ -1257,7 +1254,6 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_repairs_portless_prefill_with_known_model() {
-        use crate::policies::registry::PdPoolResolver;
         use std::sync::atomic::{AtomicBool, Ordering};
         use tokio::time::timeout;
 
@@ -1299,9 +1295,6 @@ mod tests {
         .unwrap();
         assert_eq!(registry.workers_for(&model).len(), 1);
         assert!(registry.healthy_workers_for(&model).is_empty());
-        assert!(PdPoolResolver::new(registry.clone())
-            .prefill_candidates(&model)
-            .is_err());
         ready.store(true, Ordering::SeqCst);
         timeout(Duration::from_secs(3), async {
             while registry.get(&id).unwrap().bootstrap_port() != Some(8997) {

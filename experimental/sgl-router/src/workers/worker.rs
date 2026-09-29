@@ -250,12 +250,12 @@ impl Worker {
     }
 
     /// A prefill whose bootstrap port `/server_info` has not reported.
-    pub fn lacks_bootstrap_port(&self) -> bool {
+    pub(crate) fn lacks_bootstrap_port(&self) -> bool {
         self.mode() == WorkerMode::Prefill && self.bootstrap_port.is_none()
     }
 
     /// A portless prefill still within [`BOOTSTRAP_PORT_GRACE`], and so unroutable.
-    pub fn awaiting_bootstrap_port(&self) -> bool {
+    pub(crate) fn awaiting_bootstrap_port(&self) -> bool {
         self.lacks_bootstrap_port() && self.pooled_at.elapsed() < BOOTSTRAP_PORT_GRACE
     }
 
