@@ -182,10 +182,6 @@ class TestGetLastLocTritonSafe(CustomTestCase):
         self.assertTrue(torch.equal(actual, expected))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestLastLocUsesTritonDispatch(CustomTestCase):
     """Backend guard for the paged-decode `last_loc` computation.
 
@@ -245,3 +241,7 @@ class TestLastLocUsesTritonDispatch(CustomTestCase):
                     decode not in self.NON_TRITON_BACKENDS
                 )
                 self.assertEqual(self._predicate_with(prefill, decode), expected)
+
+
+if __name__ == "__main__":
+    unittest.main()
