@@ -714,7 +714,9 @@ class GroupCoordinator:
                 torch.distributed.all_reduce(input_, group=self.device_group)
             return input_
 
-        if self.host_staged_comm is not None and self.host_staged_comm.should_use(input_):
+        if self.host_staged_comm is not None and self.host_staged_comm.should_use(
+            input_
+        ):
             return self.host_staged_comm.all_reduce(input_)
 
         if self.ll_comm is not None and self.ll_comm.should_use(input_):

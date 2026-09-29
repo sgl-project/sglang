@@ -13,6 +13,7 @@ what NCCL returns for two ranks.
 Only bf16 tensors of at most SGLANG_LL_ALLREDUCE_MAX_BYTES (default 64 KiB)
 take this path; everything else keeps the existing one.
 """
+
 import ctypes
 import logging
 import mmap
@@ -78,10 +79,14 @@ _CPP = "void ll_ar(torch::Tensor t, int64_t base, int64_t rank, int64_t slot_byt
 
 
 class LLAllReduce:
-    def __init__(self, group, rank_in_group: int, world_size: int, device: torch.device):
+    def __init__(
+        self, group, rank_in_group: int, world_size: int, device: torch.device
+    ):
         assert world_size == 2, "LL all-reduce is written for two ranks"
         self.rank = rank_in_group
-        self.max_bytes = int(os.environ.get("SGLANG_LL_ALLREDUCE_MAX_BYTES", str(64 << 10)))
+        self.max_bytes = int(
+            os.environ.get("SGLANG_LL_ALLREDUCE_MAX_BYTES", str(64 << 10))
+        )
         # an LL word carries 4 data bytes in 8
         self.slot_bytes = 2 * self.max_bytes
         total = _HEADER + 4 * self.slot_bytes
@@ -89,8 +94,14 @@ class LLAllReduce:
         from torch.utils.cpp_extension import load_inline
 
         def build():
-            return load_inline("sgl_ll_allreduce", _CPP, cuda_sources=_SRC, functions=["ll_ar"],
-                               extra_cuda_cflags=["-O3"], verbose=False)
+            return load_inline(
+                "sgl_ll_allreduce",
+                _CPP,
+                cuda_sources=_SRC,
+                functions=["ll_ar"],
+                extra_cuda_cflags=["-O3"],
+                verbose=False,
+            )
 
         # one builder, the other loads the cached module
         self.ext = build() if rank_in_group == 0 else None
@@ -98,7 +109,11 @@ class LLAllReduce:
         if self.ext is None:
             self.ext = build()
 
-        name = [f"/dev/shm/sgl_ll_ar_{os.getpid()}_{time.time_ns()}" if rank_in_group == 0 else None]
+        name = [
+            f"/dev/shm/sgl_ll_ar_{os.getpid()}_{time.time_ns()}"
+            if rank_in_group == 0
+            else None
+        ]
         src = torch.distributed.get_process_group_ranks(group)[0]
         torch.distributed.broadcast_object_list(name, src=src, group=group)
         self.path = name[0]
@@ -112,22 +127,33 @@ class LLAllReduce:
         buf = np.frombuffer(self.mm, dtype=np.uint8)
         # the reader first-touches the peer's slots
         peer = 1 - rank_in_group
-        buf[_HEADER + peer * 2 * self.slot_bytes: _HEADER + (peer + 1) * 2 * self.slot_bytes] = 0
+        buf[
+            _HEADER + peer * 2 * self.slot_bytes : _HEADER
+            + (peer + 1) * 2 * self.slot_bytes
+        ] = 0
         torch.distributed.barrier(group=group)
         # one rank at a time: both registering the same pages at once failed
         # now and then with cudaErrorInvalidValue
         for r in range(world_size):
             if r == rank_in_group:
                 with torch.cuda.device(device):
-                    err = torch.cuda.cudart().cudaHostRegister(buf.ctypes.data, total, 3)  # Portable | Mapped
+                    err = torch.cuda.cudart().cudaHostRegister(
+                        buf.ctypes.data, total, 3
+                    )  # Portable | Mapped
                     if int(err) != 0:
                         raise RuntimeError(f"cudaHostRegister failed: {int(err)}")
             torch.distributed.barrier(group=group)
         dptr = ctypes.c_uint64()
         cuda = ctypes.CDLL("libcuda.so.1")
-        cuda.cuMemHostGetDevicePointer_v2.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.c_void_p, ctypes.c_uint]
+        cuda.cuMemHostGetDevicePointer_v2.argtypes = [
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.c_void_p,
+            ctypes.c_uint,
+        ]
         with torch.cuda.device(device):
-            rc = cuda.cuMemHostGetDevicePointer_v2(ctypes.byref(dptr), buf.ctypes.data, 0)
+            rc = cuda.cuMemHostGetDevicePointer_v2(
+                ctypes.byref(dptr), buf.ctypes.data, 0
+            )
         if rc != 0:
             raise RuntimeError(f"cuMemHostGetDevicePointer failed: {rc}")
         self.base = dptr.value
@@ -136,12 +162,19 @@ class LLAllReduce:
         torch.distributed.barrier(group=group)
         if rank_in_group == 0:
             os.unlink(self.path)  # both ranks hold the mapping
-        logger.info("[AR] LL all-reduce through host memory for bf16 up to %d KiB", self.max_bytes >> 10)
+        logger.info(
+            "[AR] LL all-reduce through host memory for bf16 up to %d KiB",
+            self.max_bytes >> 10,
+        )
 
     def should_use(self, t: torch.Tensor) -> bool:
         n = t.numel() * t.element_size()
-        return (t.dtype == torch.bfloat16 and t.is_contiguous() and 0 < n <= self.max_bytes
-                and t.numel() % 2 == 0)
+        return (
+            t.dtype == torch.bfloat16
+            and t.is_contiguous()
+            and 0 < n <= self.max_bytes
+            and t.numel() % 2 == 0
+        )
 
     def all_reduce(self, t: torch.Tensor) -> torch.Tensor:
         self.ext.ll_ar(t, self.base, self.rank, self.slot_bytes, self.counter)

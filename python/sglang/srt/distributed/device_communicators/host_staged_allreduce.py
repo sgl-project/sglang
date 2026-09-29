@@ -20,6 +20,7 @@ Used only for messages of at least SGLANG_HOST_STAGED_ALLREDUCE_MIN_BYTES
 (default 1 MiB) outside CUDA graph capture; decode keeps NCCL. Enable with
 SGLANG_HOST_STAGED_ALLREDUCE=1. Two ranks only.
 """
+
 import ctypes
 import logging
 import mmap
@@ -42,24 +43,50 @@ def _libcuda():
     global _cuda
     if _cuda is None:
         _cuda = ctypes.CDLL("libcuda.so.1")
-        _cuda.cuMemHostGetDevicePointer_v2.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.c_void_p, ctypes.c_uint]
-        _cuda.cuStreamWriteValue32_v2.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint32, ctypes.c_uint]
-        _cuda.cuStreamWaitValue32_v2.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint32, ctypes.c_uint]
+        _cuda.cuMemHostGetDevicePointer_v2.argtypes = [
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.c_void_p,
+            ctypes.c_uint,
+        ]
+        _cuda.cuStreamWriteValue32_v2.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint64,
+            ctypes.c_uint32,
+            ctypes.c_uint,
+        ]
+        _cuda.cuStreamWaitValue32_v2.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint64,
+            ctypes.c_uint32,
+            ctypes.c_uint,
+        ]
     return _cuda
 
 
 class HostStagedAllReduce:
-    def __init__(self, group, rank_in_group: int, world_size: int, device: torch.device,
-                 region_bytes: int = 32 << 20):
+    def __init__(
+        self,
+        group,
+        rank_in_group: int,
+        world_size: int,
+        device: torch.device,
+        region_bytes: int = 32 << 20,
+    ):
         assert world_size == 2, "host-staged all-reduce is written for two ranks"
         self.rank = rank_in_group
         self.peer = 1 - rank_in_group
         self.device = device
         self.region_bytes = region_bytes
-        self.min_bytes = int(os.environ.get("SGLANG_HOST_STAGED_ALLREDUCE_MIN_BYTES", str(1 << 20)))
+        self.min_bytes = int(
+            os.environ.get("SGLANG_HOST_STAGED_ALLREDUCE_MIN_BYTES", str(1 << 20))
+        )
         # Both ranks must agree on the file; rank 0 picks the name and the
         # gloo group carries it (init time only, before any forward).
-        name = [f"/dev/shm/sgl_host_ar_{os.getpid()}_{time.time_ns()}" if rank_in_group == 0 else None]
+        name = [
+            f"/dev/shm/sgl_host_ar_{os.getpid()}_{time.time_ns()}"
+            if rank_in_group == 0
+            else None
+        ]
         src = torch.distributed.get_process_group_ranks(group)[0]
         torch.distributed.broadcast_object_list(name, src=src, group=group)
         self.path = name[0]
@@ -74,16 +101,22 @@ class HostStagedAllReduce:
         buf = np.frombuffer(self.mm, dtype=np.uint8)
         self.flags = np.frombuffer(self.mm, dtype=np.uint32, count=_FLAG_BYTES // 4)
         with torch.cuda.device(device):
-            err = torch.cuda.cudart().cudaHostRegister(buf.ctypes.data, self.total, 3)  # Portable | Mapped
+            err = torch.cuda.cudart().cudaHostRegister(
+                buf.ctypes.data, self.total, 3
+            )  # Portable | Mapped
             if err != 0:
                 raise RuntimeError(f"cudaHostRegister failed: {err}")
             dptr = ctypes.c_uint64()
-            rc = _libcuda().cuMemHostGetDevicePointer_v2(ctypes.byref(dptr), buf.ctypes.data, 0)
+            rc = _libcuda().cuMemHostGetDevicePointer_v2(
+                ctypes.byref(dptr), buf.ctypes.data, 0
+            )
             if rc != 0:
                 raise RuntimeError(f"cuMemHostGetDevicePointer failed: {rc}")
         self.dflags = dptr.value  # device address of the flag page
         self.host = torch.from_numpy(buf)
-        self.regions = [[self._region(r, i) for i in range(_NBUF)] for r in range(world_size)]
+        self.regions = [
+            [self._region(r, i) for i in range(_NBUF)] for r in range(world_size)
+        ]
         self.tmp = torch.empty(region_bytes, dtype=torch.uint8, device=device)
         self.seq = 0
         self.published = 0  # pieces this rank has published, ever
@@ -94,29 +127,41 @@ class HostStagedAllReduce:
         torch.distributed.barrier(group=group)
         if rank_in_group == 1:
             os.unlink(self.path)  # the mappings keep it alive
-        logger.info("host-staged all-reduce ready: %s, %d MB/region, %d MB pieces, min %d KB",
-                    self.path, region_bytes >> 20, _PIECE >> 20, self.min_bytes >> 10)
+        logger.info(
+            "host-staged all-reduce ready: %s, %d MB/region, %d MB pieces, min %d KB",
+            self.path,
+            region_bytes >> 20,
+            _PIECE >> 20,
+            self.min_bytes >> 10,
+        )
 
     def _region(self, r, i):
         off = _FLAG_BYTES + (r * _NBUF + i) * self.region_bytes
-        return self.host[off:off + self.region_bytes]
+        return self.host[off : off + self.region_bytes]
 
     # flags (uint32, monotonic): [r] = pieces rank r has landed in host
     # memory, [2 + r] = all-reduces rank r has finished reading back.
     def _write(self, stream, idx, value):
-        rc = _libcuda().cuStreamWriteValue32_v2(stream.cuda_stream, self.dflags + 4 * idx, value, 0)
+        rc = _libcuda().cuStreamWriteValue32_v2(
+            stream.cuda_stream, self.dflags + 4 * idx, value, 0
+        )
         if rc != 0:
             raise RuntimeError(f"cuStreamWriteValue32 failed: {rc}")
 
     def _wait(self, stream, idx, value):
-        rc = _libcuda().cuStreamWaitValue32_v2(stream.cuda_stream, self.dflags + 4 * idx, value, 0)  # GEQ
+        rc = _libcuda().cuStreamWaitValue32_v2(
+            stream.cuda_stream, self.dflags + 4 * idx, value, 0
+        )  # GEQ
         if rc != 0:
             raise RuntimeError(f"cuStreamWaitValue32 failed: {rc}")
 
     def should_use(self, t: torch.Tensor) -> bool:
-        return (t.is_cuda and t.is_contiguous()
-                and t.numel() * t.element_size() >= self.min_bytes
-                and not torch.cuda.is_current_stream_capturing())
+        return (
+            t.is_cuda
+            and t.is_contiguous()
+            and t.numel() * t.element_size() >= self.min_bytes
+            and not torch.cuda.is_current_stream_capturing()
+        )
 
     def all_reduce(self, t: torch.Tensor) -> torch.Tensor:
         flat = t.view(-1).view(torch.uint8)
@@ -132,21 +177,21 @@ class HostStagedAllReduce:
             slot = seq % _NBUF
             mine = self.regions[r][slot]
             theirs = self.regions[p][slot]
-            src = flat[off:off + n]
+            src = flat[off : off + n]
             pieces = [(a, min(_PIECE, n - a)) for a in range(0, n, _PIECE)]
             # the peer must have read this slot back from two calls ago
             if seq > _NBUF:
                 self._wait(self.d2h, 2 + p, seq - _NBUF)
             with torch.cuda.stream(self.d2h):
                 for a, m in pieces:
-                    mine[a:a + m].copy_(src[a:a + m], non_blocking=True)
+                    mine[a : a + m].copy_(src[a : a + m], non_blocking=True)
                     self.published += 1
                     self._write(self.d2h, r, self.published)
             base = self.published - len(pieces)
             with torch.cuda.stream(self.h2d):
                 for i, (a, m) in enumerate(pieces):
                     self._wait(self.h2d, p, base + i + 1)
-                    self.tmp[a:a + m].copy_(theirs[a:a + m], non_blocking=True)
+                    self.tmp[a : a + m].copy_(theirs[a : a + m], non_blocking=True)
                 # The add overwrites src in place, so this rank's own pieces
                 # must have left it first: the peer's counter can arrive
                 # before our D2H copies finish, and the peer would then read

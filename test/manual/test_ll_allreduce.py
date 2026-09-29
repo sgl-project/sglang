@@ -7,6 +7,7 @@ sizes, that only small bf16 messages are routed to it, that it replays
 correctly inside a CUDA graph (one graph holding many calls, as a decode step
 does), and reports the per-call time against NCCL.
 """
+
 import os
 import sys
 import time
@@ -34,7 +35,9 @@ class TestLLAllReduce(unittest.TestCase):
 
     def _check(self, numel, iters=5):
         for _ in range(iters):
-            x = torch.randn(numel, dtype=torch.bfloat16, device=self.device) * (self.rank + 1)
+            x = torch.randn(numel, dtype=torch.bfloat16, device=self.device) * (
+                self.rank + 1
+            )
             ref = x.clone()
             dist.all_reduce(ref)
             y = x.clone()
@@ -59,7 +62,10 @@ class TestLLAllReduce(unittest.TestCase):
 
     def test_cuda_graph_replay(self):
         calls = 88
-        xs = [torch.zeros(4096, dtype=torch.bfloat16, device=self.device) for _ in range(calls)]
+        xs = [
+            torch.zeros(4096, dtype=torch.bfloat16, device=self.device)
+            for _ in range(calls)
+        ]
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
@@ -73,7 +79,11 @@ class TestLLAllReduce(unittest.TestCase):
             for x in xs:
                 self.comm.all_reduce(x)
         for _ in range(3):
-            inputs = [torch.randn(4096, dtype=torch.bfloat16, device=self.device) * (self.rank + 1) for _ in xs]
+            inputs = [
+                torch.randn(4096, dtype=torch.bfloat16, device=self.device)
+                * (self.rank + 1)
+                for _ in xs
+            ]
             refs = [i.clone() for i in inputs]
             for r in refs:
                 dist.all_reduce(r)
@@ -104,7 +114,9 @@ class TestLLAllReduce(unittest.TestCase):
         ll = timed(lambda: self.comm.all_reduce(x))
         nccl = timed(lambda: dist.all_reduce(x))
         if self.rank == 0:
-            print(f"4096 x bf16 all-reduce: LL {ll*1e6:.1f} us, NCCL {nccl*1e6:.1f} us")
+            print(
+                f"4096 x bf16 all-reduce: LL {ll * 1e6:.1f} us, NCCL {nccl * 1e6:.1f} us"
+            )
 
 
 if __name__ == "__main__":

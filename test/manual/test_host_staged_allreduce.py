@@ -9,6 +9,7 @@ message sizes a TP=2 prefill produces (also when one rank's own copy to host
 lags behind the peer's), that the size threshold routes small messages
 elsewhere, and that a CUDA-graph capture never sees the host path.
 """
+
 import os
 import sys
 import time
@@ -72,7 +73,9 @@ class TestHostStagedAllReduce(unittest.TestCase):
         for numel in (224 * 2560, 2048 * 5120):
             for delay in (0, 200_000, 2_000_000):
                 for _ in range(5):
-                    x = torch.randn(numel, dtype=torch.bfloat16, device=self.device) * (self.rank + 1)
+                    x = torch.randn(numel, dtype=torch.bfloat16, device=self.device) * (
+                        self.rank + 1
+                    )
                     ref = x.clone()
                     dist.all_reduce(ref)
                     y = x.clone()
@@ -85,7 +88,9 @@ class TestHostStagedAllReduce(unittest.TestCase):
                     torch.cuda.synchronize()
                     ok = torch.tensor([int(torch.equal(ref, y))], device=self.device)
                     dist.all_reduce(ok, op=dist.ReduceOp.MIN)
-                    self.assertEqual(ok.item(), 1, f"mismatch at numel={numel} delay={delay}")
+                    self.assertEqual(
+                        ok.item(), 1, f"mismatch at numel={numel} delay={delay}"
+                    )
 
     def test_speed_report(self):
         x = torch.randn(2048 * 5120, dtype=torch.bfloat16, device=self.device)
@@ -99,7 +104,9 @@ class TestHostStagedAllReduce(unittest.TestCase):
         torch.cuda.synchronize()
         dt = (time.perf_counter() - t) / 20
         if self.rank == 0:
-            print(f"host-staged all-reduce 20 MB: {dt*1e6:.0f} us ({x.numel()*2/dt/1e9:.1f} GB/s)")
+            print(
+                f"host-staged all-reduce 20 MB: {dt * 1e6:.0f} us ({x.numel() * 2 / dt / 1e9:.1f} GB/s)"
+            )
 
 
 if __name__ == "__main__":
