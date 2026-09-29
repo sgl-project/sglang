@@ -124,9 +124,10 @@ impl WorkerRegistry {
             }
         }
         let mut w = Worker::with_cb_config(spec, cb, protocol);
-        // Keep the first-seen time so reconcile upserts cannot extend the bootstrap-port grace.
+        // An upsert (e.g. bootstrap repair racing the grace expiry) must not reset
+        // live state or extend the bootstrap-port grace.
         if let Some(prev) = self.by_id.get(&w.id) {
-            w.registered_at = prev.registered_at;
+            w.inherit(&prev);
         }
         let w = Arc::new(w);
         let id = w.id.clone();
@@ -280,13 +281,17 @@ mod tests {
     }
 
     #[test]
-    fn upsert_keeps_registration_time() {
+    fn upsert_keeps_registration_time_and_live_state() {
         let r = WorkerRegistry::default();
         let id = WorkerId("p".into());
         r.add(spec("p", WorkerMode::Prefill, &["m"])).unwrap();
-        let first = r.get(&id).unwrap().registered_at;
+        let first = r.get(&id).unwrap();
+        let _guard = first.load_guard();
         r.add(spec("p", WorkerMode::Prefill, &["m"])).unwrap();
-        assert_eq!(r.get(&id).unwrap().registered_at, first);
+        let second = r.get(&id).unwrap();
+        assert_eq!(second.registered_at, first.registered_at);
+        assert!(Arc::ptr_eq(&second.breaker, &first.breaker));
+        assert_eq!(second.router_inflight_load(), 1);
     }
 
     #[test]

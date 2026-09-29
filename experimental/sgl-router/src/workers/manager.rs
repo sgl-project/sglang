@@ -425,8 +425,8 @@ fn reconcile_unresolved_workers(
         );
         let cfg_t = cfg.clone();
         let kv_index_t = kv_index.clone();
-        // Neither model-less nor portless prefill workers can receive traffic,
-        // so replacing their unroutable registry entry is safe.
+        // The upsert keeps live load and breaker state in case the port grace
+        // expires, making the worker routable, before this repair finishes.
         let handle = tokio::spawn(async move {
             register_one(spec, registry_t, cfg_t, kv_index_t, introspector_t).await;
         });

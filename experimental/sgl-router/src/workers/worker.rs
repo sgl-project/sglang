@@ -184,7 +184,7 @@ pub struct Worker {
     /// decode and plain). Set via `--disaggregation-bootstrap-port` at
     /// worker startup; carried from `WorkerSpec`.
     bootstrap_port: Option<u16>,
-    /// First registration of this ID; upserts inherit it (see [`Self::awaiting_bootstrap_port`]).
+    /// First registration of this ID; see [`Self::awaiting_bootstrap_port`].
     pub(crate) registered_at: Instant,
 }
 
@@ -231,6 +231,15 @@ impl Worker {
     /// SGLang bootstrap server port. `None` for decode / plain workers.
     pub fn bootstrap_port(&self) -> Option<u16> {
         self.bootstrap_port
+    }
+
+    /// Continue `prev`'s identity on re-registration: its first-seen time, breaker,
+    /// and load counters, which in-flight guards still hold.
+    pub(crate) fn inherit(&mut self, prev: &Worker) {
+        self.registered_at = prev.registered_at;
+        self.breaker = Arc::clone(&prev.breaker);
+        self.active_requests = Arc::clone(&prev.active_requests);
+        self.slots = Arc::clone(&prev.slots);
     }
 
     /// A prefill whose bootstrap port is still unknown within [`BOOTSTRAP_PORT_GRACE`].
