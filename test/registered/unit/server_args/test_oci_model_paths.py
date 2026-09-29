@@ -70,7 +70,7 @@ class TestResolveOutputContract(CustomTestCase):
 
     def test_tolerates_trailing_newline_and_leaked_diagnostics(self):
         with tempfile.TemporaryDirectory() as path:
-            out = f'pulling blobs...\n{json.dumps({"path": path})}\n'
+            out = f"pulling blobs...\n{json.dumps({'path': path})}\n"
             self.assertEqual(llmman.parse_resolve_output(out, "ref"), path)
 
     def test_ignores_unknown_fields_so_the_contract_can_grow(self):
@@ -145,15 +145,19 @@ class TestModelPathHook(CustomTestCase):
         server_args = unittest.mock.Mock()
         cfg = unittest.mock.Mock(**fields)
         declared = []
-        with unittest.mock.patch(
-            "sglang.srt.arg_groups.model_path_hook.resolving_view", return_value=cfg
-        ), unittest.mock.patch(
-            "sglang.srt.arg_groups.model_path_hook.declare_resolution",
-            side_effect=lambda _sa, _src, **kw: declared.append(kw),
-        ), unittest.mock.patch(
-            "sglang.srt.arg_groups.model_path_hook.resolve_oci_model",
-            side_effect=lambda ref: f"/resolved/{ref.rsplit('/', 1)[-1]}",
-        ) as resolver:
+        with (
+            unittest.mock.patch(
+                "sglang.srt.arg_groups.model_path_hook.resolving_view", return_value=cfg
+            ),
+            unittest.mock.patch(
+                "sglang.srt.arg_groups.model_path_hook.declare_resolution",
+                side_effect=lambda _sa, _src, **kw: declared.append(kw),
+            ),
+            unittest.mock.patch(
+                "sglang.srt.arg_groups.model_path_hook.resolve_oci_model",
+                side_effect=lambda ref: f"/resolved/{ref.rsplit('/', 1)[-1]}",
+            ) as resolver,
+        ):
             resolve_oci_model_paths(server_args)
         return declared, resolver
 
