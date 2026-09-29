@@ -19,15 +19,14 @@ from sglang.srt.layers.communicator import (
     make_boundary,
     make_output_boundary,
 )
-from sglang.srt.layers.communicator import ops as comm_ops
+from sglang.srt.layers.communicator import prepare as comm_ops
+from sglang.srt.layers.communicator.ops import identity_output
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
-
-Pair = comm.CommunicateSummableTensorPairFn
 
 
 def sizes(*, dp=1, cp=1, tp=1):
@@ -105,7 +104,7 @@ class TestNonAlternatingEdges(CustomTestCase):
             residual_to=attention,
         )
         producer = make_output_boundary(edge)
-        self.assertIs(producer.output_move, Pair._trivial)
+        self.assertIs(producer.output_move, identity_output)
         consumer = make_boundary(edge)
         self.assertIs(consumer.prepare.func, comm_ops._consumer_step)
         self.assertIsNone(consumer.prepare.keywords["step"].keywords["layer_input"])
@@ -162,7 +161,10 @@ class TestNonAlternatingEdges(CustomTestCase):
             completes=SumGroup.ATTN_TP, run=MagicMock()
         )
         boundary = make_boundary(edge, fusions=(over_tp, over_attention_tp))
-        self.assertEqual(boundary.fused, (over_tp,))
+        self.assertEqual(
+            boundary.prepare.keywords["step"].keywords.get("fusions", ()),
+            (over_tp.run,),
+        )
         step = make_boundary(edge).prepare
         self.assertIs(step.keywords["step"].func, comm_ops._mlp_input_without_dp)
         all_reduce = MagicMock(side_effect=lambda h: h * 2)
@@ -277,23 +279,14 @@ class TestTheProducersUpdateChoosesTheOrder(CustomTestCase):
                 boundary = make_boundary(
                     edge, fusions=(fused,), carried_fusions=(carried,)
                 )
-                self.assertEqual(boundary.fused, (fused,) if offered else ())
+                self.assertEqual(
+                    boundary.prepare.keywords["step"].keywords.get("fusions", ()),
+                    (fused.run,) if offered else (),
+                )
                 self.assertEqual(
                     boundary.prepare.keywords["carried_fusions"],
                     (carried,) if offered else (),
                 )
-
-    def test_the_consumer_reads_as_it_declares(self):
-        full = rows(sizes(tp=2))
-        read = MagicMock()
-        edge = EdgeDecl(
-            produced=StageOutput(full),
-            need=StageInput(full, read=read),
-            residual=full,
-            residual_to=full,
-        )
-        step = make_boundary(edge).prepare.keywords["step"]
-        self.assertIs(step.keywords["read"], read)
 
     def test_the_next_ffn_completes_a_sum_left_for_it_once(self):
         full = rows(sizes(tp=2))
@@ -323,18 +316,6 @@ class TestTheProducersUpdateChoosesTheOrder(CustomTestCase):
         group.all_reduce.assert_not_called()
         torch.testing.assert_close(hidden, torch.full((3, 4), 7.0))
 
-    def test_the_producer_half_ends_on_the_rows_it_hands_on(self):
-        axis_sizes = sizes(dp=2, tp=2)
-        attention = rows(axis_sizes, TokenAxis.ATTN_DP)
-        edge = EdgeDecl(
-            produced=StageOutput(attention),
-            need=StageInput(rows(axis_sizes)),
-            residual=attention,
-            residual_to=attention,
-        )
-        with self.assertRaises(NotImplementedError):
-            make_output_boundary(edge)
-
     def test_cross_layer_update_requires_a_lifetime_guarantee(self):
         local = Layout(frozenset())
         stateful_update = SimpleNamespace(adds_plainly=False, at_producer=False)
@@ -358,6 +339,7 @@ class TestTheProducersUpdateChoosesTheOrder(CustomTestCase):
 
 
 class ProbeRead:
+    before_gather = False
     """A read that marks what it reads: the input is the residual plus 100.
     ``norms_plainly`` says whether it may stand in for a norm."""
 
@@ -411,7 +393,9 @@ class TestTheConsumerRunsItsDeclaredRead(CustomTestCase):
             ),
             fusions=fusions,
         )
-        return boundary.prepare.keywords["step"], boundary.fused
+        return boundary.prepare.keywords["step"], boundary.prepare.keywords[
+            "step"
+        ].keywords.get("fusions", ())
 
     def test_the_dp_partial_reads_the_gathered_sum_with_the_declared_read(self):
         read = ProbeRead(norms_plainly=True)
@@ -464,11 +448,9 @@ class TestTheConsumerRunsItsDeclaredRead(CustomTestCase):
                     ProbeRead(norms_plainly), fusions=(fused,)
                 )
                 self.assertIs(step.func, comm_ops._mlp_input_without_dp)
-                expected = (fused,) if norms_plainly else ()
+                expected = (fused.run,) if norms_plainly else ()
                 self.assertEqual(tried, expected)
-                self.assertEqual(
-                    step.keywords["fusions"], tuple(f.run for f in expected)
-                )
+                self.assertEqual(step.keywords["fusions"], expected)
 
     def test_the_attention_input_tries_its_kernels_only_for_such_a_read(self):
         axis_sizes = sizes(tp=2)

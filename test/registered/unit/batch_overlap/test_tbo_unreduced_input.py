@@ -32,15 +32,12 @@ class TestTboEntryReducesItsInput(CustomTestCase):
                 dict(
                     hidden_states=hidden_states[a:b],
                     residual=residual[a:b],
-                    forward_batch=SimpleNamespace(
-                        tbo_parent_token_range=(a, b), residual_stream=None
-                    ),
+                    forward_batch=SimpleNamespace(tbo_parent_token_range=(a, b)),
                 )
                 for a, b in ((0, 2), (2, 4))
             ]
 
         def execute(inputs_arr, **kwargs):
-            self.assertIsNone(batch.residual_stream)
             parts_seen.extend(inputs_arr)
             self.assertIsNot(
                 inputs_arr[0]["forward_batch"].residual_stream,
@@ -81,7 +78,9 @@ class TestTboEntryReducesItsInput(CustomTestCase):
             merged = tbo.model_forward_stages(
                 layers=[
                     SimpleNamespace(
-                        attn_stage=SimpleNamespace(input_rows=Layout(frozenset()))
+                        attn_stage=SimpleNamespace(
+                            incoming_residual_rows=Layout(frozenset())
+                        )
                     )
                 ],
                 enable_tbo=True,
@@ -98,52 +97,6 @@ class TestTboEntryReducesItsInput(CustomTestCase):
         self.assertIs(output.pending.value, merged)
         torch.testing.assert_close(merged, torch.full((4, 3), 10.0))
         torch.testing.assert_close(output.residual, torch.full((4, 3), 3.0))
-
-    def test_split_and_merge_see_the_reduced_tensor(self):
-        # Under attention DP the partial sum spans every DP rank's tokens; its
-        # reduction also brings it back to this rank's three.
-        reduced = torch.full((3, 4), 2.0)
-        hidden_states = UnreducedOutput(
-            torch.ones(6, 4), reduce_and_redistribute=lambda partial: reduced
-        )
-        seen = {}
-
-        def split(**kwargs):
-            seen["split"] = kwargs["hidden_states"]
-            return [{}, {}]
-
-        def merge(output_a, output_b, original_len):
-            seen["original_len"] = original_len
-            return None, None
-
-        with (
-            patch.object(tbo, "_model_forward_tbo_split_inputs", split),
-            patch.object(
-                tbo, "execute_overlapped_operations", lambda **kwargs: [{}, {}]
-            ),
-            patch.object(tbo, "_model_forward_tbo_merge_outputs", merge),
-            patch.object(
-                tbo.deep_gemm_wrapper,
-                "configure_deep_gemm_num_sms",
-                lambda num_sms: empty_context(),
-            ),
-        ):
-            tbo._model_forward_tbo(
-                inputs=dict(
-                    hidden_states=hidden_states,
-                    residual=torch.zeros(3, 4),
-                    positions=None,
-                    forward_batch=SimpleNamespace(residual_stream=None),
-                    zero_allocator=None,
-                ),
-                operations_strategy=SimpleNamespace(
-                    deep_gemm_num_sms=None, operations=[], tbo_delta_stages=0
-                ),
-                layer_input_rows=Layout(frozenset()),
-            )
-
-        self.assertIs(seen["split"], reduced)
-        self.assertEqual(seen["original_len"], 3)
 
 
 if __name__ == "__main__":

@@ -2655,7 +2655,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 declare_ffn(
                     sparse=self.is_layer_sparse,
                     next_sparse=self._stage_next_sparse,
-                    output=output,
+                    output_transform=output,
                 ),
                 post_attention_layernorm,
                 {"fusions": fusions},
@@ -2998,12 +2998,6 @@ class DeepseekV2Model(nn.Module):
                 and layer.mlp.num_fused_shared_experts == 0
                 and not layer.mlp._shared_expert_tp1
             ),
-            # A TP1-replicated output must not ride into the next layer's reduction.
-            requires_local_reduction=lambda layer: (
-                layer.mlp._shared_expert_tp1
-                if isinstance(layer.mlp, DeepseekV2MoE)
-                else layer.mlp.tp_size == 1
-            ),
             label="DeepSeek-V3/GLM",
         )
 
@@ -3160,7 +3154,7 @@ class DeepseekV2Model(nn.Module):
                 proxy_tensors.tensors["topk_indices"] = topk_indices
             return proxy_tensors
         else:
-            hidden_states = residual_batch.finish(hidden_states, forward_batch)
+            hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
             if not forward_batch.forward_mode.is_idle():
                 hidden_states = residual_batch.norm(
                     hidden_states, forward_batch, self.norm

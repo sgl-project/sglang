@@ -18,24 +18,25 @@ from sglang.srt.layers.communicator.adapters.attention import (
     get_attn_tp_context,
 )
 from sglang.srt.layers.communicator.boundary import (
-    BoundarySteps,
-    EdgeDecl,
-    FusedMlpInput,
-    LayerStage,
-    StageDecl,
-    StageEntry,
-    StageInput,
-    StageKind,
-    StageOutput,
     make_boundary,
     make_output_boundary,
-    stage_edges,
     tbo_split_moves,
 )
 from sglang.srt.layers.communicator.construction import (
     BatchVariant,
     StageEdges,
-    make_stage,
+)
+from sglang.srt.layers.communicator.contracts import (
+    EdgeDecl,
+    FusedMlpInput,
+    HandoffRows,
+    ProducerReduction,
+    StageDecl,
+    StageEntry,
+    StageInput,
+    StageKind,
+    StageOutput,
+    StageSteps,
 )
 from sglang.srt.layers.communicator.exit import FfnCompletion, FfnExit, MixerExit
 from sglang.srt.layers.communicator.factories import (
@@ -55,8 +56,6 @@ from sglang.srt.layers.communicator.layout import (
     token_axis_sizes,
 )
 from sglang.srt.layers.communicator.ops import (
-    CommunicateSimpleFn,
-    CommunicateSummableTensorPairFn,
     move_rows,
     tp_reduce_scatter,
 )
@@ -78,9 +77,6 @@ from sglang.srt.layers.communicator.residual.mhc import (
 )
 
 __all__ = [
-    "LayerCommunicator",
-    "LayerFacts",
-    "MHCLayerCommunicator",
     "declare_attn",
     "declare_ffn",
     "make_attn_stage",
@@ -88,17 +84,16 @@ __all__ = [
     "make_stages",
     "ADD",
     "AttentionInputs",
-    "BoundarySteps",
-    "CommunicateSimpleFn",
-    "CommunicateSummableTensorPairFn",
+    "StageSteps",
     "EdgeDecl",
+    "HandoffRows",
+    "ProducerReduction",
     "FUSE_ALLREDUCE_MAX_BATCH_SIZE",
     "FfnCompletion",
     "FfnExit",
     "FusedMlpInput",
     "HandoffOutput",
     "LayerResidual",
-    "LayerStage",
     "Layout",
     "MHCState",
     "MixerExit",
@@ -121,14 +116,7 @@ __all__ = [
     "move_rows",
     "reduce_output",
     "sparse_moe_gathers_over_moe_cp",
-    "stage_edges",
     "tbo_split_moves",
     "token_axis_sizes",
     "tp_reduce_scatter",
 ]
-
-from sglang.srt.layers.communicator.layer import (
-    LayerCommunicator,
-    LayerFacts,
-    MHCLayerCommunicator,
-)

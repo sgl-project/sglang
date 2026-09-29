@@ -142,7 +142,9 @@ def _sum_group(group: SumGroup) -> GroupCoordinator:
         return parallel.attn_tp_group
     if group is SumGroup.TP:
         return parallel.tp_group
-    return post_experts_reduction_group()
+    if group is SumGroup.MOE_OUTPUT:
+        return post_experts_reduction_group()
+    raise ValueError(f"unsupported output sum group: {group!r}")
 
 
 def token_axis_sizes(*, cp_active: bool = False) -> Dict[TokenAxis, int]:

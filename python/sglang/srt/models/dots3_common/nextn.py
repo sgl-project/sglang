@@ -119,7 +119,7 @@ class Dot3NoteModelNextN(nn.Module):
             hidden_states = head.decoder(
                 positions, hidden_states, forward_batch, zero_allocator
             )
-        hidden_states = residual_batch.finish(hidden_states, forward_batch)
+        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
 
         if not forward_batch.forward_mode.is_idle():
             hidden_states = residual_batch.norm(

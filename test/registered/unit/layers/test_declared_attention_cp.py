@@ -1,5 +1,3 @@
-from sglang.test.boundary_fixtures import make_test_stages
-
 """A MoE layer on the TP group under DSA (and MLA) prefill CP, rank by rank.
 
 Two CP ranks build the layer's communicator for real and run prepare_mlp and
@@ -21,6 +19,7 @@ from sglang.srt.layers import communicator as comm
 from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.communicator.adapters import context_parallel as dsa_cp
 from sglang.srt.layers.communicator.residual.stream import ResidualStream
+from sglang.test.boundary_fixtures import finish_exit, make_test_stages, prepare_input
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
@@ -210,16 +209,20 @@ class TestAttentionCpBoundary(CustomTestCase):
             with self.as_rank(
                 cp, dict(gather=record_gather(cp), reduce_scatter=unused)
             ):
-                self.build(use_reduce_scatter).ffn._prepare_input(
-                    self.values[cp], self.residuals[cp], self.cp_extend()
+                prepare_input(
+                    self.build(use_reduce_scatter).ffn,
+                    self.values[cp],
+                    self.residuals[cp],
+                    self.cp_extend(),
                 )
         gathered, residuals = {}, {}
         for cp in range(CP_SIZE):
             with self.as_rank(cp, dict(gather=fill_gather, reduce_scatter=unused)):
-                gathered[cp], residuals[cp] = self.build(
-                    use_reduce_scatter
-                ).ffn._prepare_input(
-                    self.values[cp], self.residuals[cp], self.cp_extend()
+                gathered[cp], residuals[cp] = prepare_input(
+                    self.build(use_reduce_scatter).ffn,
+                    self.values[cp],
+                    self.residuals[cp],
+                    self.cp_extend(),
                 )
         expected_rows = torch.cat(
             [self.values[cp] + self.residuals[cp] for cp in range(CP_SIZE)]
@@ -227,7 +230,7 @@ class TestAttentionCpBoundary(CustomTestCase):
         for cp in range(CP_SIZE):
             torch.testing.assert_close(gathered[cp], expected_rows, rtol=0, atol=0)
 
-        def ffn_output(cp, leaves):
+        def compute_output(cp, leaves):
             return gathered[cp] * PARTIAL_WEIGHTS[cp] if leaves else gathered[cp]
 
         reduced = {}
@@ -258,12 +261,12 @@ class TestAttentionCpBoundary(CustomTestCase):
                 ) as rank:
                     communicator = self.build(use_reduce_scatter)
                     with communicator.ffn.plan.output.ffn_exit(
-                        self.cp_extend()
+                        self.cp_extend(), stream=ResidualStream()
                     ) as exit_:
                         published[cp] = rank.flags.mlp_reduce_scatter
-                        output = ffn_output(cp, leaves=published[cp])
-                    back[cp], _ = exit_.finish(
-                        output, ResidualStream(residuals[cp].residual)
+                        output = compute_output(cp, leaves=published[cp])
+                    back[cp], _ = finish_exit(
+                        exit_, output, ResidualStream(residuals[cp].residual)
                     )
         return published, back, reduced
 

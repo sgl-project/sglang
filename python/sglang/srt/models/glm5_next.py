@@ -801,7 +801,6 @@ class Glm5NextDecoderLayer(nn.Module):
                 ),
                 self.input_layernorm,
                 {
-                    "residual_in_hidden": residual.ffn_update.at_producer,
                     "qkv_latent_func": self.self_attn.prepare_qkv_latent
                     if not self.is_linear_attn
                     else None,
@@ -1192,7 +1191,7 @@ class Glm5NextModel(nn.Module):
                 return PPProxyTensors({"hidden_states": hidden_states})
             return residual_batch.to_pp(hidden_states, forward_batch)
         else:
-            hidden_states = residual_batch.finish(hidden_states, forward_batch)
+            hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
             if not forward_batch.forward_mode.is_idle():
                 hidden_states = residual_batch.norm(
                     hidden_states, forward_batch, self.norm

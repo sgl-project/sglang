@@ -1069,7 +1069,7 @@ class MiMoV2Model(nn.Module):
                     else None,
                 )
 
-        hidden_states = residual_batch.finish(hidden_states, forward_batch)
+        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
 
         # A draft targeting the final layer ("after layer
         # num_hidden_layers-1") maps to capture index num_hidden_layers,

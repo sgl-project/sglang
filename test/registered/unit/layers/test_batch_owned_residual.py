@@ -216,7 +216,8 @@ class TestBatchOwnedResidual(CustomTestCase):
 
     def test_take_output_rejects_pending_or_mismatched_outputs(self):
         fb = SimpleNamespace(residual_stream=None)
-        stream = batch.start(fb)
+        batch.start(fb)
+        stream = batch.current(fb)
         value = torch.ones(2, 4)
         stream.write(value)
         pending = stream.leave(value * 2, ADD)

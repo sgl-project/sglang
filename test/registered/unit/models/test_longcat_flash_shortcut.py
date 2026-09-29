@@ -48,10 +48,12 @@ class TestLongcatShortcut(CustomTestCase):
         )
         moe_communicator.post_attention_layernorm = None
         dense_communicator.post_attention_layernorm = None
-        layer.moe_stage = StageCommunicator(moe_communicator, comm.StageKind.FFN, None)
+        layer.moe_stage = StageCommunicator(
+            moe_communicator, declaration=comm.declare_ffn()
+        )
         layer.moe_stage.prepare = lambda h, fb: fork_hidden
         layer.second_ffn = StageCommunicator(
-            dense_communicator, comm.StageKind.FFN, None
+            dense_communicator, declaration=comm.declare_ffn()
         )
         layer.self_attn = [lambda **kw: kw["hidden_states"]]
         layer.mlp = nn.Identity()

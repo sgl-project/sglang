@@ -1,5 +1,3 @@
-from sglang.test.boundary_fixtures import make_test_stages
-
 """The dense-FFN gather and take-back under attention DP x CP x TP, rank by rank.
 
 Every rank builds its layer's communicator and runs its prepare_mlp and
@@ -9,6 +7,7 @@ sum of the buffers the ranks hand to it.
 
 import unittest
 from contextlib import ExitStack, contextmanager, nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import PropertyMock, patch
 
@@ -16,12 +15,19 @@ import torch
 
 from sglang.srt.layers import communicator as comm
 from sglang.srt.layers import dp_attention, layernorm_sp
-from sglang.srt.layers.communicator import ops as comm_ops
+from sglang.srt.layers.communicator import prepare as comm_ops
+from sglang.srt.layers.communicator.contracts import BatchVariant
+from sglang.srt.layers.communicator.residual.add_norm import NORM_READ, PLAIN_RESIDUAL
 from sglang.srt.layers.cp import base as cp_base
 from sglang.srt.layers.cp import padding as cp_padding
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.test.boundary_fixtures import (
+    make_test_stages,
+    postprocess_output,
+    prepare_input,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
@@ -136,7 +142,7 @@ class TestDpCpGather(CustomTestCase):
         padding=DpPaddingMode.SUM_LEN,
         norm=layernorm,
         norm_rows=lambda rows: rows,
-        force_layernorm_before_dp_gather=False,
+        read=NORM_READ,
         ffn_input=None,
         sparse=False,
     ):
@@ -263,7 +269,7 @@ class TestDpCpGather(CustomTestCase):
                     next_sparse=False,
                     attention_norm=norm,
                     ffn_norm=norm,
-                    force_layernorm_before_dp_gather=force_layernorm_before_dp_gather,
+                    residual=PLAIN_RESIDUAL._replace(ffn_read=read),
                 )
                 yield SimpleNamespace(
                     communicator=communicator,
@@ -283,14 +289,15 @@ class TestDpCpGather(CustomTestCase):
         def gather(rank, all_reduce):
             with as_rank(*rank, all_reduce) as r:
                 self.assertIsNotNone(
-                    r.communicator.ffn.plan._cp_steps, "declared under CP"
+                    r.communicator.ffn.plan._paths.get(BatchVariant.CONTEXT_PARALLEL),
+                    "declared under CP",
                 )
                 if ffn_input is not None:
                     steps = r.communicator.ffn.plan._batch_steps(r.forward_batch)
-                    self.assertIs(steps.ffn.prepare.keywords["step"].func, ffn_input)
+                    self.assertIs(steps.entry.prepare.keywords["step"].func, ffn_input)
                 hidden_states, residual = rank_inputs(*rank)
-                return r.communicator.ffn._prepare_input(
-                    hidden_states, residual, r.forward_batch
+                return prepare_input(
+                    r.communicator.ffn, hidden_states, residual, r.forward_batch
                 )
 
         # The all-reduce is a sum over every rank: record what each rank hands
@@ -330,8 +337,11 @@ class TestDpCpGather(CustomTestCase):
             torch.testing.assert_close(hidden_states, expected, rtol=0, atol=0)
             torch.testing.assert_close(residual.residual[:tokens], own, rtol=0, atol=0)
             with as_rank(*rank, None) as r:
-                back, _ = r.communicator.ffn.plan.output.postprocess_layer(
-                    3 * hidden_states, residual, r.forward_batch
+                back, _ = postprocess_output(
+                    r.communicator.ffn.plan.output,
+                    3 * hidden_states,
+                    residual,
+                    r.forward_batch,
                 )
             expected_back = torch.zeros(group.held_rows[cp], HIDDEN).double()
             expected_back[:tokens] = 3 * norm_rows(own)
@@ -399,7 +409,7 @@ class TestDpCpGather(CustomTestCase):
             attn_tp_size=2,
             norm=rms_norm,
             norm_rows=rms_rows,
-            force_layernorm_before_dp_gather=True,
+            read=replace(NORM_READ, before_gather=True),
             ffn_input=comm_ops._mlp_input_dp_replicate,
         )
 

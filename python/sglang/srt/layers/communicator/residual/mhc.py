@@ -123,6 +123,7 @@ class _AttentionRead:
     layer's output: an MHC layer takes its input written back."""
 
     norms_plainly = False
+    before_gather = False
 
     def __init__(self, state: MHCState):
         self.state = state
@@ -165,6 +166,7 @@ class _FfnRead:
     in hc_ffn_post_pre when it takes the batch."""
 
     norms_plainly = False
+    before_gather = False
 
     def __init__(self, state: MHCState):
         self.state = state

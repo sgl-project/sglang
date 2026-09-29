@@ -1,6 +1,3 @@
-from sglang.srt.layers.communicator import StageKind
-from sglang.test.boundary_fixtures import sp_region_steps, stub_plan, stub_stage
-
 """Unit tests for srt/layers/layernorm_sp (Megatron LayerNorm sequence parallelism).
 
 Covers the pure logic that gates SP -- the Qwen3 allowlist, the config guards, and
@@ -20,10 +17,12 @@ from sglang.srt.layers import communicator as comm
 from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.communicator import (
     Layout,
+    StageKind,
     StageOutput,
     SumGroup,
 )
-from sglang.srt.layers.communicator import ops as comm_ops
+from sglang.srt.layers.communicator import prepare as comm_ops
+from sglang.srt.layers.communicator.contracts import BatchVariant
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import (
     get_flags,
@@ -32,6 +31,13 @@ from sglang.srt.runtime_context import (
     reset_context,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.test.boundary_fixtures import (
+    postprocess_output,
+    prepare_input,
+    sp_region_steps,
+    stub_plan,
+    stub_stage,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
@@ -121,29 +127,6 @@ class TestLayerNormSPValidation(CustomTestCase):
             validate_layernorm_sp(**{**self.VALID, "speculative_algorithm": "EAGLE3"})
 
 
-class TestLayerNormSPActiveFlag(CustomTestCase):
-    def tearDown(self):
-        reset_context()
-
-    def test_active_flag_is_registered_on_forward_flags(self):
-        """``sp_active`` must stay a registered ForwardFlags slot.
-
-        ``set()`` rejects names missing from ``ForwardFlags._DEFAULTS``, so this
-        fails if the slot is dropped, and it must also be in ``_GRAPH_VISIBLE``
-        because the participant linears read it under CUDA graph capture.
-        """
-        from sglang.srt.runtime_context import ForwardFlags
-
-        self.assertIn("sp_active", ForwardFlags._DEFAULTS)
-        self.assertIn("sp_active", ForwardFlags._GRAPH_VISIBLE)
-
-        self.assertFalse(get_forward().sp_active)  # default
-        get_forward().set("sp_active", True)
-        self.assertTrue(get_forward().sp_active)
-        get_forward().set("sp_active", False)
-        self.assertFalse(get_forward().sp_active)
-
-
 class _Norm:
     def __call__(self, x, residual=None, post_residual_addition=None):
         if residual is None:
@@ -157,23 +140,34 @@ class TestSpRegionSteps(CustomTestCase):
     prefill forward and, inside it, keeps every boundary on this rank's sequence
     shard: add + norm, no move, no collective."""
 
+    def test_sp_flag_remains_visible_to_traced_linears(self):
+        from sglang.srt.runtime_context import ForwardFlags
+
+        self.assertIn("sp_active", ForwardFlags._GRAPH_VISIBLE)
+        before = get_forward().sp_active
+        with get_forward().scoped(sp_active=not before):
+            self.assertEqual(get_forward().sp_active, not before)
+        self.assertEqual(get_forward().sp_active, before)
+
     def communicator(self, *, first_layer):
         c = stub_plan()
-        c._sp_steps = sp_region_steps()
-        c._input_scattered_steps = None
-        c._cp_steps = None
-        c.is_first_layer = first_layer
+        c._paths[BatchVariant.SEQUENCE_PARALLEL] = sp_region_steps()
+        c._paths[BatchVariant.INPUT_SCATTERED] = None
+        c._paths[BatchVariant.CONTEXT_PARALLEL] = None
+        c.enters_stack = first_layer
         c.is_sparse = False
         c._attn_input_fusions = ()
         c.norm = _Norm()
         c.qkv_latent_func = None
-        c._steps = self.ordinary_steps(MagicMock(side_effect=AssertionError("moved")))
+        c._paths[BatchVariant.ORDINARY] = self.ordinary_steps(
+            MagicMock(side_effect=AssertionError("moved"))
+        )
         return c
 
     def ordinary_steps(self, attention_input):
         """The layer's steps outside the region, which must not run inside it."""
-        return comm.BoundarySteps(
-            attention=comm.StageEntry(
+        return comm.StageSteps(
+            entry=comm.StageEntry(
                 prepare=partial(
                     comm_ops._consumer_step,
                     step=partial(
@@ -190,19 +184,15 @@ class TestSpRegionSteps(CustomTestCase):
                 input_move=attention_input,
                 handoff=comm_ops._hand_qkv_hook_its_input,
             ),
-            ffn=comm.StageEntry(
-                prepare=MagicMock(side_effect=AssertionError("ordinary FFN input ran")),
-                input_rows=Layout(frozenset()),
-            ),
-            ffn_output=StageOutput(Layout(frozenset()), group=SumGroup.TP),
-            ffn_output_move=MagicMock(side_effect=AssertionError("postprocess ran")),
-            ffn_sum_is_movable=True,
+            output=StageOutput(Layout(frozenset()), group=SumGroup.TP),
+            output_move=MagicMock(side_effect=AssertionError("postprocess ran")),
         )
 
     def run_prepare_attn(self, communicator, mode, hidden, residual):
         batch = SimpleNamespace(forward_mode=mode)
         with (
             get_flags().sp.override(enabled=True),
+            patch_communicator("_batch_shards_over_cp", return_value=False),
             get_forward().scoped(sp_active=False),
             patch_communicator(
                 "get_attn_tp_context",
@@ -212,8 +202,8 @@ class TestSpRegionSteps(CustomTestCase):
                 layernorm_sp, "sp_entry_scatter", side_effect=lambda h: h[:1]
             ) as scatter,
         ):
-            out = stub_stage(communicator, StageKind.ATTENTION)._prepare_input(
-                hidden, residual, batch
+            out = prepare_input(
+                stub_stage(communicator, StageKind.ATTENTION), hidden, residual, batch
             )
             return out, get_forward().sp_active, scatter
 
@@ -230,7 +220,7 @@ class TestSpRegionSteps(CustomTestCase):
     def test_decode_leaves_the_region_closed(self):
         communicator = self.communicator(first_layer=True)
         move = MagicMock(side_effect=lambda **k: k["hidden_states"])
-        communicator._steps = self.ordinary_steps(move)
+        communicator._paths[BatchVariant.ORDINARY] = self.ordinary_steps(move)
         (h, _), active, scatter = self.run_prepare_attn(
             communicator, ForwardMode.DECODE, torch.ones(2, 4), None
         )
@@ -240,7 +230,7 @@ class TestSpRegionSteps(CustomTestCase):
 
     def test_a_later_layer_does_not_reopen_the_region(self):
         communicator = self.communicator(first_layer=False)
-        communicator._steps = self.ordinary_steps(
+        communicator._paths[BatchVariant.ORDINARY] = self.ordinary_steps(
             MagicMock(side_effect=lambda **k: k["hidden_states"])
         )
         _, active, scatter = self.run_prepare_attn(
@@ -254,24 +244,29 @@ class TestSpRegionSteps(CustomTestCase):
         hidden, residual = torch.ones(1, 4), torch.full((1, 4), 3.0)
         with (
             get_flags().sp.override(enabled=True),
+            patch_communicator("_batch_shards_over_cp", return_value=False),
             get_forward().scoped(sp_active=True),
         ):
             with patch_communicator(
                 "get_attn_tp_context",
                 return_value=SimpleNamespace(input_scattered=False),
             ):
-                h, r = stub_stage(communicator, StageKind.ATTENTION)._prepare_input(
+                h, r = prepare_input(
+                    stub_stage(communicator, StageKind.ATTENTION),
                     hidden,
                     residual.clone(),
                     SimpleNamespace(forward_mode=ForwardMode.EXTEND),
                 )
             torch.testing.assert_close(h, torch.full((1, 4), 8.0))
-            h, r = stub_stage(communicator, StageKind.FFN)._prepare_input(
-                hidden, residual.clone(), object()
+            h, r = prepare_input(
+                stub_stage(communicator, StageKind.FFN),
+                hidden,
+                residual.clone(),
+                object(),
             )
             torch.testing.assert_close(h, torch.full((1, 4), 8.0))
             torch.testing.assert_close(r.residual, torch.full((1, 4), 4.0))
-            out = communicator.output.postprocess_layer(hidden, residual, object())
+            out = postprocess_output(communicator.output, hidden, residual, object())
             self.assertIs(out[0], hidden)
             self.assertIs(out[1], residual)
 

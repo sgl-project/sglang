@@ -711,7 +711,7 @@ class Step3p5Model(nn.Module):
         if not self.pp_group.is_last_rank:
             return residual_batch.to_pp(hidden_states, forward_batch)
         else:
-            hidden_states = residual_batch.finish(hidden_states, forward_batch)
+            hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
             hidden_states_before_norm = None
             if not self.pp_group.is_last_rank:
                 return residual_batch.to_pp(hidden_states, forward_batch)

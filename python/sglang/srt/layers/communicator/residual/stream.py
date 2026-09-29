@@ -158,22 +158,23 @@ class ResidualStream:
         self.check(hidden)
         return self.pending.complete() if self.pending is not None else hidden
 
-    def snapshot(self, hidden, *, group=None):
+    def snapshot(self, hidden):
         self.check(hidden)
         pending = self.pending
         if pending is None:
             return hidden.clone()
+        if not pending.update.adds_plainly:
+            raise NotImplementedError("snapshot requires a plain residual update")
         if pending.owed is None:
             value = pending.value
         elif isinstance(pending.owed, (CarriedSum, DeclaredSum)):
             value = pending.owed.complete(pending.value.clone())
         else:
             raise NotImplementedError("a finalize handoff requires main-output capture")
-        if group is not None:
-            value = group.all_reduce(value.clone())
         return value.clone() if self.residual is None else value + self.residual
 
     def finish(self, hidden, *, takes_handoff=False, preserve_declared=False):
+        """Export the contribution/residual pair; keep the stream available to readers."""
         self.check(hidden)
         if self.pending is None:
             return hidden, None

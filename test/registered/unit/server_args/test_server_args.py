@@ -1465,6 +1465,7 @@ class TestContextParallelServerArgs(CustomTestCase):
         )
         server_args._model_config = SimpleNamespace(
             hf_config=SimpleNamespace(architectures=["DeepseekV32ForCausalLM"]),
+            hf_text_config=SimpleNamespace(model_type="deepseek_v32"),
             is_multimodal=False,
         )
 

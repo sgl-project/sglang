@@ -14,6 +14,8 @@
 """The plain residual: add and RMSNorm, and the fused all-reduce + add + norm
 kernels."""
 
+from dataclasses import dataclass
+from enum import Enum, auto
 from typing import Optional
 
 import torch
@@ -280,6 +282,14 @@ class Add:
         return _redistribute_from_attn_tp_shards(residual)
 
 
+class Fp8Input(Enum):
+    """Additional input forms a projection can consume after a fused norm."""
+
+    TUPLE = auto()
+    TUPLE_AND_BF16 = auto()
+
+
+@dataclass(frozen=True)
 class NormQuantRead:
     """The input is the residual's norm, fused with the quantization the
     consumer asks for (``quant_format``) and a post-residual addition; a plain
@@ -287,6 +297,8 @@ class NormQuantRead:
     the norm."""
 
     norms_plainly = True
+    before_gather: bool = False
+    fp8_input: Optional[Fp8Input] = None
 
     def enter(self, hidden_states):
         return hidden_states
@@ -316,11 +328,13 @@ class NormQuantRead:
         )
 
 
+@dataclass(frozen=True)
 class NormRead:
     """The input is the residual's norm; a plain add of the previous output
     runs in the same kernel. An empty batch skips the norm."""
 
     norms_plainly = True
+    before_gather: bool = False
 
     def enter(self, hidden_states):
         return hidden_states

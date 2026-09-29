@@ -2,11 +2,12 @@ import unittest
 
 import test_declared_decoder_boundary as fixture
 
-from sglang.srt.layers import communicator as comm
 from sglang.srt.layers.communicator import (
     TokenAxis,
 )
-from sglang.srt.layers.communicator import ops as comm_ops
+from sglang.srt.layers.communicator import prepare as comm_ops
+from sglang.srt.layers.communicator.contracts import BatchVariant
+from sglang.srt.layers.communicator.ops import scatter_moe_cp_output
 from sglang.test.boundary_fixtures import make_test_stages
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -27,16 +28,16 @@ class TestDenseMlpUnderPrefillCP(CustomTestCase):
             stages = make_test_stages(
                 attention_norm=fixture.Norm(), ffn_norm=fixture.Norm()
             )
-        attention = stages.attn.plan._cp_steps.attention
-        steps = stages.ffn.plan._cp_steps
+        attention = stages.attn.plan._paths.get(BatchVariant.CONTEXT_PARALLEL).entry
+        steps = stages.ffn.plan._paths.get(BatchVariant.CONTEXT_PARALLEL)
         self.assertIn(TokenAxis.ATTN_CP, attention.input_rows.sharded)
-        self.assertNotIn(TokenAxis.ATTN_CP, steps.ffn.input_rows.sharded)
+        self.assertNotIn(TokenAxis.ATTN_CP, steps.entry.input_rows.sharded)
         self.assertIs(
-            steps.ffn.prepare.keywords["step"].func, comm_ops._mlp_input_gather_moe_cp
+            steps.entry.prepare.keywords["step"].func, comm_ops._mlp_input_gather_moe_cp
         )
         self.assertIs(
-            steps.ffn_output_move,
-            comm.CommunicateSummableTensorPairFn._scatter_hidden_states_moe,
+            steps.output_move,
+            scatter_moe_cp_output,
         )
 
 

@@ -135,11 +135,6 @@ class AttnTpContext:
     def set_attn_inputs(self, attn_inputs: AttentionInputs):
         get_forward().set("attn_inputs", attn_inputs)
 
-    def set_hidden_states_local(self, hidden_states: torch.Tensor) -> None:
-        attn_inputs = get_forward().attn_inputs
-        if attn_inputs is not None:
-            attn_inputs.hidden_states_local = hidden_states
-
     def fetch_qkv_latent(self):
         attn_inputs = get_forward().attn_inputs
         assert attn_inputs is not None

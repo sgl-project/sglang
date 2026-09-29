@@ -24,12 +24,13 @@ from sglang.srt.layers.communicator.adapters.lora import (
     publish_attention,
     publish_ffn,
 )
-from sglang.srt.layers.communicator.boundary import (
-    BoundarySteps,
+from sglang.srt.layers.communicator.contracts import (
+    BatchVariant,
     StageEntry,
     StageKind,
+    StageSteps,
 )
-from sglang.srt.layers.communicator.ops import CommunicateSimpleFn
+from sglang.srt.layers.communicator.ops import gather_attention_tp
 from sglang.srt.layers.communicator.residual.access import buffer, from_pp
 from sglang.srt.layers.communicator.residual.add_norm import (
     ADD,
@@ -51,58 +52,40 @@ class StageCommunicator:
     def __init__(
         self,
         plan: "StagePlan",
-        kind: StageKind,
-        norm,
         *,
-        declaration: Optional["StageDeclaration"] = None,
+        declaration: "StageDeclaration",
     ):
         self.plan = plan
-        self.kind = kind
-        self.norm = norm
-        self._declaration = declaration
+        self.declaration = declaration
 
     @property
-    def declaration(self) -> "StageDeclaration":
-        """Immutable source contract for constructing another local sequence."""
-        if self._declaration is None:
-            raise RuntimeError("this boundary was constructed from raw layout edges")
-        return self._declaration
+    def kind(self):
+        return self.declaration.kind
+
+    @property
+    def norm(self):
+        return self.plan.norm
 
     def entry(
-        self, forward_batch: ForwardBatch, steps: Optional[BoundarySteps] = None
+        self, forward_batch: ForwardBatch, steps: Optional[StageSteps] = None
     ) -> StageEntry:
         if steps is None:
             steps = self.plan._batch_steps(forward_batch)
-        entry = steps.attention if self.kind is StageKind.ATTENTION else steps.ffn
-        if entry is None:
-            raise NotImplementedError(
-                f"a layer that is one stage has no {self.kind.name.lower()} stage"
-            )
-        return entry
+        return steps.entry
 
     def _prepare(
         self,
         hidden_states,
-        residual,
+        stream: ResidualStream,
         forward_batch: ForwardBatch,
-        steps: Optional[BoundarySteps] = None,
+        steps: Optional[StageSteps] = None,
         **call,
     ):
         """The stage's input and the residual, from the previous stage's output
         (``call``: what the stage's read takes, e.g. the attention's
         ``quant_format``)."""
         entry = self.entry(forward_batch, steps)
-        stream = (
-            residual
-            if isinstance(residual, ResidualStream)
-            else ResidualStream(residual)
-        )
-        if not isinstance(residual, ResidualStream):
-            if residual is not None or entry.input_sum is not None:
-                hidden_states = stream.leave(
-                    hidden_states, call.get("update", ADD), declared_sum=entry.input_sum
-                )
-        elif (
+        if (
             stream.pending is None
             and stream.residual is None
             and entry.input_sum is not None
@@ -136,8 +119,8 @@ class StageCommunicator:
         return self.plan.fusions
 
     @property
-    def input_rows(self):
-        return self.plan.input_rows
+    def incoming_residual_rows(self):
+        return self.plan.incoming_residual_rows
 
     @property
     def input_on_attention_tp_slices(self):
@@ -158,11 +141,11 @@ class StageCommunicator:
 
     def finish(self, hidden_states, forward_batch):
         """Hand this attention's actual contribution to the following stage."""
-        if self.kind is not StageKind.ATTENTION or not self.plan.fixed_output:
+        if self.kind is not StageKind.ATTENTION or not self.plan.direct_handoff:
             raise RuntimeError(
                 "use the stage exit scope for an FFN or single-stage mixer"
             )
-        produced = self.plan.produced(self.kind, forward_batch)
+        produced = self.plan.produced(forward_batch)
         return current(forward_batch).leave(
             hidden_states,
             produced.update,
@@ -171,24 +154,24 @@ class StageCommunicator:
 
     def exit(self, forward_batch):
         result = (
-            self.plan.output.ffn_exit(forward_batch)
+            self.plan.output.ffn_exit(forward_batch, stream=current(forward_batch))
             if self.kind is StageKind.FFN
-            else self.plan.output.mixer_exit(forward_batch)
+            else self.plan.output.mixer_exit(
+                forward_batch, stream=current(forward_batch)
+            )
         )
-        result._stream = current(forward_batch)
         return result
 
     def from_pp(self, tensors, forward_batch, *, allow_missing_residual: bool = False):
         hidden_states, residual = from_pp(
             tensors,
-            residual_in_hidden=self.plan.residual_in_hidden,
+            residual_in_hidden=(
+                self.declaration.previous is not None
+                and self.declaration.previous.update.at_producer
+            ),
             allow_missing_residual=allow_missing_residual,
         )
-        declared_sum = None
-        if forward_batch is not None:
-            steps = self.plan._batch_steps(forward_batch)
-            entry = steps.attention or steps.ffn
-            declared_sum = entry.input_sum
+        declared_sum = self.entry(forward_batch).input_sum
         hidden_states, forward_batch.residual_stream = ResidualStream.arrive(
             hidden_states, residual, ADD, declared_sum=declared_sum
         )
@@ -208,11 +191,9 @@ class StageCommunicator:
         return hidden_states, stream.snapshot(hidden_states)
 
     def postprocess(self, hidden_states, forward_batch):
-        hidden_states, stream = self.plan.output.postprocess_layer(
+        return self.plan.output.postprocess_layer(
             hidden_states, current(forward_batch), forward_batch
         )
-        forward_batch.residual_stream = stream
-        return hidden_states
 
     def branch_input(self, source, hidden_states, forward_batch):
         hidden_states, stream = branch.branch_input(
@@ -240,11 +221,14 @@ class StageCommunicator:
         forward_batch.residual_stream = stream
         return hidden_states
 
-    def _prepare_input(self, hidden_states, residual, forward_batch, **call):
+    def _prepare_input(self, hidden_states, stream, forward_batch, **call):
         plan = self.plan
         if self.kind is StageKind.ATTENTION:
             publish_attention(plan._publish_lora_layout)
-            if plan._sp_steps is not None and plan.is_first_layer:
+            if (
+                plan._paths.get(BatchVariant.SEQUENCE_PARALLEL) is not None
+                and plan.enters_stack
+            ):
                 get_forward().set(
                     "sp_active", layernorm_sp.runs_sp(forward_batch.forward_mode)
                 )
@@ -252,7 +236,7 @@ class StageCommunicator:
                     hidden_states = layernorm_sp.sp_entry_scatter(hidden_states)
         else:
             publish_ffn(plan._publish_lora_layout, self.entry(forward_batch).input_rows)
-        return self._prepare(hidden_states, residual, forward_batch, **call)
+        return self._prepare(hidden_states, stream, forward_batch, **call)
 
     def _prepare_attention(
         self,
@@ -315,11 +299,11 @@ class StageCommunicator:
                     forward_batch=forward_batch,
                 )
             )
-            # Input gathers allocate fresh DP buffers.
+            # Input gathers allocate fresh DP buffers (see gather_attention_tp).
             # Without a gather this is the mutable residual, so retention copies.
             captured_last_layer_outputs.capture(
                 gathered_last_layer_output,
-                owned=move is CommunicateSimpleFn._scattered_to_tp_attn_full
+                owned=move is gather_attention_tp
                 or (
                     move is None
                     and entry.capture_preserves_residual is not None

@@ -208,21 +208,18 @@ class CuteDSLFusion:
         # Producer capabilities; consumer kernel selection is independent.
         self.hands_off_finalize = False
         self.terminal_finalize = False
-        self.requires_local_reduction = False
 
     def install(
         self,
         service: CuteDSLFusionService,
         *,
         hands_off_finalize: bool,
-        output_is_replicated: bool,
         terminal_finalize: bool = False,
     ) -> None:
         """Install the shared workspace and this producer's capabilities."""
         self.service = service
         self.hands_off_finalize = hands_off_finalize
         self.terminal_finalize = terminal_finalize
-        self.requires_local_reduction = output_is_replicated
 
     def attention_input(self, layer) -> tuple:
         return (
@@ -233,7 +230,7 @@ class CuteDSLFusion:
     def ffn_input(self, layer) -> tuple:
         parallel = get_parallel()
         if (
-            TokenAxis.ATTN_TP_SCATTER not in layer.input_rows.sharded
+            TokenAxis.ATTN_TP_SCATTER not in layer.incoming_residual_rows.sharded
             # The workspace sums over TP, which is then the attention-TP group.
             and parallel.attn_tp_size == parallel.tp_size
             and _fused_norm_gamma(layer.norm) is not None
@@ -336,11 +333,7 @@ class CuteDSLFusion:
         """Whether this producer can emit a handoff with an unfused fallback."""
         return (
             self.hands_off_finalize
-            and (not layer.is_last_layer or self.terminal_finalize)
-            and (
-                not self.requires_local_reduction
-                or (layer.is_last_layer and self.terminal_finalize)
-            )
+            and (not layer.terminal or self.terminal_finalize)
             and self._should_use_finalize(
                 layer, forward_batch, int(forward_batch.input_ids.shape[0])
             )
@@ -377,7 +370,6 @@ def install_cutedsl_fusion(
     top_k: int,
     rms_epsilon: float,
     can_defer_finalize: _LayerPredicate,
-    requires_local_reduction: _LayerPredicate | None = None,
     label: str,
     terminal_finalize: bool = False,
 ) -> CuteDSLFusionService | None:
@@ -424,8 +416,6 @@ def install_cutedsl_fusion(
             service,
             hands_off_finalize=hands_off_finalize,
             terminal_finalize=terminal_finalize,
-            output_is_replicated=requires_local_reduction is not None
-            and bool(requires_local_reduction(layer)),
         )
     logger.info(
         "Installed one %s FlashInfer MNNVL CuTe DSL fusion handle for %d of %d layers "
