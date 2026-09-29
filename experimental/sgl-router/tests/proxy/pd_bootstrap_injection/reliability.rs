@@ -242,3 +242,24 @@ async fn decode_failure_leaves_prefill_running() {
         assert_eq!(outcomes(&ctx, &prefill_url, "prefill"), ["success"]);
     }
 }
+
+/// A streaming prefill that fails after committing a 200 is still a prefill failure.
+#[tokio::test]
+async fn prefill_sse_error_event_is_a_prefill_failure() {
+    for reorg in [false, true] {
+        let prefill =
+            MockWorker::start(vec!["data: {\"error\": {\"message\": \"boom\"}}\n\n"]).await;
+        let decode = MockWorker::start_hanging(Duration::from_secs(10)).await;
+        let ctx = pd_ctx(&prefill.url, &decode.url, reorg);
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            build_router(ctx.clone()).oneshot(chat(true)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(response.headers()["x-router-error-code"], "prefill_failed");
+        assert_eq!(outcomes(&ctx, &prefill.url, "prefill"), ["error"]);
+    }
+}

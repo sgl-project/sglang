@@ -5,7 +5,7 @@
 
 use super::preparation::{generate_room_id, BootstrapFields, PreparedChatRequest};
 use crate::discovery::WorkerMode;
-use crate::proxy::sse::{StreamEnd, StreamEndReason};
+use crate::proxy::sse::{self, StreamEnd, StreamEndReason};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{
@@ -204,7 +204,7 @@ fn spawn_prefill_request(
                 None,
             )
             .await;
-        let failure = prefill_failure(result);
+        let failure = prefill_failure(result).await;
         let prefill_url = &prefill_worker.url;
         let outcome = failure
             .as_ref()
@@ -229,20 +229,28 @@ fn spawn_prefill_request(
 
 /// Client errors and backpressure pass through; only a prefill fault becomes
 /// `prefill_failed`.
-fn prefill_failure(result: Result<Response<Body>, ApiError>) -> PrefillFailure {
-    match result {
-        Ok(response) if response.status().is_success() => None,
+async fn prefill_failure(result: Result<Response<Body>, ApiError>) -> PrefillFailure {
+    let response = match result {
+        Ok(response) if response.status().is_success() => response,
         Ok(response)
             if matches!(
                 outcome_from_status(response.status().as_u16()),
                 RequestOutcome::Error
             ) =>
         {
-            Some(Err(ApiError::PrefillFailed {
+            return Some(Err(ApiError::PrefillFailed {
                 status: Some(response.status()),
-            }))
+            }));
         }
-        result => Some(result),
+        result => return Some(result),
+    };
+    // A streaming prefill reports a late failure as a 200 carrying an SSE error event.
+    let status = response.status();
+    match axum::body::to_bytes(response.into_body(), usize::MAX).await {
+        Ok(body) if !sse::has_error_event(&body) => None,
+        _ => Some(Err(ApiError::PrefillFailed {
+            status: Some(status),
+        })),
     }
 }
 
