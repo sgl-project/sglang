@@ -100,13 +100,15 @@ jobs:
           # Print server-side error context for failed cases (step logs are not
           # retrievable from the custom container runner, so surface key errors
           # in the console output explicitly)
-          for test_case in "${test_cases[@]}"; do
-            tc_name=$(basename ${test_case} .py)
-            if [ "${overall_status}" -ne 0 ] && [ -f "/tmp/${tc_name}.log" ]; then
-              echo "===== error context: ${tc_name} ====="
-              grep -n -A 20 "Traceback (most recent call last)" /tmp/${tc_name}.log | head -n 120 || true
-            fi
-          done
+          if [ "${overall_status}" -ne 0 ]; then
+            for test_case in "${test_cases[@]}"; do
+              tc_name=$(basename ${test_case} .py)
+              if [ -f "/tmp/${tc_name}.log" ]; then
+                echo "===== error context: ${tc_name} ====="
+                grep -n -A 20 "Traceback (most recent call last)" /tmp/${tc_name}.log | head -n 150 || true
+              fi
+            done
+          fi
 
           plog_path="/root/ascend/log/debug/plog"
           if [ -d "$plog_path" ];then
@@ -118,4 +120,35 @@ jobs:
             cp ${plog_path}/* ${target_plog_path}
           fi
 
+          # Compact diagnostics printed LAST so they survive annotation tail truncation
+          if [ "${overall_status}" -ne 0 ]; then
+            echo "===== MODEL CACHE CHECK ====="
+            for m in \
+              "LLM-Research/Llama-3.2-1B-Instruct" \
+              "Qwen/Qwen3-0.6B" \
+              "Qwen/Qwen3.5-27B" \
+              "Qwen/Qwen3-32B" \
+              "Qwen3-Coder-480B-A35B-Instruct-w8a8-QuaRot"; do
+              if [ -d "/root/.cache/modelscope/hub/models/${m}" ]; then
+                echo "CACHED: ${m}"
+              else
+                echo "MISSING: ${m}"
+              fi
+            done
+
+            echo "===== UNIQUE ERROR SUMMARY (root cause candidates) ====="
+            cat /tmp/*.log \
+              | grep -E "Error|ERROR|Exception|failed|Failed|not found|No such|EZ[0-9]{4}|OOM|out of memory" \
+              | grep -vE "ERR99999|scheduler died|Check server logs|error_msg|last_error" \
+              | sed 's/^[0-9]*[-:]//' | sort | uniq -c | sort -rn | head -n 15 || true
+          fi
+
           exit ${overall_status}
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: single-test-npu-logs
+          path: /tmp/*.log
+          if-no-files-found: ignore
