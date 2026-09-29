@@ -65,7 +65,11 @@ def _prod(iterable) -> int:
 
 
 def _store_dtype_for(kv_cache_dtype: torch.dtype) -> torch.dtype:
-    if kv_cache_dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
+    if kv_cache_dtype in (
+        torch.float8_e5m2,
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
+    ):
         return torch.uint8
     return kv_cache_dtype
 
@@ -127,12 +131,21 @@ class MHASubPoolSpec(SubPoolSpec):
     head_num: int
     head_dim: int
     store_dtype: torch.dtype
+    kv_cache_dtype: Optional[torch.dtype] = None
     v_head_dim: Optional[int] = None
 
     def __post_init__(self):
         super().__post_init__()
         assert self.head_num > 0, f"head_num must be positive; got {self.head_num}"
         assert self.head_dim > 0, f"head_dim must be positive; got {self.head_dim}"
+        if self.kv_cache_dtype is None:
+            object.__setattr__(self, "kv_cache_dtype", self.store_dtype)
+        expected_store_dtype = _store_dtype_for(self.kv_cache_dtype)
+        assert self.store_dtype == expected_store_dtype, (
+            "MHASubPoolSpec.store_dtype must match the storage dtype required by "
+            f"kv_cache_dtype; got kv_cache_dtype={self.kv_cache_dtype}, "
+            f"store_dtype={self.store_dtype}, expected={expected_store_dtype}"
+        )
         if self.v_head_dim is None:
             object.__setattr__(self, "v_head_dim", self.head_dim)
         assert self.v_head_dim > 0, (
@@ -153,15 +166,6 @@ class MHASubPoolSpec(SubPoolSpec):
 
     def page_bytes(self, page_size: int) -> int:
         return page_size * self.entry_bytes()
-
-    def layer_k_offset_in_page(self, layer_id: int, page_size: int) -> int:
-        return layer_id * page_size * (self.k_row_bytes() + self.v_row_bytes())
-
-    def layer_v_offset_in_page(self, layer_id: int, page_size: int) -> int:
-        return (
-            self.layer_k_offset_in_page(layer_id, page_size)
-            + page_size * self.k_row_bytes()
-        )
 
     def view_tail_pad_bytes(self, page_size: int) -> int:
         return page_size * self.entry_bytes()
@@ -578,7 +582,7 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
         super().__init__(
             size=view_rows - page_size,
             page_size=page_size,
-            dtype=spec.store_dtype,
+            dtype=spec.kv_cache_dtype,
             head_num=spec.head_num,
             head_dim=spec.head_dim,
             layer_num=spec.layer_num,
@@ -635,6 +639,20 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
         assert self._unified_buffer.anchor_bytes(self._sub_pool_name) == 0
         raw = self._unified_buffer._raw
         return [raw.data_ptr()], [raw.numel()], [self._page_bytes]
+
+    def get_page_envelope_buffer(self) -> torch.Tensor:
+        """Return this sub-pool's page-strided view of the shared allocation."""
+        assert self._unified_buffer.anchor_bytes(self._sub_pool_name) == 0
+        raw = self._unified_buffer._raw
+        page_count = (
+            self._unified_buffer.max_slots(self._sub_pool_name) // self.page_size
+        )
+        return raw[: page_count * self._page_bytes].view(page_count, self._page_bytes)
+
+    @property
+    def grow_direction(self) -> str:
+        """Physical growth direction used by this sub-pool's L1 allocator."""
+        return self._unified_buffer.spec(self._sub_pool_name).grow_direction
 
     def _physical_to_kernel_indices(self, indices: torch.Tensor) -> torch.Tensor:
         return (indices // self.page_size) * (
@@ -1308,6 +1326,7 @@ def init_unified_mamba_pools(
             head_num=head_num,
             head_dim=head_dim,
             store_dtype=store_dtype,
+            kv_cache_dtype=kv_cache_dtype,
             grow_direction="down",
         )
     cp = mamba2_cache_params
@@ -1531,7 +1550,11 @@ class UnifiedSWAKVPool(SWAKVPool):
             "UnifiedSWAKVPool: full and swa sub-pools must share store_dtype; got "
             f"full={full_spec.store_dtype}, swa={swa_spec.store_dtype}"
         )
-        self.dtype = full_spec.store_dtype
+        assert full_spec.kv_cache_dtype == swa_spec.kv_cache_dtype, (
+            "UnifiedSWAKVPool: full and swa sub-pools must share kv_cache_dtype; got "
+            f"full={full_spec.kv_cache_dtype}, swa={swa_spec.kv_cache_dtype}"
+        )
+        self.dtype = full_spec.kv_cache_dtype
         self.head_num = full_spec.head_num
         self.head_dim = full_spec.head_dim
         self.device = unified_buffer.device
@@ -1739,7 +1762,9 @@ class UnifiedSWAKVPool(SWAKVPool):
             swa_phys = swa_phys[old_swa_mask][row_mask.to(indices.device)]
             if swa_phys.numel() == 0:
                 return
-            swa_cpu = self._filter_swa_cpu_copy(kv_cache_cpu["swa"], row_mask)
+            swa_cpu = self._filter_swa_cpu_copy(
+                swa_kv_cpu=kv_cache_cpu["swa"], row_mask=row_mask
+            )
             self.swa_kv_pool.load_cpu_copy(swa_cpu, swa_phys)
 
 
@@ -1798,6 +1823,7 @@ def init_unified_swa_pools(
         head_dim=head_dim,
         v_head_dim=v_head_dim,
         store_dtype=store_dtype,
+        kv_cache_dtype=kv_cache_dtype,
         grow_direction="down",
     )
     swa_spec = MHASubPoolSpec(
@@ -1807,6 +1833,7 @@ def init_unified_swa_pools(
         head_dim=swa_head_dim,
         v_head_dim=swa_v_head_dim,
         store_dtype=store_dtype,
+        kv_cache_dtype=kv_cache_dtype,
         grow_direction="up",
     )
     legacy_allocator_capacities = {}
@@ -1989,6 +2016,7 @@ def init_unified_mamba_swa_pools(
         head_dim=head_dim,
         v_head_dim=v_head_dim,
         store_dtype=store_dtype,
+        kv_cache_dtype=kv_cache_dtype,
         grow_direction="down",
     )
     swa_spec = MHASubPoolSpec(
@@ -1998,6 +2026,7 @@ def init_unified_mamba_swa_pools(
         head_dim=swa_head_dim,
         v_head_dim=swa_v_head_dim,
         store_dtype=store_dtype,
+        kv_cache_dtype=kv_cache_dtype,
         grow_direction="float",
     )
     cp = mamba2_cache_params

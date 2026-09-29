@@ -17,6 +17,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     grow_multi_ctas_kv_counter_buffer_if_needed,
     make_persistent_multi_ctas_kv_counter_buffer,
 )
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -43,6 +44,7 @@ def _make_backend(*, allocate_counter: bool = True):
     backend.dsa_topk_backend = SimpleNamespace(should_use_topk_v2=lambda: False)
     backend.dsa_index_topk = 2048
     backend.dsa_decode_impl = "trtllm"
+    backend._memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
     backend.req_to_token = torch.zeros(
         8, _MAX_CTX_LEN, dtype=torch.int32, device="cuda"
     )
