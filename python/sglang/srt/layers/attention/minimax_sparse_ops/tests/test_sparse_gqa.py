@@ -372,10 +372,6 @@ def test_sparse_gqa_deterministic(bs, nqh, nkh, hd, blk, tk, with_sink, seq_pat,
     )
 
 
-if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v", "-s"]))
-
-
 @pytest.mark.parametrize("page_size,engages", [(128, True), (256, True), (64, False)])
 def test_paged_tile_matches_slot_gather(page_size, engages):
     """Deriving a block's slots from its first slot must match gathering them.
@@ -422,3 +418,53 @@ def test_paged_tile_matches_slot_gather(page_size, engages):
             q2, s2, k2, v2, r2, sl2, sid2, blk, ti2, page_size=page_size
         )
         assert not torch.equal(a, b)
+
+
+def test_hisparse_slots_override_paged_tile():
+    """Pre-resolved HiSparse slots must win over the paged-tile branch.
+
+    They index the HiSparse device buffer, not req_to_token's page layout, and the
+    backend passes page_size alongside them, so a paged tile taking precedence
+    would read the wrong K/V.
+    """
+    torch.manual_seed(0)
+    bs, nqh, nkh, hd, blk, tk = 4, 64, 1, 128, 128, 16
+    seq_lens_list = make_seq_lens("aligned", bs, blk)
+    args = build_inputs(
+        bs, nqh, nkh, hd, seq_lens_list, blk, tk, with_sink=False, paged="pages"
+    )
+    q, sink, k_cache, v_cache, req_to_token, seq_lens, slot_ids, topk_idx = args
+    # Resolve every selected block through a different slot permutation, laid out
+    # like the coordinator's output: [1, batch, topk * block] int32.
+    remap = torch.randperm(k_cache.shape[0], device=DEVICE).to(torch.int32)
+    hisparse_slots = torch.full((1, bs, tk * blk), -1, dtype=torch.int32, device=DEVICE)
+    for b in range(bs):
+        for t, block in enumerate(topk_idx[0, b].tolist()):
+            if block >= 0:
+                tokens = req_to_token[b, block * blk : (block + 1) * blk].long()
+                hisparse_slots[0, b, t * blk : (t + 1) * blk] = remap[tokens]
+
+    def run(ps, slots):
+        return flash_decode_with_gqa_share_sparse(
+            q,
+            sink,
+            k_cache,
+            v_cache,
+            req_to_token,
+            seq_lens,
+            slot_ids,
+            blk,
+            topk_idx,
+            page_size=ps,
+            hisparse_slots=slots,
+        )
+
+    expected = run(0, hisparse_slots)
+    assert torch.equal(expected, run(blk, hisparse_slots))
+    # The remapped slots must change the result, else a paged tile that ignored
+    # them would pass the assertion above.
+    assert not torch.equal(expected, run(blk, None))
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v", "-s"]))
