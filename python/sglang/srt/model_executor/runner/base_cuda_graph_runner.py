@@ -22,6 +22,7 @@ from abc import abstractmethod
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Tuple
 
+from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
 from sglang.srt.runtime_context import (
     get_exec,
@@ -67,7 +68,9 @@ def get_batch_sizes_to_capture(
     """Build the (capture_bs, compile_bs) lists for the decode runner.
 
     Filters cuda_graph_config[decode].bs by attention-tp/cp alignment
-    constraints and clamps to req_to_token_pool.size.
+    constraints and clamps to req_to_token_pool.size. A separate-context dLLM
+    additionally clamps to its own max_running_requests, so every buffer sized
+    from these lists matches what the decode runner actually captures.
     """
 
     capture_bs = list(get_exec().graph.cuda_graph_config.decode.bs)
@@ -98,6 +101,14 @@ def get_batch_sizes_to_capture(
         if get_flags().capture.enable_torch_compile
         else []
     )
+
+    dllm_config = DllmConfig.from_server_args(model_runner.server_args)
+    if dllm_config is not None and dllm_config.requires_separate_context_encoding:
+        max_requests = min(dllm_config.max_running_requests, max(capture_bs))
+        capture_bs = sorted(
+            {bs for bs in capture_bs if bs <= max_requests} | {max_requests}
+        )
+        compile_bs = [bs for bs in compile_bs if bs <= max_requests]
     return capture_bs, compile_bs
 
 
