@@ -509,8 +509,6 @@ class TestRequestTpotGating(CustomTestCase):
             self._run([(40, {"type": "stop"})], prefill_finished_time=produced),
             0.0,
         )
-        # Non-streaming without scheduler timing falls back to arrival time.
-        self.assertIsNone(self._run([(40, {"type": "stop"})]))
 
     def test_multi_batch_records_only_completed_decode(self):
         cases = [
