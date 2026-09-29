@@ -132,38 +132,67 @@ class TestNarrowA2AIsExact(CustomTestCase):
 
 
 class TestGatheredWeightLayout(CustomTestCase):
-    """The gather must hand back w_kc in the layout the loader chose for it.
+    """The gather must hand back w_kc in the layout the loader chose, for free.
 
     ``deepseek_weight_loader`` stores w_kc as
     ``w_kc.transpose(1, 2).contiguous().transpose(1, 2)``: shape
     [h, qk_nope, kv_lora] but laid out as [h, kv_lora, qk_nope], and the batched
-    matmul is tuned for that. An all-gather needs a contiguous send buffer, so
-    the naive gather returns a plainly contiguous tensor -- a full copy laid out
-    differently from the slice whose place it takes.
+    matmul is tuned for that. An all-gather needs a contiguous send buffer.
+
+    The first implementation gathered into a plain buffer and rebuilt the layout
+    with ``.transpose().contiguous().transpose()`` -- correct, but it allocated a
+    second full-size copy per layer and copied the send buffer too. Measured on
+    A3 tp16 the feature cost 4.05 GiB of KV pool against 2.13 GiB of live
+    weights.
+
+    ``dsa_cp_attach_full_kv_b`` now gathers in the PHYSICAL layout and takes the
+    logical view back, which costs neither. These tests pin the two facts that
+    makes possible.
     """
 
-    def test_restoring_the_layout_reproduces_the_loaders_strides(self):
-        h_local, tp, nope, lora = 2, 4, 6, 5
-        local = (
-            torch.randn(h_local, nope, lora)
-            .transpose(1, 2)
-            .contiguous()
-            .transpose(1, 2)
-        )
+    @staticmethod
+    def _loader_w_kc(h, nope, lora):
+        """Exactly what the loader stores: transposed-contiguous."""
+        return torch.randn(h, nope, lora).transpose(1, 2).contiguous().transpose(1, 2)
+
+    def test_w_kc_is_its_own_transpose_so_the_send_buffer_is_free(self):
+        """The load-bearing fact: no copy is needed to send w_kc."""
+        local = self._loader_w_kc(2, 6, 5)
         self.assertFalse(local.is_contiguous(), "the loader's layout is not plain")
+        send = local.transpose(1, 2)
+        self.assertTrue(
+            send.is_contiguous(),
+            "w_kc's transpose must already be contiguous, or the gather pays a "
+            "full send copy per layer",
+        )
+        self.assertEqual(
+            send.contiguous().data_ptr(),
+            send.data_ptr(),
+            "contiguous() on it must not copy; same storage, not merely equal",
+        )
 
-        gathered = torch.empty(h_local * tp, nope, lora)  # what all_gather returns
+    def test_gathering_transposed_then_viewing_back_matches_the_loader(self):
+        h_local, tp, nope, lora = 2, 4, 6, 5
+        local = self._loader_w_kc(h_local, nope, lora)
+        send = local.transpose(1, 2)
+
+        # What the new code allocates: the physical layout, contiguous.
+        gathered = torch.empty(h_local * tp, *send.shape[1:])
         self.assertTrue(gathered.is_contiguous())
-        restored = gathered.transpose(1, 2).contiguous().transpose(1, 2)
+        full = gathered.transpose(1, 2)
 
-        self.assertEqual(restored.shape, (h_local * tp, nope, lora))
-        self.assertEqual(restored.stride()[1:], local.stride()[1:])
-        self.assertFalse(restored.is_contiguous())
+        self.assertEqual(full.shape, (h_local * tp, nope, lora))
+        self.assertEqual(full.stride()[1:], local.stride()[1:])
+        self.assertFalse(full.is_contiguous())
 
-    def test_a_plain_contiguous_weight_is_left_alone(self):
-        """w_vc is already plain contiguous, so it must skip the restore."""
+    def test_w_vc_takes_the_plain_path_and_its_transpose_would_not(self):
+        """w_vc is plain contiguous, so the transposed branch must not fire."""
         local = torch.randn(2, 5, 4).contiguous()
         self.assertTrue(local.is_contiguous())
+        self.assertFalse(
+            local.transpose(1, 2).is_contiguous(),
+            "if this were contiguous the branch could not tell the two apart",
+        )
         gathered = torch.empty(8, 5, 4)
         self.assertEqual(gathered.stride()[1:], local.stride()[1:])
 

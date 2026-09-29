@@ -133,18 +133,18 @@ def dsa_cp_narrow_a2a_enabled() -> bool:
           off: 210,560 tokens, 18.69 GiB
           on : 164,992 tokens, 14.64 GiB      -> **4.05 GiB, 45,568 tokens**
 
-    Nearly double the live figure. The gap is transient allocations the caching
-    allocator holds on to: :func:`dsa_cp_attach_full_kv_b` gathers ``w_kc`` into
-    a plain buffer and then allocates a *second* full copy to restore the
-    loader's layout, and the collectives stage as well. Gathering into an
-    already-transposed buffer would remove that second copy -- the local
-    ``w_kc`` is physically ``[h, kv_lora, qk_nope]`` already, so the send would
-    cost nothing -- and is the obvious next saving if this is ever turned on by
-    default.
+    Nearly double the live figure, because the caching allocator holds on to
+    transients. **That measurement predates the current gather.**
+    :func:`dsa_cp_attach_full_kv_b` used to gather ``w_kc`` into a plain buffer
+    and then allocate a *second* full copy to restore the loader's layout; it now
+    gathers in the physical layout and takes the logical view back, which costs
+    neither that copy nor the send copy -- roughly 12 MB per layer, ~0.9 GiB over
+    78. **The post-fix cost has not been re-measured**; expect a little over
+    3 GiB until it has been.
 
-    **Quote the 4 GiB, not the 2.** It is about a fifth of the A3 dcp16 KV pool,
-    on boxes where memory pressure presents as a multi-minute stall rather than
-    an OOM. Turn it on where the margin is known, not by default.
+    Whatever it measures at, it is the reason this is opt-in: 3-4 GiB is a fifth
+    of the A3 dcp16 KV pool, on boxes where memory pressure presents as a
+    multi-minute stall rather than an OOM. Turn it on where the margin is known.
 
     The exchange is exact either way: ``npu_transpose_batchmatmul`` here is a
     per-head, per-row product, and the all-to-all is a permutation of
@@ -188,16 +188,31 @@ def dsa_cp_attach_full_kv_b(self_attn) -> None:
     tp = get_parallel().attn_tp_size
     gathered_bytes = 0
     for name, w in (("w_kc", w_kc), ("w_vc", w_vc)):
-        full = w.new_empty((w.shape[0] * tp, *w.shape[1:]))
-        attn_tp_all_gather_into_tensor(full, w.contiguous())
-        if not w.is_contiguous():
-            # The loader stores w_kc transposed-contiguous -- shape
-            # [h, qk_nope, kv_lora] but laid out as [h, kv_lora, qk_nope] -- and
-            # the batched matmul is tuned for that. The all-gather needs a
-            # contiguous send buffer, so the layout has to be restored here or
-            # the full copy would be laid out differently from the slice whose
-            # place it takes. w_vc is already plain contiguous and skips this.
-            full = full.transpose(1, 2).contiguous().transpose(1, 2)
+        # Gather in the layout the tensor is PHYSICALLY in, then take the logical
+        # view back.
+        #
+        # The loader stores w_kc transposed-contiguous: shape
+        # [h, qk_nope, kv_lora] laid out as [h, kv_lora, qk_nope], and the
+        # batched matmul is tuned for that. So ``w.transpose(1, 2)`` is already
+        # contiguous and costs nothing to send, and ``full.transpose(1, 2)``
+        # hands back the loader's exact stride pattern for free.
+        #
+        # The first version gathered into a plain buffer and then rebuilt the
+        # layout with ``.transpose().contiguous().transpose()``, which allocated
+        # a SECOND full-size copy per layer and copied the send buffer as well.
+        # Measured on A3 tp16 that cost 4.05 GiB of KV pool against 2.13 GiB of
+        # live weights; this removes ~12 MB per layer of allocation and the send
+        # copy with it. w_vc is plain contiguous and takes the simple path.
+        transposed = not w.is_contiguous()
+        send = w.transpose(1, 2) if transposed else w
+        if not send.is_contiguous():
+            # An unexpected layout, not one of the two the loader produces.
+            # Correct, just not free.
+            send = send.contiguous()
+        full = w.new_empty((send.shape[0] * tp, *send.shape[1:]))
+        attn_tp_all_gather_into_tensor(full, send)
+        if transposed:
+            full = full.transpose(1, 2)
         setattr(self_attn, f"{name}_full", full)
         # w_kc is [h, 192, 512] and w_vc is [h, 512, 256]: different sizes, so
         # count what was actually allocated rather than doubling one of them.
