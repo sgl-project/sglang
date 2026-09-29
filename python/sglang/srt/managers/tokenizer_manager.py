@@ -3025,19 +3025,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if priority is not None:
                 labels["priority"] = str(priority)
         finish_type = (recv_obj.finished_reasons[i] or {}).get("type")
-        if (
-            not state.ttft_observed
-            and finish_type != "abort"
-            and self.disaggregation_mode != DisaggregationMode.PREFILL
-        ):
-            state.ttft_observed = True
-            state.last_completion_tokens = completion_tokens
-            self.metrics_collector.observe_time_to_first_token(
-                labels,
-                state.time_stats.get_first_token_latency(),
-                stream=getattr(state.obj, "stream", False),
-            )
-        elif self.disaggregation_mode != DisaggregationMode.PREFILL:
+        if not state.ttft_observed:
+            # PD prefill workers never observe TTFT, so they never reach ITL.
+            if (
+                finish_type != "abort"
+                and self.disaggregation_mode != DisaggregationMode.PREFILL
+            ):
+                state.ttft_observed = True
+                state.last_completion_tokens = completion_tokens
+                self.metrics_collector.observe_time_to_first_token(
+                    labels,
+                    state.time_stats.get_first_token_latency(),
+                    stream=getattr(state.obj, "stream", False),
+                )
+        else:
             num_new_tokens = completion_tokens - state.last_completion_tokens
             self.metrics_collector.observe_inter_token_latency(
                 labels,

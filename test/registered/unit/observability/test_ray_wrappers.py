@@ -423,6 +423,13 @@ class TestTokenizerLatencyAccounting(_TokenizerCollectorCase):
                 collector = self._run(role, counts, finish_type=finish_type)
                 self.assertEqual(self._ttft_count(collector), expected)
 
+    def test_first_batch_abort_observes_nothing(self):
+        """An abort in the first output batch (e.g. a non-streaming request aborted
+        before its first flush) must not turn its tokens into ITL samples."""
+        collector = self._run("null", [30], finish_type="abort")
+        self.assertEqual(self._ttft_count(collector), 0)
+        self.assertEqual(self._itl_samples(collector), [0.0] * 6)
+
     def test_prefill_never_observes_decode_intervals(self):
         """PD prefill's first report (0 tokens) is below the initial baseline of 1;
         the negative delta used to land in the buckets, breaking
