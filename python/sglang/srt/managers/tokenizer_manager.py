@@ -2598,7 +2598,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 state.time_stats.set_first_token_time(
                     ts=self._get_scheduler_first_token_time(state, recv_obj, i)
                 )
-                # ITL intervals start from this batch's arrival.
                 state.time_stats.set_last_time()
 
             if state.finished:
@@ -2660,15 +2659,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _get_scheduler_first_token_time(
         state: ReqState, recv_obj, i: int
     ) -> Optional[float]:
-        """First-token time recorded by the scheduler, for non-streaming requests.
-
-        Non-streaming outputs are flushed every SGLANG_FORCE_STREAM_INTERVAL
-        tokens, so the first batch can arrive long after the first token was
-        produced. Clients only see the final response, so use the scheduler's
-        timestamp (already converted to this process's clock on unpickle).
-        Streaming requests return None and keep the arrival time, which is what
-        clients observe. Also None when the scheduler sent no timing data.
-        """
+        # Non-streaming outputs are batched; use the scheduler's first-token time.
         if getattr(state.obj, "stream", False) or recv_obj.time_stats is None:
             return None
         ts = recv_obj.time_stats[i].prefill_finished_time

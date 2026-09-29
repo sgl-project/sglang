@@ -633,11 +633,7 @@ class Envs:
     SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION = EnvBool(False)
     SGLANG_REQ_WAITING_TIMEOUT = EnvFloat(-1)  # in seconds
     SGLANG_REQ_RUNNING_TIMEOUT = EnvFloat(-1)  # in seconds
-    # For non-streaming requests, the scheduler flushes intermediate output
-    # batches to the tokenizer manager every N decoded tokens, so
-    # detokenization runs incrementally instead of all at finish. TTFT does not
-    # depend on this value: the tokenizer manager takes the first-token time
-    # from the scheduler's prefill_finished_time.
+    # Non-streaming requests flush intermediate outputs every N decoded tokens.
     SGLANG_FORCE_STREAM_INTERVAL = EnvInt(50)
 
     # ===================================================================

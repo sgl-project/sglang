@@ -458,9 +458,6 @@ class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
 
 
 class TestNonStreamingFirstTokenTime(CustomTestCase):
-    """Non-streaming first outputs are batched, so the first batch can arrive
-    long after the first token; first_token_time comes from the scheduler."""
-
     def _run(self, *, stream: bool, prefill_finished_time: float):
         tm = _make_tokenizer_manager(self)
         rid = "ttft_rid"
@@ -481,7 +478,6 @@ class TestNonStreamingFirstTokenTime(CustomTestCase):
         produced = time.perf_counter() - 0.5
         stats, arrival = self._run(stream=False, prefill_finished_time=produced)
         self.assertAlmostEqual(stats.first_token_time, produced, delta=1e-3)
-        # ITL intervals still start from the batch arrival.
         self.assertGreaterEqual(stats.last_time, arrival)
 
     def test_streaming_uses_arrival_time(self):
