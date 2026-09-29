@@ -309,8 +309,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # that wide. Head split mirrors MiniMaxM3 sparse attention's.
         self._idx_group_size = 1
         if self.index_cache_enabled:
-            from sglang.srt.runtime_context import get_parallel
-
             _num_idx_heads = max(
                 sparse_cfg["sparse_num_index_heads"] // get_parallel().attn_tp_size, 1
             )
@@ -1570,6 +1568,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 disable_index_value=disable_value,
                 use_msa=self.use_msa,
                 seqlens_cpu=forward_batch.extend_seq_lens_cpu,
+                seq_lens_cpu=forward_batch.seq_lens_cpu,
                 cu_seqblocks_q=cu_seqblocks_q,
                 max_seqblock_q=max_seqblock_q,
                 all_seqblock_q=all_seqblock_q,
@@ -1579,6 +1578,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 idx_q_scale=layer.idx_q_scale_float,
                 idx_k_scale=layer.idx_k_scale_float,
                 idx_v_scale=layer.idx_v_scale_float,
+                page_size=self.page_size,
                 cached_topk_idx=cached_topk_idx,
                 return_topk_idx=want_topk,
                 loc_mapping=self._loc_mapping,

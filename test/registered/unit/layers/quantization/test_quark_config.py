@@ -201,6 +201,74 @@ class TestMixedPrecisionLayerConfig(CustomTestCase):
         self.assertIsNone(_mixed_precision_layer_map({"quant_algo": "NVFP4"}))
 
 
+class TestFusedExpertConfig(CustomTestCase):
+    """Per-expert-only entries must not leave a FusedMoE on the global scheme."""
+
+    _FP8 = {
+        "weight": {
+            "dtype": "fp8_e4m3",
+            "qscheme": "per_block",
+            "block_size": [128, 128],
+        },
+        "input_tensors": {
+            "dtype": "fp8_e4m3",
+            "qscheme": "per_group",
+            "group_size": 128,
+        },
+    }
+    _MXFP4 = {
+        "weight": {"dtype": "fp4", "qscheme": "per_group", "group_size": 32},
+        "input_tensors": {"dtype": "fp4", "qscheme": "per_group", "group_size": 32},
+    }
+    _PREFIX = "model.decoder.mlp.experts"
+
+    def _entries(self, num_experts):
+        return {
+            f"{index}.{projection}": deepcopy(self._FP8)
+            for index in range(num_experts)
+            for projection in ("gate_proj", "up_proj", "down_proj")
+        }
+
+    def _config_with(self, layer_quant_config):
+        quark_config = _bare_config()
+        quark_config.quant_config = {
+            "layer_quant_config": layer_quant_config,
+            "layer_type_quant_config": {},
+            "global_quant_config": self._MXFP4,
+        }
+        quark_config.packed_modules_mapping = {}
+        return quark_config
+
+    def _lookup(self, entries):
+        quark_config = self._config_with(
+            {f"{self._PREFIX}.{s}": cfg for s, cfg in entries.items()}
+        )
+        return quark_config._find_matched_config(self._PREFIX, torch.nn.Module())
+
+    def test_fused_moe_resolves_from_per_expert_entries(self):
+        matched = self._lookup(self._entries(288))
+        self.assertEqual(matched["weight"]["dtype"], "fp8_e4m3")
+
+    def test_incomplete_or_mixed_expert_coverage_raises(self):
+        missing = {s: c for s, c in self._entries(4).items() if not s.startswith("2.")}
+        conflicting = self._entries(4)
+        conflicting["2.up_proj"] = deepcopy(self._MXFP4)
+        partial_projections = self._entries(4)
+        del partial_projections["3.down_proj"]
+        cases = {
+            "missing_expert": (missing, "skip experts"),
+            "conflicting_scheme": (conflicting, "different quantization"),
+            "partial_projections": (partial_projections, "different projections"),
+            "fused_param_name": ({"w13_weight_scale": self._FP8}, "expert index"),
+        }
+        for name, (entries, message) in cases.items():
+            with self.subTest(name), self.assertRaisesRegex(ValueError, message):
+                self._lookup(entries)
+
+    def test_experts_without_per_expert_entries_fall_through_to_global(self):
+        self.assertEqual(self._lookup({})["weight"]["dtype"], "fp4")
+
+
 class TestParseNvfp4Excludes(CustomTestCase):
     """ModelOpt `ignore` lists mix `re:`-prefixed regexes with fnmatch globs."""
 

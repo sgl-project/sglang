@@ -67,6 +67,7 @@ from sglang.srt.arg_groups.serving_hook import (
     handle_load_balance_method,
     handle_missing_default_values,
     handle_multimodal_feature_transport,
+    handle_other_validations,
     handle_ssl_validation,
     handle_tokenizer_batching,
     ssl_verify_of,
@@ -120,6 +121,25 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_optimistic_prefill_allows_l2_write_through_only(self):
+        for policy, expected in (
+            ("write_back", 2),
+            ("write_through", 2),
+            ("write_through_selective", 0),
+        ):
+            with self.subTest(policy=policy):
+                args = ServerArgs(
+                    model_path="dummy",
+                    disaggregation_mode="prefill",
+                    optimistic_prefill_attempts=2,
+                    enable_hierarchical_cache=True,
+                    hicache_write_policy=policy,
+                )
+                handle_other_validations(args)
+                self.assertEqual(
+                    resolution_result(args, "optimistic_prefill_attempts"), expected
+                )
+
     def test_radix_eviction_policy_explicitness_is_preserved(self):
         omitted = prepare_server_args(["--model-path", "dummy"])
         separated = prepare_server_args(
@@ -201,22 +221,33 @@ class TestPrepareServerArgs(CustomTestCase):
                 args.resolve_once()
 
     def test_megamoe_requires_sm90_or_sm100(self):
-        with override_platform(is_cuda=True, is_sm90=False, is_sm100=False):
+        # is_hip is pinned as well: override_platform only replaces the facts it is
+        # given, so on a ROCm host these would otherwise describe a machine that is
+        # both CUDA and HIP, and megamoe's ROCm arm would answer instead.
+        with override_platform(
+            is_cuda=True, is_sm90=False, is_sm100=False, is_hip=False
+        ):
             args = ServerArgs(model_path="dummy", moe_a2a_backend="megamoe")
             with self.assertRaisesRegex(ValueError, "SM90"):
                 args.resolve_once()
-        with override_platform(is_cuda=False, is_sm90=False, is_sm100=False):
+        with override_platform(
+            is_cuda=False, is_sm90=False, is_sm100=False, is_hip=False
+        ):
             args = ServerArgs(model_path="dummy", moe_a2a_backend="megamoe")
             with self.assertRaisesRegex(ValueError, "CUDA"):
                 args.resolve_once()
-        with override_platform(is_cuda=True, is_sm90=False, is_sm100=True):
+        with override_platform(
+            is_cuda=True, is_sm90=False, is_sm100=True, is_hip=False
+        ):
             ServerArgs(model_path="dummy", moe_a2a_backend="megamoe").resolve_once()
 
     def test_megamoe_token_budget_must_cover_chunked_prefill(self):
         from sglang.srt.arg_groups.mega_moe_hook import validate_mega_moe_token_budget
         from sglang.srt.environ import envs
 
-        with override_platform(is_cuda=True, is_sm90=False, is_sm100=True):
+        with override_platform(
+            is_cuda=True, is_sm90=False, is_sm100=True, is_hip=False
+        ):
             args = ServerArgs(
                 model_path="dummy",
                 moe_a2a_backend="megamoe",
@@ -546,31 +577,15 @@ class TestMultimodalFeatureTransport(CustomTestCase):
         self.assertIn("4 tokenizer worker", output)
 
     @override_platform(is_cuda=True)
-    def test_legacy_keep_flag_maps_to_cuda_ipc(self):
-        server_args = ServerArgs(model_path="dummy", keep_mm_feature_on_device=True)
-
-        with patch.dict(os.environ, {"SGLANG_USE_CUDA_IPC_TRANSPORT": "0"}):
-            with self.assertLogs(serving_hook.logger, level="WARNING") as logs:
-                handle_multimodal_feature_transport(server_args)
-
-            self.assertEqual(
-                resolution_result(server_args, "mm_feature_transport"), "cuda_ipc"
-            )
-            self.assertFalse(
-                resolution_result(server_args, "keep_mm_feature_on_device")
-            )
-            self.assertTrue(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
-
-        self.assertIn("deprecated", logs.output[0])
-
-    def test_legacy_keep_flag_rejects_explicit_cuda_vmm(self):
+    def test_cuda_ipc_rejects_multi_node(self):
+        """CUDA IPC handles are node-local, so an explicit cuda_ipc on a
+        multi-node layout must be refused at resolution rather than boot a
+        server whose second node can never open the pool."""
         server_args = ServerArgs(
-            model_path="dummy",
-            keep_mm_feature_on_device=True,
-            mm_feature_transport="cuda_vmm",
+            model_path="dummy", mm_feature_transport="cuda_ipc", nnodes=2
         )
 
-        with self.assertRaisesRegex(ValueError, "conflicts.*cuda_vmm"):
+        with self.assertRaisesRegex(ValueError, "cuda_ipc only supports a single node"):
             handle_multimodal_feature_transport(server_args)
 
     @override_platform(is_cuda=True)
@@ -1450,6 +1465,7 @@ class TestContextParallelServerArgs(CustomTestCase):
         )
         server_args._model_config = SimpleNamespace(
             hf_config=SimpleNamespace(architectures=["DeepseekV32ForCausalLM"]),
+            hf_text_config=SimpleNamespace(model_type="deepseek_v32"),
             is_multimodal=False,
         )
 
@@ -1994,7 +2010,34 @@ class TestSSLArgs(unittest.TestCase):
         self.assertTrue(resolution_result(server_args, "enable_ssl_refresh"))
 
 
-class TestHiCacheArgs(unittest.TestCase):
+class TestHiCacheArgs(CustomTestCase):
+    def test_host_receive_speculative_uses_shared_retraction_pool(self):
+        """Speculation must still resolve host receive to the shared host pool."""
+        for algorithm in ("EAGLE", "EAGLE3", "NGRAM"):
+            with self.subTest(algorithm=algorithm):
+                args = self._make_args(
+                    disaggregation_mode="decode",
+                    disaggregation_decode_host_receive_threshold=0.8,
+                    speculative_algorithm=algorithm,
+                )
+                handle_pd_disaggregation(args)
+                self.assertEqual(
+                    resolution_result(args, "disaggregation_decode_retraction_backup"),
+                    "host_pool",
+                )
+                handle_hicache(args)
+                self.assertEqual(
+                    resolution_result(args, "hicache_mem_layout"), "layer_first"
+                )
+
+        for threshold in (-0.1, 1.1, float("nan")):
+            with self.subTest(threshold=threshold):
+                args = self._make_args(
+                    disaggregation_decode_host_receive_threshold=threshold
+                )
+                with self.assertRaisesRegex(ValueError, "must be between 0 and 1"):
+                    handle_pd_disaggregation(args)
+
     def test_linker_mla_dedup_requires_mooncake_linker(self):
         for enabled, linker, backend in (
             (False, False, "mooncake"),
@@ -2068,7 +2111,7 @@ class TestHiCacheArgs(unittest.TestCase):
                 },
                 3,
             ),
-            ({"hicache_write_policy": "write_through"}, 0),
+            ({"hicache_write_policy": "write_through"}, 3),
             (
                 {
                     "hicache_storage_backend": "file",
@@ -2480,8 +2523,6 @@ class TestCudaGraphConfigDataclassAccess(CustomTestCase):
 class TestPipelineParallelCompat(CustomTestCase):
     """Features supported with `pipeline-parallel-size > 1`."""
 
-    _SUPPORTED_ARCH = "GlmMoeDsaForCausalLM"
-
     @staticmethod
     def _cfg(**overrides):
         cfg = dict(
@@ -2524,10 +2565,7 @@ class TestPipelineParallelCompat(CustomTestCase):
                 )
 
     def test_eagle_is_allowed_on_prefill(self):
-        check_pipeline_parallel_compat(
-            self._cfg(speculative_algorithm="EAGLE"),
-            model_architecture=self._SUPPORTED_ARCH,
-        )
+        check_pipeline_parallel_compat(self._cfg(speculative_algorithm="EAGLE"))
 
     def test_eagle_is_rejected_outside_prefill(self):
         for mode in ("decode", "null"):
@@ -2536,34 +2574,8 @@ class TestPipelineParallelCompat(CustomTestCase):
                     check_pipeline_parallel_compat(
                         self._cfg(
                             speculative_algorithm="EAGLE", disaggregation_mode=mode
-                        ),
-                        model_architecture=self._SUPPORTED_ARCH,
+                        )
                     )
-
-    def test_eagle_is_rejected_for_unsupported_model(self):
-        with self.assertRaisesRegex(AssertionError, "DeepSeek/GLM/Qwen3.5 models"):
-            check_pipeline_parallel_compat(
-                self._cfg(speculative_algorithm="EAGLE"),
-                model_architecture="LlamaForCausalLM",
-            )
-
-    def test_supported_architectures(self):
-        for architecture in (
-            "DeepseekV2ForCausalLM",
-            "DeepseekV3ForCausalLM",
-            "DeepseekV32ForCausalLM",
-            "GlmMoeDsaForCausalLM",
-            "Qwen3_5ForCausalLM",
-            "Qwen3_5MoeForCausalLM",
-            "Qwen3_5ForConditionalGeneration",
-            "Qwen3_5MoeForConditionalGeneration",
-            "Qwen4ExpForConditionalGeneration",
-        ):
-            with self.subTest(architecture=architecture):
-                check_pipeline_parallel_compat(
-                    self._cfg(speculative_algorithm="EAGLE"),
-                    model_architecture=architecture,
-                )
 
     def test_pp_spec_env_gate_allows_aggregate_and_rejects_pd(self):
         cfg = self._cfg(
@@ -2575,33 +2587,23 @@ class TestPipelineParallelCompat(CustomTestCase):
         with patch.object(
             validation_hook.envs.SGLANG_ENABLE_PP_SPEC, "get", return_value=True
         ):
-            check_pipeline_parallel_compat(cfg, model_architecture="LlamaForCausalLM")
+            check_pipeline_parallel_compat(cfg)
             with self.assertRaisesRegex(AssertionError, "SGLANG_ENABLE_PP_SPEC"):
-                check_pipeline_parallel_compat(
-                    self._cfg(speculative_algorithm="EAGLE"),
-                    model_architecture=self._SUPPORTED_ARCH,
-                )
+                check_pipeline_parallel_compat(self._cfg(speculative_algorithm="EAGLE"))
 
     def test_nextn_resolves_to_eagle_and_is_allowed(self):
         """`--speculative-algorithm NEXTN` has collapsed to EAGLE by the time the
         validation hook runs, so the check only ever sees the resolved name."""
-        check_pipeline_parallel_compat(
-            self._cfg(speculative_algorithm="eagle"),
-            model_architecture=self._SUPPORTED_ARCH,
-        )
+        check_pipeline_parallel_compat(self._cfg(speculative_algorithm="eagle"))
 
     def test_non_eagle_speculative_algorithms_are_rejected(self):
         with self.assertRaisesRegex(AssertionError, "only supports EAGLE"):
-            check_pipeline_parallel_compat(
-                self._cfg(speculative_algorithm="EAGLE3"),
-                model_architecture=self._SUPPORTED_ARCH,
-            )
+            check_pipeline_parallel_compat(self._cfg(speculative_algorithm="EAGLE3"))
 
     def test_multi_layer_eagle_is_rejected(self):
         with self.assertRaisesRegex(AssertionError, "only supports EAGLE"):
             check_pipeline_parallel_compat(
-                self._cfg(speculative_algorithm="EAGLE", enable_multi_layer_eagle=True),
-                model_architecture=self._SUPPORTED_ARCH,
+                self._cfg(speculative_algorithm="EAGLE", enable_multi_layer_eagle=True)
             )
 
     def test_min_free_slots_delay_is_rejected(self):
@@ -3583,6 +3585,25 @@ class TestGrpcServerArgs(CustomTestCase):
             with self.assertRaises(ValueError):
                 handle_deprecated_args(sa)
 
+    def test_grpc_response_timeout(self):
+        parser = self._sidecar_parser()
+        for value in (300, 1800, 0, -1):
+            with self.subTest(timeout=value):
+                argv = ["--model-path", "dummy", "--grpc-port", "50051"]
+                if value != 300:
+                    argv += ["--grpc-response-timeout-secs", str(value)]
+                sa = ServerArgs.from_cli_args(parser.parse_args(argv))
+                if value <= 0:
+                    with self.assertRaisesRegex(
+                        ValueError, "grpc-response-timeout-secs"
+                    ):
+                        handle_deprecated_args(sa)
+                else:
+                    handle_deprecated_args(sa)
+                    self.assertEqual(
+                        resolution_result(sa, "grpc_response_timeout_secs"), value
+                    )
+
     def test_start_server_call_site_matches_native_signature(self):
         """Regression for the startup blocker: the native start_server binding
         only accepts (host, port, runtime_handle, worker_threads, ...). The
@@ -3594,7 +3615,10 @@ class TestGrpcServerArgs(CustomTestCase):
         fake_core = SimpleNamespace(start_server=MagicMock(return_value="handle"))
         fake_bridge = SimpleNamespace(RuntimeHandle=MagicMock(return_value="rt"))
         override = get_context().override_server_args(
-            host="127.0.0.1", grpc_port=50051, grpc_worker_threads=4
+            host="127.0.0.1",
+            grpc_port=50051,
+            grpc_worker_threads=4,
+            grpc_response_timeout_secs=1800,
         )
         server_args = override.install()
         self.addCleanup(override.restore)
@@ -3619,9 +3643,17 @@ class TestGrpcServerArgs(CustomTestCase):
         load_rust_extension.assert_called_once_with("sglang.srt.rust_extensions._grpc")
         _, kwargs = fake_core.start_server.call_args
         self.assertEqual(
-            set(kwargs), {"host", "port", "runtime_handle", "worker_threads"}
+            set(kwargs),
+            {
+                "host",
+                "port",
+                "runtime_handle",
+                "worker_threads",
+                "response_timeout_secs",
+            },
         )
         self.assertEqual(kwargs["worker_threads"], 4)
+        self.assertEqual(kwargs["response_timeout_secs"], 1800)
         self.assertNotIn("max_prefill_tokens", kwargs)
 
 
