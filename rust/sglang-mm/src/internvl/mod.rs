@@ -209,7 +209,10 @@ impl MmFamilyProcessor for InternVlProcessor {
             segments.push(Segment::Text(text_start..pos));
             segments.push(Segment::Media {
                 item,
-                pattern: TokenPattern::Explicit(expanded),
+                pattern: TokenPattern::Explicit {
+                    ids: expanded,
+                    content: 1..(repeat + 1),
+                },
             });
             text_start = pos + 1;
             item += 1;
@@ -223,6 +226,51 @@ impl MmFamilyProcessor for InternVlProcessor {
         segments.push(Segment::Text(text_start..input_ids.len()));
         Ok(TokenLayout { segments })
     }
+}
+
+/// The internvl scheduler-drain shape, extracted from the generic driver
+/// [`Output`](crate::driver::Output). Shared by `sglang-server`'s MM worker
+/// and the parity binding so the mapping cannot drift.
+pub struct InternVlPackedOutput {
+    pub input_ids: Vec<i64>,
+    /// Per item pixel tiles in prompt order, each flattened
+    /// `[tiles, 3, image_size, image_size]`.
+    pub features: Vec<Vec<f32>>,
+    /// Per item tile count, including the optional thumbnail.
+    pub tile_counts: Vec<u32>,
+    pub hashes: Vec<u64>,
+    pub offsets: Vec<(u32, u32)>,
+}
+
+pub fn pack_output(output: crate::driver::Output) -> Result<InternVlPackedOutput, String> {
+    use crate::pipeline::PositionOutput;
+
+    match output.positions {
+        PositionOutput::Rope1D => {}
+        _ => return Err("intern_vl pack: expected Rope1D positions".into()),
+    }
+    let mut features = Vec::with_capacity(output.items.len());
+    let mut tile_counts = Vec::with_capacity(output.items.len());
+    let mut hashes = Vec::with_capacity(output.items.len());
+    for item in output.items {
+        let tiles = match item.feature.shape.first() {
+            Some(&n) if n > 0 => n as u32,
+            _ => return Err("intern_vl pack: empty tile count".into()),
+        };
+        let TensorData::F32(pixel_values) = item.feature.data else {
+            return Err("intern_vl pack: expected f32 feature".into());
+        };
+        features.push(pixel_values);
+        tile_counts.push(tiles);
+        hashes.push(item.hash);
+    }
+    Ok(InternVlPackedOutput {
+        input_ids: output.input_ids,
+        features,
+        tile_counts,
+        hashes,
+        offsets: output.offsets,
+    })
 }
 
 #[cfg(feature = "python")]
@@ -259,9 +307,64 @@ mod python {
         Ok((pixel_values.into_pyarray(py), tiles as usize, size))
     }
 
+    /// One image source: a `str` (data:/base64/file/http, resolved by
+    /// `common::fetch`) or raw encoded `bytes`.
+    #[derive(FromPyObject)]
+    enum PyImageSource {
+        Str(String),
+        Bytes(Vec<u8>),
+    }
+
+    /// Full native pipeline at the scheduler boundary:
+    /// `(input_ids, features, tile_counts, hashes, offsets)`.
+    type PyNativeOutput<'py> = (
+        Vec<i64>,
+        Bound<'py, PyArray1<f32>>,
+        Vec<u32>,
+        Vec<u64>,
+        Vec<(u32, u32)>,
+    );
+
+    /// Drive the same typed native InternVL request pipeline used by
+    /// `sglang-server`; the image path mirrors `InternVLProcessor`.
+    #[pyfunction]
+    #[pyo3(signature = (input_ids, images, spec_json))]
+    fn process_mm<'py>(
+        py: Python<'py>,
+        input_ids: Option<Vec<i64>>,
+        images: Vec<PyImageSource>,
+        spec_json: String,
+    ) -> PyResult<PyNativeOutput<'py>> {
+        let images = images
+            .into_iter()
+            .map(|source| match source {
+                PyImageSource::Str(s) => crate::driver::ImageSource::String(s),
+                PyImageSource::Bytes(b) => crate::driver::ImageSource::Bytes(b),
+            })
+            .collect();
+        let input_ids = input_ids
+            .ok_or_else(|| PyValueError::new_err("native parity API requires input_ids"))?;
+        let input = crate::driver::MmInput { input_ids, images };
+        let packed = py
+            .detach(move || {
+                let family = crate::registry::pipeline_from_spec(&spec_json)?;
+                let output = crate::driver::process(family.as_ref(), input)?;
+                pack_output(output)
+            })
+            .map_err(PyValueError::new_err)?;
+        Ok((
+            packed.input_ids,
+            packed.features.concat().into_pyarray(py),
+            packed.tile_counts,
+            packed.hashes,
+            packed.offsets,
+        ))
+    }
+
     pub fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {
         let m = PyModule::new(parent.py(), "internvl")?;
         m.add_function(wrap_pyfunction!(preprocess, &m)?)?;
+        m.add_function(wrap_pyfunction!(process_mm, &m)?)?;
         parent.add_submodule(&m)?;
         Ok(())
     }
@@ -368,6 +471,6 @@ mod tests {
         expected.push(4);
         expected.push(9);
         assert_eq!(expanded.input_ids, expected);
-        assert_eq!(expanded.offsets, vec![(1, 514)]);
+        assert_eq!(expanded.offsets, vec![(2, 513)]);
     }
 }

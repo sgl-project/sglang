@@ -79,9 +79,13 @@ pub struct ProcessedItem {
 pub enum TokenPattern {
     /// N copies of one placeholder id (qwen-style).
     Repeat { id: i64, n: usize },
-    /// An explicit id sequence — tile markers, row separators, wrapper
-    /// tokens (minicpm/internvl-style structured expansions).
-    Explicit(Vec<i64>),
+    /// An explicit id sequence, together with the inclusive range within it
+    /// that maps to the media item. Tokens outside `content` are wrapper
+    /// markers (`<img>` / `</img>`) and stay out of the reported offsets.
+    Explicit {
+        ids: Vec<i64>,
+        content: std::ops::Range<usize>,
+    },
 }
 
 /// One span of the expanded prompt.

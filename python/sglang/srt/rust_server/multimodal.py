@@ -83,9 +83,11 @@ class RustMmFamily(msgspec.Struct, frozen=True, kw_only=True):
     image_processors: Dict[str, str]
 
     def serves(self, mm_processor_cls: Any, model_type: Optional[str]) -> bool:
+        if model_type not in self.model_types:
+            return False
         module_name, _, class_name = self.mm_processor.partition(":")
         cls = getattr(importlib.import_module(module_name), class_name)
-        return mm_processor_cls is cls and model_type in self.model_types
+        return mm_processor_cls is cls
 
 
 RUST_MM_FAMILIES: Tuple[RustMmFamily, ...] = (
