@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, List, Protocol, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Protocol, Tuple
 
 import msgspec
 
@@ -27,10 +27,16 @@ class DecisionField(msgspec.Struct, frozen=True):
 
 
 class DecisionPrompt(msgspec.Struct, frozen=True):
-    input_ids: List[int]
-    # In request order; each field is answered by the next-token scores at its position.
+    # Token ids of a text-only prompt, or the rendered text that the multimodal
+    # processor expands around the images.
+    input_ids: Optional[List[int]]
+    text: Optional[str]
+    # Data URLs, in placeholder order.
+    images: List[str]
+    # In request order; field i is answered at the i-th anchor readout position.
     fields: List[DecisionField]
-    readout_positions: List[int]
+    # (token_id, offset), resolved against the expanded prompt by the tokenizer manager.
+    readout_anchor: Tuple[int, int]
 
 
 class DecisionModelFamily(Protocol):
@@ -49,5 +55,5 @@ class DecisionModelFamily(Protocol):
         ...
 
     def encode(self, request: JevRequest) -> DecisionPrompt:
-        """The prompt ids and readout positions of a validated request."""
+        """The prompt and readout anchor of a validated request."""
         ...

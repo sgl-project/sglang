@@ -30,6 +30,14 @@ SYSTEM_PROMPT = (
 )
 NOUL_YES = "The answer is yes (affirmative, or align with the claim)."
 NOUL_NO = "The answer is no (negative, or disagree with the claim)."
+# Text the Qwen-VL processor reads as an image slot.
+IMAGE_PLACEHOLDERS = (
+    "<image>",
+    "<|vision_start|>",
+    "<|vision_end|>",
+    "<|image_pad|>",
+    "<|video_pad|>",
+)
 # The checkpoint renders its trained layout only with these template arguments.
 CHAT_TEMPLATE_KWARGS = {
     "tokenize": False,
@@ -140,23 +148,19 @@ class InternDecisionFamily:
         self.symbol_ids: List[int] = _symbol_ids(tokenizer)
 
     def validate(self, request: JevRequest) -> None:
-        _compile(request)
+        compiled = _compile(request)
+        if not request.images:
+            return
+        user_text = compiled.messages[1]["content"]
+        for placeholder in IMAGE_PLACEHOLDERS:
+            if placeholder in user_text:
+                raise DecisionInputError(
+                    f"the request text contains the image placeholder {placeholder}, "
+                    "which would take the place of an attached image"
+                )
 
     def encode(self, request: JevRequest) -> DecisionPrompt:
         compiled = _compile(request)
-        text = self.tokenizer.apply_chat_template(
-            compiled.messages, **CHAT_TEMPLATE_KWARGS
-        )
-        input_ids = self.tokenizer.encode(text, add_special_tokens=False)
-        # The distribution predicting a marker slot is read one position before it.
-        positions = [
-            i - 1 for i, token in enumerate(input_ids) if token == self.marker_id
-        ]
-        if len(positions) != len(compiled.fields) or min(positions) < 0:
-            raise ValueError(
-                f"the rendered prompt has {len(positions)} decision markers for "
-                f"{len(compiled.fields)} fields"
-            )
         fields = [
             DecisionField(
                 name=name,
@@ -165,8 +169,29 @@ class InternDecisionFamily:
             )
             for name in compiled.fields
         ]
+        messages = compiled.messages
+        if request.images:
+            # The official layout: every image, in order, before the user text.
+            parts = [{"type": "image"} for _ in request.images]
+            parts.append({"type": "text", "text": messages[1]["content"]})
+            messages = [messages[0], {"role": "user", "content": parts}, messages[2]]
+        text = self.tokenizer.apply_chat_template(messages, **CHAT_TEMPLATE_KWARGS)
+        # The distribution predicting a marker slot is read one position before it.
+        anchor = (self.marker_id, -1)
+        if request.images:
+            return DecisionPrompt(
+                input_ids=None,
+                text=text,
+                images=list(request.images),
+                fields=fields,
+                readout_anchor=anchor,
+            )
         return DecisionPrompt(
-            input_ids=input_ids, fields=fields, readout_positions=positions
+            input_ids=self.tokenizer.encode(text, add_special_tokens=False),
+            text=None,
+            images=[],
+            fields=fields,
+            readout_anchor=anchor,
         )
 
 

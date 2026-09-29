@@ -28,7 +28,7 @@ from sglang.srt.entrypoints.systemone.serving import (
     score_confidence,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.runtime_context import get_exec, get_schedule, get_serving, get_spec
+from sglang.srt.runtime_context import get_exec, get_serving, get_spec
 
 # Names the TypeSafe SDKs send by default, answered by the served checkpoint.
 MODEL_ALIASES = ("jev-latest", "jev-preview")
@@ -78,8 +78,8 @@ class DecisionModelServing(OpenAIServingBase):
             return f"{_SUBJECT} do not support --enable-mis"
         if get_exec().dllm.dllm_algorithm is not None:
             return f"{_SUBJECT} do not support --dllm-algorithm"
-        if request.images:
-            return f"{_SUBJECT} do not accept images yet, send text-only requests"
+        if get_serving().allow_auto_truncate:
+            return f"{_SUBJECT} do not support --allow-auto-truncate, which can cut off readout positions"
         return None
 
     def check_model(self, model: Optional[str]) -> Optional[str]:
@@ -93,41 +93,27 @@ class DecisionModelServing(OpenAIServingBase):
         request: JevRequest,
         raw_request: Request = None,
     ) -> Tuple[GenerateReqInput, Tuple[JevRequest, DecisionPrompt]]:
-        prompt = self._encode(request)
-        candidates = dict.fromkeys(
-            token_id for field in prompt.fields for token_id in field.candidate_ids
-        )
-        adapted = GenerateReqInput(
-            input_ids=prompt.input_ids,
-            sampling_params={"max_new_tokens": 0},
-            return_logprob=True,
-            logprob_start_len=0,
-            token_ids_logprob=list(candidates),
-            token_indices_to_pool=prompt.readout_positions,
-            stream=False,
-        )
-        return adapted, (request, prompt)
-
-    def _encode(self, request: JevRequest) -> DecisionPrompt:
         try:
             prompt = self.family.encode(request)
         except _CHAT_TEMPLATE_CLIENT_ERRORS as e:
             raise ValueError(f"the chat template failed: {e}") from e
-        num_tokens = len(prompt.input_ids)
-        context_len = self.tokenizer_manager.context_len
-        if num_tokens + self.tokenizer_manager.num_reserved_tokens >= context_len:
-            raise ValueError(
-                f"the prompt has {num_tokens} tokens, which does not fit the "
-                f"context length of {context_len} tokens"
-            )
-        # Readout positions index one extend segment, so a chunked prompt would misread them.
-        chunk = get_schedule().chunked_prefill_size
-        if chunk is not None and 0 < chunk < num_tokens:
-            raise ValueError(
-                f"the prompt has {num_tokens} tokens, above the chunked prefill "
-                f"size of {chunk} tokens"
-            )
-        return prompt
+        candidates = dict.fromkeys(
+            token_id for field in prompt.fields for token_id in field.candidate_ids
+        )
+        # The tokenizer manager resolves readout positions on the expanded prompt
+        # and refuses prompts longer than one prefill chunk.
+        adapted = GenerateReqInput(
+            text=prompt.text,
+            input_ids=prompt.input_ids,
+            image_data=prompt.images or None,
+            sampling_params={"max_new_tokens": 0},
+            return_logprob=True,
+            logprob_start_len=0,
+            token_ids_logprob=list(candidates),
+            readout_anchor=prompt.readout_anchor,
+            stream=False,
+        )
+        return adapted, (request, prompt)
 
     async def _handle_non_streaming_request(
         self,
@@ -160,7 +146,7 @@ class DecisionModelServing(OpenAIServingBase):
             model=self.tokenizer_manager.served_model_name,
             answers=answers,
             usage=JevUsage(
-                input_tokens=len(prompt.input_ids),
+                input_tokens=result["meta_info"]["prompt_tokens"],
                 output_tokens=len(answers),
                 decision_count=len(answers),
             ),
