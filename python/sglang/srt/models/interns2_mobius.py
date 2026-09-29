@@ -791,12 +791,9 @@ class InternS2MobiusForCausalLM(Qwen3_5ForCausalLM):
                     input_deepstack_embeds[:, start : start + self.hidden_size],
                 )
 
-        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
-
-        if hidden_states.shape[0] != 0:
-            hidden_states = residual_batch.final_norm(
-                hidden_states, forward_batch, self.norm
-            )
+        hidden_states = residual_batch.final_norm(
+            hidden_states, forward_batch, self.norm, skip_empty=True
+        )
         return (
             hidden_states
             if not aux_hidden_states

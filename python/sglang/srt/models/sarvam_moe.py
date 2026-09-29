@@ -1169,12 +1169,9 @@ class SarvamMLAModel(nn.Module):
 
         if not self.pp_group.is_last_rank:
             return residual_batch.to_pp(hidden_states, forward_batch)
-        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
-
-        if hidden_states.shape[0] != 0:
-            hidden_states = residual_batch.final_norm(
-                hidden_states, forward_batch, self.norm
-            )
+        hidden_states = residual_batch.final_norm(
+            hidden_states, forward_batch, self.norm, skip_empty=True
+        )
 
         return hidden_states
 
@@ -1274,9 +1271,6 @@ class SarvamMLAForCausalLM(nn.Module):
                 )
 
         if end == self.model.config.num_hidden_layers:
-            forward_batch.hidden_states = residual_batch.complete_output(
-                forward_batch.hidden_states, forward_batch
-            )
             forward_batch.hidden_states = residual_batch.final_norm(
                 forward_batch.hidden_states, forward_batch, self.model.norm
             )
@@ -1453,9 +1447,6 @@ class SarvamMoEForCausalLM(BailingMoEForCausalLM):
                 )
 
         if end == self.model.config.num_hidden_layers:
-            forward_batch.hidden_states = residual_batch.complete_output(
-                forward_batch.hidden_states, forward_batch
-            )
             forward_batch.hidden_states = residual_batch.final_norm(
                 forward_batch.hidden_states, forward_batch, self.model.norm
             )

@@ -477,11 +477,9 @@ class Qwen3Model(Qwen2Model):
             )
         if not self.pp_group.is_last_rank:
             return residual_batch.to_pp(hidden_states, forward_batch)
-        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
-        if hidden_states.shape[0] != 0:
-            hidden_states = residual_batch.final_norm(
-                hidden_states, forward_batch, self.norm
-            )
+        hidden_states = residual_batch.final_norm(
+            hidden_states, forward_batch, self.norm, skip_empty=True
+        )
         return (
             (hidden_states, aux_hidden_states) if aux_hidden_states else hidden_states
         )
