@@ -64,6 +64,7 @@ pub struct ModelArgs {
     pub model_id: String,
 
     /// Local tokenizer.json or HuggingFace repo id. Defaults to --model-id; honors HF_TOKEN / HF_HOME.
+    /// "none" skips it for load-only policies; cache-aware and length-bucket routing require one.
     #[arg(long)]
     pub tokenizer_path: Option<String>,
 

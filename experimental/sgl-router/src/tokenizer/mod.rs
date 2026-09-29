@@ -78,6 +78,10 @@ impl TokenizerRegistry {
     pub fn load_from_config(cfg: &crate::config::Config) -> Result<Self> {
         let mut me = TokenizerRegistry::default();
         let m = &cfg.model;
+        if m.tokenizer_disabled() {
+            tracing::info!(model = %m.id, "tokenizer disabled; workers tokenize requests");
+            return Ok(me);
+        }
         let (t, stats) = adapter::load_with(&m.tokenizer_path, m.tokenizer)?;
         tracing::info!(model = %m.id, backend = stats.backend().as_str(),
             l1 = stats.l1_state().as_str(), l1_cache_mb = m.tokenizer.l1_cache_mb,
@@ -359,6 +363,15 @@ mod tests {
         c.model.tokenizer_path = "/nonexistent.json".into();
         let err = TokenizerRegistry::load_from_config(&c).unwrap_err();
         assert!(err.to_string().to_lowercase().contains("tokenizer"));
+    }
+
+    #[test]
+    fn disabled_tokenizer_loads_an_empty_registry() {
+        let mut c = cfg();
+        c.model.tokenizer_path = "none".into();
+        let registry = TokenizerRegistry::load_from_config(&c).unwrap();
+        assert!(registry.get("tiny").is_none());
+        assert_eq!(registry.forwarding_scope("tiny"), ForwardingScope::Never);
     }
 
     #[test]
