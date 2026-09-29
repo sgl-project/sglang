@@ -246,7 +246,7 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
         scale when multiple shards must share one global scale, for example the
         gated w1/w3 pair.
         """
-        from flashinfer import SfLayout, nvfp4_quantize
+        from flashinfer import NVFP44Over6Config, SfLayout, nvfp4_quantize
 
         if weight.ndim != 2:
             raise ValueError(
@@ -265,6 +265,11 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
                 f"a multiple of 16, got shape {tuple(weight.shape)}."
             )
 
+        # Pin the weight recipe independently of the activation quantization
+        # environment, including the E4M3 maximum used by the global scale.
+        nvfp4_4over6_config = NVFP44Over6Config(
+            e4m3_max=448, err_mode="MSE", err_use_fast_math=True
+        )
         if weight_scale_2 is None:
             # weight_scale_2 is the NVFP4 decode scale. FlashInfer consumes its
             # reciprocal as the global encode scale, matching 448 * 6 / amax.
@@ -274,13 +279,7 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
                 .amax()
                 .to(device=weight.device, dtype=torch.float32)
             )
-            e4m3_max = (
-                256.0
-                if envs.FLASHINFER_NVFP4_4OVER6.get()
-                and envs.FLASHINFER_NVFP4_4OVER6_E4M3_USE_256.get()
-                else float(torch.finfo(torch.float8_e4m3fn).max)
-            )
-            fp8_fp4_max = e4m3_max * 6.0
+            fp8_fp4_max = nvfp4_4over6_config.e4m3_max * 6.0
             weight_scale_2 = torch.where(
                 weight_amax > 0,
                 weight_amax / fp8_fp4_max,
@@ -295,6 +294,7 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             1.0 / weight_scale_2,
             sfLayout=SfLayout.layout_linear,
             backend="cute-dsl",
+            nvfp4_4over6=nvfp4_4over6_config,
         )
         rows, cols = weight.shape
         weight_sf = weight_sf.view(torch.float8_e4m3fn).reshape(rows, cols // 16)
