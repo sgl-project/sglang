@@ -1,5 +1,6 @@
 use super::*;
 use crate::common::mock_worker::MockWorker;
+use futures::StreamExt;
 use http_body_util::BodyExt;
 
 fn pd_ctx(prefill: &str, decode: &str, reorg: bool) -> Arc<AppContext> {
@@ -31,6 +32,40 @@ fn chat(stream: bool) -> Request<Body> {
         .unwrap()
 }
 
+/// A prefill worker that answers `status` once `release` is notified.
+async fn start_prefill(release: Arc<tokio::sync::Notify>, status: StatusCode) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post(move || {
+            let release = release.clone();
+            async move {
+                release.notified().await;
+                (status, axum::Json(json!({})))
+            }
+        }),
+    );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    url
+}
+
+async fn wait_until(mut done: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !done() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+fn charged(ctx: &AppContext, url: &str, mode: &str) -> bool {
+    ctx.metrics.render().contains(&format!(
+        r#"sgl_router_worker_requests_total{{worker_url="{url}",model_id="tiny",mode="{mode}""#
+    ))
+}
+
 /// Either side's failure ends the request without waiting for the other side.
 #[tokio::test]
 async fn pd_failure_returns_without_waiting_for_the_other_side() {
@@ -39,18 +74,27 @@ async fn pd_failure_returns_without_waiting_for_the_other_side() {
     let hanging = || MockWorker::start_hanging(Duration::from_secs(10));
     for reorg in [false, true] {
         for stream in [false, true] {
-            // (prefill, decode, client status, whether prefill is blamed)
+            // (prefill, decode, client status, router error code, whether prefill is blamed)
             let cases = [
                 (
                     error(StatusCode::BAD_REQUEST).await,
                     hanging().await,
                     StatusCode::BAD_REQUEST,
+                    None,
+                    true,
+                ),
+                (
+                    error(StatusCode::SERVICE_UNAVAILABLE).await,
+                    hanging().await,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    None,
                     true,
                 ),
                 (
                     error(StatusCode::INTERNAL_SERVER_ERROR).await,
                     hanging().await,
                     StatusCode::BAD_GATEWAY,
+                    Some("prefill_failed"),
                     true,
                 ),
                 // Transport failure: the prefill body is cut off.
@@ -58,16 +102,18 @@ async fn pd_failure_returns_without_waiting_for_the_other_side() {
                     MockWorker::start_returning_partial_body(StatusCode::OK, b"{").await,
                     hanging().await,
                     StatusCode::BAD_GATEWAY,
+                    Some("upstream_body_incomplete"),
                     true,
                 ),
                 (
                     hanging().await,
                     error(StatusCode::TOO_MANY_REQUESTS).await,
                     StatusCode::TOO_MANY_REQUESTS,
+                    None,
                     false,
                 ),
             ];
-            for (prefill, decode, expected, prefill_blamed) in cases {
+            for (prefill, decode, expected, code, prefill_blamed) in cases {
                 let ctx = pd_ctx(&prefill.url, &decode.url, reorg);
                 let response = tokio::time::timeout(
                     Duration::from_secs(1),
@@ -77,19 +123,18 @@ async fn pd_failure_returns_without_waiting_for_the_other_side() {
                 .unwrap()
                 .unwrap();
                 assert_eq!(response.status(), expected);
+                let router_code = response.headers().get("x-router-error-code").cloned();
+                assert_eq!(router_code.as_ref().map(|c| c.to_str().unwrap()), code);
                 let body = response.into_body().collect().await.unwrap().to_bytes();
-                if expected == StatusCode::BAD_GATEWAY {
-                    assert!(String::from_utf8_lossy(&body).contains("prefill_failed"));
-                } else {
+                if code.is_none() {
                     assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), rejected);
                 }
-                let (url, mode) = match prefill_blamed {
-                    true => (&prefill.url, "prefill"),
-                    false => (&decode.url, "decode"),
+                let (blamed, other) = match prefill_blamed {
+                    true => ((&prefill.url, "prefill"), (&decode.url, "decode")),
+                    false => ((&decode.url, "decode"), (&prefill.url, "prefill")),
                 };
-                assert!(ctx.metrics.render().contains(&format!(
-                    r#"worker_url="{url}",model_id="tiny",mode="{mode}""#
-                )));
+                assert!(charged(&ctx, blamed.0, blamed.1));
+                assert!(!charged(&ctx, other.0, other.1));
                 let decode_worker = ctx.registry.get(&WorkerId("d".into())).unwrap();
                 assert_eq!(decode_worker.router_inflight_load(), 0);
             }
@@ -97,69 +142,94 @@ async fn pd_failure_returns_without_waiting_for_the_other_side() {
     }
 }
 
-/// Prefill waits until decode has started, then rejects the request. Verify
-/// engine cleanup both before decode headers and after its SSE pump exists.
+/// Until decode streams its first token, a prefill failure aborts decode: before
+/// decode's headers the client sees prefill's error, after them the stream breaks.
 #[tokio::test]
-async fn reorg_prefill_failure_aborts_started_decode_and_releases_load() {
-    for early_headers in [false, true] {
-        let decode = if early_headers {
-            MockWorker::start_slow_stream(vec!["data: still waiting\n\n"], Duration::from_secs(10))
-                .await
-        } else {
-            MockWorker::start_hanging(Duration::from_secs(10)).await
-        };
-        let captured = decode.captured.clone();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let prefill_url = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move {
-            let app = axum::Router::new().route(
-                "/v1/chat/completions",
-                axum::routing::post(move || {
-                    let captured = captured.clone();
-                    async move {
-                        while captured.lock().unwrap().last_body.is_none() {
-                            tokio::task::yield_now().await;
-                        }
-                        // Give the streaming response time to reach the router before prefill fails.
-                        if early_headers {
-                            tokio::time::sleep(Duration::from_millis(30)).await;
-                        }
-                        (
-                            StatusCode::BAD_REQUEST,
-                            axum::Json(json!({"error":"prefill rejected"})),
-                        )
-                    }
-                }),
-            );
-            axum::serve(listener, app).await.unwrap();
-        });
-        let ctx = pd_ctx(&prefill_url, &decode.url, true);
-        let response = tokio::time::timeout(
-            Duration::from_secs(2),
-            build_router(ctx.clone()).oneshot(chat(early_headers)),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let sent = parse_body(decode.captured.lock().unwrap().last_body.as_ref().unwrap());
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while decode.abort_log.lock().unwrap().is_empty()
-                || ctx
-                    .registry
-                    .workers_for(&ModelId("tiny".into()))
-                    .iter()
-                    .any(|w| w.router_inflight_load() != 0)
-            {
-                tokio::task::yield_now().await;
+async fn prefill_failure_aborts_decode_before_its_first_token() {
+    for reorg in [false, true] {
+        for early_headers in [false, true] {
+            let decode = if early_headers {
+                MockWorker::start_slow_stream(vec!["data: late\n\n"], Duration::from_secs(10)).await
+            } else {
+                MockWorker::start_hanging(Duration::from_secs(10)).await
+            };
+            let release = Arc::new(tokio::sync::Notify::new());
+            let prefill_url = start_prefill(release.clone(), StatusCode::BAD_REQUEST).await;
+            let ctx = pd_ctx(&prefill_url, &decode.url, reorg);
+            let request = tokio::spawn(build_router(ctx.clone()).oneshot(chat(early_headers)));
+            wait_until(|| decode.captured.lock().unwrap().last_body.is_some()).await;
+            if early_headers {
+                let response = request.await.unwrap().unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                release.notify_one();
+                assert!(response.into_body().collect().await.is_err());
+                assert!(ctx.metrics.render().contains(&format!(
+                    r#"sgl_router_stream_outcome_total{{worker_url="{}",model_id="tiny",outcome="aborted"}} 1"#,
+                    decode.url
+                )));
+            } else {
+                release.notify_one();
+                let response = request.await.unwrap().unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
             }
-        })
-        .await
-        .unwrap();
-        assert_eq!(
-            decode.abort_log.lock().unwrap()[0],
-            json!({"rid":sent["rid"], "abort_all":false})
-        );
-        server.abort();
+            let workers = ctx.registry.workers_for(&ModelId("tiny".into()));
+            wait_until(|| {
+                !decode.abort_log.lock().unwrap().is_empty()
+                    && workers.iter().all(|w| w.router_inflight_load() == 0)
+            })
+            .await;
+            let sent = parse_body(decode.captured.lock().unwrap().last_body.as_ref().unwrap());
+            assert_eq!(
+                decode.abort_log.lock().unwrap()[0],
+                json!({"rid": sent["rid"], "abort_all": false})
+            );
+        }
+    }
+}
+
+/// Decode's headers do not wait for prefill, and once decode streams its first
+/// token KV transfer is done, so a later prefill failure leaves the stream intact.
+#[tokio::test]
+async fn prefill_failure_after_decode_first_token_keeps_the_stream() {
+    for reorg in [false, true] {
+        let decode = MockWorker::start_slow_stream(
+            vec!["data: a\n\n", "data: [DONE]\n\n"],
+            Duration::from_millis(100),
+        )
+        .await;
+        let release = Arc::new(tokio::sync::Notify::new());
+        let prefill_url = start_prefill(release.clone(), StatusCode::INTERNAL_SERVER_ERROR).await;
+        let ctx = pd_ctx(&prefill_url, &decode.url, reorg);
+        let response = build_router(ctx.clone()).oneshot(chat(true)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        assert_eq!(body.next().await.unwrap().unwrap(), "data: a\n\n");
+        release.notify_one();
+        let prefill = ctx.registry.get(&WorkerId("p".into())).unwrap();
+        wait_until(|| prefill.router_inflight_load() == 0).await;
+        assert_eq!(body.next().await.unwrap().unwrap(), "data: [DONE]\n\n");
+        assert!(body.next().await.is_none());
+        assert!(decode.abort_log.lock().unwrap().is_empty());
+    }
+}
+
+/// Prefill must finish KV transfer on its own, so decode failing first leaves it running.
+#[tokio::test]
+async fn decode_failure_leaves_prefill_running() {
+    for reorg in [false, true] {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let prefill_url = start_prefill(release.clone(), StatusCode::OK).await;
+        let decode = MockWorker::start_returning_error(StatusCode::BAD_REQUEST, json!({})).await;
+        let ctx = pd_ctx(&prefill_url, &decode.url, reorg);
+        let response = build_router(ctx.clone())
+            .oneshot(chat(false))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let prefill = ctx.registry.get(&WorkerId("p".into())).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(prefill.router_inflight_load(), 1);
+        release.notify_one();
+        wait_until(|| prefill.router_inflight_load() == 0).await;
     }
 }

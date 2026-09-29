@@ -90,6 +90,7 @@ pub(super) async fn forward_chat_request(
     let prefill_load_guards = (worker_load_guard, active_request_guard);
 
     // In PD mode, prefill runs independently and decode supplies the client response.
+    let stream_abort = CancellationToken::new();
     let (response_worker, response_load_guards, prefill_task) =
         if let Some((decode, bootstrap)) = pd {
             let task = spawn_prefill_request(
@@ -99,6 +100,7 @@ pub(super) async fn forward_chat_request(
                 body.clone(),
                 prefill_load_guards,
                 bootstrap.room,
+                stream_abort.clone(),
             );
             let decode_load_guards = (
                 decode.load_guard(),
@@ -113,7 +115,7 @@ pub(super) async fn forward_chat_request(
     // In PD mode, prefill can finish before decode. Watch the registration
     // held by the response so expiration remains live for its full lifetime.
     let expiration_token = response_load_guards.1.cancel_token().clone();
-    let response_future = forward_to_response_worker(
+    let response = forward_to_response_worker(
         ctx,
         &response_worker,
         &headers,
@@ -122,29 +124,27 @@ pub(super) async fn forward_chat_request(
         response_load_guards,
         &metrics,
         expiration_token.clone(),
+        stream_abort,
     );
-    let mut failed_prefill = None;
-    let response_future = async {
-        let Some((task, prefill)) = prefill_task else {
-            return response_future.await;
-        };
-        match forward_pd(task, response_future).await {
-            PdOutcome::Decode(result) => result,
-            PdOutcome::PrefillFailed(result) => {
-                failed_prefill = Some(prefill);
-                result
+    let dispatch = async {
+        match prefill_task {
+            Some((task, prefill)) => {
+                let (result, prefill_blamed) = forward_pd(task, response).await;
+                (result, prefill_blamed.then_some(prefill))
             }
+            None => (response.await, None),
         }
     };
     // A ready response wins if request expiration fires in the same poll.
-    let result = tokio::select! {
+    let (result, blamed_prefill) = tokio::select! {
         biased;
-        result = response_future => result,
-        _ = expiration_token.cancelled() => Err(ApiError::StaleRequestExpired {
-            model: metrics.model.clone(),
-        }),
+        dispatch = dispatch => dispatch,
+        _ = expiration_token.cancelled() => {
+            let model = metrics.model.clone();
+            (Err(ApiError::StaleRequestExpired { model }), None)
+        }
     };
-    if let Some(prefill) = &failed_prefill {
+    if let Some(prefill) = &blamed_prefill {
         metrics.attribute_to(prefill);
     }
     let log_context = metrics.record_dispatch_result(&result, engine_rid);
@@ -174,6 +174,11 @@ fn parse_decode_url_header(decode_url: &str) -> Option<HeaderValue> {
         .ok()
 }
 
+/// A prefill's client-visible failure; `None` means it succeeded.
+type PrefillFailure = Option<Result<Response<Body>, ApiError>>;
+
+/// Runs prefill to completion even if the client disconnects. A failure also
+/// aborts decode's stream until its first token, which proves KV transfer completed.
 fn spawn_prefill_request(
     ctx: &AppContext,
     prefill_worker: Arc<Worker>,
@@ -181,9 +186,9 @@ fn spawn_prefill_request(
     body: Bytes,
     load_guards: LoadGuards,
     bootstrap_room: u64,
-) -> tokio::task::JoinHandle<Result<Response<Body>, ApiError>> {
+    stream_abort: CancellationToken,
+) -> tokio::task::JoinHandle<PrefillFailure> {
     let proxy = Arc::clone(&ctx.proxy);
-    // Prefill must finish KV transfer even if the client disconnects.
     tokio::spawn(async move {
         let _load_guards = load_guards;
         let result = proxy
@@ -197,60 +202,60 @@ fn spawn_prefill_request(
                 None,
             )
             .await;
+        let failure = prefill_failure(result);
         let prefill_url = &prefill_worker.url;
-        match &result {
-            Ok(response) if response.status().is_success() => {
-                tracing::debug!(%prefill_url, bootstrap_room, "prefill side completed")
-            }
-            Ok(response) => tracing::warn!(
+        match &failure {
+            None => tracing::debug!(%prefill_url, bootstrap_room, "prefill side completed"),
+            Some(Ok(response)) => tracing::debug!(
                 %prefill_url, bootstrap_room, status = %response.status(),
-                "prefill returned an error; cancelling decode",
+                "prefill rejected the request",
             ),
-            Err(error) => tracing::warn!(
-                %prefill_url, bootstrap_room, %error,
-                "prefill request failed; cancelling decode",
-            ),
+            Some(Err(error)) => {
+                tracing::warn!(%prefill_url, bootstrap_room, %error, "prefill failed")
+            }
         }
-        result
+        if failure.is_some() {
+            stream_abort.cancel();
+        }
+        failure
     })
 }
 
-/// The PD side whose result reaches the client.
-enum PdOutcome {
-    /// Decode's response, or its own failure.
-    Decode(Result<Response<Body>, ApiError>),
-    /// Prefill failed first: its 4xx verbatim, or `prefill_failed`.
-    PrefillFailed(Result<Response<Body>, ApiError>),
+/// Client errors and backpressure pass through; only a prefill fault becomes
+/// `prefill_failed`.
+fn prefill_failure(result: Result<Response<Body>, ApiError>) -> PrefillFailure {
+    match result {
+        Ok(response) if response.status().is_success() => None,
+        Ok(response)
+            if matches!(
+                outcome_from_status(response.status().as_u16()),
+                RequestOutcome::Error
+            ) =>
+        {
+            Some(Err(ApiError::PrefillFailed {
+                status: Some(response.status()),
+            }))
+        }
+        result => Some(result),
+    }
 }
 
-/// Dispatch ends at the first failure on either side; only a successful decode
-/// waits for prefill.
+/// Returns decode's response as soon as decode answers, unless prefill fails
+/// first; the flag reports that prefill's failure was returned instead.
 async fn forward_pd(
-    prefill: tokio::task::JoinHandle<Result<Response<Body>, ApiError>>,
+    prefill: tokio::task::JoinHandle<PrefillFailure>,
     decode: impl std::future::Future<Output = Result<Response<Body>, ApiError>>,
-) -> PdOutcome {
-    let prefill = async {
-        let failure = match prefill.await {
-            Ok(Ok(response)) if response.status().is_success() => return Ok(()),
-            // A prefill 4xx is the client's error; forward it verbatim.
-            Ok(Ok(response)) if response.status().is_client_error() => Ok(response),
-            Ok(Ok(response)) => Err(ApiError::PrefillFailed {
-                status: Some(response.status()),
-            }),
-            _ => Err(ApiError::PrefillFailed { status: None }),
-        };
-        Err(PdOutcome::PrefillFailed(failure))
-    };
-    let decode = async {
-        match decode.await {
-            Ok(response) if response.status().is_success() => Ok(response),
-            // Decode refused the request, so no KV transfer will complete.
-            result => Err(PdOutcome::Decode(result)),
-        }
-    };
-    match tokio::try_join!(prefill, decode) {
-        Ok(((), response)) => PdOutcome::Decode(Ok(response)),
-        Err(outcome) => outcome,
+) -> (Result<Response<Body>, ApiError>, bool) {
+    let mut decode = std::pin::pin!(decode);
+    tokio::select! {
+        biased;
+        failure = prefill => match failure {
+            Ok(None) => (decode.await, false),
+            Ok(Some(failure)) => (failure, true),
+            Err(_) => (Err(ApiError::PrefillFailed { status: None }), true),
+        },
+        // Dropping the handle leaves prefill running.
+        response = &mut decode => (response, false),
     }
 }
 
@@ -264,6 +269,7 @@ async fn forward_to_response_worker(
     load_guards: LoadGuards,
     metrics: &DispatchMetrics,
     expiration: CancellationToken,
+    stream_abort: CancellationToken,
 ) -> Result<Response<Body>, ApiError> {
     if metrics.streaming {
         // Load and duration guards live until the SSE pump ends, not just until headers arrive.
@@ -282,7 +288,7 @@ async fn forward_to_response_worker(
                 Some(metrics.first_byte_callback()),
                 Some(metrics.stream_end_callback(worker.url.clone())),
                 Some(expiration),
-                None,
+                Some(stream_abort),
             )
             .await
     } else {
