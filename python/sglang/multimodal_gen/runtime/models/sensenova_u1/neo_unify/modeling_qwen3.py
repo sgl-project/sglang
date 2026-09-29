@@ -429,6 +429,42 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
+    if (
+        q.is_cuda
+        and q.dtype is torch.bfloat16
+        and k.dtype is torch.bfloat16
+        and cos.dtype is torch.bfloat16
+        and sin.dtype is torch.bfloat16
+        and q.device == k.device == cos.device == sin.device
+        and not torch.is_grad_enabled()
+        and not torch.compiler.is_compiling()
+        and unsqueeze_dim == 1
+        and q.ndim == k.ndim == 4
+        and q.numel() > 0
+        and k.numel() > 0
+        and q.shape[2] >= 128
+        and q.shape[0] == k.shape[0]
+        and q.shape[2:] == k.shape[2:]
+        and q.shape[-1] in (32, 64)
+        and cos.shape == sin.shape == (q.shape[0], q.shape[2], q.shape[3])
+    ):
+        from sglang.kernels.ops.diffusion.rope.rope_rotate_half_bitexact import (
+            fused_rope_rotate_half_bitexact,
+        )
+
+        # The kernel rounds both products to bf16 before adding, matching
+        # the eager chain. Spatial axes are slices of the normalized HW
+        # heads; materialize those slices in the kernel's BSHD layout.
+        cos_rows = cos.reshape(-1, cos.shape[-1]).contiguous()
+        sin_rows = sin.reshape(-1, sin.shape[-1]).contiguous()
+        q_embed = fused_rope_rotate_half_bitexact(
+            q.transpose(1, 2).contiguous(), cos_rows, sin_rows
+        )
+        k_embed = fused_rope_rotate_half_bitexact(
+            k.transpose(1, 2).contiguous(), cos_rows, sin_rows
+        )
+        return q_embed.transpose(1, 2), k_embed.transpose(1, 2)
+
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
     q_embed = (q * cos) + (rotate_half(q) * sin)
