@@ -73,7 +73,7 @@ class _SharedAuxModel:
     ("model", "dflash", "is_draft_worker", "expected"),
     [
         (_SharedAuxModel(), True, False, 12),
-        # EAGLE3 may keep target hidden states past the next target forward.
+        # Only the DFlash family is known to consume them within the step.
         (_SharedAuxModel(), False, False, 0),
         (_SharedAuxModel(), True, True, 0),
         (object(), True, False, 0),

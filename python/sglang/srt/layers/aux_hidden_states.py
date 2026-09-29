@@ -33,9 +33,8 @@ class AuxHiddenStatePacker:
     buffer, avoiding the list path's transient ~2x HBM at ``torch.cat``.
     Assumes all captures share leading shape and feature size.
 
-    Build it with ``for_batch`` so a CUDA graph runner can supply the
-    destination: graphs of different sizes then alias one buffer instead of
-    each pinning its own.
+    ``for_batch`` writes into a decode graph runner's buffer when the batch
+    carries one, so every graph size aliases it instead of pinning its own.
     """
 
     def __init__(self, num_captures: int, out: Optional[torch.Tensor] = None) -> None:
@@ -48,8 +47,6 @@ class AuxHiddenStatePacker:
     def for_batch(
         cls, forward_batch: ForwardBatch, num_captures: int
     ) -> AuxHiddenStatePacker:
-        """Write into ``forward_batch.aux_hidden_states_buffer`` when a graph
-        runner provides one; allocate on first ``append`` otherwise."""
         return cls(num_captures, out=forward_batch.aux_hidden_states_buffer)
 
     def append(self, hidden: torch.Tensor) -> None:

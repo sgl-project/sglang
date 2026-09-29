@@ -122,11 +122,8 @@ class _SupportsPackedAuxHiddenStates(Protocol):
 def resolve_aux_hidden_states_width(
     *, model: Any, spec_algorithm: Any, is_draft_worker: bool
 ) -> int:
-    """Width of the packed aux output a decode graph runner shares across sizes.
-
-    Sharing is safe only when the spec worker consumes the target hidden
-    states before the next target forward, which the DFlash family does.
-    """
+    # Sharing needs the spec worker to consume target hidden states before
+    # the next target forward overwrites them; the DFlash family does.
     if not spec_algorithm.is_dflash_family() or is_draft_worker:
         return 0
     if isinstance(model, _SupportsPackedAuxHiddenStates):
