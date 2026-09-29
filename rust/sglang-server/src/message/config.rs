@@ -139,6 +139,8 @@ pub struct ServerArgs {
     /// `max_new_tokens` is clamped rather than rejected (Python
     /// `TokenizerManager._validate_one_request`).
     pub allow_auto_truncate: bool,
+    /// Use the deterministic default seed before OpenAI choice fan-out.
+    pub enable_deterministic_inference: bool,
     /// `return_hidden_states` is refused unless the server was launched with it:
     /// the scheduler simply won't produce them, so the request would 200 with the
     /// field silently missing.
@@ -181,6 +183,7 @@ impl ServerArgs {
         preferred_sampling_params,
         limit_mm_data_per_request,
         allow_auto_truncate,
+        enable_deterministic_inference,
         enable_return_hidden_states,
         num_reserved_tokens,
         version,
@@ -213,6 +216,7 @@ impl ServerArgs {
         preferred_sampling_params: Option<PreferredSamplingParams>,
         limit_mm_data_per_request: BTreeMap<String, usize>,
         allow_auto_truncate: bool,
+        enable_deterministic_inference: bool,
         enable_return_hidden_states: bool,
         num_reserved_tokens: u64,
         version: String,
@@ -243,6 +247,7 @@ impl ServerArgs {
             preferred_sampling_params,
             limit_mm_data_per_request,
             allow_auto_truncate,
+            enable_deterministic_inference,
             enable_return_hidden_states,
             num_reserved_tokens,
             version,
@@ -281,6 +286,7 @@ impl Default for ServerArgs {
             preferred_sampling_params: None,
             limit_mm_data_per_request: BTreeMap::new(),
             allow_auto_truncate: false,
+            enable_deterministic_inference: false,
             enable_return_hidden_states: false,
             num_reserved_tokens: 0,
             version: String::new(),

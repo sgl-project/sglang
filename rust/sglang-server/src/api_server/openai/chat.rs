@@ -34,7 +34,7 @@ use super::tools::{
 };
 use super::{
     AppState, ChatFormatter, ChatTemplateKwargs, collect_output, contains_media, error_payload,
-    indexed_decode_stream, openai_error, submit_generation, unix_seconds_u32,
+    indexed_decode_stream, openai_error, sampling_for_choice, submit_generation, unix_seconds_u32,
 };
 use crate::frontend::FrontendCall;
 use crate::message::config::{DefaultSamplingParams, ServerArgs};
@@ -210,7 +210,11 @@ async fn chat_completions(
             // Rendered templates own their special tokens — the pool must not
             // add another BOS/EOS (Python's `add_special_tokens=False`).
             skip_special_tokens: true,
-            sampling_params: sampling.clone(),
+            sampling_params: sampling_for_choice(
+                &sampling,
+                index,
+                state.server_args.enable_deterministic_inference,
+            ),
             stream,
             return_logprob: want_logprobs,
             logprob_start_len: -1,
