@@ -137,6 +137,7 @@ class TestDeepEPv2WireDtype(_DeepEPv2WireDtypeBase):
                 self.assertEqual(out.activation_scale_block_size, 32)
                 self.assertEqual(out.hidden_states_scale.shape[-1], HIDDEN // 32)
                 # Prefill expands but stays non-masked; only decode is masked.
+                self.assertTrue(out.is_expanded)
                 self.assertEqual(out.use_masked_gemm, not is_extend)
 
     def test_bf16_dispatch_sends_unquantized_activations(self):

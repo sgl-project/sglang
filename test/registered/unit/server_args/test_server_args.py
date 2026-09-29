@@ -3062,9 +3062,14 @@ class TestDeepEPv2Args(CustomTestCase):
         return server_args
 
     def test_validated_architectures_allowed(self):
-        from sglang.srt.configs.moe_model_registry import _DEEPEP_V2_MODELS
-
-        for architecture in _DEEPEP_V2_MODELS:
+        for architecture in (
+            "DeepseekV3ForCausalLM",
+            "DeepseekV4ForCausalLM",
+            "Qwen3MoeForCausalLM",
+            "Glm5NextForConditionalGeneration",
+            "MiMoV2ForCausalLM",
+            "MiMoV2FlashForCausalLM",
+        ):
             args = self._args(moe_runner_backend="deep_gemm")
             args._model_config.hf_config.architectures = [architecture]
             handle_a2a_moe(args)

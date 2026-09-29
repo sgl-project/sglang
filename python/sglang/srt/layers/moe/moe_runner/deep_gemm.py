@@ -590,10 +590,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             torch.cuda.synchronize()
             logger.warning("DeepEP v2 expanded contig activation returned")
 
-        # Masked (decode) path never expands rows, so weight folding must not run.
-        deepep_v2_expanded = running_state.get(
-            "deepep_v2_expanded", False
-        ) and not running_state.get("deepep_v2_masked", False)
+        deepep_v2_expanded = running_state.get("deepep_v2_expanded", False)
         # Folding the row weight into down_input_scale needs a non-power-of-two
         # scale; ue8m0 is a power of two, so it weights down_output before combine.
         # no_combine asks for raw rows, so the fold must not pre-apply the weight.
