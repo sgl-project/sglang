@@ -333,10 +333,11 @@ class Model(msgspec.Struct):
     modelexpress_config: A[
         Optional[str],
         'JSON config for ModelExpress weight loading and refit. P2P keys: "url", '
-        '"transport" ("nixl" or "transfer_engine"). Refit keys match Slime: '
+        '"transport" ("nixl" or "transfer_engine"). Refit keys: '
         '"model_name", "server_url", "initial_base_version_id", '
-        '"seed_checkpoint_path", "refit_checkpoint_dir", "s3_endpoint_url", '
-        '"s3_region_name", and client timeout/retry settings.',
+        '"seed_checkpoint_path", "refit_checkpoint_dir", '
+        '"object_storage_endpoint_url", "object_storage_region_name", '
+        "and client timeout/retry settings.",
     ] = None
     download_dir: A[
         Optional[str],

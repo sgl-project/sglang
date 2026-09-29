@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
 import torch
 
-from sglang.srt.arg_groups.overrides import modelexpress_config_of
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.model_loader.loader import (
     DefaultModelLoader,
@@ -91,54 +90,35 @@ class WeightUpdater:
     get_model_runner: Callable[[], ModelRunner]
     _model_update_group: dict = field(default_factory=dict)
 
-    def _modelexpress_generator(self):
-        model_runner = self.get_model_runner()
-        if getattr(model_runner, "modelexpress_generator", None) is None:
-            from modelexpress_rl import (
-                ModelExpressGeneratorClient,
-                ModelExpressGeneratorConfig,
-                ObjectStorageGeneratorConfig,
-                ObjectStorageType,
-                SglangGeneratorContext,
+    def update_weights_from_modelexpress(self, weight_version: str) -> tuple[bool, str]:
+        """Stage and install one version while generation is paused."""
+        self._assert_weight_cache_inactive("update_weights_from_modelexpress")
+        error = _unsupported_derived_weight_cache_error()
+        if error is not None:
+            raise RuntimeError(error)
+
+        try:
+            from modelexpress_rl import WeightVersionRef
+            from modelexpress_rl.inference.engines.sglang import (
+                get_modelexpress_generator,
             )
 
-            config = modelexpress_config_of(model_runner.server_args)
-            checkpoint = config.get("seed_checkpoint_path")
-            if not checkpoint:
-                checkpoint, _, _ = model_runner.loader._prepare_weights(
-                    model_runner.model_config.model_path,
-                    model_runner.model_config.revision,
-                    False,
+            generator = get_modelexpress_generator(self.get_model_runner())
+            staged = generator.stage_weight(version=WeightVersionRef(weight_version))
+            try:
+                install_metrics = generator.apply_weight(staged)
+                logger.info(
+                    "ModelExpress refit metrics version=%s: %s",
+                    weight_version,
+                    {**staged.metrics, **(install_metrics or {})},
                 )
-            model_runner.modelexpress_generator = (
-                ModelExpressGeneratorClient.initialize(
-                    ModelExpressGeneratorConfig(
-                        engine_context=SglangGeneratorContext(model_runner),
-                        model_name=config.get("model_name"),
-                        server_url=config.get("server_url", config.get("url")),
-                        registration_ttl_seconds=config.get("registration_ttl_seconds"),
-                        lease_ttl_seconds=config.get("lease_ttl_seconds"),
-                        max_transfer_attempts=config.get("max_transfer_attempts", 3),
-                        max_replay_chain_length=config.get(
-                            "max_replay_chain_length", 64
-                        ),
-                        rpc_timeout_seconds=config.get("rpc_timeout_seconds", 30.0),
-                        object_storage=ObjectStorageGeneratorConfig(
-                            storage_type=ObjectStorageType.S3,
-                            initial_base_version_id=config["initial_base_version_id"],
-                            seed_checkpoint_path=checkpoint,
-                            refit_checkpoint_dir=config["refit_checkpoint_dir"],
-                            endpoint_url=config.get("s3_endpoint_url"),
-                            region_name=config.get("s3_region_name"),
-                        ),
-                    )
-                )
-            )
-        return model_runner.modelexpress_generator
+            finally:
+                staged.release()
+            success, message = True, ""
+        except Exception as exc:
+            success, message = False, str(exc)
 
-    def _modelexpress_tp_agreement(
-        self, success: bool, message: str
-    ) -> tuple[bool, str]:
+        # Combine TP results before reporting success to the scheduler.
         results = [(success, message)]
         if torch.distributed.is_initialized():
             group = self.get_model_runner().tp_group.cpu_group
@@ -149,27 +129,6 @@ class WeightUpdater:
         return all(ok for ok, _ in results), " | ".join(
             msg for _, msg in results if msg
         )
-
-    def update_weights_from_modelexpress(self, weight_version: str) -> tuple[bool, str]:
-        """Stage and install one version while generation is paused."""
-        self._assert_weight_cache_inactive("update_weights_from_modelexpress")
-        error = _unsupported_derived_weight_cache_error()
-        if error is not None:
-            raise RuntimeError(error)
-
-        try:
-            from modelexpress_rl import WeightVersionRef
-
-            generator = self._modelexpress_generator()
-            staged = generator.stage_weight(version=WeightVersionRef(weight_version))
-            try:
-                generator.apply_weight(staged)
-            finally:
-                staged.release()
-            success, message = True, ""
-        except Exception as exc:
-            success, message = False, str(exc)
-        return self._modelexpress_tp_agreement(success, message)
 
     def init_weights_update_group(
         self,

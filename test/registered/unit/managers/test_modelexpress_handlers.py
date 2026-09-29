@@ -49,6 +49,11 @@ def modelexpress_modules(monkeypatch):
     modelexpress_rl.__path__ = []
     modelexpress_rl.WeightVersionRef = WeightVersionRef
     monkeypatch.setitem(sys.modules, "modelexpress_rl", modelexpress_rl)
+    integration = ModuleType("modelexpress_rl.inference.engines.sglang")
+    integration.get_modelexpress_generator = MagicMock(
+        side_effect=lambda runner: runner.modelexpress_generator
+    )
+    monkeypatch.setitem(sys.modules, integration.__name__, integration)
     monkeypatch.setattr(
         weight_updater_module,
         "get_model",
@@ -57,7 +62,7 @@ def modelexpress_modules(monkeypatch):
     monkeypatch.setattr(
         weight_updater_module, "_unsupported_derived_weight_cache_error", lambda: None
     )
-    return modelexpress_rl
+    return integration
 
 
 class Staged:
@@ -65,6 +70,7 @@ class Staged:
         self.version_id = version_id
         self.released = 0
         self.release_error = None
+        self.metrics = {}
 
     def release(self):
         self.released += 1
@@ -115,7 +121,7 @@ def model_updater(generator):
                 "server_url": "mx:8001",
                 "initial_base_version_id": "base-a",
                 "refit_checkpoint_dir": "/tmp/mx-cache",
-                "s3_endpoint_url": "http://minio:9000",
+                "object_storage_endpoint_url": "http://minio:9000",
             },
         ),
         tp_group=SimpleNamespace(cpu_group=object()),
@@ -135,80 +141,17 @@ def model_updater(generator):
     )
 
 
-@pytest.mark.parametrize("as_json", [False, True])
-@pytest.mark.parametrize("seed_checkpoint", [None, "/models/seed"])
-def test_generator_client_reuses_shared_config(
-    modelexpress_modules, as_json, seed_checkpoint
+def test_update_stages_applies_and_releases_without_a_prepare_request(
+    modelexpress_modules,
 ):
-    generator = Generator()
-    updater = model_updater(None)
-    assert not hasattr(updater.get_model_runner(), "modelexpress_generator")
-    built = []
-    args = updater.get_model_runner().server_args
-    args.modelexpress_config.update(
-        seed_checkpoint_path=seed_checkpoint,
-        s3_region_name="us-west-2",
-        registration_ttl_seconds=60,
-        lease_ttl_seconds=90,
-        max_transfer_attempts=4,
-        max_replay_chain_length=32,
-        rpc_timeout_seconds=15.0,
-        full_hf_checkpoint_interval=5,
-    )
-    if as_json:
-        args.modelexpress_config = json.dumps(args.modelexpress_config)
-
-    class ModelExpressGeneratorClient:
-        @staticmethod
-        def initialize(config):
-            built.append(config)
-            return generator
-
-    modelexpress_modules.ModelExpressGeneratorClient = ModelExpressGeneratorClient
-    modelexpress_modules.ModelExpressGeneratorConfig = SimpleNamespace
-    modelexpress_modules.ObjectStorageGeneratorConfig = SimpleNamespace
-    modelexpress_modules.ObjectStorageType = SimpleNamespace(S3="S3")
-    modelexpress_modules.SglangGeneratorContext = lambda model_runner: SimpleNamespace(
-        model_runner=model_runner
-    )
-
-    installed, _ = updater.update_weights_from_modelexpress("2")
-    installed_next, _ = updater.update_weights_from_modelexpress("3")
-
-    assert installed is True
-    assert installed_next is True
-    assert [staged.version_id for staged in generator.staged] == ["2", "3"]
-    assert generator.applied == generator.staged
-    assert all(staged.released == 1 for staged in generator.staged)
-    assert len(built) == 1
-    config = built[0]
-    assert config.engine_context.model_runner is updater.get_model_runner()
-    assert config.model_name == "model"
-    assert config.server_url == "mx:8001"
-    assert config.registration_ttl_seconds == 60
-    assert config.lease_ttl_seconds == 90
-    assert config.max_transfer_attempts == 4
-    assert config.max_replay_chain_length == 32
-    assert config.rpc_timeout_seconds == 15.0
-    assert not hasattr(config, "full_hf_checkpoint_interval")
-    assert vars(config.object_storage) == {
-        "endpoint_url": "http://minio:9000",
-        "initial_base_version_id": "base-a",
-        "seed_checkpoint_path": seed_checkpoint or "/models/launch",
-        "region_name": "us-west-2",
-        "refit_checkpoint_dir": "/tmp/mx-cache",
-        "storage_type": "S3",
-    }
-    assert updater.get_model_runner().modelexpress_generator is generator
-    assert generator.staged[0].version_id == "2"
-
-
-def test_update_stages_applies_and_releases_without_a_prepare_request():
     generator = Generator()
     updater = model_updater(generator)
 
     installed, _ = updater.update_weights_from_modelexpress("2")
 
+    modelexpress_modules.get_modelexpress_generator.assert_called_once_with(
+        updater.get_model_runner()
+    )
     assert [item.version_id for item in generator.staged] == ["2"]
     assert generator.applied == generator.staged
     assert generator.staged[0].released == 1
@@ -405,13 +348,9 @@ def test_staged_cleanup_failure_is_reported(monkeypatch):
 
 
 def test_generator_initialization_failure_is_reported(modelexpress_modules):
-    modelexpress_modules.ModelExpressGeneratorClient = SimpleNamespace(
-        initialize=MagicMock(side_effect=RuntimeError("initialization failed"))
+    modelexpress_modules.get_modelexpress_generator.side_effect = RuntimeError(
+        "initialization failed"
     )
-    modelexpress_modules.ModelExpressGeneratorConfig = SimpleNamespace
-    modelexpress_modules.ObjectStorageGeneratorConfig = SimpleNamespace
-    modelexpress_modules.ObjectStorageType = SimpleNamespace(S3="S3")
-    modelexpress_modules.SglangGeneratorContext = lambda runner: runner
 
     success, message = model_updater(None).update_weights_from_modelexpress("2")
 
@@ -430,7 +369,7 @@ def test_tp_results_include_remote_failure(monkeypatch):
         results[:] = [local, remote]
 
     monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
-    success, message = updater._modelexpress_tp_agreement(*local)
+    success, message = updater.update_weights_from_modelexpress("2")
 
     assert success is False
     assert "rank 1 load failed" in message
