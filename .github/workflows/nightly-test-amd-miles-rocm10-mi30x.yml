@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       image_tag:
-        description: "Override miles image tag (e.g. miles-rocm10-mi30x-20260930, or miles-rocm724-mi30x-20260930); empty = newest ROCm 10 by date"
+        description: "Override miles image tag (e.g. miles-rocm10-mi30x-20260930); empty = newest by date"
         required: false
         type: string
         default: ""

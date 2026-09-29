@@ -21,7 +21,6 @@ jobs:
       matrix:
         variant:
           - rocm724-mi35x
-          - rocm724-mi30x
     steps:
       - name: Checkout miles repository
         uses: actions/checkout@v4
