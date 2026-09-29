@@ -144,7 +144,8 @@ def store_k_slots_kernel(
     pid_b = tl.program_id(1)
 
     loc = tl.load(loc_ptr + pid_n).to(tl.int64)
-    # Negative slots mark padded rows; stale positive slots may exceed the buffer.
+    # Padded rows use slot 0, so a negative or too-large slot is stale. This is the
+    # only always-on bound: callers check `loc` only under SGLANG_ENABLE_ASYNC_ASSERT.
     if (loc < 0) | (loc >= size_limit):
         return
 
