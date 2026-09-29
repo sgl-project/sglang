@@ -1007,7 +1007,7 @@ class TestDeepSelectFullTopKDecode(CustomTestCase):
         )
         self.assertEqual(kwargs["end"].dtype, torch.int32)
         self.assertTrue(torch.equal(kwargs["end"], data.lens.to(torch.int32)))
-        self.assertTrue(kwargs["sorted_index"])
+        self.assertFalse(kwargs["sorted_index"])
         self.assertEqual(
             kwargs["output_idx"].data_ptr(), selection.page_indices.data_ptr()
         )

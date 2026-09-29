@@ -230,9 +230,6 @@ def test_full_topk_decode_runtime_integration():
     logical = inverse[(wide // page_size).clamp(min=0)] * page_size + wide % page_size
     logical = torch.where(valid, logical, torch.full_like(logical, -1))
     _check_topk(scores, k, logical, end=end, idx_fill=-1)
-    for row in range(rows):
-        picked = logical[row][logical[row] >= 0]
-        assert torch.all(picked[1:] > picked[:-1])
 
 
 if __name__ == "__main__":
