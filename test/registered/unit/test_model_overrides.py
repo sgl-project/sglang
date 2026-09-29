@@ -49,6 +49,100 @@ class _FakeArgs:
     metadata_but_not_overridable: A[bool, Arg(help="z")] = False
 
 
+class TestBoundaryParallelismResolution(CustomTestCase):
+    def config(self, **options):
+        return SimpleNamespace(
+            **dict(
+                dict(
+                    model_path="dummy",
+                    attn_cp_size=1,
+                    enable_prefill_cp=False,
+                    enable_attn_tp_input_scattered=False,
+                    moe_dp_size=1,
+                    cp_strategy=None,
+                    tp_size=4,
+                    dp_size=1,
+                    enable_aiter_allreduce_fusion=False,
+                ),
+                **options,
+            )
+        )
+
+    def test_input_scattered_is_resolved_only_for_forwards_without_the_scope(self):
+        from sglang.srt.arg_groups.overrides import resolving_view
+        from sglang.srt.arg_groups.parallel_hook import handle_context_parallelism
+
+        for model_type in (
+            "nemotron_h",
+            "nemotron_h_puzzle",
+            "longcat_flash",
+            "deepseek_v3",
+        ):
+            with self.subTest(model_type=model_type):
+                cfg = self.config(enable_attn_tp_input_scattered=True)
+                model = SimpleNamespace(
+                    hf_config=SimpleNamespace(architectures=["TestModel"]),
+                    hf_text_config=SimpleNamespace(model_type=model_type),
+                )
+                with (
+                    patch("sglang.srt.arg_groups.parallel_hook.run_hook"),
+                    patch(
+                        "sglang.srt.arg_groups.parallel_hook.model_config_of",
+                        return_value=model,
+                    ),
+                    patch("sglang.srt.layers.cp.base.init_cp_strategy"),
+                ):
+                    handle_context_parallelism(cfg)
+                self.assertTrue(cfg.enable_attn_tp_input_scattered)
+                self.assertEqual(
+                    resolving_view(cfg).enable_attn_tp_input_scattered,
+                    model_type == "deepseek_v3",
+                )
+
+    def test_context_parallel_model_support(self):
+        from sglang.srt.arg_groups.parallel_hook import handle_context_parallelism
+
+        cases = (
+            ("nemotron_h", 2, False, "Nemotron-H.*--attn-cp-size"),
+            ("nemotron_h_puzzle", 2, True, "Nemotron-H.*--attn-cp-size"),
+            ("longcat_flash", 2, True, "LongCat-Flash.*--enable-prefill-cp"),
+            ("nemotron_h", 1, False, None),
+            ("longcat_flash", 1, True, None),
+            ("longcat_flash", 2, False, None),
+            ("deepseek_v3", 2, True, None),
+        )
+        for model_type, cp_size, prefill, error in cases:
+            with self.subTest(model_type=model_type, cp_size=cp_size, prefill=prefill):
+                cfg = self.config(
+                    attn_cp_size=cp_size,
+                    enable_prefill_cp=prefill,
+                    cp_strategy="interleave" if prefill else None,
+                )
+                model = SimpleNamespace(
+                    hf_config=SimpleNamespace(architectures=["TestModel"]),
+                    hf_text_config=SimpleNamespace(model_type=model_type),
+                )
+                with (
+                    patch("sglang.srt.arg_groups.parallel_hook.run_hook"),
+                    patch(
+                        "sglang.srt.arg_groups.parallel_hook.model_config_of",
+                        return_value=model,
+                    ),
+                    patch("sglang.srt.layers.cp.base.init_cp_strategy") as init_cp,
+                ):
+                    if error is not None:
+                        with self.assertRaisesRegex(ValueError, error):
+                            handle_context_parallelism(cfg)
+                        init_cp.assert_not_called()
+                    else:
+                        handle_context_parallelism(cfg)
+                        init_cp.assert_called_once_with(
+                            enable_prefill_cp=prefill,
+                            cp_size=cp_size,
+                            cp_strategy=cfg.cp_strategy,
+                        )
+
+
 class TestModelOverridableWhitelist(CustomTestCase):
     def test_whitelist_derivation_from_annotated_metadata(self):
         self.assertEqual(
@@ -73,10 +167,12 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "disable_hybrid_swa_memory",
                     "sampling_backend",
                     "attention_backend",
+                    "prefill_kv_cache_dequant_dtype",
                     "page_size",
                     "moe_runner_backend",
                     "quantization",
                     "enable_dp_attention",
+                    "enable_attn_tp_input_scattered",
                     "enable_dp_lm_head",
                     "enable_tp_lm_head_all_to_all",
                     "moe_a2a_backend",
@@ -105,7 +201,11 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "fp8_gemm_runner_backend",
                     "fp4_gemm_runner_backend",
                     "disable_custom_all_reduce",
+                    "boundary_reduction",
+                    "speculative_boundary_reduction",
                     "enable_aiter_allreduce_fusion",
+                    "disable_aiter_allreduce_fusion_in_prefill",
+                    "disable_aiter_allreduce_fusion_in_decode",
                     "enable_symm_mem",
                     "speculative_attention_mode",
                     "speculative_draft_attention_backend",
@@ -116,6 +216,119 @@ class TestModelOverridableWhitelist(CustomTestCase):
                 }
             ),
         )
+
+
+class TestBoundaryReductionDefaults(CustomTestCase):
+    def test_defaults_wrappers_and_explicit_policies_reach_runtime(self):
+        from unittest.mock import patch
+
+        from sglang.srt.arg_groups.boundary_reduction import resolve_boundary_reduction
+        from sglang.srt.arg_groups.overrides import run_post_process_pass
+        from sglang.srt.runtime_context import (
+            get_exec,
+            get_spec,
+            publish,
+            reset_context,
+        )
+        from sglang.srt.server_args import ServerArgs
+
+        cases = [
+            (SimpleNamespace(architectures=[architecture]), default)
+            for architecture, default in (
+                ("Qwen3ForCausalLM", "ar"),
+                ("Qwen3Model", "ar"),
+                ("MossVLForConditionalGeneration", "ar"),
+                ("BailingMoELinearForCausalLM", "rsv"),
+                ("BailingMoeV2_5ForCausalLM", "rsv"),
+                ("LongcatFlashForCausalLM", "rsv"),
+                ("LongcatFlashForCausalLMNextN", "rsv"),
+                ("Step3VLForConditionalGeneration", "rsv"),
+                ("MiMoV2ForCausalLM", "rs+rsv"),
+                ("Qwen3MoeForCausalLM", "rs+rsv"),
+                ("OtherModel", "rs+rsv"),
+            )
+        ]
+        for key in ("text_config", "llm_config"):
+            for backbone, expected in (("qwen3", "ar"), ("qwen3_moe", "rs+rsv")):
+                cases.append(
+                    (
+                        SimpleNamespace(**{key: SimpleNamespace(model_type=backbone)}),
+                        expected,
+                    )
+                )
+        cases.append(
+            (
+                SimpleNamespace(
+                    get_text_config=lambda: SimpleNamespace(model_type="qwen3")
+                ),
+                "ar",
+            )
+        )
+        for config, default in cases:
+            for requested in ("auto", "ar", "rs", "rsv", "rs+rsv"):
+                with self.subTest(config=config, requested=requested):
+                    reset_context()
+                    try:
+                        args = ServerArgs(
+                            model_path="local-model", boundary_reduction=requested
+                        )
+                        args._model_config = SimpleNamespace(hf_config=config)
+                        with patch(
+                            "sglang.srt.arg_groups.pipeline.run_resolution_pipeline",
+                            side_effect=lambda record: run_post_process_pass(
+                                record, resolve_boundary_reduction
+                            ),
+                        ):
+                            publish(args, role="test")
+                        expected = default if requested == "auto" else requested
+                        self.assertEqual(get_exec().comm.boundary_reduction, expected)
+                        self.assertEqual(
+                            get_spec().speculative_boundary_reduction, expected
+                        )
+                        self.assertEqual(args.boundary_reduction, requested)
+                    finally:
+                        reset_context()
+
+    def test_independent_draft_and_mtp_resolution(self):
+        from unittest.mock import patch
+
+        from sglang.srt.arg_groups.boundary_reduction import resolve_boundary_reduction
+        from sglang.srt.arg_groups.overrides import (
+            resolving_view,
+            run_post_process_pass,
+        )
+        from sglang.srt.server_args import ServerArgs
+
+        for same_model in (False, True):
+            for requested in ("auto", "ar", "rs", "rsv", "rs+rsv"):
+                args = ServerArgs(
+                    model_path="target",
+                    boundary_reduction=requested,
+                    speculative_algorithm="EAGLE",
+                    speculative_draft_model_path="target" if same_model else "draft",
+                )
+                args._model_config = SimpleNamespace(
+                    hf_config=SimpleNamespace(architectures=["MiMoV2ForCausalLM"])
+                )
+                with patch(
+                    "sglang.srt.utils.hf_transformers_utils.get_config",
+                    return_value=SimpleNamespace(model_type="qwen3"),
+                ) as load:
+                    run_post_process_pass(args, resolve_boundary_reduction)
+                resolved = resolving_view(args)
+                self.assertEqual(
+                    resolved.boundary_reduction,
+                    "rs+rsv" if requested == "auto" else requested,
+                )
+                self.assertEqual(
+                    resolved.speculative_boundary_reduction,
+                    ("rs+rsv" if same_model else "ar")
+                    if requested == "auto"
+                    else requested,
+                )
+                self.assertEqual(
+                    load.call_count, int(requested == "auto" and not same_model)
+                )
 
 
 class TestDSparkCheckpointConfig(CustomTestCase):
@@ -590,6 +803,44 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
         set_global_server_args_for_scheduler(server_args)
         return get_server_args()
+
+    def test_explicit_extra_buffer_without_mamba_state_fails_fast(self):
+        with self.assertRaisesRegex(ValueError, "needs mamba state"):
+            self._construct(
+                "LlamaForCausalLM", "llama", mamba_radix_cache_strategy="extra_buffer"
+            )
+
+    def test_explicit_extra_buffer_is_harmless_with_radix_cache_disabled(self):
+        sa = self._construct(
+            "LlamaForCausalLM",
+            "llama",
+            mamba_radix_cache_strategy="extra_buffer",
+            disable_radix_cache=True,
+        )
+        self.assertFalse(self._resolved(sa, "uses_mamba_radix_cache"))
+
+    def test_explicit_extra_buffer_accepts_predicate_registered_mamba_state(self):
+        from transformers import LlamaConfig
+
+        from sglang.srt.configs import linear_attn_model_registry as registry
+
+        spec = registry.LinearAttnModelSpec(
+            config_class=LlamaConfig,
+            backend_class_name="pkg.mod.Backend",
+            config_predicate=lambda cfg: getattr(cfg, "linear_attn", False),
+            support_mamba_cache_extra_buffer=True,
+        )
+        with (
+            patch.object(registry, "_LINEAR_ATTN_MODEL_REGISTRY", [spec]),
+            override_platform(is_cuda=True),
+        ):
+            sa = self._construct(
+                "LlamaForCausalLM",
+                "llama",
+                config_extra={"linear_attn": True},
+                mamba_radix_cache_strategy="extra_buffer",
+            )
+        self.assertTrue(self._resolved(sa, "uses_mamba_radix_cache"))
 
     def test_mistral_large3_forces_bfloat16(self):
         sa = self._construct("MistralLarge3ForCausalLM", "mistral")
@@ -1703,6 +1954,14 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             "swa_full_tokens_ratio",
             _deepseek_v4_overrides(_args(swa_full_tokens_ratio=0.5), hf),
         )
+        # V4.1 leaves the ratio unset (cap-mode SWA sizing).
+        hf41 = SimpleNamespace(
+            architectures=["DeepseekV4ForCausalLM"], model_type="deepseek_v41"
+        )
+        self.assertNotIn(
+            "swa_full_tokens_ratio",
+            _deepseek_v4_overrides(_args(fp8_gemm_runner_backend="triton"), hf41),
+        )
         # An explicit user choice takes precedence over the model default.
         self.assertNotIn(
             "moe_runner_backend",
@@ -1776,6 +2035,74 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )["moe_runner_backend"],
             "flashinfer_trtllm_routed",
         )
+
+    def test_bailing_v3_mixed_mxfp4_selects_native_runner(self):
+        """Packed MXFP4 experts must not reach the FP8 Triton runner."""
+
+        def _args(**kw):
+            defaults = dict(
+                device="cuda",
+                moe_a2a_backend="none",
+                moe_runner_backend="auto",
+                _model_config=SimpleNamespace(quantization="fp8", is_fp4_experts=True),
+            )
+            defaults.update(kw)
+            return SimpleNamespace(**defaults)
+
+        with override_platform(
+            is_sm90=False, is_sm100=True, is_sm120=False, is_hip=False
+        ):
+            for architecture in (
+                "BailingMoeV3ForCausalLM",
+                "BailingMoeV3VLForConditionalGeneration",
+            ):
+                with self.subTest(architecture=architecture):
+                    declarations = collect_model_override_declarations(
+                        architecture,
+                        _args(),
+                        SimpleNamespace(architectures=[architecture]),
+                    )
+                    self.assertEqual(
+                        declarations,
+                        [
+                            (
+                                "_bailing_moe_v3_overrides",
+                                {"moe_runner_backend": "flashinfer_mxfp4"},
+                            )
+                        ],
+                    )
+
+            from sglang.srt.arg_groups.model_overrides.bailing_moe_v3 import (
+                _bailing_moe_v3_overrides,
+            )
+
+            hf = SimpleNamespace(
+                architectures=["BailingMoeV3VLForConditionalGeneration"]
+            )
+            self.assertEqual(
+                _bailing_moe_v3_overrides(_args(moe_runner_backend="triton"), hf),
+                {},
+            )
+            self.assertEqual(
+                _bailing_moe_v3_overrides(_args(moe_a2a_backend="deepep"), hf),
+                {},
+            )
+            self.assertEqual(
+                _bailing_moe_v3_overrides(
+                    _args(
+                        _model_config=SimpleNamespace(
+                            quantization="fp8", is_fp4_experts=False
+                        )
+                    ),
+                    hf,
+                ),
+                {},
+            )
+
+        with override_platform(
+            is_sm90=False, is_sm100=False, is_sm120=False, is_hip=False
+        ):
+            self.assertEqual(_bailing_moe_v3_overrides(_args(), hf), {})
 
     def test_nemotron_h_overrides_at_callable_level(self):
         from sglang.srt.arg_groups.model_overrides.nemotron_h import (
@@ -2442,7 +2769,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         # extra-buffer support requires the triton linear-attn backend
         self.assertFalse(
             supports_mamba_cache_extra_buffer(
-                SimpleNamespace(linear_attn_backend="fla"), "Qwen3NextForCausalLM"
+                SimpleNamespace(linear_attn_backend="fla"),
+                SimpleNamespace(architectures=["Qwen3NextForCausalLM"]),
             )
         )
         self.assertTrue(
@@ -2451,9 +2779,114 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     linear_attn_backend="triton",
                     linear_attn_prefill_backend="flashinfer",
                 ),
-                "Qwen3_5MoeForConditionalGeneration",
+                SimpleNamespace(architectures=["Qwen3_5MoeForConditionalGeneration"]),
             )
         )
+
+    def test_mamba_radix_cache_resolution_reads_registry_specs(self):
+        """A spec registered by config predicate (archs=[]) drives the leaves
+        exactly like an arch-registered one, and the spec's
+        `support_mamba_cache_extra_buffer` gates the extra_buffer strategy."""
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _mamba_radix_cache_resolution,
+            supports_mamba_cache_extra_buffer,
+        )
+        from sglang.srt.configs import linear_attn_model_registry as registry
+
+        class _PredicateConfig:
+            def __init__(self, linear_attn):
+                self.architectures = ["PredicateHybridForCausalLM"]
+                self.linear_attn = linear_attn
+
+        class _ArchConfig:
+            architectures = ["ArchHybridForCausalLM"]
+
+        def _view(hf, **kw):
+            defaults = dict(
+                disable_radix_cache=False,
+                mamba_radix_cache_strategy="auto",
+                disable_overlap_schedule=False,
+                page_size=None,
+                linear_attn_backend="triton",
+                linear_attn_prefill_backend=None,
+            )
+            defaults.update(kw)
+            return ResolvedView(
+                SimpleNamespace(_model_config=SimpleNamespace(hf_config=hf), **defaults)
+            )
+
+        by_predicate = registry.LinearAttnModelSpec(
+            config_class=_PredicateConfig,
+            backend_class_name="pkg.mod.Backend",
+            config_predicate=lambda cfg: cfg.linear_attn,
+            support_mamba_cache_extra_buffer=True,
+        )
+        by_arch = registry.LinearAttnModelSpec(
+            config_class=_ArchConfig,
+            backend_class_name="pkg.mod.Backend",
+            arch_names=["ArchHybridForCausalLM"],
+        )
+        with patch.object(registry, "_LINEAR_ATTN_MODEL_REGISTRY", []):
+            registry.register_linear_attn_model(by_predicate)
+            registry.register_linear_attn_model(by_arch)
+
+            # predicate hit: the leaf is declared and the spec opts into
+            # extra_buffer on the triton linear-attn backend only
+            self.assertEqual(
+                _mamba_radix_cache_resolution(_view(_PredicateConfig(True))),
+                {
+                    "uses_mamba_radix_cache": True,
+                    "mamba_radix_cache_strategy": "extra_buffer",
+                },
+            )
+            self.assertEqual(
+                _mamba_radix_cache_resolution(
+                    _view(_PredicateConfig(True), linear_attn_backend="fla")
+                ),
+                {
+                    "uses_mamba_radix_cache": True,
+                    "mamba_radix_cache_strategy": "no_buffer",
+                    "disable_overlap_schedule": True,
+                },
+            )
+            self.assertTrue(
+                supports_mamba_cache_extra_buffer(
+                    SimpleNamespace(linear_attn_backend="triton"),
+                    _PredicateConfig(True),
+                )
+            )
+            # predicate miss: not a hybrid model at all
+            self.assertEqual(
+                _mamba_radix_cache_resolution(_view(_PredicateConfig(False))), {}
+            )
+            self.assertFalse(
+                supports_mamba_cache_extra_buffer(
+                    SimpleNamespace(linear_attn_backend="triton"),
+                    _PredicateConfig(False),
+                )
+            )
+            # arch-registered spec without the opt-in: unchanged, no_buffer
+            self.assertEqual(
+                _mamba_radix_cache_resolution(_view(_ArchConfig())),
+                {
+                    "uses_mamba_radix_cache": True,
+                    "mamba_radix_cache_strategy": "no_buffer",
+                    "disable_overlap_schedule": True,
+                },
+            )
+            self.assertFalse(
+                supports_mamba_cache_extra_buffer(
+                    SimpleNamespace(linear_attn_backend="triton"), _ArchConfig()
+                )
+            )
+            # hard-coded archs do not need a spec
+            self.assertEqual(
+                _mamba_radix_cache_resolution(
+                    _view(SimpleNamespace(architectures=["Qwen3NextForCausalLM"]))
+                )["mamba_radix_cache_strategy"],
+                "extra_buffer",
+            )
 
     def test_qwen3_5_hybrid_coupled_declaration(self):
         from sglang.srt.arg_groups.model_overrides.qwen3_5 import (
@@ -2567,6 +3000,24 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             _moe_runner_backend_quant_constraints(_view(quantization="mxfp8")),
             {"moe_runner_backend": "flashinfer_trtllm"},
         )
+        # gfx950 accepts --moe-runner-backend aiter for MXFP8 only with aiter enabled
+        with (
+            override_platform(is_hip=True),
+            patch(
+                "sglang.srt.arg_groups.overrides.is_gfx95_supported",
+                return_value=True,
+            ),
+        ):
+            aiter_view = dict(quantization="mxfp8", moe_runner_backend="aiter")
+            with envs.SGLANG_USE_AITER.override(True):
+                self.assertEqual(
+                    _moe_runner_backend_quant_constraints(_view(**aiter_view)), {}
+                )
+            with envs.SGLANG_USE_AITER.override(False):
+                self.assertEqual(
+                    _moe_runner_backend_quant_constraints(_view(**aiter_view)),
+                    {"moe_runner_backend": "triton"},
+                )
         with override_platform(is_sm120=True):
             self.assertEqual(
                 _moe_runner_backend_quant_constraints(

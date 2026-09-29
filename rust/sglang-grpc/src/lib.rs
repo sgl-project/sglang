@@ -15,7 +15,6 @@ use tokio::time::Duration;
 use tracing_subscriber::EnvFilter;
 
 use bridge::{ChunkSendStatus, DEFAULT_RESPONSE_CHANNEL_CAPACITY, PyBridge};
-use proto::sglang_service_server::SglangService;
 use tokenizers::RustTokenizer;
 
 /// Handle returned to Python that controls the running gRPC server.
@@ -63,7 +62,7 @@ fn bind_listener(host: &str, port: u16) -> PyResult<TcpListener> {
 fn start_server_thread(
     rt: tokio::runtime::Runtime,
     listener: TcpListener,
-    service: impl SglangService,
+    service: server::ServerMode,
 ) -> PyResult<GrpcServerHandle> {
     let shutdown = Arc::new(Notify::new());
     let shutdown_clone = shutdown.clone();
@@ -104,7 +103,11 @@ fn start_metadata_server(
                 err
             ))
         })?;
-    start_server_thread(rt, listener, server::MetadataService { server_info_json })
+    start_server_thread(
+        rt,
+        listener,
+        server::ServerMode::Metadata(server::MetadataService { server_info_json }),
+    )
 }
 
 struct TokenizerInfo {
@@ -286,7 +289,7 @@ fn start_server(
     start_server_thread(
         rt,
         listener,
-        server::SglangServiceImpl {
+        server::ServerMode::Inference {
             bridge,
             response_timeout,
         },

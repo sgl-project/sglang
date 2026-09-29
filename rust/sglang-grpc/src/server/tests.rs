@@ -109,9 +109,9 @@ async fn follower_metadata_server_exposes_only_server_info_and_shuts_down() {
     let mut handle = crate::start_server_thread(
         runtime,
         listener,
-        super::MetadataService {
+        super::ServerMode::Metadata(super::MetadataService {
             server_info_json: server_info_json.clone(),
-        },
+        }),
     )
     .unwrap();
     assert!(handle.is_alive());

@@ -52,6 +52,13 @@ class _FakeBuffer:
         num_recv = (x[0] if isinstance(x, tuple) else x).shape[0]
         topk_idx = kwargs["topk_idx"]
         topk_weights = kwargs["topk_weights"]
+        if kwargs["do_expand"]:
+            if isinstance(x, tuple):
+                x = tuple(t.repeat_interleave(TOPK, dim=0) for t in x)
+            else:
+                x = x.repeat_interleave(TOPK, dim=0)
+            topk_idx = None
+            topk_weights = topk_weights.flatten()
         event = SimpleNamespace(event=None, current_stream_wait=lambda: None)
         return x, topk_idx, topk_weights, _FakeHandle(num_recv), event
 
@@ -93,7 +100,9 @@ class _DeepEPv2WireDtypeBase(CustomTestCase):
         for item in reversed(self._patches):
             item.stop()
 
-    def _dispatch(self, use_fp8_dispatch, num_tokens=8, is_extend_in_batch=True):
+    def _dispatch(
+        self, use_fp8_dispatch, num_tokens=8, is_extend_in_batch=True, group_size=128
+    ):
         dispatcher = deepep_v2.DeepEPv2Dispatcher(
             group=_FakeGroup(),
             router_topk=TOPK,
@@ -102,6 +111,7 @@ class _DeepEPv2WireDtypeBase(CustomTestCase):
             hidden_size=HIDDEN,
             params_dtype=torch.bfloat16,
             use_fp8_dispatch=use_fp8_dispatch,
+            activation_scale_block_size=group_size,
         )
         dispatcher._impl.num_max_dispatch_tokens_per_rank = NUM_MAX_TOKENS
         hidden_states = torch.randn((num_tokens, HIDDEN), dtype=torch.bfloat16)
@@ -116,6 +126,18 @@ class _DeepEPv2WireDtypeBase(CustomTestCase):
 
 
 class TestDeepEPv2WireDtype(_DeepEPv2WireDtypeBase):
+    def test_mxfp8_scale_group_survives_both_dispatch_layouts(self):
+        for is_extend in (True, False):
+            with self.subTest(is_extend=is_extend):
+                _, out = self._dispatch(
+                    use_fp8_dispatch=True,
+                    is_extend_in_batch=is_extend,
+                    group_size=32,
+                )
+                self.assertEqual(out.activation_scale_block_size, 32)
+                self.assertEqual(out.hidden_states_scale.shape[-1], HIDDEN // 32)
+                self.assertEqual(out.is_expanded, not is_extend)
+
     def test_bf16_dispatch_sends_unquantized_activations(self):
         hidden_states, out = self._dispatch(use_fp8_dispatch=False)
         self.assertIs(_FakeBuffer.last.dispatch_x, hidden_states)
