@@ -329,8 +329,8 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
         req.last_node = 42
         req.lock_receipt = DecLockRefParams(
             node_id=req.last_node,
-            swa_uuid_for_lock=7,
             skipped_lock_components=(ComponentType.MAMBA,),
+            component_lock_uuids={ComponentType.SWA: 7},
         )
         manager.waiting_queue = [req, keep]
         manager.staging_queue = [req]

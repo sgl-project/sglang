@@ -1,6 +1,6 @@
 import logging
 from contextlib import nullcontext
-from typing import Callable, Optional, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkable
 
 import torch
 
@@ -84,6 +84,9 @@ from sglang.srt.utils import (
     is_pin_memory_available,
 )
 
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.model_runner import ModelRunner
+
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
@@ -126,6 +129,9 @@ def _configure_target_hidden_projection(
 
 class DSparkWorkerV2(BaseSpecWorker):
     """Non-last PP stages run only the target; draft state belongs to the last stage."""
+
+    def weight_update_runners(self) -> list[tuple[str, "ModelRunner"]]:
+        return [("draft", self.draft_model_runner)] if self._hosts_draft else []
 
     def __init__(
         self,
