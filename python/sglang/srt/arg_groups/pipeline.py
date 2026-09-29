@@ -89,7 +89,6 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(validate_sampling_mask_max_tokens, server_args)
     run_hook(validate_min_free_slots_max_delay_passes, server_args)
 
-
     # Reject an explicitly enabled but incompatible hardware runtime before
     # model path resolution, downloads, or the dummy-model short circuit.
     from sglang.srt.arg_groups.parallel_hook import validate_prefill_cp_platform

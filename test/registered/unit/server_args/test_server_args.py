@@ -395,7 +395,6 @@ class TestPrepareServerArgs(CustomTestCase):
                 model_path="dummy", min_free_slots_max_delay_passes=-1
             ).resolve_once()
 
-
     def test_dsv4_prefill_backend_cli_choices(self):
         parser = server_args_module.argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
