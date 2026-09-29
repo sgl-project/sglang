@@ -266,7 +266,7 @@ impl KvEventIndex {
             format: SNAPSHOT_FORMAT,
             block_size,
             is_bigram,
-            producer_ready: hash_config.is_some() && has_nodes,
+            producer_ready: hash_config.is_some() && self.bootstrap.settled() && has_nodes,
             workers,
             cursors,
             nodes,

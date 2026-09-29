@@ -585,4 +585,48 @@ mod tests {
             "a new incarnation gets its own retry",
         );
     }
+
+    /// A worker discovered after readiness opened must still be allowed to warm,
+    /// so `enabled()` does not follow `settled()`.
+    #[test]
+    fn enabled_survives_settling_so_late_workers_still_bootstrap() {
+        let tracker = BootstrapTracker::new(Duration::from_millis(1));
+        let id = KvWorkerId::new("http://w1:30000".into(), 0);
+        tracker.register(std::slice::from_ref(&id));
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(tracker.settled(), "deadline expiry settles readiness");
+        assert!(
+            tracker.enabled(),
+            "settling must NOT disable bootstrap for workers found later",
+        );
+    }
+
+    /// The disabled case must stay distinguishable from the finished case, or a
+    /// router with no `--kv-peer-selector` would start holding batches.
+    #[test]
+    fn disabled_tracker_is_not_enabled() {
+        let t = BootstrapTracker::disabled();
+        assert!(t.settled());
+        assert!(
+            !t.enabled(),
+            "no selector configured ⇒ never register ranks"
+        );
+    }
+
+    /// The remaining window saturates at zero once the deadline passes, while
+    /// the configured timeout stays positive.
+    #[test]
+    fn time_remaining_saturates_to_zero_once_expired() {
+        let tracker = BootstrapTracker::new(Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(
+            tracker.time_remaining(),
+            Some(Duration::ZERO),
+            "expired window must read as zero, not as None",
+        );
+        assert!(
+            tracker.timeout() > Duration::ZERO,
+            "the configured timeout must stay positive",
+        );
+    }
 }
