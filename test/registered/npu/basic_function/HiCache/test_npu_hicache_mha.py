@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
+from sglang.srt.utils.npu_pinned_host_diagnostics import log_npu_host_baseline
 from sglang.test.ascend.npu_eval_accuracy_kit import _is_pr_pipeline, run_npu_pr_smoke
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
@@ -43,12 +44,15 @@ class TestAscendMhaHicache(CustomTestCase):
         ]
 
     def test_a_gsm8k(self):
+        self.addCleanup(log_npu_host_baseline, "after_mha_test")
+        log_npu_host_baseline("before_mha_test")
         for model in self.models:
             with self.subTest(model=model):
                 process = popen_launch_server(
                     model,
                     self.base_url,
                     timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                    env={"SGLANG_NPU_PINNED_HOST_DEBUG": "1"},
                     other_args=[*self.common_args],
                 )
                 try:

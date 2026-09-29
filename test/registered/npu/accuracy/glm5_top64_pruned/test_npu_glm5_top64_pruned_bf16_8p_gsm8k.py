@@ -1,6 +1,7 @@
 import os
 import unittest
 
+from sglang.srt.utils.npu_pinned_host_diagnostics import log_npu_host_baseline
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
     TestNpuAccuracyTestCaseBase,
 )
@@ -13,6 +14,7 @@ register_npu_ci(est_time=3600, suite="base-c-test-acc-16-npu-a3")
 register_npu_ci(est_time=4800, suite="nightly-acc-16-npu-a3", nightly=True)
 
 ENVS = {
+    "SGLANG_NPU_PINNED_HOST_DEBUG": "1",
     "SGLANG_SET_CPU_AFFINITY": "1",
     "STREAMS_PER_DEVICE": "32",
     "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "600",
@@ -62,6 +64,22 @@ class TestNPUGLM5_Top64_Pruned_GSM8K(TestNpuAccuracyTestCaseBase):
     }
     eval_batch_size = 16
     limit = 100
+
+    @classmethod
+    def setUpClass(cls):
+        log_npu_host_baseline("before_glm5_server")
+        try:
+            super().setUpClass()
+        except Exception:
+            log_npu_host_baseline("after_glm5_failed_launch")
+            raise
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            super().tearDownClass()
+        finally:
+            log_npu_host_baseline("after_glm5_server")
 
     def test_gsm8k(self):
         self.run_accuracy()

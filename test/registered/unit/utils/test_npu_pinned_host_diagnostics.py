@@ -96,9 +96,33 @@ class TestNpuPinnedHostDiagnostics(unittest.TestCase):
             with mock.patch.object(
                 diagnostics, "_cgroup_v2_directory", return_value=child
             ):
-                current, limit, limiting_group = diagnostics._cgroup_v2_memory(root)
+                current, limit, limiting_group, limit_kind = (
+                    diagnostics._cgroup_v2_memory(root)
+                )
 
-        self.assertEqual((current, limit, limiting_group), (800, 1000, root))
+        self.assertEqual(
+            (current, limit, limiting_group, limit_kind),
+            (800, 1000, root, "memory.max"),
+        )
+
+    def test_cgroup_memory_high_can_limit_the_auto_size_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "memory.current").write_text("700\n")
+            (root / "memory.max").write_text("2000\n")
+            (root / "memory.high").write_text("900\n")
+
+            with mock.patch.object(
+                diagnostics, "_cgroup_v2_directory", return_value=root
+            ):
+                current, limit, limiting_group, limit_kind = (
+                    diagnostics._cgroup_v2_memory(root)
+                )
+
+        self.assertEqual(
+            (current, limit, limiting_group, limit_kind),
+            (700, 900, root, "memory.high"),
+        )
 
     def test_monitor_compares_loading_and_runtime_allocator_peaks(self):
         loading = {
@@ -135,15 +159,19 @@ class TestNpuPinnedHostDiagnostics(unittest.TestCase):
             mock.patch.object(
                 diagnostics,
                 "_cgroup_v2_memory",
-                return_value=(400, 500, Path("/sys/fs/cgroup/test")),
+                return_value=(400, 500, Path("/sys/fs/cgroup/test"), "memory.max"),
             ),
             mock.patch.object(diagnostics, "_read_int", return_value=None),
+            mock.patch.object(diagnostics, "_numa_node_memory", return_value={}),
+            mock.patch.object(diagnostics, "_numa_bind_policies", return_value=[]),
         ):
             snapshot = diagnostics._host_and_cgroup_snapshot()
 
         self.assertEqual(snapshot["host_memory_used_pct"], 75.0)
         self.assertEqual(snapshot["cgroup_memory_used_pct"], 80.0)
         self.assertEqual(snapshot["cgroup_memory_headroom_bytes"], 100)
+        self.assertEqual(snapshot["effective_host_memory_headroom_bytes"], 100)
+        self.assertEqual(snapshot["effective_host_memory_limiter"], "cgroup")
 
 
 if __name__ == "__main__":
