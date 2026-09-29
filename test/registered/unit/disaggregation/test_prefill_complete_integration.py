@@ -613,6 +613,47 @@ class TestAllocationIntegration(CustomTestCase):
         self.assertFalse(entry.waiting_for_input)
         self.assertEqual(req.disagg_prefill_dp_rank, 0)
 
+    def test_normal_bootstrap_keeps_room_without_dispatching_recompute(self):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue._check_if_req_exceed_kv_capacity = Mock(return_value=False)
+        queue.pending_reqs = []
+        req = SimpleNamespace(
+            bootstrap_room=7,
+            bootstrap_host="prefill",
+            bootstrap_port=8998,
+            disagg_prefill_dp_rank=None,
+            to_finish=None,
+            finished_reason=None,
+        )
+        receiver = Mock(conclude_state=None)
+        entry = DecodeRequest(req=req, kv_receiver=receiver)
+        queue._create_receiver_and_enqueue = Mock(return_value=entry)
+        queue.kv_manager = SimpleNamespace(
+            prefill_info_table={
+                "prefill:8998": SimpleNamespace(dp_size=1),
+            },
+            submit_prefill_recompute=Mock(),
+        )
+        queue.add(req)
+        self.assertEqual(req.bootstrap_room, 7)
+        receiver.init.assert_called_once_with(0)
+        queue.kv_manager.submit_prefill_recompute.assert_not_called()
+        self.assertFalse(entry.waiting_for_input)
+
+    def test_reusing_completed_room_rejects_recomputed_prefill(self):
+        sender, receiver = self.sender(), self.receiver()
+        self.flush()
+        sender.mark_prefill_complete()
+        self.flush()
+        self.prefill.update_status(1, KVPoll.Success)
+        self.decode.update_status(1, KVPoll.Success)
+        sender.clear()
+        receiver.clear()
+        # True retraction can resume before the old room's tombstone expires.
+        # Reusing that room cannot distinguish recompute from a late sender.
+        recompute = self.sender(room=1)
+        self.assertEqual(recompute.poll(), KVPoll.Failed)
+
     def test_rebootstrap_gets_fresh_room_but_keeps_prefill_rank(self):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue._check_if_req_exceed_kv_capacity = Mock(return_value=False)

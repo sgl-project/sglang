@@ -714,8 +714,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 and get_disagg().disaggregation_decode_allocation_policy
                 == "prefill_complete"
             ):
-                # Recompute is a new transfer: do not reuse readiness or an
-                # abort tombstone from the previous one. _init_receiver saved
+                # Only upstream's true-retraction recovery reaches this branch:
+                # its old KV was discarded and must be recomputed. Ordinary
+                # bootstrap and optimistic-prefill retries keep their room.
+                # Recompute must not reuse readiness or a closed-room tombstone
+                # from the previous transfer. _init_receiver saved
                 # the actual prefill DP rank, so changing the room cannot
                 # reroute follow_bootstrap_room requests to another worker.
                 # This policy requires attention TP1/CP1/PP1; wider groups would
