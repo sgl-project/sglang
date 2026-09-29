@@ -718,5 +718,53 @@ class TestLowRatioTargetVerifyHip(CustomTestCase):
                 )
 
 
+@unittest.skipUnless(is_hip(), "HIP DeepSeek-V4 backend")
+class TestEncoderReplayRequestWindowHip(CustomTestCase):
+    """Encoder SWA bounded replay floors each request's window at its first row,
+    the floor the CUDA backend passes to window_layout."""
+
+    class _Stop(Exception):
+        pass
+
+    def _floor_passed(self, *, encoder_replay, swa_replay_start=None):
+        backend = object.__new__(DeepseekV4HipRadixBackend)
+        backend.token_to_kv_pool = SimpleNamespace(
+            request_window=SimpleNamespace(capacity=256)
+        )
+        backend.encoder_replay = encoder_replay
+        seen = {}
+
+        def fake_window_layout(req, pos, **kwargs):
+            seen.update(kwargs)
+            raise self._Stop
+
+        with mock.patch(
+            "sglang.srt.layers.attention.deepseek_v4_backend_hip_radix.window_layout",
+            side_effect=fake_window_layout,
+        ):
+            with self.assertRaises(self._Stop):
+                backend.make_core_attn_metadata(
+                    req_to_token=None,
+                    req_pool_indices_repeated=torch.tensor([3, 3, 3, 5, 5]),
+                    seq_lens_casual=torch.tensor([10, 11, 12, 20, 21]),
+                    max_seq_len=32,
+                    out_loc=None,
+                    swa_replay_start=swa_replay_start,
+                )
+        self.assertNotIn("replay", seen)
+        return seen["floor"]
+
+    def test_replay_floors_each_request_at_its_first_row(self):
+        floor = self._floor_passed(encoder_replay=True)
+        self.assertEqual(floor.tolist(), [9, 9, 9, 19, 19])
+
+    def test_without_replay_the_caller_floor_passes_through(self):
+        start = torch.tensor([4, 4, 4, 7, 7])
+        self.assertIs(self._floor_passed(encoder_replay=False), None)
+        self.assertIs(
+            self._floor_passed(encoder_replay=False, swa_replay_start=start), start
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
