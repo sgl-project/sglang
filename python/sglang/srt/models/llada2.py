@@ -749,8 +749,9 @@ class LLaDA2MoeModel(nn.Module):
             residual = None
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states, residual = self.layers[
+                self.start_layer
+            ].layer_communicator.from_pp(pp_proxy_tensors)
 
         for i in range(self.start_layer, self.end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
@@ -761,6 +762,10 @@ class LLaDA2MoeModel(nn.Module):
                     forward_batch,
                     residual,
                 )
+
+        hidden_states, residual = self.layers[
+            self.end_layer - 1
+        ].layer_communicator.finish_layer_stack(hidden_states, residual, forward_batch)
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {

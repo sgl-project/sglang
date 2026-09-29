@@ -114,9 +114,9 @@ class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
             hidden_states, residual = self.layer_communicator.finish_layer_stack(
                 hidden_states, residual, forward_batch
             )
-            if residual is not None:
-                hidden_states = hidden_states + residual
-                residual = None
+            hidden_states, residual = self.layer_communicator.fold(
+                hidden_states, residual
+            )
 
             hidden_states = self.final_layernorm(hidden_states)
 
@@ -198,9 +198,9 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
             hidden_states, residual = self.layer_communicator.finish_layer_stack(
                 hidden_states, residual, forward_batch
             )
-            if residual is not None:
-                hidden_states = hidden_states + residual
-                residual = None
+            hidden_states, residual = self.layer_communicator.fold(
+                hidden_states, residual
+            )
 
             hidden_states = self.final_layernorm(hidden_states)
 

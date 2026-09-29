@@ -478,6 +478,10 @@ class Step3TextModel(nn.Module):
                 positions, hidden_states, forward_batch, residual
             )
 
+        hidden_states, residual = self.layers[-1].layer_communicator.finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
+
         if hidden_states.shape[0] != 0:
             if residual is None:
                 hidden_states = self.norm(hidden_states)

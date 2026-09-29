@@ -138,9 +138,9 @@ class TestAMoeOnEachCpShard(CustomTestCase):
             ffn_shards_over_cp=True,
         )
         cp_rows = rows(axis_sizes, TokenAxis.ATTN_CP)
-        self.assertEqual(sides.ffn.layout, cp_rows)
-        self.assertEqual(sides.ffn_output.layout, cp_rows)
-        self.assertIs(sides.ffn_output.group, SumGroup.MOE_OUTPUT)
+        self.assertEqual(sides.ffn.input.layout, cp_rows)
+        self.assertEqual(sides.ffn.output.layout, cp_rows)
+        self.assertIs(sides.ffn.output.group, SumGroup.MOE_OUTPUT)
         edges = decoder_layer_edges(sides)
         self.assertEqual(edges.into_ffn.need.layout, edges.into_ffn.produced.layout)
 

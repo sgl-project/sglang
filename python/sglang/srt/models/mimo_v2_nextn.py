@@ -225,11 +225,15 @@ class MiMoV2ModelNextN(nn.Module):
             forward_batch=forward_batch,
             residual=None,
         )
+
+        hidden_states, residual = self.mtp_block.layer_communicator.finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
         hidden_states_before_norm = None
         if not forward_batch.forward_mode.is_idle():
             if forward_batch.return_hidden_states_before_norm:
-                hidden_states_before_norm = (
-                    hidden_states if residual is None else hidden_states + residual
+                hidden_states_before_norm = self.mtp_block.layer_communicator.snapshot(
+                    hidden_states, residual
                 )
             if residual is not None:
                 hidden_states, _ = self.final_layernorm(hidden_states, residual)

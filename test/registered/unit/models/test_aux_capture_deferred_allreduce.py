@@ -8,7 +8,7 @@ from torch import nn
 
 from sglang.srt.layers import communicator as comm
 from sglang.srt.layers.communicator import ops as comm_ops
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.models.bailing_moe import BailingMoEModel
 from sglang.srt.models.bailing_moe_v3 import BailingMoELinearModel
 from sglang.srt.models.glm4_moe import Glm4MoeModel
@@ -156,6 +156,23 @@ def build_model(model_cls, *, defer, capture):
 
 
 class TestAuxCaptureDeferredAllreduce(CustomTestCase):
+    def test_skipping_an_empty_capture_does_not_complete_its_output(self):
+        boundary = comm.LayerCommunicator.__new__(comm.LayerCommunicator)
+        partial = torch.empty(0, 4)
+        owed = comm.UnreducedOutput(partial, group=GROUP)
+        with patch.object(GROUP, "all_reduce") as reduce:
+            hidden, captured = boundary.capture_output(owed, partial, skip_empty=True)
+        self.assertIs(hidden, owed)
+        self.assertIsNone(captured)
+        reduce.assert_not_called()
+
+    def test_snapshot_without_a_residual_does_not_alias_the_main_output(self):
+        boundary = comm.LayerCommunicator.__new__(comm.LayerCommunicator)
+        hidden = torch.ones(2, 4)
+        captured = boundary.snapshot(hidden, None)
+        hidden.zero_()
+        torch.testing.assert_close(captured, torch.ones_like(hidden))
+
     def test_capture_matches_eager_reduction(self):
         inputs = torch.tensor([[0.25, -0.5, 0.75, 1.0], [1.5, 2.0, -1.0, 0.0]])
         batch = SimpleNamespace(
@@ -189,6 +206,61 @@ class TestAuxCaptureDeferredAllreduce(CustomTestCase):
                         self.assertEqual(
                             reduce.call_count, NUM_LAYERS - 1 if defer else 0
                         )
+
+
+class TestPipelineResidualReception(CustomTestCase):
+    def test_models_keep_the_received_residual_contribution(self):
+        inputs = torch.zeros(2, 4)
+        initial_residual = torch.full_like(inputs, 0.25)
+        batch = SimpleNamespace(
+            can_run_tbo=False,
+            forward_mode=ForwardMode.DECODE,
+            capture_hidden_mode=SimpleNamespace(need_capture=lambda: False),
+        )
+        for model_cls in MODELS:
+            with self.subTest(model=model_cls.__name__):
+                model = build_model(model_cls, defer=True, capture=False)
+                model.pp_group.is_first_rank = False
+                result = model(
+                    input_ids=None,
+                    positions=None,
+                    forward_batch=batch,
+                    pp_proxy_tensors=PPProxyTensors(
+                        {
+                            "hidden_states": inputs.clone(),
+                            "residual": initial_residual.clone(),
+                        }
+                    ),
+                )
+                torch.testing.assert_close(result, initial_residual + NUM_LAYERS)
+
+    def test_written_streams_do_not_read_a_separate_residual(self):
+        comm_instance = comm.LayerCommunicator.__new__(comm.LayerCommunicator)
+        comm_instance._residual = SimpleNamespace(
+            ffn_update=SimpleNamespace(at_producer=True)
+        )
+        streams = torch.randn(2, 4, 3)
+        hidden, residual = comm_instance.from_pp(
+            PPProxyTensors({"hidden_states": streams})
+        )
+        self.assertIs(hidden, streams)
+        self.assertIsNone(residual)
+
+    def test_optional_residual_and_declared_partial_keep_the_wire_values(self):
+        comm_instance = comm.LayerCommunicator.__new__(comm.LayerCommunicator)
+        partial = torch.randn(2, 4)
+        prior = torch.randn_like(partial)
+        hidden, residual = comm_instance.from_pp(
+            PPProxyTensors({"hidden_states": partial, "residual": prior})
+        )
+        self.assertIs(hidden, partial)
+        self.assertIs(residual, prior)
+        missing = PPProxyTensors({"hidden_states": partial})
+        with self.assertRaises(KeyError):
+            comm_instance.from_pp(missing)
+        hidden, residual = comm_instance.from_pp(missing, allow_missing_residual=True)
+        self.assertIs(hidden, partial)
+        self.assertIsNone(residual)
 
 
 if __name__ == "__main__":

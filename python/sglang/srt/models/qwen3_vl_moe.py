@@ -24,7 +24,6 @@ import torch.nn as nn
 
 from sglang.srt.configs.qwen3_vl import Qwen3VLMoeConfig, Qwen3VLMoeTextConfig
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.layers.communicator import reduce_output
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import get_layer_id
@@ -98,8 +97,9 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
             residual = None
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states, residual = self.layers[
+                self.start_layer
+            ].layer_communicator.from_pp(pp_proxy_tensors)
 
         aux_hidden_states = []
         for layer_idx, layer in enumerate(
@@ -107,10 +107,10 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
         ):
             layer_idx += self.start_layer
             if layer_idx in self.layers_to_capture:
-                hidden_states = reduce_output(hidden_states)
-                aux_hidden_states.append(
-                    hidden_states + residual if residual is not None else hidden_states
+                hidden_states, snapshot = layer.layer_communicator.capture_output(
+                    hidden_states, residual, at_input=True
                 )
+                aux_hidden_states.append(snapshot)
 
             if self.use_hf_deepstack_order:
                 # HF-order path (RL on-policy / FSDP). SGLang applies residual at the START of the
@@ -140,9 +140,10 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
                     and layer_idx in self.deepstack_embed_to_decoder_layer
                 ):
                     sep = self.hidden_size * layer_idx
-                    hidden_states = reduce_output(hidden_states)
-                    hidden_states.add_(
-                        input_deepstack_embeds[:, sep : sep + self.hidden_size]
+                    hidden_states, residual = layer.layer_communicator.add_to_output(
+                        hidden_states,
+                        residual,
+                        input_deepstack_embeds[:, sep : sep + self.hidden_size],
                     )
 
         # Handle deepstack for the last processed layer (HF-order path only).

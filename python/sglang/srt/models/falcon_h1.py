@@ -432,6 +432,10 @@ class FalconH1Model(nn.Module):
                 forward_batch=forward_batch,
             )
 
+        hidden_states, residual = self.layers[-1].layer_communicator.finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
+
         if not forward_batch.forward_mode.is_idle():
             if residual is None:
                 hidden_states = self.final_layernorm(hidden_states)

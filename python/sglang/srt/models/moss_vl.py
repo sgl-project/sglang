@@ -1114,10 +1114,9 @@ class MossVLTextModel(nn.Module):
         for decoder_layer in self.layers:
             if isinstance(decoder_layer, MossVLCrossAttentionDecoderLayer):
                 if not skip_cross_attention:
-                    # Fuse residual before cross-attention
-                    if residual is not None:
-                        hidden_states = hidden_states + residual
-                        residual = None
+                    hidden_states, residual = LayerCommunicator.fold(
+                        hidden_states, residual
+                    )
                     hidden_states = decoder_layer(
                         hidden_states=hidden_states,
                         cross_attention_states=cross_attention_states,
@@ -1136,6 +1135,10 @@ class MossVLTextModel(nn.Module):
                 )
             else:
                 raise ValueError(f"Unknown decoder layer type {type(decoder_layer)}")
+
+        hidden_states, residual = LayerCommunicator.finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
 
         if residual is not None:
             hidden_states, _ = self.norm(hidden_states, residual)

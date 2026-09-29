@@ -32,7 +32,6 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerFacts,
-    reduce_output,
 )
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -704,15 +703,18 @@ class GptOssModel(nn.Module):
             residual = None
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states, residual = self.layers[
+                self.start_layer
+            ].layer_communicator.from_pp(pp_proxy_tensors)
 
         # Capture hidden-state boundaries: boundary 0 is the embedding output,
         # and boundary i + 1 is the output after transformer block i.
         aux_hidden_states = []
         if self.start_layer in self.layers_to_capture:
             aux_hidden_states.append(
-                hidden_states + residual if residual is not None else hidden_states
+                self.layers[self.start_layer].layer_communicator.snapshot(
+                    hidden_states, residual, at_input=True
+                )
             )
         for i in range(self.start_layer, self.end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
@@ -721,12 +723,10 @@ class GptOssModel(nn.Module):
                     positions, hidden_states, forward_batch, residual
                 )
                 if i + 1 in self.layers_to_capture:
-                    hidden_states = reduce_output(hidden_states)
-                    aux_hidden_states.append(
-                        hidden_states + residual
-                        if residual is not None
-                        else hidden_states
+                    hidden_states, snapshot = layer.layer_communicator.capture_output(
+                        hidden_states, residual
                     )
+                    aux_hidden_states.append(snapshot)
         last_layer = self.layers[self.end_layer - 1]
         hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
             hidden_states, residual, forward_batch

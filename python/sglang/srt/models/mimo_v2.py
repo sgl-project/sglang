@@ -1040,8 +1040,9 @@ class MiMoV2Model(nn.Module):
             residual = None
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states, residual = self.layers[
+                self.start_layer
+            ].layer_communicator.from_pp(pp_proxy_tensors)
 
         aux_hidden_states = AuxHiddenStatePacker(len(self.layers_to_capture))
         if forward_batch.can_run_tbo and not self.layers_to_capture:
@@ -1090,7 +1091,7 @@ class MiMoV2Model(nn.Module):
             and self.config.num_hidden_layers in self.layers_to_capture
         ):
             aux_hidden_states.append(
-                hidden_states if residual is None else hidden_states + residual
+                last_layer.layer_communicator.snapshot(hidden_states, residual)
             )
 
         hidden_states_before_norm = None
@@ -1104,8 +1105,8 @@ class MiMoV2Model(nn.Module):
         else:
             if hidden_states.shape[0] > 0:
                 if forward_batch.return_hidden_states_before_norm:
-                    hidden_states_before_norm = (
-                        hidden_states if residual is None else hidden_states + residual
+                    hidden_states_before_norm = last_layer.layer_communicator.snapshot(
+                        hidden_states, residual
                     )
                 if residual is None:
                     hidden_states = self.norm(hidden_states)

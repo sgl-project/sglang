@@ -931,7 +931,7 @@ class TestTwoBatchOverlap(CustomTestCase):
                 )
                 steps = communicator._steps
                 self.assertEqual(
-                    steps.ffn.input_rows, communicator._declared.ffn.layout
+                    steps.ffn.input_rows, communicator._declared.ffn.input.layout
                 )
                 published = {}
                 with patch_communicator(
@@ -969,11 +969,11 @@ class TestTheAttentionOutputDecidesItsSum(CustomTestCase):
             )
             owed = attn_tp > 1
             self.assertIs(
-                sides.attention_output.group, SumGroup.ATTN_TP if owed else None
+                sides.attention.output.group, SumGroup.ATTN_TP if owed else None
             )
-            self.assertIs(sides.attention_output.always_leaves, owed)
-            self.assertIs(sides.ffn_output.group, SumGroup.TP)
-            self.assertFalse(sides.ffn_output.always_leaves)
+            self.assertIs(sides.attention.output.always_leaves, owed)
+            self.assertIs(sides.ffn.output.group, SumGroup.TP)
+            self.assertFalse(sides.ffn.output.always_leaves)
 
     def run_steps(self, produced, *, force=False):
         sizes = {
@@ -986,7 +986,7 @@ class TestTheAttentionOutputDecidesItsSum(CustomTestCase):
             produced,
             residual=sides.input_rows,
             residual_to=sides.ffn_residual_rows,
-            need=sides.ffn,
+            need=sides.ffn.input,
             update=comm.ADD,
             fusions=(),
             force_layernorm_before_gather=force,
@@ -1108,10 +1108,10 @@ class TestFusedKernelsTakeOnlyTheStepsTheyComplete(CustomTestCase):
             }
         )
         steps, fused, _ = comm_boundary._select_input_steps(
-            sides.attention_output,
+            sides.attention.output,
             residual=sides.input_rows,
             residual_to=sides.ffn_residual_rows,
-            need=sides.ffn,
+            need=sides.ffn.input,
             update=comm.ADD,
             fusions=fusions,
             force_layernorm_before_gather=False,
@@ -1179,7 +1179,7 @@ class TestTheSequenceParallelRegion(CustomTestCase):
             prepare=comm_ops._read_input,
             input_rows=comm.Layout(frozenset({TokenAxis.ATTN_TP_SCATTER})),
         ),
-        ffn_output=sequence_parallel_layer_sides(axis_sizes=SIZES).ffn_output,
+        ffn_output=sequence_parallel_layer_sides(axis_sizes=SIZES).ffn.output,
         ffn_output_move=comm.CommunicateSummableTensorPairFn._trivial,
         ffn_sum_is_movable=False,
     )
@@ -1212,10 +1212,10 @@ class TestTheSequenceParallelRegion(CustomTestCase):
                 )
                 local = frozenset({TokenAxis.ATTN_TP_SCATTER})
                 self.assertEqual(sides.input_rows.sharded, local)
-                self.assertEqual(sides.attention.gathers_itself, local)
-                self.assertEqual(sides.ffn.gathers_itself, local)
-                self.assertIsNone(sides.attention_output.group)
-                self.assertIsNone(sides.ffn_output.group)
+                self.assertEqual(sides.attention.input.gathers_itself, local)
+                self.assertEqual(sides.ffn.input.gathers_itself, local)
+                self.assertIsNone(sides.attention.output.group)
+                self.assertIsNone(sides.ffn.output.group)
                 steps = self.unbound(comm_boundary._select_boundary_steps(sides))
                 self.assertEqual(
                     (

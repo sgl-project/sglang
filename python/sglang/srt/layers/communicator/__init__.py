@@ -59,7 +59,6 @@ from sglang.srt.layers.communicator.layout import (
 from sglang.srt.layers.communicator.ops import (
     CommunicateSimpleFn,
     CommunicateSummableTensorPairFn,
-    layer_input_buffer,
     move_rows,
     tp_reduce_scatter,
 )
@@ -119,7 +118,6 @@ __all__ = [
     "enable_moe_dense_fully_dp",
     "get_attn_tp_context",
     "input_scattered_layer_sides",
-    "layer_input_buffer",
     "make_boundary",
     "make_output_boundary",
     "moe_cp_gathers_sparse_moe_input",

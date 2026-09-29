@@ -31,9 +31,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     Mamba2AttnBackend,
 )
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
-from sglang.srt.layers.communicator import UnreducedOutput, reduce_output
 from sglang.srt.layers.dp_attention import (
-    attn_tp_all_reduce,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -384,10 +382,10 @@ class NemotronHMLPLikeDecoderLayer(nn.Module):
     def forward(
         self,
         *,
-        hidden_states: torch.Tensor | UnreducedOutput,
+        hidden_states,
         residual: torch.Tensor | None,
         forward_batch: ForwardBatch,
-    ) -> tuple[torch.Tensor | UnreducedOutput, torch.Tensor]:
+    ):
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
@@ -466,10 +464,10 @@ class NemotronHAttnLikeDecoderLayer(nn.Module):
     def forward(
         self,
         *,
-        hidden_states: torch.Tensor | UnreducedOutput,
+        hidden_states,
         residual: torch.Tensor | None,
         forward_batch: ForwardBatch,
-    ) -> tuple[torch.Tensor | UnreducedOutput, torch.Tensor]:
+    ):
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
@@ -721,24 +719,6 @@ class NemotronHModel(nn.Module):
             self.norm_f = PPMissingLayer(return_tuple=True)
         self.layers_to_capture: set[int] = set()
 
-    def _capture_hidden_states(self, hidden_states, residual, boundary_idx):
-        if residual is not None and self._owes_attention_sum_at(boundary_idx):
-            # Reduce a copy so the FFN stage still receives its partial sum.
-            hidden_states = attn_tp_all_reduce(hidden_states.clone())
-        # Later norms update the input residual in place.
-        return hidden_states.clone() if residual is None else hidden_states + residual
-
-    def _owes_attention_sum_at(self, boundary_idx: int) -> bool:
-        """Whether the value at this boundary is a mixer's partial sum that the
-        FFN stage after it completes: what the layer after the boundary
-        declares it takes, or at this rank's end what the last layer declares
-        it hands on."""
-        if boundary_idx < self.end_layer:
-            edge = self.layers[boundary_idx].layer_communicator.stage_edges[0]
-        else:
-            edge = self.layers[boundary_idx - 1].layer_communicator.stage_edges[1]
-        return edge.produced.always_leaves
-
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -755,16 +735,19 @@ class NemotronHModel(nn.Module):
             residual = None
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states, residual = self.layers[
+                self.start_layer
+            ].layer_communicator.from_pp(pp_proxy_tensors)
 
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             if i in self.layers_to_capture:
-                hidden_states = reduce_output(hidden_states)
-                aux_hidden_states.append(
-                    self._capture_hidden_states(hidden_states, residual, i)
+                hidden_states, snapshot = self.layers[
+                    i
+                ].layer_communicator.capture_output(
+                    hidden_states, residual, at_input=True
                 )
+                aux_hidden_states.append(snapshot)
             layer = self.layers[i]
             if not isinstance(layer, Layers):
                 raise ValueError(f"Unknown layer type: {type(layer)}")
@@ -784,7 +767,7 @@ class NemotronHModel(nn.Module):
             )
         if self.end_layer in self.layers_to_capture:
             aux_hidden_states.append(
-                self._capture_hidden_states(hidden_states, residual, self.end_layer)
+                last_layer.layer_communicator.snapshot(hidden_states, residual)
             )
         if residual is None:
             hidden_states = self.norm_f(hidden_states)

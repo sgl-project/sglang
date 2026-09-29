@@ -700,8 +700,9 @@ class Step3p5Model(nn.Module):
             residual = None
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states, residual = self.layers[
+                self.start_layer
+            ].layer_communicator.from_pp(pp_proxy_tensors)
 
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
@@ -735,8 +736,8 @@ class Step3p5Model(nn.Module):
             else:
                 if hidden_states.shape[0] > 0:
                     # if forward_batch.return_hidden_states_before_norm:
-                    hidden_states_before_norm = (
-                        hidden_states if residual is None else hidden_states + residual
+                    hidden_states_before_norm = last_layer.layer_communicator.snapshot(
+                        hidden_states, residual
                     )
                     if residual is None:
                         hidden_states = self.norm(hidden_states)

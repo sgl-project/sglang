@@ -83,7 +83,8 @@ def defers(node):
 
 
 class Census:
-    def __init__(self):
+    def __init__(self, include_complete=False):
+        self.include_complete = include_complete
         self.trees = {}
         self.classes = {}
         for path in sorted(MODELS_DIR.rglob("*.py")):
@@ -110,7 +111,17 @@ class Census:
             name
             for name, defs in self.classes.items()
             for path, node in defs
-            if defers(node) or any(any(calls(node, h)) for h in helpers[path])
+            if defers(node)
+            or any(any(calls(node, h)) for h in helpers[path])
+            or (
+                self.include_complete
+                and any(
+                    isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Name)
+                    and call.func.id in {"LayerCommunicator", "MHCLayerCommunicator"}
+                    for call in ast.walk(node)
+                )
+            )
         }
         # A subclass defers through its base unless it replaces forward
         # without delegating to it.
@@ -121,7 +132,7 @@ class Census:
                 if name not in deferring
                 for _, node in defs
                 if set(base_names(node)) & deferring
-                and not declares_no_deferral(node)
+                and (self.include_complete or not declares_no_deferral(node))
                 and (
                     method(node, "forward") is None
                     or delegates_to_super(method(node, "forward"))
@@ -273,6 +284,7 @@ class TestLayerStackExit(CustomTestCase):
     def setUpClass(cls):
         cls.census = Census()
         cls.subjects = cls.census.subjects()
+        cls.complete_census = Census(include_complete=True)
 
     def test_derivation_finds_each_kind_of_stack(self):
         for name in (
@@ -287,12 +299,14 @@ class TestLayerStackExit(CustomTestCase):
 
     def test_each_stack_ends_at_the_exit(self):
         problems = []
-        for name, (forward, layers) in sorted(self.subjects.items()):
+        for name, (forward, layers) in sorted(self.complete_census.subjects().items()):
             exits = list(calls(forward, EXIT))
             if not exits:
                 if delegates_to_super(forward):
                     continue
-                if layers and all(self.census.layer_calls_exit(n) for n in layers):
+                if layers and all(
+                    self.complete_census.layer_calls_exit(n) for n in layers
+                ):
                     continue  # the last layer ends the stack itself
                 problems.append(f"{name}: no {EXIT} call")
                 continue
@@ -308,6 +322,87 @@ class TestLayerStackExit(CustomTestCase):
                         f"{name} line {call.lineno}: {called_name(call)} before {EXIT}"
                     )
         self.assertEqual(problems, [])
+
+    def test_pipeline_residual_is_received_through_the_boundary(self):
+        problems = []
+        for name, (forward, _) in self.complete_census.subjects().items():
+            for node in ast.walk(forward):
+                if (
+                    isinstance(node, ast.Subscript)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == "pp_proxy_tensors"
+                    and isinstance(node.slice, ast.Constant)
+                    and node.slice.value == "residual"
+                ):
+                    problems.append(f"{name}:{node.lineno}")
+        self.assertEqual(problems, [])
+
+    def test_models_use_boundary_access_for_output_values(self):
+        problems = []
+        forbidden = {
+            "UnreducedOutput",
+            "HandoffOutput",
+            "reduce_output",
+            "layer_input_buffer",
+        }
+        for path, tree in self.complete_census.trees.items():
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Name) and node.id in forbidden:
+                    problems.append(f"{path.name}:{node.lineno}: {node.id}")
+        for name, (forward, _) in self.complete_census.subjects().items():
+            for node in ast.walk(forward):
+                if (
+                    isinstance(node, ast.BinOp)
+                    and isinstance(node.op, ast.Add)
+                    and isinstance(node.left, ast.Name)
+                    and isinstance(node.right, ast.Name)
+                    and {node.left.id, node.right.id} == {"hidden_states", "residual"}
+                ):
+                    problems.append(f"{name}:{node.lineno}: residual add")
+        self.assertEqual(problems, [])
+
+    def test_split_prefill_completes_only_at_the_final_segment(self):
+        census = self.complete_census
+        containers = {name for _, name in census.stacks}
+        while True:
+            grown = {
+                name
+                for name, definitions in census.classes.items()
+                for path, node in definitions
+                if set(base_names(node)) & containers
+                or census.built_layers(path, node, containers)
+            } - containers
+            if not grown:
+                break
+            containers |= grown
+        checked = 0
+        for name in sorted(containers):
+            for path, node in census.classes[name]:
+                forward = method(node, "forward_split_prefill")
+                if forward is None:
+                    continue
+                if any(calls(forward, "forward_split_prefill")):
+                    continue  # delegates to the inherited implementation
+                with self.subTest(model=name, file=path.name):
+                    exits = list(calls(forward, EXIT))
+                    self.assertEqual(len(exits), 1)
+                    exit_call = exits[0]
+                    self.assertFalse(inside_loop(forward, exit_call))
+                    final_segments = [
+                        item
+                        for item in ast.walk(forward)
+                        if isinstance(item, ast.If)
+                        and isinstance(item.test, ast.Compare)
+                        and isinstance(item.test.left, ast.Name)
+                        and item.test.left.id == "end"
+                        and any(part is exit_call for part in ast.walk(item))
+                    ]
+                    self.assertEqual(len(final_segments), 1)
+                    for call in ast.walk(forward):
+                        if isinstance(call, ast.Call) and is_final_norm(call):
+                            self.assertLess(exit_call.lineno, call.lineno)
+                    checked += 1
+        self.assertGreater(checked, 0)
 
     def test_in_place_writes_between_layers_see_the_reduced_sum(self):
         problems = []

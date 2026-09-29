@@ -1207,8 +1207,9 @@ class Qwen3LLMModel(Qwen3Model):
             residual = None
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states, residual = self.layers[
+                self.start_layer
+            ].layer_communicator.from_pp(pp_proxy_tensors)
 
         aux_hidden_states = []
         for layer_idx, layer in enumerate(
@@ -1217,7 +1218,9 @@ class Qwen3LLMModel(Qwen3Model):
             layer_idx = layer_idx + self.start_layer
             if layer_idx in self.layers_to_capture:
                 aux_hidden_states.append(
-                    hidden_states + residual if residual is not None else hidden_states
+                    layer.layer_communicator.snapshot(
+                        hidden_states, residual, at_input=True
+                    )
                 )
 
             if self.use_hf_deepstack_order:
@@ -1251,6 +1254,10 @@ class Qwen3LLMModel(Qwen3Model):
                     hidden_states.add_(
                         input_deepstack_embeds[:, sep : sep + self.hidden_size]
                     )
+
+        hidden_states, residual = self.layers[
+            self.end_layer - 1
+        ].layer_communicator.finish_layer_stack(hidden_states, residual, forward_batch)
 
         # Handle deepstack for the last processed layer (HF-order path only).
         last_deepstack = (

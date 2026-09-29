@@ -561,8 +561,9 @@ class GigaChat35Model(nn.Module):
             residual = None
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states, residual = self.layers[
+                self.start_layer
+            ].layer_communicator.from_pp(pp_proxy_tensors)
 
         total_num_layers = self.end_layer - self.start_layer
         zero_allocator = BumpAllocator(
@@ -579,6 +580,10 @@ class GigaChat35Model(nn.Module):
                 residual=residual,
                 zero_allocator=zero_allocator,
             )
+
+        hidden_states, residual = self.layers[
+            self.end_layer - 1
+        ].layer_communicator.finish_layer_stack(hidden_states, residual, forward_batch)
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(

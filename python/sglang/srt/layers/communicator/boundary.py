@@ -100,6 +100,14 @@ class StageOutput(msgspec.Struct, frozen=True):
     update: StageUpdate = ADD
 
 
+class StageDecl(msgspec.Struct, frozen=True):
+    """A computing stage's two sides: the rows its input must be on, and what
+    its output is."""
+
+    input: StageInput
+    output: StageOutput
+
+
 class DecoderLayerSides(msgspec.Struct, frozen=True):
     """What a decoder layer declares about its attention, its FFN and the rows
     between them; ``decoder_layer_edges`` turns it into the layer's
@@ -107,10 +115,8 @@ class DecoderLayerSides(msgspec.Struct, frozen=True):
 
     # The rows the layer's input and residual arrive on.
     input_rows: Layout
-    attention: StageInput
-    attention_output: StageOutput
-    ffn: StageInput
-    ffn_output: StageOutput
+    attention: StageDecl
+    ffn: StageDecl
     # The rows the residual is on while the FFN runs.
     ffn_residual_rows: Layout
     # The rows the layer hands on.
@@ -120,14 +126,6 @@ class DecoderLayerSides(msgspec.Struct, frozen=True):
     # Whether the residual is added into one rank's share of the attention
     # output's sum before that sum completes, instead of after it.
     residual_joins_attention_sum: bool = False
-
-
-class StageDecl(msgspec.Struct, frozen=True):
-    """A computing stage's two sides: the rows its input must be on, and what
-    its output is."""
-
-    input: StageInput
-    output: StageOutput
 
 
 class EdgeDecl(msgspec.Struct, frozen=True):
@@ -167,7 +165,7 @@ def decoder_layer_edges(sides: DecoderLayerSides) -> DecoderLayerEdges:
         sides.input_rows,
         group=sides.input_owes,
         always_leaves=owes,
-        update=sides.ffn_output.update,
+        update=sides.ffn.output.update,
     )
     # Completing what the input owes leaves it and the residual on each
     # attention-TP rank's slice.
@@ -179,19 +177,19 @@ def decoder_layer_edges(sides: DecoderLayerSides) -> DecoderLayerEdges:
     return DecoderLayerEdges(
         into_attention=EdgeDecl(
             produced=arrived,
-            need=sides.attention,
+            need=sides.attention.input,
             residual=sides.input_rows,
             residual_to=attention_rows,
         ),
         into_ffn=EdgeDecl(
-            produced=sides.attention_output,
-            need=sides.ffn,
+            produced=sides.attention.output,
+            need=sides.ffn.input,
             residual=attention_rows,
             residual_to=sides.ffn_residual_rows,
             residual_joins_sum=sides.residual_joins_attention_sum,
         ),
         out_of_ffn=EdgeDecl(
-            produced=sides.ffn_output,
+            produced=sides.ffn.output,
             need=StageInput(sides.output_rows),
             residual=sides.ffn_residual_rows,
             residual_to=sides.output_rows,
@@ -207,12 +205,14 @@ def with_residual(
     replace = msgspec.structs.replace
     return replace(
         sides,
-        attention=replace(sides.attention, read=residual.attention_read),
-        attention_output=replace(
-            sides.attention_output, update=residual.attention_update
+        attention=StageDecl(
+            input=replace(sides.attention.input, read=residual.attention_read),
+            output=replace(sides.attention.output, update=residual.attention_update),
         ),
-        ffn=replace(sides.ffn, read=residual.ffn_read),
-        ffn_output=replace(sides.ffn_output, update=residual.ffn_update),
+        ffn=StageDecl(
+            input=replace(sides.ffn.input, read=residual.ffn_read),
+            output=replace(sides.ffn.output, update=residual.ffn_update),
+        ),
     )
 
 
@@ -270,14 +270,17 @@ def sequence_parallel_layer_sides(
     gathers = frozenset({TokenAxis.ATTN_TP_SCATTER})
     return DecoderLayerSides(
         input_rows=local,
-        # qkv and gate_up gather the slices into their GEMM.
-        attention=StageInput(attention, gathers_itself=gathers, read=NORM_QUANT_READ),
-        # o_proj and down reduce-scatter out of theirs, whether fused or not.
-        attention_output=StageOutput(local),
-        ffn=StageInput(
-            Layout.sharded_over(axis_sizes=axis_sizes), gathers_itself=gathers
+        # qkv and gate_up gather into GEMM; o_proj and down reduce-scatter out.
+        attention=StageDecl(
+            input=StageInput(attention, gathers_itself=gathers, read=NORM_QUANT_READ),
+            output=StageOutput(local),
         ),
-        ffn_output=StageOutput(local),
+        ffn=StageDecl(
+            input=StageInput(
+                Layout.sharded_over(axis_sizes=axis_sizes), gathers_itself=gathers
+            ),
+            output=StageOutput(local),
+        ),
         ffn_residual_rows=local,
         output_rows=local,
     )
@@ -311,19 +314,21 @@ def scattered_residual_layer_sides(
     )
     return DecoderLayerSides(
         input_rows=attention if is_first_layer else local,
-        attention=StageInput(
-            attention,
-            gathers_itself=frozenset({TokenAxis.ATTN_TP_SCATTER}),
-            read=NORM_QUANT_READ,
+        attention=StageDecl(
+            input=StageInput(
+                attention,
+                gathers_itself=frozenset({TokenAxis.ATTN_TP_SCATTER}),
+                read=NORM_QUANT_READ,
+            ),
+            output=StageOutput(attention, group=SumGroup.ATTN_TP, always_leaves=True),
         ),
-        attention_output=StageOutput(
-            attention, group=SumGroup.ATTN_TP, always_leaves=True
-        ),
-        ffn=StageInput(Layout.sharded_over(axis_sizes=axis_sizes)),
-        ffn_output=StageOutput(
-            attention,
-            group=ffn_group,
-            leaves_for_reduce_scatter=leaves_for_reduce_scatter,
+        ffn=StageDecl(
+            input=StageInput(Layout.sharded_over(axis_sizes=axis_sizes)),
+            output=StageOutput(
+                attention,
+                group=ffn_group,
+                leaves_for_reduce_scatter=leaves_for_reduce_scatter,
+            ),
         ),
         ffn_residual_rows=local,
         output_rows=attention if is_last_layer else local,
@@ -347,18 +352,20 @@ def input_scattered_layer_sides(
     )
     return DecoderLayerSides(
         input_rows=attention,
-        attention=StageInput(
-            attention,
-            gathers_itself=frozenset({TokenAxis.ATTN_TP_SCATTER}),
-            read=NORM_QUANT_READ,
+        attention=StageDecl(
+            input=StageInput(
+                attention,
+                gathers_itself=frozenset({TokenAxis.ATTN_TP_SCATTER}),
+                read=NORM_QUANT_READ,
+            ),
+            output=StageOutput(attention, group=SumGroup.ATTN_TP, always_leaves=True),
         ),
-        attention_output=StageOutput(
-            attention, group=SumGroup.ATTN_TP, always_leaves=True
-        ),
-        ffn=StageInput(Layout.sharded_over(axis_sizes=axis_sizes)),
-        # The next layer's input completes the sum; the last layer's FFN does.
-        ffn_output=StageOutput(
-            attention, group=ffn_group, leaves_for_reduce_scatter=hands_on_partial
+        ffn=StageDecl(
+            input=StageInput(Layout.sharded_over(axis_sizes=axis_sizes)),
+            # The next input completes the sum; the last FFN completes its own.
+            output=StageOutput(
+                attention, group=ffn_group, leaves_for_reduce_scatter=hands_on_partial
+            ),
         ),
         ffn_residual_rows=attention,
         output_rows=attention,
@@ -412,24 +419,26 @@ def decoder_layer_sides(
     attention_tp = axis_sizes[TokenAxis.ATTN_TP_SCATTER] > 1
     return DecoderLayerSides(
         input_rows=local if previous_on_local_rows else attention,
-        attention=StageInput(
-            attention,
-            gathers_itself=(
-                frozenset({TokenAxis.ATTN_TP_SCATTER})
-                if attention_gathers_local_rows
-                else frozenset()
+        attention=StageDecl(
+            input=StageInput(
+                attention,
+                gathers_itself=(
+                    frozenset({TokenAxis.ATTN_TP_SCATTER})
+                    if attention_gathers_local_rows
+                    else frozenset()
+                ),
+                read=NORM_QUANT_READ,
             ),
-            read=NORM_QUANT_READ,
+            # The output projection leaves the attention-TP sum to prepare_mlp.
+            output=StageOutput(
+                attention,
+                group=SumGroup.ATTN_TP if attention_tp else None,
+                always_leaves=attention_tp,
+            ),
         ),
-        # The output projection leaves the attention-TP sum to prepare_mlp.
-        attention_output=StageOutput(
-            attention,
-            group=SumGroup.ATTN_TP if attention_tp else None,
-            always_leaves=attention_tp,
-        ),
-        ffn=StageInput(ffn),
-        ffn_output=(
-            StageOutput(ffn)
+        ffn=StageDecl(
+            input=StageInput(ffn),
+            output=StageOutput(ffn)
             if ffn_on_local_rows
             else StageOutput(
                 ffn,
@@ -437,7 +446,7 @@ def decoder_layer_sides(
                 leaves_for_next_layer=leaves_for_next_layer,
                 leaves_for_reduce_scatter=leaves_for_reduce_scatter,
                 leaves_for_reduce_scatterv=leaves_for_reduce_scatterv,
-            )
+            ),
         ),
         ffn_residual_rows=local if ffn_on_local_rows else attention,
         output_rows=(

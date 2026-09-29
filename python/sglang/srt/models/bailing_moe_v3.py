@@ -32,8 +32,6 @@ from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerFacts,
     enable_moe_dense_fully_dp,
-    layer_input_buffer,
-    reduce_output,
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
@@ -1344,8 +1342,9 @@ class BailingMoELinearModel(nn.Module):
             residual = None
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states, residual = self.layers[
+                self.start_layer
+            ].layer_communicator.from_pp(pp_proxy_tensors)
 
         total_num_layers = self.end_layer - self.start_layer
         device = hidden_states.device
@@ -1382,16 +1381,12 @@ class BailingMoELinearModel(nn.Module):
                     residual=residual,
                     zero_allocator=zero_allocator,
                 )
-                if (
-                    capture_aux
-                    and i in self.layers_to_capture
-                    and layer_input_buffer(hidden_states).shape[0] != 0
-                ):
-                    hidden_states = reduce_output(hidden_states)
-                    if residual is None:
-                        dspark_aux_hidden_states.append(hidden_states)
-                    else:
-                        dspark_aux_hidden_states.append(hidden_states + residual)
+                if capture_aux and i in self.layers_to_capture:
+                    hidden_states, snapshot = layer.layer_communicator.capture_output(
+                        hidden_states, residual, skip_empty=True
+                    )
+                    if snapshot is not None:
+                        dspark_aux_hidden_states.append(snapshot)
 
         last_layer = self.layers[self.end_layer - 1]
         hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(

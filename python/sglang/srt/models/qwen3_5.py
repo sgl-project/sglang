@@ -46,7 +46,6 @@ from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_load
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerFacts,
-    reduce_output,
 )
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -1821,8 +1820,9 @@ class Qwen3_5ForCausalLM(nn.Module):
             residual = None
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states, residual = self.layers[
+                self.start_layer
+            ].layer_communicator.from_pp(pp_proxy_tensors)
 
         aux_hidden_states = []
         # Pass through decoder layers
@@ -1850,9 +1850,10 @@ class Qwen3_5ForCausalLM(nn.Module):
                 and layer_idx < 3
             ):
                 sep = self.hidden_size * layer_idx
-                hidden_states = reduce_output(hidden_states)
-                hidden_states.add_(
-                    input_deepstack_embeds[:, sep : sep + self.hidden_size]
+                hidden_states, residual = layer.layer_communicator.add_to_output(
+                    hidden_states,
+                    residual,
+                    input_deepstack_embeds[:, sep : sep + self.hidden_size],
                 )
 
         last_layer = self.layers[self.end_layer - 1]

@@ -68,11 +68,18 @@ from sglang.srt.layers.communicator.ops import (
     move_rows,
 )
 from sglang.srt.layers.communicator.output import (
-    HandoffOutput,
     UnreducedOutput,
     reduce_output,
 )
 from sglang.srt.layers.communicator.residual import LayerResidual
+from sglang.srt.layers.communicator.residual.access import (
+    add_to_output,
+    buffer,
+    finish_layer_stack,
+    fold,
+    from_pp,
+    snapshot,
+)
 from sglang.srt.layers.communicator.residual.add_norm import (
     PLAIN_RESIDUAL,
     aiter_all_reduce_fusion_enabled_for,
@@ -221,6 +228,11 @@ class LayerFusions(Protocol):
 
 
 class LayerCommunicator:
+    add_to_output = staticmethod(add_to_output)
+    buffer = staticmethod(buffer)
+    fold = staticmethod(fold)
+    finish_layer_stack = staticmethod(finish_layer_stack)
+
     # Communicators built without __init__ (e.g. test doubles) publish no LoRA
     # layout and try no fused kernel at the FFN exit.
     _publish_lora_layout: bool = False
@@ -229,6 +241,7 @@ class LayerCommunicator:
     _residual: LayerResidual = PLAIN_RESIDUAL
     # The fused kernels a backend gives the layer, if any.
     fusions: Optional[LayerFusions] = None
+    stage_edges = None
 
     def __init__(
         self,
@@ -534,14 +547,14 @@ class LayerCommunicator:
         if self._residual.attention_update.adds_plainly:
             scattered = input_scattered_layer_sides(
                 axis_sizes=token_axis_sizes(),
-                ffn_group=sides.ffn_output.group,
+                ffn_group=sides.ffn.output.group,
                 hands_on_partial=self.allow_reduce_scatter and not self.is_last_layer,
             )
             handoff = _hand_qkv_hook_its_input
         else:
             scattered = scattered_residual_layer_sides(
                 axis_sizes=token_axis_sizes(),
-                ffn_group=sides.ffn_output.group,
+                ffn_group=sides.ffn.output.group,
                 is_first_layer=self.layer_facts.is_first_layer,
                 is_last_layer=self.is_last_layer,
                 leaves_for_reduce_scatter=self.allow_reduce_scatter,
@@ -564,6 +577,39 @@ class LayerCommunicator:
             attention_fusions=self._attn_input_fusions,
             enters_stack=self.layer_facts.is_first_layer,
             **kwargs,
+        )
+
+    def snapshot(self, hidden_states, residual, *, at_input: bool = False):
+        group = None
+        if residual is not None and self.stage_edges is not None:
+            edge = self.stage_edges[0 if at_input else 1]
+            if edge.produced.always_leaves:
+                group = _sum_group(edge.produced.group)
+        return snapshot(hidden_states, residual, group=group)
+
+    def capture_output(
+        self,
+        hidden_states,
+        residual,
+        *,
+        at_input: bool = False,
+        skip_empty: bool = False,
+    ):
+        """Complete the carried output on the main path, then snapshot it.
+        Keep this explicit completion distinct from a read-only snapshot: the
+        next prepare must not select a fusion for a sum already completed here."""
+        if skip_empty:
+            storage = buffer(hidden_states)
+            if storage is not None and storage.shape[0] == 0:
+                return hidden_states, None
+        hidden_states = reduce_output(hidden_states)
+        return hidden_states, self.snapshot(hidden_states, residual, at_input=at_input)
+
+    def from_pp(self, tensors, *, allow_missing_residual: bool = False):
+        return from_pp(
+            tensors,
+            residual_in_hidden=self._residual.ffn_update.at_producer,
+            allow_missing_residual=allow_missing_residual,
         )
 
     def prepare_attn_and_capture_last_layer_outputs(
@@ -977,7 +1023,7 @@ class LayerCommunicator:
         if self._declared is None:
             raise NotImplementedError("a branch on a layer that is one stage")
         sides = self._declared
-        return sides.ffn.layout, sides.ffn_residual_rows, sides.output_rows
+        return sides.ffn.input.layout, sides.ffn_residual_rows, sides.output_rows
 
     def branch_input(
         self,
@@ -1021,23 +1067,6 @@ class LayerCommunicator:
         hidden_states = move_rows(hidden_states, rows, to, forward_batch)
         residual = move_rows(residual, rows, to, forward_batch)
         return contribution + hidden_states, residual
-
-    def finish_layer_stack(
-        self,
-        hidden_states: Union[torch.Tensor, UnreducedOutput, HandoffOutput],
-        residual: Optional[torch.Tensor],
-        forward_batch: ForwardBatch,
-        *,
-        final_norm_takes_handoff: bool = False,
-    ) -> Tuple[Union[torch.Tensor, HandoffOutput], Optional[torch.Tensor]]:
-        """Complete what this layer left for a next layer. Call it on the last
-        layer of this rank before its output reaches the final norm, the next
-        pipeline rank, or any other consumer outside the layers. A final norm
-        that does a producer's handoff together with its own work
-        (``final_norm_takes_handoff``) receives it as it is."""
-        if final_norm_takes_handoff and isinstance(hidden_states, HandoffOutput):
-            return hidden_states, residual
-        return reduce_output(hidden_states), residual
 
     def _select_ffn_exit_fusions(
         self,
@@ -1304,7 +1333,7 @@ class MHCLayerCommunicator(LayerCommunicator):
         # MHC has not been run with an FFN input gathered over attention CP.
         if (
             TokenAxis.ATTN_CP
-            in sides.attention_output.layout.sharded - sides.ffn.layout.sharded
+            in sides.attention.output.layout.sharded - sides.ffn.input.layout.sharded
         ):
             raise NotImplementedError(
                 f"MHCLayerCommunicator with a gather over attention CP: {sides=}"

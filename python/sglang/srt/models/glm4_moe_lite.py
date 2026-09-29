@@ -37,7 +37,6 @@ from sglang.srt.layers.communicator import (
     LayerFacts,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
-    reduce_output,
 )
 from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
@@ -780,8 +779,9 @@ class Glm4MoeLiteModel(nn.Module):
             residual = None
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states, residual = self.layers[
+                self.start_layer
+            ].layer_communicator.from_pp(pp_proxy_tensors)
         device = hidden_states.device
         zero_allocator = BumpAllocator(
             buffer_size=total_num_layers * 2 * (2 if forward_batch.can_run_tbo else 1),
@@ -803,8 +803,12 @@ class Glm4MoeLiteModel(nn.Module):
         for i in range(normal_start_layer, normal_end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 if i in self.layers_to_capture:
-                    hidden_states = reduce_output(hidden_states)
-                    aux_hidden_states.append(hidden_states + residual)
+                    hidden_states, snapshot = self.layers[
+                        i
+                    ].layer_communicator.capture_output(
+                        hidden_states, residual, at_input=True
+                    )
+                    aux_hidden_states.append(snapshot)
                 layer = self.layers[i]
                 hidden_states, residual = layer(
                     positions,

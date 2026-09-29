@@ -1154,8 +1154,9 @@ class SarvamMLAModel(nn.Module):
             residual = None
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states, residual = self.layers[
+                self.start_layer
+            ].layer_communicator.from_pp(pp_proxy_tensors)
 
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
@@ -1279,6 +1280,11 @@ class SarvamMLAForCausalLM(nn.Module):
                 )
 
         if end == self.model.config.num_hidden_layers:
+            forward_batch.hidden_states, forward_batch.residual = self.model.layers[
+                end - 1
+            ].layer_communicator.finish_layer_stack(
+                forward_batch.hidden_states, forward_batch.residual, forward_batch
+            )
             if forward_batch.residual is None:
                 hidden_states = self.model.norm(forward_batch.hidden_states)
             else:
@@ -1462,6 +1468,11 @@ class SarvamMoEForCausalLM(BailingMoEForCausalLM):
                 )
 
         if end == self.model.config.num_hidden_layers:
+            forward_batch.hidden_states, forward_batch.residual = self.model.layers[
+                end - 1
+            ].layer_communicator.finish_layer_stack(
+                forward_batch.hidden_states, forward_batch.residual, forward_batch
+            )
             if forward_batch.residual is None:
                 hidden_states = self.model.norm(forward_batch.hidden_states)
             else:

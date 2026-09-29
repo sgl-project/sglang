@@ -630,7 +630,11 @@ class LongcatFlashModel(nn.Module):
         topk_indices = None
         for i in range(total_num_layers):
             if i in self.layers_to_capture:
-                aux_hidden_states.append(hidden_states + residual)
+                aux_hidden_states.append(
+                    self.layers[i].moe_layer_communicator.snapshot(
+                        hidden_states, residual, at_input=True
+                    )
+                )
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]
                 hidden_states, residual, topk_indices = layer(
@@ -641,6 +645,11 @@ class LongcatFlashModel(nn.Module):
                     zero_allocator,
                     topk_indices,
                 )
+
+        last_layer = self.layers[-1]
+        hidden_states, residual = last_layer.moe_layer_communicator.finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
 
         if hidden_states.shape[0] != 0:
             if residual is None:

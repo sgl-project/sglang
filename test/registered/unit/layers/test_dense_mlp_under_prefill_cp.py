@@ -39,8 +39,8 @@ class TestDenseMlpUnderPrefillCP(CustomTestCase):
             leaves_for_reduce_scatterv=False,
         )
         # The TP group spans every CP rank, so the MLP takes every row.
-        self.assertIn(TokenAxis.ATTN_CP, sides.attention.layout.sharded)
-        self.assertNotIn(TokenAxis.ATTN_CP, sides.ffn.layout.sharded)
+        self.assertIn(TokenAxis.ATTN_CP, sides.attention.input.layout.sharded)
+        self.assertNotIn(TokenAxis.ATTN_CP, sides.ffn.input.layout.sharded)
         moves = CpMoves(
             gather=comm_ops._mlp_input_gather_moe_cp,
             take_back=comm.CommunicateSummableTensorPairFn._scatter_hidden_states_moe,
