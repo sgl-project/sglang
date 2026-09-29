@@ -61,6 +61,22 @@ class Qwen3CoderDetector(BaseFormatDetector):
     def has_tool_call(self, text: str) -> bool:
         return self.tool_call_start_token in text
 
+    def _trim_incomplete_tool_suffix(self, text: str) -> str:
+        """Drop an unfinished trailing tool-call fragment from visible text."""
+        start_idx = text.find(self.tool_call_start_token)
+        if start_idx != -1:
+            return text[:start_idx]
+
+        prefix_idx = text.find(self.tool_call_prefix)
+        if prefix_idx != -1:
+            return text[:prefix_idx]
+
+        # Truncated start marker, e.g. "...after<tool_call" or "...after<tool_cal".
+        for i in range(len(self.tool_call_start_token) - 1, 0, -1):
+            if text.endswith(self.tool_call_start_token[:i]):
+                return text[:-i]
+        return text
+
     def _get_arguments_config(
         self, func_name: str, tools: Optional[list[Tool]]
     ) -> dict:
@@ -233,7 +249,9 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
             # Visible text: everything outside complete <tool_call>...</tool_call>
             # blocks (prefix, inter-call text, and suffix). Matches streaming,
-            # which keeps emitting after </tool_call>.
+            # which keeps emitting after </tool_call>. Trim any unfinished
+            # trailing tool-call fragment so a complete call followed by an
+            # incomplete one does not leak into normal_text.
             if self.tool_call_regex.search(text):
                 normal_text = self.tool_call_regex.sub("", text)
             else:
@@ -242,6 +260,8 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 if start_idx == -1:
                     start_idx = text.find(self.tool_call_prefix)
                 normal_text = text[:start_idx] if start_idx > 0 else ""
+
+            normal_text = self._trim_incomplete_tool_suffix(normal_text)
 
             return StreamingParseResult(normal_text=normal_text, calls=calls)
 

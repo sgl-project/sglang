@@ -2428,6 +2428,48 @@ class TestQwen3CoderDetector(unittest.TestCase):
             ).normal_text
         self.assertEqual(streamed, "beforeafter")
 
+    def test_nonstrm_trims_incomplete_call_after_complete(self):
+        """Complete call + unfinished call must not leak into normal_text."""
+        complete = (
+            "<tool_call><function=get_current_weather>"
+            "<parameter=location>Paris</parameter>"
+            "</function></tool_call>"
+        )
+        text = (
+            "before"
+            + complete
+            + "between<tool_call><function=get_current_weather>"
+            "<parameter=location>Rome"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.normal_text, "beforebetween")
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_current_weather")
+        self.assertEqual(json.loads(result.calls[0].parameters)["location"], "Paris")
+
+        stream_detector = Qwen3CoderDetector()
+        streamed = ""
+        for ch in text:
+            streamed += stream_detector.parse_streaming_increment(
+                ch, self.tools
+            ).normal_text
+        self.assertEqual(streamed, "beforebetween")
+
+    def test_nonstrm_trims_truncated_tool_call_marker(self):
+        """Truncated final <tool_call marker must be stripped from normal_text."""
+        text = (
+            "before<tool_call>"
+            "<function=get_current_weather>"
+            "<parameter=location>Paris</parameter>"
+            "</function></tool_call>after<tool_call"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.normal_text, "beforeafter")
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_current_weather")
+
     def test_multiple_tool_calls(self):
         """
         Test parsing of multiple consecutive tool calls.
