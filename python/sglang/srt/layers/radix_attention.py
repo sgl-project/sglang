@@ -117,6 +117,7 @@ class RadixAttention(nn.Module):
         attn_type: AttentionType = AttentionType.DECODER,
         use_irope: bool = False,
         prefix: str = "",
+        use_prefill_attention_wrapper: bool = True,
     ):
         super().__init__()
         self.tp_q_head_num = num_heads
@@ -131,6 +132,7 @@ class RadixAttention(nn.Module):
         self.sliding_window_size = sliding_window_size or -1
         self.is_cross_attention = is_cross_attention
         self.use_irope = use_irope
+        self.use_prefill_attention_wrapper = use_prefill_attention_wrapper
         self.k_scale = None
         self.v_scale = None
         self.k_scale_float = None
@@ -175,7 +177,8 @@ class RadixAttention(nn.Module):
 
         context = get_tc_piecewise_forward_context()
         if (
-            forward_batch.forward_mode.is_extend()
+            self.use_prefill_attention_wrapper
+            and forward_batch.forward_mode.is_extend()
             and context is not None
             # ``_force_eager_attn`` is only set inside Inkling's eager
             # norm+attn+sconv region, never during tc-piecewise capture. Reading

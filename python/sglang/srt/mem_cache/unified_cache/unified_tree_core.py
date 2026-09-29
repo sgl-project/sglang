@@ -60,6 +60,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     ComponentData,
     ComponentType,
     EvictLayer,
+    InternalStateBackup,
     LinkerTransferPhase,
     LRURefreshPhase,
     TreeComponent,
@@ -367,18 +368,6 @@ class UnifiedLRUList:
             return None
         return x
 
-    def get_prev_leaf_no_lock(self, node: UnifiedTreeNode, check_id: bool = True):
-        if check_id:
-            assert node.id in self.cache
-        pt = self._pt
-        ct = self.component_type
-        x = node.lru_prev[pt]
-        while x.component_data[ct].lock_ref > 0 or len(x.children) > 0:
-            x = x.lru_prev[pt]
-        if x == self.head:
-            return None
-        return x
-
     def get_prev_no_host_lock(self, node: UnifiedTreeNode, check_id: bool = True):
         """Host-LRU walker: skip nodes whose component host_lock_ref > 0."""
         if check_id:
@@ -394,9 +383,6 @@ class UnifiedLRUList:
 
     def get_lru_no_lock(self):
         return self.get_prev_no_lock(self.tail, check_id=False)
-
-    def get_leaf_lru_no_lock(self):
-        return self.get_prev_leaf_no_lock(self.tail, check_id=False)
 
     def get_lru_no_host_lock(self):
         return self.get_prev_no_host_lock(self.tail, check_id=False)
@@ -489,6 +475,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def reset(self) -> None:
         """Rebuild the root, LRUs, sizes, evictable-leaf sets, and the empty
         match result."""
+        # End suspended walks while their session-cursor sentinels still
+        # belong to the old LRUs, clearing any pending internal victim.
+        for component in self.components:
+            if component.is_evict_device_ongoing:
+                component.evict_device_end()
+        # Internal victims awaiting the controller's backup and finish call.
+        self._pending_internal_evictions: dict[ComponentType, NodeId] = {}
         # Maintains the NodeId -> active tree node mapping.
         self._node_arena: dict[NodeId, UnifiedTreeNode] = {}
 
@@ -754,6 +747,25 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         )
         self._update_evictable_leaf_sets(node)
 
+    def dec_window_lock_only(
+        self,
+        node_id: NodeId,
+        component_type: ComponentType,
+        params: DecLockRefParams,
+    ) -> DecSwaLockOnlyResult:
+        result = DecSwaLockOnlyResult()
+        node = self.node_by_id(node_id)
+        self._assert_receipt_anchor(node, params)
+        if node is self.root_node or component_type in params.skipped_lock_components:
+            return result
+        self.components_by_type[component_type].release_window_lock(
+            node,
+            params.get_lock_uuid(component_type),
+            result.device_frees,
+            result.host_frees,
+        )
+        return result
+
     def dec_swa_lock_only(
         self,
         node_id: NodeId,
@@ -764,11 +776,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         result = DecSwaLockOnlyResult()
         node = self.node_by_id(node_id)
         self._assert_receipt_anchor(node, params)
+        if node is self.root_node:
+            return result
         swa_component = self.components_by_type.get(ComponentType.SWA)
         if swa_component is None:
             return result
         swa_component.release_window_lock(
-            node, params.swa_uuid_for_lock, result.device_frees, result.host_frees
+            node,
+            params.get_lock_uuid(ComponentType.SWA),
+            result.device_frees,
+            result.host_frees,
         )
 
         # Drop strictly-lower-priority locks co-located on the node, skipping
@@ -1279,7 +1296,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 dup = value_slice[dup_start:consumed_from]
                 abs_start = state.total_prefix_length + dup_start
                 swa_already_freed = min(
-                    max(state.params.swa_evicted_seqlen - abs_start, 0), dup.numel()
+                    max(
+                        state.params.get_evicted_seqlen(ComponentType.SWA) - abs_start,
+                        0,
+                    ),
+                    dup.numel(),
                 )
                 if swa_already_freed > 0:
                     step_actions.append(FreeDeviceKVFullOnly([dup[:swa_already_freed]]))
@@ -1573,12 +1594,15 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         result = EvictDeviceNextNodeResult()
         # The walk reads running totals for its doneness check; the result
         # carries only this step's delta.
+        component = self.components_by_type[component_type]
+        assert component_type not in self._pending_internal_evictions, (
+            f"finish the pending internal {component_type.name} eviction "
+            "before advancing"
+        )
         updated_tracker = defaultdict(int, tracker)
         self._begin_tracking_unbacked_tokens()
         try:
-            result.node_id = self.components_by_type[
-                component_type
-            ].evict_device_next_node(
+            step = component.evict_device_next_node(
                 updated_tracker, result.device_frees, result.host_frees
             )
         finally:
@@ -1587,12 +1611,99 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             delta = n - tracker.get(ct, 0)
             if delta:
                 result.tracker[ct] = delta
-        result.made_progress = result.node_id is not None or bool(result.tracker)
+        if isinstance(step, InternalStateBackup):
+            assert component_type in (ComponentType.MAMBA, ComponentType.SWA)
+            self._pending_internal_evictions[component_type] = step.node_id
+            if component_type == ComponentType.MAMBA:
+                result.mamba_backup_node_id = step.node_id
+            else:
+                result.swa_backup_node_id = step.node_id
+                result.swa_backup_num_tokens = step.num_tokens
+        else:
+            result.node_id = step
+        result.made_progress = (
+            result.node_id is not None
+            or result.mamba_backup_node_id is not None
+            or result.swa_backup_node_id is not None
+            or bool(result.tracker)
+        )
+        return result
+
+    def finish_mamba_state_eviction(self, node_id: NodeId) -> EvictDeviceNextNodeResult:
+        return self._finish_internal_component_eviction(ComponentType.MAMBA, node_id)
+
+    def finish_swa_state_eviction(self, node_id: NodeId) -> EvictDeviceNextNodeResult:
+        return self._finish_internal_component_eviction(ComponentType.SWA, node_id)
+
+    def _finish_internal_component_eviction(
+        self, component_type: ComponentType, node_id: NodeId
+    ) -> EvictDeviceNextNodeResult:
+        """Resume an internal tombstone after the controller's backup attempt."""
+        component = self.components_by_type[component_type]
+        assert component.is_evict_device_ongoing, (
+            f"{component_type.name} device eviction not started"
+        )
+        assert self._pending_internal_evictions.get(component_type) == node_id, (
+            f"no matching pending internal {component_type.name} eviction"
+        )
+        del self._pending_internal_evictions[component_type]
+        # Consuming the pending request advances the walk even if I/O changed
+        # this victim's eligibility. No frees occur before backup completion.
+        result = EvictDeviceNextNodeResult(made_progress=True)
+        node = self._node_arena.get(node_id)
+        lru = self.lru_lists[component_type]
+        enabled = self.enable_session_radix_cache
+        if (
+            node is None
+            or node.component_data[component_type].value is None
+            or node.component_data[component_type].lock_ref > 0
+            or (
+                component_type == ComponentType.MAMBA
+                and node.load_back_pending_id is not None
+            )
+            or not lru.in_list(node)
+        ):
+            if enabled:
+                component._evict_device_cursor = lru.cursor_next()
+            return result
+        if (
+            node in self.evictable_device_leaves
+            and (not enabled or component._can_evict_leaf_atomically(node))
+        ) or (
+            component_type == ComponentType.MAMBA
+            and node.component_data[BASE_COMPONENT_TYPE].value is None
+        ):
+            # Re-select changed leaves through the normal walk; internal
+            # finish must not accidentally perform an atomic Full eviction.
+            component._evict_device_cursor = node
+            return result
+        self._begin_tracking_unbacked_tokens()
+        try:
+            self._evict_component_and_detach_lru(
+                node,
+                component,
+                target=EvictLayer.DEVICE,
+                tracker=result.tracker,
+                device_frees=result.device_frees,
+                host_frees=result.host_frees,
+            )
+            self._cascade_evict(
+                node,
+                component,
+                result.tracker,
+                device_frees=result.device_frees,
+                host_frees=result.host_frees,
+            )
+        finally:
+            result.unbacked_tokens = self._finish_tracking_unbacked_tokens()
+        if enabled:
+            component._evict_device_cursor = lru.cursor_next()
         return result
 
     def evict_device_end(self, component_type: ComponentType) -> None:
         """Finish a component's device-eviction walk."""
         self.components_by_type[component_type].evict_device_end()
+        self._pending_internal_evictions.pop(component_type, None)
 
     def evict_device_leaf(
         self, node_id: NodeId, is_write_back: bool
@@ -3043,6 +3154,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def component_evictable_size(self, component_type: ComponentType) -> int:
         """Evictable token count for one component (0 if the component is absent)."""
         return self.component_evictable_size_.get(component_type, 0)
+
+    def component_protected_size(self, component_type: ComponentType) -> int:
+        return self.component_protected_size_.get(component_type, 0)
 
     def full_evictable_size(self) -> int:
         return self.evictable_size()
