@@ -1211,9 +1211,7 @@ class MQALayer(MqaAttentionBase):
             prefix=add_prefix("attn_mqa", prefix),
         )
 
-        self.use_fused_qk_norm_rope = _is_hip and _hip.use_fused_qk_norm_rope(
-            self, quant_config
-        )
+        self.use_fused_qk_norm_rope = _is_hip and _hip.use_fused_qk_norm_rope(self)
         # Static eligibility; token count and wo_b's output format are checked
         # in forward, after weights have loaded.
         self.use_fused_wo_a = (

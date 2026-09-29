@@ -341,9 +341,10 @@ export const config = {
       ],
     },
 
-    // ---------- MI350X: 4x MI350X (gfx950), TP4 + EP4. Same flags as the B200 /
-    // GB300 cells: the backends resolve automatically on HIP, and the radix cache
-    // works (turning it off cost ~10% at 32 concurrent requests). ----------
+    // ---------- MI350X: 4x MI350X (gfx950), TP4 + EP4. Same server flags as the
+    // B200 / GB300 cells plus two aiter env vars: the backends resolve automatically
+    // on HIP, and the radix cache works (turning it off cost ~10% at 32 concurrent
+    // requests). ----------
     {
       match: { hw: "mi350x", strategy: "low-latency" },
       nnodes: 1,

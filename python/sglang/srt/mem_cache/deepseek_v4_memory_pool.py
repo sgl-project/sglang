@@ -711,17 +711,6 @@ class DeepSeekV4IndexerPool(KVCache):
         """Packed fp4 rows at `slots`: (payload int8 [n, 64], scales int32 [n]),
         from the page layout [page_size * 64 payload | page_size * 4 scale]."""
         assert self.use_fp4_indexer, "packed readback only applies to the fp4 layout"
-        if self.uses_aiter_fp4_layout:
-            from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
-                read_fp4_index_k_split,
-            )
-
-            return read_fp4_index_k_split(
-                self.index_k_payload_buffer[layer_id - self.start_layer],
-                self.index_k_scale_buffer[layer_id - self.start_layer],
-                slots,
-                page_size=self.page_size,
-            )
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         slots = slots.to(torch.int64)
         p = self.page_size
@@ -741,13 +730,23 @@ class DeepSeekV4IndexerPool(KVCache):
         from sglang.srt.layers.quantization.fp8 import DSV4_DEQUANT_FP4_TABLE
 
         assert self.use_fp4_indexer, "dequant readback only applies to the fp4 layout"
+        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         if slots is None:
-            slots = torch.arange(self.size, device=self.device)
-        payload, packed = self.get_index_k_fp4(layer_id, slots.to(torch.int64))
-        u = payload.view(torch.uint8)  # [n, 64]
+            slots = torch.arange(self.size, device=buf.device)
+        slots = slots.to(torch.int64)
+        # Page layout: see get_index_k_fp4.
+        p = self.page_size
+        page, off = (slots // p).unsqueeze(-1), slots % p
+        payload_cols = (off * 64).unsqueeze(-1) + torch.arange(64, device=buf.device)
+        scale_cols = (p * 64 + off * 4).unsqueeze(-1) + torch.arange(
+            4, device=buf.device
+        )
+        u = buf[page, payload_cols].view(torch.uint8)  # [n, 64]
         codes = torch.stack([u & 0x0F, (u >> 4) & 0x0F], dim=-1)  # [n, 64, 2]
-        vals = DSV4_DEQUANT_FP4_TABLE.to(u.device)[codes.long()].flatten(1)  # [n, 128]
-        exps = torch.stack([(packed >> (8 * c)) & 0xFF for c in range(4)], dim=-1)
+        vals = DSV4_DEQUANT_FP4_TABLE.to(buf.device)[codes.long()].flatten(
+            1
+        )  # [n, 128]
+        exps = buf[page, scale_cols].to(torch.int32) & 0xFF  # [n, 4]
         scales = torch.exp2(exps.float() - 127).repeat_interleave(32, dim=-1)
         return (vals * scales).to(torch.bfloat16)
 

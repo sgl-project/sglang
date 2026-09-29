@@ -97,7 +97,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
-from sglang.srt.utils import ceil_align, is_gfx95_supported
+from sglang.srt.utils import ceil_align
 
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
@@ -1993,8 +1993,10 @@ class DeepseekV4HipRadixBackend(
             num_tokens=sum(extend_seq_lens_cpu),
             extend_seq_lens=extend_seq_lens,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
+            extend_start_loc=forward_batch.extend_start_loc,
             need_compress=not is_draft,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
+            exact_num_tokens=is_draft,
         )
 
     # ---- decoder SWA bounded replay ---------------------------------------
@@ -2899,7 +2901,6 @@ class DeepseekV4HipRadixBackend(
             backend = resolve_hip_flashmla_backend()
             if (
                 backend == "aiter_sparse"
-                and is_gfx95_supported()
                 and 0 < q.shape[0] <= SWAPAB_MAX_BATCH
                 and q.shape[1:] == (1, SWAPAB_NUM_HEADS, SWAPAB_HEAD_DIM)
                 and q.dtype == torch.bfloat16
@@ -2996,19 +2997,13 @@ class DeepseekV4HipRadixBackend(
                     "SGLANG_DSV41_TORCH_PREFILL_INDEXER (the torch prefill indexer "
                     "oracle) is not supported on HIP"
                 )
-            assert rows_per_request is not None or (
+            # HIP rejects prefill CP, the only caller passing rows_per_request
+            assert rows_per_request is None, "prefill CP is not supported on HIP"
+            assert (
                 forward_batch.seq_lens_cpu is not None
                 and forward_batch.extend_seq_lens_cpu is not None
             ), "the HIP low-ratio prefill indexer needs the batch's CPU lengths"
-            low_ratio_index_topk_hip_extend(
-                self,
-                layer,
-                x,
-                q_lora,
-                pos,
-                forward_batch,
-                query_lens_cpu=rows_per_request,
-            )
+            low_ratio_index_topk_hip_extend(self, layer, x, q_lora, pos, forward_batch)
         else:
             raise NotImplementedError(
                 f"low-ratio indexer for {forward_batch.forward_mode} on HIP"

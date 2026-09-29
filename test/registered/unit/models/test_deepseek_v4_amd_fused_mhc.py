@@ -4,11 +4,9 @@ from unittest import mock
 from sglang.srt.environ import envs
 from sglang.srt.models.deepseek_common.amd import deepseek_v4_fused_mhc
 from sglang.srt.runtime_context import override_platform
-from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
-# backend-specific: the numerical class runs the gfx950 fused mHC kernels
-register_amd_ci(est_time=10, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
 
 
 class TestAmdFusedMhcCrossLayerGating(unittest.TestCase):

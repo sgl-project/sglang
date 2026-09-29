@@ -31,7 +31,7 @@ wo_b_takes_fp8_grid = gfx95_dense.wo_b_takes_fp8_grid
 # ---- MqaAttentionBase / MQALayer ----
 
 
-def use_fused_qk_norm_rope(attn, quant_config) -> bool:
+def use_fused_qk_norm_rope(attn) -> bool:
     return bool(envs.SGLANG_OPT_USE_FUSED_QK_NORM_ROPE.get() and attn.q_head_norm)
 
 

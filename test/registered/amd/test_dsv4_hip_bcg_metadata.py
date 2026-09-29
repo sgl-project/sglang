@@ -18,7 +18,7 @@ from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=20, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 SWA_WINDOW = 128
 PAGE_SIZE = 256

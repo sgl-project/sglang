@@ -4,7 +4,6 @@ payload / scale index-K pools, then the AOT top-k transform -- the DeepGEMM path
 from __future__ import annotations
 
 import itertools
-import logging
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
@@ -40,7 +39,6 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-logger = logging.getLogger(__name__)
 
 # fp32 logits scored per candidate-block chunk stay under this many bytes
 _CANDIDATE_SCORE_BUDGET_BYTES = 1 << 30
@@ -331,8 +329,6 @@ def low_ratio_index_topk_hip_extend(
     q_lora,
     pos,
     forward_batch: ForwardBatch,
-    *,
-    query_lens_cpu: Optional[List[int]] = None,
 ) -> None:
     """Ragged prefill: the FlyDSL prefill kernel scores every token's visible compressed positions,
     candidate masks are published or applied per request, one paged top-k selects every row.
@@ -349,10 +345,8 @@ def low_ratio_index_topk_hip_extend(
         raw_indices.fill_(-1)
 
     seq_lens_cpu = _as_int_list(forward_batch.seq_lens_cpu)
-    # CP counts are local; bounded replay counts cover only each request's tail.
-    if query_lens_cpu is not None:
-        extend_lens_cpu = query_lens_cpu
-    elif metadata.late_layer_tail is not None:
+    # bounded replay counts cover only each request's tail
+    if metadata.late_layer_tail is not None:
         extend_lens_cpu = metadata.late_layer_tail.extend_seq_lens_cpu
     else:
         extend_lens_cpu = _as_int_list(forward_batch.extend_seq_lens_cpu)
