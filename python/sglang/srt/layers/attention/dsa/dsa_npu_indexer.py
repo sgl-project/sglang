@@ -7,6 +7,7 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.dsa_cp import get_dsa_cp_plan
 from sglang.srt.layers.communicator import ScatterMode
 from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
@@ -124,6 +125,61 @@ class _IndexerQueryShard:
         out = topk_indices.new_empty((self.rows * self.tp_size, topk_indices.shape[-1]))
         attn_tp_all_gather_into_tensor(out, topk_indices.contiguous())
         return out[:num_tokens]
+
+    def resolve(
+        self, topk_indices: torch.Tensor, num_tokens: int, forward_batch
+    ) -> torch.Tensor:
+        """Full-width top-k, or this rank's own rows when DSA-CP will slice anyway.
+
+        Handoff §8 W2. Under DSA-CP the gather above is pure waste: attention
+        immediately cuts the gathered tensor back to ``[local_start, local_end)``
+        with ``dsa_cp_slice``, and that is the same row range this rank already
+        holds. Both planners compute ``rows = ceil(total / tp_size)`` and
+        ``start = rank * rows``, which
+        ``test/registered/dcp/test_dsa_cp_indexer_row_agreement.py`` pins --
+        **that test is what makes this safe, and it is why it landed first.**
+        Until now the agreement was incidental, because the gather hid any
+        disagreement; skipping the gather makes it load-bearing.
+
+        Removes one all-gather of ``index_topk`` int32 per token, and its sync
+        point, from each indexer layer.
+
+        Sets ``forward_batch.npu_indexer_topk_is_local`` so the attention side
+        knows which of the two it was handed. The flag describes the most
+        recently produced top-k, which is exactly the tensor the skip-topk
+        layers pass along -- and a layer that declines to shard rewrites it to
+        False before its own attention runs.
+
+        Rows past ``num_real`` are zeroed rather than left as the operator wrote
+        them. The gather-then-slice path fills them with zeros (``dsa_cp_slice``
+        pads), so this keeps the result bitwise identical rather than merely
+        equivalent. It is at most ``tp_size - 1`` rows, on the last rank only.
+        """
+        plan = get_dsa_cp_plan(forward_batch)
+        local = plan is not None
+        if local and (plan.rows != self.rows or plan.local_start != self.start):
+            # Cannot happen while the row-agreement test passes. Gather anyway
+            # rather than fail: the gathered path stays correct either way.
+            print_info_once(
+                "DSA-CP and indexer sharding disagree on the row range "
+                f"(plan {plan.local_start}+{plan.rows} against shard "
+                f"{self.start}+{self.rows}); keeping the top-k all-gather"
+            )
+            local = False
+        forward_batch.npu_indexer_topk_is_local = local
+        if not local:
+            return self.gather(topk_indices, num_tokens)
+        # Deliberately not gated on attn_tp_rank, so a grep returns the rank
+        # count and not 1. Without this line a W2 that silently never engaged
+        # would look exactly like a W2 that worked: the output is identical
+        # either way, and only the timing would differ.
+        print_info_once(
+            "DSA-CP W2: skipping the indexer top-k all-gather; each rank keeps "
+            "the rows it scored"
+        )
+        if self.num_real < self.rows:
+            topk_indices[self.num_real :] = 0
+        return topk_indices
 
 
 def _build_indexer_query_shard(
@@ -530,7 +586,11 @@ class DSANPUIndexerMixin:
                     sparse_mode=3,
                 )[0].squeeze(1)
             if shard is not None:
-                topk_indices = shard.gather(topk_indices, num_query_tokens)
+                topk_indices = shard.resolve(
+                    topk_indices, num_query_tokens, forward_batch
+                )
+            else:
+                forward_batch.npu_indexer_topk_is_local = False
             # Keep DSA top-k as [T, K]; NPU attention expands it when needed.
             return topk_indices
 

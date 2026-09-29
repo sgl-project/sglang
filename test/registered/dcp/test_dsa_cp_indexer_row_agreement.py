@@ -38,9 +38,16 @@ Usage:
 import itertools
 import random
 import unittest
+from unittest import mock
 
+import torch
+
+from sglang.srt.layers.attention.dsa import dsa_cp as dsa_cp_module
 from sglang.srt.layers.attention.dsa.dsa_cp_layout import plan_dsa_cp_shard
-from sglang.srt.layers.attention.dsa.dsa_npu_indexer import plan_indexer_query_shard
+from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
+    _IndexerQueryShard,
+    plan_indexer_query_shard,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -168,6 +175,150 @@ class TestStageAAndDsaCpAgree(CustomTestCase):
                         min(padded),
                         f"total={total} tp={tp_size}: a padded rank precedes a full one",
                     )
+
+
+class _FakeBatch:
+    """Just enough ForwardBatch for ``get_dsa_cp_plan`` to read its cache."""
+
+    def __init__(self, plan):
+        self.npu_dsa_cp_plan = plan
+
+
+def _shard_for(extend_lens, prefix_lens, tp_size, tp_rank):
+    start, rows, num_real, _, _ = plan_indexer_query_shard(
+        prefix_lens, extend_lens, tp_size, tp_rank
+    )
+    return _IndexerQueryShard(
+        start=start,
+        rows=rows,
+        num_real=num_real,
+        total=sum(extend_lens),
+        tp_size=tp_size,
+        actual_seq_lengths_q=None,
+        actual_seq_lengths_kv=None,
+    )
+
+
+class TestW2LocalTopk(CustomTestCase):
+    """``_IndexerQueryShard.resolve`` -- handoff §8 W2.
+
+    It drops the top-k all-gather when DSA-CP is about to slice the result back
+    to the rows this rank already holds. The decision has to be exactly right:
+    taking the local path when DSA-CP is NOT running hands attention a tensor
+    a sixteenth of the width it expects, and skipping it when the two planners
+    disagree hands every query a top-k computed for a different token, with no
+    shape error to catch it.
+    """
+
+    TOPK = 8  # stands in for index_topk; only the row axis matters here
+
+    def _resolve(self, extend_lens, prefix_lens, tp_size, tp_rank, plan_rank=None):
+        """Returns (out, flag, gathered, shard). ``plan_rank`` skews the plan."""
+        shard = _shard_for(extend_lens, prefix_lens, tp_size, tp_rank)
+        plan = (
+            None
+            if plan_rank is None
+            else plan_dsa_cp_shard(
+                extend_lens,
+                [p + e for p, e in zip(prefix_lens, extend_lens)],
+                tp_size,
+                plan_rank,
+            )
+        )
+        batch = _FakeBatch(plan)
+        topk = (
+            torch.arange(shard.rows * self.TOPK, dtype=torch.int32).reshape(
+                shard.rows, self.TOPK
+            )
+            + 1
+        )
+        seen = {"gathered": False}
+
+        def _fake_gather(t, num_tokens):
+            seen["gathered"] = True
+            return t
+
+        with (
+            mock.patch.object(dsa_cp_module, "_enable_dsa_cp", True),
+            mock.patch.object(_IndexerQueryShard, "gather", _fake_gather),
+        ):
+            out = shard.resolve(topk, sum(extend_lens), batch)
+        return out, batch.npu_indexer_topk_is_local, seen["gathered"], shard
+
+    def test_gathers_when_dsa_cp_is_not_running(self):
+        """No plan means attention reads full width, so the gather must happen."""
+        out, local, gathered, _ = self._resolve([16384], [0], 16, 3, plan_rank=None)
+        self.assertFalse(local)
+        self.assertTrue(gathered, "dropped the gather with DSA-CP off")
+
+    def test_skips_the_gather_when_dsa_cp_planned_the_same_rows(self):
+        for tp_size in TP_SIZES:
+            for tp_rank in range(tp_size):
+                for extend_lens, prefix_lens in (
+                    ([16384], [0]),
+                    ([13855], [4096]),
+                    ([1557], [1_000_000]),
+                    ([5003, 4001, 6002], [0, 2048, 4096]),
+                ):
+                    with self.subTest(tp=tp_size, rank=tp_rank, ext=extend_lens):
+                        out, local, gathered, shard = self._resolve(
+                            extend_lens,
+                            prefix_lens,
+                            tp_size,
+                            tp_rank,
+                            plan_rank=tp_rank,
+                        )
+                        self.assertTrue(local)
+                        self.assertFalse(gathered)
+                        self.assertEqual(out.shape[0], shard.rows)
+
+    def test_padding_rows_are_zeroed_exactly_as_the_gather_path_leaves_them(self):
+        """``dsa_cp_slice`` zero-pads, so the local path must too -- bitwise.
+
+        Two shapes that actually produce padding, from the arithmetic rather
+        than from assumption:
+
+        * 16385 over tp 16 -> rows 1025; only rank 15 is padded, by 15 rows.
+          One chunked-prefill batch plus a single token, the everyday ragged
+          case.
+        * 17 over tp 16 -> rows 2; rank 8 holds 1 real row and ranks 9-15 hold
+          no real token at all. An all-padding rank must come back all zeros,
+          not as whatever the operator left in a top-k it never wrote.
+
+        A batch of exactly 16384 pads no rank at all, which is why that shape
+        once hid an alignment bug. It is covered by the test above, not here.
+        """
+        for extend_lens, prefix_lens, tp_size in (
+            ([16385], [0], 16),
+            ([17], [0], 16),
+        ):
+            for tp_rank in range(tp_size):
+                with self.subTest(total=sum(extend_lens), rank=tp_rank):
+                    out, local, _, shard = self._resolve(
+                        extend_lens, prefix_lens, tp_size, tp_rank, plan_rank=tp_rank
+                    )
+                    self.assertTrue(local)
+                    self.assertTrue(
+                        bool((out[: shard.num_real] != 0).all()),
+                        "zeroed a real row",
+                    )
+                    self.assertEqual(
+                        int(out[shard.num_real :].abs().sum()),
+                        0,
+                        f"rank {tp_rank} left "
+                        f"{shard.rows - shard.num_real} padding rows unzeroed; "
+                        "the gather path would have zeroed them",
+                    )
+
+    def test_falls_back_to_the_gather_when_the_planners_disagree(self):
+        """Unreachable while the agreement above holds -- and it must stay safe.
+
+        Simulated by handing the shard a plan built for a different rank, which
+        is exactly the shape a row-range disagreement would take.
+        """
+        out, local, gathered, _ = self._resolve([16384], [0], 16, 3, plan_rank=5)
+        self.assertFalse(local, "used a plan that designates other rows")
+        self.assertTrue(gathered)
 
 
 if __name__ == "__main__":

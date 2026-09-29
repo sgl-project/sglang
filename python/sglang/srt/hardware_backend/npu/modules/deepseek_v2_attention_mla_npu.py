@@ -784,10 +784,25 @@ def forward_dsa_core_npu(
             dsa_cp_rows = q_nope_out.shape[0]
             q_nope_out = dsa_cp_redistribute_heads(q_nope_out, dsa_cp_plan)
             q_pe = dsa_cp_redistribute_heads(q_pe, dsa_cp_plan)
-            # This rank's rows of the full-width top-k. A separate name is
-            # load-bearing: topk_indices is returned for the next layer to reuse,
-            # so rebinding it here would hand that layer a slice of a slice.
-            attn_topk_indices = dsa_cp_slice(topk_indices, dsa_cp_plan)
+            # This rank's rows of the top-k. A separate name is load-bearing:
+            # topk_indices is returned for the next layer to reuse, so rebinding
+            # it here would hand that layer a slice of a slice.
+            if getattr(forward_batch, "npu_indexer_topk_is_local", False):
+                # W2: the indexer scored only this rank's rows and skipped its
+                # all-gather, so there is nothing left to cut. Checked rather
+                # than assumed -- a full-width tensor arriving here would give
+                # every rank but 0 the wrong rows, silently and with no shape
+                # error downstream, which is the failure this whole path is
+                # most exposed to.
+                if topk_indices.shape[0] != dsa_cp_plan.rows:
+                    raise RuntimeError(
+                        "top-k is marked local to this rank but carries "
+                        f"{topk_indices.shape[0]} rows, not the plan's "
+                        f"{dsa_cp_plan.rows}"
+                    )
+                attn_topk_indices = topk_indices
+            else:
+                attn_topk_indices = dsa_cp_slice(topk_indices, dsa_cp_plan)
             attn_mqa = m.attn_mqa_for_dsa_cp
         else:
             attn_topk_indices = topk_indices
