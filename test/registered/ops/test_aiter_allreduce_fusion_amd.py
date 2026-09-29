@@ -10,8 +10,8 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.layers.communicator import UnreducedOutput
-from sglang.srt.layers.communicator.layer import LayerCommunicator
+from sglang.srt.layers.layer_boundary import UnreducedOutput
+from sglang.srt.layers.layer_boundary.fusions.allreduce import complete_attention_input
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
@@ -382,9 +382,7 @@ class TestAiterAllreduceFusionGate(CustomTestCase):
         norm = types.SimpleNamespace(
             forward_with_allreduce_fusion=MagicMock(return_value=("norm", "residual"))
         )
-        plan = types.SimpleNamespace(
-            input_layernorm=norm, _attn_input_fuses_quant=False
-        )
+        plan = types.SimpleNamespace(norm=norm)
         hidden = torch.ones(8, 32)
         owed = UnreducedOutput(hidden, group=group if matching_group else object())
         with (
@@ -399,12 +397,14 @@ class TestAiterAllreduceFusionGate(CustomTestCase):
             ),
             get_flags().dp.override(enabled=dp_attention),
         ):
-            result = LayerCommunicator._reduce_output_and_update_and_read_residual(
+            result = complete_attention_input(
                 plan,
                 owed,
                 hidden.clone(),
                 _fake_forward_batch(forward_mode=forward_mode),
                 None,
+                fuses_quant=False,
+                keep_bf16=False,
             )
         self.assertEqual(norm.forward_with_allreduce_fusion.called, result is not None)
         return result is not None

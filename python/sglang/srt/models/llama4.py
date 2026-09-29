@@ -25,11 +25,16 @@ import torch
 from torch import nn
 from transformers import Llama4TextConfig
 
-from sglang.srt.layers.communicator import LayerCommunicator, LayerFacts
-from sglang.srt.layers.communicator.residual import batch as residual_batch
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.layer_boundary import (
+    declare_attn,
+    declare_ffn,
+    make_stages,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -421,20 +426,19 @@ class Llama4DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        self.layer_facts = LayerFacts.init_new(
-            layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
-            is_layer_sparse=is_moe_layer,
-            is_previous_layer_sparse=is_previous_moe_layer,
-            is_next_layer_sparse=is_next_moe_layer,
-        )
-
-        self.layer_communicator = LayerCommunicator(
-            layer_facts=self.layer_facts,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
-            allow_deferred_ffn_reduction=False,
+        self.attn_boundary, self.ffn_boundary = make_stages(
+            (declare_attn(), self.input_layernorm),
+            (
+                declare_ffn(
+                    sparse=is_moe_layer,
+                    next_sparse=is_next_moe_layer,
+                ),
+                self.post_attention_layernorm,
+            ),
+            previous=declare_ffn(sparse=is_previous_moe_layer, next_sparse=is_moe_layer)
+            if layer_id != 0
+            else None,
+            terminal=layer_id == config.num_hidden_layers - 1,
         )
 
     def _is_moe_layer(self, layer_id: int) -> bool:
@@ -453,10 +457,10 @@ class Llama4DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
+        capture_output=None,
+    ) -> torch.Tensor:
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states, forward_batch, capture_output=capture_output
         )
 
         if hidden_states.shape[0] != 0:
@@ -466,16 +470,15 @@ class Llama4DecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
         # Fully Connected
-        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
+        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             hidden_states = self.feed_forward(hidden_states, forward_batch)
-        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
+        hidden_states = ffn_exit.finish(hidden_states)
 
-        return hidden_states, residual
+        return hidden_states
 
 
 class Llama4Model(nn.Module):
@@ -519,28 +522,22 @@ class Llama4Model(nn.Module):
             hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = input_embeds
-        residual = residual_batch.start(forward_batch)
-        aux_hidden_states = []
+        residual_batch.start(forward_batch)
+        aux_hidden_states = AuxHiddenStateList()
         for i in range(len(self.layers)):
-            if i in self.layers_to_capture:
-                aux_hidden_states.append(
-                    self.layers[i].layer_communicator.snapshot(
-                        hidden_states, residual, at_input=True
-                    )
-                )
             layer = self.layers[i]
-            hidden_states, residual = layer(
+            hidden_states = layer(
                 positions,
                 hidden_states,
                 forward_batch,
-                residual,
+                capture_output=aux_hidden_states.capture
+                if i in self.layers_to_capture
+                else None,
             )
 
-        hidden_states, residual = self.layers[-1].layer_communicator.finish_layer_stack(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
         if not forward_batch.forward_mode.is_idle():
-            hidden_states, _ = self.norm(hidden_states, residual)
+            hidden_states = residual_batch.norm(hidden_states, forward_batch, self.norm)
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -568,29 +565,21 @@ class Llama4ForCausalLM(LlamaForCausalLM):
     ):
         start, end = split_interval
         if start == 0:
-            forward_batch.residual = residual_batch.start(forward_batch)
+            residual_batch.start(forward_batch)
             forward_batch.hidden_states = (
                 self.model.embed_tokens(input_ids)
                 if input_embeds is None
                 else input_embeds
             )
         for layer in self.model.layers[start:end]:
-            forward_batch.hidden_states, forward_batch.residual = layer(
-                positions,
-                forward_batch.hidden_states,
-                forward_batch,
-                forward_batch.residual,
+            forward_batch.hidden_states = layer(
+                positions, forward_batch.hidden_states, forward_batch
             )
         if end != self.model.config.num_hidden_layers:
             return None
-        hidden, residual = LayerCommunicator.finish_layer_stack(
-            forward_batch.hidden_states, forward_batch.residual, forward_batch
+        forward_batch.hidden_states = residual_batch.norm(
+            forward_batch.hidden_states, forward_batch, self.model.norm
         )
-        forward_batch.residual = None
-        if residual is None:
-            forward_batch.hidden_states = self.model.norm(hidden)
-        else:
-            forward_batch.hidden_states, _ = self.model.norm(hidden, residual)
         return self.logits_processor(
             input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
         )

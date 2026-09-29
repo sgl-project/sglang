@@ -31,10 +31,10 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     Mamba2AttnBackend,
 )
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
-from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -77,7 +77,7 @@ from sglang.srt.model_loader.weight_utils import (
     replace_prefix,
     replace_substrings,
 )
-from sglang.srt.models.nemotron_h_utils import make_layer_communicator
+from sglang.srt.models.nemotron_h_utils import make_stage_boundary
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
 from sglang.srt.utils import (
@@ -375,8 +375,8 @@ class NemotronHMLPLikeDecoderLayer(nn.Module):
     mixer's attention partial sum, or a value that is complete or carries the
     sum an FFN before it left."""
 
-    def _init_layer_communicator(self, config: NemotronHConfig, layer_idx: int):
-        self.layer_communicator = make_layer_communicator(
+    def _init_stage_boundary(self, config: NemotronHConfig, layer_idx: int):
+        self.boundary = make_stage_boundary(
             self.norm, pattern=config.hybrid_override_pattern, layer_idx=layer_idx
         )
 
@@ -384,15 +384,12 @@ class NemotronHMLPLikeDecoderLayer(nn.Module):
         self,
         *,
         hidden_states,
-        residual: torch.Tensor | None,
         forward_batch: ForwardBatch,
     ):
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
-        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
+        hidden_states = self.boundary.prepare(hidden_states, forward_batch)
+        with self.boundary.exit(forward_batch) as ffn_exit:
             hidden_states = self.mixer.forward(hidden_states)
-        return ffn_exit.finish(hidden_states, residual)
+        return ffn_exit.finish(hidden_states)
 
 
 class NemotronHMLPDecoderLayer(NemotronHMLPLikeDecoderLayer):
@@ -426,7 +423,7 @@ class NemotronHMLPDecoderLayer(NemotronHMLPLikeDecoderLayer):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-        self._init_layer_communicator(config, layer_idx)
+        self._init_stage_boundary(config, layer_idx)
 
 
 class NemotronHMoEDecoderLayer(NemotronHMLPLikeDecoderLayer):
@@ -449,7 +446,7 @@ class NemotronHMoEDecoderLayer(NemotronHMLPLikeDecoderLayer):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-        self._init_layer_communicator(config, layer_idx)
+        self._init_stage_boundary(config, layer_idx)
 
 
 class NemotronHAttnLikeDecoderLayer(nn.Module):
@@ -457,8 +454,8 @@ class NemotronHAttnLikeDecoderLayer(nn.Module):
     output all-reduce to that stage's input; otherwise it reduces the output
     itself unless the fused kernel takes the sum into the next input norm."""
 
-    def _init_layer_communicator(self, config: NemotronHConfig, layer_idx: int):
-        self.layer_communicator = make_layer_communicator(
+    def _init_stage_boundary(self, config: NemotronHConfig, layer_idx: int):
+        self.boundary = make_stage_boundary(
             self.norm, pattern=config.hybrid_override_pattern, layer_idx=layer_idx
         )
 
@@ -466,20 +463,17 @@ class NemotronHAttnLikeDecoderLayer(nn.Module):
         self,
         *,
         hidden_states,
-        residual: torch.Tensor | None,
         forward_batch: ForwardBatch,
     ):
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states = self.boundary.prepare(hidden_states, forward_batch)
         if forward_batch.forward_mode.is_idle():
-            return hidden_states, residual
+            return hidden_states
 
-        with self.layer_communicator.mixer_exit(forward_batch) as mixer_exit:
+        with self.boundary.exit(forward_batch) as mixer_exit:
             hidden_states = self._forward_mixer(
                 hidden_states, forward_batch, mixer_exit.skips_reduction
             )
-        return mixer_exit.finish(hidden_states, residual)
+        return mixer_exit.finish(hidden_states)
 
 
 class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
@@ -507,7 +501,7 @@ class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-        self._init_layer_communicator(config, layer_idx)
+        self._init_stage_boundary(config, layer_idx)
 
     def _forward_mamba(
         self,
@@ -645,7 +639,7 @@ class NemotronHAttentionDecoderLayer(NemotronHAttnLikeDecoderLayer):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-        self._init_layer_communicator(config, layer_idx)
+        self._init_stage_boundary(config, layer_idx)
 
     def _forward_mixer(
         self,
@@ -733,50 +727,38 @@ class NemotronHModel(nn.Module):
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_tokens(input_ids)
-            residual = residual_batch.start(forward_batch)
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states, residual = self.layers[
-                self.start_layer
-            ].layer_communicator.from_pp(pp_proxy_tensors, forward_batch)
+            hidden_states = self.layers[self.start_layer].boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
 
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             if i in self.layers_to_capture:
-                hidden_states, snapshot = self.layers[
-                    i
-                ].layer_communicator.capture_output(
-                    hidden_states, residual, at_input=True
+                hidden_states, snapshot = self.layers[i].boundary.capture_output(
+                    hidden_states, forward_batch
                 )
                 aux_hidden_states.append(snapshot)
             layer = self.layers[i]
             if not isinstance(layer, Layers):
                 raise ValueError(f"Unknown layer type: {type(layer)}")
-            hidden_states, residual = layer.forward(
+            hidden_states = layer.forward(
                 hidden_states=hidden_states,
-                residual=residual,
                 forward_batch=forward_batch,
             )
 
-        last_layer = self.layers[self.end_layer - 1]
-        hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
-            hidden_states,
-            residual,
-            forward_batch,
-            preserve_declared=not self.pp_group.is_last_rank,
-        )
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {"hidden_states": hidden_states, "residual": residual}
+            return residual_batch.to_pp(
+                hidden_states, forward_batch, preserve_declared=True
             )
+        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
         if self.end_layer in self.layers_to_capture:
             aux_hidden_states.append(
-                last_layer.layer_communicator.snapshot(hidden_states, residual)
+                residual_batch.snapshot(hidden_states, forward_batch)
             )
-        if residual is None:
-            hidden_states = self.norm_f(hidden_states)
-        else:
-            hidden_states, _ = self.norm_f(hidden_states, residual)
+        hidden_states = residual_batch.norm(hidden_states, forward_batch, self.norm_f)
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
