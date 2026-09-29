@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Peer-snapshot bootstrap for the KV-event tree: the wire shape
-//! ([`PeerSnapshot`]) and its constants.
+//! ([`PeerSnapshot`]), its constants, and the registry of peers a snapshot
+//! may be pulled from.
 //!
 //! A freshly started replica subscribes to each worker's KV topic mid-stream:
 //! ZMQ SUB delivers deltas from whatever sequence the publisher has reached,
@@ -28,6 +29,10 @@
 use serde::{Deserialize, Serialize};
 
 use super::tree::{KvWorkerId, SnapshotNode};
+
+mod peers;
+
+pub use peers::PeerRegistry;
 
 /// Wire-format version. Bump on any incompatible change to [`PeerSnapshot`].
 pub const SNAPSHOT_FORMAT: u32 = 1;
