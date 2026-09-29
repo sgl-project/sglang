@@ -32,7 +32,7 @@ class TestQwen35EvalAMD(GSM8KMixin, CustomTestCase):
     gsm8k_score_threshold = 0.9704 * (1 - 0.05)
     gsm8k_num_examples = 1319
     gsm8k_num_threads = 256
-    gsm8k_max_tokens = 2048
+    gsm8k_max_tokens = 16384
     gsm8k_thinking = True
 
     @classmethod

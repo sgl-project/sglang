@@ -160,7 +160,7 @@ fi
 # Every accuracy gate grades through sgl-eval now, including the GSM8K-only jobs
 # that pass --skip-test-time-deps and the --skip-sglang-build jobs that never run
 # the `python[...]` install above. The `sglang[test]` extra pins the same version.
-install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache "sgl-eval==0.1.0"
+install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache "sgl-eval==0.1.2"
 
 if [[ -n "${SKIP_TT_DEPS}" ]]; then
   echo "Didn't build lmms_eval, human-eval, and others"

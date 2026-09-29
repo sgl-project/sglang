@@ -89,7 +89,7 @@ def run_gsm8k_benchmark(
             base_url=base_url,
             num_examples=num_questions,
             num_threads=parallel,
-            max_tokens=2048,
+            max_tokens=4096,
         )
     )
     return metrics["score"], metrics["invalid"], metrics["latency"]

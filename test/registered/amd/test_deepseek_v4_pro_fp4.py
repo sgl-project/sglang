@@ -105,7 +105,7 @@ class TestDeepseekV4ProFp4(CustomTestCase):
             eval_name="gsm8k",
             num_examples=1319,
             num_threads=1319,
-            max_tokens=2048,
+            max_tokens=4096,
             host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
