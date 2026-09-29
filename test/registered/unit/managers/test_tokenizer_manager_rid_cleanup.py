@@ -462,7 +462,14 @@ class TestRequestTpotGating(CustomTestCase):
     """Request TPOT is observed once, only for requests with a real decode
     interval that ran to completion on a non-prefill worker."""
 
-    def _run(self, batches, disaggregation_mode=DisaggregationMode.NULL):
+    def _run(
+        self,
+        batches,
+        disaggregation_mode=DisaggregationMode.NULL,
+        *,
+        stream=False,
+        prefill_finished_time=0.0,
+    ):
         tm = _make_tokenizer_manager(self)
         tm.enable_metrics = True
         tm.enable_priority_scheduling = False
@@ -473,16 +480,36 @@ class TestRequestTpotGating(CustomTestCase):
         state.obj.log_metrics = True
         state.obj.sampling_params = {}
         state.obj.custom_labels = None
+        state.obj.stream = stream
+        state.time_stats.created_time = time.perf_counter() - 1.0
         tm.rid_to_state[rid] = state
+        sched_stats = SchedulerReqTimeStats(
+            enable_metrics=True, prefill_finished_time=prefill_finished_time
+        )
         for completion_tokens, finished_reason in batches:
             batch_output = _make_batch_str_output(rid, finished_reason)
             batch_output.completion_tokens = [completion_tokens]
+            batch_output.time_stats = wrap_as_pickle([sched_stats])
             asyncio.run(tm._handle_batch_output(batch_output))
         (call,) = tm.metrics_collector.observe_one_finished_request.call_args_list
         return call.kwargs["time_per_output_token"]
 
-    def test_single_batch_finish_records_nothing(self):
-        """First and final output in one batch leave no decode interval."""
+    def test_single_batch_finish(self):
+        produced = time.perf_counter() - 0.5
+        # Streaming: first and final output in one batch leave no decode interval.
+        self.assertIsNone(
+            self._run(
+                [(40, {"type": "stop"})],
+                stream=True,
+                prefill_finished_time=produced,
+            )
+        )
+        # Non-streaming: decode runs from the scheduler's first-token time.
+        self.assertGreater(
+            self._run([(40, {"type": "stop"})], prefill_finished_time=produced),
+            0.0,
+        )
+        # Non-streaming without scheduler timing falls back to arrival time.
         self.assertIsNone(self._run([(40, {"type": "stop"})]))
 
     def test_multi_batch_records_only_completed_decode(self):

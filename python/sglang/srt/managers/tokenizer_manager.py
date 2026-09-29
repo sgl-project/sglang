@@ -2609,8 +2609,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if state.time_stats.trace_ctx.tracing_enable
                     else None
                 )
-                # Use the same timestamp when the first output is also final,
-                # because no decode interval was observed at this layer.
+                # Reuse the first batch's arrival time: a streaming request that
+                # finishes in its first output has no decode interval.
                 state.time_stats.set_finished_time(
                     ts=first_output_time, span_attrs=span_attrs
                 )

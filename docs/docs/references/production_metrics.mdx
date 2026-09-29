@@ -124,7 +124,7 @@ TPOT = (finished_time - first_token_time) / (completion_tokens - 1)
      = 1 / meta_info["decode_throughput"]
 ```
 
-The first token is excluded because its latency belongs to TTFT. Requests with fewer than two output tokens, no observed decode interval, aborted requests, and PD prefill workers do not contribute. The histogram is split by `is_streaming` and reuses the `--bucket-inter-token-latency` buckets.
+The first token is excluded because its latency belongs to TTFT. Requests with fewer than two output tokens, streaming requests that finish in their first output, aborted requests, and PD prefill workers do not contribute. The histogram is split by `is_streaming` and reuses the `--bucket-inter-token-latency` buckets.
 
 Unlike the token-weighted `sglang:inter_token_latency_seconds`, this metric gives every qualifying request equal weight.
 
