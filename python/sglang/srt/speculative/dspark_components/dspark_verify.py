@@ -46,9 +46,10 @@ from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_METHOD,
     sample_simulated_acc_len,
 )
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_hip, is_npu
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 
+_is_hip = is_hip()
 _is_npu = is_npu()
 
 # Draft proposal probs feeding rejection sampling; the data layer is the
@@ -159,25 +160,29 @@ class TargetVerifyExecutor:
         if folded_accept:
             return self.verify_epilogue.read_accept(bs)
 
+        simulate = self._simulate_acc_len > 0
+        # Simulated acceptance overwrites correct_len below, so a sampling accept
+        # (draft/target softmax + rejection) would be computed only to be discarded.
+        accept_sampling_info = None if simulate and _is_hip else sampling_info
         correct_len, bonus, cap_trim_lens = accept_draft_tokens(
             candidates=verify_ids_2d,
             target_logits=target_logits,
             draft_block=draft_block,
-            sampling_info=sampling_info,
+            sampling_info=accept_sampling_info,
             draft_input=draft_input,
             gamma=self.gamma,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             cutoff_layout=layout,
             fused_argmax=self._target_is_dsv41,
         )
-        if self._simulate_acc_len > 0:
+        if simulate:
             correct_len = self._simulated_correct_len(
                 bs=bs, dtype=correct_len.dtype, device=correct_len.device
             )
 
         site = (
             SpecTpSyncSite.DSPARK_ACCEPT_GREEDY
-            if sampling_info is None or sampling_info.is_all_greedy
+            if accept_sampling_info is None or accept_sampling_info.is_all_greedy
             else SpecTpSyncSite.DSPARK_ACCEPT_SAMPLE
         )
         self._tp_sync.sync(site, correct_len)
