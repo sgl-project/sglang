@@ -34,6 +34,7 @@ from sglang.srt.runtime_context import (
     get_context,
     get_disagg,
     get_observability,
+    get_parallel,
     get_schedule,
     get_serving,
 )
@@ -134,6 +135,7 @@ class SchedulerStats:
     num_prefill_inflight_queue_reqs: QueueCount = field(default_factory=QueueCount)
     num_decode_prealloc_queue_reqs: QueueCount = field(default_factory=QueueCount)
     num_decode_transfer_queue_reqs: QueueCount = field(default_factory=QueueCount)
+    num_decode_host_receive_queue_reqs: QueueCount = field(default_factory=QueueCount)
     kv_transfer_speed_gb_s: float = 0.0
     kv_transfer_latency_ms: float = 0.0
     pending_prealloc_token_usage: float = 0.0
@@ -517,6 +519,17 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             documentation="The number of requests in the decode transfer queue.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
+        )
+        self.num_decode_host_receive_queue_reqs = Gauge(
+            name="sglang:num_decode_host_receive_queue_reqs",
+            documentation="Requests in the decode transfer queue receiving into host memory or waiting for device admission.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.num_decode_host_receive_reqs = Counter(
+            name="sglang:num_decode_host_receive_reqs_total",
+            documentation="Total requests admitted to receive prefill KV in host memory.",
+            labelnames=labels.keys(),
         )
         self.kv_transfer_speed_gb_s = Histogram(
             name="sglang:kv_transfer_speed_gb_s",
@@ -1102,42 +1115,42 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         cls,
         *,
         server_args: ServerArgs,
-        ps: Any,
-        tp_rank: int,
-        pp_rank: int,
-        dp_rank: Optional[int],
         enable_priority_scheduling: bool,
         enable_lora: bool,
         enable_hierarchical_cache: bool,
     ) -> SchedulerMetricsCollectorContext:
         enable_metrics = get_observability().enable_metrics
-        is_stats_logging_rank = ps.attn_tp_rank == 0
+        parallel = get_parallel()
+        is_stats_logging_rank = parallel.attn_tp_rank == 0
         current_scheduler_metrics_enabled = enable_metrics and (
             is_stats_logging_rank
             or get_observability().enable_metrics_for_all_schedulers
         )
         enable_kv_cache_events = bool(
             get_observability().kv_events_config
-            and ps.pp_rank == 0
-            and ps.attn_tp_rank == 0
-            and ps.attn_cp_rank == 0
+            and get_parallel().pp_rank == 0
+            and parallel.attn_tp_rank == 0
+            and parallel.attn_cp_rank == 0
         )
         collector: Optional[SchedulerMetricsCollector] = None
         if enable_metrics:
-            engine_type = DisaggregationMode.to_engine_type(
-                get_disagg().disaggregation_mode
+            # Keep one metric series across role flips.
+            engine_type = (
+                "dynamic"
+                if get_disagg().enable_pd_role_switch
+                else DisaggregationMode.to_engine_type(get_disagg().disaggregation_mode)
             )
             labels = {
                 "model_name": get_serving().served_model_name,
                 "engine_type": engine_type,
-                "tp_rank": tp_rank,
-                "pp_rank": pp_rank,
-                "moe_ep_rank": ps.moe_ep_rank,
+                "tp_rank": parallel.tp_rank,
+                "pp_rank": parallel.pp_rank,
+                "moe_ep_rank": parallel.moe_ep_rank,
             }
             if enable_priority_scheduling:
                 labels["priority"] = ""
-            if dp_rank is not None:
-                labels["dp_rank"] = dp_rank
+            if parallel.dp_rank is not None:
+                labels["dp_rank"] = parallel.dp_rank
             if get_observability().extra_metric_labels:
                 labels.update(get_observability().extra_metric_labels)
             scheduler_collector_cls = resolve_collector_class(
@@ -1184,6 +1197,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
 
     def increment_transfer_failed_reqs(self) -> None:
         self.num_transfer_failed_reqs.labels(**self.labels).inc(1)
+
+    def increment_decode_host_receive_reqs(self) -> None:
+        self.num_decode_host_receive_reqs.labels(**self.labels).inc(1)
 
     def increment_prefill_retries(self, count: int) -> None:
         if count > 0:
@@ -1413,6 +1429,10 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_gauge_queue_count(
             self.num_decode_transfer_queue_reqs, stats.num_decode_transfer_queue_reqs
         )
+        self._log_gauge_queue_count(
+            self.num_decode_host_receive_queue_reqs,
+            stats.num_decode_host_receive_queue_reqs,
+        )
         self._log_gauge(
             self.pending_prealloc_token_usage, stats.pending_prealloc_token_usage
         )
@@ -1461,31 +1481,6 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         )
 
         self.last_log_time = time.perf_counter()
-
-    def log_grammar_stats(self, grammar_stats) -> None:
-        if grammar_stats.compilation_time is not None:
-            self._log_histogram(
-                self.grammar_compilation_time, grammar_stats.compilation_time
-            )
-        if grammar_stats.schema_count is not None:
-            self._log_histogram(self.grammar_schema_count, grammar_stats.schema_count)
-        if grammar_stats.ebnf_size is not None:
-            self._log_histogram(self.grammar_ebnf_size, grammar_stats.ebnf_size)
-        tree_times = grammar_stats.tree_traversal_time
-        if tree_times:
-            max_time = max(tree_times)
-            avg_time = sum(tree_times) / len(tree_times)
-            self._log_histogram(self.grammar_tree_traversal_time_max, max_time)
-            self._log_histogram(self.grammar_tree_traversal_time_avg, avg_time)
-        if grammar_stats.is_cache_hit:
-            self.num_grammar_cache_hit.labels(**self.labels).inc(1)
-        if grammar_stats.is_grammar_aborted:
-            self.num_grammar_aborted.labels(**self.labels).inc(1)
-        if grammar_stats.num_timeout > 0:
-            self.num_grammar_timeout.labels(**self.labels).inc(
-                grammar_stats.num_timeout
-            )
-        self.num_grammar_total.labels(**self.labels).inc(1)
 
     def emit_constants(
         self,
@@ -1845,25 +1840,6 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         self.histogram_time_to_first_token.labels(
             **labels, is_streaming="true" if stream else "false"
         ).observe(value)
-
-    def check_time_to_first_token_straggler(self, value: float) -> bool:
-        # Injected backends (e.g. Ray) route metrics out of process and can't
-        # introspect prometheus_client buckets here.
-        if self._histogram_cls is not None:
-            return False
-        his = self.histogram_time_to_first_token.labels(
-            **self.labels, is_streaming="true"
-        )
-        total_observations = sum(bucket._value for bucket in his._buckets)
-        if total_observations < 100:
-            return False
-        p99_threshold = total_observations * 0.99
-        cumulative_count = 0
-        for i, bucket in enumerate(his._buckets):
-            cumulative_count += bucket._value
-            if cumulative_count > p99_threshold:
-                return value >= his._upper_bounds[i]
-        return False
 
     def observe_inter_token_latency(
         self, labels: Dict[str, str], internval: float, num_new_tokens: int

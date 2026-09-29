@@ -14,7 +14,6 @@ from sglang.kernels.ops.embeddings.vocab_parallel_embedding import (
 )
 from sglang.srt.distributed import (
     divide,
-    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -22,12 +21,12 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import PackWeightMethod
-from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
     is_allocation_symmetric,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.parameter import BasevLLMParameter
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
@@ -537,7 +536,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         in-place fill deliberately stay outside the pool.
         """
         symm_alloc = use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
+            get_parallel().tp_group, disabled=not is_allocation_symmetric()
         )
         if self.tp_size == 1:
             with symm_alloc:

@@ -16,7 +16,7 @@ import torch
 from sglang.srt import runtime_context as rc
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=5, suite="base-a-test-1-npu-a2")
+register_npu_ci(est_time=5, suite="base-a-test-npu")
 
 # Mock NPU-only modules before importing the source module.
 for _ in (
@@ -35,7 +35,6 @@ for _ in (
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     AscendAttnBackend,
     AscendAttnMaskBuilder,
-    AscendAttnMultiStepDraftBackend,
     ForwardMetadata,
     ForwardMode,
     _expand_dsa_sparse_indices,
@@ -123,6 +122,41 @@ class TestReshapeKvForFiaNz(unittest.TestCase):
 
 
 class TestNormalizeMlaKRoPECache(unittest.TestCase):
+    def test_non_dcp_prefix_preserves_main_nz_page_reader(self):
+        backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        logical_k = torch.arange(2 * 4 * 32).reshape(2, 4, 1, 32).float()
+        logical_rope = logical_k + 1000
+        pages = torch.tensor([1, 0], dtype=torch.int64)
+        backend.forward_metadata = SimpleNamespace(flatten_prefix_block_tables=pages)
+        for nz in (False, True):
+
+            def storage(tensor):
+                if not nz:
+                    return tensor
+                return (
+                    tensor.view(2, 4, 2, 16)
+                    .permute(0, 2, 1, 3)
+                    .contiguous()
+                    .view_as(tensor)
+                )
+
+            backend.token_to_kv_pool = SimpleNamespace(
+                get_key_buffer=lambda _: storage(logical_k),
+                get_value_buffer=lambda _: storage(logical_rope),
+            )
+            with (
+                rc.get_parallel().override(dcp_enabled=False),
+                patch(
+                    "sglang.srt.hardware_backend.npu.attention.ascend_backend.is_fia_nz",
+                    return_value=nz,
+                ),
+            ):
+                k, rope = backend._load_mla_prefix_cache(
+                    SimpleNamespace(layer_id=0), None
+                )
+            torch.testing.assert_close(k, logical_k[pages])
+            torch.testing.assert_close(rope, logical_rope[pages])
+
     def test_both_prefix_branches_preserve_token_and_head_layout(self):
         # Exercise the actual inline expressions without invoking NPU attention.
         tree = ast.parse(inspect.getsource(AscendAttnBackend))
@@ -175,6 +209,7 @@ class TestNpuMlaDcpWrite(unittest.TestCase):
             dtype=torch.bfloat16,
             store_dtype=torch.bfloat16,
             dsa_kv_cache_store_fp8=False,
+            use_fia_nz=False,
             k_buffer=[torch.empty(1024, 1, 4, dtype=torch.bfloat16)],
             v_buffer=[torch.empty(1024, 1, 2, dtype=torch.bfloat16)],
             _raise_if_native_kv_cache_disabled=lambda: None,
@@ -270,6 +305,40 @@ class TestNpuMlaDcpRead(unittest.TestCase):
 
 
 class TestNpuDcpMetadata(unittest.TestCase):
+    def test_dcp_graph_keeps_v1_update_when_draft_uses_v2(self):
+        path = (
+            Path(inspect.getsourcefile(AscendAttnBackend)).parents[1]
+            / "graph_runner/npu_graph_runner.py"
+        )
+        tree = ast.parse(path.read_text())
+        assignment = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(t, ast.Attribute) and t.attr == "use_fias_v2_bsnd"
+                for t in node.targets
+            )
+        )
+        code = compile(ast.Expression(assignment.value), str(path), "eval")
+        for dcp in (False, True):
+            for enabled in (False, True):
+                result = eval(
+                    code,
+                    dict(
+                        self=SimpleNamespace(mla_dcp_graph=dcp),
+                        envs=SimpleNamespace(
+                            SGLANG_NPU_USE_FIAS_V2_BSND=SimpleNamespace(
+                                get=lambda: enabled
+                            )
+                        ),
+                        model_runner=SimpleNamespace(
+                            spec_algorithm=SimpleNamespace(is_dspark=lambda: True)
+                        ),
+                    ),
+                )
+                self.assertEqual(result, enabled and not dcp)
+
     def test_replay_lengths_share_zero_padding_with_non_dcp(self):
         # Execute the actual runner's replay-update block without importing its
         # distributed/model-loading dependencies in this CPU-only test.
@@ -296,7 +365,12 @@ class TestNpuDcpMetadata(unittest.TestCase):
         for dcp in (False, True):
             for mode in (ForwardMode.DECODE, ForwardMode.TARGET_VERIFY):
                 for raw_bs in (0, 1, 3, 4):
-                    for use_metadata in (False, True):
+                    for use_metadata, is_dflash in (
+                        (False, False),
+                        (True, False),
+                        (False, True),
+                        (True, True),
+                    ):
                         lengths = torch.arange(raw_bs, dtype=torch.int64) + 5
                         host_metadata = [17] * 4 if use_metadata else None
                         runner = SimpleNamespace(
@@ -305,7 +379,10 @@ class TestNpuDcpMetadata(unittest.TestCase):
                             raw_bs=raw_bs,
                             captured_req_width=7,
                             model_runner=SimpleNamespace(
-                                model_config=SimpleNamespace(hf_config=None)
+                                model_config=SimpleNamespace(hf_config=None),
+                                spec_algorithm=SimpleNamespace(
+                                    is_dflash=lambda: is_dflash
+                                ),
                             ),
                             backend=MagicMock(),
                             _replay_attn_backend=lambda: SimpleNamespace(
@@ -337,7 +414,12 @@ class TestNpuDcpMetadata(unittest.TestCase):
                                     ),
                                 ),
                             )
-                            if not dcp and mode.is_target_verify() and use_metadata:
+                            if (
+                                not dcp
+                                and mode.is_target_verify()
+                                and use_metadata
+                                and is_dflash
+                            ):
                                 expected = host_metadata
                             else:
                                 expected = (
@@ -1158,78 +1240,6 @@ class TestGetSwaMask(unittest.TestCase):
         self.assertEqual(mask.dtype, torch.bool)
 
 
-class TestCanUseTnd(unittest.TestCase):
-    def test_128_128(self):
-        self.assertTrue(
-            AscendAttnBackend._can_use_tnd(
-                SimpleNamespace(qk_head_dim=128, v_head_dim=128)
-            )
-        )
-
-    def test_192_192(self):
-        self.assertTrue(
-            AscendAttnBackend._can_use_tnd(
-                SimpleNamespace(qk_head_dim=192, v_head_dim=192)
-            )
-        )
-
-    def test_256_256(self):
-        self.assertTrue(
-            AscendAttnBackend._can_use_tnd(
-                SimpleNamespace(qk_head_dim=256, v_head_dim=256)
-            )
-        )
-
-    def test_192_128(self):
-        self.assertTrue(
-            AscendAttnBackend._can_use_tnd(
-                SimpleNamespace(qk_head_dim=192, v_head_dim=128)
-            )
-        )
-
-    def test_64_64(self):
-        self.assertFalse(
-            AscendAttnBackend._can_use_tnd(
-                SimpleNamespace(qk_head_dim=64, v_head_dim=64)
-            )
-        )
-
-    def test_128_256(self):
-        self.assertFalse(
-            AscendAttnBackend._can_use_tnd(
-                SimpleNamespace(qk_head_dim=128, v_head_dim=256)
-            )
-        )
-
-    def test_256_128(self):
-        self.assertFalse(
-            AscendAttnBackend._can_use_tnd(
-                SimpleNamespace(qk_head_dim=256, v_head_dim=128)
-            )
-        )
-
-    def test_128_192(self):
-        self.assertFalse(
-            AscendAttnBackend._can_use_tnd(
-                SimpleNamespace(qk_head_dim=128, v_head_dim=192)
-            )
-        )
-
-    def test_192_256(self):
-        self.assertFalse(
-            AscendAttnBackend._can_use_tnd(
-                SimpleNamespace(qk_head_dim=192, v_head_dim=256)
-            )
-        )
-
-    def test_96_96(self):
-        self.assertFalse(
-            AscendAttnBackend._can_use_tnd(
-                SimpleNamespace(qk_head_dim=96, v_head_dim=96)
-            )
-        )
-
-
 class TestGenerateAlibiBias(unittest.TestCase):
     def setUp(self):
         self.backend = object.__new__(AscendAttnBackend)
@@ -1309,86 +1319,6 @@ class TestGenerateAlibiBias(unittest.TestCase):
             device=torch.device("cpu"),
         )
         self.assertEqual(result.dtype, torch.bfloat16)
-
-
-class TestGetCudaGraphSeqLenFillValue(unittest.TestCase):
-    def test_returns_zero(self):
-        backend = object.__new__(AscendAttnBackend)
-        self.assertEqual(backend.get_cuda_graph_seq_len_fill_value(), 0)
-
-
-class TestGetVerifyBuffers(unittest.TestCase):
-    def test_no_verify_mask(self):
-        backend = object.__new__(AscendAttnBackend)
-        self.assertIsNone(backend.verify_mask)
-
-    def test_update_is_noop(self):
-        backend = object.__new__(AscendAttnBackend)
-        backend.update_verify_buffers_to_fill_after_draft(None, None)
-        backend.update_verify_buffers_to_fill_after_draft(MagicMock(), 4)
-        backend.update_verify_buffers_to_fill_after_draft(None, 16)
-
-
-class TestCommonTemplate(unittest.TestCase):
-    @staticmethod
-    def _make_draft_backend(speculative_num_steps):
-        backend = object.__new__(AscendAttnMultiStepDraftBackend)
-        backend.speculative_num_steps = speculative_num_steps
-        return backend
-
-    def test_calls_fn_for_each_step(self):
-        """call_fn is invoked for steps 0..speculative_num_steps-2."""
-        backend = self._make_draft_backend(speculative_num_steps=4)
-        forward_batch = MagicMock()
-        forward_batch.spec_info = MagicMock()
-        call_fn = MagicMock()
-        backend.common_template(forward_batch, call_fn)
-        self.assertEqual(call_fn.call_count, 3)
-        for i in range(3):
-            call_fn.assert_any_call(i, forward_batch)
-
-    def test_zero_steps(self):
-        """speculative_num_steps=1 -> no calls (range(0))."""
-        backend = self._make_draft_backend(speculative_num_steps=1)
-        forward_batch = MagicMock()
-        forward_batch.spec_info = MagicMock()
-        call_fn = MagicMock()
-        backend.common_template(forward_batch, call_fn)
-        call_fn.assert_not_called()
-
-    def test_two_steps(self):
-        """speculative_num_steps=2 -> exactly one call with index 0."""
-        backend = self._make_draft_backend(speculative_num_steps=2)
-        forward_batch = MagicMock()
-        forward_batch.spec_info = MagicMock()
-        call_fn = MagicMock()
-        backend.common_template(forward_batch, call_fn)
-        call_fn.assert_called_once_with(0, forward_batch)
-
-    def test_call_indices(self):
-        backend = self._make_draft_backend(speculative_num_steps=5)
-        forward_batch = MagicMock()
-        forward_batch.spec_info = MagicMock()
-        indices = []
-        backend.common_template(forward_batch, lambda i, fb: indices.append(i))
-        self.assertEqual(indices, [0, 1, 2, 3])
-
-    def test_assert_spec_info_not_none(self):
-        """Raises AssertionError when forward_batch.spec_info is None."""
-        backend = self._make_draft_backend(speculative_num_steps=4)
-        forward_batch = MagicMock()
-        forward_batch.spec_info = None
-        with self.assertRaises(AssertionError):
-            backend.common_template(forward_batch, MagicMock())
-
-    def test_passes_same_forward_batch(self):
-        backend = self._make_draft_backend(speculative_num_steps=3)
-        forward_batch = MagicMock()
-        forward_batch.spec_info = MagicMock()
-        call_fn = MagicMock()
-        backend.common_template(forward_batch, call_fn)
-        for call in call_fn.call_args_list:
-            self.assertIs(call.args[1], forward_batch)
 
 
 if __name__ == "__main__":

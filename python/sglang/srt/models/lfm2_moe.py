@@ -23,7 +23,6 @@ from sglang.kernels.ops.mamba.lfm_short_conv import (
     fused_lfm_short_conv_prefill,
 )
 from sglang.srt.configs.lfm2_moe import Lfm2MoeConfig
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.mamba.causal_conv1d import (
     causal_conv1d_fn,
@@ -598,7 +597,7 @@ class Lfm2MoeForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         assert self.pp_group.is_first_rank and self.pp_group.is_last_rank
 
         self.quant_config = quant_config

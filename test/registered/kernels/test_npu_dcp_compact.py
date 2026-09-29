@@ -8,7 +8,7 @@ import torch
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_npu_ci(est_time=1, suite="base-a-test-1-npu-a2")
+register_npu_ci(est_time=1, suite="base-a-test-npu")
 
 try:
     import torch_npu  # noqa: F401
@@ -84,6 +84,7 @@ class TestNpuDcpCompactKernels(CustomTestCase):
                     kv_lora_rank=512,
                     qk_rope_head_dim=64,
                     dsa_kv_cache_store_fp8=False,
+                    use_fia_nz=False,
                     k_buffer=[
                         torch.full((512, 1, 512), -3, device=self.device, dtype=dtype)
                     ],
@@ -166,6 +167,7 @@ class TestNpuDcpCompactKernels(CustomTestCase):
             kv_lora_rank=512,
             qk_rope_head_dim=64,
             dsa_kv_cache_store_fp8=False,
+            use_fia_nz=False,
             k_buffer=[
                 torch.full((256, 1, 512), -3, device=self.device, dtype=torch.bfloat16)
             ],

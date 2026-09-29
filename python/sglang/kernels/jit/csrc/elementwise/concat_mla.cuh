@@ -2,9 +2,11 @@
 #include <sgl_kernel/utils.h>
 
 #include <sgl_kernel/utils.cuh>
+#include <sgl_kernel/warp.cuh>
 
 #include <tvm/ffi/container/tensor.h>
 
+#include <algorithm>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -138,14 +140,25 @@ struct ConcatMlaKKernel {
     D_nope.set_value(QK_NOPE_HEAD_DIM);
     D_rope.set_value(QK_ROPE_HEAD_DIM);
 
+    // The widest access is `v2.s32` (8B), and the `>> 2` stride stepping needs
+    // each row stride to be a whole number of int2's -- which is the same 8B.
+    constexpr int64_t kAlignNope = 8;
+    constexpr int64_t kAlignRope = 4;  // rope is read with `v1.s32`
+
     // Verify k: [num_tokens, num_heads, k_head_dim]
-    TensorMatcher({N, H, D}).with_strides({S0_k, S1_k, 1}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).verify(k);
+    TensorMatcher({N, H, D})
+        .with_strides({S0_k, S1_k, 1})
+        .with_dtype<bf16_t>()
+        .with_device<kDLCUDA>(device)
+        .ensure_alignment(kAlignNope)
+        .verify(k);
 
     // Verify k_nope: [num_tokens, num_heads, nope_head_dim]
     TensorMatcher({N, H, D_nope})
         .with_strides({S0_k_nope, S1_k_nope, 1})
         .with_dtype<bf16_t>()
         .with_device<kDLCUDA>(device)
+        .ensure_alignment(kAlignNope)
         .verify(k_nope);
 
     // Verify k_rope: [num_tokens, 1, rope_head_dim]
@@ -153,12 +166,8 @@ struct ConcatMlaKKernel {
         .with_strides({S0_k_rope, -1, 1})
         .with_dtype<bf16_t>()
         .with_device<kDLCUDA>(device)
+        .ensure_alignment(kAlignRope)
         .verify(k_rope);
-
-    // Check alignment
-    RuntimeCheck(reinterpret_cast<uintptr_t>(k.data_ptr()) % 16 == 0, "Tensor k must be 16-byte aligned");
-    RuntimeCheck(reinterpret_cast<uintptr_t>(k_nope.data_ptr()) % 16 == 0, "Tensor k_nope must be 16-byte aligned");
-    RuntimeCheck(reinterpret_cast<uintptr_t>(k_rope.data_ptr()) % 16 == 0, "Tensor k_rope must be 16-byte aligned");
 
     const int num_tokens = static_cast<int>(N.unwrap());
 
@@ -188,8 +197,8 @@ constexpr int OUT_LAST_DIM = A_LAST_DIM + B_LAST_DIM;
 
 template <bool kUsePDL>
 __global__ void concat_mla_absorb_q_kernel(
-    bf16_t* a,
-    bf16_t* b,
+    const bf16_t* a,
+    const bf16_t* b,
     bf16_t* out,
     const int num_items,
     const int dim_1,
@@ -199,51 +208,27 @@ __global__ void concat_mla_absorb_q_kernel(
     const int b_stride_1,
     const int64_t out_stride_0,
     const int out_stride_1) {
-  device::PDLWaitPrimary<kUsePDL>();
+  using namespace device;
+  using enum warp::LoadStorePattern::type;
+  constexpr int64_t kABytes = A_LAST_DIM * sizeof(bf16_t);
+  constexpr int64_t kBBytes = B_LAST_DIM * sizeof(bf16_t);
 
-  const int flat_warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
-  const int lane_id = get_lane_id();
+  PDLWaitPrimary<kUsePDL>();
+
+  const int flat_warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / kWarpThreads;
+  if (flat_warp_id >= num_items) return;
 
   const int idx_0 = flat_warp_id / dim_1;
   const int idx_1 = flat_warp_id % dim_1;
+  const auto out_row = out + idx_0 * out_stride_0 + idx_1 * out_stride_1;
 
-  if (flat_warp_id >= num_items) {
-    return;
-  }
+  const auto b_val = warp::load_bytes<kBBytes, WARP_UNIFORM_16B>(b + idx_0 * b_stride_0 + idx_1 * b_stride_1);
+  const auto a_val = warp::load_bytes<kABytes, WARP_UNIFORM_16B>(a + idx_0 * a_stride_0 + idx_1 * a_stride_1);
 
-  using ABufType = int4;
-  constexpr int A_NUM_UNROLL = 2;
-  static_assert(sizeof(ABufType) * A_NUM_UNROLL == A_LAST_DIM * sizeof(a[0]) / 32);
-  ABufType a_buf[A_NUM_UNROLL];
+  PDLTriggerSecondary<kUsePDL>();
 
-  using BBufType = int;
-  constexpr int B_NUM_UNROLL = 1;
-  static_assert(sizeof(BBufType) * B_NUM_UNROLL == B_LAST_DIM * sizeof(b[0]) / 32);
-  BBufType b_buf;
-
-  {
-    const BBufType* base_addr = reinterpret_cast<BBufType*>(b + idx_0 * b_stride_0 + idx_1 * b_stride_1);
-    b_buf = *(base_addr + lane_id);
-  }
-
-#pragma unroll
-  for (int i = 0; i < A_NUM_UNROLL; ++i) {
-    const ABufType* base_addr = reinterpret_cast<ABufType*>(a + idx_0 * a_stride_0 + idx_1 * a_stride_1);
-    a_buf[i] = *(base_addr + i * 32 + lane_id);
-  }
-
-  device::PDLTriggerSecondary<kUsePDL>();
-
-  {
-    BBufType* base_addr = reinterpret_cast<BBufType*>(out + idx_0 * out_stride_0 + idx_1 * out_stride_1 + A_LAST_DIM);
-    *(base_addr + lane_id) = b_buf;
-  }
-
-#pragma unroll
-  for (int i = 0; i < A_NUM_UNROLL; ++i) {
-    ABufType* base_addr = reinterpret_cast<ABufType*>(out + idx_0 * out_stride_0 + idx_1 * out_stride_1);
-    *(base_addr + i * 32 + lane_id) = a_buf[i];
-  }
+  warp::store_bytes<kBBytes, WARP_UNIFORM_16B>(out_row + A_LAST_DIM, b_val);
+  warp::store_bytes<kABytes, WARP_UNIFORM_16B>(out_row, a_val);
 }
 
 template <bool kUsePDL>
@@ -273,11 +258,21 @@ struct ConcatMlaAbsorbQKernel {
     D_b.set_value(B_LAST_DIM);
     D_out.set_value(OUT_LAST_DIM);
 
+    using device::warp::LoadStorePattern;
+    using enum LoadStorePattern::type;
+    constexpr int64_t kAlignA = LoadStorePattern::get_vec_bytes<A_LAST_DIM * sizeof(bf16_t), WARP_UNIFORM_16B>();
+    constexpr int64_t kAlignB = LoadStorePattern::get_vec_bytes<B_LAST_DIM * sizeof(bf16_t), WARP_UNIFORM_16B>();
+    // `out` carries both halves, so it must satisfy the wider one; the B half
+    // starts A_LAST_DIM in, which must not break B's own alignment.
+    constexpr int64_t kAlignOut = std::max(kAlignA, kAlignB);
+    static_assert(A_LAST_DIM * sizeof(bf16_t) % kAlignB == 0, "A width must not misalign the B half");
+
     // Verify a: [dim_0, dim_1, A_LAST_DIM]
     TensorMatcher({N0_a, N1_a, D_a})
         .with_strides({S0_a, S1_a, 1})
         .with_dtype<bf16_t>()
         .with_device<kDLCUDA>(device)
+        .ensure_alignment(kAlignA)
         .verify(a);
 
     // Verify b: [dim_0, dim_1, B_LAST_DIM]
@@ -285,6 +280,7 @@ struct ConcatMlaAbsorbQKernel {
         .with_strides({S0_b, S1_b, 1})
         .with_dtype<bf16_t>()
         .with_device<kDLCUDA>(device)
+        .ensure_alignment(kAlignB)
         .verify(b);
 
     // Verify out: [dim_0, dim_1, OUT_LAST_DIM]
@@ -292,12 +288,8 @@ struct ConcatMlaAbsorbQKernel {
         .with_strides({S0_out, S1_out, 1})
         .with_dtype<bf16_t>()
         .with_device<kDLCUDA>(device)
+        .ensure_alignment(kAlignOut)
         .verify(out);
-
-    // Check alignment
-    RuntimeCheck(reinterpret_cast<uintptr_t>(a.data_ptr()) % 16 == 0, "Tensor a must be 16-byte aligned");
-    RuntimeCheck(reinterpret_cast<uintptr_t>(b.data_ptr()) % 16 == 0, "Tensor b must be 16-byte aligned");
-    RuntimeCheck(reinterpret_cast<uintptr_t>(out.data_ptr()) % 16 == 0, "Tensor out must be 16-byte aligned");
 
     // Verify dimensions match: a.size(0) * a.size(1) == b.size(0) * b.size(1)
     RuntimeCheck(
@@ -315,8 +307,8 @@ struct ConcatMlaAbsorbQKernel {
     LaunchKernel(grid_size, block_size, device.unwrap())
         .enable_pdl(kUsePDL)(
             concat_mla_absorb_q_kernel<kUsePDL>,
-            static_cast<bf16_t*>(a.data_ptr()),
-            static_cast<bf16_t*>(b.data_ptr()),
+            static_cast<const bf16_t*>(a.data_ptr()),
+            static_cast<const bf16_t*>(b.data_ptr()),
             static_cast<bf16_t*>(out.data_ptr()),
             num_items,
             dim_1,
