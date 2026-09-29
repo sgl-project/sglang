@@ -147,10 +147,10 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
         str(mr.dtype),
         str(get_model().quantization),
         str(get_exec().moe.moe_runner_backend),
-        str(mr.tp_size),
+        str(get_parallel().tp_size),
         str(get_parallel().pp_size),
-        str(mr.attn_dp_size),
-        str(mr.moe_ep_size),
+        str(get_parallel().attn_dp_size),
+        str(get_parallel().moe_ep_size),
         str(mr.model_config.hf_config.__class__.__name__),
     ]
     # A different skip policy must not reuse previously tuned tactics.
@@ -171,7 +171,7 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
     cache_dir.mkdir(parents=True, exist_ok=True)
     return (
         cache_dir
-        / f"rank_tp{mr.tp_rank}_pp{get_parallel().pp_rank}_dp{mr.dp_rank or 0}.json"
+        / f"rank_tp{get_parallel().tp_rank}_pp{get_parallel().pp_rank}_dp{get_parallel().dp_rank or 0}.json"
     )
 
 

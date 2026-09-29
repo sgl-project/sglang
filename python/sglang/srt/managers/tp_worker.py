@@ -195,7 +195,7 @@ class BaseTpWorker(ABC):
         refcounting."""
         monkey_patch_torch_reductions()
         return MultiprocessingSerializer.deserialize(
-            serialized_named_tensors[self.model_runner.tp_rank]
+            serialized_named_tensors[get_parallel().tp_rank]
         )
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
@@ -250,12 +250,12 @@ class BaseTpWorker(ABC):
             extra = [n for n in tensors if n not in exp]
             if mismatch or missing or extra:
                 raise RuntimeError(
-                    f"[LORA-CHECK] rank{self.model_runner.tp_rank} adapter sync MISMATCH of {len(exp)} expected: "
+                    f"[LORA-CHECK] rank{get_parallel().tp_rank} adapter sync MISMATCH of {len(exp)} expected: "
                     f"{len(mismatch)} value-diff {mismatch[:5]}, {len(missing)} missing {missing[:5]}, "
                     f"{len(extra)} extra {extra[:5]}"
                 )
             logger.info(
-                f"[LORA-CHECK] rank{self.model_runner.tp_rank} adapter sync OK: {len(exp)}/{len(exp)} tensors match (sha256)"
+                f"[LORA-CHECK] rank{get_parallel().tp_rank} adapter sync OK: {len(exp)}/{len(exp)} tensors match (sha256)"
             )
         result = self.model_runner.load_lora_adapter_from_tensors(
             recv_req.to_ref(),
@@ -369,15 +369,15 @@ class TpModelWorker(BaseTpWorker):
             tp_group = self.model_runner.tp_group
             self.random_seed = broadcast_pyobj(
                 [get_device().random_seed],
-                tp_group.ranks[self.model_runner.tp_rank],
+                tp_group.ranks[tp_group.rank_in_group],
                 tp_group.cpu_group,
                 src=tp_group.ranks[0],
             )[0]
         else:
             self.random_seed = broadcast_pyobj(
                 [get_device().random_seed],
-                self.model_runner.tp_size * get_parallel().pp_rank
-                + self.model_runner.tp_rank,
+                get_parallel().tp_size * get_parallel().pp_rank
+                + get_parallel().tp_rank,
                 self.world_group.cpu_group,
                 src=self.world_group.ranks[0],
             )[0]
