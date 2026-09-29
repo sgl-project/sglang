@@ -142,7 +142,16 @@ class DsparkDraftSampler:
                     del step_idx
                     # In-graph philox noise: each replay advances the generator
                     # and redraws.
-                    noise = self.exp_noise[:bs].exponential_()
+                    from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+                    if is_npu_arch35():
+                        # NPU does not support .exponential_() in-place.
+                        # Equivalent: -log(Uniform(0,1)) ~ Exp(1)
+                        self.exp_noise[:bs].uniform_(1e-8, 1.0)
+                        self.exp_noise[:bs].log_().neg_()
+                        noise = self.exp_noise[:bs]
+                    else:
+                        noise = self.exp_noise[:bs].exponential_()
                     return self._tp_sync.sync(
                         SpecTpSyncSite.DSPARK_GRAPH_SAMPLE,
                         SampleStepTokens.execute(

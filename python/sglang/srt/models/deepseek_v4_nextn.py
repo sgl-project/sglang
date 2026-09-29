@@ -7,6 +7,9 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import prime_rope_cos_sin
+from sglang.srt.hardware_backend.npu.utils import (
+    use_npu_arch35_mxfp8_wo_a,
+)
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
 )
@@ -221,6 +224,7 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         self.pp_group = get_parallel().pp_group
         self.quant_config = quant_config
         self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
+        self.use_npu_arch35_mxfp8_wo_a = use_npu_arch35_mxfp8_wo_a(quant_config)
         self.determine_num_fused_shared_experts()
 
         self.model = DeepseekV4ModelNextN(

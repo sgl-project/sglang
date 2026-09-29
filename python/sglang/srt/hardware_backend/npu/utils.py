@@ -2,7 +2,7 @@ import functools
 import logging
 import sys
 from enum import IntEnum
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
@@ -35,16 +35,22 @@ def is_npu_arch35() -> bool:
     return acl.rt.get_device_info(0, 601) == (3510, 0)
 
 
-def use_npu_arch35_mxfp8_wo_a(quant_config) -> bool:
+def use_npu_arch35_mxfp8_wo_a(
+    quant_config, wo_a_keeps_quant_config: Optional[bool] = None
+) -> bool:
     """Whether wo_a runs the native NPU arch35 MXFP8 GEMM.
 
     Only for serialized DeepSeek block-FP8 checkpoints — those are the ones
     ``Fp8LinearMethod.process_weights_after_loading`` can reinterpret into the
     NPU arch35 MXFP8 scale layout.
     """
-    if not _is_npu or not is_npu_arch35() or quant_config is None:
-        return False
-    if not getattr(quant_config, "is_checkpoint_fp8_serialized", False):
+    if (
+        wo_a_keeps_quant_config is False
+        or not _is_npu
+        or not is_npu_arch35()
+        or quant_config is None
+        or not getattr(quant_config, "is_checkpoint_fp8_serialized", False)
+    ):
         return False
     weight_block_size = getattr(quant_config, "weight_block_size", None)
     return tuple(weight_block_size or ()) == (128, 128)
