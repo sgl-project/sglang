@@ -358,15 +358,24 @@ def test_latent_pack_decode_contract():
     )
 
 
-def test_vae_tiling_defaults_to_enabled_and_is_still_overridable():
-    # Benchmarking showed no measurable perf/memory cost from VAE tiling at
-    # 256/512px, and full-frame decode hangs on gfx1151 from 896px upward, so
-    # Qwen-Image 2.1 tiles unconditionally by default (no platform/resolution
-    # threshold). --vae-tiling false still opts out explicitly.
+def test_vae_tiling_defaults_off_but_forced_on_for_gfx1151(monkeypatch):
+    # Full-frame decode hangs on gfx1151 from 896px upward, so Qwen-Image 2.1
+    # forces tiling on there regardless of --vae-tiling. Measured on CUDA,
+    # tiling costs ~2.6x-3.8x decode wall time, so platforms without the
+    # gfx1151 hang keep the fast (untiled) default instead of paying that
+    # cost unconditionally.
     latents = torch.zeros(1, 4, 1, 56, 56)
-    assert QwenImage21PipelineConfig().vae_tiling
+    module = "sglang.multimodal_gen.configs.pipeline_configs.qwen_image21"
+
+    monkeypatch.setattr(f"{module}.current_platform.is_gfx1151", lambda: False)
+    assert not QwenImage21PipelineConfig().vae_tiling
+    assert not QwenImage21PipelineConfig().should_enable_vae_tiling(latents)
+    assert QwenImage21PipelineConfig(vae_tiling=True).should_enable_vae_tiling(latents)
+
+    monkeypatch.setattr(f"{module}.current_platform.is_gfx1151", lambda: True)
     assert QwenImage21PipelineConfig().should_enable_vae_tiling(latents)
-    assert not QwenImage21PipelineConfig(vae_tiling=False).should_enable_vae_tiling(
+    # gfx1151 forces tiling on even when the user explicitly asked for it off.
+    assert QwenImage21PipelineConfig(vae_tiling=False).should_enable_vae_tiling(
         latents
     )
 
