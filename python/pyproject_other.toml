@@ -161,7 +161,7 @@ srt_musa = [
   "torch==2.11.0.post1+musa5.2.0",
   "torch-c-dlpack-ext==0.1.5",
   "torch_musa==2.11.0.post1+musa5.2.0",
-  "torchada>=0.1.86",
+  "torchada>=0.1.90",
   "torchaudio==2.11.0+musa5.2.0",
   "torchvision==0.26.0.post1+musa5.2.0",
   "triton==3.2.0",
