@@ -135,8 +135,8 @@ def combine_topk_swa_indices(
 
     Returns int32 indices [num_tokens, padded_topk_swa] and per-token scanned-prefix
     lengths, including -1 entries skipped by attention. Width is padded to 128.
-    Preallocated out_indices must contain -1 outside the written prefix;
-    reuse requires chunk-invariant scanned-prefix lengths. out_lens is overwritten.
+    Rows are written whole and -1 padded, so preallocated out_indices / out_lens
+    are overwritten entirely; rows past the last request are -1 with length 0.
     """
     assert topk_indices.dtype == torch.int32
     assert query_start_loc.dtype == torch.int32
@@ -154,9 +154,9 @@ def combine_topk_swa_indices(
     num_reqs = seq_lens.shape[0]
     combined_topk = combined_topk_width(topk, window_size)
     if out_indices is None:
-        combined_indices = torch.full(
+        # The kernel writes whole -1 padded rows.
+        combined_indices = torch.empty(
             (num_tokens, combined_topk),
-            -1,
             dtype=torch.int32,
             device=topk_indices.device,
         )
@@ -165,7 +165,7 @@ def combine_topk_swa_indices(
         assert out_indices.dtype == torch.int32
         combined_indices = out_indices
     if out_lens is None:
-        combined_lens = torch.zeros(
+        combined_lens = torch.empty(
             num_tokens, dtype=torch.int32, device=topk_indices.device
         )
     else:
@@ -173,8 +173,10 @@ def combine_topk_swa_indices(
         assert out_lens.dtype == torch.int32
         combined_lens = out_lens
 
-    NUM_WORKERS = 128
-    _combine_topk_swa_indices_kernel[(num_reqs, NUM_WORKERS)](
+    if num_tokens == 0:
+        return combined_indices, combined_lens
+    block_t = 2  # Measured on B200 with num_warps=2, 16384 tokens, bs 1 to 64.
+    _combine_topk_swa_indices_kernel[(triton.cdiv(num_tokens, block_t),)](
         combined_indices,
         combined_indices.stride(0),
         combined_lens,
@@ -186,10 +188,16 @@ def combine_topk_swa_indices(
         gather_lens,
         compressed_base,
         swa_base,
+        num_tokens,
+        num_reqs,
         top_k=topk,
         COMPRESS_RATIO=compress_ratio,
         WINDOW_SIZE=window_size,
-        PADDED_TOP_K=triton.next_power_of_2(topk_indices.shape[-1]),
+        WIDTH=combined_topk,
+        PADDED_WIDTH=triton.next_power_of_2(combined_topk),
+        BLOCK_T=block_t,
+        SEARCH_STEPS=max(num_reqs, 1).bit_length(),
+        num_warps=2,
     )
     return combined_indices, combined_lens
 
