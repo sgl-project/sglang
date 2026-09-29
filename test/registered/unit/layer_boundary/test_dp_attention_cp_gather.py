@@ -1,7 +1,7 @@
 """The dense-FFN gather and take-back under attention DP x CP x TP, rank by rank.
 
 Every rank builds its layer's communicator and runs its prepare_mlp and
-postprocess_layer for real on CPU; the TP-group all-reduce is replaced by the
+finish_complete_output for real on CPU; the TP-group all-reduce is replaced by the
 sum of the buffers the ranks hand to it.
 """
 
@@ -293,11 +293,11 @@ class TestDpCpGather(CustomTestCase):
         def gather(rank, all_reduce):
             with as_rank(*rank, all_reduce) as r:
                 self.assertIsNotNone(
-                    r.communicator.ffn.plan._paths.get(BatchVariant.CONTEXT_PARALLEL),
+                    r.communicator.ffn.plan.paths.get(BatchVariant.CONTEXT_PARALLEL),
                     "declared under CP",
                 )
                 if ffn_input is not None:
-                    steps = r.communicator.ffn.plan._batch_steps(r.forward_batch)
+                    steps = r.communicator.ffn.plan.path_for(r.forward_batch)
                     self.assertIs(steps.entry.prepare.keywords["step"].func, ffn_input)
                 hidden_states, residual = rank_inputs(*rank)
                 return prepare_input(
@@ -414,7 +414,7 @@ class TestDpCpGather(CustomTestCase):
             norm=rms_norm,
             norm_rows=rms_rows,
             read=replace(NORM_READOUT, reads_before_dp_gather=True),
-            ffn_input=comm_ops._mlp_input_dp_replicate,
+            ffn_input=comm_ops._reduce_update_read_dp_gather,
         )
 
 

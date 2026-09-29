@@ -21,16 +21,16 @@ from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateAccumulator
 from sglang.srt.layers.layer_boundary.adapters import branch
 from sglang.srt.layers.layer_boundary.adapters.lora import (
-    publish_attention,
-    publish_ffn,
+    publish_attn_lora_rows,
+    publish_ffn_lora_rows,
 )
 from sglang.srt.layers.layer_boundary.contracts import (
     BatchVariant,
-    StageEntry,
+    EntryPath,
     StageKind,
-    StageSteps,
+    StagePath,
 )
-from sglang.srt.layers.layer_boundary.ops import gather_attention_tp
+from sglang.srt.layers.layer_boundary.ops import attn_tp_gather_input
 from sglang.srt.layers.layer_boundary.residual.access import buffer, from_pp
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
     PLAIN_ADD,
@@ -75,10 +75,10 @@ class StageBoundary:
         return self.plan.norm
 
     def entry(
-        self, forward_batch: ForwardBatch, steps: Optional[StageSteps] = None
-    ) -> StageEntry:
+        self, forward_batch: ForwardBatch, steps: Optional[StagePath] = None
+    ) -> EntryPath:
         if steps is None:
-            steps = self.plan._batch_steps(forward_batch)
+            steps = self.plan.path_for(forward_batch)
         return steps.entry
 
     def _prepare(
@@ -86,7 +86,7 @@ class StageBoundary:
         hidden_states,
         stream: ResidualStream,
         forward_batch: ForwardBatch,
-        steps: Optional[StageSteps] = None,
+        steps: Optional[StagePath] = None,
         **call,
     ):
         """The stage's input and the residual, from the previous stage's output
@@ -96,10 +96,10 @@ class StageBoundary:
         if (
             stream.pending is None
             and stream.residual is None
-            and entry.input_sum is not None
+            and entry.declared_sum is not None
         ):
-            hidden_states = stream.leave(
-                hidden_states, PLAIN_ADD, declared_sum=entry.input_sum
+            hidden_states = stream.record(
+                hidden_states, PLAIN_ADD, declared_sum=entry.declared_sum
             )
         if stream.pending is not None:
             call["update"] = stream.pending.update
@@ -115,8 +115,8 @@ class StageBoundary:
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
-        if entry.handoff is not None:
-            hidden_states = entry.handoff(
+        if entry.attn_input_adapter is not None:
+            hidden_states = entry.attn_input_adapter(
                 hidden_states, forward_batch, self.plan.qkv_latent_func
             )
         stream.write(residual)
@@ -131,8 +131,8 @@ class StageBoundary:
         return self.plan.incoming_residual_rows
 
     @property
-    def input_on_attention_tp_slices(self):
-        return self.plan.input_on_attention_tp_slices
+    def input_on_attn_tp_slices(self):
+        return self.plan.input_on_attn_tp_slices
 
     def prepare(self, hidden_states, forward_batch, *, cache=None, **call):
         """Finish the previous contribution and produce this stage's compute input.
@@ -167,15 +167,15 @@ class StageBoundary:
 
     def finish(self, hidden_states, forward_batch):
         """Hand this attention's actual contribution to the following stage."""
-        if self.kind is not StageKind.ATTENTION or not self.plan.direct_handoff:
+        if self.kind is not StageKind.ATTENTION or not self.plan.finishes_directly:
             raise RuntimeError(
                 "use the stage exit scope for an FFN or single-stage mixer"
             )
         produced = self.plan.produced(forward_batch)
-        return current(forward_batch).leave(
+        return current(forward_batch).record(
             hidden_states,
             produced.update,
-            declared_sum=produced.group if produced.always_leaves else None,
+            declared_sum=produced.group if produced.always_partial else None,
         )
 
     def exit(self, forward_batch):
@@ -220,8 +220,8 @@ class StageBoundary:
             ),
             allow_missing_residual=allow_missing_residual,
         )
-        declared_sum = self.entry(forward_batch).input_sum
-        hidden_states, forward_batch.residual_stream = ResidualStream.arrive(
+        declared_sum = self.entry(forward_batch).declared_sum
+        hidden_states, forward_batch.residual_stream = ResidualStream.from_handoff(
             hidden_states, residual, PLAIN_ADD, declared_sum=declared_sum
         )
         return hidden_states
@@ -251,11 +251,11 @@ class StageBoundary:
             hidden_states = stream.complete(hidden_states)
         return hidden_states, stream.snapshot(hidden_states)
 
-    def postprocess(self, hidden_states, forward_batch):
+    def finish_complete_output(self, hidden_states, forward_batch):
         """Move an FFN output that compute already completed outside exit()
         (the operation-scheduled TBO path) onto the rows the layer hands on;
         it chooses no reduction step."""
-        return self.plan.output.postprocess_layer(
+        return self.plan.output.finish_complete_output(
             hidden_states, current(forward_batch), forward_batch
         )
 
@@ -288,9 +288,9 @@ class StageBoundary:
     def _prepare_input(self, hidden_states, stream, forward_batch, **call):
         plan = self.plan
         if self.kind is StageKind.ATTENTION:
-            publish_attention(plan._publish_lora_layout)
+            publish_attn_lora_rows(plan._publish_lora_layout)
             if (
-                plan._paths.get(BatchVariant.SEQUENCE_PARALLEL) is not None
+                plan.paths.get(BatchVariant.SEQUENCE_PARALLEL) is not None
                 and plan.enters_stack
             ):
                 get_forward().set(
@@ -299,7 +299,9 @@ class StageBoundary:
                 if get_forward().sp_active:
                     hidden_states = layernorm_sp.sp_entry_scatter(hidden_states)
         else:
-            publish_ffn(plan._publish_lora_layout, self.entry(forward_batch).input_rows)
+            publish_ffn_lora_rows(
+                plan._publish_lora_layout, self.entry(forward_batch).input_rows
+            )
         return self._prepare(hidden_states, stream, forward_batch, **call)
 
     def _prepare_attention(
@@ -324,7 +326,7 @@ class StageBoundary:
             if capture_before_read:
                 # Embeddings precede enter; HF deepstack capture precedes the
                 # extra addition. Neither is the residual returned by the read.
-                value, previous = stream.finish(hidden_states)
+                value, previous = stream.export(hidden_states)
                 if previous is None:
                     capture_output(value)
                 else:
@@ -363,11 +365,11 @@ class StageBoundary:
                     forward_batch=forward_batch,
                 )
             )
-            # Input gathers allocate fresh DP buffers (see gather_attention_tp).
+            # Input gathers allocate fresh DP buffers (see attn_tp_gather_input).
             # Without a gather this is the mutable residual, so retention copies.
             captured_last_layer_outputs.capture(
                 gathered_last_layer_output,
-                owned=move is gather_attention_tp
+                owned=move is attn_tp_gather_input
                 or (
                     move is None
                     and entry.capture_preserves_residual is not None

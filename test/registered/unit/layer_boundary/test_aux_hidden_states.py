@@ -8,7 +8,7 @@ import torch
 
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList, AuxHiddenStatePacker
 from sglang.srt.layers.layer_boundary import StageKind
-from sglang.srt.layers.layer_boundary.residual.access import norm_output
+from sglang.srt.layers.layer_boundary.residual.access import final_norm_pair
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.test.boundary_fixtures import prepare_attention, stub_plan, stub_stage
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -35,7 +35,7 @@ class TestAuxStorage(CustomTestCase):
             backend._copy_output_to_buffer(source, tuple(buffers), 2)
 
     def test_capture_move_owns_gather_but_not_slice(self):
-        from sglang.srt.layers.layer_boundary.boundary import Boundary
+        from sglang.srt.layers.layer_boundary.boundary import EdgeBinding
         from sglang.srt.layers.layer_boundary.layout import Layout, TokenAxis
         from sglang.test.communicator_patch import patch_communicator
 
@@ -46,11 +46,11 @@ class TestAuxStorage(CustomTestCase):
             edge = SimpleNamespace(
                 residual_to=rows, produced=SimpleNamespace(layout=target)
             )
-            boundary = Boundary(edge=edge, prepare=None)
+            boundary = EdgeBinding(edge=edge, prepare=None)
             self.assertEqual(boundary.capture_move_allocates, owns)
             with (
                 patch_communicator(
-                    "_redistribute_from_attn_tp_shards",
+                    "attn_tp_gather",
                     side_effect=lambda x: torch.cat((x, x)),
                 ),
                 patch_communicator(
@@ -147,7 +147,7 @@ class TestAuxStorage(CustomTestCase):
                 with patch.object(
                     torch.Tensor, "clone", side_effect=AssertionError("extra clone")
                 ):
-                    norm_output(hidden, residual, norm, outputs.capture)
+                    final_norm_pair(hidden, residual, norm, outputs.capture)
                 hidden.zero_()
                 updated.zero_()
                 torch.testing.assert_close(
@@ -183,7 +183,7 @@ class TestBoundCaptureOwnership(CustomTestCase):
         from sglang.srt.layers import layernorm
         from sglang.srt.layers.layer_boundary import (
             PLAIN_ADD,
-            FusedMlpInput,
+            FfnInputFusion,
             SumGroup,
             declare_attn,
             declare_ffn,
@@ -212,10 +212,10 @@ class TestBoundCaptureOwnership(CustomTestCase):
 
         custom_fusions = (
             SimpleNamespace(
-                ffn_input=lambda plan: (
-                    FusedMlpInput(completes=SumGroup.ATTN_TP, run=custom_fused),
+                ffn_input_fusions=lambda plan: (
+                    FfnInputFusion(completes=SumGroup.ATTN_TP, run=custom_fused),
                 ),
-                attention_input=lambda plan: (),
+                attn_input_fusions=lambda plan: (),
             )
             if custom
             else None
@@ -224,7 +224,7 @@ class TestBoundCaptureOwnership(CustomTestCase):
             forward_mode=ForwardMode.DECODE,
             residual_stream=ResidualStream(torch.full((2, 4), 2.0)),
         )
-        hidden = fb.residual_stream.leave(torch.full((2, 4), 3.0), PLAIN_ADD)
+        hidden = fb.residual_stream.record(torch.full((2, 4), 3.0), PLAIN_ADD)
         outputs = AuxHiddenStateList()
         with (
             fixture.planning(parallel),

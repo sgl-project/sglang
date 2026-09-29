@@ -9,7 +9,7 @@ import torch
 from sglang.srt.layers.layer_boundary import (
     Layout,
     MixerExit,
-    StageOutput,
+    OutputContract,
     SumGroup,
     TokenAxis,
     UnreducedOutput,
@@ -114,27 +114,27 @@ class TestStageEdges(CustomTestCase):
                     self.assertEqual(into.residual, rows)
                     self.assertEqual(into.produced.layout, rows)
                     produced = out_of.produced
-                    may_leave = produced.always_leaves or produced.leaves_for_next_layer
+                    may_leave = produced.always_partial or produced.may_defer_to_next
                     self.assertEqual(
                         into.produced.group, produced.group if may_leave else None
                     )
                     self.assertEqual(
-                        into.produced.always_leaves, produced.always_leaves
+                        into.produced.always_partial, produced.always_partial
                     )
                     self.assertEqual(
-                        into.produced.leaves_for_next_layer,
-                        produced.leaves_for_next_layer,
+                        into.produced.may_defer_to_next,
+                        produced.may_defer_to_next,
                     )
                 self.assertEqual(
-                    layers[0].edges[0].produced, StageOutput(rows, update=None)
+                    layers[0].edges[0].produced, OutputContract(rows, update=None)
                 )
                 self.assertTrue(layers[0].enters_stack)
                 self.assertFalse(any(layer.enters_stack for layer in layers[1:]))
                 last = layers[-1].edges[1].produced
-                self.assertFalse(last.always_leaves or last.leaves_for_next_layer)
+                self.assertFalse(last.always_partial or last.may_defer_to_next)
 
     def test_what_each_kind_of_boundary_carries(self):
-        # (pattern, boundary after layer 0): group, always_leaves, leaves_for_next_layer
+        # (pattern, boundary after layer 0): group, always_partial, may_defer_to_next
         cases = {
             "M-": (SumGroup.ATTN_TP, True, False),
             "*E": (SumGroup.ATTN_TP, True, False),
@@ -148,19 +148,19 @@ class TestStageEdges(CustomTestCase):
             with self.subTest(pattern=pattern):
                 into = stages(pattern, tp=2)[1].edges[0].produced
                 self.assertEqual(
-                    (into.group, into.always_leaves, into.leaves_for_next_layer),
+                    (into.group, into.always_partial, into.may_defer_to_next),
                     expected,
                 )
         # Without attention TP a mixer's output is complete.
         into = stages("M-", tp=1)[1].edges[0].produced
-        self.assertEqual(into, StageOutput(into.layout, update=None))
+        self.assertEqual(into, OutputContract(into.layout, update=None))
         # A MoE on this rank's own rows hands on a complete output; an a2a
         # backend dispatches only the MoE, so an MLP still sums over TP.
         into = stages("EM", tp=2, a2a=True)[1].edges[0].produced
-        self.assertEqual(into, StageOutput(into.layout, update=None))
+        self.assertEqual(into, OutputContract(into.layout, update=None))
         into = stages("-M", tp=2, a2a=True)[1].edges[0].produced
         self.assertEqual(
-            (into.group, into.always_leaves, into.leaves_for_next_layer),
+            (into.group, into.always_partial, into.may_defer_to_next),
             (SumGroup.TP, False, True),
         )
 
@@ -177,19 +177,19 @@ class TestMixerExit(CustomTestCase):
             if always and may:
                 continue
             with self.subTest(
-                always_leaves=always, leaves_for_next_layer=may, movable=movable
+                always_partial=always, may_defer_to_next=may, movable=movable
             ):
-                produced = StageOutput(
+                produced = OutputContract(
                     attention,
                     group=SumGroup.ATTN_TP if always or may else None,
-                    always_leaves=always,
-                    leaves_for_next_layer=may,
+                    always_partial=always,
+                    may_defer_to_next=may,
                 )
                 communicator = SimpleNamespace(
                     plan=SimpleNamespace(
-                        _batch_steps=lambda batch: SimpleNamespace(output=produced),
+                        path_for=lambda batch: SimpleNamespace(output=produced),
                     ),
-                    _ffn_sum_can_move_to_next_layer=MagicMock(return_value=movable),
+                    _sum_deferral_allowed=MagicMock(return_value=movable),
                 )
                 hidden = torch.ones(2, 4)
                 with get_parallel().override(tp_group=tp_group, tp_size=2):

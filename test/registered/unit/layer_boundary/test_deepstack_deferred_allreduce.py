@@ -59,7 +59,7 @@ class DeferringLayer(nn.Module):
 class DeferringStageLayer(DeferringLayer):
     def forward(self, positions=None, hidden_states=None, forward_batch=None, **kwargs):
         stream = residual_batch.current(forward_batch)
-        hidden_states, residual = stream.finish(hidden_states)
+        hidden_states, residual = stream.export(hidden_states)
         residual = hidden_states if residual is None else hidden_states + residual
         stream.write(residual)
         output = (
@@ -67,7 +67,7 @@ class DeferringStageLayer(DeferringLayer):
             if self.is_last_layer
             else UnreducedOutput(torch.full_like(residual, 1 / TP_SIZE), group=GROUP)
         )
-        return stream.leave(output, PLAIN_ADD)
+        return stream.record(output, PLAIN_ADD)
 
 
 class SumNorm(nn.Module):

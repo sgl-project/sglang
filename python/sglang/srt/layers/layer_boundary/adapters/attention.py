@@ -168,7 +168,7 @@ def get_attn_tp_context():
     return ATTN_TP_CONTEXT
 
 
-def _redistribute_from_attn_tp_shards(tensor: torch.Tensor) -> torch.Tensor:
+def attn_tp_gather(tensor: torch.Tensor) -> torch.Tensor:
     gathered = get_local_dp_buffer(
         get_parallel().attn_tp_group, hidden_size=tensor.shape[-1]
     )
@@ -176,6 +176,6 @@ def _redistribute_from_attn_tp_shards(tensor: torch.Tensor) -> torch.Tensor:
     return gathered
 
 
-def _redistribute_to_attn_tp_shards(tensor: torch.Tensor) -> torch.Tensor:
+def attn_tp_slice(tensor: torch.Tensor) -> torch.Tensor:
     parallel = get_parallel()
     return tensor.tensor_split(parallel.attn_tp_size)[parallel.attn_tp_rank]

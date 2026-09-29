@@ -51,7 +51,7 @@ class TestBatchOwnedResidual(CustomTestCase):
         partial = torch.ones(2, 4)
         group = SimpleNamespace(all_reduce=Mock(side_effect=lambda x: x * 2))
         stream.write(residual)
-        hidden = stream.leave(UnreducedOutput(partial, group=group), PLAIN_ADD)
+        hidden = stream.record(UnreducedOutput(partial, group=group), PLAIN_ADD)
         result = batch.norm(hidden, fb, lambda value, prior: (value + prior, prior))
         self.assertIsNone(fb.residual_stream)
         group.all_reduce.assert_called_once()
@@ -66,7 +66,7 @@ class TestBatchOwnedResidual(CustomTestCase):
         residual = torch.ones(2, 4)
         stream = batch.current(fb)
         stream.write(residual)
-        output = stream.leave(hidden, PLAIN_ADD)
+        output = stream.record(hidden, PLAIN_ADD)
         proxy = batch.to_pp(output, fb)
         self.assertIs(proxy["hidden_states"], hidden)
         self.assertIs(proxy["residual"], residual)
@@ -156,9 +156,9 @@ class TestBatchOwnedResidual(CustomTestCase):
             def __call__(self, positions, hidden, forward_batch, **kwargs):
                 stream = batch.current(forward_batch)
                 owner_ids.append(id(stream))
-                hidden, old = stream.finish(hidden)
+                hidden, old = stream.export(hidden)
                 stream.write(hidden if old is None else hidden + old)
-                return stream.leave(
+                return stream.record(
                     UnreducedOutput(torch.ones_like(hidden), group=group), PLAIN_ADD
                 )
 
@@ -198,7 +198,7 @@ class TestBatchOwnedResidual(CustomTestCase):
         def terminal_layer(*, inputs_embeds, hidden_states, forward_batch):
             stream = batch.current(forward_batch)
             stream.write(hidden_states)
-            hidden_states = stream.leave(torch.ones_like(hidden_states), PLAIN_ADD)
+            hidden_states = stream.record(torch.ones_like(hidden_states), PLAIN_ADD)
             hidden_states = batch.fold(hidden_states, forward_batch)
             normalized = hidden_states * 3
             return batch.written(normalized, forward_batch)
@@ -220,7 +220,7 @@ class TestBatchOwnedResidual(CustomTestCase):
         stream = batch.current(fb)
         value = torch.ones(2, 4)
         stream.write(value)
-        pending = stream.leave(value * 2, PLAIN_ADD)
+        pending = stream.record(value * 2, PLAIN_ADD)
         with self.assertRaises(RuntimeError):
             batch.take_output(pending, fb)
         self.assertIs(batch.current(fb), stream)

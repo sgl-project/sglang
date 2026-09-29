@@ -77,7 +77,7 @@ class TestNemotronMTPReduction(CustomTestCase):
                     residual = torch.tensor([[7.0, 3.0], [5.0, 9.0]])
                     expected = partial * tp + residual
                     stream = ResidualStream(residual)
-                    hidden = stream.leave(
+                    hidden = stream.record(
                         partial,
                         PLAIN_ADD,
                         declared_sum=SumGroup.ATTN_TP if tp > 1 else None,

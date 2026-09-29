@@ -26,8 +26,8 @@ from sglang.srt.layers.flashinfer_comm_fusion import (
     uses_cutedsl_ar_fusion,
 )
 from sglang.srt.layers.layer_boundary.adapters.attention import (
-    _redistribute_from_attn_tp_shards,
-    _redistribute_to_attn_tp_shards,
+    attn_tp_gather,
+    attn_tp_slice,
     get_attn_tp_context,
 )
 from sglang.srt.layers.layer_boundary.residual import LayerResidualOps
@@ -274,10 +274,10 @@ class PlainAdd:
         return hidden_states
 
     def slice_residual_attn_tp(self, residual):
-        return _redistribute_to_attn_tp_shards(residual)
+        return attn_tp_slice(residual)
 
     def gather_residual_attn_tp(self, residual):
-        return _redistribute_from_attn_tp_shards(residual)
+        return attn_tp_gather(residual)
 
 
 class Fp8Input(Enum):

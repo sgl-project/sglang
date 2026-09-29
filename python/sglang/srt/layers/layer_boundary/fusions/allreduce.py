@@ -19,7 +19,7 @@ from typing import Callable, Optional, Tuple
 
 import torch
 
-from sglang.srt.layers.layer_boundary.contracts import FusedMlpInput
+from sglang.srt.layers.layer_boundary.contracts import FfnInputFusion
 from sglang.srt.layers.layer_boundary.layout import SumGroup
 from sglang.srt.layers.layer_boundary.output import UnreducedOutput
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
@@ -38,14 +38,14 @@ from sglang.srt.utils import get_bool_env_var, is_hip
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 
-def attention_fusions(plan, read=NORM_QUANT_READOUT) -> Tuple[Callable, ...]:
+def attn_input_fusions(plan, read=NORM_QUANT_READOUT) -> Tuple[Callable, ...]:
     """The fused kernels that complete what the previous layer left together
     with the residual update and the input norm, in the order they are tried.
     Each takes (owed, residual, forward_batch, post_residual_addition) and
     returns None when it does not take the batch. They add the residual
     plainly; the boundary tries them only when the update it writes in is a
     plain add. A backend's come first."""
-    given = plan.fusions.attention_input(plan) if plan.fusions else ()
+    given = plan.fusions.attn_input_fusions(plan) if plan.fusions else ()
     if not hasattr(plan.norm, "forward_with_allreduce_fusion"):
         return given
     fuses_quant = (
@@ -59,7 +59,7 @@ def attention_fusions(plan, read=NORM_QUANT_READOUT) -> Tuple[Callable, ...]:
     return (
         *given,
         partial(
-            complete_attention_input,
+            fused_attn_input,
             plan,
             fuses_quant=fuses_quant,
             keep_bf16=fuses_quant and read.fp8_input is Fp8Input.TUPLE_AND_BF16,
@@ -67,7 +67,7 @@ def attention_fusions(plan, read=NORM_QUANT_READOUT) -> Tuple[Callable, ...]:
     )
 
 
-def complete_attention_input(
+def fused_attn_input(
     plan,
     owed: UnreducedOutput,
     residual: torch.Tensor,
@@ -111,19 +111,19 @@ def complete_attention_input(
     )
 
 
-def ffn_fusions(plan) -> Tuple["FusedMlpInput", ...]:
+def ffn_input_fusions(plan) -> Tuple["FfnInputFusion", ...]:
     """The fused kernels that can take the attention -> FFN steps, in the
     order they are tried. They add the residual plainly; the boundary tries
     them only when the update it writes in is a plain add. A backend's come
     first."""
-    given = plan.fusions.ffn_input(plan) if plan.fusions else ()
+    given = plan.fusions.ffn_input_fusions(plan) if plan.fusions else ()
     if not hasattr(plan.norm, "forward_with_allreduce_fusion"):
         return given
     return (
         *given,
-        FusedMlpInput(
+        FfnInputFusion(
             completes=SumGroup.ATTN_TP,
-            run=partial(complete_ffn_input, plan),
+            run=partial(fused_ffn_input, plan),
             preserves_residual=(
                 flashinfer_preserves_residual
                 if isinstance(plan.norm, (RMSNorm, GemmaRMSNorm))
@@ -147,7 +147,7 @@ def flashinfer_preserves_residual(value, forward_batch):
     )
 
 
-def complete_ffn_input(
+def fused_ffn_input(
     plan,
     hidden_states: torch.Tensor,
     residual: torch.Tensor,

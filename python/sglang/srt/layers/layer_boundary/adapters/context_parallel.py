@@ -49,7 +49,7 @@ def maybe_prefetch_next_full_attention_kv(
         prefetch_kv_buffer(next_full_attention_layer_id)
 
 
-def dsa_cp_gather_hidden_states(hidden_states: torch.Tensor):
+def attn_cp_gather(hidden_states: torch.Tensor):
     attn_dp_size = get_parallel().attn_dp_size
     attn_tp_size = get_parallel().attn_tp_size
     assert attn_dp_size == 1 and attn_tp_size == 1
@@ -61,7 +61,7 @@ def dsa_cp_gather_hidden_states(hidden_states: torch.Tensor):
     return hidden_states
 
 
-def dsa_cp_reduce_scatter_hidden_states(hidden_states: torch.Tensor):
+def attn_cp_reduce_scatter(hidden_states: torch.Tensor):
     attn_dp_size = get_parallel().attn_dp_size
     attn_tp_size = get_parallel().attn_tp_size
     assert attn_dp_size == 1 and attn_tp_size == 1

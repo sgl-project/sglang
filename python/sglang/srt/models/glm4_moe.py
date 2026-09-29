@@ -992,7 +992,7 @@ class Glm4MoeDecoderLayer(nn.Module):
         )
 
     def op_comm_postprocess_layer(self, state):
-        hidden_states = self.ffn_boundary.postprocess(
+        hidden_states = self.ffn_boundary.finish_complete_output(
             state.pop("hidden_states_mlp_output"), state.forward_batch
         )
 

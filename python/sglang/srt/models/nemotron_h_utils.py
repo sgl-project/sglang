@@ -2,7 +2,7 @@
 
 from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA, MOE
 from sglang.srt.layers.layer_boundary import (
-    HandoffRows,
+    ExitRows,
     ProducerReduction,
     declare_attn,
     declare_ffn,
@@ -26,14 +26,14 @@ def _declaration(pattern: str, layer_idx: int):
     if is_attn_layer(pattern[layer_idx]):
         return declare_attn(
             read=NormQuantReadout(reads_before_dp_gather=True),
-            reduction=ProducerReduction.SCOPED,
+            reduction=ProducerReduction.EXIT_SCOPED,
             gathers_tp_input=False,
         )
     return declare_ffn(
         sparse=pattern[layer_idx] == MOE,
         read=NormReadout(reads_before_dp_gather=True),
         dense_tp_size=get_parallel().tp_size if pattern[layer_idx] != MOE else None,
-        handoff_rows=HandoffRows.ATTENTION,
+        exit_rows=ExitRows.ATTENTION,
     )
 
 

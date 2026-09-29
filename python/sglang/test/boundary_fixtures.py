@@ -8,7 +8,7 @@ from sglang.srt.layers.layer_boundary.factories import (
     declare_ffn,
     make_stages,
 )
-from sglang.srt.layers.layer_boundary.ops import identity_output
+from sglang.srt.layers.layer_boundary.ops import keep_output
 from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_RESIDUAL_OPS
 from sglang.srt.layers.layer_boundary.stage import StageBoundary
 
@@ -61,8 +61,8 @@ def stub_plan():
     plan.norm = None
     plan.fusions = None
     plan._publish_lora_layout = False
-    plan._fusion_rows = None
-    plan._paths = {}
+    plan._next_input_rows = None
+    plan.paths = {}
     plan.enters_stack = False
     return plan
 
@@ -82,28 +82,28 @@ def sp_region_steps():
     """Local SP rows with no owed sum, for tests of activation and exits."""
     from sglang.srt.layers.layer_boundary import (
         NORM_QUANT_READOUT,
-        EdgeDecl,
+        EdgeContract,
+        EntryPath,
+        InputContract,
         Layout,
-        StageEntry,
-        StageInput,
-        StageOutput,
-        StageSteps,
+        OutputContract,
+        StagePath,
         TokenAxis,
-        make_boundary,
+        bind_entry,
     )
-    from sglang.srt.layers.layer_boundary.prepare import _hand_qkv_hook_its_input
+    from sglang.srt.layers.layer_boundary.prepare import _attn_input_default
 
     rows = Layout(frozenset({TokenAxis.ATTN_TP_SCATTER}))
-    output = StageOutput(rows)
+    output = OutputContract(rows)
 
-    def entry(read, handoff=None):
-        selected = make_boundary(
-            EdgeDecl(output, StageInput(rows, read=read), rows, rows)
+    def entry(read, attn_input_adapter=None):
+        selected = bind_entry(
+            EdgeContract(output, InputContract(rows, read=read), rows, rows)
         )
-        return StageEntry(selected.prepare, rows, handoff=handoff)
+        return EntryPath(selected.prepare, rows, attn_input_adapter=attn_input_adapter)
 
-    return StageSteps(
-        entry(NORM_QUANT_READOUT, _hand_qkv_hook_its_input), output, identity_output
+    return StagePath(
+        entry(NORM_QUANT_READOUT, _attn_input_default), output, keep_output
     )
 
 
@@ -124,10 +124,10 @@ def prepare_raw(stage, method, hidden, residual, forward_batch, *args, **call):
     if not isinstance(residual, ResidualStream):
         stream = ResidualStream(residual)
         if residual is not None:
-            hidden = stream.leave(
+            hidden = stream.record(
                 hidden,
                 call.get("update", PLAIN_ADD),
-                declared_sum=stage.entry(forward_batch).input_sum,
+                declared_sum=stage.entry(forward_batch).declared_sum,
             )
     else:
         stream = residual
@@ -153,7 +153,7 @@ def postprocess_output(boundary, hidden, residual, forward_batch):
     stream = (
         residual if isinstance(residual, ResidualStream) else ResidualStream(residual)
     )
-    hidden = boundary.postprocess_layer(hidden, stream, forward_batch)
+    hidden = boundary.finish_complete_output(hidden, stream, forward_batch)
     if isinstance(residual, ResidualStream):
         return hidden, stream
     return (hidden, None) if stream.pending is None else stream.input(hidden)

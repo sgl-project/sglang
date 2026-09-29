@@ -23,7 +23,9 @@ class TestTboEntryReducesItsInput(CustomTestCase):
         group = SimpleNamespace(all_reduce=lambda x: x * 2)
         residual = torch.ones(4, 3)
         stream = ResidualStream(residual)
-        hidden = stream.leave(UnreducedOutput(torch.ones(4, 3), group=group), PLAIN_ADD)
+        hidden = stream.record(
+            UnreducedOutput(torch.ones(4, 3), group=group), PLAIN_ADD
+        )
         batch = SimpleNamespace(residual_stream=stream, global_forward_mode=None)
         parts_seen = []
 
@@ -56,7 +58,7 @@ class TestTboEntryReducesItsInput(CustomTestCase):
                 value, old_residual = state.input(value)
                 torch.testing.assert_close(value, torch.full((2, 3), 2.0))
                 state.write(value + old_residual)
-                part["hidden_states"] = state.leave(value * 5, PLAIN_ADD)
+                part["hidden_states"] = state.record(value * 5, PLAIN_ADD)
             return inputs_arr
 
         with (

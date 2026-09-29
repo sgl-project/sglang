@@ -1112,10 +1112,10 @@ class DeepseekV2MoE(nn.Module):
             # deferred_finalize excludes _shared_expert_tp1, so the shared add folds in.
             assert shared_output is not None
             from sglang.srt.layers.layer_boundary.fusions.cutedsl import (
-                MoeFinalizeHandoff,
+                MoeDeferredFinalize,
             )
 
-            return MoeFinalizeHandoff.from_flashinfer(
+            return MoeDeferredFinalize.from_flashinfer(
                 final_hidden_states,
                 gated_shared_output=shared_output,
                 m=hidden_states.shape[0],
@@ -2294,7 +2294,7 @@ class DeepseekV2AttentionMLA(
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
-        input_on_attention_tp_slices: bool = False,
+        input_on_attn_tp_slices: bool = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ):
@@ -2303,7 +2303,7 @@ class DeepseekV2AttentionMLA(
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
-            input_on_attention_tp_slices=input_on_attention_tp_slices,
+            input_on_attn_tp_slices=input_on_attn_tp_slices,
             llama_4_scaling=llama_4_scaling,
             prev_topk_indices=prev_topk_indices,
         )
@@ -2315,7 +2315,7 @@ class DeepseekV2AttentionMLA(
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
-        input_on_attention_tp_slices: bool = False,
+        input_on_attn_tp_slices: bool = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ):
@@ -2400,7 +2400,7 @@ class DeepseekV2AttentionMLA(
                 hidden_states,
                 forward_batch,
                 zero_allocator,
-                input_on_attention_tp_slices,
+                input_on_attn_tp_slices,
             )
         elif attn_forward_method == AttnForwardMethod.MLA_NPU:
             inner_state = forward_mla_prepare_npu(
@@ -2409,7 +2409,7 @@ class DeepseekV2AttentionMLA(
                 hidden_states,
                 forward_batch,
                 zero_allocator,
-                input_on_attention_tp_slices,
+                input_on_attn_tp_slices,
             )
         elif attn_forward_method == AttnForwardMethod.DSA_NPU:
             inner_state = forward_dsa_prepare_npu(
@@ -2418,7 +2418,7 @@ class DeepseekV2AttentionMLA(
                 hidden_states,
                 forward_batch,
                 zero_allocator,
-                input_on_attention_tp_slices,
+                input_on_attn_tp_slices,
                 prev_topk_indices,
             )
         else:
@@ -2737,9 +2737,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 forward_batch=forward_batch,
                 zero_allocator=zero_allocator,
                 llama_4_scaling=llama_4_scaling,
-                input_on_attention_tp_slices=(
-                    self.attn_boundary.input_on_attention_tp_slices
-                ),
+                input_on_attn_tp_slices=(self.attn_boundary.input_on_attn_tp_slices),
                 prev_topk_indices=prev_topk_indices,
             )
         if isinstance(hidden_states, tuple):
@@ -2813,7 +2811,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
     def op_comm_postprocess_layer(self, state):
-        hidden_states = self.ffn_boundary.postprocess(
+        hidden_states = self.ffn_boundary.finish_complete_output(
             state.pop("hidden_states_mlp_output"), state.forward_batch
         )
 
@@ -3465,7 +3463,7 @@ def dsv2_flashinfer_moe_dual_stream_graph(
         mlp_reduce_scatter=mlp_reduce_scatter,
         flashinfer_trtllm_bypass=True,
         lora_batch_layout=LoRABatchLayout.TP_GLOBAL,
-        # The op's Tensor schema cannot carry a MoeFinalizeHandoff.
+        # The op's Tensor schema cannot carry a MoeDeferredFinalize.
         defer_moe_finalize=False,
     ):
         return moe_fusion.forward_normal_dual_stream(hidden_states)

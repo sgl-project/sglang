@@ -7,14 +7,14 @@ import torch
 
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.layer_boundary import (
-    EdgeDecl,
+    EdgeContract,
+    EntryPath,
+    InputContract,
     Layout,
-    StageEntry,
-    StageInput,
-    StageOutput,
-    StageSteps,
+    OutputContract,
+    StagePath,
     SumGroup,
-    make_boundary,
+    bind_entry,
 )
 from sglang.srt.layers.layer_boundary.contracts import BatchVariant, StageKind
 from sglang.srt.layers.layer_boundary.output import UnreducedOutput
@@ -40,7 +40,7 @@ class TestResidualStream(CustomTestCase):
         self.residual = torch.full((2, 4), 3.0)
         self.partial = torch.ones(2, 4)
         self.stream = ResidualStream(self.residual)
-        self.hidden = self.stream.leave(
+        self.hidden = self.stream.record(
             UnreducedOutput(self.partial, group=self.group), PLAIN_ADD
         )
 
@@ -58,11 +58,13 @@ class TestResidualStream(CustomTestCase):
 
         read = Read()
         rows = Layout(frozenset())
-        boundary = make_boundary(
-            EdgeDecl(StageOutput(rows), StageInput(rows, read=read), rows, rows),
+        boundary = bind_entry(
+            EdgeContract(
+                OutputContract(rows), InputContract(rows, read=read), rows, rows
+            ),
             enters_stack=True,
         )
-        steps = StageSteps(StageEntry(boundary.prepare, rows), StageOutput(rows), None)
+        steps = StagePath(EntryPath(boundary.prepare, rows), OutputContract(rows), None)
         stage = StageBoundary(
             SimpleNamespace(norm=None),
             declaration=SimpleNamespace(kind=StageKind.ATTENTION),
@@ -97,15 +99,15 @@ class TestResidualStream(CustomTestCase):
 
         declared = Update(100)
         rows = Layout(frozenset())
-        boundary = make_boundary(
-            EdgeDecl(
-                StageOutput(rows, update=declared),
-                StageInput(rows, read=Read()),
+        boundary = bind_entry(
+            EdgeContract(
+                OutputContract(rows, update=declared),
+                InputContract(rows, read=Read()),
                 rows,
                 rows,
             )
         )
-        steps = StageSteps(StageEntry(boundary.prepare, rows), StageOutput(rows), None)
+        steps = StagePath(EntryPath(boundary.prepare, rows), OutputContract(rows), None)
         stage = StageBoundary(
             SimpleNamespace(norm=None),
             declaration=SimpleNamespace(kind=StageKind.ATTENTION),
@@ -114,7 +116,7 @@ class TestResidualStream(CustomTestCase):
             with self.subTest(increment=increment):
                 actual = Update(increment)
                 stream = ResidualStream(torch.full((2, 4), 3.0))
-                hidden = stream.leave(torch.ones(2, 4), actual)
+                hidden = stream.record(torch.ones(2, 4), actual)
                 result, stream = stage._prepare(hidden, stream, None, steps)
                 torch.testing.assert_close(
                     result, torch.full((2, 4), 2.0 * (4 + increment))
@@ -125,8 +127,8 @@ class TestResidualStream(CustomTestCase):
 
     def test_unbound_update_capability_fails_before_consuming_the_sum(self):
         rows = Layout(frozenset())
-        boundary = make_boundary(
-            EdgeDecl(StageOutput(rows), StageInput(rows), rows, rows)
+        boundary = bind_entry(
+            EdgeContract(OutputContract(rows), InputContract(rows), rows, rows)
         )
         with self.assertRaisesRegex(RuntimeError, "capability"):
             boundary.prepare(
@@ -139,7 +141,7 @@ class TestResidualStream(CustomTestCase):
 
     def test_declared_sum_snapshot_and_pipeline_handoff_preserve_the_partial(self):
         stream = ResidualStream(self.residual)
-        hidden = stream.leave(self.partial, PLAIN_ADD, declared_sum=SumGroup.TP)
+        hidden = stream.record(self.partial, PLAIN_ADD, declared_sum=SumGroup.TP)
         self.assertIsInstance(hidden, OwedOutput)
         with patch(
             "sglang.srt.layers.layer_boundary.residual.stream._sum_group",
@@ -148,10 +150,10 @@ class TestResidualStream(CustomTestCase):
             snapshot = stream.snapshot(hidden)
         torch.testing.assert_close(snapshot, torch.full((2, 4), 5.0))
         torch.testing.assert_close(self.partial, torch.ones(2, 4))
-        wire, residual = stream.finish(hidden, preserve_declared=True)
+        wire, residual = stream.export(hidden, preserve_declared=True)
         self.assertIs(wire, self.partial)
         self.assertIsInstance(stream.pending.owed, DeclaredSum)
-        received, rebuilt = ResidualStream.arrive(
+        received, rebuilt = ResidualStream.from_handoff(
             wire, residual, PLAIN_ADD, declared_sum=SumGroup.TP
         )
         self.assertIsInstance(received, OwedOutput)
@@ -159,16 +161,16 @@ class TestResidualStream(CustomTestCase):
 
     def test_materialized_declared_sum_is_not_reduced_again(self):
         rows = Layout(frozenset())
-        boundary = make_boundary(
-            EdgeDecl(
-                StageOutput(rows, group=SumGroup.TP, always_leaves=True),
-                StageInput(rows),
+        boundary = bind_entry(
+            EdgeContract(
+                OutputContract(rows, group=SumGroup.TP, always_partial=True),
+                InputContract(rows),
                 rows,
                 rows,
             )
         )
         stream = ResidualStream(self.residual)
-        hidden = stream.leave(self.partial, PLAIN_ADD, declared_sum=SumGroup.TP)
+        hidden = stream.record(self.partial, PLAIN_ADD, declared_sum=SumGroup.TP)
         with patch(
             "sglang.srt.layers.layer_boundary.residual.stream._sum_group",
             return_value=self.group,
@@ -191,11 +193,11 @@ class TestResidualStream(CustomTestCase):
 
     def test_declared_sum_must_match_the_consumer_contract(self):
         rows = Layout(frozenset())
-        boundary = make_boundary(
-            EdgeDecl(StageOutput(rows), StageInput(rows), rows, rows)
+        boundary = bind_entry(
+            EdgeContract(OutputContract(rows), InputContract(rows), rows, rows)
         )
         stream = ResidualStream(self.residual)
-        stream.leave(self.partial, PLAIN_ADD, declared_sum=SumGroup.TP)
+        stream.record(self.partial, PLAIN_ADD, declared_sum=SumGroup.TP)
         with self.assertRaisesRegex(RuntimeError, "sum does not match"):
             boundary.prepare(
                 self.partial,
@@ -209,7 +211,7 @@ class TestResidualStream(CustomTestCase):
     def test_snapshot_rejects_stateful_update_without_touching_main_state(self):
         update = SimpleNamespace(is_plain_add=False, update=Mock())
         stream = ResidualStream(self.residual)
-        hidden = stream.leave(UnreducedOutput(self.partial, group=self.group), update)
+        hidden = stream.record(UnreducedOutput(self.partial, group=self.group), update)
         with self.assertRaisesRegex(NotImplementedError, "plain residual update"):
             stream.snapshot(hidden)
         self.group.all_reduce.assert_not_called()
@@ -324,13 +326,13 @@ class TestResidualStream(CustomTestCase):
 
         full = Layout(frozenset())
         local = Layout(frozenset({TokenAxis.ATTN_TP_SCATTER}))
-        boundary = make_boundary(
-            EdgeDecl(StageOutput(full), StageInput(local), full, local)
+        boundary = bind_entry(
+            EdgeContract(OutputContract(full), InputContract(local), full, local)
         )
         shard = torch.full((2, 4), 3.0)
         expected = torch.cat([shard, torch.full_like(shard, 7.0)])
         with patch(
-            "sglang.srt.layers.layer_boundary.ops._redistribute_from_attn_tp_shards",
+            "sglang.srt.layers.layer_boundary.ops.attn_tp_gather",
             return_value=expected,
         ) as gather:
             captured = boundary.capture_move(shard, forward_batch=None)
@@ -339,13 +341,13 @@ class TestResidualStream(CustomTestCase):
         torch.testing.assert_close(shard, torch.full((2, 4), 3.0))
 
     def test_final_capture_uses_the_norms_residual_result(self):
-        from sglang.srt.layers.layer_boundary.residual.access import norm_output
+        from sglang.srt.layers.layer_boundary.residual.access import final_norm_pair
 
         outputs = AuxHiddenStateList()
         updated = torch.full_like(self.partial, 5.0)
         normalized = torch.full_like(self.partial, 13.0)
         norm = Mock(return_value=(normalized, updated))
-        result = norm_output(self.partial, self.residual, norm, outputs.capture)
+        result = final_norm_pair(self.partial, self.residual, norm, outputs.capture)
         self.assertIs(result, normalized)
         norm.assert_called_once_with(self.partial, self.residual)
         updated.zero_()
@@ -363,11 +365,11 @@ class TestResidualStream(CustomTestCase):
 
     def test_handles_cannot_cross_microbatches_or_be_reused_after_take(self):
         other = ResidualStream(self.residual.clone())
-        other.leave(UnreducedOutput(self.partial.clone(), group=self.group), PLAIN_ADD)
+        other.record(UnreducedOutput(self.partial.clone(), group=self.group), PLAIN_ADD)
         with self.assertRaises(RuntimeError):
             other.input(self.hidden)
         with self.assertRaises(RuntimeError):
-            self.stream.leave(torch.zeros_like(self.partial), PLAIN_ADD)
+            self.stream.record(torch.zeros_like(self.partial), PLAIN_ADD)
         self.stream.write(self.residual)
         with self.assertRaises(RuntimeError):
             self.stream.input(self.hidden)
@@ -376,8 +378,8 @@ class TestResidualStream(CustomTestCase):
     def test_local_row_move_is_owed_even_without_an_all_reduce(self):
         move = Mock(side_effect=lambda value: value[:1])
         stream = ResidualStream(self.residual[:1])
-        hidden = stream.leave(
-            UnreducedOutput(self.partial, reduce_and_redistribute=move), PLAIN_ADD
+        hidden = stream.record(
+            UnreducedOutput(self.partial, reduce_to_dp_local=move), PLAIN_ADD
         )
         self.assertIsInstance(hidden, OwedOutput)
         completed = stream.complete(hidden)
@@ -394,10 +396,12 @@ class TestResidualStream(CustomTestCase):
                 return residual * 2, residual
 
         rows = Layout(frozenset())
-        boundary = make_boundary(
-            EdgeDecl(StageOutput(rows), StageInput(rows, read=Read()), rows, rows)
+        boundary = bind_entry(
+            EdgeContract(
+                OutputContract(rows), InputContract(rows, read=Read()), rows, rows
+            )
         )
-        steps = StageSteps(StageEntry(boundary.prepare, rows), StageOutput(rows), None)
+        steps = StagePath(EntryPath(boundary.prepare, rows), OutputContract(rows), None)
         stage = StageBoundary(
             SimpleNamespace(norm=None),
             declaration=SimpleNamespace(kind=StageKind.ATTENTION),
@@ -406,8 +410,8 @@ class TestResidualStream(CustomTestCase):
         partial_ref = weakref.ref(partial)
         stream = ResidualStream(torch.full((2, 4), 3.0))
         # The deferred DP completion: sum, then this rank's rows.
-        hidden = stream.leave(
-            UnreducedOutput(partial, reduce_and_redistribute=lambda x: x[:2] * 2),
+        hidden = stream.record(
+            UnreducedOutput(partial, reduce_to_dp_local=lambda x: x[:2] * 2),
             PLAIN_ADD,
         )
         del partial
@@ -430,7 +434,7 @@ class TestBatchStageOwnership(CustomTestCase):
         contribution = torch.full_like(residual, 2)
         refs = [weakref.ref(residual), weakref.ref(contribution)]
         batch.current(fb).write(residual)
-        output = batch.current(fb).leave(contribution, PLAIN_ADD)
+        output = batch.current(fb).record(contribution, PLAIN_ADD)
         result = batch.norm(output, fb, lambda x, r: (x + r, r))
         del output, residual, contribution
         torch.testing.assert_close(result, torch.full((2, 4), 3.0))
@@ -446,7 +450,7 @@ class TestBatchStageOwnership(CustomTestCase):
         contribution = torch.full_like(residual, 2)
         refs = [weakref.ref(residual), weakref.ref(contribution)]
         batch.current(fb).write(residual)
-        output = batch.current(fb).leave(contribution, PLAIN_ADD)
+        output = batch.current(fb).record(contribution, PLAIN_ADD)
         proxy = batch.to_pp(output, fb)
         del output, residual, contribution
         self.assertTrue(all(ref() is not None for ref in refs))
@@ -471,25 +475,27 @@ class TestBatchStageOwnership(CustomTestCase):
                 return updated * 2, updated
 
         rows = Layout(frozenset())
-        boundary = make_boundary(
-            EdgeDecl(StageOutput(rows), StageInput(rows, read=Read()), rows, rows)
+        boundary = bind_entry(
+            EdgeContract(
+                OutputContract(rows), InputContract(rows, read=Read()), rows, rows
+            )
         )
         owner = stub_plan()
         owner.norm = None
-        owner._paths[BatchVariant.ORDINARY] = StageSteps(
-            StageEntry(boundary.prepare, rows), StageOutput(rows), None
+        owner.paths[BatchVariant.ORDINARY] = StagePath(
+            EntryPath(boundary.prepare, rows), OutputContract(rows), None
         )
-        owner._paths[BatchVariant.SEQUENCE_PARALLEL] = owner._paths[
+        owner.paths[BatchVariant.SEQUENCE_PARALLEL] = owner.paths[
             BatchVariant.INPUT_SCATTERED
-        ] = owner._paths[BatchVariant.CONTEXT_PARALLEL] = None
+        ] = owner.paths[BatchVariant.CONTEXT_PARALLEL] = None
         stage = stub_stage(owner, StageKind.FFN)
         a, b = [SimpleNamespace(forward_mode=ForwardMode.DECODE) for _ in range(2)]
         batch.start(a)
         batch.start(b)
         first = stage.prepare(torch.ones(2, 4), a)
         second = stage.prepare(torch.full((2, 4), 10.0), b)
-        first = batch.current(a).leave(first * 3, PLAIN_ADD)
-        second = batch.current(b).leave(second * 5, PLAIN_ADD)
+        first = batch.current(a).record(first * 3, PLAIN_ADD)
+        second = batch.current(b).record(second * 5, PLAIN_ADD)
         torch.testing.assert_close(stage.prepare(first, a), torch.full((2, 4), 14.0))
         torch.testing.assert_close(stage.prepare(second, b), torch.full((2, 4), 220.0))
         self.assertIsNot(batch.current(a), batch.current(b))

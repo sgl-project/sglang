@@ -1850,7 +1850,7 @@ class Qwen3_5ForCausalLM(nn.Module):
             hidden_states,
             forward_batch,
             self.norm,
-            handoff_norm=self.flashinfer_mnnvl_cutedsl_fusion,
+            finalize_norm=self.flashinfer_mnnvl_cutedsl_fusion,
             skip_empty=True,
         )
 

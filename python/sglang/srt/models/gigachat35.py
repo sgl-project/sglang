@@ -484,9 +484,7 @@ class GigaChat35DecoderLayer(deepseek_v2.DeepseekV2DecoderLayer):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
                 zero_allocator=zero_allocator,
-                input_on_attention_tp_slices=(
-                    self.attn_boundary.input_on_attention_tp_slices
-                ),
+                input_on_attn_tp_slices=(self.attn_boundary.input_on_attn_tp_slices),
             )
         get_attn_tp_context().clear_attn_inputs()
 

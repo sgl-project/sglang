@@ -55,7 +55,7 @@ def norm(
     layernorm,
     capture_output=None,
     *,
-    handoff_norm=None,
+    finalize_norm=None,
     skip_empty=False,
     **read_kwargs,
 ):
@@ -67,7 +67,7 @@ def norm(
         layernorm: Final norm supporting the model's output/residual pair.
         capture_output: Optional callback retaining the same updated residual;
             it must copy borrowed storage when retention requires ownership.
-        handoff_norm: Optional adapter with finalize(handoff, residual, gamma)
+        finalize_norm: Optional adapter with finalize(handoff, residual, gamma)
             for a producer-specific finalize handoff; when a handoff arrives it
             cannot be combined with capture. Without it, a handoff is completed
             unfused first. Its gamma is layernorm.gemma_weight, so the final
@@ -79,28 +79,28 @@ def norm(
         Normalized tensor. Add and norm remain together to preserve the kernel's
         accumulation/rounding order; a snapshot is not used as the norm input.
     """
-    hidden_states, residual = current(forward_batch).finish(
-        hidden_states, takes_handoff=handoff_norm is not None
+    hidden_states, residual = current(forward_batch).export(
+        hidden_states, takes_handoff=finalize_norm is not None
     )
     # The terminal consumer now owns the pair. Do not keep layer buffers alive
     # through logits processing or the next forward on this batch.
     forward_batch.residual_stream = None
-    from sglang.srt.layers.layer_boundary.output import HandoffOutput
+    from sglang.srt.layers.layer_boundary.output import DeferredFinalize
 
-    if isinstance(hidden_states, HandoffOutput):
+    if isinstance(hidden_states, DeferredFinalize):
         if residual is None:
             raise RuntimeError("invalid final deferred MoE handoff")
         if capture_output is not None:
             raise RuntimeError(
                 "final handoff capture requires an explicit capture adapter"
             )
-        hidden_states, _ = handoff_norm.finalize(
+        hidden_states, _ = finalize_norm.finalize(
             handoff=hidden_states, residual=residual, gamma=layernorm.gemma_weight
         )
         return hidden_states
     if skip_empty and hidden_states.shape[0] == 0:
         return hidden_states
-    return access.norm_output(
+    return access.final_norm_pair(
         hidden_states, residual, layernorm, capture_output, **read_kwargs
     )
 
@@ -117,7 +117,7 @@ def to_pp(hidden_states, forward_batch, *, preserve_declared=True):
 
     Runtime-selected completion work is finished before transport.
     """
-    hidden_states, residual = current(forward_batch).finish(
+    hidden_states, residual = current(forward_batch).export(
         hidden_states, preserve_declared=preserve_declared
     )
     forward_batch.residual_stream = None

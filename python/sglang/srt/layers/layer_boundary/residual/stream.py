@@ -20,25 +20,25 @@ import torch
 
 from sglang.srt.distributed import GroupCoordinator
 from sglang.srt.layers.layer_boundary.layout import SumGroup, _sum_group
-from sglang.srt.layers.layer_boundary.output import HandoffOutput, UnreducedOutput
+from sglang.srt.layers.layer_boundary.output import DeferredFinalize, UnreducedOutput
 from sglang.srt.layers.layer_boundary.residual import ResidualUpdate
 
 
-class CarriedSum(msgspec.Struct, frozen=True):
+class DeferredSum(msgspec.Struct, frozen=True):
     """Runtime reduction left by an exit decision.
 
     Fields:
         group: All-reduce group when no redistribution callable is supplied.
-        reduce_and_redistribute: Optional callable(value) returning a reduced
+        reduce_to_dp_local: Optional callable(value) returning a reduced
             value on destination rows; takes precedence over group.
     """
 
     group: Optional[GroupCoordinator] = None
-    reduce_and_redistribute: Optional[Callable] = None
+    reduce_to_dp_local: Optional[Callable] = None
 
     def complete(self, value):
-        if self.reduce_and_redistribute is not None:
-            return self.reduce_and_redistribute(value)
+        if self.reduce_to_dp_local is not None:
+            return self.reduce_to_dp_local(value)
         return self.group.all_reduce(value)
 
 
@@ -64,22 +64,22 @@ class Contribution(msgspec.Struct):
 
     value: Optional[torch.Tensor]
     update: ResidualUpdate
-    owed: Union[CarriedSum, DeclaredSum, HandoffOutput, None] = None
+    owed: Union[DeferredSum, DeclaredSum, DeferredFinalize, None] = None
 
     def for_boundary(self):
         # These forms are private inputs to the existing fused-kernel adapters.
-        if isinstance(self.owed, CarriedSum):
+        if isinstance(self.owed, DeferredSum):
             return UnreducedOutput(
-                self.value, self.owed.group, self.owed.reduce_and_redistribute
+                self.value, self.owed.group, self.owed.reduce_to_dp_local
             )
-        if isinstance(self.owed, HandoffOutput):
+        if isinstance(self.owed, DeferredFinalize):
             return self.owed
         return self.value
 
     def complete(self):
-        if isinstance(self.owed, (CarriedSum, DeclaredSum)):
+        if isinstance(self.owed, (DeferredSum, DeclaredSum)):
             value = self.owed.complete(self.value)
-        elif isinstance(self.owed, HandoffOutput):
+        elif isinstance(self.owed, DeferredFinalize):
             value = self.owed.complete()
         else:
             return self.value
@@ -123,7 +123,7 @@ class ResidualStream:
         self.pending = None
 
     @classmethod
-    def arrive(cls, hidden, residual, update, *, declared_sum=None):
+    def from_handoff(cls, hidden, residual, update, *, declared_sum=None):
         """Reconstruct a stream from a tensor handoff, including a TBO microbatch.
 
         Args:
@@ -139,7 +139,7 @@ class ResidualStream:
         stream = cls(residual)
         if residual is None:
             return stream.write(hidden), stream
-        return stream.leave(hidden, update, declared_sum=declared_sum), stream
+        return stream.record(hidden, update, declared_sum=declared_sum), stream
 
     def write(self, residual):
         if self.pending is not None:
@@ -150,11 +150,11 @@ class ResidualStream:
         self.pending = None
         return residual
 
-    def leave(self, output, update, *, declared_sum=None):
+    def record(self, output, update, *, declared_sum=None):
         """Record one producer contribution without applying its residual update.
 
         Args:
-            output: Complete tensor, UnreducedOutput, or producer-specific HandoffOutput.
+            output: Complete tensor, UnreducedOutput, or producer-specific DeferredFinalize.
             update: Producer operation that the next boundary must apply.
             declared_sum: SumGroup statically owed by a raw tensor, or None. Cannot
                 be combined with another output wrapper's completion contract.
@@ -173,9 +173,9 @@ class ResidualStream:
             contribution = Contribution(
                 output.partial,
                 update,
-                CarriedSum(output.group, output.reduce_and_redistribute),
+                DeferredSum(output.group, output.reduce_to_dp_local),
             )
-        elif isinstance(output, HandoffOutput):
+        elif isinstance(output, DeferredFinalize):
             contribution = Contribution(None, update, output)
         else:
             contribution = Contribution(output, update)
@@ -223,13 +223,13 @@ class ResidualStream:
             raise NotImplementedError("snapshot requires a plain residual update")
         if pending.owed is None:
             value = pending.value
-        elif isinstance(pending.owed, (CarriedSum, DeclaredSum)):
+        elif isinstance(pending.owed, (DeferredSum, DeclaredSum)):
             value = pending.owed.complete(pending.value.clone())
         else:
             raise NotImplementedError("a finalize handoff requires main-output capture")
         return value.clone() if self.residual is None else value + self.residual
 
-    def finish(self, hidden, *, takes_handoff=False, preserve_declared=False):
+    def export(self, hidden, *, takes_handoff=False, preserve_declared=False):
         """Export the output/residual pair without closing or consuming the stream.
 
         Args:
@@ -248,6 +248,6 @@ class ResidualStream:
             return hidden, None
         if preserve_declared and isinstance(self.pending.owed, DeclaredSum):
             return self.pending.value, self.residual
-        if takes_handoff and isinstance(self.pending.owed, HandoffOutput):
+        if takes_handoff and isinstance(self.pending.owed, DeferredFinalize):
             return self.pending.owed, self.residual
         return self.pending.complete(), self.residual

@@ -21,10 +21,10 @@ import msgspec
 
 from sglang.srt.layers.layer_boundary.contracts import (
     CpMoves,
-    EdgeDecl,
-    FusedMlpInput,
-    StageInput,
-    StageOutput,
+    EdgeContract,
+    FfnInputFusion,
+    InputContract,
+    OutputContract,
 )
 from sglang.srt.layers.layer_boundary.layout import (
     Layout,
@@ -36,32 +36,32 @@ from sglang.srt.layers.layer_boundary.layout import (
     token_axis_sizes,
 )
 from sglang.srt.layers.layer_boundary.ops import (
-    gather_attention_tp,
-    identity_output,
+    attn_cp_reduce_scatter_output,
+    attn_cp_take_back_output,
+    attn_tp_gather_input,
+    attn_tp_slice_output,
+    dp_cp_take_back_output,
+    keep_output,
+    moe_cp_take_back_output,
     move_rows,
-    output_on_residual_shard,
-    reduce_scatter_over_cp,
-    scatter_moe_cp_output,
-    scatter_output,
-    take_back_attention_cp_shard,
-    take_back_cp_shard,
+    residual_slice_output,
     tp_reduce_scatter,
     tp_slice,
-    update_and_gather,
+    update_attn_tp_gather_output,
 )
 from sglang.srt.layers.layer_boundary.prepare import (
-    _consumer_step,
-    _dispatch_consumer,
-    _mlp_input_dp_partial,
-    _mlp_input_dp_replicate,
-    _mlp_input_gather_attention_cp,
-    _mlp_input_gather_moe_cp,
-    _mlp_input_on_residual_shard,
-    _mlp_input_residual_into_sum,
-    _mlp_input_scatter,
-    _mlp_input_slice,
-    _mlp_input_without_dp,
-    _read_input,
+    _attn_tp_reduce_scatter_update_read,
+    _attn_tp_slice_update_read,
+    _dispatch_by_update,
+    _dp_gather_sum_read,
+    _reduce_update_read,
+    _reduce_update_read_dp_gather,
+    _run_entry,
+    _then_attn_cp_gather,
+    _then_moe_cp_gather,
+    _tp_reduce_scatter_update_read_gather,
+    _tp_sum_with_residual_read,
+    _update_read,
 )
 from sglang.srt.runtime_context import get_parallel
 
@@ -75,11 +75,11 @@ def tbo_split_moves(layer_input_rows: Layout) -> Tuple[Callable, Callable]:
     )
 
     if layer_input_rows == attention:
-        return identity_output, identity_output
+        return keep_output, keep_output
     if layer_input_rows.sharded - attention.sharded == {TokenAxis.ATTN_TP_SCATTER}:
         # Each rank's slice: write the residual in and gather over attention
         # TP, then take the slice of each half.
-        return update_and_gather, scatter_output
+        return update_attn_tp_gather_output, attn_tp_slice_output
     raise NotImplementedError(f"{layer_input_rows=}")
 
 
@@ -89,24 +89,24 @@ def _cp_moves() -> CpMoves:
     over the MoE-CP group and takes back only a complete output."""
     if _gathers_over_attention_cp():
         return CpMoves(
-            gather=_mlp_input_gather_attention_cp,
-            take_back=take_back_attention_cp_shard,
-            reduce_scatter=reduce_scatter_over_cp,
+            gather=_then_attn_cp_gather,
+            take_back=attn_cp_take_back_output,
+            reduce_scatter=attn_cp_reduce_scatter_output,
             reduce_scatter_group=lambda: get_parallel().attn_cp_group,
         )
     return CpMoves(
-        gather=_mlp_input_gather_moe_cp,
-        take_back=scatter_moe_cp_output,
+        gather=_then_moe_cp_gather,
+        take_back=moe_cp_take_back_output,
     )
 
 
-class Boundary(msgspec.Struct, frozen=True):
+class EdgeBinding(msgspec.Struct, frozen=True):
     """The steps one layer runs at one boundary, chosen from both sides'
     declarations. A layer runs the consumer's half of a boundary into one of
     its stages, and the producer's half of the boundary after its last stage;
     the neighbouring layer runs the other half of that one."""
 
-    edge: EdgeDecl
+    edge: EdgeContract
     # The consumer's half: completing what the input owes, the add and the
     # norm, and the moves onto the rows it needs that come before the read.
     prepare: Optional[Callable] = None
@@ -141,21 +141,22 @@ class Boundary(msgspec.Struct, frozen=True):
         )
 
 
-def input_rows(edge: EdgeDecl) -> Layout:
+def input_rows(edge: EdgeContract) -> Layout:
     """Consumer rows, retaining the axes it gathers inside its computation."""
     return Layout(
-        edge.need.layout.sharded | (edge.residual_to.sharded & edge.need.gathers_itself)
+        edge.need.layout.sharded
+        | (edge.residual_to.sharded & edge.need.gathered_by_compute)
     )
 
 
-def make_boundary(
-    edge: EdgeDecl,
+def bind_entry(
+    edge: EdgeContract,
     *,
-    fusions: Tuple["FusedMlpInput", ...] = (),
+    fusions: Tuple["FfnInputFusion", ...] = (),
     carried_fusions: Tuple[Callable, ...] = (),
     cp_moves: Optional[CpMoves] = None,
     enters_stack: bool = False,
-) -> Boundary:
+) -> EdgeBinding:
     """Bind the consumer half of an edge at construction time.
 
     Args:
@@ -170,13 +171,13 @@ def make_boundary(
         Multiple update capabilities select among preconstructed paths; a single
         capability needs no runtime dispatcher.
     """
-    capabilities = edge.update_capabilities
+    capabilities = edge.arriving_plain_add
     if not capabilities:
         if edge.produced.update is None:
             raise ValueError("an arrival must declare its update capabilities")
         capabilities = (edge.produced.update.is_plain_add,)
     paths = {
-        capability: _bind_consumer(
+        capability: _bind_entry_path(
             edge,
             is_plain_add=capability,
             fusions=fusions,
@@ -195,21 +196,21 @@ def make_boundary(
         first,
         preserves_residual=None,
         prepare=partial(
-            _dispatch_consumer,
+            _dispatch_by_update,
             paths={capability: path.prepare for capability, path in paths.items()},
         ),
     )
 
 
-def _bind_consumer(
-    edge: EdgeDecl,
+def _bind_entry_path(
+    edge: EdgeContract,
     *,
     is_plain_add: bool,
-    fusions: Tuple["FusedMlpInput", ...] = (),
+    fusions: Tuple["FfnInputFusion", ...] = (),
     carried_fusions: Tuple[Callable, ...] = (),
     cp_moves: Optional[CpMoves] = None,
     enters_stack: bool = False,
-) -> Boundary:
+) -> EdgeBinding:
     """The consumer's half of ``edge``, chosen from the edge's declarations and
     the producer's update: what a value carries for a batch (a sum or a handoff
     its producer left) is completed first, trying ``carried_fusions``; a sum
@@ -222,7 +223,7 @@ def _bind_consumer(
     producer chose for a batch."""
     # A fused kernel runs the add and the norm itself.
     plain = is_plain_add and edge.need.read.is_plain_norm
-    step, input_move = _select_input_steps(
+    step, input_move = _select_entry_step(
         edge.produced,
         residual=edge.residual,
         residual_to=edge.residual_to,
@@ -234,9 +235,9 @@ def _bind_consumer(
         enters_stack=enters_stack,
     )
     completed_step = None
-    if edge.produced.always_leaves:
-        completed_step, _ = _select_input_steps(
-            msgspec.structs.replace(edge.produced, always_leaves=False),
+    if edge.produced.always_partial:
+        completed_step, _ = _select_entry_step(
+            msgspec.structs.replace(edge.produced, always_partial=False),
             residual=edge.residual,
             residual_to=edge.residual_to,
             need=edge.need,
@@ -250,7 +251,7 @@ def _bind_consumer(
     # again (e.g. MHC expansion). Both alternatives are bound at construction.
     written_step = None
     if enters_stack:
-        written_step, _ = _select_input_steps(
+        written_step, _ = _select_entry_step(
             edge.produced,
             residual=edge.residual,
             residual_to=edge.residual_to,
@@ -263,10 +264,10 @@ def _bind_consumer(
         )
     preserves_residual = None
     if (
-        edge.produced.always_leaves
+        edge.produced.always_partial
         and edge.produced.group is SumGroup.ATTN_TP
         and isinstance(step, partial)
-        and step.func is _mlp_input_without_dp
+        and step.func is _reduce_update_read
         and not step.keywords["gathers_residual"]
     ):
         selected = step.keywords["fusions"]
@@ -276,15 +277,15 @@ def _bind_consumer(
             preserves_residual = next(
                 f.preserves_residual for f in fusions if f.run == selected[0]
             )
-    return Boundary(
+    return EdgeBinding(
         edge,
         preserves_residual=preserves_residual,
         prepare=partial(
-            _consumer_step,
+            _run_entry,
             step=step,
             is_plain_add=is_plain_add,
             carried_fusions=carried_fusions if plain else (),
-            expected_sum=edge.produced.group if edge.produced.always_leaves else None,
+            expected_sum=edge.produced.group if edge.produced.always_partial else None,
             completed_step=completed_step,
             written_step=written_step,
         ),
@@ -292,10 +293,8 @@ def _bind_consumer(
     )
 
 
-def make_output_boundary(
-    edge: EdgeDecl, *, cp_moves: Optional[CpMoves] = None
-) -> Boundary:
-    """Bind the producer half of a layer/branch handoff.
+def bind_exit(edge: EdgeContract, *, cp_moves: Optional[CpMoves] = None) -> EdgeBinding:
+    """Bind the producer half of a layer or branch exit.
 
     Args:
         edge: Output contract and destination/residual rows. Deferred updates
@@ -319,13 +318,13 @@ def make_output_boundary(
             )
     if edge.need.layout != edge.residual_to:
         raise NotImplementedError(f"{edge=}")
-    returns_over_dp, output_move, completes_sum = _select_ffn_output_move(
+    returns_over_dp, output_move, completes_sum = _select_exit_move(
         edge.produced,
         residual=edge.residual,
         to=edge.residual_to,
         cp_moves=cp_moves,
     )
-    return Boundary(
+    return EdgeBinding(
         edge,
         output_move=output_move,
         returns_over_dp=returns_over_dp,
@@ -333,14 +332,14 @@ def make_output_boundary(
     )
 
 
-def _select_input_steps(
-    produced: StageOutput,
+def _select_entry_step(
+    produced: OutputContract,
     *,
     residual: Layout,
     residual_to: Layout,
-    need: StageInput,
+    need: InputContract,
     is_plain_add: bool,
-    fusions: Tuple[FusedMlpInput, ...],
+    fusions: Tuple[FfnInputFusion, ...],
     residual_joins_sum: bool,
     cp_moves: Optional[CpMoves],
     enters_stack: bool,
@@ -357,10 +356,10 @@ def _select_input_steps(
     read = need.read
     # What the input owes by construction; a sum the producer leaves only for
     # some batches comes with the value and is completed before these steps.
-    owes = produced.group if produced.always_leaves else None
-    if produced.always_leaves and owes is None:
+    owes = produced.group if produced.always_partial else None
+    if produced.always_partial and owes is None:
         raise NotImplementedError(f"{produced=}")
-    gathered = produced.layout.sharded - need.layout.sharded - need.gathers_itself
+    gathered = produced.layout.sharded - need.layout.sharded - need.gathered_by_compute
     sliced = need.layout.sharded - produced.layout.sharded
     if sliced:
         # Each attention-TP rank takes its own slice: the reduce-scatter
@@ -376,7 +375,9 @@ def _select_input_steps(
             raise NotImplementedError(f"{produced=} {residual=} {need=}")
         return (
             partial(
-                _mlp_input_scatter if owes is SumGroup.ATTN_TP else _mlp_input_slice,
+                _attn_tp_reduce_scatter_update_read
+                if owes is SumGroup.ATTN_TP
+                else _attn_tp_slice_update_read,
                 scatters_residual=residual != residual_to,
                 read=read,
             ),
@@ -390,7 +391,9 @@ def _select_input_steps(
                 raise NotImplementedError(f"{produced=} {residual=} {need=}")
             return (
                 partial(
-                    _mlp_input_on_residual_shard, read=read, reduces=owes is not None
+                    _tp_reduce_scatter_update_read_gather,
+                    read=read,
+                    reduces=owes is not None,
                 ),
                 None,
             )
@@ -399,14 +402,14 @@ def _select_input_steps(
         if (
             owes not in (None, SumGroup.TP)
             or residual.sharded
-            or TokenAxis.ATTN_TP_SCATTER not in need.gathers_itself
+            or TokenAxis.ATTN_TP_SCATTER not in need.gathered_by_compute
             or residual_to.sharded != {TokenAxis.ATTN_TP_SCATTER}
         ):
             raise NotImplementedError(f"{produced=} {residual=} {need=}")
         return (
             partial(
-                _read_input,
-                layer_input=tp_reduce_scatter if owes is not None else tp_slice,
+                _update_read,
+                pre_move=tp_reduce_scatter if owes is not None else tp_slice,
                 enters_stack=enters_stack,
                 read=read,
             ),
@@ -416,11 +419,11 @@ def _select_input_steps(
         # Each CP rank completes its own chunk, then the CP moves gather them.
         if cp_moves is None:
             raise NotImplementedError(f"{produced=} {need=}")
-        on_chunk, _ = _select_input_steps(
+        on_chunk, _ = _select_entry_step(
             produced,
             residual=residual,
             residual_to=residual_to,
-            need=StageInput(produced.layout, read=read),
+            need=InputContract(produced.layout, read=read),
             is_plain_add=is_plain_add,
             fusions=fusions,
             residual_joins_sum=residual_joins_sum,
@@ -439,12 +442,12 @@ def _select_input_steps(
             raise NotImplementedError(f"{produced=} {residual=} {need=}")
         return (
             partial(
-                _read_input,
-                layer_input=None,
+                _update_read,
+                pre_move=None,
                 enters_stack=enters_stack,
                 read=read,
             ),
-            gather_attention_tp,
+            attn_tp_gather_input,
         )
     if (
         residual_to != produced.layout
@@ -465,7 +468,7 @@ def _select_input_steps(
             if gathers_residual:
                 return (
                     partial(
-                        _mlp_input_without_dp,
+                        _reduce_update_read,
                         gathers_residual=True,
                         fusions=(),
                         group=None,
@@ -475,8 +478,8 @@ def _select_input_steps(
                 )
             return (
                 partial(
-                    _read_input,
-                    layer_input=None,
+                    _update_read,
+                    pre_move=None,
                     enters_stack=enters_stack,
                     read=read,
                 ),
@@ -487,7 +490,7 @@ def _select_input_steps(
             # sum, so the all-reduce also brings the residual back to every row.
             if owes is not SumGroup.ATTN_TP or not is_plain_add:
                 raise NotImplementedError(f"{produced=} {residual=} {need=}")
-            return (partial(_mlp_input_residual_into_sum, read=read), None)
+            return (partial(_tp_sum_with_residual_read, read=read), None)
         # A sum over TP completes only on rows every TP rank holds: the TP group
         # spans attention DP and CP.
         if owes is not SumGroup.ATTN_TP and (
@@ -497,7 +500,7 @@ def _select_input_steps(
         fused = tuple(f for f in fusions if f.completes is owes)
         return (
             partial(
-                _mlp_input_without_dp,
+                _reduce_update_read,
                 gathers_residual=gathers_residual,
                 fusions=tuple(f.run for f in fused),
                 group=owes,
@@ -522,7 +525,7 @@ def _select_input_steps(
     ):
         return (
             partial(
-                _mlp_input_dp_partial,
+                _dp_gather_sum_read,
                 gathers_residual=gathers_residual,
                 places_cp_shards=places_cp_shards,
                 read=read,
@@ -531,7 +534,7 @@ def _select_input_steps(
         )
     return (
         partial(
-            _mlp_input_dp_replicate,
+            _reduce_update_read_dp_gather,
             gathers_residual=gathers_residual,
             reduces_attention_tp=owes_attention_tp,
             places_cp_shards=places_cp_shards,
@@ -541,8 +544,8 @@ def _select_input_steps(
     )
 
 
-def _select_ffn_output_move(
-    produced: StageOutput,
+def _select_exit_move(
+    produced: OutputContract,
     *,
     residual: Layout,
     to: Layout,
@@ -557,22 +560,22 @@ def _select_ffn_output_move(
     update = produced.update
     if produced.layout == residual:
         if to == residual:
-            return False, identity_output, False
+            return False, keep_output, False
         if to.sharded == residual.sharded - {TokenAxis.ATTN_TP_SCATTER}:
             # Each rank's slice back to the attention's rows: write the output
             # into the residual, then gather over attention TP.
-            return False, partial(update_and_gather, update=update), False
+            return False, partial(update_attn_tp_gather_output, update=update), False
         raise NotImplementedError(f"{produced=} {residual=} {to=}")
     returned = residual.sharded - produced.layout.sharded
     if returned == {TokenAxis.ATTN_TP_SCATTER} and to in (residual, produced.layout):
         # The residual stays on each rank's slice (MHC on an input-scattered
         # batch): a reduce-scatter onto the slice completes the sum the FFN
         # leaves; a complete output is only sliced.
-        sums = produced.leaves_for_reduce_scatter
+        sums = produced.may_reduce_scatter
         return (
             False,
             partial(
-                output_on_residual_shard,
+                residual_slice_output,
                 sums=sums,
                 gathers_back=to != residual,
                 update=update,
@@ -584,7 +587,7 @@ def _select_ffn_output_move(
     if returned == {TokenAxis.ATTN_CP}:
         if cp_moves is None:
             raise NotImplementedError(f"{produced=} {residual=} {to=}")
-        if not produced.leaves_for_reduce_scatter:
+        if not produced.may_reduce_scatter:
             # A complete output: this rank's block of it, nothing summed.
             return False, cp_moves.take_back, False
         # The FFN leaves its sum: only a take-back that sums over the same
@@ -596,7 +599,7 @@ def _select_ffn_output_move(
         return False, cp_moves.reduce_scatter, True
     if returned == {TokenAxis.ATTN_DP, TokenAxis.ATTN_CP}:
         # This rank's CP shard, from where the DP gather put it.
-        return False, take_back_cp_shard, False
+        return False, dp_cp_take_back_output, False
     if returned != {TokenAxis.ATTN_DP}:
         raise NotImplementedError(f"{produced=} {residual=} {to=}")
     return True, None, False
