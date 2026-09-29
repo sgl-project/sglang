@@ -40,7 +40,7 @@ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
-    LayerScatterModes,
+    LayerFacts,
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -1499,7 +1499,7 @@ class XllmDecoderLayer(nn.Module):
         is_previous_layer_sparse = _is_sparse(layer_id - 1)
         is_next_layer_sparse = _is_sparse(layer_id + 1)
 
-        self.layer_scatter_modes = LayerScatterModes.init_new(
+        self.layer_facts = LayerFacts.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
@@ -1532,10 +1532,11 @@ class XllmDecoderLayer(nn.Module):
         self.input_layernorm = _make_norm(config)
         self.post_attention_layernorm = _make_norm(config)
         self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
+            layer_facts=self.layer_facts,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
+            allow_deferred_ffn_reduction=False,
         )
 
     def forward(
@@ -1562,20 +1563,17 @@ class XllmDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-
-        if isinstance(self.mlp, XllmMLP):
-            hidden_states = self.mlp(
-                hidden_states, use_reduce_scatter=use_reduce_scatter
-            )
-        else:
-            hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
-
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
-        )
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
+            use_reduce_scatter = ffn_exit.mlp_reduce_scatter
+            if isinstance(self.mlp, XllmMLP):
+                hidden_states = self.mlp(
+                    hidden_states, use_reduce_scatter=use_reduce_scatter
+                )
+            else:
+                hidden_states = self.mlp(
+                    hidden_states, forward_batch, use_reduce_scatter
+                )
+        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
 
         return hidden_states, residual
 

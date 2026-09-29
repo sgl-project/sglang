@@ -1197,6 +1197,17 @@ class USPAttention(nn.Module):
                     k = torch.cat([k_prefix, k], dim=1)
                     v = torch.cat([v_prefix, v], dim=1)
 
+                # an all-valid key mask masks nothing; the dense SDPA mask below
+                # would pin a slow kernel (cutlassF on sm100)
+                if (
+                    attn_mask_meta is not None
+                    and "indices" in attn_mask_meta
+                    and attn_mask.dim() == 2
+                    and not torch.is_floating_point(attn_mask)
+                    and attn_mask_meta["indices"].shape[0] == attn_mask.numel()
+                ):
+                    return self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+
                 q_ = q.transpose(1, 2)
                 k_ = k.transpose(1, 2)
                 v_ = v.transpose(1, 2)

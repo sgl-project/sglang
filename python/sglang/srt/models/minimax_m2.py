@@ -31,8 +31,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
-    LayerScatterModes,
-    ScatterMode,
+    LayerFacts,
 )
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
@@ -962,7 +961,7 @@ class MiniMaxM2DecoderLayer(nn.Module):
 
         is_previous_layer_sparse = True
         is_next_layer_sparse = True
-        self.layer_scatter_modes = LayerScatterModes.init_new(
+        self.layer_facts = LayerFacts.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
@@ -971,7 +970,7 @@ class MiniMaxM2DecoderLayer(nn.Module):
         )
 
         self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
+            layer_facts=self.layer_facts,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
@@ -1139,7 +1138,6 @@ class MiniMaxM2Model(nn.Module):
             hidden_states, residual = model_forward_maybe_tbo(
                 layers=self.layers,
                 enable_tbo=True,
-                input_data_scatter_mode=ScatterMode.model_input_output(),
                 positions=positions,
                 forward_batch=forward_batch,
                 hidden_states=hidden_states,

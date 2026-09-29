@@ -6,12 +6,19 @@ import multiprocessing
 import os
 import threading
 import uuid
+import warnings
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import replace
 from itertools import islice
 from pathlib import Path
+from types import SimpleNamespace
 
 THINKING_MODE_CHOICES = ["deepseek-v3", "qwen-3", "glm-45", "kimi-k2"]
+
+# Benchmarks scored only by sgl-eval; run_eval does not serve them.
+SGL_EVAL_BENCHMARKS = frozenset(
+    {"mmlu", "gpqa", "mmmu_pro", "mmmu_pro_vision", "aime25", "aime26"}
+)
 
 
 def get_thinking_kwargs(args):
@@ -85,9 +92,35 @@ def run_sgl_eval(args):
     from sglang.test.test_utils import dump_metric
 
     spec = get(args.eval_name)
-    overrides = {"max_tokens": 2048}
+    model = getattr(args, "model", None)
+    default_gen = spec.default_gen
+    model_preset_id = getattr(args, "load_preset_from_model_id", None)
+    if model_preset_id:
+        from sgl_eval.model_preset import load_model_preset
+        from sgl_eval.preset import apply_to_gen
+
+        model_preset = load_model_preset(model_preset_id)
+        unset = dict.fromkeys(
+            ("thinking", "temperature", "top_p", "max_tokens", "reasoning_effort")
+        )
+        default_gen = apply_to_gen(
+            default_gen, None, SimpleNamespace(**unset), model_preset
+        )
+        model = model or model_preset.model
+
+    overrides = {}
+    # Omitted max_tokens keeps the 2048 CI cap; an explicit None defers to the server.
+    if hasattr(args, "max_tokens"):
+        if args.max_tokens is None:
+            warnings.warn(
+                f"sgl-eval {spec.name}: max_tokens=None leaves the output length "
+                "uncapped; generation stops only at the server limit.",
+                stacklevel=2,
+            )
+        overrides["max_tokens"] = args.max_tokens
+    elif not model_preset_id:
+        overrides["max_tokens"] = 2048
     for key in (
-        "max_tokens",
         "temperature",
         "top_p",
         "min_p",
@@ -107,12 +140,12 @@ def run_sgl_eval(args):
         chat_kwargs.setdefault("enable_thinking", thinking)
     if chat_kwargs:
         overrides["chat_template_kwargs"] = {
-            **(spec.default_gen.chat_template_kwargs or {}),
+            **(default_gen.chat_template_kwargs or {}),
             **chat_kwargs,
         }
     if getattr(args, "top_k", None) is not None:
         overrides["extra_body"] = {"top_k": args.top_k}
-    gen = replace(spec.default_gen, **overrides)
+    gen = replace(default_gen, **overrides)
     generation = {
         key: getattr(gen, key)
         for key in ("max_tokens", "temperature", "top_p", "min_p", "seed")
@@ -120,7 +153,7 @@ def run_sgl_eval(args):
     print(f"sgl-eval {spec.name} generation: {generation}", flush=True)
     sampler = ChatCompletionSampler(
         base_url=api_base_url(args),
-        model=getattr(args, "model", None),
+        model=model,
         api_key=os.environ.get("OPENAI_API_KEY", "EMPTY"),
     )
     out_parent = Path(
@@ -129,7 +162,7 @@ def run_sgl_eval(args):
     ).expanduser()
     out_dir = out_parent / f"sgl_eval_{spec.name}_{uuid.uuid4().hex}"
     out_dir.mkdir(parents=True, exist_ok=True)
-    repeats = getattr(args, "repeat", 1)
+    repeats = getattr(args, "repeat", None) or spec.default_n_repeats
     writer = PredictionsWriter(out_dir, repeats, spec.pred_schema)
     try:
         result = spec.run(
