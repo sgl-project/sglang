@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -25,9 +26,11 @@ from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
     can_defer_flux2_gated_residual,
     can_use_flux2_gated_resnorm,
+    can_use_flux2_strided_qknorm_rope,
     can_use_fused_layernorm_modulate,
     flux2_gated_resnorm_raw,
     flux2_nvfp4_swiglu_quant_active,
+    flux2_strided_qknorm_rope,
     fused_layernorm_modulate_fp8_quant_raw,
     fused_layernorm_modulate_raw,
     fused_packed_silu_mul_bitexact,
@@ -103,6 +106,68 @@ _FLUX2_LN_FP8 = BitExactFusionGate(
 )
 _FLUX2_LN_FP8_SIGS = _FLUX2_LN_FP8.verified_sigs
 assert _FLUX2_LN_FP8_SIGS is not None
+_FLUX2_STRIDED_QK_ROPE = BitExactFusionGate(
+    "FLUX.2 Klein strided QK RMSNorm+RoPE", per_signature=True
+)
+
+
+def _flux2_single_qk_rope(q, k, q_norm, k_norm, head_dim, cache, complex_freqs):
+    def reference():
+        return apply_qk_norm_with_optional_rope(
+            q=q,
+            k=k,
+            q_norm=q_norm,
+            k_norm=k_norm,
+            head_dim=head_dim,
+            cos_sin_cache=cache,
+            freqs_complex=complex_freqs,
+            is_neox=False,
+            allow_inplace=True,
+            allow_strided_qk=current_platform.is_rocm(),
+        )
+
+    gate = _FLUX2_STRIDED_QK_ROPE
+    if (
+        gate.disabled
+        or head_dim != 128
+        or type(q_norm) is not RMSNorm
+        or type(k_norm) is not RMSNorm
+        or q_norm.variance_epsilon != k_norm.variance_epsilon
+        or any(
+            norm.variance_size_override is not None
+            or getattr(norm._forward_method, "__func__", None)
+            is not RMSNorm.forward_cuda
+            for norm in (q_norm, k_norm)
+        )
+        or os.getenv("SGLANG_ENABLE_FUSED_QKNORM_ROPE", "1").lower()
+        in {"0", "false", "off", "no"}
+        or not can_use_flux2_strided_qknorm_rope(
+            q, k, q_norm.weight, k_norm.weight, cache
+        )
+    ):
+        return reference()
+    sig = (q.device, q.shape, q.stride(), cache.stride(), q_norm.variance_epsilon)
+    verified = gate.is_verified(sig)
+    if not verified and torch.cuda.is_current_stream_capturing():
+        return reference()
+    try:
+        out = flux2_strided_qknorm_rope(
+            q, k, q_norm.weight, k_norm.weight, cache, q_norm.variance_epsilon
+        )
+    except Exception as exc:
+        gate.on_exception(exc, logger=logger)
+        return reference()
+    if verified:
+        return out
+    return gate.accept_or_fallback(
+        out,
+        reference(),
+        sig=sig,
+        equal=lambda a, b: all(
+            torch.equal(x.view(torch.int16), y.view(torch.int16)) for x, y in zip(a, b)
+        ),
+        logger=logger,
+    )
 
 
 def _valid_modelopt_fp8_linear(linear: nn.Module) -> bool:
@@ -948,19 +1013,16 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         if complex_freqs is not None:
             complex_freqs = complex_freqs[: query.shape[1]]
 
-        # QK-norm (+ RoPE) via the shared helper so the fused kernel path is used
-        # here too — the single-stream block previously ran norm and RoPE as separate ops.
-        query, key = apply_qk_norm_with_optional_rope(
-            q=query,
-            k=key,
-            q_norm=self.norm_q,
-            k_norm=self.norm_k,
-            head_dim=self.head_dim,
-            cos_sin_cache=cos_sin_cache,
-            freqs_complex=complex_freqs,
-            is_neox=False,
-            allow_inplace=True,
-            allow_strided_qk=True if current_platform.is_rocm() else False,
+        # Packed QKV/MLP projection views can be normalized and rotated
+        # without materializing contiguous Q/K inputs on the supported path.
+        query, key = _flux2_single_qk_rope(
+            query,
+            key,
+            self.norm_q,
+            self.norm_k,
+            self.head_dim,
+            cos_sin_cache,
+            complex_freqs,
         )
         hidden_states = self.attn(
             query,

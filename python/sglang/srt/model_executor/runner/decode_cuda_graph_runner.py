@@ -31,7 +31,7 @@ import inspect
 import logging
 import os
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Callable, Optional, Union
+from typing import TYPE_CHECKING, Callable, Optional, Union, cast
 
 import torch
 import tqdm
@@ -155,6 +155,7 @@ def build_replay_fb_view(
     bs: int,
     raw_bs: int,
     num_tokens: int,
+    global_num_tokens_cpu: Optional[list[int]],
     seq_len_fill_value: int,
     capture_forward_mode: ForwardMode,
     is_encoder_decoder: bool,
@@ -209,6 +210,14 @@ def build_replay_fb_view(
             else buffers.mamba_track_indices[:bs]
         ),
         spec_info=forward_batch.spec_info,
+        lora_ids=(
+            None
+            if forward_batch.lora_ids is None
+            else forward_batch.lora_ids + [None] * (bs - len(forward_batch.lora_ids))
+        ),
+        can_run_decode_cuda_graph=forward_batch.can_run_decode_cuda_graph,
+        global_num_tokens_cpu=global_num_tokens_cpu,
+        dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
     )
 
 
@@ -259,12 +268,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         self.attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
-        # True if a DSACPLayerCommunicator-style prefill-CP flavor is active
-        # (DSA or MLA). These flavors feed a zigzag-split rank-local layout
-        # into the runner; MHA-arch prefill CP (Qwen3/Qwen2 MoE via PR
-        # #18233) uses the plain LayerCommunicator with an attn_tp-replicated
-        # layout and is intentionally excluded so the attn_tp-local
-        # num_token_non_padded adjustment still runs for it.
+        # True if the DSA or MLA prefill-CP flavor is active. These flavors
+        # feed a zigzag-split rank-local layout into the runner; MHA-arch
+        # prefill CP (Qwen3/Qwen2 MoE via PR #18233) keeps an
+        # attn_tp-replicated layout and is intentionally excluded so the
+        # attn_tp-local num_token_non_padded adjustment still runs for it.
         self.enable_prefill_cp = is_dsa_enable_prefill_cp() or is_mla_cp_enabled()
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
@@ -573,6 +581,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def _capture_graph_size(self, *, bs: int, num_tokens: int) -> int:
         return num_tokens if self.ragged_verify_mode else bs
+
+    def _global_num_tokens_for_graph(self, num_tokens: int) -> Optional[list[int]]:
+        if self.require_mlp_tp_gather:
+            return [num_tokens] * self.dp_size
+        if self.require_attn_tp_gather:
+            return [num_tokens]
+        return None
 
     def _resolve_attention_variant(self, forward_batch: ForwardBatch) -> Optional[str]:
         variants = self.attention_graph_variants
@@ -917,12 +932,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 {k: v[:num_tokens] for k, v in buffers.pp_proxy_tensors.items()}
             )
 
-        if self.require_mlp_tp_gather:
-            global_num_tokens_cpu = [num_tokens] * self.dp_size
-        elif self.require_attn_tp_gather:
-            global_num_tokens_cpu = [num_tokens]
-        else:
-            global_num_tokens_cpu = None
+        global_num_tokens_cpu = self._global_num_tokens_for_graph(num_tokens)
 
         if global_num_tokens_cpu is not None:
             global_dp_buffer_len = sum(global_num_tokens_cpu)
@@ -985,6 +995,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
             global_dp_buffer_len=global_dp_buffer_len,
             global_num_tokens_cpu=global_num_tokens_cpu,
+            can_run_decode_cuda_graph=True,
             mrope_positions=mrope_positions,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
@@ -1403,10 +1414,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             bs=bs,
             raw_bs=raw_bs,
             num_tokens=padded_num_tokens,
+            global_num_tokens_cpu=self._global_num_tokens_for_graph(padded_num_tokens),
             seq_len_fill_value=self.seq_len_fill_value,
             capture_forward_mode=self.capture_forward_mode,
             is_encoder_decoder=self.is_encoder_decoder,
         )
+        if (
+            self.model_runner.lora_manager is not None
+            and self.model_runner.lora_manager.enable_dp_attention
+        ):
+            self.model_runner.lora_manager.prepare_lora_batch(
+                cast(ForwardBatch, fb_view)
+            )
         # Glue-graph fast path: pointer-stable prep (static buffers + pool
         # tensors only) is captured per key; guards keep every python-visible
         # branch inside the backends constant for that key.
