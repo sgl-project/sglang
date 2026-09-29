@@ -70,6 +70,8 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+_PEER_RELOAD_MIN_INTERVAL_S = 1.0
+
 GUARD = "NixlMsgGuard".encode("ascii")
 KV_MEM_KINDS = {"VRAM", "DRAM"}
 
@@ -506,6 +508,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         # peer_name -> (handle, num_slots, head_group_idx)
         self.prep_handles_segment_src: Dict[Tuple[int, int, str], Any] = {}
         self._num_slots_src: int = 0
+        self._peer_reload_lock = threading.Lock()
+        self._peer_reload_times: Dict[str, float] = {}
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             if self.kv_args.kv_item_lens:
@@ -1519,6 +1523,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     logger.exception(
                         f"Unexpected transfer worker error for room {room}"
                     )
+                self._reload_invalidated_peers(self.transfer_infos.get(room) or {})
                 self.exceptions[room] = e
                 # An exception raised while the batch was still being built
                 # leaves the handles posted so far running, so settle here too
@@ -1615,6 +1620,40 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         self.agent.add_remote_agent(decode_kv_args.agent_metadata)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prepare_payload_xfer(decode_kv_args)
+
+    def _reload_invalidated_peers(self, room_transfer_infos: Dict[str, Any]) -> None:
+        # NIXL drops a peer's metadata after a single remote-disconnect error and
+        # never restores it, so every later transfer to that peer fails with
+        # NIXL_ERR_NOT_FOUND. Reload it from the registration we already hold.
+        for agent_name in list(room_transfer_infos):
+            peer_info = self.decode_kv_args_table.get(agent_name)
+            if peer_info is None:
+                continue
+            try:
+                if self.agent.check_remote_metadata(agent_name):
+                    continue
+                with self._peer_reload_lock:
+                    if self.agent.check_remote_metadata(agent_name):
+                        continue
+                    now = time.monotonic()
+                    last = self._peer_reload_times.get(agent_name)
+                    if last is not None and now - last < _PEER_RELOAD_MIN_INTERVAL_S:
+                        continue
+                    self._peer_reload_times[agent_name] = now
+                    logger.warning(
+                        "NIXL invalidated remote agent %s; reloading its metadata",
+                        agent_name,
+                    )
+                    self.prep_handles.pop(agent_name, None)
+                    self.prep_handles_slice_dst.pop(agent_name, None)
+                    peer_info.kv_xfer_segments = None
+                    self.agent.add_remote_agent(peer_info.agent_metadata)
+                    if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                        self._prepare_payload_xfer(peer_info)
+            except Exception:
+                logger.exception(
+                    "Failed to reload NIXL metadata for remote agent %s", agent_name
+                )
 
     def _send_kvcache_generic(
         self,
