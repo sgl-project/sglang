@@ -158,6 +158,9 @@ def action_metadata(server_args: ServerArgs) -> dict[str, Any]:
     pipeline_config = server_args.pipeline_config
     if isinstance(pipeline_config, Cosmos3Config):
         return cosmos3_action_metadata(server_args)
+    metadata = pipeline_config.action_metadata(server_args)
+    if metadata is not None:
+        return metadata
 
     policy_family = getattr(
         pipeline_config,
@@ -387,6 +390,11 @@ def _build_action_model_sampling_params(
         "enable_prefix_cache": _runtime_bool(prefix_cache, True),
         "enable_cuda_graph": _runtime_bool(cuda_graph, True),
     }
+    # Optional per-request overrides; absent keys keep the model defaults.
+    for name in ("seed", "guidance_scale", "guidance_scale_action"):
+        value = parameters.get(name, observation.get(name))
+        if value is not None:
+            sampling_kwargs[name] = value
     supported_fields = _sampling_params_field_names(sampling_params_cls)
     sp = sampling_params_cls(
         **{

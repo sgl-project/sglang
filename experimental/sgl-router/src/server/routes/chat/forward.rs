@@ -5,7 +5,7 @@
 
 use super::preparation::{generate_room_id, BootstrapFields, PreparedChatRequest};
 use crate::discovery::WorkerMode;
-use crate::proxy::sse::StreamEnd;
+use crate::proxy::sse::{StreamEnd, StreamEndReason};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{
@@ -20,6 +20,7 @@ use axum::response::IntoResponse;
 use bytes::Bytes;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 const CHAT_PATH: &str = "/v1/chat/completions";
 // Expose the selected decode worker to both PD workers and the client.
@@ -64,8 +65,6 @@ pub(super) async fn forward_chat_request(
         request.input_token_count,
         0,
     );
-    // PD requests keep using the prefill expiration token after dispatching decode.
-    let expiration_token = active_request_guard.cancel_token().clone();
     // Attribute the outcome to the worker supplying the client-visible response.
     let metrics = DispatchMetrics::new(
         ctx,
@@ -82,7 +81,12 @@ pub(super) async fn forward_chat_request(
         };
         (decode, bootstrap)
     });
-    let body = request.into_outgoing_body(ctx, pd.as_ref().map(|(_, bootstrap)| bootstrap))?;
+    let engine_rid = request.engine_rid(pd.is_some());
+    let body = request.into_outgoing_body(
+        ctx,
+        pd.as_ref().map(|(_, bootstrap)| bootstrap),
+        engine_rid.as_deref(),
+    )?;
     let prefill_load_guards = (worker_load_guard, active_request_guard);
 
     // In PD mode, prefill runs independently and decode supplies the client response.
@@ -105,13 +109,18 @@ pub(super) async fn forward_chat_request(
         (prefill, prefill_load_guards)
     };
 
+    // In PD mode, prefill can finish before decode. Watch the registration
+    // held by the response so expiration remains live for its full lifetime.
+    let expiration_token = response_load_guards.1.cancel_token().clone();
     let response_future = forward_to_response_worker(
         ctx,
         &response_worker,
         &headers,
         body,
+        engine_rid.as_deref(),
         response_load_guards,
         &metrics,
+        expiration_token.clone(),
     );
     // A ready response wins if request expiration fires in the same poll.
     let result = tokio::select! {
@@ -121,7 +130,7 @@ pub(super) async fn forward_chat_request(
             model: metrics.model.clone(),
         }),
     };
-    let log_context = metrics.record_dispatch_result(&result);
+    let log_context = metrics.record_dispatch_result(&result, engine_rid);
     // Materialize dispatch errors here so the access log retains the selected worker.
     let mut response = match result {
         Ok(mut response) => {
@@ -168,6 +177,7 @@ fn spawn_prefill_request(
                 CHAT_PATH,
                 &headers,
                 body,
+                None,
             )
             .await
         {
@@ -185,13 +195,16 @@ fn spawn_prefill_request(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn forward_to_response_worker(
     ctx: &AppContext,
     worker: &Worker,
     headers: &HeaderMap,
     body: Bytes,
+    engine_rid: Option<&str>,
     load_guards: LoadGuards,
     metrics: &DispatchMetrics,
+    expiration: CancellationToken,
 ) -> Result<Response<Body>, ApiError> {
     if metrics.streaming {
         // Load and duration guards live until the SSE pump ends, not just until headers arrive.
@@ -205,9 +218,11 @@ async fn forward_to_response_worker(
                 CHAT_PATH,
                 headers,
                 body,
+                engine_rid,
                 Some(stream_guards),
                 Some(metrics.first_byte_callback()),
                 Some(metrics.stream_end_callback(worker.url.clone())),
+                Some(expiration),
             )
             .await
     } else {
@@ -221,6 +236,7 @@ async fn forward_to_response_worker(
                 CHAT_PATH,
                 headers,
                 body,
+                engine_rid,
             )
             .await
     }
@@ -279,6 +295,9 @@ impl DispatchMetrics {
         let metrics = Arc::clone(&self.registry);
         let model = self.model.clone();
         Box::new(move |end| {
+            if end.reason == StreamEndReason::Expired {
+                metrics.record_stale_request(StaleRequestOutcome::Expired);
+            }
             metrics.record_stream_outcome(&response_worker_url, &model, classify_stream_end(end));
         })
     }
@@ -287,6 +306,7 @@ impl DispatchMetrics {
     fn record_dispatch_result(
         &self,
         result: &Result<Response<Body>, ApiError>,
+        engine_rid: Option<String>,
     ) -> RequestLogContext {
         let http_status = match result {
             Ok(response) => response.status().as_u16(),
@@ -318,6 +338,7 @@ impl DispatchMetrics {
             model_id: self.model.clone(),
             streaming: self.streaming,
             outcome,
+            engine_rid,
         }
     }
 }
