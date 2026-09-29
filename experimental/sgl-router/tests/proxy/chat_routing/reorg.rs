@@ -906,64 +906,88 @@ async fn reorg_readiness_cannot_pair_workers_across_buckets() {
     assert!(policy.calls.lock().unwrap().is_empty());
 }
 
+/// Rejects, or with `invalid` fails, every engine in one version group.
 #[derive(Debug)]
-struct RejectGroup(&'static str);
+struct RejectGroup {
+    group: &'static str,
+    invalid: bool,
+}
 
 impl EngineAdmission for RejectGroup {
     fn check(&self, engine: &Worker, _: &EngineMetrics) -> Result<Decision, PickError> {
-        Ok(match engine.version_group() == Some(self.0) {
-            true => Decision::Reject("full".into()),
-            false => Decision::Allow,
-        })
+        match engine.version_group() == Some(self.group) {
+            true if self.invalid => Err(PickError::InvalidSignal("bad load".into())),
+            true => Ok(Decision::Reject("full".into())),
+            false => Ok(Decision::Allow),
+        }
     }
 }
 
+/// A full decode group falls back to another version group; any other decode
+/// failure stops selection before dispatch.
 #[tokio::test]
 async fn full_decode_group_falls_back_to_another_version_group() {
-    let workers: Vec<_> =
-        futures::future::join_all((0..4).map(|_| MockWorker::start(vec![]))).await;
-    let decode_policy = Arc::new(FirstPolicy {
-        admission: Arc::new(RejectGroup("v1")),
-        ..Default::default()
-    });
-    let ctx = context(
-        &[],
-        vec![Bucket::new(
-            "pd",
-            BucketGroups::Pd {
-                prefill: EngineGroup::new(Arc::new(FirstPolicy::default())),
-                decode: EngineGroup::new(decode_policy),
-            },
-        )],
-    );
-    for ((id, mode, group), worker) in [
-        ("p-v1", Stage::Prefill, "v1"),
-        ("p-v2", Stage::Prefill, "v2"),
-        ("d-v1", Stage::Decode, "v1"),
-        ("d-v2", Stage::Decode, "v2"),
-    ]
-    .into_iter()
-    .zip(&workers)
-    {
-        ctx.registry
-            .add(WorkerSpec {
-                id: WorkerId(id.into()),
-                url: worker.url.clone(),
-                mode,
-                model_ids: vec![ModelId("tiny".into())],
-                bootstrap_port: Some(8998),
-                version_group: Some(group.into()),
-            })
+    for invalid in [false, true] {
+        let workers: Vec<_> =
+            futures::future::join_all((0..4).map(|_| MockWorker::start(vec![]))).await;
+        let decode_policy = Arc::new(FirstPolicy {
+            admission: Arc::new(RejectGroup {
+                group: "v1",
+                invalid,
+            }),
+            ..Default::default()
+        });
+        let ctx = context(
+            &[],
+            vec![Bucket::new(
+                "pd",
+                BucketGroups::Pd {
+                    prefill: EngineGroup::new(Arc::new(FirstPolicy::default())),
+                    decode: EngineGroup::new(decode_policy),
+                },
+            )],
+        );
+        for ((id, mode, group), worker) in [
+            ("p-v1", Stage::Prefill, "v1"),
+            ("p-v2", Stage::Prefill, "v2"),
+            ("d-v1", Stage::Decode, "v1"),
+            ("d-v2", Stage::Decode, "v2"),
+        ]
+        .into_iter()
+        .zip(&workers)
+        {
+            ctx.registry
+                .add(WorkerSpec {
+                    id: WorkerId(id.into()),
+                    url: worker.url.clone(),
+                    mode,
+                    model_ids: vec![ModelId("tiny".into())],
+                    bootstrap_port: Some(8998),
+                    version_group: Some(group.into()),
+                })
+                .unwrap();
+        }
+        let response = build_router(ctx.clone())
+            .oneshot(request(body("hello")))
+            .await
             .unwrap();
+        let dispatched: Vec<_> = workers
+            .iter()
+            .map(|w| w.captured.lock().unwrap().last_body.is_some())
+            .collect();
+        let fallback = r#"sgl_router_pd_version_group_fallback_total{model_id="tiny"} 1"#;
+        let fell_back = ctx.metrics.render().contains(fallback);
+        match invalid {
+            false => {
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(dispatched, [false, true, false, true]);
+                assert!(fell_back);
+            }
+            true => {
+                assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+                assert_eq!(dispatched, [false; 4]);
+                assert!(!fell_back);
+            }
+        }
     }
-    let response = build_router(ctx)
-        .oneshot(request(body("hello")))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let dispatched: Vec<_> = workers
-        .iter()
-        .map(|w| w.captured.lock().unwrap().last_body.is_some())
-        .collect();
-    assert_eq!(dispatched, [false, true, false, true]);
 }

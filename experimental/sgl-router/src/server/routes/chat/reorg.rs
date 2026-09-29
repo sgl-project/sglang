@@ -98,6 +98,12 @@ pub(super) async fn chat_completions(
     for bucket in buckets {
         match bucket.pick_engines(&ctx.registry, &bucket_request).await {
             Ok(picks) => {
+                if picks.skipped_version_groups > 0 {
+                    ctx.metrics.record_pd_version_group_fallback(
+                        &request.model.0,
+                        picks.skipped_version_groups,
+                    );
+                }
                 // Dispatch only after this bucket supplies the entire plain or PD selection.
                 let workers = SelectedWorkers {
                     prefill: picks.prefill.engine,
