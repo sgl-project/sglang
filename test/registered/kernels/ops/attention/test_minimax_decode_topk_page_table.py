@@ -57,7 +57,7 @@ def _effective_kv_from_selection(ti, seq_lens, block):
         (16, 8000),
         (2, 40000),  # num_blocks=313 -> medium radix path
         (1, 90000),  # num_blocks=704 -> large compaction path
-        (1, 480000),  # num_blocks=3750 -> large path near kMaxNumBlocks
+        (1, 480000),  # num_blocks=3750 -> large path near the 4096 bucket
     ],
 )
 @pytest.mark.parametrize("nqh", [8, 16])
