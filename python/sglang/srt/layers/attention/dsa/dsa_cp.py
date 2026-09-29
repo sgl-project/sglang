@@ -125,14 +125,26 @@ def dsa_cp_narrow_a2a_enabled() -> bool:
     ``t(ms) = 0.301 + 0.00697 * MB``, residuals under 0.01 ms.
 
     **Off by default, and that is the honest default.** Every rank needs the FULL
-    ``w_kc [64, 192, 512]`` and ``w_vc [64, 512, 256]`` (28.0 MB per layer)
-    *beside* its own slice, which the non-sharded paths still use: **+2.1 GB per
-    rank** over 78 layers. Aliasing the slice into the full copy would save
-    0.26 GB of that and is deliberately not done -- it would make ``w_kc`` a view
-    into another attribute, which is not worth 12% of the cost. 2.1 GB is about
-    a tenth of the A3 dcp16 KV pool, on boxes where memory pressure presents as
-    a multi-minute stall rather than an OOM. Turn it on where the margin is
-    known, not by default.
+    ``w_kc [64, 192, 512]`` and ``w_vc [64, 512, 256]`` -- 28.0 MB per layer --
+    *beside* its own slice, which the non-sharded paths still use. Over 78 layers
+    that is 2.13 GiB of live weights, but the **measured** cost is larger:
+
+        A3 tp16 dcp1, 2026-09-29, KV pool at the same mem-fraction
+          off: 210,560 tokens, 18.69 GiB
+          on : 164,992 tokens, 14.64 GiB      -> **4.05 GiB, 45,568 tokens**
+
+    Nearly double the live figure. The gap is transient allocations the caching
+    allocator holds on to: :func:`dsa_cp_attach_full_kv_b` gathers ``w_kc`` into
+    a plain buffer and then allocates a *second* full copy to restore the
+    loader's layout, and the collectives stage as well. Gathering into an
+    already-transposed buffer would remove that second copy -- the local
+    ``w_kc`` is physically ``[h, kv_lora, qk_nope]`` already, so the send would
+    cost nothing -- and is the obvious next saving if this is ever turned on by
+    default.
+
+    **Quote the 4 GiB, not the 2.** It is about a fifth of the A3 dcp16 KV pool,
+    on boxes where memory pressure presents as a multi-minute stall rather than
+    an OOM. Turn it on where the margin is known, not by default.
 
     The exchange is exact either way: ``npu_transpose_batchmatmul`` here is a
     per-head, per-row product, and the all-to-all is a permutation of
