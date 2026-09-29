@@ -141,6 +141,7 @@ const INTERNAL_STATE_ALLOWLIST: &[&str] = &[
     "effective_max_running_requests_per_dp",
     "avg_spec_accept_length",
     "step_time_dict",
+    "rust_mm_transport",
 ];
 
 fn shape_server_info(msgpack: &[u8], server_args: &ServerArgs) -> Result<Vec<u8>, String> {

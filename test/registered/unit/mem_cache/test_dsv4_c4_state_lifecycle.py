@@ -67,7 +67,7 @@ class TestUnifiedC4StateLifecycle(unittest.TestCase):
         configurator = object.__new__(DSV4PoolConfigurator)
         configurator.disaggregation_mode = "decode"
         configurator.disaggregation_decode_extra_slots = 3
-        configurator.c4_ring_size = 16
+        configurator.ring_sizes = {4: 16}
 
         self.assertEqual(configurator._unified_c4_state_pool_size(10), 14 * 16)
 
