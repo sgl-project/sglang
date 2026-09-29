@@ -7,6 +7,8 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import List, Optional, Union
 
+import numpy as np
+
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.server_args import ServerArgs
@@ -150,7 +152,11 @@ class FileRequestMetricsExporter(RequestMetricsExporter):
                 metrics_data = self._format_output_data(obj, out_dict)
 
                 def write_file():
-                    json.dump(metrics_data, self._current_file_handler)
+                    json.dump(
+                        metrics_data,
+                        self._current_file_handler,
+                        default=np.ndarray.tolist,
+                    )
                     self._current_file_handler.write("\n")
                     self._current_file_handler.flush()
 

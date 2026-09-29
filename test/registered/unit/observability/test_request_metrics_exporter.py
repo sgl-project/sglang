@@ -17,6 +17,8 @@ import types
 import unittest
 from unittest.mock import MagicMock, patch
 
+import numpy as np
+
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 
 # ── Test helper classes (local only, never injected into sys.modules) ──
@@ -276,6 +278,24 @@ class TestFileRequestMetricsExporter(unittest.TestCase):
             record = json.loads(f.readline())
         self.assertIn("request_parameters", record)
         self.assertAlmostEqual(record["latency"], 1.5)
+        exporter.close()
+
+    def test_write_record_writes_numpy_rows_as_lists(self):
+        exporter = self._make_exporter()
+        obj = _GenerateReqInput(rid="req-1", text="hello")
+        masks = [[5, 3], [7]]
+        logprobs = [[-0.5, -1.25], [0.1]]
+        for to_row in (list, np.array):
+            meta_info = {
+                "output_token_sampling_mask": [to_row(row) for row in masks],
+                "output_token_sampling_logprobs": [to_row(row) for row in logprobs],
+            }
+            asyncio.run(exporter.write_record(obj, {"meta_info": meta_info}))
+
+        (file_name,) = os.listdir(self.tmp_dir)
+        with open(os.path.join(self.tmp_dir, file_name)) as f:
+            from_lists, from_arrays = f.readlines()
+        self.assertEqual(from_arrays, from_lists)
         exporter.close()
 
     def test_write_record_skips_health_check(self):

@@ -916,6 +916,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
     if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
         apply_header_overrides(obj, request.headers)
+    obj.numpy_outputs = True
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:

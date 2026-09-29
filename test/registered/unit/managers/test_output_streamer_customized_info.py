@@ -23,8 +23,9 @@ from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
     _GenerationStreamAccumulator,
 )
-from sglang.srt.sampling.sampling_mask import SamplingMaskRows
+from sglang.srt.sampling.sampling_mask import SamplingMaskChunk, SamplingMaskRows
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils.json_response import dumps_json
 from sglang.srt.utils.weight_versions import (
     WeightVersionSpan,
     record_weight_version_events,
@@ -461,7 +462,8 @@ class TestOutputStreamerSamplingMasks(unittest.TestCase):
 
     def test_clients_receive_the_sampler_rows_unchanged(self):
         """Across decode steps, stream emissions and either IPC codec, each request gets
-        the sampler's rows exactly as the tensor-to-list conversion defines them."""
+        the sampler's rows exactly as the tensor-to-list conversion defines them,
+        as lists or as numpy rows that dumps_json writes as the same JSON."""
         processor = SchedulerBatchResultProcessor(
             **{f.name: None for f in dataclasses.fields(SchedulerBatchResultProcessor)}
         )
@@ -482,6 +484,7 @@ class TestOutputStreamerSamplingMasks(unittest.TestCase):
                     reqs.append(req)
                 expected = [([], []) for _ in modes]
                 received = [([], []) for _ in modes]
+                received_arrays = [([], []) for _ in modes]
                 for step in range(12):
                     width = (1, 7, 64)[step % 3]
                     lengths = torch.randint(
@@ -529,12 +532,54 @@ class TestOutputStreamerSamplingMasks(unittest.TestCase):
                             if modes[i] is None:
                                 self.assertIsNone(chunk)
                                 continue
-                            masks, logprobs = chunk.to_lists(
-                                support_logprobs=modes[i] == "support"
-                            )
-                            received[i][0].extend(masks)
-                            received[i][1].extend(logprobs)
+                            for rows, to_rows in (
+                                (received, chunk.to_lists),
+                                (received_arrays, chunk.to_arrays),
+                            ):
+                                masks, logprobs = to_rows(
+                                    support_logprobs=modes[i] == "support"
+                                )
+                                rows[i][0].extend(masks)
+                                rows[i][1].extend(logprobs)
                 self.assertEqual(received, expected)
+                self.assertEqual(dumps_json(received_arrays), dumps_json(expected))
+
+    def test_numpy_rows_write_the_same_json_as_lists(self):
+        """dumps_json writes to_arrays rows byte for byte as to_lists rows, including
+        float32 values whose shortest repr differs from float64's, and empty chunks."""
+        lengths = np.array([4, 3], np.int32)
+        token_ids = np.array([0, 2**31 - 1, 151_935, 42, 7, 9, 3], np.int32)
+        logprobs = np.array(
+            [0.1, -0.0, -1e-45, -3.4028235e38, -1 / 3, -2.5, 0.0], np.float32
+        )
+        empty = SamplingMaskChunk(
+            lengths=np.array([], np.int32),
+            token_ids=np.array([], np.int32),
+            logprobs=np.array([], np.float32),
+        )
+        for chunk, support_logprobs in (
+            (
+                SamplingMaskChunk(
+                    lengths=lengths, token_ids=token_ids, logprobs=logprobs
+                ),
+                True,
+            ),
+            (
+                SamplingMaskChunk(
+                    lengths=lengths, token_ids=token_ids, logprobs=logprobs[:2]
+                ),
+                False,
+            ),
+            (empty, True),
+            (empty, False),
+        ):
+            with self.subTest(
+                num_rows=len(chunk.lengths), support_logprobs=support_logprobs
+            ):
+                self.assertEqual(
+                    dumps_json(chunk.to_arrays(support_logprobs=support_logprobs)),
+                    dumps_json(chunk.to_lists(support_logprobs=support_logprobs)),
+                )
 
 
 if __name__ == "__main__":

@@ -50,6 +50,25 @@ class SamplingMaskChunk(
             start = end
         return masks, values
 
+    def to_arrays(
+        self, support_logprobs: bool
+    ) -> Tuple[List[np.ndarray], Union[List[float], List[np.ndarray]]]:
+        """Per-token views of ``to_lists``'s rows, which dumps_json writes as the same JSON."""
+        # orjson writes float64 values as it writes the Python floats of to_lists.
+        support = self.logprobs.astype(np.float64) if support_logprobs else None
+        masks: List[np.ndarray] = []
+        values: Union[List[float], List[np.ndarray]] = (
+            [] if support_logprobs else self.logprobs.tolist()
+        )
+        start = 0
+        for length in self.lengths.tolist():
+            end = start + length
+            masks.append(self.token_ids[start:end])
+            if support_logprobs:
+                values.append(support[start:end])
+            start = end
+        return masks, values
+
 
 def _chunk_from_buffers(lengths, token_ids, logprobs) -> SamplingMaskChunk:
     return SamplingMaskChunk(
