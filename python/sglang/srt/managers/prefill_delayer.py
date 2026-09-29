@@ -129,9 +129,10 @@ class PrefillDelayer:
 
         # Fields packed per rank into the all-gather tensor: prefillable,
         # token_watermark_force_allow, running_batch, max_prefill_bs,
-        # waiting_queue_len.
+        # waiting_queue_len. The gather spans the TP group, whose ranks are
+        # laid out DP-major over attn_cp_size * attn_tp_size.
         self._global_info_buffer = torch.empty(
-            (dp_size_dim, parallel.attn_tp_size, 5),
+            (dp_size_dim, parallel.attn_cp_size * parallel.attn_tp_size, 5),
             dtype=torch.int64,
             device=self._gather_device,
         )
