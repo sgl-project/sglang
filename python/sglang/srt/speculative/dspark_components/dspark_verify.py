@@ -17,6 +17,9 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     accept_greedy_triton,
     finalize_accept_lens_triton,
 )
+from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
+    simulated_bonus_sample,
+)
 from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     BuildCommitInjectLayout,
     BuildOutTokens,
@@ -149,6 +152,7 @@ class TargetVerifyExecutor:
         layout: Optional[RaggedVerifyLayout],
         prefix_lens: torch.Tensor,
         draft_tokens: torch.Tensor,
+        simulate_bonus_sampling_info=None,
     ) -> AcceptOuts:
         """Produce the per-request accept outcome after target verify.
 
@@ -179,6 +183,15 @@ class TargetVerifyExecutor:
             correct_len = self._simulated_correct_len(
                 bs=bs, dtype=correct_len.dtype, device=correct_len.device
             )
+            if simulate_bonus_sampling_info is not None:
+                bonus = sample_simulated_bonus(
+                    target_logits=target_logits,
+                    correct_len=correct_len,
+                    greedy_bonus=bonus,
+                    sampling_info=simulate_bonus_sampling_info,
+                    bs=bs,
+                    verify_num_draft_tokens=self.verify_num_draft_tokens,
+                )
 
         site = (
             SpecTpSyncSite.DSPARK_ACCEPT_GREEDY
@@ -814,6 +827,27 @@ class DsparkVerifyEpilogue:
                 positions=inject_layout.positions,
                 pool=pool,
             )
+
+
+def sample_simulated_bonus(
+    *,
+    target_logits: torch.Tensor,
+    correct_len: torch.Tensor,
+    greedy_bonus: torch.Tensor,
+    sampling_info,
+    bs: int,
+    verify_num_draft_tokens: int,
+) -> torch.Tensor:
+    """Temperature-sample every verify row and return the row at the (simulated)
+    correct_len as the bonus token. Temperature only: callers exclude top-p/top-k/min-p."""
+    bonus = simulated_bonus_sample(
+        target_logits=target_logits,
+        correct_len=correct_len,
+        temperatures=sampling_info.temperatures,
+        bs=bs,
+        rows_per_request=verify_num_draft_tokens,
+    )
+    return bonus.to(greedy_bonus.dtype).view_as(greedy_bonus)
 
 
 def accept_draft_tokens(
