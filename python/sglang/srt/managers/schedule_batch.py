@@ -1724,7 +1724,17 @@ class Req(ReqDllmMixin):
                 cow_mamba=cow_mamba,
                 max_prefix_len=key_limit,
             )
-            self.mamba_branching_seqlen = match_result.mamba_branching_seqlen
+            # Fixed system prompt: the __init__-seeded boundary is needed by
+            # the first (cold) request, but an unconditional overwrite drops it
+            # when the match returns None (empty tree). Re-derive so the seed
+            # survives the warm-up pass; see reseed_mamba_boundary_after_match.
+            from sglang.srt.system_prompt import reseed_mamba_boundary_after_match
+
+            self.mamba_branching_seqlen = reseed_mamba_boundary_after_match(
+                self.system_prefix_boundary,
+                self.prefix_len,
+                match_result.mamba_branching_seqlen,
+            )
             if match_result.cache_protected_len is None:
                 self.kv.cache_protected_len = self.prefix_len
 
