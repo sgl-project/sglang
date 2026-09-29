@@ -278,6 +278,45 @@ class HostKVCache(abc.ABC):
                     _cuda_host_unregister(buf)
         self.kv_buffer = None
 
+    def _init_device_row_stride(self, device_buffers: Iterable[torch.Tensor]) -> None:
+        """Bytes between consecutive token rows of the device KV buffers.
+
+        A packed buffer steps rows by the row width (`token_stride_size`); a
+        strided per-layer view -- the unified pool's token-major entries --
+        steps them by its own `stride(0)`. Device-side addresses in the
+        transfer kernels must use this.
+        """
+        strides = set()
+        for buf in device_buffers:
+            if buf.is_contiguous():
+                strides.add(self.token_stride_size)
+            else:
+                assert buf.stride(-1) == 1, (
+                    f"HiCache needs packed device rows; got strides {buf.stride()}"
+                )
+                strides.add(buf.stride(0) * buf.element_size())
+        if len(strides) > 1:
+            raise NotImplementedError(
+                f"HiCache: device KV buffers step rows by different strides "
+                f"{sorted(strides)} B"
+            )
+        self.device_row_stride_bytes = (
+            strides.pop() if strides else self.token_stride_size
+        )
+
+    @property
+    def device_rows_packed(self) -> bool:
+        return self.device_row_stride_bytes == self.token_stride_size
+
+    def _require_packed_device_rows(self, kernel: str) -> None:
+        if not self.device_rows_packed:
+            raise NotImplementedError(
+                f"HiCache: {kernel} steps device rows by the row width "
+                f"({self.token_stride_size} B), but this device pool's rows are "
+                f"{self.device_row_stride_bytes} B apart. Use the JIT HiCache "
+                "kernels with a layer_first or page_first host layout."
+            )
+
     @abc.abstractmethod
     def get_size_per_token(self):
         raise NotImplementedError()
