@@ -943,6 +943,7 @@
               "docs/advanced_features/quantized_kv_cache",
               "docs/advanced_features/reasoning_aware_compression",
               "docs/advanced_features/dp_dpa_smg_guide",
+              "docs/advanced_features/prefill_cp",
               "docs/advanced_features/dcp",
               "docs/advanced_features/expert_parallelism",
               "docs/advanced_features/lora",
@@ -1217,6 +1218,12 @@
                 "pages": [
                   "cookbook/autoregressive/intro",
                   {
+                    "group": "IQuestLab",
+                    "pages": [
+                      "cookbook/autoregressive/IQuestLab/IQuest-Q1"
+                    ]
+                  },
+                  {
                     "group": "IFM",
                     "pages": [
                       "cookbook/autoregressive/IFM/K2-Horizon"
@@ -1238,6 +1245,13 @@
                     "pages": [
                       "cookbook/autoregressive/ThinkingMachines/Inkling",
                       "cookbook/autoregressive/ThinkingMachines/Inkling-Small"
+                    ]
+                  },
+                  {
+                    "group": "GigaChat",
+                    "pages": [
+                      "cookbook/autoregressive/GigaChat/GigaChat3.5",
+                      "cookbook/autoregressive/GigaChat/GigaChat3.5-Reasoning"
                     ]
                   },
                   {

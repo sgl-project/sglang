@@ -126,6 +126,127 @@ struct EpilogueRunner {
     // temp storage out of the smem plan of `sorted_value == false` kernels.
     using BlockRadixSortTempStorageT = cute::conditional_t<Config::sorted_value, typename BlockRadixSortT::TempStorage, char>;
 
+    // [SGLang] The page transform is only wired into the unsorted, index-only epilogue
+    static_assert(!Config::page_transform || (cute::is_same_v<OutIdxT, int32_t> && !Config::return_value && !Config::sorted_value));
+
+    // [SGLang] Output slot for vocab index `idx` under the page transform. An invalid slot still loads
+    // (page 0, which the host guarantees exists) and then stores `fill`, so callers stay branch-free.
+    static __device__ __forceinline__ uint32_t page_transform_index(
+        uint32_t idx, bool valid, int32_t fill, const int* page_table_row, uint32_t page_bits
+    ) {
+        idx = valid ? idx : 0u;
+        int32_t mapped = (__ldg(page_table_row + (idx >> page_bits)) << page_bits) | (int32_t)(idx & ((1u << page_bits) - 1));
+        return (uint32_t)(valid ? mapped : fill);
+    }
+
+    static __device__ __forceinline__ uint64_t pack_u32x2(uint32_t lo, uint32_t hi) {
+        return (uint64_t)lo | ((uint64_t)hi << 32);
+    }
+
+    // [SGLang] The page-transform counterpart of the unsorted index epilogue. Indices are packed into
+    // `uint64_t` pairs by hand: routing loaded values through a punned `int32_t` array, as the default
+    // path does, puts that array on the stack, and the resulting stack frame also costs the main loop.
+    template<bool IS_SHORTCUT>
+    static __device__ __forceinline__ void page_transform_epilogue(
+        const uint32_t* smem_index_buf, const TopkSelectArgs &args, uint32_t batch_idx, uint32_t end_vocab_idx
+    ) {
+        int32_t* result_indices = (int32_t*)args.output_index + (uint64_t)batch_idx * args.stride_output_index_batch;
+        const int* page_table_row = args.page_table + (uint64_t)batch_idx * args.stride_page_table_batch;
+        const uint32_t page_bits = args.page_bits;
+        if constexpr (IS_SHORTCUT) {
+            constexpr uint32_t NUM_OUTPUT_IDXS_PER_STORE = NUM_BYTES_PER_GMEM_STORE / sizeof(int32_t);
+            #pragma unroll 2
+            for (uint32_t i = threadIdx.x * NUM_OUTPUT_IDXS_PER_STORE; i < args.topk; i += NUM_THREADS * NUM_OUTPUT_IDXS_PER_STORE) {
+                uint64_t out[NUM_OUTPUT_IDXS_PER_STORE / 2];
+                CUTE_UNROLL
+                for (uint32_t j = 0; j < NUM_OUTPUT_IDXS_PER_STORE; j += 2) {
+                    out[j/2] = pack_u32x2(
+                        page_transform_index(i+j, i+j < end_vocab_idx, args.idx_oob_fill_value, page_table_row, page_bits),
+                        page_transform_index(i+j+1, i+j+1 < end_vocab_idx, args.idx_oob_fill_value, page_table_row, page_bits)
+                    );
+                }
+                STORE_TO_GMEM(result_indices + i, out);
+            }
+        } else {
+            page_transform_dispatch<PAGE_TRANSFORM_VEC, 1>(smem_index_buf, result_indices, args.topk, page_table_row, page_bits);
+        }
+    }
+
+    // [SGLang] Vector width of the staged transform, fixed per kernel: the widest that still gives every thread a
+    // round at the top-k this bucket is meant for (512 / 1024, and 2048 for the 4096 bucket). Picking it at runtime
+    // instead instantiates the transform once per width, and that extra code alone measurably slows the kernel.
+    static constexpr uint32_t PAGE_TRANSFORM_VEC =
+        cute::max(cute::min((MAX_TOPK >= 4096 ? 2048u : MAX_TOPK) / NUM_THREADS, 4u), 1u);
+
+    // [SGLang] Resolve the (block-uniform) number of live rounds to a template argument, so that the staged
+    // transform below is straight-line code: a branch per round lets the register allocator reuse one round's
+    // gather registers for the next, which serializes the rounds on the scoreboard.
+    template<uint32_t VEC, uint32_t ROUNDS>
+    static __device__ __forceinline__ void page_transform_dispatch(
+        const uint32_t* smem_index_buf, int32_t* result_indices, uint32_t topk, const int* page_table_row, uint32_t page_bits
+    ) {
+        constexpr uint32_t MAX_ROUNDS = cute::max(MAX_TOPK / (NUM_THREADS * VEC), 1u);
+        if constexpr (ROUNDS < MAX_ROUNDS) {
+            if (topk > ROUNDS * NUM_THREADS * VEC) {
+                page_transform_dispatch<VEC, ROUNDS + 1>(smem_index_buf, result_indices, topk, page_table_row, page_bits);
+                return;
+            }
+        }
+        page_transform_staged<VEC, ROUNDS>(smem_index_buf, result_indices, topk, page_table_row, page_bits);
+    }
+
+    // [SGLang] Transform the staged `smem_index_buf[:topk]`. Thread `t` owns slots `(r * NUM_THREADS + t) * VEC + [0, VEC)`
+    // for rounds `r < ROUNDS`. The rounds are unrolled and split into phases -- every smem load, then every
+    // page-table gather, then every store -- so each thread keeps all of its gathers in flight at once.
+    template<uint32_t VEC, uint32_t ROUNDS>
+    static __device__ __forceinline__ void page_transform_staged(
+        const uint32_t* smem_index_buf, int32_t* result_indices, uint32_t topk, const int* page_table_row, uint32_t page_bits
+    ) {
+        static_assert(VEC == 1 || VEC == 2 || VEC == 4);
+        // Slots up to ROUNDS * NUM_THREADS * VEC stay inside the MAX_TOPK smem buffer
+        static_assert(ROUNDS * NUM_THREADS * VEC <= cute::max(MAX_TOPK, NUM_THREADS * VEC));
+
+        uint32_t idx[ROUNDS][VEC];
+        CUTE_UNROLL
+        for (uint32_t r = 0; r < ROUNDS; ++r) {
+            const uint32_t* src = smem_index_buf + (r * NUM_THREADS + threadIdx.x) * VEC;
+            if constexpr (VEC == 4) {
+                __int128_t v = ku::ld_shared(src);
+                CUTE_UNROLL
+                for (uint32_t j = 0; j < 4; ++j) idx[r][j] = (uint32_t)(v >> (32 * j));
+            } else if constexpr (VEC == 2) {
+                uint64_t v = *(const uint64_t*)src;
+                idx[r][0] = (uint32_t)v;
+                idx[r][1] = (uint32_t)(v >> 32);
+            } else {
+                idx[r][0] = *src;
+            }
+        }
+        // Slots past `topk` hold stale smem, which must not index the page table
+        CUTE_UNROLL
+        for (uint32_t r = 0; r < ROUNDS; ++r) {
+            const uint32_t base = (r * NUM_THREADS + threadIdx.x) * VEC;
+            CUTE_UNROLL
+            for (uint32_t j = 0; j < VEC; ++j)
+                idx[r][j] = page_transform_index(idx[r][j], base + j < topk, 0, page_table_row, page_bits);
+        }
+        // The host requires `topk` to end on a 32-byte boundary, so a live vector never crosses it
+        CUTE_UNROLL
+        for (uint32_t r = 0; r < ROUNDS; ++r) {
+            const uint32_t base = (r * NUM_THREADS + threadIdx.x) * VEC;
+            if (base < topk) {
+                if constexpr (VEC == 1) {
+                    result_indices[base] = (int32_t)idx[r][0];
+                } else {
+                    uint64_t out[VEC / 2];
+                    CUTE_UNROLL
+                    for (uint32_t j = 0; j < VEC; j += 2) out[j / 2] = pack_u32x2(idx[r][j], idx[r][j + 1]);
+                    st_global<VEC / 2>((uint64_t*)(result_indices + base), out);
+                }
+            }
+        }
+    }
+
     template<bool IS_SHORTCUT>  // "shortcut" means `end_vocab_idx` <= `topk`
     static __device__ __forceinline__ void topk_select_epilogue(
         typename Config::ValueT* smem_value_buf,    // [MAX_TOPK]
@@ -155,7 +276,9 @@ struct EpilogueRunner {
         int32_t output_idx_offset = args.output_idx_offset != nullptr ? __ldg(args.output_idx_offset + batch_idx) : 0;
         ValueT oob_fill_value = Config::return_value && IS_SHORTCUT ? (ValueT)args.value_oob_fill_value : (ValueT)0.0f;
 
-        if constexpr (!Config::sorted_value) {
+        if constexpr (Config::page_transform) {
+            page_transform_epilogue<IS_SHORTCUT>(smem_index_buf, args, batch_idx, end_vocab_idx);
+        } else if constexpr (!Config::sorted_value) {
             if constexpr (IS_SHORTCUT) {
                 // Saves indices 0...end_vocab_idx (plus `output_idx_offset`) followed by (args.topk-end_vocab_idx) `args.idx_oob_fill_value` into `result_indices`
                 constexpr uint32_t NUM_OUTPUT_IDXS_PER_STORE = NUM_BYTES_PER_GMEM_STORE / sizeof(OutIdxT);
