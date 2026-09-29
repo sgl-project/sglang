@@ -455,12 +455,12 @@ def _default_speculative_moe_runner_backend(
     # StandardDispatcher.skip_local_expert_mapping (token_dispatcher/standard.py)
     # reads this backend to decide whether it owes an EP global->local expert-id
     # remap; megamoe skips it, trusting the mega kernel's own remap. An
-    # unquantized MTP/NextN draft never runs the mega kernel (falls back to
-    # Triton, which needs the remap), so inheriting megamoe here corrupts
-    # expert-id dispatch the same way as the a2a case above (issue #40623).
+    # unquantized MTP/NextN draft never runs the mega kernel, so inheriting
+    # megamoe here corrupts expert-id dispatch the same way as the a2a case
+    # above (issue #40623). Prefer flashinfer_trtllm over the Triton fallback.
     # --speculative-moe-runner-backend still overrides this.
     if target_runner_backend.is_flashinfer_megamoe():
-        return MoeRunnerBackend.AUTO
+        return MoeRunnerBackend.FLASHINFER_TRTLLM
     return target_runner_backend
 
 
