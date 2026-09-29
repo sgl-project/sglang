@@ -8,7 +8,6 @@ use serde::Serialize;
 
 use super::request::GenerateRequest;
 use super::sampling::SamplingParams;
-use super::types::TokenIds;
 use super::types::{Tagged, control_messages, wire_struct};
 use crate::utils::error::Error;
 
@@ -18,7 +17,7 @@ wire_struct! {
     /// later field on the wire.
     pub(super) TokenizedGenerateReqInput<'a> {
         input_text: Option<&'a str>,
-        /// Always nil: the ids ride the ring's columnar buffer, not msgpack.
+        /// Always nil: the ids ride the ring as the `input_ids` buffer, not msgpack.
         input_ids: (),
         input_embeds: (),
         mm_inputs: (),
@@ -27,7 +26,8 @@ wire_struct! {
         return_logprob: bool,
         logprob_start_len: i64,
         top_logprobs_num: i64,
-        token_ids_logprob: Option<&'a TokenIds>,
+        /// Always nil: rides the ring as the `token_ids_logprob` buffer.
+        token_ids_logprob: (),
         stream: bool,
         /// Not exposed by this server yet; the scheduler needs the slot filled.
         return_sampling_mask: bool,
@@ -94,7 +94,7 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
             return_logprob: req.return_logprob,
             logprob_start_len: req.logprob_start_len,
             top_logprobs_num: req.top_logprobs_num,
-            token_ids_logprob: req.token_ids_logprob.as_ref(),
+            token_ids_logprob: (),
             stream: req.stream,
             return_sampling_mask: req.return_sampling_mask,
             return_flat_raw_top_logprobs: false,
