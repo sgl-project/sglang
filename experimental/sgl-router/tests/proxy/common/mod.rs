@@ -14,3 +14,12 @@ pub fn is_engine_shaped_rid(rid: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
+
+/// A loopback URL that refuses connections. Keep the returned socket alive: it
+/// holds the port bound without listening, so no parallel test can reuse it.
+#[allow(dead_code)] // not every test file needs an unreachable upstream
+pub fn refused_url() -> (String, tokio::net::TcpSocket) {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    (format!("http://{}", socket.local_addr().unwrap()), socket)
+}

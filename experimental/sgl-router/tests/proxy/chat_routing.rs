@@ -180,10 +180,7 @@ async fn edge_counters_recorded_through_middleware() {
 
 #[tokio::test]
 async fn non_streaming_upstream_unreachable_returns_502_unreachable() {
-    // Bind a port, drop it — guarantees a closed/refused TCP destination.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let dead_url = format!("http://{}", listener.local_addr().unwrap());
-    drop(listener);
+    let (dead_url, _reserved) = crate::common::refused_url();
 
     let ctx = build_ctx_with_worker(&dead_url);
     let app = build_router(ctx);
@@ -1734,9 +1731,7 @@ async fn assert_engine_abort(worker: &crate::common::mock_worker::MockWorker) {
 #[tokio::test]
 async fn non_streaming_error_path_drops_active_load_guard() {
     // Dead upstream — first connect attempt fails fast.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let dead_url = format!("http://{}", listener.local_addr().unwrap());
-    drop(listener);
+    let (dead_url, _reserved) = crate::common::refused_url();
 
     let ctx = build_ctx_with_worker(&dead_url);
     let router_inflight_load = Arc::clone(&ctx.router_inflight_load);
