@@ -327,6 +327,7 @@ mod tests {
             .to_string()
             .contains("stale_request_timeout"));
     }
+
     #[tokio::test]
     async fn abort_ends_the_stream_only_before_its_first_chunk() {
         for started in [false, true] {
@@ -350,9 +351,10 @@ mod tests {
             drop(tx);
             let rest: Vec<_> = StreamExt::collect(data).await;
             assert_eq!(rest.iter().any(Result::is_err), !started);
-            let expected = match started {
-                true => StreamEndReason::Completed,
-                false => StreamEndReason::Aborted,
+            let expected = if started {
+                StreamEndReason::Completed
+            } else {
+                StreamEndReason::Aborted
             };
             assert_eq!(end.await.unwrap().reason, expected);
         }
