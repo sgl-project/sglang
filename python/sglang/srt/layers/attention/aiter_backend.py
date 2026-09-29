@@ -85,6 +85,12 @@ from sglang.srt.layers.attention.aiter_mla_gluon import (
     mla_gluon_decode,
     prefer_mla_gluon_decode,
 )
+from sglang.srt.layers.attention.aiter_mla_paged import (
+    PagedMlaMetadata,
+    log_paged_mla_capability,
+    paged_mla_decode,
+    prefer_paged_mla_decode,
+)
 from sglang.srt.layers.attention.aiter_utils import (
     forward_decode_vectorized_5d,
     forward_extend_vectorized_5d,
@@ -164,6 +170,9 @@ class ForwardMetadata:
     asm_ctx_ready: bool = False
     asm_ctx_tok_idx: Optional[torch.Tensor] = None
     asm_ctx_cu_k: Optional[torch.Tensor] = None
+    # Page table / KV lengths / cu_seqlens_q for aiter's paged MLA kernels,
+    # built by _build_paged_mla_metadata. None routes attention elsewhere.
+    paged_mla: Optional[PagedMlaMetadata] = None
     # (page_indptr, page_ids, last_page_len); None means use the token-level table
     paged_kv_view: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
 
@@ -323,6 +332,7 @@ class AiterAttnBackend(AttentionBackend):
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
+        self.use_paged_mla_decode = False
 
         self.dcp_world_size = get_parallel().attn_dcp_size
 
@@ -566,6 +576,20 @@ class AiterAttnBackend(AttentionBackend):
                     fast_mode = False
                     intra_batch_mode = False
                 log_mla_gluon_capability(logger)
+
+            # gfx1250 has no usable ASM MLA decode: the kernels want
+            # seg-packed fp8 KV (SGLang's pool is token-major) and return
+            # non-finite output at 64 and 128 query heads. Route decode through
+            # aiter's paged kernels instead, which read the pool as-is.
+            self.use_paged_mla_decode = (
+                self.dcp_world_size <= 1
+                and self.num_draft_tokens is None
+                and prefer_paged_mla_decode(
+                    page_size=self.page_size,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                )
+            )
+            log_paged_mla_capability(logger)
 
             self.max_split_per_batch = 32 if _use_mla_ps_kernel else None
 
@@ -828,6 +852,54 @@ class AiterAttnBackend(AttentionBackend):
             0, max_seqlen_k, page_size, device=page_table.device, dtype=torch.int32
         )
         return page_table[:, strided_indices] // page_size
+
+    def _build_paged_mla_metadata(
+        self,
+        seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        bs: int,
+        max_kv_len: int,
+        page_table: Optional[torch.Tensor] = None,
+        seq_lens_out: Optional[torch.Tensor] = None,
+    ) -> PagedMlaMetadata:
+        """Page table and int32 KV lengths for aiter's paged MLA kernels.
+
+        ``page_table`` and ``seq_lens_out`` are the capture-stable destinations
+        under CUDA graph; when they are None a fresh pair is allocated. The page
+        table may be wider than ``max_kv_len`` needs -- the kernel bounds its
+        reads with the KV lengths, and only ``stride(0)`` is passed down -- so
+        rows keep a constant stride across replays.
+        """
+        page_size = self.page_size
+        if page_table is None:
+            width = (max_kv_len + page_size - 1) // page_size
+            page_table = torch.zeros(
+                (bs, width), dtype=torch.int32, device=seq_lens.device
+            )
+        else:
+            page_table = page_table[:bs]
+            width = page_table.shape[1]
+
+        create_flashmla_kv_indices_triton[
+            (bs, get_num_kv_index_blocks_flashmla(width, page_size))
+        ](
+            self.req_to_token,
+            req_pool_indices,
+            seq_lens,
+            None,
+            page_table,
+            self.req_to_token.stride(0),
+            page_table.stride(0),
+            page_size,
+        )
+
+        if seq_lens_out is None:
+            seq_lens_out = seq_lens[:bs].to(torch.int32)
+        else:
+            seq_lens_out = seq_lens_out[:bs]
+            seq_lens_out.copy_(seq_lens[:bs])
+        return PagedMlaMetadata(page_table, seq_lens_out, cu_seqlens_q)
 
     def _build_unified_page_table_from_spec(
         self,
@@ -1284,6 +1356,32 @@ class AiterAttnBackend(AttentionBackend):
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         max_q_len = self.forward_metadata.max_q_len or 1
 
+        if self.forward_metadata.paged_mla is not None:
+            # 0 tells aiter to assume a long context while capturing a graph,
+            # where the replayed lengths are not known yet. It only picks the
+            # segment count; the kernel re-derives the per-sequence tile range
+            # from seq_lens at runtime, so any choice stays correct on replay.
+            max_seqlen_kv = (
+                0
+                if self.forward_metadata.run_graph
+                else (self.forward_metadata.max_kv_len or 1)
+            )
+            return paged_mla_decode(
+                q=q,
+                k_buffer=k_buffer,
+                out=torch.empty(
+                    (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
+                    dtype=torch.bfloat16,
+                    device=q.device,
+                ),
+                meta=self.forward_metadata.paged_mla,
+                max_seqlen_kv=max_seqlen_kv,
+                page_size=self.page_size,
+                qk_head_dim=layer.qk_head_dim,
+                v_head_dim=layer.v_head_dim,
+                sm_scale=layer.scaling,
+            )
+
         if prefer_mla_gluon_decode(
             head_pad_mode=getattr(self, "head_pad_mode", "none"),
             num_head=getattr(self, "num_head", layer.tp_q_head_num),
@@ -1561,6 +1659,7 @@ class AiterAttnBackend(AttentionBackend):
         num_kv_splits = None
         swa_page_table = None
         swa_out_cache_loc = None
+        paged_mla = None
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
             swa_out_cache_loc = self.swa_kv_pool.translate_loc_from_full_to_swa(
                 forward_batch.out_cache_loc
@@ -1658,6 +1757,15 @@ class AiterAttnBackend(AttentionBackend):
                 kv_last_page_len = self.kv_last_page_len[:bs]
                 max_q_len = 1
 
+                if self.use_paged_mla_decode and bs > 0 and spec_info is None:
+                    paged_mla = self._build_paged_mla_metadata(
+                        forward_batch.seq_lens,
+                        forward_batch.req_pool_indices,
+                        self.qo_indptr_unified_decode[: bs + 1],
+                        bs,
+                        max_kv_len,
+                    )
+
                 # DCP decode runs the aiter MLA kernel (builds its own block-table
                 # metadata in forward_decode), so skip the persist metadata.
                 if _use_mla_ps_kernel and self.dcp_world_size <= 1:
@@ -1705,6 +1813,7 @@ class AiterAttnBackend(AttentionBackend):
                 run_graph=False,
                 swa_page_table=swa_page_table,
                 swa_out_cache_loc=swa_out_cache_loc,
+                paged_mla=paged_mla,
             )
 
         elif forward_batch.forward_mode.is_draft_extend_v2():
@@ -2244,6 +2353,11 @@ class AiterAttnBackend(AttentionBackend):
             self.mask_indptr = torch.zeros(
                 (max_bs + 1,), dtype=torch.int64, device=self.device
             )
+            # Slicing past the end silently truncates, so a short arange would
+            # hand the kernels a cu_seqlens_q with too few entries.
+            self.qo_indptr_unified_decode = torch.arange(
+                0, max_bs + 1, dtype=torch.int32, device=self.device
+            )
             if hasattr(self, "qo_indptr_"):
                 self.qo_indptr_ = torch.zeros(
                     (max_bs + 1,), dtype=torch.int32, device=self.device
@@ -2317,6 +2431,22 @@ class AiterAttnBackend(AttentionBackend):
                 (max_bs, max_num_blocks_per_seq),
                 dtype=torch.int32,
                 device=self.device,
+            )
+
+        if self.use_paged_mla_decode:
+            # Full-width page table: the Gluon kernel only sees stride(0), so
+            # keeping the width constant keeps the captured row stride valid
+            # however long the replayed sequences are.
+            max_num_blocks_per_seq = (
+                self.max_context_len + self.page_size - 1
+            ) // self.page_size
+            self.cuda_graph_paged_mla_page_table = torch.zeros(
+                (max_bs, max_num_blocks_per_seq),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self.cuda_graph_paged_mla_seq_lens = torch.zeros(
+                (max_bs,), dtype=torch.int32, device=self.device
             )
 
         if not self.skip_prefill:
@@ -2395,6 +2525,7 @@ class AiterAttnBackend(AttentionBackend):
         verify_token_table = None
 
         swa_page_table = None
+        paged_mla = None
         max_kv_len = (
             seq_lens_cpu.max().item()
             if seq_lens_cpu is not None
@@ -2500,6 +2631,17 @@ class AiterAttnBackend(AttentionBackend):
                 kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
                 max_q_len = 1
 
+                if self.use_paged_mla_decode and bs > 0 and spec_info is None:
+                    paged_mla = self._build_paged_mla_metadata(
+                        seq_lens,
+                        req_pool_indices,
+                        self.qo_indptr_unified_decode[: bs + 1],
+                        bs,
+                        max_kv_len,
+                        page_table=self.cuda_graph_paged_mla_page_table,
+                        seq_lens_out=self.cuda_graph_paged_mla_seq_lens,
+                    )
+
                 # DCP decode builds its own block-table metadata in
                 # forward_decode, so the persist metadata is unused here.
                 if _use_mla_ps_kernel and self.dcp_world_size <= 1:
@@ -2544,6 +2686,7 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_partial_map=reduce_partial_map,
                 num_kv_splits=num_kv_splits,
                 swa_page_table=swa_page_table,
+                paged_mla=paged_mla,
                 # num_kv_splits_indptr=num_kv_splits_indptr,
             )
 

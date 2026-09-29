@@ -229,7 +229,7 @@ class TestMlaGluonDecodeShapes(CustomTestCase):
 class TestForwardMlaDecodeDispatch(CustomTestCase):
     """_forward_mla_decode picks Gluon or the zero-pad ASM path, never both."""
 
-    def _make_backend(self, max_q_len=1):
+    def _make_backend(self, max_q_len=1, paged_mla=None):
         from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
 
         be = AiterAttnBackend.__new__(AiterAttnBackend)
@@ -237,8 +237,14 @@ class TestForwardMlaDecodeDispatch(CustomTestCase):
         be.kv_cache_dtype = fp8_dtype
         be.head_pad_mode = "zero"
         be.num_head_padded = 16
+        be.page_size = 64
         be.forward_metadata = mock.Mock(
             max_q_len=max_q_len,
+            # Mock() answers any attribute with a truthy child, so leaving
+            # paged_mla out would send every test here down the paged path.
+            paged_mla=paged_mla,
+            run_graph=False,
+            max_kv_len=64,
             kv_indices=torch.zeros(4, dtype=torch.int32),
             kv_indptr=torch.tensor([0, 1, 2, 3, 4], dtype=torch.int32),
             kv_last_page_len=torch.ones(4, dtype=torch.int32),
@@ -255,6 +261,7 @@ class TestForwardMlaDecodeDispatch(CustomTestCase):
             get_key_buffer=lambda _lid: torch.zeros(8, 576, dtype=fp8_dtype)
         )
         be._resolve_fp8_kv_scale_float = mock.Mock(return_value=1.0)
+        be._resolve_fp8_kv_scale = mock.Mock(return_value=None)
         be._resolve_mla_gluon_min_kv_seq_len = mock.Mock(return_value=128)
         be._mla_decode_fwd_with_head_pad = mock.Mock(
             return_value=torch.zeros(4, 12, 512)
@@ -315,6 +322,35 @@ class TestForwardMlaDecodeDispatch(CustomTestCase):
         )
         self.assertEqual(mock_gluon.call_args.kwargs["qlen"], 8)
         be._mla_decode_fwd_with_head_pad.assert_not_called()
+
+    @mock.patch("sglang.srt.layers.attention.aiter_backend.paged_mla_decode")
+    @mock.patch(
+        "sglang.srt.layers.attention.aiter_backend.prefer_mla_gluon_decode",
+        return_value=True,
+    )
+    @mock.patch("sglang.srt.layers.attention.aiter_backend.mla_gluon_decode")
+    def test_paged_mla_takes_precedence(self, mock_gluon, _prefer, mock_paged):
+        """Paged MLA is checked first, so a batch routed there never reaches
+        Gluon or the ASM fallback even where Gluon would be preferred."""
+        from sglang.srt.layers.attention.aiter_mla_paged import PagedMlaMetadata
+
+        meta = PagedMlaMetadata(
+            page_table=torch.zeros(4, 1, dtype=torch.int32),
+            seq_lens=torch.full((4,), 64, dtype=torch.int32),
+            cu_seqlens_q=torch.arange(5, dtype=torch.int32),
+        )
+        be = self._make_backend(paged_mla=meta)
+        out = be._forward_mla_decode(
+            torch.zeros(4, 12, 576, dtype=torch.bfloat16),
+            _layer(),
+            mock.Mock(),
+            k_descale=1.0,
+        )
+        mock_gluon.assert_not_called()
+        be._mla_decode_fwd_with_head_pad.assert_not_called()
+        self.assertIs(mock_paged.call_args.kwargs["meta"], meta)
+        self.assertEqual(mock_paged.call_args.kwargs["page_size"], 64)
+        self.assertIs(out, mock_paged.return_value)
 
 
 if __name__ == "__main__":
