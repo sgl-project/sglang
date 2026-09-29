@@ -352,11 +352,27 @@ def ensure_fp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
     )
 
 
+def _nvfp4_megamoe_activation_kwargs(config: MoeRunnerConfig) -> dict[str, Any]:
+    if not config.is_gated or config.activation not in ("silu", "situ"):
+        raise ValueError("FlashInfer NVFP4 MegaMOE only supports gated SiLU or SiTU.")
+    if config.activation == "situ":
+        # Kimi K3 stores SiTU's tanh constants in the existing GEMM1 fields.
+        # The up-branch tanh scale is not a SwiGLU hard-clamp limit.
+        return {
+            "activation": "situ",
+            "situ_beta": config.gemm1_alpha,
+            "situ_linear_beta": config.gemm1_clamp_limit,
+            "gate_up_clamp": None,
+        }
+    return {"activation": "swiglu", "gate_up_clamp": config.swiglu_limit}
+
+
 def ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
     mega = _get_or_init_flashinfer_megamoe_layer_state(layer)
     if mega is not None:
         return mega
 
+    activation_kwargs = _nvfp4_megamoe_activation_kwargs(layer.moe_runner_config)
     if envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get():
         from flashinfer.moe_ep import Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
 
@@ -365,8 +381,8 @@ def ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
             megakernel_config=Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
                 intermediate_size=layer.intermediate_size_per_partition,
                 top_k=layer.top_k,
-                gate_up_clamp=layer.moe_runner_config.swiglu_limit,
                 enable_in_kernel_fc2_reduce=envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get(),
+                **activation_kwargs,
             ),
             w13_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
@@ -396,11 +412,11 @@ def ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
         megakernel_config=Nvfp4CutedslMegaMoeConfig(
             intermediate_size=layer.intermediate_size_per_partition,
             top_k=layer.top_k,
-            gate_up_clamp=layer.moe_runner_config.swiglu_limit,
             apply_topk_in_fc1=True,
             enable_in_kernel_fc2_reduce=envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get(),
             combine_dtype=resolve_flashinfer_megamoe_combine_dtype(),
             input_norm_const=input_norm_const,
+            **activation_kwargs,
         ),
         w13_scale=layer.w13_weight_scale,
         w2_scale=layer.w2_weight_scale,
@@ -492,11 +508,7 @@ def prepare_nvfp4_moe_weights_for_flashinfer_megamoe(
 
     from flashinfer.moe_ep import MoEWeightPack
 
-    if use_w4a16 and (
-        not layer.moe_runner_config.is_gated
-        or layer.moe_runner_config.activation != "silu"
-    ):
-        raise ValueError("FlashInfer W4A16 MegaMOE only supports SwiGLU (gated SiLU).")
+    activation_kwargs = _nvfp4_megamoe_activation_kwargs(layer.moe_runner_config)
     if use_w4a16 and layer.moe_runner_config.apply_router_weight_on_input:
         raise ValueError("FlashInfer W4A16 MegaMOE applies routing weights after FC2.")
 
@@ -554,7 +566,7 @@ def prepare_nvfp4_moe_weights_for_flashinfer_megamoe(
             weights,
             intermediate_size=layer.intermediate_size_per_partition,
             hidden_size=layer.hidden_size,
-            gate_up_clamp=layer.moe_runner_config.swiglu_limit,
+            gate_up_clamp=activation_kwargs["gate_up_clamp"],
             activation_clamp=None,
         )
     if use_w4a16:
