@@ -315,11 +315,12 @@ def _fused_ar_num_tokens(hidden_states) -> int:
 def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
     if not isinstance(hidden_states, tuple):
         return hidden_states
-    # Fused RMSNorm+per-token quant emits (fp8, scale, orig_dtype). The
-    # keep-bf16 path emits (bf16, fp8, scale); both of those first slots
-    # are tensors. Distinguish by whether the last slot is a Tensor so a
-    # dtype is not passed to apply_fp8_linear as x_scale.
-    if len(hidden_states) == 3 and not isinstance(hidden_states[2], torch.Tensor):
+    # Fused RMSNorm+per-token quant emits (fp8, scale, orig_dtype); the last
+    # slot is a torch.dtype. The keep-bf16 path emits (bf16, fp8, scale), all
+    # tensors. Match the per-token layout positively on the dtype slot so a
+    # scale-less passthrough tuple (e.g. (bf16, None, None)) is not misread as
+    # quantized and does not have a dtype passed to apply_fp8_linear as x_scale.
+    if len(hidden_states) == 3 and isinstance(hidden_states[2], torch.dtype):
         if _linear_accepts_quant_tuple(linear):
             return hidden_states
         raise TypeError(
