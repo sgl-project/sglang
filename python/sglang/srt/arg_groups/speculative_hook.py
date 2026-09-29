@@ -912,6 +912,54 @@ def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
         )
 
 
+def _handle_iquest_q1_mtp_draft(server_args: ServerArgs) -> bool:
+    from sglang.srt.configs.iquest_q1 import IQuestQ1MTPConfig
+    from sglang.srt.utils.hf_transformers_utils import get_config
+
+    target = model_config_of(server_args).hf_config
+    if target.architectures[0] != "IQuestQ1ForCausalLM":
+        return False
+    cfg = resolving_view(server_args)
+    if cfg.speculative_draft_model_path in (None, cfg.model_path):
+        raise ValueError("IQuest Q1 requires an independent draft model path.")
+    draft = get_config(
+        cfg.speculative_draft_model_path,
+        trust_remote_code=cfg.trust_remote_code,
+        revision=cfg.speculative_draft_model_revision,
+    )
+    if not isinstance(draft, IQuestQ1MTPConfig):
+        raise ValueError("IQuest Q1 requires an independent MTP draft checkpoint.")
+    if draft.hidden_size != target.hidden_size or draft.vocab_size != target.vocab_size:
+        raise ValueError("MTP draft hidden size and vocabulary must match the target.")
+    if draft.num_target_layers != target.num_hidden_layers:
+        raise ValueError("MTP draft target layer count must match the target.")
+    if cfg.speculative_token_map is not None:
+        raise ValueError("MTP uses its own full-vocabulary embedding and head.")
+    steps = cfg.speculative_num_steps
+    if steps is None:
+        steps = draft.num_draft_slots
+    if steps < 1:
+        raise ValueError("MTP requires positive speculative_num_steps.")
+    if steps > draft.num_draft_slots:
+        logger.warning(
+            "MTP depth %d exceeds the checkpoint's num_draft_slots=%d.",
+            steps,
+            draft.num_draft_slots,
+        )
+    if cfg.speculative_eagle_topk not in (None, 1):
+        raise ValueError("MTP requires --speculative-eagle-topk 1.")
+    if cfg.speculative_num_draft_tokens not in (None, steps + 1):
+        raise ValueError("MTP verification width must equal draft steps + 1.")
+    declare_resolution(
+        server_args,
+        "_handle_iquest_q1_mtp_draft",
+        speculative_num_steps=steps,
+        speculative_eagle_topk=1,
+        speculative_num_draft_tokens=steps + 1,
+    )
+    return True
+
+
 def _handle_eagle_family(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
 
@@ -996,6 +1044,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
                     "DeepSeek MTP does not require setting speculative_draft_model_path."
                 )
 
+    _handle_iquest_q1_mtp_draft(server_args)
     if not cfg.speculative_adaptive and cfg.speculative_num_steps is None:
         assert (
             cfg.speculative_eagle_topk is None

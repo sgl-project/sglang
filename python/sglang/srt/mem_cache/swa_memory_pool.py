@@ -305,18 +305,6 @@ class SWAKVPool(BaseSWAKVPool):
         assert not is_swa_layer
         return self.full_kv_pool.get_index_k_with_scale_buffer(layer_id_pool)
 
-    def get_index_k_continuous(self, layer_id: int, *args, **kwargs):
-        layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
-        assert not is_swa_layer
-        return self.full_kv_pool.get_index_k_continuous(layer_id_pool, *args, **kwargs)
-
-    def get_index_k_scale_continuous(self, layer_id: int, *args, **kwargs):
-        layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
-        assert not is_swa_layer
-        return self.full_kv_pool.get_index_k_scale_continuous(
-            layer_id_pool, *args, **kwargs
-        )
-
     def get_index_k_scale_buffer(self, layer_id: int, *args, **kwargs):
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
         assert not is_swa_layer
