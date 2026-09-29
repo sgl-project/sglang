@@ -290,6 +290,46 @@ class DSANPUIndexerMixin:
 
         bs = q_lora.shape[0]
 
+        # W3 (handoff §8): when this rank will only SCORE its own rows, project
+        # only those rows too. ``wq_b`` is [T, 1536] @ [1536, 64 * 128], 25.2
+        # MFLOP per token against ``weights_proj``'s 0.46, so slicing q here
+        # removes (tp - 1)/tp of the indexer's projection work. The k path below
+        # stays full width on purpose: every attention-TP rank writes the whole
+        # index-K cache, which is what lets any of them score a subset.
+        #
+        # Neox only. The other branch rotates q and k in one
+        # ``rotary_emb(positions, q_pe, k_pe)`` call, so q cannot take a
+        # different row slice than k without splitting that call in two, and
+        # ``is_neox_style`` is ``not config.indexer_rope_interleave``, a key
+        # GLM-5.2's config does not set.
+        #
+        # Row-wise exact: every output row of a Linear and of the rotary depends
+        # only on its own input row, so the result is bitwise what the late
+        # ``shard.take`` produced -- fewer rows change the tiling, not the
+        # reduction each row sums over.
+        # Prefill CP is excluded explicitly. It has its own indexer
+        # (``do_npu_cp_balance_indexer``) further down, which knows nothing about
+        # this shard and would be handed a q that is a slice of a slice. Today CP
+        # forces attn_tp_size to 1 and the planner declines on its own, but that
+        # is a property of the tp8/cp8 layout, not a guarantee -- cp2 at tp8
+        # leaves attn_tp at 4.
+        uses_prefill_cp = (
+            self.dsa_enable_prefill_cp and forward_batch.attn_cp_metadata is not None
+        )
+        shard = (
+            _get_indexer_query_shard(forward_batch, bs, layer_scatter_modes)
+            if is_prefill and _shard_indexer_queries and not uses_prefill_cp
+            else None
+        )
+        q_sliced_early = shard is not None and self.rotary_emb.is_neox_style
+        if q_sliced_early:
+            if dynamic_scale is not None:
+                dynamic_scale = shard.take(dynamic_scale)
+            q_lora = shard.take(q_lora)
+            bs_q = shard.rows
+        else:
+            bs_q = bs
+
         if self.rotary_emb.is_neox_style:
             if not hasattr(forward_batch, "npu_indexer_sin_cos_cache"):
                 cos_sin = self.rotary_emb.cos_sin_cache[positions]
@@ -300,6 +340,11 @@ class DSANPUIndexerMixin:
             else:
                 sin, cos = forward_batch.npu_indexer_sin_cos_cache
 
+            # q rotates on this rank's rows; k still needs every one of them.
+            sin_q, cos_q = (
+                (shard.take(sin), shard.take(cos)) if q_sliced_early else (sin, cos)
+            )
+
             if self.alt_stream is not None:
                 self.alt_stream.wait_stream(torch.npu.current_stream())
                 with torch.npu.stream(self.alt_stream):
@@ -308,17 +353,17 @@ class DSANPUIndexerMixin:
                     )
                     q = self.wq_b(q_lora)[
                         0
-                    ]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
-                    q = q.view(bs, self.n_heads, self.head_dim)  # [bs, 64, 128]
+                    ]  # [rows, 1536] @ [1536, 64 * 128] = [rows, 64 * 128]
+                    q = q.view(bs_q, self.n_heads, self.head_dim)  # [rows, 64, 128]
                     q_pe, q_nope = torch.split(
                         q,
                         [self.rope_head_dim, self.head_dim - self.rope_head_dim],
                         dim=-1,
-                    )  # [bs, 64, 64 + 64]
-                    q_pe = q_pe.view(bs, self.n_heads, 1, self.rope_head_dim)
-                    q_pe = torch_npu.npu_rotary_mul(q_pe, cos, sin).view(
-                        bs, self.n_heads, self.rope_head_dim
-                    )  # [bs, n, d]
+                    )  # [rows, 64, 64 + 64]
+                    q_pe = q_pe.view(bs_q, self.n_heads, 1, self.rope_head_dim)
+                    q_pe = torch_npu.npu_rotary_mul(q_pe, cos_q, sin_q).view(
+                        bs_q, self.n_heads, self.rope_head_dim
+                    )  # [rows, n, d]
                     q = torch.cat([q_pe, q_nope], dim=-1)
                     q.record_stream(self.alt_stream)
                     q_rope_event = self.alt_stream.record_event()
@@ -328,17 +373,17 @@ class DSANPUIndexerMixin:
                 )
                 q = self.wq_b(q_lora)[
                     0
-                ]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
-                q = q.view(bs, self.n_heads, self.head_dim)  # [bs, 64, 128]
+                ]  # [rows, 1536] @ [1536, 64 * 128] = [rows, 64 * 128]
+                q = q.view(bs_q, self.n_heads, self.head_dim)  # [rows, 64, 128]
                 q_pe, q_nope = torch.split(
                     q,
                     [self.rope_head_dim, self.head_dim - self.rope_head_dim],
                     dim=-1,
-                )  # [bs, 64, 64 + 64]
-                q_pe = q_pe.view(bs, self.n_heads, 1, self.rope_head_dim)
-                q_pe = torch_npu.npu_rotary_mul(q_pe, cos, sin).view(
-                    bs, self.n_heads, self.rope_head_dim
-                )  # [bs, n, d]
+                )  # [rows, 64, 64 + 64]
+                q_pe = q_pe.view(bs_q, self.n_heads, 1, self.rope_head_dim)
+                q_pe = torch_npu.npu_rotary_mul(q_pe, cos_q, sin_q).view(
+                    bs_q, self.n_heads, self.rope_head_dim
+                )  # [rows, n, d]
                 q = torch.cat([q_pe, q_nope], dim=-1)
 
             if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
@@ -532,16 +577,16 @@ class DSANPUIndexerMixin:
                 else block_table
             )
             query = q.view(-1, self.n_heads, self.head_dim)
-            num_query_tokens = query.shape[0]
-            shard = (
-                _get_indexer_query_shard(
-                    forward_batch, num_query_tokens, layer_scatter_modes
-                )
-                if is_prefill and _shard_indexer_queries
-                else None
-            )
+            # The full width, for the gather to rebuild -- NOT query.shape[0],
+            # which W3 has already cut to shard.rows when it slices q early.
+            num_query_tokens = bs
             if shard is not None:
-                query = shard.take(query)
+                if not q_sliced_early:
+                    query = shard.take(query)
+                # weights stays a late take: under _use_ag_after_qlora with a
+                # SCATTERED input it is all-gathered to full width above, so
+                # slicing it before that would cut a slice twice. It is 0.46
+                # MFLOP per token against wq_b's 25.2, so ~2% of W3's saving.
                 weights = shard.take(weights)
                 actual_seq_lengths_q = shard.actual_seq_lengths_q
                 actual_seq_lengths_kv = shard.actual_seq_lengths_kv

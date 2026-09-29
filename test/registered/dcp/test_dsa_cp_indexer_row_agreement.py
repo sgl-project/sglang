@@ -323,5 +323,58 @@ class TestW2LocalTopk(CustomTestCase):
         self.assertTrue(gathered)
 
 
+class TestW3EarlySlice(CustomTestCase):
+    """Projecting the slice must equal slicing the projection -- handoff §8 W3.
+
+    W3 moves ``shard.take`` from after ``wq_b`` and the rotary to before them,
+    so the indexer projects ``1/tp`` of the rows instead of all of them. That is
+    only sound because every output row of a Linear depends on its own input row
+    alone -- and, for the padding rows the last rank carries, because ``wq_b``
+    has ``bias=False``. With a bias the padded rows would come back as the bias
+    instead of as zero, and the change would stop being bitwise.
+    """
+
+    def test_take_commutes_with_a_bias_free_linear(self):
+        torch.manual_seed(0)
+        weight = torch.randn(16, 12, dtype=torch.float64)
+        for total, tp_size in ((16384, 16), (16385, 16), (17, 16), (1557, 8)):
+            x = torch.randn(total, 12, dtype=torch.float64)
+            for tp_rank in range(tp_size):
+                with self.subTest(total=total, tp=tp_size, rank=tp_rank):
+                    shard = _shard_for([total], [0], tp_size, tp_rank)
+                    late = shard.take(x @ weight.T)
+                    early = shard.take(x) @ weight.T
+                    self.assertTrue(
+                        torch.equal(late, early),
+                        "projecting this rank's rows differs from slicing the "
+                        "full projection",
+                    )
+
+    def test_a_bias_would_break_it_on_the_padded_rank(self):
+        """Documents the constraint rather than trusting it stays true.
+
+        If someone gives ``wq_b`` a bias, W3 stops being bitwise and this is the
+        shape of the damage: only the padded rank, only its padded rows.
+        """
+        torch.manual_seed(0)
+        weight = torch.randn(16, 12, dtype=torch.float64)
+        bias = torch.randn(16, dtype=torch.float64)
+        total, tp_size = 16385, 16
+        x = torch.randn(total, 12, dtype=torch.float64)
+        broke = [
+            r
+            for r in range(tp_size)
+            for shard in [_shard_for([total], [0], tp_size, r)]
+            if not torch.equal(
+                shard.take(x @ weight.T + bias), shard.take(x) @ weight.T + bias
+            )
+        ]
+        self.assertEqual(
+            broke,
+            [15],
+            "expected a bias to corrupt exactly the one rank that holds padding",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
