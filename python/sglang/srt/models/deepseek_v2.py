@@ -615,12 +615,16 @@ class DeepseekV2MoE(nn.Module):
         n_shared_experts = (
             0 if config.n_shared_experts is None else int(config.n_shared_experts)
         )
-        # Gluon reuses the normal fused shared-expert representation for EP1,
-        # so AITER and Gluon see the same 257-expert weight bank. Under EP, keep
-        # the shared expert native to avoid duplicating it across EP ranks.
-        _fusion_disabled = is_shared_experts_fusion_disabled() or (
-            get_moe_runner_backend().is_gluon() and (self.moe_ep_size > 1 or is_nextn)
+        # For an EP1 target layer, Gluon reuses the normal 257-expert fused
+        # representation (256 routed + 1 shared), including its loader remap.
+        # EP layers keep shared-expert execution outside the routed-expert bank
+        # to avoid replicated EP computation/scaling, while NextN keeps its BF16
+        # shared expert native instead of packing it with the routed experts.
+        explicitly_disabled = is_shared_experts_fusion_disabled()
+        gluon_requires_native_shared = get_moe_runner_backend().is_gluon() and (
+            self.moe_ep_size > 1 or is_nextn
         )
+        _fusion_disabled = explicitly_disabled or gluon_requires_native_shared
 
         # num_fused_shared_experts drives weight remapping in deepseek_weight_loader:
         # mlp.shared_experts → mlp.experts.256 when > 0.
