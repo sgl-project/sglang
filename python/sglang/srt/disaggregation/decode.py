@@ -2481,11 +2481,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # under the current weights and sampled a fresh handoff token, but when
         # there is a remembered boundary token we are *replaying* an
         # already-emitted token. Override the handoff with it, and skip
-        # re-committing a logprob for it -- it keeps its original behavior
-        # logprob from before the retract (we never re-score generated tokens
-        # under the new policy). A rebootstrap with no boundary token (retracted
-        # before emitting any output) falls through to the normal path so its
-        # first token and logprob are committed as usual.
+        # re-committing a logprob or sampling mask for it -- it keeps its original
+        # behavior logprob and sampling mask from before the retract (we never
+        # re-score generated tokens under the new policy). A rebootstrap with no
+        # boundary token (retracted before emitting any output) falls through to
+        # the normal path so its first token and logprob are committed as usual.
         replayed_boundary = (
             decode_req.is_rebootstrap
             and decode_req.req.pd_rebootstrap_forced_output_id is not None
@@ -2554,7 +2554,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     : decode_req.req.logprob.top_logprobs_num
                 ].tolist()
             )
-        if decode_req.req.return_sampling_mask:
+        if decode_req.req.return_sampling_mask and not replayed_boundary:
             assert output_token_sampling_mask_idx is not None, (
                 "sampling mask buffer disabled on decode side"
             )
@@ -2678,13 +2678,25 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
                 if requires_host_drain:
                     decode_req.kv_receiver.abort()
-                if requires_host_drain or (
+                deferrable = (
                     self.enable_deferred_kv_release
                     and decode_req.kv_receiver.kv_mgr.enable_deferred_decode_kv_release
-                    and decode_req.kv_receiver.abort_notified
+                )
+                if deferrable and not decode_req.kv_receiver.abort_notified:
+                    # A failure decode did not initiate (prefill fault, transport
+                    # error, hicache restore failure) can still have sibling-rank
+                    # writes in flight toward these pages. force_arm: a partial
+                    # send_metadata leaves init_time None though earlier ranks
+                    # already hold destinations; this path always reaches
+                    # _do_release, which clears the tracker.
+                    decode_req.kv_receiver.ensure_abort_notified(force_arm=True)
+                if requires_host_drain or (
+                    deferrable and decode_req.kv_receiver.abort_notified
                 ):
-                    # Host pages always await a drain ack. Device pages retain
-                    # the existing opt-in deferred-release behavior.
+                    # Host pages always await a drain ack. A receiver that could
+                    # not notify (metadata never published, so no prefill holds
+                    # its destination info) has nothing in flight and releases
+                    # immediately below.
                     self._defer_release(decode_req)
                     deferred_indices.add(i)
                     indices_to_remove.add(i)

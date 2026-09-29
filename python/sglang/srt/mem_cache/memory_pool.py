@@ -4317,30 +4317,6 @@ class HybridLinearKVPool(KVCache):
         layer_id = self._transfer_full_attention_id(layer_id)
         self.full_kv_pool.invalidate_index_buffer_for_layer(layer_id)
 
-    def get_index_k_continuous(
-        self,
-        layer_id: int,
-        seq_len: int,
-        page_indices: torch.Tensor,
-    ):
-        assert self.use_dsa, "get_index_k_continuous called when use_dsa is False"
-        self._wait_for_layer(layer_id)
-        layer_id = self._transfer_full_attention_id(layer_id)
-        return self.full_kv_pool.get_index_k_continuous(layer_id, seq_len, page_indices)
-
-    def get_index_k_scale_continuous(
-        self,
-        layer_id: int,
-        seq_len: int,
-        page_indices: torch.Tensor,
-    ):
-        assert self.use_dsa, "get_index_k_scale_continuous called when use_dsa is False"
-        self._wait_for_layer(layer_id)
-        layer_id = self._transfer_full_attention_id(layer_id)
-        return self.full_kv_pool.get_index_k_scale_continuous(
-            layer_id, seq_len, page_indices
-        )
-
     def get_index_k_scale_buffer(
         self,
         layer_id: int,
@@ -5145,24 +5121,6 @@ class DSATokenToKVPool(MLATokenToKVPool):
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         return self.index_key_cache.get_local_buffer(layer_id)
-
-    def get_index_k_continuous(
-        self,
-        layer_id: int,
-        seq_len: int,
-        page_indices: torch.Tensor,
-    ):
-        return self.index_key_cache.get_k_continuous(layer_id, seq_len, page_indices)
-
-    def get_index_k_scale_continuous(
-        self,
-        layer_id: int,
-        seq_len: int,
-        page_indices: torch.Tensor,
-    ):
-        return self.index_key_cache.get_k_scale_continuous(
-            layer_id, seq_len, page_indices
-        )
 
     def get_index_k_scale_buffer(
         self,

@@ -677,8 +677,17 @@ class Envs:
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
-    # Registered TreeCore backend serving the unified radix cache.
-    SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND = EnvStr("python")
+    # The tree-core registry falls back to Python for:
+    # - Session-aware caching.
+    # - C128 or other unsupported components.
+    # - Custom component overrides.
+    # - Non-Linux platforms.
+    # - Unsupported PyTorch versions.
+    # - Devices other than CPU or CUDA.
+    # - Installs with neither the Rust extension nor its sources.
+    # - Source builds with a missing or unusable Rust toolchain.
+    # This also applies when Rust is explicitly selected.
+    SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND = EnvStr("rust")
     SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW = EnvBool(False)
 
     # ===================================================================
@@ -1341,6 +1350,9 @@ class Envs:
     SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB = EnvInt(16 * 1024)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB = EnvInt(None)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB = EnvInt(None)
+    # See docs/references/environment_variables.
+    SGLANG_ENABLE_PCIE_IPC_ALLREDUCE = EnvBool(False)
+    SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)
 
     # ===================================================================
     # RoPE cache
@@ -1366,6 +1378,8 @@ class Envs:
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
+    SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
+    SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
