@@ -127,6 +127,11 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.mamba_allocator.available_size(),
         )
 
+        # HiCache indexes the full sub-pool's per-layer views with kernel-facing IDs.
+        kvcache.full_kv_pool.host_transfer_translate = (
+            self.full_attn_allocator.translate_kv_loc_for_kernel
+        )
+
     # -- size: dynamic --
     @property
     def size(self) -> int:
@@ -343,6 +348,16 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             slot="disagg_move_gate",
             gate=gate,
             feature="PD disaggregation",
+            lazy_compaction=self.lazy_compaction,
+        )
+
+    def set_host_transfer_move_gate(self, gate: Callable[[], bool]) -> None:
+        """Block page relocation while host transfers use resolved device indices."""
+        install_move_gate(
+            self._move_gate_targets(),
+            slot="host_transfer_move_gate",
+            gate=gate,
+            feature="HiCache",
             lazy_compaction=self.lazy_compaction,
         )
 

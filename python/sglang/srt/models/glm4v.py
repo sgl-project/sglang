@@ -18,6 +18,7 @@
 """Inference-only GLM-4.1V model compatible with HuggingFace weights."""
 
 import logging
+from array import array
 from functools import lru_cache
 from typing import Iterable, List, Optional, Tuple
 
@@ -594,7 +595,7 @@ class Glm4vForConditionalGeneration(nn.Module):
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 

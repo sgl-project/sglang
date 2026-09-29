@@ -50,7 +50,6 @@ def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
 
 class TestPendingChunkedAbortRace(CustomTestCase):
     def setUp(self):
-        # The abort path asks the context for the pipeline width.
         enter_scope(self, published_topology())
 
     def test_req_left_chunked_slot_is_aborted(self):
