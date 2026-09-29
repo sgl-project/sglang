@@ -34,6 +34,7 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 
 prost = "0.13"
+prost-types = "0.13"
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 tonic = { version = "0.12", features = ["gzip", "transport"] }
 

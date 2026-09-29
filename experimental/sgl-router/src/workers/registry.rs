@@ -77,7 +77,7 @@ impl WorkerRegistry {
     /// spec carries an id that already has an entry, the prior entry
     /// stays put — it's the caller's responsibility to decide whether
     /// to evict it (and, importantly, to also clean up sidecar state
-    /// in `KvEventIndex` / `ActiveLoadRegistry` if so). Doing that
+    /// in `KvEventIndex` / `RouterInflightLoadRegistry` if so). Doing that
     /// cleanup here would leak orphan state into those sidecars when
     /// a caller actually wanted to keep the prior entry.
     pub fn add_with_cb(
@@ -463,7 +463,7 @@ mod tests {
     /// On a rejected upsert with `MixedPdAndPlain`, the registry is
     /// **not** mutated — the prior entry for the rejected id stays
     /// put. Eviction (with the matching `KvEventIndex` /
-    /// `ActiveLoadRegistry` cleanup) is the manager's responsibility;
+    /// `RouterInflightLoadRegistry` cleanup) is the manager's responsibility;
     /// doing it here would leak orphan state in those sidecars.
     #[test]
     fn upsert_rejected_with_mixed_modes_leaves_registry_unchanged() {

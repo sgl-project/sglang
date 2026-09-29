@@ -23,6 +23,7 @@ from sglang.srt.disaggregation.base.conn import (
     BaseKVSender,
     KVArgs,
     KVPoll,
+    KVTransferDestination,
     KVTransferMetric,
     StateType,
 )
@@ -35,9 +36,12 @@ from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,
     get_parallel,
+    get_schedule,
     get_serving,
+    max_prefill_buffer_tokens,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils.network import (
     NetworkAddress,
     get_local_ip_auto,
@@ -179,8 +183,10 @@ class CommonKVManager(BaseKVManager):
         self.server_args = server_args
         self.enable_deferred_decode_kv_release = (
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
+            and self.supports_deferred_decode_kv_release
         )
         self._dcp_pack_buffers = None
+        self._dcp_pack_max_tokens: Optional[int] = None
         # for p/d multi node infer
         self.bootstrap_host = get_serving().host
         self.bootstrap_port = get_disagg().disaggregation_bootstrap_port
@@ -256,6 +262,10 @@ class CommonKVManager(BaseKVManager):
             # Deferred KV release: aborted room -> (decode_ip, decode_port);
             # ack held until the transfer drains.
             self._deferred_ack_targets: Dict[int, Tuple[str, int]] = {}
+            # Fan-out peers snapshotted at registration: the sender's clear()
+            # can pop transfer_infos before the worker drains, and the drain
+            # ack would otherwise reach the registered target alone.
+            self._deferred_ack_fanout_snapshots: Dict[int, List[Tuple[str, int]]] = {}
             self.req_to_decode_prefix_len: Dict[int, int] = {}
             self.decode_kv_args_table = {}
             self.pp_group = get_parallel().pp_group
@@ -378,19 +388,26 @@ class CommonKVManager(BaseKVManager):
             f"{type(self).__name__} does not support staging memory registration"
         )
 
-    def _init_dcp_pack_buffers_once(self, dcp_size: int) -> None:
+    def _init_dcp_pack_buffers_once(
+        self, dcp_size: int, *, include_draft: bool = False
+    ) -> None:
         if self._dcp_pack_buffers is not None:
             return
         if not self.kv_args.kv_item_lens:
             return
         from sglang.srt.disaggregation.common.dcp_pack import init_dcp_pack_buffers
 
+        max_tokens = max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
+        max_tokens = ceil_align(max_tokens, self.kv_args.page_size)
         self._dcp_pack_buffers = init_dcp_pack_buffers(
             self._register_staging_memory,
             self.kv_args,
             len(self.transfer_queues),
             dcp_size,
+            max_tokens,
+            include_draft=include_draft,
         )
+        self._dcp_pack_max_tokens = max_tokens
 
     def check_status(self, bootstrap_room: int) -> KVPoll:
         return self.request_status[bootstrap_room]
@@ -669,14 +686,45 @@ class CommonKVManager(BaseKVManager):
         except Exception as e:
             logger.debug(f"Failed to send drained ABORT_ACK for room {room}: {e}")
 
+    def _abort_ack_fanout_targets(self, room: int) -> List[Tuple[str, int]]:
+        """Every decode peer of the room, dummy pairings included: each decode
+        rank counts drain acks from every prefill rank it notified, and a dummy
+        pairing still expects its ack (nothing was written, so it is trivially
+        drained). Snapshot: the control thread can register a late peer while
+        we walk the dict."""
+        infos = self.transfer_infos.get(room)
+        if not infos:
+            return []
+        targets: List[Tuple[str, int]] = []
+        for info in list(infos.values()):
+            target = (info.endpoint, info.dst_port)
+            if target not in targets:
+                targets.append(target)
+        return targets
+
     def _maybe_ack_drained_abort(self, room: int) -> None:
         """Send the deferred ack once an aborted room's chunks have drained
         (outstanding == 0). pop() makes it fire at most once."""
         if self._staging_outstanding.get(room, 0) > 0:
             return
         target = self._deferred_ack_targets.pop(room, None)
-        if target is not None:
-            self._send_abort_ack(target[0], target[1], room)
+        if target is None:
+            return
+        # With prefill TP < decode TP several decode ranks share one room, but
+        # the registry keeps only the last ABORT sender -- the earlier ranks
+        # would hold their pages for the full release timeout. Fan the ack out
+        # to every known peer: the live transfer_infos (catches peers that
+        # registered after the ABORT), the snapshot taken at registration
+        # (survives a teardown that popped transfer_infos mid-flight), and the
+        # registered sender as the guaranteed floor.
+        targets = self._abort_ack_fanout_targets(room)
+        for peer in self._deferred_ack_fanout_snapshots.pop(room, ()):
+            if peer not in targets:
+                targets.append(peer)
+        if target not in targets:
+            targets.append(target)
+        for decode_ip, decode_port in targets:
+            self._send_abort_ack(decode_ip, decode_port, room)
 
     def register_deferred_ack_target(
         self, room: int, decode_ip: str, decode_port: int
@@ -684,6 +732,10 @@ class CommonKVManager(BaseKVManager):
         """Hold this room's ack until its transfer drains. Callers must mark the
         room Failed FIRST -- registering while it still accepts chunks lets the
         worker ack, then a new chunk writes pages the decode already released."""
+        # Snapshot before target: the worker pops the target first, so writing
+        # the target first would let a drain racing this registration consume
+        # the target and strand the snapshot written after it.
+        self._deferred_ack_fanout_snapshots[room] = self._abort_ack_fanout_targets(room)
         self._deferred_ack_targets[room] = (decode_ip, decode_port)
 
     def get_kv_replica_factor(self) -> int:
@@ -1541,6 +1593,19 @@ class CommonKVSender(BaseKVSender):
     def pop_decode_prefix_len(self) -> int:
         return self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, 0)
 
+    def get_max_transfer_tokens(self) -> Optional[int]:
+        if self.kv_mgr._dcp_pack_max_tokens is None:
+            return None
+        for peer, info in self.kv_mgr.transfer_infos.get(
+            self.bootstrap_room, {}
+        ).items():
+            if (
+                not info.is_dummy
+                and self.kv_mgr.decode_kv_args_table[peer].requires_dcp_relayout
+            ):
+                return self.kv_mgr._dcp_pack_max_tokens
+        return None
+
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         return num_pages > 0 or last_chunk
 
@@ -1633,9 +1698,15 @@ class CommonKVSender(BaseKVSender):
         if hasattr(self.kv_mgr, "transfer_infos"):
             self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "_deferred_ack_targets"):
-            # Drop a held ack target if the room concluded without draining
-            # (e.g. aborted before any chunk enqueued); else it leaks on prefill.
-            self.kv_mgr._deferred_ack_targets.pop(self.bootstrap_room, None)
+            if hasattr(self.kv_mgr, "_staging_outstanding"):
+                # Preserve the target until in-flight writes drain, even when
+                # the scheduler has already observed Failed and cleared the room.
+                self.kv_mgr._maybe_ack_drained_abort(self.bootstrap_room)
+            else:
+                self.kv_mgr._deferred_ack_targets.pop(self.bootstrap_room, None)
+                self.kv_mgr._deferred_ack_fanout_snapshots.pop(
+                    self.bootstrap_room, None
+                )
 
     def abort(self):
         self.kv_mgr.record_failure(
@@ -1904,6 +1975,7 @@ class CommonKVReceiver(BaseKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
         decode_prefix_len: Optional[int] = None,
+        destination: KVTransferDestination = KVTransferDestination.DEVICE,
     ):
         raise NotImplementedError
 
@@ -1948,15 +2020,33 @@ class CommonKVReceiver(BaseKVReceiver):
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.conclude_state = KVPoll.Failed
+        self.ensure_abort_notified()
+
+    def ensure_abort_notified(self, *, force_arm: bool = False) -> None:
+        """Notify the prefill ranks (and arm drain-ack accounting) exactly once.
+        Unlike abort(), does not overwrite the recorded root cause -- callable
+        for an already-Failed room whose failure decode did not initiate."""
         if (
             not self.abort_notified
             and hasattr(self, "bootstrap_infos")
             and self.bootstrap_infos is not None
         ):
-            self._send_abort_notification()
+            self._send_abort_notification(force_arm=force_arm)
             self.abort_notified = True
 
-    def _send_abort_notification(self):
+    def _send_abort_notification(self, *, force_arm: bool = False):
+        # Once metadata is published (init_time set) prefill may already be
+        # writing; arm the drain-ack tracker BEFORE the ABORT goes out, so an
+        # ack racing back -- or fanned out by a peer rank's earlier abort of
+        # the same room -- is counted instead of dropped. Prealloc-queue
+        # receivers (init_time None) never enter the deferred-release flow
+        # that would clean the tracker up, so they stay unarmed -- except on a
+        # partial publish, where init_time is still None but earlier ranks
+        # already hold destinations; those callers defer and pass force_arm.
+        if self.kv_mgr.enable_deferred_decode_kv_release and (
+            force_arm or self.init_time is not None
+        ):
+            self.kv_mgr.register_deferred_abort_room(self.bootstrap_room)
         for bootstrap_info in self.bootstrap_infos:
             # Best-effort notification to prefill side that this request was aborted.
             try:

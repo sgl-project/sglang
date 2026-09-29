@@ -1,4 +1,5 @@
 import logging
+from array import array
 from contextlib import nullcontext
 from functools import partial
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
@@ -26,11 +27,13 @@ from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
-    LayerScatterModes,
+    LayerFacts,
+    MHCLayerCommunicator,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
+    layer_input_buffer,
+    reduce_output,
 )
-from sglang.srt.layers.communicator_mhc import MHCLayerCommunicator
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
@@ -50,6 +53,7 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils.common import PPMissingLayer
@@ -76,6 +80,10 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
 )
+from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
+    apply_mhc_post_pre_boundary,
+    is_cross_layer_mhc_fusion_enabled,
+)
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
@@ -101,7 +109,6 @@ from sglang.srt.multimodal.mm_utils import (
     run_dp_sharded_mrope_vision_model,
 )
 from sglang.srt.runtime_context import (
-    get_forward,
     get_lora,
     get_mm,
     get_parallel,
@@ -123,6 +130,15 @@ if _use_aiter_gfx95:
     )
 
 logger = logging.getLogger(__name__)
+
+# Matches DeepSeek-V4's _MHC_POST_MULT_VALUE; the fused and unfused boundaries
+# must agree on it.
+_MHC_POST_MULT_VALUE = 2.0
+
+# Conservative cap, not the crossover: at GLM-5.3-Flash's hc_mult=4 and
+# hidden_size=4096 the fusion wins to 16 tokens and reaches parity at 24, with
+# 17-23 unmeasured. Past it the pre-norm GEMM drops mhc_pre's split-K kernel.
+_MHC_FUSED_BOUNDARY_MAX_TOKENS = 16
 
 
 @torch.compile
@@ -711,7 +727,7 @@ class Glm5NextDecoderLayer(nn.Module):
         is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
         is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
 
-        self.layer_scatter_modes = LayerScatterModes.init_new(
+        self.layer_facts = LayerFacts.init_new(
             layer_id=layer_id,
             num_layers=1 if is_nextn else config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
@@ -769,13 +785,10 @@ class Glm5NextDecoderLayer(nn.Module):
             )
 
         shared_kwargs: Dict[str, Any] = dict(
-            layer_scatter_modes=self.layer_scatter_modes,
+            layer_facts=self.layer_facts,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
-            is_last_layer=(
-                is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
-            ),
             qkv_latent_func=(
                 self.self_attn.prepare_qkv_latent if not self.is_linear_attn else None
             ),
@@ -783,11 +796,17 @@ class Glm5NextDecoderLayer(nn.Module):
 
         if self.config.mhc:
             mhc_kwargs: Dict[str, Any] = dict(
-                is_first_layer=(self.layer_id == 0),
                 hc_mult=config.hc_mult,
                 hc_attn_pre=self.hc_attn_pre,
                 hc_ffn_pre=self.hc_ffn_pre,
                 hc_post=self.hc_post,
+                # Resolved once: env and platform are frozen after startup,
+                # and None keeps the dispatch off the per-boundary path.
+                hc_ffn_post_pre=(
+                    self.hc_ffn_post_pre
+                    if is_cross_layer_mhc_fusion_enabled()
+                    else None
+                ),
             )
             self.layer_communicator = MHCLayerCommunicator(
                 **shared_kwargs,
@@ -808,7 +827,7 @@ class Glm5NextDecoderLayer(nn.Module):
             rms_eps=self.config.rms_norm_eps,
             hc_eps=self.config.hc_eps,
             sinkhorn_iters=self.config.hc_sinkhorn_iters,
-            post_mult_value=2.0,
+            post_mult_value=_MHC_POST_MULT_VALUE,
             hc_norm_weight=None,
             out_norm_weight=out_norm_weight,
             out_norm_eps=out_norm_eps,
@@ -832,6 +851,46 @@ class Glm5NextDecoderLayer(nn.Module):
             hidden_states,
             out_norm_weight,
             out_norm_eps,
+        )
+
+    def hc_ffn_post_pre(
+        self, hidden_states, residual, h_res, h_post, out_norm_weight, out_norm_eps
+    ):
+        # Fuses hc_post into the pre-norm GEMM; the mhc_pre big-fuse stage
+        # still launches separately, so this is two launches instead of three.
+        assert self.config.mhc, "hc_ffn_post_pre is only valid when config.mhc=True"
+        num_tokens, hidden_size = hidden_states.shape
+        if num_tokens > _MHC_FUSED_BOUNDARY_MAX_TOKENS:
+            return None
+        hc_mult = self.config.hc_mult
+        fused = apply_mhc_post_pre_boundary(
+            layer_input=hidden_states,
+            residual=residual.view(num_tokens, hc_mult, hidden_size),
+            post=h_post.view(num_tokens, hc_mult),
+            comb=h_res.view(num_tokens, hc_mult, hc_mult),
+            hc_fn=self.hc_ffn_fn,
+            hc_scale=self.hc_ffn_scale,
+            hc_base=self.hc_ffn_base,
+            hc_mult=hc_mult,
+            rms_eps=self.config.rms_norm_eps,
+            hc_eps=self.config.hc_eps,
+            hc_post_mult=_MHC_POST_MULT_VALUE,
+            sinkhorn_iters=self.config.hc_sinkhorn_iters,
+            norm_weight=out_norm_weight,
+            norm_eps=out_norm_eps,
+            # Matches DeepSeek-V4's two hc_ffn_fn boundaries; the Triton tier's
+            # parameter is hc_fn_t and this fn has the same [mix_hc, hc_dim] layout.
+            fn_transpose=True,
+        )
+        if fused is None:
+            return None
+        next_residual, layer_input, post, comb, norm_fused = fused
+        return (
+            layer_input,
+            next_residual.reshape(num_tokens, -1),
+            comb.reshape(num_tokens, hc_mult * hc_mult),
+            post.reshape(num_tokens, hc_mult),
+            norm_fused,
         )
 
     def hc_post(self, hidden_states, residual, h_res, h_post):
@@ -861,7 +920,7 @@ class Glm5NextDecoderLayer(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ):
-        hidden_states_orig = hidden_states
+        hidden_states_orig = layer_input_buffer(hidden_states)
 
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
@@ -874,7 +933,9 @@ class Glm5NextDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
-            layer_scatter_modes=self.layer_scatter_modes,
+            input_on_attention_tp_slices=(
+                self.layer_communicator.input_on_attention_tp_slices
+            ),
             prev_topk_indices=prev_topk_indices,
         )
         if isinstance(hidden_states, tuple):
@@ -887,16 +948,6 @@ class Glm5NextDecoderLayer(nn.Module):
             hidden_states,
             residual,
             forward_batch,
-        )
-
-        should_allreduce_fusion = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
-
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
         )
 
         if isinstance(self.mlp, Glm5NextMLP):
@@ -913,26 +964,13 @@ class Glm5NextDecoderLayer(nn.Module):
         else:
             _mlp_ctx = nullcontext()
 
-        with get_forward().scoped(
-            fuse_mlp_allreduce=should_allreduce_fusion,
-            mlp_reduce_scatter=use_reduce_scatter,
-        ):
-            with _mlp_ctx:
-                hidden_states = self.mlp(
-                    hidden_states,
-                    forward_batch,
-                    gemm_output_zero_allocator,
-                )
-
-        if should_allreduce_fusion:
-            hidden_states._sglang_needs_allreduce_fusion = True
-
-        if not should_allreduce_fusion:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit, _mlp_ctx:
+            hidden_states = self.mlp(
                 hidden_states,
-                residual,
                 forward_batch,
+                gemm_output_zero_allocator,
             )
+        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
 
         return hidden_states, residual, topk_indices
 
@@ -1033,7 +1071,11 @@ class Glm5NextModel(nn.Module):
             )
         self.layers_to_capture = []
         self.dflash_capture = False
-        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
+        if (
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_deepep_v2()
+        ):
             self.enable_a2a_moe = True
         else:
             self.enable_a2a_moe = False
@@ -1116,6 +1158,7 @@ class Glm5NextModel(nn.Module):
             )
             with ctx:
                 if i in self.layers_to_capture:
+                    hidden_states = reduce_output(hidden_states)
                     aux_hidden_state = self._prepare_aux_hidden_state(
                         hidden_states, residual
                     )
@@ -1143,12 +1186,13 @@ class Glm5NextModel(nn.Module):
                 forward_batch=forward_batch,
                 hidden_states=hidden_states,
                 residual=residual,
-                input_data_scatter_mode=self.layers[
-                    normal_end_layer - 1
-                ].layer_scatter_modes.layer_output_mode,
                 zero_allocator=zero_allocator,
             )
 
+        last_layer = self.layers[self.end_layer - 1]
+        hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
         if not self.pp_group.is_last_rank:
             if self.config.mhc:
                 return PPProxyTensors({"hidden_states": hidden_states})
@@ -1173,11 +1217,13 @@ class Glm5NextModel(nn.Module):
 class Glm5NextForConditionalGeneration(nn.Module):
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_substr={
-            "model.language_model.": "model.",
             "model.visual": "visual",
-        }
+        },
+        orig_to_new_prefix={
+            "model.language_model.": "model.",
+        },
+        orig_to_new_suffix={".attn.qkv": ".attn.qkv_proj"},
     )
-
     packed_modules_mapping = {
         "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
         **Glm5NextLinearAttention._PACKED_MODULES_MAPPING,
@@ -1293,6 +1339,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
         text_config = getattr(hf_config, "text_config", hf_config)
         if not getattr(text_config, "n_shared_experts", None):
             return "No shared experts are defined in the config."
+        if getattr(text_config, "n_shared_experts", None) != 1:
+            return "Shared experts fusion requires exactly one shared expert."
         if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
             first_sparse_layer = getattr(text_config, "first_k_dense_replace", 0)
             for layer_id in range(first_sparse_layer, text_config.num_hidden_layers):
@@ -1304,20 +1352,78 @@ class Glm5NextForConditionalGeneration(nn.Module):
                         "ModelOpt FP4 keeps shared experts unquantized while routed "
                         "experts are quantized."
                     )
-        if not _is_cuda:
-            return "Shared experts fusion currently requires CUDA devices."
-        if _device_sm is not None and _device_sm < 80:
-            return "Shared experts fusion requires SM80 or newer GPUs."
         if get_parallel().moe_ep_size > 1:
             return (
                 "Shared experts fusion is not supported together with expert "
                 "parallelism yet."
             )
-        if get_moe_a2a_backend().is_deepep():
-            return (
-                "Shared experts fusion is not supported when Deepep MoE backend "
-                "is enabled."
-            )
+
+        if _is_cuda:
+            if _device_sm is not None and _device_sm < 80:
+                return "Shared experts fusion requires SM80 or newer GPUs."
+            if get_moe_a2a_backend().is_deepep():
+                return (
+                    "Shared experts fusion is not supported when Deepep MoE backend "
+                    "is enabled."
+                )
+        else:
+            if not _use_aiter_gfx95:
+                return "HIP shared experts fusion requires AITER on a gfx950 device."
+            if not get_moe_a2a_backend().is_none():
+                return (
+                    "HIP shared experts fusion is not supported when an MoE A2A "
+                    "backend is enabled."
+                )
+            parallel = get_parallel()
+            if (
+                parallel.tp_size not in (4, 8)
+                or parallel.moe_tp_size != parallel.tp_size
+            ):
+                return "HIP shared experts fusion is validated only for TP4 and TP8."
+            if (
+                getattr(text_config, "model_type", None) != "glm5_next_text"
+                or getattr(text_config, "hidden_size", None) != 4096
+                or getattr(text_config, "moe_intermediate_size", None) != 2048
+                or getattr(text_config, "n_routed_experts", None) != 288
+                or getattr(text_config, "num_experts_per_tok", None) != 8
+            ):
+                return (
+                    "HIP shared experts fusion is validated only for the "
+                    "GLM-5.3-Flash E=288/topk=8 expert geometry."
+                )
+            if (
+                getattr(text_config, "hidden_act", None) != "silu"
+                or getattr(text_config, "swiglu_limit", None) != 10.0
+            ):
+                return (
+                    "HIP shared experts fusion requires the validated "
+                    "clamped SiLU G1U1 activation."
+                )
+            if (
+                quant_config is None
+                or quant_config.get_name() != "fp8"
+                or not getattr(quant_config, "is_checkpoint_fp8_serialized", False)
+                or getattr(quant_config, "weight_block_size", None) != [128, 128]
+                or getattr(quant_config, "activation_scheme", None) != "dynamic"
+            ):
+                return (
+                    "HIP shared experts fusion requires serialized dynamic "
+                    "128x128 block-FP8 experts."
+                )
+            ignored_layers = getattr(quant_config, "ignored_layers", [])
+            packed_mapping = getattr(quant_config, "packed_modules_mapping", {})
+            first_sparse_layer = getattr(text_config, "first_k_dense_replace", 0)
+            for layer_id in range(first_sparse_layer, text_config.num_hidden_layers):
+                moe_prefix = f"model.layers.{layer_id}.mlp"
+                if is_layer_skipped(
+                    f"{moe_prefix}.experts", ignored_layers, packed_mapping
+                ) or is_layer_skipped(
+                    f"{moe_prefix}.shared_experts", ignored_layers, packed_mapping
+                ):
+                    return (
+                        "HIP shared experts fusion requires routed and shared "
+                        "experts to use the same block-FP8 layout."
+                    )
         return None
 
     def determine_num_fused_shared_experts(self):
@@ -1357,7 +1463,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         # Capturing before layer k + 1 gives the completed output of layer k.
         self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
@@ -1510,6 +1616,14 @@ class Glm5NextForConditionalGeneration(nn.Module):
             fused_cat_dim = 0
 
         params_dict = dict(self.named_parameters())
+
+        def maybe_map_fp8_block_scale_name(name: str) -> str:
+            if name.endswith("weight_scale"):
+                candidate = name.removesuffix("weight_scale") + "weight_scale_inv"
+                if candidate in params_dict:
+                    return candidate
+            return name
+
         weight_names = []
         for name, loaded_weight in weights:
             is_visual_weight = "visual" in name
@@ -1573,6 +1687,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 if "mlp.experts" in name:
                     continue
                 candidate = name.replace(weight_name, param_name)
+                candidate = maybe_map_fp8_block_scale_name(candidate)
                 if (
                     param_name
                     in {
@@ -1602,6 +1717,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                         continue
                     is_expert_weight = True
                     name = name.replace(weight_name, param_name)
+                    name = maybe_map_fp8_block_scale_name(name)
                     if name not in params_dict:
                         continue
                     param = params_dict[name]
@@ -1653,6 +1769,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                                     "fused_qkv_a_proj_with_mqa",
                                 )
                             )
+                            target = maybe_map_fp8_block_scale_name(target)
                             if target in params_dict:
                                 param = params_dict[target]
                                 weight_loader = getattr(
@@ -1663,6 +1780,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                             cached_a_proj.pop(kv_a_proj_name, None)
                         continue
 
+                    name = maybe_map_fp8_block_scale_name(name)
                     if name not in params_dict:
                         continue
 

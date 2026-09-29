@@ -150,6 +150,9 @@ async fn access_log_and_record(
                 .unwrap_or_else(|| outcome_from_status(status.as_u16()))
                 .as_str(),
             worker = log_ctx.map(|c| c.worker_url.as_str()).unwrap_or(""),
+            engine_rid = log_ctx
+                .and_then(|c| c.engine_rid.as_deref())
+                .unwrap_or(""),
             model = log_ctx.map(|c| c.model_id.as_str()).unwrap_or(""),
             stream = log_ctx.is_some_and(|c| c.streaming),
             latency_ms,
@@ -205,6 +208,10 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
         .route(
             "/flush_cache",
             post(crate::server::routes::cache::flush_cache),
+        )
+        .route(
+            crate::state::kv_events::bootstrap::SNAPSHOT_PATH,
+            get(crate::server::routes::cache::kv_snapshot),
         );
     // A route that panics on purpose, so the panic-handling layers below are
     // exercised as `build_router` actually composes them. Without it the layers
@@ -446,6 +453,7 @@ mod tests {
                         model_id: "tiny".into(),
                         streaming: false,
                         outcome: RequestOutcome::Cancelled,
+                        engine_rid: Some("1f0c2b7a4e9d4f3ab6c5d8e7f0a1b2c3".into()),
                     });
                     resp
                 }),
@@ -467,6 +475,11 @@ mod tests {
         assert!(
             logs.contains("worker=\"http://worker-a:30000\"") && logs.contains("model=\"tiny\""),
             "a routed request must be logged with its worker and model; captured:\n{logs}",
+        );
+        assert!(
+            logs.contains("engine_rid=\"1f0c2b7a4e9d4f3ab6c5d8e7f0a1b2c3\"")
+                && logs.contains("request_id="),
+            "the minted rid must be logged beside the caller's request id; captured:\n{logs}",
         );
         // The handler's outcome must win over the status-derived fallback —
         // otherwise the log and `worker_requests_total` can disagree about a
