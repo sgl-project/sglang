@@ -97,6 +97,7 @@ def build_inputs(
     with_sink=False,
     paged=True,
     dtype=torch.bfloat16,
+    page_size=None,
 ):
     max_kv_len = max(seq_lens_list)
     max_slots = batch_size * max_kv_len
@@ -114,13 +115,11 @@ def build_inputs(
         if paged == "pages":
             # What PagedTokenToKVPoolAllocator emits: page * page_size + offset, so
             # slots are contiguous inside a page while pages themselves are shuffled.
-            npages = max_kv_len // block_size
+            page = page_size or block_size
+            npages = max_kv_len // page
             pages = torch.randperm(npages, device=DEVICE) + i * npages
             req_to_token[i, :max_kv_len] = (
-                (
-                    pages[:, None] * block_size
-                    + torch.arange(block_size, device=DEVICE)[None, :]
-                )
+                (pages[:, None] * page + torch.arange(page, device=DEVICE)[None, :])
                 .reshape(-1)
                 .to(torch.int32)
             )
@@ -384,7 +383,16 @@ def test_paged_tile_matches_slot_gather(page_size, engages):
     bs, nqh, nkh, hd, blk, tk = 4, 64, 1, 128, 128, 16
     seq_lens_list = make_seq_lens("aligned", bs, blk)
     args = build_inputs(
-        bs, nqh, nkh, hd, seq_lens_list, blk, tk, with_sink=False, paged="pages"
+        bs,
+        nqh,
+        nkh,
+        hd,
+        seq_lens_list,
+        blk,
+        tk,
+        with_sink=False,
+        paged="pages",
+        page_size=page_size,
     )
     q, sink, k_cache, v_cache, req_to_token, seq_lens, slot_ids, topk_idx = args
 
@@ -404,6 +412,10 @@ def test_paged_tile_matches_slot_gather(page_size, engages):
 
     gather = run(0)
     assert torch.equal(gather, run(page_size))
+    if not engages:
+        # These pages split every block, so reading a block as one tile gives a
+        # different result: the equality above means the gather really ran.
+        assert not torch.equal(gather, run(blk))
     # A layout that violates the precondition must diverge, else the branch under
     # test never ran and the assertion above proves nothing.
     if engages:
