@@ -27,6 +27,7 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
         batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,
             batch_size=lambda: 4,
+            spec_info=None,
         )
         tbo_preparer = Mock()
         tbo_preparer.prepare_all_gather.return_value = (
