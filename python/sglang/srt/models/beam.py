@@ -21,10 +21,18 @@ from torch import nn
 from sglang.srt.configs.beam import BeamConfig
 from sglang.srt.distributed import (
     get_pp_group,
+    get_tp_group,
     moe_expert_parallel_all_reduce,
     moe_tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.dp_attention import (
+    dp_gather_replicate,
+    dp_scatter,
+    get_dp_global_num_tokens,
+    get_global_dp_buffer,
+    get_local_dp_buffer,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -38,6 +46,7 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
     should_skip_post_experts_all_reduce,
+    should_use_dp_reduce_scatterv,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -357,6 +366,36 @@ class BeamDecoderLayer(nn.Module):
         self.post_feedforward_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        # The MLP is sharded over the full TP group, so attention-DP ranks
+        # gather their tokens around it; norms and residuals stay DP-local.
+        self.gather_mlp_tokens = get_parallel().attn_dp_size > 1
+
+    def _forward_mlp(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        if not self.gather_mlp_tokens:
+            return self.mlp(hidden_states)
+        local_hidden_states = hidden_states
+        hidden_states = get_global_dp_buffer(get_tp_group())
+        dp_gather_replicate(
+            global_tokens=hidden_states,
+            local_tokens=local_hidden_states,
+            forward_batch=forward_batch,
+        )
+        global_output = self.mlp(hidden_states)
+        output = get_local_dp_buffer(get_tp_group())
+        # BeamMoE skips its all-reduces in this layout; reduce-scatter instead.
+        if isinstance(self.mlp, BeamMoE) and should_use_dp_reduce_scatterv():
+            get_tp_group().reduce_scatterv(
+                global_output, output=output, sizes=get_dp_global_num_tokens()
+            )
+        else:
+            dp_scatter(
+                local_tokens=output,
+                global_tokens=global_output,
+                forward_batch=forward_batch,
+            )
+        return output
 
     def forward(
         self,
@@ -373,7 +412,10 @@ class BeamDecoderLayer(nn.Module):
             self.attn_residual_scales,
         )
         residual = hidden_states
-        hidden_states = self.mlp(self.pre_feedforward_layernorm(hidden_states))
+        hidden_states = self._forward_mlp(
+            hidden_states=self.pre_feedforward_layernorm(hidden_states),
+            forward_batch=forward_batch,
+        )
         return depth_scaled_residual(
             self.post_feedforward_layernorm(hidden_states),
             residual,

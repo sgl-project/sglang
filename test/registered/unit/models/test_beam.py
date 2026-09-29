@@ -335,6 +335,7 @@ class TestBeamNumerics(CustomTestCase):
         for layer_id in (0, 1, 51):
             config = deep_config if layer_id == 51 else tiny_config()
             with (
+                get_parallel().override(attn_dp_size=1),
                 patch(
                     "sglang.srt.models.beam.BeamAttention",
                     return_value=torch.nn.Identity(),
