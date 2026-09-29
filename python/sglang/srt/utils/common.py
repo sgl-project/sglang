@@ -990,17 +990,6 @@ def fi_a2a_platform_blocker(
     return None
 
 
-def is_fi_a2a_supported(
-    *, dcp_size: int, tp_size: int, pp_size: int, nnodes: int
-) -> bool:
-    if not get_platform().is_sm100:
-        return False
-    if is_mnnvl_fabric_device():
-        return True
-    tp_size_per_node = tp_size // max(nnodes // pp_size, 1)
-    return tp_size_per_node % dcp_size == 0
-
-
 @lru_cache(maxsize=1)
 def _flashinfer_has_fused_dcp_reduce() -> bool:
     # A top-level find_spec locates the package without importing it.
