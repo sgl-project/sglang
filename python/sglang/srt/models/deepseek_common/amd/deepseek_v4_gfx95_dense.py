@@ -33,9 +33,10 @@ _is_gfx95_supported = is_gfx95_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 
-# aiter batched GEMM fork with wo_b's fp8-grid rounding in its epilogue; None keeps the aiter kernel
+# V4.1's wo_a route on gfx950: an aiter batched GEMM fork with wo_b's fp8-grid rounding in its
+# epilogue; None keeps the aiter kernel
 _wo_a_fp8_grid_gemm = None
-if _use_aiter and _is_gfx95_supported and envs.SGLANG_OPT_USE_AITER_BATCHED_GEMM.get():
+if _use_aiter and _is_gfx95_supported:
     from sglang.kernels.ops.gemm.gfx95_batched_gemm_bf16_fp8_grid import (
         batched_gemm_bf16_fp8_grid as _wo_a_fp8_grid_gemm,
     )

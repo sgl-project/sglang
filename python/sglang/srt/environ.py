@@ -1578,9 +1578,9 @@ class Envs:
     # Emits MXFP8 when wo_b supports it, otherwise BF16.
     SGLANG_DSV41_FUSED_WO_A = EnvBool(True)
     # Route the decode wo_a bf16 batched matmul off rocBLAS/Tensile onto aiter's
-    # tuned batched_gemm_bf16 (gfx95). On by default on ROCm; see deepseek_v4.py
+    # tuned batched_gemm_bf16 (gfx95). Off by default; see deepseek_v4.py
     # _apply_wo_a_bf16_matmul.
-    SGLANG_OPT_USE_AITER_BATCHED_GEMM = EnvBool(_default_hip)
+    SGLANG_OPT_USE_AITER_BATCHED_GEMM = EnvBool(False)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)

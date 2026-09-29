@@ -468,9 +468,11 @@ def _apply_wo_a_bf16_matmul(
     # o [T, G, D] @ wo_a [G, R, D] -> [T, G, R]; the fast paths below are gated
     # on the exact validated TP4 shapes and write token-major output directly.
     global _wo_a_aiter_batched_gemm_disabled
+    # the gfx950 routes, like the CUDA ones, are V4.1's (fast_path); DSv4 keeps the
+    # aiter batched GEMM / einsum below
+    hip_fast_path = fast_path and _is_hip and _is_gfx95_supported
     hip_decode_verify = (
-        _is_hip
-        and _is_gfx95_supported
+        hip_fast_path
         and (
             (is_decode and o.shape[0] == 1 and o.is_contiguous())
             or (is_target_verify and 2 <= o.shape[0] <= 384)
@@ -501,12 +503,7 @@ def _apply_wo_a_bf16_matmul(
             )
         )
         or hip_decode_verify
-        or (
-            _is_hip
-            and _is_gfx95_supported
-            and is_prefill
-            and 4096 <= o.shape[0] <= 65536
-        )
+        or (hip_fast_path and is_prefill and 4096 <= o.shape[0] <= 65536)
     ) and (
         o.shape[1:] == (2, 4096)
         and wo_a.shape == (2, 1024, 4096)
@@ -532,14 +529,15 @@ def _apply_wo_a_bf16_matmul(
                 o.transpose(0, 1), wo_a.transpose(1, 2), out=result.transpose(0, 1)
             )
         return result
+    if is_decode and hip_fast_path:
+        y = _hip.wo_a_fp8_grid_matmul(o, wo_a, fp8_grid)
+        if y is not None:
+            return y
     if (
         is_decode
         and _wo_a_aiter_batched_gemm_enabled
         and not _wo_a_aiter_batched_gemm_disabled
     ):
-        y = _hip.wo_a_fp8_grid_matmul(o, wo_a, fp8_grid)
-        if y is not None:
-            return y
         try:
             # aiter batched_gemm_bf16: XQ[B,M,K] @ WQ[B,N,K]^T -> [B,M,N].
             # Here batch = group G: XQ = o.transpose(0,1) [G,T,D], WQ = wo_a
@@ -1138,7 +1136,8 @@ class MQALayer(MqaAttentionBase):
 
         if alt_streams is not None and (
             (
-                (_is_cuda or _is_gfx95_supported)
+                # the gfx950 overlap is validated on V4.1 only; DSv4 on ROCm keeps one stream
+                (_is_cuda or (_is_gfx95_supported and self.is_dsv41))
                 and envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             )
             or (_is_npu and envs.SGLANG_NPU_USE_MULTI_STREAM.get())
@@ -2592,7 +2591,7 @@ class MQALayer(MqaAttentionBase):
                         wo_a = wo_a_weight.view(
                             self.n_local_groups, self.o_lora_rank, -1
                         )
-                        # ROCm: the 16-row decode kernels also serve target-verify rows
+                        # ROCm V4.1: the 16-row decode kernels also serve target-verify rows
                         o = _apply_wo_a_bf16_matmul(
                             o,
                             wo_a,
@@ -2600,6 +2599,7 @@ class MQALayer(MqaAttentionBase):
                                 forward_batch.forward_mode.is_decode()
                                 or (
                                     _is_hip
+                                    and self.is_dsv41
                                     and forward_batch.forward_mode.is_target_verify()
                                 )
                             ),
@@ -2607,7 +2607,9 @@ class MQALayer(MqaAttentionBase):
                             is_prefill=forward_batch.forward_mode.is_extend_without_speculative(),
                             fast_path=self.is_dsv41,
                             fuse_mxfp8_quant=fuse_mxfp8_quant,
-                            fp8_grid=_is_hip and _hip.wo_b_takes_fp8_grid(self),
+                            fp8_grid=_is_hip
+                            and self.is_dsv41
+                            and _hip.wo_b_takes_fp8_grid(self),
                         )
                 else:
                     o = _apply_gguf_grouped_wo_a(

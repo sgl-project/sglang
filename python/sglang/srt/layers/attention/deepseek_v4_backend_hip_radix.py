@@ -923,6 +923,11 @@ class DeepseekV4HipRadixBackend(
         self.is_draft_worker = getattr(model_runner, "is_draft_worker", False)
         self._verify_mask: Optional[VerifyMask] = None
         self.is_dspark = model_runner.spec_algorithm.is_dspark()
+        # the DSpark draft reads the target's checkpoint, so its config names V4.1 too
+        self.is_dsv41 = (
+            getattr(model_runner.model_config.hf_text_config, "model_type", None)
+            == "deepseek_v41"
+        )
         # Decode and speculative metadata can be rebuilt from device lengths.
         # The online c128 planner still consumes CPU lengths.
         self.needs_cpu_seq_lens = envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
@@ -1288,13 +1293,14 @@ class DeepseekV4HipRadixBackend(
         )
 
     def _uses_dspark_draft_window(self) -> bool:
-        """Whether the DSpark draft block takes the block-window metadata;
-        unified_kv addresses its ring by (slot, position) and keeps its own path."""
+        """Whether the V4.1 DSpark draft block takes the block-window metadata; DSv4's
+        draft keeps the causal verify indices, and unified_kv addresses its ring by
+        (slot, position) and keeps its own path."""
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
         )
 
-        return self.is_dspark_draft and not is_unified_kv_triton()
+        return self.is_dspark_draft and self.is_dsv41 and not is_unified_kv_triton()
 
     def init_forward_metadata_dspark_draft_block(
         self,

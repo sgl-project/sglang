@@ -217,7 +217,7 @@ if _use_aiter:
     from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_max_tokens
     from sglang.srt.layers.rocm_linear_utils import (
         aiter_dsv3_router_gemm,
-        aiter_dsv3_router_split_k,
+        rocm_dsv3_router_split_k,
     )
 
 if _use_aiter_gfx95:
@@ -520,7 +520,8 @@ class MoEGate(nn.Module):
             hidden_size=config.hidden_size,
             weight_dtype=self.weight.dtype,
         )
-        # Rows up to which the ROCm split-K router serves the gate (-1: never).
+        # Rows up to which the ROCm split-K router serves the gate (-1: never); V4.1
+        # only, DSv4 keeps aiter's router GEMM and gate
         self.rocm_router_max_tokens = (
             rocm_router_max_tokens(
                 num_experts=config.n_routed_experts,
@@ -528,7 +529,10 @@ class MoEGate(nn.Module):
                 topk=config.num_experts_per_tok,
                 weight_dtype=self.weight.dtype,
             )
-            if _use_aiter and self.is_deepseek_v4 and not is_hash_moe
+            if _use_aiter
+            and self.is_deepseek_v4
+            and getattr(config, "model_type", None) == "deepseek_v41"
+            and not is_hash_moe
             else -1
         )
 
@@ -1011,7 +1015,7 @@ class DeepseekV2MoE(nn.Module):
         """The router logits and, on the ROCm decode router, the split-K partials
         self.topk sums into them; fused_gate=False when anything else reads them."""
         if fused_gate and _use_aiter and not self.is_hash:
-            logits_and_partials = aiter_dsv3_router_split_k(self.gate, hidden_states)
+            logits_and_partials = rocm_dsv3_router_split_k(self.gate, hidden_states)
             if logits_and_partials is not None:
                 return logits_and_partials
         return self.gate(hidden_states, gemm_output_zero_allocator), None

@@ -35,7 +35,7 @@ def aiter_dsv3_router_gemm(
     return tgemm.mm(hidden_states, weight.detach(), otype=hidden_states.dtype)
 
 
-def aiter_dsv3_router_split_k(
+def rocm_dsv3_router_split_k(
     gate, hidden_states: torch.Tensor
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     """The ROCm decode router for gate (a MoEGate): an fp32 logits buffer plus

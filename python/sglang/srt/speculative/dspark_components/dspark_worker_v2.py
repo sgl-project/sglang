@@ -78,6 +78,7 @@ from sglang.srt.speculative.spec_utils import (
     prepare_mamba_track_for_verify,
 )
 from sglang.srt.utils import (
+    is_cuda,
     is_cuda_alike,
     is_npu,
     is_pin_memory_available,
@@ -328,11 +329,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             and not get_parallel().enable_dp_attention
             and self.model_runner.pp_size == 1
         )
-        # ROCm: inside a HIP graph the accept-site TP broadcasts need the group's pynccl communicator
+        # ROCm (V4.1 target only): inside a HIP graph the accept-site TP broadcasts
+        # need the group's pynccl communicator
         if (
             (self._verify_planner.is_compact_mode or static_epilogue_supported)
             and self._decode_graph_allowed
-            and is_cuda_alike()
+            and (is_cuda() or (is_cuda_alike() and target_is_dsv41))
         ):
             self._verify_epilogue = DsparkVerifyEpilogue(
                 max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),

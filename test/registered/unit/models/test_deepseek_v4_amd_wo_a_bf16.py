@@ -30,6 +30,7 @@ test and only imported behind ``is_hip()`` -- matching the existing AMD aiter
 op tests.
 """
 
+import functools
 import unittest
 from unittest import mock
 
@@ -47,20 +48,12 @@ class TestWoABf16BatchedGemm(unittest.TestCase):
     def setUpClass(cls):
         # Import the heavy model module only on a GPU runner (see module docstring).
         from sglang.srt.models import deepseek_v4 as dsv4
-        from sglang.srt.models.deepseek_common.amd import deepseek_v4_gfx95_dense
 
         cls.dsv4 = dsv4
-        cls.gfx95_dense = deepseek_v4_gfx95_dense
         cls.device = "cuda"  # torch maps "cuda" onto the ROCm HIP device
 
     def setUp(self):
         torch.manual_seed(0)
-        # the gfx950 wo_a route reads the exec bag (deterministic gate): publish one
-        from sglang.srt.runtime_context import get_context
-
-        override = get_context().override_server_args()
-        override.install()
-        self.addCleanup(override.restore)
         # The one-shot runtime-disable flag is process-global; reset it so a
         # failure case in one test cannot leak into another.
         self.dsv4._wo_a_aiter_batched_gemm_disabled = False
@@ -121,8 +114,6 @@ class TestWoABf16BatchedGemm(unittest.TestCase):
                     mock.patch.object(
                         self.dsv4, "_wo_a_aiter_batched_gemm_enabled", enabled
                     ),
-                    # the gfx950 fp8-grid fork would run before the aiter kernel
-                    mock.patch.object(self.gfx95_dense, "_wo_a_fp8_grid_gemm", None),
                     mock.patch.object(
                         self.dsv4, "_wo_a_batched_gemm_bf16", fake_kernel
                     ),
@@ -153,7 +144,6 @@ class TestWoABf16BatchedGemm(unittest.TestCase):
 
         with (
             mock.patch.object(self.dsv4, "_wo_a_aiter_batched_gemm_enabled", True),
-            mock.patch.object(self.gfx95_dense, "_wo_a_fp8_grid_gemm", None),
             mock.patch.object(self.dsv4, "_wo_a_batched_gemm_bf16", _boom),
         ):
             out = self.dsv4._apply_wo_a_bf16_matmul(o, wo_a, is_decode=True)
@@ -222,7 +212,8 @@ class TestWoABf16PrefillAndVerifyRoutes(unittest.TestCase):
         override = get_context().override_server_args()
         override.install()
         self.addCleanup(override.restore)
-        self.project = _apply_wo_a_bf16_matmul
+        # the gfx950 routes are V4.1's
+        self.project = functools.partial(_apply_wo_a_bf16_matmul, fast_path=True)
         torch.manual_seed(39186)
 
     def operands(self, rows, *, strided=False, dtype=torch.bfloat16, width=4096):
@@ -282,6 +273,31 @@ class TestWoABf16PrefillAndVerifyRoutes(unittest.TestCase):
                         self.assertLess(
                             (error / ref.float().square().mean()).sqrt().item(), 1e-3
                         )
+
+    def test_dsv4_keeps_the_main_routes(self):
+        """Without fast_path (DSv4) no gfx950 route runs; the aiter reroute is off by
+        default, so decode and verify rows take the einsum."""
+        from sglang.srt.models import deepseek_v4 as dsv4
+
+        taken = mock.Mock(side_effect=AssertionError("DSv4 took a V4.1 gfx950 route"))
+        with (
+            mock.patch.object(dsv4, "wo_a_bf16_gemv", taken),
+            mock.patch.object(dsv4, "wo_a_bf16_small_batch", taken),
+            mock.patch.object(dsv4._hip, "wo_a_fp8_grid_matmul", taken),
+            mock.patch.object(dsv4, "_wo_a_aiter_batched_gemm_enabled", False),
+        ):
+            for rows, kwargs in (
+                (1, dict(is_decode=True)),
+                (8, dict(is_decode=True, is_target_verify=True)),
+            ):
+                with self.subTest(rows=rows):
+                    x, w = self.operands(rows)
+                    torch.testing.assert_close(
+                        dsv4._apply_wo_a_bf16_matmul(x, w, **kwargs),
+                        torch.einsum("tgd,grd->tgr", x, w),
+                        atol=0,
+                        rtol=0,
+                    )
 
 
 if __name__ == "__main__":

@@ -78,6 +78,7 @@ def _make_backend(*, block_size, device, is_dspark_draft=True, low_ratios=()):
     # compressed-KV metadata is built only on the target worker
     backend.need_compress = not is_dspark_draft
     backend.is_dspark_draft = is_dspark_draft
+    backend.is_dsv41 = True
     # The draft verifies gamma rows, the target gamma + 1 (bonus included).
     backend.target_verify_num_draft_tokens = (
         block_size if is_dspark_draft else block_size + 1
@@ -523,6 +524,13 @@ class TestDsparkDraftBlockWindowHip(CustomTestCase):
         for cpu_mirror in (True, False):
             with self.subTest(cpu_mirror=cpu_mirror):
                 self._check_block_window_replay(cpu_mirror=cpu_mirror)
+
+    def test_dsv4_draft_keeps_the_causal_verify_indices(self):
+        """Only V4.1's DSpark draft takes the block window; DSv4's (V4-Pro) keeps main's."""
+        backend = _make_backend(block_size=3, device=self.device)
+        self.assertTrue(backend._uses_dspark_draft_window())
+        backend.is_dsv41 = False
+        self.assertFalse(backend._uses_dspark_draft_window())
 
     def _check_block_window_replay(self, *, cpu_mirror):
         block = 3
