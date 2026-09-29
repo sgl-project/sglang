@@ -68,7 +68,7 @@ patches:
   - target: sglang.srt.models.qwen3_moe.Qwen3MoeDecoderLayer.forward
     edits:
       - match: |
-          hidden_states = self.attn_stage.prepare(
+          hidden_states = self.attn_boundary.prepare(
               hidden_states,
               forward_batch,
               captured_last_layer_outputs=captured_last_layer_outputs,
@@ -83,7 +83,7 @@ patches:
               forward_batch=forward_batch,
           )
         append: "dumper.dump('attn_output', hidden_states, dims='t h[attn_tp:partial] # tp:replicated')"
-      - match: "hidden_states = self.ffn_stage.prepare(hidden_states, forward_batch)"
+      - match: "hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)"
         append: "dumper.dump('pre_mlp_residual', hidden_states, dims='t h # tp:replicated')"
       - match: "hidden_states = self.mlp(hidden_states, forward_batch)"
         append: "dumper.dump('mlp_output', hidden_states, dims='t h[moe_tp:partial] # tp:replicated')"
@@ -120,7 +120,7 @@ patches:
   - target: sglang.srt.models.qwen3_moe.Qwen3MoeDecoderLayer.forward
     edits:
       - match: |
-          hidden_states = self.attn_stage.prepare(
+          hidden_states = self.attn_boundary.prepare(
               hidden_states,
               forward_batch,
               captured_last_layer_outputs=captured_last_layer_outputs,
@@ -135,7 +135,7 @@ patches:
               forward_batch=forward_batch,
           )
         append: "dumper.dump('attn_output', hidden_states, dims='t h # tp:replicated')"
-      - match: "hidden_states = self.ffn_stage.prepare(hidden_states, forward_batch)"
+      - match: "hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)"
         append: "dumper.dump('pre_mlp_residual', hidden_states, dims='t h # tp:replicated')"
       - match: "hidden_states = self.mlp(hidden_states, forward_batch)"
         append: "dumper.dump('mlp_output', hidden_states, dims='t h[moe_tp:partial] # tp:replicated')"

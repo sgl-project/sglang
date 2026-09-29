@@ -6,7 +6,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from sglang.srt.layers.communicator import (
+from sglang.srt.layers.flashinfer_mnnvl_cutedsl import (
+    FlashInferMNNVLCuteDSLARFusion,
+    _retargeted_config,
+    _with_early_finalize_shared_load,
+)
+from sglang.srt.layers.layer_boundary import (
     ADD,
     NORM_QUANT_READ,
     Layout,
@@ -16,26 +21,21 @@ from sglang.srt.layers.communicator import (
     UnreducedOutput,
     reduce_output,
 )
-from sglang.srt.layers.communicator.construction import BatchVariant
-from sglang.srt.layers.communicator.fusions.allreduce import (
+from sglang.srt.layers.layer_boundary.construction import BatchVariant
+from sglang.srt.layers.layer_boundary.fusions.allreduce import (
     attention_fusions,
     complete_attention_input,
     complete_ffn_input,
     ffn_fusions,
 )
-from sglang.srt.layers.communicator.fusions.cutedsl import (
+from sglang.srt.layers.layer_boundary.fusions.cutedsl import (
     CuteDSLFusion,
     MoeFinalizeHandoff,
     install_cutedsl_fusion,
     prepare_cutedsl_fusion,
 )
-from sglang.srt.layers.communicator.prepare import _consumer_step, _read_input
-from sglang.srt.layers.communicator.residual.access import finish_layer_stack
-from sglang.srt.layers.flashinfer_mnnvl_cutedsl import (
-    FlashInferMNNVLCuteDSLARFusion,
-    _retargeted_config,
-    _with_early_finalize_shared_load,
-)
+from sglang.srt.layers.layer_boundary.prepare import _consumer_step, _read_input
+from sglang.srt.layers.layer_boundary.residual.access import finish_layer_stack
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -47,7 +47,7 @@ from sglang.test.communicator_patch import patch_communicator
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
-_MODULE = "sglang.srt.layers.communicator.fusions.cutedsl"
+_MODULE = "sglang.srt.layers.layer_boundary.fusions.cutedsl"
 _DECODE = SimpleNamespace(forward_mode=ForwardMode.DECODE, input_ids=torch.zeros(8))
 
 
@@ -91,8 +91,8 @@ def _bound(entry):
 def _test_layer(**kwargs):
     comm = _communicator()
     return SimpleNamespace(
-        attn_stage=stub_stage(comm, StageKind.ATTENTION),
-        ffn_stage=stub_stage(comm, StageKind.FFN),
+        attn_boundary=stub_stage(comm, StageKind.ATTENTION),
+        ffn_boundary=stub_stage(comm, StageKind.FFN),
         **kwargs,
     )
 
@@ -244,17 +244,17 @@ def test_install_does_not_require_a_fused_successor():
     reset_context()
     publish(ServerArgs(model_path="dummy"), role="test")
     first, last = _communicator(), _communicator()
-    ordinary = SimpleNamespace(ffn_stage=SimpleNamespace(fusions=None))
+    ordinary = SimpleNamespace(ffn_boundary=SimpleNamespace(fusions=None))
     install_cutedsl_fusion(
         [
             SimpleNamespace(
-                attn_stage=stub_stage(first, StageKind.ATTENTION),
-                ffn_stage=stub_stage(first, StageKind.FFN),
+                attn_boundary=stub_stage(first, StageKind.ATTENTION),
+                ffn_boundary=stub_stage(first, StageKind.FFN),
             ),
             ordinary,
             SimpleNamespace(
-                attn_stage=stub_stage(last, StageKind.ATTENTION),
-                ffn_stage=stub_stage(last, StageKind.FFN),
+                attn_boundary=stub_stage(last, StageKind.ATTENTION),
+                ffn_boundary=stub_stage(last, StageKind.FFN),
             ),
         ],
         hidden_size=8,
@@ -273,14 +273,14 @@ def test_a_service_nested_under_a_wrapper_is_prepared():
     prepared = []
     layer = torch.nn.Linear(2, 2)
     comm = _communicator()
-    layer.attn_stage, layer.ffn_stage = (
+    layer.attn_boundary, layer.ffn_boundary = (
         stub_stage(comm, StageKind.ATTENTION),
         stub_stage(comm, StageKind.FFN),
     )
     wrapper = torch.nn.Module()
     wrapper.language_model = torch.nn.Sequential(layer)
     _install([layer])
-    layer.ffn_stage.fusions.service.prepare = lambda *, max_m: prepared.append(max_m)
+    layer.ffn_boundary.fusions.service.prepare = lambda *, max_m: prepared.append(max_m)
 
     # The workspace M bound is the largest of every framework source.
     reset_context()
@@ -562,8 +562,8 @@ class TestDeferredLoraAllReduce(unittest.TestCase):
         from types import SimpleNamespace
         from unittest.mock import patch
 
-        from sglang.srt.layers.communicator import exit as exits
-        from sglang.srt.layers.communicator.fusions.cutedsl import CuteDSLFusion
+        from sglang.srt.layers.layer_boundary import exit as exits
+        from sglang.srt.layers.layer_boundary.fusions.cutedsl import CuteDSLFusion
 
         group = object()
         fb = SimpleNamespace(

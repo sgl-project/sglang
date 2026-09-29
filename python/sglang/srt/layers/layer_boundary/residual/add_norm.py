@@ -20,17 +20,17 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.layers.communicator.adapters.attention import (
-    _redistribute_from_attn_tp_shards,
-    _redistribute_to_attn_tp_shards,
-    get_attn_tp_context,
-)
-from sglang.srt.layers.communicator.residual import LayerResidual
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.flashinfer_comm_fusion import (
     is_flashinfer_allreduce_unavailable,
     uses_cutedsl_ar_fusion,
 )
+from sglang.srt.layers.layer_boundary.adapters.attention import (
+    _redistribute_from_attn_tp_shards,
+    _redistribute_to_attn_tp_shards,
+    get_attn_tp_context,
+)
+from sglang.srt.layers.layer_boundary.residual import LayerResidual
 from sglang.srt.layers.quantization.fp8_utils import (
     _use_aiter_bpreshuffle_gfx95,
     materialize_bpreshuffle_fp8_scale_tuple,

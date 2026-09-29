@@ -13,7 +13,8 @@ from typing import Callable, Optional, Sequence
 
 import torch
 
-from sglang.srt.layers.communicator import (
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.layer_boundary import (
     FusedMlpInput,
     HandoffOutput,
     SumGroup,
@@ -21,7 +22,6 @@ from sglang.srt.layers.communicator import (
     UnreducedOutput,
     get_attn_tp_context,
 )
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -359,7 +359,7 @@ class CuteDSLFusion:
 
 
 def _fusion_of(layer: torch.nn.Module) -> CuteDSLFusion | None:
-    fusions = getattr(layer.__dict__.get("ffn_stage"), "fusions", None)
+    fusions = getattr(layer.__dict__.get("ffn_boundary"), "fusions", None)
     return fusions if isinstance(fusions, CuteDSLFusion) else None
 
 
@@ -388,8 +388,8 @@ def install_cutedsl_fusion(
     # The workspace compiles one epsilon and cannot see a per-layer one.
     for layer in fusion_layers:
         for norm in (
-            layer.attn_stage.norm,
-            layer.ffn_stage.norm,
+            layer.attn_boundary.norm,
+            layer.ffn_boundary.norm,
         ):
             if _fused_norm_gamma(norm) is None:
                 continue
@@ -441,7 +441,7 @@ def prepare_cutedsl_fusion(
         for module in model.modules()
         # Only decoder modules carry an FFN stage.
         if isinstance(
-            fusion := getattr(module.__dict__.get("ffn_stage"), "fusions", None),
+            fusion := getattr(module.__dict__.get("ffn_boundary"), "fusions", None),
             CuteDSLFusion,
         )
     ]

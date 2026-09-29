@@ -4,10 +4,10 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 
-from sglang.srt.layers import communicator as comm
-from sglang.srt.layers.communicator.adapters import branch
-from sglang.srt.layers.communicator.residual.stream import ResidualStream
-from sglang.srt.layers.communicator.stage import StageCommunicator
+from sglang.srt.layers import layer_boundary as comm
+from sglang.srt.layers.layer_boundary.adapters import branch
+from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
+from sglang.srt.layers.layer_boundary.stage import StageBoundary
 from sglang.srt.models.longcat_flash import LongcatFlashDecoderLayer
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
@@ -43,16 +43,16 @@ class TestLongcatShortcut(CustomTestCase):
         layer = LongcatFlashDecoderLayer.__new__(LongcatFlashDecoderLayer)
         nn.Module.__init__(layer)
         batch = SimpleNamespace(residual_stream=ResidualStream())
-        layer.attn_stage = SimpleNamespace(
+        layer.attn_boundary = SimpleNamespace(
             prepare=lambda h, fb: h, finish=lambda h, fb: h
         )
         moe_communicator.post_attention_layernorm = None
         dense_communicator.post_attention_layernorm = None
-        layer.moe_stage = StageCommunicator(
+        layer.moe_boundary = StageBoundary(
             moe_communicator, declaration=comm.declare_ffn()
         )
-        layer.moe_stage.prepare = lambda h, fb: fork_hidden
-        layer.second_ffn = StageCommunicator(
+        layer.moe_boundary.prepare = lambda h, fb: fork_hidden
+        layer.second_ffn_boundary = StageBoundary(
             dense_communicator, declaration=comm.declare_ffn()
         )
         layer.self_attn = [lambda **kw: kw["hidden_states"]]

@@ -34,16 +34,16 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
     AuxHiddenStateList,
 )
-from sglang.srt.layers.communicator import (
-    declare_attn,
-    declare_ffn,
-    make_stages,
-)
-from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.layer_boundary import (
+    declare_attn,
+    declare_ffn,
+    make_stages,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -982,7 +982,7 @@ class MiniMaxM2DecoderLayer(nn.Module):
         is_previous_layer_sparse = True
         is_next_layer_sparse = True
 
-        self.attn_stage, self.ffn_stage = make_stages(
+        self.attn_boundary, self.ffn_boundary = make_stages(
             (declare_attn(), self.input_layernorm),
             (
                 declare_ffn(
@@ -1007,7 +1007,7 @@ class MiniMaxM2DecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
     ) -> torch.Tensor:
         # Self Attention
-        hidden_states = self.attn_stage.prepare(
+        hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
             captured_last_layer_outputs=captured_last_layer_outputs,
@@ -1021,10 +1021,10 @@ class MiniMaxM2DecoderLayer(nn.Module):
 
         # Fully Connected (MLP or MoE)
 
-        hidden_states = self.attn_stage.finish(hidden_states, forward_batch)
-        hidden_states = self.ffn_stage.prepare(hidden_states, forward_batch)
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
-        with self.ffn_stage.exit(forward_batch) as ffn_exit:
+        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             hidden_states = self.block_sparse_moe(hidden_states, forward_batch)
         hidden_states = ffn_exit.finish(hidden_states)
 
@@ -1041,7 +1041,7 @@ class MiniMaxM2DecoderLayer(nn.Module):
         tbo_subbatch_index: Optional[int] = None,
     ):
         """Communication prepare for attention - TBO operation"""
-        state.hidden_states_after_comm_pre_attn = self.attn_stage.prepare(
+        state.hidden_states_after_comm_pre_attn = self.attn_boundary.prepare(
             hidden_states, forward_batch
         )
         state.update(
@@ -1055,16 +1055,16 @@ class MiniMaxM2DecoderLayer(nn.Module):
 
     def op_comm_prepare_mlp(self, state):
         """Communication prepare for MLP - TBO operation"""
-        hidden_states = self.attn_stage.finish(
+        hidden_states = self.attn_boundary.finish(
             state.pop("hidden_states_after_attn"), state.forward_batch
         )
-        state.hidden_states_mlp_input = self.ffn_stage.prepare(
+        state.hidden_states_mlp_input = self.ffn_boundary.prepare(
             hidden_states, state.forward_batch
         )
 
     def op_comm_postprocess_layer(self, state):
         """Communication postprocess for layer - TBO operation"""
-        hidden_states = self.ffn_stage.postprocess(
+        hidden_states = self.ffn_boundary.postprocess(
             state.pop("hidden_states_mlp_output"), state.forward_batch
         )
 
@@ -1143,7 +1143,7 @@ class MiniMaxM2Model(nn.Module):
             residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = self.layers[self.start_layer].attn_stage.from_pp(
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
                 pp_proxy_tensors, forward_batch
             )
 

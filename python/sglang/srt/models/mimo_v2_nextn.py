@@ -21,16 +21,16 @@ from transformers import PretrainedConfig
 
 from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers.communicator import (
+from sglang.srt.layers.dp_attention import (
+    is_dp_attention_enabled,
+)
+from sglang.srt.layers.layer_boundary import (
     declare_attn,
     declare_ffn,
     enable_moe_dense_fully_dp,
     make_stages,
 )
-from sglang.srt.layers.communicator.residual import batch as residual_batch
-from sglang.srt.layers.dp_attention import (
-    is_dp_attention_enabled,
-)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -119,7 +119,7 @@ class MiMoV2MTPLayer(nn.Module):
             config.hidden_size, eps=config.layernorm_epsilon
         )
 
-        self.attn_stage, self.ffn_stage = make_stages(
+        self.attn_boundary, self.ffn_boundary = make_stages(
             (declare_attn(), self.input_layernorm),
             (
                 declare_ffn(
@@ -143,7 +143,7 @@ class MiMoV2MTPLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
 
-        hidden_states = self.attn_stage.prepare(hidden_states, forward_batch)
+        hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
 
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
@@ -152,10 +152,10 @@ class MiMoV2MTPLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        hidden_states = self.attn_stage.finish(hidden_states, forward_batch)
-        hidden_states = self.ffn_stage.prepare(hidden_states, forward_batch)
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         with (
-            self.ffn_stage.exit(forward_batch) as ffn_exit,
+            self.ffn_boundary.exit(forward_batch) as ffn_exit,
             get_global_expert_distribution_recorder().disable_this_region(),
         ):
             hidden_states = self.mlp(hidden_states)

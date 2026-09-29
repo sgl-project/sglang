@@ -13,7 +13,7 @@
 # ==============================================================================
 """Publish the token rows consumed by the selected stage to LoRA kernels."""
 
-from sglang.srt.layers.communicator.layout import TokenAxis
+from sglang.srt.layers.layer_boundary.layout import TokenAxis
 from sglang.srt.runtime_context import LoRABatchLayout, get_forward
 
 

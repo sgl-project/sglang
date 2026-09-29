@@ -10,9 +10,9 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
-from sglang.srt.layers.communicator import ADD
-from sglang.srt.layers.communicator.output import UnreducedOutput
-from sglang.srt.layers.communicator.residual import batch
+from sglang.srt.layers.layer_boundary import ADD
+from sglang.srt.layers.layer_boundary.output import UnreducedOutput
+from sglang.srt.layers.layer_boundary.residual import batch
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,

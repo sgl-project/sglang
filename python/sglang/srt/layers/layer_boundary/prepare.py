@@ -24,34 +24,34 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.layers.communicator.adapters.attention import (
-    AttentionInputs,
-    _redistribute_from_attn_tp_shards,
-    _redistribute_to_attn_tp_shards,
-    get_attn_tp_context,
-)
-from sglang.srt.layers.communicator.adapters.context_parallel import (
-    dsa_cp_gather_hidden_states,
-)
-from sglang.srt.layers.communicator.layout import (
-    SumGroup,
-    _cp_shard_token_rows,
-    moe_cp_gathered_rows,
-)
-from sglang.srt.layers.communicator.output import (
-    HandoffOutput,
-    UnreducedOutput,
-    reduce_output,
-)
-from sglang.srt.layers.communicator.residual import StageRead, StageUpdate
-from sglang.srt.layers.communicator.residual.add_norm import ADD, NORM_READ
-from sglang.srt.layers.communicator.residual.stream import DeclaredSum
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     dp_scatter,
     get_moe_cp_size,
     is_allocation_symmetric,
 )
+from sglang.srt.layers.layer_boundary.adapters.attention import (
+    AttentionInputs,
+    _redistribute_from_attn_tp_shards,
+    _redistribute_to_attn_tp_shards,
+    get_attn_tp_context,
+)
+from sglang.srt.layers.layer_boundary.adapters.context_parallel import (
+    dsa_cp_gather_hidden_states,
+)
+from sglang.srt.layers.layer_boundary.layout import (
+    SumGroup,
+    _cp_shard_token_rows,
+    moe_cp_gathered_rows,
+)
+from sglang.srt.layers.layer_boundary.output import (
+    HandoffOutput,
+    UnreducedOutput,
+    reduce_output,
+)
+from sglang.srt.layers.layer_boundary.residual import StageRead, StageUpdate
+from sglang.srt.layers.layer_boundary.residual.add_norm import ADD, NORM_READ
+from sglang.srt.layers.layer_boundary.residual.stream import DeclaredSum
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
@@ -64,7 +64,7 @@ _is_npu = is_npu()
 if _is_npu:
     from sglang.srt.hardware_backend.npu.cmo import prepare_weight_cache
 
-from sglang.srt.layers.communicator.ops import (
+from sglang.srt.layers.layer_boundary.ops import (
     _mlp_input_reduce_output,
     _redistribute_input_to_dp,
     _redistribute_input_to_moe_cp,

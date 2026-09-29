@@ -6,7 +6,7 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
-from sglang.srt.layers.communicator import (
+from sglang.srt.layers.layer_boundary import (
     EdgeDecl,
     Layout,
     StageEntry,
@@ -16,16 +16,16 @@ from sglang.srt.layers.communicator import (
     SumGroup,
     make_boundary,
 )
-from sglang.srt.layers.communicator.contracts import BatchVariant, StageKind
-from sglang.srt.layers.communicator.output import UnreducedOutput
-from sglang.srt.layers.communicator.residual.access import add_to_output
-from sglang.srt.layers.communicator.residual.add_norm import ADD
-from sglang.srt.layers.communicator.residual.stream import (
+from sglang.srt.layers.layer_boundary.contracts import BatchVariant, StageKind
+from sglang.srt.layers.layer_boundary.output import UnreducedOutput
+from sglang.srt.layers.layer_boundary.residual.access import add_to_output
+from sglang.srt.layers.layer_boundary.residual.add_norm import ADD
+from sglang.srt.layers.layer_boundary.residual.stream import (
     DeclaredSum,
     OwedOutput,
     ResidualStream,
 )
-from sglang.srt.layers.communicator.stage import StageCommunicator
+from sglang.srt.layers.layer_boundary.stage import StageBoundary
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.boundary_fixtures import prepare_attention, stub_plan, stub_stage
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -63,7 +63,7 @@ class TestResidualStream(CustomTestCase):
             enters_stack=True,
         )
         steps = StageSteps(StageEntry(boundary.prepare, rows), StageOutput(rows), None)
-        stage = StageCommunicator(
+        stage = StageBoundary(
             SimpleNamespace(norm=None),
             declaration=SimpleNamespace(kind=StageKind.ATTENTION),
         )
@@ -106,7 +106,7 @@ class TestResidualStream(CustomTestCase):
             )
         )
         steps = StageSteps(StageEntry(boundary.prepare, rows), StageOutput(rows), None)
-        stage = StageCommunicator(
+        stage = StageBoundary(
             SimpleNamespace(norm=None),
             declaration=SimpleNamespace(kind=StageKind.ATTENTION),
         )
@@ -142,7 +142,7 @@ class TestResidualStream(CustomTestCase):
         hidden = stream.leave(self.partial, ADD, declared_sum=SumGroup.TP)
         self.assertIsInstance(hidden, OwedOutput)
         with patch(
-            "sglang.srt.layers.communicator.residual.stream._sum_group",
+            "sglang.srt.layers.layer_boundary.residual.stream._sum_group",
             return_value=self.group,
         ):
             snapshot = stream.snapshot(hidden)
@@ -170,7 +170,7 @@ class TestResidualStream(CustomTestCase):
         stream = ResidualStream(self.residual)
         hidden = stream.leave(self.partial, ADD, declared_sum=SumGroup.TP)
         with patch(
-            "sglang.srt.layers.communicator.residual.stream._sum_group",
+            "sglang.srt.layers.layer_boundary.residual.stream._sum_group",
             return_value=self.group,
         ):
             hidden = stream.complete(hidden)
@@ -320,7 +320,7 @@ class TestResidualStream(CustomTestCase):
     def test_capture_restores_the_producers_rows_after_a_scattered_read(self):
         from unittest.mock import patch
 
-        from sglang.srt.layers.communicator import TokenAxis
+        from sglang.srt.layers.layer_boundary import TokenAxis
 
         full = Layout(frozenset())
         local = Layout(frozenset({TokenAxis.ATTN_TP_SCATTER}))
@@ -330,7 +330,7 @@ class TestResidualStream(CustomTestCase):
         shard = torch.full((2, 4), 3.0)
         expected = torch.cat([shard, torch.full_like(shard, 7.0)])
         with patch(
-            "sglang.srt.layers.communicator.ops._redistribute_from_attn_tp_shards",
+            "sglang.srt.layers.layer_boundary.ops._redistribute_from_attn_tp_shards",
             return_value=expected,
         ) as gather:
             captured = boundary.capture_move(shard, forward_batch=None)
@@ -339,7 +339,7 @@ class TestResidualStream(CustomTestCase):
         torch.testing.assert_close(shard, torch.full((2, 4), 3.0))
 
     def test_final_capture_uses_the_norms_residual_result(self):
-        from sglang.srt.layers.communicator.residual.access import norm_output
+        from sglang.srt.layers.layer_boundary.residual.access import norm_output
 
         outputs = AuxHiddenStateList()
         updated = torch.full_like(self.partial, 5.0)
@@ -388,7 +388,7 @@ class TestResidualStream(CustomTestCase):
 
 class TestBatchStageOwnership(CustomTestCase):
     def test_terminal_norm_releases_layer_buffers(self):
-        from sglang.srt.layers.communicator.residual import batch
+        from sglang.srt.layers.layer_boundary.residual import batch
 
         fb = SimpleNamespace(residual_stream=None)
         batch.start(fb)
@@ -404,7 +404,7 @@ class TestBatchStageOwnership(CustomTestCase):
         self.assertIsNone(fb.residual_stream)
 
     def test_pp_export_transfers_buffer_ownership(self):
-        from sglang.srt.layers.communicator.residual import batch
+        from sglang.srt.layers.layer_boundary.residual import batch
 
         fb = SimpleNamespace(residual_stream=None)
         batch.start(fb)
@@ -421,7 +421,7 @@ class TestBatchStageOwnership(CustomTestCase):
         self.assertTrue(all(ref() is None for ref in refs))
 
     def test_interleaved_batches_keep_independent_streams(self):
-        from sglang.srt.layers.communicator.residual import batch
+        from sglang.srt.layers.layer_boundary.residual import batch
 
         class Read:
             norms_plainly = False

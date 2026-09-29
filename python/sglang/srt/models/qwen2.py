@@ -26,12 +26,12 @@ from sglang.srt.distributed import (
     get_pp_indices,
 )
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.communicator.residual.access import (
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.layer_boundary.residual.access import (
     finish_layer_stack,
     from_pp,
     snapshot,
 )
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,

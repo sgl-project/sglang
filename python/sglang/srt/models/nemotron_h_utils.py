@@ -1,14 +1,14 @@
 """Layer-communication helpers for the Nemotron-H model."""
 
 from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA, MOE
-from sglang.srt.layers.communicator import (
+from sglang.srt.layers.layer_boundary import (
     HandoffRows,
     ProducerReduction,
     declare_attn,
     declare_ffn,
     make_stages,
 )
-from sglang.srt.layers.communicator.residual.add_norm import NormQuantRead, NormRead
+from sglang.srt.layers.layer_boundary.residual.add_norm import NormQuantRead, NormRead
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.runtime_context import get_parallel
 

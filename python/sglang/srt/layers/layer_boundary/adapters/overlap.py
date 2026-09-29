@@ -1,7 +1,7 @@
 """Row requirements at the entrance to two-batch overlap."""
 
-from sglang.srt.layers.communicator.contracts import HandoffRows
-from sglang.srt.layers.communicator.layout import enable_moe_dense_fully_dp
+from sglang.srt.layers.layer_boundary.contracts import HandoffRows
+from sglang.srt.layers.layer_boundary.layout import enable_moe_dense_fully_dp
 from sglang.srt.runtime_context import get_exec
 
 

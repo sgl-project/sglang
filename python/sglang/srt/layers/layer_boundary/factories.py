@@ -9,19 +9,19 @@ from typing import Mapping, Optional
 import msgspec
 
 from sglang.srt.layers import layernorm_sp
-from sglang.srt.layers.communicator.adapters.overlap import (
+from sglang.srt.layers.layer_boundary.adapters.overlap import (
     resolve_handoff_rows,
     tbo_handoff,
 )
-from sglang.srt.layers.communicator.boundary import _cp_moves
-from sglang.srt.layers.communicator.construction import (
+from sglang.srt.layers.layer_boundary.boundary import _cp_moves
+from sglang.srt.layers.layer_boundary.construction import (
     BatchVariant,
     _bind_stage,
     _input_can_be_scattered,
     _refuse_uncovered_cp_moe,
     _use_ag_after_qlora,
 )
-from sglang.srt.layers.communicator.contracts import (
+from sglang.srt.layers.layer_boundary.contracts import (
     EdgeDecl,
     HandoffRows,
     ProducerReduction,
@@ -30,7 +30,7 @@ from sglang.srt.layers.communicator.contracts import (
     StageKind,
     StageOutput,
 )
-from sglang.srt.layers.communicator.layout import (
+from sglang.srt.layers.layer_boundary.layout import (
     Layout,
     SumGroup,
     TokenAxis,
@@ -40,9 +40,9 @@ from sglang.srt.layers.communicator.layout import (
     sparse_moe_gathers_over_moe_cp,
     token_axis_sizes,
 )
-from sglang.srt.layers.communicator.output import OutputTransform
-from sglang.srt.layers.communicator.residual import StageRead, StageUpdate
-from sglang.srt.layers.communicator.residual.add_norm import (
+from sglang.srt.layers.layer_boundary.output import OutputTransform
+from sglang.srt.layers.layer_boundary.residual import StageRead, StageUpdate
+from sglang.srt.layers.layer_boundary.residual.add_norm import (
     ADD,
     NORM_QUANT_READ,
     NORM_READ,

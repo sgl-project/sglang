@@ -2615,7 +2615,7 @@ class KimiK3DecoderLayer(nn.Module):
     ) -> torch.Tensor:
         # For MLA layers with q_lora_rank, set up attn_inputs before the
         # forward call (normally done by the attention boundary).
-        from sglang.srt.layers.communicator import (
+        from sglang.srt.layers.layer_boundary import (
             AttentionInputs,
             get_attn_tp_context,
         )

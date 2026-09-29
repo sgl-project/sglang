@@ -11,15 +11,15 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.communicator import (
+from sglang.srt.layers.dp_attention import (
+    is_dp_attention_enabled,
+)
+from sglang.srt.layers.layer_boundary import (
     declare_attn,
     declare_ffn,
     make_stages,
 )
-from sglang.srt.layers.communicator.residual import batch as residual_batch
-from sglang.srt.layers.dp_attention import (
-    is_dp_attention_enabled,
-)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -566,7 +566,7 @@ class Step3p5DecoderLayer(nn.Module):
 
         # An MTP draft is a one-layer model; layer_id still indexes its config.
 
-        self.attn_stage, self.ffn_stage = make_stages(
+        self.attn_boundary, self.ffn_boundary = make_stages(
             (declare_attn(), self.input_layernorm),
             (
                 declare_ffn(
@@ -594,7 +594,7 @@ class Step3p5DecoderLayer(nn.Module):
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # Self Attention
-        hidden_states = self.attn_stage.prepare(
+        hidden_states = self.attn_boundary.prepare(
             hidden_states, forward_batch, post_residual_addition=post_residual_addition
         )
         if hidden_states.shape[0] != 0:
@@ -604,11 +604,11 @@ class Step3p5DecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
         # Fully Connected
-        hidden_states = self.attn_stage.finish(hidden_states, forward_batch)
-        hidden_states = self.ffn_stage.prepare(hidden_states, forward_batch)
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
         if self.use_moe:
-            with self.ffn_stage.exit(forward_batch) as ffn_exit:
+            with self.ffn_boundary.exit(forward_batch) as ffn_exit:
                 # Both share_expert and MoE return unreduced (TP-partial) outputs.
                 # Combine them first, then do a single all-reduce — saving one
                 # full-TP all-reduce per layer.
@@ -621,7 +621,7 @@ class Step3p5DecoderLayer(nn.Module):
                     hidden_states = tensor_model_parallel_all_reduce(hidden_states)
             return ffn_exit.finish(hidden_states)
 
-        with self.ffn_stage.exit(forward_batch) as ffn_exit:
+        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             hidden_states = self.mlp(hidden_states)
         return ffn_exit.finish(hidden_states)
 
@@ -700,7 +700,7 @@ class Step3p5Model(nn.Module):
             residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = self.layers[self.start_layer].attn_stage.from_pp(
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
                 pp_proxy_tensors, forward_batch
             )
 

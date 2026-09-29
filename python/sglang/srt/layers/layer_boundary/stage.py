@@ -19,33 +19,33 @@ import torch
 
 from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateAccumulator
-from sglang.srt.layers.communicator.adapters import branch
-from sglang.srt.layers.communicator.adapters.lora import (
+from sglang.srt.layers.layer_boundary.adapters import branch
+from sglang.srt.layers.layer_boundary.adapters.lora import (
     publish_attention,
     publish_ffn,
 )
-from sglang.srt.layers.communicator.contracts import (
+from sglang.srt.layers.layer_boundary.contracts import (
     BatchVariant,
     StageEntry,
     StageKind,
     StageSteps,
 )
-from sglang.srt.layers.communicator.ops import gather_attention_tp
-from sglang.srt.layers.communicator.residual.access import buffer, from_pp
-from sglang.srt.layers.communicator.residual.add_norm import (
+from sglang.srt.layers.layer_boundary.ops import gather_attention_tp
+from sglang.srt.layers.layer_boundary.residual.access import buffer, from_pp
+from sglang.srt.layers.layer_boundary.residual.add_norm import (
     ADD,
 )
-from sglang.srt.layers.communicator.residual.batch import current
-from sglang.srt.layers.communicator.residual.stream import DeclaredSum, ResidualStream
+from sglang.srt.layers.layer_boundary.residual.batch import current
+from sglang.srt.layers.layer_boundary.residual.stream import DeclaredSum, ResidualStream
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_forward
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.communicator.construction import StagePlan
-    from sglang.srt.layers.communicator.factories import StageDeclaration
+    from sglang.srt.layers.layer_boundary.construction import StagePlan
+    from sglang.srt.layers.layer_boundary.factories import StageDeclaration
 
 
-class StageCommunicator:
+class StageBoundary:
     """One stage of a layer, its attention or its FFN: the boundary into it,
     run with the stage's norm on the steps the layer chose for the batch."""
 

@@ -23,32 +23,32 @@ import torch
 
 from sglang.srt.distributed import GroupCoordinator
 from sglang.srt.environ import envs
-from sglang.srt.layers.communicator.adapters.attention import get_attn_tp_context
-from sglang.srt.layers.communicator.layout import (
+from sglang.srt.layers.dp_attention import (
+    can_use_dp_reduce_scatter,
+    is_dp_attention_enabled,
+    is_enable_moe_cp_allgather,
+)
+from sglang.srt.layers.layer_boundary.adapters.attention import get_attn_tp_context
+from sglang.srt.layers.layer_boundary.layout import (
     SumGroup,
     _ffn_has_tokens,
     _sum_group,
 )
-from sglang.srt.layers.communicator.ops import (
+from sglang.srt.layers.layer_boundary.ops import (
     _all_reduce_then_to_local_tokens,
     _redistribute_output,
     _reduce_and_redistribute_output_max_len,
     _reduce_and_redistribute_output_varlen,
     _to_local_tokens,
 )
-from sglang.srt.layers.communicator.output import (
+from sglang.srt.layers.layer_boundary.output import (
     UnreducedOutput,
 )
-from sglang.srt.layers.communicator.residual.add_norm import (
+from sglang.srt.layers.layer_boundary.residual.add_norm import (
     apply_aiter_all_reduce_fusion,
     apply_flashinfer_allreduce_fusion,
 )
-from sglang.srt.layers.communicator.residual.stream import ResidualStream
-from sglang.srt.layers.dp_attention import (
-    can_use_dp_reduce_scatter,
-    is_dp_attention_enabled,
-    is_enable_moe_cp_allgather,
-)
+from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.layers.moe import (
     can_merge_post_experts_all_reduce,
     post_experts_sum_is_one_all_reduce,

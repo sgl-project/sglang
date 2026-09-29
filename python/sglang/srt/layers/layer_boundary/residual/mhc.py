@@ -19,7 +19,7 @@ from typing import Callable, Optional
 import torch
 
 from sglang.kernels.ops.layernorm.mhc import hc_contract, hc_expand
-from sglang.srt.layers.communicator.residual import LayerResidual
+from sglang.srt.layers.layer_boundary.residual import LayerResidual
 from sglang.srt.runtime_context import get_parallel
 
 

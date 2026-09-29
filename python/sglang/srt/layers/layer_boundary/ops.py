@@ -26,21 +26,6 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.layers.communicator.adapters.attention import (
-    _redistribute_from_attn_tp_shards,
-    _redistribute_to_attn_tp_shards,
-)
-from sglang.srt.layers.communicator.adapters.context_parallel import (
-    dsa_cp_reduce_scatter_hidden_states,
-)
-from sglang.srt.layers.communicator.layout import (
-    Layout,
-    TokenAxis,
-    _cp_shard_token_rows,
-    moe_cp_gathered_rows,
-)
-from sglang.srt.layers.communicator.residual import StageUpdate
-from sglang.srt.layers.communicator.residual.add_norm import ADD
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
@@ -55,6 +40,21 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
     moe_cp_all_gather_into_tensor,
 )
+from sglang.srt.layers.layer_boundary.adapters.attention import (
+    _redistribute_from_attn_tp_shards,
+    _redistribute_to_attn_tp_shards,
+)
+from sglang.srt.layers.layer_boundary.adapters.context_parallel import (
+    dsa_cp_reduce_scatter_hidden_states,
+)
+from sglang.srt.layers.layer_boundary.layout import (
+    Layout,
+    TokenAxis,
+    _cp_shard_token_rows,
+    moe_cp_gathered_rows,
+)
+from sglang.srt.layers.layer_boundary.residual import StageUpdate
+from sglang.srt.layers.layer_boundary.residual.add_norm import ADD
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_exec, get_parallel
 

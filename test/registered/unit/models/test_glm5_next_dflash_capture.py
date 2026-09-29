@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 
-from sglang.srt.layers.communicator.residual.stream import ResidualStream
+from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.models.glm5_next import Glm5NextModel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase

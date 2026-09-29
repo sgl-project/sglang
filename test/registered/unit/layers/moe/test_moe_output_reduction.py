@@ -166,7 +166,7 @@ class TestReplicatedMoeOutput(CustomTestCase):
 class TestModelsWithExplicitDpCompletion(CustomTestCase):
     def test_direct_dp_exits_publish_their_selected_sum(self):
         # Execute the real orchestration methods without constructing weights.
-        # These models own their DP exit instead of using StageCommunicator.
+        # These models own their DP exit instead of using StageBoundary.
         import __future__
 
         for filename, method in (

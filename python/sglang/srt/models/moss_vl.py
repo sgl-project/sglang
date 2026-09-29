@@ -22,13 +22,13 @@ from sglang.srt.layers.attention.vision import (
     VisionAttentionMetadata,
     prepare_vision_attention_metadata,
 )
-from sglang.srt.layers.communicator import (
+from sglang.srt.layers.conv import Conv3dLayer
+from sglang.srt.layers.layer_boundary import (
     declare_attn,
     declare_ffn,
     make_stages,
 )
-from sglang.srt.layers.communicator.residual import batch as residual_batch
-from sglang.srt.layers.conv import Conv3dLayer
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -1017,7 +1017,7 @@ class MossVLSelfAttentionDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
         )
 
-        self.attn_stage, self.ffn_stage = make_stages(
+        self.attn_boundary, self.ffn_boundary = make_stages(
             (declare_attn(), self.input_layernorm),
             (
                 declare_ffn(sparse=False, next_sparse=False),
@@ -1034,7 +1034,7 @@ class MossVLSelfAttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         # Self Attention
-        hidden_states = self.attn_stage.prepare(hidden_states, forward_batch)
+        hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
@@ -1043,9 +1043,9 @@ class MossVLSelfAttentionDecoderLayer(nn.Module):
             )
 
         # MLP
-        hidden_states = self.attn_stage.finish(hidden_states, forward_batch)
-        hidden_states = self.ffn_stage.prepare(hidden_states, forward_batch)
-        with self.ffn_stage.exit(forward_batch) as ffn_exit:
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             hidden_states = self.mlp(hidden_states)
         hidden_states = ffn_exit.finish(hidden_states)
         return hidden_states

@@ -20,13 +20,13 @@ from typing import Callable
 
 import torch
 
-from sglang.srt.layers.communicator.layout import (
-    enable_moe_dense_fully_dp,
-)
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     get_local_dp_buffer,
     is_dp_attention_enabled,
+)
+from sglang.srt.layers.layer_boundary.layout import (
+    enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.model_executor.cuda_graph_config import (

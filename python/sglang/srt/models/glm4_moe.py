@@ -39,17 +39,17 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
-from sglang.srt.layers.communicator import (
+from sglang.srt.layers.dp_attention import (
+    is_allocation_symmetric,
+    is_dp_attention_enabled,
+)
+from sglang.srt.layers.layer_boundary import (
     declare_attn,
     declare_ffn,
     enable_moe_dense_fully_dp,
     make_stages,
 )
-from sglang.srt.layers.communicator.residual import batch as residual_batch
-from sglang.srt.layers.dp_attention import (
-    is_allocation_symmetric,
-    is_dp_attention_enabled,
-)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -866,7 +866,7 @@ class Glm4MoeDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        self.attn_stage, self.ffn_stage = make_stages(
+        self.attn_boundary, self.ffn_boundary = make_stages(
             (declare_attn(), self.input_layernorm),
             (
                 declare_ffn(
@@ -942,7 +942,7 @@ class Glm4MoeDecoderLayer(nn.Module):
         capture_output=None,
     ) -> torch.Tensor:
 
-        hidden_states = self.attn_stage.prepare(
+        hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
             quant_format=self.attn_quant_format,
@@ -955,10 +955,10 @@ class Glm4MoeDecoderLayer(nn.Module):
             forward_batch=forward_batch,
         )
 
-        hidden_states = self.attn_stage.finish(hidden_states, forward_batch)
-        hidden_states = self.ffn_stage.prepare(hidden_states, forward_batch)
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
-        with self.ffn_stage.exit(forward_batch) as ffn_exit:
+        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             hidden_states = self.mlp(hidden_states, forward_batch)
         hidden_states = ffn_exit.finish(hidden_states)
 
@@ -972,7 +972,7 @@ class Glm4MoeDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         tbo_subbatch_index: Optional[int] = None,
     ):
-        state.hidden_states_after_comm_pre_attn = self.attn_stage.prepare(
+        state.hidden_states_after_comm_pre_attn = self.attn_boundary.prepare(
             hidden_states, forward_batch
         )
         state.update(
@@ -984,15 +984,15 @@ class Glm4MoeDecoderLayer(nn.Module):
         )
 
     def op_comm_prepare_mlp(self, state):
-        hidden_states = self.attn_stage.finish(
+        hidden_states = self.attn_boundary.finish(
             state.pop("hidden_states_after_attn"), state.forward_batch
         )
-        state.hidden_states_mlp_input = self.ffn_stage.prepare(
+        state.hidden_states_mlp_input = self.ffn_boundary.prepare(
             hidden_states, state.forward_batch
         )
 
     def op_comm_postprocess_layer(self, state):
-        hidden_states = self.ffn_stage.postprocess(
+        hidden_states = self.ffn_boundary.postprocess(
             state.pop("hidden_states_mlp_output"), state.forward_batch
         )
 
@@ -1081,7 +1081,7 @@ class Glm4MoeModel(nn.Module):
             residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = self.layers[self.start_layer].attn_stage.from_pp(
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
                 pp_proxy_tensors, forward_batch
             )
 

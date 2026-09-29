@@ -13,16 +13,16 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.arg_groups.layernorm_sp_hook import validate_layernorm_sp
-from sglang.srt.layers import communicator as comm
+from sglang.srt.layers import layer_boundary as comm
 from sglang.srt.layers import layernorm_sp
-from sglang.srt.layers.communicator import (
+from sglang.srt.layers.layer_boundary import (
     Layout,
     StageKind,
     StageOutput,
     SumGroup,
 )
-from sglang.srt.layers.communicator import prepare as comm_ops
-from sglang.srt.layers.communicator.contracts import BatchVariant
+from sglang.srt.layers.layer_boundary import prepare as comm_ops
+from sglang.srt.layers.layer_boundary.contracts import BatchVariant
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import (
     get_flags,

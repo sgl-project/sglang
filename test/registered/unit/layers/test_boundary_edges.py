@@ -6,8 +6,8 @@ from unittest.mock import MagicMock, patch
 import msgspec
 import torch
 
-from sglang.srt.layers import communicator as comm
-from sglang.srt.layers.communicator import (
+from sglang.srt.layers import layer_boundary as comm
+from sglang.srt.layers.layer_boundary import (
     ADD,
     EdgeDecl,
     FusedMlpInput,
@@ -19,8 +19,8 @@ from sglang.srt.layers.communicator import (
     make_boundary,
     make_output_boundary,
 )
-from sglang.srt.layers.communicator import prepare as comm_ops
-from sglang.srt.layers.communicator.ops import identity_output
+from sglang.srt.layers.layer_boundary import prepare as comm_ops
+from sglang.srt.layers.layer_boundary.ops import identity_output
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator

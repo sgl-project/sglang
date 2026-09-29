@@ -71,9 +71,9 @@ from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.layers.communicator.residual.stream import ResidualStream
     from sglang.srt.layers.cp.base import BaseContextParallelMetadata
     from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
+    from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.managers.schedule_batch import MultimodalInputs, ScheduleBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -1257,7 +1257,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     def moe_num_token_non_padded(self) -> Optional[torch.Tensor]:
         """Bound for masking a sparse MoE's padded rows, or None when the MoE
         input is a gathered buffer whose real rows are not a prefix of it."""
-        from sglang.srt.layers.communicator import moe_cp_gathers_sparse_moe_input
+        from sglang.srt.layers.layer_boundary import moe_cp_gathers_sparse_moe_input
         from sglang.srt.layers.moe.utils import is_moe_input_scattered_across_dp_ranks
 
         if self.num_token_non_padded is None:
@@ -1916,7 +1916,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         return self.input_ids.shape[0]
 
     def prepare_attn_tp_scatter_input(self, model_runner: ModelRunner):
-        from sglang.srt.layers.communicator import get_attn_tp_context
+        from sglang.srt.layers.layer_boundary import get_attn_tp_context
 
         # Pure TP+SP has no MLP-sync pass, so stamp the decision here.
         self.attn_tp_sequence_sharded = model_runner.attn_tp_sequence_sharded(

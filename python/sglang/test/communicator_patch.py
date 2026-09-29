@@ -1,6 +1,6 @@
 """Patching a name the communicator package's modules look up.
 
-Each module of ``sglang.srt.layers.communicator`` binds the names it imports
+Each module of ``sglang.srt.layers.layer_boundary`` binds the names it imports
 in its own namespace, so a test double has to go into every module that reads
 the name, not only into the package.
 """
@@ -8,8 +8,8 @@ the name, not only into the package.
 import contextlib
 from unittest import mock
 
-from sglang.srt.layers import communicator as communicator
-from sglang.srt.layers.communicator import (
+from sglang.srt.layers import layer_boundary as communicator
+from sglang.srt.layers.layer_boundary import (
     boundary,
     construction,
     contracts,
@@ -20,13 +20,13 @@ from sglang.srt.layers.communicator import (
     output,
     prepare,
 )
-from sglang.srt.layers.communicator import residual as residual_contract
-from sglang.srt.layers.communicator import (
+from sglang.srt.layers.layer_boundary import residual as residual_contract
+from sglang.srt.layers.layer_boundary import (
     stage,
 )
-from sglang.srt.layers.communicator.adapters import attention, branch, lora, overlap
-from sglang.srt.layers.communicator.fusions import allreduce
-from sglang.srt.layers.communicator.residual import (
+from sglang.srt.layers.layer_boundary.adapters import attention, branch, lora, overlap
+from sglang.srt.layers.layer_boundary.fusions import allreduce
+from sglang.srt.layers.layer_boundary.residual import (
     access,
     add_norm,
     batch,

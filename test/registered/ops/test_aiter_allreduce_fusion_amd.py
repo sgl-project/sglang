@@ -10,8 +10,8 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.layers.communicator import UnreducedOutput
-from sglang.srt.layers.communicator.fusions.allreduce import complete_attention_input
+from sglang.srt.layers.layer_boundary import UnreducedOutput
+from sglang.srt.layers.layer_boundary.fusions.allreduce import complete_attention_input
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel

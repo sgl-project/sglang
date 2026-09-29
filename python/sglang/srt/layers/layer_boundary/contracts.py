@@ -20,10 +20,10 @@ import msgspec
 import torch
 
 from sglang.srt.distributed import GroupCoordinator
-from sglang.srt.layers.communicator.layout import Layout, SumGroup, TokenAxis
-from sglang.srt.layers.communicator.output import OutputTransform
-from sglang.srt.layers.communicator.residual import StageRead, StageUpdate
-from sglang.srt.layers.communicator.residual.add_norm import ADD, NORM_READ
+from sglang.srt.layers.layer_boundary.layout import Layout, SumGroup, TokenAxis
+from sglang.srt.layers.layer_boundary.output import OutputTransform
+from sglang.srt.layers.layer_boundary.residual import StageRead, StageUpdate
+from sglang.srt.layers.layer_boundary.residual.add_norm import ADD, NORM_READ
 
 
 class ProducerReduction(Enum):

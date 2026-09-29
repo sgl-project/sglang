@@ -18,13 +18,13 @@ from functools import cached_property
 from typing import Callable, Optional
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.communicator.adapters.attention import get_attn_tp_context
-from sglang.srt.layers.communicator.boundary import (
+from sglang.srt.layers.layer_boundary.adapters.attention import get_attn_tp_context
+from sglang.srt.layers.layer_boundary.boundary import (
     _cp_moves,
     make_boundary,
     make_output_boundary,
 )
-from sglang.srt.layers.communicator.contracts import (
+from sglang.srt.layers.layer_boundary.contracts import (
     BatchVariant,
     CpMoves,
     EdgeDecl,
@@ -33,23 +33,23 @@ from sglang.srt.layers.communicator.contracts import (
     StageKind,
     StageSteps,
 )
-from sglang.srt.layers.communicator.exit import OutputBoundary
-from sglang.srt.layers.communicator.fusions.allreduce import (
+from sglang.srt.layers.layer_boundary.exit import OutputBoundary
+from sglang.srt.layers.layer_boundary.fusions.allreduce import (
     attention_fusions,
     ffn_fusions,
 )
-from sglang.srt.layers.communicator.layout import (
+from sglang.srt.layers.layer_boundary.layout import (
     TokenAxis,
     _batch_shards_over_cp,
     _gathers_over_attention_cp,
     _generic_prefill_cp_shards_tokens,
     enable_moe_dense_fully_dp,
 )
-from sglang.srt.layers.communicator.prepare import (
+from sglang.srt.layers.layer_boundary.prepare import (
     _hand_qkv_hook_its_input,
     _hand_scattered_input_to_attention,
 )
-from sglang.srt.layers.communicator.stage import StageCommunicator
+from sglang.srt.layers.layer_boundary.stage import StageBoundary
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
 )
@@ -294,10 +294,10 @@ def _bind_stage(declaration, norm, incoming, outgoing, **options):
     if declaration.kind is StageKind.ATTENTION and outgoing.consumer is not None:
         # Layout eligibility comes from the connected consumer, not a mutable
         # link to its execution plan. Kernel binding remains consumer-owned.
-        from sglang.srt.layers.communicator.boundary import input_rows
+        from sglang.srt.layers.layer_boundary.boundary import input_rows
 
         plan._fusion_rows = {
             v: input_rows(edge) for v, edge in outgoing.entries.items()
         }
 
-    return StageCommunicator(plan, declaration=declaration)
+    return StageBoundary(plan, declaration=declaration)

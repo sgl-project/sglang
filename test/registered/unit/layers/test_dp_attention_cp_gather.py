@@ -13,15 +13,16 @@ from unittest.mock import PropertyMock, patch
 
 import torch
 
-from sglang.srt.layers import communicator as comm
-from sglang.srt.layers import dp_attention, layernorm_sp
-from sglang.srt.layers.communicator import prepare as comm_ops
-from sglang.srt.layers.communicator.contracts import BatchVariant
-from sglang.srt.layers.communicator.residual.add_norm import NORM_READ, PLAIN_RESIDUAL
+from sglang.srt.layers import dp_attention
+from sglang.srt.layers import layer_boundary as comm
+from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.cp import base as cp_base
 from sglang.srt.layers.cp import padding as cp_padding
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 from sglang.srt.layers.dp_attention import DpPaddingMode
+from sglang.srt.layers.layer_boundary import prepare as comm_ops
+from sglang.srt.layers.layer_boundary.contracts import BatchVariant
+from sglang.srt.layers.layer_boundary.residual.add_norm import NORM_READ, PLAIN_RESIDUAL
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.boundary_fixtures import (
     make_test_stages,

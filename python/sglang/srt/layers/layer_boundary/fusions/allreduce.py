@@ -19,10 +19,10 @@ from typing import Callable, Optional, Tuple
 
 import torch
 
-from sglang.srt.layers.communicator.contracts import FusedMlpInput
-from sglang.srt.layers.communicator.layout import SumGroup
-from sglang.srt.layers.communicator.output import UnreducedOutput
-from sglang.srt.layers.communicator.residual.add_norm import (
+from sglang.srt.layers.layer_boundary.contracts import FusedMlpInput
+from sglang.srt.layers.layer_boundary.layout import SumGroup
+from sglang.srt.layers.layer_boundary.output import UnreducedOutput
+from sglang.srt.layers.layer_boundary.residual.add_norm import (
     NORM_QUANT_READ,
     Fp8Input,
     NormQuantRead,

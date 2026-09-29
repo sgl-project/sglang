@@ -9,16 +9,16 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from sglang.srt.layers.communicator import (
+from sglang.srt.layers.dp_attention import DpPaddingMode
+from sglang.srt.layers.layer_boundary import (
     ADD,
     NORM_QUANT_READ,
     Layout,
     StageKind,
     TokenAxis,
 )
-from sglang.srt.layers.communicator.contracts import BatchVariant, StageEntry
-from sglang.srt.layers.communicator.prepare import _consumer_step, _read_input
-from sglang.srt.layers.dp_attention import DpPaddingMode
+from sglang.srt.layers.layer_boundary.contracts import BatchVariant, StageEntry
+from sglang.srt.layers.layer_boundary.prepare import _consumer_step, _read_input
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.backend.triton_backend import (
     TritonLoRABackend,

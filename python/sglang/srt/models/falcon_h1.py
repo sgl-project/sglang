@@ -11,16 +11,16 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     Mamba2AttnBackend,
 )
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
-from sglang.srt.layers.communicator import (
+from sglang.srt.layers.dp_attention import (
+    is_dp_attention_enabled,
+)
+from sglang.srt.layers.layer_boundary import (
     declare_attn,
     declare_ffn,
     make_stages,
 )
-from sglang.srt.layers.communicator.output import OutputTransform
-from sglang.srt.layers.communicator.residual import batch as residual_batch
-from sglang.srt.layers.dp_attention import (
-    is_dp_attention_enabled,
-)
+from sglang.srt.layers.layer_boundary.output import OutputTransform
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -222,7 +222,7 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        self.attn_stage, self.ffn_stage = make_stages(
+        self.attn_boundary, self.ffn_boundary = make_stages(
             (declare_attn(), self.input_layernorm),
             (
                 declare_ffn(
@@ -334,7 +334,7 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         **kwargs: Any,
     ):
-        hidden_states = self.attn_stage.prepare(hidden_states, forward_batch)
+        hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
 
         if not forward_batch.forward_mode.is_idle():
             # Attention block
@@ -363,9 +363,9 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
             hidden_states = attention_hidden_states + mamba_hidden_states
 
         # Fully Connected
-        hidden_states = self.attn_stage.finish(hidden_states, forward_batch)
-        hidden_states = self.ffn_stage.prepare(hidden_states, forward_batch)
-        with self.ffn_stage.exit(forward_batch) as ffn_exit:
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             hidden_states = self.feed_forward(hidden_states, forward_batch)
         return ffn_exit.finish(hidden_states)
 

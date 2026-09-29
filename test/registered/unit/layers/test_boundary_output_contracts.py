@@ -8,22 +8,22 @@ from unittest.mock import Mock, patch
 import test_declared_decoder_boundary as fixture
 import torch
 
-from sglang.srt.layers.communicator import (
+from sglang.srt.layers.layer_boundary import (
     ADD,
     ProducerReduction,
     declare_attn,
     declare_ffn,
 )
-from sglang.srt.layers.communicator import exit as exits
-from sglang.srt.layers.communicator import (
+from sglang.srt.layers.layer_boundary import exit as exits
+from sglang.srt.layers.layer_boundary import (
     make_stages,
 )
-from sglang.srt.layers.communicator.contracts import BatchVariant
-from sglang.srt.layers.communicator.fusions.cutedsl import CuteDSLFusion
-from sglang.srt.layers.communicator.layout import SumGroup
-from sglang.srt.layers.communicator.prepare import _dispatch_consumer
-from sglang.srt.layers.communicator.residual import batch
-from sglang.srt.layers.communicator.residual.stream import ResidualStream
+from sglang.srt.layers.layer_boundary.contracts import BatchVariant
+from sglang.srt.layers.layer_boundary.fusions.cutedsl import CuteDSLFusion
+from sglang.srt.layers.layer_boundary.layout import SumGroup
+from sglang.srt.layers.layer_boundary.prepare import _dispatch_consumer
+from sglang.srt.layers.layer_boundary.residual import batch
+from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
@@ -122,7 +122,7 @@ class TestBoundaryIntegrations(unittest.TestCase):
                 fixture.planning(parallel),
                 patch.object(fusion, "_should_use_finalize", return_value=True),
                 patch(
-                    "sglang.srt.layers.communicator.fusions.cutedsl.get_parallel",
+                    "sglang.srt.layers.layer_boundary.fusions.cutedsl.get_parallel",
                     return_value=parallel,
                 ),
             ):
@@ -221,10 +221,10 @@ class TestBoundaryIntegrations(unittest.TestCase):
 
             output = SimpleNamespace(finish=lambda hidden: hidden)
             layer = SimpleNamespace(
-                attn_stage=SimpleNamespace(
+                attn_boundary=SimpleNamespace(
                     prepare=prepare, finish=lambda hidden, fb: hidden
                 ),
-                ffn_stage=SimpleNamespace(
+                ffn_boundary=SimpleNamespace(
                     prepare=lambda hidden, fb, **kw: hidden,
                     exit=lambda fb: nullcontext(output),
                 ),

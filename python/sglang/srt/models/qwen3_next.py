@@ -19,15 +19,15 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
     AuxHiddenStateList,
 )
-from sglang.srt.layers.communicator import (
+from sglang.srt.layers.dp_attention import (
+    is_dp_attention_enabled,
+)
+from sglang.srt.layers.layer_boundary import (
     declare_attn,
     declare_ffn,
     make_stages,
 )
-from sglang.srt.layers.communicator.residual import batch as residual_batch
-from sglang.srt.layers.dp_attention import (
-    is_dp_attention_enabled,
-)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -477,9 +477,9 @@ def _apply_qwen3_next_mlp(
     hidden_states: torch.Tensor,
     forward_batch: ForwardBatch,
 ) -> torch.Tensor:
-    hidden_states = layer.attn_stage.finish(hidden_states, forward_batch)
-    hidden_states = layer.ffn_stage.prepare(hidden_states, forward_batch)
-    with layer.ffn_stage.exit(forward_batch) as ffn_exit:
+    hidden_states = layer.attn_boundary.finish(hidden_states, forward_batch)
+    hidden_states = layer.ffn_boundary.prepare(hidden_states, forward_batch)
+    with layer.ffn_boundary.exit(forward_batch) as ffn_exit:
         if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock):
             hidden_states = layer.mlp(
                 hidden_states,
@@ -537,7 +537,7 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.attn_stage, self.ffn_stage = make_stages(
+        self.attn_boundary, self.ffn_boundary = make_stages(
             (declare_attn(), self.input_layernorm),
             (
                 declare_ffn(
@@ -562,7 +562,7 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
     ):
         forward_batch = kwargs.get("forward_batch", None)
 
-        hidden_states = self.attn_stage.prepare(
+        hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
             captured_last_layer_outputs=captured_last_layer_outputs,
@@ -705,7 +705,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        self.attn_stage, self.ffn_stage = make_stages(
+        self.attn_boundary, self.ffn_boundary = make_stages(
             (declare_attn(), self.input_layernorm),
             (
                 declare_ffn(
@@ -832,7 +832,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
         **kwargs: Any,
     ):
-        hidden_states = self.attn_stage.prepare(
+        hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
             captured_last_layer_outputs=captured_last_layer_outputs,

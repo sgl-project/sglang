@@ -6,13 +6,13 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
-from sglang.srt.layers import communicator as comm
+from sglang.srt.layers import layer_boundary as comm
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
-from sglang.srt.layers.communicator import StageKind
-from sglang.srt.layers.communicator import prepare as comm_ops
-from sglang.srt.layers.communicator.contracts import BatchVariant
-from sglang.srt.layers.communicator.ops import identity_output
-from sglang.srt.layers.communicator.residual.stream import ResidualStream
+from sglang.srt.layers.layer_boundary import StageKind
+from sglang.srt.layers.layer_boundary import prepare as comm_ops
+from sglang.srt.layers.layer_boundary.contracts import BatchVariant
+from sglang.srt.layers.layer_boundary.ops import identity_output
+from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.models.bailing_moe import BailingMoEModel
 from sglang.srt.models.bailing_moe_v3 import BailingMoELinearModel
@@ -67,7 +67,7 @@ class DeferringLayer(nn.Module):
         self.stage_api = stage_api
         self.layer_communicator = stub_plan()
         self.layer_communicator.norm = None
-        self.attn_stage = stub_stage(self.layer_communicator, StageKind.ATTENTION)
+        self.attn_boundary = stub_stage(self.layer_communicator, StageKind.ATTENTION)
         self.layer_communicator._paths[BatchVariant.ORDINARY] = comm.StageSteps(
             entry=comm.StageEntry(
                 prepare=partial(
@@ -400,7 +400,7 @@ class TestPipelineResidualReception(CustomTestCase):
         streams = torch.randn(2, 4, 3)
         from dataclasses import replace
 
-        from sglang.srt.layers.communicator import declare_ffn
+        from sglang.srt.layers.layer_boundary import declare_ffn
 
         stage = stub_stage(comm_instance, StageKind.ATTENTION)
         stage.declaration = replace(

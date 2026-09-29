@@ -44,16 +44,16 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
     AuxHiddenStateList,
 )
-from sglang.srt.layers.communicator import (
-    declare_attn,
-    declare_ffn,
-    make_stages,
-)
-from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.flashinfer_comm_fusion import uses_cutedsl_ar_fusion
+from sglang.srt.layers.layer_boundary import (
+    declare_attn,
+    declare_ffn,
+    make_stages,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -865,7 +865,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if defer_finalize:
             if shared_output is None:
                 raise RuntimeError("Qwen deferred finalize requires shared output")
-            from sglang.srt.layers.communicator.fusions.cutedsl import (
+            from sglang.srt.layers.layer_boundary.fusions.cutedsl import (
                 MoeFinalizeHandoff,
             )
 
@@ -1053,7 +1053,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.attn_stage, self.ffn_stage = make_stages(
+        self.attn_boundary, self.ffn_boundary = make_stages(
             (declare_attn(), self.input_layernorm),
             (
                 declare_ffn(
@@ -1079,7 +1079,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
 
-        hidden_states = self.attn_stage.prepare(
+        hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
             captured_last_layer_outputs=captured_last_layer_outputs,
@@ -1093,10 +1093,10 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        hidden_states = self.attn_stage.finish(hidden_states, forward_batch)
-        hidden_states = self.ffn_stage.prepare(hidden_states, forward_batch)
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
-        with self.ffn_stage.exit(forward_batch) as ffn_exit:
+        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             hidden_states = self.mlp(hidden_states, forward_batch)
         hidden_states = ffn_exit.finish(hidden_states)
 
@@ -1180,7 +1180,7 @@ class Qwen2MoeModel(nn.Module):
             residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = self.layers[self.start_layer].attn_stage.from_pp(
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
                 pp_proxy_tensors, forward_batch
             )
 

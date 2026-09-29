@@ -9,8 +9,8 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.layers import communicator as comm
-from sglang.srt.layers.communicator.residual.stream import ResidualStream
+from sglang.srt.layers import layer_boundary as comm
+from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.runtime_context import get_forward
 from sglang.test.boundary_fixtures import stub_plan
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -50,7 +50,7 @@ def dense_layer(*, reduce_scatter):
 
     object.__setattr__(
         layer,
-        "attn_stage",
+        "attn_boundary",
         SimpleNamespace(
             prepare=lambda h, fb, **kwargs: h,
             finish=lambda h, fb: h,
@@ -58,7 +58,7 @@ def dense_layer(*, reduce_scatter):
     )
     object.__setattr__(
         layer,
-        "ffn_stage",
+        "ffn_boundary",
         SimpleNamespace(
             prepare=lambda h, fb: h,
             exit=stage_exit,
