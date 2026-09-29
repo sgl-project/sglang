@@ -113,13 +113,16 @@ def _ple_table_is_fp8(
 
 @eager_on_graph(True)
 def _breakable_qsa_indexer(layer, hidden_states, positions):
-    """Use the live batch when replaying the indexer outside captured segments."""
+    # Read the live batch on every replay of this eager break.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
     topk = layer._compute_qsa_topk_indices_eager(
-        hidden_states, positions, forward_batch, use_host_prefill_lengths=True
+        hidden_states=hidden_states,
+        positions=positions,
+        forward_batch=forward_batch,
+        use_host_prefill_lengths=True,
     )
-    # Buckets replay serially; share their backing storage instead of retaining
-    # a separate top-k allocation in every captured closure.
+    # Separate buffers cost up to buckets * max_tokens * block_topk * 4B * QSA layers.
+    # For 8 buckets / 16K tokens / topk512 / 12 layers: 3 GiB -> 384 MiB shared.
     bridge = layer._qsa_prefill_topk_bridge
     if bridge is None or bridge.shape[0] < hidden_states.shape[0]:
         bridge = topk.new_empty((hidden_states.shape[0], topk.shape[1]))
@@ -1653,9 +1656,13 @@ class Qwen4ExpAttentionDecoderLayer(
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         if is_in_breakable_cuda_graph() and forward_batch.forward_mode.is_extend():
-            return _breakable_qsa_indexer(self, hidden_states, positions)
+            return _breakable_qsa_indexer(
+                layer=self, hidden_states=hidden_states, positions=positions
+            )
         return self._compute_qsa_topk_indices_eager(
-            hidden_states, positions, forward_batch
+            hidden_states=hidden_states,
+            positions=positions,
+            forward_batch=forward_batch,
         )
 
     def _compute_qsa_topk_indices_eager(

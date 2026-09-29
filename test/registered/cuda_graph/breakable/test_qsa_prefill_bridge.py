@@ -23,7 +23,7 @@ from sglang.srt.models import qwen4_exp
 from sglang.srt.models.qwen4_exp_mtp import Qwen4ExpForCausalLMMTP
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
@@ -33,6 +33,8 @@ class TestQSAPrefillBridge(unittest.TestCase):
         runner.backend = object.__new__(BreakableCudaGraphBackend)
         runner._is_full_backend = False
         runner._qwen_bcg_mtp_embeddings = None
+        runner._qwen_bcg_hc_sidechannel = not draft
+        runner._qwen_bcg_pad_mtp_embeds = draft
         runner.capture_num_tokens = [128]
         runner.model_runner = SimpleNamespace(
             is_draft_worker=draft,
@@ -58,10 +60,12 @@ class TestQSAPrefillBridge(unittest.TestCase):
                 self._qsa_prefill_topk_bridge = None
 
             def _compute_qsa_topk_indices_eager(
-                self, hidden, positions, batch, **kwargs
+                self, hidden_states, positions, forward_batch, **kwargs
             ):
-                seen.append(batch)
-                return (hidden[: batch.rows, :2] + batch.prefix).to(torch.int32)
+                seen.append(forward_batch)
+                return (
+                    hidden_states[: forward_batch.rows, :2] + forward_batch.prefix
+                ).to(torch.int32)
 
         layer = Layer()
         x = torch.zeros((8, 2), device="cuda")
@@ -71,10 +75,16 @@ class TestQSAPrefillBridge(unittest.TestCase):
         with patch.object(
             qwen4_exp, "get_tc_piecewise_forward_context", return_value=context
         ):
-            qwen4_exp._breakable_qsa_indexer(layer, x, positions)
+            qwen4_exp._breakable_qsa_indexer(
+                layer=layer, hidden_states=x, positions=positions
+            )
             torch.cuda.synchronize()
             with BreakableCUDAGraphCapture(graph, stream=torch.cuda.Stream()):
-                result.copy_(qwen4_exp._breakable_qsa_indexer(layer, x + 1, positions))
+                result.copy_(
+                    qwen4_exp._breakable_qsa_indexer(
+                        layer=layer, hidden_states=x + 1, positions=positions
+                    )
+                )
             for rows, prefix in ((3, 17), (8, 4)):
                 context.forward_batch = SimpleNamespace(rows=rows, prefix=prefix)
                 x.fill_(2)
@@ -115,7 +125,9 @@ class TestQSAPrefillBridge(unittest.TestCase):
                 )
                 self.assertEqual(output.hidden_states.shape[0], raw)
                 padded = runner._pad_qwen_bcg_mtp_embeddings(
-                    output.mm_input_embeds, raw, 128
+                    live=output.mm_input_embeds,
+                    raw_num_tokens=raw,
+                    static_num_tokens=128,
                 )
                 torch.testing.assert_close(padded[:raw], x[:raw])
                 torch.testing.assert_close(padded[raw:], torch.zeros_like(padded[raw:]))
@@ -155,11 +167,20 @@ class TestQSAPrefillBridge(unittest.TestCase):
         def forward(input_ids, positions, padded_batch, **kwargs):
             self.assertIsNone(padded_batch.mm_input_embeds)
             return Qwen4ExpForCausalLMMTP._prepare_input_embeds(
-                layer, input_ids, padded_batch, None
+                self=layer,
+                input_ids=input_ids,
+                forward_batch=padded_batch,
+                input_embeds=None,
             )
 
         draft.model_runner.model = SimpleNamespace(forward=forward)
-        actual = draft._execute_body_capture(batch, static, 128, 122, None)
+        actual = draft._execute_body_capture(
+            forward_batch=batch,
+            static_forward_batch=static,
+            static_num_tokens=128,
+            raw_num_tokens=122,
+            shape_key=None,
+        )
         torch.testing.assert_close(actual, layer.model.embed_tokens(ids))
         self.assertEqual(actual.shape[0], 128)
         self.assertEqual(output.hidden_states.shape[0], 122)

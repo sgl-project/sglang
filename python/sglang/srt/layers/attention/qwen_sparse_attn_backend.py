@@ -1487,7 +1487,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         v_buffer = pool.get_value_buffer(layer.layer_id)
         req_to_token = self.req_to_token_pool.req_to_token
         if is_in_breakable_cuda_graph():
-            # The current batch's slot table is refreshed outside capture.
+            # Reuse the prepared slot table to avoid a D2H sync per layer on replay.
             req_to_token = self._resolve_metadata(forward_batch).token_slot_table
             req_indices = range(len(sequence_lens))
         else:

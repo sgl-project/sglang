@@ -250,6 +250,8 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
                 with self.subTest(first_rank=first_rank, positional=positional):
                     runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
                     runner._is_full_backend = False
+                    runner._qwen_bcg_hc_sidechannel = False
+                    runner._qwen_bcg_pad_mtp_embeds = False
                     runner._input_embeds_arg_idx = 3
                     backing = torch.zeros(4, 8)
                     supplied = torch.full((4, 8), 7.0) if first_rank else None
@@ -364,6 +366,8 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
 
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._is_full_backend = False
+        runner._qwen_bcg_hc_sidechannel = False
+        runner._qwen_bcg_pad_mtp_embeds = False
         runner._input_embeds_arg_idx = None
         runner.buffer_registry = SimpleNamespace(has_slot=lambda _name: False)
         runner.backend = SimpleNamespace(replay=lambda *_args, **_kwargs: None)

@@ -56,6 +56,8 @@ class TestQwen4ExpPrefill(unittest.TestCase):
             with self.subTest(arch=arch):
                 runner = object.__new__(PrefillCudaGraphRunner)
                 runner.prefill_backend_name = Backend.BREAKABLE
+                runner._qwen_bcg_hc_sidechannel = arch.endswith("ConditionalGeneration")
+                runner._qwen_bcg_pad_mtp_embeds = not runner._qwen_bcg_hc_sidechannel
                 runner.model_runner = SimpleNamespace(
                     model_config=SimpleNamespace(
                         hf_config=SimpleNamespace(architectures=[arch]),

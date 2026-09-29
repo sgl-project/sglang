@@ -311,6 +311,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # --- prefill graph config -------------------------------------
         prefill_config = get_exec().graph.cuda_graph_config.prefill
         self.prefill_backend_name = prefill_config.backend
+        qwen_bcg = self.prefill_backend_name == Backend.BREAKABLE and is_qwen4_exp(
+            model_runner.model_config.hf_config
+        )
+        self._qwen_bcg_hc_sidechannel = qwen_bcg and not model_runner.is_draft_worker
+        self._qwen_bcg_pad_mtp_embeds = qwen_bcg and model_runner.is_draft_worker
         self.prefer_eager_mixed_prefill = (
             self.prefill_backend_name == Backend.BREAKABLE
             and get_parallel().attn_dp_enabled
@@ -1251,10 +1256,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         ``capture_hidden_mode=None`` when unknown at the call site (it is
         rank-uniform; forward-time-only checking cannot split the group).
         """
-        if (
-            contains_mm_inputs
-            and self.prefill_backend_name == Backend.BREAKABLE
-            and is_qwen4_exp(self.model_runner.model_config.hf_config)
+        if contains_mm_inputs and (
+            self._qwen_bcg_hc_sidechannel or self._qwen_bcg_pad_mtp_embeds
         ):
             return False
         if self._is_full_backend and batch_size > self._capture_req_slots:
@@ -2005,22 +2008,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             : ie.shape[0]
         ].copy_(ie)
 
-    def _qwen_bcg_has_target_hc_sidechannel(self):
-        return (
-            isinstance(self.backend, BreakableCudaGraphBackend)
-            and not self.model_runner.is_draft_worker
-            and self.model_runner.model_config.hf_config.architectures[0]
-            == "Qwen4ExpForConditionalGeneration"
-        )
-
     def _pack_qwen_bcg_hc_output(self, output):
-        if self._qwen_bcg_has_target_hc_sidechannel():
+        if self._qwen_bcg_hc_sidechannel:
             # Replay cannot repeat the model's Python assignment of HC state.
             return output, self.layer_model.last_hc_hidden_states
         return output
 
     def _restore_qwen_bcg_hc_output(self, output):
-        if self._qwen_bcg_has_target_hc_sidechannel():
+        if self._qwen_bcg_hc_sidechannel:
             output, self.layer_model.last_hc_hidden_states = output
         return output
 
@@ -2087,15 +2082,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             # MTP consumes the target model's live multimodal embeddings in its
             # eager wrapper before the captured transformer body is replayed.
             tail_batch.mm_input_embeds = forward_batch.mm_input_embeds
-            if (
-                tail_batch.mm_input_embeds is not None
-                and isinstance(self.backend, BreakableCudaGraphBackend)
-                and self.model_runner.is_draft_worker
-                and self.model_runner.model_config.hf_config.architectures[0]
-                == "Qwen4ExpForCausalLMMTP"
-            ):
+            if tail_batch.mm_input_embeds is not None and self._qwen_bcg_pad_mtp_embeds:
                 tail_batch.mm_input_embeds = self._pad_qwen_bcg_mtp_embeddings(
-                    tail_batch.mm_input_embeds, raw_num_tokens, static_num_tokens
+                    live=tail_batch.mm_input_embeds,
+                    raw_num_tokens=raw_num_tokens,
+                    static_num_tokens=static_num_tokens,
                 )
         model_kwargs = kwargs
         if self._use_draft_input_embeds:
