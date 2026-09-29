@@ -19,7 +19,7 @@ from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.utils.common import is_pin_memory_available
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.sampling.sampling_observer import SamplingObserver
 
 
@@ -224,11 +224,7 @@ class SamplingBatchInfo:
             top_ks=top_ks,
             min_ps=min_ps,
             sampling_seed=sampling_seed,
-            is_all_greedy=all(r.sampling_params.top_k <= 1 for r in reqs),
-            is_any_greedy=any(r.sampling_params.top_k <= 1 for r in reqs),
-            need_top_p_sampling=any(r.sampling_params.top_p != 1.0 for r in reqs),
-            need_top_k_sampling=any(r.sampling_params.top_k != TOP_K_ALL for r in reqs),
-            need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
+            **_compute_sampling_flags(reqs),
             vocab_size=vocab_size,
             penalizer_orchestrator=penalizer_orchestrator,
             has_custom_logit_processor=has_custom_logit_processor,
@@ -383,8 +379,16 @@ class SamplingBatchInfo:
 
         return observer_state
 
-    def filter_batch(self, keep_indices: List[int], keep_indices_device: torch.Tensor):
+    def filter_batch(
+        self,
+        keep_indices: List[int],
+        keep_indices_device: torch.Tensor,
+        kept_reqs: List[Req],
+    ):
         self.penalizer_orchestrator.filter(keep_indices_device)
+
+        for name, value in _compute_sampling_flags(kept_reqs).items():
+            setattr(self, name, value)
 
         if self.has_custom_logit_processor:
             self._filter_batch_custom_logit_processor(keep_indices, keep_indices_device)
@@ -576,6 +580,16 @@ class SamplingBatchInfo:
         # Accumulate the penalty into a pre-allocated buffer to get rid of the dependency of `penalizer_orchestrator` later
         self.update_penalties()
         return dataclasses.replace(self, penalizer_orchestrator=None)
+
+
+def _compute_sampling_flags(reqs: List[Req]) -> dict:
+    return dict(
+        is_all_greedy=all(r.sampling_params.top_k <= 1 for r in reqs),
+        is_any_greedy=any(r.sampling_params.top_k <= 1 for r in reqs),
+        need_top_p_sampling=any(r.sampling_params.top_p != 1.0 for r in reqs),
+        need_top_k_sampling=any(r.sampling_params.top_k != TOP_K_ALL for r in reqs),
+        need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
+    )
 
 
 def merge_bias_tensor(

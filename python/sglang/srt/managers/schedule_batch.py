@@ -3603,7 +3603,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.return_hidden_states_mode = get_batch_return_hidden_states_mode(self.reqs)
         self.return_hidden_states = self.return_hidden_states_mode.need_capture()
 
-        self.sampling_info.filter_batch(keep_indices, keep_indices_device)
+        self.sampling_info.filter_batch(keep_indices, keep_indices_device, self.reqs)
         if self.spec_info:
             self.spec_info.filter_batch(
                 new_indices=keep_indices_device,
