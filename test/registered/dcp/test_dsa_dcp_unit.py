@@ -21,6 +21,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.arg_groups import hicache_hook
 from sglang.srt.arg_groups.overrides import _dsa_dcp_validation
 from sglang.srt.layers.attention.dsa.utils import dcp_localize_topk_slots
 from sglang.srt.layers.attention.dsa_backend import (
@@ -209,6 +210,9 @@ class TestDsaDcpValidation(CustomTestCase):
             "speculative_eagle_topk=4",
         )
 
+    def test_hicache_host_tier_passes(self):
+        self.assert_accepted(_view(enable_hierarchical_cache=True, hicache_size=96))
+
 
 class TestDsaDcpLseMergePhases(CustomTestCase):
     MERGED = (
@@ -269,6 +273,53 @@ class TestDsaDcpLseMergePhases(CustomTestCase):
                     batch(ForwardMode.EXTEND), use_dsa=True
                 )
             )
+
+
+class TestHiCacheDcpSpeculativeGate(CustomTestCase):
+    """HiCache with DCP admits EAGLE only as the packed NextN/MTP draft, whose
+    single MLA layer rides in the anchor host pool with its index translation."""
+
+    def resolve(self, speculative_algorithm, draft_model_path=None, nextn_layers=1):
+        cfg = SimpleNamespace(
+            dcp_size=8,
+            enable_hierarchical_cache=True,
+            hicache_storage_backend=None,
+            speculative_algorithm=speculative_algorithm,
+            speculative_draft_model_path=draft_model_path,
+            enable_lmcache=False,
+            enable_hisparse=False,
+            get_model_config=lambda: SimpleNamespace(
+                hf_config=SimpleNamespace(num_nextn_predict_layers=nextn_layers)
+            ),
+        )
+        with (
+            patch.object(hicache_hook, "resolving_view", return_value=cfg),
+            patch.object(hicache_hook, "use_mla_backend", return_value=True),
+        ):
+            hicache_hook.resolve_hicache_dcp_compatibility(object())
+
+    def test_packed_mtp_draft_is_admitted(self):
+        for algo in (None, "DSPARK", "EAGLE", "NEXTN"):
+            with self.subTest(algo=algo):
+                self.resolve(algo)
+
+    def test_other_drafts_are_rejected(self):
+        cases = [
+            (dict(speculative_algorithm="NGRAM"), "DSPARK or EAGLE/NEXTN"),
+            (
+                dict(speculative_algorithm="EAGLE", draft_model_path="/draft"),
+                "packed NextN/MTP draft",
+            ),
+            (
+                dict(speculative_algorithm="EAGLE", nextn_layers=0),
+                "packed NextN/MTP draft",
+            ),
+        ]
+        for kwargs, expected in cases:
+            with self.subTest(**kwargs):
+                with self.assertRaises(NotImplementedError) as ctx:
+                    self.resolve(**kwargs)
+                self.assertIn(expected, str(ctx.exception))
 
 
 if __name__ == "__main__":
