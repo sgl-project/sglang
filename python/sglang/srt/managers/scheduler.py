@@ -5573,8 +5573,10 @@ class Scheduler(
 
         state = ElasticEPStateManager.instance()
         if state is not None and state.operation_id == operation_id:
-            expected_members = list(recv_req.expected_joining_member_ids or [])
-            existing_members = list(state.operation_expected_joining_member_ids or [])
+            expected_allocations = list(recv_req.expected_joining_allocation_ids or [])
+            existing_allocations = list(
+                state.operation_expected_joining_allocation_ids or []
+            )
             conflict = None
             if state.runtime_instance_id != runtime_instance_id:
                 conflict = (
@@ -5586,10 +5588,10 @@ class Scheduler(
                     f"Operation {operation_id} already targets EP size "
                     f"{state.operation_target_ep_size}, not {new_ep_size}."
                 )
-            elif existing_members != expected_members:
+            elif existing_allocations != expected_allocations:
                 conflict = (
-                    f"Operation {operation_id} already has joining members "
-                    f"{existing_members}, not {expected_members}."
+                    f"Operation {operation_id} already has joining allocations "
+                    f"{existing_allocations}, not {expected_allocations}."
                 )
             if conflict is not None:
                 return make_output(
@@ -5657,6 +5659,25 @@ class Scheduler(
                 terminal=True,
                 effective_ep_size=old_ep_size,
             )
+        parallel = get_parallel()
+        allocation_rank_width = (
+            parallel.elastic_ep_allocation_width or parallel.tp_size // parallel.nnodes
+        )
+        requested_rank_count = new_ep_size - old_ep_size
+        if requested_rank_count != allocation_rank_width:
+            return make_output(
+                success=False,
+                message=(
+                    "This API accepts exactly one joining allocation per operation: "
+                    f"new_ep_size - effective_ep_size must equal the local rank width "
+                    f"({allocation_rank_width}), got {requested_rank_count}."
+                ),
+                operation_id=operation_id,
+                old_ep_size=old_ep_size,
+                new_ep_size=new_ep_size,
+                terminal=True,
+                effective_ep_size=old_ep_size,
+            )
         if ElasticEPStateManager.is_scaling():
             return make_output(
                 success=False,
@@ -5677,7 +5698,7 @@ class Scheduler(
             new_ep_size,
             runtime_instance_id,
             operation_id,
-            recv_req.expected_joining_member_ids,
+            recv_req.expected_joining_allocation_ids,
         ):
             return make_output(
                 success=False,

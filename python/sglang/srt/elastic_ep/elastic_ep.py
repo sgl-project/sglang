@@ -11,6 +11,13 @@ import torch
 
 from sglang.srt.distributed import parallel_state
 from sglang.srt.distributed.utils import get_global_tcp_store
+from sglang.srt.elastic_ep.runtime_topology import (
+    RuntimeTopology,
+    commit_runtime_topology,
+    get_runtime_topology,
+    publish_runtime_topology,
+    validate_append_candidate,
+)
 from sglang.srt.eplb.expert_location import broadcast_global_expert_location_metadata
 from sglang.srt.runtime_context import (
     get_exec,
@@ -35,7 +42,7 @@ class ScaleOperation:
     operation_id: str
     rank_offset: int
     target_ep_size: int
-    expected_joining_member_ids: List[str]
+    expected_joining_allocation_ids: List[str]
 
 
 @dataclass(frozen=True)
@@ -45,7 +52,7 @@ class ScaleCohort:
     rank_offset: int
     target_ep_size: int
     ready_rank_count: int
-    member_id: Optional[str]
+    allocation_id: Optional[str]
     cuda_graph_enabled: bool
 
 
@@ -81,7 +88,7 @@ def register_scale_operation(
     target_ep_size: int,
     runtime_instance_id: str,
     operation_id: str,
-    expected_joining_member_ids: Optional[List[str]] = None,
+    expected_joining_allocation_ids: Optional[List[str]] = None,
 ) -> None:
     _store_json(
         f"{_SCALE_OPERATION_KEY_PREFIX}/{rank_offset}",
@@ -90,7 +97,7 @@ def register_scale_operation(
             "operation_id": operation_id,
             "rank_offset": rank_offset,
             "target_ep_size": target_ep_size,
-            "expected_joining_member_ids": expected_joining_member_ids or [],
+            "expected_joining_allocation_ids": expected_joining_allocation_ids or [],
         },
     )
 
@@ -104,7 +111,7 @@ def register_scale_cohort(
     rank_offset: int,
     target_ep_size: int,
     timeout: float,
-    member_id: Optional[str] = None,
+    allocation_id: Optional[str] = None,
     cuda_graph_enabled: bool = False,
 ) -> ScaleCohort:
     deadline = time.monotonic() + timeout
@@ -122,11 +129,11 @@ def register_scale_cohort(
             f"Joining cohort target {target_ep_size} does not match operation "
             f"target {operation.target_ep_size}."
         )
-    if operation.expected_joining_member_ids and (
-        member_id not in operation.expected_joining_member_ids
+    if operation.expected_joining_allocation_ids and (
+        allocation_id not in operation.expected_joining_allocation_ids
     ):
         raise RuntimeError(
-            f"Joining member {member_id!r} is not authorized for operation "
+            f"Joining allocation {allocation_id!r} is not authorized for operation "
             f"{operation.operation_id}."
         )
     cohort = ScaleCohort(
@@ -135,7 +142,7 @@ def register_scale_cohort(
         rank_offset=rank_offset,
         target_ep_size=target_ep_size,
         ready_rank_count=target_ep_size - rank_offset,
-        member_id=member_id,
+        allocation_id=allocation_id,
         cuda_graph_enabled=cuda_graph_enabled,
     )
     _store_json(
@@ -180,7 +187,7 @@ class ElasticEPState:
     runtime_instance_id: Optional[str] = None
     operation_id: Optional[str] = None
     operation_target_ep_size: Optional[int] = None
-    operation_expected_joining_member_ids: Optional[List[str]] = None
+    operation_expected_joining_allocation_ids: Optional[List[str]] = None
 
     def is_active_equal_last(self) -> bool:
         return torch.equal(self.active_ranks, self.last_active_ranks)
@@ -237,10 +244,40 @@ class ElasticEPStateManager:
             inst.ep_join_rank_offset = get_parallel().ep_join_rank_offset
             if get_exec().moe.is_ep_joiner:
                 cls._init_joiner_state(inst)
+            else:
+                cls._publish_initial_runtime_topology(inst)
 
             cls._instance = inst
 
         return cls._instance
+
+    @classmethod
+    def _publish_initial_runtime_topology(cls, inst: ElasticEPState) -> None:
+        runtime_instance_id = get_parallel().elastic_ep_runtime_instance_id
+        allocation_width = get_parallel().elastic_ep_allocation_width
+        if allocation_width is None:
+            return
+
+        local_world_width = get_parallel().tp_size // get_parallel().nnodes
+        if local_world_width != allocation_width:
+            raise RuntimeError(
+                "Elastic EP automatic bootstrap resolved an inconsistent local "
+                f"allocation width (topology={local_world_width}, "
+                f"visible={allocation_width})."
+            )
+        if runtime_instance_id is None:
+            return
+        inst.runtime_instance_id = runtime_instance_id
+        if torch.distributed.get_rank() == 0:
+            publish_runtime_topology(
+                RuntimeTopology(
+                    runtime_instance_id=runtime_instance_id,
+                    initial_ep_size=inst.original_ep_size,
+                    allocation_width=allocation_width,
+                    effective_ep_size=inst.effective_ep_size,
+                    max_committed_ep_size=inst.effective_ep_size,
+                )
+            )
 
     @classmethod
     def _init_joiner_state(cls, inst: ElasticEPState) -> None:
@@ -251,6 +288,21 @@ class ElasticEPStateManager:
         inst.sync_active_to_cpu()
 
         if get_exec().moe.ep_join_mode == "scale":
+            allocation_width = get_parallel().elastic_ep_allocation_width
+            if allocation_width is not None:
+                topology = get_runtime_topology()
+                if topology is None:
+                    raise RuntimeError(
+                        "Elastic EP append allocation cannot observe the running "
+                        "world's runtime topology."
+                    )
+                validate_append_candidate(
+                    topology,
+                    rank_offset=get_parallel().ep_join_rank_offset,
+                    allocation_width=allocation_width,
+                    initial_ep_size=get_parallel().elastic_ep_initial_size,
+                )
+                inst.runtime_instance_id = topology.runtime_instance_id
             inst.effective_ep_size = (
                 get_parallel().ep_join_rank_offset + get_parallel().tp_size
             )
@@ -299,7 +351,7 @@ class ElasticEPStateManager:
         n: int,
         runtime_instance_id: str,
         operation_id: str,
-        expected_joining_member_ids: Optional[List[str]] = None,
+        expected_joining_allocation_ids: Optional[List[str]] = None,
     ) -> bool:
         inst = cls._instance
         if inst is None:
@@ -314,14 +366,14 @@ class ElasticEPStateManager:
             n,
             runtime_instance_id,
             operation_id,
-            expected_joining_member_ids,
+            expected_joining_allocation_ids,
         )
         inst.pending_ep_size = n
         inst.runtime_instance_id = runtime_instance_id
         inst.operation_id = operation_id
         inst.operation_target_ep_size = n
-        inst.operation_expected_joining_member_ids = list(
-            expected_joining_member_ids or []
+        inst.operation_expected_joining_allocation_ids = list(
+            expected_joining_allocation_ids or []
         )
         inst.scale_phase = "waiting_for_cohort"
         inst.operation_succeeded = None
@@ -382,6 +434,12 @@ class ElasticEPStateManager:
         inst.last_error = None
         inst.pending_since = None
         inst.reset()
+        if (
+            torch.distributed.is_initialized()
+            and torch.distributed.get_rank() == 0
+            and get_runtime_topology() is not None
+        ):
+            commit_runtime_topology(inst.effective_ep_size)
 
     @classmethod
     def fail_scale(cls, error: str) -> None:
