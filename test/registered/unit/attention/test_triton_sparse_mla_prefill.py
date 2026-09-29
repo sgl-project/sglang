@@ -5,8 +5,8 @@ check. The kernel is mocked, so these guard the wiring rather than the numerics
 ``test/registered/kernels/ops/attention/test_dsa_triton_sparse_mla_prefill.py``):
 
 - argument marshalling between the DSA backend and the kernel entry point,
-- the two fast-path switches being off unless asked for, at both the CLI layer
-  and the backend layer,
+- the union switch being off unless asked for, at both the CLI layer and the
+  backend layer, and forced off under graph capture or deterministic inference,
 - the validator's accept/reject boundaries,
 - that registering this backend does not change which backend SM120 selects on
   its own.
@@ -31,7 +31,7 @@ class TestTritonSparseMLAValidator(CustomTestCase):
             _validate_triton_sparse_mla_backend,
         )
 
-        defaults = dict(device_sm_major=12, num_q_heads=8, union=0)
+        defaults = dict(device_sm_major=12, num_q_heads=8, union=0, index_kpool=1)
         defaults.update(kwargs)
         return _validate_triton_sparse_mla_backend(**defaults)
 
@@ -56,11 +56,68 @@ class TestTritonSparseMLAValidator(CustomTestCase):
             self._validate(num_q_heads=16, union=4)
         self.assertIsNone(self._validate(num_q_heads=16, union=2))
 
+    def test_union_tile_must_be_a_power_of_two_of_at_least_16(self):
+        # Regression: h=4 with union 2 (GLM-5 at TP16) and h=12 with union 2
+        # passed the old `<= 32` check, then failed to compile on the first long
+        # prefill: `tl.arange` needs a power of two and `tl.dot` needs M >= 16.
+        # The launcher only catches OutOfResources, so the compile error reached
+        # the request. Both shapes must be refused at startup instead.
+        for heads, group in ((4, 2), (12, 2), (6, 4)):
+            with self.subTest(heads=heads, group=group):
+                with self.assertRaisesRegex(ValueError, "power of two"):
+                    self._validate(num_q_heads=heads, union=group)
+        for heads, group in ((4, 4), (8, 2), (8, 4), (16, 2)):
+            with self.subTest(heads=heads, group=group):
+                self.assertIsNone(self._validate(num_q_heads=heads, union=group))
+
+    def test_head_count_is_capped_at_measured_range(self):
+        # BLOCK_H = next_pow2(h) is never reduced by the smem step-down, so at
+        # h=64 / 128 the [BLOCK_H, 512] fp32 accumulator spills or misses the
+        # SM120 budget. Refuse what has not been measured rather than promise it.
+        self.assertIsNone(self._validate(num_q_heads=32))
+        with self.assertRaisesRegex(ValueError, "32 query heads"):
+            self._validate(num_q_heads=33)
+        with self.assertRaisesRegex(ValueError, "32 query heads"):
+            self._validate(num_q_heads=128)
+
+    def test_index_kpool_is_rejected_at_construction(self):
+        # Regression: only `flashmla_sparse` is rerouted for the pooled indexer
+        # tail, so this backend reached `_check_kpool_tail_backend` and raised
+        # NotImplementedError on the first prefill. Reject it at startup.
+        with self.assertRaisesRegex(ValueError, "index_kpool"):
+            self._validate(index_kpool=2)
+        self.assertIsNone(self._validate(index_kpool=1))
+
+
+class TestTritonSparseMLAUnionResolution(CustomTestCase):
+    """``_resolve_dsa_triton_union``: deterministic inference forces union off.
+
+    Union makes a token's output depend on which tokens share its group and on
+    the ``T % G`` tail, which breaks the batch invariance deterministic inference
+    promises. The requested value must survive unchanged otherwise.
+    """
+
+    def _resolve(self, **kwargs):
+        from sglang.srt.layers.attention.dsa_backend import _resolve_dsa_triton_union
+
+        return _resolve_dsa_triton_union(**kwargs)
+
+    def test_deterministic_forces_union_off(self):
+        with self.assertLogs("sglang.srt.layers.attention.dsa_backend", "WARNING"):
+            self.assertEqual(self._resolve(union=4, deterministic=True), 0)
+
+    def test_requested_value_kept_otherwise(self):
+        for union in (0, 2, 4):
+            self.assertEqual(self._resolve(union=union, deterministic=False), union)
+        self.assertEqual(self._resolve(union=0, deterministic=True), 0)
+
 
 class TestTritonSparseMLAAdapter(CustomTestCase):
     """The backend method forwards exactly what the kernel expects."""
 
-    def _call_forward(self, *, union=0, capturing=False):
+    def _call_forward(
+        self, *, union=0, capturing=False, stream_capturing=False, topk_length=None
+    ):
         from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 
         captured = {}
@@ -74,6 +131,8 @@ class TestTritonSparseMLAAdapter(CustomTestCase):
         backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
         backend.dsa_triton_union = union
 
+        # `is_available` is patched too so the stream check is reached on the
+        # CPU CI lane, where it would otherwise short-circuit.
         with (
             patch(
                 "sglang.kernels.ops.attention.dsa.triton_sparse_mla_prefill.sparse_mla_prefill",
@@ -83,6 +142,8 @@ class TestTritonSparseMLAAdapter(CustomTestCase):
                 "sglang.srt.model_executor.runner_utils.capture_mode.get_is_capture_mode",
                 lambda: capturing,
             ),
+            patch("torch.cuda.is_available", lambda: True),
+            patch("torch.cuda.is_current_stream_capturing", lambda: stream_capturing),
         ):
             out = backend._forward_triton_sparse_mla(
                 q_all=torch.zeros(4, 8, 576, dtype=torch.bfloat16),
@@ -90,6 +151,7 @@ class TestTritonSparseMLAAdapter(CustomTestCase):
                 page_table_1=torch.zeros(4, 16, dtype=torch.int32),
                 sm_scale=0.0625,
                 v_head_dim=512,
+                topk_length=topk_length,
             )
         return captured, out
 
@@ -111,11 +173,37 @@ class TestTritonSparseMLAAdapter(CustomTestCase):
         self.assertEqual(captured["union"], 4)
 
     def test_union_is_disabled_under_cuda_graph_capture(self):
-        # The union path reads the index range back to the host to size its
-        # scratch, which cannot be captured. It must degrade to the per-token
-        # path (same result) rather than break capture.
+        # The union path allocates its per-group scratch on every call, which
+        # stream capture forbids. It must degrade to the per-token path (same
+        # result) rather than break capture.
         captured, _ = self._call_forward(union=4, capturing=True)
         self.assertEqual(captured["union"], 0)
+
+    def test_union_is_disabled_when_the_stream_itself_is_capturing(self):
+        # Regression: `get_is_capture_mode` is only set when the FULL prefill
+        # graph runner captures LoRA, so under `--cuda-graph-backend-prefill
+        # full` without LoRA the union path ran its allocations inside stream
+        # capture. The stream's own capture state must be honoured too.
+        captured, _ = self._call_forward(
+            union=4, capturing=False, stream_capturing=True
+        )
+        self.assertEqual(captured["union"], 0)
+
+    def test_topk_length_is_forwarded_when_rows_match(self):
+        # Without it the kernel rebuilds the per-row valid count on every layer
+        # (~64 MB of temporaries at T=8192, topk=2048) from data the backend
+        # already holds in `dsa_cache_seqlens_int32`.
+        lengths = torch.full((4,), 16, dtype=torch.int32)
+        captured, _ = self._call_forward(topk_length=lengths)
+        self.assertIs(captured["topk_length"], lengths)
+
+    def test_topk_length_is_dropped_when_rows_diverge(self):
+        # Same contract as `_forward_flashmla_sparse`: metadata rows that do not
+        # match q rows fall back to full-width compute instead of misindexing.
+        captured, _ = self._call_forward(
+            topk_length=torch.full((5,), 16, dtype=torch.int32)
+        )
+        self.assertIsNone(captured["topk_length"])
 
 
 class TestTritonSparseMLATopkTransformRouting(CustomTestCase):

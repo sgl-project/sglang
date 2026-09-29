@@ -338,19 +338,25 @@ _DSA_IMPL_T: TypeAlias = Literal[
 ]
 
 
+# Largest head count the kernel has been measured at. Above it BLOCK_H=64/128
+# makes the [BLOCK_H, 512] fp32 accumulator spill or miss SM120's smem budget.
+_TRITON_SPARSE_MLA_MAX_HEADS = 32
+
+
 def _validate_triton_sparse_mla_backend(
     *,
     device_sm_major: int,
     num_q_heads: int,
     union: int,
+    index_kpool: int,
 ) -> None:
     """Capability check for ``--dsa-prefill-backend triton_sparse_mla``.
 
-    The kernel is CUDA-only (it uses Triton ``tl.dot`` on bf16 with an
-    architecture-tuned tile table for SM90/SM120). It has no head-count
-    requirement — the head dim is padded into a 16-row mma tile, not into the
-    grid — so the only hard constraints are the device family and the union
-    group size dividing the query-token count at call time.
+    The kernel is CUDA-only (Triton ``tl.dot`` on bf16 with a tile table tuned
+    for SM90/SM120). Heads are padded into a 16-row mma tile rather than into
+    the grid, so any count up to ``_TRITON_SPARSE_MLA_MAX_HEADS`` works; the
+    union tile is ``num_q_heads * union`` rows and must be a power of two in
+    [16, 32] (``tl.arange`` needs a power of two, ``tl.dot`` needs M >= 16).
     """
     if _is_hip:
         raise ValueError(
@@ -362,14 +368,45 @@ def _validate_triton_sparse_mla_backend(
             "triton_sparse_mla requires SM90 (Hopper) or newer; "
             f"got sm_major={device_sm_major}."
         )
+    if num_q_heads > _TRITON_SPARSE_MLA_MAX_HEADS:
+        raise ValueError(
+            "triton_sparse_mla is validated up to "
+            f"{_TRITON_SPARSE_MLA_MAX_HEADS} query heads per rank; got "
+            f"num_q_heads={num_q_heads}. Raise the attention TP degree or use "
+            "another DSA prefill backend."
+        )
+    if index_kpool > 1:
+        raise ValueError(
+            "triton_sparse_mla does not support index_kpool > 1 (the pooled "
+            f"indexer appends tail tokens to topk_indices); got {index_kpool}. "
+            "Use flashmla_sparse, which reroutes the tail."
+        )
     if union not in (0, 2, 4):
         raise ValueError(f"--dsa-triton-union must be 0, 2 or 4; got {union}.")
-    if union and num_q_heads * union > 32:
-        raise ValueError(
-            f"--dsa-triton-union {union} needs num_q_heads * union <= 32 "
-            f"(the union mma tile); got num_q_heads={num_q_heads}. "
-            "Lower the union group size or disable it."
+    if union:
+        rows = num_q_heads * union
+        if rows < 16 or rows > 32 or rows & (rows - 1):
+            raise ValueError(
+                f"--dsa-triton-union {union} needs num_q_heads * union to be a "
+                f"power of two in [16, 32] (the union mma tile); got "
+                f"num_q_heads={num_q_heads}, i.e. {rows} rows. Use a different "
+                "group size or disable union."
+            )
+
+
+def _resolve_dsa_triton_union(*, union: int, deterministic: bool) -> int:
+    """Union shares one gathered index set across G neighbouring tokens, so a
+    token's output depends on which tokens share its group and on the T % G
+    tail. That breaks the batch invariance deterministic inference promises."""
+    if union and deterministic:
+        logger.warning(
+            "--dsa-triton-union %d is disabled under "
+            "--enable-deterministic-inference: the union path makes a token's "
+            "output depend on its batch neighbours.",
+            union,
         )
+        return 0
+    return union
 
 
 class DeepseekSparseAttnBackend(
@@ -440,7 +477,10 @@ class DeepseekSparseAttnBackend(
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
         # Opt-in exact fast path for the Triton sparse-MLA prefill kernel.
-        self.dsa_triton_union: int = get_exec().kernel.dsa_triton_union
+        self.dsa_triton_union: int = _resolve_dsa_triton_union(
+            union=get_exec().kernel.dsa_triton_union,
+            deterministic=get_exec().deterministic.enable_deterministic_inference,
+        )
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
         if self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
@@ -553,6 +593,7 @@ class DeepseekSparseAttnBackend(
                 device_sm_major=self.device_sm_major,
                 num_q_heads=self.num_q_heads,
                 union=self.dsa_triton_union,
+                index_kpool=self.dsa_index_kpool,
             )
 
         # `flashmla_sparse_q8` is prefill-only (FP8 decode goes through
@@ -2249,6 +2290,7 @@ class DeepseekSparseAttnBackend(
                     page_table_1=page_table_1,
                     sm_scale=layer.scaling,
                     v_head_dim=layer.v_head_dim,
+                    topk_length=metadata.dsa_cache_seqlens_int32,
                 )
             return self._forward_flashmla_sparse(
                 q_all=q_all,
@@ -2961,6 +3003,7 @@ class DeepseekSparseAttnBackend(
         v_head_dim: int,
         page_table_1: torch.Tensor,
         sm_scale: float,
+        topk_length: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Fused Triton sparse-MLA prefill.
 
@@ -2975,10 +3018,19 @@ class DeepseekSparseAttnBackend(
             get_is_capture_mode,
         )
 
-        # The union path sizes its scratch from the observed index range, which
-        # costs one device-to-host read per call and cannot be graph-captured.
-        # Fall back to the per-token path under capture: same result, no sync.
-        union = 0 if get_is_capture_mode() else self.dsa_triton_union
+        # The union path allocates its per-group scratch on every call, which
+        # stream capture forbids. `get_is_capture_mode` misses the FULL prefill
+        # graph runner without LoRA, so also ask the stream itself. The
+        # per-token path gives the same result.
+        capturing = get_is_capture_mode() or (
+            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        )
+        union = 0 if capturing else self.dsa_triton_union
+
+        # Same contract as `_forward_flashmla_sparse`: metadata rows are expected
+        # to match q rows; fall back to full-width compute if they ever diverge.
+        if topk_length is not None and topk_length.shape[0] != q_all.shape[0]:
+            topk_length = None
 
         return sparse_mla_prefill(
             q_all,
@@ -2986,6 +3038,7 @@ class DeepseekSparseAttnBackend(
             page_table_1,
             sm_scale,
             v_head_dim,
+            topk_length=topk_length,
             union=union,
         )
 
