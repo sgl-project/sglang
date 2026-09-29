@@ -78,7 +78,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
-    make_layers,
+    make_pp_layers,
 )
 from sglang.srt.utils.common import rank0_log
 
@@ -951,11 +951,9 @@ class BailingMoELinearModel(nn.Module):
                 alt_stream=self.alt_stream,
             )
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             self.num_layers,
             layer_fn,
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=f"{prefix}.layers",
         )
 

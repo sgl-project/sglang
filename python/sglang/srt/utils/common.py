@@ -1544,6 +1544,29 @@ def make_layers(
     return modules, start_layer, end_layer
 
 
+def make_pp_layers(
+    num_hidden_layers: int,
+    layer_fn: LayerFn,
+    prefix: str = "",
+    return_tuple: bool = False,
+    offloader_kwargs: Optional[Dict[str, Any]] = None,
+) -> Tuple[torch.nn.Module, int, int]:
+    """Make this pipeline stage's layers, and return them with the stage's range.
+
+    Layers outside ``[start_layer, end_layer)`` are ``PPMissingLayer`` stand-ins.
+    """
+    parallel = get_parallel()
+    return make_layers(
+        num_hidden_layers,
+        layer_fn,
+        pp_rank=parallel.pp_rank,
+        pp_size=parallel.pp_size,
+        prefix=prefix,
+        return_tuple=return_tuple,
+        offloader_kwargs=offloader_kwargs,
+    )
+
+
 def set_random_seed(seed: int) -> None:
     """Set the random seed for all libraries."""
     random.seed(seed)

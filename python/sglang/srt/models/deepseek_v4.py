@@ -196,7 +196,7 @@ from sglang.srt.utils import (
     is_gfx942_supported,
     is_gfx1250_supported,
     log_info_on_rank0,
-    make_layers,
+    make_pp_layers,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
@@ -4337,7 +4337,7 @@ class DeepseekV4Model(nn.Module):
             else None
         )
         self.engram_layout = EngramLayout.from_config(config)
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: DeepseekV4DecoderLayer(
                 config=config,
@@ -4349,8 +4349,6 @@ class DeepseekV4Model(nn.Module):
                 hc_stats_stream=self.hc_stats_stream,
                 moe_routed_quant_stream=self.moe_routed_quant_stream,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:

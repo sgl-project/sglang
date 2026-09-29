@@ -55,7 +55,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_exec, get_parallel
-from sglang.srt.utils import LazyValue, add_prefix, make_layers
+from sglang.srt.utils import LazyValue, add_prefix, make_pp_layers
 
 logger = logging.getLogger(__name__)
 
@@ -527,7 +527,7 @@ class LagunaModel(nn.Module):
             self.embed_tokens = PPMissingLayer()
 
         decoder_layer_type = decoder_layer_type or LagunaDecoderLayer
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: decoder_layer_type(
                 layer_id=idx,
@@ -535,8 +535,6 @@ class LagunaModel(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
