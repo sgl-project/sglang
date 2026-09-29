@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.hc_mix_flydsl import flydsl_hc_mix_supported, weight_cache_key
 from sglang.srt.layers.hc_mix_triton import fused_hc_mix, fused_hc_mix_supported
 
@@ -179,7 +180,8 @@ class GatedResidual(HyperConnectionBase):
             )
             vecs = self.hc_count * self.hidden_size // 8
             self._split_combine_ok = (
-                self._jit_combine_ok
+                envs.SGLANG_HC_COMBINE_SPLIT.get()
+                and self._jit_combine_ok
                 and vecs % (8 * 160) == 0
                 and (self.hidden_size // 8) % (vecs // 8) == 0
             )
@@ -273,9 +275,9 @@ class GatedResidual(HyperConnectionBase):
             if self._mix_flydsl_weight_key != key:
                 self._mix_flydsl_weights = pack_hc_weights(down, up, self.hc_count)
                 self._mix_flydsl_weight_key = key
-            mixed_input = hc_mix(
-                hyper_input_normed, *self._mix_flydsl_weights
-            ).to(self.params_dtype)
+            mixed_input = hc_mix(hyper_input_normed, *self._mix_flydsl_weights).to(
+                self.params_dtype
+            )
         elif fused_hc_mix_supported(
             hyper_input_normed,
             self.input_mix_weight_down.weight,

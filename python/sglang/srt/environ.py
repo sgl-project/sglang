@@ -879,6 +879,8 @@ class Envs:
     # one CTA streams well inside a single launch. Default ON elsewhere, where
     # launches are cheaper and the split was tuned.
     SGLANG_HC_COMBINE_SPLIT = EnvBool(lambda: not _default_hip())
+    # Enable split HC combine for eligible shapes and batches of at most 32 rows.
+    # Set to 0 before server startup to use the unsplit combine kernel instead.
     SGLANG_USE_AITER_AG = EnvBool(True)
     # Use reduce_scatter (instead of all_reduce + dp_scatter) for the equal-chunk
     # MAX_LEN DP-MoE combine. Default ON for ROCm/HIP (uses the aiter custom
