@@ -234,7 +234,8 @@ class StagePlan:
 
     @property
     def input_on_attn_tp_slices(self):
-        return TokenAxis.ATTN_TP in self.incoming_residual_rows.sharded
+        entry = self.paths[BatchVariant.ORDINARY].entry
+        return TokenAxis.ATTN_TP in entry.input_rows.sharded
 
     def variant_for(self, forward_batch):
         # The batch determines its rows; missing paths must not change them.
