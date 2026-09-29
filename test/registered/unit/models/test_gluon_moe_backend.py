@@ -438,7 +438,7 @@ def test_glm_dispatch_covers_tp4_and_tp8_target_and_nextn_ranges():
         assert _kernel_name(4, 1, False, m).startswith("fused_moe_tp4_")
         assert _kernel_name(4, 1, True, m).startswith("fused_moe_tp4_")
     for total_tp, ep_size in ((4, 4), (8, 2), (8, 4), (8, 8)):
-        for m in range(1, 16769):
+        for m in range(1, 32769):
             assert _kernel_name(total_tp, ep_size, False, m).startswith(
                 "fused_moe_tp4_"
             )
@@ -468,7 +468,7 @@ def test_glm_ep_avoids_full_expert_exact_m_kernel(ep_size, m):
         (8, 1, False, 32769),
         (8, 1, True, 32769),
         (4, 1, False, 32769),
-        (4, 4, False, 16769),
+        (4, 4, False, 32769),
     ),
 )
 def test_glm_dispatch_rejects_uncovered_shapes(total_tp, ep_size, is_nextn, m):

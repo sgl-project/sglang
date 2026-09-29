@@ -79,7 +79,10 @@ def _kernel_name(total_tp: int, ep_size: int, is_nextn: bool, m: int) -> str:
             return "fused_moe_tp4_m1_16"
         if m <= 4192:
             return "fused_moe_tp4_m128_4192"
-        if m <= 16768:
+        if m <= 32768 and ep_size > 1:
+            # The rank-local shared kernel accepts arbitrary expert offsets and
+            # local expert banks, so it also covers 32K EP prefill.  Keep EP1
+            # on the dedicated full-expert adapter below.
             return "fused_moe_tp4_m4193_16768_shared"
         if total_tp == 4 and ep_size == 1 and m <= 32768:
             return "fused_moe_tp4_m16769_32768_shared"
