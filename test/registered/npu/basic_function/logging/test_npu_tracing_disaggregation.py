@@ -37,6 +37,7 @@ class TestNPUTracingDisaggregation(TestDisaggregationBase):
         os.environ["ASCEND_MF_STORE_URL"] = "tcp://127.0.0.1:24666"
         os.environ["SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS"] = "50"
         os.environ["SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE"] = "4"
+        os.environ["ASCEND_MF_TRANSFER_PROTOCOL"] = "device_urma"
 
         # Initialize collector first
         cls.collector = LightweightOtlpCollector()
