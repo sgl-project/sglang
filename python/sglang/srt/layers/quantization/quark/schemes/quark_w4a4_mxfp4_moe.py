@@ -227,6 +227,14 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         if self.quantize_shared_expert_online and getattr(
             layer, "_has_fused_shared", False
         ):
+            if hidden_size % OCP_MX_BLOCK_SIZE:
+                raise ValueError(
+                    f"Quantizing the shared expert at load time needs a hidden "
+                    f"size that is a multiple of the MX block size "
+                    f"{OCP_MX_BLOCK_SIZE}, got {hidden_size}: it is the K "
+                    f"dimension the gate and up projections are block-scaled "
+                    f"along."
+                )
             if intermediate_size_per_partition % OCP_MX_BLOCK_SIZE:
                 raise ValueError(
                     f"Quantizing the shared expert at load time needs an "
@@ -250,6 +258,10 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         params_dtype = torch.uint8
 
         layer._load_device = torch.get_default_device()
+        # Captured here because create_weights runs on the main thread, while
+        # the weight loader may run on worker threads under multithreaded load,
+        # where torch's default device is a different thread-local.
+        self._load_device = layer._load_device
         layer._w13_loaded_numel = 0
         layer._w2_loaded_numel = 0
 
@@ -644,7 +656,7 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
                 "Fusing an unquantized shared expert into MXFP4 routed experts "
                 "needs aiter's dynamic_mxfp4_quant, which is AMD ROCm only."
             )
-        return dynamic_mxfp4_quant(loaded_weight.to(torch.get_default_device()))
+        return dynamic_mxfp4_quant(loaded_weight.to(self._load_device))
 
     def get_online_fp8_to_mxfp4_weight_loader(self, layer, original_weight_loader):
         """

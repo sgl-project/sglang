@@ -1018,7 +1018,7 @@ class QuarkConfig(QuantizationConfig):
                 dequantization_config=self.dequantization_config,
                 quantize_shared_expert_online=self.shared_expert_needs_online_mxfp4(),
             )
-        if self._is_mx_w4a8(weight_config, input_config):
+        elif self._is_mx_w4a8(weight_config, input_config):
             logger.info_once("Using Quark MXFP4-W/FP8-A MoE scheme")
             return QuarkW4A8MXFp4MoE(weight_config, input_config)
         elif self._is_fp8_w8a8(weight_config, input_config):
@@ -1076,14 +1076,21 @@ class QuarkConfig(QuantizationConfig):
         Names the checkpoint does not carry fall back to the global spec, so a
         non-MXFP4 global spec conservatively disables fusion.
         """
-        if not (
-            envs.SGLANG_USE_AITER.get()
-            and is_hip()
-            and is_gfx95_supported()
-            and self.is_prequantized
-            and envs.SGLANG_FUSE_SHARED_EXPERTS_ONLINE_MXFP4.get()
-        ):
+        if not envs.SGLANG_FUSE_SHARED_EXPERTS_ONLINE_MXFP4.get():
             return False
+
+        if not envs.SGLANG_USE_AITER.get():
+            return self._warn_online_mxfp4_unavailable("SGLANG_USE_AITER is not set")
+        if not is_hip():
+            return self._warn_online_mxfp4_unavailable("this is not a ROCm build")
+        if not is_gfx95_supported():
+            return self._warn_online_mxfp4_unavailable(
+                "the device has no FP4 support (needs gfx95x, e.g. MI355X)"
+            )
+        if not self.is_prequantized:
+            return self._warn_online_mxfp4_unavailable(
+                "the checkpoint is not prequantized"
+            )
 
         lookup_stub = torch.nn.Module()
         try:
@@ -1092,12 +1099,33 @@ class QuarkConfig(QuantizationConfig):
                 for base in _MOE_SHARED_EXPERT_QUANT_LAYER0_BASES
             ]
         except ValueError:
-            return False
+            return self._warn_online_mxfp4_unavailable(
+                "the layer-0 MoE quantization config could not be resolved"
+            )
 
-        return all(
+        if not all(
             self._is_mx_fp4(cfg.get("weight"), cfg.get("input_tensors"))
             for cfg in moe_configs
+        ):
+            return self._warn_online_mxfp4_unavailable(
+                "the routed experts are not MXFP4"
+            )
+        return True
+
+    @staticmethod
+    def _warn_online_mxfp4_unavailable(reason: str) -> bool:
+        """Report an opt-in that cannot be honoured, and answer "unsupported".
+
+        Only reached when the checkpoint's shared expert really is excluded
+        from quantization, so the flag was asked for and is being dropped;
+        without this the fallback to a standalone shared expert is silent.
+        """
+        logger.warning_once(
+            "SGLANG_FUSE_SHARED_EXPERTS_ONLINE_MXFP4 is set but the shared "
+            f"expert will not be quantized or fused because {reason}. The model "
+            "runs with a standalone shared expert instead."
         )
+        return False
 
     def shared_expert_needs_online_mxfp4(self) -> bool:
         """Whether the fused shared slot has to be quantized while loading.
