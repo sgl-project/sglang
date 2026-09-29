@@ -156,6 +156,17 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.capture_aux_hidden_states = True
         self.model.set_dflash_layers_to_capture(layers_to_capture)
 
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[list[int]] = None):
+        if not self.pp_group.is_last_rank:
+            return
+        self.capture_aux_hidden_states = True
+        if layer_ids is None:
+            num_layers = len(self.model.layers)
+            layers_to_capture = [2, num_layers // 2, num_layers - 3]
+        else:
+            layers_to_capture = [val + 1 for val in layer_ids]
+        self.model.set_eagle3_layers_to_capture(layers_to_capture)
+
     @torch.no_grad()
     def forward(
         self,

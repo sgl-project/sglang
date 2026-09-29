@@ -55,6 +55,23 @@ class TestQwen3EagleCapture(CustomTestCase):
         self.assertTrue(layers[5]._is_layer_to_capture)
         self.assertTrue(layers[9]._is_layer_to_capture)
 
+    def test_qwen3_5_text_wrapper_forwards_eagle3_capture(self):
+        from sglang.srt.models.qwen3_5_text import Qwen3_5ForCausalLM as TextWrapper
+
+        layers = [SimpleNamespace() for _ in range(12)]
+        backbone = Qwen3_5ForCausalLM.__new__(Qwen3_5ForCausalLM)
+        backbone.layers = layers
+        backbone.layers_to_capture = []
+        wrapper = _mock_wrapper(TextWrapper, backbone)
+
+        wrapper.set_eagle3_layers_to_capture([1, 4, 8])
+
+        self.assertTrue(wrapper.capture_aux_hidden_states)
+        self.assertEqual(backbone.layers_to_capture, [2, 5, 9])
+        self.assertTrue(layers[2]._is_layer_to_capture)
+        self.assertTrue(layers[5]._is_layer_to_capture)
+        self.assertTrue(layers[9]._is_layer_to_capture)
+
 
 if __name__ == "__main__":
     unittest.main()
