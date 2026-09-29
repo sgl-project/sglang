@@ -170,8 +170,10 @@ def test_cache_linker_attachment_is_backend_independent():
     cache.tree_core = SimpleNamespace(
         enable_external_cache_linker=False,
         write_through_threshold=256,
+        page_size=64,
     )
     cache.tree_components = (ComponentType.FULL,)
+    cache._transfer_page_size = 64
     cache.linker = None
     cache._components_tuple = ()
     cache.components = {}

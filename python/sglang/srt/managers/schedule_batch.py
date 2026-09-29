@@ -3038,24 +3038,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return i + 1
 
         prefix_len = len(req.prefix_indices)
-        seq_end = prefix_len + req.extend_range.length
-        if get_parallel().dcp_enabled:
-            # DCP widens radix pages beyond scheduler chunk boundaries. Pick an
-            # absolute page depth only when the kernel produced an h snapshot.
-            mamba_track_seqlen_aligned = (seq_end // checkpoint_grid) * checkpoint_grid
-            mask = (
-                mamba_track_seqlen_aligned > prefix_len
-                and (mamba_track_seqlen_aligned - prefix_len) % cache_chunk_size == 0
-            )
-        else:
-            # Chunked prefill can leave an active request off the absolute
-            # checkpoint grid. Without DCP, keep tracking snapshots relative to
-            # that request prefix so later chunks can continue donating states.
-            mask = req.extend_range.length >= checkpoint_grid
-            mamba_track_seqlen_aligned = (
-                prefix_len
-                + (req.extend_range.length // checkpoint_grid) * checkpoint_grid
-            )
+        extend_end = prefix_len + req.extend_range.length
+        checkpoint = extend_end // checkpoint_grid * checkpoint_grid
+        # Continuing chunks need not start on the widened tree grid. Select an
+        # absolute tree boundary, and only save a state available on this
+        # extend's kernel snapshot grid. A short extend can cross that boundary.
+        mask = (
+            checkpoint > prefix_len
+            and (checkpoint - prefix_len) % cache_chunk_size == 0
+        )
         track_index = req.kv.mamba_ping_pong_track_buffer[
             req.kv.mamba_next_track_idx
         ].item()
@@ -3068,7 +3059,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # otherwise retrieved from h (i.e. unaligned).
             # We need to pass the non-aligned seqlen to the calculation. Even though
             # we pass in mamba_track_seqlen, the actual tracked seqlen is mamba_last_track_seqlen.
-            mamba_track_seqlen = seq_end
+            mamba_track_seqlen = len(req.prefix_indices) + req.extend_range.length
+
+            # mamba_track_seqlen_aligned/mamba_last_track_seqlen is actual tracked seqlen. Used to pass to
+            # mamba radix cache to track which seqlen this mamba state should store at.
+            mamba_track_seqlen_aligned = checkpoint
 
             # A coarser checkpoint grid may not be a model-state boundary, so
             # force retrieval from the intermediate h state in that case.
@@ -3101,6 +3096,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     req.mamba_branching_seqlen > len(req.prefix_indices)
                     and req.mamba_branching_seqlen < mamba_track_seqlen
                     and branching_seqlen_aligned_mask
+                    and req.mamba_branching_seqlen % checkpoint_grid == 0
                 ):
                     # We want to track mamba_track_seqlen_aligned, and it's not the last position,
                     # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.

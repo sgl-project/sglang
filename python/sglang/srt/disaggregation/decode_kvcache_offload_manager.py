@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     build_hybrid_swa_stack,
     build_kv_host_pool,
+    get_mla_host_kv_cache_dim,
 )
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
@@ -117,6 +118,13 @@ class DecodeKVCacheOffloadManager:
                 kv_pool=self.kv_cache,
                 page_size=self.page_size,
                 use_mla=isinstance(self.kv_cache, MLATokenToKVPool),
+                override_kv_cache_dim=(
+                    get_mla_host_kv_cache_dim(
+                        self.kv_cache, get_memory().hicache_mem_layout
+                    )
+                    if isinstance(self.kv_cache, MLATokenToKVPool)
+                    else None
+                ),
             )
             self.cache_controller = HiCacheController(
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
