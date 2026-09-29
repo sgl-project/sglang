@@ -23,91 +23,24 @@ SGLang is an open-source inference framework for LLMs and multimodal models, opt
 
 👋 Get started below, or meet the community at [SGLang Events](https://www.sglang.io/events), including meetups, developer meetings, workshops, and office hours.
 
-## Install and Quick Start
+## Get Started
 
-### 1. Install
-
-Choose one of the following options. These commands target Linux with NVIDIA GPUs and a CUDA 13-compatible driver. For other platforms, see [Supported Hardware](#supported-hardware).
-
-#### Option A: Install with Docker
-
-Prerequisites: Docker and NVIDIA Container Toolkit.
-
-Pull the image, which includes SGLang and its dependencies:
+Pull the Docker image, which includes SGLang and its dependencies:
 
 ```bash
 docker pull lmsysorg/sglang:latest
 ```
 
-Start a container shell:
+Alternatively, install SGLang in an activated Python environment with uv:
 
 ```bash
-HF_CACHE_DIR="$HOME/.cache/huggingface"
-docker run -it --gpus all \
-  --shm-size 32g \
-  -p 30000:30000 \
-  -v "$HF_CACHE_DIR:/root/.cache/huggingface" \
-  --ipc=host \
-  lmsysorg/sglang:latest bash
-```
-
-#### Option B: Install with uv
-
-Prerequisites: [uv](https://docs.astral.sh/uv/getting-started/installation/).
-
-Create and activate a virtual environment, then install SGLang:
-
-```bash
-uv venv --python 3.12
-source .venv/bin/activate
 uv pip install --prerelease=allow sglang
 ```
 
-### 2. Start the server
+Next, launch your model:
 
-The following example serves Qwen3.8-27B-FP8. For other models, find launch commands in the [SGLang Cookbook](https://cookbook.sglang.io/).
-
-Run the following command inside the Docker container or in your activated Python environment:
-
-```bash
-sglang serve \
-  --trust-remote-code \
-  --model-path Qwen/Qwen3.8-27B-FP8 \
-  --kv-cache-dtype fp8_e4m3 \
-  --mem-fraction-static 0.85 \
-  --attention-backend flashinfer \
-  --chunked-prefill-size 32768 \
-  --max-prefill-tokens 32768 \
-  --reasoning-parser qwen3 \
-  --tool-call-parser qwen3_coder \
-  --mamba-full-memory-ratio 4.59 \
-  --host 0.0.0.0 \
-  --port 30000 \
-  --mamba-radix-cache-strategy extra_buffer \
-  --mamba-ssm-dtype float32
-```
-
-### 3. Send a request
-
-Send a test request to verify that the server is reachable and the model can generate a response. Once the server is ready, run in another terminal:
-
-```bash
-curl http://localhost:30000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "Qwen/Qwen3.8-27B-FP8",
-    "messages": [
-      {
-        "role": "user",
-        "content": "What is the capital of France?"
-      }
-    ]
-  }'
-```
-
-The answer is in `choices[0].message.content`. See the [Quickstart guide](https://docs.sglang.io/docs/get-started/quickstart) for more API examples.
-
-Clients can use an existing OpenAI-compatible endpoint without installing SGLang locally.
+- [Quickstart](https://docs.sglang.io/docs/get-started/quickstart): Run your first model and send a request.
+- [Cookbook](https://cookbook.sglang.io/): Choose your model and hardware to get a ready-to-run launch command.
 
 ## Supported Hardware
 
