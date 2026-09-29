@@ -756,6 +756,7 @@ class TboForwardBatchPreparer:
             "dp_spec_prefill_coordination_applied",
             "return_logprob",
             "can_run_decode_cuda_graph",
+            "can_run_dp_draft_cuda_graph",
             "can_run_dp_prefill_cuda_graph",
             "dp_prefill_cuda_graph_max_prefix_len",
             "dp_padding_mode",
