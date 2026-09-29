@@ -841,9 +841,29 @@ def run_single(
         warmup_requests = int((config or {}).get("warmup_requests", 1))
         for warmup_index in range(warmup_requests):
             print(f"  Sending warmup request {warmup_index + 1}/{warmup_requests}...")
-            latency = send_request(base_url, case, framework, config)
+            first_dump_path = None
+            if framework == "sglang" and warmup_index == 0:
+                # stage timings of the cold request, to set against the
+                # steady-state stage medians
+                first_dump_path = str(
+                    (log_dir / f"perf_{case['id']}_first.json").resolve()
+                )
+                if os.path.exists(first_dump_path):
+                    os.remove(first_dump_path)
+            latency = send_request(
+                base_url, case, framework, config, perf_dump_path=first_dump_path
+            )
             if warmup_index == 0:
                 result["first_request_latency_s"] = round(latency, 3)
+                first_dump = (
+                    _read_perf_dump(first_dump_path) if first_dump_path else None
+                )
+                if first_dump is not None:
+                    result["first_request_stage_ms"] = {
+                        stage["name"]: round(float(stage["duration_ms"]), 3)
+                        for stage in first_dump.get("steps", [])
+                        if stage.get("name") and stage.get("duration_ms") is not None
+                    }
         result["warmup_requests"] = warmup_requests
 
         latency_samples: list[float] = []
