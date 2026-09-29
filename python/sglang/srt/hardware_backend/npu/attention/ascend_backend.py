@@ -85,7 +85,7 @@ def _dcp_lse_from_softmax(
 ) -> torch.Tensor:
     """The operator's two softmax halves -> the ``[T, H]`` LSE the merge takes.
 
-    ``npu_sparse_flash_attention_lse`` returns the two halves separately,
+    ``sgl_sparse_flash_attention`` returns the two halves separately,
     matching vLLM-Ascend's vendored operator, and the caller reconstructs.
     Under ``layout_query="TND"`` both come back as ``(N2, T, G)`` while
     ``cp_lse_ag_out_rs_mla`` wants ``[B, H]``, so the head axes are flattened
@@ -345,7 +345,7 @@ def _cp_allgather_and_save_kv_npu(
 
 
 _MISSING_SPARSE_FA_LSE = (
-    "DCP decode on Ascend needs torch.ops.npu.npu_sparse_flash_attention_lse, "
+    "DCP decode on Ascend needs torch.ops.npu.sgl_sparse_flash_attention, "
     "which ships in sgl-kernel-npu and is not part of CANN. It is not "
     "registered in this install. Install or rebuild sgl-kernel-npu, or run with "
     "--dcp-size 1."
@@ -478,15 +478,18 @@ class AscendAttnBackend(AttentionBackend):
 
         self.attn_cp_size = model_runner.attn_cp_size
 
-        # ``npu_sparse_flash_attention_lse`` is vendored in sgl-kernel-npu, not a
-        # CANN operator. CANN refuses ``return_softmax_lse`` under PA_BSND, its
-        # only paged layout, so the DCP partial-output merge has nowhere else to
-        # get an LSE from. Checked once here so a stock install says what is
-        # missing at startup instead of raising a bare AttributeError on the
-        # first DCP decode, naming neither DCP nor the package to install.
-        self.has_sparse_fa_lse = hasattr(
-            torch.ops.npu, "npu_sparse_flash_attention_lse"
-        )
+        # ``sgl_sparse_flash_attention`` is sgl-kernel-npu's operator, not a CANN
+        # one. CANN refuses ``return_softmax_lse`` under PA_BSND, its only paged
+        # layout, so the DCP partial-output merge has nowhere else to get an LSE
+        # from. Checked once here so a stock install says what is missing at
+        # startup instead of raising a bare AttributeError on the first DCP
+        # decode, naming neither DCP nor the package to install.
+        #
+        # The ``sgl_`` prefix is deliberate upstream: it keeps the operator in
+        # the ``npu`` namespace without colliding with torch_npu's own
+        # ``npu_sparse_flash_attention`` schema, which is the one the non-DCP
+        # call below uses. The two names differ by more than a suffix on purpose.
+        self.has_sparse_fa_lse = hasattr(torch.ops.npu, "sgl_sparse_flash_attention")
         if self.use_mla and get_parallel().dcp_enabled and not self.has_sparse_fa_lse:
             # A warning, not a raise: a prefill-only node (PD disaggregation) can
             # run with --dcp-size > 1 and never reach the decode that needs it.
@@ -1468,11 +1471,12 @@ class AscendAttnBackend(AttentionBackend):
 
                 if dcp_decode:
                     # CANN refuses return_softmax_lse under PA_BSND, its only
-                    # paged layout, so DCP calls the vendored port instead.
+                    # paged layout, so DCP calls sgl-kernel-npu's operator
+                    # instead. Same kwargs, same three outputs.
                     if not self.has_sparse_fa_lse:
                         raise RuntimeError(_MISSING_SPARSE_FA_LSE)
                     attn_out, softmax_max, softmax_sum = (
-                        torch.ops.npu.npu_sparse_flash_attention_lse(
+                        torch.ops.npu.sgl_sparse_flash_attention(
                             **call, return_softmax_lse=True
                         )
                     )
