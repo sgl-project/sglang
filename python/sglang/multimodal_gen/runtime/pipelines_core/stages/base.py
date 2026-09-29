@@ -417,6 +417,8 @@ class PipelineStage(StageDedupMixin, ABC):
         # Execute the actual stage logic with unified profiling.
         previous_batch_is_warmup = self._current_batch_is_warmup
         metrics = batch.metrics
+        if metrics is not None and self.role_affinity == RoleType.DENOISER:
+            metrics.denoising_stages.add(stage_name)
         warmup_metrics = metrics if batch.is_warmup else None
         previous_active_stage = (
             warmup_metrics.active_stage_name if warmup_metrics is not None else None

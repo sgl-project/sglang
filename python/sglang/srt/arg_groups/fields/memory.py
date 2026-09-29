@@ -1,11 +1,4 @@
-"""Config fields of the ``memory`` namespace.
-
-One class per namespace. The class *is* the namespace: a field declared here
-lands in the ``memory`` bag, which is what ``get_memory()`` returns, so a reader
-spells it exactly as before. ``ServerArgs`` composes these classes, so the
-record stays one flat object -- the split moves where declarations live, not
-how config is shaped at runtime.
-"""
+"""Config fields of the ``memory`` namespace."""
 
 from __future__ import annotations
 
@@ -119,6 +112,10 @@ class Memory(msgspec.Struct):
         int,
         "The size of host KV cache memory pool in gigabytes. Overrides --hicache-ratio in either host memory mode.",
     ] = 0
+    hicache_host_memory_fraction: A[
+        Optional[float],
+        "Fraction of the available host memory, bounded by visible cgroup memory.max/memory.high or v1 memory limits (after a 10 GiB reserve) that the HiCache host pools of all ranks on this machine may use. Applies only when neither --hicache-ratio nor --hicache-size is set: the default ratio is then reduced until the pools fit. Lower it when several engines share a memory cgroup.",
+    ] = 0.8
     hicache_write_policy: A[
         str,
         Arg(
@@ -149,7 +146,7 @@ class Memory(msgspec.Struct):
     hicache_storage_backend: A[
         Optional[str],
         Arg(
-            help="The storage backend for hierarchical KV cache. Built-in backends: file, mooncake, npu_memcache, hf3fs, nixl, aibrix. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name).",
+            help="The storage backend for hierarchical KV cache. Built-in backends: file, mooncake, npu_memcache, hf3fs, nixl, aibrix, tensorcast. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name).",
             choices=[
                 "file",
                 "sim",
@@ -163,6 +160,7 @@ class Memory(msgspec.Struct):
                 "simm",
                 "mori",
                 "shm",
+                "tensorcast",
             ],
         ),
     ] = None
@@ -216,6 +214,10 @@ class Memory(msgspec.Struct):
             choices=["mooncake", "mori"],
         ),
     ] = "mooncake"
+    enable_linker_mla_dedup: A[
+        bool,
+        "Load replicated MLA KV on rank 0 and broadcast each layer with the Mooncake linker.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention

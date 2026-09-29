@@ -391,7 +391,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
         candidate_path=(
             "python/sglang/srt/layers/flashinfer_comm_fusion.py"
             "<br>python/sglang/srt/layers/layernorm.py"
-            "<br>python/sglang/srt/layers/communicator.py"
+            "<br>python/sglang/srt/layers/layer_boundary/residual/add_norm.py"
         ),
         active_keywords=(
             "allreduce_fusion",
@@ -419,7 +419,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
         pattern="AITER allreduce fusion",
         candidate_path=(
             "python/sglang/srt/distributed/communication_op.py"
-            "<br>python/sglang/srt/layers/communicator.py"
+            "<br>python/sglang/srt/layers/layer_boundary/residual/add_norm.py"
             "<br>python/sglang/srt/layers/layernorm.py"
         ),
         active_keywords=(
@@ -721,7 +721,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
     FusionPatternSpec(
         pattern="DeepSeek comm-prep fused RMSNorm + quant / flatten-quant",
         candidate_path=(
-            "python/sglang/srt/layers/communicator.py"
+            "python/sglang/srt/layers/layer_boundary/residual/add_norm.py"
             "<br>python/sglang/srt/models/deepseek_common/attention_forward_methods/"
             "forward_mla.py"
             "<br>python/sglang/srt/models/deepseek_common/attention_forward_methods/"
