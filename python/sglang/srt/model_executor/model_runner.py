@@ -422,6 +422,8 @@ class ModelRunner:
             )
             raise
 
+        self.init_cuda_event_pool()
+
         # Get available memory before model loading.
         # Stored for later use by alloc_memory_pool().
         self.init_torch_distributed()
@@ -1158,6 +1160,29 @@ class ModelRunner:
             moe_ep_size=get_parallel().moe_ep_size,
             moe_dp_size=get_parallel().moe_dp_size,
         )
+
+    def init_cuda_event_pool(self):
+        if not (
+            current_platform.is_cuda() and envs.SGLANG_ENABLE_CUDA_EVENT_POOL.get()
+        ):
+            return
+        from sglang.srt.utils.cuda_event_pool import (
+            install_cuda_event_pool,
+            prewarm_cuda_event_pool,
+        )
+
+        gpu_id = get_device().gpu_id
+        installed = install_cuda_event_pool(
+            pool_size=envs.SGLANG_CUDA_EVENT_POOL_SIZE.get()
+        )
+        pool_state = prewarm_cuda_event_pool(gpu_id)
+        if installed and pool_state is not None:
+            logger.info(
+                "Enabled the CUDA event pool for Stream.wait_stream on "
+                "device %d with %d events.",
+                gpu_id,
+                pool_state["size"],
+            )
 
     def init_torch_distributed(self):
         self.pre_model_load_memory = bootstrap.measure_pre_model_load_memory(
