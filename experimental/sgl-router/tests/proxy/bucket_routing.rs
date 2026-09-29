@@ -457,60 +457,6 @@ async fn decode_bucket_uses_input_plus_requested_output_budget() {
     );
 }
 
-/// One prefill's version group has no decode bucket that fits the request, so
-/// selection falls back to another group instead of failing.
-#[tokio::test]
-async fn decode_bucket_mismatch_falls_back_to_another_version_group() {
-    use crate::common::mock_worker::MockWorker;
-    let workers: Vec<_> =
-        futures::future::join_all((0..4).map(|_| MockWorker::start(vec![]))).await;
-    let mut short = bucket("d-v1", BucketStage::Decode, 20, "d-v1");
-    short.max_sequence_tokens = Some(1_024);
-    let bucket_config = BucketConfig {
-        buckets: vec![
-            bucket("p-v1", BucketStage::Prefill, 10, "p-v1"),
-            bucket("p-v2", BucketStage::Prefill, 11, "p-v2"),
-            short,
-            bucket("d-v2", BucketStage::Decode, 30, "d-v2"),
-        ],
-        ttft_slo_policy: SloBucketPolicy::Disabled,
-        tps_slo_policy: SloBucketPolicy::Disabled,
-    };
-    let specs = [
-        ("p-v1", WorkerMode::Prefill, "v1"),
-        ("p-v2", WorkerMode::Prefill, "v2"),
-        ("d-v1", WorkerMode::Decode, "v1"),
-        ("d-v2", WorkerMode::Decode, "v2"),
-    ]
-    .into_iter()
-    .zip(&workers)
-    .map(|((id, mode, group), worker)| WorkerSpec {
-        version_group: Some(group.into()),
-        ..worker_spec(id, worker.url.clone(), mode)
-    })
-    .collect();
-    let ctx = build_ctx(specs, bucket_config, PolicyKind::PowerOfTwo, None);
-    let response = build_router(ctx.clone())
-        .oneshot(chat_request(None, Some(2_000)))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let dispatched: Vec<_> = workers
-        .iter()
-        .map(|w| w.captured.lock().unwrap().last_body.is_some())
-        .collect();
-    assert_eq!(dispatched, [false, true, false, true]);
-    let metrics = ctx.metrics.render();
-    assert!(metrics.contains(r#"sgl_router_pd_version_group_fallback_total{model_id="tiny"} 1"#));
-    // The skipped group never wins a prefill pick that would then be discarded.
-    let prefill_picks: u64 = metrics
-        .lines()
-        .filter(|line| line.starts_with("sgl_router_policy_decisions_total{"))
-        .map(|line| line.rsplit(' ').next().unwrap().parse::<u64>().unwrap())
-        .sum();
-    assert_eq!(prefill_picks, 1);
-}
-
 #[tokio::test]
 async fn decode_tries_later_compatible_bucket_before_capacity_fallback() {
     let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;

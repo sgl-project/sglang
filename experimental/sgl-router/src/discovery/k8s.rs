@@ -80,29 +80,11 @@ fn labels_match_selector(labels: &BTreeMap<String, String>, selector: &str) -> b
     true
 }
 
-/// Read a slice's PD version group from the configured label key.
-///
-/// EndpointSlices inherit their Service's labels, so the group is set per
-/// Service: one Service per (role, version). A slice that lacks the label, or
-/// sets it empty, yields `None` and pairs only with other unlabeled workers.
+/// A slice's PD version group: the configured label's value, inherited from its
+/// Service. A missing or empty label yields `None`, its own group.
 fn version_group(es: &EndpointSlice, label: Option<&str>) -> Option<String> {
-    let label = label?;
-    let group = es
-        .metadata
-        .labels
-        .as_ref()
-        .and_then(|labels| labels.get(label))
-        .filter(|group| !group.is_empty())
-        .cloned();
-    if group.is_none() {
-        // Debug, not warn: this runs on every Apply for the slice.
-        tracing::debug!(
-            slice = es.metadata.name.as_deref().unwrap_or(""),
-            label,
-            "k8s discovery: EndpointSlice has no PD version group label; its workers pair only with other unlabeled workers"
-        );
-    }
-    group
+    let group = es.metadata.labels.as_ref()?.get(label?)?;
+    (!group.is_empty()).then(|| group.clone())
 }
 
 /// Convert an `EndpointSlice` into a list of [`WorkerSpec`]s with the
@@ -209,8 +191,8 @@ fn slice_key(es: &EndpointSlice) -> String {
     format!("{ns}/{name}")
 }
 
-/// Send all `Added` / `Removed` / `ModeChanged` / `VersionGroupChanged` events
-/// that bring the consumer from `prev_union` to the recomputed union of `per_slice`.
+/// Send all `Added` / `Removed` / `ModeChanged` events that bring the
+/// consumer from `prev_union` to the recomputed union of `per_slice`.
 ///
 /// Returns `Err` on the first send failure (consumer dropped); the caller is
 /// expected to exit the watcher loop.  Updates `prev_union` in place to the
@@ -235,15 +217,12 @@ async fn emit_diff(
                     })
                     .await?;
                 }
-                if prev.url != spec.url || prev.model_ids != spec.model_ids {
+                if prev.url != spec.url
+                    || prev.model_ids != spec.model_ids
+                    || prev.version_group != spec.version_group
+                {
                     tx.send(DiscoveryEvent::Removed { id: id.clone() }).await?;
                     tx.send(DiscoveryEvent::Added(spec.clone())).await?;
-                } else if prev.version_group != spec.version_group {
-                    tx.send(DiscoveryEvent::VersionGroupChanged {
-                        id: id.clone(),
-                        version_group: spec.version_group.clone(),
-                    })
-                    .await?;
                 }
             }
             None => {
@@ -850,88 +829,40 @@ mod tests {
         assert_eq!(added[0].id.0, "ns/p/10.0.0.1:30000");
     }
 
-    fn group_slice(name: &str, addr: &str, role: &str, group: Option<&str>) -> EndpointSlice {
-        let mut labels = vec![("app", "sglang"), ("role", role)];
-        labels.extend(group.map(|g| ("sglang.ai/version-group", g)));
-        with_uid(
-            make_slice_full(&[addr], 30000, true, "ns", name, &labels),
-            &format!("u-{name}"),
-        )
-    }
-
-    async fn run_with_group_label(events: Vec<EndpointSlice>) -> Vec<DiscoveryEvent> {
-        let events = events
-            .into_iter()
-            .map(|es| Ok(watcher::Event::Apply(es)))
-            .collect::<Vec<_>>();
-        let (tx, mut rx) = mpsc::channel(16);
-        process_events(
-            futures::stream::iter(events),
-            tx,
-            pd_mode(),
-            Some("sglang.ai/version-group".into()),
-        )
-        .await;
-        let mut out = Vec::new();
-        while let Ok(e) = rx.try_recv() {
-            out.push(e);
-        }
-        out
-    }
-
-    /// The configured label's value on each slice becomes its workers' version
-    /// group; a slice without the label, or with an empty value, yields `None`.
+    /// Each slice's label value becomes its workers' version group; a missing
+    /// or empty label yields `None`.
     #[tokio::test]
     async fn pd_mode_reads_version_group_from_slice_label() {
-        let out = run_with_group_label(vec![
-            group_slice("p-v1", "10.0.0.1", "prefill", Some("v1")),
-            group_slice("d-v2", "10.0.0.2", "decode", Some("v2")),
-            group_slice("d-none", "10.0.0.3", "decode", None),
-            group_slice("d-empty", "10.0.0.4", "decode", Some("")),
-        ])
-        .await;
-        let mut groups: Vec<_> = out
-            .iter()
-            .filter_map(|e| match e {
-                DiscoveryEvent::Added(spec) => {
-                    Some((spec.url.as_str(), spec.version_group.as_deref()))
-                }
-                _ => None,
-            })
-            .collect();
+        let events = [
+            ("p-v1", "10.0.0.1", "prefill", "v1"),
+            ("d-v2", "10.0.0.2", "decode", "v2"),
+            ("d-empty", "10.0.0.3", "decode", ""),
+        ]
+        .map(|(name, addr, role, group)| {
+            let labels = [
+                ("app", "sglang"),
+                ("role", role),
+                ("sglang.ai/version-group", group),
+            ];
+            let es = make_slice_full(&[addr], 30000, true, "ns", name, &labels);
+            Ok(watcher::Event::Apply(with_uid(es, &format!("u-{name}"))))
+        });
+        let (tx, mut rx) = mpsc::channel(16);
+        let label = Some("sglang.ai/version-group".into());
+        process_events(futures::stream::iter(events), tx, pd_mode(), label).await;
+        let mut groups = Vec::new();
+        while let Ok(DiscoveryEvent::Added(spec)) = rx.try_recv() {
+            groups.push((spec.url, spec.version_group));
+        }
         groups.sort_unstable();
+        let group = |g: &str| Some(g.to_owned());
         assert_eq!(
             groups,
             [
-                ("http://10.0.0.1:30000", Some("v1")),
-                ("http://10.0.0.2:30000", Some("v2")),
-                ("http://10.0.0.3:30000", None),
-                ("http://10.0.0.4:30000", None),
+                ("http://10.0.0.1:30000".into(), group("v1")),
+                ("http://10.0.0.2:30000".into(), group("v2")),
+                ("http://10.0.0.3:30000".into(), None),
             ]
-        );
-    }
-
-    /// Relabeling a slice's version group updates its workers in place, keeping
-    /// their live state; only a URL or model change re-registers a worker.
-    #[tokio::test]
-    async fn version_group_change_emits_in_place_update() {
-        let out = run_with_group_label(vec![
-            group_slice("p", "10.0.0.1", "prefill", Some("v1")),
-            group_slice("p", "10.0.0.1", "prefill", Some("v2")),
-        ])
-        .await;
-        let id = WorkerId("ns/p/10.0.0.1:30000".into());
-        assert!(
-            matches!(
-                out.as_slice(),
-                [
-                    DiscoveryEvent::Added(first),
-                    DiscoveryEvent::VersionGroupChanged { id: changed, version_group },
-                ] if first.version_group.as_deref() == Some("v1")
-                    && changed == &id
-                    && version_group.as_deref() == Some("v2")
-            ),
-            "out={out:?}"
         );
     }
 

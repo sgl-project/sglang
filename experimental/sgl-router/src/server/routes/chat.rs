@@ -24,7 +24,6 @@ use axum::http::{HeaderMap, HeaderName, Response};
 use bytes::Bytes;
 use forward::{forward_chat_request, SelectedWorkers};
 use preparation::{parse_routing_fields, PreparedChatRequest};
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -116,73 +115,13 @@ async fn select_workers(
         ..RoutingContext::from_headers(ctx, headers)?
     };
 
-    let candidates = prefills_with_decode(ctx, request, candidates, resolver, &routing_context)?;
-    let prefill = pick_prefill_worker(ctx, request, policy, &candidates, &routing_context)?;
+    let prefill = pick_prefill_worker(ctx, request, policy, candidates, &routing_context)?;
     let decode = pick_decode_worker(ctx, request, &prefill, resolver, &routing_context)?;
     Ok(SelectedWorkers {
         prefill,
         decode,
         track_dispatch_timestamps: policy.needs_dispatch_timestamps(),
     })
-}
-
-/// Drop prefill candidates whose version group has no decode that can take this
-/// request, so the request falls back to another group. Decode selection has no
-/// side effects, so probing each group beats discarding a prefill pick that has
-/// already bound affinity and booked policy metrics.
-fn prefills_with_decode(
-    ctx: &AppContext,
-    request: &PreparedChatRequest,
-    candidates: &[Arc<Worker>],
-    resolver: &PdPoolResolver,
-    routing: &RoutingContext<'_>,
-) -> Result<Vec<Arc<Worker>>, ApiError> {
-    // One prefill per version group; its URL only steers host affinity, not
-    // whether the group's decodes admit the request.
-    let mut probes: Vec<&Arc<Worker>> = Vec::new();
-    for worker in candidates {
-        if probes
-            .iter()
-            .all(|probe| probe.version_group() != worker.version_group())
-        {
-            probes.push(worker);
-        }
-    }
-    if probes.len() < 2 {
-        return Ok(candidates.to_vec());
-    }
-    let mut admitted = HashSet::new();
-    let mut failure = None;
-    for prefill in &probes {
-        match pick_decode_worker(ctx, request, prefill, resolver, routing) {
-            Ok(_) => {
-                admitted.insert(prefill.version_group());
-            }
-            Err(error) => {
-                tracing::debug!(
-                    model = %request.model,
-                    version_group = ?prefill.version_group(),
-                    %error,
-                    "PD version group has no decode for this request",
-                );
-                failure = Some(error);
-            }
-        }
-    }
-    match failure {
-        Some(error) if admitted.is_empty() => Err(error),
-        Some(_) => {
-            let skipped = (probes.len() - admitted.len()) as u64;
-            ctx.metrics
-                .record_pd_version_group_fallback(&request.model.0, skipped);
-            Ok(candidates
-                .iter()
-                .filter(|worker| admitted.contains(&worker.version_group()))
-                .cloned()
-                .collect())
-        }
-        None => Ok(candidates.to_vec()),
-    }
 }
 
 fn capture_load_snapshot(

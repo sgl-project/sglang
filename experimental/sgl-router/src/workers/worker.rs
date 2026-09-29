@@ -321,6 +321,16 @@ impl Worker {
     }
 }
 
+/// Prefills whose version group has a decode in `decoders` to receive their KV.
+pub fn paired_prefills(
+    mut prefills: Vec<Arc<Worker>>,
+    decoders: &[Arc<Worker>],
+) -> Vec<Arc<Worker>> {
+    let groups: std::collections::HashSet<_> = decoders.iter().map(|d| d.version_group()).collect();
+    prefills.retain(|p| groups.contains(&p.version_group()));
+    prefills
+}
+
 impl std::fmt::Debug for Worker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Worker")

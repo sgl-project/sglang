@@ -377,32 +377,6 @@ async fn handle_discovery_event(
                 }
             }
         }
-        DiscoveryEvent::VersionGroupChanged { id, version_group } => {
-            if let Some(prev) = pending.remove(&id) {
-                let _ = prev.await;
-            }
-            let Some(w) = registry.get(&id) else {
-                tracing::warn!(
-                    id = %id,
-                    "discovery: VersionGroupChanged for unknown worker — out-of-order event from backend",
-                );
-                return;
-            };
-            tracing::info!("discovery: ~worker {id} version_group→{version_group:?}");
-            // Upsert the live entry under its new group: it keeps its breaker, load
-            // and KV-event state, and needs no re-introspection.
-            let spec = WorkerSpec {
-                id,
-                url: w.url.clone(),
-                mode: w.mode(),
-                model_ids: w.model_ids.clone(),
-                bootstrap_port: w.bootstrap_port(),
-                version_group,
-            };
-            if let Err(e) = registry.add_with_cb(spec, None, w.protocol()) {
-                tracing::warn!(error = %e, "discovery: version group update rejected");
-            }
-        }
     }
 }
 
@@ -764,45 +738,6 @@ mod tests {
 
     fn fast_introspector() -> Arc<WorkerIntrospector> {
         Arc::new(WorkerIntrospector::new(Duration::from_millis(500)))
-    }
-
-    /// A version-group change updates the live worker in place: its breaker,
-    /// in-flight load and resolved fields survive, with no re-introspection.
-    #[tokio::test]
-    async fn version_group_change_keeps_live_state() {
-        let registry = Arc::new(WorkerRegistry::default());
-        let id = WorkerId("p".into());
-        registry
-            .add(WorkerSpec {
-                id: id.clone(),
-                url: "http://127.0.0.1:1".into(),
-                mode: WorkerMode::Prefill,
-                model_ids: vec![ModelId("m".into())],
-                bootstrap_port: Some(8997),
-                version_group: Some("v1".into()),
-            })
-            .unwrap();
-        let before = registry.get(&id).unwrap();
-        let _load = before.load_guard();
-        handle_discovery_event(
-            DiscoveryEvent::VersionGroupChanged {
-                id: id.clone(),
-                version_group: Some("v2".into()),
-            },
-            &registry,
-            &None,
-            &None,
-            &None,
-            &fast_introspector(),
-            &mut HashMap::new(),
-        )
-        .await;
-        let after = registry.get(&id).unwrap();
-        assert_eq!(after.version_group(), Some("v2"));
-        assert_eq!(after.model_ids, before.model_ids);
-        assert_eq!(after.bootstrap_port(), Some(8997));
-        assert_eq!(after.router_inflight_load(), 1);
-        assert!(Arc::ptr_eq(&after.breaker, &before.breaker));
     }
 
     /// `/server_info` returns `served_model_name` => the registry entry

@@ -1576,25 +1576,22 @@ mod tests {
         }
     }
 
+    const PD_K8S: [&str; 5] = [
+        "--service-discovery",
+        "--prefill-selector",
+        "app=sglang,role=prefill",
+        "--decode-selector",
+        "app=sglang,role=decode",
+    ];
+
     #[test]
-    fn reorg_accepts_pd_version_groups_without_tokenizer() {
+    fn pd_version_group_label_reaches_k8s_config() {
         let args: Vec<_> = PD_K8S
             .iter()
             .copied()
-            .chain([
-                "--chat-routing",
-                "reorg",
-                "--policy",
-                "power_of_two",
-                "--pd-version-group-label",
-                "sglang.ai/version-group",
-                "--tokenizer-path",
-                "none",
-            ])
+            .chain(["--pd-version-group-label", "sglang.ai/version-group"])
             .collect();
-        let mut argv = vec!["router", "--model-id", "tiny"];
-        argv.extend(args);
-        let config = Cli::try_parse_from(argv).unwrap().into_config().unwrap();
+        let config = into_config_owned(with_model(&args)).unwrap();
         let DiscoveryBackend::K8s(discovery) = config.discovery else {
             panic!("expected k8s")
         };
@@ -1603,14 +1600,6 @@ mod tests {
             Some("sglang.ai/version-group")
         );
     }
-
-    const PD_K8S: [&str; 5] = [
-        "--service-discovery",
-        "--prefill-selector",
-        "app=sglang,role=prefill",
-        "--decode-selector",
-        "app=sglang,role=decode",
-    ];
 
     #[test]
     fn rejects_pd_version_group_label_outside_k8s_pd() {

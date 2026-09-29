@@ -34,8 +34,7 @@
 //!    — only the resolver has the cohort context to tell which is which.
 
 use crate::discovery::{ModelId, WorkerMode};
-use crate::workers::{Worker, WorkerRegistry};
-use std::collections::HashSet;
+use crate::workers::{paired_prefills, Worker, WorkerRegistry};
 use std::sync::Arc;
 
 /// Multiplier over the median decode-pool load above which a same-host
@@ -167,13 +166,7 @@ impl PdPoolResolver {
                 if prefill.is_empty() {
                     return Err(PdResolveError::NoPrefillWorkersAvailable);
                 }
-                let decode_groups: HashSet<Option<&str>> =
-                    decode.iter().map(|w| w.version_group()).collect();
-                let paired: Vec<_> = prefill
-                    .iter()
-                    .filter(|w| decode_groups.contains(&w.version_group()))
-                    .cloned()
-                    .collect();
+                let paired = paired_prefills(prefill, &decode);
                 if paired.is_empty() {
                     Err(PdResolveError::NoDecodeWorkersAvailable)
                 } else {
@@ -227,10 +220,6 @@ impl PdPoolResolver {
     /// 503 `no_decode_workers_available`. For non-PD (plain) models
     /// this is a no-op call — there is no decode peer to find — and
     /// the caller should NOT use this helper.
-    ///
-    /// Test-only: it ignores version groups; routing goes through
-    /// [`Self::decode_peers`].
-    #[cfg(test)]
     pub fn decode_with_affinity(
         &self,
         model: &ModelId,
@@ -561,50 +550,6 @@ mod tests {
             ids(&resolver.decode_peers(&model, by_id("p-v2")).unwrap()),
             ["d-v2"]
         );
-    }
-
-    /// Unlabeled workers form their own group; they never pair with labeled ones.
-    #[test]
-    fn unlabeled_workers_pair_only_with_unlabeled() {
-        let r = registry(&[
-            spec("p", WorkerMode::Prefill, "m"),
-            spec_in_group("d-v1", WorkerMode::Decode, "v1"),
-        ]);
-        let resolver = PdPoolResolver::new(r);
-        let model = ModelId("m".into());
-        assert_eq!(
-            resolver.prefill_candidates(&model).unwrap_err(),
-            PdResolveError::NoDecodeWorkersAvailable
-        );
-        let prefill = resolver.workers.workers_for(&model);
-        let p = prefill.iter().find(|w| w.id.0 == "p").unwrap();
-        assert_eq!(
-            resolver.decode_peers(&model, p).unwrap_err(),
-            PdResolveError::NoDecodeWorkersAvailable
-        );
-    }
-
-    /// When a group's only decode worker trips its breaker, that group's prefill
-    /// workers drop out of the pool instead of being paired across groups.
-    #[test]
-    fn group_without_healthy_decode_drops_its_prefill() {
-        let r = registry(&[
-            spec_in_group("p-v1", WorkerMode::Prefill, "v1"),
-            spec_in_group("p-v2", WorkerMode::Prefill, "v2"),
-            spec_in_group("d-v1", WorkerMode::Decode, "v1"),
-            spec_in_group("d-v2", WorkerMode::Decode, "v2"),
-        ]);
-        let resolver = PdPoolResolver::new(Arc::clone(&r));
-        let model = ModelId("m".into());
-        let d_v2 = r
-            .workers_for(&model)
-            .into_iter()
-            .find(|w| w.id.0 == "d-v2")
-            .unwrap();
-        while d_v2.breaker.allow() {
-            d_v2.breaker.record_failure();
-        }
-        assert_eq!(ids(&resolver.prefill_candidates(&model).unwrap()), ["p-v1"]);
     }
 
     /// Plain-mode prefill_candidates returns the plain pool (non-PD

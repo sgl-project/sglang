@@ -52,20 +52,13 @@ cluster-wide RBAC). For prefill/decode disaggregation, replace `--selector`
 with `--prefill-selector` and `--decode-selector`.
 
 To run two engine versions side by side in PD mode (e.g. during a rollout),
-pass `--pd-version-group-label <key>`. The router then pairs a prefill worker
-only with a decode worker that has the same value for that label, so KV is never
-transferred across versions. The label is read from the EndpointSlice, which
-copies it from its Service, so each (role, version) needs its own labeled
-Service; workers without the label, or with an empty value, form one more group.
-When no decode in a group can take a request (none healthy, all full, or no
-decode bucket fits) the request falls back to another group; it is never paired
-across groups. `sgl_router_pd_version_group_fallback_total` counts groups passed
-over because their decodes were full or did not fit. `/readyz` needs at least
-one group that has both roles (with `--chat-routing reorg`, within one bucket).
-Legacy and reorg routing both enforce these rules.
+pass `--pd-version-group-label <key>`. A prefill worker is then paired only with
+decode workers that have the same value for that EndpointSlice label (inherited
+from the Service, so use one Service per role and version), so KV never crosses
+versions. Unlabeled workers form their own group.
 
 ```bash
-sgl-router --model-id qwen3 --chat-routing reorg --policy power_of_two --service-discovery \
+sgl-router --model-id qwen3 --service-discovery \
   --prefill-selector app=engines-qwen3,role=prefill \
   --decode-selector app=engines-qwen3,role=decode \
   --pd-version-group-label sglang.ai/version-group

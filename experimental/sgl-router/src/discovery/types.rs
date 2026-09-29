@@ -91,11 +91,6 @@ pub enum DiscoveryEvent {
         id: WorkerId,
         mode: WorkerMode,
     },
-    /// Used by the k8s backend when only the PD version-group label changes.
-    VersionGroupChanged {
-        id: WorkerId,
-        version_group: Option<String>,
-    },
 }
 
 #[cfg(test)]

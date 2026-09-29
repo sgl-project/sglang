@@ -42,7 +42,6 @@
 //! | `sgl_router_cache_aware_decisions_total` | Counter | `model_id`, `decision` |
 //! | `sgl_router_diverted_overlap_blocks` | Histogram | `model_id` |
 //! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
-//! | `sgl_router_pd_version_group_fallback_total` | Counter | `model_id` |
 //! | `sgl_router_input_ids_forwarding_total` | Counter | `model_id`, `outcome` |
 //! | `sgl_router_sampling_contract_rejections_total` | Counter | `param` |
 //! | `sgl_router_tokenizer_l1_tokens_total` | Counter | `source` |
@@ -478,7 +477,6 @@ pub struct MetricsRegistry {
     cache_aware_decisions_total: Mutex<HashMap<CacheAwareDecisionKey, Arc<AtomicU64>>>,
     diverted_overlap_blocks: Mutex<HashMap<String, Histogram>>,
     ingress_tokenize_errors_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
-    pd_version_group_fallback_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
     input_ids_forwarding_total: Mutex<HashMap<InputIdsForwardingKey, Arc<AtomicU64>>>,
     sampling_contract_rejections_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
 }
@@ -883,19 +881,6 @@ impl MetricsRegistry {
             .clone();
         drop(guard);
         counter.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Add to `sgl_router_pd_version_group_fallback_total{model_id}` the PD
-    /// version `groups` passed over because none of their decode workers could
-    /// take a request that another group then served.
-    pub fn record_pd_version_group_fallback(&self, model_id: &str, groups: u64) {
-        let counter = self
-            .pd_version_group_fallback_total
-            .lock()
-            .entry(model_id.to_owned())
-            .or_default()
-            .clone();
-        counter.fetch_add(groups, Ordering::Relaxed);
     }
 
     /// Bump `sgl_router_input_ids_forwarding_total{model_id,outcome}`
@@ -1369,26 +1354,6 @@ impl MetricsRegistry {
         for (model_id, value) in entries {
             out.push_str(&format!(
                 "sgl_router_ingress_tokenize_errors_total{{model_id=\"{}\"}} {}\n",
-                escape_label(model_id),
-                value,
-            ));
-        }
-        drop(guard);
-
-        // pd_version_group_fallback_total
-        out.push_str(
-            "# HELP sgl_router_pd_version_group_fallback_total PD version groups passed over for a request because none of their decode workers could take it; the request was served by another group (never paired across groups).\n",
-        );
-        out.push_str("# TYPE sgl_router_pd_version_group_fallback_total counter\n");
-        let guard = self.pd_version_group_fallback_total.lock();
-        let mut entries: Vec<(&String, u64)> = guard
-            .iter()
-            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
-            .collect();
-        entries.sort_by(|a, b| a.0.cmp(b.0));
-        for (model_id, value) in entries {
-            out.push_str(&format!(
-                "sgl_router_pd_version_group_fallback_total{{model_id=\"{}\"}} {}\n",
                 escape_label(model_id),
                 value,
             ));
@@ -1959,19 +1924,6 @@ mod tests {
         assert!(
             out.contains(r#"sgl_router_ingress_tokenize_errors_total{model_id="other"} 1"#),
             "expected other=1; got:\n{out}",
-        );
-    }
-
-    #[test]
-    fn pd_version_group_fallback_counter_increments_per_model() {
-        let reg = MetricsRegistry::new();
-        reg.record_pd_version_group_fallback("tiny", 1);
-        reg.record_pd_version_group_fallback("tiny", 2);
-        let out = reg.render();
-        assert!(out.contains("# TYPE sgl_router_pd_version_group_fallback_total counter"));
-        assert!(
-            out.contains(r#"sgl_router_pd_version_group_fallback_total{model_id="tiny"} 3"#),
-            "expected tiny=3; got:\n{out}",
         );
     }
 

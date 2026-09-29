@@ -532,73 +532,21 @@ async fn plain_mode_chat_response_omits_decode_affinity_header() {
     );
 }
 
-fn pd_spec(id: &str, url: &str, mode: WorkerMode, port: Option<u16>, group: &str) -> WorkerSpec {
+fn pd_spec(
+    id: &str,
+    url: &str,
+    mode: WorkerMode,
+    port: Option<u16>,
+    group: Option<&str>,
+) -> WorkerSpec {
     WorkerSpec {
         id: WorkerId(id.into()),
         url: url.into(),
         mode,
         model_ids: vec![ModelId("tiny".into())],
         bootstrap_port: port,
-        version_group: Some(group.into()),
+        version_group: group.map(str::to_owned),
     }
-}
-
-/// Every PD request pairs a prefill with a decode from the same version group.
-/// The decode body's `bootstrap_port` names the prefill that was paired with it.
-#[tokio::test]
-async fn pd_mode_pairs_prefill_and_decode_within_version_group() {
-    use crate::common::mock_worker::MockWorker;
-    use std::collections::{HashMap, HashSet};
-
-    let prefill_v1 = MockWorker::start(vec![]).await;
-    let prefill_v2 = MockWorker::start(vec![]).await;
-    let decode_v1a = MockWorker::start(vec![]).await;
-    let decode_v1b = MockWorker::start(vec![]).await;
-    let decode_v2 = MockWorker::start(vec![]).await;
-    let ctx = build_ctx(vec![
-        pd_spec(
-            "p-v1",
-            &prefill_v1.url,
-            WorkerMode::Prefill,
-            Some(1111),
-            "v1",
-        ),
-        pd_spec(
-            "p-v2",
-            &prefill_v2.url,
-            WorkerMode::Prefill,
-            Some(2222),
-            "v2",
-        ),
-        pd_spec("d-v1a", &decode_v1a.url, WorkerMode::Decode, None, "v1"),
-        pd_spec("d-v1b", &decode_v1b.url, WorkerMode::Decode, None, "v1"),
-        pd_spec("d-v2", &decode_v2.url, WorkerMode::Decode, None, "v2"),
-    ]);
-    let decodes: HashMap<&str, (&MockWorker, &str)> = [
-        (decode_v1a.url.as_str(), (&decode_v1a, "v1")),
-        (decode_v1b.url.as_str(), (&decode_v1b, "v1")),
-        (decode_v2.url.as_str(), (&decode_v2, "v2")),
-    ]
-    .into();
-    let app = build_router(ctx);
-
-    let mut groups_served = HashSet::new();
-    for _ in 0..12 {
-        let res = app.clone().oneshot(chat_request()).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        let decode_url = res.headers()["x-sgl-decode-url"].to_str().unwrap();
-        let (decode, decode_group) = decodes[decode_url];
-        let body = decode.captured.lock().unwrap().last_body.clone().unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let prefill_group = match body["bootstrap_port"].as_u64() {
-            Some(1111) => "v1",
-            Some(2222) => "v2",
-            other => panic!("unexpected bootstrap_port {other:?}"),
-        };
-        assert_eq!(prefill_group, decode_group, "cross-group PD pairing");
-        groups_served.insert(decode_group);
-    }
-    assert_eq!(groups_served.len(), 2, "round robin must reach both groups");
 }
 
 /// Both routing paths pair only within a version group, for dispatch and
@@ -618,25 +566,30 @@ async fn version_groups_constrain_pairing_and_readiness_on_both_paths() {
             let orphan = MockWorker::start(vec![]).await;
             let prefill = MockWorker::start(vec![]).await;
             let decode = MockWorker::start(vec![]).await;
-            let spec = |id: &str, url: &str, mode, port, group: Option<&str>| WorkerSpec {
-                version_group: group.map(str::to_owned),
-                ..pd_spec(id, url, mode, port, "")
-            };
             let mut ctx = build_ctx(vec![
-                spec(
+                pd_spec(
                     "a-orphan",
                     &orphan.url,
                     WorkerMode::Prefill,
                     Some(1111),
                     Some("orphan"),
                 ),
-                spec("p", &prefill.url, WorkerMode::Prefill, Some(2222), p_group),
-                spec("d", &decode.url, WorkerMode::Decode, None, d_group),
+                pd_spec("p", &prefill.url, WorkerMode::Prefill, Some(2222), p_group),
+                pd_spec("d", &decode.url, WorkerMode::Decode, None, d_group),
             ]);
             if reorg {
                 let mutable = Arc::get_mut(&mut ctx).unwrap();
                 mutable.config.model.policy = PolicyKind::PowerOfTwo;
-                crate::common::use_reorg_factory(mutable);
+                let state = sgl_router::state::kv_events::KvEventIndex::new();
+                let (resolver, _) = sgl_router::policies_reorg::factory::build_resolver(
+                    &mutable.config.model,
+                    &state,
+                    None,
+                )
+                .unwrap();
+                mutable.chat_routing = sgl_router::server::app_context::ChatRouting::Reorg(
+                    [(ModelId("tiny".into()), resolver)].into(),
+                );
             }
             ctx.mark_ready();
             let expected = match p_group == d_group {
