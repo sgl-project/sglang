@@ -194,9 +194,30 @@ class TestDsaDcpValidation(CustomTestCase):
             "page_size=32",
         )
 
+    def test_eagle_chain_drafting_passes(self):
+        for algo, topk in (("EAGLE", 1), ("NEXTN", None)):
+            with self.subTest(algo=algo):
+                self.assert_accepted(
+                    _view(speculative_algorithm=algo, speculative_eagle_topk=topk)
+                )
+
+    def test_tree_drafting_is_rejected(self):
+        # Tree drafting relocates accepted KV with move_kv_cache, which is not
+        # DCP-aware.
+        self.assert_rejected(
+            _view(speculative_algorithm="EAGLE", speculative_eagle_topk=4),
+            "speculative_eagle_topk=4",
+        )
+
 
 class TestDsaDcpLseMergePhases(CustomTestCase):
-    MERGED = (ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.TARGET_VERIFY)
+    MERGED = (
+        ForwardMode.EXTEND,
+        ForwardMode.DECODE,
+        ForwardMode.TARGET_VERIFY,
+        # The EAGLE draft reads the same owner-striped pool as the target.
+        ForwardMode.DRAFT_EXTEND_V2,
+    )
     NOT_MERGED = (ForwardMode.MIXED, ForwardMode.IDLE, ForwardMode.SPLIT_PREFILL)
 
     def test_flashmla_kv_returns_lse_only_in_merged_phases(self):
