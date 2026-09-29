@@ -5,9 +5,10 @@ a group's compressed slot is any of its raw slots floor-divided by the compress 
 so per-row graph buffers are rebuilt from request lengths and ``req_to_token`` alone;
 accept-dependent speculative lengths never need the host.
 
-Both kernels run once eagerly at capture warmup,
-then are recorded into the main CUDA graph through ``init_forward_metadata_in_graph``;
-all inputs are stable-address runner buffers.
+Decode and target verify build row layout and compressed metadata in one kernel.
+Draft extend first builds its variable-length row layout, then derives metadata
+from those rows. Multi-step draft builds metadata for all steps in one launch.
+The launchers refresh graph buffers on device before replay.
 """
 
 from __future__ import annotations
@@ -30,36 +31,15 @@ def _qsa_graph_layout_kernel(
     bs,
     num_tokens,
     num_padding,
-    extend_len,  # uniform extend length (target verify); 0 -> extend_lens_ptr
-    MODE: tl.constexpr,  # 0 = decode, 1 = target verify, 2 = draft extend
 ):
     pid = tl.program_id(0)
-
-    if MODE == 0:
-        if pid < bs:
-            real = pid < bs - num_padding
-            seq_len = tl.load(seq_lens_ptr + pid).to(tl.int32)
-            req = tl.load(req_pool_ptr + pid).to(tl.int64)
-            # Padding rows alias request slot 0: it is never allocated, so
-            # its pending-ring rows are the inert dump for their state
-            # stores, and its req_to_token row reads stay in-bounds.
-            req = tl.where(real, req, 0)
-            seq_len = tl.where(real, seq_len, 1)
-            prefix = tl.maximum(seq_len - 1, 0)
-            tl.store(row_seq_lens_ptr + pid, seq_len)
-            tl.store(row_req_pool_ptr + pid, req.to(tl.int32))
-            tl.store(row_prefix_lens_ptr + pid, prefix)
-        return
 
     real_reqs = bs - num_padding
     if pid == bs:
         # Tail program: dummy rows for the static capacity past the real layout.
-        if MODE == 1:
-            row_start = real_reqs * extend_len
-        else:
-            row_start = 0
-            for j in range(real_reqs):
-                row_start += tl.load(extend_lens_ptr + j)
+        row_start = 0
+        for j in range(real_reqs):
+            row_start += tl.load(extend_lens_ptr + j)
         for row in range(row_start, num_tokens):
             tl.store(row_seq_lens_ptr + row, 1)
             tl.store(row_prefix_lens_ptr + row, 0)
@@ -68,24 +48,16 @@ def _qsa_graph_layout_kernel(
             tl.store(row_req_pool_ptr + row, 0)
         return
 
-    if MODE == 1:
-        eff = tl.where(pid < real_reqs, extend_len, 0)
-        offset = tl.minimum(pid, real_reqs) * extend_len
-    else:
-        eff = 0
-        offset = 0
-        for j in range(bs):
-            e_j = tl.where(j < real_reqs, tl.load(extend_lens_ptr + j), 0)
-            offset += tl.where(j < pid, e_j, 0)
-            eff = tl.where(j == pid, e_j, eff)
+    eff = 0
+    offset = 0
+    for j in range(bs):
+        e_j = tl.where(j < real_reqs, tl.load(extend_lens_ptr + j), 0)
+        offset += tl.where(j < pid, e_j, 0)
+        eff = tl.where(j == pid, e_j, eff)
     base = tl.load(seq_lens_ptr + pid).to(tl.int32)
     req = tl.load(req_pool_ptr + pid).to(tl.int64)
-    if MODE == 1:
-        prefix = base
-        limit = base + eff
-    else:
-        prefix = tl.maximum(base - eff, 0)
-        limit = base
+    prefix = tl.maximum(base - eff, 0)
+    limit = base
     for j in range(eff):
         row = offset + j
         seq_len = tl.minimum(prefix + 1 + j, limit)
@@ -220,8 +192,6 @@ def launch_graph_metadata(
             bs,
             num_rows,
             num_padding,
-            extend_len,
-            MODE=mode,
             num_warps=1,
         )
     _qsa_graph_row_metadata_kernel[(num_rows, triton.cdiv(max_pages, 128))](
@@ -287,9 +257,9 @@ def _qsa_draft_graph_metadata_kernel(
                 buf[8],
                 bs,
                 num_padding,
-                0,
-                step + 1,
-                0,
+                extend_len=0,
+                seq_offset=step + 1,
+                MODE=0,
             )
 
 
