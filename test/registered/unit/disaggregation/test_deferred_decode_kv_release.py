@@ -568,6 +568,7 @@ class TestAbortArmsTrackerBeforeSend(CustomTestCase):
         recv.bootstrap_room = 500
         recv.init_time = init_time
         recv.abort_notified = False
+        recv._abort_generation = None
         recv.bootstrap_infos = [{"rank_ip": "10.0.0.9", "rank_port": 7000}]
         armed_at_send = []
         sock = SimpleNamespace(
@@ -675,9 +676,11 @@ class TestResolveDeferredReleases(CustomTestCase):
         q.enable_host_receive = True
         q.gloo_group = object()
         entries = [_make_decode_req(room, room, mgr) for room in (1, 2)]
+        generations = {}
         for entry in entries:
             entry.host_staged = True
-            mgr.register_deferred_abort_room(entry.req.bootstrap_room)
+            room = entry.req.bootstrap_room
+            generations[room] = mgr.register_deferred_abort_room(room)
             q._defer_release(entry)
         with (
             patch.object(decode_mod, "discard_kv_cache_backup") as discard,
@@ -687,7 +690,7 @@ class TestResolveDeferredReleases(CustomTestCase):
         ):
             q.resolve_deferred_releases()
             discard.assert_not_called()
-            mgr.note_abort_ack(2, 0)
+            mgr.note_abort_ack(2, 0, generations[2])
             reduce.side_effect = lambda ready, **_: ready.zero_()
             q.resolve_deferred_releases()
             discard.assert_not_called()
@@ -695,7 +698,7 @@ class TestResolveDeferredReleases(CustomTestCase):
             q.resolve_deferred_releases()
             discard.assert_called_once_with(entries[1].req, q.tree_cache, "host_pool")
             self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [2])
-            mgr.note_abort_ack(1, 0)
+            mgr.note_abort_ack(1, 0, generations[1])
             q.resolve_deferred_releases()
             self.assertEqual(discard.call_count, 2)
             self.assertEqual(q._deferred_releases, [])
