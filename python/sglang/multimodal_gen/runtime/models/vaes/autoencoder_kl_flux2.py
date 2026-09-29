@@ -19,6 +19,7 @@ from diffusers.models.autoencoders.vae import (
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
 from sglang.multimodal_gen.configs.models.vaes.flux import Flux2VAEConfig
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_vae_encode
 from sglang.multimodal_gen.runtime.models.vaes.common import (
     ParallelTiledVAE,
     can_install_spatial_shard_parallel_decode,
@@ -238,6 +239,7 @@ class AutoencoderKLFlux2(ParallelTiledVAE):
 
         return enc
 
+    @cached_vae_encode
     def encode(
         self, x: torch.Tensor, return_dict: bool = True
     ) -> Union[DiagonalGaussianDistribution]:

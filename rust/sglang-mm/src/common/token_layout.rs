@@ -11,7 +11,7 @@ use crate::pipeline::{Segment, TokenLayout, TokenPattern};
 /// inclusive `(start, end)` token range it occupies — the Python
 /// `get_mm_items_offset` convention.
 pub struct ExpandedPrompt {
-    pub input_ids: Vec<i32>,
+    pub input_ids: Vec<i64>,
     pub offsets: Vec<(u32, u32)>,
 }
 
@@ -27,7 +27,7 @@ pub struct ExpandedPrompt {
 /// * every one of the `n_items` media items is placed exactly once;
 /// * no item expands to zero tokens (which would have no representable offset).
 pub fn apply_layout(
-    src: &[i32],
+    src: &[i64],
     layout: &TokenLayout,
     n_items: usize,
 ) -> Result<ExpandedPrompt, String> {
@@ -101,8 +101,8 @@ pub fn apply_layout(
 /// becomes `counts[i]` copies (i-th occurrence ↔ i-th media item). Errs when
 /// the occurrence count and `counts` disagree.
 pub fn layout_by_placeholder(
-    ids: &[i32],
-    placeholder_id: i32,
+    ids: &[i64],
+    placeholder_id: i64,
     counts: &[usize],
 ) -> Result<TokenLayout, String> {
     let found = ids.iter().filter(|&&id| id == placeholder_id).count();
@@ -141,7 +141,7 @@ pub fn layout_by_placeholder(
 mod tests {
     use super::*;
 
-    fn expand(ids: &[i32], placeholder: i32, counts: &[usize]) -> Result<ExpandedPrompt, String> {
+    fn expand(ids: &[i64], placeholder: i64, counts: &[usize]) -> Result<ExpandedPrompt, String> {
         apply_layout(
             ids,
             &layout_by_placeholder(ids, placeholder, counts)?,

@@ -8,12 +8,12 @@ from sglang.kernels.ops.attention.dsa.dequant_k_cache import dequantize_k_cache_
 from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
-from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mha_chunk_extend,
     all_gather_kv_cache_for_mha_extend,
     filter_dcp_local_kv_indices,
 )
+from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,

@@ -48,7 +48,7 @@ class TestValidateMambaExtraBufferLazyDflash(CustomTestCase):
         with override_platform(is_cuda=True):
             validate_mamba_extra_buffer(
                 view,
-                "Qwen3NextForCausalLM",
+                SimpleNamespace(architectures=["Qwen3NextForCausalLM"]),
                 mamba_cache_chunk_size_of=lambda: 64,
             )
 
@@ -82,7 +82,7 @@ class TestValidateMambaExtraBufferLazyDflash(CustomTestCase):
         with override_platform(is_cuda=True):
             validate_mamba_extra_buffer(
                 _lazy_view(page_size=None),
-                "Qwen3NextForCausalLM",
+                SimpleNamespace(architectures=["Qwen3NextForCausalLM"]),
                 mamba_cache_chunk_size_of=_must_not_be_read,
             )
 

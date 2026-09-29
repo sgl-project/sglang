@@ -704,6 +704,9 @@ class TestIdeogram4(unittest.TestCase):
         }
         stage.copy_deduplicated_outputs(base, same)
 
+        self.assertIs(same.prompt_embeds[0], base.prompt_embeds[0])
+        self.assertIs(same.prompt_embeds_mask[0], base.prompt_embeds_mask[0])
+        self.assertIsNot(same.prompt_embeds, base.prompt_embeds)
         self.assertIn("ideogram4", same.extra)
         self.assertTrue(
             torch.equal(

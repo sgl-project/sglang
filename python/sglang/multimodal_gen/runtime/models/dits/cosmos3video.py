@@ -21,6 +21,7 @@ from sglang.kernels.ops.diffusion import (
 )
 from sglang.multimodal_gen.configs.models.dits.cosmos3video import Cosmos3VideoConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_module_list_entry_in
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_conditioning
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
     get_sp_world_size,
@@ -1099,6 +1100,7 @@ class Cosmos3LanguageModel(nn.Module):
             ]
         )
 
+    @cached_conditioning
     def forward(
         self,
         text_ids: torch.Tensor,

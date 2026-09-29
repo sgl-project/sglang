@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import sys
 from array import array
 from typing import TYPE_CHECKING, Optional, Sequence
 
@@ -14,6 +15,8 @@ from sglang.srt.disaggregation.kv_events import (
     BlockStored,
     StorageMedium,
 )
+from sglang.srt.environ import envs
+from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
@@ -39,6 +42,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     SWARebuild,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.components import CacheTransferPhase
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import StorageBackupSpec
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BufferBackupSnapshot,
@@ -54,6 +58,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     RadixCacheWalkResult,
     UnifiedTreeCoreInterface,
 )
+from sglang.srt.mem_cache.utils import get_eviction_strategy
 from sglang.srt.runtime_context import get_exec, mamba_cache_chunk_size
 from sglang.srt.utils import assert_int64_array
 
@@ -65,8 +70,21 @@ if TYPE_CHECKING:
         CacheAction,
         ComponentAction,
     )
-    from sglang.srt.mem_cache.unified_cache.components import CacheTransferPhase
     from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeNode
+
+
+def _tlru_float_config(native_bindings, threshold, next_prompt_estimate):
+    """Pass numeric values without changing Python's integer/float distinction."""
+    if not all(
+        isinstance(value, (int, float)) for value in (threshold, next_prompt_estimate)
+    ):
+        raise TypeError("T-LRU parameters must be integer or floating-point numbers")
+    threshold = float(threshold)
+    if isinstance(next_prompt_estimate, int):
+        return native_bindings.TlruFloatConfig(
+            threshold, 0.0, integer_estimate=next_prompt_estimate
+        )
+    return native_bindings.TlruFloatConfig(threshold, float(next_prompt_estimate))
 
 
 def _radix_key_buffer(key: RadixKey) -> array:
@@ -231,6 +249,7 @@ def _insert_step_from_binding(step) -> InsertStepResult:
             mamba_exist=step.result.mamba_exist,
             swa_branch_inserted=step.result.swa_branch_inserted,
             host_insert_dropped=step.result.host_insert_dropped,
+            rotation_tail_declined=step.result.rotation_tail_declined,
             adopted_ranges=(
                 {
                     ComponentType(component_type): list(ranges)
@@ -297,6 +316,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     """A TreeCore backed by the Rust extension binding."""
 
     _bindings = bindings
+    supports_rotation_base = True
 
     def __init__(self, params: CacheInitParams):
         assert params.tree_components is not None
@@ -324,12 +344,25 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             raise ValueError(
                 "Rust TreeCore does not support component_registry_override"
             )
-        # The Rust core builds its own eviction strategy from the policy name
-        # alone, so a config would be dropped rather than applied.
-        if params.eviction_policy_config:
-            raise ValueError(
-                "Rust TreeCore does not support --radix-eviction-policy-config"
-            )
+        # Validate the same constructor options as Python before passing the
+        # configured eviction parameters to the native strategy.
+        eviction_strategy = get_eviction_strategy(
+            params.eviction_policy, params.eviction_policy_config
+        )
+        tlru_tail_budget = 0
+        tlru_float_config = None
+        if params.eviction_policy.lower() == "tlru":
+            threshold = eviction_strategy.threshold
+            next_prompt_estimate = eviction_strategy.next_prompt_estimate
+            if isinstance(threshold, int) and isinstance(next_prompt_estimate, int):
+                # Subtract before clamping to preserve arbitrary-size integers.
+                tlru_tail_budget = min(
+                    max(threshold - next_prompt_estimate, 0), 2 * sys.maxsize + 1
+                )
+            else:
+                tlru_float_config = _tlru_float_config(
+                    self._bindings, threshold, next_prompt_estimate
+                )
         if ComponentType.SWA in self.tree_components and (
             params.sliding_window_size is None or params.sliding_window_size <= 0
         ):
@@ -342,8 +375,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             params.is_eagle and ComponentType.MAMBA not in self.tree_components
         )
 
-        # ``device`` is derived from the construction-time allocator; the
-        # allocator/pool themselves are owned by the cache, not the tree.
+        # The cache owns allocation; keep its allocator for resolving current
+        # unified SWA addresses when building a host backup.
+        self._allocator = params.token_to_kv_pool_allocator
         if params.token_to_kv_pool_allocator:
             device = torch.device(params.token_to_kv_pool_allocator.device)
             # A bare "cuda" means the process's current device, not cuda:0.
@@ -362,12 +396,18 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         self._binding = self._binding_class()(
             self._bindings.TreeCoreInitParamsBinding(
                 eviction_policy=params.eviction_policy,
+                slru_protected_threshold=getattr(
+                    eviction_strategy, "protected_threshold", 2
+                ),
+                tlru_tail_budget=tlru_tail_budget,
+                tlru_float_config=tlru_float_config,
                 page_size=params.page_size,
                 is_write_back=False,
                 enable_hicache=False,
                 write_through_threshold=256,
                 device=str(self.device),
                 swa_sliding_window_size=params.sliding_window_size,
+                swa_req_ring=is_swa_req_ring(self._allocator),
                 enable_kv_cache_events=params.enable_kv_cache_events,
                 mamba_cache_chunk_size=(
                     mamba_cache_chunk_size() if has_mamba else None
@@ -415,9 +455,14 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def swa_tombstone_ranges(
         self, key: RadixKey, start: int, end: int
     ) -> list[tuple[int, int]]:
-        raise NotImplementedError(
-            "swa_tombstone_ranges: buffer-mode SWA window repair is not yet "
-            "ported to the Rust tree core"
+        return self._binding.swa_tombstone_ranges(
+            self._bindings.MatchParamsBinding(
+                key=_radix_key_buffer(key),
+                extra_key=key.extra_key,
+                cache_salt=key.cache_salt,
+            ),
+            start,
+            end,
         )
 
     def attach_swa_window(
@@ -426,10 +471,18 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         window_start: int,
         window_end: int,
         swa_values: torch.Tensor,
-    ) -> list:
-        raise NotImplementedError(
-            "attach_swa_window: buffer-mode SWA window repair is not yet "
-            "ported to the Rust tree core"
+    ) -> list[CacheAction | ComponentAction]:
+        return _cache_actions_from_tagged(
+            self._binding.attach_swa_window(
+                self._bindings.MatchParamsBinding(
+                    key=_radix_key_buffer(key),
+                    extra_key=key.extra_key,
+                    cache_salt=key.cache_salt,
+                ),
+                window_start,
+                window_end,
+                swa_values,
+            )
         )
 
     def inc_lock_ref(
@@ -452,6 +505,24 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             node_id, _dec_lock_ref_params_to_binding(self._bindings, params), skip_swa
         )
         return DecLockRefResult()
+
+    def dec_window_lock_only(
+        self,
+        node_id: NodeId,
+        component_type: ComponentType,
+        params: DecLockRefParams,
+    ) -> DecSwaLockOnlyResult:
+        result = DecSwaLockOnlyResult()
+        new_device_frees, new_host_frees = self._binding.dec_window_lock_only(
+            node_id,
+            int(component_type),
+            _dec_lock_ref_params_to_binding(self._bindings, params),
+        )
+        for component, tensors in new_device_frees.items():
+            result.device_frees[ComponentType(component)].extend(tensors)
+        for component, tensors in new_host_frees.items():
+            result.host_frees[ComponentType(component)].extend(tensors)
+        return result
 
     def dec_swa_lock_only(
         self,
@@ -484,20 +555,43 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         result = EvictDeviceNextNodeResult(
             node_id=binding_result.node_id,
             made_progress=binding_result.made_progress,
+            unbacked_tokens=binding_result.unbacked_tokens,
+            mamba_backup_node_id=binding_result.mamba_backup_node_id,
+            swa_backup_node_id=binding_result.swa_backup_node_id,
+            swa_backup_num_tokens=binding_result.swa_backup_num_tokens,
+        )
+        return _fill_evict_result(binding_result, result)
+
+    def finish_mamba_state_eviction(self, node_id: NodeId) -> EvictDeviceNextNodeResult:
+        binding_result = self._binding.finish_mamba_state_eviction(node_id)
+        result = EvictDeviceNextNodeResult(
+            node_id=binding_result.node_id,
+            made_progress=binding_result.made_progress,
+            unbacked_tokens=binding_result.unbacked_tokens,
+        )
+        return _fill_evict_result(binding_result, result)
+
+    def finish_swa_state_eviction(self, node_id: NodeId) -> EvictDeviceNextNodeResult:
+        binding_result = self._binding.finish_swa_state_eviction(node_id)
+        result = EvictDeviceNextNodeResult(
+            node_id=binding_result.node_id,
+            made_progress=binding_result.made_progress,
+            unbacked_tokens=binding_result.unbacked_tokens,
         )
         return _fill_evict_result(binding_result, result)
 
     def evict_device_leaf(
         self, node_id: NodeId, is_write_back: bool
     ) -> EvictDeviceLeafResult:
-        # The binding reads is_write_back from the core's construction config.
+        # The binding reads is_write_back from the core's current config.
         assert is_write_back == self.is_write_back, (
-            "is_write_back must match the core's construction config"
+            "is_write_back must match the core's current config"
         )
         binding_result = self._binding.evict_device_leaf(node_id)
         backup = binding_result.backup_kv
         result = EvictDeviceLeafResult(
-            backup_kv=_cache_action_from_tagged(backup) if backup is not None else None
+            unbacked_tokens=binding_result.unbacked_tokens,
+            backup_kv=_cache_action_from_tagged(backup) if backup is not None else None,
         )
         return _fill_evict_result(binding_result, result)
 
@@ -528,6 +622,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def component_evictable_size(self, component_type: ComponentType) -> int:
         return self._binding.component_evictable_size(int(component_type))
+
+    def component_protected_size(self, component_type: ComponentType) -> int:
+        return self._binding.component_protected_size(int(component_type))
 
     def full_evictable_size(self) -> int:
         return self._binding.full_evictable_size()
@@ -632,6 +729,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 chunked=params.chunked,
                 priority=0 if params.priority is None else params.priority,
                 track_adopted_ranges=params.track_adopted_ranges,
+                rotation_base=params.rotation_base,
             )
         )
         return _insert_step_from_binding(step)
@@ -649,7 +747,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         self, component_type: ComponentType, num_tokens: int
     ) -> DriveHostEvictionResult:
         binding_result = self._binding.drive_host_eviction(
-            int(component_type), num_tokens
+            int(component_type),
+            num_tokens,
+            envs.SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM.get(),
         )
         return _fill_evict_result(binding_result, DriveHostEvictionResult())
 
@@ -761,7 +861,31 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         self, node_id: NodeId
     ) -> tuple[torch.Tensor, dict[ComponentType, list[PoolTransfer]]]:
         device_value, comp_xfers = self._binding.build_backup_spec(node_id)
-        return device_value, _comp_xfers_from_binding(comp_xfers)
+        comp_xfers = _comp_xfers_from_binding(comp_xfers)
+        self._refresh_swa_backup_indices(comp_xfers.get(ComponentType.SWA, ()))
+        return device_value, comp_xfers
+
+    def _refresh_swa_backup_indices(self, transfers: Sequence[PoolTransfer]) -> None:
+        if not transfers:
+            return
+        from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
+            UnifiedSWAAllocatorBase,
+        )
+
+        if not isinstance(self._allocator, UnifiedSWAAllocatorBase):
+            return
+        for transfer in transfers:
+            if transfer.name != PoolName.SWA or not transfer.nodes_to_load:
+                continue
+            # Compaction can relocate SWA rows after the tree records them.
+            # FULL virtual IDs retain their meaning across that relocation.
+            full_values = [
+                self.get_component_device_value(node_id, ComponentType.FULL)
+                for node_id in transfer.nodes_to_load
+            ]
+            transfer.device_indices = self._allocator.translate_loc_from_full_to_swa(
+                torch.cat(full_values)
+            ).to(torch.int64)
 
     def build_storage_backup_spec(
         self, node_id: NodeId, pass_prefix_keys: bool
@@ -805,7 +929,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         )
         if transfers is None:
             return None
-        return [_transfer_from_binding(transfer) for transfer in transfers]
+        transfers = [_transfer_from_binding(transfer) for transfer in transfers]
+        if phase == CacheTransferPhase.BACKUP_HOST:
+            self._refresh_swa_backup_indices(transfers)
+        return transfers
 
     def build_load_back_spec(
         self, node_id: NodeId, req: Optional[Req] = None
@@ -815,7 +942,30 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         kv_xfer, comp_xfers = self._binding.build_load_back_spec(
             node_id, mamba_pool_idx
         )
-        return _transfer_from_binding(kv_xfer), _comp_xfers_from_binding(comp_xfers)
+        kv_xfer = _transfer_from_binding(kv_xfer)
+        comp_xfers = _comp_xfers_from_binding(comp_xfers)
+        swa_xfers = comp_xfers.get(ComponentType.SWA, ())
+        if swa_xfers:
+            full_node_ids = kv_xfer.nodes_to_load or []
+            full_load_slices = {}
+            offset = 0
+            for full_node_id, count in zip(
+                full_node_ids, self._binding.get_node_key_lengths(full_node_ids)
+            ):
+                full_load_slices[full_node_id] = slice(offset, offset + count)
+                offset += count
+            for transfer in swa_xfers:
+                # SWA may have holes between resident nodes, or reload while
+                # FULL stays resident. Preserve the SWA transfer's node order.
+                transfer.anchor_index_parts = [
+                    (
+                        full_load_slices[nid]
+                        if nid in full_load_slices
+                        else self.get_component_device_value(nid, ComponentType.FULL)
+                    )
+                    for nid in transfer.nodes_to_load or ()
+                ]
+        return kv_xfer, comp_xfers
 
     def prefetch_anchor_info(
         self, node_id: NodeId
@@ -877,6 +1027,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
         return self._binding.root_node_handle(extra_key)
+
+    def rotation_base_of(self, node_id: NodeId) -> Optional[int]:
+        return self._binding.rotation_base_of(node_id)
 
     def dfs_weight_order(self, node_ids: Sequence[NodeId]) -> list[int]:
         return self._binding.dfs_weight_order(list(node_ids))

@@ -8,6 +8,7 @@ after its DONE barrier -- never from the bootstrap thread for an active room.
 """
 
 import unittest
+from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -237,6 +238,73 @@ class TestNixlAbortNotification(CustomTestCase):
     def test_non_abort_message_is_not_claimed(self):
         mgr = self._mgr()
         self.assertFalse(mgr._handle_abort_notification([b"STAGING_REQ", b"11"]))
+
+
+class _StopWorker(Exception):
+    pass
+
+
+class _OneChunkQueue:
+    """Feeds the worker a single chunk, then unblocks it out of its loop."""
+
+    def __init__(self, chunk):
+        self._chunk = chunk
+        self._served = False
+
+    def get(self):
+        if self._served:
+            raise _StopWorker
+        self._served = True
+        return self._chunk
+
+
+class _SettledFailureReq:
+    """Transfer info whose first use raises a settled transport error."""
+
+    room = 7
+    is_dummy = False
+    endpoint = "10.0.0.9"
+    dst_port = 6009
+
+    @property
+    def agent_name(self):
+        raise RuntimeError("NIXL transfer encountered ERR")
+
+
+class TestNixlWorkerSettledFailureReleasesAck(CustomTestCase):
+    """Bug regression: a settled transfer failure (every handle settled, decode
+    told via conclude_failure) left the chunk counted in _staging_outstanding,
+    so the abort ack for the room could never fire and the decode's deferred
+    KV release always ran out the full timeout instead of draining."""
+
+    def test_settled_failure_uncounts_chunk_and_releases_held_ack(self):
+        mgr = _prefill_mgr(NixlKVManager)
+        mgr._staging_outstanding = defaultdict(int)
+        mgr.enable_staging = False
+        mgr.exceptions = {}
+        mgr.decode_kv_args_table = {}
+        mgr.request_status[7] = KVPoll.WaitingForInput
+        mgr.check_status = lambda r: mgr.request_status[r]
+        mgr.update_status = lambda r, s: mgr.request_status.__setitem__(r, s)
+        mgr.record_failure = MagicMock()
+        mgr._await_handles = lambda handles, failure_seen=False: (True, True)
+        mgr.transfer_infos[7] = {"sess0": _SettledFailureReq()}
+        # The decode learns of the failure and its ABORT lands while the chunk
+        # is still counted -- the interleaving that held the ack forever.
+        mgr.conclude_failure = MagicMock(
+            side_effect=lambda **kw: mgr._handle_abort_notification(
+                [b"ABORT", b"7", b"10.0.0.9", b"6009"]
+            )
+        )
+        chunk = SimpleNamespace(room=7, staging_counted=False)
+
+        with self.assertRaises(_StopWorker):
+            mgr.transfer_worker(_OneChunkQueue(chunk))
+
+        mgr.conclude_failure.assert_called_once()
+        self.assertEqual(mgr._staging_outstanding[7], 0)
+        self.assertEqual(mgr._sent, [("10.0.0.9", 6009, 7)])
+        self.assertNotIn(7, mgr._deferred_ack_targets)
 
 
 class TestNixlDecodeAckIngest(CustomTestCase):

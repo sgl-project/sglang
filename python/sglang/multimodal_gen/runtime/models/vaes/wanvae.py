@@ -29,6 +29,7 @@ from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
 from sglang.multimodal_gen.configs.models.vaes.base import (
     should_use_spatial_shard_parallel_decode,
 )
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_vae_encode
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_decode_parallel_rank,
     get_decode_parallel_world_size,
@@ -1585,6 +1586,7 @@ class AutoencoderKLWan(ParallelTiledVAE):
         self._causal_decode_initialized = True
         return out
 
+    @cached_vae_encode
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         if self.use_feature_cache:
             self.clear_cache()

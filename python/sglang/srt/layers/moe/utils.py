@@ -559,7 +559,12 @@ def draft_model_build_scope():
     original_scope = moe.in_speculative_scope
     try:
         moe.in_speculative_scope = True
-        yield
+        # Boundaries capture this resolved preference while the draft builds.
+        # Restoring it cannot change an already constructed target plan.
+        with get_exec().comm.override(
+            boundary_reduction=get_spec().speculative_boundary_reduction
+        ):
+            yield
     finally:
         moe.in_speculative_scope = original_scope
         moe.disable_shared_experts_fusion = original_fusion
@@ -759,10 +764,8 @@ def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
 
     Pass ``is_tp_path=True`` for the TP all-reduce, ``False`` for the EP one.
     """
-    return (
-        should_skip_mlp_all_reduce()
-        or should_use_dp_reduce_scatterv()
-        or post_experts_output_is_complete(is_tp_path=is_tp_path)
+    return should_skip_mlp_all_reduce() or post_experts_output_is_complete(
+        is_tp_path=is_tp_path
     )
 
 

@@ -65,20 +65,6 @@ class IndexKeyCache:
     def get_buffer(self, layer_id: int) -> torch.Tensor:
         return self.get_local_buffer(layer_id)
 
-    def get_k_continuous(self, layer_id: int, seq_len: int, page_indices: torch.Tensor):
-        buf = self.get_buffer(layer_id)
-        return index_buf_accessor.GetK.execute(
-            self.pool, buf, seq_len=seq_len, page_indices=page_indices
-        )
-
-    def get_k_scale_continuous(
-        self, layer_id: int, seq_len: int, page_indices: torch.Tensor
-    ):
-        buf = self.get_buffer(layer_id)
-        return index_buf_accessor.GetS.execute(
-            self.pool, buf, seq_len=seq_len, page_indices=page_indices
-        )
-
     def get_k_and_scale(
         self,
         layer_id: int,

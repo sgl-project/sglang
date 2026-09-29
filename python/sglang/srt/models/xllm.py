@@ -39,12 +39,14 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.communicator import (
-    LayerCommunicator,
-    LayerFacts,
-    enable_moe_dense_fully_dp,
-)
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.layer_boundary import (
+    declare_attn,
+    declare_ffn,
+    enable_moe_dense_fully_dp,
+    make_stages,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -859,11 +861,10 @@ class XllmMLP(nn.Module):
     def forward(
         self,
         x,
-        use_reduce_scatter: bool = False,
     ):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x, skip_all_reduce=use_reduce_scatter)
+        x, _ = self.down_proj(x)
         return x
 
 
@@ -1040,7 +1041,6 @@ class XllmSparseMoeBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
-        use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
@@ -1060,8 +1060,7 @@ class XllmSparseMoeBlock(nn.Module):
 
         if shared_output is not None:
             final_hidden_states += shared_output
-        if not use_reduce_scatter:
-            final_hidden_states = reduce_moe_output(final_hidden_states)
+        final_hidden_states = reduce_moe_output(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -1505,14 +1504,6 @@ class XllmDecoderLayer(nn.Module):
         is_previous_layer_sparse = _is_sparse(layer_id - 1)
         is_next_layer_sparse = _is_sparse(layer_id + 1)
 
-        self.layer_facts = LayerFacts.init_new(
-            layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
-            is_layer_sparse=self.is_layer_sparse,
-            is_previous_layer_sparse=is_previous_layer_sparse,
-            is_next_layer_sparse=is_next_layer_sparse,
-        )
-
         if self.is_layer_sparse:
             self.mlp = XllmSparseMoeBlock(
                 layer_id=layer_id,
@@ -1537,12 +1528,21 @@ class XllmDecoderLayer(nn.Module):
 
         self.input_layernorm = _make_norm(config)
         self.post_attention_layernorm = _make_norm(config)
-        self.layer_communicator = LayerCommunicator(
-            layer_facts=self.layer_facts,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
-            allow_deferred_ffn_reduction=False,
+        self.attn_boundary, self.ffn_boundary = make_stages(
+            (declare_attn(), self.input_layernorm),
+            (
+                declare_ffn(
+                    sparse=self.is_layer_sparse,
+                    next_sparse=is_next_layer_sparse,
+                ),
+                self.post_attention_layernorm,
+            ),
+            previous=declare_ffn(
+                sparse=is_previous_layer_sparse, next_sparse=self.is_layer_sparse
+            )
+            if layer_id != 0
+            else None,
+            terminal=layer_id == config.num_hidden_layers - 1,
         )
 
     def forward(
@@ -1550,13 +1550,8 @@ class XllmDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states,
-            residual,
-            forward_batch,
-        )
+    ) -> torch.Tensor:
+        hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
 
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
@@ -1565,23 +1560,17 @@ class XllmDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
-        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
-            use_reduce_scatter = ffn_exit.mlp_reduce_scatter
+        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             if isinstance(self.mlp, XllmMLP):
-                hidden_states = self.mlp(
-                    hidden_states, use_reduce_scatter=use_reduce_scatter
-                )
+                hidden_states = self.mlp(hidden_states)
             else:
-                hidden_states = self.mlp(
-                    hidden_states, forward_batch, use_reduce_scatter
-                )
-        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
+                hidden_states = self.mlp(hidden_states, forward_batch)
+        hidden_states = ffn_exit.finish(hidden_states)
 
-        return hidden_states, residual
+        return hidden_states
 
 
 class XllmModel(nn.Module):
@@ -1637,11 +1626,12 @@ class XllmModel(nn.Module):
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
-            residual = None
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
 
         for i in range(self.start_layer, self.end_layer):
             ctx = (
@@ -1651,25 +1641,16 @@ class XllmModel(nn.Module):
             )
             with ctx:
                 layer = self.layers[i]
-                hidden_states, residual = layer(
-                    positions,
-                    hidden_states,
-                    forward_batch,
-                    residual,
-                )
+                hidden_states = layer(positions, hidden_states, forward_batch)
+
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
+            return residual_batch.to_pp(hidden_states, forward_batch)
         else:
+            hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
             if hidden_states.shape[0] != 0:
-                if residual is None:
-                    hidden_states = self.norm(hidden_states)
-                else:
-                    hidden_states, _ = self.norm(hidden_states, residual)
+                hidden_states = residual_batch.norm(
+                    hidden_states, forward_batch, self.norm
+                )
 
         return hidden_states
 

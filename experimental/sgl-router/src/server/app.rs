@@ -208,6 +208,10 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
         .route(
             "/flush_cache",
             post(crate::server::routes::cache::flush_cache),
+        )
+        .route(
+            crate::state::kv_events::bootstrap::SNAPSHOT_PATH,
+            get(crate::server::routes::cache::kv_snapshot),
         );
     // A route that panics on purpose, so the panic-handling layers below are
     // exercised as `build_router` actually composes them. Without it the layers

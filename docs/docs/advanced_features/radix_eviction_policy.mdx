@@ -50,10 +50,6 @@ Omit the flag to accept every default. An unrecognized key fails at startup rath
 TypeError: SLRUStrategy.__init__() got an unexpected keyword argument 'protected_treshold'
 ```
 
-<Note>
-`--radix-eviction-policy-config` is not supported by the experimental Rust tree core (`SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=rust`), which builds its strategy from the policy name alone. Passing both fails at startup.
-</Note>
-
 ### Policy parameters
 
 `slru` and `tlru` take parameters. `lru`, `lfu`, and `priority` take none, so `--radix-eviction-policy-config` has no effect with them and any key is an error.

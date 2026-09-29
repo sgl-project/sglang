@@ -280,13 +280,10 @@ class TestNpuDeviceMixin(CustomTestCase):
         mock_npu.get_device_capability.assert_not_called()
 
     def test_pin_memory_available_for_npu_targets(self):
-        # Pinned memory stays disabled on NPU: torch_npu's pinned-memory +
-        # non_blocking H2D path is not verified against CANN (see
-        # NPUSRTPlatform.is_pin_memory_available).
         base = NPUSRTPlatform()
-        self.assertFalse(base.is_pin_memory_available())
-        self.assertFalse(base.is_pin_memory_available(device="npu"))
-        self.assertFalse(base.is_pin_memory_available(device=torch.device("npu", 0)))
+        self.assertTrue(base.is_pin_memory_available())
+        self.assertTrue(base.is_pin_memory_available(device="npu"))
+        self.assertTrue(base.is_pin_memory_available(device=torch.device("npu", 0)))
         self.assertFalse(base.is_pin_memory_available(device="cpu"))
         self.assertFalse(base.is_pin_memory_available(device=torch.device("cpu")))
 

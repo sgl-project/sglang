@@ -245,6 +245,10 @@ class TestOptimisticPrefillL3BufferWriteThrough(
     retries wait for decode, so retries that recover the prefix from L3 run
     under real load; the gsm8k score is the correctness check."""
 
+    # 32 layers x K/V x 16 fragmented pages produce at most 1024 transfer blocks,
+    # keeping each synchronous batch within the TCP fallback admission budget.
+    extra_prefill_env = {"SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES": "16"}
+
     @classmethod
     def setUpClass(cls):
         cls.hicache_dir = tempfile.mkdtemp(prefix="sglang-hicache-")

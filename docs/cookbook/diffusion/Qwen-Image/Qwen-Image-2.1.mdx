@@ -68,9 +68,13 @@ request. Times are median HTTP latency after warmup, including PNG serialization
 and excluding startup; VRAM is the sampled request-phase peak. Prompts and
 software versions affect both latency and memory use.
 
-RTX 5090 uses DiT layerwise offload and Torch SDPA; its recipe has not been
-retested with the updated checkpoint. Both RTX 5090 and RTX PRO 6000 use SDPA
-when FlashAttention is selected in this runtime. CPU offload requires host RAM.
+On one RTX 5090, native-precision, eager text-to-image or single-reference edits
+with one output and batching off keep the DiT and VAE resident and stream the
+encoder with Torch SDPA. Multiple reference images, multiple outputs, or request
+batching select DiT layerwise offload instead; use the updated Server command
+when changing these settings. The picker identifies which exact combinations
+are verified. Both RTX 5090 and RTX PRO 6000 use SDPA when FlashAttention is
+selected in this runtime. CPU offload requires host RAM.
 
 ### DGX Spark
 
@@ -113,9 +117,12 @@ Qwen-Image 2.1 supports text-to-image generation, single- and multi-image editin
 and RGBA output. Use one checkpoint for all modes.
 
 For multi-round editing, send the previous output as the next reference image.
-The server does not retain conversation state. Condition-prefix KV caches are
-reused within one request; cross-request and dialogue-history caching are not
-implemented.
+The server does not retain conversation state. Repeated prompts and reference
+images can reuse exact encoder outputs and VAE posteriors through the default
+[conditioning cache](/docs/sglang-diffusion/caching-acceleration#conditioning-cache).
+Changing the prompt or image recomputes their joint embedding; unchanged images
+can still reuse vision features. Condition-prefix KV reuse stays within each
+request. Use `--disable-conditioning-cache` to turn off cross-request reuse.
 
 ## 3. Checkpoint layout
 
@@ -184,10 +191,29 @@ text prompt; precomputed embeddings alone are insufficient.
   boundaries. With two or more GPUs, **Spatial shard** distributes full-image
   decoding without enabling tiling; floating-point rounding can still differ.
 
-See the [compatibility inventory](/docs/sglang-diffusion/compatibility_matrix)
-for configuration support and the
-[performance guide](/docs/sglang-diffusion/performance-optimization) for shared
-runtime options.
+See the [performance guide](/docs/sglang-diffusion/performance-optimization)
+for shared runtime options.
+
+### Validation boundaries
+
+The picker marks exact tested HTTP deployments, not every combination of the
+features below. Functional checks do not establish quality for lossy settings.
+
+- **Parallelism and offload:** H200/B200 full-checkpoint checks cover TP,
+  Ulysses, Ring with FlashAttention, CFG parallelism, encoder folding, and
+  all-component layerwise offload. Spatial VAE sharding was checked on two B200
+  GPUs; floating-point rounding can differ from full-image decoding.
+- **Disaggregation:** encoder, denoiser, and decoder roles were checked on three
+  B200 GPUs with same-host Mooncake TCP at 512px/4 steps. Multi-host RDMA and
+  multi-rank roles remain unverified for this model.
+- **Quantized exports:** serialized FP8, native-name Q4_0 GGUF, and calibrated
+  ModelOpt NVFP4 component exports were checked on B200, including TP2 with
+  encoder folding and separate offload checks. These results do not establish
+  support for arbitrary community exports, other GGUF types, or other hardware.
+  The NVFP4 export used six calibration requests; assess image and alpha quality
+  on your workload.
+- **LoRA:** synthetic Diffusers-format adapters were checked on one B200 and
+  TP2 with encoder folding. Trained-adapter quality remains unverified.
 
 ### Quantization
 

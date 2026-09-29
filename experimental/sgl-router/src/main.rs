@@ -289,7 +289,7 @@ fn build_app_context(
     worker_registry: Arc<WorkerRegistry>,
     routing_policies: Arc<PolicyRegistry>,
     local_inflight_requests: Arc<RouterInflightLoadRegistry>,
-    engine_state: &KvEventIndex,
+    engine_state: &Arc<KvEventIndex>,
     external_kv_indexer_client: Option<Arc<dyn PrefixIndex>>,
 ) -> Result<AppContext> {
     let block_size_oracle = engine_state.block_size_oracle();
@@ -318,6 +318,7 @@ fn build_app_context(
     app_context.block_size_oracle = block_size_oracle;
     app_context.engine_reported_load = engine_state.engine_reported_load();
     app_context.kv_metrics = engine_state.metrics_source();
+    app_context.kv_index = engine_state.snapshot_source();
     Ok(app_context)
 }
 

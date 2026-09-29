@@ -11,10 +11,15 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.communicator import LayerCommunicator, LayerFacts
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.layer_boundary import (
+    declare_attn,
+    declare_ffn,
+    make_stages,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -560,21 +565,23 @@ class Step3p5DecoderLayer(nn.Module):
         )
 
         # An MTP draft is a one-layer model; layer_id still indexes its config.
-        self.layer_facts = LayerFacts.init_new(
-            layer_id=0 if is_nextn else layer_id,
-            num_layers=1 if is_nextn else config.num_hidden_layers,
-            is_layer_sparse=self.is_moe_layer,
-            is_previous_layer_sparse=self.is_previous_layer_sparse,
-            is_next_layer_sparse=self.is_next_layer_sparse,
-        )
-        self.layer_communicator = LayerCommunicator(
-            layer_facts=self.layer_facts,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
-            # The dense MLP all-reduces its own output unless postprocess
-            # reduce-scatters it; it never leaves the sum to the next layer.
-            allow_deferred_ffn_reduction=self.use_moe,
+
+        self.attn_boundary, self.ffn_boundary = make_stages(
+            (declare_attn(), self.input_layernorm),
+            (
+                declare_ffn(
+                    sparse=self.is_moe_layer,
+                    next_sparse=self.is_next_layer_sparse,
+                ),
+                self.post_attention_layernorm,
+            ),
+            previous=declare_ffn(
+                sparse=self.is_previous_layer_sparse, next_sparse=self.is_moe_layer
+            )
+            if not (0 if is_nextn else layer_id) == 0
+            else None,
+            terminal=(0 if is_nextn else layer_id)
+            == (1 if is_nextn else config.num_hidden_layers) - 1,
         )
 
         self.layer_id = layer_id
@@ -584,15 +591,11 @@ class Step3p5DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
         post_residual_addition: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         # Self Attention
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states,
-            residual,
-            forward_batch,
-            post_residual_addition=post_residual_addition,
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states, forward_batch, post_residual_addition=post_residual_addition
         )
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
@@ -601,14 +604,11 @@ class Step3p5DecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
         # Fully Connected
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states,
-            residual,
-            forward_batch,
-        )
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
         if self.use_moe:
-            with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
+            with self.ffn_boundary.exit(forward_batch) as ffn_exit:
                 # Both share_expert and MoE return unreduced (TP-partial) outputs.
                 # Combine them first, then do a single all-reduce — saving one
                 # full-TP all-reduce per layer.
@@ -619,11 +619,11 @@ class Step3p5DecoderLayer(nn.Module):
                 hidden_states = moe_output + share_output
                 if not ffn_exit.fuse_mlp_allreduce and not ffn_exit.mlp_reduce_scatter:
                     hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-            return ffn_exit.finish(hidden_states, residual)
+            return ffn_exit.finish(hidden_states)
 
-        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
+        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             hidden_states = self.mlp(hidden_states)
-        return ffn_exit.finish(hidden_states, residual)
+        return ffn_exit.finish(hidden_states)
 
 
 class Step3p5Model(nn.Module):
@@ -697,51 +697,33 @@ class Step3p5Model(nn.Module):
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
-            residual = None
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
 
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                forward_batch,
-                residual,
-            )
+            hidden_states = layer(positions, hidden_states, forward_batch)
             # break
-        last_layer = self.layers[self.end_layer - 1]
-        hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
-            hidden_states, residual, forward_batch
-        )
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
+            return residual_batch.to_pp(hidden_states, forward_batch)
         else:
+            hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
             hidden_states_before_norm = None
             if not self.pp_group.is_last_rank:
-                return PPProxyTensors(
-                    {
-                        "hidden_states": hidden_states,
-                        "residual": residual,
-                    }
-                )
+                return residual_batch.to_pp(hidden_states, forward_batch)
             else:
                 if hidden_states.shape[0] > 0:
                     # if forward_batch.return_hidden_states_before_norm:
-                    hidden_states_before_norm = (
-                        hidden_states if residual is None else hidden_states + residual
+                    hidden_states_before_norm = residual_batch.snapshot(
+                        hidden_states, forward_batch
                     )
-                    if residual is None:
-                        hidden_states = self.norm(hidden_states)
-                    else:
-                        hidden_states, _ = self.norm(hidden_states, residual)
+                    hidden_states = residual_batch.norm(
+                        hidden_states, forward_batch, self.norm
+                    )
             return hidden_states, hidden_states_before_norm
 
 

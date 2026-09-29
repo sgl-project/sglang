@@ -2,66 +2,32 @@
 //! registers its routes here, and [`serve`] runs the assembled app on the
 //! pre-bound listener until shutdown.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
 
 use axum::{
     Router,
     extract::{Request, State},
+    http::StatusCode,
     middleware::Next,
     response::Response,
 };
 
 use super::disaggregation::bootstrap as pd_bootstrap;
 use super::{common, log, native_api, openai};
+use crate::frontend::FrontendHandle;
 use crate::message::config::ServerArgs;
-use crate::tokenizer_manager::from_scheduler::ActivityCounter;
-use crate::tokenizer_manager::wiring::Senders;
 
-/// Shared handler state: submission handles, immutable server configuration,
-/// and the API-owned chat formatter.
+/// HTTP adapter state: the shared frontend capability, immutable server
+/// configuration needed for HTTP request preparation, and the chat formatter.
 ///
 /// axum clones the router state into **every** request, so it is mounted as
-/// `Arc<AppState>` — one refcount bump per request instead of cloning each
-/// `flume::Sender` and the chat formatter. Deliberately not `Clone`, so it
+/// `Arc<AppState>` — one refcount bump per request instead of cloning the
+/// frontend handle and chat formatter. Deliberately not `Clone`, so it
 /// can only be shared through that `Arc`.
 pub(super) struct AppState {
-    pub(super) senders: Senders,
-    pub(super) response_buf: usize,
+    pub(super) frontend: FrontendHandle,
     pub(super) server_args: Arc<ServerArgs>,
     pub(super) chat_formatter: Option<openai::ChatFormatter>,
-    /// Response heartbeat (bumped per drained ring frame).
-    pub(super) response_activity: ActivityCounter,
-    /// Whether the main process's startup warmup has completed. The listener
-    /// binds before warmup so `/model_info` is available to construct that
-    /// request, but health endpoints must not advertise readiness yet.
-    pub(super) startup_readiness: StartupReadiness,
-}
-
-pub(super) struct StartupReadiness(AtomicBool);
-
-impl StartupReadiness {
-    fn new(skip_server_warmup: bool) -> Self {
-        Self(AtomicBool::new(skip_server_warmup))
-    }
-
-    pub(super) fn is_ready(&self) -> bool {
-        self.0.load(Ordering::Acquire)
-    }
-
-    fn record_warmup_status(&self, status: axum::http::StatusCode) {
-        if status.is_success() {
-            self.0.store(true, Ordering::Release);
-        }
-    }
-}
-
-impl Default for StartupReadiness {
-    fn default() -> Self {
-        Self::new(false)
-    }
 }
 
 /// Private marker attached by the main process to its startup warmup request.
@@ -79,20 +45,24 @@ async fn mark_startup_ready(
             "/generate" | "/encode" | "/v1/chat/completions"
         );
     let response = next.run(req).await;
-    if is_startup_warmup && response.status().is_success() {
-        state
-            .startup_readiness
-            .record_warmup_status(response.status());
-    }
+    record_startup_warmup_status(&state.frontend, is_startup_warmup, response.status());
     response
+}
+
+fn record_startup_warmup_status(
+    frontend: &FrontendHandle,
+    is_startup_warmup: bool,
+    status: StatusCode,
+) {
+    if is_startup_warmup && status.is_success() {
+        frontend.mark_ready();
+    }
 }
 
 pub async fn serve(
     listener: std::net::TcpListener,
-    senders: Senders,
-    response_buf: usize,
+    frontend: FrontendHandle,
     server_args: Arc<ServerArgs>,
-    response_activity: ActivityCounter,
     // The runtime's shutdown signal, shared with every worker stage: it fires
     // (disconnects) when `Runtime::request_shutdown` drops the sender, at
     // which point `serve` stops accepting and its in-flight handlers are
@@ -101,12 +71,9 @@ pub async fn serve(
 ) {
     let chat_formatter = openai::load_chat_support(&server_args);
     let state = Arc::new(AppState {
-        senders,
-        response_buf,
+        frontend,
         server_args: server_args.clone(),
         chat_formatter,
-        response_activity,
-        startup_readiness: StartupReadiness::new(server_args.skip_server_warmup),
     });
     // Each endpoint module registers its own routes and merges here.
     let router = Router::new()
@@ -170,19 +137,32 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::StatusCode;
+
+    fn frontend() -> FrontendHandle {
+        FrontendHandle::new(
+            flume::unbounded().0,
+            flume::unbounded().0,
+            crate::frontend::FrontendConfig {
+                response_capacity: 8,
+                response_activity: Default::default(),
+                startup_ready: false,
+                is_disaggregation: false,
+                mm_limits: Default::default(),
+            },
+        )
+    }
 
     #[test]
-    fn startup_readiness_requires_successful_warmup_unless_skipped() {
-        let readiness = StartupReadiness::new(false);
-        assert!(!readiness.is_ready());
+    fn only_a_successful_recognized_warmup_marks_frontend_ready() {
+        let frontend = frontend();
 
-        readiness.record_warmup_status(StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(!readiness.is_ready());
+        record_startup_warmup_status(&frontend, false, StatusCode::OK);
+        assert!(!frontend.is_ready());
 
-        readiness.record_warmup_status(StatusCode::OK);
-        assert!(readiness.is_ready());
+        record_startup_warmup_status(&frontend, true, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!frontend.is_ready());
 
-        assert!(StartupReadiness::new(true).is_ready());
+        record_startup_warmup_status(&frontend, true, StatusCode::OK);
+        assert!(frontend.is_ready());
     }
 }

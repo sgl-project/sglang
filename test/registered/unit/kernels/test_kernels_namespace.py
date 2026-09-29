@@ -313,7 +313,7 @@ def test_deep_select_spec_matches_wrapper_architectures():
 
     spec = K.registry.get_backend("attention.deep_select_topk", KernelBackend.JIT)
     assert spec.capabilities == frozenset(
-        Cap.cuda(min_sm=sm, max_sm=sm) for sm in deep_select._SUPPORTED_CAPABILITIES
+        Cap.cuda(min_sm=sm, max_sm=sm) for sm in deep_select.SUPPORTED_CUDA_ARCHS
     )
 
 

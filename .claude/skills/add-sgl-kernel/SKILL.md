@@ -29,7 +29,7 @@ Add a new operation that scales each element of a tensor by a scalar factor:
 In addition, every new kernel must ship with:
 
 - **Tests** (pytest)
-- **A benchmark script** (triton.testing)
+- **A benchmark script** (`marker.do_bench` from `sglang.kernels.jit.benchmark` — it works for any callable, not only JIT kernels)
 
 ---
 
@@ -260,62 +260,46 @@ if __name__ == "__main__":
 
 ## Step 7: Add a benchmark (required)
 
+Every benchmark must account for L2 cache reuse — see [`rules/kernel-benchmark.md`](../../rules/kernel-benchmark.md).
+
 Create `python/sglang/kernels/aot/benchmark/bench_scale.py`:
 
 ```python
-import itertools
-
 import torch
-import triton
-import triton.testing
 
 import sgl_kernel
-from sglang.utils import is_in_ci
-
-IS_CI = is_in_ci()
-
-dtypes  = [torch.float16] if IS_CI else [torch.float16, torch.bfloat16, torch.float32]
-sizes   = [4096] if IS_CI else [2**n for n in range(10, 20)]  # 1K … 512K
-factors = [2.0]
-
-configs = list(itertools.product(dtypes, sizes))
+from sglang.kernels.jit.benchmark import marker
 
 
-def torch_scale(input: torch.Tensor, factor: float) -> torch.Tensor:
-    return input * factor
+def sglang_scale(input: torch.Tensor, factor: float, out: torch.Tensor) -> None:
+    sgl_kernel.scale(input, factor, out=out)
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["dtype", "size"],
-        x_vals=configs,
-        line_arg="provider",
-        line_vals=["sglang", "torch"],
-        line_names=["SGL Kernel", "PyTorch"],
-        styles=[("green", "-"), ("red", "--")],
-        ylabel="µs (median)",
-        plot_name="scale-performance",
-        args={},
+def torch_scale(input: torch.Tensor, factor: float, out: torch.Tensor) -> None:
+    torch.mul(input, factor, out=out)
+
+
+FN_MAP = {"sglang": sglang_scale, "torch": torch_scale}
+
+
+@marker.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32], [torch.float16])
+@marker.parametrize("size", [2**n for n in range(10, 20)], [4096])  # 1K .. 512K
+@marker.benchmark("provider", ["sglang", "torch"])
+def benchmark(dtype: torch.dtype, size: int, provider: str):
+    input = torch.randn(size, dtype=dtype, device="cuda")
+    out = torch.empty_like(input)
+    return marker.do_bench(
+        FN_MAP[provider],
+        # Pass every tensor through input_args (not a closure) so marker rotates
+        # them across CUDA-graph calls to defeat L2 reuse.
+        input_args=(input, 2.0, out),
+        # Bandwidth = bytes(input) + bytes(out), both already in input_args.
+        memory_output=None,
     )
-)
-def benchmark(dtype, size, provider):
-    input  = torch.randn(size, dtype=dtype, device="cuda")
-    out    = torch.empty_like(input)
-    factor = 2.0
-
-    if provider == "sglang":
-        fn = lambda: sgl_kernel.scale(input, factor, out=out)
-    else:
-        fn = lambda: torch_scale(input, factor)
-
-    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
-        fn, quantiles=[0.5, 0.2, 0.8]
-    )
-    return 1000 * ms, 1000 * max_ms, 1000 * min_ms
 
 
 if __name__ == "__main__":
-    benchmark.run(print_data=True)
+    benchmark.run()
 ```
 
 ---

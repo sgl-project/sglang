@@ -193,7 +193,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             return output
 
         matched = finished_reason.get("matched", None)
-        if not matched:
+        if matched is None:
             return output
 
         # TODO(lmzheng): handle the case where multiple stop strs are hit

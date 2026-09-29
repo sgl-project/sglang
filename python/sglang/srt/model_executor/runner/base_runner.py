@@ -253,6 +253,7 @@ class BaseRunner(ABC):
 
         self._pre_initialize_flashinfer_allreduce_workspace()
         self._pre_initialize_fi_a2a_workspace()
+        self._pre_initialize_pcie_ipc_workspace()
 
         # Model-owned communication resources may depend on the resolved
         # request pool and must be compiled/allocated before graph capture.
@@ -288,12 +289,12 @@ class BaseRunner(ABC):
         with custom_all_reduce.register_graph_buffers).
         """
         mr = self.model_runner
-        from sglang.srt.layers.communicator import FUSE_ALLREDUCE_MAX_BATCH_SIZE
         from sglang.srt.layers.flashinfer_comm_fusion import (
             pre_initialize_workspaces,
             resolve_flashinfer_allreduce_fusion_backend,
             uses_cutedsl_ar_fusion,
         )
+        from sglang.srt.layers.layer_boundary import FUSE_ALLREDUCE_MAX_BATCH_SIZE
 
         if get_exec().comm.flashinfer_allreduce_fusion_backend is None:
             return
@@ -302,8 +303,8 @@ class BaseRunner(ABC):
             # Nothing else resolves the configured backend, so check the platform.
             resolve_flashinfer_allreduce_fusion_backend()
             if not mr.is_draft_worker:
-                # A draft installs no fusion communicator.
-                from sglang.srt.layers.moe.cutedsl_ar_fusion import (
+                # A draft installs no CuTe DSL fusion.
+                from sglang.srt.layers.layer_boundary.fusions.cutedsl import (
                     prepare_cutedsl_fusion,
                 )
 
@@ -332,6 +333,44 @@ class BaseRunner(ABC):
         from sglang.srt.layers.dcp import init_fi_a2a_workspace
 
         init_fi_a2a_workspace(get_parallel().dcp_group)
+
+    def _pre_initialize_pcie_ipc_workspace(self):
+        """Build the PCIe-IPC all-reduce workspace before graph capture.
+
+        Runs for every model, not only the ones that autotune: left to the first
+        reduction, the build lands inside another autotune context and tuning
+        declines there.
+        """
+        pcie_ipc_comm = get_parallel().tp_group.pcie_ipc_comm
+        if pcie_ipc_comm is None:
+            return
+
+        mr = self.model_runner
+        pcie_ipc_comm.prepare(
+            hidden=mr.model_config.hidden_size,
+            max_rows=self._widest_decode_rows(),
+        )
+
+    def _widest_decode_rows(self) -> Optional[int]:
+        """Rows in the widest decode reduction, or None when no graph is captured.
+
+        Same derivation the decode runner uses for its buffers, so the workspace
+        covers exactly the batches that will be issued: get_batch_sizes_to_capture
+        already applies the attention-tp alignment and the req_to_token_pool clamp,
+        which a second derivation from cuda_graph_config would miss.
+        """
+        if get_exec().graph.cuda_graph_config is None:
+            return None
+        from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+            get_batch_sizes_to_capture,
+        )
+
+        mr = self.model_runner
+        tokens_per_req = mr.decode_num_tokens_per_req()
+        capture_bs, _ = get_batch_sizes_to_capture(mr, tokens_per_req)
+        if not capture_bs:
+            return None
+        return max(capture_bs) * tokens_per_req
 
     def _flashinfer_autotune(self, *, buffers, batch_size):
         """Run flashinfer autotune.

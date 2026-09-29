@@ -18,13 +18,14 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
 from sglang.srt.layers.moe import topk as topk_module
-from sglang.srt.layers.moe.topk import TopKConfig
+from sglang.srt.layers.moe.topk import TopK, TopKConfig
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -157,6 +158,36 @@ class TestFusedSharedExpertScaling(CustomTestCase):
         num_local_experts = num_local_routed + 1  # 33
         expected_shared_id = self.EP_RANK * num_local_experts + num_local_routed
         self.assertEqual(out_ids[0, -1].item(), expected_shared_id)
+
+    def test_glm53_idle_rank_preserves_routed_topk_contract(self):
+        """An idle rank must return the pre-append top-8 shape; returning top-9
+        here would make the AITER postprocessor append shared ID 288 twice."""
+        topk = TopK.__new__(TopK)
+        torch.nn.Module.__init__(topk)
+        topk.topk_config = TopKConfig(top_k=9, num_fused_shared_experts=1)
+        topk.enable_waterfill = False
+        topk.waterfill_balancer = None
+
+        with (
+            patch.object(
+                topk_module,
+                "get_parallel",
+                return_value=SimpleNamespace(tp_group=None),
+            ),
+            patch.object(topk_module, "is_allocation_symmetric", return_value=False),
+            patch.object(
+                topk_module,
+                "use_symmetric_memory",
+                side_effect=lambda *_args, **_kwargs: nullcontext(),
+            ),
+            patch.object(
+                topk_module, "has_per_rank_fused_shared_slots", return_value=False
+            ),
+        ):
+            output = topk.empty_topk_output(torch.device("cpu"))
+
+        self.assertEqual(output.topk_ids.shape, (0, 8))
+        self.assertEqual(output.topk_weights.shape, (0, 8))
 
 
 if __name__ == "__main__":

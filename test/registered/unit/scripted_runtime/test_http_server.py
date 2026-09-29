@@ -7,7 +7,12 @@ import uuid
 import zmq
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scripted_runtime.http_server import ScriptedHttpServer
+from sglang.test.scripted_runtime.http_server import (
+    CANARY_LAUNCH_DEFAULTS,
+    DEFAULT_RUN_TIMEOUT_S,
+    ScriptedHttpServer,
+    _canary_decode_graph_override,
+)
 from sglang.test.scripted_runtime.io_struct import (
     HookReady,
     RunScript,
@@ -73,6 +78,7 @@ def _make_server(socket: zmq.Socket, process: _FakeProcess) -> ScriptedHttpServe
     server._socket = socket
     server._server_process = process
     server._dirty = None
+    server._run_timeout_s = DEFAULT_RUN_TIMEOUT_S
     return server
 
 
@@ -139,6 +145,24 @@ class TestExecuteScriptDirtyGuard(CustomTestCase):
             with self.assertRaisesRegex(RuntimeError, "dirty"):
                 server.execute_script(_sample_script)
             pair.assert_no_sent_message(self)
+
+
+class TestCanaryLaunchKwargs(CustomTestCase):
+    def test_canary_is_enabled_without_consulting_the_device(self):
+        self.assertEqual(CANARY_LAUNCH_DEFAULTS["kv_canary"], "raise")
+        self.assertEqual(CANARY_LAUNCH_DEFAULTS["kv_canary_real_data"], "partial")
+
+    def test_cuda_keeps_its_decode_graph(self):
+        self.assertEqual(
+            _canary_decode_graph_override(kv_canary="raise", device="cuda"), {}
+        )
+
+    def test_a_disabled_canary_keeps_the_decode_graph(self):
+        for device in ("cuda", "xpu", "cpu"):
+            with self.subTest(device=device):
+                self.assertEqual(
+                    _canary_decode_graph_override(kv_canary="none", device=device), {}
+                )
 
 
 if __name__ == "__main__":

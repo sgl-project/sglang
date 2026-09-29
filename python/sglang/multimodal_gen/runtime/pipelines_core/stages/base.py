@@ -287,6 +287,12 @@ class PipelineStage(StageDedupMixin, ABC):
         )
         self._component_residency_manager.begin_use(use, module=module)
 
+    def finish_unused_declared_component(self, *, component_name: str, module=None):
+        if self._component_residency_manager is None:
+            return
+        use = self._declared_component_use(component_name=component_name)
+        self._component_residency_manager.finish_unused_component(use, module=module)
+
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:

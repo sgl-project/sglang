@@ -49,6 +49,8 @@ framework-specific optimization workflow.
 - `python/sglang/multimodal_gen/runtime/models/vaes/flux2_vae_cuda_opt.py`
 - `python/sglang/multimodal_gen/runtime/models/vaes/wan_vae_cuda_opt.py`
 - `python/sglang/multimodal_gen/runtime/models/vaes/autoencoder_kl_qwenimage.py`
+- `python/sglang/multimodal_gen/runtime/models/dits/qwen_image21.py`
+- `python/sglang/kernels/ops/diffusion/rope/qknorm_complex_rope_jit.py`
 - `python/sglang/multimodal_gen/runtime/breakable_cuda_graph/runner.py`
 - `test/registered/kernels/ops/diffusion/test_modulate.py`
 - `test/registered/kernels/ops/diffusion/test_norm.py`
@@ -285,6 +287,33 @@ framework-specific optimization workflow.
   calls plus scatter/mask/final-topk launches, check the score dtype,
   contiguity, group layout, and platform before proposing another router
   kernel.
+
+17. Qwen-Image 2.1 attention prep
+- Kernels: `qknorm_complex_rope_cuda`, `qknorm_complex_rope_pack_`.
+- Locations: `rope/qknorm_complex_rope_jit.py`,
+  `csrc/diffusion/qknorm_complex_rope.cuh`, and
+  `runtime/models/dits/qwen_image21.py`.
+- Default-on and bit-exact (`BitExactFusionGate`, first call verified against
+  the eager chain): `QwenImage21Attention` projects Q, K and V with one GEMM
+  over a packed `[3C, C]` weight view straight into a `[1, P+S, 3C]` buffer
+  whose rows `[P:]` are the target tokens; one CUDA launch then normalizes Q
+  and K in place (the `RMSNorm(cast_x_before_out_mul=True)` reduction order),
+  applies the complex64 RoPE and copies the prefix K/V into rows `[:P]`, so V
+  is never copied. `apply_qk_norm_rope` uses the same kernel out of place, and
+  the single-element `torch.cat` on the attention output is gone. Unsupported
+  layouts (B > 1, SP > 1, LoRA-wrapped or quantized projections,
+  head_dim != 128) and first-sight mismatches keep the Triton
+  `qknorm_complex_rope` / `qknorm_complex_rope_kv` chain.
+- Validation: `test/registered/kernels/ops/diffusion/test_qknorm_complex_rope.py`,
+  the `test_qwen21_cuda_qk_rope_*` cases in `test_model_fast_paths.py`, and
+  `python/sglang/multimodal_gen/test/unit/test_qwen_image21_cuda.py`.
+- Workflow rule: if a Qwen-Image 2.1 trace still shows
+  `_qknorm_complex_rope_onepass_kernel` / `_qknorm_complex_rope_kv_kernel` or
+  three separate Q/K/V GEMMs per block, check the gate logs for a first-sight
+  mismatch and the projection layer type before proposing another kernel. The
+  remaining non-GEMM/attention time per block is the SiLU-mul and the
+  residual-gate + LayerNorm chain, both measured at the DRAM roofline; a fused
+  gated LayerNorm was tried and was slower than the two-kernel chain.
 
 **Faster CUDA Kernel Usage Points**
 

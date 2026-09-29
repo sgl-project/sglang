@@ -683,7 +683,7 @@ class ForwardFlags:
         "sp_active": False,
     }
 
-    # Read/written inside compiled graphs (vocab embedding, communicator,
+    # Read/written inside compiled graphs (vocab embedding, layer boundaries,
     # EP dispatch, DP gather/scatter, MLP/MoE skip-AR): plain-slot backed.
     # Before moving a flag out of this set, prove no read/write site sits
     # under torch.compile.

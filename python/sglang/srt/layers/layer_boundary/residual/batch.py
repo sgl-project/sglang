@@ -1,0 +1,143 @@
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+"""Residual access for one layer-stack invocation or TBO microbatch."""
+
+from sglang.srt.layers.layer_boundary.residual import access
+from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+
+
+def start(forward_batch):
+    """Reset forward_batch.residual_stream at entry to a fresh layer-stack call.
+
+    Call once before the first local stage on an embedding path, not per layer.
+    Pipeline reception and TBO adapters reconstruct their own streams.
+    """
+    forward_batch.residual_stream = ResidualStream()
+
+
+def current(forward_batch):
+    stream = forward_batch.residual_stream
+    if stream is None:
+        raise RuntimeError("start the layer stack before entering a stage")
+    return stream
+
+
+def complete_output(hidden_states, forward_batch):
+    """Complete the contribution while retaining its pending residual update."""
+    return current(forward_batch).complete(hidden_states)
+
+
+def take_output(hidden_states, forward_batch):
+    """Release a terminal output whose residual update has already been written."""
+    stream = current(forward_batch)
+    stream.check(hidden_states)
+    if stream.pending is not None:
+        raise RuntimeError("write the residual update before taking the final output")
+    forward_batch.residual_stream = None
+    return hidden_states
+
+
+def norm(
+    hidden_states,
+    forward_batch,
+    layernorm,
+    capture_output=None,
+    *,
+    handoff_norm=None,
+    skip_empty=False,
+    **read_kwargs,
+):
+    """Complete the layer stack and apply its terminal normalization.
+
+    Args:
+        hidden_states: Current stream output or opaque owed handle.
+        forward_batch: Batch owning the residual stream.
+        layernorm: Final norm supporting the model's output/residual pair.
+        capture_output: Optional callback retaining the same updated residual;
+            it must copy borrowed storage when retention requires ownership.
+        handoff_norm: Optional adapter with finalize(handoff, residual, gamma)
+            for a producer-specific finalize handoff; when a handoff arrives it
+            cannot be combined with capture. Without it, a handoff is completed
+            unfused first. Its gamma is layernorm.gemma_weight, so the final
+            norm must then be a GemmaRMSNorm.
+        skip_empty: Skip the ordinary norm on a zero-row completed output.
+        **read_kwargs: Extra arguments forwarded to the two-input final norm.
+
+    Returns:
+        Normalized tensor. Add and norm remain together to preserve the kernel's
+        accumulation/rounding order; a snapshot is not used as the norm input.
+    """
+    hidden_states, residual = current(forward_batch).finish(
+        hidden_states, takes_handoff=handoff_norm is not None
+    )
+    # The terminal consumer now owns the pair. Do not keep layer buffers alive
+    # through logits processing or the next forward on this batch.
+    forward_batch.residual_stream = None
+    from sglang.srt.layers.layer_boundary.output import HandoffOutput
+
+    if isinstance(hidden_states, HandoffOutput):
+        if residual is None:
+            raise RuntimeError("invalid final deferred MoE handoff")
+        if capture_output is not None:
+            raise RuntimeError(
+                "final handoff capture requires an explicit capture adapter"
+            )
+        hidden_states, _ = handoff_norm.finalize(
+            handoff=hidden_states, residual=residual, gamma=layernorm.gemma_weight
+        )
+        return hidden_states
+    if skip_empty and hidden_states.shape[0] == 0:
+        return hidden_states
+    return access.norm_output(
+        hidden_states, residual, layernorm, capture_output, **read_kwargs
+    )
+
+
+def to_pp(hidden_states, forward_batch, *, preserve_declared=True):
+    """Export hidden_states and residual as PPProxyTensors.
+
+    Args:
+        hidden_states: Current stream output or opaque owed handle.
+        forward_batch: Batch owning the stream.
+        preserve_declared: True (the default) sends a statically declared
+            partial sum unreduced for the receiver's from_pp to complete; pass
+            False only when the receiver does not declare that sum.
+
+    Runtime-selected completion work is finished before transport.
+    """
+    hidden_states, residual = current(forward_batch).finish(
+        hidden_states, preserve_declared=preserve_declared
+    )
+    forward_batch.residual_stream = None
+    return PPProxyTensors({"hidden_states": hidden_states, "residual": residual})
+
+
+def snapshot(hidden_states, forward_batch):
+    return current(forward_batch).snapshot(hidden_states)
+
+
+def add_to_output(hidden_states, forward_batch, extra):
+    output, _ = access.add_to_output(hidden_states, current(forward_batch), extra)
+    return output
+
+
+def fold(hidden_states, forward_batch):
+    output, _ = access.fold(hidden_states, current(forward_batch))
+    return output
+
+
+def written(hidden_states, forward_batch):
+    forward_batch.residual_stream = ResidualStream(hidden_states)
+    return hidden_states
