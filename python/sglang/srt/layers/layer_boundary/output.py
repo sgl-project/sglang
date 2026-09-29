@@ -46,9 +46,10 @@ class UnreducedOutput(msgspec.Struct, frozen=True):
         reduce_to_dp_local: Callable(partial) completing the sum and moving
             it to destination rows; takes precedence over group.
 
-    Exits hand this form to ResidualStream.record(), which exposes an opaque
-    OwedOutput to models. Low-level adapters use complete_owed() before reading
-    it. A group is required when reduce_to_dp_local is absent.
+    Exits hand this form to ResidualStream.record(), which keeps it as the
+    contribution's owed work and exposes an opaque OwedOutput to models.
+    Low-level adapters use complete_owed() before reading it. A group is
+    required when reduce_to_dp_local is absent.
     """
 
     partial: torch.Tensor
@@ -56,6 +57,12 @@ class UnreducedOutput(msgspec.Struct, frozen=True):
     # Under attention DP: the reduction that also brings ``partial`` back to this
     # rank's tokens (a reduce-scatter, or an all-reduce then a scatter).
     reduce_to_dp_local: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
+
+    def complete(self) -> torch.Tensor:
+        """Complete the sum, on the destination rows when it moves them."""
+        if self.reduce_to_dp_local is not None:
+            return self.reduce_to_dp_local(self.partial)
+        return self.group.all_reduce(self.partial)
 
 
 class DeferredFinalize(msgspec.Struct, frozen=True):
@@ -75,10 +82,6 @@ def complete_owed(
 ) -> Optional[torch.Tensor]:
     """Run the work an UnreducedOutput or a DeferredFinalize still owes; pass
     anything else through."""
-    if isinstance(hidden_states, UnreducedOutput):
-        if hidden_states.reduce_to_dp_local is not None:
-            return hidden_states.reduce_to_dp_local(hidden_states.partial)
-        return hidden_states.group.all_reduce(hidden_states.partial)
-    if isinstance(hidden_states, DeferredFinalize):
+    if isinstance(hidden_states, (UnreducedOutput, DeferredFinalize)):
         return hidden_states.complete()
     return hidden_states
