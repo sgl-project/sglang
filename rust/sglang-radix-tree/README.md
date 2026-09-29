@@ -11,7 +11,7 @@ Python in these cases:
 - C128 or other unsupported components.
 - Custom component overrides.
 - Non-Linux platforms.
-- PyTorch versions outside 2.11 through 2.13.
+- PyTorch versions outside 2.11 through 2.14.
 - Devices other than CPU or CUDA.
 - Installations containing neither the Rust extension nor its sources.
 - Source builds with a missing or unusable Rust toolchain.
