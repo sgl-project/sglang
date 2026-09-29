@@ -45,7 +45,7 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
-    LayerScatterModes,
+    LayerFacts,
     reduce_output,
 )
 from sglang.srt.layers.dp_attention import (
@@ -214,14 +214,13 @@ def _use_mnnvl_cutedsl_fusion(config: Qwen3_5TextConfig, is_nextn: bool) -> bool
     )
 
 
-def _layer_communicator_class(config: Qwen3_5TextConfig, is_nextn: bool):
+def _layer_fusions(config: Qwen3_5TextConfig, is_nextn: bool):
+    """The CuTe DSL kernels a layer tries before its own, when they are on."""
     if _use_mnnvl_cutedsl_fusion(config, is_nextn):
-        from sglang.srt.layers.moe.cutedsl_ar_fusion import (
-            CuteDSLFusionLayerCommunicator,
-        )
+        from sglang.srt.layers.communicator.fusions.cutedsl import CuteDSLFusion
 
-        return CuteDSLFusionLayerCommunicator
-    return LayerCommunicator
+        return CuteDSLFusion()
+    return None
 
 
 if _is_cuda:
@@ -1105,7 +1104,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         else:
             raise ValueError(f"Invalid model type: {config.model_type}")
 
-        self.layer_scatter_modes = LayerScatterModes.init_new(
+        self.layer_facts = LayerFacts.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=is_layer_sparse,
@@ -1124,13 +1123,14 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             _enable_qwen35_fused_ar_quant()
             and _linear_accepts_fp8_tuple(self.linear_attn.in_proj_qkvz)
         )
-        self.layer_communicator = _layer_communicator_class(config, is_nextn)(
-            layer_scatter_modes=self.layer_scatter_modes,
+        self.layer_communicator = LayerCommunicator(
+            layer_facts=self.layer_facts,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
             enable_fused_ar_quant=enable_fused_ar_quant,
             fused_ar_quant_keep_bf16=enable_fused_ar_quant,
+            fusions=_layer_fusions(config, is_nextn),
         )
 
     def forward(
@@ -1306,7 +1306,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         else:
             raise ValueError(f"Invalid model type: {config.model_type}")
 
-        self.layer_scatter_modes = LayerScatterModes.init_new(
+        self.layer_facts = LayerFacts.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=is_layer_sparse,
@@ -1327,13 +1327,14 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         enable_fused_ar_quant = (
             _enable_qwen35_fused_ar_quant() and _linear_accepts_fp8_tuple(self.qkv_proj)
         )
-        self.layer_communicator = _layer_communicator_class(config, is_nextn)(
-            layer_scatter_modes=self.layer_scatter_modes,
+        self.layer_communicator = LayerCommunicator(
+            layer_facts=self.layer_facts,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
             enable_fused_ar_quant=enable_fused_ar_quant,
             fused_ar_quant_keep_bf16=False,
+            fusions=_layer_fusions(config, is_nextn),
         )
 
         self.alt_stream = alt_stream
@@ -1729,7 +1730,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                     "layers: "
                     f"{unsupported_layers}"
                 )
-            from sglang.srt.layers.moe.cutedsl_ar_fusion import (
+            from sglang.srt.layers.communicator.fusions.cutedsl import (
                 install_cutedsl_fusion,
             )
 
@@ -1856,7 +1857,12 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         last_layer = self.layers[self.end_layer - 1]
         hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
-            hidden_states, residual, forward_batch
+            hidden_states,
+            residual,
+            forward_batch,
+            # The final norm below finalizes a deferred MoE output in its kernel.
+            final_norm_takes_handoff=self.flashinfer_mnnvl_cutedsl_fusion is not None
+            and self.pp_group.is_last_rank,
         )
 
         # Return intermediate tensors for pipeline parallelism
@@ -1871,7 +1877,9 @@ class Qwen3_5ForCausalLM(nn.Module):
         # The final layer has no successor to consume its deferred MoE tail.
         is_deferred_finalize = False
         if self.flashinfer_mnnvl_cutedsl_fusion is not None:
-            from sglang.srt.layers.moe.cutedsl_ar_fusion import MoeFinalizeHandoff
+            from sglang.srt.layers.communicator.fusions.cutedsl import (
+                MoeFinalizeHandoff,
+            )
 
             is_deferred_finalize = isinstance(hidden_states, MoeFinalizeHandoff)
 

@@ -109,6 +109,8 @@ class MockReq:
     def get_fill_ids(self):
         return self.full_untruncated_fill_ids[: self.extend_range.end]
 
+    skip_radix_cache_insert = False
+
     def owned_kv_len(self):
         return self.kv.kv_committed_len
 
@@ -249,8 +251,8 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         # Step 2: cache_unfinished_req (dec old lock, inc new lock)
         cache.cache_unfinished_req(req)
 
-        # Step 3: cache_finished_req (dec lock)
-        cache.cache_finished_req(req, owned_kv_len=req.kv.kv_committed_len)
+        # Step 3: release_kv_cache (insert, free the rest, dec lock)
+        release_kv_cache(req, cache)
 
         # Verify: all non-root nodes should have lock_ref == 0
         # (root always has lock_ref == 1)
@@ -299,7 +301,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         cache.cache_unfinished_req(req)
 
         # Step 3: cache_finished_req (dec leaf)
-        cache.cache_finished_req(req, owned_kv_len=req.kv.kv_committed_len)
+        release_kv_cache(req, cache)
 
         # Root lock unchanged, all nodes unlocked
         self.assertEqual(cache.root_node.lock_ref, root_lock_before)
@@ -391,7 +393,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         req.kv.kv_allocated_len = len(row_vals)
 
         cache.token_to_kv_pool_allocator.reset_mock()
-        cache.cache_finished_req(req, owned_kv_len=req.kv.kv_committed_len)
+        release_kv_cache(req, cache)
 
         # The unnamed tail slot is freed as the segment past the radix key.
         segments = cache.token_to_kv_pool_allocator.free_segments.call_args.args[0]
@@ -459,7 +461,9 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         req.last_node = object()
         req.finished_reason = None
         req.kv.cache_protected_len = 0
-        req.lock_receipt = DecLockRefParams(swa_uuid_for_lock=123)
+        req.lock_receipt = DecLockRefParams(
+            component_lock_uuids={ComponentType.SWA: 123}
+        )
         req.swa_prefix_lock_released = False
         req.pd_rebootstrap_in_progress = False
         req.sampling_params.max_new_tokens = 16
@@ -542,11 +546,11 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         queue._pre_alloc.assert_not_called()
         queue.tree_cache.dec_swa_lock_only.assert_called_once_with(
             req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=123),
+            DecLockRefParams(component_lock_uuids={ComponentType.SWA: 123}),
         )
         queue.tree_cache.dec_lock_ref.assert_called_once_with(
             req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=123),
+            DecLockRefParams(component_lock_uuids={ComponentType.SWA: 123}),
             skip_swa=True,
         )
         self.assertFalse(req.swa_prefix_lock_released)
@@ -565,7 +569,9 @@ class TestDecodeLockRefScenarios(CustomTestCase):
 
         req = MagicMock()
         req.req_pool_idx = 0
-        req.lock_receipt = DecLockRefParams(swa_uuid_for_lock=123)
+        req.lock_receipt = DecLockRefParams(
+            component_lock_uuids={ComponentType.SWA: 123}
+        )
         req.swa_prefix_lock_released = True  # SWA tail-prealloc released early
 
         prealloc_node = object()
@@ -580,7 +586,8 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         )
         decode_req.hicache_restored_node = restored_node
         decode_req.hicache_restore_lock_receipt = DecLockRefParams(
-            swa_uuid_for_lock=456, skipped_lock_components=(ComponentType.MAMBA,)
+            component_lock_uuids={ComponentType.SWA: 456},
+            skipped_lock_components=(ComponentType.MAMBA,),
         )
         decode_req.hicache_restored_kv_indices = torch.arange(4, 8, dtype=torch.int64)
 
@@ -588,11 +595,11 @@ class TestDecodeLockRefScenarios(CustomTestCase):
 
         q.tree_cache.dec_lock_ref.assert_called_once_with(
             prealloc_node,
-            DecLockRefParams(swa_uuid_for_lock=123),
+            DecLockRefParams(component_lock_uuids={ComponentType.SWA: 123}),
             skip_swa=True,
         )
         self.assertIs(req.last_node, restored_node)
-        self.assertEqual(req.lock_receipt.swa_uuid_for_lock, 456)
+        self.assertEqual(req.lock_receipt.component_lock_uuids[ComponentType.SWA], 456)
         self.assertIn(ComponentType.MAMBA, req.lock_receipt.skipped_lock_components)
         self.assertFalse(req.swa_prefix_lock_released)
         self.assertIsNone(decode_req.hicache_restored_node)
@@ -681,7 +688,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
             )
 
             cache.cache_unfinished_req(req)
-            cache.cache_finished_req(req, owned_kv_len=req.kv.kv_committed_len)
+            release_kv_cache(req, cache)
 
         # After all iterations, root lock should be 1, no protected nodes
         self.assertEqual(cache.root_node.lock_ref, 1)

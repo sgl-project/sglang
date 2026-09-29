@@ -11,6 +11,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.utils import is_gfx95_supported
 
 from .kv_layout import KVLayout
 from .utils import make_name
@@ -95,16 +96,17 @@ def fused_store_cache(
         RoPE tail in-kernel, so ``input`` must then be the un-rotated latent.
     """
     layout = KVLayout.parse(layout)
-    if is_hip_runtime():
-        assert layout is KVLayout.V4 and freqs_cis is None, (
-            "the V4.1 KV layouts are CUDA (sm100) only"
-        )
+    if is_hip_runtime() and layout is KVLayout.V4:
+        assert freqs_cis is None, "the V4 store receives already-rotated inputs"
         from sglang.kernels.ops.kvcache.triton_store_cache import (
             triton_fused_store_cache,
         )
 
         triton_fused_store_cache(input, cache, indices, page_size=page_size, type=type)
     else:
+        assert not is_hip_runtime() or is_gfx95_supported(), (
+            "V4.1 KV stores on HIP require gfx950"
+        )
         module = _jit_fused_store_module(
             name=type,
             input_dtype=input.dtype,

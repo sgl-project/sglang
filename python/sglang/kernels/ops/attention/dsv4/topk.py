@@ -331,13 +331,13 @@ def topk_transform_packed_v2(
 def topk_transform_sparse(
     logits: torch.Tensor,
     valid_lens: torch.Tensor,
-    phys_blocks: torch.Tensor,
-    page_indices: torch.Tensor,
+    blocks: torch.Tensor,
+    out_indices: torch.Tensor,
 ) -> None:
-    """Top-``k`` (``k = page_indices.shape[1]``) of each row of the bf16 sparse
-    ``logits`` within its first ``valid_lens[b]`` columns, as pool slots through
-    ``phys_blocks`` (the published blocks as pool slots / 8); ``-1`` padded,
-    unordered."""
+    """Top-``k`` (``k = out_indices.shape[1]``) of each row of the bf16 sparse
+    ``logits`` within its first ``valid_lens[b]`` columns, ``-1`` padded, unordered;
+    column ``j`` is written as ``blocks[b, j // 8] * 8 + j % 8``: pool slots for the
+    published blocks as pool slots / 8, compressed positions for logical ids."""
     topk_transform_bf16_small(
-        logits, valid_lens, phys_blocks, page_indices, CANDIDATE_BLOCK_SIZE
+        logits, valid_lens, blocks, out_indices, CANDIDATE_BLOCK_SIZE
     )

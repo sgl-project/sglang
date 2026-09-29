@@ -36,9 +36,11 @@ def make_batch(counts, logprobs):
     return SimpleNamespace(
         global_num_tokens=list(counts),
         global_num_tokens_for_logprob=list(logprobs),
+        draft_global_num_tokens=None,
         dp_spec_prefill_coordination_applied=False,
         is_extend_in_batch=False,
         can_run_decode_cuda_graph=True,
+        can_run_dp_draft_cuda_graph=True,
         can_run_dp_prefill_cuda_graph=True,
     )
 
@@ -136,6 +138,7 @@ class TestDPSpecPrefillCoordinationPlan(CustomTestCase):
                     tbo_split_seq_index=None,
                     global_forward_mode=ForwardMode.DECODE,
                     can_run_decode_cuda_graph=True,
+                    can_run_draft_cuda_graph=True,
                     can_run_prefill_cuda_graph=False,
                     prefill_cuda_graph_max_prefix_len=0,
                 )

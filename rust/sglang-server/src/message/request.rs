@@ -10,6 +10,7 @@ use itertools::izip;
 use serde::de::{DeserializeOwned, SeqAccess, Visitor, value::SeqAccessDeserializer};
 use serde::{Deserialize, Deserializer};
 
+use super::buffers::Buffer;
 use super::io_struct::{ControlRequest, TokenizedGenerateReqInput};
 use super::multimodal::{self, MmDataInput, MmItem};
 use super::response::ResponseSink;
@@ -157,8 +158,10 @@ where
 {
     struct InputIds(OneOrMany<TokenIds>);
 
+    // Token width follows `TokenIds` (i64 in this crate); main's parser was
+    // written against its i32 alias and is ported here.
     enum FirstElement {
-        Token(i32),
+        Token(i64),
         Tokens(TokenIds),
     }
 
@@ -170,17 +173,15 @@ where
                 type Value = FirstElement;
 
                 fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                    formatter.write_str("an i32 token or a list of i32 tokens")
+                    formatter.write_str("a token id or a list of token ids")
                 }
 
                 fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
-                    i32::try_from(value)
-                        .map(FirstElement::Token)
-                        .map_err(E::custom)
+                    Ok(FirstElement::Token(value))
                 }
 
                 fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
-                    i32::try_from(value)
+                    i64::try_from(value)
                         .map(FirstElement::Token)
                         .map_err(E::custom)
                 }
@@ -218,7 +219,7 @@ where
                         None => OneOrMany::One(Vec::new()),
                         Some(FirstElement::Token(first)) => {
                             let mut tokens = vec![first];
-                            while let Some(token) = sequence.next_element::<i32>()? {
+                            while let Some(token) = sequence.next_element::<i64>()? {
                                 tokens.push(token);
                             }
                             OneOrMany::One(tokens)
@@ -563,6 +564,7 @@ impl GenerateBody {
                 routed_dp_rank,
                 disagg_prefill_dp_rank,
                 mm: pack_mm(image_data, video_data, audio_data, processor_extensions),
+                mm_buffers: Vec::new(),
             },
         )
         .collect();
@@ -647,30 +649,6 @@ fn extension_value_present(value: &rmpv::Value) -> bool {
     }
 }
 
-/// One request handed to the MM worker pool: the rid to correlate the result,
-/// plus the owned inputs from [`GenerateRequest::take_mm_work`].
-#[derive(Debug)]
-pub struct MmRequest {
-    pub rid: Rid,
-    pub work: MmWorkItem,
-}
-
-/// The parked request's fields the MM worker owns; converted to the driver input
-/// by [`crate::multi_modality::payload::to_mm_input`].
-#[derive(Debug, Default)]
-pub struct MmWorkItem {
-    pub text: Option<String>,
-    pub input_ids: Option<Vec<i32>>,
-    pub image_data: Vec<MmItem>,
-    pub video_data: Vec<MmItem>,
-    pub audio_data: Vec<MmItem>,
-    pub processor_extensions: ProcessorExtensions,
-    /// See [`MmData::prefetched`].
-    pub prefetched: Vec<Bytes>,
-    /// See [`GenerateBody::mm_hashes`].
-    pub mm_hashes: Vec<String>,
-}
-
 /// The owned request as it travels request stages (single owner, so `state` is
 /// mutated lock-free). Common fields here; variant data in [`RequestKind`].
 #[derive(Debug)]
@@ -685,12 +663,14 @@ pub struct Request {
     pub kind: RequestKind,
 }
 
-/// One to_scheduler channel entry, split columnar: the scalar `header` (msgpack, `input_ids`
-/// omitted) + the raw int64 `ids` cell, so the big tensor never goes through msgpack.
+/// One to_scheduler channel entry: the scalar `header` (msgpack; `input_ids`
+/// and `token_ids_logprob` left nil) plus every non-scalar payload as a named
+/// [`Buffer`], so nothing big goes through msgpack and nothing is copied on
+/// the way to the drain. Empty for control requests.
 #[derive(Debug)]
 pub struct SchedulerRequest {
     pub header: Bytes,
-    pub ids: Bytes,
+    pub buffers: Vec<Buffer>,
 }
 
 /// Request variant — selects the request branch, scheduler wire message, and
@@ -759,6 +739,7 @@ pub struct GenerateRequest {
     pub top_logprobs_num: i64,
     /// This request's `token_ids_logprob` ids, fanned out by `into_requests` and
     /// collapsed to `None` when empty (the scheduler branches on `is not None`).
+    /// Rides the ring as the `token_ids_logprob` buffer, nil in the header.
     pub token_ids_logprob: Option<TokenIds>,
     pub return_sampling_mask: bool,
     pub return_hidden_states: bool,
@@ -785,10 +766,16 @@ pub struct GenerateRequest {
     /// scheduler header. Boxed so the common text-only request doesn't grow
     /// every `Request` moved between stages.
     pub mm: Option<Box<MmData>>,
+    /// What the MM worker produced (returned as `Encoded`): the feature tensors and their
+    /// per-item metadata, already placed inline or in shm. Pushed to the scheduler channel
+    /// with the request by [`take_buffers`](Self::take_buffers).
+    pub mm_buffers: Vec<Buffer>,
 }
 
 /// The multimodal fields of one request (see [`GenerateRequest::mm`]), each
-/// modality already fanned out to this request's own item list.
+/// modality already fanned out to this request's own item list. Also the MM
+/// processor's input: the MM worker moves it out of the request whole, and
+/// `payload::to_mm_input` converts it to the driver's.
 ///
 /// Constructed directly only by tests: `api_server::prefetch` fills its
 /// `prefetched` field, everything else gets it packed inside a `GenerateRequest`.
@@ -827,40 +814,26 @@ impl GenerateRequest {
         })
     }
 
-    /// Carve out the MM worker's inputs: `text` is cloned (the scheduler header
-    /// still needs it), `input_ids` is taken (the expanded ids replace it), and
-    /// the mm values move wholesale.
-    pub fn take_mm_work(&mut self) -> MmWorkItem {
-        let mut work = MmWorkItem {
-            text: self.text.clone(),
-            input_ids: self.input_ids.take(),
-            ..Default::default()
-        };
-        if let Some(m) = self.mm.as_deref_mut() {
-            work.image_data = std::mem::take(&mut m.image_data);
-            work.video_data = std::mem::take(&mut m.video_data);
-            work.audio_data = std::mem::take(&mut m.audio_data);
-            work.processor_extensions = std::mem::take(&mut m.processor_extensions);
-            work.prefetched = std::mem::take(&mut m.prefetched);
-            work.mm_hashes = std::mem::take(&mut m.mm_hashes);
-        }
-        work
-    }
-
     pub fn encode_header(&self) -> Result<Bytes, Error> {
         TokenizedGenerateReqInput::from(self).encode()
     }
 
-    /// `input_ids` widened to raw little-endian int64 bytes (the scheduler's
-    /// `array("q")` columnar cell — rides the to-scheduler channel outside
-    /// msgpack). Empty when not tokenized.
-    pub fn encode_data_buf(&self) -> Bytes {
-        let ids = self.input_ids.as_deref().unwrap_or(&[]);
-        let mut buf = Vec::with_capacity(ids.len() * 8);
-        for &id in ids {
-            buf.extend_from_slice(&(id as i64).to_le_bytes());
+    /// Every non-scalar payload as a named buffer, in the shape the Python
+    /// drain attaches: `input_ids` (already the scheduler's int64),
+    /// `token_ids_logprob` when present, then whatever the MM worker left in
+    /// `mm_buffers`. Pure moves -- no id is read here, and the header, the last
+    /// thing built from this request, never carries them.
+    pub fn take_buffers(&mut self) -> Vec<Buffer> {
+        let mut buffers = Vec::with_capacity(2 + self.mm_buffers.len());
+        buffers.push(Buffer::inline(
+            "input_ids",
+            self.input_ids.take().unwrap_or_default(),
+        ));
+        if let Some(ids) = self.token_ids_logprob.take() {
+            buffers.push(Buffer::inline("token_ids_logprob", ids));
         }
-        Bytes::from(buf)
+        buffers.append(&mut self.mm_buffers);
+        buffers
     }
 }
 
@@ -888,7 +861,7 @@ impl HeapBytes for String {
 }
 impl HeapBytes for TokenIds {
     fn heap_bytes(&self) -> usize {
-        self.len() * std::mem::size_of::<i32>()
+        self.len() * std::mem::size_of::<i64>()
     }
 }
 impl<T: HeapBytes> HeapBytes for Option<T> {
@@ -1349,14 +1322,12 @@ mod tests {
     }
 
     /// `mm_hashes` rides only on single requests (Python `__getitem__`
-    /// parity: batches drop it) and moves into the work item.
+    /// parity: batches drop it) and lives in the mm data.
     #[test]
     fn mm_hashes_single_only() {
-        let (mut ps, _) =
+        let (ps, _) =
             requests(r#"{"text": "a", "image_data": "u", "mm_hashes": ["a1b2", "0xff"]}"#).unwrap();
         assert_eq!(ps[0].mm.as_ref().unwrap().mm_hashes, vec!["a1b2", "0xff"]);
-        assert_eq!(ps[0].take_mm_work().mm_hashes, vec!["a1b2", "0xff"]);
-        assert!(ps[0].mm.as_ref().unwrap().mm_hashes.is_empty());
 
         // A batch cannot carry hashes (Python drops them), so it is rejected,
         // as is the nested batch shape on a single request...
@@ -1375,23 +1346,6 @@ mod tests {
         ] {
             assert!(requests(body).is_ok(), "{body}");
         }
-    }
-
-    /// `take_mm_work` clones `text` (the scheduler header still needs it) and
-    /// moves everything the worker owns out of the request.
-    #[test]
-    fn mm_work_item_takes_owned_fields() {
-        let (mut ps, _) =
-            requests(r#"{"text": "hi", "image_data": ["u1", "u2"], "audio_data": "a"}"#).unwrap();
-        let work = ps[0].take_mm_work();
-        assert_eq!(work.text.as_deref(), Some("hi"));
-        assert!(work.input_ids.is_none());
-        assert_eq!(work.image_data.len(), 2);
-        assert!(work.video_data.is_empty());
-        assert_eq!(work.audio_data, vec![MmItem::Source("a".into())]);
-        // Moved out, not cloned; `text` survives for the header.
-        assert!(ps[0].mm.as_ref().unwrap().image_data.is_empty());
-        assert_eq!(ps[0].text.as_deref(), Some("hi"));
     }
 
     /// The body limit is disabled, so an unbounded batch turns a small body into an
