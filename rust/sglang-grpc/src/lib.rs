@@ -3,8 +3,6 @@ pub mod server;
 pub mod tokenizers;
 pub(crate) mod utils;
 
-pub use sglang_grpc_types::sglang::runtime::v1 as proto;
-
 use pyo3::prelude::*;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
