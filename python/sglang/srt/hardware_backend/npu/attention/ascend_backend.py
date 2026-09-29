@@ -344,6 +344,14 @@ def _cp_allgather_and_save_kv_npu(
     )
 
 
+_MISSING_SPARSE_FA_LSE = (
+    "DCP decode on Ascend needs torch.ops.npu.npu_sparse_flash_attention_lse, "
+    "which ships in sgl-kernel-npu and is not part of CANN. It is not "
+    "registered in this install. Install or rebuild sgl-kernel-npu, or run with "
+    "--dcp-size 1."
+)
+
+
 class AscendAttnBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner, speculative_step_id: int = 0):
         super().__init__()
@@ -469,6 +477,21 @@ class AscendAttnBackend(AttentionBackend):
             self.dllm_block_size = self.dllm_config.block_size
 
         self.attn_cp_size = model_runner.attn_cp_size
+
+        # ``npu_sparse_flash_attention_lse`` is vendored in sgl-kernel-npu, not a
+        # CANN operator. CANN refuses ``return_softmax_lse`` under PA_BSND, its
+        # only paged layout, so the DCP partial-output merge has nowhere else to
+        # get an LSE from. Checked once here so a stock install says what is
+        # missing at startup instead of raising a bare AttributeError on the
+        # first DCP decode, naming neither DCP nor the package to install.
+        self.has_sparse_fa_lse = hasattr(
+            torch.ops.npu, "npu_sparse_flash_attention_lse"
+        )
+        if self.use_mla and get_parallel().dcp_enabled and not self.has_sparse_fa_lse:
+            # A warning, not a raise: a prefill-only node (PD disaggregation) can
+            # run with --dcp-size > 1 and never reach the decode that needs it.
+            # The call site raises with the same message if it does.
+            logger.warning(_MISSING_SPARSE_FA_LSE)
 
     def _is_swa_layer(self, layer: RadixAttention) -> bool:
         return (
@@ -1446,6 +1469,8 @@ class AscendAttnBackend(AttentionBackend):
                 if dcp_decode:
                     # CANN refuses return_softmax_lse under PA_BSND, its only
                     # paged layout, so DCP calls the vendored port instead.
+                    if not self.has_sparse_fa_lse:
+                        raise RuntimeError(_MISSING_SPARSE_FA_LSE)
                     attn_out, softmax_max, softmax_sum = (
                         torch.ops.npu.npu_sparse_flash_attention_lse(
                             **call, return_softmax_lse=True
