@@ -8,13 +8,14 @@ that its transfer drained (CommonKVManager.is_abort_release_safe). Device
 destinations may also release on timeout; host destinations require the ack.
 """
 
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.disaggregation import decode as decode_mod
-from sglang.srt.disaggregation.base.conn import BaseKVManager
-from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.base.conn import BaseKVManager, KVPoll
+from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
 from sglang.srt.disaggregation.decode import DecodeTransferQueue
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager
@@ -117,6 +118,93 @@ class TestAbortAckAggregation(CustomTestCase):
         self.assertFalse(mgr.is_abort_release_safe(room, required_acks=2))
 
 
+class _BareReceiver(CommonKVReceiver):
+    """Concrete shell: the ABC check blocks CommonKVReceiver.__new__."""
+
+    def poll(self):
+        raise NotImplementedError
+
+    def failure_exception(self):
+        raise NotImplementedError
+
+
+class TestAbortArmsTrackerBeforeSend(CustomTestCase):
+    """Prefill can ack the moment the ABORT lands (already-drained room), and a
+    peer rank's earlier abort of the same room can fan an ack out even sooner;
+    an ack arriving before the tracker is armed is dropped and the rank waits
+    out the full release timeout. So the receiver must arm BEFORE sending."""
+
+    def _abort_receiver(self, mgr, init_time):
+        recv = _BareReceiver.__new__(_BareReceiver)
+        recv.kv_mgr = mgr
+        recv.bootstrap_room = 500
+        recv.init_time = init_time
+        recv.abort_notified = False
+        recv.bootstrap_infos = [{"rank_ip": "10.0.0.9", "rank_port": 7000}]
+        armed_at_send = []
+        sock = SimpleNamespace(
+            send_multipart=lambda parts: armed_at_send.append(
+                500 in mgr._deferred_abort_ack_tracker
+            )
+        )
+        recv._connect_to_bootstrap_server = lambda info: (sock, threading.Lock())
+        return recv, armed_at_send
+
+    def _make_decode_manager(self, enabled=True):
+        mgr = _make_manager()
+        mgr.enable_deferred_decode_kv_release = enabled
+        mgr.local_ip, mgr.rank_port = "10.0.0.1", 6000
+        return mgr
+
+    def test_tracker_armed_before_the_abort_is_sent(self):
+        mgr = self._make_decode_manager()
+        recv, armed_at_send = self._abort_receiver(mgr, init_time=123.0)
+        recv._send_abort_notification()
+        self.assertEqual(armed_at_send, [True])
+
+    def test_prealloc_abort_does_not_arm(self):
+        # A receiver that never published metadata (init_time None) does not
+        # enter the deferred-release flow that cleans the tracker up; arming
+        # it would leak one set per aborted prealloc request.
+        mgr = self._make_decode_manager()
+        recv, armed_at_send = self._abort_receiver(mgr, init_time=None)
+        recv._send_abort_notification()
+        self.assertEqual(armed_at_send, [False])
+        self.assertNotIn(500, mgr._deferred_abort_ack_tracker)
+
+    def test_opted_out_backend_does_not_arm(self):
+        # Backends without a drain ack (mori) send the ABORT but must not arm:
+        # nothing would ever clean the tracker up.
+        mgr = self._make_decode_manager(enabled=False)
+        recv, armed_at_send = self._abort_receiver(mgr, init_time=123.0)
+        recv._send_abort_notification()
+        self.assertEqual(armed_at_send, [False])
+        self.assertNotIn(500, mgr._deferred_abort_ack_tracker)
+
+    def test_force_arm_arms_unpublished_receiver_before_send(self):
+        # Bug regression: a send_metadata that failed partway leaves init_time
+        # None while earlier ranks already hold destinations, so the transfer
+        # queue's notify-and-defer must still arm (before the send) -- else
+        # every drain ack is dropped and the hold runs out the full timeout.
+        mgr = self._make_decode_manager()
+        recv, armed_at_send = self._abort_receiver(mgr, init_time=None)
+        recv.ensure_abort_notified(force_arm=True)
+        self.assertEqual(armed_at_send, [True])
+
+    def test_ensure_abort_notified_sends_once_and_keeps_failure_records(self):
+        # For failures decode did not initiate the true root cause is already
+        # recorded; notifying must not overwrite it the way abort() does.
+        mgr = self._make_decode_manager()
+        mgr.record_failure = lambda *a, **k: self.fail(
+            "ensure_abort_notified must not touch failure records"
+        )
+        recv, armed_at_send = self._abort_receiver(mgr, init_time=123.0)
+        recv.ensure_abort_notified()
+        recv.ensure_abort_notified()
+        self.assertEqual(armed_at_send, [True])  # one send, tracker armed first
+        self.assertTrue(recv.abort_notified)
+
+
 class _FakeIdxAllocator:
     def __init__(self):
         self.freed = []
@@ -196,8 +284,8 @@ class TestResolveDeferredReleases(CustomTestCase):
         room, idx = 200, 7
         q = _make_queue()
         dreq = _make_decode_req(room, idx, mgr, n_prefill_ranks=2)
-        # In production the room is armed in abort_request when the ABORT is
-        # sent, before the scheduler defers here.
+        # In production the receiver arms the room just before it sends the
+        # ABORT (_send_abort_notification), before the scheduler defers here.
         mgr.register_deferred_abort_room(room)
         q._defer_release(dreq)
 
@@ -277,6 +365,115 @@ class TestResolveDeferredReleases(CustomTestCase):
         self.assertIs(held_req, dreq)
         self.assertEqual(held_idx, 9)
         self.assertIsInstance(deadline, float)
+
+
+def _make_pop_queue(mgr):
+    """DecodeTransferQueue shell wired for pop_transferred's Failed branch."""
+    q = _make_queue()
+    q.enable_host_receive = False
+    q.enable_deferred_kv_release = True
+    q.tp_rank = 0
+    q.scheduler = SimpleNamespace(
+        enable_decode_hicache=False,
+        enable_hisparse=False,
+        output_streamer=SimpleNamespace(stream_output=lambda reqs, logprob: None),
+        metrics_reporter=SimpleNamespace(enable_metrics=False),
+    )
+    q._poll_with_metadata_gate = lambda: [KVPoll.Failed] * len(q.queue)
+    q._clean_hicache_prefetch_resources = lambda decode_req: None
+    return q
+
+
+def _make_failed_req(mgr, room, idx, abort_notified, notifiable=True):
+    receiver = SimpleNamespace(
+        kv_mgr=mgr,
+        abort_notified=abort_notified,
+        bootstrap_infos=[{"rank": 0}, {"rank": 1}],
+        failure_exception=lambda: None,
+        clear=lambda: None,
+    )
+
+    def ensure(force_arm=False):
+        # A receiver that never published metadata has nobody to notify and
+        # leaves abort_notified False, like the real ensure_abort_notified.
+        receiver.force_arm_calls.append(force_arm)
+        if notifiable:
+            receiver.abort_notified = True
+
+    receiver.force_arm_calls = []
+    receiver.ensure_abort_notified = ensure
+    return SimpleNamespace(
+        req=SimpleNamespace(bootstrap_room=room, rid=f"r{room}", return_logprob=False),
+        kv_receiver=receiver,
+        metadata_buffer_index=idx,
+        hicache_restore_status=None,
+        host_staged=False,
+    )
+
+
+class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
+    """A transfer that fails WITHOUT a decode-initiated abort (prefill fault,
+    transport error) can still have sibling-rank writes in flight toward the
+    request's pages; releasing at t=0 re-opens the reuse race the hold exists
+    to prevent. pop_transferred must notify the prefill ranks and defer on
+    every failure kind, not only when abort_notified is already set."""
+
+    def _pop(self, q):
+        released = []
+        q._release_request = released.append
+        with patch.object(decode_mod, "prepare_abort"):
+            q.pop_transferred()
+        return released
+
+    def test_non_abort_failure_notifies_and_defers(self):
+        mgr = _make_manager()
+        mgr.enable_deferred_decode_kv_release = True
+        q = _make_pop_queue(mgr)
+        entry = _make_failed_req(mgr, room=7, idx=3, abort_notified=False)
+        q.queue = [entry]
+
+        released = self._pop(q)
+
+        self.assertTrue(entry.kv_receiver.abort_notified)  # prefill was told
+        # force_arm: the receiver may have failed mid-publish (init_time None),
+        # and this deferral only drains via acks if the tracker armed.
+        self.assertEqual(entry.kv_receiver.force_arm_calls, [True])
+        self.assertEqual(released, [])
+        self.assertEqual(len(q._deferred_releases), 1)
+        # Metadata slot stays owned by the hold until resolve time.
+        self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [])
+        self.assertEqual(q.queue, [])
+
+    def test_unnotifiable_failure_releases_immediately(self):
+        # Metadata never published: no prefill holds this destination, so no
+        # write can be in flight and holding would waste a full timeout.
+        mgr = _make_manager()
+        mgr.enable_deferred_decode_kv_release = True
+        q = _make_pop_queue(mgr)
+        entry = _make_failed_req(
+            mgr, room=8, idx=4, abort_notified=False, notifiable=False
+        )
+        q.queue = [entry]
+
+        released = self._pop(q)
+
+        self.assertEqual(released, [entry])
+        self.assertEqual(q._deferred_releases, [])
+        self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [4])
+
+    def test_backend_optout_keeps_immediate_release_and_sends_no_abort(self):
+        mgr = _make_manager()
+        mgr.enable_deferred_decode_kv_release = False
+        q = _make_pop_queue(mgr)
+        entry = _make_failed_req(mgr, room=9, idx=5, abort_notified=False)
+        receiver = entry.kv_receiver  # the release path nulls entry.kv_receiver
+        q.queue = [entry]
+
+        released = self._pop(q)
+
+        self.assertFalse(receiver.abort_notified)
+        self.assertEqual(released, [entry])
+        self.assertEqual(q._deferred_releases, [])
 
 
 class TestBackendOptIn(CustomTestCase):
