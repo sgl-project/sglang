@@ -12,9 +12,16 @@ first recurring measurement of it.
 
 GLM-5.3 keeps the GLM-5.2 base architecture (`glm_moe_dsa`, 78 layers, 256
 routed experts) and ships as FP8, so it runs into the hazard the GLM-5.2-FP8
-nightly guards against on gfx950: an FP8 GEMM error that is small per layer
-but compounds across 78 layers collapses GSM8K while short prompts still look
-fine. Only a multi-step reasoning eval catches that class of regression.
+nightly used to guard against on gfx950, and it replaces that job in the
+workflow: an FP8 GEMM error that is small per layer but compounds across 78
+layers collapses GSM8K while short prompts still look fine. Only a multi-step
+reasoning eval catches that class of regression.
+
+Measured on the full GSM8K split: 0.9742 on rocm724 (1370 s wall clock, 576 s
+weight load including the download into the pool's shared cache), 0.9712 on
+rocm10 (1018 s) and 0.9742 on rocm720 (1105 s) against the warm cache. HF
+snapshot aca966e4e02791568aa6a4ced368624b3d897f42, runs 36523773291,
+36541623736 and 36541643777.
 
 Eval harness: sgl-eval's gsm8k (zero-shot chat, \\boxed{} extraction,
 math_verify grading) through run_sgl_eval, rather than the legacy few-shot
@@ -27,7 +34,7 @@ pins the sampling so a failure is a regression rather than a reroll.
 
 Threshold: the cookbook's CUDA cells measure 97.12-97.73% on GSM8K. 0.92
 follows this repo's `measured - 0.05` convention for sgl-eval gsm8k thresholds
-and matches the GLM-5.2-FP8 and GLM-5.3-Flash nightlies on AMD.
+and matches the GLM-5.2-FP8 and GLM-5.3-Flash tests on AMD.
 
 Registry: nightly-amd-8-gpu-mi35x-glm53 suite
 """

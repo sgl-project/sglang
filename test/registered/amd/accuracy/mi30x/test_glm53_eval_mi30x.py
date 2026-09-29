@@ -10,7 +10,7 @@ The day-0 dashboard (https://rocm.github.io/sglang-ci/day0/) lists MI30x FP8 as
 a recipe cell with no CI behind it. gfx942 is not redundant with gfx950 here:
 it uses the FP8 e4m3fnuz format rather than OCP e4m3, so the FP8 weights are
 converted at load time, and it takes different AITER and tilelang kernels for
-the same forward pass. The GLM-5.2-FP8 nightly covers only gfx950.
+the same forward pass. The MI35x job covers only gfx950.
 
 MI300X (192 GB x 8) holds the ~700 GB FP8 weights with room for KV cache; the
 BF16 checkpoint does not fit single-node here, which is why this tests FP8.
