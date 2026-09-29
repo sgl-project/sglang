@@ -236,7 +236,7 @@ class DraftBlockProposer:
 
     def _base_logits_context(self):
         if self._dp_moe_sync:
-            return draft_tp_context(get_parallel().attn_tp_group)
+            return draft_tp_context(get_parallel().attn_tp_group, owns_attention=True)
         return nullcontext()
 
     def propose(

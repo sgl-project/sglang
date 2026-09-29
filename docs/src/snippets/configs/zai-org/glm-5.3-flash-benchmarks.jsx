@@ -115,50 +115,6 @@ export const benchmarks = [
     notes:
       "The published Low Latency command with FP8 KV + TRT-LLM DSA (TP4, EP1, flashinfer_trtllm MoE, fixed MTP 5/1/6 with natural acceptance) on 4x GB300, zai-org/GLM-5.3-Flash (eb9eb208eb0d) on upstream main b3dc0388ed with FlashInfer 0.6.18, measured in the 2026-09 GLM-5.3-Flash perf campaign (run 20260911_glm53flash_vs_vllm, lane sglang-mtp-trtllm-ep1). Each row is 80 ShareGPT-length random-token requests over streaming /v1/completions with ignore_eos, temperature 0, seed 42, prefix cache disabled, --context-length 16384, --max-running-requests 80, --cuda-graph-max-bs-decode 80 and --mem-fraction-static 0.90; chat is 1,000 input / 1,000 output tokens and summarization 8,000 / 1,000. TTFT and TPOT are per-run means; c16 and c80 are the median of two runs, c1 a single run. Aggregate output tok/s: chat 454.11 / 2,985.85 / 8,975.84 and summarization 457.62 / 2,466.80 / 3,803.25 at concurrency 1 / 16 / 80, at accept lengths of 5.98 / 5.98 / 4.7 (chat) and 6.0 / 6.0 / 4.5 (summarization). In the same campaign, fixed-depth MTP drafting measured 8,490.07 chat c80 tok/s against 3,664.53 for adaptive drafting on the TP4/EP4 deep_gemm command, and EP1 + flashinfer_trtllm then improved every cell over that fixed-depth command by 4.4-13.6%. The campaign's GSM8K natural-stop gate (all 1,319 problems, reasoning effort low, 8,192 max tokens, temperature 1.0 / top_p 0.95) ran these launch flags on eleven source candidates and every run stopped naturally on all 1,319 problems at 90.8-92.7%; that protocol differs from the thinking-mode GSM8K behind the accuracy figures on this page.",
   },
-  // TODO: speed measured on the earlier TP4/EP4 deep_gemm command with adaptive MTP; re-measure on the current recipe.
-  {
-    match: { hw: "gb300", strategy: "low-latency", kvDsaPair: "fp8-trtllm", dcp: "4", quant: "fp8" },
-    sglang_version: "d6ab04bdf1",
-    latencyPercentile: "Mean",
-    speed: [
-      {
-        workload: {
-          dataset: "random",
-          isl: 1024,
-          osl: 256,
-          max_concurrency: 16,
-          num_prompts: 80,
-        },
-        ttft_ms: 534.1,
-        tpot_ms: 7.31,
-        tokens_per_sec_per_gpu: 2100.76,
-      },
-    ],
-    notes:
-      "The Low Latency recipe with FP8 KV + TRT-LLM DSA and DCP4 (--dcp-size 4 --dcp-comm-backend a2a --dcp-replicate-q-proj) on 4x GB300, final weights (c5b82b63e37b) on the d6ab04bdf1 tree, adaptive MTP 5/1/6 with full decode graph: 80 random requests at 1,024 input / 256 output tokens and concurrency 16 produced 1,680.61 aggregate output tok/s at a 3.937 accept length — about 10% below the non-DCP FP8 Low Latency row. TRT-LLM DSA DCP decode returns the LSE natively, so this arm needs no patch. Re-verified on the current release image (tree fe236ea6c3) within 1.3% on 4x GB300.",
-  },
-  // TODO: speed measured on the earlier TP4/EP4 deep_gemm command with adaptive MTP; re-measure on the current recipe.
-  {
-    match: { hw: "gb300", strategy: "low-latency", kvDsaPair: "bf16-tilelang", dcp: "4", quant: "fp8" },
-    sglang_version: "d6ab04bdf1",
-    latencyPercentile: "Mean",
-    speed: [
-      {
-        workload: {
-          dataset: "random",
-          isl: 1024,
-          osl: 256,
-          max_concurrency: 16,
-          num_prompts: 80,
-        },
-        ttft_ms: 510.0,
-        tpot_ms: 8.0,
-        tokens_per_sec_per_gpu: 1957.25,
-      },
-    ],
-    notes:
-      "The Low Latency recipe with BF16 KV + TileLang DSA and DCP4 on 4x GB300, final weights (c5b82b63e37b) on the d6ab04bdf1 tree, adaptive MTP 5/1/6 with full decode graph: 80 random requests at 1,024 input / 256 output tokens and concurrency 16 produced 1,565.8 aggregate output tok/s at a 3.90 accept length. TileLang DSA DCP decode needs the LSE fix that ships in the current release image. Re-verified on the current release image (tree fe236ea6c3) within 1.3% on 4x GB300.",
-  },
   // TODO: speed measured on the earlier TP4/EP4 deep_gemm command; re-measure on the current recipe.
   {
     match: { hw: "gb300", strategy: "high-throughput" },

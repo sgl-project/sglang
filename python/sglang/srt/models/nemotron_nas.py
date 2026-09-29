@@ -23,7 +23,6 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.pooler import Pooler, PoolingType
@@ -40,6 +39,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.llama import LlamaAttention, LlamaMLP
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_layers
 from sglang.utils import logger
 
@@ -179,7 +179,7 @@ class DeciModel(nn.Module):
             else 0
         )
         vocab_size = config.vocab_size + lora_vocab
-        if get_pp_group().is_first_rank:
+        if get_parallel().pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
                 vocab_size,
                 config.hidden_size,
@@ -200,11 +200,11 @@ class DeciModel(nn.Module):
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             get_layer,
-            pp_rank=get_pp_group().rank_in_group,
-            pp_size=get_pp_group().world_size,
+            pp_rank=get_parallel().pp_group.rank_in_group,
+            pp_size=get_parallel().pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
-        if get_pp_group().is_last_rank:
+        if get_parallel().pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer(return_tuple=True)
@@ -220,7 +220,7 @@ class DeciModel(nn.Module):
         inputs_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
-        if get_pp_group().is_first_rank:
+        if get_parallel().pp_group.is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
@@ -244,7 +244,7 @@ class DeciModel(nn.Module):
                     positions, hidden_states, forward_batch, residual
                 )
 
-        if not get_pp_group().is_last_rank:
+        if not get_parallel().pp_group.is_last_rank:
             return PPProxyTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
@@ -360,7 +360,7 @@ class DeciLMForCausalLM(nn.Module):
             inputs_embeds,
             pp_proxy_tensors=pp_proxy_tensors,
         )
-        if get_pp_group().is_last_rank:
+        if get_parallel().pp_group.is_last_rank:
             if not get_embedding:
                 return self.logits_processor(
                     input_ids, hidden_states, self.lm_head, forward_batch

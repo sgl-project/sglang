@@ -22,7 +22,6 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_update as causal_conv1d_update_triton,
 )
 from sglang.srt.configs.lfm2 import Lfm2Config
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.attention.mamba.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -688,7 +687,7 @@ class Lfm2ForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         assert self.pp_group.is_first_rank and self.pp_group.is_last_rank
 
         self.quant_config = quant_config

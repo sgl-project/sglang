@@ -13,8 +13,8 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
-from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dcp import all_gather_kv_cache_for_mha_extend
+from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale_tuple,
 )
@@ -279,8 +279,14 @@ class DeepseekMHARocmForwardMixin:
     def _concat_and_cast_mha_k_rocm(
         self: DeepseekV2AttentionMLA,
         k_nope: torch.Tensor,
-        k_pe: torch.Tensor,
+        k_pe: torch.Tensor | None,
     ):
+        if self.qk_rope_head_dim == 0:
+            assert k_pe is None or k_pe.shape[-1] == 0
+            # No RoPE tail to append, so k is k_nope as-is. The concat branch
+            # below keeps k_nope's dtype, so no cast is needed here either.
+            return k_nope.contiguous()
+
         k_shape = (k_nope.shape[0], self.num_local_heads, self.qk_head_dim)
         k = k_nope.new_empty(*k_shape)
         if self.current_attention_backend == "aiter":
