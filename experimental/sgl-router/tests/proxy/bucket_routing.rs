@@ -1046,3 +1046,68 @@ async fn decode_bucket_mismatch_falls_back_to_another_version_group() {
         .sum();
     assert_eq!(prefill_picks, 1);
 }
+
+/// Prefer a group with decode capacity, but retain capacity fallback when all
+/// groups are full, without relaxing their token-length limits.
+#[tokio::test]
+async fn version_group_capacity_fallback_preserves_decode_limits() {
+    use crate::common::mock_worker::MockWorker;
+    for (short_first, second_full) in [(false, false), (false, true), (true, true)] {
+        let workers: Vec<_> =
+            futures::future::join_all((0..4).map(|_| MockWorker::start(vec![]))).await;
+        let specs = [
+            ("p1", WorkerMode::Prefill, "v1"),
+            ("p2", WorkerMode::Prefill, "v2"),
+            ("d1", WorkerMode::Decode, "v1"),
+            ("d2", WorkerMode::Decode, "v2"),
+        ]
+        .into_iter()
+        .zip(&workers)
+        .map(|((id, mode, group), worker)| WorkerSpec {
+            version_group: Some(group.into()),
+            ..worker_spec(id, worker.url.clone(), mode)
+        })
+        .collect();
+        let mut first_decode = bucket("d-first", BucketStage::Decode, 0, "d1");
+        if short_first {
+            first_decode.max_sequence_tokens = Some(10);
+        }
+        let ctx = build_ctx(
+            specs,
+            BucketConfig {
+                buckets: vec![
+                    bucket("p-first", BucketStage::Prefill, 0, "p1"),
+                    bucket("p-second", BucketStage::Prefill, 1, "p2"),
+                    first_decode,
+                    bucket("d-second", BucketStage::Decode, 1, "d2"),
+                ],
+                ttft_slo_policy: SloBucketPolicy::Disabled,
+                tps_slo_policy: SloBucketPolicy::Disabled,
+            },
+            PolicyKind::PowerOfTwo,
+            None,
+        );
+        set_native_load(&ctx, &workers[2].url, 1_000, 1_000);
+        set_native_load(
+            &ctx,
+            &workers[3].url,
+            if second_full { 1_000 } else { 0 },
+            1_000,
+        );
+        let response = build_router(ctx)
+            .oneshot(chat_request(None, Some(100)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let dispatched: Vec<_> = workers
+            .iter()
+            .map(|w| w.captured.lock().unwrap().last_body.is_some())
+            .collect();
+        let use_first = second_full && !short_first;
+        assert_eq!(
+            dispatched,
+            [use_first, !use_first, use_first, !use_first],
+            "short_first={short_first}, second_full={second_full}"
+        );
+    }
+}

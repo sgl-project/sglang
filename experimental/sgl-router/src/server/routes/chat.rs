@@ -118,7 +118,7 @@ async fn select_workers(
 
     let candidates = prefills_with_decode(ctx, request, candidates, resolver, &routing_context);
     let prefill = pick_prefill_worker(ctx, request, policy, &candidates, &routing_context)?;
-    let decode = pick_decode_worker(ctx, request, &prefill, resolver, &routing_context)?;
+    let decode = pick_decode_worker(ctx, request, &prefill, resolver, &routing_context, true)?;
     Ok(SelectedWorkers {
         prefill,
         decode,
@@ -140,22 +140,25 @@ fn prefills_with_decode(
     if candidates.iter().all(|p| Some(p.version_group()) == first) {
         return candidates.to_vec();
     }
-    let mut fits = HashMap::new();
-    let kept: Vec<_> = candidates
-        .iter()
-        .filter(|p| {
-            *fits
-                .entry(p.version_group())
-                .or_insert_with(|| pick_decode_worker(ctx, request, p, resolver, routing).is_ok())
-        })
-        .cloned()
-        .collect();
-    // With no group fitting, keep them all so the pick reports the real error.
-    if kept.is_empty() {
-        candidates.to_vec()
-    } else {
-        kept
+    // Try strict admission across groups before relaxing capacity in any group.
+    for allow_capacity_fallback in [false, true] {
+        let mut fits = HashMap::new();
+        let kept: Vec<_> = candidates
+            .iter()
+            .filter(|p| {
+                *fits.entry(p.version_group()).or_insert_with(|| {
+                    pick_decode_worker(ctx, request, p, resolver, routing, allow_capacity_fallback)
+                        .is_ok()
+                })
+            })
+            .cloned()
+            .collect();
+        if !kept.is_empty() {
+            return kept;
+        }
     }
+    // With no group fitting, keep them all so the pick reports the real error.
+    candidates.to_vec()
 }
 
 fn capture_load_snapshot(
@@ -263,6 +266,7 @@ fn pick_decode_worker(
     prefill: &Worker,
     resolver: &PdPoolResolver,
     routing: &RoutingContext<'_>,
+    allow_capacity_fallback: bool,
 ) -> Result<Option<Arc<Worker>>, ApiError> {
     if prefill.mode() != WorkerMode::Prefill {
         return Ok(None);
@@ -273,6 +277,7 @@ fn pick_decode_worker(
         .map_err(|error| pool_error(error, &request.model))?;
     let decode = select_decode_peer(&DecodeSelectionInputs {
         decode_policy_kind: ctx.config.model.decode_policy,
+        allow_capacity_fallback,
         bucket_selector: ctx.bucket_selector.as_ref(),
         model_id: &request.model,
         prefill_url: &prefill.url,
