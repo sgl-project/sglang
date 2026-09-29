@@ -331,6 +331,7 @@ class TestNpuDcpCompactKernels(CustomTestCase):
 
     def test_shared_planner_uses_triton_prefix_on_npu(self):
         from unittest.mock import patch
+
         from sglang.kernels.ops.kvcache.kv_indices import (
             create_chunked_prefix_cache_kv_indices,
         )
