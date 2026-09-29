@@ -406,7 +406,30 @@ def _dsa_cp_narrow_plan(m: "DeepseekV2AttentionMLA", forward_batch):
         return None
     if getattr(m, "w_kc_full", None) is None:
         return None
-    if dsa_cp_narrow_a2a_output_enabled() and getattr(m, "w_vc_full", None) is None:
+    return get_dsa_cp_plan(forward_batch)
+
+
+def _dsa_cp_narrow_return_plan(m: "DeepseekV2AttentionMLA", forward_batch):
+    """This forward's plan when the RETURN leg is narrowed, else None.
+
+    Independent of the inbound leg, and the measurement is why. At tp16 on A3,
+    client wall against the wide path:
+
+        ================  ==============  ==============
+        mode              6007 tokens     16007 tokens
+        ================  ==============  ==============
+        input leg only    +0.4% (floor)   -1.1% (floor)
+        both legs         **-7.5%**       **-4.7%**
+        ================  ==============  ==============
+
+    The run-to-run floor is about 1% at both lengths, so the inbound leg
+    measures as nothing and the pair measures as 105-126 ms. Whatever the
+    saving is, it is on this side -- which was not the prediction, and is the
+    reason this leg can now run without the other.
+    """
+    if not dsa_cp_narrow_a2a_output_enabled():
+        return None
+    if getattr(m, "w_vc_full", None) is None:
         return None
     return get_dsa_cp_plan(forward_batch)
 
@@ -841,11 +864,15 @@ def forward_dsa_core_npu(
             dsa_cp_plan is not None
             and _dsa_cp_narrow_plan(m, forward_batch) is not None
         )
-        # The return leg is narrowed only on request. Without it the head
-        # output goes back at the full latent width and the layer's own w_vc
-        # applies afterwards -- byte for byte the unnarrowed path, so this mode
-        # differs from plain DSA-CP on the inbound leg and nowhere else.
-        narrow_return = narrow_a2a and dsa_cp_narrow_a2a_output_enabled()
+        # The return leg is narrowed on its own switch, and needs nothing from
+        # the inbound one: the rank holds every head for its own rows after the
+        # inbound exchange whichever width that exchange used. Without it the
+        # head output goes back at the full latent width and the layer's own
+        # w_vc applies afterwards, byte for byte the unnarrowed path.
+        narrow_return = (
+            dsa_cp_plan is not None
+            and _dsa_cp_narrow_return_plan(m, forward_batch) is not None
+        )
         if dsa_cp_plan is not None:
             # DSA-CP: swap "my heads for every token" for "every head for my
             # tokens", which divides the per-query top-k KV read. k_nope/k_pe

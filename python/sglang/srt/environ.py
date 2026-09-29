@@ -987,17 +987,20 @@ class Envs:
     # full per-request KV lengths and dropping the operator's causal crop.
     # Only engages where every request's prefix reaches index_topk.
     SGLANG_NPU_ENABLE_DSA_CP_MULTI_REQUEST = EnvBool(True)
-    # DSA-CP: exchange the query BEFORE the w_kc absorb, so the inbound leg
+    # DSA-CP inbound leg: exchange the query BEFORE the w_kc absorb, so it
     # carries the 256-wide q (qk_nope 192 + rope 64) in ONE all-to-all instead
-    # of the 512-wide absorbed latent and its rope half in two. Three
-    # collectives per layer become two, which is where the measured 92 ms of
-    # the saving lives. Costs the full w_kc on every rank, 12 MB per layer.
+    # of the 512-wide absorbed latent and its rope half in two -- three
+    # collectives per layer become two. Costs the full w_kc on every rank, 12 MB
+    # per layer. MEASURED AT tp16: bitwise identical, and its effect on wall
+    # time sits under the run-to-run floor at 6007 and 16007 tokens. On its own
+    # it buys nothing that can be measured; see the OUTPUT flag below.
     SGLANG_NPU_ENABLE_DSA_CP_NARROW_A2A = EnvBool(False)
-    # ... and narrow the RETURN leg too: apply w_vc before the head output goes
-    # back on the wire, 256 wide instead of the 512-wide latent. Needs the full
-    # w_vc as well, taking the gather from 12 to 28 MB per layer -- and the
-    # remaining byte saving is worth about 0.9 us per 1000 tokens against that,
-    # so this is the half to leave off unless the memory is free.
+    # DSA-CP return leg, independent of the one above: apply w_vc before the
+    # head output goes back on the wire, 256 wide instead of the 512-wide
+    # latent. Costs the full w_vc, 16 MB per layer. This is the half that
+    # measures: with the inbound leg it saved 7.5% at 6007 tokens and 4.7% at
+    # 16007, against an inbound-only result of nothing at either. On its own it
+    # is unmeasured -- the arm that separates them has not been run.
     SGLANG_NPU_ENABLE_DSA_CP_NARROW_A2A_OUTPUT = EnvBool(False)
     # DCP extend on NPU: log each extend forward's peak device memory, per rank.
     SGLANG_DEBUG_NPU_DCP_EXTEND_MEMORY = EnvBool(False)

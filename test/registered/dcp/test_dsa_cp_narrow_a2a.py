@@ -214,7 +214,7 @@ class TestOnlyTheEnabledLegsAreGathered(CustomTestCase):
     TP = 4
     HEADS, NOPE, LORA, VDIM = 2, 6, 5, 4
 
-    def _attach(self, narrow_output):
+    def _attach(self, narrow_input=True, narrow_output=False):
         from sglang.srt.layers.attention.dsa import dsa_cp as dsa_cp_module
 
         class _Attn:
@@ -238,7 +238,9 @@ class TestOnlyTheEnabledLegsAreGathered(CustomTestCase):
         parallel = mock.Mock()
         parallel.attn_tp_size = self.TP
         with (
-            mock.patch.object(dsa_cp_module, "dsa_cp_narrow_a2a_enabled", lambda: True),
+            mock.patch.object(
+                dsa_cp_module, "dsa_cp_narrow_a2a_enabled", lambda: narrow_input
+            ),
             mock.patch.object(
                 dsa_cp_module, "dsa_cp_narrow_a2a_output_enabled", lambda: narrow_output
             ),
@@ -265,11 +267,32 @@ class TestOnlyTheEnabledLegsAreGathered(CustomTestCase):
         )
 
     def test_both_legs_gather_both_weights(self):
-        attn, calls = self._attach(narrow_output=True)
+        attn, calls = self._attach(narrow_input=True, narrow_output=True)
         self.assertEqual(len(calls), 2)
         self.assertEqual(
             attn.w_vc_full.shape, (self.HEADS * self.TP, self.LORA, self.VDIM)
         )
+
+    def test_output_only_leaves_w_kc_alone(self):
+        """The return leg runs without the inbound one, and pays only for w_vc.
+
+        Measured at tp16: the inbound leg's effect on wall time sits under the
+        run-to-run floor at both 6007 and 16007 tokens, while the pair saves
+        105-126 ms. So the return leg on its own is the combination worth
+        being able to run, and it must not drag w_kc's 12 MB per layer with it.
+        """
+        attn, calls = self._attach(narrow_input=False, narrow_output=True)
+        self.assertEqual(len(calls), 1)
+        self.assertIsNone(getattr(attn, "w_kc_full", None))
+        self.assertEqual(
+            attn.w_vc_full.shape, (self.HEADS * self.TP, self.LORA, self.VDIM)
+        )
+
+    def test_neither_leg_gathers_nothing(self):
+        attn, calls = self._attach(narrow_input=False, narrow_output=False)
+        self.assertEqual(calls, [])
+        self.assertIsNone(getattr(attn, "w_kc_full", None))
+        self.assertIsNone(getattr(attn, "w_vc_full", None))
 
     def test_the_gathered_w_kc_keeps_the_loader_stride_pattern(self):
         attn, _ = self._attach(narrow_output=False)
@@ -280,19 +303,36 @@ class TestOnlyTheEnabledLegsAreGathered(CustomTestCase):
         )
         self.assertEqual(attn.w_kc_full.stride()[1:], attn.w_kc.stride()[1:])
 
-    def test_the_return_leg_cannot_switch_itself_on(self):
-        """The output flag is meaningless without the flag that gates it."""
+    def test_the_return_leg_still_needs_dsa_cp_itself(self):
+        """Independent of the inbound leg, but not of DSA-CP.
+
+        Both legs are rearrangements of DSA-CP's own exchange. With DSA-CP off
+        there is no exchange to move work across, and gathering the weights
+        would be pure cost.
+        """
         from sglang.srt.layers.attention.dsa import dsa_cp as dsa_cp_module
 
         with (
             mock.patch.object(
                 dsa_cp_module, "_dsa_cp_narrow_a2a_output_flag", lambda: True
             ),
+            mock.patch.object(dsa_cp_module, "dsa_cp_enabled", lambda: False),
+        ):
+            self.assertFalse(dsa_cp_module.dsa_cp_narrow_a2a_output_enabled())
+
+        with (
+            mock.patch.object(
+                dsa_cp_module, "_dsa_cp_narrow_a2a_output_flag", lambda: True
+            ),
+            mock.patch.object(dsa_cp_module, "dsa_cp_enabled", lambda: True),
             mock.patch.object(
                 dsa_cp_module, "dsa_cp_narrow_a2a_enabled", lambda: False
             ),
         ):
-            self.assertFalse(dsa_cp_module.dsa_cp_narrow_a2a_output_enabled())
+            self.assertTrue(
+                dsa_cp_module.dsa_cp_narrow_a2a_output_enabled(),
+                "the return leg must not need the inbound leg",
+            )
 
 
 if __name__ == "__main__":

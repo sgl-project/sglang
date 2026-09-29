@@ -143,10 +143,10 @@ def dsa_cp_narrow_a2a_output_enabled() -> bool:
     the benefit for 43% of the weight memory.** Hence off by default, while the
     inbound leg is the one meant to become the default.
 
-    Turn it on where the KV pool has room to spare and prompts are long enough
-    for the per-token term to matter.
+    **Independent of the inbound leg**, because the measurement made that the
+    interesting combination. Each leg can be on without the other.
     """
-    return _dsa_cp_narrow_a2a_output_flag() and dsa_cp_narrow_a2a_enabled()
+    return _dsa_cp_narrow_a2a_output_flag() and dsa_cp_enabled()
 
 
 def dsa_cp_narrow_a2a_enabled() -> bool:
@@ -235,18 +235,22 @@ def dsa_cp_attach_full_kv_b(self_attn) -> None:
     layouts carry separate scale tensors that would have to be gathered with
     them.
     """
-    if not dsa_cp_narrow_a2a_enabled() or not getattr(self_attn, "use_dsa", False):
+    if not getattr(self_attn, "use_dsa", False):
         return
     w_kc = getattr(self_attn, "w_kc", None)
     w_vc = getattr(self_attn, "w_vc", None)
     if w_kc is None or w_vc is None:
         return
-    # Gather only what the enabled legs actually consume. The layer keeps using
-    # its own w_vc slice after the wide return leg, so leaving w_vc ungathered
-    # costs nothing but the bytes it would have taken.
-    wanted = [("w_kc", w_kc)]
+    # Gather only what the enabled legs actually consume, and nothing at all if
+    # neither is on. The layer keeps using its own w_vc slice after a wide
+    # return leg, so leaving w_vc ungathered costs nothing but the bytes.
+    wanted = []
+    if dsa_cp_narrow_a2a_enabled():
+        wanted.append(("w_kc", w_kc))
     if dsa_cp_narrow_a2a_output_enabled():
         wanted.append(("w_vc", w_vc))
+    if not wanted:
+        return
     not_bf16 = [(n, w.dtype) for n, w in wanted if w.dtype != torch.bfloat16]
     if not_bf16:
         print_info_once(
@@ -318,16 +322,13 @@ def dsa_cp_attach_full_kv_b(self_attn) -> None:
         _narrow_a2a_totals["driver_bytes"] += free_before - npu.mem_get_info()[0]
     # Names the legs, because the two modes differ only in speed and in this
     # number, and a log read weeks later has to say which one ran.
+    legs = {
+        "w_kc": "input leg: the query is exchanged before the absorb",
+        "w_vc": "output leg: the head output goes back through w_vc first",
+    }
     print_info_once(
         "DSA-CP narrow all-to-all is ON ("
-        + (
-            "both legs: every rank holds the full w_kc and w_vc, so the query "
-            "is exchanged before the absorb and the head output goes back "
-            "through w_vc first"
-            if len(wanted) > 1
-            else "input leg: every rank holds the full w_kc, so the query is "
-            "exchanged before the absorb; the output comes back wide"
-        )
+        + "; ".join(legs[n] for n, _ in wanted)
         + f"), {gathered_bytes / (1 << 20):.1f} MB per layer"
     )
     # Every 26 layers, so a 78-layer model logs three times and the last line
