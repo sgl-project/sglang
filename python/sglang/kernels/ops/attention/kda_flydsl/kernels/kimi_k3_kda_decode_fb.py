@@ -8,7 +8,6 @@ import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from aiter.ops.flydsl.kernels import vector
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
@@ -22,6 +21,12 @@ from flydsl._mlir.dialects import vector as mlir_vector
 from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import T
+
+try:
+    from aiter.ops.flydsl.kernels import vector
+except ImportError:
+    # Image pin acf8fdf has no kernels.vector. CombiningKind is on this dialect.
+    vector = mlir_vector
 
 _HEADS = 12
 _DIM = 128
