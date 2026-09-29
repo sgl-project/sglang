@@ -1176,7 +1176,10 @@ class HybridCacheController(BaseHiCacheController):
         )
         operation.all_hash_values = hash_value
 
-        if operation.assume_stored:
+        if operation.assume_stored and not any(
+            transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES
+            for transfer in operation.pool_transfers or []
+        ):
             # A prior hit on a suffix of this span proved it stored, and writes
             # are prefix-covered, so re-querying only adds a round trip.
             kv_hit_pages = len(hash_value)
@@ -1199,11 +1202,41 @@ class HybridCacheController(BaseHiCacheController):
 
         kv_hit_pages = hit_result.kv_hit_pages
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
+        operation.pool_storage_result.restorable_prefix_pages = (
+            hit_result.restorable_prefix_pages
+        )
 
         return (
             hash_value[:kv_hit_pages],
             kv_hit_pages * self.page_size,
         )
+
+    def _sync_storage_hit_count(self, operation, storage_hit_count: int) -> int:
+        if not any(
+            transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES
+            for transfer in operation.pool_transfers or []
+        ):
+            return super()._sync_storage_hit_count(operation, storage_hit_count)
+
+        # A trailing state can exist at 512 and 1024 but not at 768. Taking
+        # MIN of each rank's longest hit would choose a missing checkpoint.
+        # Use the request span (identical on every rank) for the collective
+        # shape, including when one rank skipped its query due to cancellation.
+        candidates = torch.zeros(
+            len(operation.token_ids) // self.page_size + 1, dtype=torch.int
+        )
+        candidates[0] = 1
+        if storage_hit_count > 0:
+            pages = operation.pool_storage_result.restorable_prefix_pages
+            if pages is None:
+                # Backends without sparse-boundary results keep their existing
+                # contiguous-prefix contract. File and Mooncake return a set.
+                pages = range(1, storage_hit_count // self.page_size + 1)
+            candidates[list(pages)] = 1
+        self._all_reduce(
+            candidates, torch.distributed.ReduceOp.MIN, self.prefetch_hits_sync_groups
+        )
+        return candidates.nonzero()[-1].item() * self.page_size
 
     def _move_pool_indices(
         self, host_pool, host_indices, device_indices, *, write_back_jit: bool

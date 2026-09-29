@@ -532,6 +532,7 @@ class HiCacheController:
         if self.enable_storage:
             raise RuntimeError("Storage backend already attached.")
         if get_parallel().attn_dcp_size > 1:
+            from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
             from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
             if storage_backend not in ("file", "mooncake"):
@@ -541,10 +542,20 @@ class HiCacheController:
             if (
                 not isinstance(self.storage_host_pool, MLATokenToKVPoolHost)
                 or self.storage_host_pool.kv_buffer is None
-                or len(getattr(self.mem_pool_host, "entries", [None])) != 1
             ):
                 raise NotImplementedError(
-                    "HiCache L3 with DCP requires one materialized MLA host pool."
+                    "HiCache L3 with DCP requires a materialized MLA host pool."
+                )
+            if self.mem_pool_host is not self.storage_host_pool and any(
+                entry.host_pool is not self.storage_host_pool
+                and (
+                    entry.name != PoolName.MAMBA
+                    or not isinstance(entry.host_pool, MambaPoolHost)
+                )
+                for entry in self.mem_pool_host.entries
+            ):
+                raise NotImplementedError(
+                    "HiCache L3 with DCP supports only MLA KV and optional KDA state."
                 )
             if self.storage_host_pool.layout not in (
                 "layer_first",
@@ -1268,15 +1279,9 @@ class HiCacheController:
                     hash_value, storage_hit_count = [], 0
                 else:
                     hash_value, storage_hit_count = self._storage_hit_query(operation)
-                storage_hit_count_tensor = torch.tensor(
-                    storage_hit_count, dtype=torch.int
+                storage_hit_count = self._sync_storage_hit_count(
+                    operation, storage_hit_count
                 )
-                self._all_reduce(
-                    storage_hit_count_tensor,
-                    torch.distributed.ReduceOp.MIN,
-                    self.prefetch_hits_sync_groups,
-                )
-                storage_hit_count = storage_hit_count_tensor.item()
 
                 # Record the TP-synced hit count; the scheduler thread decides
                 # at drain time whether to revoke (below threshold) or allocate.
@@ -1288,6 +1293,13 @@ class HiCacheController:
 
             except Empty:
                 continue
+
+    def _sync_storage_hit_count(self, operation, storage_hit_count: int) -> int:
+        hit = torch.tensor(storage_hit_count, dtype=torch.int)
+        self._all_reduce(
+            hit, torch.distributed.ReduceOp.MIN, self.prefetch_hits_sync_groups
+        )
+        return hit.item()
 
     def write_storage(
         self,
