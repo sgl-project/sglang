@@ -1120,9 +1120,15 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 self._runtime_peak_allocated_mb,
             ],
             dtype=torch.float64,
-            device=current_platform.get_device(self.local_rank),
         )
-        peaks = get_replica_group().all_reduce(peaks, op=torch.distributed.ReduceOp.MAX)
+        replica = get_replica_group()
+        if replica.world_size > 1:
+            # Host counters over gloo: the device group's first collective
+            # sets up NCCL connections, which cost the first dumped request
+            # 0.15 s of latency.
+            torch.distributed.all_reduce(
+                peaks, op=torch.distributed.ReduceOp.MAX, group=replica.cpu_group
+            )
         if not self.is_output_rank:
             return
 
