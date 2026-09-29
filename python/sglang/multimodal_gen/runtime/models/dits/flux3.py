@@ -46,8 +46,10 @@ import torch.nn.functional as F
 
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
+    can_use_fp8_rowwise,
     can_use_fused_inplace_qknorm_rope,
     can_use_fused_layernorm_modulate,
+    fp8_rowwise,
     fused_inplace_qknorm_rope,
     fused_layernorm_modulate_raw,
     fused_packed_silu_mul_bitexact,
@@ -317,9 +319,12 @@ class Flux3Fp8RowwiseLinear(nn.Module):
         flat = x.reshape(-1, self.in_features).contiguous()
         rows = flat.shape[0]
         pad = -rows % self.ROW_ALIGNMENT
-        if pad:
-            flat = F.pad(flat, (0, 0, 0, pad))
-        activation, activation_scale = quantize_fp8_rowwise(flat)
+        if can_use_fp8_rowwise(flat):
+            activation, activation_scale = fp8_rowwise(flat, self.ROW_ALIGNMENT)
+        else:
+            if pad:
+                flat = F.pad(flat, (0, 0, 0, pad))
+            activation, activation_scale = quantize_fp8_rowwise(flat)
         out = torch._scaled_mm(
             activation,
             self.weight.T,
