@@ -254,6 +254,7 @@ POSITIONAL_FIELD_ORDER = (
     "enable_torch_symm_mem",
     "enable_scattered_sconv",
     "pre_warm_nccl",
+    "boundary_reduction",
     "enable_quant_communications",
     "enable_flashinfer_allreduce_fusion",
     "enforce_disable_flashinfer_allreduce_fusion",
