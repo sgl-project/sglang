@@ -123,8 +123,10 @@ if PREFILL_TILE_BUDGET_MODE not in {"legacy", "compact"}:
     )
     PREFILL_TILE_BUDGET_MODE = "compact"
 
-# Same queue length at which LPM stops matching the waiting queue; bounds the
-# per-round cost of the cache-agnostic prefix refresh.
+# Bounds the per-round cost of the cache-agnostic prefix refresh to what LPM
+# already pays: _determine_active_policy drops LPM/HRRN to FCFS above this same
+# queue length (#1896). Inherited precedent, not a measured optimum; above it a
+# waiting request is again unprotected from eviction.
 WAITING_PREFIX_REFRESH_MAX_QUEUE = 128
 
 
