@@ -18,6 +18,9 @@ def _pdl_supported() -> bool:
     """Check if Programmatic Dependent Launch is supported (NVIDIA SM >= 90)."""
     if not torch.cuda.is_available():
         return False
+    # PDL is NVIDIA-only; disable on ROCm/HIP.
+    if hasattr(torch.version, "hip") and torch.version.hip is not None:
+        return False
     try:
         major, _ = torch.cuda.get_device_capability()
         return major >= 9
