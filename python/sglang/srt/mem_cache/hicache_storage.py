@@ -739,31 +739,40 @@ class HiCacheFile(HiCacheStorage):
         )
 
         hit_count: dict[str, int] = {PoolName.KV: kv_pages} if kv_pages else {}
-        final_pages = kv_pages
+        restorable = list(range(1, kv_pages + 1))
 
         for transfer in pool_transfers or []:
-            if final_pages == 0:
+            if not restorable:
                 break
             name = transfer.name
             if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
                 boundary = next(
                     (i for i in range(kv_pages) if not has_component(i, name)), kv_pages
                 )
-            else:  # trailing_pages
+                pool_restorable = list(range(1, boundary + 1))
+            elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
                 trailing = max(1, len(transfer.keys) if transfer.keys else 1)
                 boundary = 0
+                pool_restorable = []
                 for prefix_len in range(kv_pages, 0, -1):
                     if all(
                         has_component(i, name)
                         for i in range(max(0, prefix_len - trailing), prefix_len)
                     ):
-                        boundary = prefix_len
-                        break
+                        pool_restorable.append(prefix_len)
+                        if boundary == 0:
+                            boundary = prefix_len
+            else:
+                raise ValueError(f"Unsupported pool hit policy: {transfer.hit_policy}")
             if boundary:
                 hit_count[name] = boundary
-            final_pages = min(final_pages, boundary)
+            allowed = set(pool_restorable)
+            restorable = [p for p in restorable if p in allowed]
 
-        return PoolTransferResult(final_pages, hit_count)
+        # A recurrent checkpoint can exist at page four but not page three.
+        # Preserve all legal endpoints for the controller's rank intersection.
+        final_pages = restorable[-1] if restorable else 0
+        return PoolTransferResult(final_pages, hit_count, restorable)
 
     def _log_key(self, pool_name: str, key: str) -> str:
         if pool_name == PoolName.KV:

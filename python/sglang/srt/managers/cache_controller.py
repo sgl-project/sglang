@@ -523,9 +523,13 @@ class HiCacheController:
         primary: HostKVCache, entries: Optional[List[PoolEntry]]
     ):
         from sglang.srt.mem_cache.memory_pool import MLATokenToKVPoolFP4
+        from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
         from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
-        message = "HiCache L3 with DCP requires one materialized MLA host pool."
+        message = (
+            "HiCache L3 with DCP requires one materialized MLA host pool "
+            "and at most one materialized Mamba state pool."
+        )
         if (
             not isinstance(primary, MLATokenToKVPoolHost)
             or primary.kv_buffer is None
@@ -542,12 +546,30 @@ class HiCacheController:
             )
         if entries is None:
             return
-        if (
-            len(entries) != 1
-            or entries[0].name != PoolName.KV
-            or entries[0].host_pool is not primary
-            or entries[0].packed_draft_device_pools
-        ):
+        if len(entries) not in (1, 2):
+            raise NotImplementedError(message)
+        if any(entry.packed_draft_device_pools for entry in entries):
+            raise NotImplementedError(message)
+        seen = set()
+        for entry in entries:
+            name = entry.name
+            if name in seen:
+                raise NotImplementedError(message)
+            seen.add(name)
+            if name == PoolName.KV and entry.host_pool is primary:
+                continue
+            if (
+                name != PoolName.MAMBA
+                or not isinstance(entry.host_pool, MambaPoolHost)
+                or entry.host_pool.layout not in ("page_first", "page_first_direct")
+                or entry.device_indices_from_anchor_fn is not None
+                or entry.packed_draft_device_pools
+            ):
+                raise NotImplementedError(message)
+            buffers = entry.host_pool.get_hybrid_pool_buffer()
+            if not buffers or any(b is None or b.numel() == 0 for b in buffers):
+                raise NotImplementedError(message)
+        if PoolName.KV not in seen:
             raise NotImplementedError(message)
 
     def attach_storage_backend(
@@ -622,6 +644,7 @@ class HiCacheController:
                 )
             else:
                 # Budget speculative prefetch at half the host pool, leaving the rest for the write-back staging path.
+                # Budgets count logical slots, like prefetch occupancy and the allocator.
                 self.prefetch_capacity_limit = int(
                     0.5 * self.mem_pool_host.logical_size
                 )
@@ -1282,6 +1305,17 @@ class HiCacheController:
 
         return hash_value, storage_query_count
 
+    def _reduce_storage_hit_count(
+        self, operation, storage_hit_count: int, sync_groups=None
+    ) -> int:
+        hit_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
+        self._all_reduce(
+            hit_tensor,
+            torch.distributed.ReduceOp.MIN,
+            self.prefetch_hits_sync_groups if sync_groups is None else sync_groups,
+        )
+        return int(hit_tensor.item())
+
     def prefetch_thread_func(self):
         """
         Manage prefetching operations from storage backend to host memory.
@@ -1295,15 +1329,9 @@ class HiCacheController:
                     hash_value, storage_hit_count = [], 0
                 else:
                     hash_value, storage_hit_count = self._storage_hit_query(operation)
-                storage_hit_count_tensor = torch.tensor(
-                    storage_hit_count, dtype=torch.int
+                storage_hit_count = self._reduce_storage_hit_count(
+                    operation, storage_hit_count
                 )
-                self._all_reduce(
-                    storage_hit_count_tensor,
-                    torch.distributed.ReduceOp.MIN,
-                    self.prefetch_hits_sync_groups,
-                )
-                storage_hit_count = storage_hit_count_tensor.item()
 
                 # Record the TP-synced hit count; the scheduler thread decides
                 # at drain time whether to revoke (below threshold) or allocate.
