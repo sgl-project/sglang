@@ -43,6 +43,7 @@ from sglang.srt.disaggregation.common.utils import (
     unpack_int_lists,
 )
 from sglang.srt.disaggregation.mooncake.utils import (
+    _validate_efa_allocator_compatibility,
     check_mooncake_custom_mem_pool_enabled,
 )
 from sglang.srt.disaggregation.utils import (
@@ -216,6 +217,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
     # Implements teardown() below, so runtime PD role switching is supported.
     supports_role_switch = True
+    # Bootstrap thread defers the ABORT ack until the transfer worker drains.
+    supports_deferred_decode_kv_release = True
 
     def __init__(
         self,
@@ -224,6 +227,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
     ):
+        enable_custom_mem_pool, custom_mem_pool_type = (
+            check_mooncake_custom_mem_pool_enabled()
+        )
+        _validate_efa_allocator_compatibility(
+            enable_custom_mem_pool, custom_mem_pool_type
+        )
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.init_engine()
         self.register_buffer_to_engine()
@@ -1350,10 +1359,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         each page to ensure correctness for any page_size and head-slicing configuration.
         This may introduce performance overhead (increased TTFT) for long sequences.
         """
+        from sglang.srt.disaggregation.common.staging_buffer import (
+            compute_head_slice_params,
+        )
+
         # Extract configuration
-        local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
         src_kv_item_len = self.kv_args.kv_item_lens[0]
-        dst_tp_rank_in_group = dst_tp_rank % dst_attn_tp_size
         page_size = self.kv_args.page_size
 
         # Use total KV head count (not per-rank) for correct head distribution.
@@ -1362,43 +1373,32 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if total_kv_heads <= 0:
             total_kv_heads = self.kv_args.kv_head_num * self.attn_tp_size
 
-        src_heads_per_rank = max(1, total_kv_heads // self.attn_tp_size)
         dst_heads_per_rank = max(1, total_kv_heads // dst_attn_tp_size)
         bytes_per_head_slice_to_send = (
             dst_kv_item_len // page_size // dst_heads_per_rank
         )
 
-        # GQA replication: how many prefill ranks share the same KV head
-        src_replication = max(1, self.attn_tp_size // total_kv_heads)
-
-        # Determine slicing parameters based on TP configuration
-        if self.attn_tp_size > dst_attn_tp_size:
-            # Send KVCache from multiple prefill instances to 1 decode instance
-            src_head_start_offset = 0
-            num_heads_to_send = src_heads_per_rank
-            unique_head_idx = local_tp_rank_in_group // src_replication
-            dst_head_start_offset = (
-                unique_head_idx * src_heads_per_rank
-            ) % dst_heads_per_rank
-        else:
-            # Send KVCache from 1 prefill instance to multiple decode instances
-            # GQA replication (total_kv_heads < dst_attn_tp_size): consecutive decode
-            # ranks share one KV head (QKVParallelLinear: tp_rank // num_kv_head_replicas),
-            # so map by integer division NOT modulo or ranks 1..r-1 fetch the wrong head.
-            dst_replication = max(1, dst_attn_tp_size // total_kv_heads)
-            unique_dst_head_idx = dst_tp_rank_in_group // dst_replication
-            src_head_start_offset = (
-                unique_dst_head_idx * dst_heads_per_rank
-            ) % src_heads_per_rank
-            num_heads_to_send = dst_heads_per_rank
-            dst_head_start_offset = 0
+        (
+            src_head_start_offset,
+            num_heads_to_send,
+            dst_head_start_offset,
+            _,
+        ) = compute_head_slice_params(
+            self.attn_tp_size,
+            dst_attn_tp_size,
+            self.kv_args.engine_rank,
+            dst_tp_rank,
+            total_kv_heads,
+        )
 
         src_data_ptrs = self.kv_args.kv_data_ptrs
         src_layer_ids = self.kv_args.kv_layer_ids
         if src_layer_ids or dst_layer_ids:
             # Draft buffers break the flat [K block, V block] layout, so pair by
             # layer ID instead of the half-split used by get_mha_kv_ptrs_with_pp.
-            if any(l != src_kv_item_len for l in self.kv_args.kv_item_lens):
+            if any(
+                item_len != src_kv_item_len for item_len in self.kv_args.kv_item_lens
+            ):
                 logger.error(
                     f"[{mooncake_session_id}] head-sliced transfer assumes one item "
                     f"length for every KV entry, got {set(self.kv_args.kv_item_lens)}"
@@ -1852,12 +1852,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     )
                     or rc
                 )
-            elif st == StateType.MINIMAX_INDEX_K:
-                # Equal-TP / PP=1 only. Sub-pools are compacted sparse-layer
-                # lists, so PP>1 mis-slices and heterogeneous TP is unsupported.
+            elif st in (StateType.MINIMAX_INDEX_K, StateType.MINIMAX_DENSE_KV):
+                # Compacted layer lists require equal TP and PP=1 on both peers.
                 if self.pp_size is not None and self.pp_size > 1:
                     raise RuntimeError(
-                        "PD disagg: PP>1 not supported for MiniMax sparse index yet."
+                        "PD disagg: PP>1 not supported for MiniMax state yet."
                     )
                 if (
                     target_rank_registration_info is not None
@@ -1866,11 +1865,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 ):
                     raise RuntimeError(
                         "PD disagg: heterogeneous TP not supported for MiniMax "
-                        "sparse index yet."
+                        "state yet."
                     )
                 src_indices = list(indices)
                 dst_indices_local = list(dst_indices)
-                if len(src_indices) > len(dst_indices_local):
+                if st == StateType.MINIMAX_DENSE_KV:
+                    if len(src_indices) != len(dst_indices_local):
+                        raise RuntimeError(
+                            f"{st.value} state index length mismatch: "
+                            f"prefill={len(src_indices)}, dst={len(dst_indices_local)}"
+                        )
+                elif len(src_indices) > len(dst_indices_local):
                     src_indices = src_indices[: len(dst_indices_local)]
                 elif len(src_indices) < len(dst_indices_local):
                     dst_indices_local = dst_indices_local[: len(src_indices)]
@@ -2455,9 +2460,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         # first would let the worker drain+ack while the room is
                         # not yet Failed, so a newly enqueued chunk could still
                         # write to the freed pages. The worker (not this thread)
-                        # acks once its in-flight write drains; if nothing is in
-                        # flight, decode falls back to the release timeout.
-                        if room_active:
+                        # acks once its in-flight write drains.
+                        if (
+                            room_active
+                            or self._staging_outstanding.get(room_to_be_aborted, 0) > 0
+                        ):
                             self.update_status(room_to_be_aborted, KVPoll.Failed)
                             self.register_deferred_ack_target(
                                 room_to_be_aborted, decode_ip, decode_port
@@ -2469,10 +2476,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 f"Received abort notification for room {room_to_be_aborted}, "
                                 f"marked as Failed; ACK deferred until transfer drains"
                             )
-                        elif self._staging_outstanding.get(room_to_be_aborted, 0) == 0:
-                            # Concluded/unknown AND quiescent: ack now. A cleared
-                            # room is not automatically quiescent -- clear() can
-                            # drop a room whose chunk is still transferring.
+                        else:
+                            # Concluded/unknown AND quiescent (the branch above
+                            # already took every case with writes outstanding):
+                            # ack now so decode releases without the timeout.
                             self._send_abort_ack(
                                 decode_ip, decode_port, room_to_be_aborted
                             )

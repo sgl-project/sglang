@@ -9,6 +9,7 @@
 import logging
 import os
 import re
+from array import array
 from collections.abc import Iterable
 from functools import cached_property
 from types import SimpleNamespace
@@ -29,14 +30,10 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers import (
-    k3_ar_fusion,
-    k3_gemm_ar,
-    k3_sp_collective,
-    zero_copy_context,
-)
+from sglang.srt.layers import zero_copy_context
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
 from sglang.srt.layers.attn_residual import AttnResidual, aggregate_stream, get_cw
+from sglang.srt.layers.communication import k3_ar_fusion, k3_sp_collective
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
     dp_gather_replicate,
@@ -255,15 +252,14 @@ def _merge_weights_as_views(
     return merged, sizes
 
 
-# K3 cannot use LayerCommunicator: the attn-res aggregation kernels replace
-# input_layernorm / post_attention_layernorm, which the communicator expects
-# to own. Instead the MLP/MoE modules gather/scatter around their own body:
+# K3 manages its own boundaries: the attn-res aggregation kernels replace
+# input_layernorm / post_attention_layernorm, and the MLP/MoE modules
+# gather/scatter around their own body:
 # attention and the attn-res buffers stay in local (per-DP-rank) token space,
 # the MLP/MoE runs on the DP-gathered global batch, and the delayed prefix_sum
 # add stays local, applied after the scatter back.
 def _dp_local_buffer_group():
-    """Symmetric-memory group for the local DP buffer (mirrors
-    CommunicateSummableTensorPairFn._scatter_hidden_states)."""
+    """Symmetric-memory group holding this DP rank's local token buffer."""
     parallel = get_parallel()
     if parallel.tp_size == parallel.attn_dp_size:
         return get_parallel().tp_group
@@ -782,7 +778,7 @@ class KimiK3MoE(nn.Module):
         applies the norm)."""
         import deep_gemm
 
-        from sglang.kernels.ops.attention.dsv4 import mega_moe_pre_dispatch
+        from sglang.kernels.ops.moe.dsv4 import mega_moe_pre_dispatch
         from sglang.srt.environ import envs
         from sglang.srt.layers.moe.mega_moe import (
             _configure_mega_moe_deep_gemm_num_sms,
@@ -1794,7 +1790,6 @@ class KimiK3DeltaAttention(nn.Module):
             self.all_reduce_fusion = False
             self.o_proj.reduce_results = True
             self.o_proj.use_dp_attention_reduce = True
-        k3_gemm_ar.maybe_wrap_o_proj(self.o_proj)
         conv_weights = self.qkv_conv1d.weight.squeeze(1)
         bias = self.qkv_conv1d.bias
 
@@ -2031,7 +2026,7 @@ class KimiK3DeltaAttention(nn.Module):
             if self._bfa_w is not None:
                 w = self._bfa_w
                 n_fa, n_b = self._bfa_fa_size, self._bfa_b_size
-                from sglang.kernels.ops.kimi_k3 import kimi_k3_tiny_gemm as gemm
+                from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm as gemm
 
                 if (
                     _is_hip
@@ -2047,7 +2042,8 @@ class KimiK3DeltaAttention(nn.Module):
                     qkv, g_proj_states, f_a, beta, _pad = torch.split(
                         fused_states, self._qkvgbfa_sizes, dim=-1
                     )
-                    forget_gate = gemm(f_a, self._bfa_f_b_w)
+                    # Fused KDA decode consumes f_a and applies f_b itself.
+                    forget_gate = f_a if defer_f_b else gemm(f_a, self._bfa_f_b_w)
                     return qkv, beta, forget_gate, g_proj_states
 
                 if (
@@ -2254,7 +2250,6 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             self.all_reduce_fusion = False
             self.o_proj.reduce_results = True
             self.o_proj.use_dp_attention_reduce = True
-        k3_gemm_ar.maybe_wrap_o_proj(self.o_proj)
         if self.all_reduce_fusion:
             # Hand the GEMM a slice of the persistent symmetric buffer
             # (k3_ar_fusion.symm_buffer); the fused AR reduces it in place.
@@ -2274,7 +2269,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
 
             self.o_proj.forward = _symm_o_proj_forward
         else:
-            # K3 has no LayerCommunicator, so o_proj must reduce within the
+            # K3 owns its output reduction, so o_proj must reduce within the
             # attn-TP group itself: the default full-TP collective is the wrong
             # group at attn_tp>1 and deadlocks idle DP ranks.
             self.o_proj.use_dp_attention_reduce = True
@@ -2313,7 +2308,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                 self._gate_hidden_states = None
                 if gate_input is not None and not isinstance(x, tuple):
                     gate = self._compute_output_gate(gate_input)
-                    from sglang.kernels.ops.kimi_k3 import mla_output_gate
+                    from sglang.kernels.ops.attention import mla_output_gate
 
                     if mla_output_gate.covered(x, gate):
                         # One kernel for x * sigmoid(gate); double rounding
@@ -2593,7 +2588,7 @@ class KimiK3DecoderLayer(nn.Module):
     ) -> torch.Tensor:
         # DP attention: idle ranks (padded to the global shape) have no
         # attention metadata; pass hidden_states through shape-preserving
-        # (same as the LayerCommunicator models' is_idle skip).
+        # (matching the idle skip in other DP-attention models).
         if forward_batch.forward_mode.is_idle():
             return hidden_states
 
@@ -2636,9 +2631,9 @@ class KimiK3DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
-        # For MLA layers with q_lora_rank, set up communicator attn_inputs
-        # before the forward call (normally done by LayerCommunicator).
-        from sglang.srt.layers.communicator import (
+        # For MLA layers with q_lora_rank, set up attn_inputs before the
+        # forward call (normally done by the attention boundary).
+        from sglang.srt.layers.layer_boundary import (
             AttentionInputs,
             get_attn_tp_context,
         )
@@ -3131,7 +3126,14 @@ class KimiK3LinearForCausalLM(nn.Module):
                 }
                 quant_config.update_packed_modules_mapping({"model": model_mapping})
             else:
-                quant_config.update_packed_modules_mapping(self.packed_modules_mapping)
+                # The loader seeded this mapping from the outer model class;
+                # replacing it would drop those entries.
+                quant_config.update_packed_modules_mapping(
+                    {
+                        **(quant_config.packed_modules_mapping or {}),
+                        **self.packed_modules_mapping,
+                    }
+                )
         self.model = KimiK3LinearModel(
             config, quant_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -3166,6 +3168,11 @@ class KimiK3LinearForCausalLM(nn.Module):
             )
         self.capture_aux_hidden_states = True
         self.model.dspark_layers_to_capture = list(layer_ids)
+
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
+        # DFLASH target_layer_ids name layer outputs, which is what the DSPARK
+        # taps already capture here, so reuse them without the usual +1 shift.
+        self.set_dspark_layers_to_capture(layer_ids)
 
     @torch.no_grad()
     def forward(
@@ -3655,6 +3662,13 @@ class KimiK3ForConditionalGeneration(nn.Module):
             return 0
         return self.language_model.get_pp_proxy_dspark_hidden_size()
 
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
+        if self.language_model is None:
+            raise AttributeError(
+                "DFLASH layer capture is not available in encoder-only mode"
+            )
+        self.language_model.set_dflash_layers_to_capture(layer_ids)
+
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
         if self.language_model is None:
             raise AttributeError(
@@ -3864,7 +3878,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
         image_embeds = self.vision_tower(pixel_values, grid_thws_host.to(device))
         return self.mm_projector(image_embeds)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
