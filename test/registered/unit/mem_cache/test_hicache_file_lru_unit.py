@@ -368,6 +368,56 @@ class TestMinFreeSpaceWatermark(HiCacheFileLRUTestBase):
         self.assertFalse(b.set("nope", _t(100)))
         self.assertFalse(b.exists("nope"))
 
+    def test_pending_write_counts_toward_free_space_watermark(self):
+        b = self.make_backend(max_size="0", min_free="100")
+        b._evictor._fs_stats = lambda: (1024, 200)
+        pending = b._get_suffixed_key("pending")
+        # Pause the first writer after reservation but before any bytes reach
+        # the filesystem. A second writer must include its 80-byte commitment.
+        self.assertTrue(b._evictor.reserve(pending, 80))
+        self.assertFalse(b.set("second", _t(30)))
+        self.assertFalse(b.exists("second"))
+        self.assertIn(pending, b._evictor._pending_writes)
+        self.assertEqual(b._evictor._total_bytes, 80)
+
+        b._evictor.abort(pending)
+        self.assertTrue(b.set("second", _t(30)))
+
+    def test_committed_write_is_not_charged_twice(self):
+        b = self.make_backend(max_size="0", min_free="100")
+        b._evictor._fs_stats = lambda: (1024, 200)
+        pending = b._get_suffixed_key("pending")
+        self.assertTrue(b.set("pending", _t(80)))
+        # Once committed, statvfs accounts for the first write. A second
+        # 20-byte write exactly fits without charging the reservation again.
+        b._evictor._fs_stats = lambda: (1024, 120)
+        self.assertTrue(b.set("second", _t(20)))
+        self.assertIn(pending, b._evictor._lru)
+
+    def test_evicts_for_pending_and_new_writes(self):
+        b = self.make_backend(max_size="0", min_free="100")
+        self.assertTrue(b.set("victim", _t(100)))
+        free = [200]
+        pending = b._get_suffixed_key("pending")
+        original_remove = os.remove
+
+        def tracked_remove(path):
+            free[0] += os.path.getsize(path)
+            original_remove(path)
+
+        with (
+            mock.patch.object(
+                b._evictor, "_fs_stats", side_effect=lambda: (1024, free[0])
+            ),
+            mock.patch("os.remove", side_effect=tracked_remove),
+        ):
+            self.assertTrue(b._evictor.reserve(pending, 80))
+            self.assertTrue(b.set("second", _t(30)))
+        self.assertFalse(b.exists("victim"))
+        self.assertTrue(b.exists("second"))
+        self.assertIn(pending, b._evictor._pending_writes)
+        self.assertEqual(b._evictor._total_bytes, 110)
+
     def test_evicts_to_satisfy_min_free(self):
         b = self.make_backend(max_size="0", min_free="100")
         # Pre-seed LRU with one 80B entry that is on disk.

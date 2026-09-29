@@ -286,14 +286,18 @@ class LRUFileEvictor:
         # tmpfs frees space on unlink, so credit reclaimed bytes back to the
         # estimate rather than re-probing statvfs on every eviction.
         free = fs[1]
+        # Reservations can precede filesystem allocation. Charge pending writes
+        # until commit/abort so concurrent writers cannot spend the same free
+        # space. This is conservative while a pending write is partially on disk.
+        needed_bytes = value_bytes + sum(self._lru[key] for key in self._pending_writes)
         self._evict_while(
-            lambda reclaimed: (free + reclaimed) - value_bytes < self.min_free_bytes
+            lambda reclaimed: (free + reclaimed) - needed_bytes < self.min_free_bytes
         )
         # Re-probe: external writers may have changed free space meanwhile.
         fs = self._fs_stats()
         if fs is None:
             return True
-        return fs[1] - value_bytes >= self.min_free_bytes
+        return fs[1] - needed_bytes >= self.min_free_bytes
 
     def _scan_existing_files(self) -> None:
         """Seed LRU index from disk on startup (oldest mtime first)."""
