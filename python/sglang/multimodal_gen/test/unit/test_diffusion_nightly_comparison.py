@@ -109,6 +109,26 @@ def test_explicit_server_warmup_shape_is_preserved():
     assert command[command.index("--warmup-num-frames") + 1] == "25"
 
 
+def test_health_wait_fails_fast_when_the_server_exits(monkeypatch):
+    class ExitedProc:
+        returncode = 1
+
+        def poll(self):
+            return self.returncode
+
+    def unreachable(*args, **kwargs):
+        raise runner.requests.exceptions.ConnectionError("refused")
+
+    monkeypatch.setattr(runner.requests, "get", unreachable)
+    monkeypatch.setattr(runner.time, "sleep", lambda _: None)
+    try:
+        runner.wait_for_health("http://host:1", proc=ExitedProc(), timeout=3600)
+    except RuntimeError as e:
+        assert "exited with code 1" in str(e)
+    else:
+        raise AssertionError("wait_for_health should fail once the server exits")
+
+
 def test_perf_dump_summary_uses_medians():
     perf_dumps = [
         {

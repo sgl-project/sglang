@@ -223,8 +223,19 @@ HEALTH_ENDPOINTS = {
 }
 
 
+def _raise_if_exited(proc: subprocess.Popen | None) -> None:
+    # a server that died during startup would otherwise cost the full timeout
+    if proc is not None and proc.poll() is not None:
+        raise RuntimeError(
+            f"Server exited with code {proc.returncode} before becoming ready"
+        )
+
+
 def wait_for_health(
-    base_url: str, framework: str = "sglang", timeout: int = HEALTH_TIMEOUT
+    base_url: str,
+    framework: str = "sglang",
+    timeout: int = HEALTH_TIMEOUT,
+    proc: subprocess.Popen | None = None,
 ) -> None:
     """Poll health endpoint until 200, then verify model is loaded."""
     endpoint = HEALTH_ENDPOINTS.get(framework, "/health")
@@ -232,6 +243,7 @@ def wait_for_health(
     print(f"  Waiting for server at {health_url} ...")
     start = time.time()
     while True:
+        _raise_if_exited(proc)
         try:
             resp = requests.get(health_url, timeout=2)
             if resp.status_code == 200:
@@ -249,6 +261,7 @@ def wait_for_health(
     if framework == "sglang":
         models_url = f"{base_url}/v1/models"
         while True:
+            _raise_if_exited(proc)
             try:
                 resp = requests.get(models_url, timeout=5)
                 if resp.status_code == 200:
@@ -832,7 +845,7 @@ def run_single(
         log_thread.start()
 
         base_url = f"http://{DEFAULT_HOST}:{port}"
-        wait_for_health(base_url, framework)
+        wait_for_health(base_url, framework, proc=proc)
 
         # Identical client warmup for every framework, discarded from the
         # measurement. The first request after the server reports ready is
