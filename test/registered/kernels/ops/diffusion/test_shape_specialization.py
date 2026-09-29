@@ -6,6 +6,9 @@ with the resolution, the prompt and the input image, so a class the server's
 warmup did not hit compiles on the first request that does: 0.3-0.5 s per
 kernel on a cold cache. These kernels use such sizes only for row indices and
 row masks, so they take them unspecialized, at no cost to vectorization.
+The Wan VAE layout kernels keep their channel count, element total and
+strides specialized; with channels a multiple of 16 those stay in one class
+at every resolution.
 """
 
 from contextlib import contextmanager
@@ -25,6 +28,10 @@ from sglang.kernels.ops.diffusion import (
 )
 from sglang.kernels.ops.diffusion.layout.ulysses_qkv_triton import (
     pack_qkv_destination_major,
+)
+from sglang.kernels.ops.diffusion.layout.wan_causal_cache_triton import (
+    cat_pad_channels_last_3d,
+    dup_up3d_add,
 )
 from sglang.kernels.ops.diffusion.modulate.wan_temb_table_slices_triton import (
     fused_temb_table_slices,
@@ -118,6 +125,27 @@ def _pack_qkv(seq_len):
     pack_qkv_destination_major(q, torch.randn_like(q), torch.randn_like(q), 2)
 
 
+def _cl3d(*shape):
+    return _bf16(*shape).contiguous(memory_format=torch.channels_last_3d)
+
+
+# One-frame chunks are real (the Wan VAE decodes frame by frame), one-pixel
+# frames are not: their size-1 dims get unit strides, and the strides stay
+# specialized on purpose.
+def _wan_cat_pad(n):
+    # a Wan causal conv input: n frames, no cache, k3 padding
+    hw = max(n, 2)
+    cat_pad_channels_last_3d(_cl3d(1, 96, n, hw, hw), None, (1, 1, 1, 1, 2, 0))
+
+
+def _wan_dup_up3d(n):
+    # WanResample 2x upsample: frames and height vary, width fixed
+    hw = max(n, 2)
+    src = _cl3d(1, 128, n, hw, 16)
+    main = _cl3d(1, 64, 2 * n, 2 * hw, 32)
+    dup_up3d_add(main, src, 2, 2, 4, False)
+
+
 LAUNCHES = {
     "select01": lambda n: _select01(n, residual=False),
     "residual_select01": lambda n: _select01(n, residual=True),
@@ -127,6 +155,8 @@ LAUNCHES = {
     "qk_head_layernorm": _qk_head_layernorm,
     "temb_table_slices": _temb_table_slices,
     "pack_qkv": _pack_qkv,
+    "wan_cat_pad": _wan_cat_pad,
+    "wan_dup_up3d": _wan_dup_up3d,
 }
 
 

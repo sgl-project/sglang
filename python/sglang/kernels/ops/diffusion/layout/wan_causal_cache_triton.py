@@ -22,7 +22,10 @@ import triton.language as tl  # type: ignore
 _MAX_INT32 = 2**31 - 1
 
 
-@triton.jit
+# The per-request sizes only index. The channel count, ``total`` and the
+# strides stay specialized for the channel vectorization, and the per-layer
+# padding and cache length for their constant folding (1.5% of kernel time).
+@triton.jit(do_not_specialize=["T", "H", "W", "out_t", "out_h", "out_w"])
 def _cat_pad_cl3d_kernel(
     x_ptr,
     cache_ptr,
@@ -207,7 +210,9 @@ def cat_pad_channels_last_3d(
     return out
 
 
-@triton.jit
+# ``out_w`` stays specialized: it is the contiguous dimension of the
+# channels-first traversal.
+@triton.jit(do_not_specialize=["out_t", "out_h", "t_offset"])
 def _dup_up3d_add_kernel(
     main_ptr,
     src_ptr,
