@@ -5,14 +5,22 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use sgl_kv_indexer::{GrpcPrefixIndex, PrefixIndex, PrefixIndexConfig};
 use sgl_router::{
-    config::{CachePrefixProvider, Cli, Config, KvIndexerEndpointConfig, LogFormat, PolicyKind},
-    discovery::spawn_discovery,
+    config::{
+        CachePrefixProvider, ChatRoutingKind, Cli, Config, DiscoveryBackend,
+        KvIndexerEndpointConfig, LogFormat, PolicyKind,
+    },
+    discovery::{spawn_discovery, ModelId},
     policies::{
         factory::build_registry as build_policy_registry, prefix_provider::RadixTreePrefixProvider,
         PolicyRegistry,
     },
+    policies_reorg::factory::build_resolver as build_reorg_resolver,
     proxy::Proxy,
-    server::{app::build_router, app_context::AppContext, shutdown::drain_for_termination},
+    server::{
+        app::build_router,
+        app_context::{AppContext, ChatRouting},
+        shutdown::drain_for_termination,
+    },
     state::{
         kv_events::{BlockSizeOracle, KvEventIndex},
         load_monitor::router_inflight_load::{
@@ -50,6 +58,7 @@ const DRAIN_WARN_AFTER: Duration = Duration::from_secs(30);
 async fn main() -> Result<()> {
     // Resolve CLI configuration and set up startup logging.
     let cli = Cli::parse();
+    let routing = cli.routing.chat_routing;
     init_tracing(&cli.server.log_level, cli.server.log_format)?;
     let config = cli
         .into_config()
@@ -70,17 +79,40 @@ async fn main() -> Result<()> {
     let engine_state = start_engine_state_monitor(external_kv_indexer_client.is_some());
 
     // Build the policies that choose which workers receive each request.
-    let routing_policies = Arc::new(
-        build_policy_registry(
-            &config,
-            engine_state.tree(),
-            engine_state.block_size_oracle(),
-        )
-        .context("build policy registry")?,
-    );
+    let (routing_policies, chat_routing, reorg_cleanup) = match routing {
+        ChatRoutingKind::Legacy => (
+            Arc::new(
+                build_policy_registry(
+                    &config,
+                    engine_state.tree(),
+                    engine_state.block_size_oracle(),
+                )
+                .context("build policy registry")?,
+            ),
+            ChatRouting::Legacy,
+            None,
+        ),
+        ChatRoutingKind::Reorg => {
+            let (resolver, cleanup) = build_reorg_resolver(
+                &config.model,
+                &engine_state,
+                external_kv_indexer_client.clone(),
+            )
+            .context("build reorg policies")?;
+            (
+                Arc::new(PolicyRegistry::default()),
+                ChatRouting::Reorg([(ModelId(config.model.id.clone()), resolver)].into()),
+                cleanup,
+            )
+        }
+    };
 
     // Track this router's local view of in-flight requests.
     let (local_inflight_requests, inflight_cleanup) = start_local_inflight_tracker(&config);
+
+    // Started before worker discovery so the peer set is populated early. The
+    // registry's `synced` flag separates "not delivered yet" from "no siblings".
+    start_peer_watch(&config, &engine_state).await;
 
     // Discovery feeds worker changes to the manager, which maintains this routing catalog.
     let worker_registry = Arc::new(WorkerRegistry::default());
@@ -93,7 +125,7 @@ async fn main() -> Result<()> {
     .await?;
 
     // Share routing dependencies with HTTP handlers and mark startup complete.
-    let app_context = build_app_context(
+    let mut app_context = build_app_context(
         &config,
         tokenizers,
         worker_registry,
@@ -102,6 +134,8 @@ async fn main() -> Result<()> {
         &engine_state,
         external_kv_indexer_client,
     )?;
+    app_context.chat_routing = chat_routing;
+    let app_context = Arc::new(app_context);
     app_context.mark_ready();
 
     // Serve HTTP requests until shutdown, allowing in-flight requests to finish.
@@ -116,6 +150,9 @@ async fn main() -> Result<()> {
     discovery_handle.abort();
     worker_manager_handle.abort();
     inflight_cleanup.shutdown().await;
+    if let Some(cleanup) = reorg_cleanup {
+        cleanup.shutdown().await;
+    }
     log_shutdown(&outcome.result, outcome.inflight_drain_secs);
     outcome.result
 }
@@ -231,6 +268,43 @@ fn start_local_inflight_tracker(
     (local_inflight_requests, inflight_cleanup)
 }
 
+/// Watch the EndpointSlices of this router's own Service to keep the peer
+/// registry current.
+///
+/// A no-op unless a peer selector is set and this router maintains its own tree
+/// (no external Indexer). The CLI already rejects that combination; this keeps
+/// the invariant local.
+async fn start_peer_watch(config: &Config, engine_state: &Arc<KvEventIndex>) {
+    let DiscoveryBackend::K8s(k8s) = &config.discovery else {
+        return;
+    };
+    let Some(selector) = k8s.peer_selector.as_ref() else {
+        return;
+    };
+    if engine_state.snapshot_source().is_none() {
+        return;
+    }
+    let family = sgl_router::discovery::k8s::peer_address_family(&config.server.host);
+    // Non-fatal: routing does not depend on peer discovery.
+    if let Err(e) = sgl_router::discovery::k8s::spawn_peer_watch(
+        k8s.namespace.clone(),
+        selector.clone(),
+        engine_state.peers(),
+        family,
+        i32::from(config.server.port),
+    )
+    .await
+    {
+        // Only client construction fails here; RBAC is not checked until the
+        // watch's first LIST, and a denial there is logged by the watch itself.
+        tracing::error!(
+            error = %e,
+            "kv-bootstrap: peer watch failed to start (no usable Kubernetes client \
+             config); the peer set stays unsynced",
+        );
+    }
+}
+
 async fn start_worker_discovery_and_manager(
     config: &Config,
     worker_registry: &Arc<WorkerRegistry>,
@@ -256,9 +330,9 @@ fn build_app_context(
     worker_registry: Arc<WorkerRegistry>,
     routing_policies: Arc<PolicyRegistry>,
     local_inflight_requests: Arc<RouterInflightLoadRegistry>,
-    engine_state: &KvEventIndex,
+    engine_state: &Arc<KvEventIndex>,
     external_kv_indexer_client: Option<Arc<dyn PrefixIndex>>,
-) -> Result<Arc<AppContext>> {
+) -> Result<AppContext> {
     let block_size_oracle = engine_state.block_size_oracle();
     let proxy = Arc::new(
         Proxy::new(Duration::from_secs(config.proxy.request_timeout_secs))
@@ -285,7 +359,8 @@ fn build_app_context(
     app_context.block_size_oracle = block_size_oracle;
     app_context.engine_reported_load = engine_state.engine_reported_load();
     app_context.kv_metrics = engine_state.metrics_source();
-    Ok(Arc::new(app_context))
+    app_context.kv_index = engine_state.snapshot_source();
+    Ok(app_context)
 }
 
 /// How serving ended; `inflight_drain_secs` is `None` when the server stopped

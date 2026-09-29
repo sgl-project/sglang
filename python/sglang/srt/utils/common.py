@@ -222,11 +222,13 @@ def is_cpu() -> bool:
 
 @lru_cache(maxsize=1)
 def is_musa() -> bool:
+    if not hasattr(torch.version, "musa") or torch.version.musa is None:
+        return False
     try:
         import torchada  # noqa: F401
     except ImportError:
         return False
-    return hasattr(torch.version, "musa") and torch.version.musa is not None
+    return True
 
 
 @lru_cache(maxsize=1)
@@ -1281,6 +1283,13 @@ class Range(NamedTuple):
         return self.end - self.start
 
 
+def assert_int64_array(values: array, name: str) -> None:
+    """Require a signed int64 array suitable for zero-copy tensor views."""
+    assert (
+        isinstance(values, array) and values.typecode == "q" and values.itemsize == 8
+    ), f"{name} must be array('q') with 8-byte items"
+
+
 def flatten_arrays_to_pinned_cpu(parts: List[array[int]], pin: bool) -> torch.Tensor:
     """Flatten array.array('q') buffers into one int64 CPU tensor.
 
@@ -1943,7 +1952,7 @@ def _load_image(
                 )
     try:
         image = Image.open(BytesIO(image_bytes))
-    except OSError as e:
+    except (OSError, SyntaxError) as e:
         raise ValueError(f"Could not decode image: {e}") from e
     return _fully_load_pil_image(image)
 
@@ -1952,7 +1961,7 @@ def _fully_load_pil_image(image: Image.Image) -> Image.Image:
     """Force PIL's lazy decode while malformed input is still request-local."""
     try:
         image.load()
-    except OSError as e:
+    except (OSError, SyntaxError) as e:
         raise ValueError(f"Could not decode image: {e}") from e
     return image
 
@@ -2400,7 +2409,7 @@ def monkey_patch_p2p_access_check():
 
     setattr(tgt, "gpu_p2p_access_check", lambda *arg, **kwargs: True)
 
-    # Suppress the warnings from this delete function when using sglang.bench_one_batch
+    # Suppress the warnings from this delete function when using sglang.benchmark.one_batch
     from sglang.srt.distributed.device_communicators.custom_all_reduce import (
         CustomAllreduce,
     )
@@ -2955,18 +2964,14 @@ def direct_register_custom_op(
         raise error
 
 
-def set_gpu_proc_affinity(
-    pp_size: int,
-    tp_size: int,
-    nnodes: int,
-    gpu_id: int,
-):
+def set_gpu_proc_affinity(gpu_id: int):
     # current process
     pid = os.getpid()
     p = psutil.Process(pid)
 
-    nnodes_per_tp_group = max(nnodes // pp_size, 1)
-    tp_size_per_node = tp_size // nnodes_per_tp_group
+    parallel = get_parallel()
+    nnodes_per_tp_group = max(parallel.nnodes // parallel.pp_size, 1)
+    tp_size_per_node = parallel.tp_size // nnodes_per_tp_group
 
     # total physical cores
     total_pcores = psutil.cpu_count(logical=False)
@@ -3955,11 +3960,16 @@ class Withable(Generic[T]):
             self._value = None
 
 
-def require_mlp_tp_gather():
+def require_mlp_tp_gather(*, moe_a2a_backend=None):
     """
     Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
     """
-    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+    from sglang.srt.layers.moe.utils import MoeA2ABackend, get_moe_a2a_backend
+
+    if moe_a2a_backend is None:
+        moe_a2a_backend = get_moe_a2a_backend()
+    elif not isinstance(moe_a2a_backend, MoeA2ABackend):
+        moe_a2a_backend = MoeA2ABackend(moe_a2a_backend)
 
     # elastic-EP scale-up rewrites dp_size on the published config
     if get_parallel().enable_dp_attention:
@@ -3977,9 +3987,9 @@ def require_mlp_tp_gather():
             return True
         elif not get_parallel().enable_dp_lm_head:
             return True
-        elif get_moe_a2a_backend().is_none():
+        elif moe_a2a_backend.is_none():
             return True
-        elif get_moe_a2a_backend().is_flashinfer():
+        elif moe_a2a_backend.is_flashinfer():
             # FlashInfer MoE A2A needs a rank-invariant, DP-synchronized per-rank
             # token count: MoeAlltoAll uses fixed-geometry buffers and the decode
             # cuda-graph bucket must be identical across EP ranks, otherwise ranks
@@ -3989,7 +3999,7 @@ def require_mlp_tp_gather():
             # reuse this flag's DP-sync bookkeeping (uniform global_num_tokens +
             # max-based graph bucket). See #30432 re: the misleading flag name.
             return True
-        elif get_moe_a2a_backend().is_mori() and get_bool_env_var(
+        elif moe_a2a_backend.is_mori() and get_bool_env_var(
             "SGLANG_MORI_RECV_BOUND", "false"
         ):
             # Same bookkeeping, for the same reason. Bounding mori's receive
