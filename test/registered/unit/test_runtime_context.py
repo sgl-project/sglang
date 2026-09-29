@@ -1503,7 +1503,7 @@ class TestForwardFlags(_IsolatedServerArgs):
     def test_attn_tp_context_per_forward_slots(self):
         from types import SimpleNamespace
 
-        from sglang.srt.layers.communicator import get_attn_tp_context
+        from sglang.srt.layers.layer_boundary import get_attn_tp_context
         from sglang.srt.runtime_context import get_forward
 
         reset_context()
