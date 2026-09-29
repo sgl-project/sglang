@@ -728,8 +728,10 @@ class TextEncodingStage(ConditionEncodingStage):
                             embeds_mask
                         )
                     else:
-                        seq_lens = server_args.pipeline_config.seq_lens_from_prompt_embeds(
-                            prompt_embeds
+                        seq_lens = (
+                            server_args.pipeline_config.seq_lens_from_prompt_embeds(
+                                prompt_embeds
+                            )
                         )
                 return (
                     prompt_embeds,
