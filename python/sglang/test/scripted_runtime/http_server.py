@@ -257,7 +257,7 @@ def _spawn_server_process(
     launch_kwargs: Dict[str, Any] = dict(
         host=SERVER_HOST,
         port=get_free_port(),
-        disable_prefill_cuda_graph=True,
+        cuda_graph_backend_prefill="disabled",
         **CANARY_LAUNCH_DEFAULTS,
     )
     launch_kwargs.update(engine_kwargs)

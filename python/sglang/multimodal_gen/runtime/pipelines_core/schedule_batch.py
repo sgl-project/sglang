@@ -104,8 +104,9 @@ class Req:
     # Masks and lengths aligned to postprocessed embeddings, one entry per text encoder.
     prompt_embeds_mask: list[torch.Tensor | None] | None = None
     negative_prompt_embeds_mask: list[torch.Tensor | None] | None = None
-    prompt_seq_lens: list[list[int]] | None = None
-    negative_prompt_seq_lens: list[list[int]] | None = None
+    # A None entry means that encoder's output is not a text stream (e.g. pooled).
+    prompt_seq_lens: list[list[int] | None] | None = None
+    negative_prompt_seq_lens: list[list[int] | None] | None = None
     clip_embedding_pos: list[torch.Tensor] | None = None
     clip_embedding_neg: list[torch.Tensor] | None = None
 

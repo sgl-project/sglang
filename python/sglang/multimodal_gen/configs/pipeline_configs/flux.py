@@ -232,6 +232,12 @@ class FluxPipelineConfig(ImagePipelineConfig):
         embeddings so grouped multi-output requests preserve their explicit
         text-conditioning contract.
         """
+        # time_text_embed has no unpooled path; a missing one fails inside the DiT.
+        if not batch.pooled_embeds:
+            raise ValueError(
+                "Flux requires pooled_embeds; the text encoders produced no "
+                "pooled projection."
+            )
         txt_seq_lens = self.require_text_seq_lens(
             batch,
             1,
@@ -248,13 +254,17 @@ class FluxPipelineConfig(ImagePipelineConfig):
                 batch,
                 txt_seq_lens,
             ),
-            "pooled_projections": (
-                batch.pooled_embeds[0] if batch.pooled_embeds else None
-            ),
+            "pooled_projections": batch.pooled_embeds[0],
         }
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
         """Build Flux negative-conditioning kwargs using T5 sequence lengths."""
+        # time_text_embed has no unpooled path on the negative branch either.
+        if not batch.neg_pooled_embeds:
+            raise ValueError(
+                "Flux CFG requires neg_pooled_embeds; the negative branch has no "
+                "pooled projection."
+            )
         txt_seq_lens = self.require_text_seq_lens(
             batch,
             1,
@@ -271,9 +281,7 @@ class FluxPipelineConfig(ImagePipelineConfig):
                 batch,
                 txt_seq_lens,
             ),
-            "pooled_projections": (
-                batch.neg_pooled_embeds[0] if batch.neg_pooled_embeds else None
-            ),
+            "pooled_projections": batch.neg_pooled_embeds[0],
         }
 
 

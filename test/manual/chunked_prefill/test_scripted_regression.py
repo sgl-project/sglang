@@ -15,6 +15,19 @@ from sglang.test.scripted_runtime_chunked_helpers import (
 )
 
 
+def _run_until_prefix_locked(r):
+    # A chunk is inserted into the radix tree on the step after its forward,
+    # so last_node is still the root -- unlocked -- right after chunks_done ticks.
+    for _ in range(8):
+        if r.lock_refs >= 1:
+            return
+        # Without this the loop can leave prefill and abort a decoding req instead,
+        # passing the chunked-abort assertions for the wrong reason.
+        assert r.is_chunking, "prefix lock never appeared while the req was chunking"
+        yield
+    raise AssertionError(f"radix lock_ref must be held mid-chunk; got {r.lock_refs}")
+
+
 class TestRegressionBasic(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE)
 
@@ -240,10 +253,12 @@ class TestRegressionBasic(ScriptedTestCase):
         baseline = t.engine_stats()
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
+        yield from _run_until_prefix_locked(r)
 
-        assert r.req.kv.req_pool_idx is not None, "row must be held mid-chunk"
+        req = r.req
+        assert req is not None
+        assert req.kv.req_pool_idx is not None, "row must be held mid-chunk"
         assert r.kv_pages > 0, "committed KV must be held mid-chunk"
-        assert r.lock_refs >= 1, "radix lock_ref must be held mid-chunk"
 
         t.abort(r)
         yield from drain_until_released(t, r)
@@ -273,6 +288,7 @@ class TestRegressionBasic(ScriptedTestCase):
     def _script_pause_retract_releases_waiting_chunked_resume(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
+        yield from _run_until_prefix_locked(r)
         assert r.req.kv.req_pool_idx is not None and r.kv_pages > 0 and r.lock_refs >= 1
 
         t.pause_generation(mode="retract")
@@ -341,6 +357,9 @@ class TestRegressionPp(ScriptedTestCase):
         r = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=4)
 
         yield from run_until(r, lambda h: h.chunks_done >= 1 and h.is_chunking)
+
+        req = r.req
+        assert req is not None
 
         t.abort(r)
         yield
@@ -500,7 +519,6 @@ class TestRegressionGptOss(ScriptedTestCase):
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
         model_path="openai/gpt-oss-20b",
         mem_fraction_static=0.70,
-        disable_piecewise_cuda_graph=True,
     )
 
     def test_chunked_stash_bounded_by_kv_committed_len(self):

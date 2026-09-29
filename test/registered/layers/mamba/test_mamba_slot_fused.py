@@ -14,6 +14,7 @@ import unittest
 
 import torch
 
+from sglang.kernels.ops.mamba.mamba_state_scatter_triton import TRITON_DEVICE_TYPES
 from sglang.srt.mem_cache.mamba_slot_fused import (
     build_conv_slot_descriptor,
     fused_clear_conv_slots,
@@ -27,9 +28,6 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 register_xpu_ci(est_time=20, suite="stage-b-test-1-gpu-xpu")
 
-# Backends these kernels are verified against; extend as others gain Triton.
-TRITON_DEVICES = ("cuda", "xpu")
-
 
 def _triton_device():
     # get_device() raises when the host has no accelerator; importing this
@@ -38,7 +36,7 @@ def _triton_device():
         device = get_device()
     except RuntimeError:
         return None
-    return device if device in TRITON_DEVICES else None
+    return device if device in TRITON_DEVICE_TYPES else None
 
 
 DEVICE = _triton_device()
@@ -104,7 +102,7 @@ def _ref_copy(convs, src, dst):
 
 @unittest.skipUnless(
     DEVICE is not None,
-    f"fused conv-slot kernels need one of {TRITON_DEVICES}",
+    f"fused conv-slot kernels need one of {TRITON_DEVICE_TYPES}",
 )
 class TestMambaSlotFused(CustomTestCase):
     def test_clear_matches_reference(self):
