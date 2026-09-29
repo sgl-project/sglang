@@ -62,19 +62,37 @@ class Qwen3CoderDetector(BaseFormatDetector):
         return self.tool_call_start_token in text
 
     def _trim_incomplete_tool_suffix(self, text: str) -> str:
-        """Drop an unfinished trailing tool-call fragment from visible text."""
-        start_idx = text.find(self.tool_call_start_token)
-        if start_idx != -1:
-            return text[:start_idx]
+        """Drop an unfinished trailing tool-call fragment from visible text.
 
-        prefix_idx = text.find(self.tool_call_prefix)
-        if prefix_idx != -1:
-            return text[:prefix_idx]
+        Align with the streaming parser, which buffers any of the structural
+        tags (and their truncated prefixes) instead of emitting them as text.
+        """
+        structural_tags = (
+            self.tool_call_start_token,
+            self.tool_call_end_token,
+            self.tool_call_prefix,
+            self.function_end_token,
+            self.parameter_prefix,
+            self.parameter_end_token,
+        )
 
-        # Truncated start marker, e.g. "...after<tool_call" or "...after<tool_cal".
-        for i in range(len(self.tool_call_start_token) - 1, 0, -1):
-            if text.endswith(self.tool_call_start_token[:i]):
-                return text[:-i]
+        cut_idx = -1
+        for tag in structural_tags:
+            idx = text.find(tag)
+            if idx != -1 and (cut_idx == -1 or idx < cut_idx):
+                cut_idx = idx
+        if cut_idx != -1:
+            return text[:cut_idx]
+
+        # Truncated marker at end, e.g. "...after<tool_call" or "...after<fun".
+        best_len = 0
+        for tag in structural_tags:
+            for i in range(len(tag) - 1, 0, -1):
+                if text.endswith(tag[:i]):
+                    best_len = max(best_len, i)
+                    break
+        if best_len:
+            return text[:-best_len]
         return text
 
     def _get_arguments_config(

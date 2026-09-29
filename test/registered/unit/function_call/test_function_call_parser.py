@@ -2468,6 +2468,39 @@ class TestQwen3CoderDetector(unittest.TestCase):
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(result.calls[0].name, "get_current_weather")
 
+    def test_nonstrm_trims_truncated_other_structural_markers(self):
+        """Truncated non-<tool_call> tags must match streaming buffering."""
+        complete = (
+            "<tool_call><function=get_current_weather>"
+            "<parameter=location>Paris</parameter>"
+            "</function></tool_call>"
+        )
+        for truncated in ("after<fun", "after<param", "after</fun", "after</tool"):
+            text = "before" + complete + truncated
+            result = self.detector.detect_and_parse(text, self.tools)
+            self.assertEqual(
+                result.normal_text,
+                "beforeafter",
+                msg=f"non-stream mismatch for suffix {truncated!r}",
+            )
+            self.assertEqual(len(result.calls), 1)
+
+            for chunk_size in (1, 7, len(text)):
+                stream_detector = Qwen3CoderDetector()
+                streamed = ""
+                for i in range(0, len(text), chunk_size):
+                    streamed += stream_detector.parse_streaming_increment(
+                        text[i : i + chunk_size], self.tools
+                    ).normal_text
+                self.assertEqual(
+                    streamed,
+                    "beforeafter",
+                    msg=(
+                        f"stream mismatch for suffix {truncated!r} "
+                        f"chunk_size={chunk_size}"
+                    ),
+                )
+
     def test_multiple_tool_calls(self):
         """
         Test parsing of multiple consecutive tool calls.
