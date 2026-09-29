@@ -10206,6 +10206,54 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
         cache.sanity_check()
 
 
+class TestSWAExactRepeatWindow(CustomTestCase):
+    def test_finished_request_reuses_page_aligned_prefix(self):
+        for window in (511, 512):
+            for seq_len in (513, 1024, 1025):
+                with self.subTest(window=window, seq_len=seq_len):
+                    cfg = CacheConfig(
+                        page_size=64,
+                        components=(ComponentType.FULL, ComponentType.SWA),
+                        sliding_window_size=window,
+                        num_layers=2,
+                        full_attention_layer_ids=(0,),
+                        kv_size=2048,
+                        max_context_len=2048,
+                    )
+                    cache, allocator, pool = build_fixture(cfg)
+                    tokens = array("q", range(seq_len))
+                    req = Req(
+                        rid="exact-repeat",
+                        origin_input_text="",
+                        origin_input_ids=tokens,
+                        sampling_params=SamplingParams(max_new_tokens=1),
+                    )
+                    pool.alloc([req])
+                    alloc_size = (
+                        (seq_len + cfg.page_size - 1) // cfg.page_size * cfg.page_size
+                    )
+                    full = allocator.full_attn_allocator.alloc(alloc_size)
+                    swa = allocator.swa_attn_allocator.alloc(alloc_size)
+                    self.assertIsNotNone(full)
+                    self.assertIsNotNone(swa)
+                    allocator.full_to_swa_index_mapping[full] = swa
+                    pool.write((req.kv.req_pool_idx, slice(0, alloc_size)), full)
+                    req.kv.kv_committed_len = seq_len
+                    req.kv.kv_allocated_len = alloc_size
+                    req.last_node = cache.root_node_handle()
+
+                    cache.evict_sliding_windows(req, seq_len - 1)
+                    finish_req(cache, req, up_to=seq_len)
+                    match = cache.match_prefix(
+                        MatchPrefixParams(key=RadixKey(tokens[:-1]))
+                    )
+
+                    expected = (seq_len - 1) // cfg.page_size * cfg.page_size
+                    self.assertEqual(len(match.device_indices), expected)
+                    self.assertTrue(torch.equal(match.device_indices, full[:expected]))
+                    cache.sanity_check()
+
+
 class TestSWAWindowUnderBigramKey(CustomTestCase):
     """`cache_unfinished_req` has to leave the leaf it inserts holding a full
     sliding window of live SWA. Otherwise the match that follows the insert
