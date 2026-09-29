@@ -46,6 +46,7 @@ bound by a per-query top-k KV read, which falls by ``attn_tp_size`` when the
 queries do.
 """
 
+import logging
 from functools import lru_cache
 from typing import TYPE_CHECKING, Optional, Tuple
 
@@ -61,6 +62,8 @@ from sglang.srt.layers.communicator import ScatterMode
 from sglang.srt.layers.dcp.layout import dcp_crop_free_extend
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_npu, print_info_once
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -165,6 +168,9 @@ def dsa_cp_narrow_a2a_enabled() -> bool:
     return _dsa_cp_narrow_a2a_flag() and dsa_cp_enabled()
 
 
+_narrow_a2a_totals = {"layers": 0, "tensor_bytes": 0, "allocated_bytes": 0}
+
+
 def dsa_cp_attach_full_kv_b(self_attn) -> None:
     """Give this layer the whole attention-TP group's ``w_kc`` and ``w_vc``.
 
@@ -197,6 +203,13 @@ def dsa_cp_attach_full_kv_b(self_attn) -> None:
 
     tp = get_parallel().attn_tp_size
     gathered_bytes = 0
+    # Diagnostic, cheap: the pool loses ~4.06 GiB against 2.13 GiB of tensor
+    # bytes, and the "Load weight end" delta puts all of it inside weight
+    # loading. Reading the allocator directly says whether the excess is in
+    # OUR tensors (more, or bigger, than counted) or outside them (collective
+    # buffers, fragmentation). Two guesses have already been wrong; this
+    # measures instead.
+    allocated_before = torch.npu.memory_allocated() if hasattr(torch, "npu") else 0
     for name, w in (("w_kc", w_kc), ("w_vc", w_vc)):
         # Gather in the layout the tensor is PHYSICALLY in, then take the logical
         # view back.
@@ -227,11 +240,31 @@ def dsa_cp_attach_full_kv_b(self_attn) -> None:
         # w_kc is [h, 192, 512] and w_vc is [h, 512, 256]: different sizes, so
         # count what was actually allocated rather than doubling one of them.
         gathered_bytes += full.numel() * full.element_size()
+    _narrow_a2a_totals["layers"] += 1
+    _narrow_a2a_totals["tensor_bytes"] += gathered_bytes
+    if hasattr(torch, "npu"):
+        _narrow_a2a_totals["allocated_bytes"] += (
+            torch.npu.memory_allocated() - allocated_before
+        )
     print_info_once(
         "DSA-CP narrow all-to-all is ON: every rank holds the full w_kc and "
         f"w_vc, {gathered_bytes / (1 << 20):.1f} MB per layer, so the query can "
         "be exchanged before the absorb"
     )
+    # Every 26 layers, so a 78-layer model logs three times and the last line
+    # carries the total. Cheaper to read than 78 lines and it cannot be missed
+    # the way a single line at layer 0 can, since layer 0 has no total yet.
+    if _narrow_a2a_totals["layers"] % 26 == 0:
+        t = _narrow_a2a_totals
+        logger.info(
+            "DSA-CP narrow all-to-all: %d layers gathered, %.2f GiB of tensors, "
+            "%.2f GiB seen by the allocator (ratio %.2fx -- above 1.0 is memory "
+            "these tensors cost beyond their own bytes)",
+            t["layers"],
+            t["tensor_bytes"] / (1 << 30),
+            t["allocated_bytes"] / (1 << 30),
+            (t["allocated_bytes"] / t["tensor_bytes"]) if t["tensor_bytes"] else 0.0,
+        )
 
 
 def reset_dsa_cp_flags() -> None:
