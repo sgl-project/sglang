@@ -100,7 +100,7 @@ def check_daemon(base: str) -> None:
         ) from exc
     except json.JSONDecodeError as exc:
         raise RuntimeError(
-            f"the server at {base} is not an llmman daemon (unparseable /api/version)"
+            f"the server at {base} is not an llmman daemon (unparsable /api/version)"
         ) from exc
 
     if not isinstance(payload, dict) or not payload.get("version"):
