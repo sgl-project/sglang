@@ -437,6 +437,7 @@ class BeamModel(nn.Module):
             VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
+                use_attn_tp_group=get_parallel().enable_dp_attention,
                 prefix=add_prefix("embed_tokens", prefix),
             )
             if self.pp_group.is_first_rank
@@ -519,6 +520,7 @@ class BeamForCausalLM(nn.Module):
                 config.vocab_size,
                 config.hidden_size,
                 params_dtype=torch.bfloat16,
+                use_attn_tp_group=get_parallel().enable_dp_lm_head,
                 prefix=add_prefix("lm_head", prefix),
             )
             if self.model.pp_group.is_last_rank
