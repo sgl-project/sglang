@@ -405,8 +405,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # Destinations visible to prefill but not yet on the transfer queue.
         self._num_published_destinations = 0
         self.tp_rank = parallel.tp_rank
-        self.tp_size = parallel.tp_size
-        self.dp_size = parallel.dp_size
         self.gpu_id = gpu_id
         self.bootstrap_port = bootstrap_port
         self.max_total_num_tokens = max_total_num_tokens
