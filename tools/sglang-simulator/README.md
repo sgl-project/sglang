@@ -97,10 +97,10 @@ export SGLANG_USE_CPU_ENGINE=1
 export CUDA_VISIBLE_DEVICES=""
 ```
 
-Export `SGLANG_USE_CPU_ENGINE=1` before the process starts: the simulator
-reads it at import time to install the sgl_kernel CPU-op stand-ins, while
-SGLang re-reads it later, so setting it after import leaves the parent
-process without stand-ins.
+Set `SGLANG_USE_CPU_ENGINE=1` before importing the simulator or SGLang.
+The simulator installs the sgl_kernel CPU-op stand-ins during import, and
+SGLang caches CPU-engine detection and binds CPU ops while importing model
+modules, so changing the environment variable afterward is too late.
 
 ```bash
 export SGLANG_SIMULATOR_OUTPUT_MODE=OFFLINE
