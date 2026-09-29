@@ -69,13 +69,17 @@ The maintained tests define the supported first-version scope:
 - [`test/test_simulation_offline_blocking.py`](test/test_simulation_offline_blocking.py):
   equivalent logical results in `OFFLINE` and `BLOCKING` modes;
 - [`test/test_simulation_cache_hit_ratio.py`](test/test_simulation_cache_hit_ratio.py):
-  reusable-prefix accounting and cache-tier hit metrics across repeated runs.
+  reusable-prefix accounting and cache-tier hit metrics across repeated runs;
+- [`test/test_simulation_sgl_kernel_hook.py`](test/test_simulation_sgl_kernel_hook.py):
+  import-time resolution of the sgl_kernel CPU ops that sglang model modules
+  bind under the CPU engine (issue #41653).
 
 From `tools/sglang-simulator`:
 
 ```bash
 python3 -m pytest -q test/test_simulation_sglang_runner.py
 python3 -m pytest -q test/test_simulation_sglang_serving.py
+python3 -m pytest -q test/test_simulation_sgl_kernel_hook.py
 ```
 
 Read these tests as the minimal maintained examples for constructing a dataset,
@@ -91,6 +95,14 @@ starting the server:
 ```bash
 export SGLANG_USE_CPU_ENGINE=1
 export CUDA_VISIBLE_DEVICES=""
+```
+
+Export `SGLANG_USE_CPU_ENGINE=1` before the process starts: the simulator
+reads it at import time to install the sgl_kernel CPU-op stand-ins, while
+SGLang re-reads it later, so setting it after import leaves the parent
+process without stand-ins.
+
+```bash
 export SGLANG_SIMULATOR_OUTPUT_MODE=OFFLINE
 export SIMULATOR_OUTPUT_DIR=/tmp/sglang-simulator-serving-001
 test ! -e "$SIMULATOR_OUTPUT_DIR"
