@@ -52,6 +52,7 @@ from sglang.srt.layers.communicator.output import (
 )
 from sglang.srt.layers.communicator.residual import StageRead, StageUpdate
 from sglang.srt.layers.communicator.residual.add_norm import ADD, NORM_READ
+from sglang.srt.layers.communicator.residual.stream import DeclaredSum
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
@@ -100,6 +101,14 @@ def tp_reduce_scatter(
     if residual is not None:
         residual = residual.tensor_split(context.tp_size)[context.tp_rank]
     return output, residual
+
+
+def tp_slice(hidden_states, residual, context):
+    """The rows reduce-scatter would return, when the sum is already complete."""
+    hidden_states = hidden_states.tensor_split(context.tp_size)[context.tp_rank].clone()
+    if residual is not None:
+        residual = residual.tensor_split(context.tp_size)[context.tp_rank]
+    return hidden_states, residual
 
 
 class CommunicateSimpleFn:
@@ -263,7 +272,7 @@ def _mlp_input_without_dp(
         hidden_states = _mlp_input_reduce_output(
             hidden_states, forward_batch, may_quantize=update.adds_plainly
         )
-    else:
+    elif group is SumGroup.TP:
         hidden_states = tensor_model_parallel_all_reduce(hidden_states)
     if _is_npu and context.cache is not None:
         _ = prepare_weight_cache(hidden_states, context.cache)
@@ -411,7 +420,9 @@ def _consumer_step(
     step: Callable,
     adds_plainly: bool,
     carried_fusions: Tuple[Callable, ...],
-    owes_by_construction: bool = False,
+    expected_sum: Optional[SumGroup] = None,
+    completed_step: Optional[Callable] = None,
+    pending=None,
     written_step: Optional[Callable] = None,
     written: bool = False,
     update: StageUpdate = ADD,
@@ -422,18 +433,26 @@ def _consumer_step(
     complete value. Under attention DP the reduction back to this rank's tokens
     comes first; otherwise one of ``carried_fusions`` may complete it with the
     residual add and the read, and an empty batch has nothing to sum. An input
-    that owes its sum by construction (``owes_by_construction``) is that sum's
-    only carrier. ``call`` is what the stage's read takes (the attention's
+    whose declared sum is already completed uses ``completed_step`` instead;
+    a pending declared sum must match ``expected_sum``. ``call`` is what the stage's read takes (the attention's
     ``quant_format`` and ``post_residual_addition``)."""
     if residual is not None and update.adds_plainly != adds_plainly:
         raise RuntimeError("producer update does not match the boundary's capability")
+    if pending is not None:
+        if isinstance(pending.owed, DeclaredSum):
+            if pending.owed.group is not expected_sum:
+                raise RuntimeError("producer sum does not match the input declaration")
+        elif expected_sum is not None:
+            if pending.owed is not None:
+                raise RuntimeError("a declared input sum carried another completion")
+            step = completed_step
     if written and written_step is not None:
         step = written_step
     if not isinstance(hidden_states, torch.Tensor):
         owed = hidden_states
         if residual is None:
             raise RuntimeError(f"{type(owed).__name__} requires residual input")
-        if owes_by_construction:
+        if expected_sum is not None:
             raise RuntimeError(
                 f"an input that owes its sum by construction arrived as "
                 f"{type(owed).__name__}"
@@ -538,6 +557,7 @@ def _mlp_input_on_residual_shard(
     layernorm: torch.nn.Module,
     context: CommunicateContext,
     *,
+    reduces: bool = True,
     read: StageRead,
     update: StageUpdate,
 ):
@@ -548,7 +568,10 @@ def _mlp_input_on_residual_shard(
     if hidden_states.shape[0] == 0:
         return hidden_states, hidden_states
     shard = hidden_states.tensor_split(context.tp_size)[context.tp_rank]
-    get_parallel().tp_group.reduce_scatter_tensor(shard, hidden_states)
+    if reduces:
+        get_parallel().tp_group.reduce_scatter_tensor(shard, hidden_states)
+    else:
+        shard = shard.clone()
     shard, residual = read.update_and_read(update, shard, residual, layernorm)
     attn_tp_all_gather_into_tensor(hidden_states, shard)
     return hidden_states, residual

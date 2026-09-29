@@ -150,11 +150,11 @@ class TestMixerExit(CustomTestCase):
     def test_decision_table(self):
         tp_group = object()
         attention = Layout.sharded_over(TokenAxis.ATTN_DP, axis_sizes=sizes(tp=2))
-        for always, may, fuses in itertools.product((False, True), repeat=3):
+        for always, may, movable in itertools.product((False, True), repeat=3):
             if always and may:
                 continue
             with self.subTest(
-                always_leaves=always, leaves_for_next_layer=may, fuses=fuses
+                always_leaves=always, leaves_for_next_layer=may, movable=movable
             ):
                 produced = StageOutput(
                     attention,
@@ -164,9 +164,8 @@ class TestMixerExit(CustomTestCase):
                 )
                 communicator = SimpleNamespace(
                     _batch_steps=lambda batch: SimpleNamespace(ffn_output=produced),
-                    should_fuse_mlp_allreduce_with_next_layer=MagicMock(
-                        return_value=fuses
-                    ),
+                    _context=SimpleNamespace(tp_size=2),
+                    _ffn_sum_can_move_to_next_layer=MagicMock(return_value=movable),
                 )
                 hidden = torch.ones(2, 4)
                 with get_parallel().override(tp_group=tp_group):
@@ -174,7 +173,7 @@ class TestMixerExit(CustomTestCase):
                         skipped = should_skip_mlp_all_reduce()
                     output = mixer_exit.finish(hidden)
                 self.assertFalse(should_skip_mlp_all_reduce())
-                hands_on = may and fuses
+                hands_on = may and movable
                 self.assertEqual(mixer_exit.skips_reduction, always or hands_on)
                 self.assertEqual(skipped, always or hands_on)
                 if hands_on:

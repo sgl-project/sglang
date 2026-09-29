@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -13,13 +13,18 @@ from sglang.srt.layers.communicator import (
     StageEntry,
     StageInput,
     StageOutput,
+    SumGroup,
     make_boundary,
 )
 from sglang.srt.layers.communicator.layer import StageCommunicator
 from sglang.srt.layers.communicator.output import UnreducedOutput
 from sglang.srt.layers.communicator.residual.access import add_to_output
 from sglang.srt.layers.communicator.residual.add_norm import ADD
-from sglang.srt.layers.communicator.residual.stream import OwedOutput, ResidualStream
+from sglang.srt.layers.communicator.residual.stream import (
+    DeclaredSum,
+    OwedOutput,
+    ResidualStream,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -136,6 +141,77 @@ class TestResidualStream(CustomTestCase):
                 None,
                 None,
                 update=SimpleNamespace(adds_plainly=False),
+            )
+
+    def test_declared_sum_snapshot_and_pipeline_handoff_preserve_the_partial(self):
+        stream = ResidualStream(self.residual)
+        hidden = stream.leave(self.partial, ADD, declared_sum=SumGroup.TP)
+        self.assertIsInstance(hidden, OwedOutput)
+        with patch(
+            "sglang.srt.layers.communicator.residual.stream._sum_group",
+            return_value=self.group,
+        ):
+            snapshot = stream.snapshot(hidden)
+        torch.testing.assert_close(snapshot, torch.full((2, 4), 5.0))
+        torch.testing.assert_close(self.partial, torch.ones(2, 4))
+        wire, residual = stream.finish(hidden, preserve_declared=True)
+        self.assertIs(wire, self.partial)
+        self.assertIsInstance(stream.pending.owed, DeclaredSum)
+        received, rebuilt = ResidualStream.arrive(
+            wire, residual, ADD, declared_sum=SumGroup.TP
+        )
+        self.assertIsInstance(received, OwedOutput)
+        self.assertIs(rebuilt.pending.owed.group, SumGroup.TP)
+
+    def test_materialized_declared_sum_is_not_reduced_again(self):
+        rows = Layout(frozenset())
+        boundary = make_boundary(
+            EdgeDecl(
+                StageOutput(rows, group=SumGroup.TP, always_leaves=True),
+                StageInput(rows),
+                rows,
+                rows,
+            )
+        )
+        stream = ResidualStream(self.residual)
+        hidden = stream.leave(self.partial, ADD, declared_sum=SumGroup.TP)
+        with patch(
+            "sglang.srt.layers.communicator.residual.stream._sum_group",
+            return_value=self.group,
+        ):
+            hidden = stream.complete(hidden)
+
+        def norm(value, residual):
+            return value + residual, value + residual
+
+        result, _ = boundary.prepare(
+            hidden,
+            self.residual,
+            None,
+            norm,
+            None,
+            pending=stream.pending,
+            update=stream.pending.update,
+        )
+        torch.testing.assert_close(result, torch.full((2, 4), 5.0))
+        self.group.all_reduce.assert_called_once()
+
+    def test_declared_sum_must_match_the_consumer_contract(self):
+        rows = Layout(frozenset())
+        boundary = make_boundary(
+            EdgeDecl(StageOutput(rows), StageInput(rows), rows, rows)
+        )
+        stream = ResidualStream(self.residual)
+        stream.leave(self.partial, ADD, declared_sum=SumGroup.TP)
+        with self.assertRaisesRegex(RuntimeError, "sum does not match"):
+            boundary.prepare(
+                self.partial,
+                self.residual,
+                None,
+                None,
+                None,
+                pending=stream.pending,
+                update=ADD,
             )
 
     def test_snapshot_finishes_a_copy_without_consuming_main_work(self):

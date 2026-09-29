@@ -82,6 +82,7 @@ def finish_layer_stack(
     forward_batch: ForwardBatch,
     *,
     final_norm_takes_handoff: bool = False,
+    preserve_declared: bool = False,
 ) -> Tuple[Union[torch.Tensor, HandoffOutput], Optional[torch.Tensor]]:
     """Complete what this layer left for a next layer. Call it on the last
     layer of this rank before its output reaches the final norm, the next
@@ -92,7 +93,11 @@ def finish_layer_stack(
         stream = forward_batch.residual_stream
         if residual is not stream:
             raise RuntimeError("residual alias belongs to a different invocation")
-        output = stream.finish(hidden_states, takes_handoff=final_norm_takes_handoff)
+        output = stream.finish(
+            hidden_states,
+            takes_handoff=final_norm_takes_handoff,
+            preserve_declared=preserve_declared,
+        )
         forward_batch.residual_stream = None
         return output
     if final_norm_takes_handoff and isinstance(hidden_states, HandoffOutput):

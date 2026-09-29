@@ -14,7 +14,6 @@
 """The communicator a model layer uses."""
 
 from dataclasses import dataclass
-from enum import Enum, auto
 from functools import cached_property, partial
 from typing import Callable, Optional, Protocol, Tuple, Union
 
@@ -49,7 +48,6 @@ from sglang.srt.layers.communicator.layout import (
     SumGroup,
     TokenAxis,
     _batch_shards_over_cp,
-    _batch_size,
     _ffn_has_tokens,
     _gathers_over_attention_cp,
     _generic_prefill_cp_shards_tokens,
@@ -86,13 +84,13 @@ from sglang.srt.layers.communicator.residual.access import (
     written,
 )
 from sglang.srt.layers.communicator.residual.add_norm import (
+    ADD,
     PLAIN_RESIDUAL,
-    aiter_all_reduce_fusion_enabled_for,
     apply_aiter_all_reduce_fusion,
     apply_flashinfer_allreduce_fusion,
 )
 from sglang.srt.layers.communicator.residual.mhc import MHCState
-from sglang.srt.layers.communicator.residual.stream import ResidualStream
+from sglang.srt.layers.communicator.residual.stream import DeclaredSum, ResidualStream
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     is_enable_moe_cp_allgather,
@@ -156,11 +154,39 @@ class LayerFacts:
         )
 
 
-def _unfused_completion_matches_the_ffn(forward_batch: ForwardBatch) -> bool:
-    """Whether the next layer's all-reduce is the one the FFN would have run
-    itself, as the MoE declares it (post_experts_sum_is_one_all_reduce), on a
-    batch the FFN runs."""
-    return _ffn_has_tokens(forward_batch) and post_experts_sum_is_one_all_reduce()
+def _can_defer_ffn_reduction(forward_batch: ForwardBatch, boundary=None) -> bool:
+    """Admit ordinary single-sum outputs and the existing fused LoRA path.
+
+    A fused-kernel fallback completes the partial-output contract selected
+    before the producer ran, without recomputing the producer's LoRA path.
+    """
+    if not _ffn_has_tokens(forward_batch):
+        return False
+    if post_experts_sum_is_one_all_reduce():
+        return True
+    # LoRA-B is replicated and linear. TP1 shared experts add on rank zero
+    # when the sum is deferred. Preserve these fused paths, but keep their
+    # producer-side reduction order when no fused consumer is enabled.
+    if not (
+        (get_lora().enable_lora or envs.SGLANG_SHARED_EXPERT_TP1.get())
+        and get_moe_a2a_backend().is_none()
+        and not get_exec().comm.enable_quant_communications
+        and post_experts_reduction_group() is get_parallel().tp_group
+    ):
+        return False
+    if (
+        boundary is not None
+        and boundary.fusions is not None
+        and boundary.fusions.can_defer_all_reduce(boundary, forward_batch)
+    ):
+        return True
+    if apply_flashinfer_allreduce_fusion(forward_batch.input_ids.shape[0]):
+        return True
+    # Aiter also checks width and bytes, so use the actual residual storage.
+    residual = forward_batch.residual_stream.residual
+    return residual is not None and apply_aiter_all_reduce_fusion(
+        residual, forward_batch
+    )
 
 
 class StageCommunicator:
@@ -205,12 +231,20 @@ class StageCommunicator:
         stream = residual_batch.current(forward_batch)
         if residual is not stream:
             raise RuntimeError("residual alias belongs to a different invocation")
-        if stream is not None:
-            if stream.pending is not None:
-                call["update"] = stream.pending.update
-            if stream.pending is None and stream.residual is not None:
-                call["written"] = True
-            hidden_states, residual = stream.input(hidden_states)
+        if (
+            stream.pending is None
+            and stream.residual is None
+            and entry.input_sum is not None
+        ):
+            hidden_states = stream.leave(
+                hidden_states, ADD, declared_sum=entry.input_sum
+            )
+        if stream.pending is not None:
+            call["update"] = stream.pending.update
+            call["pending"] = stream.pending
+        if stream.pending is None and stream.residual is not None:
+            call["written"] = True
+        hidden_states, residual = stream.input(hidden_states)
         hidden_states, residual = entry.prepare(
             hidden_states, residual, forward_batch, self.norm, context, **call
         )
@@ -239,9 +273,15 @@ class LayerFusions(Protocol):
 
     def ffn_input(self, layer: "LayerCommunicator") -> Tuple["FusedMlpInput", ...]: ...
 
-    def ffn_exit(
-        self, layer: "LayerCommunicator"
-    ) -> Tuple[Callable[[ForwardBatch], Optional["FfnExitFusion"]], ...]: ...
+    requires_local_reduction: bool
+
+    def can_defer_all_reduce(
+        self, layer: "LayerCommunicator", forward_batch: ForwardBatch
+    ) -> bool: ...
+
+    def can_defer_finalize(
+        self, layer: "LayerCommunicator", forward_batch: ForwardBatch
+    ) -> bool: ...
 
 
 class LayerCommunicator:
@@ -255,7 +295,6 @@ class LayerCommunicator:
     # Communicators built without __init__ (e.g. test doubles) publish no LoRA
     # layout and try no fused kernel at the FFN exit.
     _publish_lora_layout: bool = False
-    _ffn_exit_fusions: Tuple[Callable, ...] = ()
     # A plain residual unless the layer is built with its own.
     _residual: LayerResidual = PLAIN_RESIDUAL
     # The fused kernels a backend gives the layer, if any.
@@ -303,8 +342,6 @@ class LayerCommunicator:
         )
         # The fused kernels every batch's attention input tries first.
         self._attn_input_fusions = self._select_attn_input_fusions()
-        # The fused kernels of the next layer's input the FFN exit tries first.
-        self._ffn_exit_fusions = self._select_ffn_exit_fusions()
         self._speculative_algo = SpeculativeAlgorithm.from_string(
             get_spec().speculative_algorithm
         )
@@ -433,6 +470,9 @@ class LayerCommunicator:
             handoff=None if is_ffn else _hand_qkv_hook_its_input,
             fused=into.fused,
             capture_move=into.capture_move,
+            input_sum=into_edge.produced.group
+            if into_edge.produced.always_leaves
+            else None,
         )
         self._steps = BoundarySteps(
             attention=None if is_ffn else entry,
@@ -641,7 +681,11 @@ class LayerCommunicator:
 
     def snapshot(self, hidden_states, residual, *, at_input: bool = False):
         group = None
-        if residual is not None and self.stage_edges is not None:
+        if (
+            residual is not None
+            and not isinstance(residual, ResidualStream)
+            and self.stage_edges is not None
+        ):
             edge = self.stage_edges[0 if at_input else 1]
             if edge.produced.always_leaves:
                 group = _sum_group(edge.produced.group)
@@ -663,7 +707,12 @@ class LayerCommunicator:
             if storage is not None and storage.shape[0] == 0:
                 return hidden_states, None
         hidden_states = (
-            residual.complete(hidden_states)
+            (
+                hidden_states
+                if residual.pending is not None
+                and isinstance(residual.pending.owed, DeclaredSum)
+                else residual.complete(hidden_states)
+            )
             if isinstance(residual, ResidualStream)
             else reduce_output(hidden_states)
         )
@@ -675,8 +724,10 @@ class LayerCommunicator:
             residual_in_hidden=self._residual.ffn_update.at_producer,
             allow_missing_residual=allow_missing_residual,
         )
+        steps = self._batch_steps(forward_batch)
+        entry = steps.attention or steps.ffn
         hidden_states, stream = ResidualStream.arrive(
-            hidden_states, residual, self._residual.ffn_update
+            hidden_states, residual, ADD, declared_sum=entry.input_sum
         )
         forward_batch.residual_stream = stream
         return hidden_states, stream
@@ -934,7 +985,9 @@ class LayerCommunicator:
         if isinstance(residual, ResidualStream) and self.stage_edges is None:
             # The paired boundary records the attention contribution once.
             hidden_states = residual.leave(
-                hidden_states, self._residual.attention_update
+                hidden_states,
+                self._residual.attention_update,
+                declared_sum=steps.ffn.input_sum,
             )
         return self.ffn.prepare(
             hidden_states,
@@ -969,16 +1022,34 @@ class LayerCommunicator:
             residual,
             stream,
             self._batch_steps(forward_batch).ffn_output.update,
+            self._declared_ffn_sum(
+                self._batch_steps(forward_batch),
+                self._ffn_leaves_sum_to_reduce_scatter(
+                    forward_batch, self._postprocess_dp_step(forward_batch)
+                ),
+            ),
         )
 
     @staticmethod
-    def _leave_ffn_output(hidden_states, residual, stream, update):
+    def _leave_ffn_output(hidden_states, residual, stream, update, declared_sum=None):
         if stream is None:
             return hidden_states, residual
         stream.residual = residual
         if update.at_producer:
             return stream.write(hidden_states), stream
-        return stream.leave(hidden_states, update), stream
+        return stream.leave(hidden_states, update, declared_sum=declared_sum), stream
+
+    @staticmethod
+    def _declared_ffn_sum(steps, skipped_reduction):
+        # The input-scattered path leaves the sum for the next input's TP
+        # reduce-scatter. Other skip paths complete it in the output move.
+        if (
+            skipped_reduction
+            and not steps.returns_over_dp
+            and not steps.ffn_output_move_completes_sum
+        ):
+            return SumGroup.TP
+        return None
 
     def _local_token_move_can_go_to_next_layer(
         self, forward_batch: ForwardBatch
@@ -1042,14 +1113,13 @@ class LayerCommunicator:
                 mlp_reduce_scatter=mlp_reduce_scatter,
                 complete=complete_now,
             )
-        fusion = next(
-            filter(None, (fused(forward_batch) for fused in self._ffn_exit_fusions)),
-            None,
+        defer_moe_finalize = (
+            self.fusions is not None
+            and self.fusions.can_defer_finalize(self, forward_batch)
         )
-        defer_moe_finalize = fusion is FfnExitFusion.DEFER_MOE_FINALIZE
-        # A fused kernel that takes the sum, a handoff included, skips the
-        # post-experts all-reduce.
-        fuse_mlp_allreduce = fusion is not None or self._ffn_sum_moves_to_next_layer(
+        # Producers declare remaining work independently of the kernel chosen
+        # by the consumer. Every handoff also carries an unfused completion.
+        fuse_mlp_allreduce = defer_moe_finalize or self._ffn_sum_moves_to_next_layer(
             forward_batch, mlp_reduce_scatter=mlp_reduce_scatter, dp_step=dp_step
         )
         if fuse_mlp_allreduce:
@@ -1205,28 +1275,12 @@ class LayerCommunicator:
             return stream.leave(output, update), stream
         return output, residual
 
-    def _select_ffn_exit_fusions(
-        self,
-    ) -> Tuple[Callable[[ForwardBatch], Optional["FfnExitFusion"]], ...]:
-        """The fused kernels of the next layer's input that may take this layer's
-        FFN sum, in the order they are tried. Each returns what the exit does
-        when its kernel takes this batch, or None. A backend's come first."""
-        given = self.fusions.ffn_exit(self) if self.fusions else ()
-        return (*given, self._next_input_norm_takes_ffn_sum)
-
-    def _next_input_norm_takes_ffn_sum(
-        self, forward_batch: ForwardBatch
-    ) -> Optional["FfnExitFusion"]:
-        """The aiter / flashinfer AR + add + norm of the next layer's input."""
-        if self.should_fuse_mlp_allreduce_with_next_layer(forward_batch):
-            return FfnExitFusion.NEXT_INPUT
-        return None
-
     def _ffn_sum_can_move_to_next_layer(self, forward_batch: ForwardBatch) -> bool:
         # Under the MoE-CP all-gather the fusion path would skip postprocess_layer
         # and its MoE-CP scatter, leaving hidden_states longer than the residual.
         if (
-            is_enable_moe_cp_allgather()
+            (self.fusions is not None and self.fusions.requires_local_reduction)
+            or is_enable_moe_cp_allgather()
             or not self._batch_steps(forward_batch).ffn_sum_is_movable
         ):
             return False
@@ -1252,29 +1306,6 @@ class LayerCommunicator:
 
         return not get_attn_tp_context().input_scattered
 
-    # NOTE: This function will cause torch recompilation
-    def should_fuse_mlp_allreduce_with_next_layer(
-        self, forward_batch: ForwardBatch
-    ) -> bool:
-        if not self._ffn_sum_can_move_to_next_layer(forward_batch):
-            return False
-        batch_size = _batch_size(forward_batch)
-        return (
-            (
-                apply_flashinfer_allreduce_fusion(batch_size)
-                or (
-                    _use_aiter
-                    and batch_size > 0
-                    and get_parallel().tp_size != 6
-                    and not is_dp_attention_enabled()
-                    and get_moe_a2a_backend().is_none()
-                    and aiter_all_reduce_fusion_enabled_for(forward_batch.forward_mode)
-                )
-            )
-            and (not self.is_last_layer)
-            and (self._context.tp_size > 1)
-        )
-
     def _ffn_sum_moves_to_next_layer(
         self,
         forward_batch: ForwardBatch,
@@ -1289,7 +1320,7 @@ class LayerCommunicator:
             self._context.tp_size > 1
             and not self.is_last_layer
             and self._ffn_sum_can_move_to_next_layer(forward_batch)
-            and _unfused_completion_matches_the_ffn(forward_batch)
+            and _can_defer_ffn_reduction(forward_batch, self)
             and not mlp_reduce_scatter
             # Under attention DP the next layer must also run postprocess's
             # scatter back to this rank's tokens, and nothing more.
@@ -1301,16 +1332,6 @@ class LayerCommunicator:
                 )
             )
         )
-
-
-class FfnExitFusion(Enum):
-    """What an FFN exit does when a fused kernel of the next layer's input takes
-    its sum."""
-
-    # The MoE hands its unfinalized output on; the next input finalizes it.
-    DEFER_MOE_FINALIZE = auto()
-    # The FFN leaves its all-reduce to the next input norm.
-    NEXT_INPUT = auto()
 
 
 class FfnCompletion(msgspec.Struct, frozen=True):
@@ -1337,17 +1358,20 @@ class MixerExit:
     ``with`` block ``fuse_mlp_allreduce`` on ``get_forward()`` tells its
     row-parallel output projection to skip the all-reduce. It skips when the
     stage's output always leaves its sum (to an FFN stage, which completes it in
-    its input), and when it may leave it and the fused kernel takes it into the
-    next input norm."""
+    its input), and when its output declaration permits deferring the sum. The
+    consumer decides whether to fuse its completion with the input norm."""
 
-    __slots__ = ("skips_reduction", "_hands_on", "_scope", "_update")
+    __slots__ = ("skips_reduction", "_hands_on", "_scope", "_update", "_declared_sum")
 
     def __init__(self, communicator: LayerCommunicator, forward_batch: ForwardBatch):
         produced = communicator._batch_steps(forward_batch).ffn_output
         self._update = produced.update
+        self._declared_sum = produced.group if produced.always_leaves else None
         self._hands_on = (
             produced.leaves_for_next_layer
-            and communicator.should_fuse_mlp_allreduce_with_next_layer(forward_batch)
+            and communicator._context.tp_size > 1
+            and not is_dp_attention_enabled()
+            and communicator._ffn_sum_can_move_to_next_layer(forward_batch)
         )
         self.skips_reduction = produced.always_leaves or self._hands_on
         self._scope = get_forward().scoped(fuse_mlp_allreduce=self.skips_reduction)
@@ -1367,7 +1391,9 @@ class MixerExit:
                 hidden_states, group=get_parallel().tp_group
             )
         if isinstance(residual, ResidualStream):
-            return residual.leave(hidden_states, self._update), residual
+            return residual.leave(
+                hidden_states, self._update, declared_sum=self._declared_sum
+            ), residual
         return hidden_states
 
 
@@ -1384,6 +1410,7 @@ class FfnExit:
         "mlp_reduce_scatter",
         "_complete",
         "_update",
+        "_declared_sum",
         "_scope",
     )
 
@@ -1395,7 +1422,11 @@ class FfnExit:
         self.fuse_mlp_allreduce = completion.fuse_mlp_allreduce
         self.mlp_reduce_scatter = completion.mlp_reduce_scatter
         self._complete = completion.complete
-        self._update = communicator._batch_steps(forward_batch).ffn_output.update
+        steps = communicator._batch_steps(forward_batch)
+        self._update = steps.ffn_output.update
+        self._declared_sum = communicator._declared_ffn_sum(
+            steps, completion.mlp_reduce_scatter
+        )
         self._scope = get_forward().scoped(
             fuse_mlp_allreduce=self.fuse_mlp_allreduce,
             mlp_reduce_scatter=self.mlp_reduce_scatter,
@@ -1422,7 +1453,7 @@ class FfnExit:
         else:
             hidden_states, residual = self._complete(hidden_states, residual)
         return self.communicator._leave_ffn_output(
-            hidden_states, residual, stream, self._update
+            hidden_states, residual, stream, self._update, self._declared_sum
         )
 
 

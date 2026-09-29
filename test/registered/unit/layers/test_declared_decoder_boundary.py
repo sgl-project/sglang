@@ -1427,7 +1427,9 @@ class TestInputScatteredAttention(CustomTestCase):
             batch = SimpleNamespace(residual_stream=None)
             stream = residual_batch.start(batch)
             stream.write(torch.full((4, HIDDEN), 3.0))
-            contribution = stream.leave(torch.ones(4, HIDDEN), ADD)
+            contribution = stream.leave(
+                torch.ones(4, HIDDEN), ADD, declared_sum=SumGroup.TP
+            )
             hidden, residual = communicator.prepare_attn(contribution, stream, batch)
         self.assertEqual(scattered, [4])
         # Norm: (2 * (h + r), h + r) on the slice, with h the completed sum.

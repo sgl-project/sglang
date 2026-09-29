@@ -331,7 +331,7 @@ class TestFuseMlpAllReduceGate(CustomTestCase):
                 tp_size=moe_ep_size * moe_tp_size * moe_dp_size,
             ),
         ):
-            return LayerCommunicator.should_fuse_mlp_allreduce_with_next_layer(
+            return LayerCommunicator._ffn_sum_can_move_to_next_layer(
                 _fake_communicator(ffn_sum_is_movable), forward_batch
             )
 
@@ -401,6 +401,9 @@ class TestDeferFfnReduction(CustomTestCase):
         forward_batch = types.SimpleNamespace(
             input_ids=types.SimpleNamespace(shape=(batch_size,)),
             global_dp_buffer_len=global_tokens,
+            residual_stream=types.SimpleNamespace(
+                residual=torch.ones(max(batch_size, 1), 4)
+            ),
         )
         with (
             patch_communicator(
@@ -410,6 +413,21 @@ class TestDeferFfnReduction(CustomTestCase):
             patch_communicator("is_enable_moe_cp_allgather", return_value=False),
             patch_communicator("apply_flashinfer_allreduce_fusion", return_value=fused),
             patch_communicator("_use_aiter", False),
+            patch_communicator(
+                "get_lora", return_value=types.SimpleNamespace(enable_lora=lora)
+            ),
+            patch_communicator(
+                "get_exec",
+                return_value=types.SimpleNamespace(
+                    comm=types.SimpleNamespace(
+                        enable_quant_communications=quant_communications
+                    )
+                ),
+            ),
+            patch_communicator(
+                "post_experts_reduction_group",
+                return_value=tp_group_object if tp_group else object(),
+            ),
             patch_communicator(
                 "get_attn_tp_context",
                 return_value=types.SimpleNamespace(input_scattered=False),
@@ -450,7 +468,11 @@ class TestDeferFfnReduction(CustomTestCase):
                 return_value=types.SimpleNamespace(enable_lora=lora),
             ),
             get_parallel().override(
-                moe_ep_size=1, moe_tp_size=4, moe_dp_size=1, tp_size=4
+                moe_ep_size=1,
+                moe_tp_size=4,
+                moe_dp_size=1,
+                tp_size=4,
+                tp_group=tp_group_object,
             ),
             patch.object(
                 moe_utils,

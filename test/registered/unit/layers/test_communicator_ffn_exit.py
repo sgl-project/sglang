@@ -115,7 +115,6 @@ def make_communicator(
         # A subclass decides through its own fused kernels; no TP left to defer
         # over otherwise.
         communicator._context = types.SimpleNamespace(tp_size=1)
-        communicator._ffn_exit_fusions = communicator._select_ffn_exit_fusions()
     communicator._ffn_leaves_sum_to_reduce_scatter = MagicMock(
         return_value=reduce_scatter
     )
@@ -247,48 +246,23 @@ class TestFfnExit(CustomTestCase):
 
     def test_flags_are_restored_after_the_ffn(self):
         before = published_flags()
-        self.run_exit(make_communicator(fuse=True, reduce_scatter=True))
-        self.assertEqual(published_flags(), before)
+        for fuse, reduce_scatter in ((True, False), (False, True)):
+            self.run_exit(make_communicator(fuse=fuse, reduce_scatter=reduce_scatter))
+            self.assertEqual(published_flags(), before)
 
-    def test_the_next_input_s_fused_kernel_is_tried_first(self):
-        """The base exit asks the next layer's AR + add + norm before the
-        unfused condition, and leaves the sum to it when it takes the batch."""
-        for takes in (False, True):
-            with self.subTest(takes=takes):
-                communicator = make_communicator(fuse=False, reduce_scatter=False)
-                communicator.should_fuse_mlp_allreduce_with_next_layer = MagicMock(
-                    return_value=takes
-                )
-                communicator._ffn_exit_fusions = communicator._select_ffn_exit_fusions()
-                seen, _ = self.run_exit(communicator)
-                self.assertEqual(seen, (takes, False))
-                communicator.should_fuse_mlp_allreduce_with_next_layer.assert_called_once()
-                self.assertEqual(
-                    communicator._ffn_sum_moves_to_next_layer.called, not takes
-                )
-
-    def test_subclass_decisions_are_used(self):
-        class NeverDefers(LayerCommunicator):
-            def should_fuse_mlp_allreduce_with_next_layer(self, forward_batch):
-                return False
-
-        communicator = make_communicator(
-            fuse=True, reduce_scatter=False, cls=NeverDefers
-        )
-        seen, _ = self.run_exit(communicator)
-        self.assertEqual(seen, (False, False))
-        communicator._complete_ffn_output_now.assert_called_once()
+    def test_deferral_does_not_inspect_consumer_fusion(self):
+        for allows in (False, True):
+            communicator = make_communicator(fuse=allows, reduce_scatter=False)
+            seen, _ = self.run_exit(communicator)
+            self.assertEqual(seen, (allows, False))
+            communicator._ffn_sum_moves_to_next_layer.assert_called_once()
 
     def test_deferral_implies_fusion_and_passes_the_handoff_through(self):
         """A deferring communicator publishes both flags, and a non-tensor
         handoff leaves finish() untouched for the next layer's input norm."""
 
         class Defers(LayerCommunicator):
-            def _select_ffn_exit_fusions(self):
-                return (lambda forward_batch: comm.FfnExitFusion.DEFER_MOE_FINALIZE,)
-
-            def should_fuse_mlp_allreduce_with_next_layer(self, forward_batch):
-                return False
+            fusions = types.SimpleNamespace(can_defer_finalize=lambda layer, fb: True)
 
         communicator = make_communicator(fuse=False, reduce_scatter=False, cls=Defers)
         handoff = object()

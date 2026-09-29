@@ -76,10 +76,7 @@ def defers(node):
     through ffn_exit), or wraps its output as unreduced itself."""
     if declares_no_deferral(node):
         return False
-    return any(
-        any(calls(node, name))
-        for name in ("ffn_exit", "should_fuse_mlp_allreduce_with_next_layer", UNREDUCED)
-    )
+    return any(any(calls(node, name)) for name in ("ffn_exit", UNREDUCED))
 
 
 class Census:

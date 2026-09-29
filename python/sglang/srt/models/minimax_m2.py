@@ -1184,7 +1184,10 @@ class MiniMaxM2Model(nn.Module):
 
         last_layer = self.layers[self.end_layer - 1]
         hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
-            hidden_states, residual, forward_batch
+            hidden_states,
+            residual,
+            forward_batch,
+            preserve_declared=not self.pp_group.is_last_rank,
         )
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(

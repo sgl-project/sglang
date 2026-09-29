@@ -14,7 +14,6 @@ from typing import Callable, Optional, Sequence
 import torch
 
 from sglang.srt.layers.communicator import (
-    FfnExitFusion,
     FusedMlpInput,
     HandoffOutput,
     LayerCommunicator,
@@ -201,33 +200,27 @@ class CuteDSLFusion:
     construction. At the attention input: the MoE finalize + AR + add + norm of
     a handoff the previous layer left, and the AR + add + norm of a sum it left.
     At the FFN input: the attention output's AR + add + norm. At the FFN exit:
-    handing the MoE finalize, or the all-reduce, to the next layer's kernel.
-    install_cutedsl_fusion gives it the model's service and chooses the exit
-    from the layer after this one; until then no kernel takes a batch."""
+    handing off a deferred MoE finalize with its unfused completion.
+    install_cutedsl_fusion supplies the service and producer capability;
+    consumer eligibility is checked only where the output is consumed."""
 
     def __init__(self) -> None:
         self.service: CuteDSLFusionService | None = None
-        # The FFN exit's choices, from what install() knows of the next layer.
+        # Producer capabilities; consumer kernel selection is independent.
         self.hands_off_finalize = False
-        self.next_input_absorbs = False
+        self.requires_local_reduction = False
 
     def install(
         self,
         service: CuteDSLFusionService,
         *,
         hands_off_finalize: bool,
-        next_input_absorbs: bool,
         output_is_replicated: bool,
     ) -> None:
-        """Take the model's fusion service and choose the FFN exit's kernels:
-        the MoE may hand off its finalize when it can and something after it
-        takes the handoff (``hands_off_finalize``); the FFN may leave its
-        all-reduce to the next layer's AR + norm when that layer has one, unless
-        a replicated output follows the reduction (moving it would scale that
-        by tp)."""
+        """Install the shared workspace and this producer's capabilities."""
         self.service = service
         self.hands_off_finalize = hands_off_finalize
-        self.next_input_absorbs = next_input_absorbs and not output_is_replicated
+        self.requires_local_reduction = output_is_replicated
 
     def attention_input(self, layer: LayerCommunicator) -> tuple:
         return (
@@ -253,12 +246,6 @@ class CuteDSLFusion:
                 ),
             )
         return ()
-
-    def ffn_exit(self, layer: LayerCommunicator) -> tuple:
-        return (
-            partial(self._defer_moe_finalize, layer),
-            partial(self._absorb_all_reduce, layer),
-        )
 
     def _finalize_output_and_update_and_read_residual(
         self, layer, owed, residual, forward_batch, post_residual_addition
@@ -330,26 +317,28 @@ class CuteDSLFusion:
             and not get_exec().comm.enable_quant_communications
         )
 
-    def _defer_moe_finalize(
-        self, layer, forward_batch: ForwardBatch
-    ) -> Optional[FfnExitFusion]:
-        """The MoE hands its unfinalized output to the next layer's finalize +
-        all-reduce + norm."""
-        if self.hands_off_finalize and self._should_use_finalize(
-            layer, forward_batch, int(forward_batch.input_ids.shape[0])
-        ):
-            return FfnExitFusion.DEFER_MOE_FINALIZE
-        return None
+    def can_defer_all_reduce(self, layer, forward_batch: ForwardBatch) -> bool:
+        """Preserve the producer's fused sum path when this workspace is usable.
 
-    def _absorb_all_reduce(
-        self, layer, forward_batch: ForwardBatch
-    ) -> Optional[FfnExitFusion]:
-        """The next layer's AR + norm takes the post-experts all-reduce."""
-        if self.next_input_absorbs and self._can_consume_post_moe_all_reduce(
-            layer, forward_batch, int(forward_batch.input_ids.shape[0])
-        ):
-            return FfnExitFusion.NEXT_INPUT
-        return None
+        The next consumer still selects its kernel and completes the sum with
+        an ordinary all-reduce if that kernel declines the actual input.
+        """
+        return (
+            self._common_eligible(
+                layer, forward_batch, int(forward_batch.input_ids.shape[0])
+            )
+            and not get_exec().comm.enable_quant_communications
+        )
+
+    def can_defer_finalize(self, layer, forward_batch: ForwardBatch) -> bool:
+        """Whether this producer can emit a handoff with an unfused fallback."""
+        return (
+            self.hands_off_finalize
+            and not self.requires_local_reduction
+            and self._should_use_finalize(
+                layer, forward_batch, int(forward_batch.input_ids.shape[0])
+            )
+        )
 
     def _common_eligible(self, layer, forward_batch: ForwardBatch, m: int) -> bool:
         parallel = get_parallel()
@@ -383,7 +372,6 @@ def install_cutedsl_fusion(
     rms_epsilon: float,
     can_defer_finalize: _LayerPredicate,
     requires_local_reduction: _LayerPredicate | None = None,
-    final_norm_consumes_handoff: bool = False,
     label: str,
 ) -> CuteDSLFusionService | None:
     """One shared workspace handle per fusion-enabled layer, or None.
@@ -419,23 +407,15 @@ def install_cutedsl_fusion(
         rms_epsilon=rms_epsilon,
     )
     hands_off = 0
-    for index, layer in enumerate(layers):
+    for layer in layers:
         fusion = _fusion_of(layer)
         if fusion is None:
             continue
-        successor = layers[index + 1] if index + 1 < len(layers) else None
-        if successor is None:
-            has_consumer = final_norm_consumes_handoff
-        else:
-            has_consumer = _fusion_of(successor) is not None
-        hands_off_finalize = bool(can_defer_finalize(layer)) and has_consumer
+        hands_off_finalize = bool(can_defer_finalize(layer))
         hands_off += hands_off_finalize
         fusion.install(
             service,
             hands_off_finalize=hands_off_finalize,
-            # False on the last layer: the final norm does not all-reduce.
-            next_input_absorbs=successor is not None
-            and _fusion_of(successor) is not None,
             output_is_replicated=requires_local_reduction is not None
             and bool(requires_local_reduction(layer)),
         )

@@ -83,9 +83,6 @@ class DeferringLayer(nn.Module):
             ffn_output_move=comm.CommunicateSummableTensorPairFn._trivial,
             ffn_sum_is_movable=True,
         )
-        self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer = (
-            lambda batch: defer
-        )
         self.layer_communicator._ffn_sum_moves_to_next_layer = lambda batch, **_: defer
         self.layer_communicator.is_last_layer = False
         self.layer_communicator._sp_steps = None
@@ -289,6 +286,9 @@ class TestPipelineResidualReception(CustomTestCase):
 
     def test_written_streams_do_not_read_a_separate_residual(self):
         comm_instance = comm.LayerCommunicator.__new__(comm.LayerCommunicator)
+        comm_instance._batch_steps = lambda fb: SimpleNamespace(
+            attention=SimpleNamespace(input_sum=None), ffn=None
+        )
         comm_instance._residual = SimpleNamespace(
             ffn_update=SimpleNamespace(at_producer=True)
         )
@@ -303,6 +303,9 @@ class TestPipelineResidualReception(CustomTestCase):
 
     def test_optional_residual_and_declared_partial_keep_the_wire_values(self):
         comm_instance = comm.LayerCommunicator.__new__(comm.LayerCommunicator)
+        comm_instance._batch_steps = lambda fb: SimpleNamespace(
+            attention=SimpleNamespace(input_sum=None), ffn=None
+        )
         partial = torch.randn(2, 4)
         prior = torch.randn_like(partial)
         hidden, residual = comm_instance.from_pp(

@@ -2979,7 +2979,7 @@ class DeepseekV2Model(nn.Module):
 
         install_cutedsl_fusion(
             # PP pads self.layers with PPMissingLayer, which has no communicator.
-            # A stage's last layer has no successor, so it keeps its reduction.
+            # A pipeline exit completes any handoff before sending its tensors.
             self.layers[self.start_layer : self.end_layer],
             hidden_size=config.hidden_size,
             top_k=config.num_experts_per_tok,
@@ -2999,7 +2999,6 @@ class DeepseekV2Model(nn.Module):
                 if isinstance(layer.mlp, DeepseekV2MoE)
                 else layer.mlp.tp_size == 1
             ),
-            final_norm_consumes_handoff=False,
             label="DeepSeek-V3/GLM",
         )
 
@@ -3135,7 +3134,10 @@ class DeepseekV2Model(nn.Module):
 
         last_layer = self.layers[self.end_layer - 1]
         hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
-            hidden_states, residual, forward_batch
+            hidden_states,
+            residual,
+            forward_batch,
+            preserve_declared=not self.pp_group.is_last_rank,
         )
         if not self.pp_group.is_last_rank:
             proxy_tensors = {
