@@ -14,7 +14,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="stage-a-test-cpu-intel")
 
 
 @pytest.mark.parametrize(
@@ -116,12 +116,30 @@ def test_get_embedding_and_mask_async_asserts_offset_count():
     assert "derived from offsets" in message
 
 
+def test_adjust_embedding_length_crops_overlong_embedding():
+    embedding = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+    server_args = Mock(chunked_prefill_size=-1)
+
+    with patch.object(mm_utils, "get_schedule", return_value=server_args):
+        result = mm_utils._adjust_embedding_length(embedding, 3, Mock())
+
+    torch.testing.assert_close(result, embedding[-3:], rtol=0, atol=0)
+
+
+def test_adjust_embedding_length_rejects_short_embedding():
+    embedding = torch.zeros(2, 4)
+
+    with pytest.raises(RuntimeError, match="Insufficient multimodal embedding length"):
+        mm_utils._adjust_embedding_length(embedding, 3, Mock())
+
+
 @pytest.mark.parametrize("shape", [(6, 4), (2, 3, 4), (1, 2, 3, 4)])
-def test_adjust_embedding_length_preserves_exact_flattened_rows(shape):
+def test_strict_embedding_length_preserves_exact_flattened_rows(shape):
     """Leading encoder batch axes count as tokens, not embedding width."""
     embedding = torch.arange(24, dtype=torch.float32).reshape(shape)
 
-    result = mm_utils._adjust_embedding_length(embedding, 6, Mock())
+    with envs.SGLANG_ENABLE_STRICT_MM_EMBEDDING_LENGTH.override(True):
+        result = mm_utils._adjust_embedding_length(embedding, 6, Mock())
 
     assert result is embedding
 
@@ -129,14 +147,15 @@ def test_adjust_embedding_length_preserves_exact_flattened_rows(shape):
 @pytest.mark.parametrize("shape", [(6, 4), (2, 3, 4), (1, 2, 3, 4)])
 @pytest.mark.parametrize("placeholder_count", [0, 5, 7])
 @pytest.mark.parametrize("chunked_prefill_size", [-1, 4])
-def test_adjust_embedding_length_rejects_mismatched_flattened_rows(
+def test_strict_embedding_length_rejects_mismatched_flattened_rows(
     shape, placeholder_count, chunked_prefill_size
 ):
-    """Never silently discard encoder rows or accept a shortage at placement."""
+    """Strict mode never discards encoder rows or accepts a shortage."""
     embedding = torch.arange(24, dtype=torch.float32).reshape(shape)
     original = embedding.clone()
 
     with (
+        envs.SGLANG_ENABLE_STRICT_MM_EMBEDDING_LENGTH.override(True),
         patch.object(
             mm_utils,
             "get_schedule",
@@ -202,7 +221,10 @@ def test_get_embedding_and_mask_falls_back_after_input_ids_rewrite():
         ("precomputed", False),
     ],
 )
-def test_encoder_rows_keep_their_positions_across_prefill_chunks(route, per_item):
+@pytest.mark.parametrize("strict", [False, True])
+def test_encoder_rows_keep_their_positions_across_prefill_chunks(
+    route, per_item, strict
+):
     """Flatten batch axes before chunking; cache reuse must retain row order."""
     rows = torch.arange(32, dtype=torch.float32).reshape(8, 4)
     offsets = [(2, 5), (8, 11)]
@@ -248,6 +270,7 @@ def test_encoder_rows_keep_their_positions_across_prefill_chunks(route, per_item
     override.install()
     try:
         with (
+            envs.SGLANG_ENABLE_STRICT_MM_EMBEDDING_LENGTH.override(strict),
             get_parallel().override(attn_tp_rank=0, attn_tp_size=1, tp_size=1),
             patch.object(mm_utils, "_is_hip", route == "by_item"),
             patch.object(
@@ -271,7 +294,8 @@ def test_encoder_rows_keep_their_positions_across_prefill_chunks(route, per_item
     torch.testing.assert_close(torch.cat(chunks), expected, rtol=0, atol=0)
 
 
-def test_evs_rewritten_spans_determine_chunk_row_counts():
+@pytest.mark.parametrize("strict", [False, True])
+def test_evs_rewritten_spans_determine_chunk_row_counts(strict):
     """Frame redistribution changes a chunk's row count without changing length."""
     rows = torch.arange(16, dtype=torch.float32).reshape(4, 4)
     original_ids = [0, 20, 20, 0, 20, 20, 0]
@@ -292,6 +316,7 @@ def test_evs_rewritten_spans_determine_chunk_row_counts():
     override.install()
     try:
         with (
+            envs.SGLANG_ENABLE_STRICT_MM_EMBEDDING_LENGTH.override(strict),
             get_parallel().override(attn_tp_rank=0, attn_tp_size=1, tp_size=1),
             patch.object(
                 mm_utils, "embedding_cache", mm_utils.MultiModalStaticCache(4096)
