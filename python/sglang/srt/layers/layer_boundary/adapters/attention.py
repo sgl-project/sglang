@@ -60,12 +60,6 @@ class AttentionInputs:
         # (e.g. by the input-scattered attention input step for DSA). fetch_* must NOT gather again.
         self.is_pre_gathered = is_pre_gathered
 
-    def tp_all_gather_hidden_states(self, hidden_states, forward_batch):
-        total_tokens = forward_batch.input_ids.shape[0]
-        output = hidden_states.new_empty((total_tokens, hidden_states.shape[-1]))
-        get_parallel().tp_group.all_gather_into_tensor(output, hidden_states)
-        return output
-
     def fetch_qkv_latent(self):
         if self.qkv_latent_ is not None:
             return self.qkv_latent_
@@ -74,9 +68,7 @@ class AttentionInputs:
             self.hidden_states_local, self.forward_batch
         )
         if get_attn_tp_context().input_scattered and not self.is_pre_gathered:
-            self.qkv_latent_ = self.tp_all_gather_hidden_states(
-                self.qkv_latent_, self.forward_batch
-            )
+            self.qkv_latent_ = tp_gather(self.qkv_latent_, self.forward_batch)
         return self.qkv_latent_
 
     def fetch_hidden_states(self):
@@ -84,9 +76,7 @@ class AttentionInputs:
             return self.hidden_states_
         self.hidden_states_ = self.hidden_states_local
         if get_attn_tp_context().input_scattered and not self.is_pre_gathered:
-            self.hidden_states_ = self.tp_all_gather_hidden_states(
-                self.hidden_states_, self.forward_batch
-            )
+            self.hidden_states_ = tp_gather(self.hidden_states_, self.forward_batch)
         return self.hidden_states_
 
 
@@ -174,6 +164,14 @@ def attn_tp_gather(tensor: torch.Tensor) -> torch.Tensor:
     )
     attn_tp_all_gather_into_tensor(gathered, tensor)
     return gathered
+
+
+def tp_gather(hidden_states: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
+    # Input-scattered attention keeps the same number of tokens on every TP rank.
+    total_tokens = forward_batch.input_ids.shape[0]
+    output = hidden_states.new_empty((total_tokens, hidden_states.shape[-1]))
+    get_parallel().tp_group.all_gather_into_tensor(output, hidden_states)
+    return output
 
 
 def attn_tp_slice(tensor: torch.Tensor) -> torch.Tensor:
