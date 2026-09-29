@@ -2216,7 +2216,7 @@ class ElasticScaleUpdateReq(BaseReq, kw_only=True):
     joining_rank_offset: int = 0
     joining_rank_count: int = 0
     ready_rank_count: int = 0
-    joining_member_ids: List[str] = msgspec.field(default_factory=list)
+    joining_allocation_ids: List[str] = msgspec.field(default_factory=list)
     slot_offset: int = 0
     slot_count: int = 0
     error: Optional[str] = None
@@ -2230,7 +2230,7 @@ class ScaleElasticEPReqInput(BaseReq, kw_only=True):
     new_ep_size: int
     operation_id: Optional[str] = None
     expected_instance_id: Optional[str] = None
-    expected_joining_member_ids: Optional[List[str]] = None
+    expected_joining_allocation_ids: Optional[List[str]] = None
     # Filled by TokenizerManager before scheduler fan-out. It is not accepted
     # from the public API as the runtime is authoritative for its own identity.
     runtime_instance_id: Optional[str] = None

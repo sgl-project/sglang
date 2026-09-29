@@ -872,7 +872,8 @@ class ExecMoe(msgspec.Struct):
                 "Join mode for elastic EP. 'recover' rejoins an existing slot "
                 "after a fault. 'scale' joins as a new rank beyond the original "
                 "group size and requires --node-rank 1. 'auto' derives the primary "
-                "or scale-joiner role from --elastic-ep-replica-index."
+                "initial-participant or append-joiner role from "
+                "--elastic-ep-allocation-index."
             ),
             cli_name="--elastic-ep-join-mode",
             choices=["auto", "scale", "recover"],

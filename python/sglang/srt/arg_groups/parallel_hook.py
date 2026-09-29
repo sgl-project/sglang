@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import os
+import uuid
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
@@ -28,7 +29,7 @@ from sglang.srt.runtime_context import (
     derive_attn_tp_size,
     get_platform,
 )
-from sglang.srt.utils.common import parse_connector_type
+from sglang.srt.utils.common import get_device_count, parse_connector_type
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +78,47 @@ def _boundary_parallelism_overrides(cfg, model_type: str) -> dict:
         )
         return {"enable_attn_tp_input_scattered": False}
     return {}
+
+
+def _elastic_ep_visible_device_count() -> int:
+    """Return visible accelerators without allocating a device context."""
+
+    return get_device_count()
+
+
+def _elastic_ep_raw_input(server_args: Any, field: str) -> Any:
+    raw = getattr(server_args, "_raw_input", None)
+    if raw is not None:
+        return raw[field]
+    return getattr(server_args, field)
+
+
+def _reject_automatic_elastic_ep_geometry(server_args: Any) -> None:
+    defaults = {
+        "tp_size": 1,
+        "dp_size": 1,
+        "attn_dp_size": 1,
+        "ep_size": 1,
+        "nnodes": 1,
+        "node_rank": 0,
+        "ep_join_rank_offset": 0,
+        "base_gpu_id": 0,
+        "gpu_id_step": 1,
+    }
+    conflicts = {}
+    for name, default in defaults.items():
+        value = _elastic_ep_raw_input(server_args, name)
+        if value != default:
+            conflicts[name] = value
+    if conflicts:
+        rendered = ", ".join(
+            f"--{name.replace('_', '-')}={value}" for name, value in conflicts.items()
+        )
+        raise ValueError(
+            "--elastic-ep-join-mode auto owns TP, DP, EP, node, rank-offset, "
+            "and local-device geometry; remove conflicting arguments: "
+            f"{rendered}."
+        )
 
 
 def handle_context_parallelism(server_args: Any):
@@ -489,33 +531,123 @@ def handle_elastic_ep(server_args: Any):
 
     cfg = resolving_view(server_args)
     if cfg.ep_join_mode == "auto":
-        replica_index = cfg.elastic_ep_replica_index
-        assert replica_index is not None and replica_index >= 0, (
-            "--elastic-ep-join-mode auto requires a non-negative "
-            "--elastic-ep-replica-index."
+        from sglang.srt.elastic_ep.runtime_topology import (
+            ElasticEPRecoveryRequiredError,
+            probe_runtime_topology,
+            validate_append_candidate,
         )
-        if replica_index == 0:
+
+        allocation_index = cfg.elastic_ep_allocation_index
+        assert allocation_index is not None and allocation_index >= 0, (
+            "--elastic-ep-join-mode auto requires a non-negative "
+            "--elastic-ep-allocation-index."
+        )
+        assert cfg.elastic_ep_initial_size is not None, (
+            "--elastic-ep-join-mode auto requires --elastic-ep-initial-size."
+        )
+        assert cfg.max_ep_size is not None, (
+            "--elastic-ep-join-mode auto requires --max-ep-size."
+        )
+        _reject_automatic_elastic_ep_geometry(server_args)
+
+        allocation_width = _elastic_ep_visible_device_count()
+        assert allocation_width > 0, (
+            "Elastic EP automatic bootstrap requires at least one visible GPU."
+        )
+        assert cfg.elastic_ep_initial_size > 0, (
+            "--elastic-ep-initial-size must be a positive integer."
+        )
+        assert cfg.max_ep_size > 0, "--max-ep-size must be a positive integer."
+        assert cfg.elastic_ep_initial_size % allocation_width == 0, (
+            "--elastic-ep-initial-size must be divisible by the visible-GPU "
+            "allocation width "
+            f"(initial={cfg.elastic_ep_initial_size}, width={allocation_width})."
+        )
+        assert cfg.max_ep_size % allocation_width == 0, (
+            "--max-ep-size must be divisible by the visible-GPU allocation "
+            f"width (max={cfg.max_ep_size}, width={allocation_width})."
+        )
+        assert cfg.elastic_ep_initial_size <= cfg.max_ep_size, (
+            "--elastic-ep-initial-size must not exceed --max-ep-size "
+            f"(initial={cfg.elastic_ep_initial_size}, max={cfg.max_ep_size})."
+        )
+
+        initial_allocation_count = cfg.elastic_ep_initial_size // allocation_width
+        common = {
+            "elastic_ep_allocation_width": allocation_width,
+            "dp_size": 1,
+            "enable_dp_attention": False,
+        }
+        if allocation_index < initial_allocation_count:
+            if initial_allocation_count > 1:
+                assert cfg.dist_init_addr is not None, (
+                    "A multi-allocation Elastic EP initial world requires "
+                    "--dist-init-addr."
+                )
+            if allocation_index > 0:
+                existing = probe_runtime_topology(cfg.dist_init_addr)
+                if existing is not None:
+                    raise ElasticEPRecoveryRequiredError(
+                        "Elastic EP allocation index "
+                        f"{allocation_index} belongs to an already formed runtime "
+                        f"{existing.runtime_instance_id}; recovery mode is required."
+                    )
+
             declare_resolution(
                 server_args,
                 "_handle_elastic_ep_auto_bootstrap",
+                **common,
                 ep_join_mode=None,
                 ep_join_rank_offset=0,
-                node_rank=0,
-                nnodes=1,
+                tp_size=cfg.elastic_ep_initial_size,
+                attn_dp_size=cfg.elastic_ep_initial_size,
+                ep_size=cfg.elastic_ep_initial_size,
+                node_rank=allocation_index,
+                nnodes=initial_allocation_count,
+                elastic_ep_runtime_instance_id=(
+                    uuid.uuid4().hex if allocation_index == 0 else None
+                ),
             )
         else:
+            assert cfg.dist_init_addr is not None, (
+                "An Elastic EP append allocation requires --dist-init-addr."
+            )
+            rank_offset = allocation_index * allocation_width
+            existing = probe_runtime_topology(cfg.dist_init_addr)
+            if existing is None:
+                raise RuntimeError(
+                    "Elastic EP append allocation cannot observe the running "
+                    "world's runtime topology."
+                )
+            validate_append_candidate(
+                existing,
+                rank_offset=rank_offset,
+                allocation_width=allocation_width,
+                initial_ep_size=cfg.elastic_ep_initial_size,
+            )
+            assert rank_offset + allocation_width <= cfg.max_ep_size, (
+                "Elastic EP append allocation exceeds --max-ep-size "
+                f"(offset={rank_offset}, width={allocation_width}, "
+                f"max={cfg.max_ep_size})."
+            )
             declare_resolution(
                 server_args,
                 "_handle_elastic_ep_auto_bootstrap",
+                **common,
                 ep_join_mode="scale",
-                ep_join_rank_offset=replica_index * cfg.tp_size,
+                ep_join_rank_offset=rank_offset,
+                tp_size=allocation_width,
+                attn_dp_size=allocation_width,
+                ep_size=allocation_width,
                 node_rank=1,
                 nnodes=2,
+                elastic_ep_runtime_instance_id=existing.runtime_instance_id,
             )
         cfg = resolving_view(server_args)
-    elif cfg.elastic_ep_replica_index is not None:
+    elif cfg.elastic_ep_allocation_index is not None:
         raise AssertionError(
-            "--elastic-ep-replica-index is only valid with --elastic-ep-join-mode auto."
+            "--elastic-ep-allocation-index is only valid with "
+            "--elastic-ep-join-mode auto."
         )
 
     if cfg.elastic_ep_backend is not None:

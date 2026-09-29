@@ -516,7 +516,7 @@ class ModelRunner:
                 parallel.ep_join_rank_offset,
                 join_effective_ep_size,
                 get_exec().moe.elastic_ep_scale_timeout,
-                get_parallel().elastic_ep_member_id,
+                get_parallel().elastic_ep_allocation_id,
                 cuda_graph_enabled=self._elastic_cuda_graph_enabled(),
             )
             logger.info(
@@ -2190,7 +2190,7 @@ class ModelRunner:
         )
 
     def _report_elastic_runtime_health(self, error: str, effective_size: int) -> None:
-        if self.tp_rank != 0 or get_exec().moe.is_ep_scale_joiner:
+        if get_parallel().tp_rank != 0 or get_exec().moe.is_ep_scale_joiner:
             return
         from sglang.srt.managers.io_struct import ElasticScaleUpdateReq
 
@@ -2309,9 +2309,9 @@ class ModelRunner:
                 joining_rank_offset=effective_size,
                 joining_rank_count=target_size - effective_size,
                 ready_rank_count=target_size - effective_size,
-                joining_member_ids=(
-                    [cohort.member_id]
-                    if cohort is not None and cohort.member_id is not None
+                joining_allocation_ids=(
+                    [cohort.allocation_id]
+                    if cohort is not None and cohort.allocation_id is not None
                     else []
                 ),
                 slot_offset=effective_size,
@@ -2476,7 +2476,7 @@ class ModelRunner:
                 ):
                     logger.error("[Elastic EP] %s", error)
                 return
-            if self.tp_rank == 0 and not get_exec().moe.is_ep_scale_joiner:
+            if get_parallel().tp_rank == 0 and not get_exec().moe.is_ep_scale_joiner:
                 from sglang.srt.managers.io_struct import ElasticScaleUpdateReq
 
                 self._pending_elastic_scale_update = ElasticScaleUpdateReq(
@@ -2488,8 +2488,10 @@ class ModelRunner:
                     joining_rank_offset=cohort.rank_offset,
                     joining_rank_count=pending_size - effective_size,
                     ready_rank_count=cohort.ready_rank_count,
-                    joining_member_ids=(
-                        [cohort.member_id] if cohort.member_id is not None else []
+                    joining_allocation_ids=(
+                        [cohort.allocation_id]
+                        if cohort.allocation_id is not None
+                        else []
                     ),
                 )
             if not ElasticEPStateManager.begin_scale():
