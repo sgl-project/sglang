@@ -534,8 +534,10 @@ class HiCacheController:
         if get_parallel().attn_dcp_size > 1:
             from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
-            if storage_backend != "file":
-                raise NotImplementedError("HiCache L3 with DCP requires file storage.")
+            if storage_backend not in ("file", "mooncake"):
+                raise NotImplementedError(
+                    "HiCache L3 with DCP requires file or Mooncake storage."
+                )
             if (
                 not isinstance(self.storage_host_pool, MLATokenToKVPoolHost)
                 or self.storage_host_pool.kv_buffer is None
@@ -550,7 +552,7 @@ class HiCacheController:
                 "page_first_direct",
             ):
                 raise NotImplementedError(
-                    "HiCache L3 with DCP requires a generic MLA file-page layout."
+                    "HiCache L3 with DCP requires a generic MLA page layout."
                 )
             if (
                 getattr(self.storage_host_pool.device_pool, "kv_scale_buffer", None)

@@ -1064,12 +1064,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             raise ValueError(f"Unsupported layout: {self.layout}")
 
     def get_page_buffer_meta(self, indices):
-        """
-        meta data for zero copy
-        """
-        if self.dcp_size > 1:
-            raise NotImplementedError("DCP L3 zero-copy storage is not supported.")
-        assert len(indices) % self.page_size == 0
+        """Return local buffer pointers and byte sizes for logical storage pages."""
+        if self.dcp_size > 1 and self.layout == "page_first_kv_split":
+            raise NotImplementedError(
+                "DCP L3 zero-copy storage does not support split KV buffers."
+            )
+        assert len(indices) % self.logical_page_size == 0
         ptr_list = []
         kv_buffer_data_ptr = self.kv_buffer.data_ptr()
         indices = indices.tolist()
@@ -1155,25 +1155,27 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 if scale_buffer_data_ptr is not None:
                     element_size_list.append(scale_element_size)
             return ptr_list, element_size_list
+        # Each logical page maps to one physical page in this rank's buffer.
+        page_starts = [
+            self._storage_page_index(index)
+            for index in indices[:: self.logical_page_size]
+        ]
         if self.layout == "layer_first":
-            for index in range(0, len(indices), self.page_size):
+            for index in page_starts:
                 for layer_id in range(self.layer_num):
                     k_ptr = (
                         kv_buffer_data_ptr
-                        + indices[index] * self.kv_cache_dim * self.dtype.itemsize
+                        + index * self.kv_cache_dim * self.dtype.itemsize
                         + layer_id * self.size * self.kv_cache_dim * self.dtype.itemsize
                     )
                     ptr_list.append(k_ptr)
             element_size = self.dtype.itemsize * self.page_size * self.kv_cache_dim
             element_size_list = [element_size] * len(ptr_list)
         elif self.layout in ["page_first", "page_first_direct"]:
-            for index in range(0, len(indices), self.page_size):
+            for index in page_starts:
                 k_ptr = (
                     kv_buffer_data_ptr
-                    + indices[index]
-                    * self.layer_num
-                    * self.kv_cache_dim
-                    * self.dtype.itemsize
+                    + index * self.layer_num * self.kv_cache_dim * self.dtype.itemsize
                 )
                 ptr_list.append(k_ptr)
             element_size = (
