@@ -781,6 +781,13 @@ class ModelRunner:
             pp_rank=self.pp_rank,
         )
 
+    def get_aux_hidden_states_width(self) -> int:
+        return misc_utils.resolve_aux_hidden_states_width(
+            model=self.model,
+            spec_algorithm=self.spec_algorithm,
+            is_draft_worker=self.is_draft_worker,
+        )
+
     def get_pp_proxy_topk_size(self) -> Optional[int]:
         return misc_utils.resolve_pp_proxy_topk_size(
             model_config=self.model_config,

@@ -929,6 +929,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
         folded_commit = folded_accept and epilogue.folds_commit
+        # Consume in this step: every decode graph size shares one aux output,
+        # which the next target forward overwrites (resolve_aux_hidden_states_width).
         if not folded_commit:
             self._verify_executor.commit_hidden(
                 batch=batch,
