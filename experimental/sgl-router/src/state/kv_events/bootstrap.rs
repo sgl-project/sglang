@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Peer-snapshot bootstrap for the KV-event tree: the wire shape
-//! ([`PeerSnapshot`]), its constants, and the registry of peers a snapshot
-//! may be pulled from.
+//! ([`PeerSnapshot`]) and its producer constants, the fetch client
+//! ([`fetch_snapshot`], [`fetch_cursors`]), the per-rank
+//! [`BootstrapTracker`], and the [`PeerRegistry`] of peers a snapshot may be
+//! pulled from.
 //!
 //! A freshly started replica subscribes to each worker's KV topic mid-stream:
 //! ZMQ SUB delivers deltas from whatever sequence the publisher has reached,
@@ -26,13 +28,19 @@
 //! [`super::tree::HashTree::restore_snapshot`] stays module-internal, so
 //! network input cannot become a `KvWorkerId` directly.
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 
 use super::tree::{KvWorkerId, SnapshotNode};
 
+mod fetch;
 mod peers;
+mod tracker;
 
+pub use fetch::{fetch_cursors, fetch_snapshot, FetchAnswer};
 pub use peers::PeerRegistry;
+pub use tracker::BootstrapTracker;
 
 /// Wire-format version. Bump on any incompatible change to [`PeerSnapshot`].
 pub const SNAPSHOT_FORMAT: u32 = 1;
@@ -45,14 +53,151 @@ pub const SNAPSHOT_PATH: &str = "/internal/kv_snapshot";
 pub const MAX_AGE_PARAM: &str = "max_age_ms";
 
 /// Query parameter by which a caller asks for the cursor table alone, with
-/// no tree.
+/// no tree. See [`fetch_cursors`].
 pub const CURSORS_ONLY_PARAM: &str = "cursors_only";
 
 /// Default reuse window for callers that send no [`MAX_AGE_PARAM`]. A cached
 /// export predates the caller's subscription, and events in that gap reach
 /// neither side, so callers that care send `max_age_ms` and the producer
 /// rebuilds.
-pub const PRODUCER_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+pub const PRODUCER_CACHE_TTL: Duration = Duration::from_secs(2);
+
+/// Default upper bound on one snapshot fetch that is making progress. Stalls
+/// are caught by [`SNAPSHOT_FETCH_READ_TIMEOUT`] and dead peers by
+/// [`SNAPSHOT_FETCH_CONNECT_TIMEOUT`], so this is sized for a large healthy
+/// body end to end: the producer's export build before the first byte, then
+/// tens of MB gzipped on the wire.
+pub const DEFAULT_SNAPSHOT_FETCH_TIMEOUT_CAP: Duration = Duration::from_secs(300);
+
+/// Bound on establishing the connection to a peer. A peer that is gone fails
+/// this fast, so a caller reaches its next candidate without spending the
+/// per-fetch budget on a dead one.
+pub const SNAPSHOT_FETCH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bound on the gap BETWEEN body chunks, not on the whole response.
+///
+/// This is what separates "hung" from "big": a total-request timeout fires
+/// identically on a peer that sent nothing and on one streaming a large body
+/// steadily. Bounding idle time lets an arbitrarily large healthy snapshot
+/// complete while still cutting a stalled peer loose.
+///
+/// The first gap includes the producer building its export before it sends
+/// the first byte, which takes tens of seconds on a fleet-sized tree, so the
+/// stall bound must outlast a healthy build.
+pub const SNAPSHOT_FETCH_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Per-rank bootstrap state. `settled()` waits on `Pending` ranks until the
+/// deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapState {
+    /// Registered; no snapshot applied yet.
+    Pending,
+    /// Snapshot grafted and cursor seeded.
+    Recovered,
+    /// No usable snapshot; the rank runs on live deltas only.
+    Failed,
+}
+
+impl BootstrapState {
+    /// Numeric encoding for the `sgl_router_kv_bootstrap_state` gauge.
+    pub fn as_metric(self) -> u64 {
+        match self {
+            Self::Pending => 0,
+            Self::Recovered => 1,
+            Self::Failed => 2,
+        }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        !matches!(self, Self::Pending)
+    }
+}
+
+/// How one fetch from one peer turned out; counted per peer attempt, not per
+/// rank (see [`RankOutcome`]). A closed set so no call site can mint a label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotOutcome {
+    /// Usable body.
+    Accepted,
+    /// Peer did not answer, or answered non-200 (including the 404 an older
+    /// router image returns for an endpoint it does not serve).
+    Unreachable,
+    /// Answered, but holds no state to graft.
+    ColdPeer,
+    /// Answered with an untrustworthy body (format, parents, block size).
+    Rejected,
+}
+
+impl SnapshotOutcome {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Unreachable => "unreachable",
+            Self::ColdPeer => "cold_peer",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+/// How one bounded peer sweep ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepOutcome {
+    /// A peer supplied a usable snapshot.
+    Found,
+    /// Discovery confirmed there are no siblings.
+    NoPeers,
+    /// Every sibling proved it holds no state.
+    FleetCold,
+    /// The deadline expired first.
+    TimedOut,
+}
+
+impl SweepOutcome {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Found => "found",
+            Self::NoPeers => "no_peers",
+            Self::FleetCold => "fleet_cold",
+            Self::TimedOut => "timed_out",
+        }
+    }
+}
+
+/// How one rank's bootstrap ended; recorded once per rank per incarnation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RankOutcome {
+    /// Grafted, and the splice with the live stream proven.
+    Warm,
+    /// The live stream did not join the snapshot's watermark; graft discarded.
+    Gap,
+    /// Grafted and kept, but no batch or peer witnessed the splice.
+    WarmUnwitnessed,
+    /// The accepted snapshot carried no cursor for this rank.
+    Uncovered,
+    /// No peer supplied a usable snapshot.
+    Abandoned,
+    /// The held batches overflowed before a snapshot arrived.
+    Overflow,
+    /// The publisher restarted mid-bootstrap.
+    PublisherReset,
+    /// The tree refused the snapshot's structure.
+    TreeRejected,
+}
+
+impl RankOutcome {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Warm => "warm",
+            Self::Gap => "gap",
+            Self::WarmUnwitnessed => "warm_unwitnessed",
+            Self::Uncovered => "uncovered",
+            Self::Abandoned => "abandoned",
+            Self::Overflow => "overflow",
+            Self::PublisherReset => "publisher_reset",
+            Self::TreeRejected => "tree_rejected",
+        }
+    }
+}
 
 /// A worker identity as it appears on the snapshot wire. Not a
 /// [`KvWorkerId`]; see the module docs.
@@ -96,14 +241,39 @@ pub struct PeerSnapshot {
     pub nodes: Vec<SnapshotNode>,
 }
 
+impl PeerSnapshot {
+    /// Not ready, or empty tree.
+    pub fn is_cold(&self) -> bool {
+        !self.producer_ready || self.holds_no_state()
+    }
+
+    /// Empty tree. Weaker than [`Self::is_cold`]: a peer mid-bootstrap reports
+    /// `producer_ready: false` with nodes.
+    pub fn holds_no_state(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    /// Last-applied seq the producer reports for `(url, dp_rank)`. Sequence
+    /// numbers are the publisher's, so any observer's value is evidence of
+    /// publisher progress.
+    pub fn wire_cursor_for(&self, url: &str, dp_rank: u32) -> Option<i64> {
+        let idx = self
+            .workers
+            .iter()
+            .position(|w| w.url == url && w.dp_rank == dp_rank)? as u32;
+        self.cursors
+            .iter()
+            .find(|(i, _)| *i == idx)
+            .map(|(_, seq)| *seq)
+    }
+}
+
 #[cfg(test)]
-mod tests {
+mod test_support {
     use super::*;
 
-    /// A body with every field populated survives a JSON round trip.
-    #[test]
-    fn snapshot_round_trips_through_json() {
-        let snap = PeerSnapshot {
+    pub(super) fn sample_snapshot() -> PeerSnapshot {
+        PeerSnapshot {
             format: SNAPSHOT_FORMAT,
             block_size: 64,
             is_bigram: true,
@@ -133,10 +303,21 @@ mod tests {
                     tiers: vec![],
                 },
             ],
-        };
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::sample_snapshot;
+    use super::*;
+
+    /// A body with every field populated survives a JSON round trip.
+    #[test]
+    fn snapshot_round_trips_through_json() {
+        let snap = sample_snapshot();
         let json = serde_json::to_string(&snap).unwrap();
         let back: PeerSnapshot = serde_json::from_str(&json).unwrap();
-
         assert_eq!(back, snap);
     }
 
@@ -155,5 +336,23 @@ mod tests {
         let snap: PeerSnapshot = serde_json::from_str(json).unwrap();
         assert_eq!(snap.nodes.len(), 1);
         assert!(snap.nodes[0].tiers.is_empty());
+    }
+
+    /// A rank the producer does not list, or lists without a cursor, has no
+    /// cursor.
+    #[test]
+    fn wire_cursor_for_resolves_by_wire_identity() {
+        let mut snap = sample_snapshot();
+        assert_eq!(snap.wire_cursor_for("http://a:30000", 0), Some(41));
+        assert_eq!(snap.wire_cursor_for("http://a:30000", 1), Some(7));
+        assert_eq!(snap.wire_cursor_for("http://a:30000", 2), None);
+        assert_eq!(snap.wire_cursor_for("http://b:30000", 0), None);
+
+        snap.cursors.retain(|(i, _)| *i != 1);
+        assert_eq!(
+            snap.wire_cursor_for("http://a:30000", 1),
+            None,
+            "a listed worker with no cursor entry is not a witness",
+        );
     }
 }
