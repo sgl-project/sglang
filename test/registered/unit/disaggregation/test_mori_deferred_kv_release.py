@@ -216,12 +216,13 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
         manager.engine.wait_all.assert_called_once()
         self.assertEqual(manager._sent, [])
         self.assertEqual(manager._staging_outstanding[11], 1)
-        manager.conclude_failure.assert_not_called()
-        manager._handle_abort_message(_abort_message())
-        queued_chunk, queued_statuses, failure_reason = (
-            manager._drain_queue.get_nowait()
+        # Concluded at detection; only the ACK waits for the drain.
+        manager.conclude_failure.assert_called_once_with(
+            bootstrap_room=11, failure_reason="KV transfer exceeded SLA 1ms"
         )
-        manager._drain_transfer_statuses(queued_chunk, queued_statuses, failure_reason)
+        manager._handle_abort_message(_abort_message())
+        queued_chunk, queued_statuses = manager._drain_queue.get_nowait()
+        manager._drain_transfer_statuses(queued_chunk, queued_statuses)
 
         status.Wait.assert_called_once_with()
         self.assertEqual(
@@ -229,9 +230,7 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
             [(11, AckTarget("10.0.0.3", 6000, ABORT_GENERATION))],
         )
         self.assertNotIn(11, manager._staging_outstanding)
-        manager.conclude_failure.assert_called_once_with(
-            bootstrap_room=11, failure_reason="KV transfer exceeded SLA 1ms"
-        )
+        manager.conclude_failure.assert_called_once()
 
     def test_room_cleared_after_drain_handoff_keeps_single_owner(self):
         manager = _manager()
@@ -260,7 +259,7 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
 
         self.assertEqual(manager._staging_outstanding[11], 1)
         self.assertEqual(manager._drain_queue.qsize(), 1)
-        manager.conclude_failure.assert_not_called()
+        manager.conclude_failure.assert_called_once()
 
     def test_sla_failure_keeps_legacy_early_return_when_disabled(self):
         manager = _manager(enabled=False)
@@ -309,15 +308,13 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
         is_quiescent = manager._process_transfer_chunk(_chunk())
 
         self.assertFalse(is_quiescent)
-        queued_chunk, queued_statuses, failure_reason = (
-            manager._drain_queue.get_nowait()
-        )
+        queued_chunk, queued_statuses = manager._drain_queue.get_nowait()
         self.assertEqual(queued_chunk.room, 11)
         self.assertEqual(queued_statuses, [status])
-        self.assertEqual(
-            failure_reason, "Transfer completion failed: RuntimeError('wait failed')"
+        manager.conclude_failure.assert_called_once_with(
+            bootstrap_room=11,
+            failure_reason="Transfer completion failed: RuntimeError('wait failed')",
         )
-        manager.conclude_failure.assert_not_called()
 
     def test_partial_submission_failure_transfers_ownership_to_drainer(self):
         manager = _manager()
@@ -337,17 +334,14 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
             manager._process_transfer_chunk(chunk)
         manager._handle_submission_failure(chunk, raised.exception)
 
-        queued_chunk, queued_statuses, failure_reason = (
-            manager._drain_queue.get_nowait()
-        )
+        queued_chunk, queued_statuses = manager._drain_queue.get_nowait()
         self.assertIs(queued_chunk, chunk)
         self.assertEqual(queued_statuses, [status])
-        self.assertEqual(
-            failure_reason,
-            "Transfer submission failed: later target failed",
-        )
         self.assertEqual(manager._staging_outstanding[11], 1)
-        manager.conclude_failure.assert_not_called()
+        manager.conclude_failure.assert_called_once_with(
+            bootstrap_room=11,
+            failure_reason="Transfer submission failed: later target failed",
+        )
 
     def test_drain_worker_retries_same_item_after_exception(self):
         manager = _manager()
@@ -356,7 +350,7 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
         status = MagicMock()
         manager._drain_queue = MagicMock()
         manager._drain_queue.get.side_effect = (
-            (chunk, [status], None),
+            (chunk, [status]),
             KeyboardInterrupt(),
         )
         manager._drain_transfer_statuses = MagicMock(
@@ -370,25 +364,6 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
 
         self.assertEqual(manager._drain_transfer_statuses.call_count, 2)
         log.assert_called_once()
-
-    def test_failure_notification_precedes_ownership_release(self):
-        manager = _manager()
-        chunk = _chunk()
-        status = MagicMock()
-        status.InProgress.return_value = False
-        manager.conclude_failure = MagicMock(
-            side_effect=(RuntimeError("notification failed"), None)
-        )
-        manager._mark_transfer_quiescent = MagicMock()
-
-        with self.assertRaises(RuntimeError):
-            manager._drain_transfer_statuses(chunk, [status], "transfer failed")
-        manager._mark_transfer_quiescent.assert_not_called()
-
-        manager._drain_transfer_statuses(chunk, [status], "transfer failed")
-
-        self.assertEqual(manager.conclude_failure.call_count, 2)
-        manager._mark_transfer_quiescent.assert_called_once_with(chunk)
 
 
 class TestMoriBackendOptIn(CustomTestCase):

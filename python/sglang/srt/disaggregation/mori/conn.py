@@ -354,13 +354,7 @@ class MoriKVManager(CommonKVManager):
             self._abort_ack_lock = threading.Lock()
             if self.enable_deferred_decode_kv_release:
                 self._drain_queue: Queue[
-                    Optional[
-                        Tuple[
-                            TransferKVChunk,
-                            List[TransferStatus],
-                            Optional[str],
-                        ]
-                    ]
+                    Optional[Tuple[TransferKVChunk, List[TransferStatus]]]
                 ] = Queue(maxsize=self._num_shards)
             for shard, queue in enumerate(self._transfer_queues):
                 # Track the thread so teardown() can join it: otherwise every
@@ -572,7 +566,7 @@ class MoriKVManager(CommonKVManager):
             kv_chunk, statuses
         )
         if not is_quiescent:
-            # The drainer now owns the decrement and the failure conclusion.
+            # The drainer now owns the decrement.
             return False
         if self._should_skip_transfer(room):
             return True
@@ -640,7 +634,13 @@ class MoriKVManager(CommonKVManager):
         statuses: List[TransferStatus],
         failure_reason: Optional[str],
     ) -> None:
-        self._drain_queue.put((kv_chunk, statuses, failure_reason))
+        # Conclude before the handoff so decode hears now and later chunks skip;
+        # only the ACK waits for the drain.
+        if failure_reason is not None:
+            self.conclude_failure(
+                bootstrap_room=kv_chunk.room, failure_reason=failure_reason
+            )
+        self._drain_queue.put((kv_chunk, statuses))
 
     def _drain_worker(self) -> None:
         while True:
@@ -648,10 +648,10 @@ class MoriKVManager(CommonKVManager):
             # teardown() pushes a None sentinel, as for the transfer workers.
             if item is None:
                 break
-            kv_chunk, statuses, failure_reason = item
+            kv_chunk, statuses = item
             while True:
                 try:
-                    self._drain_transfer_statuses(kv_chunk, statuses, failure_reason)
+                    self._drain_transfer_statuses(kv_chunk, statuses)
                     break
                 except Exception:
                     logger.exception(
@@ -661,18 +661,11 @@ class MoriKVManager(CommonKVManager):
                     time.sleep(max(self._wait_poll_ms, 1) / 1000)
 
     def _drain_transfer_statuses(
-        self,
-        kv_chunk: TransferKVChunk,
-        statuses: List[TransferStatus],
-        failure_reason: Optional[str],
+        self, kv_chunk: TransferKVChunk, statuses: List[TransferStatus]
     ) -> None:
         for status in statuses:
             if status.InProgress():
                 status.Wait()
-        if failure_reason is not None:
-            self.conclude_failure(
-                bootstrap_room=kv_chunk.room, failure_reason=failure_reason
-            )
         self._mark_transfer_quiescent(kv_chunk)
 
     def _should_skip_transfer(self, room: int) -> bool:
