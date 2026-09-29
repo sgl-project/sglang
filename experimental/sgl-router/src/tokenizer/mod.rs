@@ -5,6 +5,7 @@ pub mod adapter;
 pub mod chat_formatter;
 mod deepseek;
 mod kimi;
+pub mod stats;
 
 use anyhow::Result;
 use chat_formatter::ChatFormatter;
@@ -12,6 +13,17 @@ use dashmap::DashMap;
 use dynamo_tokenizers::Tokenizer;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+/// Which chats may carry router-rendered `input_ids`, by how well the model's
+/// renderer is verified against SGLang.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForwardingScope {
+    Never,
+    /// Only request shapes the per-shape guard allows.
+    Guarded,
+    /// Every non-multimodal chat.
+    AllText,
+}
 
 /// A model's chat formatter plus its fallback-logging state.
 struct ChatFormatterEntry {
@@ -50,6 +62,8 @@ pub struct TokenizerRegistry {
     /// Per-model chat formatter, present only when the model's prompt format is
     /// known; models without one fall back to raw prompt-text tokenization.
     formatters: DashMap<String, Arc<ChatFormatterEntry>>,
+    /// Resolved encode backend and L1 cache counters of the served model's tokenizer.
+    stats: Arc<stats::TokenizerStats>,
 }
 
 impl std::fmt::Debug for TokenizerRegistry {
@@ -62,10 +76,14 @@ impl std::fmt::Debug for TokenizerRegistry {
 
 impl TokenizerRegistry {
     pub fn load_from_config(cfg: &crate::config::Config) -> Result<Self> {
-        let me = TokenizerRegistry::default();
+        let mut me = TokenizerRegistry::default();
         let m = &cfg.model;
-        let t = adapter::load(&m.tokenizer_path)?;
+        let (t, stats) = adapter::load_with(&m.tokenizer_path, m.tokenizer)?;
+        tracing::info!(model = %m.id, backend = stats.backend().as_str(),
+            l1 = stats.l1_state().as_str(), l1_cache_mb = m.tokenizer.l1_cache_mb,
+            "tokenizer loaded");
         me.inner.insert(m.id.clone(), t);
+        me.stats = stats;
         match ChatFormatter::load(&m.id, &m.tokenizer_path) {
             Ok(Some(formatter)) => {
                 let formatter = formatter.with_defaults(&m.default_chat_template_kwargs);
@@ -82,16 +100,32 @@ impl TokenizerRegistry {
             tracing::info!(model = %m.id,
                 "router-generated input_ids forwarding disabled; workers tokenize messages; \
                  routing tokenization remains available");
-        } else if me.has_chat_formatter(&m.id) {
-            tracing::warn!(model = %m.id,
-                "router-generated input_ids forwarding enabled: requires the workers' model files, \
-                 --default-chat-template-kwargs, SGLANG_DEFAULT_THINKING, and \
-                 SGLANG_DSV4_REASONING_EFFORT / SGLANG_DSV41_REASONING_EFFORT; worker parser overrides \
-                 (including --tool-call-parser deepseekv32), content-format detection, and \
-                 conversation-template stop strings are not replicated. Use \
-                 --disable-input-ids-forwarding for array-only templates or when these assumptions do not hold");
+        } else {
+            match me.forwarding_scope(&m.id) {
+                ForwardingScope::AllText => tracing::info!(model = %m.id,
+                    "router-generated input_ids forwarding enabled for all text chats; requires the \
+                     workers' model files, --default-chat-template-kwargs, SGLANG_DEFAULT_THINKING, \
+                     and SGLANG_DSV4_REASONING_EFFORT"),
+                ForwardingScope::Guarded => tracing::warn!(model = %m.id,
+                    "UNVERIFIED input_ids forwarding: router rendering is verified against SGLang only \
+                     for DeepSeek-V4, so this model forwards only guarded request shapes (plain text \
+                     chat). Requires the workers' model files and --default-chat-template-kwargs; \
+                     worker parser overrides, content-format detection, and conversation-template stop \
+                     strings are not replicated. Pass --disable-input-ids-forwarding unless you have \
+                     verified parity for this model"),
+                ForwardingScope::Never if me.has_chat_formatter(&m.id) => {
+                    tracing::warn!(model = %m.id,
+                    "input_ids forwarding disabled: the DeepSeek-V4.1 renderer is not verified against \
+                     current SGLang; workers tokenize messages")
+                }
+                ForwardingScope::Never => {}
+            }
         }
         Ok(me)
+    }
+
+    pub fn stats(&self) -> &stats::TokenizerStats {
+        &self.stats
     }
 
     pub fn get(&self, model_id: &str) -> Option<Arc<Tokenizer>> {
@@ -102,6 +136,12 @@ impl TokenizerRegistry {
     /// tokenization path is available for it).
     pub fn has_chat_formatter(&self, model_id: &str) -> bool {
         self.formatters.contains_key(model_id)
+    }
+
+    pub fn forwarding_scope(&self, model_id: &str) -> ForwardingScope {
+        self.formatters
+            .get(model_id)
+            .map_or(ForwardingScope::Never, |e| e.formatter.forwarding_scope())
     }
 
     /// Render with dynamo-render and tokenize; return `None` when unavailable or unsuccessful.
@@ -172,6 +212,7 @@ mod tests {
                 id: "tiny".into(),
                 tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
                 disable_input_ids_forwarding: false,
+                tokenizer: Default::default(),
                 policy: PolicyKind::RoundRobin,
                 decode_policy: Default::default(),
                 bucket_config: None,
