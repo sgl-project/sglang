@@ -577,6 +577,12 @@ class AnthropicServing:
             request_data["top_k"] = anthropic_request.top_k
         if anthropic_request.stop_sequences is not None:
             request_data["stop"] = anthropic_request.stop_sequences
+        if anthropic_request.bootstrap_host is not None:
+            request_data["bootstrap_host"] = anthropic_request.bootstrap_host
+        if anthropic_request.bootstrap_port is not None:
+            request_data["bootstrap_port"] = anthropic_request.bootstrap_port
+        if anthropic_request.bootstrap_room is not None:
+            request_data["bootstrap_room"] = anthropic_request.bootstrap_room
 
         # Enable usage in stream so we can report it
         if anthropic_request.stream:
