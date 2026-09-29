@@ -1006,11 +1006,6 @@ class QuarkConfig(QuantizationConfig):
                 dequantization_config=self.dequantization_config,
                 quantize_shared_expert_online=self.shared_expert_needs_online_mxfp4(),
             )
-        # can_fuse_shared_expert() answers once for the whole model off layer 0,
-        # but the fused slot lives in every MoE layer and only the scheme above
-        # knows how to quantize a BF16 shared expert into it. A layer that lands
-        # here would copy that BF16 body into its own packed buffers unconverted,
-        # so fail loudly instead of serving silently corrupted weights.
         if self.shared_expert_needs_online_mxfp4():
             raise NotImplementedError(
                 f"{layer_name} does not use the W4A4 MXFP4 MoE scheme, which is "
@@ -1113,8 +1108,6 @@ class QuarkConfig(QuantizationConfig):
 
     def can_fuse_shared_expert(self) -> bool:
         if self.shared_expert_excluded_from_quant():
-            # A BF16 shared-expert body can only share the packed FP4 buffers of
-            # the routed experts if it is quantized at load time.
             return self.shared_expert_online_mxfp4_supported()
 
         # No per-layer config -> uniform spec, nothing to compare.

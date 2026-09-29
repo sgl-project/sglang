@@ -229,8 +229,6 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             if self.quantize_shared_expert_online and getattr(
                 layer, "_has_fused_shared", False
             ):
-                # The routed experts arrive packed FP4; only the fused shared
-                # slot arrives BF16 and has to be quantized on the way in.
                 weight_loader = self.get_online_shared_expert_weight_loader(
                     layer, original_weight_loader
                 )
@@ -682,8 +680,6 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         """
         if shard_id == "w2":
             weight, scale = layer.w2_weight, layer.w2_weight_scale
-            # [hidden, intermediate]: TP splits the contraction dim, which the
-            # FP4 packing halves and the aiter alignment may pad.
             shard_size = weight.shape[2] * 2 - layer.intermediate_pad
             if shard_size % OCP_MX_BLOCK_SIZE:
                 raise ValueError(
@@ -696,9 +692,6 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             row_start, row_stop = 0, weight.shape[1]
         else:
             weight, scale = layer.w13_weight, layer.w13_weight_scale
-            # [2 * intermediate, hidden]: gate takes the first half of the slot
-            # and up the second. Halve the destination rather than the source so
-            # the alignment padding stays where the kernels expect it.
             half = weight.shape[1] // 2
             shard_size = half - layer.intermediate_pad
             source = loaded_weight.narrow(0, shard_size * layer.moe_tp_rank, shard_size)
@@ -707,8 +700,6 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
 
         qweight, qscale = dynamic_mxfp4_quant(source.to(layer._load_device))
 
-        # The quantizer never writes the alignment padding, so clear it instead
-        # of leaving whatever the empty allocation held.
         weight.data[expert_id, row_start:row_stop].zero_()
         scale.data[expert_id, row_start:row_stop].zero_()
         weight.data[

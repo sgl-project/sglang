@@ -883,11 +883,6 @@ class Envs:
     # stays accuracy-gated and default OFF.
     SGLANG_ENABLE_DP_GATHER_FP8 = EnvBool(False)
     SGLANG_USE_AITER_UNIFIED_ATTN = EnvBool(False)
-    # Fuse the shared expert into the routed MoE for Quark MXFP4 checkpoints
-    # that keep the shared-expert body in BF16 (Qwen3.5 / Qwen3.8). The BF16
-    # weights are quantized to MXFP4 while loading and written into the fused
-    # slot, so the checkpoint needs no offline requantization. Opt-in: the
-    # quantization is lossy relative to the BF16 shared expert it replaces.
     SGLANG_FUSE_SHARED_EXPERTS_ONLINE_MXFP4 = EnvBool(False)
     # Select the gate/up tile layout for AITER MoE: True -> interleave
     # (matches FlyDSL `gate_mode="interleave"` kernels), False -> separated
