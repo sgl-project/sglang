@@ -29,6 +29,27 @@ from sglang.srt.utils.common import parse_connector_type
 logger = logging.getLogger(__name__)
 
 
+def _boundary_parallelism_overrides(cfg, model_type: str) -> dict:
+    """Resolve the token-row modes the model's forward actually enters."""
+    nemotron = model_type in ("nemotron_h", "nemotron_h_puzzle")
+    longcat = model_type == "longcat_flash"
+    if nemotron and cfg.attn_cp_size > 1:
+        raise ValueError("Nemotron-H does not support --attn-cp-size > 1")
+    if longcat and cfg.enable_prefill_cp and cfg.attn_cp_size > 1:
+        raise ValueError(
+            "LongCat-Flash does not support --enable-prefill-cp with --attn-cp-size > 1"
+        )
+    if (nemotron or longcat) and cfg.enable_attn_tp_input_scattered:
+        # Neither model enters the input-scattered attention scope. Preserve
+        # their existing ordinary execution and make the effective flag explicit.
+        logger.warning(
+            "Disabling input-scattered attention for %s: its forward does not enter that scope",
+            model_type,
+        )
+        return {"enable_attn_tp_input_scattered": False}
+    return {}
+
+
 def handle_context_parallelism(server_args: Any):
     # Through the registry, not a bare call: an out-of-tree replacement of
     # `validate_prefill_cp_platform` registered at its own (earlier) pipeline
@@ -42,6 +63,13 @@ def handle_context_parallelism(server_args: Any):
         model_config = model_config_of(server_args)
         hf_config = model_config.hf_config
         model_arch = hf_config.architectures[0]
+        declare_resolution(
+            server_args,
+            "boundary_parallelism",
+            **_boundary_parallelism_overrides(
+                cfg, model_config.hf_text_config.model_type
+            ),
+        )
         if (
             cfg.enable_prefill_cp
             and model_arch == "DeepseekV32ForCausalLM"
