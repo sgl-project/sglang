@@ -1162,6 +1162,8 @@ class ModelRunner:
         )
 
     def init_cuda_event_pool(self):
+        # Materialize the pool before CUDA graph capture and serving: devices
+        # without a prewarmed pool keep PyTorch's wait_stream path.
         if not (
             current_platform.is_cuda() and envs.SGLANG_ENABLE_CUDA_EVENT_POOL.get()
         ):

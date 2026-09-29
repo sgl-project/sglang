@@ -29,13 +29,25 @@ record of the same event does not alter an already-enqueued wait.
 The pre-create/borrow/recycle strategy follows TensorRT-LLM KVCM2's
 ``CachedCudaEvent`` pool.  This specialization has a shorter lease: KVCM2
 keeps general events until query/synchronize/close, while a stream dependency
-can return its event immediately after ``wait_event`` has been enqueued.
+can return its event immediately after ``wait_event`` has been enqueued.  The
+pool size therefore bounds the number of concurrent ``wait_stream`` callers,
+not the number of pending GPU waits.
 
 Explicit ``torch.cuda.Event`` instances are intentionally unaffected: their
 lifetime can extend beyond one record/wait pair and must remain owned by their
-caller.  CUDA graph capture also uses PyTorch's original implementation because
-reusing external event objects across graph captures has different lifetime
-and graph-identity requirements.
+caller.  PyTorch's original implementation is also used when:
+
+- the current stream is capturing, because reusing external event objects
+  across graph captures has different lifetime and graph-identity
+  requirements.  Only the current stream is checked; a call made while another
+  stream is capturing takes the pooled path, which issues the same record and
+  wait calls on a reused event;
+- the source is not a ``torch.cuda.Stream`` (e.g. a generic ``torch.Stream``),
+  whose ``record_event`` accepts only ``torch.Event``;
+- the source device has no prewarmed pool (see
+  :func:`prewarm_cuda_event_pool`), so events are never created on the hot
+  path;
+- every event of the pool is leased.
 """
 
 from __future__ import annotations
@@ -47,21 +59,22 @@ from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
-_INSTALL_LOCK = threading.RLock()
-_POOLS_LOCK = threading.Lock()
+# Serializes install, uninstall, prewarm and stats. wait_stream never takes it.
+_INSTALL_LOCK = threading.Lock()
+_WARNING_LOCK = threading.Lock()
 
-_TORCH: Any = None
-_STREAM_CLASS: type | None = None
-_ORIGINAL_WAIT_STREAM: Callable[..., None] | None = None
-_POOL_SIZE = 1024
+_INSTALLATION: _Installation | None = None
 _EXHAUSTION_WARNED = False
-_POOLS: dict[int, _DeviceEventPool] = {}
-_DISABLED_DEVICES: dict[int, str] = {}
 _STATS: dict[str, int] = {
-    "wait_stream_calls": 0,
     "pooled_calls": 0,
+    # Calls forwarded to PyTorch's wait_stream, for any of the reasons below.
     "original_calls": 0,
+    # The current stream was capturing; other capturing streams are not checked.
     "capture_bypasses": 0,
+    # The source was not a torch.cuda.Stream.
+    "non_cuda_source_fallbacks": 0,
+    # The source device had no prewarmed pool.
+    "unprewarmed_fallbacks": 0,
     "pool_exhaustions": 0,
     "pool_init_failures": 0,
     "pooled_call_failures": 0,
@@ -130,112 +143,128 @@ class _DeviceEventPool:
             }
 
 
-def _source_device_index(source_stream: Any) -> int:
-    device = getattr(source_stream, "device", None)
-    index = getattr(device, "index", None)
-    if index is not None:
-        return int(index)
-    if isinstance(device, int):
-        return device
-    assert _TORCH is not None
-    return int(_TORCH.cuda.current_device())
+class _Installation:
+    """State of one install.
+
+    The patched method closes over it, so a call still running after uninstall
+    keeps a consistent view and falls back to PyTorch's method.
+    """
+
+    def __init__(
+        self,
+        torch_module: Any,
+        stream_class: type,
+        original_wait_stream: Callable[..., None],
+        pool_size: int,
+    ) -> None:
+        self.torch = torch_module
+        self.stream_class = stream_class
+        self.original_wait_stream = original_wait_stream
+        self.pool_size = pool_size
+        self.pools: dict[int, _DeviceEventPool] = {}
+        self.disabled_devices: dict[int, str] = {}
 
 
-def _pool_for_device(device_index: int) -> _DeviceEventPool | None:
-    assert _TORCH is not None
-    pool = _POOLS.get(device_index)
-    if pool is not None:
-        return pool
-    with _POOLS_LOCK:
-        if device_index in _DISABLED_DEVICES:
-            return None
-        pool = _POOLS.get(device_index)
-        if pool is not None:
-            return pool
-        try:
-            pool = _DeviceEventPool(_TORCH, device_index, _POOL_SIZE)
-        except Exception as exc:
-            _increment("pool_init_failures")
-            reason = f"{type(exc).__name__}: {exc}"
-            _DISABLED_DEVICES[device_index] = reason
-            logger.warning(
-                "Disabling the CUDA event pool on device %d after initialization "
-                "failed: %s",
-                device_index,
-                reason,
-            )
-            return None
-        _POOLS[device_index] = pool
-        return pool
-
-
-def _call_original(destination_stream: Any, source_stream: Any) -> None:
-    assert _ORIGINAL_WAIT_STREAM is not None
+def _call_original(
+    original_wait_stream: Callable[..., None],
+    destination_stream: Any,
+    source_stream: Any,
+) -> None:
     _increment("original_calls")
-    _ORIGINAL_WAIT_STREAM(destination_stream, source_stream)
+    original_wait_stream(destination_stream, source_stream)
 
 
-def _pooled_wait_stream(destination_stream: Any, source_stream: Any) -> None:
+def _warn_pool_exhausted(device_index: int, pool_size: int) -> None:
     global _EXHAUSTION_WARNED
 
-    _increment("wait_stream_calls")
-    assert _TORCH is not None
-
-    # Preserve PyTorch's event ownership during graph capture. SGLang invokes
-    # wait_stream with a participating stream current in its graph paths.
-    try:
-        is_capturing = bool(_TORCH.cuda.is_current_stream_capturing())
-    except Exception:
-        # Failure to prove that reuse is safe must retain the original behavior.
-        is_capturing = True
-    if is_capturing:
-        _increment("capture_bypasses")
-        return _call_original(destination_stream, source_stream)
-
-    pool = _pool_for_device(_source_device_index(source_stream))
-    if pool is None:
-        return _call_original(destination_stream, source_stream)
-
-    event = pool.acquire()
-    if event is None:
-        # Never block waiting for a host-side lease or grow the pool in the hot
-        # path. Preserve PyTorch semantics and make exhaustion observable.
-        _increment("pool_exhaustions")
-        if not _EXHAUSTION_WARNED:
-            with _INSTALL_LOCK:
-                if not _EXHAUSTION_WARNED:
-                    logger.warning(
-                        "CUDA event pool exhausted; falling back to PyTorch's "
-                        "Stream.wait_stream event allocation. Increase "
-                        "SGLANG_CUDA_EVENT_POOL_SIZE above %d if this recurs.",
-                        _POOL_SIZE,
-                    )
-                    _EXHAUSTION_WARNED = True
-        return _call_original(destination_stream, source_stream)
-
-    try:
-        source_stream.record_event(event)
-        destination_stream.wait_event(event)
-    except BaseException:
-        _increment("pooled_call_failures")
-        pool.quarantine(event)
-        raise
-    else:
-        pool.release(event)
-        _increment("pooled_calls")
+    if _EXHAUSTION_WARNED:
+        return
+    with _WARNING_LOCK:
+        if _EXHAUSTION_WARNED:
+            return
+        _EXHAUSTION_WARNED = True
+    logger.warning(
+        "CUDA event pool exhausted on device %d: all %d events are held by "
+        "concurrent wait_stream callers or were quarantined after failures. "
+        "Falling back to PyTorch's per-call event allocation; increase "
+        "SGLANG_CUDA_EVENT_POOL_SIZE if this recurs.",
+        device_index,
+        pool_size,
+    )
 
 
-setattr(_pooled_wait_stream, "_sglang_cuda_event_pool", True)
+def _make_pooled_wait_stream(installation: _Installation) -> Callable[..., None]:
+    torch_module = installation.torch
+    cuda_stream_class = installation.stream_class
+    original_wait_stream = installation.original_wait_stream
+    pools = installation.pools
+
+    # Same parameter name as PyTorch, so wait_stream(stream=...) keeps working.
+    def wait_stream(self: Any, stream: Any) -> None:
+        # Preserve PyTorch's event ownership while the current stream is
+        # capturing. SGLang invokes wait_stream with a participating stream
+        # current in its graph paths.
+        try:
+            is_capturing = bool(torch_module.cuda.is_current_stream_capturing())
+        except Exception:
+            # Failure to prove that reuse is safe must retain the original
+            # behavior.
+            is_capturing = True
+        if is_capturing:
+            _increment("capture_bypasses")
+            return _call_original(original_wait_stream, self, stream)
+
+        # torch.Stream.record_event accepts only torch.Event, and before
+        # PyTorch 2.11 torch.cuda.Event.record assumes a torch.cuda.Stream.
+        if not isinstance(stream, cuda_stream_class):
+            _increment("non_cuda_source_fallbacks")
+            return _call_original(original_wait_stream, self, stream)
+
+        # Events are bound to one device, so the pool is keyed by the source.
+        # device_index is a plain int; stream.device builds a torch.device.
+        pool = pools.get(stream.device_index)
+        if pool is None:
+            # Never create events in the hot path; that is the stall this
+            # module removes.
+            _increment("unprewarmed_fallbacks")
+            return _call_original(original_wait_stream, self, stream)
+
+        event = pool.acquire()
+        if event is None:
+            # Never block waiting for a host-side lease or grow the pool in the
+            # hot path. Preserve PyTorch semantics and make exhaustion
+            # observable.
+            _increment("pool_exhaustions")
+            _warn_pool_exhausted(pool.device_index, pool.size)
+            return _call_original(original_wait_stream, self, stream)
+
+        try:
+            stream.record_event(event)
+            self.wait_event(event)
+        except BaseException:
+            _increment("pooled_call_failures")
+            pool.quarantine(event)
+            raise
+        else:
+            pool.release(event)
+            _increment("pooled_calls")
+
+    # Marks the patch, so a second copy of this module does not wrap it again.
+    setattr(wait_stream, "_sglang_cuda_event_pool", installation)
+    return wait_stream
 
 
-def install_cuda_event_pool(*, torch_module: Any = None, pool_size: int = 1024) -> bool:
+def install_cuda_event_pool(*, torch_module: Any = None, pool_size: int) -> bool:
     """Patch ``torch.cuda.Stream.wait_stream`` for the current process.
+
+    ``pool_size`` is the number of events per device.  Calls only use events
+    on devices materialized by :func:`prewarm_cuda_event_pool`.
 
     Returns ``True`` when this call installs the patch and ``False`` when the
     same patch is already installed or CUDA is unavailable.
     """
 
-    global _TORCH, _STREAM_CLASS, _ORIGINAL_WAIT_STREAM, _POOL_SIZE
+    global _INSTALLATION
 
     if pool_size <= 0:
         raise ValueError("CUDA event pool size must be positive")
@@ -243,81 +272,120 @@ def install_cuda_event_pool(*, torch_module: Any = None, pool_size: int = 1024) 
         import torch as torch_module  # type: ignore[no-redef]
 
     with _INSTALL_LOCK:
-        if _ORIGINAL_WAIT_STREAM is not None:
-            if torch_module is not _TORCH:
+        if _INSTALLATION is not None:
+            if torch_module is not _INSTALLATION.torch:
                 raise RuntimeError(
                     "CUDA event pool is already installed for another torch module"
                 )
-            if pool_size != _POOL_SIZE:
+            if pool_size != _INSTALLATION.pool_size:
                 raise ValueError(
                     "CUDA event pool is already installed with "
-                    f"pool_size={_POOL_SIZE}, got {pool_size}"
+                    f"pool_size={_INSTALLATION.pool_size}, got {pool_size}"
                 )
             return False
         if not torch_module.cuda.is_available():
             return False
 
         stream_class = torch_module.cuda.Stream
-        _TORCH = torch_module
-        _STREAM_CLASS = stream_class
-        _ORIGINAL_WAIT_STREAM = stream_class.wait_stream
-        _POOL_SIZE = pool_size
-        stream_class.wait_stream = _pooled_wait_stream
+        original_wait_stream = stream_class.wait_stream
+        if hasattr(original_wait_stream, "_sglang_cuda_event_pool"):
+            raise RuntimeError(
+                "torch.cuda.Stream.wait_stream is already patched by another "
+                "copy of the CUDA event pool"
+            )
+        installation = _Installation(
+            torch_module, stream_class, original_wait_stream, pool_size
+        )
+        stream_class.wait_stream = _make_pooled_wait_stream(installation)
+        _INSTALLATION = installation
         return True
 
 
 def prewarm_cuda_event_pool(device: int | None = None) -> dict[str, int] | None:
-    """Materialize one device's pool after the worker selects its device."""
+    """Materialize one device's pool after the worker selects its device.
 
-    if _TORCH is None:
-        raise RuntimeError("CUDA event pool is not installed")
-    if device is None:
-        device = int(_TORCH.cuda.current_device())
-    pool = _pool_for_device(device)
-    return None if pool is None else pool.snapshot()
+    Returns the pool snapshot, or ``None`` if materialization failed; that
+    device then keeps PyTorch's implementation.
+    """
+
+    with _INSTALL_LOCK:
+        installation = _INSTALLATION
+        if installation is None:
+            raise RuntimeError("CUDA event pool is not installed")
+        if device is None:
+            device = int(installation.torch.cuda.current_device())
+        pool = installation.pools.get(device)
+        if pool is None and device not in installation.disabled_devices:
+            try:
+                pool = _DeviceEventPool(
+                    installation.torch, device, installation.pool_size
+                )
+            except Exception as exc:
+                _increment("pool_init_failures")
+                reason = f"{type(exc).__name__}: {exc}"
+                installation.disabled_devices[device] = reason
+                logger.warning(
+                    "Disabling the CUDA event pool on device %d after "
+                    "initialization failed: %s",
+                    device,
+                    reason,
+                )
+            else:
+                installation.pools[device] = pool
+        return None if pool is None else pool.snapshot()
 
 
 def cuda_event_pool_stats() -> dict[str, Any]:
     """Return process-local counters for diagnostics and tests."""
 
-    with _POOLS_LOCK:
-        devices = {
-            str(device): pool.snapshot() for device, pool in sorted(_POOLS.items())
-        }
-        disabled_devices = dict(_DISABLED_DEVICES)
+    with _INSTALL_LOCK:
+        installation = _INSTALLATION
+        pools = {} if installation is None else dict(installation.pools)
+        disabled_devices = (
+            {} if installation is None else dict(installation.disabled_devices)
+        )
         counters: dict[str, Any] = dict(_STATS)
+    # Derived rather than counted, to keep one increment off every call.
+    counters["wait_stream_calls"] = (
+        counters["pooled_calls"]
+        + counters["original_calls"]
+        + counters["pooled_call_failures"]
+    )
     return counters | {
-        "installed": _ORIGINAL_WAIT_STREAM is not None,
-        "pool_size": _POOL_SIZE,
-        "devices": devices,
+        "installed": installation is not None,
+        "pool_size": None if installation is None else installation.pool_size,
+        "devices": {
+            str(device): pool.snapshot() for device, pool in sorted(pools.items())
+        },
         "disabled_devices": disabled_devices,
     }
 
 
 def uninstall_cuda_event_pool() -> bool:
-    """Restore PyTorch's method when no later hook has wrapped this one."""
+    """Restore PyTorch's method when no later hook has wrapped this one.
 
-    global _TORCH, _STREAM_CLASS, _ORIGINAL_WAIT_STREAM
+    The pools are dropped, so a later install can use another size.
+    """
+
+    global _INSTALLATION
     with _INSTALL_LOCK:
-        if _ORIGINAL_WAIT_STREAM is None or _STREAM_CLASS is None:
+        installation = _INSTALLATION
+        if installation is None:
             return False
-        if _STREAM_CLASS.wait_stream is not _pooled_wait_stream:
+        patched = installation.stream_class.wait_stream
+        if getattr(patched, "_sglang_cuda_event_pool", None) is not installation:
             return False
-        _STREAM_CLASS.wait_stream = _ORIGINAL_WAIT_STREAM
-        _TORCH = None
-        _STREAM_CLASS = None
-        _ORIGINAL_WAIT_STREAM = None
+        installation.stream_class.wait_stream = installation.original_wait_stream
+        # A call still in flight finds no pool and uses PyTorch's method.
+        installation.pools.clear()
+        _INSTALLATION = None
         return True
 
 
 def _reset_cuda_event_pool_for_testing() -> None:
-    global _EXHAUSTION_WARNED, _POOL_SIZE
+    global _EXHAUSTION_WARNED
 
     uninstall_cuda_event_pool()
-    with _POOLS_LOCK:
-        _POOLS.clear()
-        _DISABLED_DEVICES.clear()
     for key in _STATS:
         _STATS[key] = 0
-    _POOL_SIZE = 1024
     _EXHAUSTION_WARNED = False
