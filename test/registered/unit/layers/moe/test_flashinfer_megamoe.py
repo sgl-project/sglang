@@ -476,12 +476,14 @@ def test_capture_safe_ue8m0_pack_is_scoped(monkeypatch):
 
 
 @pytest.mark.parametrize("in_kernel_reduce", [False, True])
-def test_w4a16_keeps_weight_scale_storage_without_activation_scales(
-    monkeypatch, in_kernel_reduce
+@pytest.mark.parametrize("use_w4a16", [False, True])
+@pytest.mark.parametrize("activation", ["silu", "situ"])
+def test_nvfp4_keeps_weight_scale_storage_and_activation_contract(
+    monkeypatch, in_kernel_reduce, use_w4a16, activation
 ):
     module = _load_megamoe_module(monkeypatch)
     monkeypatch.setattr(
-        module.envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16, "get", lambda: True
+        module.envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16, "get", lambda: use_w4a16
     )
     monkeypatch.setattr(
         module.envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE,
@@ -491,14 +493,34 @@ def test_w4a16_keeps_weight_scale_storage_without_activation_scales(
     fake_moe_ep = types.ModuleType("flashinfer.moe_ep")
 
     def make_config(
-        *, intermediate_size, top_k, gate_up_clamp, enable_in_kernel_fc2_reduce
+        *,
+        intermediate_size,
+        top_k,
+        activation,
+        gate_up_clamp,
+        enable_in_kernel_fc2_reduce,
+        situ_beta=None,
+        situ_linear_beta=None,
+        apply_topk_in_fc1=False,
+        combine_dtype="bf16",
+        input_norm_const=None,
     ):
         return types.SimpleNamespace(
             intermediate_size=intermediate_size,
             top_k=top_k,
+            activation=activation,
             gate_up_clamp=gate_up_clamp,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            apply_topk_in_fc1=apply_topk_in_fc1,
+            combine_dtype=combine_dtype,
+            input_norm_const=input_norm_const,
             enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
-            kernel_name="sm100_bf16_nvfp4_bf16_cutedsl",
+            kernel_name=(
+                "sm100_bf16_nvfp4_bf16_cutedsl"
+                if use_w4a16
+                else "sm100_nvfp4_nvfp4_bf16_cutedsl"
+            ),
             knobs=None,
         )
 
@@ -511,6 +533,7 @@ def test_w4a16_keeps_weight_scale_storage_without_activation_scales(
             return tensors.hidden_states
 
     fake_moe_ep.Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig = make_config
+    fake_moe_ep.Nvfp4CutedslMegaMoeConfig = make_config
     fake_moe_ep.BootstrapConfig = types.SimpleNamespace
     fake_moe_ep.FleetParams = types.SimpleNamespace
     fake_moe_ep.MegaConfig = types.SimpleNamespace
@@ -519,27 +542,48 @@ def test_w4a16_keeps_weight_scale_storage_without_activation_scales(
     monkeypatch.setitem(sys.modules, "flashinfer.moe_ep", fake_moe_ep)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    # No activation-scale fields: W4A16 consumes only weight decode scales.
+    hidden, intermediate = (32, 64) if use_w4a16 else (128, 128)
+    # W4A16 consumes only weight decode scales; activation scales exist only
+    # in the W4A4 case below.
     layer = types.SimpleNamespace(
         layer_id=0,
-        hidden_size=32,
+        hidden_size=hidden,
         num_experts=2,
         moe_ep_size=1,
         moe_ep_rank=0,
-        intermediate_size_per_partition=64,
+        intermediate_size_per_partition=intermediate,
         top_k=2,
-        moe_runner_config=types.SimpleNamespace(swiglu_limit=None),
-        w13_weight=torch.zeros(2, 128, 16, dtype=torch.uint8).transpose(1, 2),
-        w2_weight=torch.zeros(2, 32, 32, dtype=torch.uint8).transpose(1, 2),
+        moe_runner_config=types.SimpleNamespace(
+            is_gated=True,
+            activation=activation,
+            swiglu_limit=8.0,
+            gemm1_alpha=4.0 if activation == "situ" else None,
+            gemm1_clamp_limit=25.0 if activation == "situ" else None,
+        ),
+        w13_weight=torch.zeros(
+            2, 2 * intermediate, hidden // 2, dtype=torch.uint8
+        ).transpose(1, 2),
+        w2_weight=torch.zeros(
+            2, hidden, intermediate // 2, dtype=torch.uint8
+        ).transpose(1, 2),
         w13_weight_scale=torch.zeros(2, 512, dtype=torch.float8_e4m3fn),
         w2_weight_scale=torch.zeros(2, 512, dtype=torch.float8_e4m3fn),
         g1_alphas=torch.tensor([0.25, 0.5], dtype=torch.float32),
         g2_alphas=torch.tensor([0.75, 1.0], dtype=torch.float32),
     )
+    if not use_w4a16:
+        layer.w13_input_scale_quant = torch.tensor(2.0)
+        layer.w2_input_scale_quant = torch.tensor([1.25, 1.5])
 
     mega = module.ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer)
     config = mega.backend.megakernel
     assert config.enable_in_kernel_fc2_reduce is in_kernel_reduce
+    assert config.activation == ("situ" if activation == "situ" else "swiglu")
+    assert config.gate_up_clamp == (None if activation == "situ" else 8.0)
+    assert config.situ_beta == (4.0 if activation == "situ" else None)
+    assert config.situ_linear_beta == (25.0 if activation == "situ" else None)
+    assert config.apply_topk_in_fc1 is (not use_w4a16)
+    assert config.input_norm_const == (None if use_w4a16 else 2.0)
     fc1, fc2 = mega.backend.transformed_weights
     assert len(fc1) == len(fc2) == 2
     for actual, expected in zip(
@@ -557,7 +601,7 @@ def test_w4a16_keeps_weight_scale_storage_without_activation_scales(
     # Scales are staged on each forward, so a shared workspace sees this
     # layer's current decode scales after a weight update.
     dispatch_output = types.SimpleNamespace(
-        hidden_states=torch.zeros(1, 32, dtype=torch.bfloat16),
+        hidden_states=torch.zeros(1, hidden, dtype=torch.bfloat16),
         topk_output=types.SimpleNamespace(
             topk_ids=torch.tensor([[0, 1]], dtype=torch.int32),
             topk_weights=torch.tensor([[0.25, 0.75]], dtype=torch.float32),
@@ -568,6 +612,7 @@ def test_w4a16_keeps_weight_scale_storage_without_activation_scales(
         mega_forward=layer._flashinfer_megamoe_forward,
         fc1_alpha=layer.g1_alphas,
         fc2_alpha=layer.g2_alphas,
+        fc1_norm_const=None if use_w4a16 else layer.w2_input_scale_quant,
     )
     for scale in (2.0, 3.0):
         layer.g1_alphas.fill_(scale)
@@ -579,12 +624,21 @@ def test_w4a16_keeps_weight_scale_storage_without_activation_scales(
         )
         assert mega.tensors.fc1_alpha.data_ptr() == layer.g1_alphas.data_ptr()
         assert mega.tensors.fc2_alpha.data_ptr() == layer.g2_alphas.data_ptr()
-        assert mega.tensors.fc1_norm_const is None
+        if use_w4a16:
+            assert mega.tensors.fc1_norm_const is None
+        else:
+            assert mega.tensors.fc1_norm_const is layer.w2_input_scale_quant
+        assert mega.tensors.topk_weights is dispatch_output.topk_output.topk_weights
         torch.testing.assert_close(mega.tensors.fc1_alpha, torch.full((2,), scale))
         torch.testing.assert_close(mega.tensors.fc2_alpha, torch.full((2,), scale + 1))
 
 
-def test_w4a16_reload_preserves_layer_and_prepared_weight_storage(monkeypatch):
+@pytest.mark.parametrize(
+    "activation,situ_linear_beta", [("silu", None), ("situ", 25.0), ("situ", None)]
+)
+def test_w4a16_reload_preserves_layer_and_prepared_weight_storage(
+    monkeypatch, activation, situ_linear_beta
+):
     module = _load_megamoe_module(monkeypatch)
     monkeypatch.setattr(
         module.envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16, "get", lambda: True
@@ -606,8 +660,10 @@ def test_w4a16_reload_preserves_layer_and_prepared_weight_storage(monkeypatch):
     layer.quant_config = types.SimpleNamespace(use_per_token_activation=True)
     layer.moe_runner_config = types.SimpleNamespace(
         is_gated=True,
-        activation="silu",
+        activation=activation,
         swiglu_limit=None,
+        gemm1_alpha=4.0 if activation == "situ" else None,
+        gemm1_clamp_limit=situ_linear_beta,
         apply_router_weight_on_input=False,
     )
     layer.g1_alphas = layer.g1_alphas_up = torch.ones(2)
@@ -629,7 +685,8 @@ def test_w4a16_reload_preserves_layer_and_prepared_weight_storage(monkeypatch):
             )
     canonical = {name: (p.shape, p.dtype) for name, p in layer.named_parameters()}
 
-    def preprocess(weights, **kwargs):
+    def preprocess(weights, *, intermediate_size, hidden_size):
+        assert (intermediate_size, hidden_size) == (intermediate, hidden)
         result = []
         for weight, scale in (
             (weights.w13, weights.w13_scale),
