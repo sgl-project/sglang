@@ -17,6 +17,7 @@ Covers:
 import asyncio
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import msgspec
@@ -134,6 +135,10 @@ def _make_tokenizer_manager(case) -> TokenizerManager:
     tm.server_args.dp_size = 1
     tm.disaggregation_mode = "none"
     tm.rid_to_state = {}
+    tm._parallel_sample_groups = {}
+    tm._parallel_sample_rid_to_parent = {}
+    tm._parallel_sample_groups_complete = set()
+    tm._parallel_sample_abort_requested = set()
     tm.encoder_dispatch_ready = {}
     tm.enable_metrics = False
     tm.enable_trace = False
@@ -361,6 +366,94 @@ class TestRidToStateCleanupOnAbort(CustomTestCase):
         self.assertEqual(
             state.out_list[0]["meta_info"]["finish_reason"]["type"], "abort"
         )
+
+
+class TestParallelSamplingAbort(CustomTestCase):
+    def test_parent_rid_aborts_all_regenerated_children(self):
+        tm = _make_tokenizer_manager(self)
+        tm._dispatch_to_scheduler = Mock()
+        parent_rid = "parallel-parent"
+        child_rids = {"parallel-child-0", "parallel-child-1"}
+        tm._parallel_sample_groups[parent_rid] = set(child_rids)
+        for child_rid in child_rids:
+            tm.rid_to_state[child_rid] = _make_req_state(child_rid)
+            tm._parallel_sample_rid_to_parent[child_rid] = parent_rid
+
+        tm.abort_request(parent_rid)
+
+        dispatched = [
+            call.args[0] for call in tm._dispatch_to_scheduler.call_args_list
+        ]
+        self.assertEqual({request.rid for request in dispatched}, child_rids)
+        self.assertTrue(all(request.abort_all is False for request in dispatched))
+        self.assertTrue(all(tm.rid_to_state[rid].abort_sent for rid in child_rids))
+
+    def test_abort_all_stops_active_parallel_sampling(self):
+        tm = _make_tokenizer_manager(self)
+        tm._dispatch_to_scheduler = Mock()
+        parent_rid = "parallel-parent"
+        tm._parallel_sample_groups[parent_rid] = {"parallel-child"}
+
+        tm.abort_request(abort_all=True)
+
+        self.assertIn(parent_rid, tm._parallel_sample_abort_requested)
+        dispatched = tm._dispatch_to_scheduler.call_args.args[0]
+        self.assertIsInstance(dispatched, AbortReq)
+        self.assertTrue(dispatched.abort_all)
+
+    def test_phase_one_abort_prevents_parallel_children(self):
+        tm = _make_tokenizer_manager(self)
+
+        class FakeRequest:
+            def __init__(self, rid):
+                self.rid = rid
+                self.return_prompt_token_ids = False
+
+            def regenerate_rid(self):
+                self.rid = f"generated-{self.rid}"
+                return self.rid
+
+        class FakeBatch:
+            batch_size = 1
+            parallel_sample_num = 2
+            _parallel_sampling_parent_rid = "parallel-parent"
+            rid = ["placeholder-rid"]
+            stream = False
+
+            def __getitem__(self, index):
+                return FakeRequest(self.rid[index])
+
+        tokenized = SimpleNamespace(
+            mm_inputs=None,
+            sampling_params=SimpleNamespace(max_new_tokens=8),
+            stream=True,
+        )
+        tm._tokenize_one_request = AsyncMock(return_value=tokenized)
+        tm._send_one_request = AsyncMock()
+
+        def init_req_state(req):
+            tm.rid_to_state[req.rid] = _make_req_state(req.rid)
+
+        tm._init_req_state = Mock(side_effect=init_req_state)
+
+        async def aborted_response(*args):
+            yield {"meta_info": {"finish_reason": {"type": "abort"}}}
+
+        tm._wait_one_response = Mock(return_value=aborted_response())
+
+        async def drive():
+            result = []
+            async for output in tm._handle_batch_request(
+                FakeBatch(), request_rids={"placeholder-rid"}
+            ):
+                result.append(output)
+            return result
+
+        asyncio.run(drive())
+
+        tm._send_one_request.assert_awaited_once()
+        self.assertNotIn("parallel-parent", tm._parallel_sample_groups)
+        self.assertFalse(tm._parallel_sample_rid_to_parent)
 
 
 class TestAbortOutputPayload(CustomTestCase):

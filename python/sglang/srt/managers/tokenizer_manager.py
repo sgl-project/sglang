@@ -42,6 +42,7 @@ from typing import (
     Iterable,
     List,
     Optional,
+    Set,
     Tuple,
     Union,
 )
@@ -658,6 +659,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_running_status(self):
         # Request states
         self.rid_to_state: Dict[str, ReqState] = {}
+        self._parallel_sample_groups: Dict[str, Set[str]] = {}
+        self._parallel_sample_rid_to_parent: Dict[str, str] = {}
+        self._parallel_sample_groups_complete: Set[str] = set()
+        self._parallel_sample_abort_requested: Set[str] = set()
         self.encoder_dispatch_ready: Dict[str, threading.Event] = {}
         self.event_loop = None
         self.asyncio_tasks = set()
@@ -920,6 +925,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # undelivered states, but abort dispatched requests for scheduler-side
             # cleanup.
             self._release_req_states_on_failure(request_rids)
+            if isinstance(obj, GenerateReqInput) and getattr(
+                obj, "parallel_sample_num", 1
+            ) > 1:
+                parent_rid = getattr(obj, "_parallel_sampling_parent_rid", None)
+                parent_rids = (
+                    [parent_rid] if parent_rid is not None else list(obj.rid)
+                )
+                for parent_rid in set(parent_rids):
+                    self._discard_parallel_sample_group(parent_rid)
             raise
 
     def _detect_input_format(
@@ -1814,7 +1828,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # Delete the key to prevent resending abort request to the scheduler and
             # to ensure aborted request state is cleaned up.
             if state.obj.rid in self.rid_to_state:
-                del self.rid_to_state[state.obj.rid]
+                self._drop_req_state(state.obj.rid)
 
             # Mark ongoing LoRA request as finished.
             if self.enable_lora and state.obj.lora_path:
@@ -2010,12 +2024,39 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             # Tokenize all requests
             objs = [obj[i] for i in range(batch_size)]
-            tokenized_objs = await asyncio.gather(
-                *(self._tokenize_one_request(obj) for obj in objs)
+            parallel_parent_rid = getattr(
+                obj, "_parallel_sampling_parent_rid", None
             )
+            parallel_parent_rids = [
+                parallel_parent_rid or request_obj.rid for request_obj in objs
+            ]
+            for parent_rid in set(parallel_parent_rids):
+                self._start_parallel_sample_group(parent_rid)
+
+            try:
+                tokenized_objs = await asyncio.gather(
+                    *(self._tokenize_one_request(obj) for obj in objs)
+                )
+            except BaseException:
+                for parent_rid in set(parallel_parent_rids):
+                    self._discard_parallel_sample_group(parent_rid)
+                raise
+
+            # The normalized batch IDs are placeholders for parallel sampling;
+            # each dispatched phase gets its own state and regenerated RID.
+            original_rids = obj.rid if isinstance(obj.rid, list) else [obj.rid]
+            for rid in set(original_rids):
+                self._drop_req_state(rid)
 
             # Cache the common prefix for parallel sampling
+            parallel_aborted_rids = set()
             for i in range(batch_size):
+                parent_rid = parallel_parent_rids[i]
+                if (
+                    parent_rid in parallel_aborted_rids
+                    or self._parallel_sample_abort_requested_for(parent_rid)
+                ):
+                    continue
                 tmp_obj = copy.copy(objs[i])
                 tokenized_obj = copy.copy(tokenized_objs[i])
                 # Ensure independent mm_items so wrap_shm_features won't mutate the original
@@ -2030,12 +2071,32 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 tokenized_obj.stream = False
                 self._init_req_state(tmp_obj)
                 request_rids.add(tmp_obj.rid)
+                self._register_parallel_sample_rid(parent_rid, tmp_obj.rid)
                 await self._send_one_request(tokenized_obj)
-                await self._wait_one_response(tmp_obj, request).__anext__()
+                phase1_output = await self._wait_one_response(
+                    tmp_obj, request
+                ).__anext__()
+                if self._parallel_sample_abort_requested_for(
+                    parent_rid
+                ) or self._is_abort_output(phase1_output):
+                    parallel_aborted_rids.add(parent_rid)
+                    self._discard_parallel_sample_group(parent_rid)
 
             # Expand requests, assign new rids for them, and send them
             for i in range(batch_size):
+                parent_rid = parallel_parent_rids[i]
+                if (
+                    parent_rid in parallel_aborted_rids
+                    or self._parallel_sample_abort_requested_for(parent_rid)
+                ):
+                    self._mark_parallel_sample_group_complete(parent_rid)
+                    continue
                 for _ in range(obj.parallel_sample_num):
+                    if (
+                        parent_rid in parallel_aborted_rids
+                        or self._parallel_sample_abort_requested_for(parent_rid)
+                    ):
+                        break
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
                     # Ensure independent mm_items so wrap_shm_features won't mutate the original
@@ -2047,6 +2108,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
                     self._init_req_state(tmp_obj)
                     request_rids.add(tmp_obj.rid)
+                    self._register_parallel_sample_rid(parent_rid, tmp_obj.rid)
                     state = self.rid_to_state[tmp_obj.rid]
                     tokenized_obj.time_stats = state.time_stats
                     if tmp_obj.return_prompt_token_ids:
@@ -2055,8 +2117,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     generators.append(self._wait_one_response(tmp_obj, request))
                     rids.append(tmp_obj.rid)
 
-                self.rid_to_state[objs[i].rid].time_stats.set_finished_time()
-                del self.rid_to_state[objs[i].rid]
+                self._mark_parallel_sample_group_complete(parent_rid)
 
         # Wait for all requests
         is_stream = hasattr(obj, "stream") and obj.stream
@@ -2116,6 +2177,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if not abort_all and not rid:
             logger.warning("Ignore abort_request with empty rid and abort_all=False")
             return
+        if abort_all:
+            self._parallel_sample_abort_requested.update(
+                self._parallel_sample_groups
+            )
+            self._abort_request(abort_all=True)
+            return
+        if not abort_all and rid in self._parallel_sample_groups:
+            self._parallel_sample_abort_requested.add(rid)
+            for child_rid in tuple(self._parallel_sample_groups[rid]):
+                self._abort_request(child_rid)
+            return
+        self._abort_request(rid, abort_all)
+
+    def _abort_request(self, rid: str, abort_all: bool = False):
         state = None if abort_all else self.rid_to_state.get(rid)
         if not abort_all:
             if state is not None:
@@ -2136,6 +2211,62 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.metrics_collector.observe_one_aborted_request(
                 self.metrics_collector.labels
             )
+
+    def _start_parallel_sample_group(self, parent_rid: str):
+        self._parallel_sample_groups[parent_rid] = set()
+        self._parallel_sample_groups_complete.discard(parent_rid)
+        self._parallel_sample_abort_requested.discard(parent_rid)
+
+    def _register_parallel_sample_rid(self, parent_rid: str, rid: str):
+        self._parallel_sample_groups.setdefault(parent_rid, set()).add(rid)
+        self._parallel_sample_rid_to_parent[rid] = parent_rid
+
+    def _parallel_sample_abort_requested_for(self, parent_rid: str) -> bool:
+        return parent_rid in self._parallel_sample_abort_requested
+
+    def _maybe_remove_parallel_sample_group(self, parent_rid: str):
+        if (
+            parent_rid in self._parallel_sample_groups_complete
+            and not self._parallel_sample_groups.get(parent_rid)
+        ):
+            self._parallel_sample_groups.pop(parent_rid, None)
+            self._parallel_sample_groups_complete.discard(parent_rid)
+            self._parallel_sample_abort_requested.discard(parent_rid)
+
+    def _mark_parallel_sample_group_complete(self, parent_rid: str):
+        if parent_rid in self._parallel_sample_groups:
+            self._parallel_sample_groups_complete.add(parent_rid)
+            self._maybe_remove_parallel_sample_group(parent_rid)
+
+    def _unregister_parallel_sample_rid(self, rid: str):
+        parent_rid = self._parallel_sample_rid_to_parent.pop(rid, None)
+        if parent_rid is None:
+            return
+        children = self._parallel_sample_groups.get(parent_rid)
+        if children is not None:
+            children.discard(rid)
+            self._maybe_remove_parallel_sample_group(parent_rid)
+
+    def _discard_parallel_sample_group(self, parent_rid: str):
+        children = self._parallel_sample_groups.pop(parent_rid, set())
+        for rid in children:
+            self._parallel_sample_rid_to_parent.pop(rid, None)
+        self._parallel_sample_groups_complete.discard(parent_rid)
+        self._parallel_sample_abort_requested.discard(parent_rid)
+
+    def _drop_req_state(self, rid: str):
+        self.rid_to_state.pop(rid, None)
+        self._unregister_parallel_sample_rid(rid)
+
+    @staticmethod
+    def _is_abort_output(output: Any) -> bool:
+        if not isinstance(output, dict):
+            return False
+        finish_reason = (output.get("meta_info") or {}).get("finish_reason")
+        return (
+            isinstance(finish_reason, dict)
+            and finish_reason.get("type") == "abort"
+        )
 
     async def pause_generation(self, obj: PauseGenerationReqInput):
         async with self.is_pause_cond:
@@ -2293,9 +2424,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Abort the request if the client is disconnected.
         async def abort_request():
             await asyncio.sleep(2)
-            rids = [obj.rid] if obj.is_single else obj.rid
+            parent_rid = getattr(obj, "_parallel_sampling_parent_rid", None)
+            if parent_rid is not None:
+                rids = [parent_rid]
+            else:
+                rids = [obj.rid] if obj.is_single else obj.rid
             for rid in rids:
-                if rid in self.rid_to_state:
+                if rid in self.rid_to_state or rid in self._parallel_sample_groups:
                     self.abort_request(rid)
 
         background_tasks = BackgroundTasks()
@@ -2635,7 +2770,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         )
                     )
 
-                del self.rid_to_state[rid]
+                self._drop_req_state(rid)
 
                 # Mark ongoing LoRA request as finished.
                 if self.enable_lora and state.obj.lora_path:
@@ -3464,7 +3599,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         }
         if state.prompt_token_ids is not None:
             out["prompt_token_ids"] = state.prompt_token_ids
-        del self.rid_to_state[recv_obj.rid]
+        self._drop_req_state(recv_obj.rid)
 
         state.out_list.append(out)
         state.event.set()
@@ -3682,7 +3817,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             "Failed to abort request %s during cleanup", rid
                         )
                 else:
-                    del self.rid_to_state[rid]
+                    self._drop_req_state(rid)
             dispatch_ready = self.encoder_dispatch_ready.pop(rid, None)
             if dispatch_ready is not None:
                 dispatch_ready.set()
