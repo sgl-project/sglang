@@ -182,6 +182,11 @@ def _host_and_cgroup_snapshot() -> dict[str, object]:
         if limit is not None and limit >= 1 << 60:
             limit = None
         limit_kind = "memory.limit_in_bytes" if limit is not None else None
+    hard_limit = (
+        limit
+        if limit_kind == "memory.limit_in_bytes"
+        else _read_int(cgroup / "memory.max")
+    )
 
     cgroup_headroom = (
         max(0, limit - current) if current is not None and limit is not None else None
@@ -203,8 +208,10 @@ def _host_and_cgroup_snapshot() -> dict[str, object]:
             host_total,
         ),
         "cgroup_memory_current_bytes": current,
-        "cgroup_memory_max_bytes": limit,
-        "cgroup_memory_used_pct": _percent(current, limit),
+        "cgroup_memory_max_bytes": hard_limit,
+        "cgroup_memory_used_pct": _percent(current, hard_limit),
+        "cgroup_memory_effective_limit_bytes": limit,
+        "cgroup_memory_effective_used_pct": _percent(current, limit),
         "cgroup_memory_peak_bytes": _read_int(cgroup / "memory.peak"),
         "cgroup_memory_high_bytes": _read_int(cgroup / "memory.high"),
         "cgroup_memory_limit_path": str(cgroup) if limit is not None else None,
