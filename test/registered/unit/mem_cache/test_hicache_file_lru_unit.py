@@ -189,7 +189,10 @@ class TestReadErrors(HiCacheFileLRUTestBase):
                 with self.subTest(metadata=enable_metadata_cache, size=size):
                     b = self.make_backend(enable_metadata_cache=enable_metadata_cache)
                     self.assertTrue(b.set("key", _t(8, fill=1)))
-                    with open(b._get_component_path("key"), "r+b") as f:
+                    with open(
+                        os.path.join(b.file_path, b._get_suffixed_key("key") + ".bin"),
+                        "r+b",
+                    ) as f:
                         f.truncate(size)
 
                     self.assertIsNone(b.get("key", _t(8)))
@@ -218,7 +221,9 @@ class TestReadErrors(HiCacheFileLRUTestBase):
         keys = ["first", "short", "last"]
         for key in keys:
             self.assertTrue(b.set(key, _t(8, fill=5)))
-        with open(b._get_component_path("short"), "r+b") as f:
+        with open(
+            os.path.join(b.file_path, b._get_suffixed_key("short") + ".bin"), "r+b"
+        ) as f:
             f.truncate(7)
 
         results = b.batch_get(keys, [_t(8) for _ in keys])
