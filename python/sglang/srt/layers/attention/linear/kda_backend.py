@@ -26,7 +26,7 @@ from sglang.srt.layers.attention.linear.utils import (
     select_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu
+from sglang.srt.utils import extend_mem_profile, is_cpu, is_cuda, is_hip, is_npu
 from sglang.srt.utils.common import is_gfx95_supported, rank0_log
 
 # KDA always uses the triton causal_conv1d_fn (no CUDA override).
@@ -1071,10 +1071,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 self.forward_metadata.conv_states_mask_indices
             ] = mixed_qkv[self.forward_metadata.track_conv_indices]
 
-        qkv = self._convolve_prefill(
-            layer, forward_batch, mixed_qkv, conv_states, cache_indices
-        )
-        q, k, v = qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
+        with extend_mem_profile.phase("kda:conv"):
+            qkv = self._convolve_prefill(
+                layer, forward_batch, mixed_qkv, conv_states, cache_indices
+            )
+            q, k, v = qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
 
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
@@ -1112,42 +1113,43 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 dtype=torch.float32,
                 device=ssm_states.device,
             )
-        core_attn_out = self.kernel_dispatcher.extend(
-            q=q,
-            k=k,
-            v=v,
-            g=a,
-            beta=b,
-            ssm_states=ssm_states,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            A_log=layer.A_log,
-            dt_bias=layer.dt_bias,
-            lower_bound=layer.lower_bound,
-            beta_is_raw=True,
-            extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-            extend_prefix_lens=forward_batch.extend_prefix_lens,
-            layer_id=layer.layer_id,
-            # draft_extend_v2 must stay rollback-able, so kernels that commit state
-            # in place (e.g. FlashKDA) must not run for it.
-            is_spec_decode=forward_batch.forward_mode.is_draft_extend_v2(),
-            return_intermediate_states=track_ssm,
-            # Which global chunk rows of h the track snapshot will read; lets
-            # kernels that cannot materialize per-chunk states (NVIDIA KDA) take the
-            # fast path when the snapshot only needs the final state.
-            track_ssm_h_src=(
-                self.forward_metadata.track_ssm_h_src if track_ssm else None
-            ),
-            track_state=h_track_buf,
-            track_chunk_idx=(track_chunk_idx if h_track_buf is not None else None),
-            state_checkpoint_cu_starts=self.forward_metadata.state_checkpoint_cu_starts,
-            num_state_checkpoints=self.forward_metadata.num_state_checkpoints,
-            state_checkpoint_every_n_tokens=(
-                self.forward_metadata.state_checkpoint_every_n_tokens
-            ),
-            state_checkpoint_indices=self.forward_metadata.state_checkpoint_indices,
-            track_ssm_h_batch_src=self.forward_metadata.track_ssm_h_batch_src,
-        )
+        with extend_mem_profile.phase("kda:extend"):
+            core_attn_out = self.kernel_dispatcher.extend(
+                q=q,
+                k=k,
+                v=v,
+                g=a,
+                beta=b,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                lower_bound=layer.lower_bound,
+                beta_is_raw=True,
+                extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                extend_prefix_lens=forward_batch.extend_prefix_lens,
+                layer_id=layer.layer_id,
+                # draft_extend_v2 must stay rollback-able, so kernels that commit state
+                # in place (e.g. FlashKDA) must not run for it.
+                is_spec_decode=forward_batch.forward_mode.is_draft_extend_v2(),
+                return_intermediate_states=track_ssm,
+                # Which global chunk rows of h the track snapshot will read; lets
+                # kernels that cannot materialize per-chunk states (NVIDIA KDA) take the
+                # fast path when the snapshot only needs the final state.
+                track_ssm_h_src=(
+                    self.forward_metadata.track_ssm_h_src if track_ssm else None
+                ),
+                track_state=h_track_buf,
+                track_chunk_idx=(track_chunk_idx if h_track_buf is not None else None),
+                state_checkpoint_cu_starts=self.forward_metadata.state_checkpoint_cu_starts,
+                num_state_checkpoints=self.forward_metadata.num_state_checkpoints,
+                state_checkpoint_every_n_tokens=(
+                    self.forward_metadata.state_checkpoint_every_n_tokens
+                ),
+                state_checkpoint_indices=self.forward_metadata.state_checkpoint_indices,
+                track_ssm_h_batch_src=self.forward_metadata.track_ssm_h_batch_src,
+            )
         if track_ssm:
             # Snapshot the SSM state at the last track-aligned chunk boundary
             # from the kernel's per-chunk states (h) / final states into the
