@@ -606,7 +606,35 @@ class SchedulePolicy:
 class AddReqResult(Enum):
     CONTINUE = auto()  # Continue to add requests
     NO_TOKEN = auto()  # No token left
+    NO_TOKEN_FOR_REQUEST = auto()  # This request does not fit the current KV budget
     OTHER = auto()  # Other reasons to stop adding requests
+
+
+@dataclass
+class PrefillLookahead:
+    """Bound the queue positions inspected after the first rejected request."""
+
+    window: int
+    stop_index: Optional[int] = None
+
+    def allows(self, queue_index: int) -> bool:
+        return self.stop_index is None or queue_index < self.stop_index
+
+    def start(self, rejected_index: int) -> bool:
+        if self.window <= 0:
+            return False
+        if self.stop_index is None:
+            self.stop_index = rejected_index + 1 + self.window
+        return True
+
+    def should_bypass(
+        self, queue_index: int, result: AddReqResult, added: bool
+    ) -> bool:
+        return (
+            not added
+            and result == AddReqResult.NO_TOKEN_FOR_REQUEST
+            and self.start(queue_index)
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1332,6 +1360,10 @@ class PrefillAdder:
                         has_chunked_req=has_chunked_req,
                     )
                     if isinstance(admission, AddReqResult):
+                        # Host load-back has already been attempted, so this is
+                        # no longer a side-effect-free candidate rejection.
+                        if admission == AddReqResult.NO_TOKEN_FOR_REQUEST:
+                            return AddReqResult.NO_TOKEN
                         return admission
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 req.kv.cache_protected_len = len(req.prefix_indices)
@@ -1367,7 +1399,9 @@ class PrefillAdder:
             swa_host_hit_length=swa_host_hit_length,
         )
         if not can_admit:
-            return AddReqResult.NO_TOKEN
+            # No state has been committed yet, so the scheduler may safely try
+            # another waiting request when bounded lookahead is enabled.
+            return AddReqResult.NO_TOKEN_FOR_REQUEST
 
         # Without chunking, allow the first request even above the input cap.
         if (

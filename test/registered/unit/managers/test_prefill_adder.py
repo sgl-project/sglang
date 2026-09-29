@@ -269,7 +269,7 @@ class TestPrefillAdder(CustomTestCase):
         req.full_untruncated_fill_ids = list(range(512))
         self.assertEqual(
             adder.add_one_req(req, has_chunked_req=True, truncation_align_size=None),
-            AddReqResult.NO_TOKEN,
+            AddReqResult.NO_TOKEN_FOR_REQUEST,
         )
         self.assertEqual(adder.can_run_list, [])
 
@@ -292,7 +292,7 @@ class TestPrefillAdder(CustomTestCase):
             adder.add_one_req(
                 second, has_chunked_req=False, truncation_align_size=None
             ),
-            AddReqResult.NO_TOKEN,
+            AddReqResult.NO_TOKEN_FOR_REQUEST,
         )
         self.assertEqual(adder.can_run_list, [first])
 
@@ -311,7 +311,7 @@ class TestPrefillAdder(CustomTestCase):
         req = self.create_shared_req("locked-prefix")
         self.assertEqual(
             adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None),
-            AddReqResult.NO_TOKEN,
+            AddReqResult.NO_TOKEN_FOR_REQUEST,
         )
         self.mock_tree_cache.inc_lock_ref.assert_called_once()
         self.assertEqual(adder.can_run_list, [])
@@ -915,7 +915,7 @@ class TestPrefillAdder(CustomTestCase):
                 adder.add_one_req(
                     req, has_chunked_req=False, truncation_align_size=None
                 ),
-                AddReqResult.NO_TOKEN,
+                AddReqResult.NO_TOKEN_FOR_REQUEST,
             )
         self.assertEqual(len(adder.can_run_list), 0)
 
@@ -1133,7 +1133,7 @@ class TestPrefillAdder(CustomTestCase):
             truncation_align_size=None,
         )
 
-        self.assertEqual(result, AddReqResult.NO_TOKEN)
+        self.assertEqual(result, AddReqResult.NO_TOKEN_FOR_REQUEST)
         self.assertEqual(delayer.calls, [])
         self.assertEqual(adder.can_run_list, [])
 
@@ -1163,7 +1163,7 @@ class TestPrefillAdder(CustomTestCase):
             truncation_align_size=None,
         )
 
-        self.assertEqual(result, AddReqResult.NO_TOKEN)
+        self.assertEqual(result, AddReqResult.NO_TOKEN_FOR_REQUEST)
         self.assertEqual(delayer.calls, [])
         self.assertEqual(adder.can_run_list, [])
 

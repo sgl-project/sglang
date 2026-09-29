@@ -216,6 +216,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
+    PrefillLookahead,
     SchedulePolicy,
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
@@ -3936,8 +3937,14 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
+        lookahead = PrefillLookahead(get_schedule().prefill_lookahead_window)
         # Get requests from the waiting queue to a new prefill batch
-        for req in self.waiting_queue:
+        for queue_index, req in enumerate(self.waiting_queue):
+            if not lookahead.allows(queue_index):
+                if not adder.can_run_list and not running_batch.is_empty():
+                    running_batch.batch_is_full = True
+                break
+
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 continue
 
@@ -3999,26 +4006,15 @@ class Scheduler(
                 truncation_align_size=self.truncation_align_size,
             )
 
-            if self.enable_lora:
+            added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
+            if self.enable_lora and added:
                 running_loras.add(req.lora_id)
 
             if res != AddReqResult.CONTINUE:
-                if res == AddReqResult.NO_TOKEN:
-                    if (
-                        self.enable_hierarchical_cache
-                        or self.enable_unified_cache_external_linker
-                    ):
-                        # Set batch_is_full after making sure there are requests that can be served
-                        running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
-                            not running_batch.is_empty()
-                        )
-                    else:
-                        running_batch.batch_is_full = True
                 # revert matched mamba idx to avoid memory leak, if req is not added.
                 # Only free if the slot was freshly allocated in this batch (not
                 # pre-existing from a session). Session-held slots have their own
                 # lifecycle and freeing them here causes double-free.
-                added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added:
                     # init_next_round_input() may stage deferred Mamba COW/clear
                     # metadata before add_one_req() rejects the request.
@@ -4029,6 +4025,24 @@ class Scheduler(
                             req.kv.mamba_pool_idx.unsqueeze(-1)
                         )
                         req.kv.mamba_pool_idx = None
+
+                if lookahead.should_bypass(queue_index, res, added):
+                    continue
+
+                if res in (
+                    AddReqResult.NO_TOKEN,
+                    AddReqResult.NO_TOKEN_FOR_REQUEST,
+                ):
+                    if (
+                        self.enable_hierarchical_cache
+                        or self.enable_unified_cache_external_linker
+                    ):
+                        # Set batch_is_full after making sure there are requests that can be served
+                        running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
+                            not running_batch.is_empty()
+                        )
+                    else:
+                        running_batch.batch_is_full = True
                 break
 
         if mamba_allocator is not None:

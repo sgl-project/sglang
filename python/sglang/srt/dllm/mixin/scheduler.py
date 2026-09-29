@@ -331,7 +331,10 @@ class SchedulerDllmMixin:
             )
 
             if res != AddReqResult.CONTINUE:
-                if res == AddReqResult.NO_TOKEN:
+                if res in (
+                    AddReqResult.NO_TOKEN,
+                    AddReqResult.NO_TOKEN_FOR_REQUEST,
+                ):
                     running_batch.batch_is_full = True
                 break
 

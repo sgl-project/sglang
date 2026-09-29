@@ -3,7 +3,12 @@ from array import array
 from unittest.mock import patch
 
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.schedule_policy import CacheAwarePolicy, SchedulePolicy
+from sglang.srt.managers.schedule_policy import (
+    AddReqResult,
+    CacheAwarePolicy,
+    PrefillLookahead,
+    SchedulePolicy,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -22,6 +27,40 @@ def _make_req(rid, origin_input_text, origin_input_ids, sampling_params=None, **
         sampling_params,
         **kwargs,
     )
+
+
+class TestPrefillLookahead(CustomTestCase):
+    def test_disabled_window_never_starts(self):
+        lookahead = PrefillLookahead(window=0)
+
+        self.assertFalse(lookahead.start(rejected_index=3))
+        self.assertTrue(lookahead.allows(queue_index=100))
+
+    def test_window_covers_only_following_queue_positions(self):
+        lookahead = PrefillLookahead(window=2)
+
+        self.assertTrue(lookahead.start(rejected_index=3))
+        self.assertTrue(lookahead.allows(queue_index=4))
+        self.assertTrue(lookahead.allows(queue_index=5))
+        self.assertFalse(lookahead.allows(queue_index=6))
+
+    def test_later_rejections_do_not_extend_window(self):
+        lookahead = PrefillLookahead(window=2)
+
+        self.assertTrue(lookahead.start(rejected_index=3))
+        self.assertTrue(lookahead.start(rejected_index=4))
+        self.assertFalse(lookahead.allows(queue_index=6))
+
+    def test_only_side_effect_free_rejection_can_be_bypassed(self):
+        lookahead = PrefillLookahead(window=2)
+
+        self.assertFalse(
+            lookahead.should_bypass(3, AddReqResult.NO_TOKEN_FOR_REQUEST, added=True)
+        )
+        self.assertFalse(lookahead.should_bypass(3, AddReqResult.NO_TOKEN, added=False))
+        self.assertTrue(
+            lookahead.should_bypass(3, AddReqResult.NO_TOKEN_FOR_REQUEST, added=False)
+        )
 
 
 class TestSchedulePolicyHRRN(CustomTestCase):

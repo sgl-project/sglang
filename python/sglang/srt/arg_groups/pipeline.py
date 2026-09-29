@@ -101,11 +101,13 @@ def run_resolution_pipeline(server_args: Any) -> None:
         default_unset_prefill_decode_interval,
         validate_experimental_sgl_marlin,
         validate_prefill_decode_interval,
+        validate_prefill_lookahead_window,
         validate_response_store,
         validate_sampling_mask_max_tokens,
     )
 
     run_hook(validate_prefill_decode_interval, server_args)
+    run_hook(validate_prefill_lookahead_window, server_args)
     run_hook(validate_response_store, server_args)
     run_hook(validate_sampling_mask_max_tokens, server_args)
 

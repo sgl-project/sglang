@@ -500,6 +500,12 @@ def validate_prefill_decode_interval(server_args: Any):
         raise ValueError("--prefill-decode-interval must be non-negative.")
 
 
+def validate_prefill_lookahead_window(server_args: Any):
+    cfg = resolving_view(server_args)
+    if cfg.prefill_lookahead_window < 0:
+        raise ValueError("--prefill-lookahead-window must be non-negative.")
+
+
 def default_unset_prefill_decode_interval(server_args: Any):
     """Leave Qwen3-VL Hopper free to pick 22; everyone else stays disabled."""
     from sglang.srt.arg_groups.overrides import declare_resolution

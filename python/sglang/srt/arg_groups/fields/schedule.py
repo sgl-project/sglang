@@ -86,6 +86,15 @@ class Schedule(msgspec.Struct):
         Optional[int],
         "The maximum number of requests in a prefill batch. If not specified, there is no limit.",
     ] = None
+    prefill_lookahead_window: A[
+        int,
+        (
+            "After a request fails prefill admission because its KV demand does "
+            "not fit, inspect at most this many following waiting requests for a "
+            "smaller request that fits. Set to 0 to preserve strict queue-order "
+            "admission."
+        ),
+    ] = 0
     schedule_policy: A[
         str,
         Arg(
