@@ -9,9 +9,6 @@ from compressed_tensors.quantization import QuantizationStrategy
 from torch.nn import Parameter
 
 from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
-from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
-    NPUW8A8Int8DynamicLinearMethod,
-)
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.parameter import (
     ChannelQuantScaleParameter,
@@ -30,6 +27,32 @@ _is_cuda = is_cuda()
 _is_cpu = is_cpu()
 if _is_cuda:
     from sgl_kernel import int8_scaled_mm
+
+
+def _requantize_int8_with_max_scale(
+    weight: torch.Tensor, weight_scale: torch.Tensor, logical_widths: list[int]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    max_w_scale = weight_scale.max()
+    requantized_weight = weight.clone()
+
+    unfused_module_in_checkpoint = (
+        weight_scale[-1] > torch.finfo(torch.float8_e4m3fn).min
+    )
+    if unfused_module_in_checkpoint:
+        int8_info = torch.iinfo(torch.int8)
+        start = 0
+        for idx, logical_width in enumerate(logical_widths):
+            end = start + logical_width
+            weight_dq = weight[start:end, :].float() * weight_scale[idx]
+            requantized_weight[start:end, :] = torch.clamp(
+                torch.round(weight_dq / max_w_scale),
+                int8_info.min,
+                int8_info.max,
+            ).to(torch.int8)
+            start = end
+
+    max_w_scale_channelwise = max_w_scale.expand(weight.size(0)).clone()
+    return requantized_weight, max_w_scale_channelwise
 
 
 class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
@@ -103,7 +126,7 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
     def process_weights_after_loading(self, layer) -> None:
         if _is_cpu:
             if self.strategy == QuantizationStrategy.TENSOR:
-                max_w_scale, weight = requantize_with_max_scale(
+                weight, max_w_scale = _requantize_int8_with_max_scale(
                     weight=layer.weight,
                     weight_scale=layer.weight_scale,
                     logical_widths=layer.logical_widths,
@@ -228,6 +251,10 @@ class NPUCompressedTensorsW8A8Int8(CompressedTensorsW8A8Int8):
             raise NotImplementedError(
                 "Static compressed-tensors scheme is not yet supported on NPU."
             )
+        from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+            NPUW8A8Int8DynamicLinearMethod,
+        )
+
         self.kernel = NPUW8A8Int8DynamicLinearMethod()
 
     @classmethod
