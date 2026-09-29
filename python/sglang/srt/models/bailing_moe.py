@@ -31,6 +31,10 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.aux_hidden_states import (
+    AuxHiddenStateAccumulator,
+    AuxHiddenStateList,
+)
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerFacts,
@@ -722,7 +726,8 @@ class BailingMoEBlock(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
-        captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
+        captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
+        capture_output=None,
     ) -> torch.Tensor:
         hidden_states, residual = (
             self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
@@ -730,6 +735,7 @@ class BailingMoEBlock(nn.Module):
                 residual,
                 forward_batch,
                 captured_last_layer_outputs=captured_last_layer_outputs,
+                capture_output=capture_output,
             )
         )
 
@@ -822,16 +828,9 @@ class BailingMoEModel(nn.Module):
                 self.start_layer
             ].layer_communicator.from_pp(pp_proxy_tensors, forward_batch)
 
-        aux_hidden_states = []
+        aux_hidden_states = AuxHiddenStateList()
         for i in range(self.start_layer, self.end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
-                if i in self.layers_to_capture:
-                    hidden_states, snapshot = self.layers[
-                        i
-                    ].layer_communicator.capture_output(
-                        hidden_states, residual, at_input=True
-                    )
-                    aux_hidden_states.append(snapshot)
                 layer = self.layers[i]
                 hidden_states, residual = layer(
                     positions,
@@ -843,6 +842,9 @@ class BailingMoEModel(nn.Module):
                         if getattr(layer, "_is_layer_to_capture", False)
                         else None
                     ),
+                    capture_output=aux_hidden_states.capture
+                    if i in self.layers_to_capture
+                    else None,
                 )
         last_layer = self.layers[self.end_layer - 1]
         hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(

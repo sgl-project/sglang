@@ -28,6 +28,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerFacts,
@@ -1178,10 +1179,16 @@ class BailingMoELinearDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
+        capture_output=None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
+        hidden_states, residual = (
+            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                hidden_states,
+                residual,
+                forward_batch,
+                capture_output=capture_output,
+            )
         )
 
         if not forward_batch.forward_mode.is_idle():
@@ -1370,7 +1377,11 @@ class BailingMoELinearModel(nn.Module):
             and capture_mode.need_capture()
         )
         if capture_aux:
-            dspark_aux_hidden_states: List[torch.Tensor] = []
+            dspark_aux_hidden_states = AuxHiddenStateList()
+
+            def capture_output(value, *, owned=False):
+                if value.shape[0] != 0:
+                    dspark_aux_hidden_states.capture(value, owned=owned)
 
         for i in range(self.start_layer, self.end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
@@ -1381,13 +1392,12 @@ class BailingMoELinearModel(nn.Module):
                     forward_batch=forward_batch,
                     residual=residual,
                     zero_allocator=zero_allocator,
+                    capture_output=capture_output
+                    if capture_aux
+                    and i > self.start_layer
+                    and i - 1 in self.layers_to_capture
+                    else None,
                 )
-                if capture_aux and i in self.layers_to_capture:
-                    hidden_states, snapshot = layer.layer_communicator.capture_output(
-                        hidden_states, residual, skip_empty=True
-                    )
-                    if snapshot is not None:
-                        dspark_aux_hidden_states.append(snapshot)
 
         last_layer = self.layers[self.end_layer - 1]
         hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
@@ -1399,10 +1409,16 @@ class BailingMoELinearModel(nn.Module):
             )
         else:
             if not forward_batch.forward_mode.is_idle():
-                if residual is None:
-                    hidden_states = self.norm(hidden_states)
-                else:
-                    hidden_states, _ = self.norm(hidden_states, residual)
+                hidden_states = last_layer.layer_communicator.norm_output(
+                    hidden_states,
+                    residual,
+                    self.norm,
+                    capture_output=(
+                        capture_output
+                        if capture_aux and self.end_layer - 1 in self.layers_to_capture
+                        else None
+                    ),
+                )
             if capture_aux and len(dspark_aux_hidden_states) > 0:
                 return hidden_states, dspark_aux_hidden_states
             return hidden_states

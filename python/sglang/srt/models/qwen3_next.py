@@ -15,6 +15,10 @@ from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
+from sglang.srt.layers.aux_hidden_states import (
+    AuxHiddenStateAccumulator,
+    AuxHiddenStateList,
+)
 from sglang.srt.layers.communicator import LayerCommunicator, LayerFacts
 from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.layers.dp_attention import (
@@ -550,7 +554,7 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
-        captured_last_layer_outputs: Optional[list[torch.Tensor]] = None,
+        captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
         **kwargs,
     ):
         forward_batch = kwargs.get("forward_batch", None)
@@ -826,7 +830,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
-        captured_last_layer_outputs: Optional[list[torch.Tensor]] = None,
+        captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
         **kwargs: Any,
     ):
         hidden_states, residual = (
@@ -931,7 +935,7 @@ class Qwen3NextModel(nn.Module):
             hidden_states = self.embed_tokens(input_ids)
 
         residual = residual_batch.start(forward_batch)
-        aux_hidden_states = []
+        aux_hidden_states = AuxHiddenStateList()
         for i in range(len(self.layers)):
             layer = self.layers[i]
             with get_global_expert_distribution_recorder().with_current_layer(i):

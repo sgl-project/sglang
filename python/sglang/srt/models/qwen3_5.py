@@ -23,7 +23,6 @@ import torch
 import torch.nn as nn
 import triton
 
-# Layers - Attention
 from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_qkvzba_split_reshape_cat_contiguous,
@@ -41,6 +40,12 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
+
+# Layers - Attention
+from sglang.srt.layers.aux_hidden_states import (
+    AuxHiddenStateAccumulator,
+    AuxHiddenStateList,
+)
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerFacts,
@@ -1540,7 +1545,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
-        captured_last_layer_outputs: Optional[list[torch.Tensor]] = None,
+        captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
         **kwargs,
     ):
         hidden_states, residual = (
@@ -1825,7 +1830,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 self.start_layer
             ].layer_communicator.from_pp(pp_proxy_tensors, forward_batch)
 
-        aux_hidden_states = []
+        aux_hidden_states = AuxHiddenStateList()
         # Pass through decoder layers
         for layer_idx in range(self.start_layer, self.end_layer):
             layer = self.layers[layer_idx]

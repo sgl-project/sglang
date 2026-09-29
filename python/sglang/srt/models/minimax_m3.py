@@ -35,6 +35,10 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.aux_hidden_states import (
+    AuxHiddenStateAccumulator,
+    AuxHiddenStateList,
+)
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerFacts,
@@ -1369,7 +1373,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
-        captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
+        captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
         **kwargs,
     ) -> torch.Tensor:
         hidden_states, residual = (
@@ -1484,7 +1488,7 @@ class MiniMaxM3Model(nn.Module):
                 self.start_layer
             ].layer_communicator.from_pp(pp_proxy_tensors, forward_batch)
 
-        aux_hidden_states = []
+        aux_hidden_states = AuxHiddenStateList()
         if forward_batch.can_run_tbo:
             hidden_states, residual = model_forward_maybe_tbo(
                 layers=self.layers,

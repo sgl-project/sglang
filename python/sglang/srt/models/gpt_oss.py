@@ -29,6 +29,7 @@ from transformers import PretrainedConfig
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerFacts,
@@ -618,9 +619,15 @@ class GptOssDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        capture_output=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
+        hidden_states, residual = (
+            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                hidden_states,
+                residual,
+                forward_batch,
+                capture_output=capture_output,
+            )
         )
 
         if hidden_states.shape[0] != 0:
@@ -710,24 +717,19 @@ class GptOssModel(nn.Module):
 
         # Capture hidden-state boundaries: boundary 0 is the embedding output,
         # and boundary i + 1 is the output after transformer block i.
-        aux_hidden_states = []
-        if self.start_layer in self.layers_to_capture:
-            aux_hidden_states.append(
-                self.layers[self.start_layer].layer_communicator.snapshot(
-                    hidden_states, residual, at_input=True
-                )
-            )
+        aux_hidden_states = AuxHiddenStateList()
         for i in range(self.start_layer, self.end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]
                 hidden_states, residual = layer(
-                    positions, hidden_states, forward_batch, residual
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    residual,
+                    capture_output=aux_hidden_states.capture
+                    if i in self.layers_to_capture
+                    else None,
                 )
-                if i + 1 in self.layers_to_capture:
-                    hidden_states, snapshot = layer.layer_communicator.capture_output(
-                        hidden_states, residual
-                    )
-                    aux_hidden_states.append(snapshot)
         last_layer = self.layers[self.end_layer - 1]
         hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
             hidden_states, residual, forward_batch
@@ -741,10 +743,20 @@ class GptOssModel(nn.Module):
             )
         else:
             if hidden_states.shape[0] != 0:
-                if residual is None:
-                    hidden_states = self.norm(hidden_states)
-                else:
-                    hidden_states, _ = self.norm(hidden_states, residual)
+                hidden_states = last_layer.layer_communicator.norm_output(
+                    hidden_states,
+                    residual,
+                    self.norm,
+                    capture_output=(
+                        aux_hidden_states.append
+                        if self.end_layer in self.layers_to_capture
+                        else None
+                    ),
+                )
+            elif self.end_layer in self.layers_to_capture:
+                aux_hidden_states.append(
+                    last_layer.layer_communicator.snapshot(hidden_states, residual)
+                )
         if len(aux_hidden_states) == 0:
             return hidden_states
 

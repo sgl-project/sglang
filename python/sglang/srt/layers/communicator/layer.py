@@ -59,9 +59,11 @@ from sglang.srt.layers.communicator.layout import (
     token_axis_sizes,
 )
 from sglang.srt.layers.communicator.ops import (
+    CommunicateSimpleFn,
     _all_reduce_then_to_local_tokens,
     _hand_qkv_hook_its_input,
     _hand_scattered_input_to_attention,
+    _mlp_input_without_dp,
     _redistribute_output,
     _reduce_and_redistribute_output_step,
     _to_local_tokens,
@@ -79,6 +81,7 @@ from sglang.srt.layers.communicator.residual.access import (
     finish_layer_stack,
     fold,
     from_pp,
+    norm_output,
     snapshot,
     written,
 )
@@ -94,6 +97,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     is_enable_moe_cp_allgather,
 )
+from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.moe import (
     can_merge_post_experts_all_reduce,
     get_moe_a2a_backend,
@@ -244,6 +248,7 @@ class LayerCommunicator:
     add_to_output = staticmethod(add_to_output)
     buffer = staticmethod(buffer)
     fold = staticmethod(fold)
+    norm_output = staticmethod(norm_output)
     written = staticmethod(written)
     finish_layer_stack = staticmethod(finish_layer_stack)
 
@@ -361,6 +366,46 @@ class LayerCommunicator:
             else None
         )
 
+        # Bind aux ownership to the selected input implementation once.
+        for name in ("_steps", "_cp_steps", "_input_scattered_steps", "_sp_steps"):
+            steps = self.__dict__[name]
+            if steps is None or steps.ffn is None:
+                continue
+            prepare = steps.ffn.prepare
+            if isinstance(prepare, partial):
+                prepare = prepare.keywords.get("step", prepare)
+            norm = self.post_attention_layernorm
+            known_norm = isinstance(norm, (RMSNorm, GemmaRMSNorm)) and type(
+                norm
+            ).forward_with_allreduce_fusion in (
+                RMSNorm.forward_with_allreduce_fusion,
+                GemmaRMSNorm.forward_with_allreduce_fusion,
+            )
+            if (
+                known_norm
+                and isinstance(prepare, partial)
+                and prepare.func is _mlp_input_without_dp
+                and not prepare.keywords["gathers_residual"]
+                and steps.ffn.fused
+                and steps.ffn.fused[0].run
+                == self._mlp_input_reduce_output_and_update_and_read_residual
+            ):
+                self.__dict__[name] = msgspec.structs.replace(
+                    steps,
+                    attention=msgspec.structs.replace(
+                        steps.attention,
+                        capture_preserves_residual=self._capture_keeps_residual,
+                    ),
+                )
+
+    def _capture_keeps_residual(self, value, forward_batch):
+        # The CUDA wrapper allocates a fresh residual even on backend fallback.
+        return (
+            not _use_aiter
+            and get_parallel().attn_tp_size > 1
+            and apply_flashinfer_allreduce_fusion(value.shape[0])
+        )
+
     def _init_stage(self, stage: "LayerStage") -> None:
         """A layer that is one stage: every batch runs the two boundaries its
         declarations give."""
@@ -387,6 +432,7 @@ class LayerCommunicator:
             input_move=into.input_move,
             handoff=None if is_ffn else _hand_qkv_hook_its_input,
             fused=into.fused,
+            capture_move=into.capture_move,
         )
         self._steps = BoundarySteps(
             attention=None if is_ffn else entry,
@@ -643,7 +689,38 @@ class LayerCommunicator:
         captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
         quant_format: str = "",
+        capture_output: Optional[Callable] = None,
     ):
+        # Aux consumers need a materialized output before the input norm.
+        # Complete communication here, preserving the existing add+norm kernel
+        # and its FP32 accumulation. Its residual result also supplies capture.
+        capture_before_read = capture_output is not None and (
+            residual is None
+            or (
+                isinstance(residual, ResidualStream)
+                and residual.residual is None
+                and residual.pending is None
+            )
+            or post_residual_addition is not None
+        )
+        if capture_output is not None:
+            hidden_states = (
+                residual.complete(hidden_states)
+                if isinstance(residual, ResidualStream)
+                else reduce_output(hidden_states)
+            )
+            if capture_before_read:
+                # Embeddings precede enter; HF deepstack capture precedes the
+                # extra addition. Neither is the residual returned by the read.
+                value, previous = (
+                    residual.finish(hidden_states)
+                    if isinstance(residual, ResidualStream)
+                    else (hidden_states, residual)
+                )
+                if previous is None:
+                    capture_output(value)
+                else:
+                    capture_output(value + previous, owned=True)
         hidden_states, residual = self.prepare_attn(
             hidden_states,
             residual,
@@ -651,6 +728,17 @@ class LayerCommunicator:
             quant_format=quant_format,
             post_residual_addition=post_residual_addition,
         )
+        if capture_output is not None and not capture_before_read:
+            value = residual.residual
+            move = self.attn.entry(forward_batch).capture_move
+            if move is not None:
+                value = move(value, forward_batch=forward_batch)
+            keeps = self.attn.entry(forward_batch).capture_preserves_residual
+            capture_output(
+                value,
+                owned=self.attn.entry(forward_batch).capture_move_allocates
+                or (move is None and keeps is not None and keeps(value, forward_batch)),
+            )
         if captured_last_layer_outputs is not None:
             residual_value = residual.residual
             move = self.attn.entry(forward_batch).input_move
@@ -663,35 +751,17 @@ class LayerCommunicator:
                     context=self._context,
                 )
             )
-            if (
-                gathered_last_layer_output is residual_value
-                # An accumulator that copies on append already holds a snapshot.
-                and not getattr(captured_last_layer_outputs, "copies_on_append", False)
-                and not self._post_attn_residual_is_read_only(
-                    residual_value, forward_batch
-                )
-            ):
-                gathered_last_layer_output = residual_value.clone()
-            captured_last_layer_outputs.append(gathered_last_layer_output)
+            keeps = self.attn.entry(forward_batch).capture_preserves_residual
+            captured_last_layer_outputs.capture(
+                gathered_last_layer_output,
+                owned=move is CommunicateSimpleFn._scattered_to_tp_attn_full
+                or (
+                    move is None
+                    and keeps is not None
+                    and keeps(residual_value, forward_batch)
+                ),
+            )
         return hidden_states, residual
-
-    def _post_attn_residual_is_read_only(
-        self, residual: torch.Tensor, forward_batch: ForwardBatch
-    ) -> bool:
-        """True if ``prepare_mlp``'s post-attention RMSNorm leaves ``residual``
-        untouched, so Eagle3 aux capture can keep its reference and skip the clone.
-
-        Of the base fused entry's kernels only flashinfer's writes a fresh
-        ``residual_out`` (see ``flashinfer_allreduce_residual_rmsnorm``); the aiter
-        kernel and every plain norm fold into ``residual`` in place. It runs when
-        ``prepare_mlp`` selected a fused entry that may return a new residual and
-        the batch is not input-scattered.
-        """
-        return (
-            any(f.may_return_new_residual for f in self.ffn.entry(forward_batch).fused)
-            and not get_attn_tp_context().input_scattered
-            and apply_flashinfer_allreduce_fusion(residual.shape[0])
-        )
 
     def publish_attn_lora_layout(self) -> None:
         """Attention consumes the DP-local token batch."""
@@ -829,7 +899,6 @@ class LayerCommunicator:
             FusedMlpInput(
                 completes=SumGroup.ATTN_TP,
                 run=self._mlp_input_reduce_output_and_update_and_read_residual,
-                may_return_new_residual=True,
             ),
         )
 

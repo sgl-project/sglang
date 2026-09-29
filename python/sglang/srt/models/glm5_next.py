@@ -25,6 +25,7 @@ from sglang.srt.eplb.expert_distribution import (
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerFacts,
@@ -918,13 +919,17 @@ class Glm5NextDecoderLayer(nn.Module):
         zero_allocator: Optional[BumpAllocator] = None,
         gemm_output_zero_allocator: BumpAllocator = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
+        capture_output=None,
     ):
         hidden_states_orig = self.layer_communicator.buffer(hidden_states)
 
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states,
-            residual,
-            forward_batch,
+        hidden_states, residual = (
+            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                hidden_states,
+                residual,
+                forward_batch,
+                capture_output=capture_output,
+            )
         )
 
         hidden_states = self.self_attn(
@@ -1139,7 +1144,7 @@ class Glm5NextModel(nn.Module):
                 normal_end_layer = self.first_k_dense_replace
             elif self.first_k_dense_replace < normal_start_layer:
                 normal_end_layer = normal_start_layer = 0
-        aux_hidden_states = []
+        aux_hidden_states = AuxHiddenStateList()
         topk_indices = None
         for i in range(normal_start_layer, normal_end_layer):
             # NOTE: torch dynamo does not support graph break in context manager
@@ -1149,22 +1154,16 @@ class Glm5NextModel(nn.Module):
                 else get_global_expert_distribution_recorder().with_current_layer(i)
             )
             with ctx:
-                if i in self.layers_to_capture:
-                    if self.dflash_capture and self.config.mhc:
-                        # hc_post has completed the streams; contracting them
-                        # creates the retained value without copying the wide input.
-                        aux_hidden_state = self._prepare_aux_hidden_state(hidden_states)
-                    else:
-                        hidden_states, aux_hidden_state = self.layers[
-                            i
-                        ].layer_communicator.capture_output(
-                            hidden_states, residual, at_input=True
-                        )
+
+                def capture_output(aux_hidden_state, *, owned=False):
+                    aux_hidden_state = self._prepare_aux_hidden_state(aux_hidden_state)
+                    owned = owned or (self.dflash_capture and self.config.mhc)
                     if self.enable_a2a_moe and i > self.first_k_dense_replace:
-                        aux_hidden_state = get_parallel().attn_tp_group.all_gather(
-                            aux_hidden_state, dim=0
-                        )
-                    aux_hidden_states.append(aux_hidden_state)
+                        group = get_parallel().attn_tp_group
+                        aux_hidden_state = group.all_gather(aux_hidden_state, dim=0)
+                        owned = owned or group.world_size > 1
+                    aux_hidden_states.capture(aux_hidden_state, owned=owned)
+
                 layer = self.layers[i]
                 hidden_states, residual, topk_indices = layer(
                     positions,
@@ -1174,6 +1173,9 @@ class Glm5NextModel(nn.Module):
                     zero_allocator,
                     gemm_output_zero_allocator,
                     prev_topk_indices=topk_indices,
+                    capture_output=capture_output
+                    if i in self.layers_to_capture
+                    else None,
                 )
 
         if normal_end_layer != self.end_layer:

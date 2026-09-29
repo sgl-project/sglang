@@ -118,6 +118,9 @@ class DeferringLayer(nn.Module):
             # later norms mutate the residual; captured snapshots must stay intact
             residual.add_(hidden_states)
         stream.write(residual)
+        capture = kwargs.get("capture_output")
+        if capture is not None:
+            capture(residual.clone())
         with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
             partial = torch.full_like(hidden_states, 0.5)
         hidden_states, residual = ffn_exit.finish(partial, stream)
@@ -130,7 +133,7 @@ class SumNorm(nn.Module):
     def forward(self, hidden_states, residual=None, **kwargs):
         if residual is None:
             return hidden_states
-        return hidden_states + residual, residual
+        return hidden_states + residual, hidden_states + residual
 
 
 def build_model(model_cls, *, defer, capture):
@@ -211,6 +214,29 @@ class TestAuxCaptureDeferredAllreduce(CustomTestCase):
                             reduce.call_count, NUM_LAYERS - 1 if defer else 0
                         )
 
+    def test_terminal_capture_uses_the_final_norm_boundary(self):
+        inputs = torch.ones(2, 4)
+        batch = SimpleNamespace(
+            can_run_tbo=False,
+            forward_mode=ForwardMode.DECODE,
+            capture_hidden_mode=SimpleNamespace(need_capture=lambda: True),
+        )
+        for cls in (GptOssModel, LagunaModel, BailingMoELinearModel):
+            with self.subTest(model=cls.__name__):
+                model = build_model(cls, defer=True, capture=True)
+                model.layers_to_capture = [
+                    NUM_LAYERS - 1 if cls is BailingMoELinearModel else NUM_LAYERS
+                ]
+                result, snapshots = model(
+                    input_ids=None,
+                    positions=None,
+                    forward_batch=batch,
+                    input_embeds=inputs.clone(),
+                )
+                self.assertEqual(len(snapshots), 1)
+                torch.testing.assert_close(snapshots[0], inputs + NUM_LAYERS)
+                torch.testing.assert_close(result, inputs + NUM_LAYERS)
+
 
 class TestPipelineResidualReception(CustomTestCase):
     def test_models_keep_the_received_residual_contribution(self):
@@ -237,6 +263,29 @@ class TestPipelineResidualReception(CustomTestCase):
                     ),
                 )
                 torch.testing.assert_close(result, initial_residual + NUM_LAYERS)
+
+    def test_bailing_capture_does_not_include_a_previous_pipeline_ranks_layer(self):
+        model = build_model(BailingMoELinearModel, defer=True, capture=True)
+        model.pp_group.is_first_rank = False
+        model.start_layer = 2
+        model.layers_to_capture = [model.start_layer - 1]
+        inputs = torch.zeros(2, 4)
+        residual = torch.full_like(inputs, 0.25)
+        batch = SimpleNamespace(
+            can_run_tbo=False,
+            forward_mode=ForwardMode.DECODE,
+            capture_hidden_mode=SimpleNamespace(need_capture=lambda: True),
+        )
+        result = model(
+            None,
+            None,
+            batch,
+            pp_proxy_tensors=PPProxyTensors(
+                {"hidden_states": inputs, "residual": residual}
+            ),
+        )
+        self.assertIsInstance(result, torch.Tensor)
+        torch.testing.assert_close(result, torch.full_like(inputs, 2.25))
 
     def test_written_streams_do_not_read_a_separate_residual(self):
         comm_instance = comm.LayerCommunicator.__new__(comm.LayerCommunicator)

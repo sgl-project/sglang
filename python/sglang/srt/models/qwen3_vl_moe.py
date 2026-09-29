@@ -24,6 +24,7 @@ import torch.nn as nn
 
 from sglang.srt.configs.qwen3_vl import Qwen3VLMoeConfig, Qwen3VLMoeTextConfig
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -102,16 +103,11 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
                 self.start_layer
             ].layer_communicator.from_pp(pp_proxy_tensors, forward_batch)
 
-        aux_hidden_states = []
+        aux_hidden_states = AuxHiddenStateList()
         for layer_idx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer]
         ):
             layer_idx += self.start_layer
-            if layer_idx in self.layers_to_capture:
-                hidden_states, snapshot = layer.layer_communicator.capture_output(
-                    hidden_states, residual, at_input=True
-                )
-                aux_hidden_states.append(snapshot)
 
             if self.use_hf_deepstack_order:
                 # HF-order path (RL on-policy / FSDP). SGLang applies residual at the START of the
@@ -126,6 +122,9 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
                     forward_batch,
                     residual,
                     post_residual_addition=deepstack_embeds,
+                    capture_output=aux_hidden_states.capture
+                    if layer_idx in self.layers_to_capture
+                    else None,
                 )
             else:
                 # Inference path: add deepstack directly to hidden_states at the end of the layer
@@ -135,6 +134,9 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
                     hidden_states,
                     forward_batch,
                     residual,
+                    capture_output=aux_hidden_states.capture
+                    if layer_idx in self.layers_to_capture
+                    else None,
                 )
                 if (
                     input_deepstack_embeds is not None
