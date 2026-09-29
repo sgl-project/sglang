@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.models.kimi_k3 import _merge_dtype_ok
+from sglang.srt.models.kimi_k3 import _is_unquantized_mergeable
 from sglang.srt.models.kimi_k3_rocm_quant import _k3_channel_fp8_to_bf16
 from sglang.test.test_utils import CustomTestCase
 
@@ -71,27 +71,27 @@ class TestMergeDtypeGuard(CustomTestCase):
         for dtype in (torch.float8_e4m3fn, torch.uint8, torch.int8):
             with self.subTest(dtype=dtype):
                 weights = [torch.zeros(4, 4).to(dtype) for _ in range(2)]
-                self.assertFalse(_merge_dtype_ok(weights))
+                self.assertFalse(_is_unquantized_mergeable(weights))
 
     def test_accepts_plain_float_weights(self):
         for dtype in (torch.bfloat16, torch.float16):
             with self.subTest(dtype=dtype):
                 weights = [torch.zeros(4, 4, dtype=dtype) for _ in range(2)]
-                self.assertTrue(_merge_dtype_ok(weights))
+                self.assertTrue(_is_unquantized_mergeable(weights))
 
     def test_rejects_mixed_dtypes(self):
         weights = [
             torch.zeros(4, 4, dtype=torch.bfloat16),
             torch.zeros(4, 4, dtype=torch.float16),
         ]
-        self.assertFalse(_merge_dtype_ok(weights))
+        self.assertFalse(_is_unquantized_mergeable(weights))
 
     def test_rejects_float32(self):
         """The merged buffer is only built for the two half dtypes the fused
         KDA/MoE kernels read; fp32 must not slip in through a dtype-agreement
         check that only asks whether the operands match each other."""
         weights = [torch.zeros(4, 4, dtype=torch.float32) for _ in range(2)]
-        self.assertFalse(_merge_dtype_ok(weights))
+        self.assertFalse(_is_unquantized_mergeable(weights))
 
 
 if __name__ == "__main__":

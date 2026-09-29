@@ -221,7 +221,7 @@ def _k3_bf16_gemm(
 # chain + o_norm here.
 
 
-def _merge_dtype_ok(weights: list[torch.Tensor]) -> bool:
+def _is_unquantized_mergeable(weights: list[torch.Tensor]) -> bool:
     """Return whether these weights may be concatenated into one fused buffer.
 
     _merge_weights_as_views cats .weight alone, so anything carrying a separate
@@ -1854,9 +1854,10 @@ class KimiK3DeltaAttention(nn.Module):
         else:
             if any(getattr(mod, "weight", None) is None for mod in mods):
                 return
-            # Leave a quantized checkpoint on the unfused b_proj/f_a_proj GEMVs;
-            # the merged buffer would drop their scales.
-            if not _merge_dtype_ok([mod.weight for mod in mods]):
+            # ROCm Quark checkpoints: leave per-channel FP8 / MXFP4 weights on
+            # the unfused b_proj/f_a_proj GEMVs; the merged buffer would drop
+            # their scales.
+            if _is_hip and not _is_unquantized_mergeable([mod.weight for mod in mods]):
                 return
             self._bfa_w, sizes = _merge_weights_as_views(mods, pad_rows_to=8)
             self._bfa_f_b_w = self.f_b_proj.weight
@@ -1916,7 +1917,7 @@ class KimiK3DeltaAttention(nn.Module):
         # Whitelist the dtype rather than only require the three to agree: the
         # merged buffer carries only .weight, so quantized weights that happen to
         # match each other still lose their per-channel scales.
-        if not _merge_dtype_ok(ws):
+        if not _is_unquantized_mergeable(ws):
             return False
         return len({(w.dtype, w.shape[1]) for w in ws}) == 1
 
