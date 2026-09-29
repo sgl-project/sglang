@@ -1234,16 +1234,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         A replicated (``sharded=False``) forward keeps the full DP-group count.
         """
-        from sglang.srt.utils.common import require_mlp_tp_gather
-
         if self.global_num_tokens_cpu is not None:
-            # DP / MLP-sync path: per-DP padded width.
-            if require_mlp_tp_gather():
-                num_tokens_per_dp = self.global_num_tokens_cpu[
-                    dp_slot_in(self.global_num_tokens_cpu)
-                ]
-            else:
-                num_tokens_per_dp = self.global_num_tokens_cpu[0]
+            # DP / MLP-sync path: per-DP padded width. The list's own length
+            # picks the slot, not require_mlp_tp_gather(): the scheduler
+            # stores a length-1 list when no MLP TP-gather runs, and the
+            # draft forward re-evaluates that flag under the patched
+            # draft-TP context (tp_size == attn_tp_size), flipping the
+            # branch and indexing the length-1 list by attn_dp_rank.
+            num_tokens_per_dp = self.global_num_tokens_cpu[
+                dp_slot_in(self.global_num_tokens_cpu)
+            ]
         else:
             # Pure TP+SP: local input width.
             num_tokens_per_dp = self._forward_num_tokens()
