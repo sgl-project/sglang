@@ -70,6 +70,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 futures = "0.3"
 bytes = "1"
+# Gzips the /internal/kv_snapshot body once per build.
+flate2 = "1"
 rand = "0.8"
 tokio-stream = { version = "0.1", features = ["net"] }
 dashmap = "6"

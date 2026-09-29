@@ -287,13 +287,13 @@ def _fused_scale_shift_4d_kernel(
     normalized_ptr,
     scale_ptr,
     shift_ptr,
-    scale_constant: tl.constexpr,  # scale_constant is either 0 or 1.
+    scale_constant: tl.constexpr,  # None omits the constant addition.
     inner_dim,
     seq_len,
     num_frames,
     frame_seqlen,
-    FP32_MODULATE: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    FP32_MODULATE: tl.constexpr = _FP32_MODULATE,
 ):
     pid_row = tl.program_id(0)
     pid_col = tl.program_id(1)
@@ -320,7 +320,11 @@ def _fused_scale_shift_4d_kernel(
     scale = tl.load(scale_ptrs, mask=mask, other=0.0)
     shift = tl.load(shift_ptrs, mask=mask, other=0.0)
 
-    if FP32_MODULATE:
+    if scale_constant is None:
+        # CuTe's residual path has no extra +0 on the gate. In particular,
+        # adding +0 would change a negative-zero gate before multiplication.
+        output = normalized * scale + shift
+    elif FP32_MODULATE:
         output = normalized.to(tl.float32) * (
             scale_constant + scale.to(tl.float32)
         ) + shift.to(tl.float32)
@@ -353,9 +357,9 @@ def fuse_scale_shift_kernel_blc_opt(
     stride_sc_c,
     SCALE_IS_SCALAR: tl.constexpr,
     SHIFT_IS_SCALAR: tl.constexpr,
-    FP32_MODULATE: tl.constexpr,
     BLOCK_L: tl.constexpr,
     BLOCK_C: tl.constexpr,
+    FP32_MODULATE: tl.constexpr = _FP32_MODULATE,
 ):
     pid_l = tl.program_id(0)
     pid_c = tl.program_id(1)
@@ -406,6 +410,51 @@ def fuse_scale_shift_kernel_blc_opt(
         y = x * (scale_constant + scale) + shift
 
     tl.store(y_ptr + x_off, y, mask=mask)
+
+
+def try_fused_scaled_residual_bf16(
+    residual: torch.Tensor, x: torch.Tensor, gate: torch.Tensor
+) -> torch.Tensor | None:
+    """Return CuTe's BF16 residual output without computing its unused norm."""
+    if (
+        not is_cuda()
+        or torch.is_grad_enabled()
+        or torch.compiler.is_compiling()
+        or not x.is_cuda
+        or x.dtype != torch.bfloat16
+        or residual.dtype != x.dtype
+        or gate.dtype != torch.float32
+        or residual.device != x.device
+        or gate.device != x.device
+        or x.ndim != 3
+        or residual.shape != x.shape
+        or gate.ndim != 4
+        or gate.shape[0] != x.shape[0]
+        or gate.shape[2:] != (1, x.shape[-1])
+        or gate.shape[1] == 0
+        or x.shape[1] % gate.shape[1] != 0
+        or not x.is_contiguous()
+        or x.numel() == 0
+    ):
+        return None
+    batch, tokens, channels = x.shape
+    frames = gate.shape[1]
+    output = torch.empty_like(x)
+    block_n = max(64, min(512, triton.next_power_of_2(channels)))
+    _fused_scale_shift_4d_kernel[(batch * tokens, triton.cdiv(channels, block_n))](
+        output,
+        x,
+        gate.reshape(batch * frames, channels).contiguous(),
+        residual.contiguous(),
+        None,
+        channels,
+        tokens,
+        frames,
+        tokens // frames,
+        BLOCK_N=block_n,
+        num_warps=2 if block_n == 64 else 4,
+    )
+    return output
 
 
 def fuse_scale_shift_kernel(
@@ -471,7 +520,6 @@ def fuse_scale_shift_kernel(
             L,
             num_frames,
             frame_seqlen,
-            FP32_MODULATE=_FP32_MODULATE,
             BLOCK_N=block_n,
             num_warps=num_warps,
         )
@@ -543,7 +591,6 @@ def fuse_scale_shift_kernel(
             s_sc,
             SCALE_IS_SCALAR=need_scale_scalar,
             SHIFT_IS_SCALAR=need_shift_scalar,
-            FP32_MODULATE=_FP32_MODULATE,
             BLOCK_L=block_l,
             BLOCK_C=block_c,
             num_warps=4,
