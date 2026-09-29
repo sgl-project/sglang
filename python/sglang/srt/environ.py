@@ -1460,13 +1460,10 @@ class Envs:
     # Mint capture's measured footprint as one span so the graph pool is carved
     # out of a single contiguous region instead of grown segment by segment.
     SGLANG_ENABLE_GRAPH_POOL_PRECARVE = EnvBool(False)
-    # Reuse pre-created no-timing CUDA events for Stream.wait_stream instead of
-    # creating one per call. Calls made while the current stream is capturing
-    # keep PyTorch's original path. CUDA only; no-op on ROCm/other backends.
+    # Reuse prewarmed no-timing CUDA events for the hot-path cross-stream waits
+    # (sglang.srt.utils.cuda_event_pool.wait_stream) instead of creating one per
+    # call. CUDA only; no-op on ROCm/other backends.
     SGLANG_ENABLE_CUDA_EVENT_POOL = EnvBool(False)
-    # Events per device. Each event is leased only while one wait_stream call
-    # enqueues its record and wait, so this bounds concurrent callers.
-    SGLANG_CUDA_EVENT_POOL_SIZE = EnvInt(1024)
     # Eager forward wraps the ForwardBatch's own tensors instead of copying them
     # into the CUDA graph buffer registry (no per-iter device-to-device copy).
     SGLANG_EAGER_INPUT_NO_COPY = EnvBool(False)

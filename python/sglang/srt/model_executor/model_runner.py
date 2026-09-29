@@ -228,6 +228,7 @@ from sglang.srt.utils import (
     set_cuda_arch,
     slow_rank_detector,
 )
+from sglang.srt.utils.cuda_event_pool import prewarm_cuda_event_pool
 from sglang.srt.utils.device_timer import device_timer_ctx
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.nvtx_utils import profile_range
@@ -1162,29 +1163,12 @@ class ModelRunner:
         )
 
     def init_cuda_event_pool(self):
-        # Materialize the pool before CUDA graph capture and serving: devices
-        # without a prewarmed pool keep PyTorch's wait_stream path.
-        if not (
-            current_platform.is_cuda() and envs.SGLANG_ENABLE_CUDA_EVENT_POOL.get()
-        ):
-            return
-        from sglang.srt.utils.cuda_event_pool import (
-            install_cuda_event_pool,
-            prewarm_cuda_event_pool,
-        )
-
-        gpu_id = get_device().gpu_id
-        installed = install_cuda_event_pool(
-            pool_size=envs.SGLANG_CUDA_EVENT_POOL_SIZE.get()
-        )
-        pool_state = prewarm_cuda_event_pool(gpu_id)
-        if installed and pool_state is not None:
-            logger.info(
-                "Enabled the CUDA event pool for Stream.wait_stream on "
-                "device %d with %d events.",
-                gpu_id,
-                pool_state["size"],
-            )
+        # Prewarm before CUDA graph capture and serving; devices without a pool
+        # keep PyTorch's wait_stream path.
+        if current_platform.is_cuda() and envs.SGLANG_ENABLE_CUDA_EVENT_POOL.get():
+            gpu_id = get_device().gpu_id
+            prewarm_cuda_event_pool(gpu_id)
+            logger.info("Enabled the CUDA event pool on device %d.", gpu_id)
 
     def init_torch_distributed(self):
         self.pre_model_load_memory = bootstrap.measure_pre_model_load_memory(
