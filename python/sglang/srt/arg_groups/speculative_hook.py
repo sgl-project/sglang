@@ -221,11 +221,11 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 
     if envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get():
         if (
-            cfg.speculative_algorithm not in ("EAGLE", "EAGLE3")
+            cfg.speculative_algorithm not in ("EAGLE", "EAGLE3", "DSPARK")
             or cfg.enable_multi_layer_eagle
         ):
             raise ValueError(
-                "DP spec/prefill coordination requires single-layer EAGLE or EAGLE3"
+                "DP spec/prefill coordination requires single-layer EAGLE, EAGLE3 or DSPARK"
             )
 
     if cfg.speculative_adaptive:
@@ -598,7 +598,10 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 "(built-in TP MoE), 'megamoe', or 'mori', got "
                 f"{cfg.moe_a2a_backend!r}."
             )
-        if not _is_npu and cfg.moe_a2a_backend != "none":
+        if not _is_npu and (
+            cfg.moe_a2a_backend != "none"
+            or envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
+        ):
             from sglang.srt.speculative.ragged_verify import (
                 RaggedVerifyMode,
                 read_ragged_verify_mode,
@@ -606,8 +609,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
 
             if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
                 raise ValueError(
-                    "DSpark with dp attention + "
-                    f"moe_a2a_backend={cfg.moe_a2a_backend!r} requires "
+                    "DSpark DP MoE or prefill coordination requires "
                     "SGLANG_RAGGED_VERIFY_MODE=static."
                 )
         if cfg.attn_cp_size > 1:
