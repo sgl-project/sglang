@@ -518,6 +518,7 @@ class KimiK3MoE(nn.Module):
                 )
                 # mega pre-dispatch consumes raw topk_ids/topk_weights
                 or get_moe_a2a_backend().is_megamoe()
+                or get_moe_a2a_backend().is_flashinfer_megamoe()
                 else None
             ),
         )
@@ -548,6 +549,7 @@ class KimiK3MoE(nn.Module):
         _a2a_backend = get_moe_a2a_backend()
         self._ep_a2a = (
             _a2a_backend.is_megamoe()
+            or _a2a_backend.is_flashinfer_megamoe()
             or _a2a_backend.is_deepep()
             or _a2a_backend.is_mooncake()
             or _a2a_backend.is_ascend_fuseep()
@@ -2361,6 +2363,7 @@ def _shards_moe_rows() -> bool:
     backend = get_moe_a2a_backend()
     return (
         backend.is_megamoe()
+        or backend.is_flashinfer_megamoe()
         or backend.is_deepep()
         or backend.is_mooncake()
         or backend.is_ascend_fuseep()
