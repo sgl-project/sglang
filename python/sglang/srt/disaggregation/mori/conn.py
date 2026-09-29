@@ -560,11 +560,13 @@ class MoriKVManager(CommonKVManager):
 
         statuses = self._submit_transfer_chunk(kv_chunk)
 
-        if (
-            self._should_skip_transfer(room)
-            and not self.enable_deferred_decode_kv_release
-        ):
-            return True
+        if self._should_skip_transfer(room):
+            if not self.enable_deferred_decode_kv_release:
+                return True
+            # Aborted after submit: the writes must still quiesce before the ACK,
+            # but that wait belongs to the drainer, not this shard worker.
+            self._enqueue_transfer_drain(kv_chunk, statuses, None)
+            return False
 
         failure_reason, is_quiescent = self._wait_for_chunk_completion(
             kv_chunk, statuses
