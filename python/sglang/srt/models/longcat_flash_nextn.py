@@ -41,7 +41,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs import LongcatFlashConfig
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.communicator import LayerCommunicator, LayerFacts
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -159,7 +159,7 @@ class LongcatFlashDenseDecoderLayer(nn.Module):
 
         self.attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
-        self.layer_scatter_modes = LayerScatterModes.init_new(
+        self.layer_facts = LayerFacts.init_new(
             layer_id=self.layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=False,
@@ -167,7 +167,7 @@ class LongcatFlashDenseDecoderLayer(nn.Module):
             is_next_layer_sparse=False,
         )
         self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
+            layer_facts=self.layer_facts,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
         )

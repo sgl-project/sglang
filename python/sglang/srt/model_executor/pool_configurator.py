@@ -809,7 +809,13 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         return self._solve_pool_sizes(max_total_num_tokens, page_size)
 
 
-def compute_swa_request_cap(*, page_size: int, window: int, attn_dp_size: int) -> int:
+def compute_swa_request_cap(
+    *,
+    page_size: int,
+    window: int,
+    attn_dp_size: int,
+    max_running_requests: int | None = None,
+) -> int:
     """Worst-case SWA slots the scheduler holds live at max_running_requests."""
     draft_tokens = get_spec().speculative_num_draft_tokens or 1
     eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
@@ -833,7 +839,9 @@ def compute_swa_request_cap(*, page_size: int, window: int, attn_dp_size: int) -
         decode_alloc = 2 * get_alloc_len_per_decode()
     per_request = trailing_tokens + decode_alloc
 
-    num_reqs = get_schedule().max_running_requests // attn_dp_size
+    if max_running_requests is None:
+        max_running_requests = get_schedule().max_running_requests
+    num_reqs = max_running_requests // attn_dp_size
     if get_disagg().disaggregation_mode == "decode":
         return (
             per_request * num_reqs

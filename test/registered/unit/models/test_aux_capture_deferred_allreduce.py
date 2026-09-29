@@ -1,4 +1,5 @@
 import unittest
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -6,6 +7,7 @@ import torch
 from torch import nn
 
 from sglang.srt.layers import communicator as comm
+from sglang.srt.layers.communicator import ops as comm_ops
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models.bailing_moe import BailingMoEModel
 from sglang.srt.models.bailing_moe_v3 import BailingMoELinearModel
@@ -46,24 +48,55 @@ class DeferringLayer(nn.Module):
         super().__init__()
         self.return_topk = return_topk
         self.layer_communicator = comm.LayerCommunicator.__new__(comm.LayerCommunicator)
-        self.layer_communicator._ffn_output = comm.StageOutput(
-            comm.Layout(frozenset()),
-            group=comm.SumGroup.TP,
-            leaves_for_next_layer=True,
+        self.layer_communicator._steps = comm.BoundarySteps(
+            attention=comm.StageEntry(
+                prepare=partial(
+                    comm_ops._consumer_step,
+                    step=partial(
+                        comm_ops._read_input,
+                        layer_input=None,
+                        enters_stack=False,
+                        read=comm.NORM_QUANT_READ,
+                        update=comm.ADD,
+                    ),
+                    carried_fusions=(),
+                ),
+                input_rows=comm.Layout(frozenset()),
+                input_move=comm.CommunicateSimpleFn._trivial,
+                handoff=comm_ops._hand_qkv_hook_its_input,
+            ),
+            ffn=comm.StageEntry(
+                prepare=partial(
+                    comm_ops._read_input,
+                    layer_input=None,
+                    enters_stack=False,
+                    read=comm.NORM_READ,
+                    update=comm.ADD,
+                ),
+                input_rows=comm.Layout(frozenset()),
+            ),
+            ffn_output=comm.StageOutput(
+                comm.Layout(frozenset()),
+                group=comm.SumGroup.TP,
+                leaves_for_next_layer=True,
+            ),
+            ffn_output_move=comm.CommunicateSummableTensorPairFn._trivial,
+            ffn_sum_is_movable=True,
         )
         self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer = (
             lambda batch: defer
         )
         self.layer_communicator._ffn_sum_moves_to_next_layer = lambda batch, **_: defer
         self.layer_communicator.is_last_layer = False
-        self.layer_communicator._postprocess_scatters_to_local_tokens = False
-        self.layer_communicator.ffn_reduction_group = lambda: GROUP
+        self.layer_communicator._sp_steps = None
+        self.layer_communicator._input_scattered_steps = None
+        self.layer_communicator._cp_steps = None
+        self.layer_communicator.ffn_reduction_group = lambda forward_batch: GROUP
         self.layer_communicator._ffn_leaves_sum_to_reduce_scatter = (
             lambda batch, dp_step: False
         )
-        self.layer_communicator.postprocess_layer = lambda hidden, residual, batch: (
-            all_reduce(hidden),
-            residual,
+        self.layer_communicator._complete_ffn_output_now = (
+            lambda hidden, residual, **_: (all_reduce(hidden), residual)
         )
 
     def forward(

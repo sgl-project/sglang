@@ -3,13 +3,17 @@ and applies the input norm in the form the attention's quant format wants."""
 
 import contextlib
 import unittest
+from functools import partial
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
+import msgspec
 import torch
 
 from sglang.srt.layers import communicator as comm
+from sglang.srt.layers.communicator import ops as comm_ops
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -42,14 +46,49 @@ class Norm:
 def communicator(norm):
     c = comm.LayerCommunicator.__new__(comm.LayerCommunicator)
     c.input_layernorm = norm
-    c._sp_region = False
+    # A layer inside the stack: an absent residual was written back before.
+    c.layer_facts = SimpleNamespace(is_first_layer=False)
+    c._sp_steps = None
+    c._input_scattered_steps = None
+    c._cp_steps = None
     c.qkv_latent_func = None
     c._context = None
     c.enable_fused_ar_quant = False
     c.fused_ar_quant_keep_bf16 = False
-    c._communicate_simple_fn = lambda hidden_states, **_: hidden_states
     # Construction picks the fused entries; call it under the platform patches.
     c._attn_input_fusions = c._select_attn_input_fusions()
+    # A layer whose attention takes its input as it is and owes nothing on it.
+    c._steps = comm.BoundarySteps(
+        attention=comm.StageEntry(
+            prepare=partial(
+                comm_ops._consumer_step,
+                step=partial(
+                    comm_ops._read_input,
+                    layer_input=None,
+                    enters_stack=False,
+                    read=comm.NORM_QUANT_READ,
+                    update=comm.ADD,
+                ),
+                carried_fusions=c._attn_input_fusions,
+            ),
+            input_rows=comm.Layout(frozenset()),
+            input_move=lambda hidden_states, **_: hidden_states,
+            handoff=comm_ops._hand_qkv_hook_its_input,
+        ),
+        ffn=comm.StageEntry(
+            prepare=partial(
+                comm_ops._read_input,
+                layer_input=None,
+                enters_stack=False,
+                read=comm.NORM_READ,
+                update=comm.ADD,
+            ),
+            input_rows=comm.Layout(frozenset()),
+        ),
+        ffn_output=comm.StageOutput(comm.Layout(frozenset())),
+        ffn_output_move=comm.CommunicateSummableTensorPairFn._trivial,
+        ffn_sum_is_movable=False,
+    )
     return c
 
 
@@ -64,29 +103,27 @@ def platform(*, use_aiter=False, gfx95=False, fusion=False, kernel_group=True):
     group = SimpleNamespace(all_reduce=all_reduce)
     with contextlib.ExitStack() as stack:
         for name, mock in kernels.items():
-            stack.enter_context(patch.object(comm, name, mock, create=True))
-        stack.enter_context(patch.object(comm, "_use_aiter", use_aiter))
-        stack.enter_context(patch.object(comm, "_is_gfx95_supported", gfx95))
+            stack.enter_context(patch_communicator(name, mock, create=True))
+        stack.enter_context(patch_communicator("_use_aiter", use_aiter))
+        stack.enter_context(patch_communicator("_is_gfx95_supported", gfx95))
         stack.enter_context(
-            patch.object(comm, "_use_aiter_bpreshuffle_gfx95", False, create=True)
+            patch_communicator("_use_aiter_bpreshuffle_gfx95", False, create=True)
         )
         stack.enter_context(
-            patch.object(comm, "apply_aiter_all_reduce_fusion", return_value=False)
+            patch_communicator("apply_aiter_all_reduce_fusion", return_value=False)
         )
         stack.enter_context(
-            patch.object(comm, "apply_flashinfer_allreduce_fusion", return_value=fusion)
+            patch_communicator("apply_flashinfer_allreduce_fusion", return_value=fusion)
         )
         # The group the fused kernel reduces over.
         stack.enter_context(
-            patch.object(
-                comm,
+            patch_communicator(
                 "post_experts_reduction_group",
                 return_value=group if kernel_group else SimpleNamespace(),
             )
         )
         stack.enter_context(
-            patch.object(
-                comm,
+            patch_communicator(
                 "get_attn_tp_context",
                 return_value=SimpleNamespace(input_scattered=False, is_dsa=False),
             )
@@ -211,6 +248,38 @@ class TestPrepareAttnSteps(CustomTestCase):
                 else:
                     self.assertEqual(norm.calls, [])
                     self.assertIs(residual, local)
+
+    def test_an_owed_reduce_scatter_is_not_offered_to_a_fused_kernel(self):
+        with platform(fusion=True) as (_, all_reduce, _):
+            c = communicator(Norm())
+            takes_anything = MagicMock(return_value=("fused", "fused"))
+            c._steps = msgspec.structs.replace(
+                c._steps,
+                attention=msgspec.structs.replace(
+                    c._steps.attention,
+                    prepare=partial(
+                        comm_ops._consumer_step,
+                        step=partial(
+                            comm_ops._read_input,
+                            layer_input=None,
+                            enters_stack=False,
+                            read=comm.NORM_QUANT_READ,
+                            update=comm.ADD,
+                        ),
+                        carried_fusions=(takes_anything,),
+                    ),
+                ),
+            )
+            partial_sum = torch.ones(3, 4)
+            step = MagicMock(return_value=torch.full((1, 4), 7.0))
+            c.prepare_attn(
+                comm.UnreducedOutput(partial_sum, reduce_and_redistribute=step),
+                torch.zeros(1, 4),
+                None,
+            )
+            step.assert_called_once_with(partial_sum)
+            takes_anything.assert_not_called()
+            self.assertEqual(all_reduce.call_count, 0)
 
     def test_an_unreduced_output_without_a_residual_is_rejected(self):
         for step in (None, MagicMock()):

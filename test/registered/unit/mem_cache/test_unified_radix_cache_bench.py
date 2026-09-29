@@ -37,6 +37,7 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=29, stage="base-b", runner_config="1-gpu-small")
@@ -592,7 +593,7 @@ def bench_lock_unlock(
     )
 
 
-def bench_cache_finished(
+def bench_release(
     num_seqs=5000,
     chunk_len=256,
     kv_size=500_000,
@@ -600,9 +601,9 @@ def bench_cache_finished(
     verify=False,
     page_size=1,
 ):
-    """cache_finished_req throughput — full request lifecycle.
+    """Request release throughput — full request lifecycle.
 
-    Simulates: match_prefix → inc_lock_ref → alloc → fill req_to_token → cache_finished_req.
+    Simulates: match_prefix → inc_lock_ref → alloc → fill req_to_token → insert_req + free + unpin.
     """
     env = _make_env(num_seqs, chunk_len, kv_size, components, page_size)
 
@@ -644,15 +645,13 @@ def bench_cache_finished(
         req_items.append(req)
 
     if not req_items:
-        return BenchResult("cache_finished", 0, 0, 0, [])
+        return BenchResult("release", 0, 0, 0, [])
 
     warmup = min(20, len(req_items) // 10)
     return bench_api(
-        "cache_finished",
+        "release",
         lambda: req_items,
-        lambda req: env.tree.cache_finished_req(
-            req, owned_kv_len=req.kv.kv_committed_len
-        ),
+        lambda req: finish_req(env.tree, req, req.kv.kv_committed_len),
         len(req_items) - warmup,
         env.avg_tokens,
         warmup,
@@ -669,7 +668,7 @@ ALL_BENCHMARKS = {
     "match": bench_match_prefix,
     "evict": bench_evict,
     "lock": bench_lock_unlock,
-    "cache_finished": bench_cache_finished,
+    "release": bench_release,
 }
 
 
@@ -791,8 +790,8 @@ class _BenchSuite:
     def test_bench_lock_unlock(self):
         self._run(bench_lock_unlock)
 
-    def test_bench_cache_finished(self):
-        self._run(bench_cache_finished)
+    def test_bench_release(self):
+        self._run(bench_release)
 
 
 for _cfg in _CI_BENCH_CONFIGS:
@@ -837,7 +836,7 @@ def _run_bench_cli():
         "--benchmarks",
         nargs="+",
         default=["all"],
-        help="insert match evict lock cache_finished all",
+        help="insert match evict lock release all",
     )
     args, _ = parser.parse_known_args()
 
