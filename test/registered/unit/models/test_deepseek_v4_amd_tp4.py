@@ -20,7 +20,6 @@ from sglang.srt.layers.engram import EngramEmbedding
 from sglang.srt.runtime_context import get_forward, get_parallel, reset_context
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.dsv4_moe_stub import make_dsv4_moe_stub
 from sglang.test.kernels.utils import multigpu_pytest_main
 from sglang.test.test_utils import publish_build_topology
 
@@ -197,6 +196,48 @@ def test_model_handoff_and_graph_replay(group, rows, verify):
                     torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
 
+def _moe_stub(rank, *, dual, shared_tp1):
+    """A DeepseekV2MoE with fake experts (routed x * (rank + 1), shared x * 0.5), so a
+    done or skipped reduction shows in its output."""
+    from sglang.srt.layers.moe.topk import TopKOutputFormat
+    from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
+
+    def experts(x, *args, **kwargs):
+        return x * (rank + 1)
+
+    def gate(x, *args, **kwargs):
+        return x
+
+    experts.quant_method = None
+    experts.moe_runner_config = SimpleNamespace(inplace=False)
+    gate.rocm_router_max_tokens = -1  # the split-K router never serves the fake gate
+    moe = DeepseekV2MoE.__new__(DeepseekV2MoE)
+    torch.nn.Module.__init__(moe)
+    vars(moe).update(
+        tp_size=4,
+        is_deepseek_v4=True,
+        _shared_expert_tp1=shared_tp1,
+        layer_id=0,
+        is_nextn=False,
+        is_hash=False,
+        _fuse_shared_experts_inside_sbo=False,
+        _fuse_finalize_all_reduce=False,
+        num_fused_shared_experts=0,
+        routed_scaling_factor=1.0,
+        experts=experts,
+        gate=gate,
+        alt_stream=torch.cuda.Stream(),
+        topk=lambda *a, **kw: SimpleNamespace(format=TopKOutputFormat.STANDARD),
+        _maybe_quant_moe_input_once=lambda x: None,
+        _should_quant_routed_input_mxfp8=lambda x: False,
+        _forward_shared_experts=lambda x, *a, **kw: x * 0.5,
+        forward=lambda x, *a, **kw: (
+            moe.forward_normal_dual_stream if dual else moe.forward_normal
+        )(x),
+    )
+    return moe
+
+
 @pytest.mark.parametrize(
     "rows,dual,defer,shared_tp1",
     [
@@ -216,9 +257,7 @@ def test_moe_model_handoff(group, rows, dual, defer, shared_tp1):
     from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer
 
     layer = _layer(group)
-    layer.mlp = make_dsv4_moe_stub(
-        group.rank_in_group, dual=dual, shared_tp1=shared_tp1
-    )
+    layer.mlp = _moe_stub(group.rank_in_group, dual=dual, shared_tp1=shared_tp1)
     layer._run_moe_ffn_dp_sync = lambda *a, **kw: (
         DeepseekV4DecoderLayer._run_moe_ffn_dp_sync(layer, *a, **kw)
     )
@@ -275,6 +314,42 @@ def test_moe_model_handoff(group, rows, dual, defer, shared_tp1):
         ):
             torch.testing.assert_close(unfused[0], fused[0], atol=0.01, rtol=0.01)
             torch.testing.assert_close(unfused[1], fused[1], atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("flag", ["mlp_reduce_scatter", "fuse_mlp_allreduce"])
+@pytest.mark.parametrize("dual", [False, True], ids=["normal", "dual-stream"])
+def test_moe_skipped_reduction_keeps_post(group, dual, flag):
+    """A reduce-scattered or elsewhere-fused MoE output must not reach the fused all-reduce
+    + mHC post: the pending post stays pending and no collective runs."""
+    from sglang.srt.layers.moe.mhc_post_fusion import (
+        MhcPostFusion,
+        use_mhc_post_fusion,
+    )
+
+    moe = _moe_stub(0, dual=dual, shared_tp1=False)
+    x = torch.ones(1, 5120, device="cuda", dtype=torch.bfloat16)
+    residual = torch.randn(1, 4, 5120, device="cuda", dtype=torch.bfloat16)
+    post = torch.rand(1, 4, device="cuda")
+    state = MhcPostFusion(residual, post, torch.rand(1, 4, 4, device="cuda"), None)
+    with (
+        get_forward().scoped(**{flag: True}, flashinfer_trtllm_bypass=False),
+        use_mhc_post_fusion(state),
+        patch(
+            "sglang.srt.distributed.communication_op.tensor_model_parallel_all_reduce"
+        ) as reduction,
+        patch(
+            "sglang.srt.distributed.communication_op.moe_tensor_model_parallel_all_reduce"
+        ) as moe_reduction,
+        patch(
+            "sglang.srt.models.deepseek_v2.get_exec",
+            return_value=SimpleNamespace(moe=SimpleNamespace(enable_eplb=False)),
+        ),
+    ):
+        actual = moe(x)
+    assert state.output is None
+    reduction.assert_not_called()
+    moe_reduction.assert_not_called()
+    torch.testing.assert_close(actual, x * 1.5, atol=0, rtol=0)
 
 
 # ---- sharded Engram ----
