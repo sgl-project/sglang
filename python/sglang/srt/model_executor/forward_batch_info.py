@@ -69,7 +69,6 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 from sglang.srt.utils.npu_pinned_host_diagnostics import (
-    npu_pinned_host_debug_enabled,
     trace_npu_pinned_host_allocation,
 )
 
@@ -1732,7 +1731,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self._pad_inputs_to_size(model_runner, num_tokens, bs)
         self.global_num_tokens_cpu = global_num_tokens
         self.use_pin_memory = not _is_cpu
-        if _is_npu and npu_pinned_host_debug_enabled():
+        if _is_npu:
             with trace_npu_pinned_host_allocation(
                 "prepare_mlp_sync_batch.global_num_tokens",
                 requested_bytes=len(global_num_tokens) * 8,

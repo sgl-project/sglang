@@ -1,8 +1,4 @@
-"""Opt-in diagnostics for NPU pinned host allocations.
-
-Set SGLANG_NPU_PINNED_HOST_DEBUG=1 to log allocator and host memory state at
-the SGLang call sites that have produced aclrtMallocHostWithCfg failures.
-"""
+"""Log NPU pinned host allocations and host memory pressure by default."""
 
 from __future__ import annotations
 
@@ -27,10 +23,6 @@ _last_log_time: dict[str, float] = {}
 _call_counts: dict[str, int] = {}
 
 
-def npu_pinned_host_debug_enabled() -> bool:
-    return os.environ.get("SGLANG_NPU_PINNED_HOST_DEBUG") == "1"
-
-
 def _read_cgroup_value(name: str) -> str | None:
     try:
         with open(f"/sys/fs/cgroup/{name}") as file:
@@ -48,13 +40,6 @@ def _read_proc_value(path: str, key: str) -> str | None:
     except OSError:
         pass
     return None
-
-
-def _read_lines(path: Path) -> list[str]:
-    try:
-        return path.read_text().splitlines()
-    except OSError:
-        return []
 
 
 def _read_int(path: Path) -> int | None:
@@ -361,36 +346,6 @@ def _memory_snapshot() -> dict[str, object]:
     return snapshot
 
 
-def log_npu_host_baseline(event: str) -> None:
-    """Record runner pressure before or after a test without initializing NPU."""
-    try:
-        snapshot = _host_and_cgroup_snapshot()
-    except Exception as exc:  # noqa: BLE001
-        snapshot = {"host_memory_stats_error": repr(exc)}
-    cgroup_mounts = [
-        line
-        for line in _read_lines(Path("/proc/self/mountinfo"))
-        if " - cgroup2 " in line
-        or (" - cgroup " in line and "memory" in line.split(" - ", 1)[1])
-    ]
-    logger.warning(
-        "NPU host baseline: %s",
-        {
-            "event": event,
-            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-            "pid": os.getpid(),
-            "ci_run_id": os.environ.get("GITHUB_RUN_ID"),
-            "ci_job": os.environ.get("GITHUB_JOB"),
-            "runner_name": os.environ.get("RUNNER_NAME"),
-            "container_hostname": os.environ.get("HOSTNAME"),
-            "host_boot_id_hash": _boot_id_hash(),
-            "cgroup_memberships": _read_lines(Path("/proc/self/cgroup")),
-            "cgroup_memory_mounts": cgroup_mounts,
-        }
-        | snapshot,
-    )
-
-
 class PinnedHostMemoryMonitor:
     """Sample scheduler Host memory through model loading and request handling.
 
@@ -400,7 +355,7 @@ class PinnedHostMemoryMonitor:
     """
 
     def __init__(self, *, enabled: bool):
-        self.enabled = enabled and npu_pinned_host_debug_enabled()
+        self.enabled = enabled
         self.phase = "loading"
         self.loading_active_peak_bytes: int | None = None
         self.loading_reserved_peak_bytes: int | None = None
@@ -494,9 +449,9 @@ def trace_npu_pinned_host_allocation(
     """Log a sampled before/after snapshot, and always log allocation failures.
 
     Sampling keeps per-token D2H traces manageable; allocations >= 1 GiB are
-    always logged. No torch_npu API is called unless the opt-in flag is set.
+    always logged. Call sites enable this only on NPU.
     """
-    if not enabled or not npu_pinned_host_debug_enabled():
+    if not enabled:
         yield
         return
 
@@ -537,10 +492,3 @@ def trace_npu_pinned_host_allocation(
                 | {"elapsed_seconds": round(time.monotonic() - started, 3)}
                 | _memory_snapshot(),
             )
-
-
-if __name__ == "__main__":
-    import sys
-
-    logging.basicConfig(level=logging.WARNING)
-    log_npu_host_baseline(sys.argv[1] if len(sys.argv) > 1 else "manual")

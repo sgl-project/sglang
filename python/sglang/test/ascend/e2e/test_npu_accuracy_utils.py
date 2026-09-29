@@ -161,11 +161,10 @@ def run_evalscope(
 
     logger.info(f"Generated evalscope script: {script_path}")
 
-    install_cmd = [
-        "/bin/bash",
-        os.path.join(os.path.dirname(__file__), "run_evalscope.sh"),
-    ]
-    subprocess.run(install_cmd, check=True)
+    install_cmd = (
+        "/bin/bash /root/sglang/python/sglang/test/ascend/e2e/run_evalscope.sh"
+    )
+    subprocess.run(install_cmd, shell=True, check=True)
 
     python_bin = "test_env_evalscope/bin/python"
     cmd = f"{python_bin} {script_path}"
@@ -300,7 +299,6 @@ def assert_metrics(self, metrics):
 
 class TestNpuAccuracyTestCaseBase(CustomTestCase):
     model = None
-    eval_model_name = None
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     backend = "sglang"
     datasets = ["gsm8k"]
@@ -482,7 +480,7 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
         host = parsed_url.hostname
         port = parsed_url.port
         if self.benchmark_tool == EVALSCOPE:
-            model_name = self.eval_model_name or os.path.basename(self.model)
+            model_name = os.path.basename(self.model)
             max_retries = (
                 self.max_retries
                 if self.max_retries is not None

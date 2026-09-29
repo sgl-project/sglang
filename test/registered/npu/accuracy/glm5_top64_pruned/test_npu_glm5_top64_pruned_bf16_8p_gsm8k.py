@@ -1,20 +1,5 @@
-import os
-import sys
 import unittest
-from pathlib import Path
 
-# Nightly runs the image's preinstalled sglang. On a diagnostic PR, use this
-# checkout in both the test process and its server subprocess so new probes run.
-if os.environ.get("GITHUB_EVENT_NAME") == "pull_request":
-    source_python = Path(__file__).resolve().parents[5] / "python"
-    sys.path.insert(0, str(source_python))
-    existing_pythonpath = os.environ.get("PYTHONPATH")
-    os.environ["PYTHONPATH"] = str(source_python) + (
-        os.pathsep + existing_pythonpath if existing_pythonpath else ""
-    )
-    print(f"NPU diagnostic checkout source: {source_python}", flush=True)
-
-from sglang.srt.utils.npu_pinned_host_diagnostics import log_npu_host_baseline
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
     TestNpuAccuracyTestCaseBase,
 )
@@ -27,7 +12,6 @@ register_npu_ci(est_time=3600, suite="base-c-test-acc-16-npu-a3")
 register_npu_ci(est_time=4800, suite="nightly-acc-16-npu-a3", nightly=True)
 
 ENVS = {
-    "SGLANG_NPU_PINNED_HOST_DEBUG": "1",
     "SGLANG_SET_CPU_AFFINITY": "1",
     "STREAMS_PER_DEVICE": "32",
     "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "600",
@@ -62,37 +46,17 @@ OTHER_ARGS = [
 
 
 class TestNPUGLM5_Top64_Pruned_GSM8K(TestNpuAccuracyTestCaseBase):
-    model = os.environ.get(
-        "SGLANG_GLM5_TOP64_MODEL_PATH", GLM5_TOP64_PRUNED_GSM8K_MODEL_PATH
-    )
-    eval_model_name = "glm-5"
+    model = GLM5_TOP64_PRUNED_GSM8K_MODEL_PATH
     envs = ENVS
     other_args = OTHER_ARGS
     accuracy = 0.48
     datasets = ["gsm8k"]
-    dataset_dir = os.environ.get("SGLANG_GLM5_GSM8K_DATASET_DIR")
     generation_config = {
         "max_tokens": 2048,
         "temperature": 0.01,
     }
     eval_batch_size = 16
     limit = 100
-
-    @classmethod
-    def setUpClass(cls):
-        log_npu_host_baseline("before_glm5_server")
-        try:
-            super().setUpClass()
-        except Exception:
-            log_npu_host_baseline("after_glm5_failed_launch")
-            raise
-
-    @classmethod
-    def tearDownClass(cls):
-        try:
-            super().tearDownClass()
-        finally:
-            log_npu_host_baseline("after_glm5_server")
 
     def test_gsm8k(self):
         self.run_accuracy()
