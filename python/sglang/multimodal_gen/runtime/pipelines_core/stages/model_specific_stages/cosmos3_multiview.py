@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import PIL.Image
@@ -81,6 +82,10 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.vision import load_image, load_video
 
 logger = init_logger(__name__)
+
+# Clips decoded concurrently by the input stage (one ffmpeg process each).
+# Arbitrary; 8 keeps a 22-clip rig within a few seconds on a 24-core host.
+COSMOS3_MULTIVIEW_MEDIA_THREADS = 8
 
 # ``batch.extra`` keys shared by the multiview stages.
 EXTRA_CONTROL_PIXELS = "multiview_control_pixels"
@@ -218,7 +223,7 @@ def media_hw(path: str) -> tuple[int, int]:
                 return int(stream.height), int(stream.width)
     except Exception:  # PyAV missing or metadata unreadable: decode instead.
         pass
-    decoded = load_video(path)
+    decoded = load_video(path, max_frames=1)
     if not decoded:
         raise ValueError(f"No frames decoded from Cosmos3 multiview media {path!r}.")
     first = decoded[0]
@@ -235,12 +240,12 @@ def load_media_uint8_cthw(
     if media_kind(path) == "image":
         frames = [load_image(path).convert("RGB")]
     else:
-        decoded = load_video(path)
+        decoded = load_video(path, max_frames=max_frames)
         if not decoded:
             raise ValueError(
                 f"No frames decoded from Cosmos3 multiview media {path!r}."
             )
-        frames = [frame.convert("RGB") for frame in decoded[:max_frames]]
+        frames = [frame.convert("RGB") for frame in decoded]
     cthw = torch.stack([_pil_to_uint8_tensor(frame) for frame in frames], dim=1)
     return fit_uint8_cthw(cthw, height=height, width=width)
 
@@ -669,19 +674,15 @@ class Cosmos3MultiviewInputStage(PipelineStage):
         keep_first: bool,
         require_complete: bool = False,
     ) -> torch.Tensor:
-        clips = []
-        for view in views:
+        def load_one(view: MultiviewViewInput) -> torch.Tensor:
             path = view.control if field == "control" else view.vision
             if path is None:
                 if field == "vision":
-                    clips.append(
-                        torch.full(
-                            (3, num_frames, height, width),
-                            COSMOS3_MULTIVIEW_GRAY_LEVEL,
-                            dtype=torch.uint8,
-                        )
+                    return torch.full(
+                        (3, num_frames, height, width),
+                        COSMOS3_MULTIVIEW_GRAY_LEVEL,
+                        dtype=torch.uint8,
                     )
-                    continue
                 raise ValueError(
                     f"Cosmos3 multiview camera {view.camera_key!r} is missing {field} input."
                 )
@@ -696,7 +697,14 @@ class Cosmos3MultiviewInputStage(PipelineStage):
                     f"Known camera {view.camera_key!r} requires a complete RGB video of "
                     f"{num_frames} frames for view completion."
                 )
-            clips.append(pad_view_frames_uint8(frames, num_frames=num_frames))
+            return pad_view_frames_uint8(frames, num_frames=num_frames)
+
+        # Each clip decodes in its own ffmpeg subprocess and the resize releases
+        # the GIL, so the rig's clips overlap on threads; order is preserved.
+        with ThreadPoolExecutor(
+            max_workers=min(COSMOS3_MULTIVIEW_MEDIA_THREADS, max(len(views), 1))
+        ) as pool:
+            clips = list(pool.map(load_one, views))
         return torch.cat(clips, dim=1).unsqueeze(0).contiguous()
 
     def _load_lidar(

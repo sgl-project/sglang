@@ -7,11 +7,13 @@ wiring."""
 
 import copy
 import os
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 
 import msgspec
+import numpy as np
 import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
@@ -90,6 +92,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     pad_view_frames_uint8,
     synthetic_multiview_pixels,
 )
+from sglang.multimodal_gen.runtime.utils.vision import load_video
 
 # ``transformer/config.json["multiview"]`` of the Sep-14 2026 export (HF 3e7d669): masked
 # Triton backend, unversioned. Kept only to pin that such exports are refused.
@@ -907,6 +910,36 @@ class TestPerViewCaptions(unittest.TestCase):
                 batch_size=1,
                 device=torch.device("cpu"),
             )
+
+
+class TestInputLoading(unittest.TestCase):
+    def test_load_video_prefix_matches_full_decode(self):
+        # The input stage decodes only the frames a request uses; stopping the
+        # decoder early must return the same frames a full decode would.
+        try:
+            import imageio
+        except ImportError:  # pragma: no cover - imageio ships with the runtime
+            self.skipTest("imageio is not installed")
+        rng = np.random.default_rng(0)
+        base = rng.integers(0, 256, size=(64, 96, 3), dtype=np.uint8)
+        frames = [np.roll(base, 3 * i, axis=1) for i in range(24)]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "clip.mp4")
+            try:
+                with imageio.get_writer(path, fps=10, macro_block_size=None) as writer:
+                    for frame in frames:
+                        writer.append_data(frame)
+            except Exception as exc:  # pragma: no cover - no ffmpeg on this host
+                self.skipTest(f"cannot encode a test clip here: {exc}")
+            full = load_video(path)
+            prefix = load_video(path, max_frames=5)
+            self.assertEqual(len(full), 24)
+            self.assertEqual(len(prefix), 5)
+            for a, b in zip(prefix, full[:5]):
+                self.assertTrue(np.array_equal(np.asarray(a), np.asarray(b)))
+            self.assertEqual(len(load_video(path, max_frames=100)), 24)
+            with self.assertRaisesRegex(ValueError, "max_frames"):
+                load_video(path, max_frames=0)
 
 
 class TestLidarItems(unittest.TestCase):

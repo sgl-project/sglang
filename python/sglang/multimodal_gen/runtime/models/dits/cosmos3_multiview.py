@@ -176,7 +176,10 @@ class Cosmos3MultiviewTransformer(Cosmos3OmniTransformer):
         """One causal UND pass per caption, K/V concatenated along the sequence.
 
         Every caption restarts its text positions at zero; the GEN origin is
-        placed past the longest caption by ``_packed_position_ids``.
+        placed past the longest caption by ``_packed_position_ids``. One pass
+        per caption rather than one padded batch: the batch saves ~0.1 s per
+        request (the ~1k-token passes are already GEMM-bound) while the padded
+        GEMM shapes round the K/V differently, ~2% relative in late layers.
         """
         caches: list[list[tuple[torch.Tensor, torch.Tensor]]] = []
         for ids in text_ids.split(list(lengths), dim=1):
