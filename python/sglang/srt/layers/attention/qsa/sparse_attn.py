@@ -442,6 +442,160 @@ def _compact_kv(
     )
 
 
+@triton.jit
+def _compact_kv_paged(
+    k,
+    v,
+    req_to_token,
+    req_indices,
+    indices,
+    seq_lens,
+    cu_k,
+    out_k,
+    out_v,
+    topk: tl.constexpr,
+    heads: tl.constexpr,
+    dim: tl.constexpr,
+    req_stride: tl.constexpr,
+    idx_stride: tl.constexpr,
+    pad_cols,
+    PAGE: tl.constexpr,
+    VEC: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """``_compact_kv`` with the vectorized-5D paged cache as its destination.
+
+    Same gather, different store address: the rows land directly in the layout
+    FlyDSL's ``pa_decode_tile`` reads, instead of a linear ``[token, head, dim]``
+    region that a later permute has to rearrange. The loads are unchanged, so the
+    layout costs nothing beyond the address arithmetic.
+
+        out_k[block, head, d // VEC, slot, d % VEC]
+        out_v[block, head, slot // VEC, d, slot % VEC]
+
+    with ``block = row // PAGE`` and ``slot = row % PAGE`` over the page-aligned
+    row index. Always zero-fills: a paged kernel reads whole pages, so every slot
+    past a row's valid count must hold zeros rather than stale bytes.
+
+    Both stores keep the natural ``[cols, dims]`` tile. In ``out_v`` the *slot*
+    axis is the contiguous one, so that tile puts ``dim`` on the fast axis and
+    each lane's element lands VEC*2 bytes from its neighbour's -- but the tile as
+    a whole still covers a contiguous ``dim * VEC`` region per VEC group, and the
+    backend vectorizes it. Transposing with ``tl.trans`` to put the VEC slots in
+    adjacent lanes was measured slower at every batch (5.7 vs 3.8us at one row,
+    143 vs 114us at 64): the LDS round-trip costs more than the addressing buys.
+    """
+    batch, head, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    cols = block * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
+    dims = tl.arange(0, BLOCK_D)
+    length = tl.load(seq_lens + batch)
+    req = tl.load(req_indices + batch)
+    pack_start = tl.load(cu_k + batch)
+    valid_count = tl.load(cu_k + batch + 1) - pack_start
+    positions = tl.load(indices + batch * idx_stride + cols, mask=cols < topk, other=-1)
+    valid = (cols < valid_count) & (positions >= 0) & (positions < length)
+    slots = tl.load(
+        req_to_token + req * req_stride + tl.where(valid, positions, 0),
+        mask=valid,
+        other=0,
+    )
+    # 64-bit element offsets: see `_compact_kv` -- an FP8 pool on one GPU holds
+    # enough tokens for slot * heads * dim to exceed int32.
+    src = slots.to(tl.int64)[:, None] * heads * dim + head * dim + dims[None, :]
+    rows = pack_start + cols
+    blk = (rows // PAGE).to(tl.int64)
+    slot = rows % PAGE
+    in_d = dims < dim
+    load_mask = valid[:, None] & in_d[None, :]
+    # `cols < pad_cols`, not `valid`: the zero fill has to cover the whole page.
+    keep = cols < pad_cols
+
+    dst_k = (
+        blk[:, None] * (heads * dim * PAGE)
+        + head * (dim * PAGE)
+        + (dims[None, :] // VEC) * (PAGE * VEC)
+        + slot[:, None] * VEC
+        + (dims[None, :] % VEC)
+    )
+    dst_v = (
+        blk[:, None] * (heads * PAGE * dim)
+        + head * (PAGE * dim)
+        + (slot[:, None] // VEC) * (dim * VEC)
+        + dims[None, :] * VEC
+        + (slot[:, None] % VEC)
+    )
+    store_mask = keep[:, None] & in_d[None, :]
+    out_dtype = out_k.dtype.element_ty
+    tl.store(
+        out_k + dst_k,
+        tl.load(k + src, mask=load_mask, other=0.0).to(out_dtype),
+        mask=store_mask,
+    )
+    tl.store(
+        out_v + dst_v,
+        tl.load(v + src, mask=load_mask, other=0.0).to(out_dtype),
+        mask=store_mask,
+    )
+
+
+def qwen_sparse_kv_extraction_paged_triton(
+    k,
+    v,
+    req_to_token,
+    req_indices,
+    indices,
+    seq_lens,
+    cu_k,
+    out_k,
+    out_v,
+    batch,
+    topk,
+    page: int,
+    stride_cols: int,
+):
+    """Gather the selected K/V straight into a vectorized-5D paged cache.
+
+    ``out_k``/``out_v`` are the cache tensors (or any contiguous buffer of the
+    same element count -- the kernel addresses them flat). ``cu_k`` must hold the
+    page-aligned row starts, i.e. ``arange(batch + 1) * stride_cols``, and
+    ``stride_cols`` must be a whole number of pages.
+
+    Like the strided branch of ``qwen_sparse_kv_extraction_compact_triton``, this
+    assumes the valid entries of each ``indices`` row are contiguous at the front.
+    """
+    _, heads, dim = k.shape
+    vec = 16 // out_k.element_size()
+    if dim % vec or page % vec or stride_cols % page:
+        raise ValueError(
+            f"paged gather needs dim and page divisible by {vec} and a whole "
+            f"number of pages per row; got dim={dim} page={page} stride={stride_cols}"
+        )
+    block_topk = 16
+    _compact_kv_paged[(batch, heads, triton.cdiv(stride_cols, block_topk))](
+        k,
+        v,
+        req_to_token,
+        req_indices,
+        indices,
+        seq_lens,
+        cu_k,
+        out_k,
+        out_v,
+        topk,
+        heads,
+        dim,
+        req_to_token.stride(0),
+        indices.stride(0),
+        stride_cols,
+        PAGE=page,
+        VEC=vec,
+        BLOCK_TOPK=block_topk,
+        BLOCK_D=triton.next_power_of_2(dim),
+        num_warps=8,
+    )
+
+
 def qwen_sparse_valid_counts_triton(seq_lens, indices, counts, batch, topk):
     """Valid-count pass alone, without the packed cu_seqlens prefix sum."""
     _fa2_valid_counts[(batch,)](
@@ -516,6 +670,7 @@ __all__ = [
     "qwen_sparse_fa2_cu_seqlens_triton",
     "qwen_sparse_valid_counts_triton",
     "qwen_sparse_kv_extraction_compact_triton",
+    "qwen_sparse_kv_extraction_paged_triton",
     "sparse_gqa_fwd_interface_triton",
     "sparse_gqa_fwd_interface_triton_ck",
 ]

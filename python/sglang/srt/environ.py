@@ -856,9 +856,31 @@ class Envs:
     SGLANG_USE_AITER = EnvBool(False)
     # Use gfx950 BF16 Qwen HC mix when AITER FlyDSL hc_mix is available.
     SGLANG_AITER_HC_MIX = EnvBool(True)
+    # Serve the post-gather QSA attention with AITER's FlyDSL BF16 paged decode
+    # instead of the CK varlen fallback. CK runs a prefill-shaped kernel here: its
+    # TileFmhaShape puts only seqlen_q on the MFMA M axis, so a length-one decode
+    # query fills 1 of 128 rows. The FlyDSL kernel flattens the GQA group onto M
+    # (12 of 16 rows at Hq=24/Hkv=2) and splits KV across CTAs. Measured 8-17x on
+    # the isolated attention call at D=256, budget 2048, but it is not bit-exact
+    # with CK, so it is opt-in until acceptance length is confirmed end to end.
+    SGLANG_AITER_QSA_PA_DECODE = EnvBool(False)
+    # Pin the FlyDSL paged-decode KV split count. num_partitions is a compile-time
+    # constant and must not vary across CUDA-graph captures, so 0 means "ask aiter
+    # once, at the captured maximum batch, then reuse". Upstream clamps its
+    # recommendation to [4, 8], which was tuned for batched serving; at low
+    # concurrency the grid is only num_seqs * num_kv_heads * splits CTAs, so a
+    # larger value may be worth forcing.
+    SGLANG_AITER_QSA_PA_DECODE_SPLITS = EnvInt(0)
+    # Split hc_combine into a gate + apply pair. The split buys small-M rows more
+    # CTAs than the one-CTA-per-row fused kernel, at the price of a second
+    # dispatch. Default OFF for ROCm/HIP, where that dispatch is the whole cost:
+    # profiling Qwen decode on gfx950 put both halves at the ~4.2us floor every
+    # launch-bound kernel in the trace sits at, so the pair spent 8.3us on work
+    # one CTA streams well inside a single launch. Default ON elsewhere, where
+    # launches are cheaper and the split was tuned.
+    SGLANG_HC_COMBINE_SPLIT = EnvBool(lambda: not _default_hip())
     # Enable split HC combine for eligible shapes and batches of at most 32 rows.
     # Set to 0 before server startup to use the unsplit combine kernel instead.
-    SGLANG_HC_COMBINE_SPLIT = EnvBool(True)
     SGLANG_USE_AITER_AG = EnvBool(True)
     # Use reduce_scatter (instead of all_reduce + dp_scatter) for the equal-chunk
     # MAX_LEN DP-MoE combine. Default ON for ROCm/HIP (uses the aiter custom

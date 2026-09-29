@@ -16,6 +16,7 @@ import msgspec
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.qsa.config import (
     is_qwen_qsa,
@@ -29,9 +30,14 @@ from sglang.srt.layers.attention.qsa.metadata import (
     build_rope_position_matrix,
     compressed_decode_view,
 )
+from sglang.srt.layers.attention.qsa.pa_decode_flydsl import (
+    flydsl_qsa_pa_decode_supported,
+    paged_cache_views,
+)
 from sglang.srt.layers.attention.qsa.sparse_attn import (
     qwen_sparse_fa2_cu_seqlens_triton,
     qwen_sparse_kv_extraction_compact_triton,
+    qwen_sparse_kv_extraction_paged_triton,
     qwen_sparse_valid_counts_triton,
     sparse_gqa_fwd_interface_triton,
     sparse_gqa_fwd_interface_triton_ck,
@@ -232,6 +238,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._trtllm_sparse_tables = {}
         self._mtp_shared_sparse_indices = None
         self._trtllm_workspace = None
+        self._flydsl_partials = {}
         self._graph_extend_lens = None
         self._graph_extend_lens_pin = None
 
@@ -1512,6 +1519,152 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
         return output.reshape(q.shape[0], -1)
 
+    def _get_flydsl_partials(
+        self, capacity_rows, num_kv_heads, splits, group_size, head_dim, dtype, device
+    ):
+        """Split-KV partials for the FlyDSL paged decode, cached per shape.
+
+        Allocated at the captured maximum batch and sliced per call: the kernel
+        refuses to allocate mid-capture, and `num_partitions` is one of its
+        compile-time constants, so neither may vary once a graph is recorded.
+        """
+        key = (capacity_rows, num_kv_heads, splits, group_size, head_dim, dtype, device)
+        cached = self._flydsl_partials.get(key)
+        if cached is None:
+            from aiter.ops.flydsl.pa_decode import flydsl_pa_decode_partials
+
+            cached = flydsl_pa_decode_partials(
+                capacity_rows,
+                num_kv_heads,
+                splits,
+                1,  # query_length: every QSA row is its own length-one sequence
+                group_size,
+                head_dim,
+                dtype=dtype,
+                device=device,
+            )
+            self._flydsl_partials[key] = cached
+        return cached
+
+    def _forward_flydsl_sparse(
+        self,
+        q: torch.Tensor,
+        k_buffer: torch.Tensor,
+        v_buffer: torch.Tensor,
+        layer,
+        forward_batch,
+        metadata,
+        topk_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Post-gather QSA attention via AITER's FlyDSL BF16 paged decode.
+
+        Shares the page-aligned gather and static arange block table with
+        ``_forward_trtllm_sparse``; only the cache layout and the kernel differ.
+        Each query row is its own length-one sequence with its own selected KV,
+        so ``num_seqs == q.shape[0]`` and the kernel's ``query_length`` is 1 --
+        this holds for speculative verify rows too, which arrive here one row per
+        draft token.
+        """
+        from aiter.ops.flydsl.pa_decode import (
+            flydsl_pa_decode,
+            flydsl_pa_decode_recommended_splits,
+        )
+
+        batch, topk = topk_indices.shape
+        page = _TRTLLM_SPARSE_PAGE_SIZE
+        pages_per_row = (topk + page - 1) // page
+        stride = pages_per_row * page
+        device = q.device
+        num_kv_heads = k_buffer.shape[1]
+        head_dim = k_buffer.shape[2]
+        group_size = q.shape[1] // num_kv_heads
+
+        sequence_lens = metadata.sequence_lengths
+        if metadata.is_cuda_graph:
+            valid_counts = metadata.fa2_valid_counts
+            if valid_counts is None:
+                raise RuntimeError("QSA CUDA graph metadata is incomplete")
+        else:
+            valid_counts = torch.empty(batch, dtype=torch.int32, device=device)
+        qwen_sparse_valid_counts_triton(
+            sequence_lens, topk_indices, valid_counts, batch, topk
+        )
+        cu_strided, block_tables = self._get_trtllm_sparse_tables(
+            batch, pages_per_row, page, device
+        )
+        capacity_rows = self._cuda_graph_max_tokens if metadata.is_cuda_graph else batch
+        # Gather into the query dtype: an FP8 pool is dequantized on the way in, so the
+        # paged kernel always runs the bf16 q + bf16 KV path.
+        packed_k, packed_v = self._get_fa2_scratch(
+            max(capacity_rows, batch) * stride,
+            num_kv_heads,
+            head_dim,
+            q.dtype,
+            k_buffer.device,
+        )
+        # Gathers straight into the kernel's vectorized-5D layout, so the views
+        # below cost nothing. The FlashInfer path uses the linear-destination
+        # gather instead, since its cache layout differs.
+        key_cache, value_cache = paged_cache_views(
+            packed_k[: batch * stride],
+            packed_v[: batch * stride],
+            batch * pages_per_row,
+            page,
+            num_kv_heads,
+            head_dim,
+        )
+        qwen_sparse_kv_extraction_paged_triton(
+            k_buffer,
+            v_buffer,
+            self.req_to_token_pool.req_to_token,
+            (
+                metadata.row_req_pool_indices
+                if metadata.row_req_pool_indices is not None
+                else forward_batch.req_pool_indices
+            ),
+            topk_indices,
+            sequence_lens,
+            cu_strided,
+            key_cache,
+            value_cache,
+            batch,
+            topk,
+            page,
+            stride,
+        )
+        # Pinned so a captured graph and its replays agree; 0 means "ask once".
+        splits = envs.SGLANG_AITER_QSA_PA_DECODE_SPLITS.get() or (
+            flydsl_pa_decode_recommended_splits(
+                max(capacity_rows, batch), num_kv_heads, page
+            )
+        )
+        pmax, psum, pout = self._get_flydsl_partials(
+            max(capacity_rows, batch),
+            num_kv_heads,
+            splits,
+            group_size,
+            head_dim,
+            q.dtype,
+            device,
+        )
+        output = torch.empty(
+            (batch, q.shape[1], head_dim), dtype=q.dtype, device=device
+        )
+        flydsl_pa_decode(
+            output,
+            q.contiguous(),
+            key_cache,
+            value_cache,
+            block_tables,
+            valid_counts,
+            layer.scaling,
+            num_partitions=splits,
+            pmax=pmax[:batch],
+            psum=psum[:batch],
+            pout=pout[:batch],
+        )
+        return output.reshape(q.shape[0], -1)
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -1561,6 +1714,11 @@ class QwenSparseAttnBackend(AttentionBackend):
                 metadata,
                 topk_indices,
                 trtllm_decode,
+            )
+
+        if flydsl_qsa_pa_decode_supported(q, k_buffer, _TRTLLM_SPARSE_PAGE_SIZE):
+            return self._forward_flydsl_sparse(
+                q, k_buffer, v_buffer, layer, forward_batch, metadata, topk_indices
             )
 
         flash_attn_varlen_func = _resolve_flash_attn_varlen_func()
