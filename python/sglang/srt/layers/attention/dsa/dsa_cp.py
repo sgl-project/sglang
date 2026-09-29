@@ -322,15 +322,12 @@ def dsa_cp_attach_full_kv_b(self_attn) -> None:
         _narrow_a2a_totals["reserved_bytes"] += npu.memory_reserved() - reserved_before
         free_after = npu.mem_get_info()[0]
         _narrow_a2a_totals["driver_bytes"] += free_before - free_after
-        # Then wait for the collectives and look again. The KV pool is sized
-        # right after weight loading, from the driver's free-memory figure, and
-        # neither get_available_gpu_memory nor empty_device_cache synchronizes
-        # on the NPU path. If a collective's workspace is still outstanding when
-        # that reading is taken, the pool is sized against memory that is about
-        # to come back -- and the evidence says something of that shape is
-        # happening: the pool loses 1.92 GiB more than these tensors weigh, at
-        # three different gather sizes, and at the first forward that 1.92 GiB
-        # is sitting FREE rather than held by anything.
+        # Synchronize and look again. This was a hypothesis about where the
+        # extra ~1.95 GiB goes and it is REFUTED: -0.07 GiB came back, i.e.
+        # nothing. Kept because it is nearly free at load time and it stops the
+        # question being asked a fifth time. The answer turned out to be
+        # HCCL_BUFFSIZE: HCCL reserves twice it on this communicator's first
+        # all-gather, and the runs above set 1000 MiB, so 2000 MiB = 1.95 GiB.
         npu.synchronize()
         _narrow_a2a_totals["sync_bytes"] += npu.mem_get_info()[0] - free_after
     # Names the legs, because the two modes differ only in speed and in this
@@ -647,9 +644,11 @@ def dsa_cp_redistribute_heads(x: torch.Tensor, plan: DsaCpPlan) -> torch.Tensor:
     # npu_transpose_batchmatmul and view() refuses that.
     send = x.reshape(tp, plan.rows, h, d).contiguous()
     recv = torch.empty_like(send)
+    # Bool first: this runs twice a layer on the default DSA-CP path, and after
+    # the first forward it must cost one global read and nothing else.
     global _first_a2a_logged
-    npu = getattr(torch, "npu", None)
-    measure = npu is not None and not _first_a2a_logged
+    measure = not _first_a2a_logged and getattr(torch, "npu", None) is not None
+    npu = torch.npu if measure else None
     before = npu.mem_get_info()[0] if measure else 0
     parallel.attn_tp_group.all_to_all_single(recv, send)
     if measure:
