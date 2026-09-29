@@ -18,20 +18,21 @@ pytestmark = pytest.mark.skipif(not is_npu(), reason="NPU is required")
 impl = importlib.import_module("sgl_kernel_npu.qwen3_8_flash_next.qsa_sparse_attention")
 
 
-def inputs(heads=3, kv_heads=1):
+def inputs(heads=3, kv_heads=1, rows=4):
     torch.manual_seed(997)
-    q = torch.randn(4, heads, 256, device="npu", dtype=torch.bfloat16)
+    q = torch.randn(rows, heads, 256, device="npu", dtype=torch.bfloat16)
     k = torch.randn(64, kv_heads, 256, device="npu", dtype=q.dtype)
     v = torch.randn_like(k)
-    slots = torch.full((4, 2051), -1, device="npu", dtype=torch.int32)
+    slots = torch.full((rows, 2051), -1, device="npu", dtype=torch.int32)
     slots[1:, :17] = torch.arange(17, device="npu", dtype=torch.int32)
     return q, k, v, slots
 
 
 @pytest.mark.parametrize("heads,kv_heads", [(3, 1), (6, 1), (12, 1), (24, 2)])
 @pytest.mark.parametrize("layout", ["flat", "paged", "fia"])
-def test_dispatch_graph(heads, kv_heads, layout, monkeypatch):
-    q, k, v, s = inputs(heads, kv_heads)
+@pytest.mark.parametrize("rows", [4, 33])
+def test_dispatch_graph(heads, kv_heads, layout, rows, monkeypatch):
+    q, k, v, s = inputs(heads, kv_heads, rows)
     if layout == "paged":
         k, v = k.reshape(4, 16, kv_heads, 256), v.reshape(4, 16, kv_heads, 256)
     elif layout == "fia":
@@ -43,6 +44,9 @@ def test_dispatch_graph(heads, kv_heads, layout, monkeypatch):
     def traced(*args):
         assert args[1].data_ptr() == k.data_ptr()
         assert args[2].data_ptr() == v.data_ptr()
+        if heads == 3:
+            expected_path = "grouped_direct" if rows >= 32 else "grouped_split"
+            assert impl.dispatch_info(*args[:4])["path"] == expected_path
         calls.append((args[1].shape, args[2].shape))
         return raw(*args)
 
