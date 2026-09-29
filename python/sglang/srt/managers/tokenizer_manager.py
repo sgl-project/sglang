@@ -925,13 +925,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # undelivered states, but abort dispatched requests for scheduler-side
             # cleanup.
             self._release_req_states_on_failure(request_rids)
-            if isinstance(obj, GenerateReqInput) and getattr(
-                obj, "parallel_sample_num", 1
-            ) > 1:
+            if (
+                isinstance(obj, GenerateReqInput)
+                and getattr(obj, "parallel_sample_num", 1) > 1
+            ):
                 parent_rid = getattr(obj, "_parallel_sampling_parent_rid", None)
-                parent_rids = (
-                    [parent_rid] if parent_rid is not None else list(obj.rid)
-                )
+                parent_rids = [parent_rid] if parent_rid is not None else list(obj.rid)
                 for parent_rid in set(parent_rids):
                     self._discard_parallel_sample_group(parent_rid)
             raise
@@ -2024,9 +2023,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             # Tokenize all requests
             objs = [obj[i] for i in range(batch_size)]
-            parallel_parent_rid = getattr(
-                obj, "_parallel_sampling_parent_rid", None
-            )
+            parallel_parent_rid = getattr(obj, "_parallel_sampling_parent_rid", None)
             parallel_parent_rids = [
                 parallel_parent_rid or request_obj.rid for request_obj in objs
             ]
@@ -2178,10 +2175,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             logger.warning("Ignore abort_request with empty rid and abort_all=False")
             return
         if abort_all:
-            self._parallel_sample_abort_requested.update(
-                self._parallel_sample_groups
-            )
-            self._abort_request(abort_all=True)
+            self._parallel_sample_abort_requested.update(self._parallel_sample_groups)
+            self._abort_request("", abort_all=True)
             return
         if not abort_all and rid in self._parallel_sample_groups:
             self._parallel_sample_abort_requested.add(rid)
@@ -2263,10 +2258,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if not isinstance(output, dict):
             return False
         finish_reason = (output.get("meta_info") or {}).get("finish_reason")
-        return (
-            isinstance(finish_reason, dict)
-            and finish_reason.get("type") == "abort"
-        )
+        return isinstance(finish_reason, dict) and finish_reason.get("type") == "abort"
 
     async def pause_generation(self, obj: PauseGenerationReqInput):
         async with self.is_pause_cond:

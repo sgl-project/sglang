@@ -381,9 +381,7 @@ class TestParallelSamplingAbort(CustomTestCase):
 
         tm.abort_request(parent_rid)
 
-        dispatched = [
-            call.args[0] for call in tm._dispatch_to_scheduler.call_args_list
-        ]
+        dispatched = [call.args[0] for call in tm._dispatch_to_scheduler.call_args_list]
         self.assertEqual({request.rid for request in dispatched}, child_rids)
         self.assertTrue(all(request.abort_all is False for request in dispatched))
         self.assertTrue(all(tm.rid_to_state[rid].abort_sent for rid in child_rids))
