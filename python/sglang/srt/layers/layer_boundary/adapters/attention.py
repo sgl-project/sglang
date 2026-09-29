@@ -57,7 +57,7 @@ class AttentionInputs:
         self.hidden_states_ = None
         self.qkv_latent_ = None
         # When True, hidden_states_local is already attn_tp-gathered upstream
-        # (e.g. by MHC's prepare_attn for DSA). fetch_* must NOT gather again.
+        # (e.g. by the input-scattered attention input step for DSA). fetch_* must NOT gather again.
         self.is_pre_gathered = is_pre_gathered
 
     def tp_all_gather_hidden_states(self, hidden_states, forward_batch):

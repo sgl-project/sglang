@@ -40,7 +40,7 @@ class DeferringLayer(nn.Module):
     def __init__(self, is_last_layer):
         super().__init__()
         self.is_last_layer = is_last_layer
-        # The model ends its layers at this communicator's finish_layer_stack.
+        # The model completes this layer's deferred output when it leaves the stack.
 
     def forward(
         self, positions=None, hidden_states=None, forward_batch=None, residual=None, **_

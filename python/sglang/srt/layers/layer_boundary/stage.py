@@ -144,8 +144,10 @@ class StageBoundary:
             cache: FFN-only NPU weight cache prefetched on the FFN input path.
             **call: Attention-only read/adapter options: quant_format,
                 post_residual_addition, captured_last_layer_outputs and capture_output.
-                FFN stages do not accept these options.
-                Capture callbacks retain borrowed storage by copying when necessary.
+                FFN stages do not accept these options. A capture callback is
+                called as capture_output(value, owned=bool): owned=True means
+                value is fresh storage it may keep, and owned=False means it
+                must copy before retaining.
 
         Returns:
             Compute input in the selected read's format (possibly quantized).
@@ -250,6 +252,9 @@ class StageBoundary:
         return hidden_states, stream.snapshot(hidden_states)
 
     def postprocess(self, hidden_states, forward_batch):
+        """Move an FFN output that compute already completed outside exit()
+        (the operation-scheduled TBO path) onto the rows the layer hands on;
+        it chooses no reduction step."""
         return self.plan.output.postprocess_layer(
             hidden_states, current(forward_batch), forward_batch
         )

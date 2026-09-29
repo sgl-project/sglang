@@ -436,8 +436,8 @@ def _mlp_input_gather_moe_cp(
     update: StageUpdate = ADD,
 ):
     """Gather for the FFN, then over the MoE-CP group so each rank holds all
-    tokens of its MoE group (moe_dp_size < attn_cp_size). The residual stays at
-    TP_ATTN_FULL."""
+    tokens of its MoE group (moe_dp_size < attn_cp_size). The residual stays on
+    this rank's attention rows."""
     # Early return on empty tensor is safe for MOE_CP because:
     # - During CP extend: zigzag split guarantees all CP ranks have non-zero tokens,
     #   so no rank hits this path while others proceed to the allgather.

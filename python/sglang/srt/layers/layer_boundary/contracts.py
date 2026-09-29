@@ -31,8 +31,9 @@ class ProducerReduction(Enum):
 
     PARTIAL is attention-only: finish() publishes its partial sum. SCOPED
     follows exit() flags for an FFN or single-stage mixer. LOCAL_TAIL is FFN-only:
-    compute adds a replicated component after its internal sum, preventing
-    the boundary from treating the final output as an ordinary partial sum.
+    compute adds a replicated component after its internal sum, so the
+    boundary never defers that sum to the next layer. A selected reduce-scatter
+    still applies, so compute must add the tail only when it completes the sum.
     """
 
     PARTIAL = auto()
@@ -193,6 +194,9 @@ class StageEntry(msgspec.Struct, frozen=True):
             adapts already-placed input for attention.
         capture_move: Optional movement of the updated residual back onto the
             producer's rows for auxiliary capture.
+        capture_move_allocates: Whether capture_move returns fresh storage (a
+            gather) rather than a view (a cut); capture then retains it
+            without copying.
         input_sum: Statically owed sum group for an otherwise raw input tensor.
         preserves_residual: Optional (residual, batch) predicate certifying this
             input path leaves residual untouched, including backend fallback.

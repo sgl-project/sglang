@@ -344,7 +344,9 @@ class OutputBoundary:
 
 
 def _can_defer_ffn_reduction(forward_batch: ForwardBatch, boundary=None) -> bool:
-    """Admit ordinary single-sum outputs and the existing fused LoRA path.
+    """Admit ordinary single-sum outputs, plus LoRA and TP1 shared-expert
+    outputs when a fused consumer (the backend's can_defer_all_reduce,
+    FlashInfer or aiter) can take them.
 
     A fused-kernel fallback completes the partial-output contract selected
     before the producer ran, without recomputing the producer's LoRA path.
@@ -411,8 +413,10 @@ class MixerExit:
     ``with`` block ``fuse_mlp_allreduce`` on ``get_forward()`` tells its
     row-parallel output projection to skip the all-reduce. It skips when the
     stage's output always leaves its sum (to an FFN stage, which completes it in
-    its input), and when its output declaration permits deferring the sum. The
-    consumer decides whether to fuse its completion with the input norm."""
+    its input), or when its declaration permits deferring the sum to the next
+    attention stage and the batch allows it: TP > 1, no attention DP, and no
+    input-scattered or MoE-CP all-gather layout. The consumer decides whether
+    to fuse its completion with the input norm."""
 
     __slots__ = (
         "skips_reduction",

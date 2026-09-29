@@ -68,7 +68,9 @@ def norm(
         capture_output: Optional callback retaining the same updated residual;
             it must copy borrowed storage when retention requires ownership.
         handoff_norm: Optional adapter with finalize(handoff, residual, gamma)
-            for a producer-specific finalize handoff; cannot be combined with capture.
+            for a producer-specific finalize handoff; cannot be combined with
+            capture. Its gamma is layernorm.gemma_weight, so the final norm must
+            then be a GemmaRMSNorm.
         skip_empty: Skip the ordinary norm on a zero-row completed output.
         **read_kwargs: Extra arguments forwarded to the two-input final norm.
 
@@ -108,8 +110,9 @@ def to_pp(hidden_states, forward_batch, *, preserve_declared=True):
     Args:
         hidden_states: Current stream output or opaque owed handle.
         forward_batch: Batch owning the stream.
-        preserve_declared: Keep a statically declared partial unreduced only
-            when the receiver reconstructs that same sum in from_pp (the default).
+        preserve_declared: True (the default) sends a statically declared
+            partial sum unreduced for the receiver's from_pp to complete; pass
+            False only when the receiver does not declare that sum.
 
     Runtime-selected completion work is finished before transport.
     """

@@ -60,7 +60,8 @@ class UnreducedOutput(msgspec.Struct, frozen=True):
 
 class HandoffOutput(msgspec.Struct, frozen=True):
     """A layer output that still owes work only its producer knows how to do (a
-    MoE's finalize and sum), left for the next layer's input. A fused kernel
+    MoE's finalize and sum), left for the next layer's input or for a terminal
+    norm that accepts it (residual_batch.norm(handoff_norm=...)). A fused kernel
     there may do that work together with its own; anything else passes it
     through reduce_output(), which calls ``complete()``."""
 

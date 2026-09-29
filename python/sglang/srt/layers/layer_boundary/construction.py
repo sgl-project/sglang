@@ -144,7 +144,8 @@ class StagePlan:
         direct_handoff: Attention can publish its output with finish instead of
             an exit scope and output transport.
         qkv_latent_func: Optional hook for prepared attention input.
-        fusions: Optional backend provider of ordered consumer fusion candidates.
+        fusions: Optional backend provider of ordered consumer fusion candidates
+            and the producer deferral policies (see make_attn_stage).
 
     The plan owns static paths, not per-forward tensors or a neighbour's norm.
     Runtime residual state belongs to the ForwardBatch's ResidualStream.

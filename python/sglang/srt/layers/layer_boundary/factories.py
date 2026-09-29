@@ -196,7 +196,8 @@ class StageDeclaration:
         sparse: Whether this FFN is a MoE; used to resolve input/output rows.
             Expert routing and all-to-all remain inside the MoE computation.
         terminal: Whether this stage ends the model's layer stack. Prevents
-            leaving work that requires a following layer.
+            leaving work that requires a following layer; a finalize handoff
+            may still reach the terminal norm when the fusion provider allows it.
         output_transform: Optional operation on the FFN contribution before
             residual update, with an explicit reduction-order contract.
         reduction: Whether compute always leaves a partial sum, obeys the
@@ -279,6 +280,7 @@ def declare_attn(
         terminal: Whether this stage ends the model's layer stack.
         reduction: PARTIAL for an output projection that always skips reduction;
             SCOPED for a mixer that follows its exit scope's reduction decision.
+            LOCAL_TAIL is rejected for attention stages.
         gathers_tp_input: Whether compute gathers attention-TP input slices itself.
 
     Returns:
@@ -326,7 +328,9 @@ def declare_ffn(
             to derive the TBO handoff when handoff_rows is not supplied.
         dense_tp_size: Dense compute width: None for configuration, 1 for local
             compute, or the full TP size.
-        reduction: How compute cooperates with the exit's reduction decision.
+        reduction: How compute cooperates with the exit's reduction decision:
+            SCOPED (default) follows the exit scope; LOCAL_TAIL marks a
+            replicated tail after the sum. PARTIAL is rejected for FFN stages.
         handoff_rows: Explicit output-row requirement; otherwise derived from
             the adjacent FFN kinds and TBO configuration.
 
@@ -593,8 +597,11 @@ def make_attn_stage(
             None leaves a layer/stack handoff for an independently bound reader.
         qkv_latent_func: Optional attention input hook, invoked after preparation
             and movement onto the compute input rows.
-        fusions: Optional backend provider of ordered attention_input(plan) and
-            ffn_input(plan) candidates and can_defer_finalize(plan, batch) policy.
+        fusions: Optional backend provider. Consumer side: ordered
+            attention_input(plan) and ffn_input(plan) candidates. Producer side
+            (FFN exit): can_defer_finalize(plan, batch), called on every exit,
+            and can_defer_all_reduce(plan, batch), called when LoRA or TP1 shared
+            experts are enabled.
 
     Returns:
         A StageBoundary with precomputed paths for supported batch variants.

@@ -11,4 +11,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""What the communicator takes from the modules it serves."""
+"""What the stage boundaries take from the modules they serve."""

@@ -440,7 +440,7 @@ class GigaChat35DecoderLayer(deepseek_v2.DeepseekV2DecoderLayer):
             pre_layernorm=self.post_attention_layernorm if self._use_pre else None,
             post_layernorm=self.post_self_attn_layernorm,
         )
-        # The communicator chooses its fused steps from its norms when built.
+        # The stage boundaries choose their fused steps from their norms when built.
         self.attn_boundary, self.ffn_boundary = self._build_stages(
             input_layernorm=attn_prepare_layernorm,
             post_attention_layernorm=mlp_prepare_layernorm,

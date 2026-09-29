@@ -85,11 +85,13 @@ def finish_layer_stack(
     final_norm_takes_handoff: bool = False,
     preserve_declared: bool = False,
 ) -> Tuple[Union[torch.Tensor, HandoffOutput], Optional[torch.Tensor]]:
-    """Complete what this layer left for a next layer. Call it on the last
-    layer of this rank before its output reaches the final norm, the next
-    pipeline rank, or any other consumer outside the layers. A final norm
-    that does a producer's handoff together with its own work
-    (``final_norm_takes_handoff``) receives it as it is."""
+    """Complete what this layer left for a next layer, for callers that carry
+    an explicit residual tensor or merge TBO microbatches. Stage-boundary
+    decoders use residual_batch.norm(), to_pp() or take_output() instead:
+    to_pp() keeps a declared partial sum for the receiving from_pp(), which
+    this helper would complete early. A final norm that does a producer's
+    handoff together with its own work (``final_norm_takes_handoff``)
+    receives it as it is."""
     if isinstance(residual, ResidualStream):
         return residual.finish(
             hidden_states,

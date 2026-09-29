@@ -2633,7 +2633,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         qkv_latent_func: Optional[Callable],
         output=None,
     ):
-        """The communicator for this layer's norms; it chooses its boundary
+        """The stage boundaries for this layer's norms; they choose their
         steps from them at construction."""
         fusions = None
         if (
@@ -2983,7 +2983,7 @@ class DeepseekV2Model(nn.Module):
         )
 
         install_cutedsl_fusion(
-            # PP pads self.layers with PPMissingLayer, which has no communicator.
+            # PP pads self.layers with PPMissingLayer, which has no stage boundaries.
             # A pipeline exit completes any handoff before sending its tensors.
             self.layers[self.start_layer : self.end_layer],
             hidden_size=config.hidden_size,
