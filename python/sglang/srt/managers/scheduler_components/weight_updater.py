@@ -32,9 +32,9 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    ModelExpressWeightUpdateReqOutput,
     PullWeightsReqInput,
     PullWeightsReqOutput,
-    ModelExpressWeightUpdateReqOutput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
@@ -252,7 +252,10 @@ class SchedulerWeightUpdaterManager:
             )
         success, message = self.tp_worker.update_weights_from_modelexpress(recv_req)
         if success:
-            self.flush_cache_after_weight_update(recv_req)
+            success, message = self.flush_cache_after_weight_update(
+                recv_req, success, message
+            )
+        if success:
             self.record_weight_version_after_update(recv_req.weight_version)
         else:
             logger.error(message)
