@@ -37,6 +37,7 @@ use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::WorkerRegistry;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
@@ -454,13 +455,19 @@ async fn new_connections_refused_after_drain_completes() {
 
     // A fresh connection must now be refused — the listener is closed. A child
     // process a parallel test is spawning can hold an inherited copy of the
-    // socket until it execs, so allow a short window for the last close.
+    // socket until it execs; a connection queued on that copy must never be
+    // served, only dropped when it closes.
     let err = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            match tokio::net::UnixStream::connect(&addr).await {
+            let mut stream = match tokio::net::UnixStream::connect(&addr).await {
                 Err(err) => break err,
-                Ok(_) => tokio::time::sleep(Duration::from_millis(10)).await,
-            }
+                Ok(stream) => stream,
+            };
+            let _ = stream.write_all(b"GET /healthz HTTP/1.1\r\n\r\n").await;
+            assert!(
+                !matches!(stream.read(&mut [0]).await, Ok(1)),
+                "a connection was served after the drain completed",
+            );
         }
     })
     .await
