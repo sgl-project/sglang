@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import gc
 import importlib
+import logging
 import math
 from typing import Optional
 
@@ -26,7 +26,17 @@ _SUPPORTED_TOPOLOGIES = {
     (8, 4): (64, 1024),
     (8, 8): (32, 2048),
 }
+_NEXTN_LOCAL_EXPERTS = {
+    (1, 4): 256,
+    (4, 1): 64,
+    (1, 8): 256,
+    (2, 4): 128,
+    (4, 2): 64,
+    (8, 1): 32,
+}
 _KERNEL_PACKAGE = "sglang.srt.layers.moe.gluon_kernels.glm_mxfp4"
+_LOGGED_SHARED_MODES = set()
+logger = logging.getLogger(__name__)
 
 
 def _require(condition: bool, message: str) -> None:
@@ -95,6 +105,54 @@ def _kernel_name(total_tp: int, ep_size: int, is_nextn: bool, m: int) -> str:
     )
 
 
+def validate_gluon_quant_method(layer, quant_method) -> None:
+    """Validate the only target and draft expert ABIs consumed by this backend."""
+
+    from sglang.srt.layers.quantization.quark.quark import QuarkFusedMoEMethod
+    from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4_moe import (
+        QuarkW4A4MXFp4MoE,
+    )
+    from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+
+    serialized_quark_mxfp4 = (
+        isinstance(quant_method, QuarkFusedMoEMethod)
+        and isinstance(getattr(layer, "scheme", None), QuarkW4A4MXFp4MoE)
+        and layer.scheme.is_checkpoint_mxfp4_serialized
+    )
+    moe_ep_size = getattr(layer, "moe_ep_size", 1)
+    moe_tp_size = getattr(layer, "moe_tp_size", None)
+    local_routed = getattr(
+        layer, "_num_local_routed", getattr(layer, "num_experts", None)
+    )
+    glm_nextn_topology = (
+        _NEXTN_LOCAL_EXPERTS.get((moe_ep_size, moe_tp_size)) == local_routed
+    )
+    glm_nextn_bf16 = (
+        isinstance(quant_method, UnquantizedFusedMoEMethod)
+        and str(getattr(layer, "layer_name", "")).endswith("decoder.mlp.experts")
+        and getattr(layer, "num_experts", None) == 256
+        and getattr(layer, "hidden_size", None) == 6144
+        and getattr(layer, "top_k", None) == 8
+        and glm_nextn_topology
+        and getattr(layer, "intermediate_size_per_partition", None) * moe_tp_size
+        == 2048
+        and getattr(layer, "w13_weight", None) is not None
+        and getattr(layer, "w2_weight", None) is not None
+        and layer.w13_weight.dtype == torch.bfloat16
+        and layer.w2_weight.dtype == torch.bfloat16
+        and tuple(layer.w13_weight.shape)
+        == (local_routed, 2 * layer.intermediate_size_per_partition, 6144)
+        and tuple(layer.w2_weight.shape)
+        == (local_routed, 6144, layer.intermediate_size_per_partition)
+    )
+    if not (serialized_quark_mxfp4 or glm_nextn_bf16):
+        raise ValueError(
+            "--moe-runner-backend gluon supports only serialized Quark W4A4 "
+            "MXFP4 target experts or the GLM NextN BF16 draft-expert ABI; "
+            "other formats and topologies are not supported."
+        )
+
+
 class GlmMxfp4GluonMoeBackend(GluonMoeBackend):
     """Strict GLM-5.2/5.3 W4A4 backend with TP/EP-aware dispatch."""
 
@@ -145,7 +203,11 @@ class GlmMxfp4GluonMoeBackend(GluonMoeBackend):
             "no A2A MoE": not layer._enable_a2a_moe,
             "no EPLB": not get_exec().moe.enable_eplb,
             "MoE DP size 1": get_parallel().moe_dp_size == 1,
-            "unfused shared expert": layer.num_fused_shared_experts == 0,
+            "supported shared expert layout": layer.num_fused_shared_experts in (0, 1)
+            and not (
+                layer.num_fused_shared_experts == 1
+                and (layer.moe_ep_size > 1 or layer.is_nextn)
+            ),
             "no replicated shared expert": not layer._shared_expert_tp1,
             "no SBO shared-expert fusion": not layer._fuse_shared_experts_inside_sbo,
             "positive routed scaling": isinstance(
@@ -167,14 +229,29 @@ class GlmMxfp4GluonMoeBackend(GluonMoeBackend):
         self.expert_start = experts.moe_ep_rank * self.local_experts
         self.total_tp, self.ep_size = topology
         self.is_nextn = layer.is_nextn
+        # The generic model/loader owns the policy. When enabled, consume the
+        # same appended shared-expert slot as AITER instead of repacking a
+        # second copy of the dense shared weights here.
+        self.fuse_shared_expert = layer.num_fused_shared_experts == 1
+        mode_key = (self.total_tp, self.ep_size, self.is_nextn, self.fuse_shared_expert)
+        if mode_key not in _LOGGED_SHARED_MODES:
+            _LOGGED_SHARED_MODES.add(mode_key)
+            logger.info(
+                "GLM Gluon MoE TP%d/EP%d%s uses %s shared expert",
+                self.total_tp,
+                self.ep_size,
+                " NextN" if self.is_nextn else "",
+                "fused" if self.fuse_shared_expert else "native",
+            )
 
     def _routed_weights(self):
         values = tuple(getattr(self.experts, name, None) for name in _WEIGHT_NAMES)
+        stored_experts = self.local_experts + int(self.fuse_shared_expert)
         packed_shapes = (
-            (self.local_experts, 2 * self.local_intermediate, 3072),
-            (self.local_experts, 2 * self.local_intermediate, 192),
-            (self.local_experts, 6144, self.local_intermediate // 2),
-            (self.local_experts, 6144, self.local_intermediate // 32),
+            (stored_experts, 2 * self.local_intermediate, 3072),
+            (stored_experts, 2 * self.local_intermediate, 192),
+            (stored_experts, 6144, self.local_intermediate // 2),
+            (stored_experts, 6144, self.local_intermediate // 32),
         )
         if all(
             isinstance(value, torch.nn.Parameter)
@@ -210,75 +287,41 @@ class GlmMxfp4GluonMoeBackend(GluonMoeBackend):
             _pack_scale(w2_scale),
         )
 
-    def _shared_weights(self):
-        # EP ranks and the draft layer keep the shared expert on its native path.
-        if self.ep_size > 1 or self.is_nextn:
-            return (None,) * 4, True
-        shared = self.layer.shared_experts
-        values = (
-            shared.gate_up_proj.weight,
-            getattr(shared.gate_up_proj, "weight_scale", None),
-            shared.down_proj.weight,
-            getattr(shared.down_proj, "weight_scale", None),
-        )
-        _require(
-            all(
-                isinstance(value, torch.nn.Parameter)
-                and value.dtype == torch.uint8
-                and value.is_contiguous()
-                for value in values
-            ),
-            "GLM target shared expert must use serialized MXFP4",
-        )
-        return values, False
-
-    def _prepare_weights(self) -> None:
-        if self.parameters is not None:
-            return
+    def prepare_weights(self) -> None:
         _require(
             not torch.cuda.is_current_stream_capturing(),
             "GLM Gluon weights must be prepared before CUDA graph capture",
         )
         routed = self._routed_weights()
-        shared, native_shared = self._shared_weights()
-        packed = []
-        for index, (name, routed_value, shared_value) in enumerate(
-            zip(_WEIGHT_NAMES, routed, shared)
-        ):
-            if native_shared:
+        if self.fuse_shared_expert:
+            packed = list(routed)
+        else:
+            packed = []
+            for index, (name, routed_value) in enumerate(zip(_WEIGHT_NAMES, routed)):
                 shared_value = (
                     torch.full_like(routed_value[:1], 127)
                     if index % 2
                     else torch.zeros_like(routed_value[:1])
                 )
-            else:
-                raw = shared_value.unsqueeze(0)
-                shared_value = _pack_scale(raw) if index % 2 else _pack_weight(raw)
-            _require(
-                tuple(shared_value.shape) == (1, *routed_value.shape[1:]),
-                "GLM shared-expert packed shape changed",
-            )
-            backing = torch.cat((routed_value, shared_value), dim=0)
-            current = getattr(self.experts, name, None)
-            prefix = backing[: self.local_experts]
-            if isinstance(current, torch.nn.Parameter):
-                current.data = prefix
-            else:
-                setattr(
-                    self.experts,
-                    name,
-                    torch.nn.Parameter(prefix, requires_grad=False),
-                )
-            packed.append(backing)
+                backing = torch.cat((routed_value, shared_value), dim=0)
+                current = getattr(self.experts, name, None)
+                prefix = backing[: self.local_experts]
+                if isinstance(current, torch.nn.Parameter):
+                    current.data = prefix
+                else:
+                    setattr(
+                        self.experts,
+                        name,
+                        torch.nn.Parameter(prefix, requires_grad=False),
+                    )
+                packed.append(backing)
 
         self.parameters = (
             self.layer.gate.weight,
             self.layer.gate.e_score_correction_bias,
             *packed,
         )
-        self.native_shared = native_shared
-        gc.collect()
-        torch.cuda.empty_cache()
+        self.native_shared = not self.fuse_shared_expert
 
     def forward(
         self,
@@ -302,7 +345,10 @@ class GlmMxfp4GluonMoeBackend(GluonMoeBackend):
         )
         _require(not skip_shared_experts, "GLM Gluon MoE requires shared experts")
         _require(input_ids_global is None, "GLM Gluon MoE rejects global input IDs")
-        self._prepare_weights()
+        _require(
+            self.parameters is not None,
+            "GLM Gluon weights were not prepared after checkpoint loading",
+        )
 
         name = _kernel_name(
             self.total_tp, self.ep_size, self.is_nextn, hidden_states.shape[0]

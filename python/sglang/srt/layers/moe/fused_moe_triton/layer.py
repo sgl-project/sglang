@@ -96,15 +96,6 @@ _is_cpu = is_cpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
-_GLM_NEXTN_GLUON_LOCAL_EXPERTS = {
-    (1, 4): 256,
-    (4, 1): 64,
-    (1, 8): 256,
-    (2, 4): 128,
-    (4, 2): 64,
-    (8, 1): 32,
-}
-
 # Log the deferred-finalize config at most once per process (rank). Different MoE
 # layers can resolve to different quant methods, so print_info_once (keyed on the
 # full message) would otherwise fire once per distinct quant method.
@@ -138,51 +129,11 @@ def _validate_gluon_quant_method(layer, quant_method) -> None:
     if not get_moe_runner_backend().is_gluon():
         return
 
-    from sglang.srt.layers.quantization.quark.quark import QuarkFusedMoEMethod
-    from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4_moe import (
-        QuarkW4A4MXFp4MoE,
+    from sglang.srt.layers.moe.glm_mxfp4_gluon import (
+        validate_gluon_quant_method,
     )
 
-    serialized_quark_mxfp4 = (
-        isinstance(quant_method, QuarkFusedMoEMethod)
-        and isinstance(getattr(layer, "scheme", None), QuarkW4A4MXFp4MoE)
-        and layer.scheme.is_checkpoint_mxfp4_serialized
-    )
-    # GLM NextN stores its single draft layer's routed experts in BF16.  The
-    # bound GLM backend quantizes exactly this audited tensor ABI during bind;
-    # no other unquantized MoE topology is accepted here.
-    moe_ep_size = getattr(layer, "moe_ep_size", 1)
-    moe_tp_size = getattr(layer, "moe_tp_size", None)
-    local_routed = getattr(
-        layer, "_num_local_routed", getattr(layer, "num_experts", None)
-    )
-    glm_nextn_topology = (
-        _GLM_NEXTN_GLUON_LOCAL_EXPERTS.get((moe_ep_size, moe_tp_size)) == local_routed
-    )
-    glm_nextn_bf16 = (
-        isinstance(quant_method, UnquantizedFusedMoEMethod)
-        and str(getattr(layer, "layer_name", "")).endswith("decoder.mlp.experts")
-        and getattr(layer, "num_experts", None) == 256
-        and getattr(layer, "hidden_size", None) == 6144
-        and getattr(layer, "top_k", None) == 8
-        and glm_nextn_topology
-        and getattr(layer, "intermediate_size_per_partition", None) * moe_tp_size
-        == 2048
-        and getattr(layer, "w13_weight", None) is not None
-        and getattr(layer, "w2_weight", None) is not None
-        and layer.w13_weight.dtype == torch.bfloat16
-        and layer.w2_weight.dtype == torch.bfloat16
-        and tuple(layer.w13_weight.shape)
-        == (local_routed, 2 * layer.intermediate_size_per_partition, 6144)
-        and tuple(layer.w2_weight.shape)
-        == (local_routed, 6144, layer.intermediate_size_per_partition)
-    )
-    if not (serialized_quark_mxfp4 or glm_nextn_bf16):
-        raise ValueError(
-            "--moe-runner-backend gluon supports only serialized Quark W4A4 "
-            "MXFP4 target experts or the GLM NextN BF16 draft-expert ABI; "
-            "other formats and topologies are not supported."
-        )
+    validate_gluon_quant_method(layer, quant_method)
 
 
 def _copy_weight_view_before_h2d(loaded_weight: torch.Tensor) -> torch.Tensor:
