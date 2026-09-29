@@ -610,22 +610,70 @@ async fn pd_mode_pairs_prefill_and_decode_within_version_group() {
     assert_eq!(groups_served.len(), 2, "round robin must reach both groups");
 }
 
-/// Prefill and decode workers exist, but in different version groups: no pair
-/// is possible, so the request fails instead of crossing groups.
+/// Both routing paths pair only within a version group, for dispatch and
+/// readiness; unlabeled workers form their own group, and a prefill whose group
+/// has no decode is never dispatched.
 #[tokio::test]
-async fn pd_mode_without_same_group_decode_returns_no_decode_workers_available() {
-    let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
-    let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
-    let ctx = build_ctx(vec![
-        pd_spec("p-v1", &prefill.url, WorkerMode::Prefill, Some(8997), "v1"),
-        pd_spec("d-v2", &decode.url, WorkerMode::Decode, None, "v2"),
-    ]);
-
-    let res = build_router(ctx).oneshot(chat_request()).await.unwrap();
-    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(
-        res.headers().get("x-router-error-code").unwrap(),
-        "no_decode_workers_available",
-    );
-    assert!(decode.captured.lock().unwrap().last_body.is_none());
+async fn version_groups_constrain_pairing_and_readiness_on_both_paths() {
+    use crate::common::mock_worker::MockWorker;
+    for reorg in [false, true] {
+        for (p_group, d_group) in [
+            (None, None),
+            (Some("v1"), Some("v1")),
+            (Some("v1"), Some("v2")),
+            (None, Some("v1")),
+            (Some("v1"), None),
+        ] {
+            let orphan = MockWorker::start(vec![]).await;
+            let prefill = MockWorker::start(vec![]).await;
+            let decode = MockWorker::start(vec![]).await;
+            let spec = |id: &str, url: &str, mode, port, group: Option<&str>| WorkerSpec {
+                version_group: group.map(str::to_owned),
+                ..pd_spec(id, url, mode, port, "")
+            };
+            let mut ctx = build_ctx(vec![
+                spec(
+                    "a-orphan",
+                    &orphan.url,
+                    WorkerMode::Prefill,
+                    Some(1111),
+                    Some("orphan"),
+                ),
+                spec("p", &prefill.url, WorkerMode::Prefill, Some(2222), p_group),
+                spec("d", &decode.url, WorkerMode::Decode, None, d_group),
+            ]);
+            if reorg {
+                let mutable = Arc::get_mut(&mut ctx).unwrap();
+                mutable.config.model.policy = PolicyKind::PowerOfTwo;
+                crate::common::use_reorg_factory(mutable);
+            }
+            ctx.mark_ready();
+            let expected = match p_group == d_group {
+                true => StatusCode::OK,
+                false => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            let app = build_router(ctx);
+            let ready = app
+                .clone()
+                .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(ready.status(), expected, "readyz reorg={reorg}");
+            let response = app.oneshot(chat_request()).await.unwrap();
+            assert_eq!(response.status(), expected, "chat reorg={reorg}");
+            response.into_body().collect().await.unwrap();
+            assert!(orphan.captured.lock().unwrap().last_body.is_none());
+            let forwarded = decode.captured.lock().unwrap().last_body.clone();
+            match expected {
+                StatusCode::OK => {
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&forwarded.unwrap()).unwrap();
+                    assert_eq!(body["bootstrap_port"], 2222);
+                }
+                _ => assert!(
+                    forwarded.is_none() && prefill.captured.lock().unwrap().last_body.is_none()
+                ),
+            }
+        }
+    }
 }

@@ -115,13 +115,26 @@ async fn select_workers(
         ..RoutingContext::from_headers(ctx, headers)?
     };
 
-    let prefill = pick_prefill_worker(ctx, request, policy, candidates, &routing_context)?;
-    let decode = pick_decode_worker(ctx, request, &prefill, resolver, &routing_context)?;
-    Ok(SelectedWorkers {
-        prefill,
-        decode,
-        track_dispatch_timestamps: policy.needs_dispatch_timestamps(),
-    })
+    let mut candidates = candidates.to_vec();
+    loop {
+        let prefill = pick_prefill_worker(ctx, request, policy, &candidates, &routing_context)?;
+        match pick_decode_worker(ctx, request, &prefill, resolver, &routing_context) {
+            Ok(decode) => {
+                return Ok(SelectedWorkers {
+                    prefill,
+                    decode,
+                    track_dispatch_timestamps: policy.needs_dispatch_timestamps(),
+                })
+            }
+            // Another version group may still have a decode that fits this request.
+            Err(error) => {
+                candidates.retain(|w| w.version_group() != prefill.version_group());
+                if candidates.is_empty() {
+                    return Err(error);
+                }
+            }
+        }
+    }
 }
 
 fn capture_load_snapshot(
