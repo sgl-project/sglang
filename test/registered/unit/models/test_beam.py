@@ -81,18 +81,16 @@ class _LoadedExpert:
 
 
 class TestBeamConfig(CustomTestCase):
-    def test_unsupported_attention_and_head_parallelism_fail_before_allocation(self):
-        for field in ("enable_dp_attention", "enable_dp_lm_head"):
-            with (
-                self.subTest(field=field),
-                get_context().override_server_args(**{field: True}),
-                patch("sglang.srt.models.beam.BeamModel") as model,
-            ):
-                with self.assertRaisesRegex(
-                    NotImplementedError, "attention data parallelism"
-                ):
-                    BeamForCausalLM(tiny_config())
-                model.assert_not_called()
+    def test_fully_data_parallel_dense_mlp_fails_before_allocation(self):
+        # Dense layers gather attention-DP tokens over the full TP group; a
+        # replicated dense MLP would change the scheduler's scatter mode.
+        with (
+            get_context().override_server_args(moe_dense_tp_size=1),
+            patch("sglang.srt.models.beam.BeamModel") as model,
+        ):
+            with self.assertRaisesRegex(NotImplementedError, "moe_dense_tp_size=1"):
+                BeamForCausalLM(tiny_config())
+            model.assert_not_called()
 
     def test_expert_relocation_fails_before_allocation(self):
         for options in (

@@ -497,10 +497,10 @@ class BeamForCausalLM(nn.Module):
         super().__init__()
         if quant_config is not None:
             raise NotImplementedError("Beam currently supports unquantized weights")
-        if get_parallel().enable_dp_attention or get_parallel().enable_dp_lm_head:
+        if get_parallel().moe_dense_tp_size == 1:
             raise NotImplementedError(
-                "Beam does not yet support attention data parallelism or a "
-                "data-parallel LM head"
+                "Beam shards dense MLP layers over the full TP group; "
+                "moe_dense_tp_size=1 is not supported"
             )
         if (
             get_exec().moe.enable_eplb
