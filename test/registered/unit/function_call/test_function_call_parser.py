@@ -2436,9 +2436,7 @@ class TestQwen3CoderDetector(unittest.TestCase):
             "</function></tool_call>"
         )
         text = (
-            "before"
-            + complete
-            + "between<tool_call><function=get_current_weather>"
+            "before" + complete + "between<tool_call><function=get_current_weather>"
             "<parameter=location>Rome"
         )
         result = self.detector.detect_and_parse(text, self.tools)
