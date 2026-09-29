@@ -170,6 +170,73 @@ class TestMamba(unittest.TestCase):
             req_to_token_pool.mamba_allocator.available_size() == mamba_cache_size - 1
         )
 
+    @unittest.skipUnless(torch.cuda.is_available(), "host-sync checks need CUDA")
+    def test_prefill_slot_setup_does_not_sync_host(self):
+        """Under the overlap schedule the scheduler clears and maps mamba slots for
+        a new prefill while the previous forward is still running; a host sync
+        there drains that forward."""
+        _, req_to_token_pool, _ = self._setup_pools()
+        mamba_pool = req_to_token_pool.mamba_pool
+        temporal = mamba_pool.mamba_cache.temporal
+        temporal.fill_(1)
+        slots = req_to_token_pool.mamba_allocator.alloc(3)
+        reqs = [
+            Req(
+                rid=i,
+                origin_input_text="",
+                origin_input_ids=array("q"),
+                sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+            )
+            for i in range(2)
+        ]
+        # The first call builds the cached conv-slot descriptor (a one-time copy).
+        warm = req_to_token_pool.mamba_allocator.alloc(1)
+        mamba_pool.clear_slots(warm)
+        temporal.fill_(1)
+        torch.cuda.synchronize()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            mamba_pool.clear_slots(slots)
+            select_index = req_to_token_pool.alloc(reqs)
+            # The check itself catches the synchronizing forms both calls used.
+            with self.assertRaises(RuntimeError):
+                temporal[:, slots] = 0
+            probe = req_to_token_pool.req_index_to_mamba_index_mapping.clone()
+            with self.assertRaises(RuntimeError):
+                probe[select_index] = probe[: len(select_index)]
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+
+        cleared = torch.zeros(
+            temporal.shape[1], dtype=torch.bool, device=temporal.device
+        )
+        cleared[slots] = True
+        self.assertTrue(torch.all(temporal[:, cleared] == 0))
+        self.assertTrue(torch.all(temporal[:, ~cleared] == 1))
+        expected = torch.stack([req.kv.mamba_pool_idx for req in reqs]).to(torch.int32)
+        self.assertTrue(
+            torch.equal(
+                req_to_token_pool.req_index_to_mamba_index_mapping[select_index],
+                expected,
+            )
+        )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "host-sync checks need CUDA")
+    def test_async_h2d_does_not_sync_host(self):
+        from sglang.srt.utils.common import async_h2d
+
+        values = [3, 0, 7, 1]
+        torch.cuda.synchronize()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            copied = async_h2d(values, torch.int32, "cuda")
+            with self.assertRaises(RuntimeError):
+                torch.tensor(values, dtype=torch.int32, device="cuda")
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+        self.assertEqual(copied.dtype, torch.int32)
+        self.assertEqual(copied.tolist(), values)
+
     def test_mamba_pool_deduplicated_conv_window_axis(self):
         class WindowFirstMambaPool(MambaPool):
             conv_window_axis = 0

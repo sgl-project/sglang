@@ -75,6 +75,7 @@ from sglang.srt.mem_cache.utils import (
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
+    async_h2d,
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
@@ -1007,7 +1008,11 @@ class MambaPool:
             fused_clear_conv_slots(self._conv_slot_desc, indices)
             temporal = self.mamba_cache.temporal
             if temporal.numel() > 0:
-                temporal[:, indices] = 0
+                # `temporal[:, indices] = 0` copies the scalar host-to-device and
+                # waits for the stream; fill in place instead.
+                temporal.index_fill_(
+                    1, indices.to(device=temporal.device, dtype=torch.int64), 0
+                )
             return
         if not _is_npu:
             need_size = len(indices)
@@ -1480,12 +1485,19 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
             )
         mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
-        self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
+        # Indexing with the Python list would copy it host-to-device from
+        # pageable memory and wait for the in-flight forward.
+        select_index_device = async_h2d(
+            select_index,
+            torch.int64,
+            self.req_index_to_mamba_index_mapping.device,
+        )
+        self.req_index_to_mamba_index_mapping[select_index_device] = mamba_index_tensor
         if self.enable_mamba_extra_buffer:
             ping_pong_tensor = torch.stack(mamba_ping_pong_track_buffers)
-            self.req_index_to_mamba_ping_pong_track_buffer_mapping[select_index] = (
-                ping_pong_tensor
-            )
+            self.req_index_to_mamba_ping_pong_track_buffer_mapping[
+                select_index_device
+            ] = ping_pong_tensor
         return select_index
 
     def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:

@@ -561,6 +561,19 @@ def is_pin_memory_available(device=None) -> bool:
     return current_platform.is_pin_memory_available(device)
 
 
+def async_h2d(values, dtype: torch.dtype, device) -> torch.Tensor:
+    """Copy a host list of numbers to ``device`` without blocking the host.
+
+    ``torch.tensor(values, device=cuda)`` (and indexing a CUDA tensor with a
+    Python list) copies from pageable memory, which waits for the stream to
+    drain. Staging through pinned memory keeps the copy stream-ordered.
+    """
+    pin = is_pin_memory_available(device)
+    return torch.tensor(values, dtype=dtype, pin_memory=pin).to(
+        device, non_blocking=pin
+    )
+
+
 def async_d2h(tensor: torch.Tensor) -> torch.Tensor:
     """Enqueue a CUDA-to-pinned-host copy on the current stream."""
     if not tensor.is_cuda:
