@@ -532,11 +532,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         parallel = get_parallel()
         self.elastic_worker_count = parallel.num_dp_ranks
         self.attn_replica_size = attn_replica_size()
-        self.elastic_instance_id = uuid.uuid4().hex
+        self.elastic_instance_id = (
+            get_parallel().elastic_ep_runtime_instance_id or uuid.uuid4().hex
+        )
+        self.elastic_initial_ep_size = (
+            get_parallel().elastic_ep_initial_size
+            or self.elastic_worker_count * self.attn_replica_size
+        )
+        self.elastic_allocation_width = get_parallel().elastic_ep_allocation_width
+        self.elastic_max_committed_ep_size = (
+            self.elastic_worker_count * self.attn_replica_size
+        )
         self.elastic_operation_id = None
         self.elastic_operation_target = None
         self.elastic_operation_succeeded = None
-        self.elastic_expected_joining_member_ids = []
+        self.elastic_expected_joining_allocation_ids = []
         self.elastic_pending_ep_size = None
         self.elastic_scale_phase = "idle"
         self.elastic_last_error = None
@@ -549,7 +559,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.elastic_joining_rank_offset = None
         self.elastic_joining_rank_count = 0
         self.elastic_ready_rank_count = 0
-        self.elastic_joining_member_ids = []
+        self.elastic_joining_allocation_ids = []
         self._elastic_scale_lock = asyncio.Lock()
         self.enable_metrics = get_observability().enable_metrics
         self.incremental_streaming_output = get_serving().incremental_streaming_output
@@ -3696,7 +3706,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.elastic_joining_rank_offset = msg.joining_rank_offset
         self.elastic_joining_rank_count = msg.joining_rank_count
         self.elastic_ready_rank_count = msg.ready_rank_count
-        self.elastic_joining_member_ids = list(msg.joining_member_ids)
+        self.elastic_joining_allocation_ids = list(msg.joining_allocation_ids)
         if not msg.terminal:
             return
 
@@ -3710,6 +3720,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.elastic_worker_count = physical_ep_size_to_dp_size(
             msg.effective_ep_size, self.attn_replica_size
         )
+        self.elastic_max_committed_ep_size = max(
+            self.elastic_max_committed_ep_size,
+            msg.effective_ep_size,
+        )
         self.elastic_pending_ep_size = None
         self.elastic_operation_succeeded = True
         self.elastic_last_error = None
@@ -3722,7 +3736,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "target_ep_size": self.elastic_operation_target,
             "operation_succeeded": self.elastic_operation_succeeded,
             "is_scaling_elastic_ep": self.elastic_pending_ep_size is not None,
+            "initial_ep_size": self.elastic_initial_ep_size,
+            "allocation_width": self.elastic_allocation_width,
             "effective_ep_size": self.elastic_worker_count * self.attn_replica_size,
+            "max_committed_ep_size": self.elastic_max_committed_ep_size,
             "pending_ep_size": self.elastic_pending_ep_size,
             "scale_phase": self.elastic_scale_phase,
             "last_error": self.elastic_last_error,
@@ -3731,7 +3748,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "joining_rank_offset": self.elastic_joining_rank_offset,
             "joining_rank_count": self.elastic_joining_rank_count,
             "ready_rank_count": self.elastic_ready_rank_count,
-            "joining_member_ids": list(self.elastic_joining_member_ids),
+            "joining_allocation_ids": list(self.elastic_joining_allocation_ids),
         }
 
     async def scale_elastic_ep(
@@ -3802,15 +3819,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     pending_ep_size=self.elastic_pending_ep_size,
                     scale_phase=self.elastic_scale_phase,
                 )
-            requested_members = list(obj.expected_joining_member_ids or [])
-            if requested_members != self.elastic_expected_joining_member_ids:
+            requested_allocations = list(obj.expected_joining_allocation_ids or [])
+            if requested_allocations != self.elastic_expected_joining_allocation_ids:
                 return ScaleElasticEPReqOutput(
                     success=False,
                     conflict=True,
                     message=(
-                        f"Operation {operation_id} already has joining members "
-                        f"{self.elastic_expected_joining_member_ids}, not "
-                        f"{requested_members}."
+                        f"Operation {operation_id} already has joining allocations "
+                        f"{self.elastic_expected_joining_allocation_ids}, not "
+                        f"{requested_allocations}."
                     ),
                     operation_id=operation_id,
                     instance_id=self.elastic_instance_id,
@@ -3847,8 +3864,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.elastic_operation_id = operation_id
             self.elastic_operation_target = obj.new_ep_size
             self.elastic_operation_succeeded = None
-            self.elastic_expected_joining_member_ids = list(
-                obj.expected_joining_member_ids or []
+            self.elastic_expected_joining_allocation_ids = list(
+                obj.expected_joining_allocation_ids or []
             )
             self.elastic_pending_ep_size = obj.new_ep_size
             self.elastic_scale_phase = "submitting"
@@ -3858,14 +3875,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 obj.new_ep_size - self.elastic_worker_count
             )
             self.elastic_ready_rank_count = 0
-            self.elastic_joining_member_ids = list(
-                obj.expected_joining_member_ids or []
+            self.elastic_joining_allocation_ids = list(
+                obj.expected_joining_allocation_ids or []
             )
         scheduler_obj = ScaleElasticEPReqInput(
             new_ep_size=obj.new_ep_size,
             operation_id=operation_id,
             expected_instance_id=obj.expected_instance_id,
-            expected_joining_member_ids=obj.expected_joining_member_ids,
+            expected_joining_allocation_ids=obj.expected_joining_allocation_ids,
             runtime_instance_id=self.elastic_instance_id,
             submission_id=uuid.uuid4().hex,
         )
@@ -3919,6 +3936,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         )
         if pending_response is None:
             self.elastic_worker_count = obj.new_ep_size
+            self.elastic_max_committed_ep_size = max(
+                self.elastic_max_committed_ep_size,
+                obj.new_ep_size,
+            )
             self.elastic_pending_ep_size = None
             self.elastic_scale_phase = "serving_expanded"
             self.elastic_operation_succeeded = True
