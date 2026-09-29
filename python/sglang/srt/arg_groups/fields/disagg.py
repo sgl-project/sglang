@@ -90,9 +90,11 @@ class Disagg(msgspec.Struct):
                 "Storage backend for KV preserved across PD decode retraction. "
                 "'cpu_tensor' uses per-request CPU tensors. 'host_pool' uses "
                 "a reserved HiCache pool and does not fall back on exhaustion. "
+                "'none' keeps no backup: a retracted request is aborted with "
+                "503 for the client to retry. "
                 "If omitted, the backend is inferred from the decode KV pool."
             ),
-            choices=["cpu_tensor", "host_pool"],
+            choices=["cpu_tensor", "host_pool", "none"],
         ),
     ] = None
     num_reserved_decode_tokens: A[
@@ -168,3 +170,7 @@ class Disagg(msgspec.Struct):
         "The path of the PD-Multiplexing config file.",
     ] = None
     sm_group_num: A[int, "Number of sm partition groups."] = 8
+    disaggregation_decode_host_receive_threshold: A[
+        float,
+        "Device token usage fraction at which incoming KV is received in the decode retraction host pool, excluding evictable cache pages. Range [0, 1]; 0 disables host receive. Size with --hicache-size or --hicache-ratio; requires dense MHA and a transfer backend that supports host destinations. No built-in backend currently supports this.",
+    ] = 0.0
