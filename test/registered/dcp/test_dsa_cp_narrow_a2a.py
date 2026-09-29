@@ -1,28 +1,24 @@
-"""CPU unit test: DSA-CP's narrow all-to-all (handoff §8 W1) is exact.
+"""CPU unit test: DSA-CP's narrow all-to-all is exact.
 
-DSA-CP swaps "my heads for every token" for "every head for my tokens" *after*
+DSA-CP swaps "my heads for every token" for "every head for my tokens" after
 ``q_b_proj`` and the absorb through ``w_kc``, so the wire carries the 512-wide
-absorbed latent on the way in and the 512-wide attention output on the way back.
-Both are fixed linear functions of narrower tensors beside them: q is 256 wide
-coming out of ``q_b_proj`` and the head output is 256 (``v_head_dim``).
-
+absorbed latent in and the 512-wide attention output back. Both are linear
+functions of narrower tensors beside them: q is 256 wide out of ``q_b_proj``
+and the head output is ``v_head_dim`` 256.
 ``SGLANG_NPU_ENABLE_DSA_CP_NARROW_A2A`` moves the inbound exchange to the
-narrow side, and ``..._OUTPUT`` the return leg as well. Measured on A3 tp16, a
-served A/B: **92 ms + 2.08 us/token** with both legs, of which the 92 ms is the
-third collective going away and nothing else. The price is the full weights on
-every rank -- ``w_kc`` alone is 12 MB per layer, both are 28 -- and at tp16 that
-came to **4.06 GiB of KV pool**, which is why it is off by default and why the
-return leg is a second switch.
+narrow side and ``..._OUTPUT`` the return leg; the two are independent.
 
 **The claim this file pins:** deferring the absorb past the exchange changes
-nothing, because ``npu_transpose_batchmatmul`` here is a product per (token,
-head) pair and the all-to-all only moves those pairs between ranks. That holds
-only if each rank absorbs with the ``w_kc`` of the head it ENDS UP holding, not
-the head it was assigned -- which is exactly what the full weights buy and
-exactly what a plausible implementation gets wrong.
+nothing, because ``npu_transpose_batchmatmul`` is a product per (token, head)
+pair and the all-to-all only moves those pairs between ranks. That holds only
+if each rank absorbs with the ``w_kc`` of the head it ENDS UP holding, not the
+head it was assigned -- which is what the full weights buy, and what a
+plausible implementation gets wrong. One test is the negative case, showing
+that reusing the local slice after the swap really is wrong.
 
-The second test is the negative: it shows that reusing the local slice after the
-swap is wrong, so the full-weight requirement is not decoration.
+The rest pins which weights each mode gathers. That is invisible to any test
+of results -- both modes compute the same answer -- and shows up only as KV
+pool, 12 MB per layer for the inbound leg and 16 for the return.
 
 Usage:
     python -m pytest test_dsa_cp_narrow_a2a.py -v
@@ -204,11 +200,8 @@ class TestGatheredWeightLayout(CustomTestCase):
 class TestOnlyTheEnabledLegsAreGathered(CustomTestCase):
     """Which weights the loader gathers has to follow which legs are narrowed.
 
-    The inbound leg needs the full ``w_kc``; the return leg needs the full
-    ``w_vc`` on top, and that second one is 16 of the 28 MB per layer for about
-    12% of the saving. Gathering it anyway is invisible -- everything still
-    computes the right answer -- and costs 1.2 GiB of KV pool on a 78-layer
-    model at tp16. So the selection is worth pinning.
+    Gathering one that nothing reads is invisible -- everything still computes
+    the right answer -- and costs 1.2 GiB of KV pool at 78 layers and tp16.
     """
 
     TP = 4
@@ -259,8 +252,7 @@ class TestOnlyTheEnabledLegsAreGathered(CustomTestCase):
         self.assertIsNotNone(getattr(attn, "w_kc_full", None))
         self.assertIsNone(
             getattr(attn, "w_vc_full", None),
-            "w_vc was gathered although the return leg is wide, which is the "
-            "16 MB per layer this mode exists to save",
+            "w_vc gathered although the return leg is wide: 16 MB per layer",
         )
         self.assertEqual(
             attn.w_kc_full.shape, (self.HEADS * self.TP, self.NOPE, self.LORA)
@@ -274,13 +266,7 @@ class TestOnlyTheEnabledLegsAreGathered(CustomTestCase):
         )
 
     def test_output_only_leaves_w_kc_alone(self):
-        """The return leg runs without the inbound one, and pays only for w_vc.
-
-        Measured at tp16: the inbound leg's effect on wall time sits under the
-        run-to-run floor at both 6007 and 16007 tokens, while the pair saves
-        105-126 ms. So the return leg on its own is the combination worth
-        being able to run, and it must not drag w_kc's 12 MB per layer with it.
-        """
+        """The return leg runs without the inbound one, paying only for w_vc."""
         attn, calls = self._attach(narrow_input=False, narrow_output=True)
         self.assertEqual(len(calls), 1)
         self.assertIsNone(getattr(attn, "w_kc_full", None))
@@ -304,12 +290,9 @@ class TestOnlyTheEnabledLegsAreGathered(CustomTestCase):
         self.assertEqual(attn.w_kc_full.stride()[1:], attn.w_kc.stride()[1:])
 
     def test_the_return_leg_still_needs_dsa_cp_itself(self):
-        """Independent of the inbound leg, but not of DSA-CP.
-
-        Both legs are rearrangements of DSA-CP's own exchange. With DSA-CP off
-        there is no exchange to move work across, and gathering the weights
-        would be pure cost.
-        """
+        """Independent of the inbound leg, but not of DSA-CP itself: both legs
+        rearrange DSA-CP's own exchange, so with it off there is nothing to
+        rearrange and the gathered weights would be pure cost."""
         from sglang.srt.layers.attention.dsa import dsa_cp as dsa_cp_module
 
         with (

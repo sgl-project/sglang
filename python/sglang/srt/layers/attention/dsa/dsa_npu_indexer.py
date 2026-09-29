@@ -146,29 +146,21 @@ class _IndexerQueryShard:
     ) -> torch.Tensor:
         """Full-width top-k, or this rank's own rows when DSA-CP will slice anyway.
 
-        Handoff §8 W2. Under DSA-CP the gather above is pure waste: attention
-        immediately cuts the gathered tensor back to ``[local_start, local_end)``
-        with ``dsa_cp_slice``, and that is the same row range this rank already
-        holds. Both planners compute ``rows = ceil(total / tp_size)`` and
-        ``start = rank * rows``, which
+        Under DSA-CP the gather is waste: attention cuts the gathered tensor
+        straight back to ``[local_start, local_end)``, the range this rank
+        already holds. Both planners compute ``rows = ceil(total / tp_size)``
+        and ``start = rank * rows``, which
         ``test/registered/dcp/test_dsa_cp_indexer_row_agreement.py`` pins --
-        **that test is what makes this safe, and it is why it landed first.**
-        Until now the agreement was incidental, because the gather hid any
-        disagreement; skipping the gather makes it load-bearing.
+        that agreement was incidental while the gather hid it, and skipping the
+        gather makes it load-bearing.
 
-        Removes one all-gather of ``index_topk`` int32 per token, and its sync
-        point, from each indexer layer.
+        Sets ``forward_batch.npu_indexer_topk_is_local`` so attention knows
+        which of the two it was handed. It describes the most recent top-k,
+        which is the tensor the skip-topk layers pass along, and a layer that
+        declines to shard rewrites it to False before its own attention runs.
 
-        Sets ``forward_batch.npu_indexer_topk_is_local`` so the attention side
-        knows which of the two it was handed. The flag describes the most
-        recently produced top-k, which is exactly the tensor the skip-topk
-        layers pass along -- and a layer that declines to shard rewrites it to
-        False before its own attention runs.
-
-        Rows past ``num_real`` are zeroed rather than left as the operator wrote
-        them. The gather-then-slice path fills them with zeros (``dsa_cp_slice``
-        pads), so this keeps the result bitwise identical rather than merely
-        equivalent. It is at most ``tp_size - 1`` rows, on the last rank only.
+        Rows past ``num_real`` are zeroed to match what ``dsa_cp_slice`` pads,
+        keeping the result bitwise identical rather than merely equivalent.
         """
         plan = get_dsa_cp_plan(forward_batch)
         local = plan is not None
@@ -184,10 +176,9 @@ class _IndexerQueryShard:
         forward_batch.npu_indexer_topk_is_local = local
         if not local:
             return self.gather(topk_indices, num_tokens)
-        # Deliberately not gated on attn_tp_rank, so a grep returns the rank
-        # count and not 1. Without this line a W2 that silently never engaged
-        # would look exactly like a W2 that worked: the output is identical
-        # either way, and only the timing would differ.
+        # Not gated on attn_tp_rank, so a grep returns the rank count: the
+        # output is identical whether or not this engaged, only the timing
+        # differs, so this line is the only evidence it ran.
         print_info_once(
             "DSA-CP W2: skipping the indexer top-k all-gather; each rank keeps "
             "the rows it scored"
@@ -305,29 +296,22 @@ class DSANPUIndexerMixin:
 
         bs = q_lora.shape[0]
 
-        # W3 (handoff §8): when this rank will only SCORE its own rows, project
-        # only those rows too. ``wq_b`` is [T, 1536] @ [1536, 64 * 128], 25.2
-        # MFLOP per token against ``weights_proj``'s 0.46, so slicing q here
-        # removes (tp - 1)/tp of the indexer's projection work. The k path below
-        # stays full width on purpose: every attention-TP rank writes the whole
-        # index-K cache, which is what lets any of them score a subset.
+        # When this rank will only SCORE its own rows, project only those rows.
+        # ``wq_b`` is [T, 1536] @ [1536, 64 * 128], 25.2 MFLOP per token against
+        # ``weights_proj``'s 0.46, so this removes (tp - 1)/tp of the indexer's
+        # projection work. The k path below stays full width on purpose: every
+        # attention-TP rank writes the whole index-K cache, which is what lets
+        # any of them score a subset. Row-wise exact, so the result is bitwise
+        # what the late ``shard.take`` produced.
         #
-        # Neox only. The other branch rotates q and k in one
+        # Neox only: the other branch rotates q and k in one
         # ``rotary_emb(positions, q_pe, k_pe)`` call, so q cannot take a
-        # different row slice than k without splitting that call in two, and
-        # ``is_neox_style`` is ``not config.indexer_rope_interleave``, a key
-        # GLM-5.2's config does not set.
+        # different row slice than k without splitting it in two.
         #
-        # Row-wise exact: every output row of a Linear and of the rotary depends
-        # only on its own input row, so the result is bitwise what the late
-        # ``shard.take`` produced -- fewer rows change the tiling, not the
-        # reduction each row sums over.
-        # Prefill CP is excluded explicitly. It has its own indexer
-        # (``do_npu_cp_balance_indexer``) further down, which knows nothing about
-        # this shard and would be handed a q that is a slice of a slice. Today CP
-        # forces attn_tp_size to 1 and the planner declines on its own, but that
-        # is a property of the tp8/cp8 layout, not a guarantee -- cp2 at tp8
-        # leaves attn_tp at 4.
+        # Prefill CP is excluded explicitly -- its own indexer further down knows
+        # nothing about this shard and would get a slice of a slice. CP forces
+        # attn_tp_size to 1 today so the planner declines anyway, but that is a
+        # property of the tp8/cp8 layout, not a guarantee.
         uses_prefill_cp = (
             self.dsa_enable_prefill_cp and forward_batch.attn_cp_metadata is not None
         )
@@ -593,15 +577,15 @@ class DSANPUIndexerMixin:
             )
             query = q.view(-1, self.n_heads, self.head_dim)
             # The full width, for the gather to rebuild -- NOT query.shape[0],
-            # which W3 has already cut to shard.rows when it slices q early.
+            # which is already cut to shard.rows when q is sliced early.
             num_query_tokens = bs
             if shard is not None:
                 if not q_sliced_early:
                     query = shard.take(query)
                 # weights stays a late take: under _use_ag_after_qlora with a
                 # SCATTERED input it is all-gathered to full width above, so
-                # slicing it before that would cut a slice twice. It is 0.46
-                # MFLOP per token against wq_b's 25.2, so ~2% of W3's saving.
+                # slicing it earlier would cut a slice twice. At 0.46 MFLOP per
+                # token against wq_b's 25.2 it is ~2% of the saving anyway.
                 weights = shard.take(weights)
                 actual_seq_lengths_q = shard.actual_seq_lengths_q
                 actual_seq_lengths_kv = shard.actual_seq_lengths_kv

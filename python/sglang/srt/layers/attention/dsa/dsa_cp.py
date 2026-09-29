@@ -46,7 +46,6 @@ bound by a per-query top-k KV read, which falls by ``attn_tp_size`` when the
 queries do.
 """
 
-import logging
 from functools import lru_cache
 from typing import TYPE_CHECKING, Optional, Tuple
 
@@ -62,8 +61,6 @@ from sglang.srt.layers.communicator import ScatterMode
 from sglang.srt.layers.dcp.layout import dcp_crop_free_extend
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_npu, print_info_once
-
-logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -116,125 +113,50 @@ def _dsa_cp_narrow_a2a_output_flag() -> bool:
 
 
 def dsa_cp_narrow_a2a_output_enabled() -> bool:
-    """Whether to narrow the RETURN leg as well as the inbound one.
+    """Whether to narrow the return leg: apply ``w_vc`` before the exchange back.
 
-    The two halves of the narrow exchange are separable, and they are not worth
-    the same. Per row-head, the wire carries:
-
-        ============================  ============  =========  ==============
-        mode                          collectives   values     gathered
-        ============================  ============  =========  ==============
-        wide (default)                3             1088       nothing
-        narrow input                  2             768        w_kc, 12 MB
-        narrow input + output         2             512        both, 28 MB
-        ============================  ============  =========  ==============
-
-    Dropping a collective costs nothing in memory and saves a fixed amount;
-    narrowing the bytes costs weights and saves in proportion to tokens. The
-    A3 tp16 measurement separates them: the whole feature saved
-    **92 ms + 2.08 us/token**, and the 92 ms is the third collective going away
-    -- 1.18 ms per layer, which is four times what HCCL's own cost model
-    predicts for a call of that size, because the reshape and permute around
-    each all-to-all cost more than the transfer.
-
-    The return leg is 320 of the 576 values the full mode saves, so it carries
-    about 44% of the per-token term and none of the fixed one. At 16k tokens
-    that is 125 ms with it and 111 ms without: **the input leg alone is 88% of
-    the benefit for 43% of the weight memory.** Hence off by default, while the
-    inbound leg is the one meant to become the default.
-
-    **Independent of the inbound leg**, because the measurement made that the
-    interesting combination. Each leg can be on without the other.
+    Independent of :func:`dsa_cp_narrow_a2a_enabled`; either leg runs alone.
+    Needs the full ``w_vc``, 16 MB per layer.
     """
     return _dsa_cp_narrow_a2a_output_flag() and dsa_cp_enabled()
 
 
 def dsa_cp_narrow_a2a_enabled() -> bool:
-    """Whether to exchange the query before the absorb instead of after it.
+    """Whether to exchange the query before the ``w_kc`` absorb, not after it.
 
-    DSA-CP swaps heads for tokens *after* ``q_b_proj`` and the absorb through
-    ``w_kc``, so the wire carries the 512-wide absorbed latent on the way in and
-    the 512-wide attention output on the way back. Both are fixed linear
-    functions of narrower tensors beside them: q is 256 wide coming out of
-    ``q_b_proj`` (``qk_nope`` 192 + rope 64) and the head output is 256
-    (``v_head_dim``). Exchanging on the narrow side moves 512 values per
-    row-head instead of 1088, in two collectives rather than three -- or 768 in
-    two when only the inbound leg is narrowed, which is the default shape of
-    this flag and the one :func:`dsa_cp_narrow_a2a_output_enabled` explains.
+    DSA-CP swaps heads for tokens after ``q_b_proj`` and the absorb, so the wire
+    carries the 512-wide absorbed latent in and the 512-wide attention output
+    back. Both are linear functions of narrower tensors beside them: q is 256
+    wide out of ``q_b_proj`` (``qk_nope`` 192 + rope 64) and the head output is
+    ``v_head_dim`` 256. Exchanging on the narrow side moves 768 values per
+    row-head instead of 1088, in two collectives instead of three, and 512 with
+    the return leg as well.
 
-    **Measured** (``glm5.2_testing/p17_a2a_shape_probe.py``, A3 tp8, 16,384
-    tokens, bf16): 272.0 MB in 2.808 ms today against 128.0 MB in 1.532 ms
-    proposed -- 2.12x the bytes, **1.83x the time**, saving 1.276 ms per layer or
-    99.6 ms per 78-layer forward. HCCL time follows bytes here:
-    ``t(ms) = 0.301 + 0.00697 * MB``, residuals under 0.01 ms.
+    Exact either way: ``npu_transpose_batchmatmul`` is a per-head, per-row
+    product and the all-to-all only permutes (token, head) pairs, so absorbing
+    then permuting equals permuting then absorbing -- provided each rank holds
+    the ``w_kc``/``w_vc`` of the head it ends up with, which is what the full
+    weights buy. Verified bitwise at 2018 / 6021 / 16022 tokens.
 
-    **Off by default, and that is the honest default.** Every rank needs the FULL
-    ``w_kc [64, 192, 512]`` and ``w_vc [64, 512, 256]`` -- 28.0 MB per layer --
-    *beside* its own slice, which the non-sharded paths still use. Over 78 layers
-    that is 2.13 GiB of live weights, but the **measured** cost is larger:
-
-        A3 tp16 dcp1, 2026-09-29, KV pool at the same mem-fraction
-          off: 210,560 tokens, 18.69 GiB
-          on : 164,992 tokens, 14.64 GiB      -> **4.05 GiB, 45,568 tokens**
-
-    Nearly double the live figure, and **the cause is not yet known.** The first
-    guess was transient allocations: :func:`dsa_cp_attach_full_kv_b` used to
-    gather ``w_kc`` into a plain buffer and then build a *second* full copy to
-    restore the loader's layout. It now gathers in the physical layout and views
-    back, removing that copy and the send copy -- and the pool came back at
-    164,736 tokens, i.e. **unchanged**. The guess was wrong, for a reason the
-    source states plainly: ``get_available_gpu_memory`` calls
-    ``empty_device_cache`` before ``mem_get_info``, so freed transients were
-    never in the measurement. The single-allocation gather is still worth having
-    (it lowers peak memory *during* loading, where OOM risk is highest) but it
-    buys no pool.
-
-    So ~1.9 GiB of live memory is unaccounted for. Candidates not yet
-    distinguished: collective buffers HCCL keeps for the new message shapes, and
-    allocator fragmentation from 156 mid-sized allocations interleaved with the
-    weight loads. The ``Load weight end ... mem usage=`` line brackets it --
-    compare it between a narrow-on and narrow-off launch and the gap either
-    falls inside weight loading or after it.
-
-    Whatever the cause, 4 GiB is the number to plan with: a fifth of the A3
-    dcp16 KV pool, on boxes where memory pressure presents as a multi-minute
-    stall rather than an OOM. Turn it on where the margin is known.
-
-    The exchange is exact either way: ``npu_transpose_batchmatmul`` here is a
-    per-head, per-row product, and the all-to-all is a permutation of
-    (token, head) pairs, so absorbing then permuting and permuting then
-    absorbing agree -- provided each rank holds the ``w_kc``/``w_vc`` of the head
-    it ends up with, which is exactly what the full weights buy.
+    Off by default. Measured on A3 tp16: 3.7-7.8% faster at 6007 tokens and
+    3-4.5% at 16007, but **8-13% slower below 3000**, and it costs 4.06 GiB of
+    KV pool -- 2.13 GiB of weights plus 2 x ``HCCL_BUFFSIZE``, which HCCL
+    charges the attention-TP communicator on its first sizeable collective.
+    ``DSA_CP_HANDOFF_2026-09-24.md`` section 8 has the tables.
     """
     return _dsa_cp_narrow_a2a_flag() and dsa_cp_enabled()
-
-
-_narrow_a2a_totals = {
-    "layers": 0,
-    "tensor_bytes": 0,
-    "allocated_bytes": 0,
-    "reserved_bytes": 0,
-    "driver_bytes": 0,
-    "sync_bytes": 0,
-}
 
 
 def dsa_cp_attach_full_kv_b(self_attn) -> None:
     """Give this layer the whole attention-TP group's ``w_kc`` and ``w_vc``.
 
     Called once per layer from the weight loader, after it has split
-    ``kv_b_proj`` into the two and applied the NPU layout. The loader itself
-    does not change: this reads what it produced and all-gathers it.
-
-    Needed only by the narrow all-to-all
-    (:func:`dsa_cp_narrow_a2a_enabled`), which absorbs *after* the exchange and
-    so needs whichever head the rank ends up holding, not the head it was
-    assigned. ``w_vc`` is gathered only when the return leg is narrowed too
-    (:func:`dsa_cp_narrow_a2a_output_enabled`); the inbound leg alone needs
-    ``w_kc``, which is 12 MB per layer against 28. Refuses quietly and leaves
-    the feature off if the weights are not bf16 -- the FP8 and block-scaled
-    layouts carry separate scale tensors that would have to be gathered with
-    them.
+    ``kv_b_proj`` and applied the NPU layout; the loader itself does not change.
+    Each leg of the narrow all-to-all absorbs after the exchange, so it needs
+    the weights of the head the rank ends up holding rather than the head it was
+    assigned. Only the enabled legs are gathered, and nothing at all when both
+    are off. Declines on non-bf16 weights: the quantized layouts carry scale
+    tensors that would have to be gathered with them.
     """
     if not getattr(self_attn, "use_dsa", False):
         return
@@ -242,9 +164,6 @@ def dsa_cp_attach_full_kv_b(self_attn) -> None:
     w_vc = getattr(self_attn, "w_vc", None)
     if w_kc is None or w_vc is None:
         return
-    # Gather only what the enabled legs actually consume, and nothing at all if
-    # neither is on. The layer keeps using its own w_vc slice after a wide
-    # return leg, so leaving w_vc ungathered costs nothing but the bytes.
     wanted = []
     if dsa_cp_narrow_a2a_enabled():
         wanted.append(("w_kc", w_kc))
@@ -255,11 +174,8 @@ def dsa_cp_attach_full_kv_b(self_attn) -> None:
     not_bf16 = [(n, w.dtype) for n, w in wanted if w.dtype != torch.bfloat16]
     if not_bf16:
         print_info_once(
-            "DSA-CP narrow all-to-all is off: it needs bf16 weights to "
-            "all-gather, got "
+            "DSA-CP narrow all-to-all is off: it needs bf16 weights, got "
             + ", ".join(f"{n}={d}" for n, d in not_bf16)
-            + ". The quantized layouts carry scale tensors that would have to "
-            "be gathered with them."
         )
         return
 
@@ -267,115 +183,27 @@ def dsa_cp_attach_full_kv_b(self_attn) -> None:
 
     tp = get_parallel().attn_tp_size
     gathered_bytes = 0
-    # Diagnostic, cheap. The pool loses ~4.06 GiB against 2.13 GiB of tensor
-    # bytes, and the "Load weight end" delta puts all of it inside weight
-    # loading. The first reading answered half of that: the allocator sees
-    # exactly 2.13 GiB, ratio 1.00x, so the excess is NOT our tensors being
-    # bigger or more numerous than counted. It is memory the torch allocator
-    # never sees -- which is also why empty_device_cache does not give it back.
-    # These three numbers separate the two places that leaves:
-    #   reserved - allocated   the allocator's own pool growth: block rounding
-    #                          and fragmentation. Inside torch, recoverable.
-    #   driver   - reserved    everything else on the device -- HCCL's buffers
-    #                          for these collectives, runtime workspaces. Only
-    #                          gathering less, or into fewer buffers, moves it.
-    npu = getattr(torch, "npu", None)
-    allocated_before = npu.memory_allocated() if npu else 0
-    reserved_before = npu.memory_reserved() if npu else 0
-    free_before = npu.mem_get_info()[0] if npu else 0
     for name, w in wanted:
-        # Gather in the layout the tensor is PHYSICALLY in, then take the logical
-        # view back.
-        #
-        # The loader stores w_kc transposed-contiguous: shape
-        # [h, qk_nope, kv_lora] laid out as [h, kv_lora, qk_nope], and the
-        # batched matmul is tuned for that. So ``w.transpose(1, 2)`` is already
-        # contiguous and costs nothing to send, and ``full.transpose(1, 2)``
-        # hands back the loader's exact stride pattern for free.
-        #
-        # The first version gathered into a plain buffer and then rebuilt the
-        # layout with ``.transpose().contiguous().transpose()``, which allocated
-        # a SECOND full-size copy per layer and copied the send buffer as well.
-        # Measured on A3 tp16 that cost 4.05 GiB of KV pool against 2.13 GiB of
-        # live weights; this removes ~12 MB per layer of allocation and the send
-        # copy with it. w_vc is plain contiguous and takes the simple path.
+        # Gather in the layout the tensor is physically in, then view back. The
+        # loader stores w_kc as [h, qk_nope, kv_lora] laid out transposed, and
+        # the batched matmul is tuned for that, so transposing here is free both
+        # ways and no second full-size copy is needed. w_vc is plain contiguous.
         transposed = not w.is_contiguous()
         send = w.transpose(1, 2) if transposed else w
         if not send.is_contiguous():
-            # An unexpected layout, not one of the two the loader produces.
-            # Correct, just not free.
             send = send.contiguous()
         full = w.new_empty((send.shape[0] * tp, *send.shape[1:]))
-        # This collective costs 2 x HCCL_BUFFSIZE beyond the bytes it moves,
-        # once, and there is no way around it from here. Measured on A3 tp16 as
-        # KV pool lost beyond the weights themselves: 2.00 GiB at the 1000 MiB
-        # default, 1.02 GiB at 500 -- it follows the knob, not the transfer.
-        # HCCL charges it to the communicator on its first sizeable collective,
-        # and the gather's only crime is being early: it runs during weight
-        # loading, so the pool is sized after it and pays. The wide path's own
-        # all-to-all pays the same thing at warm-up, after sizing, out of
-        # whatever margin was left -- which is why it looks free.
-        #
-        # Doing the gather as an all-to-all instead was tried (a7d9d60270) on
-        # the theory that the charge was per op. It is not: 4.19 GiB against
-        # 4.13, pool 164,864 against 164,736. Reverted. HCCL_BUFFSIZE=500 is the
-        # only lever that moved it, and it is global.
         attn_tp_all_gather_into_tensor(full, send)
         if transposed:
             full = full.transpose(1, 2)
         setattr(self_attn, f"{name}_full", full)
-        # w_kc is [h, 192, 512] and w_vc is [h, 512, 256]: different sizes, so
-        # count what was actually allocated rather than doubling one of them.
         gathered_bytes += full.numel() * full.element_size()
-    _narrow_a2a_totals["layers"] += 1
-    _narrow_a2a_totals["tensor_bytes"] += gathered_bytes
-    if npu:
-        _narrow_a2a_totals["allocated_bytes"] += (
-            npu.memory_allocated() - allocated_before
-        )
-        _narrow_a2a_totals["reserved_bytes"] += npu.memory_reserved() - reserved_before
-        free_after = npu.mem_get_info()[0]
-        _narrow_a2a_totals["driver_bytes"] += free_before - free_after
-        # Synchronize and look again. This was a hypothesis about where the
-        # extra ~1.95 GiB goes and it is REFUTED: -0.07 GiB came back, i.e.
-        # nothing. Kept because it is nearly free at load time and it stops the
-        # question being asked a fifth time. The answer turned out to be
-        # HCCL_BUFFSIZE: HCCL reserves twice it on this communicator's first
-        # all-gather, and the runs above set 1000 MiB, so 2000 MiB = 1.95 GiB.
-        npu.synchronize()
-        _narrow_a2a_totals["sync_bytes"] += npu.mem_get_info()[0] - free_after
-    # Names the legs, because the two modes differ only in speed and in this
-    # number, and a log read weeks later has to say which one ran.
-    legs = {
-        "w_kc": "input leg: the query is exchanged before the absorb",
-        "w_vc": "output leg: the head output goes back through w_vc first",
-    }
+    legs = {"w_kc": "input leg", "w_vc": "output leg"}
     print_info_once(
         "DSA-CP narrow all-to-all is ON ("
-        + "; ".join(legs[n] for n, _ in wanted)
+        + ", ".join(legs[n] for n, _ in wanted)
         + f"), {gathered_bytes / (1 << 20):.1f} MB per layer"
     )
-    # Every 26 layers, so a 78-layer model logs three times and the last line
-    # carries the total. Cheaper to read than 78 lines and it cannot be missed
-    # the way a single line at layer 0 can, since layer 0 has no total yet.
-    if _narrow_a2a_totals["layers"] % 26 == 0:
-        t = _narrow_a2a_totals
-        gib = 1 << 30
-        logger.info(
-            "DSA-CP narrow all-to-all: %d layers gathered, %.2f GiB of tensors, "
-            "%.2f GiB allocated, %.2f GiB reserved, %.2f GiB taken off the "
-            "device (%.2fx the tensors), %.2f GiB of which came back on "
-            "synchronize. The last figure is the one that matters: memory still "
-            "outstanding when the KV pool is sized is memory the pool does not "
-            "get, even though nothing ends up holding it.",
-            t["layers"],
-            t["tensor_bytes"] / gib,
-            t["allocated_bytes"] / gib,
-            t["reserved_bytes"] / gib,
-            t["driver_bytes"] / gib,
-            (t["driver_bytes"] / t["tensor_bytes"]) if t["tensor_bytes"] else 0.0,
-            t["sync_bytes"] / gib,
-        )
 
 
 def reset_dsa_cp_flags() -> None:
@@ -587,46 +415,6 @@ def dsa_cp_slice(x: torch.Tensor, plan: DsaCpPlan) -> torch.Tensor:
     return torch.cat([sliced, pad], dim=0)
 
 
-def _log_first_a2a_device_cost(before: int) -> None:
-    """Say, once, what the first DSA-CP all-to-all took off the device.
-
-    The weight gather measured a **fixed** ~1.95 GiB that the torch allocator
-    never sees: 2.89 GiB of device for 0.91 GiB of tensors with one weight
-    gathered, 4.05 GiB for 2.13 GiB with two, and between layer 52 and 78 the
-    device grew 0.32 GiB against 0.30 GiB of tensors. A one-time cost, paid on
-    the attention-TP group's first collective, and the sizes of what is being
-    gathered barely move it.
-
-    That raises the question this answers. The narrow all-to-all makes the
-    group's first collective happen during **weight loading**, so the KV pool
-    is sized after it and pays for it. The wide path's first collective is this
-    all-to-all, at the **first forward** -- after the pool is already sized. If
-    the number below matches, the wide path is paying the same memory out of
-    whatever margin was left over, and the narrow path does not cost it so much
-    as make it visible. If it does not, the cost is genuinely the gather's.
-
-    Either answer matters beyond this feature: memory the pool sizing cannot
-    see is what makes a box run out of room at a mem-fraction that looked safe.
-    """
-    npu = getattr(torch, "npu", None)
-    if npu is None:
-        return
-    after = npu.mem_get_info()[0]
-    logger.info(
-        "DSA-CP first all-to-all on the attention-TP group: device free "
-        "%.2f -> %.2f GiB, %.2f GiB taken. Torch has %.2f GiB reserved in "
-        "total at this point (not a delta). Anything taken here is charged "
-        "after the KV pool was already sized.",
-        before / (1 << 30),
-        after / (1 << 30),
-        (before - after) / (1 << 30),
-        npu.memory_reserved() / (1 << 30),
-    )
-
-
-_first_a2a_logged = False
-
-
 def dsa_cp_redistribute_heads(x: torch.Tensor, plan: DsaCpPlan) -> torch.Tensor:
     """``[num_tokens, h, d]`` -> ``[rows, h * tp_size, d]``, by all-to-all.
 
@@ -658,16 +446,7 @@ def dsa_cp_redistribute_heads(x: torch.Tensor, plan: DsaCpPlan) -> torch.Tensor:
     # npu_transpose_batchmatmul and view() refuses that.
     send = x.reshape(tp, plan.rows, h, d).contiguous()
     recv = torch.empty_like(send)
-    # Bool first: this runs twice a layer on the default DSA-CP path, and after
-    # the first forward it must cost one global read and nothing else.
-    global _first_a2a_logged
-    measure = not _first_a2a_logged and getattr(torch, "npu", None) is not None
-    npu = torch.npu if measure else None
-    before = npu.mem_get_info()[0] if measure else 0
     parallel.attn_tp_group.all_to_all_single(recv, send)
-    if measure:
-        _first_a2a_logged = True
-        _log_first_a2a_device_cost(before)
     return recv.permute(1, 0, 2, 3).reshape(plan.rows, tp * h, d)
 
 

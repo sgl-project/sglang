@@ -390,17 +390,13 @@ def _apply_interleaved_rope_with_half_output(rotary_emb, positions, q_pe, k_pe):
 
 
 def _dsa_cp_narrow_plan(m: "DeepseekV2AttentionMLA", forward_batch):
-    """This forward's DSA-CP plan when the narrow (W1) exchange applies, else None.
+    """This forward's DSA-CP plan when the inbound leg is narrowed, else None.
 
-    The narrow exchange swaps q *before* the ``w_kc`` absorb, so the inbound
-    all-to-all carries the 256-wide query rather than the 512-wide absorbed
-    latent, in one collective rather than two. With
-    :func:`dsa_cp_narrow_a2a_output_enabled` it also takes the head output
-    through ``w_vc`` before the return leg. It needs the full weights the
-    loader gathers -- ``w_kc`` always, ``w_vc`` only for the return leg -- and
-    when that gather declined, because the flag is off or the weights are not
-    bf16, the attributes are absent and this returns None, which puts the layer
-    back on the wide path with no other change.
+    The exchange moves to before the ``w_kc`` absorb, so one all-to-all carries
+    the 256-wide query instead of two carrying the absorbed latent and its rope
+    half. Needs the full ``w_kc``; when the weight loader's gather declined, the
+    attribute is absent and this returns None, putting the layer back on the
+    wide path with no other change.
     """
     if not dsa_cp_narrow_a2a_enabled():
         return None
@@ -410,22 +406,10 @@ def _dsa_cp_narrow_plan(m: "DeepseekV2AttentionMLA", forward_batch):
 
 
 def _dsa_cp_narrow_return_plan(m: "DeepseekV2AttentionMLA", forward_batch):
-    """This forward's plan when the RETURN leg is narrowed, else None.
+    """This forward's plan when the return leg is narrowed, else None.
 
-    Independent of the inbound leg, and the measurement is why. At tp16 on A3,
-    client wall against the wide path:
-
-        ================  ==============  ==============
-        mode              6007 tokens     16007 tokens
-        ================  ==============  ==============
-        input leg only    +0.4% (floor)   -1.1% (floor)
-        both legs         **-7.5%**       **-4.7%**
-        ================  ==============  ==============
-
-    The run-to-run floor is about 1% at both lengths, so the inbound leg
-    measures as nothing and the pair measures as 105-126 ms. Whatever the
-    saving is, it is on this side -- which was not the prediction, and is the
-    reason this leg can now run without the other.
+    Independent of the inbound leg: the rank holds every head for its own rows
+    after the inbound exchange whichever width that exchange used.
     """
     if not dsa_cp_narrow_a2a_output_enabled():
         return None
@@ -541,10 +525,9 @@ def forward_dsa_prepare_npu(
 
         q_nope, q_pe = q.split([m.qk_nope_head_dim, m.qk_rope_head_dim], dim=-1)
 
-        # W1: under the narrow exchange the absorb is DEFERRED, not skipped -- it
-        # runs below, after the all-to-all, on this rank's token rows and every
-        # head. Doing it here would widen q_nope from 192 to 512 before it goes
-        # on the wire, which is the whole cost W1 removes.
+        # Under the narrow exchange the absorb is DEFERRED, not skipped: it runs
+        # after the all-to-all, below. Doing it here would widen q_nope from 192
+        # to 512 before it goes on the wire.
         narrow_plan = _dsa_cp_narrow_plan(m, forward_batch)
         if narrow_plan is None:
             q_nope_out = torch_npu.npu_transpose_batchmatmul(
@@ -568,16 +551,14 @@ def forward_dsa_prepare_npu(
             q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
         if narrow_plan is not None:
-            # One all-to-all on the fused [q_nope | q_pe] (192 + 64), against two
-            # on the absorbed latent and its rope half (512 + 64). RoPE has
-            # already run, so q_pe travels rotated and the positions never have
-            # to be sliced to match.
+            # One all-to-all on the fused [q_nope | q_pe], against two on the
+            # absorbed latent and its rope half. RoPE has already run, so q_pe
+            # travels rotated and the positions never have to be sliced to match.
             #
-            # The width to restore to is recorded BEFORE the swap: afterwards
-            # q_nope_out is plan.rows tall and the original row count -- which
-            # may be padded past num_tokens -- is no longer recoverable from the
-            # tensors. Handing back a narrower width makes the next layer's KV
-            # write index a tensor smaller than its slot map describes.
+            # Record the width to restore to BEFORE the swap: afterwards the
+            # original row count, which may be padded past num_tokens, is no
+            # longer recoverable from the tensors, and restoring to a narrower
+            # one hands the next layer a tensor smaller than its slot map says.
             forward_batch.npu_dsa_cp_input_rows = q_nope.shape[0]
             q_swapped = dsa_cp_redistribute_heads(
                 torch.cat([q_nope, q_pe], dim=-1), narrow_plan
@@ -864,11 +845,6 @@ def forward_dsa_core_npu(
             dsa_cp_plan is not None
             and _dsa_cp_narrow_plan(m, forward_batch) is not None
         )
-        # The return leg is narrowed on its own switch, and needs nothing from
-        # the inbound one: the rank holds every head for its own rows after the
-        # inbound exchange whichever width that exchange used. Without it the
-        # head output goes back at the full latent width and the layer's own
-        # w_vc applies afterwards, byte for byte the unnarrowed path.
         narrow_return = (
             dsa_cp_plan is not None
             and _dsa_cp_narrow_return_plan(m, forward_batch) is not None
@@ -878,9 +854,8 @@ def forward_dsa_core_npu(
             # tokens", which divides the per-query top-k KV read. k_nope/k_pe
             # stay full width, and the padded row count must be handed back.
             if narrow_a2a:
-                # W1: prepare already swapped, on the narrow side and before the
-                # absorb, so q_nope_out and q_pe arrive [rows, all heads, d] and
-                # the width to restore to came with them.
+                # prepare already swapped, before the absorb, so q_nope_out and
+                # q_pe arrive [rows, all heads, d] with the width to restore to.
                 dsa_cp_rows = forward_batch.npu_dsa_cp_input_rows
             else:
                 dsa_cp_rows = q_nope_out.shape[0]
@@ -890,12 +865,10 @@ def forward_dsa_core_npu(
             # topk_indices is returned for the next layer to reuse, so rebinding
             # it here would hand that layer a slice of a slice.
             if getattr(forward_batch, "npu_indexer_topk_is_local", False):
-                # W2: the indexer scored only this rank's rows and skipped its
+                # The indexer scored only this rank's rows and skipped its
                 # all-gather, so there is nothing left to cut. Checked rather
-                # than assumed -- a full-width tensor arriving here would give
-                # every rank but 0 the wrong rows, silently and with no shape
-                # error downstream, which is the failure this whole path is
-                # most exposed to.
+                # than assumed: a full-width tensor here would give every rank
+                # but 0 the wrong rows, with no shape error downstream.
                 if topk_indices.shape[0] != dsa_cp_plan.rows:
                     raise RuntimeError(
                         "top-k is marked local to this rank but carries "
@@ -921,9 +894,8 @@ def forward_dsa_core_npu(
         if dsa_cp_plan is not None:
             attn_output = attn_output.reshape(dsa_cp_plan.rows, -1, m.kv_lora_rank)
             if narrow_return:
-                # W1: take the head output down from the 512-wide latent to
-                # v_head_dim BEFORE it goes back on the wire. w_vc_full, not
-                # w_vc: this rank is holding every head, not its own eight.
+                # Take the head output down to v_head_dim BEFORE the return leg.
+                # w_vc_full, not w_vc: this rank holds every head right now.
                 attn_output = torch_npu.npu_transpose_batchmatmul(
                     attn_output.contiguous(),
                     m.w_vc_full,
@@ -944,9 +916,8 @@ def forward_dsa_core_npu(
         # buffers themselves are reserved and survive.
         forward_batch.npu_dcp_extend_kv = None
     if w_vc_applied:
-        # W1 already took the head output through w_vc, before the return leg,
-        # so attn_output is [num_tokens, num_local_heads, v_head_dim] and the
-        # latent view below would be wrong about its last dimension.
+        # Already through w_vc, so attn_output is [num_tokens, num_local_heads,
+        # v_head_dim] and the latent view below would have the wrong last dim.
         attn_bmm_output = attn_output
     else:
         attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
