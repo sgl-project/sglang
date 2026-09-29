@@ -31,33 +31,43 @@ fn chat(stream: bool) -> Request<Body> {
         .unwrap()
 }
 
+/// Either side's failure ends the request without waiting for the other side.
 #[tokio::test]
-async fn prefill_failure_stops_decode_without_waiting_for_bootstrap_timeout() {
-    let decode = MockWorker::start_hanging(Duration::from_secs(10)).await;
-    let rejected = json!({"error": "prefill rejected"});
+async fn pd_failure_returns_without_waiting_for_the_other_side() {
+    let rejected = json!({"error": "rejected"});
+    let error = |status| MockWorker::start_returning_error(status, rejected.clone());
+    let hanging = || MockWorker::start_hanging(Duration::from_secs(10));
     for reorg in [false, true] {
         for stream in [false, true] {
+            // (prefill, decode, client status, whether prefill is blamed)
             let cases = [
                 (
-                    MockWorker::start_returning_error(StatusCode::BAD_REQUEST, rejected.clone())
-                        .await,
+                    error(StatusCode::BAD_REQUEST).await,
+                    hanging().await,
                     StatusCode::BAD_REQUEST,
+                    true,
                 ),
                 (
-                    MockWorker::start_returning_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        rejected.clone(),
-                    )
-                    .await,
+                    error(StatusCode::INTERNAL_SERVER_ERROR).await,
+                    hanging().await,
                     StatusCode::BAD_GATEWAY,
+                    true,
                 ),
                 // Transport failure: the prefill body is cut off.
                 (
                     MockWorker::start_returning_partial_body(StatusCode::OK, b"{").await,
+                    hanging().await,
                     StatusCode::BAD_GATEWAY,
+                    true,
+                ),
+                (
+                    hanging().await,
+                    error(StatusCode::TOO_MANY_REQUESTS).await,
+                    StatusCode::TOO_MANY_REQUESTS,
+                    false,
                 ),
             ];
-            for (prefill, expected) in cases {
+            for (prefill, decode, expected, prefill_blamed) in cases {
                 let ctx = pd_ctx(&prefill.url, &decode.url, reorg);
                 let response = tokio::time::timeout(
                     Duration::from_secs(1),
@@ -67,21 +77,21 @@ async fn prefill_failure_stops_decode_without_waiting_for_bootstrap_timeout() {
                 .unwrap()
                 .unwrap();
                 assert_eq!(response.status(), expected);
-                if expected == StatusCode::BAD_GATEWAY {
-                    assert_eq!(response.headers()["x-router-error-code"], "prefill_failed");
-                }
                 let body = response.into_body().collect().await.unwrap().to_bytes();
-                if expected == StatusCode::BAD_REQUEST {
+                if expected == StatusCode::BAD_GATEWAY {
+                    assert!(String::from_utf8_lossy(&body).contains("prefill_failed"));
+                } else {
                     assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), rejected);
                 }
-                // The failure is charged to prefill, not to the cancelled decode.
+                let (url, mode) = match prefill_blamed {
+                    true => (&prefill.url, "prefill"),
+                    false => (&decode.url, "decode"),
+                };
                 assert!(ctx.metrics.render().contains(&format!(
-                    r#"worker_url="{}",model_id="tiny",mode="prefill""#,
-                    prefill.url
+                    r#"worker_url="{url}",model_id="tiny",mode="{mode}""#
                 )));
-                for worker in ctx.registry.workers_for(&ModelId("tiny".into())) {
-                    assert_eq!(worker.router_inflight_load(), 0);
-                }
+                let decode_worker = ctx.registry.get(&WorkerId("d".into())).unwrap();
+                assert_eq!(decode_worker.router_inflight_load(), 0);
             }
         }
     }

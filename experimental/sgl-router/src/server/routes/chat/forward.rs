@@ -128,9 +128,13 @@ pub(super) async fn forward_chat_request(
         let Some((task, prefill)) = prefill_task else {
             return response_future.await;
         };
-        let (result, prefill_failed) = forward_pd(task, response_future).await;
-        failed_prefill = prefill_failed.then_some(prefill);
-        result
+        match forward_pd(task, response_future).await {
+            PdOutcome::Decode(result) => result,
+            PdOutcome::PrefillFailed(result) => {
+                failed_prefill = Some(prefill);
+                result
+            }
+        }
     };
     // A ready response wins if request expiration fires in the same poll.
     let result = tokio::select! {
@@ -211,30 +215,42 @@ fn spawn_prefill_request(
     })
 }
 
-/// Return decode's response unless prefill fails first; the flag reports a prefill failure.
+/// The PD side whose result reaches the client.
+enum PdOutcome {
+    /// Decode's response, or its own failure.
+    Decode(Result<Response<Body>, ApiError>),
+    /// Prefill failed first: its 4xx verbatim, or `prefill_failed`.
+    PrefillFailed(Result<Response<Body>, ApiError>),
+}
+
+/// Dispatch ends at the first failure on either side; only a successful decode
+/// waits for prefill.
 async fn forward_pd(
     prefill: tokio::task::JoinHandle<Result<Response<Body>, ApiError>>,
     decode: impl std::future::Future<Output = Result<Response<Body>, ApiError>>,
-) -> (Result<Response<Body>, ApiError>, bool) {
-    // Either side's `Err` ends `try_join!` and carries the client result.
+) -> PdOutcome {
     let prefill = async {
-        match prefill.await {
-            Ok(Ok(response)) if response.status().is_success() => Ok(()),
+        let failure = match prefill.await {
+            Ok(Ok(response)) if response.status().is_success() => return Ok(()),
             // A prefill 4xx is the client's error; forward it verbatim.
-            Ok(Ok(response)) if response.status().is_client_error() => Err((Ok(response), true)),
-            Ok(Ok(response)) => Err((
-                Err(ApiError::PrefillFailed {
-                    status: Some(response.status()),
-                }),
-                true,
-            )),
-            _ => Err((Err(ApiError::PrefillFailed { status: None }), true)),
+            Ok(Ok(response)) if response.status().is_client_error() => Ok(response),
+            Ok(Ok(response)) => Err(ApiError::PrefillFailed {
+                status: Some(response.status()),
+            }),
+            _ => Err(ApiError::PrefillFailed { status: None }),
+        };
+        Err(PdOutcome::PrefillFailed(failure))
+    };
+    let decode = async {
+        match decode.await {
+            Ok(response) if response.status().is_success() => Ok(response),
+            // Decode refused the request, so no KV transfer will complete.
+            result => Err(PdOutcome::Decode(result)),
         }
     };
-    let decode = async { decode.await.map_err(|error| (Err(error), false)) };
     match tokio::try_join!(prefill, decode) {
-        Ok(((), response)) => (Ok(response), false),
-        Err(failure) => failure,
+        Ok(((), response)) => PdOutcome::Decode(Ok(response)),
+        Err(outcome) => outcome,
     }
 }
 
