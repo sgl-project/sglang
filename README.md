@@ -4,19 +4,19 @@
 <img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="SGLang" width="400">
 </p>
 
-SGLang is an open-source framework for fast inference with large language and multimodal models. Whether you're serving your first model, processing a dataset, or building a training pipeline, SGLang helps you get more out of your hardware, from a single GPU to a distributed cluster.
+SGLang is an open-source framework for fast inference with large language and multimodal models. It is built for agentic workloads, RL rollouts, and large-scale model serving. Prefix caching reuses shared context across multi-turn requests, continuous batching improves throughput, and distributed inference scales from a single GPU to large clusters.
 
 👋 New here? Start with the example below, explore [sglang.io](https://www.sglang.io/), or find a recipe for your model in the [Cookbook](https://cookbook.sglang.io/). Join our [Slack](https://slack.sglang.io/) for development and discussion. Want to meet the people building SGLang? Come join a meetup, workshop, or office hour. You can find us at [SGLang Events](https://www.sglang.io/events).
 
 ## Install and Quick Start
 
-### Install
+### 1. Install
 
-Choose one of the following options. See the [installation guide](https://docs.sglang.io/docs/get-started/install) for platform-specific requirements.
+Choose one of the following options. These commands target Linux with NVIDIA GPUs and a CUDA 13-compatible driver. For other platforms, see [Supported Hardware](#supported-hardware).
 
-#### Option 1: Docker
+#### Option A: Install with Docker
 
-Requires Linux, a supported NVIDIA GPU with a CUDA 13-compatible driver, Docker, and NVIDIA Container Toolkit.
+Prerequisites: Docker and NVIDIA Container Toolkit.
 
 Pull the image, which includes SGLang and its dependencies:
 
@@ -35,9 +35,9 @@ docker run -it --gpus all \
   lmsysorg/sglang:latest bash
 ```
 
-#### Option 2: Install with uv
+#### Option B: Install with uv
 
-Alternatively, install SGLang in a Python environment with [uv](https://docs.astral.sh/uv/getting-started/installation/). This requires a compatible Linux/NVIDIA environment.
+Prerequisites: [uv](https://docs.astral.sh/uv/getting-started/installation/).
 
 Create and activate a virtual environment, then install SGLang:
 
@@ -47,7 +47,7 @@ source .venv/bin/activate
 uv pip install --prerelease=allow sglang
 ```
 
-### Start the server
+### 2. Start the server
 
 The following example serves Qwen3.8-27B-FP8. For other models, find launch commands in the [SGLang Cookbook](https://cookbook.sglang.io/).
 
@@ -71,7 +71,7 @@ sglang serve \
   --mamba-ssm-dtype float32
 ```
 
-### Send a request
+### 3. Send a request
 
 Send a test request to verify that the server is reachable and the model can generate a response. Once the server is ready, run in another terminal:
 
@@ -93,31 +93,35 @@ The answer is in `choices[0].message.content`. See the [Quickstart guide](https:
 
 Clients can use an existing OpenAI-compatible endpoint without installing SGLang locally.
 
-## SGLang Diffusion
+## Supported Hardware
 
-SGLang Diffusion accelerates image and video generation with diffusion models. It supports optimized attention kernels, caching, quantization, and multi-GPU inference. See the [installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation) to get started and the [deployment guide](https://docs.sglang.io/docs/sglang-diffusion/deployment_cookbook) for performance and memory configurations.
+SGLang supports a wide range of GPUs, TPUs, NPUs, CPUs, and Apple Silicon platforms.
 
-## SGLang Omni
+| Platform | Representative hardware |
+| --- | --- |
+| [NVIDIA](https://docs.sglang.io/docs/hardware-platforms/nvidia-gpus) | A100; H100/H200/H800/H20; B200/B300/GB200/GB300; select RTX 30/40/50 series, RTX 6000 Ada / PRO 6000; [DGX Spark](https://lmsys.org/blog/2025-11-03-gpt-oss-on-nvidia-dgx-spark/), [Jetson Orin](https://docs.sglang.io/docs/hardware-platforms/nvidia_jetson) |
+| [AMD](https://docs.sglang.io/docs/hardware-platforms/amd_gpu) | Instinct MI300X, MI325X, MI350X, MI355X |
+| [Google TPU](https://docs.sglang.io/docs/hardware-platforms/tpu) | v6e, v7; [SGL-JAX](https://github.com/sgl-project/sglang-jax) / [SGL-torchtpu](https://lmsys.org/blog/2026-07-30-sglang-google-tpu/) |
+| Intel | [Arc / Arc Pro B-Series GPUs](https://docs.sglang.io/docs/hardware-platforms/xpu), [Xeon CPUs](https://docs.sglang.io/docs/hardware-platforms/cpu_server) |
+| [Apple Silicon](https://docs.sglang.io/docs/hardware-platforms/apple_metal) | Macs via Metal / MLX |
+| [Huawei Ascend](https://docs.sglang.io/docs/hardware-platforms/ascend-npus/getting-started/installation) | A3, 950PR/DT NPUs |
+| [Moore Threads](https://docs.sglang.io/docs/hardware-platforms/mthreads_gpu) | MTT S5000 GPUs |
 
-[SGLang Omni](https://github.com/sgl-project/sglang-omni) is a separate serving framework for audio and unified multimodal models, including text-to-speech (TTS) and automatic speech recognition (ASR). It supports streaming and OpenAI-compatible APIs for speech generation and transcription. See the [documentation](https://sgl-project.github.io/sglang-omni/) for supported models, installation, and usage.
+Integrations in progress: AWS Trainium, [Alibaba T-Head PPU](https://github.com/sgl-project/sglang/issues/37519), [Cambricon MLU](https://github.com/sgl-project/sglang/pull/26898), Qualcomm QAIC, MetaX, Hygon HCU/DCU, Iluvatar CoreX, and more.
 
-## RL and Post-Training
+See the [Cookbook](https://cookbook.sglang.io/) and platform guides for model compatibility and setup.
 
-Use SGLang as the rollout engine in your training workflow. Integrations include [Miles](https://github.com/radixark/miles), [AReaL](https://github.com/inclusionAI/AReaL), [slime](https://github.com/THUDM/slime), [Tunix](https://github.com/google/tunix), and [verl](https://github.com/volcengine/verl). Follow your framework's guide for installation, weight updates, and resource management.
+## SGL Ecosystem
 
-## Mini-SGLang
-
-**Curious how it all works? Start with ~5,000 lines of Python.**
-
-We built [Mini-SGLang](https://github.com/sgl-project/mini-sglang) to make inference engines easier to understand. Read the code, run a model, and try changing how it works. Along the way, you'll explore:
-
-- Radix cache reuses KV cache across requests with shared prefixes.
-- Overlap scheduling overlaps CPU scheduling with GPU computation.
-- Chunked prefill processes long prompts in chunks.
-- Tensor parallelism distributes inference across GPUs.
-- Optimized kernels integrate FlashAttention and FlashInfer.
-
-Read the [source code](https://github.com/sgl-project/mini-sglang), follow the [architecture walkthrough](https://github.com/sgl-project/mini-sglang/blob/main/docs/structures.md), or [run your first model](https://github.com/sgl-project/mini-sglang#readme).
+| Area | Projects | Purpose |
+| --- | --- | --- |
+| Education | [Mini-SGLang](https://github.com/sgl-project/mini-sglang), [zero-to-sglang](https://github.com/datawhalechina/zero-to-sglang), [DeepLearning.AI course](https://www.deeplearning.ai/short-courses/efficient-inference-with-sglang-text-and-image-generation/) | Learn inference engine design and efficient text and image generation through code and hands-on courses. |
+| Diffusion | [SGLang Diffusion](https://docs.sglang.io/docs/sglang-diffusion/installation) | Image and video generation with diffusion models. |
+| Audio | [SGLang Omni](https://github.com/sgl-project/sglang-omni) | Audio model serving for text-to-speech (TTS) and automatic speech recognition (ASR). |
+| RL and Post-Training | [Miles](https://github.com/radixark/miles), [slime](https://github.com/THUDM/slime), [AReaL](https://github.com/inclusionAI/AReaL), [Tunix](https://github.com/google/tunix), [verl](https://github.com/volcengine/verl) | Training frameworks that integrate SGLang for rollout generation. |
+| Speculative Decoding | [SpecForge](https://github.com/sgl-project/SpecForge) | Train draft models for speculative decoding and deploy them with SGLang. |
+| KV Cache | [HiCache](https://docs.sglang.io/docs/advanced_features/hicache_design), [Mooncake](https://kvcache-ai.github.io/Mooncake/), [LMCache](https://docs.lmcache.ai/developer_guide/integration.html) | Hierarchical KV caching across GPU memory, host memory, and external storage, with cache transfer and reuse for distributed inference. |
+| Deployment and Orchestration | [SMG](https://github.com/smg-project/smg), [RBG](https://github.com/sgl-project/rbg), [llm-d](https://llm-d.ai/docs/dev/operations/disaggregation/sglang), [Ray Serve](https://docs.ray.io/en/latest/serve/llm/user-guides/sglang.html), [NVIDIA Dynamo](https://docs.nvidia.com/dynamo/backends/sg-lang/reference-guide) | Deploy and scale SGLang inference services with routing, load balancing, and cluster orchestration. |
 
 ## Development and Contributing
 
