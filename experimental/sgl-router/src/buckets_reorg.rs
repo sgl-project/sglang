@@ -225,22 +225,37 @@ impl Bucket {
                     Stage::Decode
                 };
                 // A prefill hands its KV only to a decode in its own version group.
-                let prefills = paired_prefills(prefills, &decoders);
+                let mut prefills = paired_prefills(prefills, &decoders);
                 if prefills.is_empty() {
                     return Err((stage, PickError::NoCandidates));
                 }
-                let prefill = self
-                    .pick_from_group(prefill, Stage::Prefill, prefills, request)
-                    .await?;
-                let group = prefill.engine.version_group();
-                let peers = decoders
-                    .into_iter()
-                    .filter(|d| d.version_group() == group)
-                    .collect();
-                let decode = self
-                    .pick_from_group(decode, Stage::Decode, peers, request)
-                    .await?;
-                (prefill, Some(decode))
+                loop {
+                    let prefill = self
+                        .pick_from_group(prefill, Stage::Prefill, prefills.clone(), request)
+                        .await?;
+                    let group = prefill.engine.version_group();
+                    let peers = decoders
+                        .iter()
+                        .filter(|d| d.version_group() == group)
+                        .cloned()
+                        .collect();
+                    match self
+                        .pick_from_group(decode, Stage::Decode, peers, request)
+                        .await
+                    {
+                        Ok(decode) => break (prefill, Some(decode)),
+                        // A full group leaves the other version groups eligible.
+                        Err((
+                            _,
+                            PickError::NoCandidates
+                            | PickError::NoAdmissibleEngine(_)
+                            | PickError::AdmissionRejected(_),
+                        )) if prefills.iter().any(|p| p.version_group() != group) => {
+                            prefills.retain(|p| p.version_group() != group);
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
             }
         };
         Ok(BucketPick { prefill, decode })

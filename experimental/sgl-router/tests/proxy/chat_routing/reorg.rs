@@ -905,3 +905,67 @@ async fn reorg_readiness_cannot_pair_workers_across_buckets() {
     );
     assert!(policy.calls.lock().unwrap().is_empty());
 }
+
+/// Rejects every engine in one version group.
+#[derive(Debug)]
+struct RejectGroup(&'static str);
+
+impl EngineAdmission for RejectGroup {
+    fn check(&self, engine: &Worker, _: &EngineMetrics) -> Result<Decision, PickError> {
+        Ok(match engine.version_group() == Some(self.0) {
+            true => Decision::Reject("full".into()),
+            false => Decision::Allow,
+        })
+    }
+}
+
+/// A version group whose decodes are full falls back to another group.
+#[tokio::test]
+async fn full_decode_group_falls_back_to_another_version_group() {
+    let workers: Vec<_> =
+        futures::future::join_all((0..4).map(|_| MockWorker::start(vec![]))).await;
+    let decode_policy = Arc::new(FirstPolicy {
+        admission: Arc::new(RejectGroup("v1")),
+        ..FirstPolicy::default()
+    });
+    let ctx = context(
+        &[],
+        vec![Bucket::new(
+            "pd",
+            BucketGroups::Pd {
+                prefill: EngineGroup::new(Arc::new(FirstPolicy::default())),
+                decode: EngineGroup::new(decode_policy),
+            },
+        )],
+    );
+    for ((id, mode, group), worker) in [
+        ("p-v1", Stage::Prefill, "v1"),
+        ("p-v2", Stage::Prefill, "v2"),
+        ("d-v1", Stage::Decode, "v1"),
+        ("d-v2", Stage::Decode, "v2"),
+    ]
+    .into_iter()
+    .zip(&workers)
+    {
+        ctx.registry
+            .add(WorkerSpec {
+                id: WorkerId(id.into()),
+                url: worker.url.clone(),
+                mode,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: Some(8998),
+                version_group: Some(group.into()),
+            })
+            .unwrap();
+    }
+    let response = build_router(ctx)
+        .oneshot(request(body("hello")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let dispatched: Vec<_> = workers
+        .iter()
+        .map(|w| w.captured.lock().unwrap().last_body.is_some())
+        .collect();
+    assert_eq!(dispatched, [false, true, false, true]);
+}

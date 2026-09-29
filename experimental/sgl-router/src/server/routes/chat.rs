@@ -24,6 +24,7 @@ use axum::http::{HeaderMap, HeaderName, Response};
 use bytes::Bytes;
 use forward::{forward_chat_request, SelectedWorkers};
 use preparation::{parse_routing_fields, PreparedChatRequest};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -115,13 +116,46 @@ async fn select_workers(
         ..RoutingContext::from_headers(ctx, headers)?
     };
 
-    let prefill = pick_prefill_worker(ctx, request, policy, candidates, &routing_context)?;
+    let candidates = prefills_with_decode(ctx, request, candidates, resolver, &routing_context);
+    let prefill = pick_prefill_worker(ctx, request, policy, &candidates, &routing_context)?;
     let decode = pick_decode_worker(ctx, request, &prefill, resolver, &routing_context)?;
     Ok(SelectedWorkers {
         prefill,
         decode,
         track_dispatch_timestamps: policy.needs_dispatch_timestamps(),
     })
+}
+
+/// Keep prefills whose version group has a decode that fits this request, so a
+/// full group falls back to another. Decode selection has no side effects, while
+/// a discarded prefill pick would already have bound affinity.
+fn prefills_with_decode(
+    ctx: &AppContext,
+    request: &PreparedChatRequest,
+    candidates: &[Arc<Worker>],
+    resolver: &PdPoolResolver,
+    routing: &RoutingContext<'_>,
+) -> Vec<Arc<Worker>> {
+    let first = candidates.first().map(|p| p.version_group());
+    if candidates.iter().all(|p| Some(p.version_group()) == first) {
+        return candidates.to_vec();
+    }
+    let mut fits = HashMap::new();
+    let kept: Vec<_> = candidates
+        .iter()
+        .filter(|p| {
+            *fits
+                .entry(p.version_group())
+                .or_insert_with(|| pick_decode_worker(ctx, request, p, resolver, routing).is_ok())
+        })
+        .cloned()
+        .collect();
+    // With no group fitting, keep them all so the pick reports the real error.
+    if kept.is_empty() {
+        candidates.to_vec()
+    } else {
+        kept
+    }
 }
 
 fn capture_load_snapshot(
