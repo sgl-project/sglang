@@ -48,7 +48,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_model, get_parallel, get_serving
-from sglang.srt.utils import add_prefix, is_hip
+from sglang.srt.utils import add_prefix, is_cuda, is_gfx95_supported, is_hip
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
 logger = logging.getLogger(__name__)
@@ -60,8 +60,9 @@ _is_hip = is_hip()
 
 
 def _cuda_kernels(t: torch.Tensor) -> bool:
-    """True where the Triton kernels apply (CUDA and ROCm); CPU takes the torch paths."""
-    return t.is_cuda
+    """True where the Triton kernels apply (CUDA and gfx950); other ROCm GPUs and CPU
+    take the torch paths."""
+    return t.is_cuda and (is_cuda() or is_gfx95_supported())
 
 
 def _is_prime(n: int) -> bool:
