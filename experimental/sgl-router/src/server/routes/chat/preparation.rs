@@ -84,9 +84,10 @@ impl PreparedChatRequest {
         })
     }
 
-    pub(super) fn engine_rid(&self, pd_mode: bool) -> Option<String> {
-        // Caller IDs are unsafe for prefix aborts; fan-out regenerates IDs; PD must finish KV transfer.
-        if self.caller_set_rid || self.fans_out || pd_mode {
+    pub(super) fn engine_rid(&self) -> Option<String> {
+        // Caller IDs are unsafe for prefix aborts; fan-out regenerates IDs.
+        // PD shares the minted ID, but only decode arms abort-on-drop.
+        if self.caller_set_rid || self.fans_out {
             return None;
         }
         Some(uuid::Uuid::new_v4().simple().to_string())
