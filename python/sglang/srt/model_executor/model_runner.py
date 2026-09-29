@@ -45,10 +45,12 @@ from sglang.srt.elastic_ep.elastic_ep import (
     maybe_recover_ep_ranks,
     register_scale_cohort,
     try_admit_scale_ranks,
+    update_dp_attention_for_elastic_ep,
+    validate_scale_cohort_topology,
 )
 from sglang.srt.elastic_ep.expert_backup_client import ExpertBackupClient
 from sglang.srt.elastic_ep.topology import (
-    physical_ep_rank_to_dp_rank,
+    attn_replica_size,
     physical_ep_size_to_dp_size,
 )
 from sglang.srt.environ import envs
@@ -500,11 +502,6 @@ class ModelRunner:
             return
 
         join_effective_ep_size = get_parallel().ep_join_rank_offset + self.tp_size
-        parallel = get_parallel()
-        attn_replica_size = parallel.attn_tp_size * parallel.attn_cp_size
-        join_effective_dp_size = physical_ep_size_to_dp_size(
-            join_effective_ep_size, attn_replica_size
-        )
         dist.barrier(group=self.tp_group.cpu_group)
         if self.tp_rank == 0:
             register_scale_cohort(
@@ -528,17 +525,14 @@ class ModelRunner:
             )
         )
 
-        from sglang.srt.layers.dp_attention import (
-            enable_joiner_all_gather,
-            update_dp_attention_post_scale,
-        )
+        from sglang.srt.layers.dp_attention import enable_joiner_all_gather
 
         enable_joiner_all_gather()
-        update_dp_attention_post_scale(
-            new_dp_size=join_effective_dp_size,
-            new_dp_rank=physical_ep_rank_to_dp_rank(global_ep_rank, attn_replica_size),
+        join_effective_dp_size = update_dp_attention_for_elastic_ep(
+            physical_ep_size=join_effective_ep_size,
+            physical_ep_rank=global_ep_rank,
+            override_scope="elastic_ep.scale_join",
         )
-        get_context().override("elastic_ep.scale_join", dp_size=join_effective_dp_size)
         if self.eplb_manager is not None:
             self.eplb_manager.disable_rebalance(
                 "EPLB rebalance is disabled while elastic EP scale-up "
@@ -2222,21 +2216,13 @@ class ModelRunner:
                 "is being finalized"
             )
 
-        from sglang.srt.layers.dp_attention import update_dp_attention_post_scale
-
-        parallel = get_parallel()
-        attn_replica_size = parallel.attn_tp_size * parallel.attn_cp_size
-        target_dp_size = physical_ep_size_to_dp_size(target_size, attn_replica_size)
-        effective_dp_size = physical_ep_size_to_dp_size(
-            effective_size, attn_replica_size
+        replica_size = attn_replica_size()
+        effective_dp_size = physical_ep_size_to_dp_size(effective_size, replica_size)
+        target_dp_size = update_dp_attention_for_elastic_ep(
+            physical_ep_size=target_size,
+            physical_ep_rank=self._elastic_global_rank(),
+            override_scope="elastic_ep.scale",
         )
-        update_dp_attention_post_scale(
-            new_dp_size=target_dp_size,
-            new_dp_rank=physical_ep_rank_to_dp_rank(
-                self._elastic_global_rank(), attn_replica_size
-            ),
-        )
-        get_context().override("elastic_ep.scale", dp_size=target_dp_size)
 
         recapture_cuda_graph = self._elastic_cuda_graph_enabled()
         if recapture_cuda_graph:
@@ -2364,6 +2350,16 @@ class ModelRunner:
                     f"Requested target EP size {pending_size} does not match "
                     f"joining cohort target {cohort.target_ep_size}"
                 )
+                ElasticEPStateManager.fail_scale(error)
+                self._reset_eplb_after_elastic_scale_failure()
+                self._report_elastic_scale_failure(error, effective_size)
+                if self.tp_rank == 0 and not get_exec().moe.is_ep_scale_joiner:
+                    logger.error("[Elastic EP] %s", error)
+                return
+            try:
+                validate_scale_cohort_topology(cohort)
+            except ValueError as exc:
+                error = str(exc)
                 ElasticEPStateManager.fail_scale(error)
                 self._reset_eplb_after_elastic_scale_failure()
                 self._report_elastic_scale_failure(error, effective_size)

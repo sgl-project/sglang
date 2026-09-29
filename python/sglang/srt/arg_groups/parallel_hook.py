@@ -458,16 +458,27 @@ def handle_elastic_ep(server_args: Any):
         )
     if scaling_active:
         resolved = resolved_view(server_args)
-        from sglang.srt.elastic_ep.topology import (
-            derive_attn_tp_size,
-            physical_ep_size_to_dp_size,
-        )
+        from sglang.srt.elastic_ep.topology import physical_ep_size_to_dp_size
+        from sglang.srt.runtime_context import derive_attention_widths
 
         try:
-            attn_tp_size = derive_attn_tp_size(
+            divisor = cfg.dp_size * resolved.attn_cp_size
+            if (
+                cfg.tp_size <= 0
+                or cfg.dp_size <= 0
+                or resolved.attn_cp_size <= 0
+                or cfg.tp_size % divisor
+            ):
+                raise ValueError(
+                    "Invalid attention topology: "
+                    f"tp_size={cfg.tp_size}, dp_size={cfg.dp_size}, "
+                    f"attn_cp_size={resolved.attn_cp_size}."
+                )
+            _, attn_tp_size = derive_attention_widths(
                 tp_size=cfg.tp_size,
                 dp_size=cfg.dp_size,
                 attn_cp_size=resolved.attn_cp_size,
+                enable_dp_attention=True,
             )
             attn_replica_size = attn_tp_size * resolved.attn_cp_size
             physical_ep_size_to_dp_size(cfg.max_ep_size, attn_replica_size)
@@ -478,6 +489,13 @@ def handle_elastic_ep(server_args: Any):
                 physical_ep_size_to_dp_size(cfg.ep_join_rank_offset, attn_replica_size)
         except ValueError as exc:
             raise AssertionError(str(exc)) from exc
+
+        if attn_tp_size > 1:
+            assert cfg.moe_dense_tp_size == 1, (
+                "Elastic EP scale-up with attention TP greater than one requires "
+                "--moe-dense-tp-size 1 "
+                f"(got moe_dense_tp_size={cfg.moe_dense_tp_size})."
+            )
 
         assert cfg.elastic_ep_scale_timeout > 0, (
             "--elastic-ep-scale-timeout must be greater than zero."

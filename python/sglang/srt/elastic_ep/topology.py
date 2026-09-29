@@ -2,14 +2,13 @@ from __future__ import annotations
 
 from typing import Sequence
 
+from sglang.srt.runtime_context import get_parallel
 
-def derive_attn_tp_size(*, tp_size: int, dp_size: int, attn_cp_size: int) -> int:
-    divisor = dp_size * attn_cp_size
-    if tp_size <= 0 or dp_size <= 0 or attn_cp_size <= 0 or tp_size % divisor:
-        raise ValueError(
-            f"Invalid attention topology: {tp_size=}, {dp_size=}, {attn_cp_size=}."
-        )
-    return tp_size // divisor
+
+def attn_replica_size() -> int:
+    """Return the fixed physical width of one attention-DP replica."""
+    parallel = get_parallel()
+    return parallel.attn_tp_size * parallel.attn_cp_size
 
 
 def physical_ep_size_to_dp_size(ep_size: int, attn_replica_size: int) -> int:

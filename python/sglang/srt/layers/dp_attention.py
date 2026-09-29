@@ -20,7 +20,10 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.elastic_ep.topology import physical_ep_rank_to_dp_rank
+from sglang.srt.elastic_ep.topology import (
+    attn_replica_size,
+    physical_ep_rank_to_dp_rank,
+)
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     derive_attention_ranks,
@@ -109,7 +112,7 @@ def dp_gather_slot() -> int:
     if world_dp_gather_enabled():
         return physical_ep_rank_to_dp_rank(
             parallel.tp_rank + parallel.ep_join_rank_offset,
-            parallel.attn_tp_size * parallel.attn_cp_size,
+            attn_replica_size(),
         )
     return parallel.attn_dp_rank
 

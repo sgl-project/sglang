@@ -63,7 +63,10 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.elastic_ep.topology import physical_ep_size_to_dp_size
+from sglang.srt.elastic_ep.topology import (
+    attn_replica_size,
+    physical_ep_size_to_dp_size,
+)
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
@@ -491,7 +494,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.startup_time: Optional[Dict[str, Any]] = None
         parallel = get_parallel()
         self.elastic_dp_size = parallel.dp_size
-        self.attn_replica_size = parallel.attn_tp_size * parallel.attn_cp_size
+        self.attn_replica_size = attn_replica_size()
         self.elastic_pending_ep_size = None
         self.elastic_scale_phase = "idle"
         self.elastic_last_error = None

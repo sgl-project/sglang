@@ -27,6 +27,7 @@ import setproctitle
 import zmq
 
 from sglang.srt.elastic_ep.topology import (
+    attn_replica_size,
     physical_ep_rank_to_dp_rank,
     physical_ep_size_to_dp_size,
 )
@@ -181,7 +182,7 @@ class DataParallelController:
 
         self.launch_dp_size: int = get_parallel().dp_size
         parallel = get_parallel()
-        self.attn_replica_size = parallel.attn_tp_size * parallel.attn_cp_size
+        self.attn_replica_size = attn_replica_size()
         if (
             get_exec().moe.elastic_ep_backend is not None
             and parallel.max_ep_size is not None
