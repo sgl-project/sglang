@@ -96,7 +96,7 @@ def _free_req(req, _tree_cache, *, is_insert):
     req.kv.mamba_pool_idx = None
 
 
-@patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
+@patch("sglang.srt.mem_cache.common.release_kv_cache", side_effect=_free_req)
 @patch("sglang.srt.disaggregation.prefill.maybe_cache_unfinished_req")
 def test_aborted_final_result_releases_hybrid_cache(
     maybe_cache_unfinished_req, release_kv_cache
@@ -121,7 +121,7 @@ def test_aborted_final_result_releases_hybrid_cache(
     assert req.rid not in scheduler.disagg_prefill_pending_chunk_rids
 
 
-@patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
+@patch("sglang.srt.mem_cache.common.release_kv_cache", side_effect=_free_req)
 def test_aborted_middle_result_releases_after_last_chunk(release_kv_cache):
     scheduler = _Scheduler()
     req = _Req(inflight_middle_chunks=1)
@@ -134,7 +134,7 @@ def test_aborted_middle_result_releases_after_last_chunk(release_kv_cache):
     scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
 
 
-@patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
+@patch("sglang.srt.mem_cache.common.release_kv_cache", side_effect=_free_req)
 def test_aborted_middle_result_waits_for_inflight_chunk(release_kv_cache):
     scheduler = _Scheduler()
     req = _Req(inflight_middle_chunks=1)
@@ -151,7 +151,7 @@ def test_aborted_middle_result_waits_for_inflight_chunk(release_kv_cache):
     scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
 
 
-@patch("sglang.srt.disaggregation.prefill.release_kv_cache")
+@patch("sglang.srt.mem_cache.common.release_kv_cache")
 def test_delayed_result_ignores_already_retired_request(release_kv_cache):
     scheduler = _Scheduler()
     req = _Req(inflight_middle_chunks=0, allocated=False)
@@ -163,7 +163,7 @@ def test_delayed_result_ignores_already_retired_request(release_kv_cache):
     scheduler.output_streamer.stream_output.assert_not_called()
 
 
-@patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
+@patch("sglang.srt.mem_cache.common.release_kv_cache", side_effect=_free_req)
 def test_sender_abort_failure_does_not_skip_local_cleanup(release_kv_cache):
     scheduler = _Scheduler()
     req = _Req(inflight_middle_chunks=0)
@@ -177,7 +177,7 @@ def test_sender_abort_failure_does_not_skip_local_cleanup(release_kv_cache):
     assert req.finished()
 
 
-@patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
+@patch("sglang.srt.mem_cache.common.release_kv_cache", side_effect=_free_req)
 @patch("sglang.srt.disaggregation.prefill.maybe_cache_unfinished_req")
 def test_grammar_rejection_retires_prefill_before_transfer(
     maybe_cache_unfinished_req, release_kv_cache
@@ -225,7 +225,7 @@ def test_aborted_result_releases_mamba_allocated_before_kv():
         (SamplingMaskStatus.INVALID, 500, "InternalServerError"),
     ],
 )
-@patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
+@patch("sglang.srt.mem_cache.common.release_kv_cache", side_effect=_free_req)
 def test_sampling_mask_abort_preserves_error_and_releases_once(
     release_kv_cache, status, http_status, err_type, transport_error
 ):

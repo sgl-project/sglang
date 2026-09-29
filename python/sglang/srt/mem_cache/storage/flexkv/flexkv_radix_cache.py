@@ -485,7 +485,12 @@ class FlexKVRadixCache(RadixCache):
     # ------------------------------------------------------------------
 
     def release_aborted_request(self, handle: CacheRequestHandle) -> None:
-        """Clean up tracking for an aborted request without invoking FlexKV."""
+        """Cancel-phase cleanup: drop lookup/prefetch, not an in-flight STORE.
+
+        Must run *before* KV finalization / STORE. Popping
+        ``_inflight_store_nodes`` afterwards would ``dec_lock_ref`` a store still
+        on ``store_stream``.
+        """
         self._load_markers.pop(handle, None)
         with self._node_lock:
             node = self._inflight_store_nodes.pop(handle, None)
