@@ -355,8 +355,6 @@ class HunYuanAttention(nn.Module):
             q, k = self.rotary_emb(positions, q, k)
             ori_k = k
             if self.use_qk_norm:
-                # q = self.query_layernorm(q.view(-1, self.num_heads, self.head_dim).contiguous())
-                # k = self.key_layernorm(k.view(-1, self.num_kv_heads, self.head_dim).contiguous())
                 q = self.query_layernorm(
                     q.reshape(-1, self.head_dim).contiguous()
                 ).reshape(-1, self.q_size)
@@ -599,6 +597,7 @@ class HunYuanMoEV1ForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config, logit_scale=logit_scale)
         self.sampler = create_sampler()
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
