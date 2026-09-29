@@ -472,11 +472,6 @@ class AscendKDAAttnBackend(KDAAttnBackend):
 class AscendKDAHybridLinearAttnBackend:
     """KDA-specific hybrid backend with strided destination state mover.
 
-    ``AscendHybridLinearAttnBackend`` uses ``move_intermediate_cache`` which
-    assumes a contiguous destination layout. KDA's temporal SSM state on NPU
-    is transposed (-1, -2) and requires the strided variant
-    ``move_intermediate_cache_kda`` to preserve correct (V, K) indexing.
-
     This class overrides only ``update_mamba_state_after_mtp_verify`` to
     substitute the KDA-aware mover; the rest of the hybrid behaviour is
     inherited unchanged.
@@ -499,7 +494,7 @@ class AscendKDAHybridLinearAttnBackend:
                 req_pool_indices=None,
             ):
                 from sgl_kernel_npu.mamba.mamba_state_update_triton import (
-                    conv_state_rollback,
+                    conv_state_rollback_kda,
                     move_intermediate_cache_kda,
                 )
                 from sgl_kernel_npu.mamba.speculative_state_scatter import (
@@ -586,7 +581,7 @@ class AscendKDAHybridLinearAttnBackend:
 
                 if not has_conv_snapshots:
                     if dst_indices_tensor.numel() > 0:
-                        conv_state_rollback(
+                        conv_state_rollback_kda(
                             conv_states,
                             dst_indices_tensor,
                             last_steps,
@@ -597,7 +592,7 @@ class AscendKDAHybridLinearAttnBackend:
                         mamba_track_indices is not None
                         and mamba_track_indices.numel() > 0
                     ):
-                        conv_state_rollback(
+                        conv_state_rollback_kda(
                             conv_states,
                             mamba_track_indices,
                             mamba_steps_to_track,
