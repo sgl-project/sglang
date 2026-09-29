@@ -374,7 +374,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
 )
 
 # Architectures that support the extra_buffer mamba radix cache strategy.
-# The single source of truth; `supports_mamba_cache_extra_buffer` reads it.
+# Registry specs opt in through `support_mamba_cache_extra_buffer` instead.
 _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
     {
         "KimiLinearForCausalLM",
@@ -409,12 +409,17 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
 )
 
 
-def supports_mamba_cache_extra_buffer(view: Any, model_arch: str) -> bool:
-    """Whether ``model_arch`` supports the extra_buffer strategy on the
-    configured linear-attention backend (pure read)."""
+def supports_mamba_cache_extra_buffer(view: Any, hf_config: Any) -> bool:
+    """Whether the model of ``hf_config`` supports the extra_buffer strategy on
+    the configured linear-attention backend (pure read)."""
+    from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec
+
     if get_platform().is_xpu:
         return False
-    if model_arch in _MAMBA_EXTRA_BUFFER_ARCHS:
+    spec = get_linear_attn_spec(hf_config)
+    if hf_config.architectures[0] in _MAMBA_EXTRA_BUFFER_ARCHS or (
+        spec is not None and spec.support_mamba_cache_extra_buffer
+    ):
         return view.linear_attn_backend == "triton"
     return False
 
@@ -422,9 +427,7 @@ def supports_mamba_cache_extra_buffer(view: Any, model_arch: str) -> bool:
 @register_post_process
 def _mamba_radix_cache_resolution(view: Any) -> dict:
     """Resolve hybrid-Mamba cache settings using the current page size and overlap policy."""
-    from sglang.srt.configs.linear_attn_model_registry import (
-        get_linear_attn_spec_by_arch,
-    )
+    from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec
 
     hf_config = model_config_of(view).hf_config
     model_arch = hf_config.architectures[0]
@@ -435,7 +438,9 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
             layer_type == "mamba"
             for layer_type in getattr(hf_config, "layer_types", [])
         )
-    spec = get_linear_attn_spec_by_arch(model_arch)
+    # Specs registered by config predicate (archs=[]) are only reachable
+    # through the HF config, not the architecture name.
+    spec = get_linear_attn_spec(hf_config)
     if not ((spec is not None and spec.uses_mamba_radix_cache) or in_branch):
         return {}
 
@@ -447,7 +452,7 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
         wants_overlap = not view.disable_overlap_schedule
         wants_paging = view.page_size is not None and view.page_size > 1
         if (wants_overlap or wants_paging) and supports_mamba_cache_extra_buffer(
-            view, model_arch
+            view, hf_config
         ):
             declared["mamba_radix_cache_strategy"] = "extra_buffer"
         else:
@@ -920,20 +925,6 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
         and view.nnodes == 1
         and not view.disable_custom_all_reduce
     )
-    if envs.SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION.get() and model_arch in {
-        "Qwen3_5MoeForCausalLM",
-        "Qwen3_5MoeForConditionalGeneration",
-    }:
-        # The Qwen backend owns one workspace for ordinary AR and MoE finalize;
-        # do not allocate or fall back to the legacy TRTLLM/MNNVL workspace.
-        if view.flashinfer_allreduce_fusion_backend is not None:
-            logger.warning(
-                "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION owns both Qwen3.5 "
-                "AllReduce fusion patterns; suppressing the separately configured "
-                "--flashinfer-allreduce-fusion-backend=%s",
-                view.flashinfer_allreduce_fusion_backend,
-            )
-        return {"flashinfer_allreduce_fusion_backend": None}
     if (
         view.flashinfer_allreduce_fusion_backend is None
         and model_arch in _FLASHINFER_ALLREDUCE_FUSION_ARCHS
@@ -1426,8 +1417,15 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
 
         is_gfx95_mxfp8 = get_platform().is_hip and is_gfx95_supported()
         allowed = list(MXFP8_MOE_RUNNER_BACKEND_CHOICES)
-        if is_gfx95_mxfp8:
+        # Every other entry is CUDA-only. Honor an explicit triton request on ROCm
+        # instead of sending it back to flashinfer_trtllm, whose MoE apply path
+        # imports flashinfer.
+        if is_gfx95_mxfp8 or (get_platform().is_hip and moe_runner_backend == "triton"):
             allowed.append("triton")
+        if is_gfx95_mxfp8:
+            # the aiter MXFP8 MoE quant info is built only when aiter is enabled
+            if envs.SGLANG_USE_AITER.get():
+                allowed.append("aiter")
 
         if view.moe_a2a_backend == "flashinfer_megamoe":
             mxfp8_default = "flashinfer_megamoe"
