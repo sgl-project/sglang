@@ -9,9 +9,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
-    DestroyWeightsUpdateGroupReqInput,
     EndWeightUpdateReqInput,
-    InitWeightsUpdateGroupReqInput,
     UpdateWeightsFromDistributedReqInput,
 )
 from sglang.srt.managers.scheduler_components.weight_updater import (
@@ -47,8 +45,8 @@ def _manager(tp_worker, draft_worker):
     return manager
 
 
-def _session_manager(target_runner, draft_runner):
-    target_runner.weight_updater._m2n_receivers = {}
+def _session_manager(target_runner, draft_runner, *, m2n=True):
+    target_runner.weight_updater._m2n_receivers = {"pp0": Mock()} if m2n else {}
     return _manager(
         tp_worker=SimpleNamespace(
             model_runner=target_runner, iter_runners=lambda: [("", target_runner)]
@@ -58,25 +56,6 @@ def _session_manager(target_runner, draft_runner):
             if draft_runner is not None
             else None
         ),
-    )
-
-
-def _init_group(manager, name="pp0", *, m2n=True, success=True):
-    def initialize(req):
-        if success and m2n:
-            manager.tp_worker.model_runner.weight_updater._m2n_receivers[name] = Mock()
-        return success, "initialized" if success else "failed"
-
-    manager.tp_worker.init_weights_update_group = Mock(side_effect=initialize)
-    return manager.init_weights_update_group(
-        InitWeightsUpdateGroupReqInput(
-            master_address="localhost",
-            master_port=12345,
-            rank_offset=1,
-            world_size=2,
-            group_name=name,
-            m2n_manifest={"schema_version": 1} if m2n else None,
-        )
     )
 
 
@@ -128,7 +107,7 @@ def test_m2n_ipc_waves_and_residual_finalize_once(concurrent):
 
 
 @pytest.mark.parametrize("failure", ["native", "process_group"])
-def test_m2n_teardown_is_native_first_and_retryable(failure):
+def test_m2n_teardown_preserves_resources_on_failure(failure):
     from sglang.srt.model_executor.model_runner_components.weight_updater import (
         WeightUpdater,
     )
@@ -194,90 +173,61 @@ def test_m2n_receive_respects_upstream_weight_cache_guards(cache):
     receiver.receive.assert_not_called()
 
 
+@pytest.mark.parametrize("m2n", [False, True])
 @pytest.mark.parametrize(
-    "initial,restart,sync_base,with_draft",
-    [
-        ("target", "target", True, True),
-        ("all", "all", True, False),
-        ("all", "target", True, False),
-        ("target", "all", True, True),
-        ("target", "target", False, True),
-    ],
+    "selector,sync_base", [("target", True), ("all", True), ("target", False)]
 )
-def test_m2n_session_restart_keeps_original_selector_and_preparation(
-    initial, restart, sync_base, with_draft
-):
+def test_open_weight_update_session_rejects_reentry(m2n, selector, sync_base):
     target, draft = Mock(), Mock()
-    manager = _session_manager(target, draft if with_draft else None)
+    manager = _session_manager(target, draft, m2n=m2n)
     manager._weight_update_in_progress = False
-    assert _init_group(manager).success
     with patch("torch.distributed.barrier") as barrier:
         assert manager.begin_weight_update(
-            BeginWeightUpdateReqInput(selector=initial)
+            BeginWeightUpdateReqInput(selector="target")
         ).success
         manager._weight_update_loaded = manager._weight_update_requires_post_load = True
+        manager._weight_update_pending_version = "pending"
         barrier.reset_mock()
-        output = manager.begin_weight_update(
-            BeginWeightUpdateReqInput(selector=restart, sync_base=sync_base)
-        )
-        same_session = initial == restart and sync_base
-        assert output.success is same_session
-        assert manager._weight_update_selector == initial
-        assert manager._weight_update_in_progress is True
-        assert manager._weight_update_loaded is (not same_session)
-        assert manager._weight_update_requires_post_load is (not same_session)
-        if not same_session:
-            barrier.assert_not_called()
-        manager.end_weight_update(EndWeightUpdateReqInput())
-    for role, runner in (("target", target), ("draft", draft)):
-        selected = initial in ("all", role) and (role == "target" or with_draft)
-        assert runner.begin_weight_update.call_count == int(selected)
-        assert runner.end_weight_update.call_count == int(selected)
+        with pytest.raises(AssertionError, match="already open"):
+            manager.begin_weight_update(
+                BeginWeightUpdateReqInput(selector=selector, sync_base=sync_base)
+            )
+        barrier.assert_not_called()
+    assert manager._weight_update_selector == "target"
+    assert manager._weight_update_sync_base is True
+    assert manager._weight_update_loaded is True
+    assert manager._weight_update_requires_post_load is True
+    assert manager._weight_update_pending_version == "pending"
+    target.begin_weight_update.assert_called_once()
+    draft.begin_weight_update.assert_not_called()
 
 
-def test_m2n_group_lifecycle_preserves_ordinary_session_reentry_guard():
-    manager = _session_manager(Mock(), None)
-    assert not _init_group(manager, success=False).success
-    assert _init_group(manager, "residual", m2n=False).success
-    assert not manager._m2n_update_groups
+def test_failed_m2n_update_does_not_reopen_session():
+    target = Mock()
+    manager = _session_manager(target, None)
+    manager._weight_update_in_progress = False
+    with patch("torch.distributed.barrier"):
+        assert manager.begin_weight_update(
+            BeginWeightUpdateReqInput(selector="target")
+        ).success
+    target.weight_updater.receive_weights_from_m2n.side_effect = RuntimeError(
+        "transfer failed"
+    )
+    req = _distributed_req(selector="target")
+    req.load_format = "nccl_m2n"
+    output = manager.update_weights_from_distributed(req)
+    assert not output.success
+    assert "restart the affected rollout engines" in output.message
+    assert manager._weight_update_in_progress
+    target.end_weight_update.assert_not_called()
     with pytest.raises(AssertionError, match="already open"):
-        manager.begin_weight_update(BeginWeightUpdateReqInput())
-
-    assert _init_group(manager, "pp0").success
-    assert _init_group(manager, "pp1").success
-    receivers = manager.tp_worker.model_runner.weight_updater._m2n_receivers
-
-    def destroy(req):
-        if req.group_name == "pp0" and "pp0" in receivers:
-            receivers.pop("pp0")
-            return False, "failed while destroying pp1"
-        if req.group_name == "pp1":
-            receivers.clear()
-        return True, "done"
-
-    manager.tp_worker.destroy_weights_update_group = Mock(side_effect=destroy)
-    assert manager.destroy_weights_update_group(
-        DestroyWeightsUpdateGroupReqInput(group_name="residual")
-    ).success
-    assert manager._m2n_update_groups == {"pp0", "pp1"}
-    req = DestroyWeightsUpdateGroupReqInput(group_name="pp0")
-    assert not manager.destroy_weights_update_group(req).success
-    assert manager._m2n_update_groups == {"pp1"}
-    assert manager.destroy_weights_update_group(req).success
-    assert manager._m2n_update_groups == {"pp1"}
-    assert manager.destroy_weights_update_group(
-        DestroyWeightsUpdateGroupReqInput(group_name="pp1")
-    ).success
-    assert not manager._m2n_update_groups
-    with pytest.raises(AssertionError, match="already open"):
-        manager.begin_weight_update(BeginWeightUpdateReqInput())
+        manager.begin_weight_update(BeginWeightUpdateReqInput(selector="target"))
 
 
 def test_m2n_with_draft_rejects_all_before_preparing_weights():
     target, draft = Mock(), Mock()
     manager = _session_manager(target, draft)
     manager._weight_update_in_progress = False
-    assert _init_group(manager).success
     output = manager.begin_weight_update(BeginWeightUpdateReqInput())
     assert not output.success
     assert not manager._weight_update_in_progress

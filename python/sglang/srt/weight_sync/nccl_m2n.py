@@ -840,7 +840,9 @@ class NcclM2NReceiver:
 
     def _prepare_receive(self) -> None:
         if getattr(self, "_failed_receive_buffers", None) is not None:
-            raise RuntimeError("A failed M2N stream must be destroyed before retrying")
+            raise RuntimeError(
+                "A failed M2N stream cannot receive more weights; restart the rollout engine"
+            )
         # Refresh and validate live parameters before any native receive. FP8
         # updates must keep the existing inference storage and scale format.
         self._params = dict(self.model.named_parameters())

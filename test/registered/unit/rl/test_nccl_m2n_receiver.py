@@ -376,7 +376,7 @@ def test_concurrent_receive_failure_drains_all_streams_before_releasing_buffers(
         NcclM2NReceiver.receive_many(receivers)
     assert drains == [0, 1]
     assert references[0]() is not None
-    with pytest.raises(RuntimeError, match="destroyed before retrying"):
+    with pytest.raises(RuntimeError, match="failed M2N stream"):
         receivers[0]._prepare_receive()
     # The failed receiver retains its buffer through a failed teardown too.
     with patch("sglang.srt.weight_sync.nccl_m2n._nccl_m2n", return_value=m2n):
