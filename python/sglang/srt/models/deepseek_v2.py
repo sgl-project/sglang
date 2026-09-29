@@ -2127,8 +2127,15 @@ class DeepseekV2AttentionMLA(
         # DSA-CP: every head, for this rank's slice of the batch's tokens. Only
         # the attention module needs the full head count -- the query is
         # redistributed by all-to-all, so every weight stays head-sharded.
+        #
+        # ``self.use_dsa`` and not ``self.indexer is not None``: a skip-topk layer
+        # owns no Indexer but still attends with the previous layer's top-k, so it
+        # needs this module. Without the ``use_dsa`` half, every NPU DeepSeek at
+        # attention TP > 1 built it -- including non-DSA V3, where topk_indices is
+        # always None and the module is dead weight registered with the attention
+        # backend.
         self.attn_mqa_for_dsa_cp = None
-        if dsa_cp_enabled():
+        if self.use_dsa and dsa_cp_enabled():
             self.attn_mqa_for_dsa_cp = RadixAttention(
                 self.num_heads,
                 self.kv_lora_rank + self.qk_rope_head_dim,
