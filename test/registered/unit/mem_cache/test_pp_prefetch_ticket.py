@@ -6,6 +6,7 @@ import unittest
 from array import array
 from contextlib import nullcontext
 from queue import Empty, Queue
+from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 import torch
@@ -16,7 +17,12 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestOutcome,
 )
 from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+    PoolTransferResult,
+)
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
     PPPrefetchDecision,
@@ -26,16 +32,18 @@ from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
-class TestPPPrefetchTicket(unittest.TestCase):
+class TestPPPrefetchTicket(CustomTestCase):
     def setUp(self):
         self.c = c = HybridCacheController.__new__(HybridCacheController)
         c.page_size = c.prefetch_threshold = 4
         c.pp_rank = c.tp_rank = 0
         c.pp_size, c.tp_size = 4, 2
+        c.storage_config = SimpleNamespace(dcp_size=1)
         c.pp_group, c.pp_prefetch_command_group = "pp", "command"
         c.pp_prefetch_command_thread = None
         c.prefetch_hits_sync_groups = c.prefetch_completion_sync_groups = ["pp", "tp"]
@@ -162,6 +170,31 @@ class TestPPPrefetchTicket(unittest.TestCase):
             [call.kwargs["pp_rank"] for call in c._storage_hit_query.call_args_list],
             [0, 2, 0, 2],
         )
+
+    def test_ticket_intersects_sparse_checkpoints_across_local_pp_queries(self):
+        """PP stages may share an earlier checkpoint but not each other's maxima."""
+        c = self.c
+        del c._storage_hit_query  # Exercise the production query and ticket path.
+        c.storage_backend = Mock()
+        c.storage_backend.batch_exists_v2.side_effect = [
+            PoolTransferResult(4, {PoolName.MAMBA: 4}, [1, 4]),
+            PoolTransferResult(3, {PoolName.MAMBA: 3}, [1, 3]),
+        ]
+        transfer = PoolTransfer(
+            PoolName.MAMBA,
+            keys=["__placeholder__"],
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
+        submission = c.submit_prefetch(
+            CacheRequestHandle("sparse", 0),
+            RadixKey(list(range(16))),
+            None,
+            None,
+            [],
+            [transfer],
+        )
+        self.assertTrue(submission.decision)
+        self.assertEqual(c.pp_prefetch_command_queue.get_nowait().storage_hit_count, 4)
 
     def test_tp_only_preserves_normal_prefetch(self):
         c = self.c

@@ -69,7 +69,7 @@ class LRUFileEvictor:
         config_suffix: str,
         *,
         tp_rank: int,
-        is_mla_model: bool,
+        is_storage_owner: bool,
         extra_config: Optional[dict] = None,
         on_evict: Optional[Callable[[str], None]] = None,
     ) -> None:
@@ -78,9 +78,9 @@ class LRUFileEvictor:
         self._tp_rank = tp_rank
         self._on_evict = on_evict
 
-        # MLA shares KV across TP ranks; each rank still owns its side pools.
-        self._is_storage_owner = not is_mla_model or tp_rank == 0
-        self._owned_suffixes = (config_suffix,) if self._is_storage_owner else ()
+        # The controller and file backend select the same writer for each shard.
+        self._is_storage_owner = is_storage_owner
+        self._owned_suffixes = (config_suffix,) if is_storage_owner else ()
 
         # suffixed_key -> file size in bytes; oldest at front.
         self._lru: OrderedDict[str, int] = OrderedDict()

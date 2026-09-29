@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
     DEFAULT_TENANT_ID,
     MooncakeStoreConfig,
@@ -74,7 +75,7 @@ def _make_storage_config(tenant_id=DEFAULT_TENANT_ID):
     if tenant_id is not None:
         extra_config["tenant_id"] = tenant_id
 
-    return SimpleNamespace(
+    return HiCacheStorageConfig(
         tp_rank=0,
         tp_size=1,
         pp_rank=0,

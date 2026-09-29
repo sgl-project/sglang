@@ -73,6 +73,22 @@ class StorageAttachment:
                 "launch with --enable-hierarchical-cache to attach a backend.",
             )
 
+        from sglang.srt.runtime_context import get_parallel, get_server_args
+
+        if get_parallel().attn_dcp_size > 1:
+            from sglang.srt.arg_groups.hicache_hook import validate_hicache_dcp_storage
+
+            try:
+                validate_hicache_dcp_storage(
+                    get_server_args(),
+                    storage_backend=storage_backend,
+                    prefetch_policy=(
+                        hicache_storage_prefetch_policy or cache.prefetch_stop_policy
+                    ),
+                )
+            except NotImplementedError as e:
+                return False, str(e)
+
         if cache.enable_storage:
             current_backend = controller.storage_backend_type
             if current_backend != storage_backend:
@@ -91,7 +107,8 @@ class StorageAttachment:
             )
 
         # Apply policies before the controller attach, so the storage threads
-        # observe the new values as soon as they start.
+        # observe the new values as soon as they start. A failed attach restores them.
+        previous_policies = self._policy_state()
         self._apply_policies(hicache_storage_prefetch_policy, hicache_write_policy)
 
         logger.info(f"Attaching HiCache storage backend: {storage_backend}")
@@ -107,6 +124,7 @@ class StorageAttachment:
             )
         except Exception as e:
             logger.exception(f"Failed to parse storage_backend_extra_config_json: {e}")
+            self._restore_policy_state(previous_policies)
             return (
                 False,
                 f"Failed to parse storage_backend_extra_config_json "
@@ -126,6 +144,7 @@ class StorageAttachment:
             logger.exception(
                 f"Failed to attach storage backend '{storage_backend}': {e}"
             )
+            self._restore_policy_state(previous_policies)
             return False, f"Failed to attach storage backend '{storage_backend}': {e}"
 
         self.apply_runtime_config(
@@ -333,6 +352,24 @@ class StorageAttachment:
                 f"Expected one of {list(_WRITE_POLICIES)}."
             )
         return None
+
+    def _policy_state(self) -> tuple:
+        cache = self._cache
+        return (
+            cache.prefetch_stop_policy,
+            cache.cache_controller.write_policy,
+            cache.write_through_threshold,
+            cache.is_write_back,
+        )
+
+    def _restore_policy_state(self, state: tuple) -> None:
+        cache = self._cache
+        (
+            cache.prefetch_stop_policy,
+            cache.cache_controller.write_policy,
+            cache.write_through_threshold,
+            cache.is_write_back,
+        ) = state
 
     def _apply_policies(
         self,

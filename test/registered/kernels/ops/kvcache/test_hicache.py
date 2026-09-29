@@ -1,3 +1,4 @@
+import ctypes
 import sys
 
 import pytest
@@ -10,7 +11,10 @@ from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer_page_unified_lf,
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import (
+    MHATokenToKVPool,
+    MLATokenToKVPool,
+)
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     alloc_with_pin_memory,
@@ -574,6 +578,125 @@ def test_hicache_page_first_staged_write_back_mla(
     layout: str, element_dim: int, page_count: int
 ) -> None:
     _run_page_first_staged_write_back_mla(layout, element_dim, page_count)
+
+
+@pytest.mark.parametrize(
+    "layout,backend",
+    [
+        ("layer_first", "kernel"),
+        ("page_first", "kernel"),
+        ("page_first_direct", "direct"),
+    ],
+)
+@pytest.mark.skipif(
+    not is_cuda(), reason="DCP descriptor GPU transfers qualified on CUDA"
+)
+@pytest.mark.parametrize("dcp", [2, 4])
+def test_mla_dcp_storage_descriptors_round_trip_on_gpu(layout, backend, dcp):
+    """Real GPU copies must agree with the L3 physical byte descriptors.
+
+    Sequential ranks use one GPU. Snapshotting descriptor bytes models a
+    synchronous storage boundary; the separate TCP test exercises Mooncake.
+    All source/host/restore allocations differ, with untouched GPU guard rows.
+    """
+    page = 16
+    logical_page = page * dcp
+
+    def indices(pages, device):
+        return torch.tensor(
+            [p * logical_page + i for p in pages for i in range(logical_page)],
+            device=device,
+            dtype=torch.int64,
+        )
+
+    for rank in (0, dcp - 1):
+        device_pool = MLATokenToKVPool(
+            size=page * 16,
+            page_size=page,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            dtype=torch.bfloat16,
+            layer_num=2,
+            device=DEVICE,
+            enable_memory_saver=False,
+        )
+        hosts = []
+        try:
+            for _ in range(2):
+                hosts.append(
+                    MLATokenToKVPoolHost(
+                        device_pool,
+                        host_to_device_ratio=2,
+                        host_size=0,
+                        page_size=logical_page,
+                        layout=layout,
+                        pin_memory=True,
+                        device="cpu",
+                        dcp_size=dcp,
+                        dcp_rank=rank,
+                    )
+                )
+            source, target = hosts
+            expected = []
+            for layer, buffer in enumerate(device_pool.kv_buffer):
+                words = buffer.view(torch.int32)
+                words.copy_(
+                    (
+                        torch.arange(words.numel(), device=DEVICE, dtype=torch.int32)
+                        + layer * 100003
+                        + rank * 1000003
+                    ).reshape(words.shape)
+                )
+                original = buffer.clone()
+                restored = torch.full_like(buffer, 3)
+                for src, dst in zip((7, 2, 11), (4, 10, 1)):
+                    restored[dst * page : (dst + 1) * page].copy_(
+                        original[src * page : (src + 1) * page]
+                    )
+                expected.append(restored)
+            host_device = (
+                "cpu" if layout == "page_first" or backend == "direct" else DEVICE
+            )
+            # The controller runs copies on a dedicated stream. The CUDA batch
+            # memcpy API rejects the legacy default stream on older runtimes.
+            transfer_stream = torch.cuda.Stream()
+            transfer_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(transfer_stream):
+                source.backup_from_device_all_layer(
+                    device_pool,
+                    indices((5, 1, 9), host_device),
+                    indices((7, 2, 11), "cpu" if backend == "direct" else DEVICE),
+                    backend,
+                )
+            torch.cuda.synchronize()
+            src_ptrs, src_sizes = source.get_page_buffer_meta(indices((5, 1, 9), "cpu"))
+            dst_ptrs, dst_sizes = target.get_page_buffer_meta(indices((8, 3, 0), "cpu"))
+            assert src_sizes == dst_sizes
+            assert sum(src_sizes) == 3 * page * 2 * 576 * 2
+            for src, dst, size in zip(src_ptrs, dst_ptrs, src_sizes):
+                for pool, ptr in ((source, src), (target, dst)):
+                    base = pool.kv_buffer.data_ptr()
+                    assert base <= ptr and ptr + size <= base + pool.kv_buffer.nbytes
+                ctypes.memmove(dst, ctypes.string_at(src, size), size)
+            with torch.cuda.stream(transfer_stream):
+                for layer, buffer in enumerate(device_pool.kv_buffer):
+                    buffer.fill_(3)
+                    target.load_to_device_per_layer(
+                        device_pool,
+                        indices((8, 3, 0), "cpu" if backend == "direct" else DEVICE),
+                        indices((4, 10, 1), "cpu" if backend == "direct" else DEVICE),
+                        layer,
+                        backend,
+                    )
+            torch.cuda.synchronize()
+            for actual, wanted in zip(device_pool.kv_buffer, expected):
+                torch.testing.assert_close(
+                    actual.view(torch.uint8), wanted.view(torch.uint8), rtol=0, atol=0
+                )
+        finally:
+            torch.cuda.synchronize()
+            for host in hosts:
+                host.destroy()
 
 
 def test_hicache_page_first_staged_write_back_mha_staged_only_alignment() -> None:
