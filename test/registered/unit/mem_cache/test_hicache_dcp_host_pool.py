@@ -45,16 +45,24 @@ def _fake_mla_device_pool(size: int = 1024) -> SimpleNamespace:
     )
 
 
-def _make_host_pool(dcp_rank: int, device_size: int = 1024) -> MLATokenToKVPoolHost:
+def _make_host_pool(
+    dcp_rank: int,
+    device_size: int = 1024,
+    dcp_size: int = DCP_SIZE,
+    layout: str = "layer_first",
+    dtype: torch.dtype = torch.float16,
+) -> MLATokenToKVPoolHost:
+    device = _fake_mla_device_pool(device_size)
+    device.store_dtype = dtype
     return MLATokenToKVPoolHost(
-        _fake_mla_device_pool(device_size),
+        device,
         host_to_device_ratio=2.0,
         host_size=0,
-        page_size=WIDENED_PAGE,
-        layout="layer_first",
+        page_size=PHYSICAL_PAGE * dcp_size,
+        layout=layout,
         pin_memory=False,
         device="cpu",
-        dcp_size=DCP_SIZE,
+        dcp_size=dcp_size,
         dcp_rank=dcp_rank,
     )
 
@@ -188,10 +196,51 @@ class TestTransferEntryPointsTranslate(CustomTestCase):
         torch.testing.assert_close(kwargs["src_indices"], expected)
         torch.testing.assert_close(kwargs["dst_indices"], expected)
 
-    def test_l3_data_page_is_guarded(self):
-        pool = _make_host_pool(dcp_rank=0)
-        with self.assertRaises(AssertionError):
-            pool.get_data_page(0)
+
+class TestDcpStoragePages(CustomTestCase):
+    def test_logical_pages_map_to_physical_rows(self):
+        cases = (
+            (2, "layer_first", torch.bfloat16),
+            (2, "page_first", torch.bfloat16),
+            (2, "page_first_direct", torch.bfloat16),
+            (4, "page_first", torch.bfloat16),
+            (2, "page_first", torch.uint8),
+        )
+        for dcp, layout, dtype in cases:
+            with self.subTest(dcp=dcp, layout=layout, dtype=dtype):
+                source = _make_host_pool(1, dcp_size=dcp, layout=layout, dtype=dtype)
+                target = _make_host_pool(1, dcp_size=dcp, layout=layout, dtype=dtype)
+                values = torch.arange(source.kv_buffer.numel()) % 251
+                source.kv_buffer.copy_(values.reshape(source.kv_buffer.shape))
+                target.kv_buffer.zero_()
+                expected = target.kv_buffer.clone()
+
+                def physical_page(buffer, page, layout=layout):
+                    if layout == "layer_first":
+                        return buffer[:, page * 64 : (page + 1) * 64]
+                    if layout == "page_first":
+                        return buffer[page * 64 : (page + 1) * 64]
+                    return buffer[page : page + 1]
+
+                payload = source.get_data_page(3 * 64 * dcp)
+                torch.testing.assert_close(
+                    payload, physical_page(source.kv_buffer, 3).flatten()
+                )
+                target.set_from_flat_data_page(5 * 64 * dcp, payload)
+                physical_page(expected, 5).copy_(physical_page(source.kv_buffer, 3))
+                torch.testing.assert_close(target.kv_buffer, expected, rtol=0, atol=0)
+
+    def test_invalid_logical_starts_and_zero_copy_are_rejected(self):
+        pool = _make_host_pool(1, dcp_size=2, layout="page_first")
+        for index in (-128, 1, 64):
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                pool.get_data_page(index)
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                pool.set_from_flat_data_page(index, pool.get_dummy_flat_data_page())
+        with self.assertRaises(IndexError):
+            pool.get_data_page(pool.logical_size)
+        with self.assertRaises(NotImplementedError):
+            pool.get_page_buffer_meta(torch.arange(128))
 
 
 if __name__ == "__main__":
