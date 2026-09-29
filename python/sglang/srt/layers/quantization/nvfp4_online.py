@@ -26,8 +26,10 @@ from sglang.srt.layers.quantization.utils import (
     is_layer_skipped,
     per_tensor_dequantize,
 )
+from sglang.srt.utils.common import temp_set_env
 
 logger = logging.getLogger(__name__)
+_nvfp4_weight_quantization_lock = threading.Lock()
 
 
 class NvFp4OnlineConfig(ModelOptQuantConfig):
@@ -289,13 +291,19 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             weight_scale_2 = weight_scale_2.to(
                 device=weight.device, dtype=torch.float32
             )
-        fp4_weight, weight_sf = nvfp4_quantize(
-            weight.contiguous(),
-            1.0 / weight_scale_2,
-            sfLayout=SfLayout.layout_linear,
-            backend="cute-dsl",
-            nvfp4_4over6=nvfp4_4over6_config,
-        )
+        # FlashInfer still uses an environment flag for exact FP4 math.
+        # Serialize the scope so parallel weight loaders restore it correctly.
+        with (
+            _nvfp4_weight_quantization_lock,
+            temp_set_env(FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1"),
+        ):
+            fp4_weight, weight_sf = nvfp4_quantize(
+                weight.contiguous(),
+                1.0 / weight_scale_2,
+                sfLayout=SfLayout.layout_linear,
+                backend="cute-dsl",
+                nvfp4_4over6=nvfp4_4over6_config,
+            )
         rows, cols = weight.shape
         weight_sf = weight_sf.view(torch.float8_e4m3fn).reshape(rows, cols // 16)
         return (
