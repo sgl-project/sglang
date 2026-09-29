@@ -497,6 +497,7 @@ def _make_generate_obj(rid, is_single):
     obj.max_thinking_tokens = None
     obj.normalize_batch_and_arguments = Mock()
     if not is_single:
+        obj.batch_size = len(rid)
         obj.__getitem__.side_effect = lambda i: Mock()
     return obj
 
@@ -636,6 +637,34 @@ class TestParallelStreamTaskCleanup(CustomTestCase):
             self.assertTrue(sibling_closed.is_set())
 
         asyncio.run(drive())
+
+
+class TestParallelSamplingRequestCleanup(CustomTestCase):
+    def test_completed_parallel_samples_release_all_request_states(self):
+        tm = _make_tm_for_generate(self)
+        tm.request_metrics_exporter_manager = Mock()
+        tm.request_metrics_exporter_manager.exporter_enabled.return_value = False
+        obj = GenerateReqInput(text=["hello", "world"], sampling_params={"n": 2})
+        tokenized = MagicMock()
+        tokenized.mm_inputs = None
+        tokenized.sampling_params = MagicMock()
+        tm._tokenize_one_request = AsyncMock(return_value=tokenized)
+
+        async def send(tokenized_obj):
+            async def respond():
+                await asyncio.sleep(0)
+                await tm._handle_batch_output(_make_batch_str_output(tokenized_obj.rid))
+
+            asyncio.create_task(respond())
+
+        tm._send_one_request = send
+
+        async def drive():
+            return [response async for response in tm.generate_request(obj)]
+
+        outputs = asyncio.run(drive())
+        self.assertEqual(len(outputs[0]), 4)
+        self.assertFalse(tm.rid_to_state)
 
 
 class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):

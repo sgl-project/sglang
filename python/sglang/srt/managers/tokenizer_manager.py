@@ -3492,7 +3492,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         else None
                     ),
                 )
-                for i in range(len(obj.rid))
+                for i in range(obj.batch_size)
             ]
 
         for rid, sub_obj, bootstrap_room in items:
