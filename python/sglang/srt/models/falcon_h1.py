@@ -477,11 +477,15 @@ class FalconH1ForCausalLM(nn.Module):
                 prefix=add_prefix("lm_head", prefix),
                 use_attn_tp_group=get_parallel().enable_dp_lm_head,
             )
-        self.lm_head = self.lm_head.float()
+            self.lm_head = self.lm_head.float()
         self.lm_head_multiplier = config.lm_head_multiplier
         self.logits_processor = LogitsProcessor(
             config, logit_scale=self.lm_head_multiplier
         )
+        if config.tie_word_embeddings:
+            # Casting the tied head in place also casts the input embedding.
+            # Keep the shared weight in the model dtype and compute FP32 logits.
+            self.logits_processor.use_fp32_lm_head = True
 
     @torch.no_grad()
     def forward(
