@@ -18,6 +18,9 @@ from ..common.utils import (
     unit_scale,
 )
 
+# Must match _MAX_NUM_BLOCKS in ops/attention/minimax_decode_topk.py.
+_JIT_TOPK_MAX_NUM_BLOCKS = 16384
+
 
 def _prune_decode_configs(configs, named_args, **kwargs):
     """Drop autotune configs whose token tile is smaller than a sparse block.
@@ -894,10 +897,9 @@ def flash_decode_with_topk_idx(
         dtype=torch.float32,
         device=q.device,
     )
-    # 16384 == TopKTrait::kMaxNumBlocksCap (minimax_decode_topk.cuh).
     use_jit_topk = (
         envs.SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX.get()
-        and score.shape[2] <= 16384
+        and score.shape[2] <= _JIT_TOPK_MAX_NUM_BLOCKS
         and topk <= 32
     )
     # If the live context has <= topk sparse blocks, the downstream dense

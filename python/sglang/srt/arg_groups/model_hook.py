@@ -32,7 +32,7 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.arg_groups.resolution_hooks import run_hook
 from sglang.srt.configs.embedding_model_spec import BCGPrefillPolicy
-from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
+from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
@@ -137,7 +137,6 @@ def _configure_rocm_fp8_wo_a_gemm(model_config: Any, download_dir: str | None) -
 
 
 def handle_model_specific_adjustments(server_args: Any):
-
     cfg = resolving_view(server_args)
     from sglang.srt.configs.model_config import (
         get_mimo_v2_fused_qkv_expected_tp_size,
@@ -195,9 +194,9 @@ def handle_model_specific_adjustments(server_args: Any):
                 f"{sorted(CP_DECODE_ATTN_TP_SUPPORTED_ARCHS)}."
             )
 
-    _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
+    _hybrid_spec = get_linear_attn_spec(hf_config)
     if _hybrid_spec is not None and _hybrid_spec.uses_mamba_radix_cache:
-        handle_mamba_radix_cache(server_args, model_arch)
+        handle_mamba_radix_cache(server_args, hf_config)
 
     # Collect the declarative model overrides (registry) on the
     # pristine config and stash them for publish-time flags resolution;
@@ -407,7 +406,21 @@ def handle_model_specific_adjustments(server_args: Any):
             if not resolved_view(server_args).enable_dp_attention and cfg.nnodes == 1:
                 # TODO (Hubert): Put this back later
                 # server_args.enable_aiter_allreduce_fusion = True
-                logger.info("Enable Aiter AllReduce Fusion for DeepseekV3ForCausalLM")
+
+                if model_arch == "GlmMoeDsaForCausalLM":
+                    declare_resolution(
+                        server_args,
+                        "_handle_model_specific_adjustments",
+                        enable_aiter_allreduce_fusion=True,
+                    )
+                    declare_resolution(
+                        server_args,
+                        "_handle_model_specific_adjustments",
+                        disable_aiter_allreduce_fusion_in_prefill=True,
+                    )
+                    logger.info(
+                        "Enable Aiter AllReduce Fusion on decode phase for GlmMoeDsaForCausalLM"
+                    )
 
             # The fp4-checkpoint draft spec-MoE resolution moved to the
             # resolution pipeline (arg_groups/overrides.py:
@@ -500,7 +513,9 @@ def handle_model_specific_adjustments(server_args: Any):
         ):
             # TODO (Hubert): Put this back later
             # server_args.enable_aiter_allreduce_fusion = True
-            logger.info("Enable Aiter AllReduce Fusion for GptOssForCausalLM")
+            # logger.info("Enable Aiter AllReduce Fusion for GptOssForCausalLM")
+            pass
+
         quantization_config = getattr(hf_config, "quantization_config", None)
         is_mxfp4_quant_format = (
             quantization_config is not None
@@ -674,7 +689,7 @@ def handle_model_specific_adjustments(server_args: Any):
     # for them this re-invocation is an idempotent no-op plus validation.
     # Kept ahead of the sparse-head pass: the legacy per-branch calls
     # resolved before that tail write of disable_overlap_schedule.
-    handle_mamba_radix_cache(server_args, model_arch)
+    handle_mamba_radix_cache(server_args, hf_config)
 
     run_post_process_pass(server_args, _sparse_head_overlap_disable)
 
@@ -918,7 +933,7 @@ def handle_model_capability_adjustments(server_args: Any):
         )
 
 
-def handle_mamba_radix_cache(server_args: Any, model_arch: str):
+def handle_mamba_radix_cache(server_args: Any, hf_config: Any):
     # Resolution moved to the resolution pipeline (arg_groups/overrides.py:
     # _mamba_radix_cache_resolution), invoked here at each legacy call
     # slot; this handler keeps the validation.
@@ -935,22 +950,21 @@ def handle_mamba_radix_cache(server_args: Any, model_arch: str):
         if mamba_extra_buffer_of(view):
             raise ValueError(
                 f"--mamba-radix-cache-strategy {view.mamba_radix_cache_strategy} "
-                f"needs mamba state, got {model_arch}."
+                f"needs mamba state, got {hf_config.architectures[0]}."
             )
         return
 
     if mamba_extra_buffer_of(view):
         validate_mamba_extra_buffer(
             view,
-            model_arch,
+            hf_config,
             mamba_cache_chunk_size_of=lambda: mamba_cache_chunk_size(server_args),
         )
     else:
-        validate_mamba_no_buffer(view, model_arch)
+        validate_mamba_no_buffer(view, hf_config.architectures[0])
 
 
 def handle_language_model_only(server_args: Any):
-
     cfg = resolving_view(server_args)
     if not cfg.language_model_only:
         return

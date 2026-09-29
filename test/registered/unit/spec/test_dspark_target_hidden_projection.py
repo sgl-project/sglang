@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.layers.aux_hidden_states import pack_aux_hidden_states
 from sglang.srt.models.dspark import DSparkDraftMixin
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
 )
@@ -48,16 +49,13 @@ class DSparkTargetHiddenProjectionTest(CustomTestCase):
             ),
         )
         with (
-            mock.patch(
-                "sglang.srt.speculative.dspark_components.dspark_worker_v2.get_pp_group",
-                return_value=SimpleNamespace(is_last_rank=False),
-            ),
+            get_parallel().override(pp_group=SimpleNamespace(is_last_rank=False)),
             mock.patch(
                 "sglang.srt.speculative.dspark_components.dspark_worker_v2.get_schedule",
                 return_value=SimpleNamespace(page_size=1),
             ),
         ):
-            worker = DSparkWorkerV2(None, 0, None, 0, target)
+            worker = DSparkWorkerV2(None, 0, 0, target)
         worker.alloc_memory_pool()
         worker.init_attention_backends()
         worker.init_cuda_graphs()
