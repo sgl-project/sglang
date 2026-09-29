@@ -3028,7 +3028,8 @@ class AiterAttnBackend(AttentionBackend):
             causal=False,
             return_lse=True,
         )[:2]
-        # aiter returns [heads, tokens]; the merge indexes [tokens, heads].
+        # the merge_state_triton needs lse layout [tokens, heads].
+        # See https://github.com/sgl-project/sglang/blob/98fce73d5bd0a25afe7d68443d314190b1c47e64/python/sglang/kernels/ops/attention/merge_state.py#L13-L15
         return output, lse.transpose(0, 1).contiguous()
 
     def _forward_extend_skip_prefix(
@@ -3056,7 +3057,8 @@ class AiterAttnBackend(AttentionBackend):
             causal=True,
             return_lse=True,
         )[:2]
-        # aiter returns [heads, tokens]; the merge indexes [tokens, heads].
+        # the merge_state_triton needs lse layout [tokens, heads].
+        # See https://github.com/sgl-project/sglang/blob/98fce73d5bd0a25afe7d68443d314190b1c47e64/python/sglang/kernels/ops/attention/merge_state.py#L13-L15
         return output, lse.transpose(0, 1).contiguous()
 
     @staticmethod
