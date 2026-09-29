@@ -1631,6 +1631,13 @@
                     "pages": [
                       "cookbook/vla/OpenPI/Pi0.5"
                     ]
+                  },
+                  {
+                    "group": "FLUX",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/vla/FLUX/FLUX-3-Action"
+                    ]
                   }
                 ]
               },
