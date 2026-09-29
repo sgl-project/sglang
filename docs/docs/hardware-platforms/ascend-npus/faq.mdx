@@ -358,9 +358,16 @@ using `SGLANG_NPU_PINNED_HOST_DEBUG=1` to compare all ranks and Ascend plog.
 
 If DeepSeek-V2-Lite-W8A8 is already available, the nightly HiCache MLA case
 is a closer control than the allocator-only probe. Its default `--tp-size 4`
-and `--hicache-size 30` request about 30 GB of Host cache **per rank**, whereas
-the probe above holds only 0.5 GB per worker. Run from the repository root in
-the same NPU Python environment, replacing the model path:
+and `--hicache-size 30` request about 30 decimal GB of Host cache **per rank**,
+whereas the probe above holds only 0.5 GB per worker. The normal torch_npu
+pinned Host allocator rounds each separate allocation up to a power of two.
+With this model's 512:64 K/V widths and NPU's split K/V layout, the two
+buffers can therefore reserve about 32 + 4 = 36 GiB per rank, or 144 GiB
+across four ranks, even though SGLang's pre-allocation check uses the 30 GB
+logical size. Check the actual `pinned_reserved_bytes` in the diagnostic log;
+the estimate assumes the default, non-expandable Host allocator and no
+Memfabric override. Run from the repository root in the same NPU Python
+environment, replacing the model path:
 
 ```bash
 export PYTHONPATH="$PWD/python:${PYTHONPATH:-}"
