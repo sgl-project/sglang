@@ -227,6 +227,10 @@ impl PdPoolResolver {
     /// 503 `no_decode_workers_available`. For non-PD (plain) models
     /// this is a no-op call — there is no decode peer to find — and
     /// the caller should NOT use this helper.
+    ///
+    /// Test-only: it ignores version groups; routing goes through
+    /// [`Self::decode_peers`].
+    #[cfg(test)]
     pub fn decode_with_affinity(
         &self,
         model: &ModelId,

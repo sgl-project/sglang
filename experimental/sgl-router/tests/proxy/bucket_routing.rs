@@ -457,8 +457,8 @@ async fn decode_bucket_uses_input_plus_requested_output_budget() {
     );
 }
 
-/// The preferred prefill's version group has no decode bucket that fits the
-/// request, so selection moves to another group instead of failing.
+/// One prefill's version group has no decode bucket that fits the request, so
+/// selection falls back to another group instead of failing.
 #[tokio::test]
 async fn decode_bucket_mismatch_falls_back_to_another_version_group() {
     use crate::common::mock_worker::MockWorker;
@@ -490,7 +490,7 @@ async fn decode_bucket_mismatch_falls_back_to_another_version_group() {
     })
     .collect();
     let ctx = build_ctx(specs, bucket_config, PolicyKind::PowerOfTwo, None);
-    let response = build_router(ctx)
+    let response = build_router(ctx.clone())
         .oneshot(chat_request(None, Some(2_000)))
         .await
         .unwrap();
@@ -500,6 +500,15 @@ async fn decode_bucket_mismatch_falls_back_to_another_version_group() {
         .map(|w| w.captured.lock().unwrap().last_body.is_some())
         .collect();
     assert_eq!(dispatched, [false, true, false, true]);
+    let metrics = ctx.metrics.render();
+    assert!(metrics.contains(r#"sgl_router_pd_version_group_fallback_total{model_id="tiny"} 1"#));
+    // The skipped group never wins a prefill pick that would then be discarded.
+    let prefill_picks: u64 = metrics
+        .lines()
+        .filter(|line| line.starts_with("sgl_router_policy_decisions_total{"))
+        .map(|line| line.rsplit(' ').next().unwrap().parse::<u64>().unwrap())
+        .sum();
+    assert_eq!(prefill_picks, 1);
 }
 
 #[tokio::test]
