@@ -910,6 +910,24 @@ class AiterAttnBackend(AttentionBackend):
             seq_lens_out.copy_(seq_lens[:bs])
         return PagedMlaMetadata(page_table, seq_lens_out, cu_seqlens_q)
 
+    def _resolve_fp8_kv_scale(
+        self, layer: RadixAttention, k_descale
+    ) -> Optional[torch.Tensor]:
+        """The paged MLA kernels dereference the KV descale, so hand them a
+        device scalar. Cached on the layer: the value is fixed for the whole run
+        and building it per call would allocate inside a captured graph."""
+        if self.kv_cache_dtype != fp8_dtype:
+            return None
+        cached = getattr(layer, "_aiter_kv_scale_tensor", None)
+        if cached is None:
+            cached = torch.tensor(
+                self._resolve_fp8_kv_scale_float(layer, k_descale),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            layer._aiter_kv_scale_tensor = cached
+        return cached
+
     def _build_unified_page_table_from_spec(
         self,
         spec_info,
@@ -1389,6 +1407,7 @@ class AiterAttnBackend(AttentionBackend):
                 qk_head_dim=layer.qk_head_dim,
                 v_head_dim=layer.v_head_dim,
                 sm_scale=layer.scaling,
+                kv_descale=self._resolve_fp8_kv_scale(layer, k_descale),
             )
 
         if prefer_mla_gluon_decode(
@@ -1469,6 +1488,7 @@ class AiterAttnBackend(AttentionBackend):
             qk_head_dim=layer.qk_head_dim,
             v_head_dim=layer.v_head_dim,
             sm_scale=layer.scaling,
+            kv_descale=self._resolve_fp8_kv_scale(layer, k_descale),
         )
         if self.head_pad_mode == "zero":
             o = o[:, : layer.tp_q_head_num, :].contiguous()

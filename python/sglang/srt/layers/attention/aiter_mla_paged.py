@@ -5,7 +5,8 @@ gfx1250 and a plain Triton one elsewhere -- but they differ from the ASM
 ``aiter.mla`` entry points SGLang normally uses: they read the KV cache as a
 paged ``[num_blocks, page_size, num_kv_heads, qk_head_dim]`` tensor, a plain
 view of SGLang's pool, and take a 2-D page table. Nothing about Q or the cache
-has to be repacked; the cache is bf16.
+has to be repacked, and the cache may be bf16 or fp8 e4m3 with a scalar
+descale.
 
 Only gfx1250 routes here. gfx942 and gfx950 have tuned ASM MLA paths already;
 gfx1250 has none that work, its decode kernels wanting seg-packed fp8 KV and
@@ -26,9 +27,11 @@ from __future__ import annotations
 import functools
 import logging
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 
+from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_gfx1250_supported, is_hip
 
@@ -36,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 # The Gluon kernels are built for a 64-token page (128 is FP4-only).
 _SUPPORTED_PAGE_SIZE = 64
-_SUPPORTED_KV_DTYPES = (torch.bfloat16,)
+_SUPPORTED_KV_DTYPES = (torch.bfloat16, fp8_dtype)
 
 
 @dataclass
@@ -165,6 +168,7 @@ def _run(
     qk_head_dim: int,
     v_head_dim: int,
     sm_scale: float,
+    kv_descale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     fn(
         q=q,
@@ -179,7 +183,7 @@ def _run(
         qk_rope_head_dim=qk_head_dim - v_head_dim,
         causal=True,
         q_descale=None,
-        kv_descale=None,
+        kv_descale=kv_descale,
     )
     return out
 
