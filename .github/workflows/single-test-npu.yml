@@ -16,9 +16,9 @@ concurrency:
 jobs:
   single-node-poc:
     name: single-node-poc
-    runs-on: linux-aarch64-a3-800t-8
+    runs-on: linux-amd64-a5-8
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B070
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-950-B072
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -41,8 +41,8 @@ jobs:
 
           # Test cases - 使用时替换为实际的测试用例路径
           test_cases=(
-            "test/registered/npu/vlm_models/test_npu_vision_openai_server_a.py"
-            #"test/registered/npu/basic_function/pd_disaggregation/test_npu_disaggregation_hybrid_attention.py"
+            "test/registered/npu/basic_function/api_related/test_npu_api_related_tool_call.py"
+            "test/registered/npu/basic_function/logging/test_npu_tracing_disaggregation.py"
             #"test/registered/npu/basic_function/mambacache/test_npu_qwen3_next_models_mtp.py"
           )
 
