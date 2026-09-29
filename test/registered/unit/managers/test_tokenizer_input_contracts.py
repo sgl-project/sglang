@@ -1,16 +1,13 @@
 """Request IDs become canonical only after processor expansion and copying.
 
 These tests exercise the tokenizer boundary with ordinary synthetic processor
-outputs. They guard vocabulary validation before expansion, the distinct
-embedding override contract, and ownership when an optional duplicate is omitted.
+outputs. They guard vocabulary validation before expansion and the distinct
+embedding override, session continuation and batch metadata contracts.
 """
 
 import asyncio
-import copy
-import gc
 import sys
 import unittest
-import weakref
 from array import array
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -28,12 +25,7 @@ from transformers import (
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.environ import envs
-from sglang.srt.managers.io_struct import (
-    EmbeddingReqInput,
-    GenerateReqInput,
-    msgpack_decode,
-    msgpack_encode,
-)
+from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -173,7 +165,7 @@ class TestTokenizerInputContracts(CustomTestCase):
         manager._wait_one_response = wait_one
         self.manager = manager
 
-    def _generate(self, obj, output=None, *, strip=False, processor=None):
+    def _generate(self, obj, output=None, *, processor=None):
         if processor is not None:
             self.manager.mm_processor = processor
         elif output is not None:
@@ -184,8 +176,7 @@ class TestTokenizerInputContracts(CustomTestCase):
         async def run():
             return [response async for response in self.manager.generate_request(obj)]
 
-        with envs.SGLANG_MM_STRIP_PROCESSOR_INPUT_IDS.override(strip):
-            asyncio.run(run())
+        asyncio.run(run())
         return self.sent[-1]
 
     def test_generation_vocabulary_validation_precedes_request_state(self):
@@ -530,25 +521,14 @@ class TestTokenizerInputContracts(CustomTestCase):
         # A processor may already have expanded its own internal padding IDs.
         output.input_ids = list(output.padded_input_ids)
         original = list(output.input_ids)
-        for strip in (False, True):
-            with self.subTest(strip=strip):
-                tokenized = self._generate(
-                    GenerateReqInput(input_ids=[0, 3, 15], image_data=["image"]),
-                    output,
-                    strip=strip,
-                )
-                self.assertEqual(list(tokenized.input_ids), original)
-                self.assertEqual(tokenized.token_type_ids, [0, 1, 1, 0])
-                self.assertEqual(output.input_ids, original)
-                self.assertIs(tokenized.mm_inputs.mm_items, output.mm_items)
-                self.assertIs(
-                    tokenized.mm_inputs.padded_input_ids, output.padded_input_ids
-                )
-                self.assertEqual(tokenized.mm_inputs.im_token_id, 3)
-                if strip:
-                    self.assertIsNone(tokenized.mm_inputs.input_ids)
-                else:
-                    self.assertIs(tokenized.mm_inputs, output)
+        tokenized = self._generate(
+            GenerateReqInput(input_ids=[0, 3, 15], image_data=["image"]),
+            output,
+        )
+        self.assertEqual(list(tokenized.input_ids), original)
+        self.assertEqual(tokenized.token_type_ids, [0, 1, 1, 0])
+        self.assertEqual(output.input_ids, original)
+        self.assertIs(tokenized.mm_inputs, output)
         output.input_ids.append(2)
         self.assertEqual(list(tokenized.input_ids), original)
 
@@ -560,7 +540,6 @@ class TestTokenizerInputContracts(CustomTestCase):
                 embed_override_token_id=-1,
                 embed_overrides=[torch.ones(4)],
             ),
-            strip=True,
         )
         self.assertEqual(list(tokenized.input_ids), [1, -1, 2])
         self.assertEqual(tokenized.positional_embed_overrides.positions, [1])
@@ -571,10 +550,8 @@ class TestTokenizerInputContracts(CustomTestCase):
         tokenized = self._generate(
             EmbeddingReqInput(input_ids=[0, 3, 15], image_data=["image"]),
             output,
-            strip=True,
         )
         self.assertEqual(list(tokenized.input_ids), output.input_ids)
-        self.assertIsNone(tokenized.mm_inputs.input_ids)
         self.assertEqual(tokenized.token_type_ids, [0, 1, 1, 0])
 
     def test_empty_session_continuation_retains_normalization_contract(self):
@@ -589,7 +566,6 @@ class TestTokenizerInputContracts(CustomTestCase):
         tokenized = self._generate(
             GenerateReqInput(input_ids=[0, 3, 15], image_data=["image"]),
             output,
-            strip=True,
         )
         mm_inputs = MultimodalInputs.from_processor_output(tokenized.mm_inputs)
         req = SimpleNamespace(origin_input_ids=array("q", [7, 8]) + tokenized.input_ids)
@@ -598,130 +574,6 @@ class TestTokenizerInputContracts(CustomTestCase):
         )
         self.assertEqual(list(req.origin_input_ids), [7, 8] + output.padded_input_ids)
         self.assertEqual(list(tokenized.input_ids), output.input_ids)
-
-    def test_broadcast_materializes_stripped_output_on_both_ranks(self):
-        output = _output()
-        tokenized = self._generate(
-            GenerateReqInput(input_ids=[0, 3, 15], image_data=["image"]),
-            output,
-            strip=True,
-        )
-        transferred = []
-
-        def broadcast(objects, **kwargs):
-            if objects[0] is None:
-                objects[0] = copy.deepcopy(transferred[0])
-            else:
-                transferred.append(objects[0])
-
-        with (
-            patch("torch.distributed.is_available", return_value=True),
-            patch("torch.distributed.is_initialized", return_value=True),
-            patch("torch.distributed.get_world_size", return_value=2),
-            patch("torch.distributed.broadcast_object_list", side_effect=broadcast),
-        ):
-            for rank in (0, 1):
-                scheduler = Scheduler.__new__(Scheduler)
-                scheduler.dp_tp_cpu_group = object()
-                scheduler.dp_tp_group = SimpleNamespace(
-                    rank_in_group=rank, first_rank=0
-                )
-                scheduler.model_config = SimpleNamespace(
-                    requires_mm_token_modalities=False
-                )
-                materialized = scheduler._process_and_broadcast_mm_inputs(
-                    tokenized.mm_inputs
-                )
-                self.assertEqual(materialized.padded_input_ids, output.padded_input_ids)
-                self.assertEqual(materialized.mm_items[0].offsets, [(1, 2)])
-                self.assertEqual(materialized.mm_items[0].hash, 7)
-                self.assertEqual(materialized.im_token_id, 3)
-
-    def test_output_without_ids_keeps_the_request_ids(self):
-        output = _output()
-        output.input_ids = None
-        tokenized = self._generate(
-            GenerateReqInput(input_ids=[0, 3, 3, 15], image_data=["image"]),
-            output,
-            strip=True,
-        )
-        self.assertEqual(list(tokenized.input_ids), [0, 3, 3, 15])
-        self.assertIs(tokenized.mm_inputs, output)
-
-    def test_unconsumed_processor_ids_are_not_removed(self):
-        request = GenerateReqInput(input_ids=[0, 15])
-        self._generate(request)
-        output = _output()
-        with envs.SGLANG_MM_STRIP_PROCESSOR_INPUT_IDS.override(True):
-            tokenized = self.manager._create_tokenized_object(
-                request, None, request.input_ids, mm_inputs=output
-            )
-        self.assertEqual(list(tokenized.input_ids), [0, 15])
-        self.assertIs(tokenized.mm_inputs, output)
-        self.assertEqual(output.input_ids, [0, 3, 3, 15])
-
-    def test_encoder_output_is_consumed_before_stripping(self):
-        output = _output()
-        override = get_context().override_server_args(
-            language_only=True, encoder_transfer_backend="zmq_to_tokenizer"
-        )
-        override.install()
-        self.addCleanup(override.restore)
-        self.manager._handle_epd_disaggregation_encode_request = lambda obj: None
-        self.manager.mm_receiver = SimpleNamespace(
-            recv_mm_data=AsyncMock(return_value=output)
-        )
-        tokenized = self._generate(
-            GenerateReqInput(input_ids=[0, 3, 15], image_data=["image"]),
-            output,
-            strip=True,
-        )
-        self.assertEqual(list(tokenized.input_ids), output.input_ids)
-        self.assertIsNone(tokenized.mm_inputs.input_ids)
-        self.assertEqual(output.input_ids, [0, 3, 3, 15])
-
-    def test_wire_roundtrip_omits_only_the_consumed_duplicate(self):
-        output = _output()
-        output.input_ids = [0] * 4092 + output.input_ids
-        output.padded_input_ids = [0] * 4092 + output.padded_input_ids
-        output.mm_items[0].offsets = [(4093, 4094)]
-        output.token_type_ids = torch.zeros(4096, dtype=torch.long)
-        payloads = []
-        for strip in (False, True):
-            tokenized = self._generate(
-                GenerateReqInput(input_ids=[0, 3, 15], image_data=["image"]),
-                output,
-                strip=strip,
-            )
-            tokenized.time_stats = None
-            payloads.append(msgpack_encode(tokenized))
-        decoded = msgpack_decode(payloads[1])
-        self.assertEqual(list(decoded.input_ids), output.input_ids)
-        self.assertIsNone(decoded.mm_inputs.input_ids)
-        self.assertEqual(decoded.mm_inputs.padded_input_ids, output.padded_input_ids)
-        self.assertEqual(decoded.mm_inputs.mm_items[0].offsets, [(4093, 4094)])
-        self.assertLess(len(payloads[1]), len(payloads[0]))
-
-    def test_outputs_with_attached_ownership_are_not_replaced(self):
-        for attach in ("state", "finalizer"):
-            with self.subTest(attach=attach):
-                output = _output()
-                released = []
-                if attach == "state":
-                    output.owner = object()
-                else:
-                    weakref.finalize(output, released.append, "released")
-                tokenized = self._generate(
-                    GenerateReqInput(input_ids=[0, 3, 15], image_data=["image"]),
-                    output,
-                    strip=True,
-                )
-                self.assertIs(tokenized.mm_inputs, output)
-                self.manager.mm_processor = None
-                del output
-                gc.collect()
-                self.assertFalse(released)
-                self.assertEqual(list(tokenized.input_ids), [0, 3, 3, 15])
 
     def test_public_hash_and_namespace_fields_survive_tokenization(self):
         output = _output()
@@ -733,7 +585,7 @@ class TestTokenizerInputContracts(CustomTestCase):
             mm_content_hashes=[content_hash],
             cache_salt="workspace-a",
         )
-        tokenized = self._generate(request, output, strip=True)
+        tokenized = self._generate(request, output)
         self.assertEqual(tokenized.mm_inputs.mm_items[0].hash, 7)
         self.assertEqual(request.mm_content_hashes, [content_hash])
         self.assertEqual(tokenized.cache_salt, "workspace-a")
