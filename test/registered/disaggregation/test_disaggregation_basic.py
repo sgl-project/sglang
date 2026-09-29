@@ -1,5 +1,6 @@
 import asyncio
 import json
+import math
 import os
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -76,6 +77,44 @@ class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServer
         assert len(input_logprobs) > 0, (
             f"input_logprobs should have at least one token, but got {len(input_logprobs)}"
         )
+
+    def test_streaming_token_ids_logprobs(self):
+        token_ids = [0, 1, 2]
+        for interval in (1, 4):
+            with self.subTest(stream_interval=interval):
+                with requests.post(
+                    self.lb_url + "/generate",
+                    json={
+                        "text": "The capital of France is",
+                        "sampling_params": {
+                            "temperature": 0,
+                            "max_new_tokens": 4,
+                            "ignore_eos": True,
+                            "stream_interval": interval,
+                        },
+                        "return_logprob": True,
+                        "token_ids_logprob": token_ids,
+                        "stream": True,
+                    },
+                    stream=True,
+                    timeout=60,
+                ) as response:
+                    self.assertEqual(response.status_code, 200)
+                    meta = None
+                    for line in response.iter_lines():
+                        if line.startswith(b"data: ") and line != b"data: [DONE]":
+                            meta = json.loads(line[6:])["meta_info"]
+                self.assertIsNotNone(meta)
+                self.assertEqual(meta["completion_tokens"], 4)
+                self.assertEqual(len(meta["output_token_logprobs"]), 4)
+                rows = meta["output_token_ids_logprobs"]
+                self.assertEqual(len(rows), 4)
+                # The handoff omits arbitrary-token logprobs for the first
+                # token, but its position must not displace later decode rows.
+                self.assertIsNone(rows[0])
+                for row in rows[1:]:
+                    self.assertEqual([entry[1] for entry in row], token_ids)
+                    self.assertTrue(all(math.isfinite(entry[0]) for entry in row))
 
     def test_chat_completion_top_logprobs(self):
         client = openai.Client(api_key="empty", base_url=f"{self.lb_url}/v1")

@@ -1,7 +1,10 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+import torch
+
+from sglang.srt.disaggregation.decode import DecodeRequest, DecodeTransferQueue
+from sglang.srt.disaggregation.utils import DisaggregationMode, MetadataBuffers
 from sglang.srt.managers.scheduler_components.output_streamer import (
     _GenerationStreamAccumulator,
 )
@@ -59,6 +62,9 @@ class _FakeReq:
     def finished(self):
         return False
 
+    def check_match_stop_str_prefix(self):
+        return False
+
     def init_incremental_detokenize(self):
         return self.output_ids_through_stop, 0
 
@@ -79,6 +85,78 @@ def _make_accumulator() -> _GenerationStreamAccumulator:
 
 
 class TestOutputStreamerLogprobs(unittest.TestCase):
+    def test_pd_handoff_preserves_decode_token_ids_logprobs(self):
+        for rebootstrap, replay in ((False, False), (True, False), (True, True)):
+            with self.subTest(rebootstrap=rebootstrap, replay=replay):
+                req = _FakeReq(is_retracted=False, max_new_tokens=3)
+                req.stream = True
+                req.bootstrap_host = "127.0.0.1"
+                req.bootstrap_room = 9
+                req.pd_rebootstrap_forced_output_id = 42 if replay else None
+                req.return_sampling_mask = False
+                req.time_stats = SimpleNamespace(set_wait_queue_entry_time=lambda: None)
+                req.logprob.top_logprobs_num = 1
+                req.logprob.token_ids_logprob = [42]
+                req.logprob.output_token_ids_logprobs_val = [[]] if replay else []
+                req.logprob.output_token_ids_logprobs_idx = [[]] if replay else []
+                if not replay:
+                    req.logprob.output_token_logprobs_val = []
+                    req.logprob.output_token_logprobs_idx = []
+                    req.logprob.output_top_logprobs_val = []
+                    req.logprob.output_top_logprobs_idx = []
+
+                buffers = MetadataBuffers(
+                    size=1,
+                    hidden_size=2,
+                    hidden_states_dtype=torch.float32,
+                    max_sampling_mask_tokens=4,
+                )
+                buffers.bootstrap_room[0][0] = 9
+                buffers.output_ids[0][0] = 99 if replay else 42
+                buffers.output_token_logprobs_val[0][0] = -0.5
+                buffers.output_token_logprobs_idx[0][0] = 42
+                buffers.output_top_logprobs_val[0][0] = -0.5
+                buffers.output_top_logprobs_idx[0][0] = 42
+                queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+                queue.scheduler = SimpleNamespace(
+                    kv_checksum_computer=None,
+                    batch_result_processor=SimpleNamespace(
+                        _maybe_update_reasoning_tokens=lambda req, token_id: None
+                    ),
+                )
+                queue.spec_algorithm = SpeculativeAlgorithm.NONE
+                queue.metadata_buffers = buffers
+                queue._commit_transfer_to_req(
+                    DecodeRequest(
+                        req=req,
+                        kv_receiver=SimpleNamespace(clear=lambda: None),
+                        metadata_buffer_index=0,
+                        is_rebootstrap=rebootstrap,
+                    )
+                )
+
+                self.assertEqual(req.output_ids, [42])
+                self.assertEqual(req.logprob.output_token_logprobs_val, [-0.5])
+                self.assertEqual(req.logprob.output_token_ids_logprobs_val, [[]])
+                self.assertEqual(req.logprob.output_token_ids_logprobs_idx, [[]])
+                req.output_ids_through_stop = req.output_ids
+                first = _make_accumulator()
+                first.accept(req=req)
+                self.assertEqual(first.output_token_ids_logprobs_val, [[[]]])
+
+                req.output_ids.append(43)
+                req.logprob.output_token_logprobs_val.append(-0.25)
+                req.logprob.output_token_logprobs_idx.append(43)
+                req.logprob.output_top_logprobs_val.append([-0.25])
+                req.logprob.output_top_logprobs_idx.append([43])
+                req.logprob.output_token_ids_logprobs_val.append([-1.25])
+                req.logprob.output_token_ids_logprobs_idx.append([42])
+                second = _make_accumulator()
+                second.accept(req=req)
+                self.assertEqual(second.output_token_ids_logprobs_val, [[[-1.25]]])
+                self.assertEqual(second.output_token_ids_logprobs_idx, [[[42]]])
+                self.assertEqual(req.send_output_token_logprobs_offset, 2)
+
     def test_retracted_empty_output_does_not_advance_logprob_offset(self):
         req = _FakeReq(is_retracted=True, max_new_tokens=16)
         accumulator = _make_accumulator()
