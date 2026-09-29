@@ -11,7 +11,13 @@ from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
-from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
+from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
+    CompletionRequest,
+    ErrorResponse,
+    OpenAIServingRequest,
+    ResponsesRequest,
+)
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.runtime_context import get_observability
@@ -257,6 +263,21 @@ class OpenAIServingBase(ABC):
         if raw_request is None:
             return None
         return raw_request.headers.get("x-smg-routing-key")
+
+    def _extract_generation_routing(
+        self,
+        request: Union[ChatCompletionRequest, CompletionRequest, ResponsesRequest],
+        raw_request: Optional[Request],
+    ) -> dict[str, Any]:
+        return {
+            "bootstrap_host": request.bootstrap_host,
+            "bootstrap_port": request.bootstrap_port,
+            "bootstrap_room": request.bootstrap_room,
+            "routed_dp_rank": self.extract_routed_dp_rank_from_header(
+                raw_request, request.routed_dp_rank
+            ),
+            "disagg_prefill_dp_rank": request.disagg_prefill_dp_rank,
+        }
 
     def extract_routed_dp_rank_from_header(
         self, raw_request: Request, body_routed_dp_rank: Optional[int] = None
