@@ -24,7 +24,11 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN
 
-register_xpu_ci(est_time=300, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(
+    est_time=300,
+    suite="stage-b-test-1-gpu-xpu",
+    disabled="XPU CI image does not include an XPU-compatible NIXL/UCX build",
+)
 
 _XPU_AVAILABLE = torch.xpu.is_available()
 
