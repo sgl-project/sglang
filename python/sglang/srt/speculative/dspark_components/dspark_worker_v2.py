@@ -1,5 +1,4 @@
 import logging
-from contextlib import nullcontext
 from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkable
 
 import torch
@@ -431,9 +430,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         return getattr(self.target_worker, name)
 
     def _draft_context(self):
-        if self._draft_dp_context_enabled:
-            return draft_tp_context(get_parallel().attn_tp_group, owns_attention=True)
-        return nullcontext()
+        return draft_tp_context(self._draft_dp_context_enabled)
 
     def alloc_memory_pool(
         self,

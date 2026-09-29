@@ -35,7 +35,6 @@ from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.constrained.base_grammar_backend import GrammarMask
 from sglang.srt.distributed.parallel_state import (
-    GroupCoordinator,
     get_self_pp_group,
     patch_pipeline_parallel_group,
     patch_tensor_parallel_group,
@@ -52,6 +51,7 @@ from sglang.srt.mem_cache.allocation import (
 )
 from sglang.srt.runtime_context import (
     get_exec,
+    get_parallel,
     get_spec,
     mamba_track_grid,
     max_speculative_num_draft_tokens,
@@ -747,12 +747,19 @@ def draft_pp_context():
         yield
 
 
-@contextmanager
-def draft_tp_context(tp_group: GroupCoordinator, *, owns_attention: bool):
-    # Draft model doesn't use dp and has its own tp group.
-    # We disable mscclpp now because it doesn't support 2 comm groups.
-    with patch_tensor_parallel_group(tp_group, owns_attention=owns_attention):
-        yield
+def draft_tp_context(owns_attention: bool):
+    """Enter the TP placement that draft work runs under.
+
+    Work that owns attention (an attention-owning draft, or DSpark's DP-MoE
+    sync) runs on the target's attention-TP group; other draft work keeps the
+    target's TP placement. Enter it from outside any draft scope, where
+    ``attn_tp_group`` is still the target's.
+    """
+    if not owns_attention:
+        return contextlib.nullcontext()
+    return patch_tensor_parallel_group(
+        get_parallel().attn_tp_group, owns_attention=True
+    )
 
 
 def spec_stage_span(name: str):
