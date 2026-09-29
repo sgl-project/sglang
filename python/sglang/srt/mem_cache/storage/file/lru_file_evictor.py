@@ -78,9 +78,9 @@ class LRUFileEvictor:
         self._tp_rank = tp_rank
         self._on_evict = on_evict
 
-        # MLA ranks share the same physical files, so centralize LRU bookkeeping
-        # on rank 0; non-MLA ranks each own their own files via the suffix.
-        self._is_storage_owner = (not is_mla_model) or (tp_rank == 0)
+        # MLA shares KV across TP ranks; each rank still owns its side pools.
+        self._is_storage_owner = not is_mla_model or tp_rank == 0
+        self._owned_suffixes = (config_suffix,) if self._is_storage_owner else ()
 
         # suffixed_key -> file size in bytes; oldest at front.
         self._lru: OrderedDict[str, int] = OrderedDict()
@@ -91,16 +91,30 @@ class LRUFileEvictor:
         self._load_config(extra_config or {})
 
         self._eviction_configured = self.max_size_bytes > 0 or self.min_free_bytes > 0
-        self._eviction_enabled = self._eviction_configured and self._is_storage_owner
-        if self._eviction_configured and not self._is_storage_owner:
+        self._eviction_enabled = self._eviction_configured and bool(
+            self._owned_suffixes
+        )
+        if self._eviction_configured and not self._owned_suffixes:
             logger.info(
-                f"HiCacheFile rank {self._tp_rank} (MLA): eviction handled by rank 0; "
+                f"HiCacheFile rank {self._tp_rank}: eviction handled by the shard writer; "
                 f"this rank skips LRU bookkeeping and will not create new files."
             )
 
         if not self._eviction_enabled:
             return
 
+        self._initialize_eviction()
+
+    def add_owned_suffix(self, suffix: str) -> None:
+        """Register a rank-owned side pool before storage workers start."""
+        if suffix in self._owned_suffixes:
+            return
+        self._owned_suffixes += (suffix,)
+        self._eviction_enabled = self._eviction_configured
+        if self._eviction_enabled:
+            self._initialize_eviction()
+
+    def _initialize_eviction(self) -> None:
         # Clamp max_size to the filesystem capacity so a too-large cap can't OOM tmpfs.
         fs = self._fs_stats()
         if fs is not None and self.max_size_bytes > 0:
@@ -175,9 +189,9 @@ class LRUFileEvictor:
         """
         if not self._eviction_configured:
             return True  # unbounded storage: nothing to enforce
-        if not self._is_storage_owner:
+        if not suffixed_key.endswith(self._owned_suffixes):
             logger.warning(
-                f"HiCacheFile rank {self._tp_rank} is not the MLA storage owner; "
+                f"HiCacheFile rank {self._tp_rank} does not own this namespace; "
                 f"not caching new key {key} because file eviction is enabled."
             )
             return False
@@ -240,7 +254,9 @@ class LRUFileEvictor:
 
     def touch(self, suffixed_key: str, tensor_path: str) -> None:
         """Mark key as MRU, adopting an untracked on-disk file if needed."""
-        if not self._eviction_enabled:
+        if not self._eviction_enabled or not suffixed_key.endswith(
+            self._owned_suffixes
+        ):
             return
         with self._lock:
             if suffixed_key in self._lru:
@@ -307,7 +323,7 @@ class LRUFileEvictor:
                 continue
             stem = fn[:-4]
             # Only files belonging to this rank/model.
-            if not stem.endswith(self.config_suffix):
+            if not stem.endswith(self._owned_suffixes):
                 continue
             fp = os.path.join(self.file_path, fn)
             try:
@@ -316,6 +332,8 @@ class LRUFileEvictor:
                 continue
             entries.append((st.st_mtime, stem, st.st_size))
         entries.sort(key=lambda e: e[0])  # oldest first
+        self._lru.clear()
+        self._total_bytes = 0
         for _, stem, size in entries:
             self._lru[stem] = size
             self._total_bytes += size
