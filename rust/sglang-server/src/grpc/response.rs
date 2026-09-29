@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use sglang_grpc_types::proto;
+use sglang_grpc_types::sglang::runtime::v1 as proto;
 use tonic::{Code, Status};
 
 use super::ResponseStream;

@@ -4,7 +4,7 @@
 //! no internal representation are rejected explicitly instead of being
 //! silently ignored or expanding frontend behavior in this wiring change.
 
-use sglang_grpc_types::proto;
+use sglang_grpc_types::sglang::runtime::v1 as proto;
 use tonic::Status;
 
 use crate::frontend::FrontendRequest;
