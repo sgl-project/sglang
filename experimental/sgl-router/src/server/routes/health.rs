@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::discovery::ModelId;
-use crate::policies::registry::{PdPoolResolver, PdPools};
-use crate::server::app_context::AppContext;
+use crate::policies::registry::PdPoolResolver;
+use crate::server::app_context::{AppContext, ChatRouting};
 use axum::extract::State;
 use axum::http::StatusCode;
 use std::sync::Arc;
@@ -18,11 +18,17 @@ pub async fn readyz(State(ctx): State<Arc<AppContext>>) -> StatusCode {
     if !ctx.is_ready() {
         return StatusCode::SERVICE_UNAVAILABLE;
     }
-    let resolver = PdPoolResolver::new(Arc::clone(&ctx.registry));
-    let ready = match resolver.resolve(&ModelId(ctx.config.model.id.clone())) {
-        Ok(PdPools::Plain { workers }) => !workers.is_empty(),
-        Ok(PdPools::Pd { prefill, decode }) => !prefill.is_empty() && !decode.is_empty(),
-        Err(_) => false,
+    let model = ModelId(ctx.config.model.id.clone());
+    let ready = match &ctx.chat_routing {
+        ChatRouting::Legacy => PdPoolResolver::new(Arc::clone(&ctx.registry))
+            .prefill_candidates(&model)
+            .is_ok_and(|workers| !workers.is_empty()),
+        ChatRouting::Reorg(resolvers) => resolvers.get(&model).is_some_and(|resolver| {
+            resolver
+                .buckets
+                .iter()
+                .any(|bucket| bucket.has_ready_workers(&ctx.registry, &model))
+        }),
     };
     if ready {
         StatusCode::OK
@@ -112,15 +118,30 @@ mod tests {
 
         use WorkerMode::{Decode, Plain, Prefill};
 
-        for (model, modes, ready) in [
-            (None, vec![Plain], false),
-            (Some("other"), vec![Plain], false),
-            (Some("stub-model"), vec![Prefill], false),
-            (Some("stub-model"), vec![Decode], false),
-            (Some("stub-model"), vec![Prefill, Decode], true),
+        for (model, workers, ready) in [
+            (None, vec![(Plain, None)], false),
+            (Some("other"), vec![(Plain, None)], false),
+            (Some("stub-model"), vec![(Prefill, None)], false),
+            (Some("stub-model"), vec![(Decode, None)], false),
+            (
+                Some("stub-model"),
+                vec![(Prefill, None), (Decode, None)],
+                true,
+            ),
+            // Both roles present, but in different version groups: nothing can pair.
+            (
+                Some("stub-model"),
+                vec![(Prefill, Some("v1")), (Decode, Some("v2"))],
+                false,
+            ),
+            (
+                Some("stub-model"),
+                vec![(Prefill, Some("v1")), (Decode, Some("v1"))],
+                true,
+            ),
         ] {
             let ctx = test_ctx(true, false);
-            for (i, mode) in modes.into_iter().enumerate() {
+            for (i, (mode, group)) in workers.into_iter().enumerate() {
                 ctx.registry
                     .add(WorkerSpec {
                         id: WorkerId(i.to_string()),
@@ -128,6 +149,7 @@ mod tests {
                         mode,
                         model_ids: model.map(|m| ModelId(m.into())).into_iter().collect(),
                         bootstrap_port: (mode == Prefill).then_some(8997),
+                        version_group: group.map(str::to_owned),
                     })
                     .unwrap();
             }
@@ -147,6 +169,7 @@ mod tests {
                     mode,
                     model_ids: vec![ModelId(ctx.config.model.id.clone())],
                     bootstrap_port: None,
+                    version_group: None,
                 })
                 .unwrap();
         }
@@ -167,6 +190,7 @@ mod tests {
                     mode: WorkerMode::Plain,
                     model_ids: vec![ModelId(ctx.config.model.id.clone())],
                     bootstrap_port: None,
+                    version_group: None,
                 })
                 .expect("test worker accepted");
         }

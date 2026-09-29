@@ -50,6 +50,11 @@ pub enum WorkerMode {
 /// `bootstrap_host`/`bootstrap_port` plus a random `bootstrap_room`
 /// u64 onto every PD-disagg request body so the prefill engine can
 /// match incoming KV-transfer requests from the decode peer.
+///
+/// `version_group` scopes PD pairing: a prefill worker is only paired
+/// with a decode worker whose `version_group` is equal, so two engine
+/// versions rolled out side by side never exchange KV. `None` is its own
+/// group, which keeps unlabeled deployments pairing freely.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerSpec {
     pub id: WorkerId,
@@ -58,6 +63,8 @@ pub struct WorkerSpec {
     pub model_ids: Vec<ModelId>,
     #[serde(default)]
     pub bootstrap_port: Option<u16>,
+    #[serde(default)]
+    pub version_group: Option<String>,
 }
 
 /// Event produced by a discovery backend and consumed by `WorkerManager`.
@@ -97,6 +104,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("qwen".into())],
             bootstrap_port: None,
+            version_group: None,
         };
         let s = serde_json::to_string(&w).unwrap();
         let d: WorkerSpec = serde_json::from_str(&s).unwrap();
@@ -111,6 +119,7 @@ mod tests {
             mode: WorkerMode::Prefill,
             model_ids: vec![ModelId("qwen".into())],
             bootstrap_port: Some(8997),
+            version_group: None,
         };
         let s = serde_json::to_string(&w).unwrap();
         assert!(s.contains("\"bootstrap_port\":8997"));
@@ -152,6 +161,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("m1".into())],
             bootstrap_port: None,
+            version_group: None,
         });
         let s = serde_json::to_string(&e).unwrap();
         let d: DiscoveryEvent = serde_json::from_str(&s).unwrap();

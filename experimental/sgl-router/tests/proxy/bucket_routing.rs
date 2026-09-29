@@ -220,6 +220,7 @@ fn worker_spec(id: &str, url: String, mode: WorkerMode) -> WorkerSpec {
         mode,
         model_ids: vec![ModelId("tiny".into())],
         bootstrap_port: (mode == WorkerMode::Prefill).then_some(8997),
+        version_group: None,
     }
 }
 

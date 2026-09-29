@@ -438,6 +438,7 @@ fn reconcile_unresolved_workers(
             mode: worker.mode(),
             model_ids: worker.model_ids.clone(),
             bootstrap_port: worker.bootstrap_port(),
+            version_group: worker.version_group().map(str::to_owned),
         };
         // `debug!` not `info!`: this fires every interval for each
         // still-unresolved worker, so info-level would spam for one that is
@@ -648,6 +649,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("m".into())],
             bootstrap_port: None,
+            version_group: None,
         };
         let cb = cb_config_for_spec(&spec, &cfg).expect("model has cb config");
         assert_eq!(cb.threshold.get(), 5);
@@ -763,6 +765,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
             bootstrap_port: None,
+            version_group: None,
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
 
@@ -807,6 +810,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
             bootstrap_port: None,
+            version_group: None,
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
 
@@ -856,6 +860,7 @@ mod tests {
                 mode: WorkerMode::Plain,
                 model_ids: Vec::new(),
                 bootstrap_port: None,
+                version_group: None,
             };
             tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
             let registered = tokio::time::timeout(Duration::from_secs(2), async {
@@ -926,6 +931,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
             bootstrap_port: None,
+            version_group: None,
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
         // Wait until the manager has both registered the worker AND
@@ -1027,6 +1033,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
             bootstrap_port: None,
+            version_group: None,
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
         // Wait for the manager to land the registry write so the
@@ -1107,6 +1114,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
             bootstrap_port: None,
+            version_group: None,
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
 
@@ -1225,6 +1233,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
             bootstrap_port: None,
+            version_group: None,
         }))
         .await
         .unwrap();
@@ -1283,6 +1292,7 @@ mod tests {
             mode: WorkerMode::Prefill,
             model_ids: vec![model.clone()],
             bootstrap_port: None,
+            version_group: Some("v1".into()),
         }))
         .await
         .unwrap();
@@ -1304,6 +1314,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(registry.healthy_workers_for(&model).len(), 1);
+        assert_eq!(registry.get(&id).unwrap().version_group(), Some("v1"));
         drop(tx);
         manager.await.unwrap();
     }
@@ -1344,6 +1355,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
             bootstrap_port: None,
+            version_group: None,
         };
         tx.send(DiscoveryEvent::Added(spec)).await.unwrap();
 
@@ -1433,6 +1445,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
             bootstrap_port: None,
+            version_group: None,
         }))
         .await
         .unwrap();
@@ -1557,6 +1570,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
             bootstrap_port: None,
+            version_group: None,
         }))
         .await
         .unwrap();
@@ -1684,6 +1698,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
             bootstrap_port: None,
+            version_group: None,
         }))
         .await
         .unwrap();
@@ -1755,6 +1770,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
             bootstrap_port: None,
+            version_group: None,
         }))
         .await
         .unwrap();

@@ -253,6 +253,7 @@ mod tests {
             mode,
             model_ids: models.iter().map(|m| ModelId((*m).into())).collect(),
             bootstrap_port: None,
+            version_group: None,
         }
     }
 

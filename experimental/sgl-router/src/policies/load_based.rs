@@ -63,6 +63,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: None,
+            version_group: None,
         }))
     }
 

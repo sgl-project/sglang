@@ -14,8 +14,8 @@ use crate::config::{
     default_shutdown_drain_secs, default_stale_request_timeout_secs, resolve_mode, AffinityConfig,
     AffinityMode, CacheAwareConfig, CachePrefixProvider, ChatRoutingKind, CircuitBreakerConfig,
     Config, DecodePolicyKind, DiscoveryBackend, EligibilityConfig, FilterKind, FusedTerm,
-    InflightLoadConfig, K8sDiscoveryConfig, KvIndexerEndpointConfig, LogFormat, ModelConfig,
-    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
+    InflightLoadConfig, K8sDiscoveryConfig, K8sDiscoveryMode, KvIndexerEndpointConfig, LogFormat,
+    ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
     StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, TokenizerBackend, TokenizerConfig,
     DEFAULT_FUSE, DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS, DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
 };
@@ -190,6 +190,11 @@ pub struct DiscoveryArgs {
     /// and every replica starts cold.
     #[arg(long)]
     pub kv_peer_selector: Option<String>,
+    /// EndpointSlice label key whose value is a worker's PD version group; a
+    /// prefill worker is paired only with decode workers of the same group.
+    /// Requires --prefill-selector and --decode-selector.
+    #[arg(long)]
+    pub pd_version_group_label: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -528,9 +533,10 @@ impl DiscoveryArgs {
                     self.service_discovery_namespace.is_none()
                         && self.selector.is_empty()
                         && self.prefill_selector.is_empty()
-                        && self.decode_selector.is_empty(),
+                        && self.decode_selector.is_empty()
+                        && self.pd_version_group_label.is_none(),
                     "--service-discovery-namespace / --selector / --prefill-selector / \
-                         --decode-selector require --service-discovery"
+                         --decode-selector / --pd-version-group-label require --service-discovery"
                 );
                 // Peer replicas are found through EndpointSlices too, so with
                 // any other backend the flag would be accepted and then
@@ -550,6 +556,19 @@ impl DiscoveryArgs {
                     join_selector(&self.prefill_selector).as_deref(),
                     join_selector(&self.decode_selector).as_deref(),
                 )?;
+                let version_group_label = self
+                    .pd_version_group_label
+                    .map(|label| label.trim().to_owned());
+                if let Some(label) = &version_group_label {
+                    ensure!(
+                        matches!(mode, K8sDiscoveryMode::PdDisaggregation { .. }),
+                        "--pd-version-group-label requires --prefill-selector and --decode-selector"
+                    );
+                    ensure!(
+                        !label.is_empty(),
+                        "--pd-version-group-label must not be empty"
+                    );
+                }
                 // An empty selector matches every EndpointSlice in the watched
                 // namespace(s), turning unrelated Services into "siblings".
                 ensure!(
@@ -563,6 +582,7 @@ impl DiscoveryArgs {
                     namespace: self.service_discovery_namespace.unwrap_or_default(),
                     mode,
                     peer_selector: self.kv_peer_selector,
+                    version_group_label,
                 })
             }
         };
@@ -950,7 +970,7 @@ fn join_selector(terms: &[String]) -> Option<String> {
 mod tests {
     use super::*;
     use crate::config::{
-        DiscoveryBackend, K8sDiscoveryMode, ScoreTermKind, MAX_KV_BOOTSTRAP_TIMEOUT_MS,
+        DiscoveryBackend, ScoreTermKind, MAX_KV_BOOTSTRAP_TIMEOUT_MS,
         MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS,
     };
 
@@ -1555,6 +1575,99 @@ mod tests {
                 }
             ),
             _ => panic!("expected k8s backend"),
+        }
+    }
+
+    #[test]
+    fn reorg_accepts_pd_version_groups_without_tokenizer() {
+        let args: Vec<_> = PD_K8S
+            .iter()
+            .copied()
+            .chain([
+                "--chat-routing",
+                "reorg",
+                "--policy",
+                "power_of_two",
+                "--pd-version-group-label",
+                "sglang.ai/version-group",
+                "--tokenizer-path",
+                "none",
+            ])
+            .collect();
+        let mut argv = vec!["router", "--model-id", "tiny"];
+        argv.extend(args);
+        let config = Cli::try_parse_from(argv).unwrap().into_config().unwrap();
+        let DiscoveryBackend::K8s(discovery) = config.discovery else {
+            panic!("expected k8s")
+        };
+        assert_eq!(
+            discovery.version_group_label.as_deref(),
+            Some("sglang.ai/version-group")
+        );
+    }
+
+    const PD_K8S: [&str; 5] = [
+        "--service-discovery",
+        "--prefill-selector",
+        "app=sglang,role=prefill",
+        "--decode-selector",
+        "app=sglang,role=decode",
+    ];
+
+    #[test]
+    fn k8s_pd_version_group_label() {
+        let mut args = PD_K8S.to_vec();
+        args.extend(["--pd-version-group-label", " sglang.ai/version-group "]);
+        let c = into_config_owned(with_model(&args)).unwrap();
+        match &c.discovery {
+            DiscoveryBackend::K8s(k) => assert_eq!(
+                k.version_group_label.as_deref(),
+                Some("sglang.ai/version-group")
+            ),
+            _ => panic!("expected k8s backend"),
+        }
+        let c = into_config_owned(with_model(&PD_K8S)).unwrap();
+        match &c.discovery {
+            DiscoveryBackend::K8s(k) => assert_eq!(k.version_group_label, None),
+            _ => panic!("expected k8s backend"),
+        }
+    }
+
+    #[test]
+    fn rejects_pd_version_group_label_outside_k8s_pd() {
+        for (args, expected) in [
+            (
+                vec![
+                    "--worker-urls",
+                    "http://x:30000",
+                    "--pd-version-group-label",
+                    "v",
+                ],
+                "require --service-discovery",
+            ),
+            (
+                vec![
+                    "--service-discovery",
+                    "--selector",
+                    "app=sglang",
+                    "--pd-version-group-label",
+                    "v",
+                ],
+                "requires --prefill-selector and --decode-selector",
+            ),
+            (
+                PD_K8S
+                    .iter()
+                    .copied()
+                    .chain(["--pd-version-group-label", " "])
+                    .collect(),
+                "must not be empty",
+            ),
+        ] {
+            let err = into_config_owned(with_model(&args))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(expected), "args={args:?} got: {err}");
         }
     }
 

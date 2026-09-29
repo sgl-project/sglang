@@ -18,6 +18,7 @@ fn worker(id: &str, mode: WorkerMode) -> Arc<Worker> {
         mode,
         model_ids: vec![ModelId("m".into())],
         bootstrap_port: None,
+        version_group: None,
     }))
 }
 

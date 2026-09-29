@@ -58,6 +58,7 @@ async fn radix_tree_routes_cache_aware_request_to_cached_worker() {
                 mode: WorkerMode::Plain,
                 model_ids: vec![ModelId(MODEL.into())],
                 bootstrap_port: None,
+                version_group: None,
             })
             .unwrap();
     }
