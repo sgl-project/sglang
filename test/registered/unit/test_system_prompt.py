@@ -16,6 +16,7 @@ from sglang.srt.system_prompt import (
     cap_mamba_donate_len,
     is_system_prefix_warm,
     resolve_system_prompt,
+    reseed_mamba_boundary_after_match,
     seed_mamba_boundary,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -134,6 +135,56 @@ class TestMambaBoundary(CustomTestCase):
         self.assertIsNone(seed_mamba_boundary(None, 64))
         self.assertIsNone(seed_mamba_boundary(0, 64))
         self.assertIsNone(seed_mamba_boundary(128, 0))
+
+
+class TestReseedAfterMatch(CustomTestCase):
+    """The post-match re-derivation that keeps the boundary seed alive.
+
+    Bug regression: ``init_next_round_input`` overwrote
+    ``mamba_branching_seqlen`` with the match result unconditionally, so on an
+    empty tree (first warm-up request) the ``__init__``-seeded boundary died and
+    prefill tracked the prompt tail instead of the boundary; the finish donate
+    then stored the tail state under the boundary-capped key, poisoning the
+    shared node for every later warm request. Each case below guards one
+    branch of the re-derivation.
+    """
+
+    def test_first_request_restores_seed(self):
+        # Empty tree: match returns prefix 0 and branching None -> the seed
+        # must come back so prefill tracks the boundary state.
+        self.assertEqual(
+            reseed_mamba_boundary_after_match(64, 0, None),
+            64,
+        )
+
+    def test_cold_partial_prefix_restores_seed(self):
+        # KV partially cached but boundary not covered, no branching point ->
+        # still the warm-up pass; track the boundary.
+        self.assertEqual(
+            reseed_mamba_boundary_after_match(64, 32, None),
+            64,
+        )
+
+    def test_match_branching_wins(self):
+        # Mamba state evicted (match found a branching point to re-track):
+        # the match's recovery plan must not be clobbered by the seed.
+        self.assertEqual(
+            reseed_mamba_boundary_after_match(64, 32, 32),
+            32,
+        )
+
+    def test_warm_stays_none(self):
+        # Boundary fully covered, no branching point: warm request. Returning
+        # the seed here would flip is_system_prefix_warm to False and cost the
+        # request a full ping-pong path (concurrency regression to pool/3).
+        self.assertIsNone(reseed_mamba_boundary_after_match(64, 64, None))
+        self.assertIsNone(reseed_mamba_boundary_after_match(64, 100, None))
+
+    def test_feature_off_passthrough(self):
+        # Default path stays byte-identical: without a boundary the match
+        # result passes through untouched, warm or not.
+        self.assertIsNone(reseed_mamba_boundary_after_match(None, 0, None))
+        self.assertEqual(reseed_mamba_boundary_after_match(None, 0, 32), 32)
 
 
 class TestSystemPrefixWarm(CustomTestCase):
