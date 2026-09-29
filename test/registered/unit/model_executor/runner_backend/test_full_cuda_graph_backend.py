@@ -158,14 +158,14 @@ class TestCaptureOneNoProfiling(CustomTestCase):
                 captured_refs.append(weakref.ref(owner))
             return object()
 
-        with mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH-1"):
+        with mock.patch("torch.cuda.CUDAGraph", return_value=mock.Mock(name="graph_1")):
             backend.capture_one(shape_key, forward_fn)
 
         self.assertEqual(len(captured_refs), 1)
         self.assertIsNotNone(captured_refs[0]())
         self.assertEqual(len(backend._capture_owners[shape_key]), 1)
 
-        with mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH-2"):
+        with mock.patch("torch.cuda.CUDAGraph", return_value=mock.Mock(name="graph_2")):
             backend.capture_one(shape_key, forward_fn)
         gc.collect()
 
@@ -185,7 +185,7 @@ class TestCaptureOneNoProfiling(CustomTestCase):
         shape_key = ShapeKey(size=2)
         capture_inputs = object()
 
-        with mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH"):
+        with mock.patch("torch.cuda.CUDAGraph", return_value=mock.Mock(name="graph")):
             backend.capture_one(
                 shape_key, lambda: object(), capture_inputs=capture_inputs
             )
