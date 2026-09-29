@@ -22,7 +22,9 @@ dashboard = _load_script(
 )
 
 
-def test_sglang_server_warmup_matches_measured_shape():
+def test_sglang_launch_is_exactly_the_recipe():
+    # An outside benchmark launches the published recipe as-is, so the harness
+    # must not add shape-specific warmup flags of its own.
     case = {
         "model": "example/model",
         "num_gpus": 2,
@@ -36,10 +38,50 @@ def test_sglang_server_warmup_matches_measured_shape():
         30000,
     )
 
-    resolution_index = command.index("--warmup-resolutions")
-    frame_index = command.index("--warmup-num-frames")
-    assert command[resolution_index + 1] == "768x512"
-    assert command[frame_index + 1] == "121"
+    assert "--warmup-resolutions" not in command
+    assert "--warmup-num-frames" not in command
+    assert command[-4:] == ["--warmup-mode", "server", "--tp-size", "2"]
+
+
+class _FakeResponse:
+    def __init__(self, payload=None, content=b""):
+        self._payload = payload
+        self.content = content
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._payload
+
+
+def test_sglang_video_latency_includes_polling_and_download(monkeypatch):
+    statuses = iter(["queued", "in_progress", "completed"])
+    fetched = []
+
+    class FakeRequests:
+        @staticmethod
+        def post(url, json=None, timeout=None):
+            return _FakeResponse({"id": "job-1"})
+
+        @staticmethod
+        def get(url, timeout=None):
+            fetched.append(url)
+            if url.endswith("/content"):
+                return _FakeResponse(content=b"mp4-bytes")
+            return _FakeResponse({"status": next(statuses)})
+
+    sleeps = []
+    monkeypatch.setattr(runner, "requests", FakeRequests)
+    monkeypatch.setattr(runner.time, "sleep", sleeps.append)
+    case = {"model": "example/model", "prompt": "p", "width": 64, "height": 64}
+
+    latency = runner.send_video_request_sglang("http://host", case)
+
+    assert latency >= 0
+    assert fetched[-1] == "http://host/v1/videos/job-1/content"
+    assert fetched.count("http://host/v1/videos/job-1") == 3
+    assert sleeps == [runner.POLL_INTERVAL_S] * 2
 
 
 def test_explicit_server_warmup_shape_is_preserved():
@@ -109,11 +151,14 @@ def test_dashboard_uses_historical_median_and_shows_server_breakdown():
     current = {
         "timestamp": "2026-09-04T00:00:00+00:00",
         "commit_sha": "abcdef123456",
+        "methodology": "client-e2e-v1",
+        "warmup_requests": 1,
         "results": [
             {
                 "case_id": "example",
                 "framework": "sglang",
                 "model": "example/model",
+                "first_request_latency_s": 25.0,
                 "latency_s": 10.4,
                 "latency_samples_s": [10.3, 10.4, 10.5],
                 "measurement_count": 3,
@@ -152,6 +197,7 @@ def test_dashboard_uses_historical_median_and_shows_server_breakdown():
     assert alerts == []
     assert "Incomplete Server Telemetry" in markdown
     assert "**model**: 2/3 server samples available" in markdown
-    assert "| 3 | 2/3 | **10.40** |" in markdown
+    assert "| 3 | 2/3 | 25.00 | **10.40** |" in markdown
+    assert "Methodology `client-e2e-v1`" in markdown
     assert "## SGLang Server-Side Breakdown" in markdown
     assert "| model | 10.00 | 0.10 | 9.80 | 0.10 | 196.00 |" in markdown
