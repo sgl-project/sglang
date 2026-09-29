@@ -66,7 +66,7 @@ pub(super) async fn forward_chat_request(
         0,
     );
     // Attribute the outcome to the worker supplying the client-visible response.
-    let mut metrics = DispatchMetrics::new(
+    let metrics = DispatchMetrics::new(
         ctx,
         &request,
         decode.as_deref().unwrap_or(&prefill),
@@ -95,6 +95,7 @@ pub(super) async fn forward_chat_request(
         if let Some((decode, bootstrap)) = pd {
             let task = spawn_prefill_request(
                 ctx,
+                &metrics,
                 Arc::clone(&prefill),
                 headers.clone(),
                 body.clone(),
@@ -144,10 +145,8 @@ pub(super) async fn forward_chat_request(
             (Err(ApiError::StaleRequestExpired { model }), None)
         }
     };
-    if let Some(prefill) = &blamed_prefill {
-        metrics.attribute_to(prefill);
-    }
-    let log_context = metrics.record_dispatch_result(&result, engine_rid);
+    let log_context =
+        metrics.record_dispatch_result(&result, engine_rid, blamed_prefill.as_deref());
     // Materialize dispatch errors here so the access log retains the selected worker.
     let mut response = match result {
         Ok(mut response) => {
@@ -179,8 +178,10 @@ type PrefillFailure = Option<Result<Response<Body>, ApiError>>;
 
 /// Runs prefill to completion even if the client disconnects. A failure also
 /// aborts decode's stream until its first token, which proves KV transfer completed.
+#[allow(clippy::too_many_arguments)]
 fn spawn_prefill_request(
     ctx: &AppContext,
+    metrics: &DispatchMetrics,
     prefill_worker: Arc<Worker>,
     headers: HeaderMap,
     body: Bytes,
@@ -189,6 +190,7 @@ fn spawn_prefill_request(
     stream_abort: CancellationToken,
 ) -> tokio::task::JoinHandle<PrefillFailure> {
     let proxy = Arc::clone(&ctx.proxy);
+    let (registry, model) = (Arc::clone(&metrics.registry), metrics.model.clone());
     tokio::spawn(async move {
         let _load_guards = load_guards;
         let result = proxy
@@ -204,6 +206,10 @@ fn spawn_prefill_request(
             .await;
         let failure = prefill_failure(result);
         let prefill_url = &prefill_worker.url;
+        let outcome = failure
+            .as_ref()
+            .map_or(RequestOutcome::Success, dispatch_outcome);
+        registry.record_worker_request(prefill_url, &model, WorkerModeLabel::Prefill, outcome);
         match &failure {
             None => tracing::debug!(%prefill_url, bootstrap_room, "prefill side completed"),
             Some(Ok(response)) => tracing::debug!(
@@ -368,36 +374,30 @@ impl DispatchMetrics {
         })
     }
 
-    /// Charge the outcome to the prefill worker that caused it.
-    fn attribute_to(&mut self, prefill: &Worker) {
-        self.worker_url = prefill.url.clone();
-        self.mode = WorkerModeLabel::Prefill;
-    }
-
-    // HTTP status determines the outcome; router cancellations and dispatch failures stay distinct.
+    /// Logs a blamed prefill's failure against it; its task already recorded the outcome.
     fn record_dispatch_result(
         &self,
         result: &Result<Response<Body>, ApiError>,
         engine_rid: Option<String>,
+        blamed_prefill: Option<&Worker>,
     ) -> RequestLogContext {
-        let http_status = match result {
-            Ok(response) => response.status().as_u16(),
-            Err(error) => error.status_code().as_u16(),
-        };
-        let outcome = match result {
-            Err(ApiError::StaleRequestExpired { .. }) => {
-                self.registry
-                    .record_stale_request(StaleRequestOutcome::Expired);
-                RequestOutcome::Cancelled
+        if let Err(ApiError::StaleRequestExpired { .. }) = result {
+            self.registry
+                .record_stale_request(StaleRequestOutcome::Expired);
+        }
+        let outcome = dispatch_outcome(result);
+        let worker_url = match blamed_prefill {
+            Some(prefill) => &prefill.url,
+            None => {
+                self.registry.record_worker_request(
+                    &self.worker_url,
+                    &self.model,
+                    self.mode,
+                    outcome,
+                );
+                &self.worker_url
             }
-            // These 503s come from the router, not worker backpressure.
-            Err(ApiError::BreakerOpen { .. } | ApiError::WorkerMisconfigured { .. }) => {
-                RequestOutcome::Error
-            }
-            _ => outcome_from_status(http_status),
         };
-        self.registry
-            .record_worker_request(&self.worker_url, &self.model, self.mode, outcome);
         if !self.streaming {
             self.registry.observe_request_duration(
                 &self.model,
@@ -406,12 +406,25 @@ impl DispatchMetrics {
         }
         // The app middleware emits the access log and edge counters exactly once.
         RequestLogContext {
-            worker_url: self.worker_url.clone(),
+            worker_url: worker_url.clone(),
             model_id: self.model.clone(),
             streaming: self.streaming,
             outcome,
             engine_rid,
         }
+    }
+}
+
+// HTTP status determines the outcome; router cancellations and dispatch failures stay distinct.
+fn dispatch_outcome(result: &Result<Response<Body>, ApiError>) -> RequestOutcome {
+    match result {
+        Ok(response) => outcome_from_status(response.status().as_u16()),
+        Err(ApiError::StaleRequestExpired { .. }) => RequestOutcome::Cancelled,
+        // These 503s come from the router, not worker backpressure.
+        Err(ApiError::BreakerOpen { .. } | ApiError::WorkerMisconfigured { .. }) => {
+            RequestOutcome::Error
+        }
+        Err(error) => outcome_from_status(error.status_code().as_u16()),
     }
 }
 

@@ -60,10 +60,16 @@ async fn wait_until(mut done: impl FnMut() -> bool) {
     .unwrap();
 }
 
-fn charged(ctx: &AppContext, url: &str, mode: &str) -> bool {
-    ctx.metrics.render().contains(&format!(
-        r#"sgl_router_worker_requests_total{{worker_url="{url}",model_id="tiny",mode="{mode}""#
-    ))
+/// Request outcomes recorded against the worker at `url`.
+fn outcomes(ctx: &AppContext, url: &str, mode: &str) -> Vec<String> {
+    let prefix = format!(
+        r#"sgl_router_worker_requests_total{{worker_url="{url}",model_id="tiny",mode="{mode}",outcome=""#
+    );
+    let metrics = ctx.metrics.render();
+    metrics
+        .lines()
+        .filter_map(|line| Some(line.strip_prefix(&prefix)?.split('"').next()?.to_string()))
+        .collect()
 }
 
 /// Either side's failure ends the request without waiting for the other side.
@@ -133,8 +139,8 @@ async fn pd_failure_returns_without_waiting_for_the_other_side() {
                     true => ((&prefill.url, "prefill"), (&decode.url, "decode")),
                     false => ((&decode.url, "decode"), (&prefill.url, "prefill")),
                 };
-                assert!(charged(&ctx, blamed.0, blamed.1));
-                assert!(!charged(&ctx, other.0, other.1));
+                assert_eq!(outcomes(&ctx, blamed.0, blamed.1).len(), 1);
+                assert!(outcomes(&ctx, other.0, other.1).is_empty());
                 let decode_worker = ctx.registry.get(&WorkerId("d".into())).unwrap();
                 assert_eq!(decode_worker.router_inflight_load(), 0);
             }
@@ -210,6 +216,8 @@ async fn prefill_failure_after_decode_first_token_keeps_the_stream() {
         assert_eq!(body.next().await.unwrap().unwrap(), "data: [DONE]\n\n");
         assert!(body.next().await.is_none());
         assert!(decode.abort_log.lock().unwrap().is_empty());
+        assert_eq!(outcomes(&ctx, &prefill_url, "prefill"), ["error"]);
+        assert_eq!(outcomes(&ctx, &decode.url, "decode"), ["success"]);
     }
 }
 
@@ -231,5 +239,6 @@ async fn decode_failure_leaves_prefill_running() {
         assert_eq!(prefill.router_inflight_load(), 1);
         release.notify_one();
         wait_until(|| prefill.router_inflight_load() == 0).await;
+        assert_eq!(outcomes(&ctx, &prefill_url, "prefill"), ["success"]);
     }
 }
