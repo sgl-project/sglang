@@ -454,7 +454,7 @@ def capture_prefill_graph(
     capture_num_tokens = _normalize_prefill_capture_num_tokens(
         prefill_config.bs,
         alignment=get_cuda_graph_batch_size_alignment(),
-        max_capture_tokens=max_capture_tokens,
+        max_capture_tokens=min(max_capture_tokens, max(prefill_config.bs)),
     )
     # Resolve the aligned, context- and request-capacity-bounded buckets once
     # before constructing the runner so every backend consumes the same config.
