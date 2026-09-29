@@ -479,7 +479,7 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
             },
         }
 
-    def _respond(self, stream):
+    def _respond(self, stream, tool_choice):
         serving = make_serving()
         serving.default_chat_template_kwargs = None
         serving.reasoning_parser = "response_template"
@@ -508,7 +508,7 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
         request = ResponsesRequest(
             model="x",
             input="Weather?",
-            tool_choice="required",
+            tool_choice=tool_choice,
             tools=[
                 {
                     "type": "function",
@@ -545,11 +545,18 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
             return asyncio.run(respond())
 
     def test_required_tool_json_is_parsed_under_delimited_template(self):
-        """Required-tool JSON after the reasoning becomes a completed function
-        call, also when it ends on the tool closer that detokenization keeps."""
-        for stream in (False, True):
-            with self.subTest(stream=stream):
-                response = self._respond(stream)
+        """Required or named tool JSON after the reasoning becomes a completed
+        function call, also when it ends on the tool closer that detokenization
+        keeps."""
+        named = {"type": "function", "name": "get_weather"}
+        cases = [
+            (choice, stream)
+            for choice in ("required", named)
+            for stream in (False, True)
+        ]
+        for tool_choice, stream in cases:
+            with self.subTest(tool_choice=tool_choice, stream=stream):
+                response = self._respond(stream, tool_choice)
 
                 self.assertEqual(response["status"], "completed")
                 self.assertEqual(

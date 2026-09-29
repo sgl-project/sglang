@@ -43,12 +43,31 @@ def _schema_types(schema: Any) -> tuple[str, ...]:
     return tuple(types)
 
 
+_JSON_TYPE_NAMES = {
+    bool: ("boolean",), int: ("integer", "number"), float: ("number",), type(None): ("null",),
+    dict: ("object",), list: ("array",), str: ("string",),
+}
+
+
 def _coerce(raw: str, types: tuple[str, ...]) -> Any:
+    if "string" in types and set(types) != {"string"}:
+        # Any text is a valid string, so only text that is exactly the JSON of another declared type is cast.
+        try:
+            decoded = json.loads(raw)
+        except (ValueError, RecursionError):
+            return raw
+        if raw != raw.strip():
+            return raw
+        types = tuple(type_name for type_name in types if type_name in _JSON_TYPE_NAMES[type(decoded)])
     for type_name in types:
         try:
             if type_name == "integer":
                 return int(raw)
             if type_name == "number":
+                try:
+                    return int(raw)  # exact, where float() rounds integers beyond 2**53
+                except ValueError:
+                    pass
                 number = float(raw)
                 if number != number or number in (float("inf"), float("-inf")):
                     continue  # NaN / inf are not valid JSON numbers
@@ -62,7 +81,7 @@ def _coerce(raw: str, types: tuple[str, ...]) -> Any:
                 decoded = json.loads(raw)
                 if isinstance(decoded, dict if type_name == "object" else list):
                     return decoded
-        except ValueError:
+        except (ValueError, RecursionError):
             continue
     return raw  # `string` params, unknown types and failed casts all keep the original text
 

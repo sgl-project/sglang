@@ -109,7 +109,9 @@ def _load_serving_template(
 ) -> tuple[dict, ResponseTemplate]:
     """Use the explicit template, then checkpoint metadata, then the detector's
     built-in fallback."""
-    template = resolve_response_template(tokenizer, template) or fallback
+    template = resolve_response_template(tokenizer, template)
+    if template is None:
+        template = fallback
     if template is None:
         raise ValueError("response_template is required")
     return template, validate_response_template_for_serving(template)

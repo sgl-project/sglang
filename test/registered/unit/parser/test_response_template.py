@@ -219,6 +219,9 @@ class TestResponseTemplateLoading(CustomTestCase):
             GEMMA4_RESPONSE_TEMPLATE,
         )
         self.assertIs(FallbackDetector().response_template, XML_TOOL_TEMPLATE)
+        # Present metadata is validated even when empty; only absent metadata falls back.
+        with self.assertRaisesRegex(ValueError, "non-empty dict"):
+            FallbackDetector(tokenizer=SimpleNamespace(response_template={}))
 
     def test_tool_detector_requires_tool_calls_field(self):
         template = copy.deepcopy(GEMMA4_RESPONSE_TEMPLATE)

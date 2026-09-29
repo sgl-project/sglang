@@ -22,6 +22,7 @@ output dicts. Any divergence indicates a regression in the new executor."""
 import copy
 import random
 import unittest
+from unittest import mock
 
 from sglang.srt.parser.chat_parsing import ResponseParser, parse_response
 from sglang.srt.parser.chat_parsing.response_parser import _coerce, _schema_types
@@ -1561,6 +1562,26 @@ class ToolArgCoercionTest(unittest.TestCase):
             self.assertEqual(_coerce(raw, ("boolean",)), expected)
         # Non-boolean text stays a string rather than silently becoming False.
         self.assertEqual(_coerce("maybe", ("boolean",)), "maybe")
+
+    def test_coerce_number_keeps_large_integers_exact(self):
+        for raw in ("9007199254740993", "-9007199254740993"):
+            self.assertEqual(_coerce(raw, ("number",)), int(raw))
+
+    def test_coerce_string_union_keeps_text_that_is_not_json_of_another_type(self):
+        # Any text is a valid string, so text that only a permissive cast would accept stays a string ...
+        for raw, types in [("007", ("string", "integer")), ("123_456", ("integer", "string")), (" 7", ("string", "integer")),
+                           ("1", ("string", "boolean")), ("True", ("string", "boolean")), ("None", ("string", "null"))]:
+            self.assertEqual(_coerce(raw, types), raw)
+        # ... while exact JSON of another declared type keeps its precedence.
+        self.assertEqual(_coerce("7", ("string", "integer")), 7)
+        self.assertIs(_coerce("true", ("string", "boolean")), True)
+        self.assertIsNone(_coerce("null", ("string", "null")))
+
+    def test_coerce_keeps_text_when_json_decoding_hits_the_recursion_limit(self):
+        # How deeply JSON must nest to exhaust the decoder depends on the Python version.
+        with mock.patch("json.loads", side_effect=RecursionError):
+            for types in [("array",), ("object",)]:
+                self.assertEqual(_coerce("[[1]]", types), "[[1]]")
 
     def test_coerce_object_array_require_matching_json(self):
         # A JSON object body is only accepted for an `object` param, a JSON array only for `array`.
