@@ -97,9 +97,12 @@ def init_world_group(
 
 def _sync_srt_world_group() -> None:
     import sglang.srt.distributed.parallel_state as srt_parallel_state
+    from sglang.srt.runtime_context import get_parallel
 
     if srt_parallel_state._WORLD is None:
         srt_parallel_state._WORLD = _WORLD
+    if srt_parallel_state._WORLD is _WORLD:
+        get_parallel().override_permanently(world_group=_WORLD)
 
 
 def _clear_srt_world_group() -> None:
@@ -110,18 +113,11 @@ def _clear_srt_world_group() -> None:
 
 
 def _sync_srt_tp_group() -> None:
-    """Lend this package's TP group to `srt`, and state the widths it implies.
+    """Expose this package's TP group, widths, and ranks to shared SRT layers.
 
-    Shared `srt` layers run in this package and ask `get_parallel()` for how to
-    shard -- `srt/layers/attention/vision.py` reads `attn_tp_size`. The
-    published `srt` config cannot answer: `gpu_worker.py` publishes a dummy
-    carrying *this* package's `tp_size`, which a sequence-parallel launch sets
-    to 1 while the group lent here is as wide as the world. So the widths are
-    permanently overridden alongside the group -- this runs with no `srt`
-    config published at all, which is exactly why it cannot go through
-    `RuntimeContext.override` (it requires one).
-
-    Only tensor parallelism folds this way, so every other dimension is one.
+    Use the group's actual width: sequence parallelism can make it wider than
+    the TP size in the dummy SRT configuration. Other parallel dimensions are
+    one. Overrides also work before SRT configuration is published.
     """
     import sglang.srt.distributed.parallel_state as srt_parallel_state
     from sglang.srt.runtime_context import derive_parallel_widths, get_parallel
@@ -132,6 +128,15 @@ def _sync_srt_tp_group() -> None:
         srt_parallel_state._ATTN_TP = _TP
     if srt_parallel_state._ATTN_TP is _TP:
         get_parallel().override_permanently(
+            tp_group=_TP,
+            attn_tp_group=_TP,
+            tp_size=_TP.world_size,
+            tp_rank=_TP.rank_in_group,
+            attn_tp_rank=_TP.rank_in_group,
+            moe_tp_rank=_TP.rank_in_group,
+            attn_cp_rank=0,
+            pp_rank=0,
+            moe_ep_rank=0,
             **derive_parallel_widths(
                 tp_size=_TP.world_size,
                 attn_cp_size=1,
@@ -150,7 +155,10 @@ def _clear_srt_tp_group() -> None:
 
     if srt_parallel_state._ATTN_TP is _TP:
         srt_parallel_state._ATTN_TP = None
-        get_parallel().clear_derived_widths()
+        get_parallel().clear_stamp()
+        if srt_parallel_state._WORLD is not None:
+            # Restore the still-active WORLD handle after clearing TP overrides.
+            get_parallel().override_permanently(world_group=srt_parallel_state._WORLD)
     if srt_parallel_state._TP is _TP:
         srt_parallel_state._TP = None
 
@@ -252,17 +260,10 @@ def init_distributed_environment(
             "distributed environment"
         )
 
-        # For MPS, MUSA, and XPU, don't pass device_id as it doesn't support device indices
         extra_args = (
-            {}
-            if (
-                current_platform.is_mps()
-                or current_platform.is_musa()
-                or current_platform.is_npu()
-                or current_platform.is_cpu()
-                or current_platform.is_xpu()
-            )
-            else dict(device_id=device_id)
+            dict(device_id=device_id)
+            if current_platform.supports_distributed_device_id()
+            else {}
         )
 
         if timeout is not None:
@@ -698,6 +699,9 @@ def use_tensor_parallel_group(tp_group: GroupCoordinator):
             tp_size=tp_group.world_size,
             tp_rank=tp_group.rank_in_group,
             tp_group=tp_group,
+            attn_tp_group=tp_group,
+            attn_tp_rank=tp_group.rank_in_group,
+            moe_tp_rank=tp_group.rank_in_group,
             # Only tensor parallelism folds here, so every other dimension is
             # one and the quotients come out of the shared derivation.
             **derive_parallel_widths(

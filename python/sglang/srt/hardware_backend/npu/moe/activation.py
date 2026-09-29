@@ -7,7 +7,6 @@ import torch.nn.functional as F
 from sglang.srt.distributed.communication_op import (
     tensor_model_parallel_all_gather,
 )
-from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -148,8 +147,35 @@ class NPUSitu(BaseActivation):
         )
 
 
+class NPUSituMXFP8Quant(BaseActivation):
+    """A5 AscendC grouped SiTU with valid-row MXFP8 quantization."""
+
+    def __init__(self, *, beta: float = 4.0, linear_beta: float = 25.0):
+        from sgl_kernel_npu.activation.situ_mxfp8_quant import situ_mxfp8_quant
+
+        self.situ_mxfp8_quant = situ_mxfp8_quant
+        self.beta = float(beta)
+        self.linear_beta = float(linear_beta)
+
+    def _apply_activation(
+        self,
+        hidden_states: torch.Tensor,
+        group_list: torch.Tensor,
+        group_list_type: int,
+    ):
+        return self.situ_mxfp8_quant(
+            hidden_states,
+            group_list,
+            group_list_type,
+            beta=self.beta,
+            linear_beta=self.linear_beta,
+        )
+
+
 class NPUGeluAndMul(BaseActivation):
     def __init__(self):
+        from sglang.srt.layers.activation import GeluAndMul
+
         self._gelu = GeluAndMul()
 
     def _apply_activation(self, hidden_states: torch.Tensor):

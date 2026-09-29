@@ -44,7 +44,7 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
             positions_casual=torch.tensor([base + 5], dtype=torch.int32),
             swa_page_indices=torch.tensor([[base + 6, base + 7]], dtype=torch.int32),
             swa_topk_lengths=torch.tensor([base + 8], dtype=torch.int32),
-            c4_sparse_topk=512,
+            index_topk=512,
             swa_out_cache_loc=torch.tensor([base + 9], dtype=torch.int32),
             unified=UnifiedKvMetadata(),
         )

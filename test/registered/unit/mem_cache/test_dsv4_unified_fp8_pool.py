@@ -1,5 +1,6 @@
 import contextlib
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -9,7 +10,10 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4TokenToKVPool,
     DeepSeekV4UnifiedKVPool,
     dsv4_unified_row_bytes,
+    resolve_unified_kv_fp8,
 )
+from sglang.srt.mem_cache.kv_cache_configurator import unified_fp8_for_dsv4_pool
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -235,6 +239,107 @@ class TestDSV4UnifiedRegionBuffers(CustomTestCase):
             _, nope = fp8.unified_region_buffers(ratio)
             _, rope = fp8.unified_rope_region_buffers(ratio)
             self.assertAlmostEqual((nope + rope) / whole, 0.625)
+
+
+class TestResolveUnifiedKvFp8(CustomTestCase):
+    def test_override_false_wins_over_env(self):
+        env_mod = "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate"
+        with patch(f"{env_mod}.is_unified_kv_fp8", return_value=True):
+            self.assertFalse(resolve_unified_kv_fp8(False))
+            self.assertTrue(resolve_unified_kv_fp8(True))
+            self.assertTrue(resolve_unified_kv_fp8(None))
+
+    def test_none_follows_env_off(self):
+        env_mod = "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate"
+        with patch(f"{env_mod}.is_unified_kv_fp8", return_value=False):
+            self.assertFalse(resolve_unified_kv_fp8(None))
+            self.assertFalse(resolve_unified_kv_fp8(False))
+            self.assertTrue(resolve_unified_kv_fp8(True))
+
+
+class TestDsv4PoolFp8Gate(CustomTestCase):
+    _ENV = "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate"
+
+    def _layout(self, *, is_draft_worker, algo, env_on=True):
+        with patch(f"{self._ENV}.is_unified_kv_fp8", return_value=env_on):
+            return unified_fp8_for_dsv4_pool(
+                is_draft_worker=is_draft_worker, spec_algorithm=algo
+            )
+
+    def test_dspark_draft_stays_bf16_when_env_on(self):
+        self.assertFalse(
+            self._layout(
+                is_draft_worker=True, algo=SpeculativeAlgorithm.DSPARK, env_on=True
+            )
+        )
+
+    def test_eagle_draft_stays_two_pool_when_env_on(self):
+        self.assertTrue(
+            self._layout(
+                is_draft_worker=True, algo=SpeculativeAlgorithm.EAGLE, env_on=True
+            )
+        )
+
+    def test_target_stays_two_pool_under_dspark_and_eagle(self):
+        for algo in (SpeculativeAlgorithm.DSPARK, SpeculativeAlgorithm.EAGLE):
+            with self.subTest(algo=algo):
+                self.assertTrue(
+                    self._layout(is_draft_worker=False, algo=algo, env_on=True)
+                )
+
+    def test_env_off_is_bf16_for_every_worker(self):
+        for draft, algo in (
+            (True, SpeculativeAlgorithm.DSPARK),
+            (True, SpeculativeAlgorithm.EAGLE),
+            (False, SpeculativeAlgorithm.DSPARK),
+        ):
+            with self.subTest(draft=draft, algo=algo):
+                self.assertFalse(
+                    self._layout(is_draft_worker=draft, algo=algo, env_on=False)
+                )
+
+
+class TestUnifiedKvPoolFollowsCtorFp8(CustomTestCase):
+    def _pool(self, fp8):
+        return DeepSeekV4UnifiedKVPool(
+            stage_ratios=[0],
+            num_slots=2,
+            num_blocks=1,
+            page_size=256,
+            qk_nope_head_dim=NOPE_DIM,
+            qk_rope_head_dim=ROPE_DIM,
+            device="cpu",
+            memory_saver_adapter=_StubMemorySaver(),
+            custom_mem_pool=None,
+            swa_ring_size=8,
+            fp8=fp8,
+        )
+
+    def test_dspark_draft_layout_has_no_rope_pool(self):
+        env = "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate"
+        with patch(f"{env}.is_unified_kv_fp8", return_value=True):
+            fp8 = unified_fp8_for_dsv4_pool(
+                is_draft_worker=True, spec_algorithm=SpeculativeAlgorithm.DSPARK
+            )
+        self.assertFalse(fp8)
+        pool = self._pool(fp8)
+        buf = pool.kv_buffer[0]
+        self.assertEqual(buf.dtype, torch.bfloat16)
+        self.assertEqual(buf.shape[1], NOPE_DIM + ROPE_DIM)
+        self.assertIsNone(pool.kv_buffer_rope[0])
+
+    def test_eagle_draft_layout_has_rope_pool(self):
+        env = "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate"
+        with patch(f"{env}.is_unified_kv_fp8", return_value=True):
+            fp8 = unified_fp8_for_dsv4_pool(
+                is_draft_worker=True, spec_algorithm=SpeculativeAlgorithm.EAGLE
+            )
+        self.assertTrue(fp8)
+        pool = self._pool(fp8)
+        buf, rope = pool.kv_buffer[0], pool.kv_buffer_rope[0]
+        self.assertEqual(buf.dtype, torch.float8_e4m3fn)
+        self.assertEqual(rope.dtype, torch.bfloat16)
+        self.assertEqual(rope.shape[1], ROPE_DIM)
 
 
 if __name__ == "__main__":

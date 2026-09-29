@@ -544,7 +544,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         row = req_to_token_pool.req_to_c128_sidecar[int(req_pool_idx)]
         self.release_c128_pages(row[row > 0])
         row.zero_()
-        self.get_kvcache().clear_c128_req_state(int(req_pool_idx))
+        self.get_kvcache().clear_request_scoped_state(int(req_pool_idx))
 
     def available_size(self):
         return min(

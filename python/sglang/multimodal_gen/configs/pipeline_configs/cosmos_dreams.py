@@ -9,7 +9,7 @@ causal transformer class.
 
 import math
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, ClassVar
 
 from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
     ACTION_CONDITIONING_MODE,
@@ -19,6 +19,7 @@ from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
     load_cosmos_dreams_manifest,
     resolve_inference_profile,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import (
     Cosmos3Config,
     _transformer_config,
@@ -36,6 +37,10 @@ COSMOS_DREAMS_HISTORY_MAX_FRAMES = 901
 
 @dataclass
 class CosmosDreamsConfig(Cosmos3Config):
+    # Single-task pipeline; the parent's multi-task declaration (TI2V, T2I, V2V)
+    # does not apply, so requests resolve to task_type alone.
+    supported_task_types: ClassVar[tuple[ModelTaskType, ...] | None] = None
+
     transformer_class_override: str | None = "CosmosDreamsTransformer"
 
     # Conditioning contract this pipeline drives; the Transfer subclass overrides it.
@@ -154,3 +159,27 @@ class CosmosDreamsConfig(Cosmos3Config):
 
     def supports_dynamic_batching(self) -> bool:
         return False
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.cosmos_dreams import (
+        CosmosDreamsSamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    # Cosmos-Dreams (Cosmos3-Interactive): causal, action-conditioned Cosmos3.
+    # The hf path must sort before "nvidia/Cosmos3-Nano" in the partial-path
+    # match, so local folders named after the release resolve here.
+    register_configs(
+        sampling_param_cls=CosmosDreamsSamplingParams,
+        pipeline_config_cls=CosmosDreamsConfig,
+        hf_model_paths=["nvidia/Cosmos3-Nano-Sim-Bimanual"],
+        # Matches the release ``Cosmos3NanoSimBimanualPipeline`` ``_class_name``
+        # and the recipe-named ``CosmosDreamsPipeline`` of earlier exports.
+        model_detectors=[
+            lambda hf_id: (
+                "cosmos3nanosimbimanualpipeline" in hf_id.lower()
+                or "cosmosdreamspipeline" in hf_id.lower()
+            )
+        ],
+    )

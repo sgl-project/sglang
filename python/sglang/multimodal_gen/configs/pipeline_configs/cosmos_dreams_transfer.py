@@ -106,3 +106,22 @@ def training_kv_window(model_path: str | None) -> tuple[int | None, int]:
             f"got {window!r}."
         )
     return window, int(sink)
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.cosmos_dreams_transfer import (
+        CosmosDreamsTransferSamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    # Cosmos-Dreams-Transfer: the same causal recipe conditioned on a control
+    # video (edge, blur, depth, or seg) instead of actions.
+    register_configs(
+        sampling_param_cls=CosmosDreamsTransferSamplingParams,
+        pipeline_config_cls=CosmosDreamsTransferConfig,
+        hf_model_paths=["nvidia/Cosmos3-Nano-Sim-Depth"],
+        # Matches the release ``Cosmos3NanoSimTransferPipeline`` ``_class_name``.
+        model_detectors=[
+            lambda hf_id: "cosmos3nanosimtransferpipeline" in hf_id.lower()
+        ],
+    )

@@ -84,6 +84,9 @@ class RuntimeHandle:
         self.tokenizer_manager.auto_create_handle_loop()
         self._event_loop = self.tokenizer_manager.event_loop
 
+    def set_engine_state_changed_callback(self, callback) -> None:
+        self.tokenizer_manager.set_engine_state_changed_callback(callback)
+
     @property
     def _tm_loop(self):
         """Return the TokenizerManager loop used by communicator RPCs."""
@@ -449,8 +452,9 @@ class RuntimeHandle:
             ServerStatus.UnHealthy,
         )
 
-    def get_is_ready(self) -> bool:
-        return self.tokenizer_manager.is_ready()
+    def is_pause(self) -> bool:
+        """Return the tokenizer manager's authoritative generation pause state."""
+        return self.tokenizer_manager.is_pause
 
     def tokenize(self, text: str, add_special_tokens: bool = True) -> str:
         tokenizer = self.tokenizer_manager.tokenizer

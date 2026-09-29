@@ -50,6 +50,24 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             "overhead without improving prefill performance."
         )
 
+    if not 0 <= cfg.disaggregation_decode_host_receive_threshold <= 1:
+        raise ValueError(
+            "--disaggregation-decode-host-receive-threshold must be between 0 and 1"
+        )
+    if cfg.disaggregation_decode_host_receive_threshold > 0:
+        if cfg.enable_hisparse or cfg.enable_pd_role_switch:
+            raise ValueError(
+                "Decode host receive does not yet support HiSparse or role switching"
+            )
+
+        if cfg.disaggregation_decode_retraction_backup == "cpu_tensor":
+            raise ValueError("Decode host KV buffering requires host_pool retraction")
+        declare_resolution(
+            server_args,
+            "handle_pd_disaggregation",
+            disaggregation_decode_retraction_backup="host_pool",
+        )
+
     if cfg.disaggregation_mode == "decode" and cfg.dcp_size > 1:
         # Fake transfer moves no KV and is only used for synthetic decode
         # benchmarks, so it does not need the DCP relayout from Mooncake/NIXL.
@@ -62,16 +80,6 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 "PD decode DCP requires --disaggregation-transfer-backend "
                 "mooncake, nixl, or fake for synthetic benchmarking, got "
                 f"{cfg.disaggregation_transfer_backend!r}."
-            )
-        if cfg.disaggregation_decode_enable_radix_cache:
-            raise ValueError(
-                "PD decode DCP currently requires chunk cache; "
-                "--disaggregation-decode-enable-radix-cache is not supported."
-            )
-        if cfg.enable_hierarchical_cache:
-            raise ValueError(
-                "PD decode DCP currently requires chunk cache; "
-                "--enable-hierarchical-cache is not supported."
             )
 
     if cfg.disaggregation_mode == "decode":
@@ -86,7 +94,7 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with --disaggregation-transfer-backend fake"
                 )
-            if cfg.speculative_algorithm is not None:
+            if cfg.speculative_algorithm not in (None, "DSPARK"):
                 raise ValueError(
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with speculative decoding "

@@ -16,10 +16,11 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
 import msgspec
 
+from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import (
     Cosmos3Config,
     _transformer_config,
@@ -555,6 +556,10 @@ def parse_multiview_deployment_config(
 class Cosmos3MultiviewConfig(Cosmos3Config):
     """Cosmos3 Multiview-AV: 11-camera WSM-to-RGB transfer in one denoising pass."""
 
+    # Single-task pipeline; the parent's multi-task declaration (TI2V, T2I, V2V)
+    # does not apply, so requests resolve to task_type alone.
+    supported_task_types: ClassVar[tuple[ModelTaskType, ...] | None] = None
+
     # Same weights, different GEN cross-attention: the loader instantiates the
     # multiview transformer subclass instead of the checkpoint's class name.
     transformer_class_override: str | None = "Cosmos3MultiviewTransformer"
@@ -604,3 +609,21 @@ class Cosmos3MultiviewConfig(Cosmos3Config):
 
     def supports_dynamic_batching(self) -> bool:
         return False
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.cosmos3_multiview import (
+        Cosmos3MultiviewSamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    # Cosmos3 Multiview-AV: 11-camera WSM transfer with maskless cross-camera
+    # attention. The hf path is the pre-release folder name, which must sort
+    # before the shorter "nvidia/Cosmos3-Nano" in the partial-path match.
+    register_configs(
+        sampling_param_cls=Cosmos3MultiviewSamplingParams,
+        pipeline_config_cls=Cosmos3MultiviewConfig,
+        hf_model_paths=["nvidia/Cosmos3-Nano-Transfer-Auto"],
+        # Matches the ``Cosmos3MultiviewPipeline`` ``_class_name`` of the checkpoint.
+        model_detectors=[lambda hf_id: "cosmos3multiviewpipeline" in hf_id.lower()],
+    )
