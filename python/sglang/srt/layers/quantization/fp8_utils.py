@@ -547,6 +547,15 @@ if get_platform().is_blackwell and is_flashinfer_available():
             ),
         )
 
+    # FlashInfer's @backend_requirement wrapper re-binds the signature, probes the
+    # device capability and re-runs the problem-size gates on *every* call: ~30 us
+    # per call, M-independent, which is most of a small-M MXFP8 linear's host cost
+    # during an eager prefill. The (backend, layout, shape, dtype) keys are fixed by
+    # the checkpoint, so validate each key once through the checked path and use
+    # FlashInfer's `skip_check` fast path afterwards. A rejected key is never cached,
+    # so unsupported shapes keep raising the original error.
+    _mxfp8_mm_checked: set = set()
+
     @register_custom_op(
         op_name="flashinfer_mm_mxfp8",
         mutates_args=[],
@@ -563,7 +572,18 @@ if get_platform().is_blackwell and is_flashinfer_available():
         use_8x4_sf_layout: bool = False,
         backend: str = "auto",
     ) -> torch.Tensor:
-        return _raw_flashinfer_mm_mxfp8(
+        # `auto` still needs the wrapper to resolve the backend, so leave it checked.
+        key = (
+            backend,
+            use_8x4_sf_layout,
+            q_input.shape,
+            weight_t.shape,
+            q_input.dtype,
+            weight_t.dtype,
+            out_dtype,
+        )
+        skip_check = backend != "auto" and key in _mxfp8_mm_checked
+        output = _raw_flashinfer_mm_mxfp8(
             q_input,
             weight_t,
             x_scale_u8,
@@ -571,7 +591,11 @@ if get_platform().is_blackwell and is_flashinfer_available():
             out_dtype=out_dtype,
             use_8x4_sf_layout=use_8x4_sf_layout,
             backend=backend,
+            skip_check=skip_check,
         )
+        if not skip_check:
+            _mxfp8_mm_checked.add(key)
+        return output
 
 
 if get_platform().is_sm90 and is_flashinfer_available():

@@ -451,5 +451,121 @@ class TestApplyFp8LinearPrequantOutputDtype(CustomTestCase):
                 self._run(dtype)
 
 
+@unittest.skipUnless(
+    torch.cuda.is_available()
+    and hasattr(fp8_utils, "flashinfer_mm_mxfp8")
+    and hasattr(fp8_utils, "_raw_flashinfer_mm_mxfp8"),
+    "FlashInfer MXFP8 dense path is unavailable on this platform",
+)
+class TestMxfp8MmValidatedOnce(CustomTestCase):
+    """The MXFP8 dense wrapper validates each shape once, then skips FlashInfer's checks.
+
+    flashinfer's @backend_requirement wrapper re-binds the signature, probes the
+    device capability and re-runs the problem-size gates on every call (~32 us on a
+    2560x4096 linear and just as much at M=8), so the wrapper must stop paying that
+    once a (backend, layout, shape, dtype) key has been validated.
+    """
+
+    def _tensors(self, m=8, k=2560, n=4096):
+        return (
+            torch.empty(m, k, device="cuda"),
+            torch.empty(k, n, dtype=torch.float8_e4m3fn, device="cuda"),
+            torch.empty(0, dtype=torch.uint8, device="cuda"),
+            torch.empty(0, dtype=torch.uint8, device="cuda"),
+        )
+
+    def _fake_raw(self, skip_flags):
+        def fake_raw(q_input, weight_t, x_scale_u8, weight_scale_t, **kwargs):
+            skip_flags.append(kwargs["skip_check"])
+            return torch.empty(
+                (q_input.shape[0], weight_t.shape[1]),
+                dtype=kwargs["out_dtype"],
+                device=q_input.device,
+            )
+
+        return fake_raw
+
+    def test_first_call_checks_then_skips(self):
+        skip_flags = []
+        with (
+            patch.object(
+                fp8_utils,
+                "_raw_flashinfer_mm_mxfp8",
+                side_effect=self._fake_raw(skip_flags),
+            ),
+            patch.object(fp8_utils, "_mxfp8_mm_checked", set()),
+        ):
+            for _ in range(3):
+                fp8_utils.flashinfer_mm_mxfp8(
+                    *self._tensors(), out_dtype=torch.bfloat16, backend="cutlass"
+                )
+
+        self.assertEqual(skip_flags, [False, True, True])
+
+    def test_each_shape_is_validated_separately(self):
+        skip_flags = []
+        with (
+            patch.object(
+                fp8_utils,
+                "_raw_flashinfer_mm_mxfp8",
+                side_effect=self._fake_raw(skip_flags),
+            ),
+            patch.object(fp8_utils, "_mxfp8_mm_checked", set()),
+        ):
+            fp8_utils.flashinfer_mm_mxfp8(
+                *self._tensors(m=8), out_dtype=torch.bfloat16, backend="cutlass"
+            )
+            fp8_utils.flashinfer_mm_mxfp8(
+                *self._tensors(m=8), out_dtype=torch.bfloat16, backend="cutlass"
+            )
+            fp8_utils.flashinfer_mm_mxfp8(
+                *self._tensors(m=1024), out_dtype=torch.bfloat16, backend="cutlass"
+            )
+
+        self.assertEqual(skip_flags, [False, True, False])
+
+    def test_rejected_shape_is_never_cached(self):
+        """n < 128 must keep raising flashinfer's error instead of failing later."""
+        skip_flags = []
+
+        def fake_raw(q_input, weight_t, x_scale_u8, weight_scale_t, **kwargs):
+            skip_flags.append(kwargs["skip_check"])
+            if not kwargs["skip_check"]:
+                raise ValueError("MXFP8 requires n >= 128 and k >= 128")
+            return torch.empty(0)
+
+        with (
+            patch.object(fp8_utils, "_raw_flashinfer_mm_mxfp8", side_effect=fake_raw),
+            patch.object(fp8_utils, "_mxfp8_mm_checked", set()),
+        ):
+            for _ in range(2):
+                with self.assertRaises(ValueError):
+                    fp8_utils.flashinfer_mm_mxfp8(
+                        *self._tensors(n=64),
+                        out_dtype=torch.bfloat16,
+                        backend="cutlass",
+                    )
+
+        self.assertEqual(skip_flags, [False, False])
+
+    def test_auto_backend_is_always_checked(self):
+        """`auto` still has to resolve the backend inside the decorator."""
+        skip_flags = []
+        with (
+            patch.object(
+                fp8_utils,
+                "_raw_flashinfer_mm_mxfp8",
+                side_effect=self._fake_raw(skip_flags),
+            ),
+            patch.object(fp8_utils, "_mxfp8_mm_checked", set()),
+        ):
+            for _ in range(2):
+                fp8_utils.flashinfer_mm_mxfp8(
+                    *self._tensors(), out_dtype=torch.bfloat16, backend="auto"
+                )
+
+        self.assertEqual(skip_flags, [False, False])
+
+
 if __name__ == "__main__":
     unittest.main()
