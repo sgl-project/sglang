@@ -5219,6 +5219,17 @@ class DSATokenToKVPool(MLATokenToKVPool):
     def get_state_buf_infos(self):
         return self.index_key_cache.state_buf_infos()
 
+    def get_state_layer_ids(self):
+        """Logical layer id for each entry of ``get_state_buf_infos()``.
+
+        ``index_key_cache.state_buf_infos()`` emits one entry per *local*
+        layer in order, so entry ``i`` is logical layer ``start_layer + i``.
+        Under PP each peer's local index space is offset differently, so the
+        ids have to travel with the pointers for the PD transfer to pair
+        entries correctly.
+        """
+        return list(range(self.start_layer, self.start_layer + self.layer_num))
+
     def get_kv_size_bytes(self):
         kv_size_bytes = super().get_kv_size_bytes()
         for index_k_cache in self.index_k_with_scale_buffer:

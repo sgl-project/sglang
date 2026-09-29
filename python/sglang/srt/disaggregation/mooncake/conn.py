@@ -1802,6 +1802,31 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         local_tp_rank_in_group=local_tp_rank_in_group,
                     ):
                         continue
+                if st == StateType.DSA:
+                    # PP re-splits the KV by layer, so the peers' entry lists
+                    # cover different logical ranges and cannot be paired
+                    # positionally. Same resolution the QSA state above uses.
+                    dsa_entry_pairs = build_transfer_entry_pairs(
+                        src_state_layer_ids,
+                        dst_state_layer_ids,
+                        len(src_data_ptrs),
+                        len(dst_data_ptrs),
+                        allow_positional_fallback=self.pp_size == 1,
+                    )
+                    layout_mismatches = [
+                        (i, j, src_item_lens[i], dst_item_lens[j])
+                        for i, j in dsa_entry_pairs
+                        if src_item_lens[i] != dst_item_lens[j]
+                    ]
+                    if layout_mismatches:
+                        raise RuntimeError(
+                            "DSA indexer layout differs between mapped prefill "
+                            f"and decode entries: {layout_mismatches}"
+                        )
+                    src_data_ptrs = [src_data_ptrs[i] for i, _ in dsa_entry_pairs]
+                    src_item_lens = [src_item_lens[i] for i, _ in dsa_entry_pairs]
+                    dst_data_ptrs = [dst_data_ptrs[j] for _, j in dsa_entry_pairs]
+                    dst_item_lens = [dst_item_lens[j] for _, j in dsa_entry_pairs]
                 src_indices = list(indices)
                 dst_indices_local = list(dst_indices)
                 if (

@@ -1090,6 +1090,13 @@ def build_staging_slot_metadata(
     return k_buffers, v_buffers, k_ids + v_ids
 
 
+# Draft indexer entries share one id space with target layers on the wire,
+# which encodes layer ids as unsigned ints. Park them above any real layer id
+# so a PP prefill and a non-PP decode agree on them regardless of local
+# layer_num.
+DSA_DRAFT_LAYER_ID_BASE = 1 << 20
+
+
 def append_state_component(
     kv_args: KVArgs,
     state_type: StateType,
@@ -1565,8 +1572,31 @@ def setup_state_kv_args(
                     draft_token_to_kv_pool.layer_num if draft_token_to_kv_pool else 0
                 )
             else:
+                # Layer identity has to travel with the pointers: under PP the
+                # two peers' entry lists cover different logical layer ranges,
+                # so pairing them positionally writes into the wrong layer.
+                dsa_layer_ids = []
+                if hasattr(token_to_kv_pool, "get_state_layer_ids"):
+                    dsa_layer_ids = list(token_to_kv_pool.get_state_layer_ids())
+                    if draft_token_to_kv_pool is not None and isinstance(
+                        draft_token_to_kv_pool, DSATokenToKVPool
+                    ):
+                        n_draft = len(draft_token_to_kv_pool.get_state_buf_infos()[0])
+                        dsa_layer_ids += [
+                            DSA_DRAFT_LAYER_ID_BASE + k for k in range(n_draft)
+                        ]
+                    if len(dsa_layer_ids) != len(data_ptrs):
+                        # Never ship a partial mapping: build_transfer_entry_pairs
+                        # rejects one-sided metadata, so a wrong length here would
+                        # surface as an opaque transfer failure instead.
+                        dsa_layer_ids = []
                 append_state_component(
-                    kv_args, StateType.DSA, data_ptrs, data_lens, item_lens
+                    kv_args,
+                    StateType.DSA,
+                    data_ptrs,
+                    data_lens,
+                    item_lens,
+                    layer_ids=dsa_layer_ids,
                 )
                 if tail_ptrs:
                     append_state_component(
