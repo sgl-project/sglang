@@ -64,9 +64,7 @@ def _check_contract(out, seq_lens, block_size, topk, S):
 @pytest.mark.parametrize("H", [1, 2])
 @pytest.mark.parametrize("B", [1, 5, 32])
 @pytest.mark.parametrize("topk", [16, 32, 64])
-@pytest.mark.parametrize(
-    "max_ctx", [4096, 131072, 524288] + ([2097152] if torch.version.hip else [])
-)
+@pytest.mark.parametrize("max_ctx", [4096, 131072, 524288, 2097152])
 def test_decode_topk_distinct(dtype_sl, H, B, topk, max_ctx):
     torch.manual_seed(1234)
     block_size = 128
@@ -133,12 +131,11 @@ def test_decode_topk_small_num_blocks(seq_len):
 
 @pytest.mark.parametrize("S", [4096, 4097, 8192, 8193, 16384])
 def test_decode_topk_register_buckets(S):
-    """Cover every register bucket, including both boundaries.
+    """Cover both sides of every register-bucket boundary.
 
-    The radix path is instantiated per bucket (4096 / 8192 / 16384 rows), so a row
-    length that crosses a boundary selects a different instantiation. S=4096 is the
-    largest the other cases reach, which leaves the 8192 and 16384 instantiations
-    unexercised without this.
+    On CUDA the radix path is instantiated per bucket (4096 / 8192 / 16384 rows),
+    so a row one past a bucket selects the next instantiation. The other cases only
+    reach the 4096 and 16384 buckets, and only at their exact capacities.
     """
     block_size, topk = 128, 16
     H, B = 1, 1
