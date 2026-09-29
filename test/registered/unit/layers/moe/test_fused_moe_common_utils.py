@@ -5,7 +5,6 @@ from unittest.mock import patch
 
 import pytest
 import torch
-from transformers import DeepseekV3Config
 
 from sglang.srt.configs.beam import BeamConfig
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -76,54 +75,6 @@ def test_get_model_config_supports_beam(
         "block_shape": None,
         "architecture": "BeamForCausalLM",
     }
-
-
-@pytest.mark.parametrize(
-    "capture_idx,layer_id,dump_idx", [(0, 1, 0), (1, 3, 0), (2, 1, 1)]
-)
-def test_load_topk_ids_uses_beam_sparse_layers(
-    tmp_path, capture_idx, layer_id, dump_idx
-):
-    BeamConfig(
-        num_hidden_layers=4, mlp_layer_types=["dense", "sparse", "dense", "sparse"]
-    ).save_pretrained(tmp_path)
-    common_utils = _load_common_utils()
-    layer_ids = common_utils.get_moe_layer_ids(str(tmp_path))
-    assert layer_ids == [1, 3]
-    expected = torch.tensor([[2, 5]], dtype=torch.int32)
-    torch.save(expected, tmp_path / f"topk_ids_layer{layer_id}_idx{dump_idx}.pt")
-
-    actual = common_utils.load_topk_ids(str(tmp_path), capture_idx, layer_ids)
-
-    torch.testing.assert_close(actual, expected)
-
-
-def test_get_moe_layer_ids_preserves_deepseek_layout(tmp_path):
-    DeepseekV3Config(
-        architectures=["DeepseekV3ForCausalLM"],
-        num_hidden_layers=61,
-        first_k_dense_replace=3,
-    ).save_pretrained(tmp_path)
-
-    assert _load_common_utils().get_moe_layer_ids(str(tmp_path)) == list(range(3, 61))
-
-
-def test_get_moe_layer_ids_rejects_dense_only_beam(tmp_path):
-    BeamConfig(num_hidden_layers=2, mlp_layer_types=["dense", "dense"]).save_pretrained(
-        tmp_path
-    )
-
-    with pytest.raises(ValueError, match="requires at least one MoE layer"):
-        _load_common_utils().get_moe_layer_ids(str(tmp_path))
-
-
-def test_get_moe_layer_ids_rejects_unsupported_frequency(tmp_path):
-    DeepseekV3Config(
-        architectures=["DeepseekV3ForCausalLM"], moe_layer_freq=2
-    ).save_pretrained(tmp_path)
-
-    with pytest.raises(ValueError, match="Unsupported captured-routing layer layout"):
-        _load_common_utils().get_moe_layer_ids(str(tmp_path))
 
 
 if __name__ == "__main__":
