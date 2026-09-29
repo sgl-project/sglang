@@ -11,6 +11,3 @@ pub mod sglang {
         }
     }
 }
-
-/// Short alias for consumers that work with only the current runtime API.
-pub use sglang::runtime::v1 as proto;
