@@ -13,6 +13,7 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
 )
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.dsa.dsa_cp import (
+    dsa_cp_narrow_a2a_enabled,
     dsa_cp_redistribute_heads,
     dsa_cp_restore_tokens,
     dsa_cp_slice,
@@ -387,6 +388,23 @@ def _apply_interleaved_rope_with_half_output(rotary_emb, positions, q_pe, k_pe):
     return q_pe, k_pe
 
 
+def _dsa_cp_narrow_plan(m: "DeepseekV2AttentionMLA", forward_batch):
+    """This forward's DSA-CP plan when the narrow (W1) exchange applies, else None.
+
+    The narrow exchange swaps q *before* the ``w_kc`` absorb and the head output
+    *after* ``w_vc``, so the all-to-alls carry 256-wide tensors instead of the
+    512-wide latent. It needs the full ``w_kc``/``w_vc`` the weight loader
+    gathers; when that gather declined -- the flag is off, or the weights are
+    not bf16 -- the attributes are absent and this returns None, which puts the
+    layer back on the wide path with no other change.
+    """
+    if not dsa_cp_narrow_a2a_enabled():
+        return None
+    if getattr(m, "w_kc_full", None) is None or getattr(m, "w_vc_full", None) is None:
+        return None
+    return get_dsa_cp_plan(forward_batch)
+
+
 def forward_dsa_prepare_npu(
     m: "DeepseekV2AttentionMLA",
     positions: torch.Tensor,
@@ -494,13 +512,19 @@ def forward_dsa_prepare_npu(
 
         q_nope, q_pe = q.split([m.qk_nope_head_dim, m.qk_rope_head_dim], dim=-1)
 
-        q_nope_out = torch_npu.npu_transpose_batchmatmul(
-            q_nope,
-            m.w_kc,
-            perm_x1=(1, 0, 2),
-            perm_x2=(0, 1, 2),
-            perm_y=(1, 0, 2),
-        )
+        # W1: under the narrow exchange the absorb is DEFERRED, not skipped -- it
+        # runs below, after the all-to-all, on this rank's token rows and every
+        # head. Doing it here would widen q_nope from 192 to 512 before it goes
+        # on the wire, which is the whole cost W1 removes.
+        narrow_plan = _dsa_cp_narrow_plan(m, forward_batch)
+        if narrow_plan is None:
+            q_nope_out = torch_npu.npu_transpose_batchmatmul(
+                q_nope,
+                m.w_kc,
+                perm_x1=(1, 0, 2),
+                perm_x2=(0, 1, 2),
+                perm_y=(1, 0, 2),
+            )
 
         if is_mla_preprocess_enabled() and not m.rotary_emb.is_neox_style:
             # Match the half-layout RoPE outputs used by MLA preprocessing.
@@ -513,6 +537,33 @@ def forward_dsa_prepare_npu(
                     0, positions
                 )
             q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
+
+        if narrow_plan is not None:
+            # One all-to-all on the fused [q_nope | q_pe] (192 + 64), against two
+            # on the absorbed latent and its rope half (512 + 64). RoPE has
+            # already run, so q_pe travels rotated and the positions never have
+            # to be sliced to match.
+            #
+            # The width to restore to is recorded BEFORE the swap: afterwards
+            # q_nope_out is plan.rows tall and the original row count -- which
+            # may be padded past num_tokens -- is no longer recoverable from the
+            # tensors. Handing back a narrower width makes the next layer's KV
+            # write index a tensor smaller than its slot map describes.
+            forward_batch.npu_dsa_cp_input_rows = q_nope.shape[0]
+            q_swapped = dsa_cp_redistribute_heads(
+                torch.cat([q_nope, q_pe], dim=-1), narrow_plan
+            )
+            q_nope, q_pe = q_swapped.split(
+                [m.qk_nope_head_dim, m.qk_rope_head_dim], dim=-1
+            )
+            q_nope_out = torch_npu.npu_transpose_batchmatmul(
+                q_nope.contiguous(),
+                m.w_kc_full,
+                perm_x1=(1, 0, 2),
+                perm_x2=(0, 1, 2),
+                perm_y=(1, 0, 2),
+            )
+            q_pe = q_pe.contiguous()
 
         if dsa_use_prefill_cp(forward_batch):
             # support allgather+rerrange
@@ -710,6 +761,9 @@ def forward_dsa_core_npu(
     # a trailing arg. None everywhere else.
     gate: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    # Set before any branch: only the W1 path below flips it, and the DCP
+    # branches reach the w_vc block without passing through it.
+    w_vc_applied = False
     # GLM-5.2 dispatches DSA_NPU here rather than to forward_absorb_core, so
     # forward_mla.py's DCP block never runs for it and DCP is composed here too.
     dcp_extend = (
@@ -777,13 +831,23 @@ def forward_dsa_core_npu(
                 f"it: attn_mqa_for_dsa_cp={m.attn_mqa_for_dsa_cp is not None}, "
                 f"topk_indices={topk_indices is not None}"
             )
+        narrow_a2a = (
+            dsa_cp_plan is not None
+            and _dsa_cp_narrow_plan(m, forward_batch) is not None
+        )
         if dsa_cp_plan is not None:
             # DSA-CP: swap "my heads for every token" for "every head for my
             # tokens", which divides the per-query top-k KV read. k_nope/k_pe
             # stay full width, and the padded row count must be handed back.
-            dsa_cp_rows = q_nope_out.shape[0]
-            q_nope_out = dsa_cp_redistribute_heads(q_nope_out, dsa_cp_plan)
-            q_pe = dsa_cp_redistribute_heads(q_pe, dsa_cp_plan)
+            if narrow_a2a:
+                # W1: prepare already swapped, on the narrow side and before the
+                # absorb, so q_nope_out and q_pe arrive [rows, all heads, d] and
+                # the width to restore to came with them.
+                dsa_cp_rows = forward_batch.npu_dsa_cp_input_rows
+            else:
+                dsa_cp_rows = q_nope_out.shape[0]
+                q_nope_out = dsa_cp_redistribute_heads(q_nope_out, dsa_cp_plan)
+                q_pe = dsa_cp_redistribute_heads(q_pe, dsa_cp_plan)
             # This rank's rows of the top-k. A separate name is load-bearing:
             # topk_indices is returned for the next layer to reuse, so rebinding
             # it here would hand that layer a slice of a slice.
@@ -817,10 +881,23 @@ def forward_dsa_core_npu(
             topk_indices=attn_topk_indices,
         )
         if dsa_cp_plan is not None:
+            attn_output = attn_output.reshape(dsa_cp_plan.rows, -1, m.kv_lora_rank)
+            if narrow_a2a:
+                # W1: take the head output down from the 512-wide latent to
+                # v_head_dim BEFORE it goes back on the wire. w_vc_full, not
+                # w_vc: this rank is holding every head, not its own eight.
+                attn_output = torch_npu.npu_transpose_batchmatmul(
+                    attn_output.contiguous(),
+                    m.w_vc_full,
+                    perm_x1=(1, 0, 2),
+                    perm_x2=(0, 1, 2),
+                    perm_y=(1, 0, 2),
+                )
+                w_vc_applied = True
             # Undo the swap: everything downstream expects this rank's own heads
             # for the whole batch.
             attn_output = dsa_cp_restore_tokens(
-                attn_output.reshape(dsa_cp_plan.rows, -1, m.kv_lora_rank),
+                attn_output,
                 dsa_cp_plan,
                 dsa_cp_rows,
             )
@@ -828,28 +905,34 @@ def forward_dsa_core_npu(
         # Drop the reference so a later forward cannot read a stale gather; the
         # buffers themselves are reserved and survive.
         forward_batch.npu_dcp_extend_kv = None
-    attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
-
-    if _is_npu_arch35 or (
-        forward_batch.forward_mode.is_extend()
-        and not forward_batch.forward_mode.is_draft_extend_v2()
-        and not forward_batch.forward_mode.is_target_verify()
-    ):
-        attn_bmm_output = torch_npu.npu_transpose_batchmatmul(
-            attn_output,
-            m.w_vc,
-            perm_x1=(1, 0, 2),
-            perm_x2=(0, 1, 2),
-            perm_y=(1, 0, 2),
-        )
+    if w_vc_applied:
+        # W1 already took the head output through w_vc, before the return leg,
+        # so attn_output is [num_tokens, num_local_heads, v_head_dim] and the
+        # latent view below would be wrong about its last dimension.
+        attn_bmm_output = attn_output
     else:
-        attn_bmm_output = torch.empty(
-            (attn_output.shape[0], m.num_local_heads, m.v_head_dim),
-            dtype=attn_output.dtype,
-            device=attn_output.device,
-        )
-        attn_output = attn_output.contiguous()
-        torch.ops.npu.batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
+        attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
+
+        if _is_npu_arch35 or (
+            forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_draft_extend_v2()
+            and not forward_batch.forward_mode.is_target_verify()
+        ):
+            attn_bmm_output = torch_npu.npu_transpose_batchmatmul(
+                attn_output,
+                m.w_vc,
+                perm_x1=(1, 0, 2),
+                perm_x2=(0, 1, 2),
+                perm_y=(1, 0, 2),
+            )
+        else:
+            attn_bmm_output = torch.empty(
+                (attn_output.shape[0], m.num_local_heads, m.v_head_dim),
+                dtype=attn_output.dtype,
+                device=attn_output.device,
+            )
+            attn_output = attn_output.contiguous()
+            torch.ops.npu.batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
 
     attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
 

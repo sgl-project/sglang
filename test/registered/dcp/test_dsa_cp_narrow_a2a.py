@@ -1,0 +1,172 @@
+"""CPU unit test: DSA-CP's narrow all-to-all (handoff §8 W1) is exact.
+
+DSA-CP swaps "my heads for every token" for "every head for my tokens" *after*
+``q_b_proj`` and the absorb through ``w_kc``, so the wire carries the 512-wide
+absorbed latent on the way in and the 512-wide attention output on the way back.
+Both are fixed linear functions of narrower tensors beside them: q is 256 wide
+coming out of ``q_b_proj`` and the head output is 256 (``v_head_dim``).
+
+``SGLANG_NPU_ENABLE_DSA_CP_NARROW_A2A`` moves the exchange to the narrow side.
+Measured at tp8 on A3: 2.12x fewer bytes in 2 collectives rather than 3, 1.83x
+faster, 1.276 ms per layer. The price is the full ``w_kc``/``w_vc`` on every
+rank, about +2.1 GB, which is why it is off by default.
+
+**The claim this file pins:** deferring the absorb past the exchange changes
+nothing, because ``npu_transpose_batchmatmul`` here is a product per (token,
+head) pair and the all-to-all only moves those pairs between ranks. That holds
+only if each rank absorbs with the ``w_kc`` of the head it ENDS UP holding, not
+the head it was assigned -- which is exactly what the full weights buy and
+exactly what a plausible implementation gets wrong.
+
+The second test is the negative: it shows that reusing the local slice after the
+swap is wrong, so the full-weight requirement is not decoration.
+
+Usage:
+    python -m pytest test_dsa_cp_narrow_a2a.py -v
+    python test_dsa_cp_narrow_a2a.py
+"""
+
+import unittest
+
+import torch
+
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
+# Small but ragged on every axis, so a wrong reshape cannot pass by symmetry.
+TP_SIZES = [2, 3, 4, 8]
+TOKEN_COUNTS = [1, 7, 16, 17, 33]
+
+
+def _absorb(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """[t, h, d] x [h, d, l] -> [t, h, l]: the per-head product the NPU op does."""
+    return torch.einsum("thd,hdl->thl", x, w)
+
+
+class TestNarrowA2AIsExact(CustomTestCase):
+    def _case(self, total, tp_size, heads_per_rank=2, nope=6, lora=5):
+        torch.manual_seed(total * 100 + tp_size)
+        heads = heads_per_rank * tp_size
+        q_nope = torch.randn(total, heads, nope, dtype=torch.float64)
+        w_kc = torch.randn(heads, nope, lora, dtype=torch.float64)
+        rows = -(-total // tp_size)
+        return q_nope, w_kc, rows
+
+    def test_deferring_the_absorb_past_the_exchange_changes_nothing(self):
+        """Absorb-then-swap and swap-then-absorb agree, rank by rank.
+
+        The all-to-all is modelled exactly: rank r ends up holding every head
+        for token rows [r * rows, (r + 1) * rows), so whatever the wide path
+        delivers to rank r is that slice of the fully absorbed tensor.
+        """
+        for total in TOKEN_COUNTS:
+            for tp_size in TP_SIZES:
+                q_nope, w_kc, rows = self._case(total, tp_size)
+                wide_all = _absorb(q_nope, w_kc)
+                for tp_rank in range(tp_size):
+                    lo = min(tp_rank * rows, total)
+                    hi = min(lo + rows, total)
+                    with self.subTest(total=total, tp=tp_size, rank=tp_rank):
+                        wide = wide_all[lo:hi]
+                        narrow = _absorb(q_nope[lo:hi], w_kc)
+                        self.assertTrue(
+                            torch.equal(wide, narrow),
+                            "absorbing after the swap differs from absorbing before it",
+                        )
+
+    def test_absorbing_with_the_local_slice_after_the_swap_is_wrong(self):
+        """The negative: this is why the full w_kc has to be gathered.
+
+        After the exchange a rank holds every head, so indexing w_kc by its own
+        assigned head block lines the wrong matrix up against each head. Nothing
+        about the shapes objects -- the result is simply different, which is the
+        failure mode the full-weight gather exists to prevent.
+        """
+        heads_per_rank, tp_size, total = 2, 4, 17
+        q_nope, w_kc, rows = self._case(total, tp_size, heads_per_rank)
+        wide_all = _absorb(q_nope, w_kc)
+        wrong_ranks = []
+        for tp_rank in range(tp_size):
+            lo = min(tp_rank * rows, total)
+            hi = min(lo + rows, total)
+            if lo == hi:
+                continue
+            local_w = w_kc[
+                tp_rank * heads_per_rank : (tp_rank + 1) * heads_per_rank
+            ].repeat(tp_size, 1, 1)
+            if not torch.equal(_absorb(q_nope[lo:hi], local_w), wide_all[lo:hi]):
+                wrong_ranks.append(tp_rank)
+        self.assertEqual(
+            wrong_ranks,
+            [
+                r
+                for r in range(tp_size)
+                if min(r * rows, total) < min(r * rows + rows, total)
+            ],
+            "using the local w_kc slice after the swap should be wrong on every "
+            "rank that holds a token; if it is not, this test has stopped "
+            "modelling the exchange",
+        )
+
+    def test_w_vc_commutes_with_the_return_leg_too(self):
+        """W1 also moves w_vc BEFORE the restore, which is the same argument."""
+        for total in TOKEN_COUNTS:
+            for tp_size in TP_SIZES:
+                torch.manual_seed(total + tp_size)
+                heads = 2 * tp_size
+                rows = -(-total // tp_size)
+                attn_out = torch.randn(total, heads, 5, dtype=torch.float64)
+                w_vc = torch.randn(heads, 5, 4, dtype=torch.float64)
+                for tp_rank in range(tp_size):
+                    lo = min(tp_rank * rows, total)
+                    hi = min(lo + rows, total)
+                    with self.subTest(total=total, tp=tp_size, rank=tp_rank):
+                        self.assertTrue(
+                            torch.equal(
+                                _absorb(attn_out, w_vc)[lo:hi],
+                                _absorb(attn_out[lo:hi], w_vc),
+                            )
+                        )
+
+
+class TestGatheredWeightLayout(CustomTestCase):
+    """The gather must hand back w_kc in the layout the loader chose for it.
+
+    ``deepseek_weight_loader`` stores w_kc as
+    ``w_kc.transpose(1, 2).contiguous().transpose(1, 2)``: shape
+    [h, qk_nope, kv_lora] but laid out as [h, kv_lora, qk_nope], and the batched
+    matmul is tuned for that. An all-gather needs a contiguous send buffer, so
+    the naive gather returns a plainly contiguous tensor -- a full copy laid out
+    differently from the slice whose place it takes.
+    """
+
+    def test_restoring_the_layout_reproduces_the_loaders_strides(self):
+        h_local, tp, nope, lora = 2, 4, 6, 5
+        local = (
+            torch.randn(h_local, nope, lora)
+            .transpose(1, 2)
+            .contiguous()
+            .transpose(1, 2)
+        )
+        self.assertFalse(local.is_contiguous(), "the loader's layout is not plain")
+
+        gathered = torch.empty(h_local * tp, nope, lora)  # what all_gather returns
+        self.assertTrue(gathered.is_contiguous())
+        restored = gathered.transpose(1, 2).contiguous().transpose(1, 2)
+
+        self.assertEqual(restored.shape, (h_local * tp, nope, lora))
+        self.assertEqual(restored.stride()[1:], local.stride()[1:])
+        self.assertFalse(restored.is_contiguous())
+
+    def test_a_plain_contiguous_weight_is_left_alone(self):
+        """w_vc is already plain contiguous, so it must skip the restore."""
+        local = torch.randn(2, 5, 4).contiguous()
+        self.assertTrue(local.is_contiguous())
+        gathered = torch.empty(8, 5, 4)
+        self.assertEqual(gathered.stride()[1:], local.stride()[1:])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -102,10 +102,106 @@ def _dsa_cp_multi_request_flag() -> bool:
     return envs.SGLANG_NPU_ENABLE_DSA_CP_MULTI_REQUEST.get()
 
 
+@lru_cache(maxsize=1)
+def _dsa_cp_narrow_a2a_flag() -> bool:
+    return envs.SGLANG_NPU_ENABLE_DSA_CP_NARROW_A2A.get()
+
+
+def dsa_cp_narrow_a2a_enabled() -> bool:
+    """Whether to exchange the query before the absorb instead of after it.
+
+    DSA-CP swaps heads for tokens *after* ``q_b_proj`` and the absorb through
+    ``w_kc``, so the wire carries the 512-wide absorbed latent on the way in and
+    the 512-wide attention output on the way back. Both are fixed linear
+    functions of narrower tensors beside them: q is 256 wide coming out of
+    ``q_b_proj`` (``qk_nope`` 192 + rope 64) and the head output is 256
+    (``v_head_dim``). Exchanging on the narrow side moves 1088 values per
+    row-head instead of 512, in two collectives rather than three.
+
+    **Measured** (``glm5.2_testing/p17_a2a_shape_probe.py``, A3 tp8, 16,384
+    tokens, bf16): 272.0 MB in 2.808 ms today against 128.0 MB in 1.532 ms
+    proposed -- 2.12x the bytes, **1.83x the time**, saving 1.276 ms per layer or
+    99.6 ms per 78-layer forward. HCCL time follows bytes here:
+    ``t(ms) = 0.301 + 0.00697 * MB``, residuals under 0.01 ms.
+
+    **Off by default, and that is the honest default.** Every rank needs the FULL
+    ``w_kc [64, 192, 512]`` and ``w_vc [64, 512, 256]`` (28.0 MB per layer)
+    *beside* its own slice, which the non-sharded paths still use: **+2.1 GB per
+    rank** over 78 layers. Aliasing the slice into the full copy would save
+    0.26 GB of that and is deliberately not done -- it would make ``w_kc`` a view
+    into another attribute, which is not worth 12% of the cost. 2.1 GB is about
+    a tenth of the A3 dcp16 KV pool, on boxes where memory pressure presents as
+    a multi-minute stall rather than an OOM. Turn it on where the margin is
+    known, not by default.
+
+    The exchange is exact either way: ``npu_transpose_batchmatmul`` here is a
+    per-head, per-row product, and the all-to-all is a permutation of
+    (token, head) pairs, so absorbing then permuting and permuting then
+    absorbing agree -- provided each rank holds the ``w_kc``/``w_vc`` of the head
+    it ends up with, which is exactly what the full weights buy.
+    """
+    return _dsa_cp_narrow_a2a_flag() and dsa_cp_enabled()
+
+
+def dsa_cp_attach_full_kv_b(self_attn) -> None:
+    """Give this layer the whole attention-TP group's ``w_kc`` and ``w_vc``.
+
+    Called once per layer from the weight loader, after it has split
+    ``kv_b_proj`` into the two and applied the NPU layout. The loader itself
+    does not change: this reads what it produced and all-gathers it.
+
+    Needed only by the narrow all-to-all
+    (:func:`dsa_cp_narrow_a2a_enabled`), which absorbs *after* the exchange and
+    so needs whichever head the rank ends up holding, not the head it was
+    assigned. Refuses quietly and leaves the feature off if the weights are not
+    bf16 -- the FP8 and block-scaled layouts carry separate scale tensors that
+    would have to be gathered with them.
+    """
+    if not dsa_cp_narrow_a2a_enabled() or not getattr(self_attn, "use_dsa", False):
+        return
+    w_kc = getattr(self_attn, "w_kc", None)
+    w_vc = getattr(self_attn, "w_vc", None)
+    if w_kc is None or w_vc is None:
+        return
+    if w_kc.dtype != torch.bfloat16 or w_vc.dtype != torch.bfloat16:
+        print_info_once(
+            "DSA-CP narrow all-to-all is off: it needs bf16 w_kc/w_vc to "
+            f"all-gather, got {w_kc.dtype}/{w_vc.dtype}. The quantized layouts "
+            "carry scale tensors that would have to be gathered with them."
+        )
+        return
+
+    from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
+
+    tp = get_parallel().attn_tp_size
+    gathered_bytes = 0
+    for name, w in (("w_kc", w_kc), ("w_vc", w_vc)):
+        full = w.new_empty((w.shape[0] * tp, *w.shape[1:]))
+        attn_tp_all_gather_into_tensor(full, w.contiguous())
+        if not w.is_contiguous():
+            # The loader stores w_kc transposed-contiguous -- shape
+            # [h, qk_nope, kv_lora] but laid out as [h, kv_lora, qk_nope] -- and
+            # the batched matmul is tuned for that. The all-gather needs a
+            # contiguous send buffer, so the layout has to be restored here or
+            # the full copy would be laid out differently from the slice whose
+            # place it takes. w_vc is already plain contiguous and skips this.
+            full = full.transpose(1, 2).contiguous().transpose(1, 2)
+        setattr(self_attn, f"{name}_full", full)
+        # w_kc is [h, 192, 512] and w_vc is [h, 512, 256]: different sizes, so
+        # count what was actually allocated rather than doubling one of them.
+        gathered_bytes += full.numel() * full.element_size()
+    print_info_once(
+        "DSA-CP narrow all-to-all is ON: every rank holds the full w_kc and "
+        f"w_vc, {gathered_bytes / (1 << 20):.1f} MB per layer, so the query can "
+        "be exchanged before the absorb"
+    )
+
+
 def reset_dsa_cp_flags() -> None:
     """Re-read the DSA-CP env flags. For tests; never call this while serving."""
     _dsa_cp_flag.cache_clear()
     _dsa_cp_multi_request_flag.cache_clear()
+    _dsa_cp_narrow_a2a_flag.cache_clear()
 
 
 def dsa_cp_multi_request_enabled() -> bool:

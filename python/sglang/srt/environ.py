@@ -987,6 +987,12 @@ class Envs:
     # full per-request KV lengths and dropping the operator's causal crop.
     # Only engages where every request's prefix reaches index_topk.
     SGLANG_NPU_ENABLE_DSA_CP_MULTI_REQUEST = EnvBool(True)
+    # DSA-CP: exchange the query BEFORE the w_kc absorb and the attention output
+    # AFTER w_vc, so the all-to-alls carry 256-wide tensors instead of the
+    # 512-wide latent -- 2.12x fewer bytes in 2 collectives rather than 3,
+    # measured 1.83x faster at tp8 on A3. Off by default: it needs the FULL
+    # w_kc and w_vc on every rank, about +1.9 GB per rank over 78 layers.
+    SGLANG_NPU_ENABLE_DSA_CP_NARROW_A2A = EnvBool(False)
     # DCP extend on NPU: log each extend forward's peak device memory, per rank.
     SGLANG_DEBUG_NPU_DCP_EXTEND_MEMORY = EnvBool(False)
     # DCP extend on NPU: gathered rows per prefix-gather collective, which caps
