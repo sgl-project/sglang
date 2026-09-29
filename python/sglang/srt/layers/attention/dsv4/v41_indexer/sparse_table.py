@@ -10,7 +10,6 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
-    amax8_varlen,
     amax_topk_blocks,
     candidate_row_lens,
 )
@@ -25,6 +24,7 @@ from sglang.kernels.ops.attention.dsv4.index_logits import (
 )
 from sglang.kernels.ops.attention.dsv4.topk import (
     topk_transform_paged_v2,
+    topk_transform_ragged_amax8,
     topk_transform_ragged_v2,
     topk_transform_sparse,
 )
@@ -372,7 +372,6 @@ def _build_prefill_table(
     )
 
 
-# TODO(dark): support fusion of publish + topk of publish layer
 def publish_prefill_table(
     *,
     data: DeepGEMMPrefillData,
@@ -382,29 +381,30 @@ def publish_prefill_table(
     topk_blocks: int,
     out_positions: torch.Tensor,
 ) -> _SparsePrefillTable:
-    """The source's own top-k into ``out_positions`` and the chunk's table, from one
-    pass over its dense scores; ``index_page_table`` is at ``index_page_size`` slots."""
+    """Source top-k and a sparse table from tiled dense scores.
+
+    ``index_page_table`` is at ``index_page_size`` slots.
+    """
     rows = data.num_rows
     device = data.q_fp4.device
     nblocks, valid_lens = candidate_row_lens(data.compress_lens, topk_blocks)
     blocks = torch.empty(rows, topk_blocks, dtype=torch.int32, device=device)
     zero_offsets = torch.zeros(rows, dtype=torch.int32, device=device)
-    # the block keys read the score rows through 32-byte vectors
     for tile, logits in score_tiles(data, kv, width_align=8):
         lens = data.compress_lens[tile]
-        topk_transform_ragged_v2(
-            logits,
-            lens,
-            out_offsets=data.request_starts[tile],
-            out_indices=out_positions[tile],
-        )
         # keys past a row's block count stay unset; the top-k reads a row
         # up to its block count only (v2 wants the stride a multiple of 4)
         width_blocks = (
             logits.shape[1] + CANDIDATE_BLOCK_SIZE - 1
         ) // CANDIDATE_BLOCK_SIZE
         keys = logits.new_empty(logits.shape[0], (width_blocks + 3) // 4 * 4)
-        amax8_varlen(logits, lens, out=keys)
+        topk_transform_ragged_amax8(
+            logits,
+            lens,
+            out_offsets=data.request_starts[tile],
+            out_indices=out_positions[tile],
+            out_block_keys=keys,
+        )
         topk_transform_ragged_v2(
             keys,
             nblocks[tile],

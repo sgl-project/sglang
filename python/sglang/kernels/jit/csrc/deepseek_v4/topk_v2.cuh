@@ -126,6 +126,59 @@ struct TopKRaggedParams {
   uint32_t topk;
 };
 
+#ifndef USE_ROCM
+struct TopKRaggedAmax8Params {
+  TopKRaggedParams topk;
+  float* __restrict__ block_keys;
+  int64_t key_stride;
+};
+
+struct BlockAmax8Output {
+  float* __restrict__ keys;
+  uint32_t last_block;
+
+  SGL_DEVICE void operator()(const Streaming::vec_t& vec, uint32_t base) const {
+    const auto block = base / 8;
+    if (block >= last_block) return;
+    float value = vec[0];
+#pragma unroll
+    for (uint32_t i = 1; i < 4; ++i)
+      value = fmaxf(value, vec[i]);
+    // Complete blocks occupy two adjacent lanes in the vector-load iteration.
+    const auto pair_mask = 3u << ((threadIdx.x % 32) & ~1u);
+    value = fmaxf(value, __shfl_xor_sync(pair_mask, value, 1));
+    if (base % 8 == 0) keys[block] = value;
+  }
+};
+
+struct BlockAmax8Histogram {
+  float* __restrict__ keys;
+
+  SGL_DEVICE void operator()(const TopKProblem& problem, uint32_t* histogram) const {
+    constexpr uint32_t kVecSize = device::kMaxVecBytes / sizeof(float);
+    constexpr uint32_t kVecs = 8 / kVecSize;
+    const auto num_blocks = (problem.seq_len + 7) / 8;
+    for (uint32_t block = threadIdx.x; block < num_blocks; block += kBlockSize) {
+      float key = -impl::infinity_value();
+#pragma unroll
+      for (uint32_t v = 0; v < kVecs; ++v) {
+        device::AlignedVector<float, kVecSize> vec;
+        vec.load(problem.in, block * kVecs + v);
+#pragma unroll
+        for (uint32_t j = 0; j < kVecSize; ++j) {
+          if (block * 8 + v * kVecSize + j < problem.seq_len) {
+            const auto value = vec[j];
+            key = fmaxf(key, value);
+            atomicAdd(&histogram[impl::extract_coarse_bin<Streaming::kHistBits>(value)], 1);
+          }
+        }
+      }
+      keys[block] = block + 1 == num_blocks ? impl::infinity_value() : key;
+    }
+  }
+};
+#endif
+
 template <typename F>
 SGL_DEVICE void for_each_item(uint32_t topk, const F& f) {
   static_assert(kMaxTopK % kBlockSize == 0);
@@ -249,6 +302,60 @@ TOPK_KERNEL void topk_ragged_kernel(const __grid_constant__ TopKRaggedParams par
   }
   // PDL trigger secondary at the end the block typically has no use, so ignore it
 }
+
+#ifndef USE_ROCM
+template <bool kPDL>
+TOPK_KERNEL void topk_ragged_amax8_kernel(const __grid_constant__ TopKRaggedAmax8Params params) {
+  device::enable_smem_spilling();
+  const auto& p = params.topk;
+  const auto row = blockIdx.x;
+  const auto tx = threadIdx.x;
+  const auto length = static_cast<uint32_t>(p.seq_lens[row]);
+  const auto offset = p.out_offsets[row];
+  const auto scores = p.scores + row * p.score_stride;
+  const auto out = p.topk_indices + row * static_cast<int64_t>(p.topk);
+  const auto keys = params.block_keys + row * params.key_stride;
+  if (length <= p.topk) {
+    device::PDLWaitPrimary<kPDL>();
+    for_each_item(p.topk, [&](uint32_t i, uint32_t) { out[i] = i < length ? static_cast<int32_t>(i) + offset : -1; });
+    const auto num_blocks = (length + 7) / 8;
+    if (tx < num_blocks) {
+      float value = impl::infinity_value();
+      if (tx + 1 < num_blocks) {
+        Streaming::vec_t lo, hi;
+        lo.load(scores, tx * 2);
+        hi.load(scores, tx * 2 + 1);
+        value = lo[0];
+#pragma unroll
+        for (uint32_t i = 1; i < 4; ++i)
+          value = fmaxf(value, lo[i]);
+#pragma unroll
+        for (uint32_t i = 0; i < 4; ++i)
+          value = fmaxf(value, hi[i]);
+      }
+      keys[tx] = value;
+    }
+    return;
+  }
+  const auto problem = TopKProblem{
+      .in = scores,
+      .out = out,
+      .topk = p.topk,
+      .seq_len = length,
+      .bias = offset,
+  };
+  const auto output = BlockAmax8Output{keys, (length - 1) / 8};
+  __shared__ impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Smem> smem;
+  if (length <= kReg2MaxSeqLen) {
+    Register2::forward<kPDL>(problem, &smem, output);
+  } else if (length <= kReg4MaxSeqLen) {
+    Register4::forward<kPDL>(problem, &smem, output);
+  } else {
+    Streaming::forward<kPDL>(problem, &smem, BlockAmax8Histogram{keys});
+  }
+  if (tx == 0) keys[output.last_block] = impl::infinity_value();
+}
+#endif
 
 #ifdef USE_ROCM
 // Only the ROCm DSA prefill emits this layout today, so CUDA/XPU builds stay
@@ -883,6 +990,51 @@ struct TopKKernel {
         .config({.use_pdl = kUsePDL})
         .launch(topk_ragged_kernel<kUsePDL>, params);
   }
+
+#ifndef USE_ROCM
+  static void transform_ragged_amax8(
+      const tvm::ffi::TensorView scores,
+      const tvm::ffi::TensorView seq_lens,
+      const tvm::ffi::TensorView out_offsets,
+      const tvm::ffi::TensorView topk_indices,
+      const tvm::ffi::TensorView block_keys) {
+    using namespace host;
+    auto B = SymbolicSize{"batch_size"};
+    auto L = SymbolicSize{"max_seq_len"};
+    auto S = SymbolicSize{"score_stride"};
+    auto K = SymbolicSize{"topk"};
+    auto N = SymbolicSize{"block_keys"};
+    auto O = SymbolicSize{"key_stride"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLGPU>();
+    TensorMatcher({B, L}).with_strides({S, 1}).with_dtype<float>().with_device(device_).verify(scores);
+    TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(seq_lens);
+    TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(out_offsets);
+    TensorMatcher({B, K}).with_dtype<int32_t>().with_device(device_).verify(topk_indices);
+    TensorMatcher({B, N}).with_strides({O, 1}).with_dtype<float>().with_device(device_).verify(block_keys);
+    RuntimeCheck(S.unwrap() % 8 == 0, "score_stride must be a multiple of 8");
+    RuntimeCheck(N.unwrap() >= div_ceil(L.unwrap(), int64_t{8}), "block_keys must cover the score width");
+    const auto topk = static_cast<uint32_t>(K.unwrap());
+    RuntimeCheck(topk > 0 && topk <= kMaxTopK, "topk must be in (0, 2048]");
+    const auto params = TopKRaggedAmax8Params{
+        .topk =
+            {
+                .scores = static_cast<float*>(scores.data_ptr()),
+                .seq_lens = static_cast<const int32_t*>(seq_lens.data_ptr()),
+                .row_starts = nullptr,
+                .out_offsets = static_cast<const int32_t*>(out_offsets.data_ptr()),
+                .topk_indices = static_cast<int32_t*>(topk_indices.data_ptr()),
+                .score_stride = S.unwrap(),
+                .topk = topk,
+            },
+        .block_keys = static_cast<float*>(block_keys.data_ptr()),
+        .key_stride = O.unwrap(),
+    };
+    LaunchKernel(static_cast<uint32_t>(B.unwrap()), kBlockSize, device_.unwrap())
+        .config({.use_pdl = kUsePDL})
+        .launch(topk_ragged_amax8_kernel<kUsePDL>, params);
+  }
+#endif
 
 #ifdef USE_ROCM  // see the packed kernel above
   /**
