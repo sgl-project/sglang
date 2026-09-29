@@ -511,7 +511,6 @@ from sglang.kernels.spec import KernelSpec
 # Triton / TileLang kernels migrated from srt/layers top-level strays
 # (RFC #29630, Phase 2.5); registered for inventory.
 _PHASE25_KERNELS = [
-    ("gemma4_fused_ops", "gemma4_fused_routing", "triton"),
     ("gemma4_fused_ops", "gemma_qkv_rmsnorm", "triton"),
     ("mhc_head", "fused_hc_head", "triton"),
     ("hy4_ihc", "fused_hy4_ihc_pre", "triton"),
@@ -555,3 +554,29 @@ for _fn in ("fused_dual_residual_rmsnorm", "fused_rmsnorm"):
         )
     )
 del _fn
+
+
+# Public entry points inventoried by logical operator group (RFC #29630).
+register_kernel(
+    KernelSpec(
+        op="layernorm.rmsnorm_hf",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.layernorm.rmsnorm_hf:rmsnorm_hf",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="layernorm.grouped_gemma_rmsnorm",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm:grouped_gemma_rmsnorm",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="layernorm.rms_normalize_triton",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.layernorm.rms_normalize_hip:rms_normalize_triton",
+    )
+)

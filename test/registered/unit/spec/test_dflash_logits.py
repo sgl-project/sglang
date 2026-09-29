@@ -272,7 +272,8 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
     assert worker.draft_model.lm_head is None
 
 
-def test_worker_skips_graph_folded_sampler_above_capture_limit():
+@pytest.mark.parametrize("sample_route", ["selector", "lilicorr"])
+def test_worker_skips_graph_folded_sampler_above_capture_limit(sample_route):
     """A batch above the captured graph limit must use the eager sampler.
 
     max-running-requests can exceed cuda-graph-max-bs-decode.  Such a batch is
@@ -286,7 +287,11 @@ def test_worker_skips_graph_folded_sampler_above_capture_limit():
         max_bs=8,
         stage_sampling_params=lambda **kwargs: staged.append(kwargs),
     )
-    worker = SimpleNamespace(_draft_sampler=sampler, selector=object())
+    worker = SimpleNamespace(
+        _draft_sampler=sampler,
+        selector=object() if sample_route == "selector" else None,
+        lilicorr=object() if sample_route == "lilicorr" else None,
+    )
     batch = SimpleNamespace(sampling_info=object())
 
     assert worker_mod.DFlashWorkerV2._prepare_draft_sampler(worker, batch=batch, bs=8)
@@ -331,7 +336,7 @@ def test_worker_checks_real_draft_sampler_capacity(sampler_kind, bs):
             candidate_pool_size=0,
         )
 
-    worker = SimpleNamespace(_draft_sampler=sampler, selector=selector)
+    worker = SimpleNamespace(_draft_sampler=sampler, selector=selector, lilicorr=None)
     batch = SimpleNamespace(
         sampling_info=SimpleNamespace(
             top_ks=torch.ones(bs, dtype=torch.int32),
@@ -354,6 +359,83 @@ def test_worker_without_graph_folded_sampler_stays_eager():
     assert not worker_mod.DFlashWorkerV2._prepare_draft_sampler(
         worker, batch=SimpleNamespace(sampling_info=None), bs=9
     )
+
+
+def test_worker_stages_lilicorr_sampling_only_within_capture_limit():
+    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+    from sglang.srt.speculative.lilicorr_utils import LiLiCorrDraftSampler
+
+    class Head(torch.nn.Module):
+        candidate_topk = 2
+
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(4))
+
+        def build_token_table(self, embed_tokens):
+            return None
+
+    sampler = LiLiCorrDraftSampler(
+        head=Head(),
+        embed_tokens=None,
+        lm_head=None,
+        block_size=4,
+        max_bs=8,
+        anchor_features=4,
+        sampling_enabled=True,
+    )
+    worker = SimpleNamespace(_draft_sampler=sampler, selector=None, lilicorr=object())
+    batch = SimpleNamespace(
+        sampling_info=SimpleNamespace(
+            top_ks=torch.full((8,), 4),
+            temperatures=torch.full((8, 1), 0.7),
+        )
+    )
+
+    assert worker_mod.DFlashWorkerV2._prepare_draft_sampler(worker, batch=batch, bs=8)
+    torch.testing.assert_close(sampler.temperatures, torch.full((8,), 0.7))
+    assert not sampler.greedy_mask.any()
+
+    larger_batch = SimpleNamespace(
+        sampling_info=SimpleNamespace(
+            top_ks=torch.full((9,), 4),
+            temperatures=torch.full((9, 1), 0.4),
+        )
+    )
+    assert not worker_mod.DFlashWorkerV2._prepare_draft_sampler(
+        worker, batch=larger_batch, bs=9
+    )
+    torch.testing.assert_close(sampler.temperatures, torch.full((8,), 0.7))
+    assert not sampler.greedy_mask.any()
+
+
+def test_lilicorr_sampling_falls_back_when_the_device_cannot_accept_it(monkeypatch):
+    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+
+    warnings = []
+    monkeypatch.setattr(
+        worker_mod.logger, "warning", lambda *args: warnings.append(args)
+    )
+    monkeypatch.setattr(
+        worker_mod, "is_dflash_sampling_verify_available", lambda: False
+    )
+    worker = SimpleNamespace(
+        selector=None,
+        lilicorr=object(),
+        _lilicorr_sampling_enabled=False,
+        _warned_sampling_fallback=False,
+        model_runner=SimpleNamespace(tp_rank=0),
+    )
+    batch = SimpleNamespace(sampling_info=SimpleNamespace(is_all_greedy=False))
+
+    worker_mod.DFlashWorkerV2._validate_phase1_sampling_support(worker, batch)
+    assert worker._warned_sampling_fallback
+    assert len(warnings) == 1
+
+    worker._lilicorr_sampling_enabled = True
+    worker._warned_sampling_fallback = False
+    worker_mod.DFlashWorkerV2._validate_phase1_sampling_support(worker, batch)
+    assert len(warnings) == 1
 
 
 def test_worker_warns_once_when_selector_sampling_is_disabled(monkeypatch):
