@@ -26,7 +26,6 @@ from sglang.test.test_utils import (
 register_npu_ci(
     est_time=400,
     suite="base-b-test-4-npu-a3",
-    disabled="Temporarily disable this test case due to DTS2026091464350",
 )
 register_npu_ci(est_time=2400, suite="nightly-4-npu-a3", nightly=True)
 

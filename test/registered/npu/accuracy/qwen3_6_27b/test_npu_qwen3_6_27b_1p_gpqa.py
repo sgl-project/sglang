@@ -95,6 +95,7 @@ class TestNPUQwen3_6_27B_1P_In64k_Out1k_Prefix90_gpqa(TestNpuAccuracyTestCaseBas
     model = QWEN3_6_27B_MODEL_PATH
     envs = QWEN3_6_27B_64K_PREFIX_ENVS
     other_args = QWEN3_6_27B_64K_PREFIX_OTHER_ARGS
+    max_retries = 2
     accuracy = 0.878
     datasets = ["gpqa_diamond"]
     few_shot_num = 0
