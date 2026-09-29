@@ -7,6 +7,11 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import (
     _validate_gluon_quant_method,
 )
 from sglang.srt.layers.moe.gluon_backend import GluonMoeBackend
+from sglang.srt.layers.moe.gluon_backend import (
+    bind_gluon_moe_backend,
+    forward_gluon_moe,
+    prepare_gluon_moe_weights,
+)
 from sglang.srt.models import deepseek_v2
 from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -21,6 +26,9 @@ class _Backend(GluonMoeBackend):
 
     def bind(self, layer, experts):
         self.bound = True
+
+    def prepare_weights(self):
+        self.prepared = True
 
     def forward(self, hidden_states, **kwargs):
         if self.result is None:
@@ -43,12 +51,15 @@ def _moe_shell() -> DeepseekV2MoE:
 
 def test_gluon_backend_is_strict_and_uses_native_finalize(monkeypatch):
     moe = _moe_shell()
-    monkeypatch.setattr(deepseek_v2, "get_moe_runner_backend", lambda: _Gluon())
+    monkeypatch.setattr(
+        "sglang.srt.layers.moe.utils.get_moe_runner_backend", lambda: _Gluon()
+    )
     monkeypatch.setattr(deepseek_v2, "post_experts_all_reduce", lambda value: value + 3)
     backend = _Backend()
 
-    moe.bind_gluon_moe_backend(backend)
-    output = moe.forward_normal(torch.zeros((2, 4), dtype=torch.bfloat16))
+    bind_gluon_moe_backend(moe, backend)
+    output = forward_gluon_moe(moe, torch.zeros((2, 4), dtype=torch.bfloat16))
+    output = moe._finalize_normal_output(output, None)
 
     assert backend.bound
     torch.testing.assert_close(output, torch.full_like(output, 5))
@@ -56,15 +67,19 @@ def test_gluon_backend_is_strict_and_uses_native_finalize(monkeypatch):
 
 def test_gluon_backend_missing_implementation_raises(monkeypatch):
     moe = _moe_shell()
-    monkeypatch.setattr(deepseek_v2, "get_moe_runner_backend", lambda: _Gluon())
+    monkeypatch.setattr(
+        "sglang.srt.layers.moe.utils.get_moe_runner_backend", lambda: _Gluon()
+    )
 
     with pytest.raises(RuntimeError, match="no Gluon implementation was bound"):
-        moe.forward_normal(torch.zeros((2, 4), dtype=torch.bfloat16))
+        forward_gluon_moe(moe, torch.zeros((2, 4), dtype=torch.bfloat16))
 
 
 def test_gluon_backend_is_selected_before_other_forward_paths(monkeypatch):
     moe = _moe_shell()
-    monkeypatch.setattr(deepseek_v2, "get_moe_runner_backend", lambda: _Gluon())
+    monkeypatch.setattr(
+        "sglang.srt.layers.moe.utils.get_moe_runner_backend", lambda: _Gluon()
+    )
 
     def reject_mega_moe(*_args, **_kwargs):
         raise AssertionError("MegaMoE selection must not run for Gluon")
@@ -80,11 +95,56 @@ def test_gluon_backend_is_selected_before_other_forward_paths(monkeypatch):
 
 def test_gluon_backend_rejects_invalid_output(monkeypatch):
     moe = _moe_shell()
-    monkeypatch.setattr(deepseek_v2, "get_moe_runner_backend", lambda: _Gluon())
-    moe.bind_gluon_moe_backend(_Backend(lambda value: value[:, :2]))
+    monkeypatch.setattr(
+        "sglang.srt.layers.moe.utils.get_moe_runner_backend", lambda: _Gluon()
+    )
+    bind_gluon_moe_backend(moe, _Backend(lambda value: value[:, :2]))
 
     with pytest.raises(RuntimeError, match="must match the input tensor contract"):
-        moe.forward_normal(torch.zeros((2, 4), dtype=torch.bfloat16))
+        forward_gluon_moe(moe, torch.zeros((2, 4), dtype=torch.bfloat16))
+
+
+def test_gluon_weights_are_prepared_by_post_load_hook():
+    backend = _Backend()
+    experts = SimpleNamespace(_gluon_moe_backend=backend)
+
+    prepare_gluon_moe_weights(experts)
+
+    assert backend.prepared
+
+
+def test_quark_post_load_invokes_gluon_prepare(monkeypatch):
+    from sglang.srt.layers.quantization.quark.schemes import (
+        quark_w4a4_mxfp4_moe as quark_moe,
+    )
+
+    monkeypatch.setattr(quark_moe, "_is_gfx1250", False)
+    monkeypatch.setattr(quark_moe, "_is_shuffle_moe_mxfp4", False)
+    monkeypatch.setattr(quark_moe, "e8m0_shuffle", lambda value: value)
+    scheme = object.__new__(quark_moe.QuarkW4A4MXFp4MoE)
+    scheme._owns_moe_weight_layout = True
+    scheme.is_checkpoint_mxfp4_serialized = True
+    scheme.dequantization_config = None
+    backend = _Backend()
+    layer = SimpleNamespace(
+        w13_weight=torch.nn.Parameter(
+            torch.zeros((1, 16, 16), dtype=torch.uint8), requires_grad=False
+        ),
+        w2_weight=torch.nn.Parameter(
+            torch.zeros((1, 16, 16), dtype=torch.uint8), requires_grad=False
+        ),
+        w13_weight_scale=torch.nn.Parameter(
+            torch.zeros((1, 16, 8), dtype=torch.uint8), requires_grad=False
+        ),
+        w2_weight_scale=torch.nn.Parameter(
+            torch.zeros((1, 16, 8), dtype=torch.uint8), requires_grad=False
+        ),
+        _gluon_moe_backend=backend,
+    )
+
+    scheme.process_weights_after_loading(layer)
+
+    assert backend.prepared
 
 
 class _Gluon:
@@ -97,11 +157,55 @@ class _Gluon:
         return False
 
 
-def test_gluon_keeps_shared_experts_out_of_generic_fusion(monkeypatch):
+def test_gluon_ep1_reuses_generic_shared_expert_fusion(monkeypatch):
     model = deepseek_v2.DeepseekV2ForCausalLM.__new__(deepseek_v2.DeepseekV2ForCausalLM)
     model.config = SimpleNamespace(n_shared_experts=1)
     monkeypatch.setattr(deepseek_v2, "is_shared_experts_fusion_disabled", lambda: False)
     monkeypatch.setattr(deepseek_v2, "get_moe_runner_backend", lambda: _Gluon())
+    monkeypatch.setattr(
+        deepseek_v2, "get_parallel", lambda: SimpleNamespace(moe_ep_size=1)
+    )
+
+    model.determine_num_fused_shared_experts()
+
+    assert model.num_fused_shared_experts == 1
+
+
+def test_gluon_ep1_honors_disable_shared_experts_fusion(monkeypatch):
+    model = deepseek_v2.DeepseekV2ForCausalLM.__new__(deepseek_v2.DeepseekV2ForCausalLM)
+    model.config = SimpleNamespace(n_shared_experts=1)
+    monkeypatch.setattr(deepseek_v2, "is_shared_experts_fusion_disabled", lambda: True)
+    monkeypatch.setattr(deepseek_v2, "get_moe_runner_backend", lambda: _Gluon())
+    monkeypatch.setattr(
+        deepseek_v2, "get_parallel", lambda: SimpleNamespace(moe_ep_size=1)
+    )
+
+    model.determine_num_fused_shared_experts()
+
+    assert model.num_fused_shared_experts == 0
+
+
+def test_gluon_ep_keeps_shared_expert_native(monkeypatch):
+    model = deepseek_v2.DeepseekV2ForCausalLM.__new__(deepseek_v2.DeepseekV2ForCausalLM)
+    model.config = SimpleNamespace(n_shared_experts=1)
+    monkeypatch.setattr(deepseek_v2, "is_shared_experts_fusion_disabled", lambda: False)
+    monkeypatch.setattr(deepseek_v2, "get_moe_runner_backend", lambda: _Gluon())
+    monkeypatch.setattr(
+        deepseek_v2, "get_parallel", lambda: SimpleNamespace(moe_ep_size=4)
+    )
+
+    model.determine_num_fused_shared_experts()
+
+    assert model.num_fused_shared_experts == 0
+
+
+def test_gluon_glm_nextn_pins_shared_expert_native(monkeypatch):
+    from sglang.srt.models import glm4_moe
+
+    model = glm4_moe.GlmMoeDsaForCausalLMNextN.__new__(
+        glm4_moe.GlmMoeDsaForCausalLMNextN
+    )
+    monkeypatch.setattr(glm4_moe, "get_moe_runner_backend", lambda: _Gluon())
 
     model.determine_num_fused_shared_experts()
 
@@ -246,7 +350,7 @@ def _glm_backend_shell(monkeypatch, total_tp=8, ep_size=1, ep_rank=0, is_nextn=F
         is_nextn=is_nextn,
         _enable_a2a_moe=False,
         alt_stream=None,
-        num_fused_shared_experts=0,
+        num_fused_shared_experts=int(ep_size == 1 and not is_nextn),
         _fuse_shared_experts_inside_sbo=False,
         _shared_expert_tp1=False,
         shared_experts=object(),
@@ -297,6 +401,31 @@ def test_glm_backend_rejects_fp8_checkpoint(monkeypatch):
 
     with pytest.raises(RuntimeError, match="serialized MXFP4 target"):
         backend.bind(layer, experts)
+
+
+def test_glm_backend_fuses_shared_expert_by_default(monkeypatch):
+    backend, layer, experts = _glm_backend_shell(monkeypatch)
+
+    backend.bind(layer, experts)
+
+    assert backend.fuse_shared_expert
+
+
+def test_glm_backend_honors_disable_shared_experts_fusion(monkeypatch):
+    backend, layer, experts = _glm_backend_shell(monkeypatch)
+    layer.num_fused_shared_experts = 0
+
+    backend.bind(layer, experts)
+
+    assert not backend.fuse_shared_expert
+
+
+def test_glm_backend_rejects_forward_before_post_load_prepare(monkeypatch):
+    backend, layer, experts = _glm_backend_shell(monkeypatch)
+    backend.bind(layer, experts)
+
+    with pytest.raises(RuntimeError, match="not prepared after checkpoint loading"):
+        backend.forward(torch.zeros((1, 6144), dtype=torch.bfloat16))
 
 
 def test_glm_dispatch_covers_tp4_and_tp8_target_and_nextn_ranges():
