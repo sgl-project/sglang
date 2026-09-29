@@ -319,7 +319,7 @@ class GptOssSparseMoeBlock(nn.Module):
         # unpadded slice so the small bf16 router GEMM dimensions stay
         # untouched, while the experts call gets to keep the padded view
         # and skip the duplicate pad inside the MXFP4 method. The output
-        # is then trimmed back to the unpadded width so postprocess_layer
+        # is then trimmed back to the unpadded width so the FFN boundary
         # can pair it with the (M, hidden_dim_unpadded) residual.
         num_tokens = hidden_states.shape[0]
         hidden_dim_unpadded = self.hidden_size

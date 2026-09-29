@@ -48,8 +48,16 @@ class TokenAxis(Enum):
 
 
 class Layout(msgspec.Struct, frozen=True):
-    """The token axes a rank's rows are sharded over. Single-rank axes are left
-    out, so two layouts are equal exactly when every rank holds the same tokens."""
+    """Describe token-row sharding under the active parallel topology.
+
+    Fields:
+        sharded: Axes across which ranks own different token rows. Factories
+            omit size-one axes through sharded_over().
+
+    This describes supported token partitions, not a general device mesh or
+    hidden-dimension placement. Row order and padding come from the batch's
+    shared token mapping, not from per-tensor metadata in this object.
+    """
 
     sharded: FrozenSet[TokenAxis]
 

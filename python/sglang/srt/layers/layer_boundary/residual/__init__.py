@@ -22,7 +22,19 @@ import torch
 
 
 class StageUpdate(Protocol):
-    """How a stage's output is written into the residual."""
+    """Producer-owned operation writing a contribution into the residual.
+
+    Fields:
+        adds_plainly: Whether update is plain addition, permitting compatible
+            add+norm fusion and adding the residual on one rank before a sum.
+        at_producer: Whether the producer writes the residual at its exit rather
+            than leaving the operation for the next prepare.
+        can_defer_across_layers: Whether parameters/state remain valid after
+            leaving the producer layer, including any offload or state reuse.
+
+    The shard conversion methods must move any update-associated state together
+    with the residual. Nonlinear updates must not claim adds_plainly.
+    """
 
     # A plain add, which one rank may run before the sum it adds into
     # completes (the DP partial order, a residual that joins the attention
@@ -36,7 +48,12 @@ class StageUpdate(Protocol):
     can_defer_across_layers: bool
 
     def update(self, hidden_states, residual) -> torch.Tensor:
-        """The residual with the output written into it."""
+        """Write hidden_states, the producer contribution, into residual.
+
+        Implementations define their residual representation and return the updated
+        tensor. Boundary ordering may put a plain add before an eligible sum.
+        This operation does not perform the consumer's normalization.
+        """
 
     def residual_to_attn_tp_shard(self, residual) -> torch.Tensor:
         """This attention-TP rank's slice of the residual, with whatever the
@@ -47,7 +64,18 @@ class StageUpdate(Protocol):
 
 
 class StageRead(Protocol):
-    """How a stage reads its input from the residual."""
+    """Consumer-owned operation deriving compute input from the residual.
+
+    Fields:
+        norms_plainly: Read is normalization/optional quantization without changing
+            the residual, allowing compatible fused add+norm implementations.
+        before_gather: Preserve this read on source rows before a DP gather.
+
+    enter initializes the stack residual. read consumes an already-written
+    residual; update_and_read first applies the actual producer's update.
+    Both reads return (compute_input, residual), preserving their kernel's
+    rounding order rather than normalizing a separately rounded snapshot.
+    """
 
     # The input is the residual's norm, in the quantization the call asks for,
     # and the residual is left as it is: what a fused add + norm kernel computes,
@@ -66,8 +94,19 @@ class StageRead(Protocol):
         quant_format: str = "",
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Tuple:
-        """The input and the residual, from a residual that already holds the
-        previous stage's output."""
+        """Read input from a residual that already includes the producer update.
+
+        Args:
+            residual: Updated residual tensor in this implementation's representation.
+            norm: Consumer normalization module.
+            quant_format: Requested input quantization format, or empty for the
+                read's default format; supported values belong to the implementation.
+            post_residual_addition: Kept for signature parity with update_and_read;
+                current read implementations ignore or reject it.
+
+        Returns:
+            (compute_input, residual), potentially with a quantized input format.
+        """
 
     def update_and_read(
         self,
@@ -78,8 +117,20 @@ class StageRead(Protocol):
         quant_format: str = "",
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Tuple:
-        """Write the previous stage's output into the residual with its
-        producer's ``update``, then read the input."""
+        """Apply a producer update and read input while preserving kernel ordering.
+
+        Args:
+            update: Actual producer's StageUpdate, not a consumer-inferred operation.
+            hidden_states: Producer contribution after required communication.
+            residual: Previous residual, or None at entry where supported.
+            norm: Consumer normalization module.
+            quant_format: Requested input quantization format, as in read().
+            post_residual_addition: Optional extra added after update, before norm.
+
+        Returns:
+            (compute_input, residual). A fused implementation can preserve FP32
+            accumulation through norm without materializing a rounded intermediate.
+        """
 
 
 class LayerResidual(NamedTuple):

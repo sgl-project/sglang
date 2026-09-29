@@ -1,8 +1,9 @@
 """FlashInfer MNNVL CuTe DSL AllReduce fusion, shared across architectures.
 
 Two patterns share one workspace, both consumed at the next layer's input
-RMSNorm: AR + residual + RMSNorm, and the same with the MoE finalize and the
-shared-expert add folded in when the runner hands back a MoeFinalizeHandoff.
+RMSNorm (and, with terminal_finalize, at the final norm): AR + residual +
+RMSNorm, and the same with the MoE finalize and the shared-expert add folded in
+when the runner hands back a MoeFinalizeHandoff.
 """
 
 from __future__ import annotations
@@ -201,7 +202,10 @@ class CuteDSLFusion:
     At the FFN input: the attention output's AR + add + norm. At the FFN exit:
     handing off a deferred MoE finalize with its unfused completion.
     install_cutedsl_fusion supplies the service and producer capability;
-    consumer eligibility is checked only where the output is consumed."""
+    consumer eligibility is checked only where the output is consumed. Producer
+    policy: can_defer_all_reduce keeps a LoRA/TP1 shared-expert sum deferrable
+    while the workspace can take it; can_defer_finalize also covers a terminal
+    FFN when terminal_finalize is installed."""
 
     def __init__(self) -> None:
         self.service: CuteDSLFusionService | None = None
@@ -375,7 +379,10 @@ def install_cutedsl_fusion(
 ) -> CuteDSLFusionService | None:
     """One shared workspace handle per fusion-enabled layer, or None.
 
-    Every entry of ``layers`` carries its attention and FFN stages.
+    Every entry of ``layers`` carries ``attn_boundary`` and ``ffn_boundary``.
+    terminal_finalize lets the last layer hand its finalize to the final norm;
+    the model must then pass the returned service as
+    residual_batch.norm(handoff_norm=...).
     """
     if get_flags().moe.in_speculative_scope:
         # A draft shares the target's process, which holds one workspace.

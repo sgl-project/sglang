@@ -302,7 +302,7 @@ class BaseRunner(ABC):
             # Nothing else resolves the configured backend, so check the platform.
             resolve_flashinfer_allreduce_fusion_backend()
             if not mr.is_draft_worker:
-                # A draft installs no fusion communicator.
+                # A draft installs no CuTe DSL fusion.
                 from sglang.srt.layers.layer_boundary.fusions.cutedsl import (
                     prepare_cutedsl_fusion,
                 )

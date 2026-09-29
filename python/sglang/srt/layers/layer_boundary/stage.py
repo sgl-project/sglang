@@ -46,8 +46,16 @@ if TYPE_CHECKING:
 
 
 class StageBoundary:
-    """One stage of a layer, its attention or its FFN: the boundary into it,
-    run with the stage's norm on the steps the layer chose for the batch."""
+    """Model-facing preparation and completion for one compute stage.
+
+    Args:
+        plan: Precomputed entry/exit paths, this stage's norm and input hooks.
+        declaration: Immutable stage description used to construct related
+            boundaries without exposing this object's execution plan.
+
+    The boundary does not run attention or FFN computation. Per-forward residual
+    state is read from forward_batch.residual_stream, not stored here.
+    """
 
     def __init__(
         self,
@@ -127,6 +135,24 @@ class StageBoundary:
         return self.plan.input_on_attention_tp_slices
 
     def prepare(self, hidden_states, forward_batch, *, cache=None, **call):
+        """Finish the previous contribution and produce this stage's compute input.
+
+        Args:
+            hidden_states: Tensor or opaque owed-output handle belonging to this
+                forward's residual stream. Do not unwrap or modify a partial sum.
+            forward_batch: Batch owning the stream and selecting the prepared path.
+            cache: FFN-only NPU weight cache prefetched on the FFN input path.
+            **call: Attention-only read/adapter options: quant_format,
+                post_residual_addition, captured_last_layer_outputs and capture_output.
+                FFN stages do not accept these options. A capture callback is
+                called as capture_output(value, owned=bool): owned=True means
+                value is fresh storage it may keep, and owned=False means it
+                must copy before retaining.
+
+        Returns:
+            Compute input in the selected read's format (possibly quantized).
+            Updates forward_batch.residual_stream with the resulting residual.
+        """
         if cache is not None:
             call["cache"] = cache
         prepare = (
@@ -153,6 +179,17 @@ class StageBoundary:
         )
 
     def exit(self, forward_batch):
+        """Select and scope one FFN or single-stage mixer's output decision.
+
+        Args:
+            forward_batch: Active batch whose stream receives the compute result.
+
+        Returns:
+            A context manager publishing reduction/finalize flags during compute.
+            Call its finish(output) exactly once after successful compute, including
+            when compute is skipped for an empty input. It completes or carries work
+            using the same decision rather than selecting a second path.
+        """
         result = (
             self.plan.output.ffn_exit(forward_batch, stream=current(forward_batch))
             if self.kind is StageKind.FFN
@@ -163,6 +200,18 @@ class StageBoundary:
         return result
 
     def from_pp(self, tensors, forward_batch, *, allow_missing_residual: bool = False):
+        """Restore the residual stream from a pipeline handoff.
+
+        Args:
+            tensors: PPProxyTensors containing hidden_states and, ordinarily, residual.
+            forward_batch: Batch receiving a new stream.
+            allow_missing_residual: Accept a handoff without the residual key for
+                model paths that explicitly support it.
+
+        Returns:
+            Tensor or owed handle for prepare. A producer-written residual and a
+            declared partial sum are reconstructed from the incoming contract.
+        """
         hidden_states, residual = from_pp(
             tensors,
             residual_in_hidden=(
@@ -181,6 +230,18 @@ class StageBoundary:
         return current(forward_batch).snapshot(hidden_states)
 
     def capture_output(self, hidden_states, forward_batch, *, skip_empty=False):
+        """Capture an output while preserving the caller's reduction timing.
+
+        Args:
+            hidden_states: Current stream output or opaque owed handle.
+            forward_batch: Batch owning that stream.
+            skip_empty: Return no snapshot for a known zero-row output buffer.
+
+        Returns:
+            (updated_handle, snapshot). Dynamic owed work is completed on the main
+            contribution; a declared sum is reduced only on the snapshot copy.
+            Always use updated_handle afterwards. Plain residual updates are required.
+        """
         stream = current(forward_batch)
         if skip_empty:
             storage = buffer(hidden_states)
@@ -191,6 +252,9 @@ class StageBoundary:
         return hidden_states, stream.snapshot(hidden_states)
 
     def postprocess(self, hidden_states, forward_batch):
+        """Move an FFN output that compute already completed outside exit()
+        (the operation-scheduled TBO path) onto the rows the layer hands on;
+        it chooses no reduction step."""
         return self.plan.output.postprocess_layer(
             hidden_states, current(forward_batch), forward_batch
         )

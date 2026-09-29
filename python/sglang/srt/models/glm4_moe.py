@@ -884,7 +884,7 @@ class Glm4MoeDecoderLayer(nn.Module):
         )
 
         # Detect if QKV uses aiter FP8 per-token quant so we can fuse
-        # RMSNorm + FP8 quant into a single kernel in prepare_attn
+        # RMSNorm + FP8 quant into a single kernel in the attention boundary's read
         self.attn_quant_format = ""
         self._detect_attn_quant_format()
 

@@ -399,7 +399,7 @@ def scatter_moe_cp_output(
     forward_batch: ForwardBatch,
     **kwargs,
 ):
-    """Scatter MoE output back to TP_ATTN_FULL after MOE_FULL computation.
+    """Return a MoE output computed on the MoE-CP-gathered rows to this rank's attention rows.
 
     After moe_tensor_model_parallel_all_reduce (which runs unconditionally since
     mlp_reduce_scatter=False for this path), all ranks in the moe_cp group hold the

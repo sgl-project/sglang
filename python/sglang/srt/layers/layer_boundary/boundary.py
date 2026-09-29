@@ -156,11 +156,19 @@ def make_boundary(
     cp_moves: Optional[CpMoves] = None,
     enters_stack: bool = False,
 ) -> Boundary:
-    """Bind only the update capabilities that can reach this edge.
+    """Bind the consumer half of an edge at construction time.
 
-    Execution receives the producer's actual update from the residual stream.
-    A single capability needs no dispatcher; multiple capabilities select one
-    of the already constructed paths at the consumer.
+    Args:
+        edge: Producer/consumer contracts, residual rows and update capabilities.
+        fusions: Ordered candidates for completing a declared sum with the read.
+        carried_fusions: Ordered candidates accepting dynamically carried work.
+        cp_moves: Context-parallel strategy operations for this edge, if needed.
+        enters_stack: Whether the read must initialize the stack's residual.
+
+    Returns:
+        A Boundary whose prepare accepts the actual update from the stream.
+        Multiple update capabilities select among preconstructed paths; a single
+        capability needs no runtime dispatcher.
     """
     capabilities = edge.update_capabilities
     if not capabilities:
@@ -287,10 +295,18 @@ def _bind_consumer(
 def make_output_boundary(
     edge: EdgeDecl, *, cp_moves: Optional[CpMoves] = None
 ) -> Boundary:
-    """The producer's half of ``edge``, out of a layer's last stage onto the
-    rows the layer hands on (``edge.need``), whose consumer runs in the next
-    layer: the postprocess that moves the output there. ``cp_moves`` for an
-    edge that returns across attention CP."""
+    """Bind the producer half of a layer/branch handoff.
+
+    Args:
+        edge: Output contract and destination/residual rows. Deferred updates
+            must outlive the producer; pipeline handoffs require a plain add
+            or a residual already written by the producer.
+        cp_moves: Context-parallel return operations, when the edge needs them.
+
+    Returns:
+        A Boundary with fixed transport or a marker for batch-dependent DP
+        transport. The receiver binds its read independently.
+    """
     update = edge.produced.update
     if not getattr(update, "at_producer", False):
         if not getattr(update, "can_defer_across_layers", False):
