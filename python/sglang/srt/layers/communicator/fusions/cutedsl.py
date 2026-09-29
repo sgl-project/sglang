@@ -16,7 +16,6 @@ import torch
 from sglang.srt.layers.communicator import (
     FusedMlpInput,
     HandoffOutput,
-    LayerCommunicator,
     SumGroup,
     TokenAxis,
     UnreducedOutput,
@@ -196,7 +195,7 @@ class CuteDSLFusionService:
 
 
 class CuteDSLFusion:
-    """One layer's CuTe DSL kernels, given to its LayerCommunicator at
+    """One layer's CuTe DSL kernels, given to its stage at
     construction. At the attention input: the MoE finalize + AR + add + norm of
     a handoff the previous layer left, and the AR + add + norm of a sum it left.
     At the FFN input: the attention output's AR + add + norm. At the FFN exit:
@@ -208,6 +207,7 @@ class CuteDSLFusion:
         self.service: CuteDSLFusionService | None = None
         # Producer capabilities; consumer kernel selection is independent.
         self.hands_off_finalize = False
+        self.terminal_finalize = False
         self.requires_local_reduction = False
 
     def install(
@@ -216,25 +216,27 @@ class CuteDSLFusion:
         *,
         hands_off_finalize: bool,
         output_is_replicated: bool,
+        terminal_finalize: bool = False,
     ) -> None:
         """Install the shared workspace and this producer's capabilities."""
         self.service = service
         self.hands_off_finalize = hands_off_finalize
+        self.terminal_finalize = terminal_finalize
         self.requires_local_reduction = output_is_replicated
 
-    def attention_input(self, layer: LayerCommunicator) -> tuple:
+    def attention_input(self, layer) -> tuple:
         return (
             partial(self._finalize_output_and_update_and_read_residual, layer),
             partial(self._reduce_output_and_update_and_read_residual, layer),
         )
 
-    def ffn_input(self, layer: LayerCommunicator) -> tuple:
+    def ffn_input(self, layer) -> tuple:
         parallel = get_parallel()
         if (
             TokenAxis.ATTN_TP_SCATTER not in layer.input_rows.sharded
             # The workspace sums over TP, which is then the attention-TP group.
             and parallel.attn_tp_size == parallel.tp_size
-            and _fused_norm_gamma(layer.post_attention_layernorm) is not None
+            and _fused_norm_gamma(layer.norm) is not None
         ):
             return (
                 FusedMlpInput(
@@ -255,7 +257,7 @@ class CuteDSLFusion:
         handoff is completed by its producer's own tail."""
         if not isinstance(owed, MoeFinalizeHandoff):
             return None
-        gamma = _fused_norm_gamma(layer.input_layernorm)
+        gamma = _fused_norm_gamma(layer.norm)
         if gamma is None or not self._should_use_finalize(layer, forward_batch, owed.m):
             return None
         if post_residual_addition is not None:
@@ -280,7 +282,7 @@ class CuteDSLFusion:
         return self.service.all_reduce_residual_rms_norm(
             local_contribution=owed.partial,
             residual=residual,
-            gamma=_fused_norm_gamma(layer.input_layernorm),
+            gamma=_fused_norm_gamma(layer.norm),
         )
 
     def _mlp_input_reduce_output_and_update_and_read_residual(
@@ -298,7 +300,7 @@ class CuteDSLFusion:
         return self.service.all_reduce_residual_rms_norm(
             local_contribution=hidden_states,
             residual=residual,
-            gamma=_fused_norm_gamma(layer.post_attention_layernorm),
+            gamma=_fused_norm_gamma(layer.norm),
         )
 
     def _should_use_finalize(self, layer, forward_batch: ForwardBatch, m: int) -> bool:
@@ -313,7 +315,7 @@ class CuteDSLFusion:
         """Incoming, and independent of this layer's own successor."""
         return (
             self._common_eligible(layer, forward_batch, m)
-            and _fused_norm_gamma(layer.input_layernorm) is not None
+            and _fused_norm_gamma(layer.norm) is not None
             and not get_exec().comm.enable_quant_communications
         )
 
@@ -334,7 +336,11 @@ class CuteDSLFusion:
         """Whether this producer can emit a handoff with an unfused fallback."""
         return (
             self.hands_off_finalize
-            and not self.requires_local_reduction
+            and (not layer.is_last_layer or self.terminal_finalize)
+            and (
+                not self.requires_local_reduction
+                or (layer.is_last_layer and self.terminal_finalize)
+            )
             and self._should_use_finalize(
                 layer, forward_batch, int(forward_batch.input_ids.shape[0])
             )
@@ -355,12 +361,12 @@ class CuteDSLFusion:
             and parallel.tp_size > 1
             # The FFN runs on the full rows, not each rank's own slice.
             and TokenAxis.ATTN_TP_SCATTER
-            not in layer.ffn.entry(forward_batch).input_rows.sharded
+            not in layer.fusion_rows(forward_batch).sharded
         )
 
 
 def _fusion_of(layer: torch.nn.Module) -> CuteDSLFusion | None:
-    fusions = getattr(layer.layer_communicator, "fusions", None)
+    fusions = getattr(layer.__dict__.get("ffn_stage"), "fusions", None)
     return fusions if isinstance(fusions, CuteDSLFusion) else None
 
 
@@ -373,10 +379,11 @@ def install_cutedsl_fusion(
     can_defer_finalize: _LayerPredicate,
     requires_local_reduction: _LayerPredicate | None = None,
     label: str,
+    terminal_finalize: bool = False,
 ) -> CuteDSLFusionService | None:
     """One shared workspace handle per fusion-enabled layer, or None.
 
-    Every entry of ``layers`` must carry a ``layer_communicator``.
+    Every entry of ``layers`` carries its attention and FFN stages.
     """
     if get_flags().moe.in_speculative_scope:
         # A draft shares the target's process, which holds one workspace.
@@ -389,8 +396,8 @@ def install_cutedsl_fusion(
     # The workspace compiles one epsilon and cannot see a per-layer one.
     for layer in fusion_layers:
         for norm in (
-            layer.layer_communicator.input_layernorm,
-            layer.layer_communicator.post_attention_layernorm,
+            layer.attn_stage.norm,
+            layer.ffn_stage.norm,
         ):
             if _fused_norm_gamma(norm) is None:
                 continue
@@ -416,6 +423,7 @@ def install_cutedsl_fusion(
         fusion.install(
             service,
             hands_off_finalize=hands_off_finalize,
+            terminal_finalize=terminal_finalize,
             output_is_replicated=requires_local_reduction is not None
             and bool(requires_local_reduction(layer)),
         )
@@ -441,11 +449,9 @@ def prepare_cutedsl_fusion(
     fusions = [
         fusion
         for module in model.modules()
-        # Most modules carry no layer_communicator.
+        # Only decoder modules carry an FFN stage.
         if isinstance(
-            fusion := getattr(
-                module.__dict__.get("layer_communicator"), "fusions", None
-            ),
+            fusion := getattr(module.__dict__.get("ffn_stage"), "fusions", None),
             CuteDSLFusion,
         )
     ]

@@ -10,24 +10,12 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
-from sglang.srt.layers.communicator import (
-    ADD,
-    BoundarySteps,
-    EdgeDecl,
-    LayerCommunicator,
-    Layout,
-    StageEntry,
-    StageInput,
-    StageOutput,
-    make_boundary,
-)
-from sglang.srt.layers.communicator.legacy_stage import StageCommunicator
+from sglang.srt.layers.communicator import ADD
 from sglang.srt.layers.communicator.output import UnreducedOutput
 from sglang.srt.layers.communicator.residual import batch
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
-    PPProxyTensors,
 )
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -41,13 +29,15 @@ class TestBatchOwnedResidual(CustomTestCase):
         fb = SimpleNamespace(residual_stream=None)
         with self.assertRaisesRegex(RuntimeError, "start"):
             batch.current(fb)
-        old = batch.start(fb)
+        batch.start(fb)
+        old = batch.current(fb)
         self.assertIs(old, batch.current(fb))
         value = torch.ones(2, 4)
         ref = weakref.ref(value)
         old.write(value)
         del value, old
-        fresh = batch.start(fb)
+        batch.start(fb)
+        fresh = batch.current(fb)
         self.assertIs(fresh, batch.current(fb))
         self.assertIsNone(fresh.pending)
         self.assertIsNone(fresh.residual)
@@ -55,41 +45,31 @@ class TestBatchOwnedResidual(CustomTestCase):
 
     def test_terminal_completion_releases_batch_before_final_norm(self):
         fb = SimpleNamespace(residual_stream=None)
-        stream = batch.start(fb)
+        batch.start(fb)
+        stream = batch.current(fb)
         residual = torch.full((2, 4), 3.0)
         partial = torch.ones(2, 4)
         group = SimpleNamespace(all_reduce=Mock(side_effect=lambda x: x * 2))
         stream.write(residual)
         hidden = stream.leave(UnreducedOutput(partial, group=group), ADD)
-        complete, residual_value = LayerCommunicator.finish_layer_stack(
-            hidden, stream, fb
-        )
+        result = batch.norm(hidden, fb, lambda value, prior: (value + prior, prior))
         self.assertIsNone(fb.residual_stream)
-        self.assertIs(residual_value, residual)
         group.all_reduce.assert_called_once()
-        torch.testing.assert_close(complete + residual_value, torch.full((2, 4), 5.0))
+        torch.testing.assert_close(result, torch.full((2, 4), 5.0))
         with self.assertRaisesRegex(RuntimeError, "start"):
             batch.current(fb)
 
-    def test_pp_receive_attaches_and_export_releases_the_same_stream(self):
-        communicator = LayerCommunicator.__new__(LayerCommunicator)
-        communicator._batch_steps = lambda fb: SimpleNamespace(
-            attention=SimpleNamespace(input_sum=None), ffn=None
-        )
+    def test_pp_export_releases_the_batch_owner(self):
         fb = SimpleNamespace(residual_stream=None)
+        batch.start(fb)
         hidden = torch.full((2, 4), 2.0)
         residual = torch.ones(2, 4)
-        received, stream = communicator.from_pp(
-            PPProxyTensors({"hidden_states": hidden, "residual": residual}), fb
-        )
-        self.assertIs(stream, batch.current(fb))
-        self.assertIs(stream.pending.value, received)
-        self.assertIs(stream.pending.update, ADD)
-        exported, exported_residual = communicator.finish_layer_stack(
-            received, stream, fb
-        )
-        self.assertIs(exported, hidden)
-        self.assertIs(exported_residual, residual)
+        stream = batch.current(fb)
+        stream.write(residual)
+        output = stream.leave(hidden, ADD)
+        proxy = batch.to_pp(output, fb)
+        self.assertIs(proxy["hidden_states"], hidden)
+        self.assertIs(proxy["residual"], residual)
         self.assertIsNone(fb.residual_stream)
 
     def test_tbo_metadata_and_reused_batch_remain_stream_free_between_calls(self):
@@ -127,10 +107,11 @@ class TestBatchOwnedResidual(CustomTestCase):
                     for start in (0, 2)
                 ]
             self.assertTrue(all(child.residual_stream is None for child in children))
-            owner = batch.start(parent)
+            batch.start(parent)
+            owner = batch.current(parent)
             self.assertTrue(all(child.residual_stream is None for child in children))
             hidden = owner.write(torch.ones(size, 4))
-            LayerCommunicator.finish_layer_stack(hidden, owner, parent)
+            batch.norm(hidden, parent, lambda value: value)
             cloned = replace(parent)
             self.assertIsNone(cloned.residual_stream)
             self.assertIsNone(parent.residual_stream)
@@ -172,19 +153,14 @@ class TestBatchOwnedResidual(CustomTestCase):
         group = SimpleNamespace(all_reduce=Mock(side_effect=lambda x: x * 2))
 
         class Layer:
-            layer_communicator = LayerCommunicator.__new__(LayerCommunicator)
-
-            def __call__(self, positions, hidden, forward_batch, *legacy_residual):
+            def __call__(self, positions, hidden, forward_batch, **kwargs):
                 stream = batch.current(forward_batch)
-                if legacy_residual:
-                    self_outer.assertIs(legacy_residual[0], stream)
                 owner_ids.append(id(stream))
                 hidden, old = stream.finish(hidden)
                 stream.write(hidden if old is None else hidden + old)
-                result = stream.leave(
+                return stream.leave(
                     UnreducedOutput(torch.ones_like(hidden), group=group), ADD
                 )
-                return (result, stream) if legacy_residual else result
 
         self_outer = self
         fb = SimpleNamespace(
@@ -252,51 +228,6 @@ class TestBatchOwnedResidual(CustomTestCase):
             batch.take_output(value.clone(), fb)
         self.assertIs(batch.take_output(value, fb), value)
         self.assertIsNone(fb.residual_stream)
-
-    def test_interleaved_stages_share_only_their_own_batch_stream(self):
-        class Read:
-            norms_plainly = False
-
-            def enter(self, value):
-                return value
-
-            def read(self, value, norm, quant_format="", **kwargs):
-                return value * 2, value
-
-            def update_and_read(self, update, value, residual, norm, **kwargs):
-                updated = update.update(value, residual)
-                return updated * 2, updated
-
-        rows = Layout(frozenset())
-        boundary = make_boundary(
-            EdgeDecl(StageOutput(rows), StageInput(rows, read=Read()), rows, rows)
-        )
-        steps = BoundarySteps(
-            StageEntry(boundary.prepare, rows), None, StageOutput(rows), None, False
-        )
-        stage = StageCommunicator(
-            SimpleNamespace(input_layernorm=None),
-            "attention",
-            "input_layernorm",
-        )
-        a, b = [SimpleNamespace(residual_stream=None) for _ in range(2)]
-        sa, sb = batch.start(a), batch.start(b)
-        first, first_alias = stage._prepare(torch.ones(2, 4), sa, a, steps)
-        second, second_alias = stage._prepare(torch.full((2, 4), 10.0), sb, b, steps)
-        self.assertIs(first_alias, batch.current(a))
-        self.assertIs(second_alias, batch.current(b))
-        first = sa.leave(first * 3, ADD)
-        second = sb.leave(second * 5, ADD)
-        torch.testing.assert_close(
-            stage._prepare(first, sa, a, steps)[0], torch.full((2, 4), 14.0)
-        )
-        torch.testing.assert_close(
-            stage._prepare(second, sb, b, steps)[0], torch.full((2, 4), 220.0)
-        )
-        self.assertIsNot(batch.current(a), batch.current(b))
-        batch.start(a)
-        self.assertIsNone(batch.current(a).residual)
-        self.assertIsNotNone(batch.current(b).residual)
 
 
 if __name__ == "__main__":

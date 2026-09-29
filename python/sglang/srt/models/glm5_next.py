@@ -2,7 +2,7 @@ import logging
 from array import array
 from contextlib import nullcontext
 from functools import partial
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -13,7 +13,7 @@ from sglang.kernels.ops.layernorm.mhc import hc_contract
 from sglang.kernels.ops.layernorm.mhc import hc_post as _hc_post_fn
 from sglang.kernels.ops.layernorm.mhc import hc_pre as _hc_pre_fn
 from sglang.srt.batch_overlap.two_batch_overlap import (
-    model_forward_maybe_tbo,
+    model_forward_stages,
 )
 from sglang.srt.configs.glm5_next import Glm5NextConfig, Glm5NextTextConfig
 from sglang.srt.configs.model_config import is_deepseek_dsa
@@ -27,12 +27,15 @@ from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.communicator import (
-    LayerCommunicator,
-    LayerFacts,
-    MHCLayerCommunicator,
+    PLAIN_RESIDUAL,
+    MHCState,
+    declare_attn,
+    declare_ffn,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
+    make_stages,
 )
+from sglang.srt.layers.communicator.residual import access as residual_access
 from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -727,14 +730,6 @@ class Glm5NextDecoderLayer(nn.Module):
         is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
         is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
 
-        self.layer_facts = LayerFacts.init_new(
-            layer_id=layer_id,
-            num_layers=1 if is_nextn else config.num_hidden_layers,
-            is_layer_sparse=self.is_layer_sparse,
-            is_previous_layer_sparse=is_previous_layer_sparse,
-            is_next_layer_sparse=is_next_layer_sparse,
-        )
-
         if self.is_layer_sparse:
             self.mlp = Glm5NextMoE(
                 config=config,
@@ -784,36 +779,52 @@ class Glm5NextDecoderLayer(nn.Module):
                 torch.empty(mix_hc, hc_dim, dtype=torch.float32)
             )
 
-        shared_kwargs: Dict[str, Any] = dict(
-            layer_facts=self.layer_facts,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
-            qkv_latent_func=(
-                self.self_attn.prepare_qkv_latent if not self.is_linear_attn else None
-            ),
-        )
-
+        terminal = layer_id == (1 if is_nextn else config.num_hidden_layers) - 1
+        residual = PLAIN_RESIDUAL
         if self.config.mhc:
-            mhc_kwargs: Dict[str, Any] = dict(
+            residual = MHCState(
                 hc_mult=config.hc_mult,
                 hc_attn_pre=self.hc_attn_pre,
                 hc_ffn_pre=self.hc_ffn_pre,
                 hc_post=self.hc_post,
-                # Resolved once: env and platform are frozen after startup,
-                # and None keeps the dispatch off the per-boundary path.
                 hc_ffn_post_pre=(
                     self.hc_ffn_post_pre
                     if is_cross_layer_mhc_fusion_enabled()
                     else None
                 ),
+                is_last_layer=terminal,
+            ).layer_residual()
+        self.attn_stage, self.ffn_stage = make_stages(
+            (
+                declare_attn(
+                    read=residual.attention_read, update=residual.attention_update
+                ),
+                self.input_layernorm,
+                {
+                    "residual_in_hidden": residual.ffn_update.at_producer,
+                    "qkv_latent_func": self.self_attn.prepare_qkv_latent
+                    if not self.is_linear_attn
+                    else None,
+                },
+            ),
+            (
+                declare_ffn(
+                    sparse=self.is_layer_sparse,
+                    next_sparse=is_next_layer_sparse,
+                    read=residual.ffn_read,
+                    update=residual.ffn_update,
+                ),
+                self.post_attention_layernorm,
+            ),
+            previous=declare_ffn(
+                sparse=is_previous_layer_sparse,
+                next_sparse=self.is_layer_sparse,
+                update=residual.ffn_update,
             )
-            self.layer_communicator = MHCLayerCommunicator(
-                **shared_kwargs,
-                **mhc_kwargs,
-            )
-        else:
-            self.layer_communicator = LayerCommunicator(**shared_kwargs)
+            if layer_id != 0
+            else None,
+            terminal=terminal,
+        )
 
     def _hc_pre(
         self, hc_fn, hc_scale, hc_base, hidden_states, out_norm_weight, out_norm_eps
@@ -915,21 +926,15 @@ class Glm5NextDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
         zero_allocator: Optional[BumpAllocator] = None,
         gemm_output_zero_allocator: BumpAllocator = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
         capture_output=None,
     ):
-        hidden_states_orig = self.layer_communicator.buffer(hidden_states)
+        hidden_states_orig = residual_access.buffer(hidden_states)
 
-        hidden_states, residual = (
-            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
-                hidden_states,
-                residual,
-                forward_batch,
-                capture_output=capture_output,
-            )
+        hidden_states = self.attn_stage.prepare(
+            hidden_states, forward_batch, capture_output=capture_output
         )
 
         hidden_states = self.self_attn(
@@ -937,9 +942,7 @@ class Glm5NextDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
-            input_on_attention_tp_slices=(
-                self.layer_communicator.input_on_attention_tp_slices
-            ),
+            input_on_attention_tp_slices=(self.attn_stage.input_on_attention_tp_slices),
             prev_topk_indices=prev_topk_indices,
         )
         if isinstance(hidden_states, tuple):
@@ -948,11 +951,8 @@ class Glm5NextDecoderLayer(nn.Module):
             topk_indices = None
         get_attn_tp_context().clear_attn_inputs()
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states,
-            residual,
-            forward_batch,
-        )
+        hidden_states = self.attn_stage.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_stage.prepare(hidden_states, forward_batch)
 
         if isinstance(self.mlp, Glm5NextMLP):
             gemm_output_zero_allocator = None
@@ -968,15 +968,15 @@ class Glm5NextDecoderLayer(nn.Module):
         else:
             _mlp_ctx = nullcontext()
 
-        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit, _mlp_ctx:
+        with self.ffn_stage.exit(forward_batch) as ffn_exit, _mlp_ctx:
             hidden_states = self.mlp(
                 hidden_states,
                 forward_batch,
                 gemm_output_zero_allocator,
             )
-        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
+        hidden_states = ffn_exit.finish(hidden_states)
 
-        return hidden_states, residual, topk_indices
+        return (hidden_states, topk_indices)
 
 
 class Glm5NextModel(nn.Module):
@@ -1106,12 +1106,12 @@ class Glm5NextModel(nn.Module):
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
-            residual = residual_batch.start(forward_batch)
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states, residual = self.layers[
-                self.start_layer
-            ].layer_communicator.from_pp(pp_proxy_tensors, forward_batch)
+            hidden_states = self.layers[self.start_layer].attn_stage.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
         device = hidden_states.device
         zero_allocator = BumpAllocator(
             buffer_size=total_num_layers * 2 * (2 if forward_batch.can_run_tbo else 1),
@@ -1165,11 +1165,10 @@ class Glm5NextModel(nn.Module):
                     aux_hidden_states.capture(aux_hidden_state, owned=owned)
 
                 layer = self.layers[i]
-                hidden_states, residual, topk_indices = layer(
+                (hidden_states, topk_indices) = layer(
                     positions,
                     hidden_states,
                     forward_batch,
-                    residual,
                     zero_allocator,
                     gemm_output_zero_allocator,
                     prev_topk_indices=topk_indices,
@@ -1179,38 +1178,25 @@ class Glm5NextModel(nn.Module):
                 )
 
         if normal_end_layer != self.end_layer:
-            hidden_states, residual = model_forward_maybe_tbo(
+            hidden_states = model_forward_stages(
                 layers=self.layers[normal_end_layer : self.end_layer],
                 enable_tbo=True,
                 positions=positions,
                 forward_batch=forward_batch,
                 hidden_states=hidden_states,
-                residual=residual,
                 zero_allocator=zero_allocator,
             )
 
-        last_layer = self.layers[self.end_layer - 1]
-        hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
-            hidden_states,
-            residual,
-            forward_batch,
-            preserve_declared=not self.pp_group.is_last_rank,
-        )
         if not self.pp_group.is_last_rank:
             if self.config.mhc:
                 return PPProxyTensors({"hidden_states": hidden_states})
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
+            return residual_batch.to_pp(hidden_states, forward_batch)
         else:
+            hidden_states = residual_batch.finish(hidden_states, forward_batch)
             if not forward_batch.forward_mode.is_idle():
-                if residual is None:
-                    hidden_states = self.norm(hidden_states)
-                else:
-                    hidden_states, _ = self.norm(hidden_states, residual)
+                hidden_states = residual_batch.norm(
+                    hidden_states, forward_batch, self.norm
+                )
 
         if len(aux_hidden_states) == 0:
             return hidden_states

@@ -96,12 +96,12 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
-            residual = residual_batch.start(forward_batch)
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states, residual = self.layers[
-                self.start_layer
-            ].layer_communicator.from_pp(pp_proxy_tensors, forward_batch)
+            hidden_states = self.layers[self.start_layer].attn_stage.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
 
         aux_hidden_states = AuxHiddenStateList()
         for layer_idx, layer in enumerate(
@@ -116,11 +116,10 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
                 deepstack_embeds = self.get_deepstack_embeds(
                     layer_idx - 1, input_deepstack_embeds
                 )
-                hidden_states, residual = layer(
+                hidden_states = layer(
                     positions,
                     hidden_states,
                     forward_batch,
-                    residual,
                     post_residual_addition=deepstack_embeds,
                     capture_output=aux_hidden_states.capture
                     if layer_idx in self.layers_to_capture
@@ -129,11 +128,10 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
             else:
                 # Inference path: add deepstack directly to hidden_states at the end of the layer
                 # (original, grounding-correct order).
-                hidden_states, residual = layer(
+                hidden_states = layer(
                     positions,
                     hidden_states,
                     forward_batch,
-                    residual,
                     capture_output=aux_hidden_states.capture
                     if layer_idx in self.layers_to_capture
                     else None,
@@ -143,9 +141,9 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
                     and layer_idx in self.deepstack_embed_to_decoder_layer
                 ):
                     sep = self.hidden_size * layer_idx
-                    hidden_states, residual = layer.layer_communicator.add_to_output(
+                    hidden_states = residual_batch.add_to_output(
                         hidden_states,
-                        residual,
+                        forward_batch,
                         input_deepstack_embeds[:, sep : sep + self.hidden_size],
                     )
 
@@ -156,28 +154,17 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
             else None
         )
 
-        last_layer = self.layers[self.end_layer - 1]
-        hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
-            hidden_states,
-            residual,
-            forward_batch,
-            preserve_declared=not self.pp_group.is_last_rank,
-        )
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
+            return residual_batch.to_pp(hidden_states, forward_batch)
         else:
+            hidden_states = residual_batch.finish(hidden_states, forward_batch)
             if hidden_states.shape[0] != 0:
-                if residual is None:
-                    hidden_states = self.norm(hidden_states)
-                else:
-                    hidden_states, _ = self.norm(
-                        hidden_states, residual, post_residual_addition=last_deepstack
-                    )
+                hidden_states = residual_batch.norm(
+                    hidden_states,
+                    forward_batch,
+                    self.norm,
+                    post_residual_addition=last_deepstack,
+                )
 
         if len(aux_hidden_states) == 0:
             return hidden_states

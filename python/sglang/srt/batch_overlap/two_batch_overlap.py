@@ -18,6 +18,7 @@ from sglang.srt.layers.communicator import (
     Layout,
     tbo_split_moves,
 )
+from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.layers.communicator.residual.access import finish_layer_stack
 from sglang.srt.layers.communicator.residual.stream import ResidualStream
 from sglang.srt.layers.moe import (
@@ -928,6 +929,67 @@ def _compute_extend_num_tokens(input_ids, forward_mode: ForwardMode):
 
 
 # -------------------------------- Execution ---------------------------------------
+
+
+def model_forward_stages(
+    layers,
+    enable_tbo: bool,
+    positions: torch.Tensor,
+    forward_batch: ForwardBatch,
+    hidden_states: torch.Tensor,
+    zero_allocator: Optional[BumpAllocator] = None,
+):
+    """Run stage operations with an independent residual stream per microbatch."""
+    strategy = OperationsStrategy.init_new_tbo(
+        layers, forward_batch.global_forward_mode
+    )
+    inputs = dict(
+        positions=positions,
+        hidden_states=hidden_states,
+        forward_batch=forward_batch,
+        zero_allocator=zero_allocator,
+    )
+    if not enable_tbo:
+        return execute_operations(inputs, strategy.operations)["hidden_states"]
+
+    stream = residual_batch.current(forward_batch)
+    pending = stream.pending
+    hidden_states, residual = stream.finish(hidden_states)
+    inputs["hidden_states"] = hidden_states
+    parts = _model_forward_tbo_split_inputs(
+        **inputs, residual=residual, layer_input_rows=layers[0].attn_stage.input_rows
+    )
+    for part in parts:
+        part["hidden_states"], child_stream = ResidualStream.arrive(
+            part["hidden_states"],
+            part.pop("residual"),
+            pending.update if pending is not None else None,
+        )
+        part["forward_batch"].residual_stream = child_stream
+
+    original_len = hidden_states.shape[0]
+    forward_batch.residual_stream = None
+    del inputs, pending, stream, hidden_states, residual
+
+    context = (
+        empty_context()
+        if _is_hip
+        else deep_gemm_wrapper.configure_deep_gemm_num_sms(strategy.deep_gemm_num_sms)
+    )
+    with context:
+        outputs = execute_overlapped_operations(
+            inputs_arr=parts,
+            operations_arr=[strategy.operations] * 2,
+            delta_stages=[0, strategy.tbo_delta_stages],
+        )
+    for output in outputs:
+        output["residual"] = residual_batch.current(output["forward_batch"])
+    hidden_states, forward_batch.residual_stream = _model_forward_tbo_merge_outputs(
+        *outputs, original_len
+    )
+    for output in outputs:
+        output["forward_batch"].residual_stream = None
+    return hidden_states
 
 
 def model_forward_maybe_tbo(

@@ -1,7 +1,8 @@
 import itertools
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import torch
 
@@ -10,15 +11,12 @@ from sglang.srt.layers.communicator import (
     NORM_QUANT_READ,
     NORM_READ,
     Layout,
-    StageDecl,
-    StageInput,
+    MixerExit,
     StageOutput,
     SumGroup,
     TokenAxis,
     UnreducedOutput,
-    stage_edges,
 )
-from sglang.srt.layers.communicator.layer import MixerExit
 from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
 from sglang.srt.models import nemotron_h_utils as utils
 from sglang.srt.runtime_context import get_parallel
@@ -26,6 +24,27 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+
+
+def layer_stage(pattern, index):
+    from sglang.srt.layers.communicator.construction import BatchVariant
+    from sglang.srt.layers.communicator.factories import _connections
+
+    previous = utils._declaration(pattern, index - 1) if index else None
+    declaration = replace(
+        utils._declaration(pattern, index),
+        previous=previous,
+        terminal=index == len(pattern) - 1,
+    )
+    incoming, outgoing = _connections(declaration)
+    return SimpleNamespace(
+        kind=declaration.kind,
+        edges=(
+            incoming.entries[BatchVariant.ORDINARY],
+            outgoing.exits[BatchVariant.ORDINARY],
+        ),
+        enters_stack=index == 0,
+    )
 
 
 def sizes(*, dp=1, tp=1):
@@ -37,12 +56,31 @@ def sizes(*, dp=1, tp=1):
 
 
 def stages(pattern, *, dp=1, tp=1, a2a=False):
-    backend = SimpleNamespace(is_none=lambda: not a2a)
+    from sglang.test.communicator_patch import patch_communicator
+
+    parallel = SimpleNamespace(
+        attn_dp_size=dp,
+        attn_tp_size=tp,
+        attn_cp_size=1,
+        tp_size=dp * tp,
+        moe_dp_size=1,
+        moe_dense_tp_size=None,
+    )
     with (
-        patch.object(utils, "token_axis_sizes", return_value=sizes(dp=dp, tp=tp)),
-        patch.object(utils, "get_moe_a2a_backend", return_value=backend),
+        patch_communicator(
+            "get_exec",
+            return_value=SimpleNamespace(
+                comm=SimpleNamespace(boundary_reduction="rs+rsv"),
+                overlap=SimpleNamespace(enable_two_batch_overlap=False),
+            ),
+        ),
+        patch_communicator("token_axis_sizes", return_value=sizes(dp=dp, tp=tp)),
+        patch_communicator("get_parallel", return_value=parallel),
+        patch_communicator("is_moe_input_scattered_across_dp_ranks", return_value=a2a),
+        patch_communicator("enable_moe_dense_fully_dp", return_value=False),
+        patch_communicator("_generic_prefill_cp_shards_tokens", return_value=False),
     ):
-        return [utils.layer_stage(pattern, i) for i in range(len(pattern))]
+        return [layer_stage(pattern, i) for i in range(len(pattern))]
 
 
 class TestStageEdges(CustomTestCase):
@@ -94,8 +132,8 @@ class TestStageEdges(CustomTestCase):
             "MM": (SumGroup.ATTN_TP, False, True),
             "-M": (SumGroup.TP, False, True),
             "EM": (SumGroup.MOE_OUTPUT, False, True),
-            "--": (None, False, False),
-            "E-": (None, False, False),
+            "--": (SumGroup.TP, False, True),
+            "E-": (SumGroup.MOE_OUTPUT, False, True),
         }
         for pattern, expected in cases.items():
             with self.subTest(pattern=pattern):
@@ -128,19 +166,6 @@ class TestStageEdges(CustomTestCase):
                     )
                     self.assertIs(out_of.produced.update, ADD)
 
-    def test_the_residual_follows_the_input_onto_a_finer_slice(self):
-        axis_sizes = sizes(dp=2, tp=2)
-        attention = Layout.sharded_over(TokenAxis.ATTN_DP, axis_sizes=axis_sizes)
-        local = Layout.sharded_over(
-            TokenAxis.ATTN_DP, TokenAxis.ATTN_TP_SCATTER, axis_sizes=axis_sizes
-        )
-        full = Layout.sharded_over(axis_sizes=axis_sizes)
-        for need, during in ((local, local), (full, attention)):
-            stage = StageDecl(StageInput(need), StageOutput(need))
-            into, out_of = stage_edges(previous=None, stage=stage, rows=attention)
-            self.assertEqual((into.residual, into.residual_to), (attention, during))
-            self.assertEqual((out_of.residual, out_of.residual_to), (during, attention))
-
 
 class TestMixerExit(CustomTestCase):
     """A mixer skips its output all-reduce when its output always leaves the sum
@@ -163,7 +188,9 @@ class TestMixerExit(CustomTestCase):
                     leaves_for_next_layer=may,
                 )
                 communicator = SimpleNamespace(
-                    _batch_steps=lambda batch: SimpleNamespace(ffn_output=produced),
+                    plan=SimpleNamespace(
+                        _batch_steps=lambda batch: SimpleNamespace(ffn_output=produced),
+                    ),
                     _ffn_sum_can_move_to_next_layer=MagicMock(return_value=movable),
                 )
                 hidden = torch.ones(2, 4)

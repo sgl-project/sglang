@@ -1,4 +1,5 @@
-from sglang.srt.layers.communicator.layer import FfnExit
+from sglang.srt.layers.communicator.residual import batch as residual_batch
+from sglang.test.boundary_fixtures import stub_plan
 
 """A Step-3.5 dense layer must leave its all-reduce out when postprocess
 reduce-scatters its output; otherwise the output is summed twice. The layer's
@@ -12,7 +13,7 @@ from unittest.mock import MagicMock
 import torch
 
 from sglang.srt.layers import communicator as comm
-from sglang.srt.layers.communicator.residual import batch as residual_batch
+from sglang.srt.layers.communicator.residual.stream import ResidualStream
 from sglang.srt.runtime_context import get_forward
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -33,24 +34,40 @@ def dense_layer(*, reduce_scatter):
         return hidden_states
 
     complete = MagicMock(side_effect=lambda h, r: (h, r))
-    communicator = SimpleNamespace(
-        prepare_attn=lambda h, r, fb, **_: (h, h if r is None else r),
-        prepare_mlp=lambda h, r, fb: (h, r),
-        _batch_steps=lambda fb: SimpleNamespace(
-            ffn_output=SimpleNamespace(update=comm.ADD)
-        ),
-        _declared_ffn_sum=lambda steps, skipped: None,
-        _leave_ffn_output=lambda h, r, stream, update, declared_sum: (h, r),
-        # A dense layer never leaves its sum to the next layer.
-        _select_ffn_completion=lambda fb: comm.FfnCompletion(
-            defer_moe_finalize=False,
-            fuse_mlp_allreduce=False,
-            mlp_reduce_scatter=reduce_scatter,
-            complete=complete,
+    plan = stub_plan()
+    plan._batch_steps = lambda fb: SimpleNamespace(
+        ffn_output=comm.StageOutput(comm.Layout(frozenset())),
+        returns_over_dp=False,
+        ffn_output_move_completes_sum=False,
+    )
+    plan.output._select_ffn_completion = lambda fb: comm.FfnCompletion(
+        defer_moe_finalize=False,
+        fuse_mlp_allreduce=False,
+        mlp_reduce_scatter=reduce_scatter,
+        complete=complete,
+    )
+
+    def stage_exit(fb):
+        result = plan.output.ffn_exit(fb)
+        result._stream = fb.residual_stream
+        return result
+
+    object.__setattr__(
+        layer,
+        "attn_stage",
+        SimpleNamespace(
+            prepare=lambda h, fb, **kwargs: h,
+            finish=lambda h, fb: h,
         ),
     )
-    communicator.ffn_exit = lambda fb: FfnExit(communicator, fb)
-    object.__setattr__(layer, "layer_communicator", communicator)
+    object.__setattr__(
+        layer,
+        "ffn_stage",
+        SimpleNamespace(
+            prepare=lambda h, fb: h,
+            exit=stage_exit,
+        ),
+    )
     object.__setattr__(layer, "use_moe", False)
     object.__setattr__(layer, "mlp", mlp)
     object.__setattr__(layer, "self_attn", lambda **kwargs: kwargs["hidden_states"])
@@ -68,8 +85,9 @@ class TestStep3p5DenseReduceScatter(CustomTestCase):
                 layer.forward(
                     positions=None,
                     hidden_states=torch.ones(2, 4),
-                    forward_batch=batch,
-                    residual=stream,
+                    forward_batch=SimpleNamespace(
+                        residual_stream=ResidualStream(torch.ones(2, 4))
+                    ),
                 )
                 self.assertEqual(seen["mlp_reduce_scatter"], reduce_scatter)
                 self.assertFalse(seen["fuse_mlp_allreduce"])

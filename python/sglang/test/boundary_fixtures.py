@@ -71,6 +71,7 @@ def stub_plan():
     plan._fusion_rows = None
     plan._cp_steps = plan._sp_steps = plan._input_scattered_steps = None
     plan.is_first_layer = False
+    plan.is_last_layer = False
     plan.residual_in_hidden = False
     # Keep production variant selection while tests replace individual paths.
     plan._batch_steps = lambda batch: {

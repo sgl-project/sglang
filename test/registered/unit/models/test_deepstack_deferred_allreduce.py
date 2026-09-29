@@ -1,5 +1,3 @@
-from sglang.srt.layers.communicator.residual.add_norm import ADD
-
 """Deepstack visual embeddings are added to a decoder layer's output. When the
 layer left its FFN all-reduce to the next layer, that output is one rank's
 partial sum, and an embedding added to it is counted once per rank."""
@@ -10,8 +8,10 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 
-from sglang.srt.layers.communicator import LayerCommunicator, UnreducedOutput
+from sglang.srt.layers.communicator import UnreducedOutput
 from sglang.srt.layers.communicator.residual import batch as residual_batch
+from sglang.srt.layers.communicator.residual.add_norm import ADD
+from sglang.srt.layers.communicator.residual.stream import OwedOutput
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -41,21 +41,19 @@ class DeferringLayer(nn.Module):
         super().__init__()
         self.is_last_layer = is_last_layer
         # The model ends its layers at this communicator's finish_layer_stack.
-        self.layer_communicator = LayerCommunicator.__new__(LayerCommunicator)
 
     def forward(
         self, positions=None, hidden_states=None, forward_batch=None, residual=None, **_
     ):
-        stream = forward_batch.residual_stream
-        hidden_states, residual = stream.finish(hidden_states)
+        if isinstance(hidden_states, UnreducedOutput):
+            hidden_states = all_reduce(hidden_states.partial)
         residual = hidden_states if residual is None else hidden_states + residual
-        stream.write(residual)
-        output = (
-            torch.ones_like(residual)
-            if self.is_last_layer
-            else UnreducedOutput(torch.full_like(residual, 1 / TP_SIZE), group=GROUP)
+        if self.is_last_layer:
+            return torch.ones_like(residual), residual
+        return (
+            UnreducedOutput(torch.full_like(residual, 1 / TP_SIZE), group=GROUP),
+            residual,
         )
-        return stream.leave(output, ADD), stream
 
 
 class DeferringStageLayer(DeferringLayer):
@@ -82,7 +80,8 @@ class SumNorm(nn.Module):
 def stub_model(cls, **attrs):
     model = cls.__new__(cls)
     nn.Module.__init__(model)
-    layers = [DeferringLayer(i == NUM_LAYERS - 1) for i in range(NUM_LAYERS)]
+    layer_type = DeferringStageLayer
+    layers = [layer_type(i == NUM_LAYERS - 1) for i in range(NUM_LAYERS)]
     common = dict(
         pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
         layers=layers,
@@ -118,7 +117,13 @@ def qwen3_5():
     )
 
 
-MODELS = (qwen3_vl_moe, qwen3_5)
+def interns2_mobius():
+    from sglang.srt.models.interns2_mobius import InternS2MobiusForCausalLM
+
+    return stub_model(InternS2MobiusForCausalLM, meta_mlp=nn.ModuleList())
+
+
+MODELS = (qwen3_vl_moe, qwen3_5, interns2_mobius)
 
 
 class TestDeepstackOnDeferredReduction(CustomTestCase):
@@ -130,7 +135,7 @@ class TestDeepstackOnDeferredReduction(CustomTestCase):
         return model.forward(
             input_ids=None,
             positions=None,
-            forward_batch=SimpleNamespace(),
+            forward_batch=SimpleNamespace(residual_stream=None),
             input_embeds=self.embeds.clone(),
             input_deepstack_embeds=deepstack,
         )
@@ -174,10 +179,7 @@ class TestSplitPrefillCompletion(CustomTestCase):
                 with self.subTest(model=model_cls.__name__, tokens=tokens):
                     # Also leave the final output: the stack exit must handle it
                     # independently of the last layer's fusion decision.
-                    stage_api = model_cls in (
-                        Qwen3ForCausalLM,
-                        SarvamMoEForCausalLM,
-                    )
+                    stage_api = True
                     layer_type = DeferringStageLayer if stage_api else DeferringLayer
                     wrapper = SimpleNamespace(
                         model=SimpleNamespace(
@@ -198,7 +200,10 @@ class TestSplitPrefillCompletion(CustomTestCase):
                         input_embeds=torch.zeros(tokens, HIDDEN),
                     )
                     self.assertIsNone(first)
-                    self.assertIsNotNone(batch.residual_stream.pending.owed)
+                    self.assertIsInstance(
+                        batch.hidden_states,
+                        OwedOutput if stage_api else UnreducedOutput,
+                    )
                     result = model_cls.forward_split_prefill(
                         wrapper, None, None, batch, (2, NUM_LAYERS)
                     )

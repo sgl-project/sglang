@@ -191,17 +191,19 @@ class OutputBoundary:
             dp_step=dp_step,
         )
         steps = self.plan._batch_steps(forward_batch)
-        if not steps.ffn_output.leaves_for_next_layer:
+        defer_moe_finalize = (
+            self.plan.fusions is not None
+            and self.plan.fusions.can_defer_finalize(self.plan, forward_batch)
+        )
+        if not steps.ffn_output.leaves_for_next_layer and not (
+            self.plan.is_last_layer and defer_moe_finalize
+        ):
             return FfnCompletion(
                 defer_moe_finalize=False,
                 fuse_mlp_allreduce=False,
                 mlp_reduce_scatter=mlp_reduce_scatter,
                 complete=complete_now,
             )
-        defer_moe_finalize = (
-            self.plan.fusions is not None
-            and self.plan.fusions.can_defer_finalize(self.plan, forward_batch)
-        )
         # Producers declare remaining work independently of the kernel chosen
         # by the consumer. Every handoff also carries an unfused completion.
         fuse_mlp_allreduce = defer_moe_finalize or self._ffn_sum_moves_to_next_layer(

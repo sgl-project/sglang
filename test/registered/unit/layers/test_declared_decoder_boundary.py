@@ -2083,7 +2083,7 @@ class TestTwoLayers(CustomTestCase):
             )
 
         def forward(rank):
-            batch = SimpleNamespace(**vars(forward_batch), residual_stream=None)
+            batch = SimpleNamespace(**vars(forward_batch))
             s = states[rank]
             layers = [
                 make_test_stages(

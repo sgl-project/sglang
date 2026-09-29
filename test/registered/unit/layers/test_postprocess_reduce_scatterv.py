@@ -261,8 +261,9 @@ class TestLongcatNextnReducesItsMlp(CustomTestCase):
             ),
             patch.object(nextn, "RMSNorm"),
             patch.object(nextn, "get_parallel"),
-            patch.object(nextn, "LayerFacts"),
-            patch.object(nextn, "LayerCommunicator"),
+            patch.object(nextn, "declare_attn"),
+            patch.object(nextn, "declare_ffn"),
+            patch.object(nextn, "make_stages", return_value=(None, None)),
         ):
             nextn.LongcatFlashDenseDecoderLayer(config, layer_id=0)
         self.assertIs(mlp_kwargs.get("reduce_results"), True)

@@ -79,8 +79,8 @@ from sglang.srt.layers.communicator.residual.mhc import (
 
 __all__ = [
     "LayerCommunicator",
-    "MHCLayerCommunicator",
     "LayerFacts",
+    "MHCLayerCommunicator",
     "declare_attn",
     "declare_ffn",
     "make_attn_stage",

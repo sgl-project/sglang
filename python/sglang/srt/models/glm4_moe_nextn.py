@@ -101,20 +101,15 @@ class Glm4MoeModelNextN(nn.Module):
                 )
             )
 
-        residual = residual_batch.start(forward_batch)
+        residual_batch.start(forward_batch)
         with get_global_expert_distribution_recorder().disable_this_region():
-            hidden_states, residual = self.decoder(
-                positions, hidden_states, forward_batch, residual
-            )
+            hidden_states = self.decoder(positions, hidden_states, forward_batch)
 
-        hidden_states, residual = self.decoder.layer_communicator.finish_layer_stack(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states = residual_batch.finish(hidden_states, forward_batch)
         if not forward_batch.forward_mode.is_idle():
-            if residual is not None:
-                hidden_states, _ = self.shared_head.norm(hidden_states, residual)
-            else:
-                hidden_states = self.shared_head.norm(hidden_states)
+            hidden_states = residual_batch.norm(
+                hidden_states, forward_batch, self.shared_head.norm
+            )
 
         return hidden_states
 
