@@ -66,6 +66,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 jobs:
   set-image-config:
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     outputs:
       ref: ${{ steps.set-vars.outputs.ref }}
@@ -122,59 +123,9 @@ jobs:
           # Write to GITHUB_OUTPUT and print to the log in one command.
           echo "run_start_metadata=${RUN_START_METADATA}" | tee -a $GITHUB_OUTPUT
 
-  # A PR touching this workflow runs only the three tests that have shown
-  # pinned-host allocation failures. These jobs install the PR checkout so the
-  # diagnostic code under python/ is actually used instead of the image copy.
-  diagnose-hicache-mha:
-    name: diagnose-hicache-mha
-    if: ${{ github.event_name == 'pull_request' && github.workflow == 'Nightly Test (NPU)' }}
-    needs: [set-image-config]
-    uses: ./.github/workflows/_npu-pr-test-stage.yml
-    with:
-      self_name: diagnose-hicache-mha
-      runner_config: linux-aarch64-a3-2-
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
-      run_timeout_minutes: '120'
-      skip_pr_test_health_check: ${{ 'true' }}
-      upload_test_logs: true
-      diagnostic_test_file: registered/npu/basic_function/HiCache/test_npu_hicache_mha.py
-    secrets: inherit
-
-  diagnose-hicache-mla:
-    name: diagnose-hicache-mla
-    if: ${{ github.event_name == 'pull_request' && github.workflow == 'Nightly Test (NPU)' }}
-    needs: [set-image-config]
-    uses: ./.github/workflows/_npu-pr-test-stage.yml
-    with:
-      self_name: diagnose-hicache-mla
-      runner_config: linux-aarch64-a3-4-
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
-      run_timeout_minutes: '120'
-      skip_pr_test_health_check: ${{ 'true' }}
-      upload_test_logs: true
-      diagnostic_test_file: registered/npu/basic_function/HiCache/test_npu_hicache_mla.py
-    secrets: inherit
-
-  diagnose-glm5-top64:
-    name: diagnose-glm5-top64
-    if: ${{ github.event_name == 'pull_request' && github.workflow == 'Nightly Test (NPU)' }}
-    needs: [set-image-config]
-    uses: ./.github/workflows/_npu-single-node-test-stage.yml
-    with:
-      test_suite: diagnose-glm5-top64
-      runner: linux-aarch64-a3-16-
-      test_type: accuracy
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
-      install_sglang_deps: true
-      test_timeout_minutes: '120'
-      skip_pr_test_health_check: ${{ 'true' }}
-      upload_test_logs: true
-      diagnostic_test_file: registered/npu/accuracy/glm5_top64_pruned/test_npu_glm5_top64_pruned_bf16_8p_gsm8k.py
-    secrets: inherit
-
   nightly-1-npu-a3:
     name: nightly-1-npu-a3
-    if: ${{ !(github.event_name == 'pull_request' && github.workflow == 'Nightly Test (NPU)') && !cancelled() }}
+    if: ${{ !cancelled() }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -184,12 +135,12 @@ jobs:
       run_timeout_minutes: '90'
       timeout_per_file: '3600'
       is_nightly_pipeline_job: true
-      skip_pr_test_health_check: ${{ 'true' }}
+      skip_pr_test_health_check: 'true'
     secrets: inherit
 
   nightly-2-npu-a3:
     name: nightly-2-npu-a3
-    if: ${{ !(github.event_name == 'pull_request' && github.workflow == 'Nightly Test (NPU)') && !cancelled() }}
+    if: ${{ !cancelled() }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -199,13 +150,13 @@ jobs:
       run_timeout_minutes: '90'
       timeout_per_file: '3600'
       is_nightly_pipeline_job: true
-      skip_pr_test_health_check: ${{ 'true' }}
+      skip_pr_test_health_check: 'true'
     secrets: inherit
 
   # The nightly-4-npu-a3 suite is split across 2 parallel partition jobs, mirroring base-b-test-4-npu-a3 in the PR pipeline.
   nightly-4-npu-a3:
     name: nightly-4-npu-a3
-    if: ${{ !(github.event_name == 'pull_request' && github.workflow == 'Nightly Test (NPU)') && !cancelled() }}
+    if: ${{ !cancelled() }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -216,12 +167,12 @@ jobs:
       timeout_per_file: '3600'
       partitions: '{"size":2,"arr":[0,1]}'
       is_nightly_pipeline_job: true
-      skip_pr_test_health_check: ${{ 'true' }}
+      skip_pr_test_health_check: 'true'
     secrets: inherit
 
   nightly-8-npu-a3:
     name: nightly-8-npu-a3
-    if: ${{ !(github.event_name == 'pull_request' && github.workflow == 'Nightly Test (NPU)') && !cancelled() }}
+    if: ${{ !cancelled() }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -231,12 +182,12 @@ jobs:
       run_timeout_minutes: '60'
       timeout_per_file: '3600'
       is_nightly_pipeline_job: true
-      skip_pr_test_health_check: ${{ 'true' }}
+      skip_pr_test_health_check: 'true'
     secrets: inherit
 
   nightly-16-npu-a3:
     name: nightly-16-npu-a3
-    if: ${{ !(github.event_name == 'pull_request' && github.workflow == 'Nightly Test (NPU)') && !cancelled() }}
+    if: ${{ !cancelled() }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -246,12 +197,12 @@ jobs:
       run_timeout_minutes: '120'
       timeout_per_file: '3600'
       is_nightly_pipeline_job: true
-      skip_pr_test_health_check: ${{ 'true' }}
+      skip_pr_test_health_check: 'true'
     secrets: inherit
 
   nightly-perf-2-npu-a3:
     name: nightly-perf-2-npu-a3
-    if: ${{ !(github.event_name == 'pull_request' && github.workflow == 'Nightly Test (NPU)') && !cancelled() }}
+    if: ${{ !cancelled() }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -259,7 +210,7 @@ jobs:
       test_type: 'perf'
       test_suite: nightly-perf-2-npu-a3
       is_nightly_pipeline_job: true
-      skip_pr_test_health_check: ${{ 'true' }}
+      skip_pr_test_health_check: 'true'
       image: ${{ needs.set-image-config.outputs.image_a3 }}
       install_sglang_deps: false
       device_type_for_deps: 'a3'
@@ -267,7 +218,7 @@ jobs:
 
   nightly-perf-4-npu-a3:
     name: nightly-perf-4-npu-a3
-    if: ${{ !(github.event_name == 'pull_request' && github.workflow == 'Nightly Test (NPU)') && !cancelled() }}
+    if: ${{ !cancelled() }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -275,7 +226,7 @@ jobs:
       test_type: 'perf'
       test_suite: nightly-perf-4-npu-a3
       is_nightly_pipeline_job: true
-      skip_pr_test_health_check: ${{ 'true' }}
+      skip_pr_test_health_check: 'true'
       image: ${{ needs.set-image-config.outputs.image_a3 }}
       install_sglang_deps: false
       device_type_for_deps: 'a3'
@@ -283,7 +234,7 @@ jobs:
 
   nightly-perf-16-npu-a3:
     name: nightly-perf-16-npu-a3
-    if: ${{ !(github.event_name == 'pull_request' && github.workflow == 'Nightly Test (NPU)') && !cancelled() }}
+    if: ${{ !cancelled() }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -291,7 +242,7 @@ jobs:
       test_type: 'perf'
       test_suite: nightly-perf-16-npu-a3
       is_nightly_pipeline_job: true
-      skip_pr_test_health_check: ${{ 'true' }}
+      skip_pr_test_health_check: 'true'
       image: ${{ needs.set-image-config.outputs.image_a3 }}
       install_sglang_deps: false
       device_type_for_deps: 'a3'
@@ -301,7 +252,7 @@ jobs:
   # The acc-2 suite is split across 4 parallel partition jobs via the single `partitions` input.
   nightly-acc-2-npu-a3:
     name: nightly-acc-2-npu-a3
-    if: ${{ !(github.event_name == 'pull_request' && github.workflow == 'Nightly Test (NPU)') && !cancelled() }}
+    if: ${{ !cancelled() }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -310,7 +261,7 @@ jobs:
       test_suite: nightly-acc-2-npu-a3
       is_nightly_pipeline_job: true
       partitions: '{"size":4,"arr":[0,1,2,3]}'
-      skip_pr_test_health_check: ${{ 'true' }}
+      skip_pr_test_health_check: 'true'
       image: ${{ needs.set-image-config.outputs.image_a3 }}
       install_sglang_deps: false
       device_type_for_deps: 'a3'
@@ -318,7 +269,7 @@ jobs:
 
   nightly-acc-16-npu-a3:
     name: nightly-acc-16-npu-a3
-    if: ${{ !(github.event_name == 'pull_request' && github.workflow == 'Nightly Test (NPU)') && !cancelled() }}
+    if: ${{ !cancelled() }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -326,7 +277,7 @@ jobs:
       test_type: 'accuracy'
       test_suite: nightly-acc-16-npu-a3
       is_nightly_pipeline_job: true
-      skip_pr_test_health_check: ${{ 'true' }}
+      skip_pr_test_health_check: 'true'
       image: ${{ needs.set-image-config.outputs.image_a3 }}
       install_sglang_deps: false
       device_type_for_deps: 'a3'
@@ -334,7 +285,7 @@ jobs:
 
   nightly-acc-4-npu-a5:
     name: nightly-acc-4-npu-a5
-    if: ${{ !(github.event_name == 'pull_request' && github.workflow == 'Nightly Test (NPU)') && !cancelled() }}
+    if: ${{ !cancelled() }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -342,14 +293,14 @@ jobs:
       test_type: 'accuracy'
       test_suite: nightly-acc-4-npu-a5
       is_nightly_pipeline_job: true
-      skip_pr_test_health_check: ${{ 'true' }}
+      skip_pr_test_health_check: 'true'
       image: ${{ needs.set-image-config.outputs.image_a5 }}
       install_sglang_deps: false
       device_type_for_deps: 'a5'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
   nightly-poc-multi-node-tests:
     name: multi-node-poc
-    if: ${{ !(github.event_name == 'pull_request' && github.workflow == 'Nightly Test (NPU)') && !cancelled() }}
+    if: ${{ !cancelled() }}
     needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-16-npu-a3]
     strategy:
       fail-fast: false
@@ -397,7 +348,7 @@ jobs:
 
   nightly-poc-multi-node-mix-tests:
     name: multi-node-mix-poc
-    if: ${{ !(github.event_name == 'pull_request' && github.workflow == 'Nightly Test (NPU)') && !cancelled() }}
+    if: ${{ !cancelled() }}
     needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-16-npu-a3, nightly-poc-multi-node-tests]
     strategy:
       fail-fast: false
@@ -428,7 +379,7 @@ jobs:
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
   check-all-jobs:
-    if: ${{ !(github.event_name == 'pull_request' && github.workflow == 'Nightly Test (NPU)') && !cancelled() }}
+    if: ${{ !cancelled() }}
     needs:
       - nightly-1-npu-a3
       - nightly-2-npu-a3

@@ -1,5 +1,18 @@
 import os
+import sys
 import unittest
+from pathlib import Path
+
+# Nightly runs the image's preinstalled sglang. On a diagnostic PR, use this
+# checkout in both the test process and its server subprocess so new probes run.
+if os.environ.get("GITHUB_EVENT_NAME") == "pull_request":
+    source_python = Path(__file__).resolve().parents[5] / "python"
+    sys.path.insert(0, str(source_python))
+    existing_pythonpath = os.environ.get("PYTHONPATH")
+    os.environ["PYTHONPATH"] = str(source_python) + (
+        os.pathsep + existing_pythonpath if existing_pythonpath else ""
+    )
+    print(f"NPU diagnostic checkout source: {source_python}", flush=True)
 
 from sglang.srt.utils.npu_pinned_host_diagnostics import log_npu_host_baseline
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (

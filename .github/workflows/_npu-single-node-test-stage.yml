@@ -6,18 +6,22 @@ on:
       runner:
         required: true
         type: string
+        default: linux-aarch64-a3-16
       test_type:
         required: true
         type: string
+        default: perf
         description: perf or accuracy
       test_suite:
         required: true
         type: string
+        default: ''
         description: name of test suite to run via run_suite.py (mutually exclusive with test_case)
       image:
         required: true
         type: string
         description: image for pods
+        default: "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.1.0-a3"
       install_sglang_deps:
         required: false
         type: boolean
@@ -71,10 +75,6 @@ on:
         description: 'If true, upload the test logs as a GitHub Actions artifact (only enabled by pr-test-npu)'
         type: boolean
         default: false
-      diagnostic_test_file:
-        description: 'Optional registered/npu/... path relative to test/; run only this file and emit host-memory baselines.'
-        type: string
-        default: ''
 
 env:
   SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check }}
@@ -100,12 +100,6 @@ jobs:
           # Pin to the event SHA (not the branch name) so every job in this run
           # checks out the same commit even if the branch advances mid-run.
           ref: ${{ inputs.ref || github.sha }}
-
-      - name: Host memory before dependency install
-        if: inputs.diagnostic_test_file != ''
-        run: |
-          git rev-parse HEAD
-          python3 python/sglang/srt/utils/npu_pinned_host_diagnostics.py before_dependency_install
 
       - name: Check PR test health
         uses: actions/github-script@v8
@@ -236,12 +230,6 @@ jobs:
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
 
-      - name: Host memory after dependency install
-        if: inputs.diagnostic_test_file != ''
-        run: |
-          python3 python/sglang/srt/utils/npu_pinned_host_diagnostics.py after_dependency_install
-          python3 -c 'import sglang.srt.utils.npu_pinned_host_diagnostics as d; print("diagnostic_module_path:", d.__file__)'
-
       - name: Run test
         timeout-minutes: ${{ fromJson(inputs.test_timeout_minutes) }}
         env:
@@ -250,7 +238,6 @@ jobs:
           SGLANG_IS_IN_CI: true
           TRANSFORMERS_VERBOSITY: "error"
           GDN_ATTN_BACKEND_TRITON: 1
-          DIAGNOSTIC_TEST_FILE: ${{ inputs.diagnostic_test_file }}
         shell: bash
         run: |
           # Fail fast on any command error, undefined variable, or pipe failure.
@@ -445,19 +432,10 @@ jobs:
             exit 0
           fi
 
-          if [[ -n "${DIAGNOSTIC_TEST_FILE}" ]]; then
-            case "${DIAGNOSTIC_TEST_FILE}" in
-              registered/npu/*.py) ;;
-              *) echo "Invalid diagnostic test file: ${DIAGNOSTIC_TEST_FILE}" >&2; exit 1 ;;
-            esac
-            test -f "${DIAGNOSTIC_TEST_FILE}"
-            echo "Running diagnostic test file: ${DIAGNOSTIC_TEST_FILE}"
-            ${PYTHON_FOR_SGLANG} -u "${DIAGNOSTIC_TEST_FILE}" 2>&1 | tee "${LOG_TEE_TARGETS[@]}" || test_exit_code=$?
-          else
-            # Capture mode (--enable-retry --max-attempts 1) keeps test subprocesses
-            # off the tee pipe, so leftover servers cannot block pipeline exit.
-            ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} ${NIGHTLY_FLAG} ${PARTITION_ARGS} ${TIMEOUT_FLAG} --enable-retry --max-attempts 1 --timeout-per-file 7200 2>&1 | tee "${LOG_TEE_TARGETS[@]}" || test_exit_code=$?
-          fi
+          # Run NPU test suite with run_suite.py.
+          # Capture mode (--enable-retry --max-attempts 1) keeps test subprocesses off the
+          # tee pipe, so leftover server processes cannot block the pipeline on exit.
+          ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} ${NIGHTLY_FLAG} ${PARTITION_ARGS} ${TIMEOUT_FLAG} --enable-retry --max-attempts 1 --timeout-per-file 7200 2>&1 | tee "${LOG_TEE_TARGETS[@]}" || test_exit_code=$?
 
           echo "Finished test: ${tc_name}"
 
@@ -489,10 +467,6 @@ jobs:
             echo "" >> $GITHUB_STEP_SUMMARY
           fi
           exit ${test_exit_code}
-
-      - name: Host memory after test
-        if: always() && inputs.diagnostic_test_file != ''
-        run: python3 python/sglang/srt/utils/npu_pinned_host_diagnostics.py after_test
 
       - name: Upload test logs
         if: always() && inputs.use_coverage_runner != true && inputs.upload_test_logs == true
