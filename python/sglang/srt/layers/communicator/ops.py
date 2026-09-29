@@ -33,6 +33,10 @@ from sglang.srt.layers.communicator.adapters.attention import (
     _redistribute_to_attn_tp_shards,
     get_attn_tp_context,
 )
+from sglang.srt.layers.communicator.adapters.context_parallel import (
+    dsa_cp_gather_hidden_states,
+    dsa_cp_reduce_scatter_hidden_states,
+)
 from sglang.srt.layers.communicator.layout import (
     CommunicateContext,
     Layout,
@@ -48,10 +52,6 @@ from sglang.srt.layers.communicator.output import (
 )
 from sglang.srt.layers.communicator.residual import StageRead, StageUpdate
 from sglang.srt.layers.communicator.residual.add_norm import ADD, NORM_READ
-from sglang.srt.layers.communicator_dsa_cp import (
-    dsa_cp_gather_hidden_states,
-    dsa_cp_reduce_scatter_hidden_states,
-)
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,

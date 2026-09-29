@@ -16,6 +16,12 @@ from sglang.srt.layers.communicator import (
     UnreducedOutput,
     reduce_output,
 )
+from sglang.srt.layers.communicator.fusions.cutedsl import (
+    CuteDSLFusion,
+    MoeFinalizeHandoff,
+    install_cutedsl_fusion,
+    prepare_cutedsl_fusion,
+)
 from sglang.srt.layers.communicator.ops import _consumer_step, _read_input
 from sglang.srt.layers.flashinfer_mnnvl_cutedsl import (
     FlashInferMNNVLCuteDSLARFusion,
@@ -23,12 +29,6 @@ from sglang.srt.layers.flashinfer_mnnvl_cutedsl import (
     _with_early_finalize_shared_load,
 )
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.moe.cutedsl_ar_fusion import (
-    CuteDSLFusion,
-    MoeFinalizeHandoff,
-    install_cutedsl_fusion,
-    prepare_cutedsl_fusion,
-)
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_forward, publish, reset_context
@@ -38,7 +38,7 @@ from sglang.test.communicator_patch import patch_communicator
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
-_MODULE = "sglang.srt.layers.moe.cutedsl_ar_fusion"
+_MODULE = "sglang.srt.layers.communicator.fusions.cutedsl"
 _DECODE = SimpleNamespace(forward_mode=ForwardMode.DECODE, input_ids=torch.zeros(8))
 
 

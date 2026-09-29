@@ -303,7 +303,7 @@ class BaseRunner(ABC):
             resolve_flashinfer_allreduce_fusion_backend()
             if not mr.is_draft_worker:
                 # A draft installs no fusion communicator.
-                from sglang.srt.layers.moe.cutedsl_ar_fusion import (
+                from sglang.srt.layers.communicator.fusions.cutedsl import (
                     prepare_cutedsl_fusion,
                 )
 
