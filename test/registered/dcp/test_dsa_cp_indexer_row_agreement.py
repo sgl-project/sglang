@@ -234,7 +234,9 @@ class TestW2LocalTopk(CustomTestCase):
         )
         seen = {"gathered": False}
 
-        def _fake_gather(t, num_tokens):
+        def _fake_gather(_self, t, num_tokens):
+            # patch.object on the CLASS leaves this unbound, so it is handed
+            # the shard as well -- the collective itself needs a process group.
             seen["gathered"] = True
             return t
 
