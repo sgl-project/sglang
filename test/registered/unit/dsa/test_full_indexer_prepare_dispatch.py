@@ -30,9 +30,9 @@ def _arguments(
     return tuple(arguments)
 
 
-def test_full_indexer_prepare_falls_back_for_unprofiled_rows():
-    assert indexer_prepare.full_indexer_prepare(*_arguments(0), eps=1e-6) is None
-    assert indexer_prepare.full_indexer_prepare(*_arguments(129), eps=1e-6) is None
+@pytest.mark.parametrize("rows", (0, 129))
+def test_full_indexer_prepare_falls_back_for_unprofiled_rows(rows):
+    assert indexer_prepare.full_indexer_prepare(*_arguments(rows), eps=1e-6) is None
 
 
 @pytest.mark.parametrize(
@@ -52,29 +52,26 @@ def test_full_indexer_prepare_supports_general_geometries(
     )
 
 
-@pytest.mark.parametrize("rope_dim", (2, 32, 64, 96, 128))
-def test_full_indexer_prepare_supports_general_rope_dimensions(rope_dim):
-    assert indexer_prepare.is_full_indexer_prepare_layout_supported(
-        128, rope_dim, 128, "ue8m0"
-    )
-
-
 @pytest.mark.parametrize(
-    "head_dim,rope_dim,block_size,scale_fmt",
+    "head_dim,rope_dim,block_size,scale_fmt,supported",
     (
-        (64, 64, 128, "ue8m0"),
-        (128, 0, 128, "ue8m0"),
-        (128, 63, 128, "ue8m0"),
-        (128, 130, 128, "ue8m0"),
-        (128, 64, 64, "ue8m0"),
-        (128, 64, 128, "tensor"),
+        *((128, rope_dim, 128, "ue8m0", True) for rope_dim in (2, 32, 64, 96, 128)),
+        (64, 64, 128, "ue8m0", False),
+        (128, 0, 128, "ue8m0", False),
+        (128, 63, 128, "ue8m0", False),
+        (128, 130, 128, "ue8m0", False),
+        (128, 64, 64, "ue8m0", False),
+        (128, 64, 128, "tensor", False),
     ),
 )
-def test_full_indexer_prepare_rejects_unsupported_layouts(
-    head_dim, rope_dim, block_size, scale_fmt
+def test_full_indexer_prepare_layout_support(
+    head_dim, rope_dim, block_size, scale_fmt, supported
 ):
-    assert not indexer_prepare.is_full_indexer_prepare_layout_supported(
-        head_dim, rope_dim, block_size, scale_fmt
+    assert (
+        indexer_prepare.is_full_indexer_prepare_layout_supported(
+            head_dim, rope_dim, block_size, scale_fmt
+        )
+        is supported
     )
 
 
@@ -108,104 +105,45 @@ def test_full_indexer_prepare_rejects_unsupported_geometries(
 def test_full_indexer_prepare_dispatches_supported_decode_rows(monkeypatch):
     calls = []
 
-    def run_small(*args, **kwargs):
-        calls.append(("small", args[0].shape[0], kwargs))
-        return "q", "weights"
+    def stub(kind):
+        def run(*args, **kwargs):
+            calls.append((kind, args[0].shape[0], kwargs))
+            return "q", "weights"
 
-    def run_large(*args, **kwargs):
-        calls.append(("large", args[0].shape[0], kwargs))
-        return "q", "weights"
+        return run
 
     package = "sglang.kernels.ops.attention.dsa.hip_gfx950.gluon"
-    monkeypatch.setitem(
-        sys.modules,
-        f"{package}.generic",
-        SimpleNamespace(indexer_prepare=run_small),
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        f"{package}.large_m",
-        SimpleNamespace(indexer_prepare=run_large),
-    )
-
-    assert indexer_prepare.full_indexer_prepare(*_arguments(1), eps=1e-6) == (
-        "q",
-        "weights",
-    )
-    for rows in (2, 4, 10, 40, 64, 96, 128):
-        assert indexer_prepare.full_indexer_prepare(*_arguments(rows), eps=1e-6) == (
-            "q",
-            "weights",
+    for module, kind in (("generic", "small"), ("large_m", "large")):
+        monkeypatch.setitem(
+            sys.modules,
+            f"{package}.{module}",
+            SimpleNamespace(indexer_prepare=stub(kind)),
         )
-    assert indexer_prepare.full_indexer_prepare(
-        *_arguments(64, heads=16), eps=1e-6
-    ) == ("q", "weights")
-    assert indexer_prepare.full_indexer_prepare(
-        *_arguments(64, hidden_size=3072, q_lora_rank=1536), eps=1e-6
-    ) == ("q", "weights")
-    assert indexer_prepare.full_indexer_prepare(
-        *_arguments(64, hidden_size=4608), eps=1e-6
-    ) == ("q", "weights")
-    assert indexer_prepare.full_indexer_prepare(
-        *_arguments(10, rope_dim=32),
-        eps=1e-6,
-        rope_dim=32,
-        is_neox_style=True,
-    ) == ("q", "weights")
-    assert indexer_prepare.full_indexer_prepare(
-        *_arguments(64, rope_dim=128),
-        eps=1e-6,
-        rope_dim=128,
-        is_neox_style=True,
-    ) == ("q", "weights")
-    assert [(kind, rows) for kind, rows, _ in calls] == [
-        ("small", 1),
-        ("small", 2),
-        ("small", 4),
-        ("small", 10),
-        ("small", 40),
-        ("large", 64),
-        ("large", 96),
-        ("large", 128),
-        ("small", 64),
-        ("large", 64),
-        ("small", 64),
-        ("small", 10),
-        ("large", 64),
-    ]
-    for _, _, kwargs in calls[:-2]:
-        assert kwargs == {
-            "eps": 1e-6,
-            "rope_dim": 64,
-            "is_neox_style": False,
-        }
-    assert calls[-2][2] == {
-        "eps": 1e-6,
-        "rope_dim": 32,
-        "is_neox_style": True,
-    }
-    assert calls[-1][2] == {
-        "eps": 1e-6,
-        "rope_dim": 128,
-        "is_neox_style": True,
-    }
+
+    cases = (
+        *(("small", rows, {}, {}) for rows in (1, 2, 4, 10, 40)),
+        *(("large", rows, {}, {}) for rows in (64, 96, 128)),
+        ("small", 64, {"heads": 16}, {}),
+        ("large", 64, {"hidden_size": 3072, "q_lora_rank": 1536}, {}),
+        ("small", 64, {"hidden_size": 4608}, {}),
+        ("small", 10, {"rope_dim": 32}, {"rope_dim": 32, "is_neox_style": True}),
+        ("large", 64, {"rope_dim": 128}, {"rope_dim": 128, "is_neox_style": True}),
+    )
+    defaults = {"eps": 1e-6, "rope_dim": 64, "is_neox_style": False}
+    for expected_kind, rows, shapes, options in cases:
+        assert indexer_prepare.full_indexer_prepare(
+            *_arguments(rows, **shapes), eps=1e-6, **options
+        ) == ("q", "weights")
+        assert calls[-1] == (expected_kind, rows, defaults | options)
 
 
-@pytest.mark.parametrize("rope_dim", (0, 63, 130))
-def test_full_indexer_prepare_rejects_invalid_rope_dimensions(rope_dim):
-    cos_sin_width = max(rope_dim, 1)
+@pytest.mark.parametrize(
+    "rope_dim,table_width", ((0, 1), (63, 63), (130, 130), (32, 64))
+)
+def test_full_indexer_prepare_rejects_invalid_rope(rope_dim, table_width):
     assert (
         indexer_prepare.full_indexer_prepare(
-            *_arguments(1, rope_dim=cos_sin_width), eps=1e-6, rope_dim=rope_dim
-        )
-        is None
-    )
-
-
-def test_full_indexer_prepare_rejects_mismatched_rope_table():
-    assert (
-        indexer_prepare.full_indexer_prepare(
-            *_arguments(1, rope_dim=64), eps=1e-6, rope_dim=32
+            *_arguments(1, rope_dim=table_width), eps=1e-6, rope_dim=rope_dim
         )
         is None
     )

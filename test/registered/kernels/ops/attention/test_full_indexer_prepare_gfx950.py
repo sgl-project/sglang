@@ -1,6 +1,7 @@
 """Correctness, graph replay, and performance tests for the gfx950 kernel."""
 
 import unittest
+from itertools import product
 
 import torch
 import torch.nn.functional as F
@@ -10,6 +11,8 @@ from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=300, suite="stage-b-test-1-gpu-small-amd-mi35x")
+
+_ROWS = (1, 2, 4, 8, 10, 16, 32, 40, 64, 96, 128)
 
 _RUNNABLE = is_hip() and is_gfx95_supported()
 if _RUNNABLE:
@@ -70,6 +73,10 @@ def _make_cos_sin(rope_dim: int) -> torch.Tensor:
     return torch.cat((freqs.cos(), freqs.sin()), dim=-1).to(torch.bfloat16)
 
 
+def _randn(*shape: int, scale: float = 0.01) -> torch.Tensor:
+    return torch.randn(*shape, device="cuda", dtype=torch.bfloat16).mul_(scale)
+
+
 def _snr(actual: torch.Tensor, expected: torch.Tensor) -> float:
     actual = actual.float()
     expected = expected.float()
@@ -103,17 +110,11 @@ class TestFullIndexerPrepareGfx950(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         torch.manual_seed(7)
-        device = "cuda"
-        cls.wq = torch.randn(4096, 2048, device=device, dtype=torch.bfloat16).mul_(0.01)
-        cls.wk = torch.randn(128, 6144, device=device, dtype=torch.bfloat16).mul_(0.01)
-        cls.wgate = torch.randn(32, 6144, device=device, dtype=torch.bfloat16).mul_(
-            0.01
-        )
-        cls.gamma = (
-            torch.randn(128, device=device, dtype=torch.bfloat16).mul_(0.05).add_(1)
-        )
-        cls.beta = torch.randn(128, device=device, dtype=torch.bfloat16).mul_(0.01)
-
+        cls.wq = _randn(4096, 2048)
+        cls.wk = _randn(128, 6144)
+        cls.wgate = _randn(32, 6144)
+        cls.gamma = _randn(128, scale=0.05).add_(1)
+        cls.beta = _randn(128)
         cls.cos_sin = _make_cos_sin(64)
 
     def _inputs(
@@ -123,12 +124,8 @@ class TestFullIndexerPrepareGfx950(CustomTestCase):
         q_lora_rank: int = 2048,
         page_size: int = 64,
     ):
-        x = torch.randn(rows, hidden_size, device="cuda", dtype=torch.bfloat16).mul_(
-            0.1
-        )
-        q_lora = torch.randn(
-            rows, q_lora_rank, device="cuda", dtype=torch.bfloat16
-        ).mul_(0.1)
+        x = _randn(rows, hidden_size, scale=0.1)
+        q_lora = _randn(rows, q_lora_rank, scale=0.1)
         positions = (
             torch.arange(rows, device="cuda", dtype=torch.int64) * 17 + 3
         ) % 256
@@ -144,33 +141,25 @@ class TestFullIndexerPrepareGfx950(CustomTestCase):
 
     def _native_prepare(
         self,
-        x,
-        q_lora,
-        positions,
-        slots,
-        cache,
-        wq=None,
-        wk=None,
-        wgate=None,
+        inputs,
+        model_weights=None,
+        norm=None,
         cos_sin=None,
+        eps: float = 1e-6,
         rope_dim: int = 64,
         is_neox_style: bool = False,
     ):
-        wq = self.wq if wq is None else wq
-        wk = self.wk if wk is None else wk
-        wgate = self.wgate if wgate is None else wgate
+        x, q_lora, positions, slots, cache = inputs
+        wq, wk, wgate = model_weights or (self.wq, self.wk, self.wgate)
+        gamma, beta = norm or (self.gamma, self.beta)
         cos_sin = self.cos_sin if cos_sin is None else cos_sin
         rows = x.shape[0]
         heads = wgate.shape[0]
         q = F.linear(q_lora, wq).reshape(rows, heads, 128)
         key = F.linear(x, wk)
-        key = F.layer_norm(
-            key.float(),
-            (128,),
-            self.gamma.float(),
-            self.beta.float(),
-            1e-6,
-        ).to(torch.bfloat16)
+        key = F.layer_norm(key.float(), (128,), gamma.float(), beta.float(), eps).to(
+            torch.bfloat16
+        )
         q = _rotate_reference(q, cos_sin, positions, rope_dim, is_neox_style)
         key = _rotate_reference(key, cos_sin, positions, rope_dim, is_neox_style)
         q_fp8, q_scale = act_quant(q, 128, "ue8m0")
@@ -190,19 +179,93 @@ class TestFullIndexerPrepareGfx950(CustomTestCase):
     def _weights(self, heads: int, q_lora_rank: int, hidden_size: int):
         if (heads, q_lora_rank, hidden_size) == (32, 2048, 6144):
             return self.wq, self.wk, self.wgate
-        wq = torch.randn(
-            heads * 128,
-            q_lora_rank,
-            device="cuda",
-            dtype=torch.bfloat16,
-        ).mul_(0.01)
-        wk = torch.randn(128, hidden_size, device="cuda", dtype=torch.bfloat16).mul_(
-            0.01
+        return (
+            _randn(heads * 128, q_lora_rank),
+            _randn(128, hidden_size),
+            _randn(heads, hidden_size),
         )
-        wgate = torch.randn(
-            heads, hidden_size, device="cuda", dtype=torch.bfloat16
-        ).mul_(0.01)
-        return wq, wk, wgate
+
+    def _prepare(
+        self,
+        inputs,
+        model_weights=None,
+        norm=None,
+        cos_sin=None,
+        eps: float = 1e-6,
+        rope_dim: int = 64,
+        is_neox_style: bool = False,
+        kernel=None,
+    ):
+        x, q_lora, positions, slots, cache = inputs
+        model_weights = model_weights or (self.wq, self.wk, self.wgate)
+        norm = norm or (self.gamma, self.beta)
+        cos_sin = self.cos_sin if cos_sin is None else cos_sin
+        kernel = full_indexer_prepare if kernel is None else kernel
+        return kernel(
+            x,
+            q_lora,
+            *model_weights,
+            *norm,
+            cos_sin,
+            positions,
+            slots,
+            cache,
+            eps=eps,
+            rope_dim=rope_dim,
+            is_neox_style=is_neox_style,
+        )
+
+    def _benchmark(
+        self,
+        inputs,
+        model_weights=None,
+        norm=None,
+        cos_sin=None,
+        eps: float = 1e-6,
+        rope_dim: int = 64,
+        is_neox_style: bool = False,
+        warmup: int = 50,
+        rep: int = 100,
+        compare_generic: bool = False,
+    ):
+        kwargs = dict(
+            model_weights=model_weights,
+            norm=norm,
+            cos_sin=cos_sin,
+            eps=eps,
+            rope_dim=rope_dim,
+            is_neox_style=is_neox_style,
+        )
+        fused_ms = triton.testing.do_bench(
+            lambda: self._prepare(inputs, **kwargs), warmup=warmup, rep=rep
+        )
+        native_ms = triton.testing.do_bench(
+            lambda: self._native_prepare(inputs, **kwargs), warmup=warmup, rep=rep
+        )
+        generic_ms = None
+        if compare_generic:
+            generic_ms = triton.testing.do_bench(
+                lambda: self._prepare(inputs, **kwargs, kernel=small_m_indexer_prepare),
+                warmup=warmup,
+                rep=rep,
+            )
+
+        x, q_lora, _, _, cache = inputs
+        heads = (model_weights or (self.wq, self.wk, self.wgate))[2].shape[0]
+        result = (
+            f"M={x.shape[0]} hidden={x.shape[1]} heads={heads} "
+            f"q_lora_rank={q_lora.shape[1]} page={cache.shape[1]}: "
+            f"fused={fused_ms * 1000:.1f}us native={native_ms * 1000:.1f}us "
+            f"speedup={native_ms / fused_ms:.2f}x"
+        )
+        if generic_ms is not None:
+            result += (
+                f" generic={generic_ms * 1000:.1f}us "
+                f"schedule-speedup={generic_ms / fused_ms:.2f}x"
+            )
+            self.assertLess(fused_ms, generic_ms * 0.8)
+        print(result)
+        self.assertLess(fused_ms, native_ms * 0.9)
 
     def _run_case(
         self,
@@ -217,32 +280,24 @@ class TestFullIndexerPrepareGfx950(CustomTestCase):
         is_neox_style: bool = False,
         benchmark: bool = False,
     ):
-        x, q_lora, positions, slots, cache = self._inputs(
-            rows, hidden_size, q_lora_rank, page_size
-        )
-        wq, wk, wgate = self._weights(heads, q_lora_rank, hidden_size)
-        gamma = self.gamma.to(norm_dtype)
-        beta = self.beta.to(norm_dtype)
+        inputs = self._inputs(rows, hidden_size, q_lora_rank, page_size)
+        model_weights = self._weights(heads, q_lora_rank, hidden_size)
+        norm = (self.gamma.to(norm_dtype), self.beta.to(norm_dtype))
         cos_sin = self.cos_sin if rope_dim == 64 else _make_cos_sin(rope_dim)
-
-        q, weights = full_indexer_prepare(
-            x,
-            q_lora,
-            wq,
-            wk,
-            wgate,
-            gamma,
-            beta,
-            cos_sin,
-            positions,
-            slots,
-            cache,
+        kwargs = dict(
+            model_weights=model_weights,
+            norm=norm,
+            cos_sin=cos_sin,
             eps=eps,
             rope_dim=rope_dim,
             is_neox_style=is_neox_style,
         )
+        q, weights = self._prepare(inputs, **kwargs)
         torch.cuda.synchronize()
 
+        x, q_lora, positions, slots, cache = inputs
+        wq, wk, wgate = model_weights
+        gamma, beta = norm
         q_ref = F.linear(q_lora, wq).reshape(rows, heads, 128)
         q_ref = _rotate_reference(q_ref, cos_sin, positions, rope_dim, is_neox_style)
         gate = F.linear(x, wgate)
@@ -265,82 +320,25 @@ class TestFullIndexerPrepareGfx950(CustomTestCase):
         for row, slot in enumerate(slots.tolist()):
             self.assertGreater(_snr(_decode_cache_row(cache, slot), key_ref[row]), 20)
 
-        graph_cache = torch.zeros_like(cache)
+        graph_inputs = (*inputs[:-1], torch.zeros_like(cache))
         stream = torch.cuda.Stream()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
-            graph_q, graph_weights = full_indexer_prepare(
-                x,
-                q_lora,
-                wq,
-                wk,
-                wgate,
-                gamma,
-                beta,
-                cos_sin,
-                positions,
-                slots,
-                graph_cache,
-                eps=eps,
-                rope_dim=rope_dim,
-                is_neox_style=is_neox_style,
-            )
+            graph_q, graph_weights = self._prepare(graph_inputs, **kwargs)
         graph_q.zero_()
         graph_weights.zero_()
-        graph_cache.zero_()
+        graph_inputs[-1].zero_()
         graph.replay()
         torch.cuda.synchronize()
         self.assertTrue(torch.equal(graph_q, q))
         self.assertTrue(torch.equal(graph_weights, weights))
-        self.assertTrue(torch.equal(graph_cache, cache))
+        self.assertTrue(torch.equal(graph_inputs[-1], cache))
 
         if benchmark:
-
-            def fused():
-                return full_indexer_prepare(
-                    x,
-                    q_lora,
-                    wq,
-                    wk,
-                    wgate,
-                    gamma,
-                    beta,
-                    cos_sin,
-                    positions,
-                    slots,
-                    cache,
-                    eps=eps,
-                    rope_dim=rope_dim,
-                    is_neox_style=is_neox_style,
-                )
-
-            def native():
-                return self._native_prepare(
-                    x,
-                    q_lora,
-                    positions,
-                    slots,
-                    cache,
-                    wq=wq,
-                    wk=wk,
-                    wgate=wgate,
-                    cos_sin=cos_sin,
-                    rope_dim=rope_dim,
-                    is_neox_style=is_neox_style,
-                )
-
-            fused_ms = triton.testing.do_bench(fused, warmup=50, rep=100)
-            native_ms = triton.testing.do_bench(native, warmup=50, rep=100)
-            print(
-                f"hidden={hidden_size} heads={heads} q_lora_rank={q_lora_rank} "
-                f"page={page_size} M={rows}: "
-                f"fused={fused_ms * 1000:.1f}us native={native_ms * 1000:.1f}us "
-                f"speedup={native_ms / fused_ms:.2f}x"
-            )
-            self.assertLess(fused_ms, native_ms * 0.9)
+            self._benchmark(inputs, **kwargs)
 
     def test_decode_shapes_correctness_and_graph_replay(self):
-        for rows in (1, 2, 4, 8, 10, 16, 32, 40, 64, 96, 128):
+        for rows in _ROWS:
             with self.subTest(rows=rows):
                 self._run_case(rows)
 
@@ -351,77 +349,34 @@ class TestFullIndexerPrepareGfx950(CustomTestCase):
         self._run_case(10, norm_dtype=torch.float32)
 
     def test_generalized_rope_dimensions_and_layouts(self):
-        for rows in (10, 64):
-            for rope_dim in (32, 64, 128):
-                for is_neox_style in (False, True):
-                    with self.subTest(
-                        rows=rows,
-                        rope_dim=rope_dim,
-                        is_neox_style=is_neox_style,
-                    ):
-                        self._run_case(
-                            rows,
-                            rope_dim=rope_dim,
-                            is_neox_style=is_neox_style,
-                        )
+        for rows, rope_dim, is_neox_style in product(
+            (10, 64), (32, 64, 128), (False, True)
+        ):
+            with self.subTest(
+                rows=rows, rope_dim=rope_dim, is_neox_style=is_neox_style
+            ):
+                self._run_case(rows, rope_dim=rope_dim, is_neox_style=is_neox_style)
 
     def test_negative_slots_compute_query_without_writing_cache(self):
-        for q_lora_rank in (1024, 2048):
-            wq = (
-                self.wq
-                if q_lora_rank == 2048
-                else torch.randn(
-                    32 * 128,
-                    q_lora_rank,
-                    device="cuda",
-                    dtype=torch.bfloat16,
-                ).mul_(0.01)
-            )
-            for rows in (1, 3, 10, 64):
-                with self.subTest(rows=rows, q_lora_rank=q_lora_rank):
-                    x, q_lora, positions, slots, cache = self._inputs(
-                        rows, q_lora_rank=q_lora_rank
-                    )
-                    slots.fill_(-1)
-                    cache.fill_(0xA5)
-                    before = cache.clone()
+        for q_lora_rank, rows in product((1024, 2048), (1, 3, 10, 64)):
+            wq = self.wq if q_lora_rank == 2048 else _randn(32 * 128, q_lora_rank)
+            with self.subTest(rows=rows, q_lora_rank=q_lora_rank):
+                inputs = self._inputs(rows, q_lora_rank=q_lora_rank)
+                inputs[3].fill_(-1)
+                inputs[4].fill_(0xA5)
+                before = inputs[4].clone()
+                kwargs = dict(model_weights=(wq, self.wk, self.wgate))
 
-                    q, weights = full_indexer_prepare(
-                        x,
-                        q_lora,
-                        wq,
-                        self.wk,
-                        self.wgate,
-                        self.gamma,
-                        self.beta,
-                        self.cos_sin,
-                        positions,
-                        slots,
-                        cache,
-                        eps=1e-6,
-                    )
-                    graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(graph):
-                        graph_q, graph_weights = full_indexer_prepare(
-                            x,
-                            q_lora,
-                            wq,
-                            self.wk,
-                            self.wgate,
-                            self.gamma,
-                            self.beta,
-                            self.cos_sin,
-                            positions,
-                            slots,
-                            cache,
-                            eps=1e-6,
-                        )
-                    graph.replay()
-                    torch.cuda.synchronize()
+                outputs = self._prepare(inputs, **kwargs)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    graph_outputs = self._prepare(inputs, **kwargs)
+                graph.replay()
+                torch.cuda.synchronize()
 
-                    self.assertTrue(torch.equal(cache, before))
-                    for output in (q, weights, graph_q, graph_weights):
-                        self.assertTrue(torch.isfinite(output.float()).all())
+                self.assertTrue(torch.equal(inputs[4], before))
+                for output in (*outputs, *graph_outputs):
+                    self.assertTrue(torch.isfinite(output.float()).all())
 
     def test_generalized_geometries(self):
         cases = [
@@ -440,74 +395,18 @@ class TestFullIndexerPrepareGfx950(CustomTestCase):
                 page_size=page_size,
             ):
                 self._run_case(
-                    rows,
-                    heads,
-                    q_lora_rank,
-                    hidden_size,
-                    page_size,
-                    benchmark=True,
+                    rows, heads, q_lora_rank, hidden_size, page_size, benchmark=True
                 )
 
     def test_decode_shapes_performance(self):
-        for rows in (1, 2, 4, 8, 10, 16, 32, 40, 64, 96, 128):
+        for rows in _ROWS:
             with self.subTest(rows=rows):
-                x, q_lora, positions, slots, cache = self._inputs(rows)
-
-                def fused():
-                    return full_indexer_prepare(
-                        x,
-                        q_lora,
-                        self.wq,
-                        self.wk,
-                        self.wgate,
-                        self.gamma,
-                        self.beta,
-                        self.cos_sin,
-                        positions,
-                        slots,
-                        cache,
-                        eps=1e-6,
-                    )
-
-                def native():
-                    return self._native_prepare(x, q_lora, positions, slots, cache)
-
-                fused_ms = triton.testing.do_bench(fused, warmup=100, rep=300)
-                native_ms = triton.testing.do_bench(native, warmup=100, rep=300)
-                small_m_ms = None
-                if rows in (64, 96, 128):
-
-                    def small_m():
-                        return small_m_indexer_prepare(
-                            x,
-                            q_lora,
-                            self.wq,
-                            self.wk,
-                            self.wgate,
-                            self.gamma,
-                            self.beta,
-                            self.cos_sin,
-                            positions,
-                            slots,
-                            cache,
-                            eps=1e-6,
-                        )
-
-                    small_m_ms = triton.testing.do_bench(small_m, warmup=100, rep=300)
-                print(
-                    f"M={rows}: fused={fused_ms * 1000:.1f}us "
-                    f"native={native_ms * 1000:.1f}us "
-                    f"speedup={native_ms / fused_ms:.2f}x"
-                    + (
-                        f" small-M={small_m_ms * 1000:.1f}us "
-                        f"schedule-speedup={small_m_ms / fused_ms:.2f}x"
-                        if small_m_ms is not None
-                        else ""
-                    )
+                self._benchmark(
+                    self._inputs(rows),
+                    warmup=100,
+                    rep=300,
+                    compare_generic=rows >= 64,
                 )
-                self.assertLess(fused_ms, native_ms * 0.9)
-                if small_m_ms is not None:
-                    self.assertLess(fused_ms, small_m_ms * 0.8)
 
 
 if __name__ == "__main__":
