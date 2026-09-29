@@ -324,45 +324,6 @@ async fn pd_mode_bootstrap_port_matches_chosen_prefill_worker() {
     );
 }
 
-/// A rejected prefill must override a decode response that cannot be valid without KV.
-#[tokio::test]
-async fn pd_mode_prefill_5xx_returns_bad_gateway() {
-    let prefill = crate::common::mock_worker::MockWorker::start_returning_error(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        json!({"error": "simulated prefill failure"}),
-    )
-    .await;
-    let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
-    let ctx = build_ctx(vec![
-        WorkerSpec {
-            id: WorkerId("p1".into()),
-            url: prefill.url.clone(),
-            mode: WorkerMode::Prefill,
-            model_ids: vec![ModelId("tiny".into())],
-            bootstrap_port: Some(8997),
-        },
-        WorkerSpec {
-            id: WorkerId("d1".into()),
-            url: decode.url.clone(),
-            mode: WorkerMode::Decode,
-            model_ids: vec![ModelId("tiny".into())],
-            bootstrap_port: None,
-        },
-    ]);
-    let app = build_router(ctx);
-
-    let res = app.oneshot(chat_request()).await.unwrap();
-    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
-    assert_eq!(res.headers()["x-router-error-code"], "prefill_failed");
-
-    // Prefill also received its body — it just returned 5xx. The
-    // bootstrap fields are present so the engine WOULD have honoured
-    // the bootstrap_room if the mock had succeeded.
-    let prefill_body = await_captured_body(&prefill, Duration::from_secs(2), "prefill").await;
-    let pv = parse_body(&prefill_body);
-    assert_eq!(bootstrap_port(&pv), Some(8997));
-}
-
 fn streaming_chat_request() -> Request<Body> {
     Request::builder()
         .method("POST")

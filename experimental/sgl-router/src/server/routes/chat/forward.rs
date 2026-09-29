@@ -66,7 +66,7 @@ pub(super) async fn forward_chat_request(
         0,
     );
     // Attribute the outcome to the worker supplying the client-visible response.
-    let metrics = DispatchMetrics::new(
+    let mut metrics = DispatchMetrics::new(
         ctx,
         &request,
         decode.as_deref().unwrap_or(&prefill),
@@ -94,7 +94,7 @@ pub(super) async fn forward_chat_request(
         if let Some((decode, bootstrap)) = pd {
             let task = spawn_prefill_request(
                 ctx,
-                prefill,
+                Arc::clone(&prefill),
                 headers.clone(),
                 body.clone(),
                 prefill_load_guards,
@@ -105,7 +105,7 @@ pub(super) async fn forward_chat_request(
                 ctx.router_inflight_load
                     .register(decode.id.clone(), decode.url.clone(), 0, 1),
             );
-            (decode, decode_load_guards, Some(task))
+            (decode, decode_load_guards, Some((task, prefill)))
         } else {
             (prefill, prefill_load_guards, None)
         };
@@ -123,11 +123,14 @@ pub(super) async fn forward_chat_request(
         &metrics,
         expiration_token.clone(),
     );
+    let mut failed_prefill = None;
     let response_future = async {
-        match prefill_task {
-            Some(prefill) => forward_pd(prefill, response_future).await,
-            None => response_future.await,
-        }
+        let Some((task, prefill)) = prefill_task else {
+            return response_future.await;
+        };
+        let (result, prefill_failed) = forward_pd(task, response_future).await;
+        failed_prefill = prefill_failed.then_some(prefill);
+        result
     };
     // A ready response wins if request expiration fires in the same poll.
     let result = tokio::select! {
@@ -137,6 +140,9 @@ pub(super) async fn forward_chat_request(
             model: metrics.model.clone(),
         }),
     };
+    if let Some(prefill) = &failed_prefill {
+        metrics.attribute_to(prefill);
+    }
     let log_context = metrics.record_dispatch_result(&result, engine_rid);
     // Materialize dispatch errors here so the access log retains the selected worker.
     let mut response = match result {
@@ -187,39 +193,48 @@ fn spawn_prefill_request(
                 None,
             )
             .await;
-        tracing::debug!(prefill_url = %prefill_worker.url, bootstrap_room, "prefill request finished");
+        let prefill_url = &prefill_worker.url;
+        match &result {
+            Ok(response) if response.status().is_success() => {
+                tracing::debug!(%prefill_url, bootstrap_room, "prefill side completed")
+            }
+            Ok(response) => tracing::warn!(
+                %prefill_url, bootstrap_room, status = %response.status(),
+                "prefill returned an error; cancelling decode",
+            ),
+            Err(error) => tracing::warn!(
+                %prefill_url, bootstrap_room, %error,
+                "prefill request failed; cancelling decode",
+            ),
+        }
         result
     })
 }
 
+/// Return decode's response unless prefill fails first; the flag reports a prefill failure.
 async fn forward_pd(
     prefill: tokio::task::JoinHandle<Result<Response<Body>, ApiError>>,
     decode: impl std::future::Future<Output = Result<Response<Body>, ApiError>>,
-) -> Result<Response<Body>, ApiError> {
-    enum Failure {
-        Response(Response<Body>),
-        Proxy(ApiError),
-    }
+) -> (Result<Response<Body>, ApiError>, bool) {
+    // Either side's `Err` ends `try_join!` and carries the client result.
     let prefill = async {
         match prefill.await {
             Ok(Ok(response)) if response.status().is_success() => Ok(()),
-            Ok(Ok(response)) if response.status().is_client_error() => {
-                Err(Failure::Response(response))
-            }
-            Ok(Ok(response)) => Err(Failure::Proxy(ApiError::PrefillFailed {
-                status: Some(response.status()),
-            })),
-            result => {
-                tracing::warn!(?result, "prefill failed; cancelling decode");
-                Err(Failure::Proxy(ApiError::PrefillFailed { status: None }))
-            }
+            // A prefill 4xx is the client's error; forward it verbatim.
+            Ok(Ok(response)) if response.status().is_client_error() => Err((Ok(response), true)),
+            Ok(Ok(response)) => Err((
+                Err(ApiError::PrefillFailed {
+                    status: Some(response.status()),
+                }),
+                true,
+            )),
+            _ => Err((Err(ApiError::PrefillFailed { status: None }), true)),
         }
     };
-    let decode = async { decode.await.map_err(Failure::Proxy) };
+    let decode = async { decode.await.map_err(|error| (Err(error), false)) };
     match tokio::try_join!(prefill, decode) {
-        Ok(((), response)) => Ok(response),
-        Err(Failure::Response(response)) => Ok(response),
-        Err(Failure::Proxy(error)) => Err(error),
+        Ok(((), response)) => (Ok(response), false),
+        Err(failure) => failure,
     }
 }
 
@@ -328,6 +343,12 @@ impl DispatchMetrics {
             }
             metrics.record_stream_outcome(&response_worker_url, &model, classify_stream_end(end));
         })
+    }
+
+    /// Charge the outcome to the prefill worker that caused it.
+    fn attribute_to(&mut self, prefill: &Worker) {
+        self.worker_url = prefill.url.clone();
+        self.mode = WorkerModeLabel::Prefill;
     }
 
     // HTTP status determines the outcome; router cancellations and dispatch failures stay distinct.

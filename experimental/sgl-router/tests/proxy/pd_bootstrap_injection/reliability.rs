@@ -2,81 +2,83 @@ use super::*;
 use crate::common::mock_worker::MockWorker;
 use http_body_util::BodyExt;
 
-fn spec(id: &str, url: &str, mode: WorkerMode) -> WorkerSpec {
-    WorkerSpec {
+fn pd_ctx(prefill: &str, decode: &str, reorg: bool) -> Arc<AppContext> {
+    let spec = |id: &str, url: &str, mode| WorkerSpec {
         id: WorkerId(id.into()),
         url: url.into(),
         mode,
         model_ids: vec![ModelId("tiny".into())],
         bootstrap_port: Some(8997),
+    };
+    let mut ctx = build_ctx(vec![
+        spec("p", prefill, WorkerMode::Prefill),
+        spec("d", decode, WorkerMode::Decode),
+    ]);
+    if reorg {
+        let mutable = Arc::get_mut(&mut ctx).unwrap();
+        mutable.config.model.policy = PolicyKind::PowerOfTwo;
+        crate::common::use_reorg_factory(mutable);
     }
+    ctx
+}
+
+fn chat(stream: bool) -> Request<Body> {
+    Request::post("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"model": "tiny", "stream": stream}).to_string(),
+        ))
+        .unwrap()
 }
 
 #[tokio::test]
 async fn prefill_failure_stops_decode_without_waiting_for_bootstrap_timeout() {
     let decode = MockWorker::start_hanging(Duration::from_secs(10)).await;
-    for reorg in [true, false] {
-        for streaming in [false, true] {
-            for status in [
-                StatusCode::BAD_REQUEST,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                StatusCode::BAD_GATEWAY,
-            ] {
-                let prefill =
-                    MockWorker::start_returning_error(status, json!({"error": "prefill rejected"}))
-                        .await;
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let closed_url = format!("http://{}", listener.local_addr().unwrap());
-                drop(listener);
-                let url = if status == StatusCode::BAD_GATEWAY {
-                    &closed_url
-                } else {
-                    &prefill.url
-                };
-                let mut ctx = build_ctx(vec![
-                    spec("p", url, WorkerMode::Prefill),
-                    spec("d", &decode.url, WorkerMode::Decode),
-                ]);
-                if reorg {
-                    let mutable = Arc::get_mut(&mut ctx).unwrap();
-                    mutable.config.model.policy = PolicyKind::PowerOfTwo;
-                    let state = sgl_router::state::kv_events::KvEventIndex::new();
-                    let (resolver, _) = sgl_router::policies_reorg::factory::build_resolver(
-                        &mutable.config.model,
-                        &state,
-                        None,
+    let rejected = json!({"error": "prefill rejected"});
+    for reorg in [false, true] {
+        for stream in [false, true] {
+            let cases = [
+                (
+                    MockWorker::start_returning_error(StatusCode::BAD_REQUEST, rejected.clone())
+                        .await,
+                    StatusCode::BAD_REQUEST,
+                ),
+                (
+                    MockWorker::start_returning_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        rejected.clone(),
                     )
-                    .unwrap();
-                    mutable.chat_routing = sgl_router::server::app_context::ChatRouting::Reorg(
-                        [(ModelId("tiny".into()), resolver)].into(),
-                    );
-                }
-                let request = Request::post("/v1/chat/completions")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({"model": "tiny", "stream": streaming}).to_string(),
-                    ))
-                    .unwrap();
+                    .await,
+                    StatusCode::BAD_GATEWAY,
+                ),
+                // Transport failure: the prefill body is cut off.
+                (
+                    MockWorker::start_returning_partial_body(StatusCode::OK, b"{").await,
+                    StatusCode::BAD_GATEWAY,
+                ),
+            ];
+            for (prefill, expected) in cases {
+                let ctx = pd_ctx(&prefill.url, &decode.url, reorg);
                 let response = tokio::time::timeout(
                     Duration::from_secs(1),
-                    build_router(ctx.clone()).oneshot(request),
+                    build_router(ctx.clone()).oneshot(chat(stream)),
                 )
                 .await
                 .unwrap()
                 .unwrap();
-                let expected = if status.is_client_error() {
-                    status
-                } else {
-                    StatusCode::BAD_GATEWAY
-                };
                 assert_eq!(response.status(), expected);
-                let body = response.into_body().collect().await.unwrap().to_bytes();
-                if status.is_client_error() {
-                    assert_eq!(
-                        serde_json::from_slice::<Value>(&body).unwrap(),
-                        json!({"error": "prefill rejected"})
-                    );
+                if expected == StatusCode::BAD_GATEWAY {
+                    assert_eq!(response.headers()["x-router-error-code"], "prefill_failed");
                 }
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                if expected == StatusCode::BAD_REQUEST {
+                    assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), rejected);
+                }
+                // The failure is charged to prefill, not to the cancelled decode.
+                assert!(ctx.metrics.render().contains(&format!(
+                    r#"worker_url="{}",model_id="tiny",mode="prefill""#,
+                    prefill.url
+                )));
                 for worker in ctx.registry.workers_for(&ModelId("tiny".into())) {
                     assert_eq!(worker.router_inflight_load(), 0);
                 }
@@ -121,49 +123,24 @@ async fn reorg_prefill_failure_aborts_started_decode_and_releases_load() {
             );
             axum::serve(listener, app).await.unwrap();
         });
-        let mut ctx = build_ctx(vec![
-            spec("p", &prefill_url, WorkerMode::Prefill),
-            spec("d", &decode.url, WorkerMode::Decode),
-        ]);
-        let mutable = Arc::get_mut(&mut ctx).unwrap();
-        mutable.config.model.policy = PolicyKind::PowerOfTwo;
-        let state = sgl_router::state::kv_events::KvEventIndex::new();
-        let (resolver, _) = sgl_router::policies_reorg::factory::build_resolver(
-            &mutable.config.model,
-            &state,
-            None,
-        )
-        .unwrap();
-        mutable.chat_routing = sgl_router::server::app_context::ChatRouting::Reorg(
-            [(ModelId("tiny".into()), resolver)].into(),
-        );
-        let request = Request::post("/v1/chat/completions")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                json!({"model":"tiny", "stream":early_headers}).to_string(),
-            ))
-            .unwrap();
+        let ctx = pd_ctx(&prefill_url, &decode.url, true);
         let response = tokio::time::timeout(
             Duration::from_secs(2),
-            build_router(ctx.clone()).oneshot(request),
+            build_router(ctx.clone()).oneshot(chat(early_headers)),
         )
         .await
         .unwrap()
         .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let sent = parse_body(decode.captured.lock().unwrap().last_body.as_ref().unwrap());
-        assert!(sent["rid"].is_string());
         tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if !decode.abort_log.lock().unwrap().is_empty()
-                    && ctx
-                        .registry
-                        .workers_for(&ModelId("tiny".into()))
-                        .iter()
-                        .all(|w| w.router_inflight_load() == 0)
-                {
-                    break;
-                }
+            while decode.abort_log.lock().unwrap().is_empty()
+                || ctx
+                    .registry
+                    .workers_for(&ModelId("tiny".into()))
+                    .iter()
+                    .any(|w| w.router_inflight_load() != 0)
+            {
                 tokio::task::yield_now().await;
             }
         })
