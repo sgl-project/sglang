@@ -1568,6 +1568,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
 
             seq_len = origin_input_len
+            if decode_req.req.multimodal_inputs is not None:
+                # PD-disagg mm requests: this side computes the expanded mm
+                # token count from its own local preprocessing, while the
+                # prefill instance materializes the count from its
+                # encoder-side pipeline. Any divergence between the two shows
+                # up as the state index length mismatch in the transfer
+                # backend. Log decode's registration base per mm request.
+                logger.info(
+                    "disagg mm state registration: rid=%s "
+                    "origin_input_len=%d (decode's own expanded count)",
+                    decode_req.req.rid,
+                    origin_input_len,
+                )
 
             def _mamba_payload():
                 return [

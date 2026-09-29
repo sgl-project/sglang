@@ -2646,9 +2646,22 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 )
             elif st == StateType.DSA:
                 if len(src_indices) != len(dst_indices):
+                    # dst is sized by decode's own request length; src by the
+                    # KV range prefill actually materialized. These diverge
+                    # for multimodal requests when the two instances expand
+                    # mm placeholders independently (e.g. encoder-sidecar
+                    # real frame count vs decode-side local estimate).
                     raise RuntimeError(
                         f"State index length mismatch at component {i}: "
-                        f"prefill={len(src_indices)}, dst={len(dst_indices)}"
+                        f"prefill={len(src_indices)}, dst={len(dst_indices)}. "
+                        f"This means the two engines disagree on the request's "
+                        f"expanded input length: decode preallocated for a "
+                        f"longer sequence than prefill materialized. For "
+                        f"multimodal requests under PD disaggregation, check "
+                        f"that the mm token count is identical on both sides "
+                        f"(encoder sidecar count vs decode-local preprocessing "
+                        f"count) and that prefill chunked prefill covered "
+                        f"len(origin_input_ids) tokens."
                     )
                 h = self._send_kvcache_generic(
                     peer_name=peer_name,

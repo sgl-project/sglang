@@ -1390,6 +1390,23 @@ class SchedulerDisaggregationPrefillMixin:
             # that decode used to register the destination row.
             seq_len = min(req.extend_range.end, transfer_input_len)
             c128_seq_len = transfer_input_len
+            if req.multimodal_inputs is not None:
+                # PD-disagg mm requests: decode registers its state payloads
+                # from its own (independently computed) expanded input length.
+                # If that differs from the range prefill materialized, the KV
+                # /state index length checks in the transfer backend fail.
+                # Log both accounting bases so the divergence is directly
+                # visible in the prefill log.
+                logger.info(
+                    "disagg mm state base: rid=%s materialized seq_len=%d "
+                    "(extend_range.end=%d, transfer_input_len=%d, "
+                    "fill_ids=%d)",
+                    req.rid,
+                    seq_len,
+                    req.extend_range.end,
+                    transfer_input_len,
+                    len(req.full_untruncated_fill_ids),
+                )
 
             def _mamba_payload():
                 return [
