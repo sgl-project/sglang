@@ -606,7 +606,7 @@ class ExecComm(msgspec.Struct):
     ] = False
     enable_mscclpp: A[
         bool,
-        "Enable using mscclpp for small messages for all-reduce kernel and fall back to NCCL.",
+        "Enable MSCCL++ for tuned AllReduce and AllGather messages, with NCCL fallback.",
     ] = False
     enable_torch_symm_mem: A[
         bool,
@@ -620,6 +620,19 @@ class ExecComm(msgspec.Struct):
         bool,
         "Pre-warm NCCL/RCCL communicators during startup to reduce P99 TTFT cold-start latency. Default: enabled for AMD/HIP (RCCL), disabled for NVIDIA/CUDA (NCCL).",
     ] = False
+    boundary_reduction: A[
+        Literal["auto", "ar", "rs", "rsv", "rs+rsv"],
+        Arg(
+            help="Select FFN boundary reduction: ar uses all-reduce then token "
+            "redistribution; rs and rsv permit fixed-size and variable-size "
+            "reduce-scatter respectively; rs+rsv permits both (RSv first). "
+            "Unsupported paths fall back to ar. The option applies to the FFN "
+            "stages of decoders built with stage boundaries, where auto resolves "
+            "the model default; other models ignore it. Required attention and "
+            "MoE collectives and all-reduce fusion are unaffected.",
+            resolvable=True,
+        ),
+    ] = "auto"
     enable_quant_communications: A[
         Optional[bool],
         "Enable INT8 quantization of TP communications (limited support).",
