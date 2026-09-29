@@ -12,7 +12,6 @@ include = [
     "build.rs",
     "README.md",
     "src/**",
-    "tests/**",
     "sglang/**/*.proto",
 ]
 
