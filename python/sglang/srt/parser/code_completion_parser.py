@@ -82,7 +82,9 @@ def is_completion_template_defined() -> bool:
 
 def generate_completion_prompt_from_request(request: CompletionRequest) -> str:
     global completion_template_name
-    if request.suffix == "":
+    # The field defaults to None. Only "" was skipped, so a normal
+    # completion was filled in with the word None.
+    if request.suffix is None or request.suffix == "":
         return request.prompt
 
     return generate_completion_prompt(
