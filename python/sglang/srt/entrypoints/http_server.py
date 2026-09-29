@@ -63,6 +63,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from fastapi.routing import APIRoute
+from pydantic import ValidationError
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
@@ -74,6 +75,11 @@ from sglang.srt.entrypoints.anthropic.protocol import (
 )
 from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
 from sglang.srt.entrypoints.api_contract import generate_contract_error
+from sglang.srt.entrypoints.decision.protocol import (
+    DecisionsRouteRequest,
+    JevRequest,
+)
+from sglang.srt.entrypoints.decision.serving import DecisionModelServing
 from sglang.srt.entrypoints.engine import (
     Engine,
     init_tokenizer_manager,
@@ -90,7 +96,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ClassifyRequest,
     CompletionRequest,
-    DecisionRequest,
     DetokenizeRequest,
     EmbeddingRequest,
     ErrorResponse,
@@ -358,6 +363,9 @@ async def lifespan(fast_api_app: FastAPI):
     fast_api_app.state.systemone_serving = SystemOneServing(
         fast_api_app.state.openai_serving_chat
     )
+    fast_api_app.state.decision_model_serving = DecisionModelServing(
+        _global_state.tokenizer_manager
+    )
 
     # Launch tool server
     tool_server = None
@@ -610,6 +618,11 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
     return ORJSONResponse(content=error.model_dump(), status_code=exc.status_code)
 
 
+TYPESAFE_REQUEST_ID_HEADER = "x-typesafe-request-id"
+# /v1/decisions validation tags a Jev body's errors after "body".
+_JEV_BODY_LOC = ("body", "jev")
+
+
 # Custom exception handlers to change validation error status codes
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
@@ -629,17 +642,26 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         )
 
     route_path = request.url.path.removeprefix(request.scope.get("root_path", ""))
-    if route_path == "/v1/systemone":
+    errors = exc.errors()
+    jev_body = route_path == "/v1/decisions" and any(
+        tuple(error["loc"][:2]) == _JEV_BODY_LOC for error in errors
+    )
+    if route_path in ("/v1/systemone", "/v1/jev") or jev_body:
         # The System One API documents FastAPI's default 422 detail list. The
         # optional input echo is left out, since it can be any client value.
         detail = [
-            {key: value for key, value in error.items() if key != "input"}
-            for error in exc.errors()
+            {
+                **{key: value for key, value in error.items() if key != "input"},
+                "loc": _untagged_loc(error["loc"]),
+            }
+            for error in errors
         ]
-        return ORJSONResponse(
+        response = ORJSONResponse(
             status_code=HTTPStatus.UNPROCESSABLE_ENTITY.value,
             content={"detail": jsonable_encoder(detail)},
         )
+        response.headers[TYPESAFE_REQUEST_ID_HEADER] = _typesafe_request_id(request)
+        return response
 
     exc_str = str(exc)
     errors_str = str(exc.errors())
@@ -1963,10 +1985,18 @@ async def v1_score_request(request: ScoringRequest, raw_request: Request):
 
 
 @app.post("/v1/decisions", dependencies=[Depends(validate_json_request)])
-async def v1_decisions_request(request: DecisionRequest, raw_request: Request):
-    """Answer typed choice, score, and yes or no questions about an input by scoring single-token answer labels through the scoring API, without generation."""
-    return await raw_request.app.state.openai_serving_decisions.handle_request(
-        request, raw_request
+async def v1_decisions_request(request: DecisionsRouteRequest, raw_request: Request):
+    """Answer typed choice, score, and yes or no questions about an input by scoring single-token answer labels through the scoring API, without generation.
+
+    A body with a state, or with questions keyed by field name, is a Jev request for a decision model checkpoint.
+    """
+    if isinstance(request, JevRequest):
+        return await jev_decisions(request, raw_request)
+    return _with_typesafe_request_id(
+        await raw_request.app.state.openai_serving_decisions.handle_request(
+            request, raw_request
+        ),
+        raw_request,
     )
 
 
@@ -2086,11 +2116,60 @@ async def anthropic_v1_count_tokens(
 
 ## System One compatible decision API
 @app.post("/v1/systemone", dependencies=[Depends(validate_json_request)])
-async def systemone_decisions(request: SystemOneRequest, raw_request: Request):
-    """System One compatible decisions, answered by candidate scoring without generation."""
-    return await raw_request.app.state.systemone_serving.handle_request(
-        request, raw_request
+async def systemone_decisions(raw_request: Request):
+    """System One compatible decisions, answered by candidate scoring without generation.
+
+    A decision model checkpoint answers with its own trained protocol instead.
+    """
+    state = raw_request.app.state
+    decision_model = state.decision_model_serving.family is not None
+    model = JevRequest if decision_model else SystemOneRequest
+    try:
+        body = await raw_request.json()
+    except ValueError as e:
+        raise RequestValidationError(
+            [{"type": "json_invalid", "loc": ("body",), "msg": "JSON decode error"}]
+        ) from e
+    try:
+        request = model.model_validate(body)
+    except ValidationError as e:
+        raise RequestValidationError(
+            [{**error, "loc": ("body", *error["loc"])} for error in e.errors()]
+        ) from e
+    if decision_model:
+        return await jev_decisions(request, raw_request)
+    return _with_typesafe_request_id(
+        await state.systemone_serving.handle_request(request, raw_request),
+        raw_request,
     )
+
+
+@app.post("/v1/jev", dependencies=[Depends(validate_json_request)])
+async def jev_decisions(request: JevRequest, raw_request: Request):
+    """Decision model checkpoints: every field's answer read at its readout position in one prefill."""
+    return _with_typesafe_request_id(
+        await raw_request.app.state.decision_model_serving.handle_request(
+            request, raw_request
+        ),
+        raw_request,
+    )
+
+
+def _untagged_loc(loc) -> tuple:
+    loc = tuple(loc)
+    if loc[:2] == _JEV_BODY_LOC:
+        return ("body", *loc[2:])
+    return loc
+
+
+def _typesafe_request_id(raw_request: Request) -> str:
+    return raw_request.headers.get(TYPESAFE_REQUEST_ID_HEADER) or uuid.uuid4().hex
+
+
+def _with_typesafe_request_id(response, raw_request: Request):
+    if isinstance(response, Response):
+        response.headers[TYPESAFE_REQUEST_ID_HEADER] = _typesafe_request_id(raw_request)
+    return response
 
 
 ## SageMaker API

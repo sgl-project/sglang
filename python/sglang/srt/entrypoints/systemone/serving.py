@@ -254,13 +254,13 @@ def _answer(
     if view.kind == "choice":
         return SystemOneChoiceAnswer(
             choice=view.names[probabilities.index(max(probabilities))],
-            confidence=_choice_confidence(_normalized(probabilities)),
+            confidence=choice_confidence(_normalized(probabilities)),
             probabilities=probabilities_by_name,
             x_label_mass=mass,
         )
     return SystemOneScoreAnswer(
         score=math.fsum(i * p for i, p in enumerate(probabilities)),
-        confidence=_score_confidence(_normalized(probabilities)),
+        confidence=score_confidence(_normalized(probabilities)),
         legend=_legend(view),
         probabilities=probabilities_by_name,
         x_label_mass=mass,
@@ -327,7 +327,7 @@ def _normalized(probabilities: List[float]) -> List[float]:
     return [p / total for p in probabilities]
 
 
-def _choice_confidence(q: List[float]) -> float:
+def choice_confidence(q: List[float]) -> float:
     """How far the top option stands above a uniform guess, from 0 to 1."""
     n = len(q)
     if n == 1:
@@ -335,7 +335,7 @@ def _choice_confidence(q: List[float]) -> float:
     return min(1.0, max(0.0, (n * max(q) - 1) / (n - 1)))
 
 
-def _score_confidence(q: List[float]) -> float:
+def score_confidence(q: List[float]) -> float:
     """One minus the spread around the top level relative to a uniform spread, floored at 0."""
     n = len(q)
     if n == 1:

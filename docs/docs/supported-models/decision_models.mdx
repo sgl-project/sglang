@@ -252,6 +252,28 @@ What to expect from this route:
 - The SDKs' `models.list()` and response `request_id` are not supported, because `GET /v1/models` keeps its OpenAI format and no request id header is sent.
 - The SDKs time out after 10 seconds and retry, so raise their timeout for requests with many questions over a long state. A request whose client gives up still finishes its encoding and part of its prefill, so each retry repeats at least the encoding.
 
+## Decision model checkpoints
+
+Some checkpoints are trained as decision models, with their own prompt layout. SGLang serves them with the request and response of the Jev (System One) API: the server renders the model's trained prompt, runs one prefill, and reads every field's answer from the next-token scores at its position. The supported family is [Intern-Decision](https://github.com/internlm/Intern-Decision) (`internlm/Intern-Decision-0.8B`, `-2B`, `-4B`), detected by the `<decision>` token its tokenizer ships.
+
+Three routes serve it: `POST /v1/jev`; `POST /v1/decisions` when the body has a `state` or its `questions` are keyed by field name, where other bodies stay the requests above; and `POST /v1/systemone` when the served model is a decision model, where other models keep the [System One compatible API](#system-one-compatible-api).
+
+```bash Command
+curl -s http://127.0.0.1:30000/v1/decisions -H "Content-Type: application/json" -d '{
+  "state": {"left_box": "red", "right_box": "blue"},
+  "questions": {
+    "box": {"type": "choice", "instructions": "Which box is red?", "criteria": {"left": "The left box", "right": "The right box"}},
+    "red_exists": {"type": "noul", "instructions": "Is at least one box red?"},
+    "red_count": {"type": "score", "instructions": "How many boxes are red?", "criteria": ["Zero", "One", "Two"]}
+  },
+  "temperature": 1.992418
+}'
+```
+
+Each answer has `probabilities`, `decision`, and `confidence`, plus `choice`, `noul` (the probability of yes), or `score` with its `legend`. Confidence uses TypeSafe's formulas for choice and score and is the top probability for noul. `temperature` applies the official calibration, `softmax(log p / T)`, without changing `decision`; the published values are 2.747761 (0.8B), 2.100509 (2B), and 1.992418 (4B). `model` may name the served model, `jev-latest`, or `jev-preview`, and every response carries `x-typesafe-request-id`.
+
+Limits: 1 to 16 questions, and at most 62 options or levels per question for Intern-Decision, one per answer symbol. Invalid requests, including text that contains `<decision>`, return 422 with the field location. Text-only requests are served, and the route refuses images, prompts longer than `--chunked-prefill-size`, `--chat-template`, speculative decoding, `--enable-mis`, and `--dllm-algorithm`.
+
 ## Build decisions without `/v1/decisions`
 
 When you need your own prompt or labels, build the prompt on the client and score it through `/v1/score`, which takes token ids and one label list per item. This needs `transformers` and `jinja2` on the client. Every label must be exactly one token at the answer position:
