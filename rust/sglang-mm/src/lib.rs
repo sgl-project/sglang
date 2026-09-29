@@ -10,6 +10,7 @@ pub mod common;
 pub mod driver;
 pub mod dsv41;
 pub mod inkling;
+pub mod internvl;
 pub mod pipeline;
 pub mod qwen_vl;
 pub mod registry;
