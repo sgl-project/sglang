@@ -408,6 +408,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         # group, independent of idle peer DP ranks; it is built and run under
         # the same placement.
         self.draft_owns_attention = get_parallel().enable_dp_attention
+        # Inside the draft scope the context answers the draft's narrowed rank.
+        self._target_tp_rank = get_parallel().tp_rank
         with draft_pp_context(), draft_tp_context(self.draft_owns_attention):
             bundle = build_draft_tp_worker(
                 server_args=server_args,
@@ -645,7 +647,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 # shared graph capture/replay; keep the draft eager under dp
                 # attention.
                 capture_decode_cuda_graph = False
-                if self.model_runner.tp_group.rank_in_group == 0:
+                if self._target_tp_rank == 0:
                     logger.warning(
                         "Disable DFLASH draft cuda graph because dp attention "
                         "is enabled (draft runs eager)."
@@ -790,7 +792,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     def _maybe_build_draft_sampler(self):
         def _eager(reason):
-            if self.model_runner.tp_group.rank_in_group == 0:
+            if self._target_tp_rank == 0:
                 logger.info("DFLASH draft greedy head kept eager (reason=%s).", reason)
             return None
 
@@ -816,7 +818,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             if not head_supported:
                 return _eager("unsupported quantized lm_head")
             self.draft_model.lm_head = lm_head
-            if self.model_runner.tp_group.rank_in_group == 0:
+            if self._target_tp_rank == 0:
                 logger.info(
                     "DFLASH selector decode folded into the draft cuda graph "
                     "(sampling_enabled=%s).",
@@ -851,7 +853,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             embed_proj = self.draft_model.embed_proj
             if prefix_gru is None or embed_proj is None:
                 return _eager("Domino projector modules are unavailable")
-            if self.model_runner.tp_group.rank_in_group == 0:
+            if self._target_tp_rank == 0:
                 logger.info(
                     "DFLASH Domino rollout folded into the draft cuda graph (tp=%s).",
                     int(tp_group.world_size),
@@ -890,7 +892,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 return _eager("added vocab")
             num_org = int(shard.num_org_elements)
             org_vocab_start = int(shard.org_vocab_start_index)
-        if self.model_runner.tp_group.rank_in_group == 0:
+        if self._target_tp_rank == 0:
             logger.info(
                 "DFLASH draft greedy head folded into the draft cuda graph (tp=%d).",
                 tp_group.world_size,

@@ -3262,9 +3262,7 @@ class TestNothingReadsThePlacementBeforeItIsFrozen(CustomTestCase):
     def test_no_method_called_before_the_freeze_reads_what_it_freezes(self):
         methods = self._model_runner()
         frozen = self._frozen_names(methods)
-        self.assertLessEqual(
-            {"tp_group", "pp_group"}, frozen, "found no frozen groups; census is broken"
-        )
+        self.assertIn("pp_group", frozen, "found no frozen group; census is broken")
         offenders = []
         for lineno, name in self._calls_before_the_freeze(methods):
             fn = methods.get(name)

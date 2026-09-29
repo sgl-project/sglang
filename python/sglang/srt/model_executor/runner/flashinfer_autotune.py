@@ -254,7 +254,7 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
 
     mr = model_runner
     cache_path = flashinfer_autotune_cache_path(mr)
-    sync_group = _autotune_tactic_sync_group(mr.tp_group)
+    sync_group = _autotune_tactic_sync_group(get_parallel().tp_group)
     reuse_cache = envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.get()
     if reuse_cache:
         autotune_cache = cache_path
@@ -425,7 +425,7 @@ def maybe_flashinfer_autotune_extend(
     try:
         run_flashinfer_autotune_forward(mr, forward_fn, run_lm_head=False)
     except torch.OutOfMemoryError:
-        if _autotune_tactic_sync_group(mr.tp_group) is not None:
+        if _autotune_tactic_sync_group(get_parallel().tp_group) is not None:
             # Tuning is collective: this rank has stopped reducing while its
             # peers wait on the next tactic, so skipping the pass would hang
             # them. Fail instead of degrading alone.

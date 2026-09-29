@@ -1135,7 +1135,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         self.model_runner.model,
                         bs in self.compile_bs,
                         num_tokens=bs * self.captured_req_width,
-                        tp_group=self.model_runner.tp_group,
+                        tp_group=get_parallel().tp_group,
                     ) as forward:
                         self.capture_one_shape(
                             bs,
