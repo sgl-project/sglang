@@ -378,6 +378,13 @@ class AnthropicMessagesRequest(BaseModel):
     output_config: Optional[AnthropicOutputConfig] = None
     betas: Optional[list[str]] = None
 
+    # Native Messages requests use the same PD rendezvous as Chat Completions.
+    bootstrap_host: Optional[Union[list[str], str]] = None
+    bootstrap_port: Optional[Union[list[Optional[int]], int]] = None
+    bootstrap_room: Optional[Union[list[int], int]] = None
+    routed_dp_rank: Optional[int] = None
+    disagg_prefill_dp_rank: Optional[int] = None
+
     @field_validator("model")
     @classmethod
     def _validate_model(cls, v):
