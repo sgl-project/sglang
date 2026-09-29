@@ -834,6 +834,8 @@ class TboForwardBatchPreparer:
                 token_ids_logprobs=None,
                 extend_input_logprob_token_ids_gpu=None,
                 next_token_logits_buffer=None,
+                # The aux packer runs in the parent model forward, not per child.
+                aux_hidden_states_buffer=None,
                 return_hidden_states_before_norm=False,
                 # TBO children start unplanned — planned by the TBO-aware init
                 # flow; a stale parent "ready" would wrongly skip that.
