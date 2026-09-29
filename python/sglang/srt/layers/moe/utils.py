@@ -441,10 +441,6 @@ def get_deepep_v2_fp8_scale_format() -> DeepEPv2Fp8ScaleFormat:
 
 
 def _default_speculative_a2a_backend(target_a2a_backend: MoeA2ABackend) -> MoeA2ABackend:
-    # megamoe's global-expert-id dispatch assumes a quantized layer; MTP/NextN
-    # drafts never are, so inheriting it mismatches their actual Triton runner
-    # and corrupts expert-id dispatch (issue #40623). Default to none instead;
-    # --speculative-moe-a2a-backend still overrides this.
     if target_a2a_backend.is_flashinfer_megamoe():
         return MoeA2ABackend.NONE
     return target_a2a_backend
@@ -453,13 +449,6 @@ def _default_speculative_a2a_backend(target_a2a_backend: MoeA2ABackend) -> MoeA2
 def _default_speculative_moe_runner_backend(
     target_runner_backend: MoeRunnerBackendLike,
 ) -> MoeRunnerBackendLike:
-    # StandardDispatcher.skip_local_expert_mapping (token_dispatcher/standard.py)
-    # reads this backend to decide whether it owes an EP global->local expert-id
-    # remap; megamoe skips it, trusting the mega kernel's own remap. An
-    # unquantized MTP/NextN draft never runs the mega kernel, so inheriting
-    # megamoe here corrupts expert-id dispatch the same way as the a2a case
-    # above (issue #40623). Prefer flashinfer_trtllm over the Triton fallback.
-    # --speculative-moe-runner-backend still overrides this.
     if target_runner_backend.is_flashinfer_megamoe():
         return MoeRunnerBackend.FLASHINFER_TRTLLM
     return target_runner_backend
