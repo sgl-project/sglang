@@ -50,8 +50,8 @@ _is_xpu = is_xpu()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 
-if not (_is_cuda or _is_hip or _is_xpu or _is_npu):
-    warnings.warn(f"Only CUDA, HIP and XPU support AWQ currently.")
+if not (_is_cuda or _is_hip or _is_xpu or _is_npu or _is_cpu):
+    warnings.warn("Only CUDA, HIP, XPU, NPU and CPU support AWQ currently.")
 
 logger = logging.getLogger(__name__)
 
