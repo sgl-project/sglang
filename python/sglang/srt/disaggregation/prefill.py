@@ -367,6 +367,19 @@ class PrefillBootstrapQueue:
         )
         kv_sender_class = get_kv_class(backend, KVClassType.SENDER)
 
+        # Record the authoritative (encoder-side, post-multimodal) expanded
+        # input length for this room, so the bootstrap thread can push it to
+        # decode when decode's own expansion count disagrees (see
+        # CommonKVManager.push_prefill_input_len).
+        note_room_input_len = getattr(self.kv_manager, "note_room_input_len", None)
+        if note_room_input_len is not None:
+            note_room_input_len(req.bootstrap_room, len(req.origin_input_ids))
+            # Rooms whose bootstrap (decode registration) completed before
+            # this admission never see the completion-time push -- retry here.
+            getattr(self.kv_manager, "push_prefill_input_len", lambda _: None)(
+                req.bootstrap_room
+            )
+
         dest_tp_ranks = [self.tp_rank]
 
         req.disagg_kv_sender = kv_sender_class(
