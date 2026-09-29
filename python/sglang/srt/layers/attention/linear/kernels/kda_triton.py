@@ -434,8 +434,21 @@ def _extend_blocked(
     h_pos = 0
     num_chunks = sum(-(-n // _KDA_CHUNK_TOKENS) for n in seq_lens)
 
-    def run(s, e, cu_list, initial_state, indices):
+    def run(s, e, cu_list, initial_state, indices, seq_start, seq_end, chunk_offset=0):
         nonlocal h_out, h_pos
+        call_common = common
+        if common.get("track_state") is not None:
+            # Snapshot rows follow the original batch, while the kernel indexes
+            # the sequences and chunks of this call. A split must translate
+            # both coordinates, including a checkpoint at a block boundary.
+            # Negative/out-of-range chunk indices are not written by the kernel.
+            call_common = dict(
+                common,
+                track_state=common["track_state"][seq_start:seq_end],
+                track_chunk_idx=(
+                    common["track_chunk_idx"][seq_start:seq_end] - chunk_offset
+                ),
+            )
         out = chunk_kda(
             q=q[:, s:e],
             k=k[:, s:e],
@@ -445,7 +458,7 @@ def _extend_blocked(
             cu_seqlens=_cached_cu_seqlens(cu_list, cu_dtype, device),
             initial_state=initial_state,
             initial_state_indices=indices,
-            **common,
+            **call_common,
         )
         if return_intermediate_states:
             h = out[1]
@@ -473,7 +486,16 @@ def _extend_blocked(
                 scratch_index = torch.zeros(1, dtype=cache_indices.dtype, device=device)
             for b0 in range(0, length, block):
                 b1 = min(b0 + block, length)
-                run(start + b0, start + b1, [0, b1 - b0], scratch, scratch_index)
+                run(
+                    start + b0,
+                    start + b1,
+                    [0, b1 - b0],
+                    scratch,
+                    scratch_index,
+                    i,
+                    i + 1,
+                    b0 // _KDA_CHUNK_TOKENS,
+                )
             ssm_states[safe_idx] = torch.where(
                 valid, scratch.to(ssm_states.dtype), ssm_states[safe_idx]
             )
@@ -489,7 +511,7 @@ def _extend_blocked(
                 cu_list = [0]
                 for m in seq_lens[i:j]:
                     cu_list.append(cu_list[-1] + m)
-                run(start, start + total, cu_list, ssm_states, cache_indices[i:j])
+                run(start, start + total, cu_list, ssm_states, cache_indices[i:j], i, j)
             start += total
             i = j
     if return_intermediate_states:
