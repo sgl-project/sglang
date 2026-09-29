@@ -555,9 +555,7 @@ class MoEGate(nn.Module):
         return logits
 
 
-# The dedicated 4 MiB push slot fits 384 rows of 5120 BF16 values.
-# The dispatch gate also checks slot capacity and available counters.
-_FUSED_FINALIZE_ALL_REDUCE_MAX_TOKENS = 384
+_FUSED_FINALIZE_ALL_REDUCE_MAX_TOKENS = 1024
 
 
 class DeepseekV2MoE(nn.Module):
@@ -972,6 +970,22 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states, forward_batch, input_ids_global=input_ids_global
             )
 
+    def _can_fuse_finalize_all_reduce(
+        self, hidden_states: torch.Tensor, has_shared_output: bool
+    ) -> bool:
+        return (
+            self._fuse_finalize_all_reduce
+            and has_shared_output
+            and hidden_states.shape[-1] == 5120
+            and not self._shared_expert_tp1
+            and self.tp_size > 1
+            and hidden_states.shape[0] <= _FUSED_FINALIZE_ALL_REDUCE_MAX_TOKENS
+            and not should_skip_post_experts_all_reduce(is_tp_path=True)
+            and should_use_fuse_finalize_all_reduce(
+                self.experts, hidden_states.shape[0], hidden_states.shape[-1]
+            )
+        )
+
     def forward_normal_dual_stream(
         self,
         hidden_states: torch.Tensor,
@@ -1049,18 +1063,8 @@ class DeepseekV2MoE(nn.Module):
                 )
                 ready = self.routed_quant_stream.record_event()
             routed_pre_quant_input = Mxfp8RoutedInputPreQuant(x_q, x_sf, ready)
-        # The mHC post-split consumes the reduced row without an RMSNorm.
-        use_fused_finalize_all_reduce = (
-            self._fuse_finalize_all_reduce
-            and has_shared_output
-            and hidden_states.shape[-1] == 5120
-            and not self._shared_expert_tp1
-            and self.tp_size > 1
-            and hidden_states.shape[0] <= _FUSED_FINALIZE_ALL_REDUCE_MAX_TOKENS
-            and not should_skip_post_experts_all_reduce(is_tp_path=True)
-            and should_use_fuse_finalize_all_reduce(
-                self.experts, hidden_states.shape[0], hidden_states.shape[-1]
-            )
+        use_fused_finalize_all_reduce = self._can_fuse_finalize_all_reduce(
+            hidden_states, has_shared_output
         )
         deferred_finalize = use_fused_finalize_all_reduce or (
             has_shared_output

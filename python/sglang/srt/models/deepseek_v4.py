@@ -474,7 +474,7 @@ def _apply_wo_a_bf16_matmul(
             )
             or (
                 is_target_verify
-                and 0 < o.shape[0] <= 384
+                and 0 < o.shape[0] <= 1024
                 and get_platform().is_blackwell
             )
             or (
@@ -1263,7 +1263,7 @@ class MQALayer(MqaAttentionBase):
             and get_platform().is_blackwell
             and q.dtype == self.q_norm.weight.dtype == torch.bfloat16
             and q.ndim == 2
-            and 0 < q.shape[0] <= 8
+            and 0 < q.shape[0] <= 512
             and q.shape[1] == 1280
             and q.stride(1) == 1
             and getattr(method, "mxfp8_dense_backend", None)
@@ -1313,7 +1313,7 @@ class MQALayer(MqaAttentionBase):
                 _is_cuda
                 and q_out is not None
                 and (
-                    0 < q.shape[0] <= 8
+                    0 < q.shape[0] <= 4095
                     or (
                         self.is_dsv41
                         and get_platform().is_blackwell
@@ -2952,7 +2952,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             and self.hc_pre_from_prev_sublayer
             and self.hc_mult == 4
             and x.shape[1] == 5120
-            and x.shape[0] <= 384
+            and x.shape[0] <= 1024
             and x.dtype == residual.dtype == torch.bfloat16
             and post.dtype == comb.dtype == torch.float32
             and all(t.is_contiguous() for t in (x, residual, post, comb))
@@ -3201,6 +3201,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         combined: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sglang.kernels.ops.layernorm.mhc import hc_combine
+        from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 
         quantize = quantized is not None
         x_flat = x.flatten(1)
@@ -3230,16 +3231,34 @@ class DeepseekV4DecoderLayer(nn.Module):
                     )
 
                     return hc_norm_prefill(combined, norm.weight, norm.variance_epsilon)
+                if (
+                    quantize
+                    and combined.is_cuda
+                    and get_platform().is_blackwell
+                    and 0 < combined.shape[0] <= 512
+                    and combined.dtype == norm.weight.dtype == torch.bfloat16
+                    and combined.stride(1) == 1
+                    and not norm.cast_x_before_out_mul
+                    and norm.variance_size_override is None
+                    and not is_batch_invariant_mode_enabled()
+                ):
+                    from sglang.kernels.ops.layernorm.mxfp8_epilogue import (
+                        rmsnorm_mxfp8,
+                    )
+
+                    y, y_q, y_sf = rmsnorm_mxfp8(
+                        combined, norm.weight, norm.variance_epsilon
+                    )
+                    quantized.append(Mxfp8SwizzledInput(y_q, y_sf))
+                    return y
                 return norm(combined)
             if apply_pre is None:
                 return norm(x[:, 0, :].contiguous())
-            from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
-
             if (
                 x.is_cuda
                 and get_platform().is_blackwell
                 and (
-                    0 < x.shape[0] <= 96
+                    0 < x.shape[0] <= 512
                     or (
                         self.config.model_type == "deepseek_v41"
                         and 4096 <= x.shape[0] <= 65536
@@ -3253,8 +3272,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 and norm.variance_size_override is None
                 and not is_batch_invariant_mode_enabled()
             ):
-                # The fused scale writer supports the small decode/verify tile only.
-                if quantize and x.shape[0] <= 8:
+                if quantize and x.shape[0] <= 512:
                     from sglang.kernels.ops.layernorm.hc_combine_norm import (
                         hc_combine_norm_mxfp8,
                     )
@@ -3455,7 +3473,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             and get_platform().is_blackwell
             and (
                 (
-                    128 <= x.shape[0] <= 384
+                    9 <= x.shape[0] <= 1024
                     and (
                         forward_batch.forward_mode.is_decode()
                         or forward_batch.forward_mode.is_target_verify()
@@ -3554,7 +3572,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             stats_stream is not None
             and forward_batch.forward_mode.is_extend_without_speculative()
         )
-        medium_verify = 128 <= x.shape[0] <= 384 and (
+        medium_verify = 9 <= x.shape[0] <= 1024 and (
             forward_batch.forward_mode.is_decode()
             or forward_batch.forward_mode.is_target_verify()
         )
@@ -4484,7 +4502,7 @@ class DeepseekV4Model(nn.Module):
                 if (
                     self.config.model_type == "deepseek_v41"
                     and (
-                        128 <= hidden_states.shape[0] <= 384
+                        9 <= hidden_states.shape[0] <= 1024
                         or (
                             4096 <= hidden_states.shape[0] <= 65536
                             and forward_batch.forward_mode.is_extend_without_speculative()

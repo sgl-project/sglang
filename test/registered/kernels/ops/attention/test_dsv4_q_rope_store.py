@@ -26,7 +26,7 @@ class TestQRopeStore(CustomTestCase):
         freqs = torch.polar(
             torch.ones(8192, 32, device="cuda"), torch.randn(8192, 32, device="cuda")
         )
-        for rows in (1, 2, 5, 6, 8):
+        for rows in (1, 2, 5, 6, 8, 9, 128, 129, 512, 1024, 4095):
             for heads in (8, 16, 32):
                 for dtype in (torch.int32, torch.int64):
                     q = torch.randn(
@@ -94,7 +94,9 @@ class TestQRopeStore(CustomTestCase):
             torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
     def test_graph_replay(self):
-        self._check_graph_replay(6)
+        for rows in (6, 9, 129, 512, 1024, 4095):
+            with self.subTest(rows=rows):
+                self._check_graph_replay(rows)
 
     def test_large_prefill_graph_replay(self):
         self._check_graph_replay(4097)

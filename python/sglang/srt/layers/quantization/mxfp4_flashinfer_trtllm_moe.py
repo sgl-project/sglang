@@ -419,7 +419,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         # Preserve the ordinary output shape in the medium-batch autotuner
         # cache key. The deferred ABI ignores this allocation and returns the
         # expanded GEMM output for the separate fused finalize epilogue.
-        if not defer_finalize or 96 < num_tokens <= 384:
+        if not defer_finalize or 96 < num_tokens <= 1024:
             with use_symmetric_memory(
                 get_parallel().tp_group, disabled=not is_allocation_symmetric()
             ):
@@ -526,7 +526,6 @@ _fused_finalize_all_reduce_comm = None
 
 
 def _fused_finalize_all_reduce_comm_world_size() -> Optional[int]:
-    """Reserve a separate push plane for up to 384 rows of fused MoE output."""
     global _fused_finalize_all_reduce_world_size, _fused_finalize_all_reduce_probed
     global _fused_finalize_all_reduce_comm
     if not _fused_finalize_all_reduce_probed:
@@ -550,8 +549,8 @@ def _fused_finalize_all_reduce_comm_world_size() -> Optional[int]:
                     ca_comm.device,
                     max_pull_size=0,
                     max_pull_blocks=0,
-                    max_push_size=4 * 1024 * 1024,
-                    max_push_blocks=512,
+                    max_push_size=12 * 1024 * 1024,
+                    max_push_blocks=1024,
                 )
                 register_comm_cleanup(fused_comm)
             if fused_comm.disabled:
