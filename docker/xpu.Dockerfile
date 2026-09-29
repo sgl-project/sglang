@@ -1,7 +1,7 @@
 # docker build -t sglang:xpu -f xpu.Dockerfile --build-arg http_proxy=${http_proxy} --build-arg https_proxy=${https_proxy} --build-arg no_proxy=${no_proxy} --no-cache .
 
 # Use Intel deep learning essentials base image with Ubuntu 24.04
-FROM intel/deep-learning-essentials:2026.0.0-devel-ubuntu24.04
+FROM intel/deep-learning-essentials:2026.1.4-devel-ubuntu24.04
 
 # Avoid interactive prompts during package install
 ENV DEBIAN_FRONTEND=noninteractive
@@ -24,8 +24,8 @@ USER root
 
 # Pin Level-Zero UMD + IGC (rolling PPA once faulted libze on B580; see sgl-kernel-xpu#296).
 # Keep in lockstep with the host xe KMD; override via --build-arg.
-ARG COMPUTE_RUNTIME_VERSION=26.18.38308.1
-ARG IGC_VERSION=2.34.4+21428
+ARG COMPUTE_RUNTIME_VERSION=26.35.39758.10
+ARG IGC_VERSION=2.41.5+22716
 ARG GMM_VERSION=22.10.0
 
 RUN apt-get update && apt-get install -y software-properties-common curl && \
@@ -78,7 +78,7 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 WORKDIR /sgl-workspace
 
-RUN pip install --no-cache-dir torch==2.13.0+xpu torchvision==0.28.0+xpu torchaudio==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu && \
+RUN pip install --no-cache-dir torch==2.14.0+xpu torchvision==0.29.0+xpu torchaudio==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu && \
     pip install --no-cache-dir msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser einops tabulate --root-user-action=ignore
 
 RUN echo "Cloning ${SG_LANG_BRANCH} from ${SG_LANG_REPO}" && \
