@@ -83,8 +83,8 @@ fn labels_match_selector(labels: &BTreeMap<String, String>, selector: &str) -> b
 /// Read a slice's PD version group from the configured label key.
 ///
 /// EndpointSlices inherit their Service's labels, so the group is set per
-/// Service: one Service per (role, version). A slice that lacks the label
-/// yields `None` and pairs only with other unlabeled workers.
+/// Service: one Service per (role, version). A slice that lacks the label, or
+/// sets it empty, yields `None` and pairs only with other unlabeled workers.
 fn version_group(es: &EndpointSlice, label: Option<&str>) -> Option<String> {
     let label = label?;
     let group = es
@@ -92,6 +92,7 @@ fn version_group(es: &EndpointSlice, label: Option<&str>) -> Option<String> {
         .labels
         .as_ref()
         .and_then(|labels| labels.get(label))
+        .filter(|group| !group.is_empty())
         .cloned();
     if group.is_none() {
         // Debug, not warn: this runs on every Apply for the slice.
@@ -208,8 +209,8 @@ fn slice_key(es: &EndpointSlice) -> String {
     format!("{ns}/{name}")
 }
 
-/// Send all `Added` / `Removed` / `ModeChanged` events that bring the
-/// consumer from `prev_union` to the recomputed union of `per_slice`.
+/// Send all `Added` / `Removed` / `ModeChanged` / `VersionGroupChanged` events
+/// that bring the consumer from `prev_union` to the recomputed union of `per_slice`.
 ///
 /// Returns `Err` on the first send failure (consumer dropped); the caller is
 /// expected to exit the watcher loop.  Updates `prev_union` in place to the
@@ -234,12 +235,15 @@ async fn emit_diff(
                     })
                     .await?;
                 }
-                if prev.url != spec.url
-                    || prev.model_ids != spec.model_ids
-                    || prev.version_group != spec.version_group
-                {
+                if prev.url != spec.url || prev.model_ids != spec.model_ids {
                     tx.send(DiscoveryEvent::Removed { id: id.clone() }).await?;
                     tx.send(DiscoveryEvent::Added(spec.clone())).await?;
+                } else if prev.version_group != spec.version_group {
+                    tx.send(DiscoveryEvent::VersionGroupChanged {
+                        id: id.clone(),
+                        version_group: spec.version_group.clone(),
+                    })
+                    .await?;
                 }
             }
             None => {
@@ -876,13 +880,14 @@ mod tests {
     }
 
     /// The configured label's value on each slice becomes its workers' version
-    /// group; a slice without the label yields `None`.
+    /// group; a slice without the label, or with an empty value, yields `None`.
     #[tokio::test]
     async fn pd_mode_reads_version_group_from_slice_label() {
         let out = run_with_group_label(vec![
             group_slice("p-v1", "10.0.0.1", "prefill", Some("v1")),
             group_slice("d-v2", "10.0.0.2", "decode", Some("v2")),
             group_slice("d-none", "10.0.0.3", "decode", None),
+            group_slice("d-empty", "10.0.0.4", "decode", Some("")),
         ])
         .await;
         let mut groups: Vec<_> = out
@@ -901,14 +906,15 @@ mod tests {
                 ("http://10.0.0.1:30000", Some("v1")),
                 ("http://10.0.0.2:30000", Some("v2")),
                 ("http://10.0.0.3:30000", None),
+                ("http://10.0.0.4:30000", None),
             ]
         );
     }
 
-    /// Relabeling a slice's version group re-registers its workers so the new
-    /// group takes effect; a worker is never left paired under its old group.
+    /// Relabeling a slice's version group updates its workers in place, keeping
+    /// their live state; only a URL or model change re-registers a worker.
     #[tokio::test]
-    async fn version_group_change_emits_remove_then_add() {
+    async fn version_group_change_emits_in_place_update() {
         let out = run_with_group_label(vec![
             group_slice("p", "10.0.0.1", "prefill", Some("v1")),
             group_slice("p", "10.0.0.1", "prefill", Some("v2")),
@@ -920,11 +926,10 @@ mod tests {
                 out.as_slice(),
                 [
                     DiscoveryEvent::Added(first),
-                    DiscoveryEvent::Removed { id: removed },
-                    DiscoveryEvent::Added(second),
+                    DiscoveryEvent::VersionGroupChanged { id: changed, version_group },
                 ] if first.version_group.as_deref() == Some("v1")
-                    && removed == &id
-                    && second.version_group.as_deref() == Some("v2")
+                    && changed == &id
+                    && version_group.as_deref() == Some("v2")
             ),
             "out={out:?}"
         );
