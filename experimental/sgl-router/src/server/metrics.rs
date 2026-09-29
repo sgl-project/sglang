@@ -260,11 +260,14 @@ pub enum StreamOutcome {
     ClientDisconnect,
     /// The router's stale-request deadline aborted the stream.
     Expired,
+    /// The router aborted the stream before its first chunk.
+    Aborted,
 }
 
 pub(crate) fn classify_stream_end(end: StreamEnd) -> StreamOutcome {
     match end.reason {
         StreamEndReason::Expired => StreamOutcome::Expired,
+        StreamEndReason::Aborted => StreamOutcome::Aborted,
         StreamEndReason::UpstreamError
         | StreamEndReason::IdleTimeout
         | StreamEndReason::PumpPanicked => StreamOutcome::UpstreamError,
@@ -282,6 +285,7 @@ impl StreamOutcome {
             Self::UpstreamError => "upstream_error",
             Self::ClientDisconnect => "client_disconnect",
             Self::Expired => "expired",
+            Self::Aborted => "aborted",
         }
     }
 }
@@ -1602,6 +1606,7 @@ mod tests {
             (StreamEndReason::IdleTimeout, UpstreamError),
             (StreamEndReason::PumpPanicked, UpstreamError),
             (StreamEndReason::Expired, Expired),
+            (StreamEndReason::Aborted, Aborted),
         ] {
             for saw_error_event in [false, true] {
                 let end = StreamEnd {
