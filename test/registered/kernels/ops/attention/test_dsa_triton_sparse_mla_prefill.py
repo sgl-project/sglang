@@ -14,6 +14,9 @@ over the sparse-MLA contract. Each case guards a distinct failure mode:
 - Head counts whose tuned tile exceeds the device shared-memory budget. Guards
   the h=32-on-SM120 launch failure (100 KB/CTA): the launcher must step the tile
   down, not propagate OutOfResources to the request.
+- The union dedup contract on its own: unique ascending rows per group with the
+  exact ownership bits. A duplicated row is weighted twice by the kernel, an
+  error small enough to hide under the cosine gate of the end-to-end check.
 """
 
 import unittest
@@ -21,6 +24,7 @@ import unittest
 import torch
 
 from sglang.kernels.ops.attention.dsa.triton_sparse_mla_prefill import (
+    _union_dedup,
     sparse_mla_prefill,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -160,25 +164,43 @@ class TestDSATritonSparseMLAPrefill(CustomTestCase):
             "union G=2 h=16 smem fallback",
         )
 
-    def test_union_workspace_reuse_across_batch_shapes(self):
-        # The union scratch is cached per (group size, span, device) and reused
-        # across calls, with an epoch counter standing in for re-zeroing. Two
-        # ways that goes wrong: a later, larger batch reading marks left by an
-        # earlier one, and the epoch wrapping (every 128 calls) without clearing
-        # rows the current batch does not cover. Alternate the batch size and
-        # run past the wrap.
-        topk, S = 512, 1024
-        cases = []
-        for T in (256, 1024, 256):
-            q, kv, g = _qkv(T, S, 8, seed=T + 31)
-            idx = _overlapping_indices(T, topk, S, g)
-            cases.append((T, q, kv, idx, _reference(q, kv, idx)))
+    def test_union_dedup_contract(self):
+        # Each group's rows must come out exactly once, with ownership bits equal
+        # to the OR of the tokens that selected them; -1 slots must be dropped,
+        # not counted. Checked against a Python set reference so a membership
+        # slip cannot hide behind the kernel's cosine gate.
+        G, K, S = 4, 64, 256
+        g = torch.Generator(device="cuda").manual_seed(77)
+        idx = _overlapping_indices(3 * G, K, S, g)
+        idx[1, 40:] = -1  # a ragged row in the first group
+        idx[9, :] = -1  # a token with no selection at all
+        uidx, ubits, ulen = _union_dedup(idx, G)
+        self.assertEqual(tuple(uidx.shape), (3, G * K))
+        for grp in range(3):
+            rows = {}
+            for tok in range(G):
+                for v in idx[grp * G + tok].tolist():
+                    if v >= 0:
+                        rows[v] = rows.get(v, 0) | (1 << tok)
+            n = int(ulen[grp])
+            self.assertEqual(n, len(rows), f"group {grp}: unique count")
+            got = dict(zip(uidx[grp, :n].tolist(), ubits[grp, :n].tolist()))
+            self.assertEqual(len(got), n, f"group {grp}: a row was emitted twice")
+            self.assertEqual(got, rows, f"group {grp}: rows or bits")
 
-        for round_ in range(45):  # 45 * 3 calls > the 127-epoch wrap
-            for T, q, kv, idx, ref in cases:
-                out = sparse_mla_prefill(q, kv, idx, SM_SCALE, D_V, union=2)
-                if round_ in (0, 43, 44):
-                    self._assert_matches(out, ref, f"union reuse T={T} round={round_}")
+    def test_union_falls_back_when_tile_is_illegal(self):
+        # Regression: h=4 with G=2 is an 8-row tile, which tl.dot cannot run;
+        # the launcher only catches OutOfResources, so the compile error used to
+        # reach the caller. The kernel entry must take the per-token path instead
+        # and still match the reference.
+        T, topk, S = 256, 256, 512
+        q, kv, g = _qkv(T, S, 4, seed=91)
+        idx = _overlapping_indices(T, topk, S, g)
+        self._assert_matches(
+            sparse_mla_prefill(q, kv, idx, SM_SCALE, D_V, union=2),
+            _reference(q, kv, idx),
+            "union G=2 h=4 falls back",
+        )
 
     def test_int64_indexing_matches_int32(self):
         # A KV pool past ~3.7M rows overflows int32 element offsets and the
