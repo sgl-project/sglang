@@ -17,11 +17,12 @@ from sglang.srt.layers.attention.qsa.metadata import (
     build_rope_position_matrix,
 )
 from sglang.srt.layers.attention.qsa.mqa import qsa_mqa_decode, qsa_mqa_prefill
-from sglang.srt.layers.cp.collocated import cp_symmetric_memory
 from sglang.srt.layers.cp.utils import (
+    ContextParallelStrategyKind,
     cp_materialize_global_token_order,
     cp_shard_hidden_states,
     cp_shard_position_ids,
+    get_cp_strategy,
 )
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -543,6 +544,13 @@ class QSAIndexer(MultiPlatformOp):
         cache). Selection then scores the local rows against all compressed
         blocks of their request, position-driven, so the output rows line up
         with the local query rows the sparse attention consumes."""
+        strategy = get_cp_strategy()
+        if strategy is None or strategy.kind != ContextParallelStrategyKind.ZIGZAG:
+            strategy_name = strategy.name if strategy is not None else "none"
+            raise NotImplementedError(
+                "QSA prefill CP only supports the zigzag strategy; "
+                f"got {strategy_name}."
+            )
         meta = forward_batch.attn_cp_metadata
         num_local = int(meta.total_q_prev_tokens + meta.total_q_next_tokens)
         global_logical = getattr(forward_batch, "positions", None)
@@ -563,8 +571,7 @@ class QSAIndexer(MultiPlatformOp):
         q, token_k, _ = self.project_qk(hidden_states, positions)
         # Raw keys of the whole sequence in global token order: the ring store
         # and the compression use the global write plan unchanged.
-        with cp_symmetric_memory():
-            token_k_local = token_k.reshape(num_local, -1).contiguous()
+        token_k_local = token_k.reshape(num_local, -1).contiguous()
         token_k_full = cp_materialize_global_token_order(
             token_k_local, forward_batch
         ).reshape(-1, self.index_kv_heads, self.index_head_dim)

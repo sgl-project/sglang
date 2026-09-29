@@ -37,9 +37,10 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     sparse_gqa_fwd_interface_triton_ck,
     sparse_gqa_packed_decode_triton,
 )
-from sglang.srt.layers.cp.collocated import cp_symmetric_memory
 from sglang.srt.layers.cp.utils import (
+    ContextParallelStrategyKind,
     cp_materialize_global_token_order,
+    get_cp_strategy,
     is_cp_active,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -1392,6 +1393,13 @@ class QwenSparseAttnBackend(AttentionBackend):
         absolute end position (bottom-right causal), ``cu_k`` is the request's
         base row in the packed full K/V, and ``topk_indices`` are per-request
         logical positions exactly as in the non-CP path."""
+        strategy = get_cp_strategy()
+        if strategy is None or strategy.kind != ContextParallelStrategyKind.ZIGZAG:
+            strategy_name = strategy.name if strategy is not None else "none"
+            raise NotImplementedError(
+                "QSA prefill CP only supports the zigzag strategy; "
+                f"got {strategy_name}."
+            )
         meta = forward_batch.attn_cp_metadata
         prefix_lens = getattr(forward_batch, "extend_prefix_lens_cpu", None)
         if prefix_lens is not None and any(int(x) for x in prefix_lens):
@@ -1405,8 +1413,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         v = v.reshape(-1, layer.tp_v_head_num, layer.v_head_dim)
         k_width = k.shape[1] * k.shape[2]
         v_width = v.shape[1] * v.shape[2]
-        with cp_symmetric_memory():
-            kv_local = torch.cat([k.flatten(1), v.flatten(1)], dim=-1)
+        kv_local = torch.cat([k.flatten(1), v.flatten(1)], dim=-1)
         kv_full = cp_materialize_global_token_order(kv_local, forward_batch)
         k_full, v_full = kv_full.split([k_width, v_width], dim=-1)
         k_full = k_full.reshape(-1, k.shape[1], k.shape[2]).contiguous()
