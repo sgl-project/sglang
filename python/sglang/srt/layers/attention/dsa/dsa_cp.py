@@ -263,9 +263,8 @@ def dsa_cp_attach_full_kv_b(self_attn) -> None:
         )
         return
 
-    from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
-
-    tp = get_parallel().attn_tp_size
+    parallel = get_parallel()
+    tp = parallel.attn_tp_size
     gathered_bytes = 0
     # Diagnostic, cheap. The pool loses ~4.06 GiB against 2.13 GiB of tensor
     # bytes, and the "Load weight end" delta puts all of it inside weight
@@ -306,7 +305,24 @@ def dsa_cp_attach_full_kv_b(self_attn) -> None:
             # Correct, just not free.
             send = send.contiguous()
         full = w.new_empty((send.shape[0] * tp, *send.shape[1:]))
-        attn_tp_all_gather_into_tensor(full, send)
+        # Gather with all-to-all rather than all-gather, which is not a
+        # micro-optimisation: HCCL charges 2 x HCCL_BUFFSIZE to a communicator
+        # the first time it runs all_gather_into_tensor. Measured on A3 tp16,
+        # as KV pool lost beyond the weights' own bytes: 2.00 GiB at the 1000
+        # MiB default, 1.02 GiB at 500. So it tracks the knob, not the transfer.
+        #
+        # The same group's first all_to_all_single takes 0.00 GiB, measured on
+        # the wide path. Sending tp copies of the local slice and keeping one
+        # block from each peer IS an all-gather, so this is the same result
+        # computed with the op that costs nothing extra. The price is a send
+        # buffer of tp copies -- 192 MB for w_kc, 256 MB for w_vc -- allocated
+        # and freed per layer, at load time, where it does not compete with the
+        # KV pool because pool sizing happens afterwards and calls
+        # empty_device_cache first.
+        parallel.attn_tp_group.all_to_all_single(
+            full.view(tp, *send.shape),
+            send.unsqueeze(0).expand(tp, *send.shape).contiguous(),
+        )
         if transposed:
             full = full.transpose(1, 2)
         setattr(self_attn, f"{name}_full", full)
