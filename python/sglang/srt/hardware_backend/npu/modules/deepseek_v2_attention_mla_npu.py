@@ -14,6 +14,7 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.dsa.dsa_cp import (
     dsa_cp_narrow_a2a_enabled,
+    dsa_cp_narrow_a2a_output_enabled,
     dsa_cp_redistribute_heads,
     dsa_cp_restore_tokens,
     dsa_cp_slice,
@@ -391,16 +392,21 @@ def _apply_interleaved_rope_with_half_output(rotary_emb, positions, q_pe, k_pe):
 def _dsa_cp_narrow_plan(m: "DeepseekV2AttentionMLA", forward_batch):
     """This forward's DSA-CP plan when the narrow (W1) exchange applies, else None.
 
-    The narrow exchange swaps q *before* the ``w_kc`` absorb and the head output
-    *after* ``w_vc``, so the all-to-alls carry 256-wide tensors instead of the
-    512-wide latent. It needs the full ``w_kc``/``w_vc`` the weight loader
-    gathers; when that gather declined -- the flag is off, or the weights are
-    not bf16 -- the attributes are absent and this returns None, which puts the
-    layer back on the wide path with no other change.
+    The narrow exchange swaps q *before* the ``w_kc`` absorb, so the inbound
+    all-to-all carries the 256-wide query rather than the 512-wide absorbed
+    latent, in one collective rather than two. With
+    :func:`dsa_cp_narrow_a2a_output_enabled` it also takes the head output
+    through ``w_vc`` before the return leg. It needs the full weights the
+    loader gathers -- ``w_kc`` always, ``w_vc`` only for the return leg -- and
+    when that gather declined, because the flag is off or the weights are not
+    bf16, the attributes are absent and this returns None, which puts the layer
+    back on the wide path with no other change.
     """
     if not dsa_cp_narrow_a2a_enabled():
         return None
-    if getattr(m, "w_kc_full", None) is None or getattr(m, "w_vc_full", None) is None:
+    if getattr(m, "w_kc_full", None) is None:
+        return None
+    if dsa_cp_narrow_a2a_output_enabled() and getattr(m, "w_vc_full", None) is None:
         return None
     return get_dsa_cp_plan(forward_batch)
 
@@ -835,6 +841,11 @@ def forward_dsa_core_npu(
             dsa_cp_plan is not None
             and _dsa_cp_narrow_plan(m, forward_batch) is not None
         )
+        # The return leg is narrowed only on request. Without it the head
+        # output goes back at the full latent width and the layer's own w_vc
+        # applies afterwards -- byte for byte the unnarrowed path, so this mode
+        # differs from plain DSA-CP on the inbound leg and nowhere else.
+        narrow_return = narrow_a2a and dsa_cp_narrow_a2a_output_enabled()
         if dsa_cp_plan is not None:
             # DSA-CP: swap "my heads for every token" for "every head for my
             # tokens", which divides the per-query top-k KV read. k_nope/k_pe
@@ -882,7 +893,7 @@ def forward_dsa_core_npu(
         )
         if dsa_cp_plan is not None:
             attn_output = attn_output.reshape(dsa_cp_plan.rows, -1, m.kv_lora_rank)
-            if narrow_a2a:
+            if narrow_return:
                 # W1: take the head output down from the 512-wide latent to
                 # v_head_dim BEFORE it goes back on the wire. w_vc_full, not
                 # w_vc: this rank is holding every head, not its own eight.

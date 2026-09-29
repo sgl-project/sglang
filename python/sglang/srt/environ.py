@@ -987,12 +987,18 @@ class Envs:
     # full per-request KV lengths and dropping the operator's causal crop.
     # Only engages where every request's prefix reaches index_topk.
     SGLANG_NPU_ENABLE_DSA_CP_MULTI_REQUEST = EnvBool(True)
-    # DSA-CP: exchange the query BEFORE the w_kc absorb and the attention output
-    # AFTER w_vc, so the all-to-alls carry 256-wide tensors instead of the
-    # 512-wide latent -- 2.12x fewer bytes in 2 collectives rather than 3,
-    # measured 1.83x faster at tp8 on A3. Off by default: it needs the FULL
-    # w_kc and w_vc on every rank, about +1.9 GB per rank over 78 layers.
+    # DSA-CP: exchange the query BEFORE the w_kc absorb, so the inbound leg
+    # carries the 256-wide q (qk_nope 192 + rope 64) in ONE all-to-all instead
+    # of the 512-wide absorbed latent and its rope half in two. Three
+    # collectives per layer become two, which is where the measured 92 ms of
+    # the saving lives. Costs the full w_kc on every rank, 12 MB per layer.
     SGLANG_NPU_ENABLE_DSA_CP_NARROW_A2A = EnvBool(False)
+    # ... and narrow the RETURN leg too: apply w_vc before the head output goes
+    # back on the wire, 256 wide instead of the 512-wide latent. Needs the full
+    # w_vc as well, taking the gather from 12 to 28 MB per layer -- and the
+    # remaining byte saving is worth about 0.9 us per 1000 tokens against that,
+    # so this is the half to leave off unless the memory is free.
+    SGLANG_NPU_ENABLE_DSA_CP_NARROW_A2A_OUTPUT = EnvBool(False)
     # DCP extend on NPU: log each extend forward's peak device memory, per rank.
     SGLANG_DEBUG_NPU_DCP_EXTEND_MEMORY = EnvBool(False)
     # DCP extend on NPU: gathered rows per prefix-gather collective, which caps

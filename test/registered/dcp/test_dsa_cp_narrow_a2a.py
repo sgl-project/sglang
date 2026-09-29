@@ -6,10 +6,13 @@ absorbed latent on the way in and the 512-wide attention output on the way back.
 Both are fixed linear functions of narrower tensors beside them: q is 256 wide
 coming out of ``q_b_proj`` and the head output is 256 (``v_head_dim``).
 
-``SGLANG_NPU_ENABLE_DSA_CP_NARROW_A2A`` moves the exchange to the narrow side.
-Measured at tp8 on A3: 2.12x fewer bytes in 2 collectives rather than 3, 1.83x
-faster, 1.276 ms per layer. The price is the full ``w_kc``/``w_vc`` on every
-rank, about +2.1 GB, which is why it is off by default.
+``SGLANG_NPU_ENABLE_DSA_CP_NARROW_A2A`` moves the inbound exchange to the
+narrow side, and ``..._OUTPUT`` the return leg as well. Measured on A3 tp16, a
+served A/B: **92 ms + 2.08 us/token** with both legs, of which the 92 ms is the
+third collective going away and nothing else. The price is the full weights on
+every rank -- ``w_kc`` alone is 12 MB per layer, both are 28 -- and at tp16 that
+came to **4.06 GiB of KV pool**, which is why it is off by default and why the
+return leg is a second switch.
 
 **The claim this file pins:** deferring the absorb past the exchange changes
 nothing, because ``npu_transpose_batchmatmul`` here is a product per (token,
@@ -27,6 +30,7 @@ Usage:
 """
 
 import unittest
+from unittest import mock
 
 import torch
 
@@ -195,6 +199,100 @@ class TestGatheredWeightLayout(CustomTestCase):
         )
         gathered = torch.empty(8, 5, 4)
         self.assertEqual(gathered.stride()[1:], local.stride()[1:])
+
+
+class TestOnlyTheEnabledLegsAreGathered(CustomTestCase):
+    """Which weights the loader gathers has to follow which legs are narrowed.
+
+    The inbound leg needs the full ``w_kc``; the return leg needs the full
+    ``w_vc`` on top, and that second one is 16 of the 28 MB per layer for about
+    12% of the saving. Gathering it anyway is invisible -- everything still
+    computes the right answer -- and costs 1.2 GiB of KV pool on a 78-layer
+    model at tp16. So the selection is worth pinning.
+    """
+
+    TP = 4
+    HEADS, NOPE, LORA, VDIM = 2, 6, 5, 4
+
+    def _attach(self, narrow_output):
+        from sglang.srt.layers.attention.dsa import dsa_cp as dsa_cp_module
+
+        class _Attn:
+            use_dsa = True
+
+        attn = _Attn()
+        # The loader's two layouts: w_kc transposed-contiguous, w_vc plain.
+        attn.w_kc = torch.randn(
+            self.HEADS, self.LORA, self.NOPE, dtype=torch.bfloat16
+        ).transpose(1, 2)
+        attn.w_vc = torch.randn(
+            self.HEADS, self.LORA, self.VDIM, dtype=torch.bfloat16
+        ).contiguous()
+
+        calls = []
+
+        def _fake_all_gather(out, inp):
+            calls.append(tuple(inp.shape))
+            out.copy_(inp.repeat(self.TP, 1, 1))
+
+        parallel = mock.Mock()
+        parallel.attn_tp_size = self.TP
+        with (
+            mock.patch.object(dsa_cp_module, "dsa_cp_narrow_a2a_enabled", lambda: True),
+            mock.patch.object(
+                dsa_cp_module, "dsa_cp_narrow_a2a_output_enabled", lambda: narrow_output
+            ),
+            mock.patch.object(dsa_cp_module, "get_parallel", lambda: parallel),
+            mock.patch(
+                "sglang.srt.layers.dp_attention.attn_tp_all_gather_into_tensor",
+                _fake_all_gather,
+            ),
+        ):
+            dsa_cp_module.dsa_cp_attach_full_kv_b(attn)
+        return attn, calls
+
+    def test_input_only_leaves_w_vc_alone(self):
+        attn, calls = self._attach(narrow_output=False)
+        self.assertEqual(len(calls), 1, "input-only must gather exactly one weight")
+        self.assertIsNotNone(getattr(attn, "w_kc_full", None))
+        self.assertIsNone(
+            getattr(attn, "w_vc_full", None),
+            "w_vc was gathered although the return leg is wide, which is the "
+            "16 MB per layer this mode exists to save",
+        )
+        self.assertEqual(
+            attn.w_kc_full.shape, (self.HEADS * self.TP, self.NOPE, self.LORA)
+        )
+
+    def test_both_legs_gather_both_weights(self):
+        attn, calls = self._attach(narrow_output=True)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(
+            attn.w_vc_full.shape, (self.HEADS * self.TP, self.LORA, self.VDIM)
+        )
+
+    def test_the_gathered_w_kc_keeps_the_loader_stride_pattern(self):
+        attn, _ = self._attach(narrow_output=False)
+        self.assertFalse(
+            attn.w_kc_full.is_contiguous(),
+            "the batched matmul is tuned for the transposed layout; a "
+            "contiguous full copy means the gather rebuilt it and paid twice",
+        )
+        self.assertEqual(attn.w_kc_full.stride()[1:], attn.w_kc.stride()[1:])
+
+    def test_the_return_leg_cannot_switch_itself_on(self):
+        """The output flag is meaningless without the flag that gates it."""
+        from sglang.srt.layers.attention.dsa import dsa_cp as dsa_cp_module
+
+        with (
+            mock.patch.object(
+                dsa_cp_module, "_dsa_cp_narrow_a2a_output_flag", lambda: True
+            ),
+            mock.patch.object(
+                dsa_cp_module, "dsa_cp_narrow_a2a_enabled", lambda: False
+            ),
+        ):
+            self.assertFalse(dsa_cp_module.dsa_cp_narrow_a2a_output_enabled())
 
 
 if __name__ == "__main__":

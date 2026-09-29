@@ -110,6 +110,45 @@ def _dsa_cp_narrow_a2a_flag() -> bool:
     return envs.SGLANG_NPU_ENABLE_DSA_CP_NARROW_A2A.get()
 
 
+@lru_cache(maxsize=1)
+def _dsa_cp_narrow_a2a_output_flag() -> bool:
+    return envs.SGLANG_NPU_ENABLE_DSA_CP_NARROW_A2A_OUTPUT.get()
+
+
+def dsa_cp_narrow_a2a_output_enabled() -> bool:
+    """Whether to narrow the RETURN leg as well as the inbound one.
+
+    The two halves of the narrow exchange are separable, and they are not worth
+    the same. Per row-head, the wire carries:
+
+        ============================  ============  =========  ==============
+        mode                          collectives   values     gathered
+        ============================  ============  =========  ==============
+        wide (default)                3             1088       nothing
+        narrow input                  2             768        w_kc, 12 MB
+        narrow input + output         2             512        both, 28 MB
+        ============================  ============  =========  ==============
+
+    Dropping a collective costs nothing in memory and saves a fixed amount;
+    narrowing the bytes costs weights and saves in proportion to tokens. The
+    A3 tp16 measurement separates them: the whole feature saved
+    **92 ms + 2.08 us/token**, and the 92 ms is the third collective going away
+    -- 1.18 ms per layer, which is four times what HCCL's own cost model
+    predicts for a call of that size, because the reshape and permute around
+    each all-to-all cost more than the transfer.
+
+    The return leg is 320 of the 576 values the full mode saves, so it carries
+    about 44% of the per-token term and none of the fixed one. At 16k tokens
+    that is 125 ms with it and 111 ms without: **the input leg alone is 88% of
+    the benefit for 43% of the weight memory.** Hence off by default, while the
+    inbound leg is the one meant to become the default.
+
+    Turn it on where the KV pool has room to spare and prompts are long enough
+    for the per-token term to matter.
+    """
+    return _dsa_cp_narrow_a2a_output_flag() and dsa_cp_narrow_a2a_enabled()
+
+
 def dsa_cp_narrow_a2a_enabled() -> bool:
     """Whether to exchange the query before the absorb instead of after it.
 
@@ -118,8 +157,10 @@ def dsa_cp_narrow_a2a_enabled() -> bool:
     the 512-wide attention output on the way back. Both are fixed linear
     functions of narrower tensors beside them: q is 256 wide coming out of
     ``q_b_proj`` (``qk_nope`` 192 + rope 64) and the head output is 256
-    (``v_head_dim``). Exchanging on the narrow side moves 1088 values per
-    row-head instead of 512, in two collectives rather than three.
+    (``v_head_dim``). Exchanging on the narrow side moves 512 values per
+    row-head instead of 1088, in two collectives rather than three -- or 768 in
+    two when only the inbound leg is narrowed, which is the default shape of
+    this flag and the one :func:`dsa_cp_narrow_a2a_output_enabled` explains.
 
     **Measured** (``glm5.2_testing/p17_a2a_shape_probe.py``, A3 tp8, 16,384
     tokens, bf16): 272.0 MB in 2.808 ms today against 128.0 MB in 1.532 ms
@@ -187,9 +228,12 @@ def dsa_cp_attach_full_kv_b(self_attn) -> None:
     Needed only by the narrow all-to-all
     (:func:`dsa_cp_narrow_a2a_enabled`), which absorbs *after* the exchange and
     so needs whichever head the rank ends up holding, not the head it was
-    assigned. Refuses quietly and leaves the feature off if the weights are not
-    bf16 -- the FP8 and block-scaled layouts carry separate scale tensors that
-    would have to be gathered with them.
+    assigned. ``w_vc`` is gathered only when the return leg is narrowed too
+    (:func:`dsa_cp_narrow_a2a_output_enabled`); the inbound leg alone needs
+    ``w_kc``, which is 12 MB per layer against 28. Refuses quietly and leaves
+    the feature off if the weights are not bf16 -- the FP8 and block-scaled
+    layouts carry separate scale tensors that would have to be gathered with
+    them.
     """
     if not dsa_cp_narrow_a2a_enabled() or not getattr(self_attn, "use_dsa", False):
         return
@@ -197,11 +241,20 @@ def dsa_cp_attach_full_kv_b(self_attn) -> None:
     w_vc = getattr(self_attn, "w_vc", None)
     if w_kc is None or w_vc is None:
         return
-    if w_kc.dtype != torch.bfloat16 or w_vc.dtype != torch.bfloat16:
+    # Gather only what the enabled legs actually consume. The layer keeps using
+    # its own w_vc slice after the wide return leg, so leaving w_vc ungathered
+    # costs nothing but the bytes it would have taken.
+    wanted = [("w_kc", w_kc)]
+    if dsa_cp_narrow_a2a_output_enabled():
+        wanted.append(("w_vc", w_vc))
+    not_bf16 = [(n, w.dtype) for n, w in wanted if w.dtype != torch.bfloat16]
+    if not_bf16:
         print_info_once(
-            "DSA-CP narrow all-to-all is off: it needs bf16 w_kc/w_vc to "
-            f"all-gather, got {w_kc.dtype}/{w_vc.dtype}. The quantized layouts "
-            "carry scale tensors that would have to be gathered with them."
+            "DSA-CP narrow all-to-all is off: it needs bf16 weights to "
+            "all-gather, got "
+            + ", ".join(f"{n}={d}" for n, d in not_bf16)
+            + ". The quantized layouts carry scale tensors that would have to "
+            "be gathered with them."
         )
         return
 
@@ -225,7 +278,7 @@ def dsa_cp_attach_full_kv_b(self_attn) -> None:
     allocated_before = npu.memory_allocated() if npu else 0
     reserved_before = npu.memory_reserved() if npu else 0
     free_before = npu.mem_get_info()[0] if npu else 0
-    for name, w in (("w_kc", w_kc), ("w_vc", w_vc)):
+    for name, w in wanted:
         # Gather in the layout the tensor is PHYSICALLY in, then take the logical
         # view back.
         #
@@ -263,10 +316,19 @@ def dsa_cp_attach_full_kv_b(self_attn) -> None:
         )
         _narrow_a2a_totals["reserved_bytes"] += npu.memory_reserved() - reserved_before
         _narrow_a2a_totals["driver_bytes"] += free_before - npu.mem_get_info()[0]
+    # Names the legs, because the two modes differ only in speed and in this
+    # number, and a log read weeks later has to say which one ran.
     print_info_once(
-        "DSA-CP narrow all-to-all is ON: every rank holds the full w_kc and "
-        f"w_vc, {gathered_bytes / (1 << 20):.1f} MB per layer, so the query can "
-        "be exchanged before the absorb"
+        "DSA-CP narrow all-to-all is ON ("
+        + (
+            "both legs: every rank holds the full w_kc and w_vc, so the query "
+            "is exchanged before the absorb and the head output goes back "
+            "through w_vc first"
+            if len(wanted) > 1
+            else "input leg: every rank holds the full w_kc, so the query is "
+            "exchanged before the absorb; the output comes back wide"
+        )
+        + f"), {gathered_bytes / (1 << 20):.1f} MB per layer"
     )
     # Every 26 layers, so a 78-layer model logs three times and the last line
     # carries the total. Cheaper to read than 78 lines and it cannot be missed
@@ -294,6 +356,7 @@ def reset_dsa_cp_flags() -> None:
     _dsa_cp_flag.cache_clear()
     _dsa_cp_multi_request_flag.cache_clear()
     _dsa_cp_narrow_a2a_flag.cache_clear()
+    _dsa_cp_narrow_a2a_output_flag.cache_clear()
 
 
 def dsa_cp_multi_request_enabled() -> bool:
