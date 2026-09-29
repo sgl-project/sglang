@@ -2828,35 +2828,30 @@ class TestBreakableCudaGraphMultimodalAllowlist(CustomTestCase):
 class TestCutedslMoeMaxNumTokens(CustomTestCase):
     """The shared CuteDSL MoE per-forward token bound. Fields are set directly
     to exercise the math independently of __post_init__ resolution.
-
-    cg-refactor: the legacy disable_piecewise_cuda_graph /
-    piecewise_cuda_graph_max_tokens / cuda_graph_max_bs fields were
-    consolidated into cuda_graph_config; the helper accepts the legacy
-    kwarg names for test readability and translates them to the per-phase
-    dataclasses.
     """
 
-    def _args(self, **overrides):
+    def _args(
+        self,
+        *,
+        prefill_backend=Backend.BREAKABLE,
+        prefill_graph_max_tokens=2048,
+        decode_graph_max_bs=512,
+        **overrides,
+    ):
         server_args = ServerArgs(model_path="dummy")
         fields = dict(
             speculative_algorithm=None,
             speculative_num_draft_tokens=None,
             max_prefill_tokens=16384,
-            disable_piecewise_cuda_graph=False,
-            piecewise_cuda_graph_max_tokens=2048,
-            cuda_graph_max_bs=512,
         )
         fields.update(overrides)
-        disable_piecewise = fields.pop("disable_piecewise_cuda_graph")
-        piecewise_max = fields.pop("piecewise_cuda_graph_max_tokens")
-        cg_max_bs = fields.pop("cuda_graph_max_bs")
         for key, value in fields.items():
             setattr(server_args, key, value)
         server_args.cuda_graph_config = CudaGraphConfig(
-            decode=PhaseConfig(backend=Backend.FULL, max_bs=cg_max_bs),
+            decode=PhaseConfig(backend=Backend.FULL, max_bs=decode_graph_max_bs),
             prefill=PhaseConfig(
-                backend=(Backend.DISABLED if disable_piecewise else Backend.BREAKABLE),
-                max_bs=piecewise_max,
+                backend=prefill_backend,
+                max_bs=prefill_graph_max_tokens,
             ),
         )
         return server_args
@@ -2865,20 +2860,20 @@ class TestCutedslMoeMaxNumTokens(CustomTestCase):
         self.assertEqual(cutedsl_moe_max_num_tokens(self._args()), 16384)
 
     def test_speculative_decoding_scales_decode_bound(self):
-        # decode bound 512 * 8 dominates the small prefill/piecewise bounds
+        # decode bound 512 * 8 dominates the small prefill bounds
         args = self._args(
             max_prefill_tokens=512,
-            piecewise_cuda_graph_max_tokens=512,
+            prefill_graph_max_tokens=512,
             speculative_algorithm="EAGLE",
             speculative_num_draft_tokens=8,
         )
         self.assertEqual(cutedsl_moe_max_num_tokens(args), 4096)
 
-    def test_piecewise_bound_excluded_when_disabled(self):
+    def test_prefill_graph_bound_excluded_when_disabled(self):
         args = self._args(
             max_prefill_tokens=512,
-            disable_piecewise_cuda_graph=True,
-            cuda_graph_max_bs=64,
+            prefill_backend=Backend.DISABLED,
+            decode_graph_max_bs=64,
         )
         self.assertEqual(cutedsl_moe_max_num_tokens(args), 512)
 

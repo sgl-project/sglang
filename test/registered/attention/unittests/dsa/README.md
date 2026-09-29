@@ -92,7 +92,7 @@ hardware/SDK. The variant tests live in `test_dsa.py` as
   enabling default tests.
 - Runner-mode integration is now plumbed at the fixture level:
   `DSAMockModelRunner` accepts `disable_cuda_graph`,
-  `disable_piecewise_cuda_graph`, and `runner_batch_size` kwargs;
+  `disable_prefill_cuda_graph`, and `runner_batch_size` kwargs;
   `build_dsa_attention_fixture` passes them through; and
   `dsa_attention.py` exposes the standard adapter callbacks
   (`make_dsa_case_with_prefix_lens`, `dsa_fixture_inputs`,
