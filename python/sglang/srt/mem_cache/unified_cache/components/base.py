@@ -679,7 +679,7 @@ class TreeComponent(ABC):
         return None
 
     def align_storage_prefetch_length(
-        self, node: UnifiedTreeNode, prefetch_tokens: int
+        self, node_id: NodeId, prefetch_tokens: int
     ) -> int:
         """Align the prefetch span to this component's storage boundaries."""
         return prefetch_tokens

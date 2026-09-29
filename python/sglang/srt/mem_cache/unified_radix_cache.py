@@ -2030,7 +2030,7 @@ class UnifiedRadixCache(BasePrefixCache):
             prefetch_length = min(
                 prefetch_length,
                 self.components[ct].align_storage_prefetch_length(
-                    self.tree_core.node_by_id(last_host_node_id), prefetch_length
+                    last_host_node_id, prefetch_length
                 ),
             )
         prefetch_key = prefetch_key[:prefetch_length]

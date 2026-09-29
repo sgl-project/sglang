@@ -42,7 +42,7 @@ if TYPE_CHECKING:
         CacheAction,
         ComponentAction,
     )
-    from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
+    from sglang.srt.mem_cache.unified_radix_cache import NodeId, UnifiedTreeNode
 
 
 class C128SidecarComponent(TreeComponent):
@@ -404,9 +404,10 @@ class C128SidecarComponent(TreeComponent):
         return slot_page_size, group_tokens, group_tokens // anchor_page_size
 
     def align_storage_prefetch_length(
-        self, node: UnifiedTreeNode, prefetch_tokens: int
+        self, node_id: NodeId, prefetch_tokens: int
     ) -> int:
         """Keep L3 recovery on complete absolute C128 group boundaries."""
+        node = self.tree_core.node_by_id(node_id)
         _, group_tokens, _ = self._storage_geometry()
         if self._node_depth(node) % group_tokens != 0:
             return 0

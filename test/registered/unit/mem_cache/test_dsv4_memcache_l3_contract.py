@@ -410,10 +410,12 @@ def _make_c128_component_and_path(page_size=16):
 def test_c128_storage_prefetch_alignment_uses_absolute_anchor_depth():
     component, root, aligned_tail, _ = _make_c128_component_and_path()
     partial_anchor = _FakeNode(list(range(128)), parent=root, hashes=["h0"])
+    nodes = {node.id: node for node in (root, aligned_tail, partial_anchor)}
+    component.tree_core.node_by_id = nodes.__getitem__
 
-    assert component.align_storage_prefetch_length(root, 4095) == 2048
-    assert component.align_storage_prefetch_length(aligned_tail, 4096) == 4096
-    assert component.align_storage_prefetch_length(partial_anchor, 4096) == 0
+    assert component.align_storage_prefetch_length(root.id, 4095) == 2048
+    assert component.align_storage_prefetch_length(aligned_tail.id, 4096) == 4096
+    assert component.align_storage_prefetch_length(partial_anchor.id, 4096) == 0
 
 
 def test_c128_backup_uses_group_endpoint_hash():
