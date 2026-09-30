@@ -518,7 +518,7 @@ jobs:
             cd /sglang-checkout/test &&
             GITHUB_STEP_SUMMARY=/sglang-checkout/github_summary_ci.md \
             SGLANG_IS_IN_CI=true \
-            python3 run_suite.py --hw xpu --suite stage-a-test-1-gpu-xpu,stage-b-test-1-gpu-xpu --timeout-per-file 600 --enable-retry ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
+            python3 run_suite.py --hw xpu --suite stage-a-test-1-gpu-xpu,stage-b-test-1-gpu-xpu --timeout-per-file 600 --retry-timeout-increase 0 --enable-retry ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
           " || TEST_EXIT_CODE=$?
           echo "$(<github_summary_ci.md)" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
