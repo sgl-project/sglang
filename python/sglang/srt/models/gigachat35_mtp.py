@@ -18,6 +18,7 @@ from typing import Iterable, Optional
 import torch
 from torch import nn
 
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -81,7 +82,7 @@ class GigaChat35ModelNextN(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> torch.Tensor:
         zero_allocator = BumpAllocator(
             buffer_size=2,
             dtype=torch.float32,
@@ -106,24 +107,24 @@ class GigaChat35ModelNextN(nn.Module):
                 )
             )
 
-        residual = None
-        hidden_states, residual = self.decoder(
+        residual_batch.start(forward_batch)
+        hidden_states = self.decoder(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
-            residual=residual,
             zero_allocator=zero_allocator,
         )
 
+        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
+
         hidden_states_before_norm = None
         if not forward_batch.forward_mode.is_idle():
-            hidden_states_before_norm = (
-                hidden_states if residual is None else hidden_states + residual
+            hidden_states_before_norm = residual_batch.snapshot(
+                hidden_states, forward_batch
             )
-            if residual is not None:
-                hidden_states, _ = self.shared_head.norm(hidden_states, residual)
-            else:
-                hidden_states = self.shared_head.norm(hidden_states)
+            hidden_states = residual_batch.final_norm(
+                hidden_states, forward_batch, self.shared_head.norm
+            )
 
         return hidden_states, hidden_states_before_norm
 
@@ -140,7 +141,6 @@ class GigaChat35ForCausalLMNextN(DeepseekV2WeightLoaderMixin, nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.pp_group = get_parallel().pp_group
-        self.tp_size = get_parallel().tp_size
         self.num_fused_shared_experts = 0
         self.draft_model_idx = draft_model_idx or 0
 
