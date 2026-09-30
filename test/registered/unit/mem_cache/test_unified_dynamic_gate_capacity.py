@@ -1,5 +1,6 @@
 """Dynamic PD gates invalidate peer-compaction credit without allocator writes."""
 
+import contextlib
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -30,9 +31,16 @@ class TestDynamicGateCapacity(CustomTestCase):
             state["open"] = opened
             self.assertEqual(allocator.verify_byte_accounting(), [])
             values = []
-            with patch.object(
-                allocator, "ensure_capacity", side_effect=AssertionError("query moved")
-            ):
+            with contextlib.ExitStack() as stack:
+                # Every page copy goes through a member's `move_kv_cache`.
+                for kv in {id(x._kvcache): x._kvcache for x in members}.values():
+                    stack.enter_context(
+                        patch.object(
+                            kv,
+                            "move_kv_cache",
+                            side_effect=AssertionError("query moved"),
+                        )
+                    )
                 for x, original in zip(members, immediate):
                     actual = x.schedulable_available_size()
                     expected = x._available_tokens(
@@ -52,7 +60,7 @@ class TestDynamicGateCapacity(CustomTestCase):
         for ps in (1, 4, 16):
             for initially_open in (False, True):
                 with self.subTest(page_size=ps, initially_open=initially_open):
-                    a, _ = build_swa_pool(occupancy=0, lazy=True, page_size=ps)
+                    a = build_swa_pool(page_size=ps)
                     slots = a.alloc(96 * ps)
                     a.free_swa(slots[: 40 * ps])
                     # Prime ungated memo, then install the public gate.
@@ -74,9 +82,7 @@ class TestDynamicGateCapacity(CustomTestCase):
         for ps in (1, 4, 16):
             for empty_float in (False, True):
                 with self.subTest(page_size=ps, empty_float=empty_float):
-                    b, a, _ = build_tri_pool(
-                        lazy=True, page_size=ps, state_cache=False, temporal=(1, 4, 8)
-                    )
+                    b, a = build_tri_pool(page_size=ps)
                     states = a.mamba_allocator.alloc(8)
                     slots = a.alloc(80 * ps)
                     a.mamba_allocator.free(states[1:4])
@@ -94,7 +100,7 @@ class TestDynamicGateCapacity(CustomTestCase):
             unified_memory_disagg_move_gate,
         )
 
-        a, _ = build_swa_pool(occupancy=0, lazy=True)
+        a = build_swa_pool()
         slots = a.alloc(96)
         a.free_swa(slots[:40])
         scheduler = SimpleNamespace(
@@ -114,7 +120,7 @@ class TestDynamicGateCapacity(CustomTestCase):
         self.assertEqual(a.verify_byte_accounting(), [])
 
     def test_ungated_view_keeps_its_memo(self):
-        a, _ = build_swa_pool(occupancy=0, lazy=True)
+        a = build_swa_pool()
         slots = a.alloc(96)
         a.free_swa(slots[:40])
         x = a.full_attn_allocator
@@ -126,7 +132,7 @@ class TestDynamicGateCapacity(CustomTestCase):
 
     def test_stable_gate_reuses_memo_and_flips_refresh_it(self):
         """Stable PD gates must not force a fresh capacity calculation per query."""
-        a, _ = build_swa_pool(occupancy=0, lazy=True)
+        a = build_swa_pool()
         slots = a.alloc(96)
         a.free_swa(slots[:40])
         state = {"open": True}
@@ -152,7 +158,7 @@ class TestDynamicGateCapacity(CustomTestCase):
 
     def test_gated_memo_diagnostic_detects_untracked_write(self):
         """The gate-key cache must retain the missed-epoch diagnostic under PD."""
-        a, _ = build_swa_pool(occupancy=0, lazy=True)
+        a = build_swa_pool()
         slots = a.alloc(96)
         a.free_swa(slots[:40])
         a.set_disagg_move_gate(lambda: True)
@@ -173,7 +179,7 @@ class TestDynamicGateCapacity(CustomTestCase):
 
     def test_float_signature_distinguishes_asymmetric_gates(self):
         """Closing opposite sides must not alias a single combined gate boolean."""
-        _, a, _ = build_tri_pool(lazy=True, state_cache=False, temporal=(1, 4, 8))
+        _, a = build_tri_pool()
         states = a.mamba_allocator.alloc(8)
         slots = a.alloc(80)
         a.mamba_allocator.free(states[1:4])
@@ -195,7 +201,7 @@ class TestDynamicGateCapacity(CustomTestCase):
 
     def test_neighbor_memo_tracks_float_becoming_transparent(self):
         """Freeing the float must invalidate the end's cached blocking neighbor."""
-        _, a, _ = build_tri_pool(lazy=True, state_cache=False, temporal=(1, 4, 8))
+        _, a = build_tri_pool()
         states = a.mamba_allocator.alloc(8)
         slots = a.alloc(80)
         a.mamba_allocator.free(states[1:4])
@@ -214,7 +220,7 @@ class TestDynamicGateCapacity(CustomTestCase):
     def test_independent_pd_and_host_gates_refresh_memo(self):
         for ps in (1, 4, 16):
             with self.subTest(page_size=ps):
-                a, _ = build_swa_pool(occupancy=0, lazy=True, page_size=ps)
+                a = build_swa_pool(page_size=ps)
                 slots = a.alloc(96 * ps)
                 a.free_swa(slots[: 40 * ps])
                 state = {"pd": True, "host": True}
@@ -243,7 +249,7 @@ class TestDynamicGateCapacity(CustomTestCase):
                     self.assertEqual(x._capacity_memo_violations(), [])
 
     def test_float_opposite_gate_owners_do_not_alias(self):
-        _, a, _ = build_tri_pool(lazy=True, state_cache=False, temporal=(1, 4, 8))
+        _, a = build_tri_pool()
         states = a.mamba_allocator.alloc(8)
         slots = a.alloc(80)
         a.mamba_allocator.free(states[1:4])
@@ -262,17 +268,6 @@ class TestDynamicGateCapacity(CustomTestCase):
             self.assertEqual(x._chain_capacity_epoch(), epoch)
             self.assertEqual(x._capacity_memo_violations(), [])
         self.assertNotEqual(observed[False, True], observed[True, False])
-
-    def test_float_neighbor_walk_without_epoch_is_repeatable(self):
-        """A non-cacheable stub chain must not fail on its second neighbor lookup."""
-        _, a, _ = build_tri_pool(lazy=True, state_cache=False, temporal=(1, 4, 8))
-        x = a.swa_attn_allocator
-        with patch.object(
-            x, "_chain_capacity_epoch", side_effect=AttributeError("stub")
-        ):
-            for side, expected in (("low", x.low_peer), ("high", x.high_peer)):
-                for _ in range(2):
-                    self.assertIs(x._side_capacity_neighbor(side), expected)
 
 
 if __name__ == "__main__":

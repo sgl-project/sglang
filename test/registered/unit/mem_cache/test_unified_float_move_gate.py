@@ -4,7 +4,6 @@ import itertools
 import unittest
 from unittest.mock import patch
 
-import test_unified_tri_pool as tri_fixture
 import torch
 
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
@@ -13,12 +12,17 @@ from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.unified_allocator_fixtures import (
+    FakeKVCache,
+    FakeUnifiedSWAKVPool,
+    tri_sub_pool_specs,
+)
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def build_geometry(ps, ratio, lazy, pattern, gate):
-    fs, ss, ms = tri_fixture._tri_specs(
+    fs, ss, ms = tri_sub_pool_specs(
         full_layer_num=ratio[0],
         swa_layer_num=ratio[1],
         state_layer_num=1,
@@ -33,8 +37,8 @@ def build_geometry(ps, ratio, lazy, pattern, gate):
         enable_memory_saver=False,
         page_size=ps,
     )
-    kv = tri_fixture._FakeUnifiedSWAKVPool(pool)
-    mk = tri_fixture._FakeKVCache(pool.max_slots("mamba"))
+    kv = FakeUnifiedSWAKVPool(pool)
+    mk = FakeKVCache(pool.max_slots("mamba"))
     a = UnifiedMambaSWATokenToKVPoolAllocator(
         unified_buffer=pool,
         kvcache=kv,
