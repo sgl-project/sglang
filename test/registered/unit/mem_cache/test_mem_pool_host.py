@@ -393,9 +393,13 @@ class TestHostMemoryBudget(CustomTestCase):
             free_hugetlb_bytes=unittest.mock.Mock(return_value=96 * gib),
             supports_hugetlb=unittest.mock.Mock(return_value=True),
         )
-        budget = self._budget_for(allocator, "npu", available=reserve + 64 * gib)
-        self.assertEqual(budget, 64 * gib // 8)
-        allocator.free_hugetlb_bytes.assert_not_called()
+        for device in ("npu", torch.device("npu")):
+            with self.subTest(device=repr(device)):
+                budget = self._budget_for(
+                    allocator, device, available=reserve + 64 * gib
+                )
+                self.assertEqual(budget, 64 * gib // 8)
+                allocator.free_hugetlb_bytes.assert_not_called()
 
     def test_request_rounds_each_mapping_only_on_the_hugetlb_path(self):
         # Two 1.1 GiB mappings reserve 4 pages of a 1 GiB-page pool, not the
