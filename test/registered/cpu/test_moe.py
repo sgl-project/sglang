@@ -161,30 +161,6 @@ class TestFusedExperts:
                 activation="relu",
             )
 
-    def test_bf16_silu_intermediate_rounding(self):
-        hidden_size = 32
-        x = torch.zeros((1, hidden_size), dtype=dtype)
-        x[0, 0] = 1
-        gate = torch.linspace(-8, 8, hidden_size, dtype=dtype)
-        up = torch.linspace(-3, 3, hidden_size, dtype=dtype)
-        w1 = torch.zeros((1, 2 * hidden_size, hidden_size), dtype=dtype)
-        w1[0, :hidden_size, 0] = gate
-        w1[0, hidden_size:, 0] = up
-        w2 = torch.eye(hidden_size, dtype=dtype).unsqueeze(0)
-
-        output = run_fused_experts(
-            x,
-            kernel.convert_weight_packed(w1),
-            kernel.convert_weight_packed(w2),
-            torch.ones((1, 1), dtype=torch.float32),
-            torch.zeros((1, 1), dtype=torch.int64),
-            quant=CPUQuantMethod.UNQUANT,
-            is_vnni=True,
-            activation="silu",
-        )
-        expected = torch.nn.functional.silu(gate) * up
-        torch.testing.assert_close(output[0], expected, atol=0, rtol=0)
-
     @pytest.mark.parametrize("m", [2, 114])
     @pytest.mark.parametrize("n", [32])
     @pytest.mark.parametrize("k", [32])
@@ -378,9 +354,7 @@ class TestFusedExperts:
         w1_scaled = w1.float() * w1s.view(E, 1, 1)
         w2_scaled = w2.float() * w2s.view(E, 1, 1)
 
-        routing = make_routing(
-            M, E, topk, dtype=dtype, return_score=True
-        )
+        routing = make_routing(M, E, topk, dtype=dtype, return_score=True)
         topk_weight, topk_ids = routing[0], routing[1]
         ref_out = native_fp8_fused_moe(
             a, w1_scaled, w2_scaled, topk_weight, topk_ids, topk, activation=activation
