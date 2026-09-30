@@ -11,6 +11,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     build_unified_commit_inject_layout,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 
@@ -98,6 +99,84 @@ class TargetHiddenKvInjector:
                 cache_loc_2d=cache_loc_2d,
                 commit_lens=commit_lens,
                 target_hidden_is_projected=target_hidden_is_projected,
+            )
+
+    def inject_projected_context(
+        self,
+        *,
+        projected_context: torch.Tensor,
+        cache_loc: torch.Tensor,
+        positions: torch.Tensor,
+        cache_loc_2d: Optional[torch.Tensor] = None,
+        commit_lens: Optional[torch.Tensor] = None,
+        state_slot: Optional[torch.Tensor] = None,
+        final_pos: Optional[torch.Tensor] = None,
+    ) -> None:
+        if projected_context is None or projected_context.numel() == 0:
+            return
+        device = self.model_runner.device
+        cache_loc = cache_loc.to(device=device, dtype=torch.int64, non_blocking=True)
+        positions = positions.to(device=device, dtype=torch.int64, non_blocking=True)
+        projected_context = projected_context.to(device=device, non_blocking=True)
+        n_real = positions.shape[0]
+        if projected_context.shape[0] > n_real:
+            projected_context = projected_context[:n_real]
+        if cache_loc_2d is not None:
+            cache_loc_2d = cache_loc_2d.to(
+                device=device, dtype=torch.int64, non_blocking=True
+            )
+        if commit_lens is not None:
+            commit_lens = commit_lens.to(
+                device=device, dtype=torch.int32, non_blocking=True
+            )
+        if state_slot is not None:
+            state_slot = state_slot.to(
+                device=device, dtype=torch.int64, non_blocking=True
+            )
+        if final_pos is not None:
+            final_pos = final_pos.to(
+                device=device, dtype=torch.int64, non_blocking=True
+            )
+
+        pool = self.draft_model_runner.token_to_kv_pool
+        if isinstance(pool, DeepSeekV4TokenToKVPool):
+            if is_unified_kv_triton():
+                swa_loc = self._unified_inject_loc(
+                    pool=pool,
+                    positions=positions,
+                    cache_loc_2d=cache_loc_2d,
+                    commit_lens=commit_lens,
+                    state_slot=state_slot,
+                    final_pos=final_pos,
+                )
+            else:
+                swa_loc = pool.translate_loc_from_full_to_swa(cache_loc).to(torch.int32)
+                if commit_lens is not None and cache_loc_2d is not None:
+                    bs, verify_len = cache_loc_2d.shape
+                    col = torch.arange(verify_len, device=cache_loc.device).view(1, -1)
+                    committed_mask = (
+                        col < commit_lens.to(torch.long).view(-1, 1)
+                    ).reshape(-1)
+                    swa_loc = torch.where(
+                        committed_mask, swa_loc, torch.full_like(swa_loc, -1)
+                    )
+            with torch.inference_mode():
+                self.draft_model.write_projected_context_kv(
+                    projected_context=projected_context,
+                    swa_loc=swa_loc,
+                    positions=positions,
+                    pool=pool,
+                )
+            return
+
+        with torch.inference_mode():
+            self.draft_model.write_projected_context_kv(
+                projected_context=projected_context,
+                pool=pool,
+                positions=positions,
+                cache_loc=cache_loc,
+                cache_loc_2d=cache_loc_2d,
+                commit_lens=commit_lens,
             )
 
     def _inject_mla(

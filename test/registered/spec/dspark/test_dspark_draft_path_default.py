@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -119,6 +120,112 @@ class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
         with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
             with self.assertRaisesRegex(ValueError, "static"):
                 _handle_dspark(server_args)
+
+
+class TestDsparkReplicatedPPDraft(CustomTestCase):
+    def _replicated_args(self, mode: str) -> ServerArgs:
+        server_args = _make_dspark_server_args(
+            model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
+        )
+        server_args.pp_size = 2
+        server_args.disaggregation_mode = mode
+        server_args.speculative_dspark_pp_replicated_draft = True
+        server_args.disable_cuda_graph = True
+        server_args.pp_async_batch_depth = 0
+        server_args.enable_dp_attention = False
+        server_args.speculative_use_rejection_sampling = False
+        server_args.disable_radix_cache = True
+        server_args.attn_cp_size = 1
+        server_args.enable_mixed_chunk = True
+        return server_args
+
+    def test_prefill_and_decode_are_admitted(self):
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            for mode in ("prefill", "decode"):
+                args = self._replicated_args(mode)
+                _handle_dspark(args)
+                self.assertFalse(resolution_result(args, "enable_mixed_chunk"))
+                self.assertEqual(args.speculative_draft_scheduling_policy, "tail")
+
+    def test_bubble_policy_requires_replicated_pp_draft(self):
+        args = self._replicated_args("decode")
+        args.speculative_draft_scheduling_policy = "bubble"
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            _handle_dspark(args)
+
+        args.speculative_dspark_pp_replicated_draft = False
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            with self.assertRaisesRegex(ValueError, "replicated-draft"):
+                _handle_dspark(args)
+
+    def test_decode_cuda_graph_is_admitted(self):
+        args = self._replicated_args("decode")
+        args.disable_cuda_graph = False
+        args.cuda_graph_max_bs_decode = 256
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            _handle_dspark(args)
+
+    def test_dp4_tp4_builtin_moe_is_admitted(self):
+        args = self._replicated_args("decode")
+        args.enable_dp_lm_head = True
+        args.attn_dp_size = 4
+        args.tp_size = 4
+        args.moe_a2a_backend = "none"
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            _handle_dspark(args)
+
+        args.attn_dp_size = 2
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            with self.assertRaisesRegex(ValueError, "attn_tp_size=1"):
+                _handle_dspark(args)
+
+        args.attn_dp_size = 4
+        args.moe_a2a_backend = "megamoe"
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            with self.assertRaisesRegex(ValueError, "built-in TP MoE"):
+                _handle_dspark(args)
+
+    def test_prefill_requires_only_prefill_graph_disabled(self):
+        args = self._replicated_args("prefill")
+        args.disable_cuda_graph = False
+        args.disable_prefill_cuda_graph = True
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            _handle_dspark(args)
+
+        args.disable_prefill_cuda_graph = False
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            with self.assertRaisesRegex(ValueError, "prefill CUDA graph"):
+                _handle_dspark(args)
+
+    def test_non_pd_mode_is_rejected(self):
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            with self.assertRaisesRegex(ValueError, "PD disaggregation"):
+                _handle_dspark(self._replicated_args("null"))
+
+    def test_unbundled_draft_is_rejected(self):
+        args = self._replicated_args("decode")
+        args.speculative_draft_model_path = "separate/draft"
+        with self.assertRaisesRegex(ValueError, "bundled DeepSeek-V4"):
+            _handle_dspark(args)
+
+    def test_prefill_radix_cache_is_admitted(self):
+        args = self._replicated_args("prefill")
+        args.disable_radix_cache = False
+        with (
+            envs.SGLANG_RAGGED_VERIFY_MODE.override("static"),
+            patch(
+                "sglang.srt.speculative.dspark_components.dspark_config."
+                "read_draft_checkpoint_config",
+                return_value=None,
+            ),
+        ):
+            _handle_dspark(args)
+
+    def test_decode_radix_cache_is_rejected(self):
+        args = self._replicated_args("decode")
+        args.disable_radix_cache = False
+        with self.assertRaisesRegex(ValueError, "Decode.*disable-radix-cache"):
+            _handle_dspark(args)
 
 
 class TestDsparkFoldedSamplingDefault(CustomTestCase):

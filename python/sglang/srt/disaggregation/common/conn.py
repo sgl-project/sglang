@@ -38,9 +38,11 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     get_serving,
+    get_spec,
     max_prefill_buffer_tokens,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.dspark_components.dspark_pp import validate_pd_contract
 from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils.network import (
     NetworkAddress,
@@ -102,6 +104,7 @@ class PrefillServerInfo:
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
     enable_dsa_cache_layer_split: bool = False
+    dspark_pp_owner_version: int = 0
     dsv41_spec_layout: Optional[dict] = None
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
@@ -129,6 +132,7 @@ class PrefillServerInfo:
         )
         self.follow_bootstrap_room = bool(self.follow_bootstrap_room)
         self.enable_dsa_cache_layer_split = bool(self.enable_dsa_cache_layer_split)
+        self.dspark_pp_owner_version = int(self.dspark_pp_owner_version)
         self.prefill_http_port = (
             int(self.prefill_http_port) if self.prefill_http_port is not None else None
         )
@@ -169,6 +173,13 @@ class CommonKVManager(BaseKVManager):
     ):
         self.kv_args = args
         self.kv_cache_dtype_str = args.kv_cache_dtype_str
+        self.dspark_pp_owner_version = int(
+            (get_spec().speculative_algorithm or "").upper() == "DSPARK"
+            and (
+                get_parallel().pp_size == 1
+                or get_spec().speculative_dspark_pp_replicated_draft
+            )
+        )
         self.dsv41_spec_layout = get_dsv41_spec_layout(args)
         self.kv_item_lens_sum = sum(args.kv_item_lens)
         self.state_item_lens_sum = sum(x for comp in args.state_item_lens for x in comp)
@@ -206,6 +217,11 @@ class CommonKVManager(BaseKVManager):
         )
         self.pp_size = get_parallel().pp_size
         self.pp_rank = self.kv_args.pp_rank
+        self.allow_src_superset_transfer = (
+            self.disaggregation_mode == DisaggregationMode.PREFILL
+            and bool(self.dspark_pp_owner_version)
+            and self.pp_size == 1
+        )
         self.local_ip = get_local_ip_auto()
         cp_sharded_prefill = self.attn_cp_size > 1 and (
             self.is_hybrid_mla_backend or get_parallel().enable_dsa_cache_layer_split
@@ -951,6 +967,12 @@ class CommonKVManager(BaseKVManager):
             return False
 
         # Sanity checks
+        validate_pd_contract(
+            bool(self.dspark_pp_owner_version),
+            bool(info.dspark_pp_owner_version),
+            self.pp_size,
+            info.pp_size,
+        )
         if info.page_size is not None and info.page_size != self.kv_args.page_size:
             raise RuntimeError(
                 f"Page size mismatch: prefill server has page_size={info.page_size}, "
@@ -1071,15 +1093,22 @@ class CommonKVManager(BaseKVManager):
             else:
                 required_prefill_response_num *= info.attn_cp_size // self.attn_cp_size
 
-        # PP rank mapping — decode pp size should be equal to prefill pp size or 1
-        assert self.pp_size == info.pp_size or self.pp_size == 1, (
-            f"Decode pp size ({self.pp_size}) should be equal to prefill pp size ({info.pp_size}) or 1",
-        )
+        # PP rank mapping. DSpark can fan one full-model prefill rank out to both
+        # replicated-draft decode stages; the entry metadata selects each stage's
+        # target-layer subset.
         if info.pp_size == self.pp_size:
             target_pp_ranks = [self.pp_rank]
-        else:
+        elif self.pp_size == 1:
             target_pp_ranks = list(range(info.pp_size))
             required_prefill_response_num *= info.pp_size // self.pp_size
+        elif self.dspark_pp_owner_version and self.pp_size == 2 and info.pp_size == 1:
+            target_pp_ranks = [0]
+            required_dst_info_num *= self.pp_size
+        else:
+            raise ValueError(
+                "Unsupported PD pipeline topology: "
+                f"decode PP{self.pp_size}, prefill PP{info.pp_size}"
+            )
 
         info.target_tp_rank = target_tp_rank
         info.target_tp_ranks = target_tp_ranks
@@ -1150,6 +1179,7 @@ class CommonKVManager(BaseKVManager):
             "rank_port": self.rank_port,
             "page_size": self.kv_args.page_size,
             "kv_cache_dtype": self.kv_cache_dtype_str,
+            "dspark_pp_owner_version": self.dspark_pp_owner_version,
             "dsv41_spec_layout": self.dsv41_spec_layout,
             "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
@@ -2086,6 +2116,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.dp_size = None
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
+        self.dspark_pp_owner_version: Optional[int] = None
         self.dsv41_spec_layout: Optional[dict] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
@@ -2156,6 +2187,13 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         rank_port = int(data["rank_port"])
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
+        dspark_pp_owner_version = int(data.get("dspark_pp_owner_version", 0))
+        if self.dspark_pp_owner_version is None:
+            self.dspark_pp_owner_version = dspark_pp_owner_version
+        elif self.dspark_pp_owner_version != dspark_pp_owner_version:
+            return web.Response(
+                text="Inconsistent PP DSpark protocol version", status=400
+            )
         prefill_http_port = data.get("prefill_http_port")
         dsv41_spec_layout = data.get("dsv41_spec_layout")
 
@@ -2256,6 +2294,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 pp_size=self.pp_size,
                 page_size=self.page_size,
                 kv_cache_dtype=self.kv_cache_dtype,
+                dspark_pp_owner_version=self.dspark_pp_owner_version,
                 dsv41_spec_layout=self.dsv41_spec_layout,
                 follow_bootstrap_room=(
                     self.follow_bootstrap_room
