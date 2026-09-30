@@ -768,15 +768,13 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     the selected weights.
     """
     probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
-    if filter_apply_order == "joint":
-        probs_sum = torch.cumsum(probs_sort, dim=-1)
     probs_sort[
         torch.arange(0, probs.shape[-1], device=probs.device).view(1, -1)
         >= top_ks.view(-1, 1)
     ] = 0.0
     if filter_apply_order == "top_k_first":
         probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
-        probs_sum = torch.cumsum(probs_sort, dim=-1)
+    probs_sum = torch.cumsum(probs_sort, dim=-1)
     probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
 
     if need_min_p_sampling:
@@ -854,8 +852,6 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
     else:
         probs = torch.softmax(logits, dim=-1)
         probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
-        if filter_apply_order == "joint":
-            probs_sum = torch.cumsum(probs_sort, dim=-1)
 
         # when top_k is -1 (in which sglang turns it to TOP_K_ALL), make it explicitly equal to logit's size
         topk_all_mask = top_ks == TOP_K_ALL
@@ -866,7 +862,7 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
         probs_sort.masked_fill_(top_k_mask, 0.0)
         if filter_apply_order == "top_k_first":
             probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
-            probs_sum = torch.cumsum(probs_sort, dim=-1)
+        probs_sum = torch.cumsum(probs_sort, dim=-1)
         top_p_mask = probs_sum - probs_sort > top_ps.view(-1, 1)
         probs_sort.masked_fill_(top_p_mask, 0.0)
 
