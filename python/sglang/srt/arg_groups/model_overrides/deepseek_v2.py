@@ -86,6 +86,11 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                     "Context parallel feature is still under experiment. It has only been verified on Hopper platform."
                 )
                 # DSA CP runs data-parallel groups as attention DP.
+                assert not (cfg.attn_dp_size > 1 and cfg.dp_size > 1), (
+                    f"--dp-size {cfg.dp_size} with --attn-dp-size {cfg.attn_dp_size}: "
+                    "data-parallel replicas combined with attention data parallelism "
+                    "are not supported."
+                )
                 attn_dp_size = cfg.attn_dp_size * cfg.dp_size
                 overrides["attn_dp_size"] = attn_dp_size
                 overrides["dp_size"] = 1
@@ -162,6 +167,11 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                 "Verified on Hopper with the fa3 backend."
             )
             # MLA CP runs data-parallel groups as attention DP.
+            assert not (cfg.attn_dp_size > 1 and cfg.dp_size > 1), (
+                f"--dp-size {cfg.dp_size} with --attn-dp-size {cfg.attn_dp_size}: "
+                "data-parallel replicas combined with attention data parallelism "
+                "are not supported."
+            )
             attn_dp_size = cfg.attn_dp_size * cfg.dp_size
             overrides["attn_dp_size"] = attn_dp_size
             overrides["dp_size"] = 1

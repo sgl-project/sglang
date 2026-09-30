@@ -124,6 +124,11 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
         )
 
     # DeepSeek-V4 CP runs data-parallel groups as attention DP.
+    assert not (cfg.attn_dp_size > 1 and cfg.dp_size > 1), (
+        f"--dp-size {cfg.dp_size} with --attn-dp-size {cfg.attn_dp_size}: "
+        "data-parallel replicas combined with attention data parallelism "
+        "are not supported."
+    )
     attn_dp_size = cfg.attn_dp_size * cfg.dp_size
     declare_resolution(
         server_args,
