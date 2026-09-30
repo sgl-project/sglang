@@ -25,7 +25,7 @@ STOP_ID = 99
 
 
 def _trim(output, finished_reason, no_stop_trim):
-    stub = SimpleNamespace(is_tool_call_parser_gpt_oss=False)
+    stub = SimpleNamespace(harmony_call_token_id=None)
     return DetokenizerManager.trim_matched_stop(
         stub, output, finished_reason, no_stop_trim
     )
