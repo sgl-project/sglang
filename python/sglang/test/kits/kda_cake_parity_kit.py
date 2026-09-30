@@ -683,13 +683,24 @@ class KDACakeParityMixin:
 
     def test_cake_kda_kernels_match_triton(self):
         results = []
+        launch_failures = []
         for arm in self._arms():
             reference = self._reference(arm.state_dtype)
-            process, log_dir, files = self._launch(
-                arm.extra_args, arm.env, arm.name, arm.state_dtype
-            )
+            # A crashed or unhealthy arm must not hide the other arms' tables.
+            try:
+                process, log_dir, files = self._launch(
+                    arm.extra_args, arm.env, arm.name, arm.state_dtype
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"[kda-parity] arm={arm.name}: server launch failed: {exc}")
+                launch_failures.append((arm, exc))
+                continue
             try:
                 actual = self._observe_all()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[kda-parity] arm={arm.name}: serving failed: {exc}")
+                launch_failures.append((arm, exc))
+                continue
             finally:
                 self._shutdown(process, files)
             self._dump(arm.name, actual)
@@ -701,6 +712,9 @@ class KDACakeParityMixin:
             print(f"[kda-parity] {arm.name} route counts: {counts}")
             results.append((arm, metrics, counts))
 
+        for arm, exc in launch_failures:
+            with self.subTest(arm=arm.name):
+                self.fail(f"{arm.name}: server did not serve the prompts: {exc}")
         for arm, metrics, counts in results:
             with self.subTest(arm=arm.name):
                 self._assert_parity(arm, metrics)
