@@ -68,6 +68,7 @@ class PtxKDAKernel(LinearAttnKernelBase):
         # source tensor: this kernel instance is shared by every KDA layer.
         self._param_flat = {}
         self._unsupported_logged = False
+        self._no_lower_bound_logged = False
         # (bucket, H, K, V, device) -> staging dict for ragged token counts.
         self._staging = {}
 
@@ -225,6 +226,9 @@ class PtxKDAKernel(LinearAttnKernelBase):
             )
         eligible = (
             not kwargs.get("is_spec_decode")
+            # Only the safe gate is supported: without a lower bound the
+            # per-chunk decay overflows fp32 exp and the kernel returns NaN.
+            and lower_bound is not None
             # The native kernel cannot write the fp32 track snapshot buffer;
             # a batch carrying one must take the Triton fallback, which
             # forwards the snapshot arguments (see _triton_extend). Leaving
@@ -235,6 +239,12 @@ class PtxKDAKernel(LinearAttnKernelBase):
             and supported_shape
         )
         if not eligible:
+            if lower_bound is None and not self._no_lower_bound_logged:
+                self._no_lower_bound_logged = True
+                logger.warning(
+                    "PTX KDA prefill needs a gate lower bound (safe gate), and "
+                    "this model has none. Falling back to Triton."
+                )
             if shape_known and not supported_shape and not self._unsupported_logged:
                 self._unsupported_logged = True
                 logger.warning(
