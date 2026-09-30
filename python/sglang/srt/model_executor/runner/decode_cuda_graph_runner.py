@@ -260,7 +260,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.require_mlp_tp_gather or self.require_attn_tp_gather
         )
         self.require_mlp_sync = (
-            get_parallel().enable_dp_attention or self.require_gathered_buffer
+            get_parallel().attn_dp_enabled or self.require_gathered_buffer
         )
         self.enable_two_batch_overlap = get_exec().overlap.enable_two_batch_overlap
         self.use_ngram_embedding = model_runner.ngram_embedding_manager.enabled
@@ -414,7 +414,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.model_runner.model_config.vocab_size, rows=logits_buffer_rows
             ),
             dtype=self.model_runner.model_config.dtype,
-            dp_size=self.dp_size,
+            num_dp_ranks=self.num_dp_ranks,
             pp_size=self.pp_size,
             is_encoder_decoder=self.is_encoder_decoder,
             require_mlp_tp_gather=self.require_mlp_tp_gather,
@@ -458,7 +458,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             enable_prefill_cp=self.enable_prefill_cp,
             require_mlp_tp_gather=self.require_mlp_tp_gather,
             attn_tp_sharded_fn=self.model_runner.attn_tp_sequence_sharded,
-            dp_size=self.dp_size,
+            num_dp_ranks=self.num_dp_ranks,
             source=self.buffers,
         )
 
@@ -584,7 +584,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def _global_num_tokens_for_graph(self, num_tokens: int) -> Optional[list[int]]:
         if self.require_mlp_tp_gather:
-            return [num_tokens] * self.dp_size
+            return [num_tokens] * self.num_dp_ranks
         if self.require_attn_tp_gather:
             return [num_tokens]
         return None
@@ -1427,7 +1427,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         if (
             self.model_runner.lora_manager is not None
-            and self.model_runner.lora_manager.enable_dp_attention
+            and self.model_runner.lora_manager.attn_dp_enabled
         ):
             self.model_runner.lora_manager.prepare_lora_batch(
                 cast(ForwardBatch, fb_view)

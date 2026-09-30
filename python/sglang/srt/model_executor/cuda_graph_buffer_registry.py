@@ -530,7 +530,7 @@ def build_decode_registry(
     require_mlp_tp_gather: bool = False,
     # Per-bucket attn-TP sharded (SP) predicate; defaults to replicated.
     attn_tp_sharded_fn: Callable[[int], bool] = lambda num_tokens: False,
-    dp_size: int = 1,
+    num_dp_ranks: int = 1,
     register_global_num_tokens: bool = True,
     share_pool: bool = True,
     source: Optional[Any] = None,
@@ -700,7 +700,7 @@ def build_decode_registry(
                 buf.fill_(ctx.padded_num_tokens)
 
         _global_shape = (
-            (lambda _bs, _mt: (dp_size,))
+            (lambda _bs, _mt: (num_dp_ranks,))
             if require_mlp_tp_gather
             else (lambda _bs, _mt: (1,))
         )
@@ -1048,7 +1048,7 @@ def build_eager_registry(
         register_global_num_tokens=False,
         require_gathered_buffer=False,
         require_mlp_tp_gather=False,
-        dp_size=get_parallel().dp_size,
+        num_dp_ranks=get_parallel().num_dp_ranks,
         share_pool=True,
         source=None,
     )

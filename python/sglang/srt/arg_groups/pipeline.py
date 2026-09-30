@@ -38,6 +38,11 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     cfg = resolving_view(server_args)
 
+    from sglang.srt.arg_groups.parallel_hook import handle_deprecated_dp_attention
+
+    # Before any handler reads the DP layout.
+    run_hook(handle_deprecated_dp_attention, server_args)
+
     from sglang.srt.arg_groups.mega_moe_hook import handle_mega_moe
 
     run_hook(handle_mega_moe, server_args)

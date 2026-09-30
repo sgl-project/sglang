@@ -65,7 +65,7 @@ def _make_options(**overrides):
         attn_cp_size=1,
         dcp_size=1,
         pp_size=1,
-        dp_size=1,
+        num_dp_ranks=1,
         ep_size=1,
         cpu_offload_gb=0,
         offload_group_size=-1,

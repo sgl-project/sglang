@@ -400,14 +400,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         # spec broadcasts must stay within the attn-TP group.
         self._tp_sync = SpecTpSync(
             get_parallel().attn_tp_group
-            if get_parallel().enable_dp_attention
+            if get_parallel().attn_dp_enabled
             else get_parallel().tp_group
         )
 
         # Under dp attention, the draft worker runs on the per-DP attn-TP
         # group, independent of idle peer DP ranks; it is built and run under
         # the same placement.
-        self.draft_owns_attention = get_parallel().enable_dp_attention
+        self.draft_owns_attention = get_parallel().attn_dp_enabled
         # Inside the draft scope the context answers the draft's narrowed rank.
         self._target_tp_rank = get_parallel().tp_rank
         with draft_pp_context(), draft_tp_context(self.draft_owns_attention):
@@ -642,7 +642,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "device graph capture.",
                     type(current_platform).__name__,
                 )
-            if get_parallel().enable_dp_attention and capture_decode_cuda_graph:
+            if get_parallel().attn_dp_enabled and capture_decode_cuda_graph:
                 # Idle DP ranks skip the draft step, so they cannot join a
                 # shared graph capture/replay; keep the draft eager under dp
                 # attention.
@@ -1292,7 +1292,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         the full embedding once during init and keep it replicated, making
         the draft block-id lookup a collective-free on-device F.embedding.
         """
-        if not get_parallel().enable_dp_attention:
+        if not get_parallel().attn_dp_enabled:
             return
 
         tp_group = get_parallel().tp_group
@@ -2332,7 +2332,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             # verify forward (IDLE mode) so its cross-DP collectives stay in
             # lockstep with the active DP group; the draft block's
             # collectives are within-rank and skipped.
-            if get_parallel().enable_dp_attention:
+            if get_parallel().attn_dp_enabled:
                 idle_verify_input = DFlashVerifyInput(
                     draft_token=torch.empty((0,), dtype=torch.long, device=self.device),
                     positions=torch.empty((0,), dtype=torch.int64, device=self.device),
@@ -2723,7 +2723,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         # their DP-gather segment offsets disagree. Fall back to eager verify
         # whenever any DP rank is idle this round.
         if (
-            get_parallel().enable_dp_attention
+            get_parallel().attn_dp_enabled
             and verify_forward_batch.original_global_num_tokens_cpu is not None
             and min(verify_forward_batch.original_global_num_tokens_cpu) == 0
         ):
@@ -2732,7 +2732,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Mixed-round guard: an extend rank's raw token counts disagree with
         # the verify batch's spec-scaled counts on the DP-gather layout; run
         # eager, symmetric with the idle guard above.
-        if get_parallel().enable_dp_attention and batch.is_extend_in_batch:
+        if get_parallel().attn_dp_enabled and batch.is_extend_in_batch:
             verify_forward_batch.can_run_decode_cuda_graph = False
 
         target_out = self.target_worker.forward_batch_generation(

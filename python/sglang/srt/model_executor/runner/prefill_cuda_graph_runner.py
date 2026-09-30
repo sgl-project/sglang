@@ -311,7 +311,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.prefill_backend_name = prefill_config.backend
         self.prefer_eager_mixed_prefill = (
             self.prefill_backend_name == Backend.BREAKABLE
-            and get_parallel().enable_dp_attention
+            and get_parallel().attn_dp_enabled
             and getattr(
                 model_runner.attn_backend,
                 "prefer_eager_mixed_prefill_under_dp_attention",
@@ -1432,7 +1432,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return registry.get_slot(name).slice_for(bs, num_tokens)
 
         if self.require_mlp_tp_gather:
-            global_num_tokens_cpu = [num_tokens] * self.dp_size
+            global_num_tokens_cpu = [num_tokens] * self.num_dp_ranks
         elif self.require_attn_tp_gather:
             global_num_tokens_cpu = [num_tokens]
         else:

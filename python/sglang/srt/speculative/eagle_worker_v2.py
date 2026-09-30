@@ -186,8 +186,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Use the same attention topology during draft construction and execution.
         self.draft_owns_attention = (
-            get_parallel().enable_dp_attention
-            and self.speculative_algorithm.is_eagle3()
+            get_parallel().attn_dp_enabled and self.speculative_algorithm.is_eagle3()
         )
         with (
             draft_tp_context(self.draft_owns_attention),

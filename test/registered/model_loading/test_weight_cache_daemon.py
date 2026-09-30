@@ -352,11 +352,10 @@ class TestWeightCacheDaemonQwen3MoeDP(TestWeightCacheDaemonTP2):
     """Qwen3 with static attention DP through the existing IPC fixture."""
 
     daemon_args = [
-        "--dp",
+        "--attn-dp-size",
         "2",
         "--ep-size",
         "1",
-        "--enable-dp-attention",
         "--enable-dp-lm-head",
         "--random-seed",
         "42",

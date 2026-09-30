@@ -53,7 +53,7 @@ export const DeepSeekOCR2Deployment = () => {
     }
 
     if (strategyArray.includes('dp')) {
-      cmd += ` \\\n  --dp 1 \\\n  --enable-dp-attention`;
+      cmd += ` \\\n  --attn-dp-size 1`;
     }
 
     if (strategyArray.includes('ep')) {

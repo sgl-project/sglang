@@ -84,7 +84,7 @@ _UNQUANTIZED_LM_HEAD_METHODS = {
 # None outside a FlashInfer autotune pass; inside one, whether that pass runs the
 # LM head. Not-None means the forward's output is discarded -- attention backends
 # read that via get_in_autotune_dummy_run() to skip a cross-node exchange.
-# Skipping the LM head skips its [batch * dp_size, vocab] all-gather, which OOMs
+# Skipping the LM head skips its [batch * num_dp_ranks, vocab] all-gather, which OOMs
 # under DP attention with a tight mem_fraction_static.
 _autotune_run_lm_head: Optional[bool] = None
 
@@ -189,7 +189,7 @@ def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
 
 
 # FlashInfer autotune skips the unprofiled LM-head all-gather; its
-# [batch * dp_size, vocab] output can OOM under tight DP-attention memory.
+# [batch * num_dp_ranks, vocab] output can OOM under tight DP-attention memory.
 _in_autotune_dummy_run = False
 
 

@@ -106,8 +106,8 @@ class _LocalOnlyLoRABackend(BaseLoRABackend):
 class TestDPAttentionBackendContract(CustomTestCase):
     def test_manager_requires_global_routing_only_for_dp_attention(self):
         """DPA must not proceed with local-only routing; non-DPA remains supported."""
-        for enable_dp_attention in (False, True):
-            with self.subTest(enable_dp_attention=enable_dp_attention):
+        for attn_dp_enabled in (False, True):
+            with self.subTest(attn_dp_enabled=attn_dp_enabled):
                 backend = _LocalOnlyLoRABackend(
                     max_loras_per_batch=3, device=torch.device("cpu")
                 )
@@ -115,7 +115,7 @@ class TestDPAttentionBackendContract(CustomTestCase):
                 pool.max_loras_per_batch = 3
                 pool.uid_to_buffer_id = {None: 0, "adapter": 1}
                 manager = LoRAManager.__new__(LoRAManager)
-                manager.enable_dp_attention = enable_dp_attention
+                manager.attn_dp_enabled = attn_dp_enabled
                 manager.max_loras_per_batch = 3
                 manager.num_pinned_loras = 1
                 manager.lora_backend = backend
@@ -146,7 +146,7 @@ class TestDPAttentionBackendContract(CustomTestCase):
                         NotImplementedError,
                         "_LocalOnlyLoRABackend.*prepare_global_lora_batch",
                     )
-                    if enable_dp_attention
+                    if attn_dp_enabled
                     else nullcontext()
                 )
                 with (
@@ -190,12 +190,12 @@ def test_manager_rejects_dp_attention_with_multi_rank_attention_groups(
 ):
     with (
         get_context().override_server_args(
-            enable_dp_attention=True, enable_lora_overlap_loading=False
+            tp_size=4, attn_dp_size=2, enable_lora_overlap_loading=False
         ) as args,
         get_parallel().override(
             tp_size=4, attn_dp_size=2, moe_tp_size=4, **attention_widths
         ),
-        pytest.raises(ValueError, match="requires --dp-size equal to --tp-size"),
+        pytest.raises(ValueError, match="requires --attn-dp-size equal to --tp-size"),
     ):
         LoRAManager(
             base_model=torch.nn.Linear(2, 2),
@@ -219,7 +219,7 @@ def test_communicator_publishes_layout_at_each_transition(
             monkeypatch.setattr(
                 module,
                 "get_parallel",
-                lambda: SimpleNamespace(enable_dp_attention=publish_lora_layout),
+                lambda: SimpleNamespace(attn_dp_enabled=publish_lora_layout),
             )
     # Start from TP_GLOBAL so an unpublished transition is distinguishable.
     initial = LoRABatchLayout.TP_GLOBAL
@@ -285,7 +285,7 @@ def test_communicator_publishes_layout_at_each_transition(
 @pytest.mark.parametrize("can_run_decode_cuda_graph", [False, True])
 def test_manager_uses_current_dp_cuda_graph_eligibility(can_run_decode_cuda_graph):
     manager = LoRAManager.__new__(LoRAManager)
-    manager.enable_dp_attention = True
+    manager.attn_dp_enabled = True
     manager.max_bs_in_cuda_graph = 4
     tokens = torch.zeros(2, dtype=torch.int64)
     forward_batch = ForwardBatch(

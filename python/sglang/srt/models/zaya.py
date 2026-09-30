@@ -842,7 +842,7 @@ class ZayaAttention(nn.Module):
         assert attn_tp_size == self.tp_size, (
             f"ZAYA1 head-parallel attention requires the attention TP group "
             f"({attn_tp_size}) to equal the global TP group ({self.tp_size}); "
-            "DP attention (enable_dp_attention) is not supported for ZAYA1."
+            "attention DP is not supported for ZAYA1."
         )
         assert self.num_q_heads_full % self.tp_size == 0, (
             f"num_attention_heads ({self.num_q_heads_full}) must be divisible "
