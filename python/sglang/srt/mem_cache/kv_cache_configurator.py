@@ -316,6 +316,17 @@ class KVCacheConfigurator:
             )
         return full_capacity or swa_capacity
 
+    def logical_token_capacity(self, *, max_total_num_tokens: int) -> int:
+        """Request tokens a pool of `max_total_num_tokens` per-rank rows holds."""
+        # SWA allocators never widen under DCP.
+        if self.is_hybrid_swa:
+            return max_total_num_tokens
+        # Target rows widen into attn_dcp_size ids; draft sizes already carry
+        # loc_space_scale.
+        return (
+            max_total_num_tokens * get_parallel().attn_dcp_size // self.loc_space_scale
+        )
+
     def _build_fp4_quant_method(self, *, num_layers: int):
         if not is_float4_e2m1fn_x2(self.kv_cache_dtype):
             return None
@@ -1684,7 +1695,7 @@ class KVCacheConfigurator:
         common = {
             "page_size": get_schedule().page_size,
             "device": self.device,
-            "enable_memory_saver": False,
+            "enable_memory_saver": get_exec().features.enable_memory_saver,
         }
         full_pool_kwargs = {
             **common,
@@ -1797,6 +1808,7 @@ class KVCacheConfigurator:
             device=self.device,
             enable_kv_cache_copy=(get_spec().speculative_algorithm is not None),
             token_to_kv_pool_class=swa_pool_class,
+            enable_memory_saver=get_exec().features.enable_memory_saver,
             **kwargs,
         )
         return token_to_kv_pool

@@ -56,8 +56,10 @@ class EngineScoreMixin:
 
         Setwise scoring is expressed via ``score_extraction_token_id``: pass a single
         item containing the whole candidate block with one extraction token per
-        candidate, and the head is pooled AT those positions, so ``scores`` becomes
-        the ``[N x num_labels]`` per-candidate matrix.
+        candidate, and the readout is taken AT those positions, so ``scores``
+        becomes the ``[N x num_labels]`` per-candidate matrix. SequenceClassification
+        pools the head there; CausalLM reads label-token logprobs there (batched
+        path only).
 
         Args:
             query: The query text or pre-tokenized token IDs.
@@ -69,10 +71,11 @@ class EngineScoreMixin:
             embed_override_token_id: Placeholder token ID used to locate override positions.
             query_embed_overrides: Embedding vectors replacing placeholder tokens in query.
             item_embed_overrides: Per-item embedding vectors replacing placeholder tokens in items.
-            score_extraction_token_id: SequenceClassification-only. When set, pool the
-                head at every occurrence of this token per sequence instead of the last
-                token; ``scores`` becomes nested — one ``[Ni x num_labels]`` matrix per
-                item (``len(scores) == len(items)``), where ``Ni`` is the number of
+            score_extraction_token_id: When set, read the score head (SeqCls) or
+                label-token logprobs (CausalLM) at every occurrence of
+                this token per sequence instead of the last token; ``scores`` becomes
+                nested — one ``[Ni x num_labels]`` matrix per item
+                (``len(scores) == len(items)``), where ``Ni`` is the number of
                 extraction tokens (candidates) in item ``i``.
             return_pooled_hidden_states: Whether to include raw pooled transformer
                 hidden states (before the task head) in the result. Only supported

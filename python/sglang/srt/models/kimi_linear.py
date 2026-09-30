@@ -120,6 +120,7 @@ class KimiMoE(nn.Module):
 
         self.topk = TopK(
             top_k=config.num_experts_per_token,
+            layer_id=self.layer_idx,
             renormalize=moe_renormalize,
             use_grouped_topk=True,
             num_expert_group=config.num_expert_group,
@@ -209,7 +210,7 @@ class KimiDeltaAttention(nn.Module):
         safe_gate / lower_bound: clamp the forget gate from below. ``lower_bound``
             is ignored unless ``safe_gate`` is set.
         reduce_results: forwarded to ``o_proj``; set False when the caller does
-            its own all-reduce (e.g. a fused MoE/attention communicator).
+            its own all-reduce (e.g. a fused MoE/attention boundary).
         shard_on_attn_tp: shard on the attention-TP group instead of the global
             TP group. Required under DP attention, where attn_tp_size < tp_size.
         v_head_dim: asymmetric value head dim; defaults to the key head dim.
