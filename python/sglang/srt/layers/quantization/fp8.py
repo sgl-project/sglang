@@ -124,6 +124,7 @@ _is_cuda = is_cuda()
 _is_musa = is_musa()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
+_CPU_FP8_MOE_BLOCK_SIZE = (128, 128)
 _is_cpu = is_cpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
@@ -2627,6 +2628,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if get_moe_runner_backend().is_hpc_ops():
             self._prepare_hpc_ops_weights(layer)
 
+        if _is_cpu and not self.block_quant:
+            _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+            block_n, block_k = _CPU_FP8_MOE_BLOCK_SIZE
+            for weight_name in ("w13_weight", "w2_weight"):
+                weight = getattr(layer, weight_name)
+                scale = getattr(layer, f"{weight_name}_scale")
+                block_scales = scale.reshape(-1, 1, 1).expand(
+                    -1,
+                    (weight.shape[1] + block_n - 1) // block_n,
+                    (weight.shape[2] + block_k - 1) // block_k,
+                )
+                setattr(
+                    layer,
+                    f"{weight_name}_scale_inv",
+                    torch.nn.Parameter(block_scales.contiguous(), requires_grad=False),
+                )
+
         if hasattr(layer, "dispatcher"):
             layer.dispatcher.set_quant_config(
                 {
@@ -2972,11 +2990,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 topk_ids,
                 False,  # inplace See [Note] inplace should be False in fused_experts.
                 CPUQuantMethod.FP8_W8A16,
-                layer.w13_weight_scale_inv,  # w1_scale
-                layer.w2_weight_scale_inv,  # w2_scale
+                layer.w13_weight_scale_inv,
+                layer.w2_weight_scale_inv,
                 None,  # w1_zp
                 None,  # w2_zp
-                self.quant_config.weight_block_size,  # block_size
+                (
+                    self.quant_config.weight_block_size
+                    if self.block_quant
+                    else list(_CPU_FP8_MOE_BLOCK_SIZE)
+                ),
                 None,  # w1 bias
                 None,  # w3 bias
                 None,  # alpha

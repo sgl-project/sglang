@@ -1252,6 +1252,27 @@ else:
             shape = (max(num_token_padding, input.shape[0]), shape[1])
         output = torch.empty(shape, device=input.device, dtype=fp8_dtype)
 
+        if input.device.type == "cpu":
+            if scale is None:
+                if use_per_token_if_dynamic:
+                    scale = (
+                        input.float().abs().amax(dim=1, keepdim=True).clamp_min(1e-12)
+                        / fp8_max
+                    )
+                else:
+                    scale = (
+                        input.float().abs().amax().clamp_min(1e-12).reshape(1)
+                        / fp8_max
+                    )
+            else:
+                assert scale.numel() == 1, (
+                    f"Expected scalar scale, got numel={scale.numel()}"
+                )
+            output[: input.shape[0]].copy_(
+                (input.float() / scale).clamp(fp8_min, fp8_max).to(fp8_dtype)
+            )
+            return output, scale
+
         if scale is None:
             # Dynamic scaling
             if use_per_token_if_dynamic:
