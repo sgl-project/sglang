@@ -14,14 +14,16 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE,
+    DEFAULT_HYBRID_GDN_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TARGET_MODEL_EAGLE,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    try_cached_model,
 )
 
-register_cuda_ci(est_time=900, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=1400, stage="extra-b", runner_config="4-gpu-h100")
 
 # topk=1 chains and a topk=2 tree: the relayed topology is constant for the
 # former and data-dependent for the latter, so both shapes are covered.
@@ -40,9 +42,12 @@ class TestPPSpecConsistency(CustomTestCase):
     crash. Pin both.
     """
 
-    def _run(self, pp_size: int, shape: str):
+    model = DEFAULT_TARGET_MODEL_EAGLE
+    max_tokens = 512
+
+    def _spec_args(self, shape: str):
         num_steps, topk, num_draft_tokens = SPEC_SHAPES[shape]
-        other_args = [
+        return [
             "--speculative-algorithm",
             "EAGLE",
             "--speculative-draft-model-path",
@@ -53,14 +58,15 @@ class TestPPSpecConsistency(CustomTestCase):
             topk,
             "--speculative-num-draft-tokens",
             num_draft_tokens,
-            "--mem-fraction-static",
-            "0.7",
         ]
+
+    def _run(self, pp_size: int, shape: str):
+        other_args = self._spec_args(shape) + ["--mem-fraction-static", "0.7"]
         if pp_size > 1:
             other_args += ["--pp-size", str(pp_size), "--disable-overlap-schedule"]
 
         process = popen_launch_server(
-            DEFAULT_TARGET_MODEL_EAGLE,
+            self.model,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
@@ -70,10 +76,10 @@ class TestPPSpecConsistency(CustomTestCase):
             metrics = run_eval(
                 SimpleNamespace(
                     base_url=DEFAULT_URL_FOR_TEST,
-                    model=DEFAULT_TARGET_MODEL_EAGLE,
+                    model=self.model,
                     eval_name="gsm8k",
                     api="completion",
-                    max_tokens=512,
+                    max_tokens=self.max_tokens,
                     num_examples=256,
                     num_threads=32,
                 )
@@ -119,6 +125,37 @@ class TestPPSpecConsistency(CustomTestCase):
 
     def test_pp_matches_non_pp_tree(self):
         self._assert_matches("tree")
+
+
+class TestPPSpecHybridConsistency(TestPPSpecConsistency):
+    """Hybrid GDN target with its own MTP head: every non-last stage must commit
+    the accepted recurrent state, or accuracy drops while acceptance looks normal."""
+
+    model = try_cached_model(DEFAULT_HYBRID_GDN_SMALL_MODEL_NAME_FOR_TEST)
+    max_tokens = 2048
+
+    def _spec_args(self, shape: str):
+        return [
+            "--trust-remote-code",
+            "--language-only",
+            "--speculative-algorithm",
+            "NEXTN",
+            "--speculative-num-steps",
+            "3",
+            "--speculative-eagle-topk",
+            "1",
+            "--speculative-num-draft-tokens",
+            "4",
+            "--mamba-radix-cache-strategy",
+            "extra_buffer",
+            "--mamba-track-interval",
+            "128",
+            "--reasoning-parser",
+            "qwen3",
+        ]
+
+    def test_pp_matches_non_pp_tree(self):
+        self.skipTest("MTP drafts a chain")
 
 
 class TestPPSpecGate(CustomTestCase):
