@@ -343,6 +343,31 @@ class TestHugetlbPool(unittest.TestCase):
                 ):
                     self.assertEqual(mmap_allocator.hugetlb_pool_free_bytes(), 0)
 
+    def test_hugetlb_pool_free_bytes_is_bounded_by_the_cgroup_limit(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._sysfs(root, free_2mb=6144)
+            with (
+                unittest.mock.patch.object(mmap_allocator, "_HUGEPAGE_SYSFS_DIR", root),
+                envs.SGLANG_HUGEPAGE_SIZE.override("2MB"),
+            ):
+                pool = 6144 * 2 * 1024**2
+                for cgroup, expected in [
+                    (None, pool),  # no container limit: the sysfs pool as-is
+                    (pool + 1, pool),  # cgroup room above the pool: the pool bounds
+                    (1024**3, 1024**3),  # in-container: the cgroup bounds
+                ]:
+                    with (
+                        self.subTest(cgroup=cgroup),
+                        unittest.mock.patch.object(
+                            mmap_allocator,
+                            "cgroup_hugetlb_headroom_bytes",
+                            return_value=cgroup,
+                        ),
+                    ):
+                        self.assertEqual(
+                            mmap_allocator.hugetlb_pool_free_bytes(), expected
+                        )
+
 
 if __name__ == "__main__":
     unittest.main()
