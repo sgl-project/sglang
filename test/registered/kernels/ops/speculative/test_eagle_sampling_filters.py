@@ -1,10 +1,11 @@
 """Regression tests for EAGLE sampling-filter semantics."""
 
+import sys
 from types import SimpleNamespace
 
+import pytest
 import torch
 from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
-
 from sglang.srt.speculative.eagle_utils import _apply_joint_top_k_top_p
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -36,3 +37,7 @@ def test_filtered_support_matches_joint_top_k_top_p_support():
     expected_probs = torch.zeros_like(original_probs)
     expected_probs[0, :4] = original_probs[0, :4] / original_probs[0, :4].sum()
     torch.testing.assert_close(filtered_probs, expected_probs)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
