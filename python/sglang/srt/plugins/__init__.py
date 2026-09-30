@@ -125,6 +125,15 @@ def load_plugins():
         GENERAL_PLUGINS_GROUP,
         excluded_dists=_get_excluded_dists(),
     )
+    # Fail before any plugin runs rather than start without the requested one.
+    if envs.FOUNDRY_GRAPH_EXTENSION_CONFIG.get() and "foundry" not in plugins:
+        raise ValueError(
+            "FOUNDRY_GRAPH_EXTENSION_CONFIG is set but the 'foundry' plugin did not "
+            "load (not installed, failed to import, or excluded by SGLANG_PLUGINS / "
+            "SGLANG_PLATFORM). Install the foundry package "
+            "(https://github.com/foundry-org/foundry), or unset "
+            "FOUNDRY_GRAPH_EXTENSION_CONFIG."
+        )
 
     for name, (func, dist_name) in plugins.items():
         source = HookSource(plugin_name=name, dist_name=dist_name)

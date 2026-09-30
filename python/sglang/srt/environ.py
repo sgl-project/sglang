@@ -1805,6 +1805,9 @@ class Envs:
     # ===================================================================
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")
+    # Config path read by the external "foundry" plugin (CUDA graph save/restore);
+    # load_plugins() raises if it is set and that plugin did not load.
+    FOUNDRY_GRAPH_EXTENSION_CONFIG = EnvStr(None)
 
     # ===================================================================
     # KV-Canary and Token-Oracle (testing only)
