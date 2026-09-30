@@ -5299,6 +5299,9 @@ class Scheduler(
             self.metrics_reporter.record_scheduler_idle()
         else:
             self.metrics_reporter.record_scheduler_active(time.monotonic_ns())
+        # Paused loops skip on_idle; publish here so a pause-time flush_cache
+        # (weight update) reaches KV-event routers before resume.
+        self.kv_events_publisher.publish_kv_events()
 
     def is_fully_idle(self, for_health_check=False, ignore_waiting=False) -> bool:
         # Health check piggybacks on running requests in process_output.
