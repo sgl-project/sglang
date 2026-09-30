@@ -56,7 +56,7 @@ runtime_base = [
   "regex",
   "requests",
   "scipy",
-  "sentencepiece",
+  "sentencepiece==0.2.1",  # 0.2.2 rejects null pieces in InternVL tokenizers.
   "setproctitle",
   "smg-grpc-servicer>=0.9.0",
   "soundfile==0.13.1",
