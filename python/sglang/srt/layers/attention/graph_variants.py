@@ -111,7 +111,7 @@ def create_dsv41_candidate_graph_variants(
         (capture_forward_mode == ForwardMode.DECODE or dspark_target_verify)
         and model_runner.device == "cuda"
         and not is_hip()
-        and torch.cuda.get_device_capability(model_runner.gpu_id)[0] >= 10
+        and torch.cuda.get_device_capability(model_runner.gpu_id)[0] >= 9
         and getattr(text_config, "model_type", None) == "deepseek_v41"
         and getattr(text_config, "candidate_source_layer_id", -1) >= 0
     ):
@@ -122,7 +122,7 @@ def create_dsv41_candidate_graph_variants(
     ratios = set(text_config.compress_ratios) & {1, 2}
     topk = text_config.index_topk
     variants = []
-    # Verify needs per-query causal top-k, so it always keeps candidate filtering.
+    # Verify needs per-query causal top-k, so it cannot skip low-ratio scoring.
     if topk > 0 and ratios and not dspark_target_verify:
         variants.append(("candidate_all", topk * min(ratios)))
         if ratios == {1, 2}:

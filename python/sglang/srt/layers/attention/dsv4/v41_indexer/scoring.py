@@ -249,7 +249,8 @@ class ChunkScores(msgspec.Struct, frozen=True):
     rows: slice  # into the request's rows
     tok: torch.Tensor
     lens: torch.Tensor
-    scores: torch.Tensor  # [rows, lc] bf16, -inf past each row's length
+    scores: torch.Tensor  # [rows, lc], or compact candidate scores
+    candidate_blocks: Optional[torch.Tensor] = None
 
 
 class DecodeScores(msgspec.Struct, frozen=True):
@@ -257,7 +258,8 @@ class DecodeScores(msgspec.Struct, frozen=True):
     lmax: int
     lens: torch.Tensor  # [bs]
     slots: torch.Tensor  # [bs, lmax]
-    scores: torch.Tensor  # [bs, lmax]
+    scores: torch.Tensor  # [bs, lmax], or compact candidate scores
+    candidate_blocks: Optional[torch.Tensor] = None
 
 
 def prefill_requests(
@@ -266,6 +268,8 @@ def prefill_requests(
     out: Selection,
     token_to_kv_pool: DeepSeekV4TokenToKVPool,
     req_to_token: torch.Tensor,
+    candidate_blocks: Optional[torch.Tensor] = None,
+    block_size: int = 8,
 ) -> Iterator[tuple[RequestScores, Iterator[ChunkScores]]]:
     """Requests with nothing visible yet are skipped."""
     pool = token_to_kv_pool
@@ -279,6 +283,15 @@ def prefill_requests(
     # A compressed position is visible once the query has passed its last token.
     compress_lens = (pos + 1) // ratio
     topk = indexer.index_topk
+    # Unsupported shapes keep the independent Torch scoring/selection path.
+    if candidate_blocks is not None and not (
+        q.is_cuda
+        and torch.version.cuda is not None
+        and q.shape[1:] == (32, 128)
+        and q.dtype == weights.dtype == torch.bfloat16
+        and block_size == 8
+    ):
+        candidate_blocks = None
     for r in torch.unique_consecutive(req).tolist():
         tok = (req == r).nonzero().squeeze(1)
         lens = compress_lens[tok]
@@ -295,7 +308,12 @@ def prefill_requests(
         yield (
             request,
             _score_chunks(
-                indexer=indexer, q=q, weights=weights, index_k=index_k, request=request
+                indexer=indexer,
+                q=q,
+                weights=weights,
+                index_k=index_k,
+                request=request,
+                candidate_blocks=candidate_blocks,
             ),
         )
 
@@ -307,16 +325,36 @@ def _score_chunks(
     weights: torch.Tensor,
     index_k: torch.Tensor,
     request: RequestScores,
+    candidate_blocks: Optional[torch.Tensor] = None,
 ) -> Iterator[ChunkScores]:
     lc, j = request.lc, request.columns
     # Chunk rows so the [rows, heads, lc] bf16 scores stay under the budget.
     rows_per_chunk = max(1, _TORCH_SCORE_BUDGET_BYTES // (q.shape[1] * lc * 2))
+    if candidate_blocks is not None and index_k.dtype == torch.bfloat16:
+        from sglang.kernels.ops.attention.dsv4.candidate_bf16_mqa import (
+            candidate_bf16_mqa_logits,
+        )
+
+        # No [rows, heads, lc] or per-query K tensor on this path. Bound the
+        # FP32 output and the logical-index/top-k temporaries instead.
+        width = candidate_blocks.shape[1] * 8
+        rows_per_chunk = max(1, _TORCH_SCORE_BUDGET_BYTES // max(1, width * 32))
+    else:
+        candidate_blocks = None
     for start in range(0, request.tok.numel(), rows_per_chunk):
         rows = slice(start, start + rows_per_chunk)
         tok_c, lens_c = request.tok[rows], request.lens[rows]
-        s = indexer.scores(q[tok_c], index_k, weights[tok_c])
-        s = s.masked_fill(j[None, :] >= lens_c[:, None], -torch.inf)
-        yield ChunkScores(rows=rows, tok=tok_c, lens=lens_c, scores=s)
+        blocks = None if candidate_blocks is None else candidate_blocks[tok_c]
+        if blocks is None:
+            s = indexer.scores(q[tok_c], index_k, weights[tok_c])
+            s = s.masked_fill(j[None, :] >= lens_c[:, None], -torch.inf)
+        else:
+            s = candidate_bf16_mqa_logits(
+                q[tok_c], index_k, weights[tok_c], blocks, lens_c
+            )
+        yield ChunkScores(
+            rows=rows, tok=tok_c, lens=lens_c, scores=s, candidate_blocks=blocks
+        )
 
 
 def write_prefill(
@@ -338,6 +376,8 @@ def decode_scores(
     out: Selection,
     token_to_kv_pool: DeepSeekV4TokenToKVPool,
     req_to_token: torch.Tensor,
+    candidate_blocks: Optional[torch.Tensor] = None,
+    block_size: int = 8,
 ) -> Optional[DecodeScores]:
     """None when there is no row, or nothing visible yet."""
     pool = token_to_kv_pool
@@ -365,10 +405,22 @@ def decode_scores(
     slots = req_to_token[req[:, None], (j * ratio)[None, :]].to(torch.int64) // ratio
     slots = slots.masked_fill(~valid, 0)
     table = pool.get_index_k_with_scale_buffer(inputs.layer_id)
+    kwargs = {}
+    if candidate_blocks is not None:
+        kwargs = dict(
+            candidate_blocks=candidate_blocks, candidate_block_size=block_size
+        )
     scores = fp4_index_logits_decode(
-        q, weights, slots, lens, table, table.shape[1] // 68
+        q, weights, slots, lens, table, table.shape[1] // 68, **kwargs
     )
-    return DecodeScores(bs=bs, lmax=lmax, lens=lens, slots=slots, scores=scores)
+    return DecodeScores(
+        bs=bs,
+        lmax=lmax,
+        lens=lens,
+        slots=slots,
+        scores=scores,
+        candidate_blocks=candidate_blocks,
+    )
 
 
 def write_decode(out: Selection, d: DecodeScores, idx: torch.Tensor) -> None:
@@ -380,3 +432,37 @@ def write_decode(out: Selection, d: DecodeScores, idx: torch.Tensor) -> None:
     ).to(torch.int32)
     if out.raw_indices is not None:
         out.raw_indices[: d.bs, :k] = torch.where(reach, idx, -1).to(torch.int32)
+
+
+def compact_topk(
+    scores: torch.Tensor,
+    blocks: torch.Tensor,
+    lengths: torch.Tensor,
+    topk: int,
+    width: int,
+    block_size: int,
+) -> torch.Tensor:
+    """Restore compact columns to request-local positions; width pads invalid picks.
+
+    write_prefill/write_decode sort these positions before mapping to physical
+    slots. The -inf check drops padding even when top-k exceeds visibility.
+    """
+    out = torch.full(
+        (scores.shape[0], topk), width, dtype=torch.int64, device=scores.device
+    )
+    k = min(topk, scores.shape[1])
+    if not k or not scores.shape[0]:
+        return out
+    values, columns = scores.topk(k, dim=-1, sorted=False)
+    positions = (
+        blocks.long().gather(1, columns // block_size) * block_size
+        + columns % block_size
+    )
+    valid = (
+        (values > -torch.inf)
+        & (positions >= 0)
+        & (positions < width)
+        & (positions < lengths[:, None])
+    )
+    out[:, :k] = positions.masked_fill(~valid, width)
+    return out

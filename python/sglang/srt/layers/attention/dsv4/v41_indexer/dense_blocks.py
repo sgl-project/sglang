@@ -15,6 +15,7 @@ from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
 
 from .scoring import (
     DeepGEMMPrefillData,
+    compact_topk,
     decode_scores,
     get_deep_gemm_prefill_data,
     prefill_requests,
@@ -60,12 +61,14 @@ class DenseBlocksBackend:
         candidate_topk_blocks: int,
         candidate_block_size: int,
         use_deep_gemm_prefill: bool,
+        use_triton_candidates: bool = False,
     ) -> None:
         self.token_to_kv_pool = token_to_kv_pool
         self.req_to_token = req_to_token
         self.topk_blocks = candidate_topk_blocks
         self.block_size = candidate_block_size
         self.use_deep_gemm_prefill = use_deep_gemm_prefill
+        self.use_triton_candidates = use_triton_candidates
 
     def publish_prefill(self, inputs: PrefillInputs, out: Selection):
         if self.use_deep_gemm_prefill:
@@ -116,11 +119,23 @@ class DenseBlocksBackend:
             out=out,
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
+            candidate_blocks=(
+                published.blocks
+                if self.use_triton_candidates and published is not None
+                else None
+            ),
+            block_size=self.block_size,
         )
         if d is None:
             return
         assert published is not None and published.blocks.shape[0] == d.bs
         k = min(inputs.indexer.index_topk, d.lmax)
+        if d.candidate_blocks is not None:
+            idx = compact_topk(
+                d.scores, d.candidate_blocks, d.lens, k, d.lmax, self.block_size
+            )
+            write_decode(out, d, idx)
+            return
         idx = topk_among_blocks(
             d.scores, d.lens, published.blocks, k, block_size=self.block_size
         )
@@ -214,8 +229,21 @@ class DenseBlocksBackend:
             out=out,
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
+            candidate_blocks=published.blocks if self.use_triton_candidates else None,
+            block_size=self.block_size,
         ):
             for chunk in chunks:
+                if chunk.candidate_blocks is not None:
+                    idx = compact_topk(
+                        chunk.scores,
+                        chunk.candidate_blocks,
+                        chunk.lens,
+                        request.k,
+                        request.lc,
+                        self.block_size,
+                    )
+                    write_prefill(out, request, chunk, idx)
+                    continue
                 idx = topk_among_blocks(
                     chunk.scores,
                     chunk.lens,
