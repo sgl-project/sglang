@@ -29,14 +29,12 @@ def print_host_summary() -> None:
     print(f"Runner architecture: {platform.machine()}")
     print(f"Python version: {platform.python_version()}")
 
-    # Memory reporting is optional; sysconf support varies by platform.
+    # Memory reporting is diagnostic-only; it must not fail the preflight.
     try:
-        memory_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-    except (AttributeError, OSError, ValueError):
-        memory_bytes = -1
-    if memory_bytes > 0:
-        print(f"Memory total (bytes): {memory_bytes}")
-    else:
+        import psutil
+
+        print(f"Memory total (bytes): {psutil.virtual_memory().total}")
+    except Exception:
         print("Memory total (bytes): unavailable")
     print(f"Root disk total (bytes): {disk_usage.total}")
     print(f"Root disk available (bytes): {disk_usage.free}")
