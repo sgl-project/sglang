@@ -40,8 +40,8 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.layer_boundary import (
     declare_attn,
     declare_ffn,
-    enable_moe_dense_fully_dp,
     get_attn_tp_context,
+    is_dense_ffn_fully_dp,
     make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
@@ -560,7 +560,7 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
                 is_nextn=is_nextn,
             )
         else:
-            if enable_moe_dense_fully_dp():
+            if is_dense_ffn_fully_dp():
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
@@ -590,12 +590,12 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
             (
                 declare_ffn(
                     sparse=self.is_layer_sparse,
-                    next_sparse=is_next_layer_sparse,
+                    next_layer_sparse=is_next_layer_sparse,
                 ),
                 self.post_attention_layernorm,
             ),
             previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_sparse=self.is_layer_sparse
+                sparse=is_previous_layer_sparse, next_layer_sparse=self.is_layer_sparse
             )
             if layer_id != 0
             else None,
@@ -637,7 +637,7 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
             hidden_states,
             forward_batch,
             quant_format=getattr(self, "_gfx95_quant_format", ""),
-            capture_output=capture_output,
+            capture=capture_output,
         )
 
         hidden_states = self.self_attn(
@@ -645,9 +645,7 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
-            input_on_attention_tp_slices=(
-                self.attn_boundary.input_on_attention_tp_slices
-            ),
+            input_on_attn_tp_slices=(self.attn_boundary.input_on_attn_tp_slices),
         )
         if isinstance(hidden_states, tuple):
             hidden_states = hidden_states[0]
@@ -694,7 +692,7 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
         )
 
     def op_comm_postprocess_layer(self, state):
-        hidden_states = self.ffn_boundary.postprocess(
+        hidden_states = self.ffn_boundary.finish_complete_output(
             state.pop("hidden_states_mlp_output"), state.forward_batch
         )
 
@@ -830,7 +828,7 @@ class Glm4MoeLiteModel(nn.Module):
         else:
             hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
             if not forward_batch.forward_mode.is_idle():
-                hidden_states = residual_batch.norm(
+                hidden_states = residual_batch.final_norm(
                     hidden_states, forward_batch, self.norm
                 )
 
