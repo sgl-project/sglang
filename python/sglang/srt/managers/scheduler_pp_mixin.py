@@ -1278,6 +1278,8 @@ class SchedulerPPMixin:
             accept_index.to(device),
             pp_outputs["spec_accept_lens"].to(device) - 1,
             self.token_to_kv_pool_allocator,
+            # Non-final PP stages do not retain state-capture outputs.
+            state_captures=(),
         )
 
     def _pp_spec_adopt_relayed_tree(
