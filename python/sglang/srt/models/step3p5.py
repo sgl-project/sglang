@@ -236,7 +236,13 @@ class Step3p5MoEMLP(nn.Module):
     ) -> torch.Tensor:
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
-            router_logits, _ = self.gate(hidden_states)
+            if self.need_fp32_gate:
+                router_logits = torch.matmul(
+                    hidden_states.to(torch.float32),
+                    self.gate.weight.t().to(torch.float32),
+                )
+            else:
+                router_logits, _ = self.gate(hidden_states)
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -252,8 +258,10 @@ class Step3p5MoEMLP(nn.Module):
             topk_output=topk_output,
         )
         if shared_output is not None:
-            shared_output.add_(final_hidden_states)
+            shared_output.add_(final_hidden_states, alpha=self.routed_scaling_factor)
             final_hidden_states = shared_output
+        else:
+            final_hidden_states *= self.routed_scaling_factor
         return final_hidden_states
 
 
