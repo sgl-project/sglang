@@ -194,6 +194,13 @@ def handle_attention_aiter(attn, forward_batch):
     if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
         return AttnForwardMethod.MHA
     if forward_batch.forward_mode.is_extend_without_speculative():
+        # gfx1250 has no working MHA extend under aiter -- the ragged kernels
+        # wedge the HSA queue mid-prefill -- so take the absorbed route, where
+        # the Gluon MLA prefill kernel reads the latent cache directly. It is
+        # the more expensive shape (576-wide latent K against 192-wide MHA K),
+        # hence confined to the arch that needs it.
+        if getattr(get_attn_backend(), "use_paged_mla_prefill", False):
+            return AttnForwardMethod.MLA
         if not _support_mha_one_shot(attn, forward_batch, "aiter"):
             return AttnForwardMethod.MHA_CHUNKED_KV
         if get_parallel().dcp_enabled:
