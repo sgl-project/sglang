@@ -28,10 +28,15 @@ activation address.
 
 from __future__ import annotations
 
+import csv
+import logging
+from pathlib import Path
 from typing import Optional, Tuple
 
 import msgspec
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 class _Handoff(msgspec.Struct):
@@ -42,16 +47,32 @@ class _Handoff(msgspec.Struct):
     packed: Optional[torch.Tensor] = None
     x_q: Optional[torch.Tensor] = None
     x_s: Optional[torch.Tensor] = None
+    # HIP route+MXFP4 publish. Its own produced pointer, so a CUDA take()
+    # cannot observe or clear it.
+    hip_produced: Optional[torch.Tensor] = None
+    hip_fp4: Optional[torch.Tensor] = None
+    hip_scale: Optional[torch.Tensor] = None
+    moe_inter_dim: Optional[int] = None
+    num_experts: Optional[int] = None
 
 
 _handoff = _Handoff()
 
 
-def stage(x: torch.Tensor) -> None:
+def stage(
+    x: torch.Tensor,
+    moe_inter_dim: Optional[int] = None,
+    num_experts: Optional[int] = None,
+) -> None:
     """Publish the routed activations for the upcoming topk call. Caller pairs
     this with clear() after the experts call (try/finally)."""
     _handoff.request_x = x
     _handoff.produced_x = None
+    _handoff.hip_produced = None
+    _handoff.hip_fp4 = None
+    _handoff.hip_scale = None
+    _handoff.moe_inter_dim = moe_inter_dim
+    _handoff.num_experts = num_experts
 
 
 def clear() -> None:
@@ -60,6 +81,136 @@ def clear() -> None:
     _handoff.packed = None
     _handoff.x_q = None
     _handoff.x_s = None
+    _handoff.hip_produced = None
+    _handoff.hip_fp4 = None
+    _handoff.hip_scale = None
+    _handoff.moe_inter_dim = None
+    _handoff.num_experts = None
+
+
+def staged_activation() -> Optional[torch.Tensor]:
+    """The activation row the model staged for this topk, or None."""
+    return _handoff.request_x
+
+
+def staged_moe_shape() -> Tuple[Optional[int], Optional[int]]:
+    """(intermediate size per rank, expert count) staged with the activation."""
+    return _handoff.moe_inter_dim, _handoff.num_experts
+
+
+def publish_hip_mxfp4(x: torch.Tensor, fp4: torch.Tensor, scale: torch.Tensor) -> None:
+    """Publish token-order MXFP4 for the staged rows. Consume-once."""
+    _handoff.request_x = None
+    _handoff.hip_produced = x
+    _handoff.hip_fp4 = fp4
+    _handoff.hip_scale = scale
+
+
+def take_hip_mxfp4(
+    x: torch.Tensor,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """Consume the published (fp4 uint8, e8m0 uint8) for these exact rows."""
+    produced = _handoff.hip_produced
+    if produced is None or _handoff.hip_fp4 is None or _handoff.hip_scale is None:
+        return None
+    if (
+        produced.data_ptr() != x.data_ptr()
+        or produced.shape != x.shape
+        or produced.dtype != x.dtype
+        or produced.stride() != x.stride()
+    ):
+        return None
+    out = (_handoff.hip_fp4, _handoff.hip_scale)
+    _handoff.hip_produced = None
+    _handoff.hip_fp4 = None
+    _handoff.hip_scale = None
+    return out
+
+
+def _padded_token_bucket(num_tokens: int) -> int:
+    """Same bucket fused_moe uses: next power of two below 32768."""
+    if num_tokens <= 1:
+        return 1
+    if num_tokens < 32768:
+        return 1 << (num_tokens - 1).bit_length()
+    return 32768 if num_tokens < 131072 else 131072
+
+
+_prequant_rows_cache: Optional[frozenset[tuple[str, str, int, int, int]]] = None
+
+
+def _prequant_rows() -> frozenset[tuple[str, str, int, int, int]]:
+    """Rows whose GEMM1 consumes host MXFP4.
+
+    Keyed by (gfx, cu_num, token bucket, inter_dim, expert count) for hidden
+    3584 and top-16. block_m 16 ``_f16in`` rows are omitted: that kernel reads
+    bf16 and faults on fp4. A missing config, a different GPU, or any other
+    shape is absent, and the caller keeps the unfused route and quant.
+    """
+    global _prequant_rows_cache
+    if _prequant_rows_cache is not None:
+        return _prequant_rows_cache
+    try:
+        import aiter
+        from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+
+        gfx = str(get_gfx_runtime())
+        cu = str(get_cu_num())
+        path = (
+            Path(aiter.__file__).parent
+            / "configs"
+            / "model_configs"
+            / "kimik3_a4w4_tuned_fmoe.csv"
+        )
+        rows: set[tuple[str, str, int, int, int]] = set()
+        with path.open() as f:
+            for row in csv.DictReader(f):
+                if (
+                    row.get("gfx") != gfx
+                    or row.get("cu_num") != cu
+                    or row.get("model_dim") != "3584"
+                    or row.get("topk") != "16"
+                    or row.get("block_m") == "16"
+                    or "_f16in" in row.get("kernelName1", "")
+                ):
+                    continue
+                rows.add(
+                    (
+                        gfx,
+                        cu,
+                        int(row["token"]),
+                        int(row["inter_dim"]),
+                        int(row["expert"]),
+                    )
+                )
+        _prequant_rows_cache = frozenset(rows)
+        return _prequant_rows_cache
+    except Exception:
+        # Do not cache the failure: a missing import during startup must not
+        # disable the replacement for the rest of the process.
+        logger.warning("K3 MXFP4 route-quant config unavailable", exc_info=True)
+        return frozenset()
+
+
+def hip_prequant_bucket(
+    num_tokens: int,
+    inter_dim: Optional[int],
+    num_experts: Optional[int],
+) -> bool:
+    """Whether this shape's tuned GEMM1 consumes prequantized MXFP4."""
+    if inter_dim is None or num_experts is None:
+        return False
+    rows = _prequant_rows()
+    if not rows:
+        return False
+    gfx, cu = next(iter(rows))[:2]
+    return (
+        gfx,
+        cu,
+        _padded_token_bucket(num_tokens),
+        int(inter_dim),
+        int(num_experts),
+    ) in rows
 
 
 def try_route_quant_fused(
@@ -113,7 +264,9 @@ def take(
     activation rows, or None. Storage identity is verified so a re-viewed or
     copied tensor simply misses."""
     produced = _handoff.produced_x
-    if produced is None:
+    # A HIP publish never sets packed. Returning the Nones would look like a
+    # hit to the CUDA consumer.
+    if produced is None or _handoff.packed is None:
         return None
     if (
         produced.data_ptr() != x.data_ptr()
