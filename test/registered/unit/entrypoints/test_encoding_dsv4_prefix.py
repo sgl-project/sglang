@@ -59,7 +59,10 @@ class TestAssistantGenerationPrefix(unittest.TestCase):
                         {
                             "id": "c1",
                             "type": "function",
-                            "function": {"name": "search", "arguments": '{"query": "q"}'},
+                            "function": {
+                                "name": "search",
+                                "arguments": '{"query": "q"}',
+                            },
                         }
                     ],
                 },
@@ -81,7 +84,9 @@ class TestAssistantGenerationPrefix(unittest.TestCase):
             ]
         )
         self.assertTrue(prompt.rstrip().endswith(THINKING_END))
-        self.assertLess(prompt.rfind("Reminder: use tools."), prompt.rfind(ASSISTANT_TOKEN))
+        self.assertLess(
+            prompt.rfind("Reminder: use tools."), prompt.rfind(ASSISTANT_TOKEN)
+        )
 
 
 if __name__ == "__main__":
