@@ -37,7 +37,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.layer_boundary import (
     declare_attn,
     declare_ffn,
-    enable_moe_dense_fully_dp,
+    is_dense_ffn_fully_dp,
     make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
@@ -259,6 +259,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
 
         self.topk = TopK(
             top_k=self.top_k,
+            layer_id=self.layer_id,
             renormalize=self.norm_topk_prob,
             use_grouped_topk=self.use_grouped_topk,
             num_expert_group=self.num_expert_group,
@@ -623,7 +624,7 @@ class LLaDA2MoeBlock(nn.Module):
                 prefix=add_prefix("mlp", prefix),
             )
         else:
-            if enable_moe_dense_fully_dp():
+            if is_dense_ffn_fully_dp():
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
@@ -643,12 +644,12 @@ class LLaDA2MoeBlock(nn.Module):
             (
                 declare_ffn(
                     sparse=self.is_layer_sparse,
-                    next_sparse=is_next_layer_sparse,
+                    next_layer_sparse=is_next_layer_sparse,
                 ),
                 self.post_attention_layernorm,
             ),
             previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_sparse=self.is_layer_sparse
+                sparse=is_previous_layer_sparse, next_layer_sparse=self.is_layer_sparse
             )
             if layer_id != 0
             else None,
@@ -763,7 +764,7 @@ class LLaDA2MoeModel(nn.Module):
         else:
             hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
             if not forward_batch.forward_mode.is_idle():
-                hidden_states = residual_batch.norm(
+                hidden_states = residual_batch.final_norm(
                     hidden_states, forward_batch, self.norm
                 )
             return hidden_states

@@ -177,7 +177,7 @@ class TestAttentionCpBoundary(CustomTestCase):
                 last=False,
                 sparse=True,
                 previous_sparse=False,
-                next_sparse=False,
+                next_layer_sparse=False,
                 attention_norm=layernorm,
                 ffn_norm=layernorm,
             )

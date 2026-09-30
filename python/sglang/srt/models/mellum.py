@@ -454,12 +454,12 @@ class MellumDecoderLayer(Qwen3MoeDecoderLayer):
             (
                 declare_ffn(
                     sparse=self.is_layer_sparse,
-                    next_sparse=is_next_layer_sparse,
+                    next_layer_sparse=is_next_layer_sparse,
                 ),
                 self.post_attention_layernorm,
             ),
             previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_sparse=self.is_layer_sparse
+                sparse=is_previous_layer_sparse, next_layer_sparse=self.is_layer_sparse
             )
             if layer_id != 0
             else None,

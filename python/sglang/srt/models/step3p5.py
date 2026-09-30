@@ -4,9 +4,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.srt.distributed import (
-    tensor_model_parallel_all_reduce,
-)
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -32,6 +29,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     reduce_moe_output,
+    should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -50,7 +48,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_stream
+from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import add_prefix, is_cuda, is_non_idle_and_non_empty, make_layers
 
 Step3p5Config = None
@@ -183,15 +181,16 @@ class Step3p5MoEMLP(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
+        shared_output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
         if (
             not get_moe_a2a_backend().is_deepep()
             and not get_moe_a2a_backend().is_ascend_fuseep()
         ):
-            return self.forward_normal(hidden_states)
+            return self.forward_normal(hidden_states, shared_output)
         else:
-            return self.forward_deepep(hidden_states, forward_batch)
+            return self.forward_deepep(hidden_states, forward_batch, shared_output)
 
     def get_moe_weights(self):
         return [
@@ -206,6 +205,7 @@ class Step3p5MoEMLP(nn.Module):
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
+        shared_output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
@@ -227,12 +227,17 @@ class Step3p5MoEMLP(nn.Module):
                 router_logits=topk_output.router_logits,
             )
         final_hidden_states = self.experts(hidden_states, topk_output)
+        if shared_output is not None:
+            final_hidden_states += shared_output
         final_hidden_states = reduce_moe_output(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
     def forward_deepep(
-        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        shared_output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
@@ -251,6 +256,9 @@ class Step3p5MoEMLP(nn.Module):
             hidden_states=hidden_states,
             topk_output=topk_output,
         )
+        if shared_output is not None:
+            shared_output.add_(final_hidden_states)
+            final_hidden_states = shared_output
         return final_hidden_states
 
     def op_gate(self, state):
@@ -538,9 +546,9 @@ class Step3p5DecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
             )
-            # reduce_results=False: share_expert output stays unreduced and is
-            # combined with the (also unreduced) MoE output, then a single
-            # all-reduce covers both — saving one full-TP all-reduce per layer.
+            # The MoE block adds the shared expert's output to the routed output
+            # before its one reduction. Where the routed output arrives complete
+            # on each rank's own tokens, the shared expert is not TP-sharded.
             self.share_expert = Step3p5MLP(
                 hidden_size=self.hidden_size,
                 intermediate_size=config.share_expert_dim,
@@ -548,6 +556,18 @@ class Step3p5DecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("share_expert", prefix),
                 reduce_results=False,
+                **(
+                    dict(tp_rank=0, tp_size=1)
+                    if get_moe_a2a_backend().is_deepep()
+                    or get_moe_a2a_backend().is_mooncake()
+                    or get_moe_a2a_backend().is_nixl()
+                    or get_moe_a2a_backend().is_mori()
+                    or get_moe_a2a_backend().is_ascend_fuseep()
+                    or get_moe_a2a_backend().is_flashinfer()
+                    or get_moe_a2a_backend().is_flashinfer_megamoe()
+                    or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                    else {}
+                ),
             )
             self.use_moe = True
         else:
@@ -571,12 +591,13 @@ class Step3p5DecoderLayer(nn.Module):
             (
                 declare_ffn(
                     sparse=self.is_moe_layer,
-                    next_sparse=self.is_next_layer_sparse,
+                    next_layer_sparse=self.is_next_layer_sparse,
                 ),
                 self.post_attention_layernorm,
             ),
             previous=declare_ffn(
-                sparse=self.is_previous_layer_sparse, next_sparse=self.is_moe_layer
+                sparse=self.is_previous_layer_sparse,
+                next_layer_sparse=self.is_moe_layer,
             )
             if not (0 if is_nextn else layer_id) == 0
             else None,
@@ -609,16 +630,10 @@ class Step3p5DecoderLayer(nn.Module):
 
         if self.use_moe:
             with self.ffn_boundary.exit(forward_batch) as ffn_exit:
-                # Both share_expert and MoE return unreduced (TP-partial) outputs.
-                # Combine them first, then do a single all-reduce — saving one
-                # full-TP all-reduce per layer.
-                # Force fuse_mlp_allreduce=True so MoE skips its internal AR.
                 share_output = self.share_expert(hidden_states)
-                with get_forward().scoped(fuse_mlp_allreduce=True):
-                    moe_output = self.moe(hidden_states, forward_batch)
-                hidden_states = moe_output + share_output
-                if not ffn_exit.fuse_mlp_allreduce and not ffn_exit.mlp_reduce_scatter:
-                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                hidden_states = self.moe(
+                    hidden_states, forward_batch, shared_output=share_output
+                )
             return ffn_exit.finish(hidden_states)
 
         with self.ffn_boundary.exit(forward_batch) as ffn_exit:
@@ -721,7 +736,7 @@ class Step3p5Model(nn.Module):
                     hidden_states_before_norm = residual_batch.snapshot(
                         hidden_states, forward_batch
                     )
-                    hidden_states = residual_batch.norm(
+                    hidden_states = residual_batch.final_norm(
                         hidden_states, forward_batch, self.norm
                     )
             return hidden_states, hidden_states_before_norm

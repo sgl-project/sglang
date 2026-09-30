@@ -11,14 +11,14 @@ import torch
 
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.layers.layer_boundary import (
-    ADD,
-    NORM_QUANT_READ,
+    NORM_QUANT_READOUT,
+    PLAIN_ADD,
     Layout,
     StageKind,
     TokenAxis,
 )
-from sglang.srt.layers.layer_boundary.contracts import BatchVariant, StageEntry
-from sglang.srt.layers.layer_boundary.prepare import _consumer_step, _read_input
+from sglang.srt.layers.layer_boundary.contracts import BatchVariant, EntryPath
+from sglang.srt.layers.layer_boundary.prepare import _run_entry, _update_read
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.backend.triton_backend import (
     TritonLoRABackend,
@@ -233,42 +233,42 @@ def test_communicator_publishes_layout_at_each_transition(
     communicator = stub_plan()
     communicator._publish_lora_layout = publish_lora_layout
     communicator.enters_stack = False
-    communicator._paths[BatchVariant.SEQUENCE_PARALLEL] = None
+    communicator.paths[BatchVariant.SEQUENCE_PARALLEL] = None
     communicator.norm = lambda x: x
     communicator.qkv_latent_func = None
     gathered, local = Layout(frozenset()), Layout(frozenset({TokenAxis.ATTN_DP}))
     # The rows of the steps the batch runs decide, not the ordinary steps'.
-    communicator._paths[BatchVariant.ORDINARY] = SimpleNamespace(
+    communicator.paths[BatchVariant.ORDINARY] = SimpleNamespace(
         entry=SimpleNamespace(input_rows=local if gathered_over_dp else gathered)
     )
-    attention_entry = StageEntry(
+    attention_entry = EntryPath(
         input_rows=local,
         prepare=partial(
-            _consumer_step,
+            _run_entry,
             step=partial(
-                _read_input,
-                layer_input=None,
+                _update_read,
+                pre_move=None,
                 enters_stack=False,
-                read=NORM_QUANT_READ,
-                update=ADD,
+                read=NORM_QUANT_READOUT,
+                update=PLAIN_ADD,
             ),
             carried_fusions=(),
-            adds_plainly=True,
+            is_plain_add=True,
         ),
         input_move=lambda hidden_states, **kwargs: hidden_states,
-        handoff=lambda hidden_states, *args: hidden_states,
+        attn_input_adapter=lambda hidden_states, *args: hidden_states,
     )
-    ffn_entry = StageEntry(
+    ffn_entry = EntryPath(
         prepare=lambda hidden_states, residual, *args, **kwargs: (
             hidden_states,
             residual,
         ),
         input_rows=gathered if gathered_over_dp else local,
         input_move=None,
-        handoff=None,
+        attn_input_adapter=None,
     )
     selected = SimpleNamespace(entry=ffn_entry)
-    communicator._batch_steps = lambda forward_batch: selected
+    communicator.path_for = lambda forward_batch: selected
     hidden = torch.zeros(num_tokens, 4)
     with get_forward().scoped(lora_batch_layout=initial):
         for _ in range(2):

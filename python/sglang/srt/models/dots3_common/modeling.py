@@ -61,7 +61,7 @@ from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
     declare_attn,
     declare_ffn,
-    enable_moe_dense_fully_dp,
+    is_dense_ffn_fully_dp,
     make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
@@ -1553,7 +1553,7 @@ class Dots3DecoderLayer(nn.Module):
                 is_nextn=is_nextn,
             )
         else:
-            if enable_moe_dense_fully_dp():
+            if is_dense_ffn_fully_dp():
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
@@ -1577,12 +1577,12 @@ class Dots3DecoderLayer(nn.Module):
             (
                 declare_ffn(
                     sparse=self.is_layer_sparse,
-                    next_sparse=is_next_layer_sparse,
+                    next_layer_sparse=is_next_layer_sparse,
                 ),
                 self.post_attention_layernorm,
             ),
             previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_sparse=self.is_layer_sparse
+                sparse=is_previous_layer_sparse, next_layer_sparse=self.is_layer_sparse
             )
             if layer_id != 0
             else None,
@@ -1660,7 +1660,7 @@ class Dots3DecoderLayer(nn.Module):
     def op_mlp(self, state):
         hidden_states = state.pop("hidden_states_mlp_input")
         if not (
-            enable_moe_dense_fully_dp()
+            is_dense_ffn_fully_dp()
             and (not self.is_layer_sparse)
             and hidden_states.shape[0] == 0
         ):
@@ -1671,7 +1671,7 @@ class Dots3DecoderLayer(nn.Module):
             state.hidden_states_mlp_output = hidden_states
 
     def op_comm_postprocess_layer(self, state):
-        hidden_states = self.ffn_boundary.postprocess(
+        hidden_states = self.ffn_boundary.finish_complete_output(
             state.pop("hidden_states_mlp_output"), state.forward_batch
         )
 
@@ -1800,7 +1800,7 @@ class Dots3Model(nn.Module):
             return residual_batch.to_pp(hidden_states, forward_batch)
         else:
             if not forward_batch.forward_mode.is_idle():
-                hidden_states = residual_batch.norm(
+                hidden_states = residual_batch.final_norm(
                     hidden_states, forward_batch, self.norm
                 )
         return hidden_states

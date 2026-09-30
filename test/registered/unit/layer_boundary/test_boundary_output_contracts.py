@@ -9,7 +9,7 @@ import test_declared_decoder_boundary as fixture
 import torch
 
 from sglang.srt.layers.layer_boundary import (
-    ADD,
+    PLAIN_ADD,
     ProducerReduction,
     declare_attn,
     declare_ffn,
@@ -21,7 +21,7 @@ from sglang.srt.layers.layer_boundary import (
 from sglang.srt.layers.layer_boundary.contracts import BatchVariant
 from sglang.srt.layers.layer_boundary.fusions.cutedsl import CuteDSLFusion
 from sglang.srt.layers.layer_boundary.layout import SumGroup
-from sglang.srt.layers.layer_boundary.prepare import _dispatch_consumer
+from sglang.srt.layers.layer_boundary.prepare import _dispatch_by_update
 from sglang.srt.layers.layer_boundary.residual import batch
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -35,12 +35,12 @@ class TestBoundaryIntegrations(unittest.TestCase):
     def test_dp_mixer_keeps_attention_group_reduction(self):
         parallel = fixture.parallel_of(attn_dp=2, attn_tp=2)
         rows = fixture.comm.Layout(frozenset())
-        produced = fixture.comm.StageOutput(
-            rows, group=SumGroup.ATTN_TP, leaves_for_next_layer=True
+        produced = fixture.comm.OutputContract(
+            rows, group=SumGroup.ATTN_TP, may_defer_to_next=True
         )
-        plan = SimpleNamespace(_batch_steps=lambda _: SimpleNamespace(output=produced))
-        boundary = exits.OutputBoundary(plan)
-        boundary._ffn_sum_can_move_to_next_layer = lambda _: True
+        plan = SimpleNamespace(path_for=lambda _: SimpleNamespace(output=produced))
+        boundary = exits.ExitPolicy(plan)
+        boundary._sum_deferral_allowed = lambda _: True
         with (
             fixture.planning(parallel),
             patch.object(exits, "is_dp_attention_enabled", return_value=True),
@@ -62,12 +62,10 @@ class TestBoundaryIntegrations(unittest.TestCase):
                 (declare_ffn(), fixture.Norm()),
                 previous=declare_ffn(),
             )
-        attn.plan._batch_steps = lambda _: attn.plan._paths[
-            BatchVariant.INPUT_SCATTERED
-        ]
+        attn.plan.path_for = lambda _: attn.plan.paths[BatchVariant.INPUT_SCATTERED]
         fb = SimpleNamespace(residual_stream=ResidualStream(torch.full((4, 4), 3.0)))
-        hidden = fb.residual_stream.leave(
-            torch.ones(4, 4), ADD, declared_sum=SumGroup.TP
+        hidden = fb.residual_stream.record(
+            torch.ones(4, 4), PLAIN_ADD, declared_sum=SumGroup.TP
         )
         wire = batch.to_pp(hidden, fb)
         self.assertIsNone(fb.residual_stream)
@@ -89,9 +87,7 @@ class TestBoundaryIntegrations(unittest.TestCase):
                 (declare_ffn(), fixture.Norm()),
                 previous=declare_ffn(),
             )
-            attn.plan._batch_steps = lambda _: attn.plan._paths[
-                BatchVariant.INPUT_SCATTERED
-            ]
+            attn.plan.path_for = lambda _: attn.plan.paths[BatchVariant.INPUT_SCATTERED]
             attn.plan.qkv_latent_func = None
             entry = attn.entry(fb)
             hidden, residual = fb.residual_stream.input(hidden)
@@ -101,7 +97,7 @@ class TestBoundaryIntegrations(unittest.TestCase):
                 fb,
                 fixture.Norm(),
                 pending=fb.residual_stream.pending,
-                update=ADD,
+                update=PLAIN_ADD,
             )
         self.assertEqual(reductions, ["RS"])
         torch.testing.assert_close(output, torch.full((2, 4), 10.0))
@@ -116,11 +112,11 @@ class TestBoundaryIntegrations(unittest.TestCase):
         for accepted in (False, True):
             fusion = CuteDSLFusion()
             fusion.install(
-                SimpleNamespace(), hands_off_finalize=True, terminal_finalize=accepted
+                SimpleNamespace(), defers_finalize=True, terminal_finalize=accepted
             )
             with (
                 fixture.planning(parallel),
-                patch.object(fusion, "_should_use_finalize", return_value=True),
+                patch.object(fusion, "_finalize_eligible", return_value=True),
                 patch(
                     "sglang.srt.layers.layer_boundary.fusions.cutedsl.get_parallel",
                     return_value=parallel,
@@ -133,7 +129,7 @@ class TestBoundaryIntegrations(unittest.TestCase):
                 )
                 fb.residual_stream = ResidualStream(torch.ones(2, 4))
                 with patch.object(
-                    ffn.plan.output, "_postprocess_dp_step", return_value=None
+                    ffn.plan.output, "_dp_reduce_scatter_step", return_value=None
                 ):
                     decision = ffn.exit(fb)
                 self.assertEqual(decision.defer_moe_finalize, accepted)
@@ -142,7 +138,7 @@ class TestBoundaryIntegrations(unittest.TestCase):
         plain = Mock(side_effect=AssertionError("cannot add a missing residual"))
         generic = Mock(return_value=("input", None))
         self.assertEqual(
-            _dispatch_consumer(
+            _dispatch_by_update(
                 None, None, None, None, paths={True: plain, False: generic}
             ),
             ("input", None),
@@ -191,21 +187,20 @@ class TestBoundaryIntegrations(unittest.TestCase):
                         exits, "post_experts_reduction_group", return_value=group
                     ),
                     patch.object(
-                        exits, "apply_flashinfer_allreduce_fusion", return_value=enabled
+                        exits, "flashinfer_ar_fusion_applies", return_value=enabled
                     ),
-                    patch.object(
-                        exits, "apply_aiter_all_reduce_fusion", return_value=False
-                    ),
+                    patch.object(exits, "aiter_ar_fusion_applies", return_value=False),
                 ):
                     self.assertEqual(
-                        exits._can_defer_ffn_reduction(fb), enabled and (lora or shared)
+                        exits._batch_allows_deferred_sum(fb),
+                        enabled and (lora or shared),
                     )
 
     def test_unsupported_producer_contracts_fail_at_declaration(self):
         with self.assertRaises(ValueError):
-            declare_ffn(reduction=ProducerReduction.PARTIAL)
+            declare_ffn(reduction=ProducerReduction.ALWAYS_PARTIAL)
         with self.assertRaises(ValueError):
-            declare_attn(reduction=ProducerReduction.LOCAL_TAIL)
+            declare_attn(reduction=ProducerReduction.TAIL_AFTER_SUM)
 
     def test_dense_decoder_forwards_capture_callback(self):
         from sglang.srt.models.llama4 import Llama4DecoderLayer
@@ -214,9 +209,9 @@ class TestBoundaryIntegrations(unittest.TestCase):
         for cls in (Qwen3DecoderLayer, Llama4DecoderLayer):
             captures = []
 
-            def prepare(hidden, fb, capture_output=None, **kwargs):
-                if capture_output is not None:
-                    capture_output(hidden)
+            def prepare(hidden, fb, capture=None, **kwargs):
+                if capture is not None:
+                    capture(hidden)
                 return hidden
 
             output = SimpleNamespace(finish=lambda hidden: hidden)

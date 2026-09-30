@@ -218,9 +218,15 @@ impl BootstrapTracker {
         self.fetch_cap
     }
 
-    /// Register ranks as `Pending` and return the obligation set: each rank
-    /// paired with the incarnation number a later control message must still
-    /// match to be allowed to act on it.
+    /// Register ranks as `Pending` and return obligations for the ones newly
+    /// inserted: each paired with a freshly minted incarnation number a later
+    /// control message must still match to be allowed to act on it.
+    ///
+    /// A rank already registered keeps its state and incarnation and yields no
+    /// obligation: whoever holds its existing obligation owns it. Decided under
+    /// the `states` lock, so concurrent callers registering the same rank get
+    /// exactly one obligation between them. A rank [`Self::forget`] removed is
+    /// new again and gets a new incarnation.
     ///
     /// Ranks added after the tracker has latched are recorded (so metrics stay
     /// accurate) but cannot un-settle readiness. The first registration is not
@@ -241,23 +247,12 @@ impl BootstrapTracker {
         let mut epochs = self.epochs.lock();
         let mut obligations = Vec::with_capacity(ids.len());
         for id in ids {
-            let fresh = !states.contains_key(id);
-            states.entry(id.clone()).or_insert(BootstrapState::Pending);
-            // A rank still present keeps its incarnation; one that was
-            // forgotten gets a new one, so a result started for the previous
-            // incarnation is recognisably stale.
-            let epoch = if fresh {
-                let e = self.epoch_seq.fetch_add(1, Ordering::Relaxed) + 1;
-                epochs.insert(id.clone(), e);
-                e
-            } else {
-                // A registered rank always has an epoch (`register` and `forget`
-                // write both maps together). Mint rather than default to 0 so a
-                // future asymmetry cannot make two incarnations share a number.
-                *epochs
-                    .entry(id.clone())
-                    .or_insert_with(|| self.epoch_seq.fetch_add(1, Ordering::Relaxed) + 1)
-            };
+            if states.contains_key(id) {
+                continue;
+            }
+            states.insert(id.clone(), BootstrapState::Pending);
+            let epoch = self.epoch_seq.fetch_add(1, Ordering::Relaxed) + 1;
+            epochs.insert(id.clone(), epoch);
             obligations.push((id.clone(), epoch));
         }
         obligations
@@ -400,9 +395,17 @@ mod tests {
         let first = t.register(std::slice::from_ref(&a));
         let e1 = first[0].1;
 
-        // Re-registering a still-present rank keeps its incarnation.
-        let again = t.register(std::slice::from_ref(&a));
-        assert_eq!(again[0].1, e1, "a live rank keeps its incarnation");
+        // Re-registering a still-present rank yields no obligation and keeps
+        // its incarnation.
+        assert!(
+            t.register(std::slice::from_ref(&a)).is_empty(),
+            "a registered rank's obligation is already held",
+        );
+        assert_eq!(
+            t.epoch_of(&a),
+            Some(e1),
+            "a live rank keeps its incarnation"
+        );
 
         t.forget(std::slice::from_ref(&a));
         assert_eq!(t.epoch_of(&a), None);
@@ -613,8 +616,9 @@ mod tests {
         );
     }
 
-    /// The remaining window saturates at zero once the deadline passes, while
-    /// the configured timeout stays positive.
+    /// The premise behind `BootstrapDeps::deadline`'s settled branch: the
+    /// remaining window saturates at zero, so a late rank needs the configured
+    /// timeout instead.
     #[test]
     fn time_remaining_saturates_to_zero_once_expired() {
         let tracker = BootstrapTracker::new(Duration::from_millis(1));

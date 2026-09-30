@@ -33,12 +33,12 @@ def dense_layer(*, reduce_scatter):
 
     complete = MagicMock(side_effect=lambda h, r: (h, r))
     plan = stub_plan()
-    plan._batch_steps = lambda fb: SimpleNamespace(
-        output=comm.StageOutput(comm.Layout(frozenset())),
+    plan.path_for = lambda fb: SimpleNamespace(
+        output=comm.OutputContract(comm.Layout(frozenset())),
         returns_over_dp=False,
         output_move_completes_sum=False,
     )
-    plan.output._select_ffn_completion = lambda fb, steps: comm.FfnCompletion(
+    plan.output._decide = lambda fb, steps: comm.ExitDecision(
         defer_moe_finalize=False,
         fuse_mlp_allreduce=False,
         mlp_reduce_scatter=reduce_scatter,

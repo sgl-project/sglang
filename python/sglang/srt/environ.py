@@ -633,11 +633,7 @@ class Envs:
     SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION = EnvBool(False)
     SGLANG_REQ_WAITING_TIMEOUT = EnvFloat(-1)  # in seconds
     SGLANG_REQ_RUNNING_TIMEOUT = EnvFloat(-1)  # in seconds
-    # For non-streaming requests, the scheduler still flushes intermediate
-    # output batches to the tokenizer manager every N decoded tokens so that
-    # `first_token_time`/TTFT can be recorded. Lower this (e.g. to 1) to get
-    # an accurate TTFT for benchmarking; the upstream default of 50 trades
-    # off some TTFT-metric accuracy for less IPC overhead.
+    # Non-streaming requests flush intermediate outputs every N decoded tokens.
     SGLANG_FORCE_STREAM_INTERVAL = EnvInt(50)
 
     # ===================================================================
@@ -1772,8 +1768,8 @@ class Envs:
     # either direction. See srt/layers/communication/k3_ar_fusion.py.
     SGLANG_K3_AR_FUSION = EnvBool(False)
     # K3 SP-MoE fused residual + reduce-scatter and matching all-gather over
-    # CustomAllReduceV2's MNNVL push workspace. Auto-probed for the validated
-    # TP8 GB300 configuration; set 0/1 to override. See
+    # CustomAllReduceV2's MNNVL push workspace. Auto-probed for checked-in
+    # TP4/TP8 GB300 and TP16 GB200/GB300 tuning; set 0/1 to override. See
     # srt/layers/communication/k3_sp_collective.py.
     SGLANG_K3_SP_COLLECTIVE = EnvBool(False)
     # Keep K3's post-MoE residual stream token-sharded between consecutive

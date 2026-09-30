@@ -12,30 +12,30 @@ from sglang.srt.layers.flashinfer_mnnvl_cutedsl import (
     _with_early_finalize_shared_load,
 )
 from sglang.srt.layers.layer_boundary import (
-    ADD,
-    NORM_QUANT_READ,
+    NORM_QUANT_READOUT,
+    PLAIN_ADD,
     Layout,
     StageKind,
     SumGroup,
     TokenAxis,
     UnreducedOutput,
-    reduce_output,
+    complete_owed,
 )
 from sglang.srt.layers.layer_boundary.construction import BatchVariant
 from sglang.srt.layers.layer_boundary.fusions.allreduce import (
-    attention_fusions,
-    complete_attention_input,
-    complete_ffn_input,
-    ffn_fusions,
+    attn_input_fusions,
+    ffn_input_fusions,
+    fused_attn_input,
+    fused_ffn_input,
 )
 from sglang.srt.layers.layer_boundary.fusions.cutedsl import (
     CuteDSLFusion,
-    MoeFinalizeHandoff,
+    MoeDeferredFinalize,
     install_cutedsl_fusion,
     prepare_cutedsl_fusion,
 )
-from sglang.srt.layers.layer_boundary.prepare import _consumer_step, _read_input
-from sglang.srt.layers.layer_boundary.residual.access import finish_layer_stack
+from sglang.srt.layers.layer_boundary.prepare import _run_entry, _update_read
+from sglang.srt.layers.layer_boundary.residual.access import export_output
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -56,28 +56,28 @@ def _communicator():
     comm.terminal = False
     comm.fusions = CuteDSLFusion()
     comm.norm = RMSNorm(8, eps=1e-6)
-    comm._attn_input_fusions = attention_fusions(comm)
+    comm._attn_input_fusions = attn_input_fusions(comm)
     # Only the ordinary batches' attention input half, with these entries.
-    comm._paths[BatchVariant.SEQUENCE_PARALLEL] = comm._paths[
+    comm.paths[BatchVariant.SEQUENCE_PARALLEL] = comm.paths[
         BatchVariant.INPUT_SCATTERED
-    ] = comm._paths[BatchVariant.CONTEXT_PARALLEL] = None
-    comm._paths[BatchVariant.ORDINARY] = SimpleNamespace(
+    ] = comm.paths[BatchVariant.CONTEXT_PARALLEL] = None
+    comm.paths[BatchVariant.ORDINARY] = SimpleNamespace(
         entry=SimpleNamespace(
             prepare=partial(
-                _consumer_step,
-                adds_plainly=True,
+                _run_entry,
+                is_plain_add=True,
                 step=partial(
-                    _read_input,
-                    layer_input=None,
+                    _update_read,
+                    pre_move=None,
                     enters_stack=False,
-                    read=NORM_QUANT_READ,
-                    update=ADD,
+                    read=NORM_QUANT_READOUT,
+                    update=PLAIN_ADD,
                 ),
                 carried_fusions=comm._attn_input_fusions,
             ),
             input_move=None,
-            input_sum=None,
-            handoff=None,
+            declared_sum=None,
+            attn_input_adapter=None,
         )
     )
     return comm
@@ -115,7 +115,7 @@ def _install(layers, **kwargs):
 def eligible():
     """Every shared gate open, so a case varies only the predicate it names."""
     with (
-        patch.object(CuteDSLFusion, "_common_eligible", return_value=True),
+        patch.object(CuteDSLFusion, "_eligible", return_value=True),
         patch(
             f"{_MODULE}.get_exec",
             return_value=SimpleNamespace(
@@ -137,13 +137,13 @@ def test_last_layer_consumes_but_does_not_skip_the_pending_all_reduce(eligible):
                 residual + 1,
             )
         ),
-        hands_off_finalize=False,
+        defers_finalize=False,
     )
     hidden_states = UnreducedOutput(torch.zeros(8, 8))
 
     with (
         patch_communicator(
-            "reduce_output",
+            "complete_owed",
             lambda *a, **k: pytest.fail("fell through to the unfused path"),
         ),
     ):
@@ -163,40 +163,40 @@ def test_cutedsl_entries_come_before_the_base_fused_kernel():
     fusion = comm.fusions
     finalize, reduce, base_input = comm._attn_input_fusions
     assert _bound(finalize) == (
-        fusion._finalize_output_and_update_and_read_residual,
+        fusion._finalize_add_norm,
         (comm,),
     )
     assert _bound(reduce) == (
-        fusion._reduce_output_and_update_and_read_residual,
+        fusion._all_reduce_add_norm,
         (comm,),
     )
-    assert _bound(base_input) == (complete_attention_input, (comm,))
-    base = (complete_ffn_input, (comm,))
-    cutedsl = (fusion._mlp_input_reduce_output_and_update_and_read_residual, (comm,))
+    assert _bound(base_input) == (fused_attn_input, (comm,))
+    base = (fused_ffn_input, (comm,))
+    cutedsl = (fusion._ffn_input_all_reduce_add_norm, (comm,))
     with patch(
         f"{_MODULE}.get_parallel",
         return_value=SimpleNamespace(attn_tp_size=2, tp_size=2),
     ):
-        comm.variants = {
+        comm.edges = {
             BatchVariant.ORDINARY: SimpleNamespace(
                 incoming=SimpleNamespace(residual=Layout(frozenset()))
             )
         }
-        fusions = ffn_fusions(comm)
+        fusions = ffn_input_fusions(comm)
         assert _bound(fusions[0].run) == cutedsl
         assert _bound(fusions[1].run) == base
         # The workspace reduces over the TP group, which is the attention-TP group here.
         assert [f.completes for f in fusions] == [SumGroup.ATTN_TP] * 2
         # A residual on each rank's slice is gathered first, which the
         # workspace does not do.
-        comm.variants = {
+        comm.edges = {
             BatchVariant.ORDINARY: SimpleNamespace(
                 incoming=SimpleNamespace(
-                    residual=Layout(frozenset({TokenAxis.ATTN_TP_SCATTER}))
+                    residual=Layout(frozenset({TokenAxis.ATTN_TP}))
                 )
             )
         }
-        assert [_bound(f.run) for f in ffn_fusions(comm)] == [base]
+        assert [_bound(f.run) for f in ffn_input_fusions(comm)] == [base]
 
 
 def test_the_fusion_runs_only_on_the_ffn_full_rows():
@@ -223,20 +223,20 @@ def test_the_fusion_runs_only_on_the_ffn_full_rows():
     ):
         for sharded, eligible in (
             (frozenset(), True),
-            (frozenset({TokenAxis.ATTN_TP_SCATTER}), False),
+            (frozenset({TokenAxis.ATTN_TP}), False),
         ):
-            comm._batch_steps = lambda fb, rows=Layout(sharded): SimpleNamespace(
+            comm.path_for = lambda fb, rows=Layout(sharded): SimpleNamespace(
                 entry=SimpleNamespace(input_rows=rows)
             )
-            assert fusion._common_eligible(comm, _DECODE, 8) is eligible
+            assert fusion._eligible(comm, _DECODE, 8) is eligible
 
 
 def test_finalize_handoff_is_a_producer_capability(eligible):
     comm = _communicator()
     fusion = comm.fusions
     assert not fusion.can_defer_finalize(comm, _DECODE)
-    fusion.install(SimpleNamespace(), hands_off_finalize=True)
-    with patch.object(CuteDSLFusion, "_should_use_finalize", return_value=True):
+    fusion.install(SimpleNamespace(), defers_finalize=True)
+    with patch.object(CuteDSLFusion, "_finalize_eligible", return_value=True):
         assert fusion.can_defer_finalize(comm, _DECODE)
 
 
@@ -263,8 +263,8 @@ def test_install_does_not_require_a_fused_successor():
         can_defer_finalize=lambda layer: True,
         label="test",
     )
-    assert first.fusions.hands_off_finalize
-    assert last.fusions.hands_off_finalize
+    assert first.fusions.defers_finalize
+    assert last.fusions.defers_finalize
 
 
 def test_a_service_nested_under_a_wrapper_is_prepared():
@@ -339,7 +339,7 @@ def test_the_handoff_views_the_producer_storage():
     gemm2_out = torch.empty(m * top_k + 4, 16, dtype=torch.bfloat16)
     expert_weights = torch.empty(m + 1, top_k, dtype=torch.bfloat16)
     permuted_indices = torch.empty(m + 1, top_k, dtype=torch.int32)
-    handoff = MoeFinalizeHandoff.from_flashinfer(
+    handoff = MoeDeferredFinalize.from_flashinfer(
         SimpleNamespace(
             gemm2_out=gemm2_out,
             expert_weights=expert_weights,
@@ -358,7 +358,7 @@ def test_the_handoff_views_the_producer_storage():
 
 def _handoff(finish):
     rows = torch.zeros(2, 8)
-    return MoeFinalizeHandoff(
+    return MoeDeferredFinalize(
         routed_output=rows,
         expert_weights=rows,
         permuted_indices=rows,
@@ -373,7 +373,7 @@ def test_its_producer_completes_a_handoff_for_any_other_reader():
     the MoE's own unfused tail, run once."""
     finished = torch.full((2, 8), 3.0)
     finish = MagicMock(return_value=finished)
-    assert reduce_output(_handoff(finish)) is finished
+    assert complete_owed(_handoff(finish)) is finished
     finish.assert_called_once_with()
 
 
@@ -390,7 +390,7 @@ def test_from_flashinfer_completes_with_the_moe_s_own_sum():
         "finalize_flashinfer_trtllm_deferred_output",
         side_effect=lambda d, s: s + 1,
     ) as finalize:
-        handoff = MoeFinalizeHandoff.from_flashinfer(
+        handoff = MoeDeferredFinalize.from_flashinfer(
             deferred, gated_shared_output=shared, m=2, reduce=lambda h: h * 10
         )
         finalize.assert_not_called()
@@ -416,8 +416,8 @@ def test_a_handoff_the_kernel_does_not_take_is_completed_then_normed():
     with (
         # A norm the kernel could fold in, on a batch it does not take.
         patch(f"{_MODULE}._fused_norm_gamma", return_value=torch.ones(8)),
-        patch.object(CuteDSLFusion, "_should_use_finalize", return_value=False),
-        patch.object(CuteDSLFusion, "_common_eligible", return_value=False),
+        patch.object(CuteDSLFusion, "_finalize_eligible", return_value=False),
+        patch.object(CuteDSLFusion, "_eligible", return_value=False),
     ):
         hidden, residual = prepare_input(
             stub_stage(comm, StageKind.ATTENTION),
@@ -434,7 +434,7 @@ def test_the_layer_stack_hands_a_handoff_only_to_a_final_norm_that_takes_it():
     for takes, completed in ((True, 0), (False, 1)):
         finish = MagicMock(return_value=torch.ones(2, 8))
         handoff = _handoff(finish)
-        hidden, _ = finish_layer_stack(
+        hidden, _ = export_output(
             handoff, torch.zeros(2, 8), _DECODE, final_norm_takes_handoff=takes
         )
         assert finish.call_count == completed
@@ -596,16 +596,14 @@ class TestDeferredLoraAllReduce(unittest.TestCase):
                     exits, "get_parallel", return_value=SimpleNamespace(tp_group=group)
                 ),
                 patch.object(exits, "post_experts_reduction_group", return_value=group),
-                patch.object(
-                    exits, "apply_flashinfer_allreduce_fusion", return_value=False
-                ),
+                patch.object(exits, "flashinfer_ar_fusion_applies", return_value=False),
                 patch.object(
                     provider, "can_defer_all_reduce", return_value=eligible
                 ) as gate,
             ):
                 # Avoid platform-specific Aiter details: no residual cannot fuse.
                 with patch.object(exits, "_use_aiter", False, create=True):
-                    result = exits._can_defer_ffn_reduction(fb, boundary)
+                    result = exits._batch_allows_deferred_sum(fb, boundary)
                 self.assertEqual(result, eligible and not a2a)
                 if a2a:
                     gate.assert_not_called()

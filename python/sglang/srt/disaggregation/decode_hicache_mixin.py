@@ -253,7 +253,7 @@ class DecodeHiCacheTransferMixin:
 
         dr.hicache_restored_kv_indices = torch.cat(
             [rematch.device_indices[pm.l1_prefix_len :], new_indices]
-        )
+        )[: pm.restore_token_count]
         dr.hicache_restored_node = restored_node
         dr.hicache_restore_lock_receipt = self.tree_cache.inc_lock_ref(
             restored_node

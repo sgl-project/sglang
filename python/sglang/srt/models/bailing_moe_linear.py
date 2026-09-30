@@ -300,6 +300,7 @@ class BailingMoE(nn.Module):
 
         self.topk = TopK(
             top_k=self.top_k,
+            layer_id=self.layer_id,
             use_grouped_topk=self.use_grouped_topk,
             renormalize=self.norm_expert_prob,
             num_expert_group=self.num_expert_group,
@@ -829,11 +830,13 @@ class BailingMoELinearDecoderLayer(nn.Module):
             (
                 declare_ffn(
                     sparse=is_moe_layer,
-                    next_sparse=is_next_layer_moe_layer,
+                    next_layer_sparse=is_next_layer_moe_layer,
                 ),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn(sparse=is_previous_moe_layer, next_sparse=is_moe_layer)
+            previous=declare_ffn(
+                sparse=is_previous_moe_layer, next_layer_sparse=is_moe_layer
+            )
             if layer_id != 0
             else None,
             terminal=layer_id == (1 if is_nextn else config.num_hidden_layers) - 1,
@@ -1009,7 +1012,7 @@ class BailingMoELinearModel(nn.Module):
         else:
             hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
             if not forward_batch.forward_mode.is_idle():
-                hidden_states = residual_batch.norm(
+                hidden_states = residual_batch.final_norm(
                     hidden_states, forward_batch, self.norm
                 )
             return hidden_states

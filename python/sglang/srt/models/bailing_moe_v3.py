@@ -33,7 +33,7 @@ from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
     declare_attn,
     declare_ffn,
-    enable_moe_dense_fully_dp,
+    is_dense_ffn_fully_dp,
     make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
@@ -1110,7 +1110,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
         is_next_layer_sparse = not (self.expert_num == 1) and (
             self.layer_id + 1 >= config.first_k_dense_replace
         )
-        if enable_moe_dense_fully_dp():
+        if is_dense_ffn_fully_dp():
             mlp_tp_rank, mlp_tp_size = 0, 1
         else:
             mlp_tp_rank, mlp_tp_size = None, None
@@ -1162,11 +1162,13 @@ class BailingMoELinearDecoderLayer(nn.Module):
             (
                 declare_ffn(
                     sparse=is_moe_layer,
-                    next_sparse=is_next_layer_sparse,
+                    next_layer_sparse=is_next_layer_sparse,
                 ),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn(sparse=is_previous_moe_layer, next_sparse=is_moe_layer)
+            previous=declare_ffn(
+                sparse=is_previous_moe_layer, next_layer_sparse=is_moe_layer
+            )
             if layer_id != 0
             else None,
             terminal=layer_id == (1 if is_nextn else config.num_hidden_layers) - 1,
@@ -1183,7 +1185,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         hidden_states = self.attn_boundary.prepare(
-            hidden_states, forward_batch, capture_output=capture_output
+            hidden_states, forward_batch, capture=capture_output
         )
 
         if not forward_batch.forward_mode.is_idle():
@@ -1213,7 +1215,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
 
         with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             if not (
-                enable_moe_dense_fully_dp()
+                is_dense_ffn_fully_dp()
                 and (not self.is_layer_sparse)
                 and hidden_states.shape[0] == 0
             ):
@@ -1397,11 +1399,11 @@ class BailingMoELinearModel(nn.Module):
         else:
             hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
             if not forward_batch.forward_mode.is_idle():
-                hidden_states = residual_batch.norm(
+                hidden_states = residual_batch.final_norm(
                     hidden_states,
                     forward_batch,
                     self.norm,
-                    capture_output=capture_output
+                    capture=capture_output
                     if capture_aux and self.end_layer - 1 in self.layers_to_capture
                     else None,
                 )
