@@ -62,6 +62,9 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
 from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
+from sglang.srt.layers.attention.dsa.utils import (
+    maybe_prefetch_next_full_attention_kv,
+)
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
@@ -75,12 +78,9 @@ from sglang.srt.layers.flashinfer_comm_fusion import uses_cutedsl_ar_fusion
 from sglang.srt.layers.layer_boundary import (
     declare_attn,
     declare_ffn,
-    enable_moe_dense_fully_dp,
     get_attn_tp_context,
+    is_dense_ffn_fully_dp,
     make_stages,
-)
-from sglang.srt.layers.layer_boundary.adapters.context_parallel import (
-    maybe_prefetch_next_full_attention_kv,
 )
 from sglang.srt.layers.layer_boundary.residual import access as residual_access
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
@@ -1112,10 +1112,10 @@ class DeepseekV2MoE(nn.Module):
             # deferred_finalize excludes _shared_expert_tp1, so the shared add folds in.
             assert shared_output is not None
             from sglang.srt.layers.layer_boundary.fusions.cutedsl import (
-                MoeFinalizeHandoff,
+                MoeDeferredFinalize,
             )
 
-            return MoeFinalizeHandoff.from_flashinfer(
+            return MoeDeferredFinalize.from_flashinfer(
                 final_hidden_states,
                 gated_shared_output=shared_output,
                 m=hidden_states.shape[0],
@@ -2294,7 +2294,7 @@ class DeepseekV2AttentionMLA(
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
-        input_on_attention_tp_slices: bool = False,
+        input_on_attn_tp_slices: bool = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ):
@@ -2303,7 +2303,7 @@ class DeepseekV2AttentionMLA(
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
-            input_on_attention_tp_slices=input_on_attention_tp_slices,
+            input_on_attn_tp_slices=input_on_attn_tp_slices,
             llama_4_scaling=llama_4_scaling,
             prev_topk_indices=prev_topk_indices,
         )
@@ -2315,7 +2315,7 @@ class DeepseekV2AttentionMLA(
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
-        input_on_attention_tp_slices: bool = False,
+        input_on_attn_tp_slices: bool = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ):
@@ -2400,7 +2400,7 @@ class DeepseekV2AttentionMLA(
                 hidden_states,
                 forward_batch,
                 zero_allocator,
-                input_on_attention_tp_slices,
+                input_on_attn_tp_slices,
             )
         elif attn_forward_method == AttnForwardMethod.MLA_NPU:
             inner_state = forward_mla_prepare_npu(
@@ -2409,7 +2409,7 @@ class DeepseekV2AttentionMLA(
                 hidden_states,
                 forward_batch,
                 zero_allocator,
-                input_on_attention_tp_slices,
+                input_on_attn_tp_slices,
             )
         elif attn_forward_method == AttnForwardMethod.DSA_NPU:
             inner_state = forward_dsa_prepare_npu(
@@ -2418,7 +2418,7 @@ class DeepseekV2AttentionMLA(
                 hidden_states,
                 forward_batch,
                 zero_allocator,
-                input_on_attention_tp_slices,
+                input_on_attn_tp_slices,
                 prev_topk_indices,
             )
         else:
@@ -2599,7 +2599,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 is_nextn=is_nextn,
             )
         else:
-            if enable_moe_dense_fully_dp():
+            if is_dense_ffn_fully_dp():
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
@@ -2656,14 +2656,15 @@ class DeepseekV2DecoderLayer(nn.Module):
             (
                 declare_ffn(
                     sparse=self.is_layer_sparse,
-                    next_sparse=self._stage_next_sparse,
+                    next_layer_sparse=self._stage_next_sparse,
                     output_transform=output,
                 ),
                 post_attention_layernorm,
                 {"fusions": fusions},
             ),
             previous=declare_ffn(
-                sparse=self._stage_previous_sparse, next_sparse=self.is_layer_sparse
+                sparse=self._stage_previous_sparse,
+                next_layer_sparse=self.is_layer_sparse,
             )
             if not self._stage_enters_stack
             else None,
@@ -2726,7 +2727,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
-            captured_last_layer_outputs=captured_last_layer_outputs,
+            capture_gathered=captured_last_layer_outputs,
             quant_format=self._resolve_gfx95_quant_format(),
         )
 
@@ -2737,9 +2738,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 forward_batch=forward_batch,
                 zero_allocator=zero_allocator,
                 llama_4_scaling=llama_4_scaling,
-                input_on_attention_tp_slices=(
-                    self.attn_boundary.input_on_attention_tp_slices
-                ),
+                input_on_attn_tp_slices=(self.attn_boundary.input_on_attn_tp_slices),
                 prev_topk_indices=prev_topk_indices,
             )
         if isinstance(hidden_states, tuple):
@@ -2813,7 +2812,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
     def op_comm_postprocess_layer(self, state):
-        hidden_states = self.ffn_boundary.postprocess(
+        hidden_states = self.ffn_boundary.finish_complete_output(
             state.pop("hidden_states_mlp_output"), state.forward_batch
         )
 
@@ -3158,7 +3157,7 @@ class DeepseekV2Model(nn.Module):
         else:
             hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
             if not forward_batch.forward_mode.is_idle():
-                hidden_states = residual_batch.norm(
+                hidden_states = residual_batch.final_norm(
                     hidden_states, forward_batch, self.norm
                 )
 
@@ -3421,6 +3420,8 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         kv_cache_device,
         create_chunked_prefix_cache_kv_indices_fn,
     ):
+        if _is_npu:
+            return None
         return prepare_decode_context_parallel_metadata(
             seq_lens=seq_lens,
             extend_prefix_lens=extend_prefix_lens,
@@ -3465,7 +3466,7 @@ def dsv2_flashinfer_moe_dual_stream_graph(
         mlp_reduce_scatter=mlp_reduce_scatter,
         flashinfer_trtllm_bypass=True,
         lora_batch_layout=LoRABatchLayout.TP_GLOBAL,
-        # The op's Tensor schema cannot carry a MoeFinalizeHandoff.
+        # The op's Tensor schema cannot carry a MoeDeferredFinalize.
         defer_moe_finalize=False,
     ):
         return moe_fusion.forward_normal_dual_stream(hidden_states)
