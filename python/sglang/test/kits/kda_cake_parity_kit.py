@@ -11,6 +11,11 @@ multi-sequence grids), and a cached-prefix residual (a short suffix prefilled
 from a non-zero recurrent state), each followed by ``max_new_tokens`` greedy
 decode steps.
 
+Each arm is compared with a Triton reference served with the same state pool
+dtype (``--mamba-ssm-dtype``): the prepared Cake prefill exports serve the
+FP32 pool, while the Cake decode kernel requires the BF16 pool on SM100+, so
+the decode arms and their reference run with ``bfloat16``.
+
 Prefill parity is judged on the input positions. Pooled over every input
 position of every prompt, the candidate must agree with the reference on the
 top-1 next-token prediction for at least ``parity_top1_agreement`` of the
@@ -98,6 +103,11 @@ class CakeArm:
     env: dict[str, str] = field(
         default_factory=lambda: {"SGLANG_KDA_CAKE_PREFILL_API": "prepared"}
     )
+    # ``--mamba-ssm-dtype`` of the arm *and* of its Triton reference (one
+    # reference server per distinct state dtype). The prepared Cake prefill
+    # exports serve the FP32 state pool; the Cake decode kernel requires the
+    # BF16 pool on SM100+ (``--linear-attn-decode-backend cake``).
+    state_dtype: str = "float32"
     cake_prefill: bool = True
     cake_decode: bool = False
     # The TF32 export serves bounded gates only; a model with an unbounded
@@ -130,10 +140,11 @@ DECODE_ARM = CakeArm(
         "--linear-attn-decode-backend",
         "cake",
     ),
+    state_dtype="bfloat16",
     cake_prefill=False,
     cake_decode=True,
 )
-# The production configuration: Cake prefill (BF16) and Cake decode.
+# The production configuration: Cake prefill (BF16) and Cake decode, BF16 pool.
 BF16_DECODE_ARM = CakeArm(
     name="cake_bf16_decode",
     extra_args=(
@@ -142,6 +153,7 @@ BF16_DECODE_ARM = CakeArm(
         "--linear-attn-decode-backend",
         "cake",
     ),
+    state_dtype="bfloat16",
     cake_decode=True,
 )
 
@@ -211,8 +223,6 @@ class KDACakeParityMixin:
     # Shared by the reference and every candidate arm.
     base_args: tuple[str, ...] = (
         "--trust-remote-code",
-        "--mamba-ssm-dtype",
-        "float32",
         "--mamba-radix-cache-strategy",
         "extra_buffer",
         "--mem-fraction-static",
@@ -248,7 +258,13 @@ class KDACakeParityMixin:
     parity_mean_logprob_delta: float = 0.1
     parity_top1_agreement: float = 0.97
     parity_top1_floor: float = 0.90
-    parity_output_agreement: float = 0.90
+    # Greedy output agreement is bounded by near-tie positions in natural
+    # text: on Kimi-Linear-48B a second launch of the Triton reference agreed
+    # on 0.92 of the output tokens and the Cake BF16 prefill (Triton decode)
+    # on 0.76 (16-token continuations), so the floor catches a broken decode
+    # (which diverges within the first steps of every prompt) rather than
+    # kernel-level rounding.
+    parity_output_agreement: float = 0.60
     tokens_per_word: float = 1.3
 
     # ---- prompts -----------------------------------------------------------
@@ -329,7 +345,7 @@ class KDACakeParityMixin:
                 time.sleep(2)
 
     # ---- server lifecycle --------------------------------------------------
-    def _launch(self, extra_args, env_overrides, log_prefix):
+    def _launch(self, extra_args, env_overrides, log_prefix, state_dtype):
         env = os.environ.copy()
         env.update(env_overrides)
         log_dir = tempfile.mkdtemp(prefix=f"kda_parity_{log_prefix}_")
@@ -337,6 +353,8 @@ class KDACakeParityMixin:
         stderr = open(os.path.join(log_dir, "stderr.log"), "w")
         other_args = [
             *self.base_args,
+            "--mamba-ssm-dtype",
+            state_dtype,
             "--tp",
             str(self.tp_size),
             *extra_args,
@@ -460,6 +478,10 @@ class KDACakeParityMixin:
                         continue
                     row = counts.get(event.get("mode"))
                     if row is None:
+                        continue
+                    # A one-token prefill (the ``/health_generate`` probe) is a
+                    # decode-shaped request; the Cake prefill never serves it.
+                    if event.get("reason") == "t1_decode_shape":
                         continue
                     if event.get("cake_success"):
                         row["cake_success"] += 1
@@ -623,18 +645,29 @@ class KDACakeParityMixin:
             arms = (TRITON_CONTROL_ARM,) + arms
         return arms
 
-    def test_cake_kda_kernels_match_triton(self):
-        process, log_dir, files = self._launch(self.reference_args, {}, "reference")
-        try:
-            reference = self._observe_all()
-        finally:
-            self._shutdown(process, files)
-        self.assertGreater(len(reference), 0)
-        self._dump("reference", reference)
+    def _reference(self, state_dtype: str) -> dict[str, _Observation]:
+        """Serve the Triton reference with the given state pool dtype (once per dtype)."""
+        cache = self.__dict__.setdefault("_references", {})
+        if state_dtype not in cache:
+            process, _, files = self._launch(
+                self.reference_args, {}, f"reference_{state_dtype}", state_dtype
+            )
+            try:
+                reference = self._observe_all()
+            finally:
+                self._shutdown(process, files)
+            self.assertGreater(len(reference), 0)
+            self._dump(f"reference_{state_dtype}", reference)
+            cache[state_dtype] = reference
+        return cache[state_dtype]
 
+    def test_cake_kda_kernels_match_triton(self):
         results = []
         for arm in self._arms():
-            process, log_dir, files = self._launch(arm.extra_args, arm.env, arm.name)
+            reference = self._reference(arm.state_dtype)
+            process, log_dir, files = self._launch(
+                arm.extra_args, arm.env, arm.name, arm.state_dtype
+            )
             try:
                 actual = self._observe_all()
             finally:
@@ -644,7 +677,7 @@ class KDACakeParityMixin:
                 name: self._compare(reference[name], actual[name]) for name in reference
             }
             counts = self._route_counts(log_dir)
-            self._report(arm.name, metrics)
+            self._report(f"{arm.name} (state pool {arm.state_dtype})", metrics)
             print(f"[kda-parity] {arm.name} route counts: {counts}")
             results.append((arm, metrics, counts))
 
@@ -671,7 +704,13 @@ class KDACakeParityMixin:
                 )
 
     def _assert_route(
-        self, arm_name: str, mode: str, counts: dict[str, int], *, cake: bool, fallback: bool
+        self,
+        arm_name: str,
+        mode: str,
+        counts: dict[str, int],
+        *,
+        cake: bool,
+        fallback: bool,
     ) -> None:
         if not cake:
             self.assertEqual(
