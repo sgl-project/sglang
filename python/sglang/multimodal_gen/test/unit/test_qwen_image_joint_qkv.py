@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
     QwenImageCrossAttention,
     _joint_qkv_head_views,
     _project_qkv_into_joint_buffers,
+    _sync_into_buffer,
     _use_joint_qkv_buffers,
 )
 from sglang.test.test_utils import CustomTestCase
@@ -213,6 +214,22 @@ class _JointQkvCase(CustomTestCase):
         self.assertTrue(torch.equal(joint_out[0], ref_out[0]))
         self.assertTrue(torch.equal(joint_out[1], ref_out[1]))
 
+    def _assert_compiled_forward_matches_eager(self, attn) -> None:
+        with patch(FUSED_INPLACE_QKNORM, return_value=False):
+            torch.manual_seed(20260902)
+            eager_out = self._forward(attn)
+            torch.manual_seed(20260902)
+            compiled = torch.compile(attn, dynamic=False)
+            hidden, encoder = _streams(dim=attn.added_kv_proj_dim, dtype=torch.bfloat16)
+            with patch(SP_WORLD_SIZE, return_value=1):
+                compiled_out = compiled(
+                    hidden_states=hidden,
+                    encoder_hidden_states=encoder,
+                    image_rotary_emb=None,
+                )
+        torch.testing.assert_close(compiled_out[0], eager_out[0], rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(compiled_out[1], eager_out[1], rtol=2e-2, atol=2e-2)
+
     def _assert_forward_bypasses_joint_buffers(
         self, attn: QwenImageCrossAttention, *, dtype: torch.dtype
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -236,6 +253,11 @@ class TestQwenImageJointQkvBuffers(_JointQkvCase):
         buffer views in place; their values must still reach the joint buffers."""
         with patch(FUSED_INPLACE_QKNORM, return_value=False):
             self._assert_joint_path_matches_join_seqs_path(_attention())
+
+    def test_compiled_forward_matches_eager_when_qk_norm_returns_fresh_tensors(self):
+        """With the in-place QK-norm off, the joint buffers are filled by the
+        copy-back; that path must compile and agree with eager."""
+        self._assert_compiled_forward_matches_eager(_attention())
 
     def test_fp16_parameters_and_streams_take_the_joint_path(self):
         """--dit-precision fp16 keeps every operand FP16, which the out= GEMMs
@@ -379,6 +401,36 @@ class TestQwenImageJointQkvBuffers(_JointQkvCase):
         self.assertTrue(eligible(h=h16, e=e16, attention=fp16))
 
 
+class TestSyncIntoBufferUnderCompile(CustomTestCase):
+    def test_out_of_place_sync_compiles_without_graph_breaks(self):
+        """Tracing the copy-back must produce one graph: no storage-pointer
+        comparison while Dynamo is compiling."""
+
+        @torch.no_grad()
+        def probe(x):
+            out = torch.empty_like(x)
+            _sync_into_buffer(value=x + 1, buf_view=out)
+            return out * 2
+
+        x = torch.arange(8, dtype=torch.float32)
+        report = torch._dynamo.explain(probe)(x)
+        self.assertEqual(report.graph_break_count, 0, report.break_reasons)
+        self.assertEqual(report.graph_count, 1)
+        torch._dynamo.reset()
+        self.assertTrue(torch.equal(torch.compile(probe)(x), (x + 1) * 2))
+
+    def test_eager_sync_copies_fresh_values_and_keeps_aliases(self):
+        """Eager keeps the storage check: a fresh value is copied back, an
+        aliased one must not pay a redundant copy_. The version counter is
+        shared by a tensor and its views, so it counts in-place writes."""
+        buf = torch.zeros(8)
+        _sync_into_buffer(value=torch.ones(8), buf_view=buf)
+        self.assertTrue(torch.equal(buf, torch.ones(8)))
+        version = buf._version
+        _sync_into_buffer(value=buf[2:6], buf_view=buf[2:6])
+        self.assertEqual(buf._version, version)
+
+
 @requires_convrot_kernel
 class TestQwenImageJointQkvBuffersConvRot(_JointQkvCase):
     """The same forward with the six projections on convrot_int8's JIT
@@ -392,6 +444,13 @@ class TestQwenImageJointQkvBuffersConvRot(_JointQkvCase):
         attn = _attention(quant_config=self.config)
         self.assertEqual(attn.to_q.weight.dtype, torch.int8)
         self._assert_joint_path_matches_join_seqs_path(attn)
+
+    def test_compiled_forward_matches_eager(self):
+        """The out= writes into the joint buffers go through the registered
+        custom ops under torch.compile; they must trace and agree with eager."""
+        self._assert_compiled_forward_matches_eager(
+            _attention(quant_config=self.config)
+        )
 
     def test_fp16_streams_bypass_joint_buffers_and_return_fp16(self):
         """FP16 streams must skip the joint buffers (the out= kernel stores BF16

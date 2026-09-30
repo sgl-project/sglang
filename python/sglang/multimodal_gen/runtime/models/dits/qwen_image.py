@@ -870,9 +870,10 @@ def _joint_qkv_head_views(
 
 
 def _sync_into_buffer(*, value: torch.Tensor, buf_view: torch.Tensor) -> None:
-    # In-place QK-norm/RoPE leaves value aliased to buf_view; only the
-    # non-fused fallback returns a fresh tensor that must be copied back.
-    if value.data_ptr() != buf_view.data_ptr():
+    # In-place QK-norm/RoPE aliases value to buf_view; only the non-fused
+    # fallback returns a fresh tensor that must be copied back.
+    # Dynamo cannot trace data_ptr(); a self-aliased copy_ is a no-op anyway.
+    if torch.compiler.is_compiling() or value.data_ptr() != buf_view.data_ptr():
         buf_view.copy_(value)
 
 
