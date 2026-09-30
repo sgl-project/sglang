@@ -397,12 +397,7 @@ fn convert_content(content: &Value, i: usize) -> Result<Value, String> {
                 }
                 json!({"type": "image_url", "image_url": image_url})
             }
-            "input_video" => {
-                let url = url_field(part.get("video_url"))
-                    .ok_or_else(|| format!("input[{i}]: `input_video` is missing `video_url`"))?;
-                json!({"type": "video_url", "video_url": {"url": url}})
-            }
-            "image_url" | "video_url" | "input_audio" => part.clone(),
+            "image_url" => part.clone(),
             other => {
                 return Err(format!(
                     "input[{i}]: content part type `{other}` is not supported"
@@ -762,6 +757,11 @@ mod tests {
             (
                 json!({"model": "m", "input": "x", "tools": [{"type": "web_search"}]}),
                 "web_search",
+            ),
+            (
+                json!({"model": "m", "input": [{"role": "user", "content": [
+                    {"type": "input_video", "video_url": "https://x/v.mp4"}]}]}),
+                "input_video",
             ),
             (
                 json!({"model": "m", "input": "x", "reasoning": {"effort": "huge"}}),

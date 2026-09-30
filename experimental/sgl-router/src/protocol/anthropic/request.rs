@@ -397,9 +397,8 @@ fn convert_block(block: &Value, at: &str) -> Result<Option<Value>, String> {
             json!({"type": "text", "text": block.get("text").and_then(Value::as_str).unwrap_or("")})
         }
         "image" => json!({"type": "image_url", "image_url": {"url": source_url(block, at)?}}),
-        "video" => json!({"type": "video_url", "video_url": {"url": source_url(block, at)?}}),
         "search_result" => json!({"type": "text", "text": search_result_text(block)}),
-        "image_url" | "video_url" | "input_audio" => block.clone(),
+        "image_url" => block.clone(),
         "thinking" | "redacted_thinking" => return Ok(None),
         "" => return Err(format!("messages.{at}.type: field required")),
         other => {
@@ -605,13 +604,12 @@ mod tests {
     }
 
     #[test]
-    fn images_and_video() {
+    fn images() {
         let c = chat(
             json!({"model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": [
                 {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "AAA"}},
                 {"type": "image", "source": {"type": "url", "url": "https://x/a.png"}},
-                {"type": "video", "source": {"type": "url", "url": "https://x/v.mp4"}},
-                {"type": "text", "text": "describe"},
+                    {"type": "text", "text": "describe"},
             ]}]}),
         );
         assert_eq!(
@@ -619,7 +617,6 @@ mod tests {
             json!([
                 {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAA"}},
                 {"type": "image_url", "image_url": {"url": "https://x/a.png"}},
-                {"type": "video_url", "video_url": {"url": "https://x/v.mp4"}},
                 {"type": "text", "text": "describe"},
             ])
         );
@@ -758,6 +755,11 @@ mod tests {
                 json!({"model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": [
                     {"type": "document", "source": {}}]}]}),
                 "document",
+            ),
+            (
+                json!({"model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": [
+                    {"type": "video", "source": {"type": "url", "url": "https://x/v.mp4"}}]}]}),
+                "video",
             ),
         ] {
             let err = to_chat(req.clone(), false).expect_err(&req.to_string());
