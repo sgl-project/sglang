@@ -1,15 +1,7 @@
 """Readback and runtime updates for the scheduler's internal state.
 
-The controller holds the live ``Scheduler`` rather than narrow arguments: both
-sides answer about the state *at call time* -- which queues hold requests now,
-what the draft worker has recorded now -- so a snapshot taken at construction
-would report the wrong thing. It only reads the scheduler; every write goes
-through a collaborator the scheduler already owns, or through the config
-override entry point.
-
-Adding a readback field means adding a contribution method below; adding a
-tunable means adding an entry to ``_update_handlers``. Neither touches
-``scheduler.py``.
+Holds the live ``Scheduler`` because both sides answer about the state at call
+time; it only reads it.
 """
 
 from __future__ import annotations
@@ -163,8 +155,7 @@ class SchedulerInternalStateController:
             logger.warning(str(rejection))
             return SetInternalStateReqOutput(updated=False)
 
-        # Worker commands are applied directly; the rest lands on the config
-        # bags in one override so a partial failure cannot leave them split.
+        # Worker commands apply directly; config keys land in one override.
         overrides = {}
         for key, value in requested.items():
             overrides.update(handlers[key].apply(key, value) or {})
@@ -291,8 +282,6 @@ class SchedulerInternalStateController:
 
 
 class _UpdateHandler:
-    """Validation and application of one tunable key."""
-
     def __init__(
         self,
         validate: Callable[[str, Any], None],
@@ -303,5 +292,4 @@ class _UpdateHandler:
 
 
 def _override(key: str, value: Any) -> Dict[str, Any]:
-    """Apply as a plain config override."""
     return {key: value}
