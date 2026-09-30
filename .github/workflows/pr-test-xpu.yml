@@ -185,7 +185,7 @@ jobs:
         # Old stage-a (30) + stage-b (120) = 150; +20% headroom for --enable-retry.
         timeout-minutes: 180
         run: |
-          docker exec ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/test && python3 run_suite.py --hw xpu --suite stage-a-test-1-gpu-xpu,stage-b-test-1-gpu-xpu --enable-retry"
+          docker exec ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/test && python3 run_suite.py --hw xpu --suite stage-a-test-1-gpu-xpu,stage-b-test-1-gpu-xpu --timeout-per-file 600 --enable-retry"
 
       - name: Cleanup container
         if: always()
