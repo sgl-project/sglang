@@ -63,6 +63,18 @@ def _cl3d(shape, dtype):
     )
 
 
+def _channels_first_3d(shape, dtype):
+    # Frames-major storage viewed as (B, C, T, H, W), like the WanResample output.
+    b, c, t, h, w = shape
+    return torch.randn((b, t, c, h, w), device=DEVICE, dtype=dtype).permute(
+        0, 2, 1, 3, 4
+    )
+
+
+def _video(layout, shape, dtype):
+    return _cl3d(shape, dtype) if layout == "cl" else _channels_first_3d(shape, dtype)
+
+
 # ---------------------------------------------------------------------------
 # USP output head merge
 # ---------------------------------------------------------------------------
@@ -532,6 +544,7 @@ def _ref_cat_pad(x, cache, padding):
 
 
 @torch.no_grad()
+@pytest.mark.parametrize("x_layout", ["cl", "cf"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize(
     "c,t,h,w,cache_t,pads",
@@ -543,9 +556,9 @@ def _ref_cat_pad(x, cache, padding):
         (48, 4, 10, 14, 2, (1, 1, 1, 1, 2, 0)),  # encoder-style T=4 chunk
     ],
 )
-def test_cat_pad_channels_last_3d_bitwise(dtype, c, t, h, w, cache_t, pads):
+def test_cat_pad_channels_last_3d_bitwise(dtype, c, t, h, w, cache_t, pads, x_layout):
     torch.cuda.manual_seed(0)
-    x = _cl3d((1, c, t, h, w), dtype)
+    x = _video(x_layout, (1, c, t, h, w), dtype)
     cache = None
     if cache_t:
         # Strided interior view: caches may arrive as non-contiguous slices.
@@ -576,22 +589,26 @@ def test_cat_pad_channels_last_3d_bitwise(dtype, c, t, h, w, cache_t, pads):
 @torch.no_grad()
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize(
+    "main_layout,src_layout", [("cf", "cl"), ("cf", "cf"), ("cl", "cf"), ("cl", "cl")]
+)
+@pytest.mark.parametrize(
     "c_in,c_out,t,h,w,ft,fs,drop",
     [
         (128, 64, 1, 10, 14, 2, 2, False),
         (128, 64, 1, 10, 14, 2, 2, True),  # first_chunk slicing
         (64, 32, 2, 10, 14, 1, 2, False),
+        (128, 64, 1, 10, 7, 2, 2, False),  # rows of 14: runs of 2 outputs
+        (32, 32, 2, 10, 7, 1, 1, False),  # rows of 7: no vector runs
     ],
 )
-def test_dup_up3d_add_bitwise(dtype, c_in, c_out, t, h, w, ft, fs, drop):
+def test_dup_up3d_add_bitwise(
+    dtype, c_in, c_out, t, h, w, ft, fs, drop, main_layout, src_layout
+):
     torch.cuda.manual_seed(0)
     repeats = c_out * ft * fs * fs // c_in
-    src = _cl3d((1, c_in, t, h, w), dtype)
+    src = _video(src_layout, (1, c_in, t, h, w), dtype)
     t_out = t * ft - (ft - 1 if drop else 0)
-    # Main arm as a permuted view, like the WanResample 2D output.
-    main = torch.randn(
-        (1, t_out, c_out, h * fs, w * fs), device=DEVICE, dtype=dtype
-    ).permute(0, 2, 1, 3, 4)
+    main = _video(main_layout, (1, c_out, t_out, h * fs, w * fs), dtype)
 
     dup = src.repeat_interleave(repeats, dim=1)
     dup = dup.view(1, c_out, ft, fs, fs, t, h, w)
