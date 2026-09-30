@@ -109,18 +109,24 @@ def main() -> None:
         )
         try:
             out_c = cake.extend(
-            q.clone(),
-            k.clone(),
-            v.clone(),
-            g.clone(),
-            beta,
-            ssm_states=pool_c,
-            layer_id=int(d["layer_id"]),
-            **common,
-            **cp_kwargs,
+                q.clone(),
+                k.clone(),
+                v.clone(),
+                g.clone(),
+                beta,
+                ssm_states=pool_c,
+                layer_id=int(d["layer_id"]),
+                **common,
+                **cp_kwargs,
             )
         except Exception as exc:  # noqa: BLE001 - report and continue
-            err = dict(file=os.path.basename(path), layer=int(d["layer_id"]), lengths=lengths, heads=int(q.shape[2]), error=str(exc)[:300])
+            err = dict(
+                file=os.path.basename(path),
+                layer=int(d["layer_id"]),
+                lengths=lengths,
+                heads=int(q.shape[2]),
+                error=str(exc)[:300],
+            )
             rows.append(err)
             print(json.dumps(err), flush=True)
             continue
