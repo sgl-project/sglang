@@ -2754,17 +2754,16 @@ class SplitKBufferPool:
     """
 
     _buffers = {}
-    _device = None
 
     @classmethod
     def get_buffers(
         cls, split_k: int, total_tokens: int, h_q: int, d_v: int, device: torch.device
     ):
-        """Get or create intermediate buffers for the given configuration."""
-        key = (split_k, total_tokens, h_q, d_v, device)
+        """Get or create stream-local buffers for the given configuration."""
+        stream = torch.cuda.current_stream(device).cuda_stream
+        key = (split_k, total_tokens, h_q, d_v, device, stream)
 
-        if key not in cls._buffers or cls._device != device:
-            cls._device = device
+        if key not in cls._buffers:
             partial_output = torch.empty(
                 split_k, total_tokens, h_q, d_v, dtype=torch.float32, device=device
             )
@@ -2785,7 +2784,6 @@ class SplitKBufferPool:
     def clear(cls):
         """Clear all cached buffers."""
         cls._buffers.clear()
-        cls._device = None
 
 
 def fused_gather_attn_decode_dsv4_dual_scope_low_overhead(
