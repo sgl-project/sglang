@@ -1640,5 +1640,33 @@ def test_qsa_draft_metadata_multi_step_graph(bs, padding):
                     )
 
 
+@pytest.mark.parametrize("query_lens", [[1, 7], [17, 3]])
+def test_qsa_chunk_prefill_known_max_q_graph_replay(query_lens):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA GPU required")
+    torch.manual_seed(42)
+    rows = sum(query_lens)
+    q = torch.randn(rows, 4, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(rows, 1, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    cu = torch.tensor([0, query_lens[0], rows], device="cuda", dtype=torch.int32)
+    lengths = torch.tensor(query_lens, device="cuda", dtype=torch.int32)
+    indices = torch.zeros(rows, 1, device="cuda", dtype=torch.int32)
+    expected = sparse_gqa_fwd_interface_triton_ck(
+        q, k, v, indices, cu, cu, lengths, 128**-0.5
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = sparse_gqa_fwd_interface_triton_ck(
+            q, k, v, indices, cu, cu, lengths, 128**-0.5, max_q=max(query_lens)
+        )
+    q.add_(0.5)
+    expected = sparse_gqa_fwd_interface_triton_ck(
+        q, k, v, indices, cu, cu, lengths, 128**-0.5
+    )
+    graph.replay()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
