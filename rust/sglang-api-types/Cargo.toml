@@ -1,6 +1,6 @@
 [package]
 name = "sglang-api-types"
-description = "Generated SGLang API types: prost structs, schema-driven serde, tonic services"
+description = "Generated SGLang API types: prost structs, tonic services, schema-driven serde"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,6 +14,7 @@ crate-type = ["rlib"]
 [dependencies]
 bytes = { workspace = true }
 prost = { workspace = true }
+prost-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tonic = { workspace = true }
