@@ -5,11 +5,14 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import torch
 
 from sglang.srt.layers.attention import qwen_sparse_attn_backend
 from sglang.srt.layers.attention.qsa import qsa_indexer
 from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import QwenSparseAttnBackend
+from sglang.srt.layers.cp import base as cp_base
+from sglang.srt.layers.cp import zigzag
 from sglang.srt.layers.cp.base import ContextParallelStrategyKind
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -65,6 +68,191 @@ def test_cuda_indexer_forwards_global_rope_to_cp_path():
     indexer.forward_cuda_cp.assert_called_once_with(
         hidden, local_rope, batch, metadata, global_rope
     )
+
+
+def _cpu_sparse_chunk_attention(q, k, v, indices, cu_q, cu_k, kv_lens, scale):
+    """CPU oracle for the chunk kernel's packed K/V and causal conventions."""
+    output = torch.empty_like(q)
+    for entry in range(kv_lens.numel()):
+        start, end = int(cu_q[entry]), int(cu_q[entry + 1])
+        for row in range(start, end):
+            visible = int(kv_lens[entry]) - (end - start) + row - start + 1
+            selected = indices[row]
+            selected = selected[selected >= 0].long()
+            assert (selected < visible).all()
+            selected = selected + int(cu_k[entry])
+            keys = k.index_select(0, selected).repeat_interleave(
+                q.shape[1] // k.shape[1], dim=1
+            )
+            values = v.index_select(0, selected).repeat_interleave(
+                q.shape[1] // v.shape[1], dim=1
+            )
+            scores = torch.einsum("hd,nhd->hn", q[row], keys) * scale
+            output[row] = torch.einsum("hn,nhd->hd", scores.softmax(-1), values)
+    return output
+
+
+@pytest.mark.parametrize("prefix_lens", [(4, 8), (0, 4), (0, 0)])
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("save_kv_cache", [True, False])
+@pytest.mark.parametrize(
+    "query_dtype,cache_dtype",
+    [(torch.float32, torch.float32), (torch.bfloat16, torch.float8_e4m3fn)],
+)
+def test_qsa_cp_cached_prefix_matches_full_context_attention(
+    monkeypatch, prefix_lens, rank, save_kv_cache, query_dtype, cache_dtype
+):
+    # Unequal request lengths exercise both zigzag halves and uneven rank sizes.
+    extend_lens = [8, 5]
+    seq_lens = [prefix + length for prefix, length in zip(prefix_lens, extend_lens)]
+    monkeypatch.setattr(
+        cp_base, "get_parallel", lambda: SimpleNamespace(attn_cp_rank=rank)
+    )
+    monkeypatch.setattr(zigzag, "get_device", lambda: SimpleNamespace(device="cpu"))
+    strategy = zigzag.ZigzagCPStrategy(cp_size=2)
+    meta = strategy.build_metadata(sum(extend_lens), seq_lens, extend_lens)
+    meta.per_rank_logical_token = meta.per_rank_actual_token
+    meta.per_rank_actual_token = [8, 8]
+    meta.max_rank_len = [8, 8]
+    monkeypatch.setattr(qwen_sparse_attn_backend, "get_cp_strategy", lambda: strategy)
+
+    generator = torch.Generator().manual_seed(42)
+    keys = [
+        torch.randn(length, 1, 4, generator=generator).to(query_dtype)
+        for length in seq_lens
+    ]
+    values = [
+        torch.randn(length, 1, 4, generator=generator).to(query_dtype)
+        for length in seq_lens
+    ]
+    # Cached prefixes have already incurred the KV pool's storage rounding.
+    for key, value, prefix in zip(keys, values, prefix_lens):
+        key[:prefix] = key[:prefix].to(cache_dtype).to(query_dtype)
+        value[:prefix] = value[:prefix].to(cache_dtype).to(query_dtype)
+    queries = torch.randn(sum(extend_lens), 2, 4, generator=generator).to(query_dtype)
+    new_k = torch.cat([key[prefix:] for key, prefix in zip(keys, prefix_lens)])
+    new_v = torch.cat([value[prefix:] for value, prefix in zip(values, prefix_lens)])
+
+    # Request IDs and physical token slots deliberately differ from packed order.
+    req_indices = [4, 1]
+    req_to_token = torch.zeros(5, max(seq_lens), dtype=torch.int32)
+    slots = torch.randperm(80, generator=generator)[: sum(seq_lens)] + 1
+    k_cache = torch.full((81, 1, 4), float("nan"), dtype=cache_dtype)
+    v_cache = torch.full_like(k_cache, float("nan"))
+    out_cache_locs = []
+    offset = 0
+    for i, (length, prefix) in enumerate(zip(seq_lens, prefix_lens)):
+        request_slots = slots[offset : offset + length]
+        offset += length
+        req_to_token[req_indices[i], :length] = request_slots.to(torch.int32)
+        k_cache[request_slots[:prefix]] = keys[i][:prefix].to(cache_dtype)
+        v_cache[request_slots[:prefix]] = values[i][:prefix].to(cache_dtype)
+        out_cache_locs.append(request_slots[prefix:])
+    out_cache_loc = torch.cat(out_cache_locs)
+    initial_k, initial_v = k_cache.clone(), v_cache.clone()
+
+    def store_kv(layer, locations, k, v):
+        k_cache[locations.long()] = k.to(cache_dtype)
+        v_cache[locations.long()] = v.to(cache_dtype)
+
+    pool = SimpleNamespace(
+        set_kv_buffer=Mock(side_effect=store_kv),
+        get_key_buffer=Mock(return_value=k_cache),
+        get_value_buffer=Mock(return_value=v_cache),
+    )
+    if not any(prefix_lens):
+        pool.get_key_buffer.side_effect = AssertionError(
+            "zero prefix needs no cache read"
+        )
+        pool.get_value_buffer.side_effect = AssertionError(
+            "zero prefix needs no cache read"
+        )
+    backend = SimpleNamespace(
+        token_to_kv_pool=pool,
+        req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+        _pad_extend_output=QwenSparseAttnBackend._pad_extend_output,
+    )
+    batch = SimpleNamespace(
+        attn_cp_metadata=meta,
+        seq_lens_cpu=seq_lens,
+        extend_seq_lens_cpu=extend_lens,
+        extend_prefix_lens_cpu=list(prefix_lens),
+        req_pool_indices=torch.tensor(req_indices),
+        out_cache_loc=out_cache_loc,
+    )
+    local_q = strategy.shard_hidden_states(queries, batch)
+    local_k = strategy.shard_hidden_states(new_k, batch)
+    local_v = strategy.shard_hidden_states(new_v, batch)
+    num_local = meta.total_q_prev_tokens + meta.total_q_next_tokens
+    local_rows = strategy.shard_hidden_states(torch.arange(sum(extend_lens)), batch)[
+        :num_local
+    ]
+    logical_positions = torch.cat(
+        [torch.arange(prefix, length) for prefix, length in zip(prefix_lens, seq_lens)]
+    )
+    local_positions = logical_positions.index_select(0, local_rows)
+
+    def gather_new_kv(local_kv, forward_batch):
+        assert forward_batch is batch
+        torch.testing.assert_close(
+            local_kv, torch.cat([local_k.flatten(1), local_v.flatten(1)], dim=-1)
+        )
+        return torch.cat([new_k.flatten(1), new_v.flatten(1)], dim=-1)
+
+    monkeypatch.setattr(
+        qwen_sparse_attn_backend, "cp_materialize_global_token_order", gather_new_kv
+    )
+
+    def sparse_chunk_attention(q, k, v, indices, cu_q, cu_k, kv_lens, scale):
+        # The last local query in each block identifies its absolute causal end.
+        expected_ends = local_positions[cu_q[1:].long() - 1] + 1
+        torch.testing.assert_close(kv_lens.long(), expected_ends)
+        assert k.dtype == v.dtype == q.dtype
+        return _cpu_sparse_chunk_attention(q, k, v, indices, cu_q, cu_k, kv_lens, scale)
+
+    monkeypatch.setattr(
+        qwen_sparse_attn_backend,
+        "sparse_gqa_fwd_interface_triton_ck",
+        sparse_chunk_attention,
+    )
+    layer = SimpleNamespace(
+        layer_id=0,
+        tp_q_head_num=2,
+        tp_k_head_num=1,
+        tp_v_head_num=1,
+        head_dim=4,
+        qk_head_dim=4,
+        v_head_dim=4,
+        scaling=0.5,
+    )
+    # The indexer supplies causal logical positions and marks other slots invalid.
+    candidates = torch.arange(max(seq_lens), dtype=torch.int32).expand(num_local, -1)
+    topk = torch.where(candidates <= local_positions[:, None], candidates, -1)
+    actual = QwenSparseAttnBackend._forward_extend_cp(
+        backend, local_q, local_k, local_v, layer, batch, topk, save_kv_cache
+    )
+
+    expected = []
+    row = 0
+    for i, (length, prefix) in enumerate(zip(extend_lens, prefix_lens)):
+        for position in range(prefix, prefix + length):
+            visible_keys = keys[i][: position + 1, 0]
+            visible_values = values[i][: position + 1, 0]
+            scores = queries[row] @ visible_keys.T * layer.scaling
+            expected.append(scores.softmax(-1) @ visible_values)
+            row += 1
+    expected = torch.stack(expected).index_select(0, local_rows).flatten(1)
+    torch.testing.assert_close(actual[:num_local], expected)
+    assert actual.shape == (8, 8)
+    torch.testing.assert_close(actual[num_local:], torch.zeros_like(actual[num_local:]))
+    if save_kv_cache:
+        pool.set_kv_buffer.assert_called_once()
+        initial_k[out_cache_loc] = new_k.to(cache_dtype)
+        initial_v[out_cache_loc] = new_v.to(cache_dtype)
+    else:
+        pool.set_kv_buffer.assert_not_called()
+    torch.testing.assert_close(k_cache.float(), initial_k.float(), equal_nan=True)
+    torch.testing.assert_close(v_cache.float(), initial_v.float(), equal_nan=True)
 
 
 if __name__ == "__main__":

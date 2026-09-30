@@ -569,8 +569,9 @@ class QSAIndexer(MultiPlatformOp):
         )
         # Local q (normed + roped) and raw local k; no ring store here.
         q, token_k, _ = self.project_qk(hidden_states, positions)
-        # Raw keys of the whole sequence in global token order: the ring store
-        # and the compression use the global write plan unchanged.
+        # Raw keys of all new tokens in global packed order: the ring store
+        # and compression use the global write plan unchanged. Cached prefix
+        # groups already reside in the compressed-K pool on every rank.
         token_k_local = token_k.reshape(num_local, -1).contiguous()
         token_k_full = cp_materialize_global_token_order(
             token_k_local, forward_batch

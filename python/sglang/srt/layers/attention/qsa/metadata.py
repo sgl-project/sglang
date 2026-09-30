@@ -54,6 +54,9 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     - ``token_to_batch_idx`` maps every query/token row handled by the indexer
       onto a row of ``sequence_lengths``/``token_slot_table``; DP attention
       token padding adds physical rows beyond this mapping, never inside it.
+      For CP extend, it covers the global packed *new* tokens used by the
+      compression write plan. Query selection uses a zigzag-sharded copy;
+      cached prefix tokens are K/V context, not rows in this mapping.
     - For the paged modes the mapping is the identity
       (``arange(num_query_rows)``), so page-table/MQA inputs built per
       ``sequence_lengths`` row line up with per-query sparse-attention rows.
