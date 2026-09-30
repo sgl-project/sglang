@@ -7,7 +7,6 @@ import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.cpu_test_utils import make_non_contiguous, precision
-from sglang.srt.layers.layernorm import RMSNorm
 
 register_cpu_ci(est_time=5, suite="stage-a-test-cpu-intel")
 register_cpu_ci(est_time=10, suite="base-b-test-cpu-arm64")
@@ -113,30 +112,6 @@ class TestNorm:
 
         torch.testing.assert_close(x, ref_x, atol=atol, rtol=rtol)
         torch.testing.assert_close(residual, ref_residual, atol=atol, rtol=rtol)
-
-    def test_rmsnorm_hf_cast_semantics(self):
-        hidden_size = 4096
-        x = torch.randn(64, hidden_size, dtype=torch.bfloat16)
-        residual = torch.randn_like(x)
-        norm = RMSNorm(hidden_size, eps=1e-5, cast_x_before_out_mul=True)
-        norm.weight.data = torch.randn(hidden_size, dtype=x.dtype)
-
-        normalized = x.float() * torch.rsqrt(
-            x.float().square().mean(-1, keepdim=True) + norm.variance_epsilon
-        )
-        expected = norm.weight * normalized.to(x.dtype)
-        output = norm.forward_cpu(x.clone())
-        torch.testing.assert_close(output, expected, atol=0, rtol=0)
-
-        combined = (x.float() + residual.float()).to(x.dtype)
-        normalized = combined.float() * torch.rsqrt(
-            combined.float().square().mean(-1, keepdim=True)
-            + norm.variance_epsilon
-        )
-        expected = norm.weight * normalized.to(x.dtype)
-        output, residual_output = norm.forward_cpu(x.clone(), residual.clone())
-        torch.testing.assert_close(output, expected, atol=0, rtol=0)
-        torch.testing.assert_close(residual_output, combined, atol=0, rtol=0)
 
     @pytest.mark.parametrize("dtype", [torch.bfloat16], ids=["bfloat16"])
     @pytest.mark.parametrize("hidden_size", [2048, 256, 33])

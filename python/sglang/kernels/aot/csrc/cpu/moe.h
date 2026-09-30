@@ -101,8 +101,7 @@ inline void sum_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ in
   }
 }
 
-inline at::vec::Vectorized<float> silu_for_moe(
-    const at::vec::Vectorized<float>& x) {
+inline at::vec::Vectorized<float> silu_for_moe(const at::vec::Vectorized<float>& x) {
   const auto one = at::vec::Vectorized<float>(1.f);
   return x / (one + x.neg().exp_u20());
 }
