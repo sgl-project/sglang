@@ -456,8 +456,7 @@ class HiCacheFile(HiCacheStorage):
         )
 
     def _get_suffixed_key(self, key: str) -> str:
-        # MLA KV/indexer pages are replicated, but hybrid recurrent state is
-        # TP-sharded. Never reuse legacy, rank-ambiguous Mamba files.
+        # MLA KV/indexer pages are replicated; Mamba state is TP-sharded.
         if self._is_mla_model and key.endswith(".mamba"):
             key = key[: -len(".mamba")] + self._mamba_tp_suffix
         return key + self.config_suffix
@@ -467,8 +466,8 @@ class HiCacheFile(HiCacheStorage):
         if ".mamba.tp" in key:
             return key.endswith(self._mamba_tp_suffix)
         if key.endswith(".mamba"):
-            return False  # Legacy state cannot be assigned to a TP rank safely.
-        return self._tp_rank == 0  # Replicated pages have a single eviction owner.
+            return False  # Legacy state has no rank identity.
+        return self._tp_rank == 0  # Rank 0 owns replicated pages.
 
     def _get_component_key(self, key: str, component_name: Optional[str] = None) -> str:
         if component_name is None or component_name in ("__default__", PoolName.KV):

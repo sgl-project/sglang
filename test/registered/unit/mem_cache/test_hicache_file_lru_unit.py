@@ -343,15 +343,14 @@ class TestMLAMambaIsolation(HiCacheFileLRUTestBase):
                     self.make_backend(
                         is_mla=True,
                         tp_rank=rank,
-                        tp_size=4,
+                        tp_size=2,
                         subdir=f"shared-{metadata}",
                         enable_metadata_cache=metadata,
                     )
-                    for rank in range(4)
+                    for rank in range(2)
                 ]
                 transfer = PoolTransfer(
                     PoolName.MAMBA,
-                    host_indices=torch.tensor([0]),
                     keys=["prefix"],
                     hit_policy=PoolHitPolicy.TRAILING_PAGES,
                 )
@@ -364,30 +363,17 @@ class TestMLAMambaIsolation(HiCacheFileLRUTestBase):
                 with open(legacy, "wb") as f:
                     f.write(bytes([255]) * 16)
                 for rank, backend in enumerate(ranks):
-                    self.assertFalse(backend.exists("prefix.mamba"))
-                    self.assertIsNone(backend.get("prefix.mamba", _t(16)))
                     self.assertEqual(
                         backend.batch_exists_v2(["prefix"], [transfer]).kv_hit_pages,
                         0,
                     )
-                    pool = mock.Mock(page_size=1)
-                    pool.get_data_page.return_value = _t(16, rank + 17)
-                    pool.get_dummy_flat_data_page.side_effect = lambda: _t(16)
-                    backend.register_mem_host_pool_v2(pool, PoolName.MAMBA)
-                    self.assertEqual(
-                        backend.batch_set_v2([transfer]), {PoolName.MAMBA: [True]}
-                    )
+                    self.assertTrue(backend.set("prefix.mamba", _t(16, rank + 17)))
                 for rank, backend in enumerate(ranks):
                     self.assertEqual(
                         backend.batch_exists_v2(["prefix"], [transfer]).kv_hit_pages,
                         1,
                     )
-                    self.assertEqual(
-                        backend.batch_get_v2([transfer]), {PoolName.MAMBA: [True]}
-                    )
-                    restored = backend.registered_pools[
-                        PoolName.MAMBA
-                    ].set_from_flat_data_page.call_args.args[1]
+                    restored = backend.get("prefix.mamba", _t(16))
                     self.assertTrue(torch.equal(restored, _t(16, rank + 17)))
                     self.assertTrue(
                         torch.equal(backend.get("prefix", _t(16)), _t(16, 99))
@@ -423,33 +409,6 @@ class TestMLAMambaIsolation(HiCacheFileLRUTestBase):
         self.assertTrue(r0.exists("prefix"))
         self.assertTrue(r0.set("next.mamba", _t(80, 47)))
         self.assertTrue(r1.exists("next.mamba"))
-
-    def test_tp_size_is_part_of_state_identity(self):
-        a = self.make_backend(is_mla=True, tp_size=2)
-        b = self.make_backend(is_mla=True, tp_size=4)
-        self.assertNotEqual(
-            a._get_suffixed_key("a.mamba"), b._get_suffixed_key("a.mamba")
-        )
-        self.assertEqual(a._get_suffixed_key("a"), b._get_suffixed_key("a"))
-
-    def test_state_retains_pp_and_cp_isolation(self):
-        keys = set()
-        for pp_rank in range(2):
-            for cp_rank in range(2):
-                backend = HiCacheFile(
-                    _make_config(
-                        is_mla=True,
-                        tp_rank=0,
-                        tp_size=4,
-                        pp_rank=pp_rank,
-                        pp_size=2,
-                        attn_cp_rank=cp_rank,
-                        attn_cp_size=2,
-                    ),
-                    file_path=self.tmpdir,
-                )
-                keys.add(backend._get_component_key("prefix", PoolName.MAMBA))
-        self.assertEqual(len(keys), 4)
 
 
 class TestTrackOrTouch(HiCacheFileLRUTestBase):

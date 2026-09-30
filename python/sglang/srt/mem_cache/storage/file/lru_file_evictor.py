@@ -79,8 +79,7 @@ class LRUFileEvictor:
         self._tp_rank = tp_rank
         self._on_evict = on_evict
 
-        # Replicated MLA pages belong to rank 0. Hybrid models additionally
-        # own TP-local state files, selected by the backend's key predicate.
+        # Hybrid MLA models also own TP-local state, selected by owns_key.
         self._is_storage_owner = (
             owns_key is not None or not is_mla_model or tp_rank == 0
         )
