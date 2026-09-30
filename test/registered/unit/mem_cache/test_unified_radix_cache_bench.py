@@ -561,7 +561,6 @@ def bench_evict_step(
     kv_size=500_000,
     components=None,
     verify=False,
-    tree_cls=None,
     page_size=1,
     step_tokens=64,
 ):
@@ -572,7 +571,7 @@ def bench_evict_step(
     evictable-leaf set) instead of the prefill-shaped batch evictions of
     ``bench_evict``. Prints the evictable-leaf count before and after.
     """
-    env = _make_env(num_seqs, chunk_len, kv_size, components, tree_cls, page_size)
+    env = _make_env(num_seqs, chunk_len, kv_size, components, page_size)
     inserted = _fill_no_evict(env)
     step_tokens = max(step_tokens, page_size)
 
