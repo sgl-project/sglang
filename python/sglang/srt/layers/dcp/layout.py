@@ -20,10 +20,45 @@ from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.utils import print_info_once
 
 logger = logging.getLogger(__name__)
+
+
+def dcp_interleave_size() -> int:
+    """How many consecutive positions a rank holds before the next rank's run.
+
+    ``1`` -- one position per rank, round robin -- is this branch's rule and
+    CUDA's: the Triton store at ``kernels/ops/kvcache/mla_buffer.py:42``
+    hardcodes ``loc % DCP_WORLD_SIZE == DCP_RANK`` and the MHA read paths
+    hardcode the same, so CUDA cannot read a page-interleaved pool.
+
+    ``page_size`` is what upstream #37787 and vLLM-Ascend both use on NPU. It
+    is NOT a different memory layout: the allocator already pages virtual space
+    at ``page_size * dcp_size`` either way (an upstream convention, see
+    ``arg_groups/overrides.py``), so within one allocator page both rules give a
+    rank the same 128 physical rows and the same block-table entry. What differs
+    is WHICH positions those rows hold -- strided under 1, one contiguous run
+    under ``page_size``. Radix matching stays at ``page_size * dcp_size`` under
+    both; lowering ``--page-size`` is the lever for that, not this.
+
+    NPU only. Every caller that CUDA also reaches passes 1 explicitly.
+    """
+    if not envs.SGLANG_NPU_DCP_PAGE_INTERLEAVE.get():
+        return 1
+    return get_schedule().page_size
+
+
+def dcp_owner_count(length: int, dcp_size: int, dcp_rank: int, interleave: int) -> int:
+    """How many of positions ``[0, length)`` rank ``dcp_rank`` owns.
+
+    The scalar form of ``get_dcp_lens``, for the CPU-side gather plan.
+    """
+    cycle = dcp_size * interleave
+    full, rem = divmod(length, cycle)
+    return full * interleave + min(max(rem - dcp_rank * interleave, 0), interleave)
 
 
 def get_dcp_lens(
@@ -209,7 +244,7 @@ def update_local_kv_lens_for_dcp(kv_len_arr):
 
 
 def plan_dcp_owner_write(
-    loc: torch.Tensor, dcp_size: int, dcp_rank: int
+    loc: torch.Tensor, dcp_size: int, dcp_rank: int, interleave_size: int = 1
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Rows of ``loc`` this rank owns, and the physical rows they land on.
 
@@ -230,8 +265,9 @@ def plan_dcp_owner_write(
     captured and shares one write location across layers, so there the filter
     is computed once per forward.
     """
-    owned_idx = torch.nonzero((loc % dcp_size) == dcp_rank).squeeze(1)
-    return owned_idx, loc[owned_idx] // dcp_size
+    local = localize_dcp_indices(loc, dcp_size, dcp_rank, interleave_size)
+    owned_idx = torch.nonzero(local >= 0).squeeze(1)
+    return owned_idx, local[owned_idx]
 
 
 # Reusable device buffers for the extend gather, keyed by purpose, dtype, device
@@ -313,14 +349,23 @@ def plan_dcp_extend_gather(
     dcp_size: int,
     dcp_rank: int,
     max_piece_gather_rows: int,
+    interleave_size: int = 1,
 ) -> DcpExtendGatherPlan:
     """Plan the extend-time gather of the prefix KV into position order.
 
-    Under the owner rule ``pos % dcp_size == rank`` with each request's prefix
-    starting at position 0, rank r holds positions ``r, r + dcp_size, ...`` of a
-    request in order, so position p sits in rank ``p % dcp_size``'s send at
-    local row ``p // dcp_size``. Local shards are concatenated per request, as
-    the planner's ``dcp_local_prefix_kv_indices`` lists them.
+    Each request's prefix starts at position 0 and rank r holds the positions
+    whose ``interleave_size``-block is ``r`` mod ``dcp_size``, in order. So
+    position p sits in rank ``(p // B) % dcp_size``'s send at local row
+    ``(p // (B * dcp_size)) * B + p % B``, for ``B = interleave_size``. At
+    ``B == 1`` that is the historical rule, ``rank p % dcp_size`` and row
+    ``p // dcp_size``. Local shards are concatenated per request, as the
+    planner's ``dcp_local_prefix_kv_indices`` lists them.
+
+    Piece cuts fall on whole ``B``-blocks, which is what keeps the mapping from
+    a local-row range to a global-position range independent of the rank: local
+    rows ``[row, row + take)`` cover global positions ``[row * dcp_size,
+    (row + take) * dcp_size)`` under either rule, provided ``row`` and ``take``
+    are multiples of ``B``.
 
     The sends are cut into pieces of ``max_piece_gather_rows // dcp_size`` rows
     (at least one), so no collective gathers more than ``max_piece_gather_rows``
@@ -333,9 +378,13 @@ def plan_dcp_extend_gather(
     """
     prefix_lens = [int(p) for p in prefix_lens]
     extend_lens = [int(e) for e in extend_lens]
-    local_lens = [p // dcp_size + int(dcp_rank < p % dcp_size) for p in prefix_lens]
-    padded_lens = [-(-p // dcp_size) for p in prefix_lens]
-    piece_rows = max(1, max_piece_gather_rows // dcp_size)
+    b = interleave_size
+    local_lens = [dcp_owner_count(p, dcp_size, dcp_rank, b) for p in prefix_lens]
+    # The widest rank's local length, which is rank 0's: every rank pads to it
+    # so one all-gather covers the group.
+    padded_lens = [dcp_owner_count(p, dcp_size, 0, b) for p in prefix_lens]
+    # Rounded down to a whole block, so a cut never splits one rank's run.
+    piece_rows = max(b, (max_piece_gather_rows // dcp_size) // b * b)
 
     pieces = []
     parts = []
@@ -358,6 +407,7 @@ def plan_dcp_extend_gather(
                         extend_end,
                         out_start,
                         out_end,
+                        b,
                     )
                 )
                 parts = []
@@ -388,6 +438,7 @@ def plan_dcp_extend_gather(
                 extend_end,
                 out_start,
                 out_end,
+                b,
             )
         )
     return DcpExtendGatherPlan(
@@ -408,20 +459,27 @@ def _dcp_extend_gather_piece(
     extend_end: int,
     out_start: int,
     out_end: int,
+    interleave_size: int = 1,
 ) -> DcpExtendGatherPiece:
     """Close one piece: index its output rows into its rank-major scratch."""
     send_len = send_end - send_start
     gathered_rows = send_len * dcp_size
+    b = interleave_size
     index = []
     for kind, first, second in parts:
         if kind == "prefix":
-            # Position p of a request whose send starts at `second` is rank
-            # p % dcp_size's local row second + p // dcp_size.
+            # Position p of a request whose send starts at `second` is owned by
+            # rank (p // b) % dcp_size, at local row
+            # (p // (b * dcp_size)) * b + p % b. At b == 1 that is p % dcp_size
+            # and p // dcp_size.
             positions, request_send_offset = first, second
+            owner = torch.div(positions, b, rounding_mode="floor") % dcp_size
+            local_row = (
+                torch.div(positions, b * dcp_size, rounding_mode="floor") * b
+                + positions % b
+            )
             index.append(
-                (positions % dcp_size) * send_len
-                + (request_send_offset - send_start)
-                + positions // dcp_size
+                owner * send_len + (request_send_offset - send_start) + local_row
             )
         else:
             start = gathered_rows + first - extend_start

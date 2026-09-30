@@ -24,7 +24,11 @@ from sglang.kernels.ops.attention.dcp_kernels import (
     create_dcp_kv_indices,
     update_kv_lens_and_indices,
 )
-from sglang.srt.layers.dcp.layout import update_local_kv_lens_for_dcp
+from sglang.srt.layers.dcp.layout import (
+    dcp_interleave_size,
+    localize_dcp_indices,
+    update_local_kv_lens_for_dcp,
+)
 from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_device, get_parallel
@@ -112,9 +116,26 @@ def prepare_decode_context_parallel_metadata(
     )
     # Prefix lengths are dcp_size-aligned (widened allocator page), so no nonzero().
     # `get_mla_kv_buffer` is a read door with the caller-translates contract.
+    #
+    # The allocator page is a multiple of interleave * dcp_size, so a prefix
+    # starts on a cycle boundary and this rank's share is a fixed slice of the
+    # array rather than a data-dependent selection. At interleave 1 the reshape
+    # is the [rank::dcp_size] stride this replaced, and localize_dcp_indices
+    # reduces to the `// dcp_size` that translate_dcp_read_ids applies.
+    interleave = dcp_interleave_size()
     translator = get_attn_backend().kv_index_translator
-    dcp_local_prefix_kv_indices = translator.translate_dcp_read_ids(
-        dcp_prefix_kv_indices[parallel.dcp_rank :: parallel.dcp_size]
+    if interleave == 1:
+        owned = dcp_prefix_kv_indices[parallel.dcp_rank :: parallel.dcp_size]
+    else:
+        owned = (
+            dcp_prefix_kv_indices.view(-1, parallel.dcp_size, interleave)[
+                :, parallel.dcp_rank, :
+            ]
+            .reshape(-1)
+            .contiguous()
+        )
+    dcp_local_prefix_kv_indices = translator.translate_full_attn_ids(
+        localize_dcp_indices(owned, parallel.dcp_size, parallel.dcp_rank, interleave)
     )
     dcp_kv_buffer = torch.empty(
         (

@@ -1018,6 +1018,15 @@ class Envs:
     # the scratch a layer holds beside the gathered context. The default is
     # 256 MiB of latent KV; <= 0 gathers the whole prefix in one collective.
     SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS = EnvInt(1 << 18)
+    # DCP on NPU: shard the latent KV in page_size-sized runs instead of one
+    # position per rank. Upstream #37787 and vLLM-Ascend both do this, and
+    # matching them is what stops every upstream DCP change from silently
+    # assuming a partition we do not have. Same allocator, same physical rows,
+    # same block table -- only which positions a rank holds changes, so the
+    # gathered context is bit-identical and only the wire order differs.
+    # CUDA is unaffected: its Triton store hardcodes one position per rank.
+    # Off until the box confirms parity and timing, then this default flips.
+    SGLANG_NPU_DCP_PAGE_INTERLEAVE = EnvBool(False)
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.

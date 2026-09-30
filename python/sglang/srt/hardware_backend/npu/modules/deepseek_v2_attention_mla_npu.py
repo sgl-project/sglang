@@ -31,6 +31,7 @@ from sglang.srt.layers.dcp import (
 )
 from sglang.srt.layers.dcp.layout import (
     dcp_extend_gather_buffer,
+    dcp_interleave_size,
     plan_dcp_extend_gather,
     remap_dcp_sparse_indices,
 )
@@ -582,13 +583,13 @@ def forward_dsa_prepare_npu(
             # Decode only, unlike upstream's _use_dsa_dcp_partial_attention:
             # our extend reads the GATHERED context, whose coordinates are
             # global, so remapping there would point every index at the wrong
-            # row. interleave_size stays 1 -- this pool shards per token, not
-            # per page; see _get_kv_lens_and_block_tables.
+            # row. The interleave must match the pool's owner rule exactly.
             parallel = get_parallel()
             topk_indices = remap_dcp_sparse_indices(
                 topk_indices,
                 parallel.attn_dcp_size,
                 parallel.attn_dcp_rank,
+                interleave_size=dcp_interleave_size(),
             )
     else:
         topk_indices = prev_topk_indices
@@ -696,6 +697,7 @@ def _dcp_gather_extend_kv_npu(
             parallel.dcp_size,
             parallel.dcp_rank,
             _dcp_extend_gather_piece_rows,
+            dcp_interleave_size(),
         )
         plan = plan._replace(
             pieces=[

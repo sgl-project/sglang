@@ -4,7 +4,11 @@ import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
-from sglang.srt.layers.dcp.layout import localize_dcp_indices, plan_dcp_owner_write
+from sglang.srt.layers.dcp.layout import (
+    dcp_interleave_size,
+    localize_dcp_indices,
+    plan_dcp_owner_write,
+)
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKOnlyPool,
     MHATokenToKVPool,
@@ -749,15 +753,15 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def _copy_indices_for_buffer(self, indices, uses_global_slots):
         if uses_global_slots or self.dcp_size <= 1:
             return indices
-        # These index buffer ROWS, not pages, and this pool shards rows per
-        # token -- so the interleave is 1, not page_size. #37787 passed
-        # page_size because its own pool shards in page blocks; under this
-        # owner rule that selects the wrong rows for the transfer, silently.
+        # These index buffer ROWS, not pages, so the interleave is whatever
+        # this pool shards rows by -- not page_size unconditionally, which is
+        # what #37787 passed and what silently selects the wrong rows when the
+        # pool shards per token.
         local_indices = localize_dcp_indices(
             indices,
             self.dcp_size,
             self.dcp_rank,
-            1,
+            dcp_interleave_size(),
         )
         return local_indices[local_indices >= 0]
 
@@ -1041,11 +1045,14 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 cache_v.index_select(0, owned_idx),
             )
 
-        owned = (loc % dcp_size) == get_parallel().attn_dcp_rank
+        local = localize_dcp_indices(
+            loc, dcp_size, get_parallel().attn_dcp_rank, dcp_interleave_size()
+        )
         # Static shape, no NonZero, no stream sync: capturable. See the note
-        # above for why row 0 is the right place to send the rest.
+        # above for why row 0 is the right place to send the rest. localize
+        # marks non-owned rows -1, which must not reach the store.
         return (
-            torch.where(owned, loc // dcp_size, loc.new_zeros(())),
+            torch.where(local >= 0, local, loc.new_zeros(())),
             cache_k,
             cache_v,
         )
@@ -1071,7 +1078,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         """This forward's owner filter, computed once and reused by every layer."""
         if self._dcp_extend_write_plan is None:
             self._dcp_extend_write_plan = plan_dcp_owner_write(
-                loc, dcp_size, get_parallel().attn_dcp_rank
+                loc,
+                dcp_size,
+                get_parallel().attn_dcp_rank,
+                dcp_interleave_size(),
             )
         return self._dcp_extend_write_plan
 

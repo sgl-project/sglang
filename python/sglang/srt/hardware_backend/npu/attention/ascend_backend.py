@@ -36,6 +36,7 @@ from sglang.srt.layers.attention.dsa.dsa_cp import (
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dcp.layout import (
     dcp_crop_free_extend,
+    dcp_interleave_size,
     get_dcp_chain_spec_lens,
     get_dcp_lens,
 )
@@ -502,28 +503,27 @@ class AscendAttnBackend(AttentionBackend):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Build rank-local paged KV metadata for NPU DSA DCP.
 
-        ``interleave_size=1``, not ``page_size``: upstream shards the latent KV
-        in page-sized blocks, this pool shards it per token -- the allocator
-        widens a page to ``page_size * dcp_size`` and rank r owns the slots with
-        ``loc % dcp_size == r`` (``plan_dcp_owner_write``,
-        ``maybe_dcp_kernel_indices``). The block TABLE is the same either way,
-        since both stride by ``page_size * dcp_size``; the lengths and the
-        top-k remap are not. Moving to page-interleave means changing the pool
-        and the extend gather together, which is its own commit.
+        The interleave must be the pool's, not ``page_size`` unconditionally:
+        the block TABLE is the same under either rule, since both stride by
+        ``page_size * dcp_size``, but the LENGTHS are not, and a length built
+        against the wrong partition points the operator past this rank's rows.
         """
         parallel = get_parallel()
+        interleave = dcp_interleave_size()
         if is_spec:
             local_kv_lens = get_dcp_chain_spec_lens(
                 kv_lens_cpu,
                 self.speculative_num_draft_tokens,
                 parallel.attn_dcp_size,
                 parallel.attn_dcp_rank,
+                interleave_size=interleave,
             )
         else:
             local_kv_lens = get_dcp_lens(
                 kv_lens_cpu,
                 parallel.attn_dcp_size,
                 parallel.attn_dcp_rank,
+                interleave_size=interleave,
             ).int()
         page_stride = self.page_size * parallel.attn_dcp_size
         max_len = int(kv_lens_cpu.max().item()) if kv_lens_cpu.numel() else 0
