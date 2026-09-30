@@ -340,9 +340,9 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
         # A2A path: bounded by the dispatcher's own workspace limit.
         max_num_tokens = dispatcher.max_num_tokens * getattr(dispatcher, "ep_size", 1)
     else:
-        # Standard allgather path: the MoE sees up to dp_size local forwards
-        # gathered together, so scale the per-rank forward bound by dp_size.
-        max_num_tokens = get_parallel().dp_size * cutedsl_moe_max_num_tokens()
+        # Standard allgather path: the MoE sees up to num_dp_ranks local forwards
+        # gathered together, so scale the per-rank forward bound by num_dp_ranks.
+        max_num_tokens = get_parallel().num_dp_ranks * cutedsl_moe_max_num_tokens()
     top_k = layer.top_k if layer.top_k is not None else layer.moe_runner_config.top_k
     # inference_mode(False) ensures the wrapper's pre-allocated CUDA-graph
     # buffers are normal tensors.  This call typically happens inside

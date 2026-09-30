@@ -42,11 +42,11 @@ def print_deprecated_warning(message: str):
 #   * an old valued flag replaced by a renamed valued flag
 #       -> `DeprecatedAliasStoreAction`.
 #
-# Only the second has a registration today (`--disable-cuda-graph`). The other
-# three are kept because the shapes recur -- this package has retired flags of
-# every one of them -- and the fiddly parts (`nargs=0` on a boolean, where the
-# const goes, warn-and-continue versus `parser.error`) are what a
-# reimplementation gets wrong. Pass `new_flag=` so the warning tells the
+# Only the second has registrations today (`--disable-cuda-graph`,
+# `--enable-dp-attention`). The other three are kept because the shapes recur
+# -- this package has retired flags of every one of them -- and the fiddly
+# parts (`nargs=0` on a boolean, where the const goes, warn-and-continue versus
+# `parser.error`) are what a reimplementation gets wrong. Pass `new_flag=` so the warning tells the
 # operator what to switch to; that pointer is the whole point.
 
 
