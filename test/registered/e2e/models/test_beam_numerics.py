@@ -2,11 +2,14 @@
 
 Each case guards a precision decision of the serving policy: the BF16 head
 projection ahead of FP32 output processing, FP32 rotary and fused-activation
-intermediates under both eager and full-graph Inductor execution, the FP32
-routing coefficients and runner-side routed scale for a one-token compiled MoE,
-and the batch-one compiled decode path against the eager oracle.
+intermediates under both eager and full-graph Inductor execution, the fused
+Q/K norm and rotation against the unfused rounding up to 1M positions, the
+single-rounding CUDA SSMax, the FP32 routing coefficients and runner-side
+routed scale for a one-token compiled MoE, and the batch-one compiled decode
+path against the eager oracle.
 """
 
+import copy
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -18,10 +21,17 @@ from torch._inductor import config as inductor_config
 
 import sglang as sgl
 from sglang.kernels.fused_op import BaseFusedOp
+from sglang.kernels.ops.attention.fused_qknorm_rope import fused_qk_norm_rope
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_loader.utils import set_default_torch_dtype
-from sglang.srt.models.beam import BeamAttention, BeamMLP, BeamMoE
+from sglang.srt.models.beam import (
+    BeamAttention,
+    BeamMLP,
+    BeamMoE,
+    apply_ssmax,
+    compute_ssmax_scale,
+)
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.common import (
@@ -195,6 +205,93 @@ class TestBeamNumerics(CustomTestCase):
         finally:
             activation.leave_torch_compile()
             rotary.leave_torch_compile()
+
+    @torch.inference_mode()
+    def test_fused_sliding_prologue_keeps_unfused_rounding_at_long_positions(self):
+        config = copy.deepcopy(self.config)
+        config.max_position_embeddings = 1 << 20
+        with (
+            get_context().override_server_args(),
+            get_parallel().override(
+                tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0, attn_dp_size=1
+            ),
+            set_default_torch_dtype(torch.bfloat16),
+            torch.device("cuda"),
+        ):
+            attention = BeamAttention(config, layer_id=0)
+        self.assertTrue(attention.use_fused_qk_norm_rope)
+        generator = torch.Generator(device="cuda").manual_seed(47)
+        for norm in (attention.q_norm, attention.k_norm):
+            norm.weight.copy_(
+                0.5 + torch.rand(norm.weight.shape, device="cuda", generator=generator)
+            )
+        head_dim = config.head_dim
+        sizes = [attention.q_size, attention.kv_size, attention.kv_size]
+        positions = torch.cat(
+            [
+                torch.arange(start, start + 256, device="cuda")
+                for start in (0, 131072, 524288, (1 << 20) - 256)
+            ]
+        )
+        shape = (positions.numel(), sum(sizes))
+        qkv = (3 * torch.randn(shape, device="cuda", generator=generator)).bfloat16()
+
+        q, k, _ = qkv.clone().split(sizes, dim=-1)
+        q = attention.q_norm(q.reshape(-1, head_dim)).view(q.shape)
+        k = attention.k_norm(k.reshape(-1, head_dim)).view(k.shape)
+        unfused = torch.cat(attention.rotary_emb(positions, q, k), dim=-1)
+
+        fused_qkv = qkv.clone()
+        q, k, v = fused_qkv.split(sizes, dim=-1)
+        attention._fused_qk_norm_rope(positions, q, k)
+        torch.testing.assert_close(v, qkv[:, -attention.kv_size :], atol=0, rtol=0)
+        fused = fused_qkv[:, : -attention.kv_size]
+
+        # Norm reductions may still differ by one BF16 ULP in rare elements.
+        self.assertLess((fused != unfused).float().mean().item(), 1e-3)
+        torch.testing.assert_close(fused, unfused, atol=0.05, rtol=2**-7)
+
+        # The fast-math kernel recomputes the angles and fails the same bound.
+        approx_qkv = qkv.clone()
+        fused_qk_norm_rope(
+            qkv=approx_qkv,
+            num_heads_q=attention.num_heads,
+            num_heads_k=attention.num_kv_heads,
+            num_heads_v=attention.num_kv_heads,
+            head_dim=head_dim,
+            eps=config.rms_norm_eps,
+            q_weight=attention.q_norm.weight,
+            k_weight=attention.k_norm.weight,
+            base=config.rope_parameters["sliding_attention"]["rope_theta"],
+            is_neox=True,
+            position_ids=positions.int(),
+            factor=1.0,
+            low=0.0,
+            high=0.0,
+            attention_factor=1.0,
+        )
+        approx = approx_qkv[:, : -attention.kv_size]
+        self.assertGreater((approx != unfused).float().mean().item(), 1e-3)
+
+    @torch.inference_mode()
+    def test_cuda_ssmax_rounds_once_on_packed_query_rows(self):
+        positions = torch.tensor([0, 511, 2047, 8191, 262143, 1048575], device="cuda")
+        generator = torch.Generator(device="cuda").manual_seed(48)
+        q_size, kv_size = 6 * 128, 128
+        qkv = torch.randn(
+            positions.numel(),
+            q_size + 2 * kv_size,
+            device="cuda",
+            generator=generator,
+        ).bfloat16()
+        q = qkv[:, :q_size]
+        scale = compute_ssmax_scale(positions)
+        expected = (q.float() * scale.unsqueeze(-1)).bfloat16()
+
+        actual = apply_ssmax(q, scale)
+
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        self.assertFalse(torch.equal(expected, q * scale.unsqueeze(-1).bfloat16()))
 
     @torch.inference_mode()
     def test_single_token_compiled_moe_preserves_runner_scale(self):
