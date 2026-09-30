@@ -123,6 +123,36 @@ class TestFlux2XpuNormFusions(CustomTestCase):
         self.assertEqual(returned.data_ptr(), gemm_input[..., 1536:].data_ptr())
         self.assertTrue(torch.equal(gemm_input, expected))
 
+    def test_attention_reads_fused_projection_slices_in_place(self):
+        # Single-block q/k/v are row-strided slices of the fused projection
+        # output; the XPU backend must feed them to flash attention without a
+        # copy and get the same result as contiguous inputs.
+        from sglang.multimodal_gen.runtime.layers.attention.backends import (
+            xpu_backend,
+        )
+
+        torch.manual_seed(5)
+        tokens, heads, head_dim = 256, 12, 128
+        proj = torch.randn(1, tokens, 13824, device="xpu", dtype=torch.bfloat16)
+        q, k, v = (
+            proj[..., i * heads * head_dim : (i + 1) * heads * head_dim].view(
+                1, tokens, heads, head_dim
+            )
+            for i in range(3)
+        )
+        self.assertEqual(
+            xpu_backend._as_fa_input(q, tokens, heads, head_dim).data_ptr(),
+            q.data_ptr(),
+        )
+        impl = xpu_backend.XPUAttentionImpl(
+            num_heads=heads,
+            head_size=head_dim,
+            causal=False,
+            softmax_scale=head_dim**-0.5,
+        )
+        expected = impl.forward(q.contiguous(), k.contiguous(), v.contiguous())
+        self.assertTrue(torch.equal(impl.forward(q, k, v), expected))
+
     def test_flux2_imports_without_intel_triton(self):
         # Regression: the kernel module imported `triton.language.extra.intel`
         # at module scope. The package facade resolves `_EXPORTS` eagerly on

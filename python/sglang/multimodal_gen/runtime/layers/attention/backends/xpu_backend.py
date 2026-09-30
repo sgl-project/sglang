@@ -61,6 +61,27 @@ def _get_cu_seqlens(device_index: int, bsz: int, seqlen: int) -> torch.Tensor:
     )
 
 
+def _as_fa_input(t: torch.Tensor, rows: int, heads: int, head_dim: int) -> torch.Tensor:
+    """``t`` as the ``[rows, heads, head_dim]`` flash-attention input, copying only if needed.
+
+    The kernel reads rows through their stride, so a head-packed row-strided view
+    (e.g. q/k/v slices of a fused projection output) is used in place; measured
+    bit-identical to the contiguous input.
+    """
+    try:
+        view = t.view(rows, heads, head_dim)
+    except RuntimeError:
+        return t.contiguous().view(rows, heads, head_dim)
+    if (
+        view.stride(-1) == 1
+        and view.stride(-2) == head_dim
+        and view.stride(0) % 8 == 0
+        and view.data_ptr() % 16 == 0
+    ):
+        return view
+    return view.contiguous()
+
+
 class XPUAttentionImpl(AttentionImpl):
     def __init__(
         self,
@@ -93,9 +114,9 @@ class XPUAttentionImpl(AttentionImpl):
         max_seqlen_q = seqlen_q
         max_seqlen_k = seqlen_k
 
-        q_ = query.contiguous().reshape(bsz * seqlen_q, nheads_q, d)
-        k_ = key.contiguous().reshape(bsz * seqlen_k, nheads_k, d)
-        v_ = value.contiguous().reshape(bsz * seqlen_k, nheads_k, d)
+        q_ = _as_fa_input(query, bsz * seqlen_q, nheads_q, d)
+        k_ = _as_fa_input(key, bsz * seqlen_k, nheads_k, d)
+        v_ = _as_fa_input(value, bsz * seqlen_k, nheads_k, d)
         cu_q = _get_cu_seqlens(q_.device.index, bsz, seqlen_q)
         cu_k = _get_cu_seqlens(q_.device.index, bsz, seqlen_k)
 
