@@ -8,6 +8,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
@@ -111,6 +112,7 @@ def _accept_sampling_core(
             bs=bs,
             max_top_k=draft_input.max_top_k,
             uniform_top_k_value=draft_input.uniform_top_k_value,
+            filter_apply_order=get_exec().kernel.sampling_filter_order,
         )
     (
         retrieve_index,

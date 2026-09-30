@@ -20,6 +20,7 @@ from sglang.srt.layers.logprob_processor import (
     OutputLogprobProcessor,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
+from sglang.srt.sampling.filtered_probs import renorm_top_k_top_p
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.utils.async_probe import sanitize_nan_logits
@@ -362,13 +363,20 @@ class Sampler(nn.Module):
                 )
         else:
             backend = get_exec().kernel.sampling_backend
+            filter_apply_order = get_exec().kernel.sampling_filter_order
             if backend in ("flashinfer", "intel_xpu"):
                 assert sampling_info.sampling_seed is None, (
                     f"Sampling seed is not supported for {backend} backend"
                 )
                 if sampling_info.need_min_p_sampling:
-                    probs = top_k_renorm_prob(probs, sampling_info.top_ks)
-                    probs = top_p_renorm_prob(probs, sampling_info.top_ps)
+                    probs = renorm_top_k_top_p(
+                        probs,
+                        sampling_info.top_ks,
+                        sampling_info.top_ps,
+                        filter_apply_order,
+                        top_k_renorm=top_k_renorm_prob,
+                        top_p_renorm=top_p_renorm_prob,
+                    )
                     batch_next_token_ids = min_p_sampling_from_probs(
                         probs, sampling_info.min_ps
                     )
@@ -398,23 +406,23 @@ class Sampler(nn.Module):
                         probs.contiguous(),
                         sampling_info.top_ks,
                         sampling_info.top_ps,
-                        filter_apply_order="top_k_first",
+                        filter_apply_order=filter_apply_order,
                     )
                     if return_sampling_mask:
-                        # Match the sampler's top-k-first order and cutoff ties.
                         capture_probs = select_capture_rows(probs)
-                        capture_top_ks = select_capture_rows(sampling_info.top_ks)
-                        capture_top_ps = select_capture_rows(sampling_info.top_ps)
                         capture_tokens = select_capture_rows(batch_next_token_ids)
-                        filtered_probs = capture_probs
-                        if sampling_info.need_top_k_sampling:
-                            filtered_probs = top_k_renorm_prob(
-                                capture_probs, capture_top_ks
-                            )
-                        if sampling_info.need_top_p_sampling:
-                            filtered_probs = top_p_renorm_prob(
-                                filtered_probs, capture_top_ps
-                            )
+                        filtered_probs = renorm_top_k_top_p(
+                            capture_probs,
+                            select_capture_rows(sampling_info.top_ks)
+                            if sampling_info.need_top_k_sampling
+                            else None,
+                            select_capture_rows(sampling_info.top_ps)
+                            if sampling_info.need_top_p_sampling
+                            else None,
+                            filter_apply_order,
+                            top_k_renorm=top_k_renorm_prob,
+                            top_p_renorm=top_p_renorm_prob,
+                        )
                         selected_weight = torch.gather(
                             filtered_probs,
                             1,
@@ -437,6 +445,7 @@ class Sampler(nn.Module):
                     sampling_info.sampling_seed,
                     positions,
                     return_filtered_probs=return_sampling_mask,
+                    filter_apply_order=filter_apply_order,
                 )
                 if return_sampling_mask:
                     (
@@ -637,6 +646,7 @@ class Sampler(nn.Module):
                 sampling_info.sampling_seed,
                 positions,
                 npu_top_k_top_p_eligible=sampling_info.npu_top_k_top_p_eligible,
+                filter_apply_order=get_exec().kernel.sampling_filter_order,
             )
             return batch_next_token_ids.to(torch.int32)
 
@@ -746,6 +756,7 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     positions: torch.Tensor,
     *,
     return_filtered_probs: bool = False,
+    filter_apply_order: str = "top_k_first",
 ):
     """
     A top-k, top-p and min-p sampling implementation with native pytorch operations.
@@ -757,12 +768,15 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     the selected weights.
     """
     probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+    if filter_apply_order == "joint":
+        probs_sum = torch.cumsum(probs_sort, dim=-1)
     probs_sort[
         torch.arange(0, probs.shape[-1], device=probs.device).view(1, -1)
         >= top_ks.view(-1, 1)
     ] = 0.0
-    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
-    probs_sum = torch.cumsum(probs_sort, dim=-1)
+    if filter_apply_order == "top_k_first":
+        probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+        probs_sum = torch.cumsum(probs_sort, dim=-1)
     probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
 
     if need_min_p_sampling:
@@ -806,13 +820,18 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
     sampling_seed: Optional[torch.Tensor],
     positions: torch.Tensor,
     npu_top_k_top_p_eligible: bool = False,
+    filter_apply_order: str = "top_k_first",
 ):
     """A top-k, top-p and min-p sampling implementation for ascend npu with torch_npu interface.
 
     Takes temperature-scaled logits as input (softmax is applied internally).
     """
     # torch_npu.npu_top_k_top_p requires top_k value range in [1, 1024]
-    if hasattr(torch_npu, "npu_top_k_top_p") and npu_top_k_top_p_eligible:
+    if (
+        filter_apply_order == "top_k_first"
+        and hasattr(torch_npu, "npu_top_k_top_p")
+        and npu_top_k_top_p_eligible
+    ):
         logits_top_k_top_p = torch_npu.npu_top_k_top_p(logits, top_ps, top_ks)
         probs_top_k_top_p = logits_top_k_top_p.softmax(dim=-1)
 
@@ -835,6 +854,8 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
     else:
         probs = torch.softmax(logits, dim=-1)
         probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+        if filter_apply_order == "joint":
+            probs_sum = torch.cumsum(probs_sort, dim=-1)
 
         # when top_k is -1 (in which sglang turns it to TOP_K_ALL), make it explicitly equal to logit's size
         topk_all_mask = top_ks == TOP_K_ALL
@@ -843,9 +864,9 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
             1, -1
         ) >= top_ks.view(-1, 1)
         probs_sort.masked_fill_(top_k_mask, 0.0)
-        probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
-
-        probs_sum = torch.cumsum(probs_sort, dim=-1)
+        if filter_apply_order == "top_k_first":
+            probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+            probs_sum = torch.cumsum(probs_sort, dim=-1)
         top_p_mask = probs_sum - probs_sort > top_ps.view(-1, 1)
         probs_sort.masked_fill_(top_p_mask, 0.0)
 

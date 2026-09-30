@@ -7,7 +7,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import SamplingMaskOutput, SamplingMaskStatus
-from sglang.srt.runtime_context import get_spec
+from sglang.srt.runtime_context import get_exec, get_spec
 from sglang.srt.speculative.dflash_utils import (
     build_speculative_verify_target_probs,
     is_dflash_sampling_verify_available,
@@ -86,6 +86,7 @@ class SpeculativeSamplingMaskCapture(msgspec.Struct):
                 bs=bs,
                 max_top_k=draft_input.max_top_k,
                 uniform_top_k_value=draft_input.uniform_top_k_value,
+                filter_apply_order=get_exec().kernel.sampling_filter_order,
             )
         return cls(
             target_probs=target_probs,

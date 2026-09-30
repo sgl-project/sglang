@@ -97,7 +97,9 @@ class TestSamplingMaskCapture(CustomTestCase):
             sampler_module,
             "get_exec",
             return_value=SimpleNamespace(
-                kernel=SimpleNamespace(sampling_backend=backend)
+                kernel=SimpleNamespace(
+                    sampling_backend=backend, sampling_filter_order="top_k_first"
+                )
             ),
         ):
             return self.sampler._sample_from_probs(
@@ -193,7 +195,10 @@ class TestSamplingMaskCapture(CustomTestCase):
                 with patch(
                     "sglang.srt.layers.sampler.get_exec",
                     return_value=SimpleNamespace(
-                        kernel=SimpleNamespace(sampling_backend=backend)
+                        kernel=SimpleNamespace(
+                            sampling_backend=backend,
+                            sampling_filter_order="top_k_first",
+                        )
                     ),
                 ):
                     sampled, capture = self.sampler._sample_from_probs(

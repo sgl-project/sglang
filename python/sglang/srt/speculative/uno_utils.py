@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
 import torch
 from flashinfer import top_k as _flashinfer_top_k
@@ -9,6 +9,7 @@ from flashinfer import top_k as _flashinfer_top_k
 from sglang.kernels.ops.speculative.reject_sampling import (
     chain_speculative_sampling_triton,
 )
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
     build_speculative_verify_target_probs,
@@ -23,11 +24,16 @@ def _normalize_sparse_topk_probs(
     temperatures: torch.Tensor,
     valid: torch.Tensor,
     top_ps: torch.Tensor,
+    log_normalizer: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Normalize a compact top-k support with top-k-first top-p semantics."""
+    """Normalize compact support using full-vocabulary mass for joint top-p."""
     scaled = topk_logits.float() / temperatures
     scaled = scaled.masked_fill(~valid, float("-inf"))
-    probs = torch.softmax(scaled, dim=-1)
+    probs = (
+        torch.softmax(scaled, dim=-1)
+        if log_normalizer is None
+        else torch.exp(scaled - log_normalizer.unsqueeze(1))
+    )
     cdf = torch.cumsum(probs, dim=-1)
     probs = probs.masked_fill((cdf - probs) > top_ps, 0.0)
     return probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
@@ -133,6 +139,7 @@ def _build_sparse_target_support_tensors(
     batch_size: int,
     forward_width: int,
     max_top_k: int,
+    filter_apply_order: str = "top_k_first",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build compact support using the fastest available top-k primitive."""
     rows = batch_size * forward_width
@@ -163,11 +170,17 @@ def _build_sparse_target_support_tensors(
         dtype=expanded_top_ks.dtype,
         device=next_token_logits.device,
     )[None, :]
+    log_normalizer = None
+    if filter_apply_order == "joint":
+        log_normalizer = torch.logsumexp(
+            next_token_logits.float() / expanded_temperatures, dim=-1
+        )
     probs = _normalize_sparse_topk_probs(
         topk_logits,
         expanded_temperatures,
         ranks < expanded_top_ks,
         expanded_top_ps,
+        log_normalizer,
     )
     return (
         topk_ids.view(batch_size, forward_width, max_top_k),
@@ -184,8 +197,10 @@ def _build_sparse_target_support(
     max_top_k: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return compact target token IDs/probabilities without a dense scatter."""
+    filter_apply_order = "top_k_first"
     if bool(getattr(sampling_info, "need_top_p_sampling", False)):
         top_ps = sampling_info.top_ps
+        filter_apply_order = get_exec().kernel.sampling_filter_order
     else:
         top_ps = torch.ones(
             (batch_size,),
@@ -201,6 +216,7 @@ def _build_sparse_target_support(
         batch_size,
         forward_width,
         max_top_k,
+        filter_apply_order,
     )
 
 
@@ -285,6 +301,7 @@ def _build_dense_probs(
         max_top_k=max_top_k,
         uniform_top_k_value=uniform_top_k_value,
         use_sparse_topk=True,
+        filter_apply_order=get_exec().kernel.sampling_filter_order,
     )
 
 
