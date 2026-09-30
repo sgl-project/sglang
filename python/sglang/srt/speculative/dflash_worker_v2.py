@@ -94,7 +94,6 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
-from sglang.srt.utils.common import empty_context
 
 _is_npu = is_npu()
 
@@ -406,19 +405,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
         # Under dp attention, the draft worker runs on the per-DP attn-TP
-        # group, independent of idle peer DP ranks.
-        self.draft_tp_context = (
-            draft_tp_context if get_parallel().enable_dp_attention else empty_context
-        )
-        # Use the same attention topology during draft construction and execution.
+        # group, independent of idle peer DP ranks; it is built and run under
+        # the same placement.
         self.draft_owns_attention = get_parallel().enable_dp_attention
-        if self.draft_owns_attention:
-            draft_init_ctx = draft_tp_context(
-                get_parallel().attn_tp_group, owns_attention=True
-            )
-        else:
-            draft_init_ctx = empty_context()
-        with draft_pp_context(), draft_init_ctx:
+        # Inside the draft scope the context answers the draft's narrowed rank.
+        self._target_tp_rank = get_parallel().tp_rank
+        with draft_pp_context(), draft_tp_context(self.draft_owns_attention):
             bundle = build_draft_tp_worker(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -621,10 +613,7 @@ class DFlashWorkerV2(BaseSpecWorker):
     def init_attention_backends(self):
         with (
             draft_pp_context(),
-            self.draft_tp_context(
-                self.draft_model_runner.tp_group,
-                owns_attention=self.draft_owns_attention,
-            ),
+            draft_tp_context(self.draft_owns_attention),
         ):
             self._draft_worker.init_attention_backends()
         self._need_mamba_verify_commit = mambaish_config(
@@ -637,10 +626,7 @@ class DFlashWorkerV2(BaseSpecWorker):
     def init_cuda_graphs(self):
         with (
             draft_pp_context(),
-            self.draft_tp_context(
-                self.draft_model_runner.tp_group,
-                owns_attention=self.draft_owns_attention,
-            ),
+            draft_tp_context(self.draft_owns_attention),
         ):
             capture_decode_cuda_graph = (
                 get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
@@ -661,7 +647,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 # shared graph capture/replay; keep the draft eager under dp
                 # attention.
                 capture_decode_cuda_graph = False
-                if self.model_runner.tp_group.rank_in_group == 0:
+                if self._target_tp_rank == 0:
                     logger.warning(
                         "Disable DFLASH draft cuda graph because dp attention "
                         "is enabled (draft runs eager)."
@@ -806,7 +792,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     def _maybe_build_draft_sampler(self):
         def _eager(reason):
-            if self.model_runner.tp_group.rank_in_group == 0:
+            if self._target_tp_rank == 0:
                 logger.info("DFLASH draft greedy head kept eager (reason=%s).", reason)
             return None
 
@@ -832,7 +818,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             if not head_supported:
                 return _eager("unsupported quantized lm_head")
             self.draft_model.lm_head = lm_head
-            if self.model_runner.tp_group.rank_in_group == 0:
+            if self._target_tp_rank == 0:
                 logger.info(
                     "DFLASH selector decode folded into the draft cuda graph "
                     "(sampling_enabled=%s).",
@@ -867,7 +853,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             embed_proj = self.draft_model.embed_proj
             if prefix_gru is None or embed_proj is None:
                 return _eager("Domino projector modules are unavailable")
-            if self.model_runner.tp_group.rank_in_group == 0:
+            if self._target_tp_rank == 0:
                 logger.info(
                     "DFLASH Domino rollout folded into the draft cuda graph (tp=%s).",
                     int(tp_group.world_size),
@@ -906,7 +892,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 return _eager("added vocab")
             num_org = int(shard.num_org_elements)
             org_vocab_start = int(shard.org_vocab_start_index)
-        if self.model_runner.tp_group.rank_in_group == 0:
+        if self._target_tp_rank == 0:
             logger.info(
                 "DFLASH draft greedy head folded into the draft cuda graph (tp=%d).",
                 tp_group.world_size,
@@ -1857,10 +1843,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         with (
             torch.inference_mode(),
-            self.draft_tp_context(
-                self.draft_model_runner.tp_group,
-                owns_attention=self.draft_owns_attention,
-            ),
+            draft_tp_context(self.draft_owns_attention),
         ):
             ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
             if self.lilicorr is not None:
@@ -2567,10 +2550,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         with (
             torch.inference_mode(),
-            self.draft_tp_context(
-                self.draft_model_runner.tp_group,
-                owns_attention=self.draft_owns_attention,
-            ),
+            draft_tp_context(self.draft_owns_attention),
         ):
             draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
@@ -2638,10 +2618,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     self._draft_sampler.q_out[:bs],
                 )
         elif self.selector is not None:
-            with self.draft_tp_context(
-                self.draft_model_runner.tp_group,
-                owns_attention=self.draft_owns_attention,
-            ):
+            with draft_tp_context(self.draft_owns_attention):
                 draft_next = self._propose_selector_block(
                     draft_logits_output=draft_logits_output,
                     bs=bs,
@@ -2667,10 +2644,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_hidden = draft_logits_output.hidden_states
             if draft_hidden is None:
                 raise RuntimeError("DFLASH draft model returned no hidden states.")
-            with self.draft_tp_context(
-                self.draft_model_runner.tp_group,
-                owns_attention=self.draft_owns_attention,
-            ):
+            with draft_tp_context(self.draft_owns_attention):
                 draft_next, lilicorr_candidate_ids, lilicorr_q_rows = (
                     propose_lilicorr_block(
                         head=self.lilicorr,
@@ -2691,10 +2665,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             if draft_hidden is None:
                 raise RuntimeError("DFLASH draft model returned no hidden states.")
             draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
-            with self.draft_tp_context(
-                self.draft_model_runner.tp_group,
-                owns_attention=self.draft_owns_attention,
-            ):
+            with draft_tp_context(self.draft_owns_attention):
                 draft_next = self._greedy_sample_from_vocab_parallel_head(
                     hidden_states=draft_hidden[:, 1:, :].reshape(
                         -1, draft_hidden.shape[-1]

@@ -66,7 +66,7 @@ def _make_backend(runner):
     backend._memory_saver_adapter = None
     backend._cuda_graph_runner = runner
     backend._device_module = runner.device_module
-    backend._tp_group = runner.model_runner.tp_group
+    backend._tp_group = SimpleNamespace(barrier=mock.Mock(name="barrier"))
     return backend
 
 
@@ -75,10 +75,8 @@ def _make_runner(*, enable_profile, profiler, num_tokens_per_bs=1, mode_name="DE
         synchronize=mock.Mock(name="synchronize"),
         graph=mock.Mock(name="graph", side_effect=lambda **kw: _FakeGraphCtx()),
     )
-    tp_group = SimpleNamespace(barrier=mock.Mock(name="barrier"))
     runner = SimpleNamespace(
         device_module=device_module,
-        model_runner=SimpleNamespace(tp_group=tp_group),
         num_tokens_per_bs=num_tokens_per_bs,
         capture_forward_mode=SimpleNamespace(name=mode_name),
         enable_profile_cuda_graph=enable_profile,

@@ -616,7 +616,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         # --- capture --------------------------------------------------
         self.device_module.synchronize()
-        self.model_runner.tp_group.barrier()
+        get_parallel().tp_group.barrier()
         self.capture()
 
         self.raw_num_tokens = 0
