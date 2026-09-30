@@ -4,6 +4,7 @@ output followed by .to(float8_e4m3fn) -- same kernel math, cast at store."""
 import pytest
 import torch
 
+from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
 from sglang.kernels.ops.attention.dsv4.elementwise import fused_q_norm_rope
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -14,12 +15,8 @@ ROPE_DIM = 64
 
 
 def _make_freqs(max_pos: int) -> torch.Tensor:
-    inv_freq = 1.0 / (
-        10000.0 ** (torch.arange(0, ROPE_DIM, 2, device="cuda").float() / ROPE_DIM)
-    )
-    t = torch.arange(max_pos, device="cuda").float()
-    angles = torch.outer(t, inv_freq)
-    return torch.polar(torch.ones_like(angles), angles)
+    # The production table (base 10000, no YaRN), on the device the kernels run on.
+    return precompute_freqs_cis(ROPE_DIM, max_pos, 0, 10000, 1, 32, 1).to("cuda")
 
 
 @pytest.mark.parametrize("num_tokens", [1, 3, 64, 511])

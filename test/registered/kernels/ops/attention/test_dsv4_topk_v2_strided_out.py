@@ -32,6 +32,9 @@ def test_topk_v2_strided_out_matches_dense(bs, max_seq):
         bs, n_pages
     )
     plan = plan_topk_v2(seq_lens)
+    # The transform kernel prefetches plan metadata before its PDL wait, so plan
+    # and transform must not be stream-adjacent (see test_topk_v2._plan).
+    torch.cuda.synchronize()
 
     dense = torch.full((bs, TOPK), -7, dtype=torch.int32, device=dev)
     topk_transform_paged_v2(scores, seq_lens, page_table, dense, PAGE_SIZE, plan)

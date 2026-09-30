@@ -85,6 +85,7 @@ class CompressorBackendMixin:
         kv_layout: KVLayout = KVLayout.V4,
         fp8_2buff: bool = False,
         kv_cache_rope: Optional[torch.Tensor] = None,
+        uniform_fp8_store: bool = False,
     ) -> None:
         assert compress_ratio == 4 or compress_ratio == 128
         assert rotate == is_indexer == (head_dim == 128)
@@ -150,6 +151,7 @@ class CompressorBackendMixin:
             ),
             fp8_2buff=fp8_2buff,
             kvcache_rope=kv_cache_rope,
+            uniform_fp8_store=uniform_fp8_store,
         )
 
     def forward_unified(
@@ -172,22 +174,6 @@ class CompressorBackendMixin:
             is_unified_kv_triton,
         )
 
-        if token_to_kv_pool.uniform_fp8 and not compressor.is_in_indexer:
-            # The fused epilogue writes only the packed FlashMLA layout.
-            from sglang.srt.layers.attention.dsv4.compressor_trtllm import (
-                forward_compress_uniform_fp8,
-            )
-
-            forward_compress_uniform_fp8(
-                self,
-                token_to_kv_pool=token_to_kv_pool,
-                kv_score_input=kv_score_input,
-                state_pool=state_pool,
-                compressor=compressor,
-                layer_id=layer_id,
-            )
-            return
-
         out_loc = self._get_out_loc(compressor.ratio)
         use_fp4_indexer = (
             compressor.is_in_indexer and self.enable_deepseek_v4_fp4_indexer
@@ -198,6 +184,7 @@ class CompressorBackendMixin:
         kv_scale_cache = None
         fp8_2buff = False
         kv_cache_rope = None
+        uniform_fp8_store = False
         if compressor.is_in_indexer:
             page_size = token_to_kv_pool.get_index_k_page_size(compressor.ratio)
             if use_hip_fp4:
@@ -224,6 +211,12 @@ class CompressorBackendMixin:
             page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
             # The pool's page format (V4, or the V4.1 fp8 / fp4 layouts).
             kv_layout = token_to_kv_pool.get_extra_key_layout(layer_id)
+            if token_to_kv_pool.uniform_fp8:
+                # trtllm-gen's uniform-FP8 pool: the same fused epilogue, storing
+                # plain e4m3 rows (per-tensor scale 1.0) instead of the packed
+                # FlashMLA layout.
+                uniform_fp8_store = True
+                kv_cache = kv_cache.view(torch.uint8)
             if hasattr(compress_kv_pool, "translate_loc_to_hisparse_device"):
                 out_loc = compress_kv_pool._translate_loc_to_hisparse_device(out_loc)
         self._forward_compress_all_in_one(
@@ -250,6 +243,7 @@ class CompressorBackendMixin:
             kv_cache_rope=(
                 None if kv_cache_rope is None else kv_cache_rope.view(dtype=torch.uint8)
             ),
+            uniform_fp8_store=uniform_fp8_store,
         )
         online_c128_mtp = getattr(self, "online_c128_mtp", None)
         if online_c128_mtp is not None:
