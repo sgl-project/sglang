@@ -43,7 +43,7 @@ Generated commands leave `--mamba-full-memory-ratio` at its `0.9` default, which
 
 ## Playground
 
-Use the Playground for lower-level tuning such as attention parallelism, MoE communication, speculative decoding, and reasoning or tool parsers. It inherits every selection from the deployment panel and shows only the command-line diff.
+Use the Playground for lower-level tuning such as attention parallelism, MoE communication, speculative decoding, and reasoning or tool parsers. It inherits every selection from the deployment panel and shows only the command-line diff. The CP knob enables prefill context parallelism, which is experimental for this model and measured slower at input lengths up to 8k — validate it on your workload before adopting.
 
 import { Playground } from "/src/snippets/_playground.jsx";
 
@@ -118,7 +118,7 @@ Keep the checkpoint's KDA lower-bound setting unchanged. In particular, do not o
 
 ### Keep the KV and DSA backends paired
 
-On Blackwell, the recipes default to an FP8 KV cache with TRT-LLM DSA: on GB300 this pairing measured 2.9–5.7% higher throughput and about 1.8x the KV token capacity at identical pool bytes, with GSM8K accuracy within noise of BF16. BF16 KV with TileLang DSA remains selectable in the deployment panel and is the default on H100 and H200, where FP8 KV with TRT-LLM DSA is disabled. Switch the dtype and both DSA backends together; TileLang DSA with FP8 KV is not a valid CUDA combination.
+On Blackwell, the recipes default to an FP8 KV cache with TRT-LLM DSA: on GB300 this pairing measured 2.9–5.7% higher throughput under sustained batches and about 1.8x the KV token capacity at identical pool bytes, with GSM8K accuracy within noise of BF16. BF16 KV with TileLang DSA remains selectable in the deployment panel and is the default on H100 and H200, where FP8 KV with TRT-LLM DSA is disabled. Switch the dtype and both DSA backends together; TileLang DSA with FP8 KV is not a valid CUDA combination.
 
 ### Extend the cache hierarchy
 
@@ -219,6 +219,7 @@ sglang serve \
   --disaggregation-mode prefill \
   --disaggregation-bootstrap-port 8998 \
   --disaggregation-transfer-backend nixl \
+  --nccl-port 29501 \
   --host 0.0.0.0 \
   --port 31000
 ```
@@ -234,6 +235,7 @@ sglang serve \
   --moe-runner-backend triton \
   --disaggregation-mode decode \
   --disaggregation-transfer-backend nixl \
+  --nccl-port 29502 \
   --host 0.0.0.0 \
   --port 32000
 ```
