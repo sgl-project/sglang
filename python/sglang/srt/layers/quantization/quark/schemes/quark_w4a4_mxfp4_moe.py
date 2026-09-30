@@ -821,9 +821,10 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         layer.w2_weight = torch.nn.Parameter(qw2_weight, requires_grad=False)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if not getattr(self, "_owns_moe_runner", False):
+        if not getattr(self, "_owns_moe_weight_layout", False):
             raise RuntimeError(
-                "Quark MXFP4 weight preshuffling requires an owned AITER runner."
+                "Quark MXFP4 weight preshuffling requires a backend that owns "
+                "the resulting weight layout."
             )
 
         if (
@@ -887,6 +888,10 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             # Weights are stored as torch.uint8 but semantically MXFP4
             layer.dispatcher.set_quant_config({"weight_dtype": torch.float4_e2m1fn_x2})
 
+        from sglang.srt.layers.moe.gluon_backend import prepare_gluon_moe_weights
+
+        prepare_gluon_moe_weights(layer)
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
@@ -897,13 +902,21 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
 
         self.moe_runner_config = moe_runner_config
         self._owns_moe_runner = False
+        self._owns_moe_weight_layout = False
         moe_runner_backend = get_moe_runner_backend()
         if moe_runner_backend.is_auto() and get_moe_a2a_backend().supports_aiter():
             moe_runner_backend = MoeRunnerBackend.AITER
 
-        if moe_runner_backend.is_aiter():
+        if moe_runner_backend.is_gluon():
+            # Gluon consumes the serialized MXFP4 weights through the
+            # whole-layer DeepseekV2MoE backend before this scheme's ordinary
+            # routed-expert apply path.
+            self.runner = None
+            self._owns_moe_weight_layout = True
+        elif moe_runner_backend.is_aiter():
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
             self._owns_moe_runner = True
+            self._owns_moe_weight_layout = True
         else:
             raise NotImplementedError(
                 "Quark MXFP4 MoE currently requires the AITER runner; "

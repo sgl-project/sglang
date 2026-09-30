@@ -2568,6 +2568,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 }
             )
 
+        from sglang.srt.layers.moe.gluon_backend import prepare_gluon_moe_weights
+
+        prepare_gluon_moe_weights(layer)
+
     def _prepare_flashinfer_trtllm_activation_params(self, layer: Module) -> None:
         """Materialize optional TRT-LLM SwiGLU parameters once per expert."""
         num_experts = int(layer.num_local_experts)
@@ -2760,6 +2764,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             return
 
         moe_runner_backend = get_moe_runner_backend()
+
+        # DeepSeek-V4 keeps its hash-routed prefix on the native AMD path even
+        # when later layers use the strict whole-layer Gluon backend.
+        if moe_runner_backend.is_gluon():
+            if not (self.is_fp4_expert and _is_hip and _use_aiter):
+                raise NotImplementedError(
+                    "DeepSeek-V4 FP4 with --moe-runner-backend gluon requires "
+                    "ROCm and AITER for the native hash-routed prefix."
+                )
+            moe_runner_backend = MoeRunnerBackend.AITER
 
         if moe_runner_backend.is_auto():
             if self.is_deepgemm_moe_runner_backend_enabled():
