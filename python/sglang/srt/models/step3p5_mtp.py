@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -109,25 +110,22 @@ class Step3p5AMultiTokenPredictor(nn.Module):
                     dim=-1,
                 )
             )
-        hidden_states, residual = self.mtp_block(
+        residual_batch.start(forward_batch)
+        hidden_states = self.mtp_block(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
-            residual=None,
         )
-        hidden_states, residual = self.mtp_block.layer_communicator.finish_layer_stack(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
         hidden_states_before_norm = None
         if not forward_batch.forward_mode.is_idle():
             # if forward_batch.return_hidden_states_before_norm:
-            hidden_states_before_norm = (
-                hidden_states if residual is None else hidden_states + residual
+            hidden_states_before_norm = residual_batch.snapshot(
+                hidden_states, forward_batch
             )
-            if residual is not None:
-                hidden_states, _ = self.shared_head.norm(hidden_states, residual)
-            else:
-                hidden_states = self.shared_head.norm(hidden_states)
+            hidden_states = residual_batch.final_norm(
+                hidden_states, forward_batch, self.shared_head.norm
+            )
 
         return hidden_states, hidden_states_before_norm
 

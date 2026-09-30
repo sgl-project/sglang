@@ -16,17 +16,19 @@ from sglang.srt.configs.step3_vl import (
     Step3VisionEncoderConfig,
     Step3VLConfig,
 )
-from sglang.srt.distributed import (
-    tensor_model_parallel_all_reduce,
-)
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.vision import VisionAttention
-from sglang.srt.layers.communicator import LayerCommunicator, LayerFacts
 from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.layer_boundary import (
+    declare_attn,
+    declare_ffn,
+    make_stages,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -39,6 +41,7 @@ from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.utils import reduce_moe_output
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -77,6 +80,7 @@ class Step3TextMLP(nn.Module):
         hidden_act: str,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        reduce_results: bool = True,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -92,6 +96,7 @@ class Step3TextMLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
+            reduce_results=reduce_results,
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -162,8 +167,6 @@ class Step3TextMoEMLP(nn.Module):
             hidden_states=hidden_states, topk_output=topk_output
         )
 
-        if self.tp_size > 1:
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_dim)
 
 
@@ -338,14 +341,6 @@ class Step3TextDecoderLayer(nn.Module):
         )
         self.is_next_layer_sparse = True if layer_id + 1 in moe_layers_idx else False
 
-        self.layer_facts = LayerFacts.init_new(
-            layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
-            is_layer_sparse=self.is_layer_sparse,
-            is_previous_layer_sparse=self.is_previous_layer_sparse,
-            is_next_layer_sparse=self.is_next_layer_sparse,
-        )
-
         if not self.is_layer_sparse:
             self.mlp = Step3TextMLP(
                 hidden_size=config.hidden_size,
@@ -369,6 +364,7 @@ class Step3TextDecoderLayer(nn.Module):
                     hidden_act="silu",
                     quant_config=quant_config,
                     prefix=add_prefix("share_expert", prefix),
+                    reduce_results=False,
                 )
             else:
                 self.moe = Step3TextMoEMLP(
@@ -378,11 +374,22 @@ class Step3TextDecoderLayer(nn.Module):
                     prefix=add_prefix("mlp", prefix),
                 )
 
-        self.layer_communicator = LayerCommunicator(
-            layer_facts=self.layer_facts,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-            allow_deferred_ffn_reduction=False,
+        self.attn_boundary, self.ffn_boundary = make_stages(
+            (declare_attn(), self.input_layernorm),
+            (
+                declare_ffn(
+                    sparse=self.is_layer_sparse,
+                    next_layer_sparse=self.is_next_layer_sparse,
+                ),
+                self.post_attention_layernorm,
+            ),
+            previous=declare_ffn(
+                sparse=self.is_previous_layer_sparse,
+                next_layer_sparse=self.is_layer_sparse,
+            )
+            if layer_id != 0
+            else None,
+            terminal=layer_id == config.num_hidden_layers - 1,
         )
 
     def moe_mlp_forward(self, hidden_states):
@@ -392,19 +399,16 @@ class Step3TextDecoderLayer(nn.Module):
             hidden_states += self.share_expert(h)
         else:
             hidden_states = self.moe(hidden_states)
-        return hidden_states
+        return reduce_moe_output(hidden_states)
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
 
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
 
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
@@ -413,17 +417,16 @@ class Step3TextDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
-        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             if self.use_moe:
                 hidden_states = self.moe_mlp_forward(hidden_states)
             else:
                 hidden_states = self.mlp(hidden_states)
-        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
+        hidden_states = ffn_exit.finish(hidden_states)
 
-        return hidden_states, residual
+        return hidden_states
 
 
 class Step3TextModel(nn.Module):
@@ -471,18 +474,14 @@ class Step3TextModel(nn.Module):
         else:
             hidden_states = input_embeds
 
-        residual = None
+        residual_batch.start(forward_batch)
         for i in range(len(self.layers)):
             layer = self.layers[i]
-            hidden_states, residual = layer(
-                positions, hidden_states, forward_batch, residual
-            )
+            hidden_states = layer(positions, hidden_states, forward_batch)
 
-        if hidden_states.shape[0] != 0:
-            if residual is None:
-                hidden_states = self.norm(hidden_states)
-            else:
-                hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states = residual_batch.final_norm(
+            hidden_states, forward_batch, self.norm, skip_empty=True
+        )
         return hidden_states
 
 

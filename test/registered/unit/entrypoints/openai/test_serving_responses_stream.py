@@ -1,4 +1,5 @@
 import asyncio
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -252,6 +253,55 @@ class NonHarmonyStreamTestCase(CustomTestCase):
                     if p["type"] == "response.function_call_arguments.delta"
                 )
                 self.assertEqual(deltas, full_item.arguments)
+
+    def test_detector_selected_tool_parser_matches_full_and_streamed_arguments(self):
+        serving = make_serving()
+        serving.reasoning_parser = None
+        serving.tool_call_parser = "iquest_q1"
+        arguments = '{"city":"北京"}'
+        for choice, raw in (
+            ({"type": "function", "name": "get_weather"}, arguments),
+            ("required", '[{"name":"get_weather","parameters":' + arguments + "}]"),
+        ):
+            with self.subTest(choice=choice):
+                request = ResponsesRequest(
+                    model="x",
+                    input="weather?",
+                    stream=True,
+                    store=False,
+                    tool_choice=choice,
+                    tools=[
+                        {
+                            "type": "function",
+                            "name": "get_weather",
+                            "parameters": {"type": "object"},
+                        }
+                    ],
+                )
+                (full_item,) = serving._make_response_output_items(
+                    request,
+                    raw,
+                    serving.tokenizer_manager.tokenizer,
+                    require_reasoning=False,
+                )
+                events = StreamFixture(serving, request).run(
+                    [
+                        engine_chunk(raw[:i], i, finish=i == len(raw))
+                        for i in range(1, len(raw) + 1)
+                    ]
+                )
+                (stream_item,) = find_completed_event(events)["response"]["output"]
+                for item in (full_item.model_dump(), stream_item):
+                    self.assertEqual(item["type"], "function_call")
+                    self.assertEqual(item["name"], "get_weather")
+                    self.assertEqual(json.loads(item["arguments"]), {"city": "北京"})
+                    self.assertTrue(item["call_id"])
+                deltas = "".join(
+                    p["delta"]
+                    for p in event_payloads(events)
+                    if p["type"] == "response.function_call_arguments.delta"
+                )
+                self.assertEqual(deltas, stream_item["arguments"])
 
     def test_final_output_preserves_text_tool_text_order(self):
         from sglang.srt.function_call.core_types import (

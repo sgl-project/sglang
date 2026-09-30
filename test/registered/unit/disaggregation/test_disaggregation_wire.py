@@ -458,6 +458,51 @@ class TestQwen4StateWire(unittest.TestCase):
             [(0, 2), (1, 3)],
         )
 
+    def _qsa_compressed_manager(self, *, src_item_len):
+        manager = object.__new__(MooncakeKVManager)
+        manager.attn_tp_size = 4
+        manager.pp_size = 1
+        manager.is_mla_backend = False
+        manager.is_hybrid_mla_backend = False
+        manager.kv_args = SimpleNamespace(
+            engine_rank=0,
+            state_types=[StateType.QSA_COMPRESSED],
+            state_data_ptrs=[[1000]],
+            state_item_lens=[[src_item_len]],
+            state_dim_per_tensor=[[]],
+            state_layer_ids=[[24]],
+        )
+        manager.sent = []
+        manager._send_kvcache_generic = lambda **kw: manager.sent.append(kw) or 0
+        return manager
+
+    def test_qsa_compressed_layout_mismatch_rejected_before_transfer(self):
+        """Equal attention TP with fp8 on one peer only halves that peer's
+        compressed item length. The transfer uses the source length as the
+        destination stride, so the mismatch must be rejected before any write."""
+        req = SimpleNamespace(mooncake_session_id="session", dst_state_indices=[[3]])
+        decode_info = SimpleNamespace(
+            dst_attn_tp_size=4,
+            dst_state_data_ptrs=[[2000]],
+            dst_state_item_lens=[[16]],
+            dst_state_dim_per_tensor=[[]],
+            dst_state_layer_ids=[[24]],
+        )
+        manager = self._qsa_compressed_manager(src_item_len=32)
+        with self.assertRaisesRegex(RuntimeError, "QSA_COMPRESSED layout differs"):
+            MooncakeKVManager.maybe_send_extra(
+                manager, req, [[3]], None, target_rank_registration_info=decode_info
+            )
+        self.assertEqual(manager.sent, [])
+
+        manager = self._qsa_compressed_manager(src_item_len=16)
+        rc = MooncakeKVManager.maybe_send_extra(
+            manager, req, [[3]], None, target_rank_registration_info=decode_info
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(manager.sent), 1)
+        self.assertEqual(manager.sent[0]["item_lens"], [16])
+
     def test_replicated_state_tp_policy(self):
         for src_tp, dst_tp, rank, expected in (
             (4, 1, 0, True),
@@ -889,6 +934,68 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                     ([[7, 8, 9]], expected),
                 )
 
+    def test_rebootstrap_replay_keeps_one_sampling_mask_row_per_token(self):
+        """A PD rebootstrap that replays an already-emitted token keeps that token's
+        sampling-mask row instead of adding the prefill worker's fresh one."""
+        with envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(True):
+            buffers = MetadataBuffers(
+                size=1,
+                hidden_size=2,
+                hidden_states_dtype=torch.float32,
+                max_sampling_mask_tokens=4,
+            )
+            buffers.set_buf(
+                self._make_req(
+                    None,
+                    sampling_mask=[7, 8, 9],
+                    sampling_logprobs=[-1.25, -1.5, -2.0],
+                )
+            )
+            queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+            queue.scheduler = SimpleNamespace(
+                kv_checksum_computer=None,
+                batch_result_processor=SimpleNamespace(
+                    _maybe_update_reasoning_tokens=lambda req, token_id: None
+                ),
+            )
+            queue.spec_algorithm = SimpleNamespace(is_none=lambda: True)
+            queue.metadata_buffers = buffers
+            # Retracting popped token 6 from output_ids; its row is still queued.
+            sampling_mask_rows = SamplingMaskRows()
+            sampling_mask_rows.append(
+                np.array([5, 1], np.int32), np.array([-0.5, -2.25], np.float32)
+            )
+            sampling_mask_rows.append(
+                np.array([6, 2], np.int32), np.array([-0.25, -1.75], np.float32)
+            )
+            req = SimpleNamespace(
+                rid="r0",
+                bootstrap_host="127.0.0.1",
+                bootstrap_room=9,
+                output_ids=[5],
+                pd_rebootstrap_forced_output_id=6,
+                return_logprob=False,
+                return_sampling_mask=True,
+                sampling_logprobs_mode="support",
+                sampling_mask_rows=sampling_mask_rows,
+                time_stats=SimpleNamespace(set_wait_queue_entry_time=lambda: None),
+            )
+
+            queue._commit_transfer_to_req(
+                DecodeRequest(
+                    req=req,
+                    kv_receiver=SimpleNamespace(clear=lambda: None),
+                    metadata_buffer_index=0,
+                    is_rebootstrap=True,
+                )
+            )
+
+            self.assertEqual(req.output_ids, [5, 6])
+            self.assertEqual(
+                req.sampling_mask_rows.take().to_lists(support_logprobs=True),
+                ([[5, 1], [6, 2]], [[-0.5, -2.25], [-0.25, -1.75]]),
+            )
+
     def test_decode_input_requires_valid_seed_for_every_request(self):
         seeds = (
             torch.tensor([1, 2, 3], dtype=torch.int32),
@@ -898,6 +1005,13 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             reqs=[self._make_req(seed) for seed in seeds],
             device="cpu",
             enable_overlap=False,
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    architectures=["GlmMoeDsaForCausalLM"],
+                    index_share_for_mtp_iteration=True,
+                    index_topk=3,
+                )
+            ),
         )
         # The draft-input shape comes from the spec bag.
         override = get_context().override_server_args(
@@ -911,6 +1025,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
 
         draft_input = build_eagle_disagg_draft_input(batch, last_tokens, None)
         self.assertTrue(torch.equal(draft_input.dsa_topk_indices, torch.stack(seeds)))
+        self.assertTrue(draft_input.cuda_graph_compatible)
 
         for invalid_seed in (
             None,
@@ -919,6 +1034,34 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             batch.reqs[1].output_dsa_topk_indices = invalid_seed
             draft_input = build_eagle_disagg_draft_input(batch, last_tokens, None)
             self.assertIsNone(draft_input.dsa_topk_indices)
+            # A model that shares the DSA index across MTP iterations cannot run
+            # the captured graph without a seed, so the draft must fall back to
+            # eager on every DP rank -- not just the ranks missing the seed.
+            self.assertFalse(draft_input.cuda_graph_compatible)
+
+    def test_decode_input_stays_graph_compatible_without_dsa_index_sharing(self):
+        """Models that don't share the DSA index keep the captured graph even
+        when no seed is transferred; only index_share_for_mtp_iteration models
+        need the seed."""
+        batch = SimpleNamespace(
+            reqs=[self._make_req(None)],
+            device="cpu",
+            enable_overlap=False,
+            model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+        )
+        override = get_context().override_server_args(
+            speculative_eagle_topk=1,
+            speculative_num_steps=5,
+            enable_multi_layer_eagle=False,
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+        draft_input = build_eagle_disagg_draft_input(
+            batch, torch.tensor([11], dtype=torch.int64), None
+        )
+        self.assertIsNone(draft_input.dsa_topk_indices)
+        self.assertTrue(draft_input.cuda_graph_compatible)
 
     def test_pd_decode_fused_topk_remaps_wire_positions_to_local_slots(self):
         wire_positions = (
@@ -938,6 +1081,13 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             reqs=[self._make_req(seed) for seed in wire_positions],
             device="cpu",
             enable_overlap=False,
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    architectures=["GlmMoeDsaForCausalLM"],
+                    index_share_for_mtp_iteration=True,
+                    index_topk=3,
+                )
+            ),
             req_pool_indices=torch.tensor([3, 1], dtype=torch.int64),
             req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
             seq_lens=torch.tensor([4, 4], dtype=torch.int32),

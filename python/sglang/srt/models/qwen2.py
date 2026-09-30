@@ -27,6 +27,11 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.layer_boundary.residual.access import (
+    export_output,
+    from_pp,
+    snapshot,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -408,15 +413,12 @@ class Qwen2Model(nn.Module):
             residual = None
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states, residual = from_pp(pp_proxy_tensors)
 
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             if i in self.layers_to_capture:
-                aux_hidden_states.append(
-                    hidden_states + residual if residual is not None else hidden_states
-                )
+                aux_hidden_states.append(snapshot(hidden_states, residual))
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
@@ -424,6 +426,8 @@ class Qwen2Model(nn.Module):
                 forward_batch,
                 residual,
             )
+
+        hidden_states, residual = export_output(hidden_states, residual, forward_batch)
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {

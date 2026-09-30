@@ -22,6 +22,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image21 import (
 )
 from sglang.multimodal_gen.configs.sample.qwenimage21 import QwenImage21SamplingParams
 from sglang.multimodal_gen.registry import _get_config_info
+from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
 from sglang.multimodal_gen.runtime.entrypoints.openai.image_api import (
     _resolve_image_output_format,
 )
@@ -33,6 +34,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_
 )
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 from sglang.multimodal_gen.runtime.models.dits.qwen_image21 import build_layout
+from sglang.multimodal_gen.runtime.models.encoders.base import (
+    EncoderTensorParallelMixin,
+)
 from sglang.multimodal_gen.runtime.models.encoders.qwen3vl_vision import (
     Qwen3VLVisionRotaryEmbedding,
 )
@@ -118,6 +122,78 @@ def test_prompt_conditioning_uses_training_template_and_pre_norm(prompt, image_c
     for image in images:
         assert image.mode == "RGBA"
         assert image.getpixel((0, 0)) == (12, 34, 56, 0)
+
+
+class ConditioningTestEncoder(EncoderTensorParallelMixin, torch.nn.Module):
+    def __init__(self, device):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones((), device=device))
+        self.model = SimpleNamespace(
+            visual=SimpleNamespace(rotary_pos_emb=SimpleNamespace())
+        )
+        self.calls = 0
+
+    def forward(self, input_ids, **kwargs):
+        self.calls += 1
+        hidden = input_ids[..., None].float().expand(-1, -1, 4) * self.weight
+        return SimpleNamespace(hidden_states=tuple(hidden + i for i in range(32)))
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="CUDA required"
+            ),
+        ),
+    ],
+)
+@torch.no_grad()
+def test_prompt_cache_skips_processor_and_weight_preparation(device):
+    def process(text, **kwargs):
+        image_value = sum(kwargs["images"][0].getpixel((0, 0)))
+        return BatchFeature(
+            data={
+                "input_ids": torch.tensor([[1, len(text[0]), 99, 99, image_value, 0]]),
+                "attention_mask": torch.tensor([[1, 1, 1, 1, 1, 0]]),
+            }
+        )
+
+    processor = Mock(side_effect=process)
+    processor.tokenizer.convert_tokens_to_ids.return_value = 99
+    processor.apply_chat_template.return_value = [[1]]
+    encoder = ConditioningTestEncoder(device).eval()
+    stage = QwenImage21EncodingStage(encoder, processor, None, None)
+    stage.use_declared_component = Mock(return_value=nullcontext(encoder))
+    image = Image.new("RGBA", (2, 2), (12, 34, 56, 128))
+    cache = ConditioningCache(1024)
+    with cache.scope():
+        first, slots = stage.encode_prompt("edit", [image], device)
+        expected = first.clone()
+        first.zero_()
+        slots.zero_()
+        restored, slots = stage.encode_prompt("edit", [image.copy()], device)
+        torch.testing.assert_close(restored, expected, atol=0, rtol=0)
+        assert slots.tolist() == [False, True, False]
+        assert encoder.calls == processor.call_count == 1
+        stage.use_declared_component.assert_called_once()
+        assert cache.stats()["entries"] == 1
+        assert cache.bytes == 3 * 4 * 4 + 3
+        assert cache.bypasses == 0  # no oversized duplicate of all hidden states
+        changed, _ = stage.encode_prompt("another edit", [image], device)
+        assert not torch.equal(changed, expected)
+        image.putpixel((0, 0), (12, 34, 56, 255))
+        changed_alpha, _ = stage.encode_prompt("edit", [image], device)
+        assert not torch.equal(changed_alpha, expected)
+        assert encoder.calls == 3
+        with cache.scope(refresh=True):
+            stage.encode_prompt("edit", [image], device)
+        with cache.scope(enabled=False):
+            stage.encode_prompt("edit", [image], device)
+        assert encoder.calls == processor.call_count == 5
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

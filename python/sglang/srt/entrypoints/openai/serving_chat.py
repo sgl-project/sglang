@@ -106,7 +106,10 @@ from sglang.srt.parser.jinja_template_utils import (
     MEDIA_URL_PART_TYPES,
     process_content_for_template_format,
 )
-from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.parser.reasoning_parser import (
+    IQuestQ1ReasoningDetector,
+    ReasoningParser,
+)
 from sglang.srt.sampling.sampling_params import (
     set_request_reasoning_end_token_ids,
 )
@@ -2564,12 +2567,12 @@ class OpenAIServingChat(OpenAIServingBase):
         # as constraint (mirrors the streaming path). For auto: always try.
         if self.tool_call_parser:
             parser = FunctionCallParser(
-                tools, self.tool_call_parser, tokenizer=self.tokenizer_manager.tokenizer
+                tools,
+                self.tool_call_parser,
+                tokenizer=self.tokenizer_manager.tokenizer,
+                tool_choice=tool_choice,
             )
-            detector_owns_format = (
-                parser.detector.supports_structural_tag()
-                or parser.detector.parses_required_natively()
-            )
+            detector_owns_format = parser.owns_tool_format()
             should_try_parser = not is_required or detector_owns_format
             if should_try_parser and parser.has_tool_call(text):
                 try:
@@ -2844,6 +2847,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 request.reasoning_effort = "medium" if enabled else "no_think"
             return
 
+        if self.reasoning_parser == "iquest_q1":
+            request.chat_template_kwargs = {
+                **(request.chat_template_kwargs or {}),
+                "thinking": enabled,
+                "enable_thinking": enabled,
+            }
+            return
+
         if self.reasoning_parser == "inkling":
             # Effort-conditioned, not toggled: "none" (0.0) is the off switch.
             if not enabled:
@@ -2901,6 +2912,11 @@ class OpenAIServingChat(OpenAIServingBase):
         """
         if not self.reasoning_parser:
             return False
+
+        if self.reasoning_parser == "iquest_q1":
+            return IQuestQ1ReasoningDetector.thinking_enabled(
+                request.chat_template_kwargs or {}
+            )
 
         if self.reasoning_parser == "minimax-m3":
             # M3 template prefills <mm:think> for thinking_mode=enabled, so it never
@@ -3008,11 +3024,9 @@ class OpenAIServingChat(OpenAIServingBase):
                         tools=effective_tools,
                         tool_call_parser=self.tool_call_parser,
                         tokenizer=self.tokenizer_manager.tokenizer,
+                        tool_choice=request.tool_choice,
                     )
-                    use_native_parser = (
-                        probe.detector.supports_structural_tag()
-                        or probe.detector.parses_required_natively()
-                    )
+                    use_native_parser = probe.owns_tool_format()
                 if use_native_parser:
                     parser_dict[index] = probe
                 else:

@@ -28,14 +28,15 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.communicator import (
-    LayerCommunicator,
-    LayerFacts,
-    enable_moe_dense_fully_dp,
-    layer_input_buffer,
-    reduce_output,
-)
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.layer_boundary import (
+    declare_attn,
+    declare_ffn,
+    is_dense_ffn_fully_dp,
+    make_stages,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -1109,7 +1110,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
         is_next_layer_sparse = not (self.expert_num == 1) and (
             self.layer_id + 1 >= config.first_k_dense_replace
         )
-        if enable_moe_dense_fully_dp():
+        if is_dense_ffn_fully_dp():
             mlp_tp_rank, mlp_tp_size = 0, 1
         else:
             mlp_tp_rank, mlp_tp_size = None, None
@@ -1148,27 +1149,29 @@ class BailingMoELinearDecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(self.hidden_size, eps=rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(self.hidden_size, eps=rms_norm_eps)
 
-        self.layer_facts = LayerFacts.init_new(
-            layer_id=layer_id,
-            # NextN wraps a single decoder layer whose checkpoint prefix is the
-            # post-model layer id. Treat it as a one-layer model for scatter-mode
-            # planning so A2A/DeepEP outputs are gathered before logits.
-            num_layers=1 if is_nextn else config.num_hidden_layers,
-            is_layer_sparse=is_moe_layer,
-            is_previous_layer_sparse=is_previous_moe_layer,
-            is_next_layer_sparse=is_next_layer_sparse,
-        )
-
-        self.layer_communicator = LayerCommunicator(
-            layer_facts=self.layer_facts,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
-            qkv_latent_func=(
-                self.attention.prepare_qkv_latent
-                if self.attention_type == 1 and self.use_mla
-                else None
+        self.attn_boundary, self.ffn_boundary = make_stages(
+            (
+                declare_attn(),
+                self.input_layernorm,
+                {
+                    "qkv_latent_func": self.attention.prepare_qkv_latent
+                    if self.attention_type == 1 and self.use_mla
+                    else None
+                },
             ),
+            (
+                declare_ffn(
+                    sparse=is_moe_layer,
+                    next_layer_sparse=is_next_layer_sparse,
+                ),
+                self.post_attention_layernorm,
+            ),
+            previous=declare_ffn(
+                sparse=is_previous_moe_layer, next_layer_sparse=is_moe_layer
+            )
+            if layer_id != 0
+            else None,
+            terminal=layer_id == (1 if is_nextn else config.num_hidden_layers) - 1,
         )
 
     @torch.inference_mode()
@@ -1177,12 +1180,12 @@ class BailingMoELinearDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
+        capture_output=None,
         **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
+    ) -> torch.Tensor:
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states, forward_batch, capture=capture_output
         )
 
         if not forward_batch.forward_mode.is_idle():
@@ -1207,13 +1210,12 @@ class BailingMoELinearDecoderLayer(nn.Module):
                     forward_batch=forward_batch,
                 )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
-        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
+        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             if not (
-                enable_moe_dense_fully_dp()
+                is_dense_ffn_fully_dp()
                 and (not self.is_layer_sparse)
                 and hidden_states.shape[0] == 0
             ):
@@ -1221,9 +1223,9 @@ class BailingMoELinearDecoderLayer(nn.Module):
                     hidden_states,
                     forward_batch=forward_batch,
                 )
-        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
+        hidden_states = ffn_exit.finish(hidden_states)
 
-        return hidden_states, residual
+        return hidden_states
 
     @staticmethod
     def shared_moe_coefficient_loader(
@@ -1341,11 +1343,12 @@ class BailingMoELinearModel(nn.Module):
                 hidden_states = self.word_embeddings(input_ids)
             else:
                 hidden_states = input_embeds
-            residual = None
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
 
         total_num_layers = self.end_layer - self.start_layer
         device = hidden_states.device
@@ -1370,43 +1373,40 @@ class BailingMoELinearModel(nn.Module):
             and capture_mode.need_capture()
         )
         if capture_aux:
-            dspark_aux_hidden_states: List[torch.Tensor] = []
+            dspark_aux_hidden_states = AuxHiddenStateList()
+
+            def capture_output(value, *, owned=False):
+                if value.shape[0] != 0:
+                    dspark_aux_hidden_states.capture(value, owned=owned)
 
         for i in range(self.start_layer, self.end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]
-                hidden_states, residual = layer(
+                hidden_states = layer(
                     hidden_states=hidden_states,
                     positions=positions,
                     forward_batch=forward_batch,
-                    residual=residual,
                     zero_allocator=zero_allocator,
+                    capture_output=capture_output
+                    if capture_aux
+                    and i > self.start_layer
+                    and (i - 1 in self.layers_to_capture)
+                    else None,
                 )
-                if (
-                    capture_aux
-                    and i in self.layers_to_capture
-                    and layer_input_buffer(hidden_states).shape[0] != 0
-                ):
-                    hidden_states = reduce_output(hidden_states)
-                    if residual is None:
-                        dspark_aux_hidden_states.append(hidden_states)
-                    else:
-                        dspark_aux_hidden_states.append(hidden_states + residual)
 
-        last_layer = self.layers[self.end_layer - 1]
-        hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
-            hidden_states, residual, forward_batch
-        )
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+            return residual_batch.to_pp(hidden_states, forward_batch)
         else:
+            hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
             if not forward_batch.forward_mode.is_idle():
-                if residual is None:
-                    hidden_states = self.norm(hidden_states)
-                else:
-                    hidden_states, _ = self.norm(hidden_states, residual)
+                hidden_states = residual_batch.final_norm(
+                    hidden_states,
+                    forward_batch,
+                    self.norm,
+                    capture=capture_output
+                    if capture_aux and self.end_layer - 1 in self.layers_to_capture
+                    else None,
+                )
             if capture_aux and len(dspark_aux_hidden_states) > 0:
                 return hidden_states, dspark_aux_hidden_states
             return hidden_states

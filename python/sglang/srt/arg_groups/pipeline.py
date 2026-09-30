@@ -92,6 +92,9 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(validate_prefill_cp_platform, server_args)
     run_hook(handle_hardware_runtime_validation, server_args)
     if cfg.model_path.lower() in ["none", "dummy"]:
+        from sglang.srt.arg_groups.boundary_reduction import resolve_boundary_reduction
+
+        run_post_process_pass(server_args, resolve_boundary_reduction)
         return
 
     from sglang.srt.arg_groups.model_path_hook import (
@@ -283,6 +286,10 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 
     run_hook(handle_speculative_decoding, server_args)
+
+    from sglang.srt.arg_groups.boundary_reduction import resolve_boundary_reduction
+
+    run_post_process_pass(server_args, resolve_boundary_reduction)
 
     # After the speculative hook so speculative_algorithm is final.
     from sglang.srt.arg_groups.layernorm_sp_hook import handle_layernorm_sp

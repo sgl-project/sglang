@@ -84,6 +84,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_memory,
     get_mm,
+    get_model,
     get_parallel,
     get_schedule,
     get_spec,
@@ -1554,6 +1555,12 @@ class KVCacheConfigurator:
         )
         from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
+        # Indexer uses the allocator-global slot space on DCP target workers.
+        dcp_size = get_parallel().attn_dcp_size
+        if self.is_draft_worker:
+            index_size = max_total_num_tokens
+        else:
+            index_size = max_total_num_tokens * dcp_size
         is_arch35 = is_npu_arch35()
         use_compact_indexer_layout = (
             is_dsa_model
@@ -1575,11 +1582,13 @@ class KVCacheConfigurator:
         )
         token_to_kv_pool = NPUMLATokenToKVPool(
             max_total_num_tokens,
-            page_size=self.pool_page_size,
+            page_size=get_schedule().page_size,
             dtype=self.kv_cache_dtype,
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
             index_head_dim=(self.model_config.index_head_dim if is_dsa_model else None),
+            index_size=index_size,
+            index_page_size=get_schedule().page_size,
             indexer_layer_ids=indexer_layer_ids,
             kv_cache_dim=(
                 calculate_mla_kv_cache_dim(
@@ -1588,6 +1597,7 @@ class KVCacheConfigurator:
                 if use_dsa_fp8_kv_cache_storage
                 else None
             ),
+            is_draft_worker=self.is_draft_worker,
             layer_num=self.layer_info.num_effective_layers,
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,
@@ -1695,7 +1705,7 @@ class KVCacheConfigurator:
         common = {
             "page_size": get_schedule().page_size,
             "device": self.device,
-            "enable_memory_saver": False,
+            "enable_memory_saver": get_exec().features.enable_memory_saver,
         }
         full_pool_kwargs = {
             **common,
@@ -1808,6 +1818,7 @@ class KVCacheConfigurator:
             device=self.device,
             enable_kv_cache_copy=(get_spec().speculative_algorithm is not None),
             token_to_kv_pool_class=swa_pool_class,
+            enable_memory_saver=get_exec().features.enable_memory_saver,
             **kwargs,
         )
         return token_to_kv_pool
@@ -1921,9 +1932,16 @@ class KVCacheConfigurator:
         )
         from sglang.srt.mem_cache.qsa_kv_pool import (
             QSATokenToKVPool,
+            resolve_qsa_indexer_dtype,
         )
 
         qsa_profile = parse_qsa_profile(self.model_config.hf_config)
+        qsa_indexer_dtype = get_model().qsa_indexer_dtype
+        if qsa_indexer_dtype != "auto" and qsa_profile is None:
+            raise ValueError(
+                f"--qsa-indexer-dtype {qsa_indexer_dtype} needs a model with a "
+                "compressed QSA indexer (Qwen4-Exp); this model has none"
+            )
         if qsa_profile is None:
             pool_class = HybridLinearKVPool
             extra_args["use_mla"] = self.use_mla_backend
@@ -1935,6 +1953,7 @@ class KVCacheConfigurator:
                 qsa_compress_ratio=qsa_profile.compress_ratio,
                 qsa_token_topk=qsa_profile.budget,
                 num_request_slots=req_to_token_pool.req_to_token.shape[0],
+                qsa_indexer_dtype=resolve_qsa_indexer_dtype(qsa_indexer_dtype),
             )
         token_to_kv_pool = pool_class(
             page_size=self.pool_page_size,
@@ -2047,8 +2066,13 @@ class KVCacheConfigurator:
                     )
 
                     token_to_kv_pool_allocator = NPUPagedTokenToKVPoolAllocator(
-                        sizes.max_total_num_tokens,
-                        page_size=get_schedule().page_size,
+                        # DCP allocation is in the global virtual loc space.
+                        # The target attention path localizes these locs when
+                        # building rank-local metadata; draft/indexer paths
+                        # consume the allocator locs directly.
+                        sizes.max_total_num_tokens * get_parallel().attn_dcp_size,
+                        page_size=get_schedule().page_size
+                        * get_parallel().attn_dcp_size,
                         dtype=self.kv_cache_dtype,
                         device=self.device,
                         kvcache=token_to_kv_pool,
