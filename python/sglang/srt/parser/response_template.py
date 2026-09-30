@@ -21,7 +21,7 @@ import logging
 from collections.abc import Callable, Sequence
 from typing import Any
 
-from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
@@ -31,12 +31,17 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.response_template_structural_tag import (
+    supports_tool_call_structural_tag,
+    tool_call_structural_tag,
+)
 from sglang.srt.parser.chat_parsing.content_parsers import _apply_transform
 from sglang.srt.parser.chat_parsing.response_parser import ResponseParser
 from sglang.srt.parser.chat_parsing.response_templates import (
     ResponseTemplate,
     load_response_template,
 )
+from sglang.srt.utils import print_warning_once
 
 logger = logging.getLogger(__name__)
 
@@ -129,14 +134,21 @@ def _streaming_template(template: dict[str, Any]) -> ResponseTemplate:
     return load_response_template(result)
 
 
-def _reasoning_only_template(template: dict[str, Any]) -> ResponseTemplate:
-    thinking = copy.deepcopy(template["fields"][_THINKING_FIELD])
-    thinking["optional"] = True
+def _reasoning_only_template(
+    template: dict[str, Any], *, ends_at_answer: bool
+) -> ResponseTemplate:
+    fields = {_THINKING_FIELD: copy.deepcopy(template["fields"][_THINKING_FIELD])}
+    if ends_at_answer:
+        # Text between thinking and the answer, like a tool call, stays normal.
+        fields[_PASSTHROUGH_FIELD] = {}
+        fields[_CONTENT_FIELD] = copy.deepcopy(template["fields"][_CONTENT_FIELD])
+    for field in fields.values():
+        field["optional"] = True
     anchor_name = (
         "start_anchor_pattern" if "start_anchor_pattern" in template else "start_anchor"
     )
     return load_response_template(
-        {anchor_name: template[anchor_name], "fields": {_THINKING_FIELD: thinking}}
+        {anchor_name: template[anchor_name], "fields": fields}
     )
 
 
@@ -227,15 +239,16 @@ class ResponseTemplateStreamAdapter:
         return self._end_reasoning(events + self._parser.finalize()[1])
 
     def _end_reasoning(self, events: list[dict]) -> list[dict]:
-        # Stop parsing at the reasoning closer, where the grammar backend starts
+        # Stop parsing at the reasoning end, where the grammar backend starts
         # the JSON schema, and pass the rest through unchanged.
         if self._grammar_start != GRAMMAR_AFTER_REASONING:
             return events
+        if _CONTENT_FIELD in self._template.fields:
+            end_field, end_types = _CONTENT_FIELD, ("region_open",)
+        else:
+            end_field, end_types = _THINKING_FIELD, ("region_close", "region_malformed")
         for index, event in enumerate(events):
-            if event.get("field") == _THINKING_FIELD and event["type"] in (
-                "region_close",
-                "region_malformed",
-            ):
+            if event.get("field") == end_field and event["type"] in end_types:
                 self._verbatim = True
                 text = self._parser.input_text[event["end"] :]
                 return events[: index + 1] + (
@@ -392,12 +405,22 @@ class ResponseTemplateReasoningDetector:
             if thinking and thinking.close_literals
             else self._default_think_end
         )
+        content = loaded.fields.get(_CONTENT_FIELD)
+        ends_at_answer = bool(
+            self.think_end_token and content is not None and content.open_literals
+        )
+        if ends_at_answer:
+            # Reasoning ends when the answer opens, which requires an explicit
+            # content opener to directly follow the thinking closer.
+            self.think_end_token += content.open_literals[0]
         self.think_start_self_label = ""
         if grammar_start == GRAMMAR_AFTER_REASONING and thinking is None:
             grammar_start = GRAMMAR_FROM_START
         self._grammar_start = grammar_start
         if grammar_start == GRAMMAR_AFTER_REASONING:
-            self._template = _reasoning_only_template(template)
+            self._template = _reasoning_only_template(
+                template, ends_at_answer=ends_at_answer
+            )
         else:
             self._template = _streaming_template(template)
         self._prefix = prefix
@@ -476,7 +499,10 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
         self._template = _tool_extraction_template(template)
         self._prefix = prefix
         self._adapter = ResponseTemplateStreamAdapter(self._template, prefix=prefix)
-        self.tool_close_literals = loaded.fields[_TOOL_FIELD].close_literals or []
+        self._tool_field = loaded.fields[_TOOL_FIELD]
+        self._thinking_field = loaded.fields.get(_THINKING_FIELD)
+        self._content_field = loaded.fields.get(_CONTENT_FIELD)
+        self.tool_close_literals = self._tool_field.close_literals or []
         if self.tool_close_literals:
             self.eot_token = self.tool_close_literals[0]
         self.incomplete_tool_call_indices: set[int] = set()
@@ -635,23 +661,57 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
         return ToolStreamingParseResult(normal_text=normal_text, calls=pending_calls)
 
     def supports_structural_tag(self) -> bool:
-        return False
+        # Forced calls then keep the native format, which this detector parses
+        # instead of the JSON array used without a template-derived tag.
+        return supports_tool_call_structural_tag(self._tool_field)
+
+    def get_structural_tag(
+        self,
+        tools: list[Tool] | None = None,
+        tool_choice: Any = "auto",
+        thinking_mode: bool = False,
+        parallel_tool_calls: bool = True,
+    ):
+        named = isinstance(tool_choice, ToolChoice)
+        tool_dicts = [
+            tool.model_dump()
+            for tool in tools or ()
+            if not named or tool.function.name == tool_choice.function.name
+        ]
+        # The tag covers thinking, so it applies from the first output token.
+        tag = tool_call_structural_tag(
+            self._tool_field,
+            tool_dicts,
+            parallel_tool_calls=parallel_tool_calls and not named,
+            thinking=self._thinking_field,
+            answer=self._content_field if tool_choice == "auto" else None,
+        )
+        if tag is None:
+            return None
+        from xgrammar import StructuralTag
+
+        return StructuralTag.model_validate(tag)
 
     def validate_structure_constraint_request(
         self,
+        tools: list[Tool],
         tool_choice: Any,
-        parallel_tool_calls: bool,
         strict_requested: bool,
-    ) -> None:
-        if tool_choice == "auto" and not parallel_tool_calls:
-            raise ValueError(
-                f"{type(self).__name__} cannot enforce "
-                "parallel_tool_calls=False with automatic tool choice"
+    ) -> bool:
+        """Whether to constrain automatic tool choice."""
+        if tool_choice == "auto" and not strict_requested:
+            return False
+        # Raises for unencodable names before the caller would log and drop
+        # the error, leaving the request unconstrained.
+        tag = self.get_structural_tag(tools=tools, tool_choice=tool_choice)
+        if tool_choice != "auto":
+            return False
+        if tag is None:
+            print_warning_once(
+                f"{type(self).__name__} cannot enforce strict tools under "
+                "automatic tool choice for this response template"
             )
-        if tool_choice == "auto" and strict_requested:
-            raise ValueError(
-                f"{type(self).__name__} does not support strict tool constraints"
-            )
+        return tag is not None
 
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError(
@@ -691,3 +751,27 @@ def tool_close_token_ids(
     tool_call_parser: str | None, tokenizer: Any | None
 ) -> frozenset[int]:
     return frozenset(tool_close_tokens(tool_call_parser, tokenizer))
+
+
+def tool_grammar_covers_reasoning(
+    tool_call_parser: str | None, tool_call_constraint: Any, request: Any
+) -> bool:
+    """Whether the tool-call grammar of `request` also constrains thinking.
+
+    Template-derived tool call tags cover thinking, unless an output constraint
+    replaces them under automatic tool choice."""
+    from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+    detector_class = FunctionCallParser.ToolCallParserEnum.get(tool_call_parser)
+    response_format = request.response_format
+    return (
+        detector_class is not None
+        and issubclass(detector_class, ResponseTemplateToolDetector)
+        and tool_call_constraint is not None
+        and tool_call_constraint[0] == "structural_tag"
+        and not (
+            request.regex
+            or request.ebnf
+            or (response_format is not None and response_format.type != "text")
+        )
+    )

@@ -712,19 +712,24 @@ class ServingChatTestCase(unittest.TestCase):
                 "thinking": {"open": "<think>", "close_pattern": "</think>"},
             },
         }
+        json_object = {"response_format": {"type": "json_object"}}
         cases = {
             "auto tool choice": ("response_template", {"tools": [_WEATHER_TOOL]}, None),
-            "named tool after reasoning": (
+            "named tool with a template grammar": (
                 "response_template",
                 {"tools": [_WEATHER_TOOL], "tool_choice": named},
-                GRAMMAR_AFTER_REASONING,
+                None,
             ),
             "response_format after reasoning": (
                 "response_template",
-                {"response_format": {"type": "json_object"}},
+                json_object,
                 GRAMMAR_AFTER_REASONING,
             ),
-            "required tool without reasoning": (None, required, GRAMMAR_FROM_START),
+            "response_format without reasoning": (
+                None,
+                {"tools": [_WEATHER_TOOL], **json_object},
+                GRAMMAR_FROM_START,
+            ),
             "required tool, reasoning without an end token": (
                 "response_template",
                 required,
@@ -745,25 +750,31 @@ class ServingChatTestCase(unittest.TestCase):
                 )
                 self.assertEqual(request._response_parser_grammar_start, grammar_start)
 
-    def test_required_tool_json_is_parsed_under_delimited_template(self):
-        """Required-tool JSON after the reasoning becomes the call, also when it
-        ends on the tool closer that detokenization keeps."""
-        payload = '[{"name": "get_weather", "parameters": {"city": "Paris"}}]'
-        for reasoning_parser in (None, "response_template"):
+    def test_tool_call_is_parsed_under_delimited_template(self):
+        """A tool call after the reasoning becomes the call, also when it ends
+        on the tool closer that detokenization keeps before a JSON answer."""
+        payload = '<call:get_weather>{"city": "Paris"}</call>'
+        cases = (
+            (None, {"tool_choice": "required"}),
+            ("response_template", {"tool_choice": "required"}),
+            ("response_template", {"response_format": {"type": "json_object"}}),
+        )
+        for reasoning_parser, constraint in cases:
             self._use_delimited_response_template(reasoning_parser)
             reasoning = "Check the forecast." if reasoning_parser else ""
             text = (f"<think>{reasoning}</think>" if reasoning else "") + payload
-            text += "</call>"
             for stream in (False, True):
-                with self.subTest(reasoning_parser=reasoning_parser, stream=stream):
+                with self.subTest(
+                    reasoning_parser=reasoning_parser, **constraint, stream=stream
+                ):
                     adapted, request = self._convert_rendered_as(
                         "<assistant>",
                         ChatCompletionRequest(
                             model="x",
                             messages=[{"role": "user", "content": "Weather?"}],
                             tools=[_WEATHER_TOOL],
-                            tool_choice="required",
                             stream=stream,
+                            **constraint,
                         ),
                     )
                     if stream:
@@ -816,6 +827,23 @@ class ServingChatTestCase(unittest.TestCase):
                     self.assertEqual(got_reasoning, reasoning)
                     self.assertEqual(content, "")
                     self.assertEqual(finish_reasons, ["tool_calls"])
+
+    def test_kept_tool_closer_after_json_answer_is_trimmed(self):
+        self._use_delimited_response_template("response_template")
+        _, request = self._convert_rendered_as(
+            "<assistant>",
+            ChatCompletionRequest(
+                model="x",
+                messages=[{"role": "user", "content": "Weather?"}],
+                tools=[_WEATHER_TOOL],
+                response_format={"type": "json_object"},
+            ),
+        )
+        output = self._stopped_on_token('<think>Plan</think><answer>{"a": 1}</call>', 7)
+        message = (
+            self.chat._build_chat_response(request, [output], 0).choices[0].message
+        )
+        self.assertEqual((message.content, message.tool_calls), ('{"a": 1}', None))
 
     def test_native_output_under_other_constraints_is_parsed_by_the_template(self):
         """A structural tag, regex or EBNF can spell the template's own framing,
@@ -1265,6 +1293,49 @@ class ServingChatTestCase(unittest.TestCase):
             ],
             [8, 9],
         )
+
+    def test_template_tool_call_grammar_covers_reasoning(self):
+        self.tm._config_overrides.update(
+            {"reasoning_parser": "beam", "tool_call_parser": "beam"}
+        )
+        self.chat = OpenAIServingChat(self.tm, self.template_manager)
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        cases = (
+            ("required", False, None, False),
+            ("auto", False, None, True),
+            ("auto", True, None, False),
+            # Under automatic choice, the output constraint wins over the grammar.
+            ("auto", True, {"type": "json_object"}, True),
+        )
+        for tool_choice, strict, response_format, require_reasoning in cases:
+            with self.subTest(
+                tool_choice=tool_choice, strict=strict, response_format=response_format
+            ):
+                req = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "hi"}],
+                    tools=[
+                        {
+                            **_WEATHER_TOOL,
+                            "function": {**_WEATHER_TOOL["function"], "strict": strict},
+                        }
+                    ],
+                    tool_choice=tool_choice,
+                    response_format=response_format,
+                )
+
+                processed = self.chat._process_messages(req, is_multimodal=False)
+
+                self.assertIs(processed.require_reasoning, require_reasoning)
+                self.assertIsNone(processed.reasoning_end_token_ids)
+                if strict or tool_choice != "auto":
+                    self.assertEqual(
+                        processed.tool_call_constraint[0], "structural_tag"
+                    )
+                else:
+                    self.assertIsNone(processed.tool_call_constraint)
 
     def test_kimi_tool_call_keeps_template_default_thinking(self):
         self.template_manager.chat_template_name = None

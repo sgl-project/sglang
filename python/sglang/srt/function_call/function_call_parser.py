@@ -288,10 +288,8 @@ class FunctionCallParser:
             or self.tool_strict_level >= ToolStrictLevel.FUNCTION
         )
         if isinstance(self.detector, ResponseTemplateToolDetector):
-            self.detector.validate_structure_constraint_request(
-                tool_choice,
-                parallel_tool_calls,
-                should_constrain_auto,
+            should_constrain_auto = self.detector.validate_structure_constraint_request(
+                self.tools, tool_choice, should_constrain_auto
             )
 
         # Highest priority: model-native structural_tag when available.

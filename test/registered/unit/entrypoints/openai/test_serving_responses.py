@@ -445,7 +445,6 @@ class SkipSpecialTokensForwardingTestCase(CustomTestCase):
 
 
 class ResponseTemplateRequiredToolTestCase(CustomTestCase):
-    # Every field is delimited, so the template gives no field to the JSON.
     TEMPLATE = {
         "start_anchor": "<assistant>",
         "fields": {
@@ -469,7 +468,7 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
         return {
             "text": (
                 "<think>Check the forecast.</think>"
-                '[{"name": "get_weather", "parameters": {"city": "Paris"}}]</call>'
+                '<call:get_weather>{"city": "Paris"}</call>'
             ),
             "meta_info": {
                 "prompt_tokens": 3,
@@ -479,7 +478,7 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
             },
         }
 
-    def _respond(self, stream, tool_choice):
+    def _respond(self, stream, constraint):
         serving = make_serving()
         serving.default_chat_template_kwargs = None
         serving.reasoning_parser = "response_template"
@@ -487,7 +486,6 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
         serving._reasoning_detector = ResponseTemplateReasoningDetector(
             response_template=self.TEMPLATE
         )
-        # Always-on reasoning: the output grammar starts after the reasoning.
         serving.template_manager.reasoning_config = ReasoningToggleConfig(
             special_case="always"
         )
@@ -508,7 +506,6 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
         request = ResponsesRequest(
             model="x",
             input="Weather?",
-            tool_choice=tool_choice,
             tools=[
                 {
                     "type": "function",
@@ -521,6 +518,7 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
             ],
             stream=stream,
             store=False,
+            **constraint,
         )
         rendered = MessageProcessingResult(
             prompt="<assistant>",
@@ -544,28 +542,28 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
         ):
             return asyncio.run(respond())
 
-    def test_required_tool_json_is_parsed_under_delimited_template(self):
-        """Required or named tool JSON after the reasoning becomes a completed
-        function call, also when it ends on the tool closer that detokenization
-        keeps."""
-        named = {"type": "function", "name": "get_weather"}
-        cases = [
-            (choice, stream)
-            for choice in ("required", named)
-            for stream in (False, True)
-        ]
-        for tool_choice, stream in cases:
-            with self.subTest(tool_choice=tool_choice, stream=stream):
-                response = self._respond(stream, tool_choice)
+    def test_tool_call_is_parsed_under_delimited_template(self):
+        """A tool call after the reasoning becomes a completed function call,
+        also when it ends on the tool closer that detokenization keeps before a
+        JSON answer."""
+        constraints = (
+            {"tool_choice": "required"},
+            {"tool_choice": {"type": "function", "name": "get_weather"}},
+            {"text": {"format": {"type": "json_object"}}},
+        )
+        for constraint in constraints:
+            for stream in (False, True):
+                with self.subTest(**constraint, stream=stream):
+                    response = self._respond(stream, constraint)
 
-                self.assertEqual(response["status"], "completed")
-                self.assertEqual(
-                    [item["type"] for item in response["output"]],
-                    ["reasoning", "function_call"],
-                )
-                call = response["output"][1]
-                self.assertEqual(call["name"], "get_weather")
-                self.assertEqual(orjson.loads(call["arguments"]), {"city": "Paris"})
+                    self.assertEqual(response["status"], "completed")
+                    self.assertEqual(
+                        [item["type"] for item in response["output"]],
+                        ["reasoning", "function_call"],
+                    )
+                    call = response["output"][1]
+                    self.assertEqual(call["name"], "get_weather")
+                    self.assertEqual(orjson.loads(call["arguments"]), {"city": "Paris"})
 
 
 class InputItemNormalizationTestCase(CustomTestCase):

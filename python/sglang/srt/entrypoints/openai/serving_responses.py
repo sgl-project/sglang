@@ -2334,7 +2334,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                     delta = text[stream_offset:]
                     stream_offset = len(text)
                 if finish_reason is not None:
-                    delta = self._drop_kept_tool_close(delta, finish_reason, request)
+                    delta = self._drop_kept_tool_close(
+                        delta, finish_reason, request, text
+                    )
                 if not delta and finish_reason is None:
                     continue
                 # finish_reason is sticky, so it would otherwise re-flush.

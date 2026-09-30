@@ -108,6 +108,7 @@ from sglang.srt.parser.response_template import (
     ResponseTemplateToolDetector,
     configure_response_template_request,
     tool_close_tokens,
+    tool_grammar_covers_reasoning,
 )
 from sglang.srt.sampling.sampling_params import (
     set_request_reasoning_end_token_ids,
@@ -836,7 +837,10 @@ class OpenAIServingChat(OpenAIServingBase):
             stream_offsets[index] = len(content["text"])
         if finish_reason_type is not None:
             delta = self._drop_kept_tool_close(
-                delta, content["meta_info"].get("finish_reason"), request
+                delta,
+                content["meta_info"].get("finish_reason"),
+                request,
+                content["text"],
             )
 
         # Attach logprobs to the first chunk emitted this step (reasoning,
@@ -1255,14 +1259,21 @@ class OpenAIServingChat(OpenAIServingBase):
         text: str,
         finish_reason: dict[str, Any] | None,
         request: ChatCompletionRequest | ResponsesRequest,
+        output: str | None = None,
     ) -> str:
         # Detokenization keeps a tool-call closer that stops generation; after
         # JSON-schema output it ends no native call, so trim it like any stop.
+        # Before the reasoning end, the grammar has not started and the closer
+        # may end a native call.
         if (
             not text
             or request._response_parser_grammar_start is None
             or (isinstance(request, ChatCompletionRequest) and request.no_stop_trim)
             or not isinstance(finish_reason, dict)
+            or (
+                request._response_parser_grammar_start == GRAMMAR_AFTER_REASONING
+                and self._reasoning_detector.think_end_token not in (output or text)
+            )
         ):
             return text
         closer = tool_close_tokens(
@@ -1397,7 +1408,9 @@ class OpenAIServingChat(OpenAIServingBase):
             configure_response_template_request(request)
             result.uses_response_template = True
         result.tool_call_constraint = tool_call_constraint
-        result.require_reasoning = thinking_mode
+        result.require_reasoning = thinking_mode and not tool_grammar_covers_reasoning(
+            self.tool_call_parser, tool_call_constraint, request
+        )
         result.skip_special_tokens = request.skip_special_tokens
         if self.reasoning_parser == "k2_horizon" and thinking_mode:
             parser = ReasoningParser(

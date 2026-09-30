@@ -530,6 +530,7 @@ class TestResponseTemplateAdapters(CustomTestCase):
         """JSON-schema output passes through unchanged from where its grammar
         starts, including template delimiters inside its strings."""
         plain = '[{"name": "get_weather", "parameters": {"days": 3}}]'
+        call = '<call:get_weather>{"days": 3}</call>'
         delimited = (
             '[{"name": "get_weather", "parameters": '
             '{"location": "<answer>Paris</answer>", "details": "<think>x</think>"}}]'
@@ -540,9 +541,10 @@ class TestResponseTemplateAdapters(CustomTestCase):
             (None, "<think>Plan</think>" + plain, ("Plan", "")),
             (
                 GRAMMAR_AFTER_REASONING,
-                "<think>Plan</think>" + delimited,
+                "<think>Plan</think><answer>" + delimited,
                 ("Plan", delimited),
             ),
+            (GRAMMAR_AFTER_REASONING, "<think>Plan</think>" + call, ("Plan", call)),
             (GRAMMAR_FROM_START, delimited, ("", delimited)),
         )
         for grammar_start, output, expected in cases:
@@ -683,6 +685,21 @@ class TestResponseTemplateAdapters(CustomTestCase):
         self.assertEqual(detector.think_end_token, "</analysis>")
         self.assertTrue(detector.thinks_internally)
         self.assertEqual(detector.reasoning_default, "always")
+
+    def test_literal_content_opener_extends_think_end_token(self):
+        literal = copy.deepcopy(GEMMA4_RESPONSE_TEMPLATE)
+        literal["fields"]["content"]["open"] = "<|channel>final\n"
+        pattern = copy.deepcopy(GEMMA4_RESPONSE_TEMPLATE)
+        pattern["fields"]["content"]["open_pattern"] = r"<\|channel>(?:final)\n"
+
+        def think_end(template):
+            return ResponseTemplateReasoningDetector(
+                response_template=template
+            ).think_end_token
+
+        self.assertEqual(think_end(GEMMA4_RESPONSE_TEMPLATE), "<channel|>")
+        self.assertEqual(think_end(literal), "<channel|><|channel>final\n")
+        self.assertEqual(think_end(pattern), "<channel|>")
 
     def test_transform_each_tool_region_emits_all_calls(self):
         template = {
@@ -1030,7 +1047,7 @@ class TestResponseTemplateAdapters(CustomTestCase):
         self.assertEqual(closed.normal_text, "")
         self.assertEqual(closed.calls, [])
 
-    def test_strict_tools_require_native_constraint_support(self):
+    def test_unforced_tool_guarantees_are_left_unconstrained(self):
         tokenizer = SimpleNamespace(response_template=GEMMA4_RESPONSE_TEMPLATE)
         tool = _tool()
         tool.function.strict = True
@@ -1040,8 +1057,9 @@ class TestResponseTemplateAdapters(CustomTestCase):
             tokenizer=tokenizer,
         )
 
-        with self.assertRaisesRegex(ValueError, "does not support strict"):
-            parser.get_structure_constraint("auto")
+        self.assertIsNone(
+            parser.get_structure_constraint("auto", parallel_tool_calls=False)
+        )
 
     def test_required_and_named_tools_use_generic_json_schema(self):
         tokenizer = SimpleNamespace(response_template=GEMMA4_RESPONSE_TEMPLATE)
@@ -1070,17 +1088,6 @@ class TestResponseTemplateAdapters(CustomTestCase):
             strict_parser.get_structure_constraint("required")[0],
             "json_schema",
         )
-
-    def test_parallel_false_auto_is_rejected_without_native_constraint(self):
-        tokenizer = SimpleNamespace(response_template=GEMMA4_RESPONSE_TEMPLATE)
-        parser = FunctionCallParser(
-            tools=[_tool()],
-            tool_call_parser="response_template",
-            tokenizer=tokenizer,
-        )
-
-        with self.assertRaisesRegex(ValueError, "parallel_tool_calls=False"):
-            parser.get_structure_constraint("auto", parallel_tool_calls=False)
 
 
 if __name__ == "__main__":
