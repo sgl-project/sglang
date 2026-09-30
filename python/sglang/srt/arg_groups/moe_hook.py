@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import os
 from typing import Any
@@ -30,7 +31,11 @@ from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
-from sglang.srt.utils.common import is_sm100_supported, parse_connector_type
+from sglang.srt.utils.common import (
+    get_bool_env_var,
+    is_sm100_supported,
+    parse_connector_type,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -460,12 +465,7 @@ def handle_a2a_moe(server_args: Any):
         )
 
     if a2a_backend == "mori":
-        ep_version = envs.SGLANG_MORI_EP_VERSION.get()
-        if ep_version not in ("epv1", "epv2"):
-            raise ValueError(
-                f"SGLANG_MORI_EP_VERSION must be epv1 or epv2; got {ep_version!r}"
-            )
-        is_epv2 = ep_version == "epv2"
+        is_epv2 = _resolve_mori_ep_version(server_args) == "epv2"
         if cfg.deepep_mode == "auto":
             declare_resolution(
                 server_args,
@@ -473,8 +473,17 @@ def handle_a2a_moe(server_args: Any):
                 deepep_mode="normal",
             )
             logger.warning("auto set deepep_mode=`normal` for MORI EP")
-        elif is_epv2 and cfg.deepep_mode != "normal":
-            raise ValueError("MORI EPv2 currently supports deepep_mode=`normal` only")
+        elif is_epv2 and cfg.deepep_mode == "low_latency":
+            # EPv2 has one graph-capturable kernel for prefill and decode.
+            declare_resolution(
+                server_args,
+                "_handle_a2a_moe",
+                deepep_mode="normal",
+            )
+            logger.warning(
+                "MORI EPv2 has no separate low-latency kernel; "
+                "using deepep_mode=`normal` for deepep_mode=`low_latency`"
+            )
 
         if is_epv2:
             logger.warning(
@@ -696,6 +705,119 @@ def validate_flashinfer_a2a_token_budget(server_args: Any) -> None:
             "or unset it to size from --chunked-prefill-size, or lower "
             "--chunked-prefill-size / the CUDA graph max batch sizes."
         )
+
+
+def _resolve_mori_ep_version(server_args: Any) -> str:
+    """Pick the MORI EP version; an unset env prefers EPv2 and falls back to EPv1."""
+    explicit = envs.SGLANG_MORI_EP_VERSION.is_set()
+    ep_version = envs.SGLANG_MORI_EP_VERSION.get()
+    if ep_version not in ("epv1", "epv2"):
+        raise ValueError(
+            f"SGLANG_MORI_EP_VERSION must be epv1 or epv2; got {ep_version!r}"
+        )
+    if ep_version == "epv1":
+        return ep_version
+
+    reason = _mori_epv2_unsupported_reason(server_args)
+    if reason is None:
+        return ep_version
+    if explicit:
+        logger.warning(
+            "SGLANG_MORI_EP_VERSION=epv2 is set explicitly, but MORI EPv2 "
+            "does not support %s; not falling back to EPv1.",
+            reason,
+        )
+        return ep_version
+    logger.warning(
+        "MORI EPv2 does not support %s; falling back to MORI EPv1. "
+        "Set SGLANG_MORI_EP_VERSION to choose the version explicitly.",
+        reason,
+    )
+    # Worker processes inherit the env, so every reader agrees on EPv1.
+    envs.SGLANG_MORI_EP_VERSION.set("epv1")
+    return "epv1"
+
+
+def _mori_epv2_unsupported_reason(server_args: Any) -> str | None:
+    cfg = resolved_view(server_args)
+    reason = _mori_epv2_config_unsupported_reason(ep_size=cfg.tp_size)
+    if reason is not None:
+        return reason
+    if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
+        return "a model loaded through an instance connector (cannot validate it)"
+    model_config = model_config_of(server_args)
+    reason = _mori_epv2_dtype_unsupported_reason(model_dtype=model_config.dtype)
+    if reason is None:
+        _warn_if_mori_epv2_unvalidated_model(hf_config=model_config.hf_config)
+    return reason
+
+
+def _mori_epv2_config_unsupported_reason(ep_size: int) -> str | None:
+    if ep_size > 8:
+        return f"ep_size={ep_size} (EPv2 is intranode-only, ep_size<=8)"
+    if not envs.SGLANG_USE_AITER.get():
+        return "SGLANG_USE_AITER=0 (EPv2 experts run on the aiter MoE runner)"
+    if get_bool_env_var("MORI_ENABLE_SDMA", "false"):
+        return "MORI_ENABLE_SDMA=1 (SDMA is EPv1-only)"
+    # Legacy knobs are only read by the EPv1 dispatcher.
+    for name in ("SGLANG_MORI_FP8_DISP", "SGLANG_MORI_FP4_DISP"):
+        if name in os.environ:
+            return f"{name} (EPv1-only; use SGLANG_MORI_DISPATCH_DTYPE)"
+    combine_dtype = _mori_requested_combine_dtype()
+    if combine_dtype == "fp4":
+        return "SGLANG_MORI_COMBINE_DTYPE=fp4"
+    # auto dispatch is fp4 for fp4 weights, and EPv2 only quantizes a bf16-dispatch combine.
+    if (
+        combine_dtype in ("fp8", "fp8_direct_cast")
+        and envs.SGLANG_MORI_DISPATCH_DTYPE.get().lower() != "bf16"
+    ):
+        return (
+            f"{combine_dtype} combine without SGLANG_MORI_DISPATCH_DTYPE=bf16 "
+            "(EPv2 quantizes combine only for bf16 dispatch)"
+        )
+    if not _mori_epv2_installed():
+        return "this MORI build (no mori.cco / mori.ops.dispatch_combine_v2)"
+    return None
+
+
+def _mori_epv2_dtype_unsupported_reason(model_dtype: Any) -> str | None:
+    import torch
+
+    if model_dtype != torch.bfloat16:
+        return f"dtype={model_dtype} (EPv2 requires bfloat16)"
+    return None
+
+
+def _warn_if_mori_epv2_unvalidated_model(hf_config: Any) -> None:
+    from sglang.srt.configs.model_config import is_deepseek_v4
+
+    if not is_deepseek_v4(hf_config):
+        architectures = hf_config.architectures or [None]
+        logger.warning(
+            "MORI EPv2 is validated end to end on DeepSeek-V4 only; running %r "
+            "on EPv2. Set SGLANG_MORI_EP_VERSION=epv1 if it misbehaves.",
+            architectures[0],
+        )
+
+
+def _mori_requested_combine_dtype() -> str:
+    # Mirrors the combine env parsing of the MORI dispatcher.
+    if "SGLANG_MORI_COMBINE_DTYPE" in os.environ:
+        return os.environ["SGLANG_MORI_COMBINE_DTYPE"].lower()
+    if get_bool_env_var("SGLANG_MORI_FP8_COMB", "false"):
+        return "fp8"
+    return "auto"
+
+
+def _mori_epv2_installed() -> bool:
+    # Locate the package without importing mori or its native extensions.
+    spec = importlib.util.find_spec("mori")
+    if spec is None or spec.submodule_search_locations is None:
+        return False
+    package_dir = list(spec.submodule_search_locations)[0]
+    return os.path.isdir(os.path.join(package_dir, "cco")) and os.path.exists(
+        os.path.join(package_dir, "ops", "dispatch_combine_v2")
+    )
 
 
 def required_mori_dispatch_tokens_per_rank(server_args: Any) -> int:

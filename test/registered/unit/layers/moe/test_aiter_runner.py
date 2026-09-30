@@ -115,5 +115,87 @@ def test_aiter_runner_preserves_no_combine_rank_for_empty_input(monkeypatch):
     assert output.hidden_states.shape == (0, 2, 4)
 
 
+@pytest.mark.parametrize("supports_output", [False, True])
+def test_aiter_runner_uses_epv2_output_when_kernel_supports_it(
+    monkeypatch, supports_output
+):
+    def fused_moe(hidden_states, output=None, **kwargs):
+        result = hidden_states + 2
+        if output is not None:
+            output.copy_(result)
+            return output
+        return result
+
+    _install_fake_aiter(monkeypatch, fused_moe)
+    monkeypatch.setattr(
+        aiter_runner, "_aiter_fused_moe_supports_output", lambda: supports_output
+    )
+    runner_input = _runner_input()
+    runner_input.hidden_states.fill_(1)
+    runner_input.output = torch.zeros_like(runner_input.hidden_states)
+    runner = AiterRunnerCore(MoeRunnerConfig(activation="silu"))
+
+    result = runner.run(runner_input, _quant_info(), running_state={}).hidden_states
+
+    torch.testing.assert_close(result, torch.full_like(result, 3))
+    assert (result.data_ptr() == runner_input.output.data_ptr()) == supports_output
+    torch.testing.assert_close(
+        runner_input.output,
+        torch.full_like(result, 3 if supports_output else 0),
+    )
+
+
+@pytest.mark.parametrize(
+    "low_latency,recv_cap,expected_rows",
+    [(False, 0, 16), (False, 32, 16), (True, 5, 5)],
+)
+def test_mori_pre_permute_consumes_dispatcher_cap(
+    monkeypatch, low_latency, recv_cap, expected_rows
+):
+    from sglang.srt.layers.moe.token_dispatcher.moriep import (
+        MoriEPLLDispatchOutput,
+        MoriEPNormalDispatchOutput,
+    )
+
+    # The dispatcher owns the override. The runner must not read it again.
+    monkeypatch.setenv("SGLANG_MORI_MOE_MAX_INPUT_TOKENS", "3")
+    fake_utils = ModuleType("sglang.kernels.ops.moe.rocm_moe_utils")
+    fake_utils.upscale = None
+    fake_utils.upscale_mxfp4 = None
+    monkeypatch.setitem(sys.modules, fake_utils.__name__, fake_utils)
+    output_type = MoriEPLLDispatchOutput if low_latency else MoriEPNormalDispatchOutput
+    hidden = torch.zeros((16, 4), dtype=torch.bfloat16)
+    scales = torch.ones((16, 1))
+    ids = torch.zeros((16, 2), dtype=torch.int32)
+    weights = torch.ones((16, 2))
+    kwargs = {} if low_latency else {"expert_output": torch.empty_like(hidden)}
+    dispatched = output_type(
+        hidden_states=hidden,
+        hidden_states_scale=scales,
+        topk_ids=ids,
+        topk_weights=weights,
+        num_recv_tokens_per_expert=torch.tensor([5]),
+        origin_topk_ids=ids[:2],
+        origin_topk_weights=weights[:2],
+        out_dtype=torch.bfloat16,
+        recv_cap=recv_cap,
+        **kwargs,
+    )
+    quant_info = _quant_info(quant_type=AiterQuantType.NONE)
+    state = {}
+    result = aiter_runner._pre_permute_deepep_to_aiter(
+        dispatched, quant_info, MoeRunnerConfig(), state
+    )
+    assert result.hidden_states.shape[0] == expected_rows
+    assert result.topk_ids.shape[0] == expected_rows
+    assert result.topk_weights.shape[0] == expected_rows
+    assert result.a1_scale.shape[0] == expected_rows
+    assert result.hidden_states.data_ptr() == hidden.data_ptr()
+    assert state["aiter_combine_topk_ids"] is dispatched.origin_topk_ids
+    if not low_latency:
+        assert result.output.shape[0] == expected_rows
+        assert result.output.data_ptr() == dispatched.expert_output.data_ptr()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

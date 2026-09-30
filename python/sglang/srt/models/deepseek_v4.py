@@ -78,6 +78,7 @@ from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_SCALE_UE8M0
 from sglang.srt.layers.dp_attention import (
     _tbo_event,
     attn_tp_all_gather,
+    attn_tp_all_gather_into_tensor,
     attn_tp_all_reduce,
     dp_gather_partial,
     dp_gather_replicate,
@@ -2673,6 +2674,28 @@ def _every_row_routed(forward_batch: ForwardBatch, num_rows: int):
         ) = saved
 
 
+def _attn_tp_all_gather_chunks(
+    local: torch.Tensor, chunk_rows: List[int]
+) -> torch.Tensor:
+    # Tensor all_gather stays on aiter AG / pynccl under graph capture; the list
+    # all_gather falls back to ProcessGroupNCCL, which invalidates HIP capture.
+    max_rows = max(chunk_rows)
+    padded = local
+    if local.shape[0] != max_rows:
+        padded = local.new_zeros((max_rows, *local.shape[1:]))
+        padded[: local.shape[0]].copy_(local)
+    gathered = local.new_empty((len(chunk_rows) * max_rows, *local.shape[1:]))
+    attn_tp_all_gather_into_tensor(gathered, padded.contiguous())
+    if all(rows == max_rows for rows in chunk_rows):
+        return gathered
+    return torch.cat(
+        [
+            gathered[i * max_rows : i * max_rows + rows]
+            for i, rows in enumerate(chunk_rows)
+        ]
+    )
+
+
 class DeepseekV4DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -3369,7 +3392,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        *,
         input_ids: Optional[torch.Tensor],
         input_ids_global: Optional[torch.Tensor],
         return_moe_output: bool = False,
@@ -3535,9 +3557,14 @@ class DeepseekV4DecoderLayer(nn.Module):
                 hidden_states = hidden_states + _shared_local[:n]
         if _use_tp_attn_a2a_scatter:
             assert _a2a_scatter_chunks is not None
-            gathered = [torch.empty_like(t) for t in _a2a_scatter_chunks]
-            attn_tp_all_gather(gathered, hidden_states.contiguous())
-            hidden_states = torch.cat(gathered)
+            if _is_hip:
+                hidden_states = _attn_tp_all_gather_chunks(
+                    hidden_states, chunk_rows=[t.shape[0] for t in _a2a_scatter_chunks]
+                )
+            else:
+                gathered = [torch.empty_like(t) for t in _a2a_scatter_chunks]
+                attn_tp_all_gather(gathered, hidden_states.contiguous())
+                hidden_states = torch.cat(gathered)
         return hidden_states
 
     # ------------------------------------------------------------------
