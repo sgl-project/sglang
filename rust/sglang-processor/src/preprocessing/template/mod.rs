@@ -1205,6 +1205,7 @@ pub enum TemplateError {
 pub fn load_chat_formatter(
     config_file: Option<&str>,
     model_path: Option<&str>,
+    model_type: Option<&str>,
     chat_template_arg: Option<&str>,
 ) -> Result<ChatFormatter, TemplateError> {
     // Python resolves registry names before looking at the filesystem — and
@@ -1221,7 +1222,7 @@ pub fn load_chat_formatter(
     // a legacy model whose config has no `chat_template` still gets one.
     if chat_template_arg.is_none()
         && let Some(model_path) = model_path
-        && let Some(spec) = infer_legacy_template_from_model_path(model_path)
+        && let Some(spec) = infer_legacy_template_from_model_path(model_path, model_type)
     {
         tracing::info!(%model_path, "inferred legacy chat template from model path");
         return Ok(ChatFormatter::Legacy(Box::new(LegacyFormatter { spec })));
@@ -1285,7 +1286,10 @@ pub fn load_chat_formatter(
 /// built-in template from the model path, optionally consulting the model's
 /// `config.json` `model_type`. `None` when nothing matches — the HF template
 /// is the fallback then, as in Python.
-fn infer_legacy_template_from_model_path(model_path: &str) -> Option<LegacySpec> {
+fn infer_legacy_template_from_model_path(
+    model_path: &str,
+    model_type: Option<&str>,
+) -> Option<LegacySpec> {
     let lower = model_path.to_lowercase();
     // Regexes without regex: every Python pattern here is a plain substring or
     // a `prefix.*suffix` pair, both on a lowercased path.
@@ -1355,11 +1359,8 @@ fn infer_legacy_template_from_model_path(model_path: &str) -> Option<LegacySpec>
         return builtin_template("whisper");
     }
 
-    // Model-type matchers read `<model_path>/config.json` (local dirs only —
-    // Python's `get_model_type` cannot resolve HF repo ids either).
-    let model_type = read_model_type(model_path)?;
     // Python `MODEL_TYPE_TO_TEMPLATE`; minicpmv4_6 is deliberately absent.
-    let name = match model_type.as_str() {
+    let name = match model_type? {
         "moss_vl" => "moss-vl",
         "internvl_chat" => "internvl-2-5",
         "multi_modality" => "janus-pro",
@@ -1373,21 +1374,6 @@ fn infer_legacy_template_from_model_path(model_path: &str) -> Option<LegacySpec>
         _ => return None,
     };
     builtin_template(name)
-}
-
-/// Python `get_model_type`: the `model_type` field of the model's `config.json`.
-fn read_model_type(model_path: &str) -> Option<String> {
-    let config_path = Path::new(model_path).join("config.json");
-    if !config_path.is_file() {
-        return None;
-    }
-    let config: Value = parse_json(
-        &read_to_string(&config_path, "model config").ok()?,
-        &config_path,
-        "model config",
-    )
-    .ok()?;
-    config.get("model_type")?.as_str().map(str::to_owned)
 }
 
 fn read_to_string(path: &Path, kind: &'static str) -> Result<String, TemplateError> {
@@ -1817,9 +1803,9 @@ mod tests {
     };
 
     use super::{
-        ChatFormatter, LegacyFormatter, LegacySpec, OneOrMany, TemplateError, ThinkingPolicy,
-        builtin_template, detect_thinking_policy, infer_legacy_template_from_model_path,
-        load_chat_formatter,
+        ChatFormatter, ChatTemplateConfig, LegacyFormatter, LegacySpec, OneOrMany, TemplateError,
+        ThinkingPolicy, builtin_template, detect_thinking_policy,
+        infer_legacy_template_from_model_path, load_chat_formatter, load_chat_support,
     };
 
     fn request() -> CreateChatCompletionRequest {
@@ -2184,6 +2170,7 @@ mod tests {
         let formatter = load_chat_formatter(
             Some(base.to_str().unwrap()),
             None,
+            None,
             Some(base.to_str().unwrap()),
         )
         .unwrap();
@@ -2219,6 +2206,7 @@ mod tests {
 
         let formatter = load_chat_formatter(
             Some(base.to_str().unwrap()),
+            None,
             None,
             Some(legacy.to_str().unwrap()),
         )
@@ -2321,7 +2309,7 @@ mod tests {
     /// A built-in `--chat-template` name resolves without any tokenizer config.
     #[test]
     fn builtin_argument_works_without_tokenizer_config() {
-        let formatter = load_chat_formatter(None, None, Some("chatml")).unwrap();
+        let formatter = load_chat_formatter(None, None, None, Some("chatml")).unwrap();
         let ChatFormatter::Legacy(formatter) = &formatter else {
             panic!("expected a legacy formatter");
         };
@@ -2349,6 +2337,7 @@ mod tests {
             Some(base.to_str().unwrap()),
             Some("models/vicuna-7b-v1.5"),
             None,
+            None,
         )
         .unwrap();
         let ChatFormatter::Legacy(formatter) = &formatter else {
@@ -2356,13 +2345,21 @@ mod tests {
         };
         assert_eq!(formatter.spec.name, "vicuna_v1.1");
         // No config at all + path matcher.
-        let formatter = load_chat_formatter(None, Some("deepseek-vl2-7b"), None).unwrap();
+        let formatter = load_chat_formatter(None, Some("deepseek-vl2-7b"), None, None).unwrap();
         let ChatFormatter::Legacy(formatter) = &formatter else {
             panic!("expected a legacy formatter");
         };
         assert_eq!(formatter.spec.name, "deepseek-vl2");
 
-        // Model-type matcher: reads `<model_path>/config.json`.
+        // Model-type matcher.
+        let formatter =
+            load_chat_formatter(None, Some("models/opaque"), Some("phi4mm"), None).unwrap();
+        let ChatFormatter::Legacy(formatter) = &formatter else {
+            panic!("expected a legacy formatter");
+        };
+        assert_eq!(formatter.spec.name, "phi-4-mm");
+
+        // `load_chat_support` reads the model type from `<model_path>/config.json`.
         let model_dir = std::env::temp_dir().join(format!(
             "sglang-openai-template-infer-model-{}",
             std::process::id()
@@ -2373,8 +2370,13 @@ mod tests {
             r#"{"model_type":"phi4mm","architectures":["Phi4MMForCausalLM"]}"#,
         )
         .unwrap();
-        let formatter = load_chat_formatter(None, Some(model_dir.to_str().unwrap()), None).unwrap();
-        let ChatFormatter::Legacy(formatter) = &formatter else {
+        let (formatter, error) = load_chat_support(&ChatTemplateConfig {
+            tokenizer_path: model_dir.to_str().unwrap().into(),
+            model_path: model_dir.to_str().unwrap().into(),
+            ..Default::default()
+        });
+        assert!(error.is_none(), "{error:?}");
+        let Some(ChatFormatter::Legacy(formatter)) = &formatter else {
             panic!("expected a legacy formatter");
         };
         assert_eq!(formatter.spec.name, "phi-4-mm");
@@ -2405,7 +2407,7 @@ mod tests {
             "paddleocr-vl",
             "whisper",
         ] {
-            let spec = infer_legacy_template_from_model_path(model_path)
+            let spec = infer_legacy_template_from_model_path(model_path, None)
                 .unwrap_or_else(|| panic!("no inference for {model_path}"));
             let _ = spec;
         }
@@ -2415,9 +2417,9 @@ mod tests {
     /// and nothing else to try, that surfaces as the missing-config error.
     #[test]
     fn minicpm_4_6_skips_legacy_inference() {
-        assert!(infer_legacy_template_from_model_path("minicpm-v-4.6").is_none());
+        assert!(infer_legacy_template_from_model_path("minicpm-v-4.6", None).is_none());
         assert!(matches!(
-            load_chat_formatter(None, Some("minicpm-v-4.6"), None),
+            load_chat_formatter(None, Some("minicpm-v-4.6"), None, None),
             Err(TemplateError::MissingConfig)
         ));
     }

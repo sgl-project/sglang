@@ -681,7 +681,7 @@ mod tests {
         chat_preprocessor_with(
             Some("llama3"),
             None,
-            sglang_processor::load_chat_formatter(None, None, Some("chatml")).unwrap(),
+            sglang_processor::load_chat_formatter(None, None, None, Some("chatml")).unwrap(),
         )
     }
 

@@ -19,7 +19,7 @@ pub use service::{PreparedChat, RendererService};
 pub(crate) use sglang_processor::ChatFormatter;
 #[cfg(test)]
 pub(crate) fn load_test_chat_formatter(name: &str) -> ChatFormatter {
-    sglang_processor::load_chat_formatter(None, None, Some(name)).unwrap()
+    sglang_processor::load_chat_formatter(None, None, None, Some(name)).unwrap()
 }
 pub use sglang_processor::{DynamoTokenizer, TextTokenizer, load_tokenizer};
 pub(crate) use sglang_processor::{resolve_model_file, resolve_tokenizer_file};

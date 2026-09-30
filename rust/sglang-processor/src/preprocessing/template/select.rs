@@ -113,6 +113,7 @@ pub fn load_chat_support(config: &ChatTemplateConfig) -> (Option<ChatFormatter>,
     match load_chat_formatter(
         tokenizer_config_file.as_deref(),
         (!config.model_path.is_empty()).then_some(config.model_path.as_str()),
+        identity.model_type.as_deref(),
         template_source,
     ) {
         Ok(mut formatter) => {
