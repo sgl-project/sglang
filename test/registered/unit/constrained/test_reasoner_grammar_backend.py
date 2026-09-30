@@ -15,7 +15,9 @@ from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
 )
 from sglang.srt.function_call.kimik3_format import THINK_CLOSE
 from sglang.srt.parser.reasoning_parser import KimiK3Detector as KimiK3ReasoningDetector
+from sglang.srt.parser.response_template import ResponseTemplateReasoningDetector
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(2.0, "base-a-test-cpu")
 register_cpu_ci(est_time=5, suite="stage-b-test-cpu-intel")
@@ -251,6 +253,33 @@ class TestReasonerGrammarBackend(unittest.TestCase):
         wrapped.accept_token(2)
         wrapped.accept_token(42)
         inner_grammar.accept_token.assert_called_once_with(42)
+
+    def test_response_template_reasoning_gives_the_thinking_opener(self):
+        """Output that skips the reasoning must not escape the grammar for want of a
+        thinking opener."""
+        backend = _DummyGrammarBackend(support_token_filter=True)
+        backend._dispatch_result = MagicMock()
+        template = {
+            "start_anchor": "<assistant>",
+            "fields": {"thinking": {"open": "<think>", "close": "</think>"}},
+        }
+        for detector, starts in (
+            (self._make_parser().detector, ()),
+            (
+                ResponseTemplateReasoningDetector(response_template=template),
+                ("<think>",),
+            ),
+        ):
+            with self.subTest(detector=type(detector).__name__):
+                reasoner = ReasonerGrammarBackend(
+                    backend, SimpleNamespace(detector=detector), self._make_tokenizer()
+                )
+                grammar = reasoner._init_value_dispatch(("structural_tag", "{}"), True)
+
+                grammar.set_reasoning_in_grammar()
+
+                self.assertEqual(grammar.think_starts, starts)
+                self.assertTrue(grammar.reasoning_in_grammar)
 
     def test_accepts_multi_token_think_start_marker(self):
         """think_start_token can be multi-token (e.g., GPT-OSS) since it's not used."""
@@ -525,6 +554,97 @@ class TestReasonerGrammarObjectFillVocabMask(unittest.TestCase):
         inner_grammar.fill_vocab_mask.assert_not_called()
         # Mask should remain all zeros (no filtering)
         self.assertTrue(torch.all(mask == 0))
+
+
+class TestReasonerGrammarObjectReasoningInGrammar(CustomTestCase):
+    """A grammar that also describes the reasoning applies from the first
+    token, while the reasoning end still bounds the thinking controls."""
+
+    _PIECES = {1: "<th", 2: "ink>", 4: "<a>", 10: "a", 11: "b", 12: "<think>"}
+
+    def _make_object(self, allowed, max_think_tokens=-1, think_starts=()):
+        inner_grammar = MagicMock()
+        inner_grammar.allocate_vocab_mask.side_effect = lambda vs, bs, d: torch.zeros(
+            (bs, (vs + 31) // 32), dtype=torch.int32
+        )
+        inner_grammar.fill_vocab_mask.side_effect = lambda mask, idx: (
+            set_token_filter_torch(mask, allowed, idx)
+        )
+        obj = ReasonerGrammarObject(
+            grammar=inner_grammar,
+            think_end_ids=[7],
+            think_excluded_token_ids=[3, 5],
+            max_think_tokens=max_think_tokens,
+            enable_token_filter=True,
+            token_filter_fn=set_token_filter_torch,
+            think_starts=think_starts,
+            decode=lambda ids: "".join(self._PIECES[i] for i in ids),
+        )
+        obj.maybe_init_reasoning(True)
+        obj.set_reasoning_in_grammar()
+        return obj, inner_grammar
+
+    def test_grammar_applies_from_the_first_token(self):
+        obj, inner_grammar = self._make_object(allowed=[1, 3, 7, 10])
+        mask = obj.allocate_vocab_mask(64, 1, "cpu")
+
+        obj.fill_vocab_mask(mask, 0)
+
+        # Strict thinking only removes its excluded tokens from the grammar's.
+        self.assertEqual(_allowed_token_ids(mask, [1, 3, 5, 7, 10, 11]), [1, 7, 10])
+        for token_id in (10, 7, 11):
+            obj.accept_token(token_id)
+        self.assertEqual(
+            [call.args[0] for call in inner_grammar.accept_token.call_args_list],
+            [10, 7, 11],
+        )
+        self.assertTrue(obj._is_generation())
+        obj.rollback(3)
+        inner_grammar.rollback.assert_called_once_with(3)
+        self.assertTrue(obj._is_thinking())
+        self.assertTrue(obj.copy().reasoning_in_grammar)
+
+    def test_budget_ends_reasoning_only_where_the_grammar_allows(self):
+        for allowed, expected in (([7, 10], [7]), ([10, 11], [10, 11])):
+            with self.subTest(allowed=allowed):
+                obj, _ = self._make_object(allowed, max_think_tokens=1)
+                obj.accept_token(10)
+                mask = obj.allocate_vocab_mask(64, 1, "cpu")
+
+                obj.fill_vocab_mask(mask, 0)
+
+                self.assertEqual(_allowed_token_ids(mask, [7, 10, 11]), expected)
+
+    def test_thinking_controls_need_the_opener(self):
+        """Budget and strict thinking filters must not bound output that skipped the
+        reasoning."""
+        obj, _ = self._make_object(
+            [7, 10, 11], max_think_tokens=1, think_starts=("<think>", "<a><think>")
+        )
+        for opening, expected in (
+            ((10, 2), [7, 10, 11]),
+            ((4, 10), [7, 10, 11]),
+            ((1, 2), [7]),
+            ((12, 10), [7]),
+            ((4, 1, 2), [7]),
+        ):
+            with self.subTest(opening=opening):
+                obj.rollback(obj._generated)
+                for token_id in opening:
+                    obj.accept_token(token_id)
+                mask = obj.allocate_vocab_mask(64, 1, "cpu")
+
+                obj.fill_vocab_mask(mask, 0)
+
+                self.assertEqual(_allowed_token_ids(mask, [7, 10, 11]), expected)
+
+    def test_is_set_before_decoding(self):
+        obj = ReasonerGrammarObject(grammar=MagicMock(), think_end_ids=[7])
+        obj.maybe_init_reasoning(True)
+        obj.accept_token(10)
+
+        with self.assertRaises(RuntimeError):
+            obj.set_reasoning_in_grammar()
 
 
 class TestReasonerGrammarObjectCurrentToken(unittest.TestCase):

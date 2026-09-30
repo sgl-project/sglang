@@ -111,6 +111,29 @@ def set_request_reasoning_end_token_ids(
     sampling_params["custom_params"] = custom_params
 
 
+# Private transport, like the reasoning terminator above: the request's grammar
+# also describes the reasoning, so it applies from the first output token.
+REQUEST_REASONING_IN_GRAMMAR_KEY = "__sglang_reasoning_in_grammar"
+
+
+def get_request_reasoning_in_grammar(
+    custom_params: Optional[Dict[str, CustomParamValue]],
+) -> bool:
+    return (
+        isinstance(custom_params, dict)
+        and custom_params.get(REQUEST_REASONING_IN_GRAMMAR_KEY) is True
+    )
+
+
+def set_request_reasoning_in_grammar(sampling_params: Dict, enabled: bool) -> None:
+    """Mark a request whose grammar also describes the reasoning."""
+    if not enabled:
+        return
+    custom_params = dict(sampling_params.get("custom_params") or {})
+    custom_params[REQUEST_REASONING_IN_GRAMMAR_KEY] = True
+    sampling_params["custom_params"] = custom_params
+
+
 class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     """
     The sampling parameters.
