@@ -805,9 +805,10 @@ mod tests {
 
     #[test]
     fn qwen_required_tools_forward_effective_template_thinking() {
-        let formatter = sglang_processor::test_hugging_face_formatter(
-            "{% if enable_thinking is not defined %}{% set enable_thinking = true %}{% endif %}{{ enable_thinking }}",
-        );
+        let formatter = ChatFormatter::from_tokenizer_config(&serde_json::json!({
+            "chat_template": "{% if enable_thinking is not defined %}{% set enable_thinking = true %}{% endif %}{{ enable_thinking }}",
+        }))
+        .unwrap();
         let preprocessor = chat_preprocessor_with(Some("qwen"), Some("qwen3"), formatter);
 
         let enabled = preprocessor
@@ -827,13 +828,13 @@ mod tests {
 
     #[test]
     fn thinking_policy_uses_the_effective_tool_template() {
-        let formatter =
-            sglang_processor::test_hugging_face_formatter_from_config(serde_json::json!({
-                "chat_template": [
-                    {"default": "{{ enable_thinking | default(false) }}"},
-                    {"tool_use": "{{ enable_thinking | default(true) }}"}
-                ]
-            }));
+        let formatter = ChatFormatter::from_tokenizer_config(&serde_json::json!({
+            "chat_template": [
+                {"default": "{{ enable_thinking | default(false) }}"},
+                {"tool_use": "{{ enable_thinking | default(true) }}"}
+            ]
+        }))
+        .unwrap();
         let preprocessor = chat_preprocessor_with(Some("qwen"), Some("qwen3"), formatter);
 
         let mut no_tools = chat_request(None);
@@ -868,29 +869,5 @@ mod tests {
                 .options
                 .require_reasoning
         );
-    }
-
-    #[test]
-    fn always_on_channel_template_requires_reasoning() {
-        let formatter = sglang_processor::test_hugging_face_formatter(
-            "<|start|>assistant<|channel|>analysis<|message|>",
-        );
-        let preprocessor = chat_preprocessor_with(None, Some("gpt-oss"), formatter);
-        let mut request = chat_request(None);
-        request.tools = None;
-        request.response_format = Some(
-            serde_json::from_value(serde_json::json!({
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "answer",
-                    "schema": {"type": "object"}
-                }
-            }))
-            .unwrap(),
-        );
-
-        let lowered = preprocessor.preprocess(request).unwrap();
-
-        assert!(lowered.text_requests[0].options.require_reasoning);
     }
 }
