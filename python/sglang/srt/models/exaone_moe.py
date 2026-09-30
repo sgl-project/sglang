@@ -786,6 +786,7 @@ class ExaoneMoEForCausalLM(nn.Module):
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
 
+            is_expert_weight = False
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
@@ -807,7 +808,11 @@ class ExaoneMoEForCausalLM(nn.Module):
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
                         continue
+                    is_expert_weight = True
                     name = name.replace(weight_name, param_name)
+                    if name not in params_dict:
+                        # The expert's layer lives on another pipeline rank.
+                        continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(
@@ -819,6 +824,8 @@ class ExaoneMoEForCausalLM(nn.Module):
                     )
                     break
                 else:
+                    if is_expert_weight:
+                        continue
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
