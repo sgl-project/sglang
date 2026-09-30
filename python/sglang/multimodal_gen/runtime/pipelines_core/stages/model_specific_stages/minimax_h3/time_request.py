@@ -33,6 +33,7 @@ def minimax_h3_time_shift_sigmas(
     *,
     num_steps: int = 50,
     shift_scale: float = 6.0,
+    dmd_steps: tuple[int, ...] | None = None,
 ) -> list[float]:
     if shift_scale <= 0:
         raise ValueError("MiniMax H3 shift_scale must be > 0")
@@ -40,6 +41,21 @@ def minimax_h3_time_shift_sigmas(
         raise ValueError("MiniMax H3 num_steps must be > 0")
 
     import torch
+
+    if dmd_steps is not None:
+        # A DMD-distilled release runs its trained rungs: unshifted integer
+        # timesteps over 1000, then the final solver update to sigma 0.
+        if int(num_steps) != len(dmd_steps) + 1:
+            raise ValueError(
+                f"this checkpoint is distilled for {len(dmd_steps)} DiT forwards "
+                f"({len(dmd_steps) + 1} sigma grid points); got "
+                f"num_inference_steps={num_steps}"
+            )
+        base = torch.tensor(
+            [step / 1000.0 for step in dmd_steps] + [0.0], dtype=torch.float32
+        )
+        shifted = float(shift_scale) * base / (1 + (float(shift_scale) - 1) * base)
+        return [float(value) for value in shifted.tolist()]
 
     # The rectified-flow sigma range is fixed at [1.0, 0.0].
     base = torch.linspace(
