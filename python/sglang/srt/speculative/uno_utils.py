@@ -5,7 +5,6 @@ from typing import Any
 
 import torch
 from flashinfer import top_k as _flashinfer_top_k
-
 from sglang.kernels.ops.speculative.reject_sampling import (
     chain_speculative_sampling_triton,
 )
@@ -20,16 +19,23 @@ _SPARSE_TOP_K_LIMIT = 128
 
 def _normalize_sparse_topk_probs(
     topk_logits: torch.Tensor,
+    full_logits: torch.Tensor,
     temperatures: torch.Tensor,
     valid: torch.Tensor,
-    top_ps: torch.Tensor,
+    top_ps: torch.Tensor | None,
 ) -> torch.Tensor:
-    """Normalize a compact top-k support with top-k-first top-p semantics."""
+    """Normalize compact top-k support with full-distribution top-p semantics."""
     scaled = topk_logits.float() / temperatures
     scaled = scaled.masked_fill(~valid, float("-inf"))
     probs = torch.softmax(scaled, dim=-1)
-    cdf = torch.cumsum(probs, dim=-1)
-    probs = probs.masked_fill((cdf - probs) > top_ps, 0.0)
+    if top_ps is not None:
+        topk_mass = torch.exp(
+            torch.logsumexp(scaled, dim=-1, keepdim=True)
+            - torch.logsumexp(full_logits.float() / temperatures, dim=-1, keepdim=True)
+        )
+        adjusted_top_ps = torch.clamp(top_ps / topk_mass, max=1.0)
+        cdf = torch.cumsum(probs, dim=-1)
+        probs = probs.masked_fill((cdf - probs) > adjusted_top_ps, 0.0)
     return probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
 
 
@@ -129,7 +135,7 @@ def _build_sparse_target_support_tensors(
     next_token_logits: torch.Tensor,
     temperatures: torch.Tensor,
     top_ks: torch.Tensor,
-    top_ps: torch.Tensor,
+    top_ps: torch.Tensor | None,
     batch_size: int,
     forward_width: int,
     max_top_k: int,
@@ -153,11 +159,11 @@ def _build_sparse_target_support_tensors(
         forward_width,
         dim=0,
     ).reshape(rows, 1)
-    expanded_top_ps = torch.repeat_interleave(
-        top_ps,
-        forward_width,
-        dim=0,
-    ).reshape(rows, 1)
+    expanded_top_ps = (
+        torch.repeat_interleave(top_ps, forward_width, dim=0).reshape(rows, 1)
+        if top_ps is not None
+        else None
+    )
     ranks = torch.arange(
         max_top_k,
         dtype=expanded_top_ks.dtype,
@@ -165,6 +171,7 @@ def _build_sparse_target_support_tensors(
     )[None, :]
     probs = _normalize_sparse_topk_probs(
         topk_logits,
+        next_token_logits,
         expanded_temperatures,
         ranks < expanded_top_ks,
         expanded_top_ps,
@@ -184,14 +191,11 @@ def _build_sparse_target_support(
     max_top_k: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return compact target token IDs/probabilities without a dense scatter."""
-    if bool(getattr(sampling_info, "need_top_p_sampling", False)):
-        top_ps = sampling_info.top_ps
-    else:
-        top_ps = torch.ones(
-            (batch_size,),
-            dtype=torch.float32,
-            device=next_token_logits.device,
-        )
+    top_ps = (
+        sampling_info.top_ps
+        if bool(getattr(sampling_info, "need_top_p_sampling", False))
+        else None
+    )
 
     return _build_sparse_target_support_tensors(
         next_token_logits,
