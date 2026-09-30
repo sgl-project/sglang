@@ -1034,21 +1034,8 @@ class SchedulerBatchResultProcessor:
                 )
 
             if req.return_sampling_mask:
-                # DFlash-family workers emit one sampling support per accepted
-                # token, so this remains one support mask per token.
-                num_mask_tokens = new_accept_len
-                if req.finished_len is not None:
-                    previous_output_len = len(req.output_ids) - new_accept_len
-                    num_mask_tokens = min(
-                        num_mask_tokens,
-                        max(0, req.finished_len - previous_output_len),
-                    )
                 self.add_sampling_mask_return_values(
-                    i,
-                    req,
-                    logits_output,
-                    num_tokens=num_mask_tokens,
-                    speculative=is_spec,
+                    i, req, logits_output, accept_len=new_accept_len
                 )
 
             if req.return_hidden_states and logits_output.hidden_states is not None:
@@ -1175,17 +1162,22 @@ class SchedulerBatchResultProcessor:
         req: Req,
         output: LogitsProcessorOutput,
         *,
-        num_tokens: int = 1,
-        speculative: bool = False,
+        accept_len: int = 1,
     ) -> None:
         """Attach sparse sampling support metadata to the return values."""
         masks = output.next_token_sampling_mask_idx[i]
         logprobs = output.next_token_sampling_logprobs[i]
-        if speculative:
-            for token in range(num_tokens):
-                req.sampling_mask_rows.append(masks[token], logprobs[token])
-        else:
+        if not isinstance(masks, list):
             req.sampling_mask_rows.append(masks, logprobs)
+            return
+        # Speculative rows carry one support per accepted token; drop the ones
+        # past finished_len, as output_ids is trimmed there.
+        step_start = len(req.output_ids) - accept_len
+        num_visible = max(
+            0, min(accept_len, self._visible_output_len(req) - step_start)
+        )
+        for token in range(num_visible):
+            req.sampling_mask_rows.append(masks[token], logprobs[token])
 
     @staticmethod
     def materialize_sampling_mask_output(
