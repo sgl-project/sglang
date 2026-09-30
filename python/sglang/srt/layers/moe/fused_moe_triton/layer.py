@@ -765,7 +765,7 @@ class FusedMoE(torch.nn.Module):
                 expert_data,
                 loaded_weight,
                 start,
-                shard_size * tp_rank,
+                0 if _is_cpu and self.use_presharded_weights else shard_size * tp_rank,
                 shard_dim,
                 shard_size,
                 not self.use_presharded_weights,
@@ -856,7 +856,7 @@ class FusedMoE(torch.nn.Module):
                 expert_data,
                 loaded_weight,
                 0,  # param_data_start
-                shard_size * tp_rank,
+                0 if _is_cpu and self.use_presharded_weights else shard_size * tp_rank,
                 shard_dim,
                 shard_size,
                 not self.use_presharded_weights,
