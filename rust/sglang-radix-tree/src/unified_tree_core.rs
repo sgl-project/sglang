@@ -144,7 +144,9 @@ pub struct InsertParams<'k, K: ChildKeyType> {
 /// Result of an insert.
 #[derive(Default)]
 pub struct InsertResult {
-    /// Tokens of the insert key that overlapped existing nodes.
+    /// Incoming value rows the caller may release as duplicates. For a
+    /// write-through insert_host, structurally matched nodes that lacked Full
+    /// host state are refilled and therefore excluded from this count.
     pub prefix_len: usize,
     /// The inserted key's full (page-aligned) length.
     pub total_len: usize,
