@@ -9,6 +9,9 @@ from sglang.kernels.ops.attention.linear.kda_nvidia_prefill import (
     chunk_kda_fwd as nvidia_chunk_kda_fwd,
 )
 from sglang.kernels.ops.attention.linear.kda_ptx_prefill import (
+    SM_ARCHS,
+)
+from sglang.kernels.ops.attention.linear.kda_ptx_prefill import (
     chunk_kda_fwd as ptx_chunk_kda_fwd,
 )
 from sglang.srt.layers.attention.linear.kernels.kda_ptx import PtxKDAKernel
@@ -16,8 +19,12 @@ from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKerne
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=180, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=300, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=80, stage="base-c", runner_config="4-gpu-gb300")
+
+
+def _ptx_supported():
+    return torch.cuda.is_available() and torch.cuda.get_device_capability() in SM_ARCHS
 
 
 def _inputs(seed, seq_len=128):
@@ -85,11 +92,8 @@ class TestKdaPrefill(CustomTestCase):
     @torch.inference_mode()
     def test_ptx_padded_raw_beta(self):
         """Raw beta must match Triton, including final state after neutral padding."""
-        if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (
-            10,
-            3,
-        ):
-            self.skipTest("PTX KDA prefill requires GB300")
+        if not _ptx_supported():
+            self.skipTest("PTX KDA prefill requires SM100 or SM103")
         q, k, v, gate, beta, a_log, dt_bias, state = _inputs(2, seq_len=1025)
         state.fill_(0.1)
         actual_state = state.clone()
@@ -159,11 +163,8 @@ class TestKdaPrefill(CustomTestCase):
 
     @torch.inference_mode()
     def test_ptx_prefill(self):
-        if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (
-            10,
-            3,
-        ):
-            self.skipTest("PTX KDA prefill requires GB300")
+        if not _ptx_supported():
+            self.skipTest("PTX KDA prefill requires SM100 or SM103")
         q, k, v, gate, beta_logits, a_log, dt_bias, state = _inputs(1)
         actual, actual_state = ptx_chunk_kda_fwd(
             q=q,
