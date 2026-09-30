@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """MiniMax-H3 released VAE decode contract."""
 
+import os
 import subprocess
 import sys
 import textwrap
@@ -23,6 +24,9 @@ from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import (
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.attention import (
     Attention,
     _apply_qk_norm,
+)
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.vae_vit import (
+    ViT3DDecoder,
 )
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.vit_utils import (
     apply_rotary_pos_emb_qk,
@@ -185,3 +189,72 @@ def test_batched_neox_rope_matches_per_tile_rows():
 
     torch.testing.assert_close(batched_q, torch.cat(rows_q, dim=0))
     torch.testing.assert_close(batched_k, torch.cat(rows_k, dim=0))
+
+
+def _h3_shaped_decoder():
+    decoder = ViT3DDecoder(
+        patch_size=1,
+        patch_size_t=1,
+        in_channels=4,
+        out_channels=3,
+        num_layers=2,
+        heads=4,
+        dim_head=64,
+        norm_type="rms_norm",
+        norm_affine=True,
+        qk_norm_type="rms_norm",
+        qk_norm_affine=False,
+        ffn_activation_fn="silu",
+        ffn_use_gated=True,
+        rope_dim_ratio=0.75,
+        rope_theta=100.0,
+        num_register_tokens=0,
+    ).cuda()
+    decoder.eval()
+    for block in decoder.transformer_blocks:
+        block.scale1.data.normal_(0, 0.1)
+        block.scale2.data.normal_(0, 0.1)
+    decoder.prepare_autocast_linear_weights(torch.float16)
+    return decoder
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fused_decoder_matches_unfused_forward():
+    from sglang.multimodal_gen.runtime.managers.forward_context import (
+        set_forward_context,
+    )
+
+    decoder = _h3_shaped_decoder()
+    latent = torch.randn(2, 4, 1, 2, 2, device="cuda", dtype=torch.float16)
+    previous = os.environ.get("MINIMAX_H3_VAE_DECODER_FUSED_NORM")
+    from sglang.kernels.ops import diffusion as diffusion_ops
+
+    try:
+        with (
+            torch.no_grad(),
+            torch.autocast("cuda", dtype=torch.float16),
+            set_forward_context(current_timestep=0, attn_metadata=None),
+            mock.patch.object(
+                diffusion_ops,
+                "h3_vae_scale_add_rmsnorm",
+                wraps=diffusion_ops.h3_vae_scale_add_rmsnorm,
+            ) as scale_add,
+            mock.patch.object(
+                diffusion_ops,
+                "h3_vae_qk_rmsnorm_rope",
+                wraps=diffusion_ops.h3_vae_qk_rmsnorm_rope,
+            ) as qk_rope,
+        ):
+            os.environ["MINIMAX_H3_VAE_DECODER_FUSED_NORM"] = "0"
+            eager = decoder(latent)
+            os.environ["MINIMAX_H3_VAE_DECODER_FUSED_NORM"] = "1"
+            fused = decoder(latent)
+            assert scale_add.call_count == 3
+            assert qk_rope.call_count == 2
+    finally:
+        if previous is None:
+            os.environ.pop("MINIMAX_H3_VAE_DECODER_FUSED_NORM", None)
+        else:
+            os.environ["MINIMAX_H3_VAE_DECODER_FUSED_NORM"] = previous
+
+    torch.testing.assert_close(fused, eager, rtol=1e-3, atol=1e-3)
