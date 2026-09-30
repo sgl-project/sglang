@@ -1362,8 +1362,6 @@ class ModelRunner:
             dtype=self.dtype,
             server_args=self.server_args,
             lora_backend=get_lora().lora_backend,
-            tp_size=get_parallel().tp_size,
-            tp_rank=get_parallel().tp_rank,
             max_lora_rank=get_lora().max_lora_rank,
             target_modules=get_lora().lora_target_modules,
             lora_paths=get_lora().lora_paths,
