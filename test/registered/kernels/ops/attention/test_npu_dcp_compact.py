@@ -1,0 +1,474 @@
+"""Ascend coverage for the shared compact DCP Triton kernels."""
+
+import unittest
+from types import SimpleNamespace
+
+import torch
+
+from sglang.test.ci.ci_register import register_npu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_npu_ci(est_time=1, suite="base-a-test-npu")
+
+try:
+    import torch_npu  # noqa: F401
+except ImportError:
+    torch_npu = None
+
+
+def _npu_is_available() -> bool:
+    return torch_npu is not None and hasattr(torch, "npu") and torch.npu.is_available()
+
+
+class TestDcpPageTableCapacityContract(unittest.TestCase):
+    def test_valid_decode_and_verify_lengths_fit_graph_and_request_tables(self):
+        # Mirror the allocation contract: graph rows cover context + verify;
+        # req_to_token has at least four additional token slots. CPU lengths
+        # can lead device lengths during overlap, but must not understate them.
+        for context in (1, 9, 127, 128, 129, 128000):
+            for window in (0, 1, 7):
+                graph_len = context + window
+                req_capacity = graph_len + 4
+                for size in (1, 2, 4, 8):
+                    for rank in range(size):
+                        for page_size in (4, 128):
+                            graph_local = graph_len // size + (rank < graph_len % size)
+                            graph_pages = max(
+                                1, (graph_local + page_size - 1) // page_size
+                            )
+                            for prefix in {0, 1, context // 2, context - 1, context}:
+                                length = prefix + window
+                                local_len = length // size + (rank < length % size)
+                                local_pages = (local_len + page_size - 1) // page_size
+                                for cpu_lead in (0, 1, window):
+                                    upper = length + cpu_lead
+                                    upper_local = upper // size + (rank < upper % size)
+                                    active_pages = min(
+                                        graph_pages,
+                                        max(
+                                            1,
+                                            (upper_local + page_size - 1) // page_size,
+                                        ),
+                                    )
+                                    self.assertLessEqual(local_pages, active_pages)
+                                if local_pages:
+                                    last_pos = (
+                                        rank + (local_pages - 1) * page_size * size
+                                    )
+                                    self.assertLess(last_pos, length)
+                                    self.assertLess(last_pos, req_capacity)
+
+
+@unittest.skipUnless(_npu_is_available(), "Ascend NPU is required")
+class TestNpuDcpCompactKernels(CustomTestCase):
+    device = "npu"
+
+    def test_pool_shared_dcp_writer_eager_and_graph(self):
+        from sglang.srt import runtime_context as rc
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
+
+        for dtype in (torch.bfloat16, torch.float16):
+            for index_dtype in (torch.int32, torch.int64):
+                # Split input views retain a wider token stride; both source
+                # data and loc exercise non-contiguous-input normalization.
+                source = torch.randn(7, 1, 1152, device=self.device, dtype=dtype)[
+                    ..., ::2
+                ]
+                latent, rope = source.split((512, 64), dim=-1)
+                loc_storage = torch.zeros(14, device=self.device, dtype=index_dtype)
+                loc = loc_storage[::2]
+                pool = SimpleNamespace(
+                    dtype=dtype,
+                    store_dtype=dtype,
+                    start_layer=0,
+                    kv_lora_rank=512,
+                    qk_rope_head_dim=64,
+                    dsa_kv_cache_store_fp8=False,
+                    use_fia_nz=False,
+                    k_buffer=[
+                        torch.full((512, 1, 512), -3, device=self.device, dtype=dtype)
+                    ],
+                    v_buffer=[
+                        torch.full((512, 1, 64), -3, device=self.device, dtype=dtype)
+                    ],
+                    _raise_if_native_kv_cache_disabled=lambda: None,
+                )
+                for size in (2, 4):
+                    for rank in range(size):
+                        with rc.get_parallel().override(
+                            dcp_enabled=True, dcp_size=size, dcp_rank=rank
+                        ):
+                            positions = torch.tensor(
+                                [0, 0, 512, 513, 514, 515, 519], dtype=index_dtype
+                            )
+                            loc.copy_(positions)
+
+                            def write():
+                                NPUMLATokenToKVPool.set_kv_buffer(
+                                    pool, SimpleNamespace(layer_id=0), loc, latent, rope
+                                )
+
+                            for _ in range(3):
+                                write()
+                            torch.npu.synchronize()
+                            graph = torch.npu.NPUGraph()
+                            with torch.npu.graph(graph):
+                                write()
+                            pointers = (
+                                loc.data_ptr(),
+                                *(
+                                    buf.data_ptr()
+                                    for buf in pool.k_buffer + pool.v_buffer
+                                ),
+                            )
+                            for shift in (0, 1, 2):
+                                current = torch.where(
+                                    positions == 0, positions, positions + shift
+                                )
+                                loc.copy_(current)
+                                source.add_(1)
+                                for replay in (False, True):
+                                    for buf in pool.k_buffer + pool.v_buffer:
+                                        buf.fill_(-3)
+                                    graph.replay() if replay else write()
+                                    torch.npu.synchronize()
+                                    owned = (current != 0) & (current % size == rank)
+                                    for buf, values in zip(
+                                        pool.k_buffer + pool.v_buffer, (latent, rope)
+                                    ):
+                                        expected = torch.full_like(
+                                            buf, -3, device="cpu"
+                                        )
+                                        expected[current[owned].long() // size] = (
+                                            values.cpu()[owned]
+                                        )
+                                        torch.testing.assert_close(
+                                            buf.cpu(), expected, atol=0, rtol=0
+                                        )
+                                    self.assertEqual(
+                                        pointers,
+                                        (
+                                            loc.data_ptr(),
+                                            *(
+                                                buf.data_ptr()
+                                                for buf in pool.k_buffer + pool.v_buffer
+                                            ),
+                                        ),
+                                    )
+
+    def test_pool_shared_dcp_writer_empty_and_cast_inputs(self):
+        from sglang.srt import runtime_context as rc
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
+
+        pool = SimpleNamespace(
+            dtype=torch.bfloat16,
+            store_dtype=torch.bfloat16,
+            start_layer=0,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            dsa_kv_cache_store_fp8=False,
+            use_fia_nz=False,
+            k_buffer=[
+                torch.full((256, 1, 512), -3, device=self.device, dtype=torch.bfloat16)
+            ],
+            v_buffer=[
+                torch.full((256, 1, 64), -3, device=self.device, dtype=torch.bfloat16)
+            ],
+            _raise_if_native_kv_cache_disabled=lambda: None,
+        )
+        with rc.get_parallel().override(dcp_enabled=True, dcp_size=2, dcp_rank=0):
+            for count in (0, 1, 7, 128):
+                loc = torch.arange(count, device=self.device, dtype=torch.int32) + 256
+                for combined in (False, True):
+                    values = torch.randn(
+                        count,
+                        1,
+                        576,
+                        device=self.device,
+                        dtype=torch.bfloat16 if combined else torch.float32,
+                    )
+                    k, v = (values, None) if combined else values.split((512, 64), -1)
+                    for buf in pool.k_buffer + pool.v_buffer:
+                        buf.fill_(-3)
+                    NPUMLATokenToKVPool.set_kv_buffer(
+                        pool, SimpleNamespace(layer_id=0), loc, k, v
+                    )
+                    torch.npu.synchronize()
+                    owned = loc.cpu() % 2 == 0
+                    for buf, source in zip(
+                        pool.k_buffer + pool.v_buffer, values.cpu().split((512, 64), -1)
+                    ):
+                        expected = torch.full_like(buf, -3, device="cpu")
+                        expected[loc.cpu()[owned].long() // 2] = source[
+                            owned
+                        ].bfloat16()
+                        torch.testing.assert_close(buf.cpu(), expected, atol=0, rtol=0)
+
+    def test_shared_dcp_prefix_index_kernel(self):
+        from sglang.kernels.ops.kvcache.kv_indices import (
+            create_chunked_prefix_cache_kv_indices,
+        )
+
+        req_to_token = torch.tensor(
+            [[10, 11, 12, 13], [20, 21, 22, 23]],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        prefix_lens = torch.tensor([3, 2], dtype=torch.int32, device=self.device)
+        cu_lens = torch.tensor([0, 3], dtype=torch.int32, device=self.device)
+        indices = torch.empty(5, dtype=torch.int32, device=self.device)
+        create_chunked_prefix_cache_kv_indices[(2,)](
+            req_to_token,
+            torch.tensor([0, 1], dtype=torch.int64, device=self.device),
+            torch.zeros(2, dtype=torch.int32, device=self.device),
+            prefix_lens,
+            cu_lens,
+            indices,
+            req_to_token.shape[1],
+        )
+
+        self.assertEqual(cu_lens.cpu().tolist(), [0, 3])
+        self.assertEqual(indices.cpu().tolist(), [10, 11, 12, 20, 21])
+
+    def test_shared_mla_dcp_page_table_kernel(self):
+        from sglang.srt.hardware_backend.npu.attention.dcp_metadata import (
+            build_mla_dcp_local_block_tables,
+        )
+
+        req_to_token = (
+            torch.arange(16, dtype=torch.int64, device=self.device).view(1, 16) + 56
+        )
+        block_tables, local_lens = build_mla_dcp_local_block_tables(
+            req_to_token,
+            torch.tensor([0], dtype=torch.int64, device=self.device),
+            torch.tensor([10], dtype=torch.int32, device=self.device),
+            physical_page_size=4,
+            dcp_size=2,
+            dcp_rank=1,
+        )
+
+        self.assertEqual(local_lens.cpu().tolist(), [5])
+        self.assertEqual(block_tables.cpu().tolist(), [[7, 8]])
+
+    def test_shared_page_tables_match_cyclic_reference(self):
+        from sglang.srt.hardware_backend.npu.attention.dcp_metadata import (
+            build_mla_dcp_local_block_tables,
+        )
+
+        # Non-monotonic page IDs, reordered requests, page boundaries, and an
+        # empty row. A fixed-width graph table also has unused trailing pages.
+        for dcp_size in (1, 2, 4):
+            page_size = 4
+            logical_page = page_size * dcp_size
+            req_to_token = (
+                torch.tensor([[7, 3, 11], [2, 9, 5], [4, 8, 6]])[:, :, None]
+                * logical_page
+                + torch.arange(logical_page)[None, None, :]
+            ).reshape(3, -1)
+            reqs = torch.tensor([2, 0, 1])
+            seq_lens = torch.tensor([2 * logical_page + 1, logical_page - 1, 0])
+            for rank in range(dcp_size):
+                for width in (None, 3, 5, 129):
+                    with self.subTest(dcp_size=dcp_size, rank=rank, width=width):
+                        table, local_lens = build_mla_dcp_local_block_tables(
+                            req_to_token.to(self.device),
+                            reqs.to(self.device),
+                            seq_lens.to(self.device),
+                            page_size,
+                            dcp_size,
+                            rank,
+                            num_pages=width,
+                        )
+                        expected = torch.zeros_like(table, device="cpu")
+                        expected_lens = torch.tensor(
+                            [len(range(rank, int(n), dcp_size)) for n in seq_lens],
+                            dtype=torch.int32,
+                        )
+                        for row, req in enumerate(reqs):
+                            for col in range(expected.shape[1]):
+                                pos = rank + col * logical_page
+                                if col * page_size < expected_lens[row]:
+                                    expected[row, col] = (
+                                        req_to_token[req, pos] // logical_page
+                                    )
+                        torch.testing.assert_close(table.cpu(), expected)
+                        torch.testing.assert_close(local_lens.cpu(), expected_lens)
+
+    def test_page_table_at_request_capacity_with_verify_headroom(self):
+        from sglang.srt.hardware_backend.npu.attention.dcp_metadata import (
+            build_mla_dcp_local_block_tables,
+        )
+
+        # context=9, verify window=7: the request pool reserves at least
+        # context + window + 4 columns and the graph covers context + window.
+        table, _ = build_mla_dcp_local_block_tables(
+            torch.arange(56, 76, device=self.device).view(1, 20),
+            torch.tensor([0], device=self.device),
+            torch.tensor([16], device=self.device),
+            4,
+            2,
+            1,
+            num_pages=3,
+        )
+        self.assertEqual(table.cpu().tolist(), [[7, 8, 0]])
+
+    def test_empty_page_table_does_not_launch_zero_grid(self):
+        from sglang.srt.hardware_backend.npu.attention.dcp_metadata import (
+            build_mla_dcp_local_block_tables,
+        )
+
+        table, lens = build_mla_dcp_local_block_tables(
+            torch.empty((1, 16), dtype=torch.int64, device=self.device),
+            torch.empty(0, dtype=torch.int64, device=self.device),
+            torch.empty(0, dtype=torch.int32, device=self.device),
+            4,
+            2,
+            0,
+        )
+        torch.npu.synchronize()
+        self.assertEqual(table.shape, (0, 1))
+        self.assertEqual(lens.shape, (0,))
+
+    def test_shared_planner_uses_triton_prefix_on_npu(self):
+        from unittest.mock import patch
+
+        from sglang.kernels.ops.kvcache.kv_indices import (
+            create_chunked_prefix_cache_kv_indices,
+        )
+        from sglang.srt import runtime_context as rc
+        from sglang.srt.layers.dcp.planner import (
+            prepare_decode_context_parallel_metadata,
+        )
+        from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+
+        translator = KVIndexTranslator.__new__(KVIndexTranslator)
+        translator.is_translating = False
+        backend = SimpleNamespace(
+            dcp_use_packed_kv=False, kv_index_translator=translator
+        )
+        table = torch.arange(40, 64, dtype=torch.int32, device=self.device).view(3, 8)
+        for prefixes in ([4, 8], [0, 4], [0, 0]):
+            prefix_lens = torch.tensor(prefixes, dtype=torch.int32, device=self.device)
+            extend_lens = torch.tensor([2, 3], dtype=torch.int32, device=self.device)
+            for rank in range(4):
+                with (
+                    self.subTest(prefixes=prefixes, rank=rank),
+                    rc.get_parallel().override(
+                        dcp_enabled=True, dcp_size=4, dcp_rank=rank, attn_dcp_size=4
+                    ),
+                    patch(
+                        "sglang.srt.layers.dcp.planner.get_attn_backend",
+                        return_value=backend,
+                    ),
+                    patch(
+                        "sglang.srt.layers.dcp.planner.get_device",
+                        return_value=SimpleNamespace(device=self.device),
+                    ),
+                ):
+                    metadata = prepare_decode_context_parallel_metadata(
+                        seq_lens=prefix_lens + extend_lens,
+                        extend_prefix_lens=prefix_lens,
+                        extend_prefix_lens_cpu=prefixes,
+                        extend_seq_lens=extend_lens,
+                        req_pool_indices=torch.tensor([2, 0], device=self.device),
+                        req_to_token=table,
+                        seq_lens_sum=sum(prefixes) + 5,
+                        kv_buffer_shape=torch.Size([32, 1]),
+                        kv_cache_dtype=torch.bfloat16,
+                        kv_cache_device=self.device,
+                        create_chunked_prefix_cache_kv_indices_fn=create_chunked_prefix_cache_kv_indices,
+                    )
+                    expected = torch.cat(
+                        [table[2, : prefixes[0]], table[0, : prefixes[1]]]
+                    )
+                    torch.testing.assert_close(
+                        metadata.dcp_local_prefix_kv_indices, expected[rank::4] // 4
+                    )
+                    self.assertIsNone(metadata.dcp_kv_buffer)
+                    self.assertIsNone(metadata.dcp_kv_indptr)
+                    self.assertIsNone(metadata.dcp_kv_indices)
+
+    def test_compact_internal_allocation_survives_graph_replay(self):
+        """Real NPU graph kernels; local copy substitutes for HCCL transport."""
+        from sglang.srt.layers.dcp.comm import dcp_a2a_lse_reduce
+
+        output = torch.randn(2, 12, 16, dtype=torch.bfloat16, device=self.device)
+        lse = torch.randn(2, 12, dtype=torch.float32, device=self.device)
+        group = SimpleNamespace(
+            world_size=2, all_to_all_single=lambda dst, src: dst.copy_(src)
+        )
+        for _ in range(3):
+            dcp_a2a_lse_reduce(output, lse, group)
+        torch.npu.synchronize()
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            merged = dcp_a2a_lse_reduce(output, lse, group)
+        for empty_shard in (False, True, False):
+            output.copy_(torch.randn_like(output))
+            lse.copy_(torch.randn_like(lse))
+            if empty_shard:
+                lse[0] = float("-inf")
+            graph.replay()
+            eager = dcp_a2a_lse_reduce(output, lse, group)
+            torch.testing.assert_close(merged, eager, atol=0, rtol=0)
+
+    def test_pack_preserves_bf16_output_and_fp32_lse_bits(self):
+        from sglang.kernels.ops.attention.dcp_kernels import dcp_pack_a2a_send
+
+        num_shards, batch_size, local_heads, head_dim = 2, 2, 6, 512
+        total_heads = num_shards * local_heads
+        output = torch.randn(
+            batch_size,
+            total_heads,
+            head_dim,
+            device=self.device,
+            dtype=torch.bfloat16,
+        )
+        lse = torch.randn(
+            batch_size, total_heads, device=self.device, dtype=torch.float32
+        )
+        packed = torch.empty(
+            num_shards,
+            batch_size,
+            local_heads,
+            head_dim + 2,
+            device=self.device,
+            dtype=torch.bfloat16,
+        )
+
+        dcp_pack_a2a_send(
+            output,
+            lse,
+            packed[..., :head_dim],
+            packed.view(torch.float32)[..., head_dim // 2],
+        )
+
+        expected_output = output.view(
+            batch_size, num_shards, local_heads, head_dim
+        ).permute(1, 0, 2, 3)
+        expected_lse = lse.view(batch_size, num_shards, local_heads).permute(1, 0, 2)
+        self.assertTrue(torch.equal(packed[..., :head_dim], expected_output))
+        self.assertTrue(
+            torch.equal(packed.view(torch.float32)[..., head_dim // 2], expected_lse)
+        )
+
+    def test_fused_unpack_merge_handles_empty_graph_row(self):
+        from sglang.kernels.ops.attention.dcp_kernels import dcp_lse_combine_triton
+
+        output = torch.randn(2, 2, 6, 512, device=self.device, dtype=torch.bfloat16)
+        lse = torch.randn(2, 2, 6, device=self.device, dtype=torch.float32)
+        lse[:, 0, 0] = float("-inf")
+
+        merged, _ = dcp_lse_combine_triton(output, lse, is_lse_base_on_e=True)
+
+        reference_weights = torch.softmax(lse.cpu(), dim=0)
+        reference = (output.cpu().float() * reference_weights.unsqueeze(-1)).sum(dim=0)
+        reference[0, 0] = 0
+        torch.testing.assert_close(
+            merged.cpu().float(), reference, atol=1e-2, rtol=1e-2
+        )
+        self.assertTrue(torch.equal(merged[0, 0], torch.zeros_like(merged[0, 0])))
+
+
+if __name__ == "__main__":
+    unittest.main()

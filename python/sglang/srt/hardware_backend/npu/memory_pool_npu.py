@@ -1,7 +1,9 @@
 from typing import TYPE_CHECKING, Optional, Sequence
 
 import torch
+import triton
 
+from sglang.kernels.ops.kvcache.mla_buffer import set_mla_kv_buffer_kernel
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.memory_pool import (
@@ -12,6 +14,7 @@ from sglang.srt.mem_cache.memory_pool import (
     get_tensor_size_bytes,
     unwrap_write_loc,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.common import is_npu
 
@@ -869,6 +872,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         loc, _, _ = unwrap_write_loc(loc_info)
         self._raise_if_native_kv_cache_disabled()
         layer_id = layer.layer_id
+        if loc.numel() == 0:
+            return
+
         if self.dsa_kv_cache_store_fp8:
             if cache_v is None:
                 cache_k, cache_v = cache_k.split(
@@ -901,6 +907,37 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self._set_fia_nz_kv_buffer(layer_id, loc, cache_k, cache_v)
             return
 
+        parallel = get_parallel()
+        if parallel.dcp_enabled:
+            # Separate NPU latent/RoPE buffers share the DCP-aware Triton body,
+            # not the CUDA host wrapper or its non-DCP no-RoPE specialization.
+            loc = loc.contiguous()
+            for dst, src in (
+                (self.k_buffer[layer_id - self.start_layer], cache_k),
+                (self.v_buffer[layer_id - self.start_layer], cache_v),
+            ):
+                src = src.reshape(-1, src.shape[-1])
+                if src.stride(-1) != 1:
+                    src = src.contiguous()
+                dst = dst.view(-1, src.shape[-1])
+                set_mla_kv_buffer_kernel[(loc.numel(), 1)](
+                    dst,
+                    src,
+                    src,
+                    loc,
+                    0,
+                    buffer_stride=dst.stride(0),
+                    nope_stride=src.stride(0),
+                    rope_stride=src.stride(0),
+                    nope_dim=src.shape[-1],
+                    rope_dim=0,
+                    BLOCK=triton.next_power_of_2(src.shape[-1]),
+                    DCP_RANK=parallel.dcp_rank,
+                    DCP_WORLD_SIZE=parallel.dcp_size,
+                    USE_GDC=False,
+                )
+            return
+
         torch_npu.npu_scatter_nd_update_(
             self.k_buffer[layer_id - self.start_layer].view(-1, 1, self.kv_lora_rank),
             loc.view(-1, 1),
@@ -913,6 +950,22 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             loc.view(-1, 1),
             cache_v.view(-1, 1, self.qk_rope_head_dim),
         )
+
+    def get_mla_kv_buffer(
+        self,
+        layer: "RadixAttention",
+        loc: torch.Tensor,
+        dst_dtype: Optional[torch.dtype] = None,
+    ):
+        """Read token-level MLA KV rows in the pool's dtype."""
+        if dst_dtype is not None and dst_dtype != self.dtype:
+            raise ValueError("NPU MLA KV reads do not support dtype conversion.")
+        layer_id = layer.layer_id
+        cache_k = self.get_key_buffer(layer_id).view(-1, 1, self.kv_lora_rank)
+        cache_v = self.get_value_buffer(layer_id).view(-1, 1, self.qk_rope_head_dim)
+        cache_k = torch.index_select(cache_k, 0, loc)
+        cache_v = torch.index_select(cache_v, 0, loc)
+        return cache_k, cache_v
 
     def _set_fia_nz_kv_buffer(
         self,

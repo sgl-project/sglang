@@ -44,10 +44,12 @@ from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     build_replay_fb_view,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     empty_context,
     get_bool_env_var,
@@ -131,9 +133,16 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM", "Step3p5ForCausalLM")
             for arch in (model_runner.model_config.hf_config.architectures or [])
         )
+        parallel = get_parallel()
+        self.mla_dcp_graph = (
+            model_runner.model_config.attention_arch == AttentionArch.MLA
+            and parallel.dcp_enabled
+            and not model_runner.is_draft_worker
+        )
         self.use_fias_v2_bsnd = (
             envs.SGLANG_NPU_USE_FIAS_V2_BSND.get()
             and model_runner.spec_algorithm.is_dspark()
+            and not self.mla_dcp_graph
         )
 
     def _init_arch_map(self):
@@ -373,7 +382,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             is_deepseek_dsa(self.model_runner.model_config.hf_config)
             or is_deepseek_v4(self.model_runner.model_config.hf_config)
         ):
-            if forward_batch.forward_mode.is_target_verify():
+            if forward_batch.forward_mode.is_target_verify() and not self.mla_dcp_graph:
                 # Only DFlash refreshes forward_metadata.seq_lens_cpu_list at
                 # replay; other algorithms keep the capture-time list, so
                 # recompute from the live batch as before — reading the
@@ -399,9 +408,15 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                     )
                     seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
             else:
-                seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
-                    self.bs - self.raw_bs
-                )
+                seq_lens_cpu = forward_batch.seq_lens.cpu()
+                if forward_batch.forward_mode.is_target_verify():
+                    seq_lens_cpu = seq_lens_cpu + self.captured_req_width
+                if self.mla_dcp_graph:
+                    parallel = get_parallel()
+                    seq_lens_cpu = get_dcp_lens(
+                        seq_lens_cpu, parallel.dcp_size, parallel.dcp_rank
+                    )
+                seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
             output = self.backend.replay_with_input_update(
                 graph_key,
                 seq_lens=seq_lens,

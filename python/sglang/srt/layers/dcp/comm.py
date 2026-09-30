@@ -225,7 +225,9 @@ def all_gather_q_for_mla_decode(
     q_pe: torch.Tensor,
 ):
     group = get_parallel().dcp_group
-    with use_symmetric_memory(group):
+    # HCCL must not use the NCCL symmetric allocator. Leave other backends'
+    # existing symmetric-memory selection unchanged.
+    with use_symmetric_memory(group, disabled=q_pe.device.type == "npu"):
         # transpose q_pe and q_nope_out from [B, H, L] to [H, B, L]
         combined = torch.cat([q_pe.transpose(0, 1), q_nope_out.transpose(0, 1)], dim=-1)
     gathered = group.all_gather(combined, dim=0)

@@ -22,13 +22,16 @@ import torch
 from sglang.srt import runtime_context as rc
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+from sglang.srt.layers.dcp.comm import all_gather_q_for_mla_decode
 from sglang.srt.layers.dcp.layout import (
     filter_dcp_local_chunk_kv_indices,
     get_dcp_lens,
 )
+from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.linear import QKVParallelLinear
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -146,6 +149,41 @@ class TestFilterDcpLocalChunkKvIndices(CustomTestCase):
 
 
 class TestGetDcpLens(CustomTestCase):
+    def test_shared_mla_query_gather_preserves_head_order(self):
+        q_nope = torch.arange(24, dtype=torch.bfloat16).view(2, 3, 4)
+        q_rope = torch.arange(12, dtype=torch.bfloat16).view(2, 3, 2)
+        group = MagicMock()
+        group.all_gather.side_effect = lambda tensor, dim: torch.cat(
+            [tensor, tensor + 100], dim=dim
+        )
+        with (
+            rc.get_parallel().override(dcp_group=group),
+            patch("sglang.srt.layers.dcp.comm.use_symmetric_memory") as symmetric,
+        ):
+            nope, rope = all_gather_q_for_mla_decode(q_nope, q_rope)
+        symmetric.assert_called_once_with(group, disabled=False)
+        torch.testing.assert_close(nope, torch.cat([q_nope, q_nope + 100], dim=1))
+        torch.testing.assert_close(rope, torch.cat([q_rope, q_rope + 100], dim=1))
+
+    def test_shared_mla_query_gather_disables_symmetric_memory_only_on_npu(self):
+        q = torch.zeros(2, 3, 4)
+        group = MagicMock()
+        group.all_gather.side_effect = lambda tensor, dim: tensor
+        for device_type in ("npu", "cuda", "cpu", "xpu", "hpu"):
+            # CPU-backed operations exercise dispatch without accelerator hardware.
+            query = SimpleNamespace(
+                device=SimpleNamespace(type=device_type),
+                transpose=q.transpose,
+                size=q.size,
+            )
+            with (
+                self.subTest(device_type=device_type),
+                rc.get_parallel().override(dcp_group=group),
+                patch("sglang.srt.layers.dcp.comm.use_symmetric_memory") as symmetric,
+            ):
+                all_gather_q_for_mla_decode(q, query)
+                symmetric.assert_called_once_with(group, disabled=device_type == "npu")
+
     def test_start_none_matches_owner_count(self):
         for n in DCP_SIZES:
             for rank in range(n):
@@ -194,6 +232,125 @@ class TestGetDcpLens(CustomTestCase):
     def test_dcp_size_one_is_identity(self):
         lens = torch.tensor(LENS, dtype=torch.int32)
         self.assertTrue(torch.equal(get_dcp_lens(lens, 1, 0), lens))
+
+    def test_metadata_planner_uses_prefix_kernel_without_packed_kv(self):
+        translator = KVIndexTranslator.__new__(KVIndexTranslator)
+        translator.is_translating = False
+        backend = SimpleNamespace(
+            dcp_use_packed_kv=False, kv_index_translator=translator
+        )
+        req_to_token = torch.arange(40, 64, dtype=torch.int32).view(3, 8)
+        req_indices = torch.tensor([2, 0])
+        extend_lens = torch.tensor([2, 3], dtype=torch.int32)
+
+        def cpu_prefix_kernel(table, reqs, starts, lens, cu_lens, out, stride):
+            for i in range(reqs.numel()):
+                out[cu_lens[i] : cu_lens[i] + lens[i]] = table[
+                    reqs[i], starts[i] : starts[i] + lens[i]
+                ]
+
+        kernel = MagicMock()
+        kernel.__getitem__.return_value.side_effect = cpu_prefix_kernel
+        for prefix_lengths in ([4, 8], [0, 4], [0, 0]):
+            prefix_lens = torch.tensor(prefix_lengths, dtype=torch.int32)
+            seq_lens = prefix_lens + extend_lens
+            all_prefix = torch.cat(
+                [req_to_token[r, :n] for r, n in zip(req_indices, prefix_lengths)]
+            )
+            for rank in range(4):
+                kernel.reset_mock()
+                with (
+                    self.subTest(prefix_lengths=prefix_lengths, rank=rank),
+                    rc.get_parallel().override(
+                        dcp_enabled=True, dcp_size=4, dcp_rank=rank, attn_dcp_size=4
+                    ),
+                    patch(
+                        "sglang.srt.layers.dcp.planner.get_attn_backend",
+                        return_value=backend,
+                    ),
+                    patch(
+                        "sglang.srt.layers.dcp.planner.get_device",
+                        return_value=SimpleNamespace(device="cpu"),
+                    ),
+                    patch(
+                        "sglang.srt.layers.dcp.planner.create_dcp_kv_indices"
+                    ) as packed,
+                ):
+                    result = prepare_decode_context_parallel_metadata(
+                        seq_lens=seq_lens,
+                        extend_prefix_lens=prefix_lens,
+                        extend_prefix_lens_cpu=prefix_lens,
+                        extend_seq_lens=extend_lens,
+                        req_pool_indices=req_indices,
+                        req_to_token=req_to_token,
+                        seq_lens_sum=int(seq_lens.sum()),
+                        kv_buffer_shape=torch.Size([32, 1]),
+                        kv_cache_dtype=torch.bfloat16,
+                        kv_cache_device="cpu",
+                        create_chunked_prefix_cache_kv_indices_fn=kernel,
+                    )
+                    torch.testing.assert_close(
+                        result.dcp_local_prefix_kv_indices, all_prefix[rank::4] // 4
+                    )
+                    kernel.__getitem__.assert_called_once_with((2,))
+                    kernel.__getitem__.return_value.assert_called_once()
+                    packed.__getitem__.assert_not_called()
+                    self.assertIsNone(result.dcp_kv_indptr)
+                    self.assertIsNone(result.dcp_kv_indices)
+                    self.assertIsNone(result.dcp_kv_buffer)
+                    self.assertIsNone(result.dcp_extend_prefix_lens_sum)
+
+    def test_metadata_planner_keeps_prefix_kernel_for_packed_kv(self):
+        translator = KVIndexTranslator.__new__(KVIndexTranslator)
+        translator.is_translating = False
+        backend = SimpleNamespace(
+            dcp_use_packed_kv=True, kv_index_translator=translator
+        )
+        table = torch.arange(40, 64, dtype=torch.int32).view(3, 8)
+        prefixes = torch.tensor([4, 8], dtype=torch.int32)
+        extend = torch.tensor([2, 3], dtype=torch.int32)
+
+        def cpu_prefix_kernel(table, reqs, starts, lens, cu_lens, out, stride):
+            for i in range(reqs.numel()):
+                out[cu_lens[i] : cu_lens[i] + lens[i]] = table[
+                    reqs[i], starts[i] : starts[i] + lens[i]
+                ]
+
+        kernel = MagicMock()
+        kernel.__getitem__.return_value.side_effect = cpu_prefix_kernel
+        with (
+            rc.get_parallel().override(
+                dcp_enabled=True, dcp_size=4, dcp_rank=1, attn_dcp_size=4
+            ),
+            patch(
+                "sglang.srt.layers.dcp.planner.get_attn_backend", return_value=backend
+            ),
+            patch(
+                "sglang.srt.layers.dcp.planner.get_device",
+                return_value=SimpleNamespace(device="cpu"),
+            ),
+            patch("sglang.srt.layers.dcp.planner.create_dcp_kv_indices") as packed,
+        ):
+            result = prepare_decode_context_parallel_metadata(
+                seq_lens=prefixes + extend,
+                extend_prefix_lens=prefixes,
+                extend_prefix_lens_cpu=[4, 8],
+                extend_seq_lens=extend,
+                req_pool_indices=torch.tensor([2, 0]),
+                req_to_token=table,
+                seq_lens_sum=17,
+                kv_buffer_shape=torch.Size([32, 1]),
+                kv_cache_dtype=torch.bfloat16,
+                kv_cache_device="cpu",
+                create_chunked_prefix_cache_kv_indices_fn=kernel,
+            )
+        kernel.__getitem__.assert_called_once_with((2,))
+        kernel.__getitem__.return_value.assert_called_once()
+        packed.__getitem__.return_value.assert_called_once()
+        expected = torch.cat([table[2, :4], table[0, :8]])[1::4] // 4
+        torch.testing.assert_close(result.dcp_local_prefix_kv_indices, expected)
+        self.assertEqual(result.dcp_kv_buffer.shape, (17, 1))
+        self.assertEqual(result.dcp_extend_prefix_lens_sum, 12)
 
     def test_gqa_current_chunk_selects_kv_for_the_global_dcp_head_layout(self):
         """A local Q shard must not restart GQA mapping at KV head zero."""
@@ -346,6 +503,22 @@ class TestGetDcpLens(CustomTestCase):
 
         self.assertEqual(model_config.get_num_kv_heads(16, dcp_size=4), 1)
         self.assertEqual(model_config.get_num_kv_heads(16), 1)
+
+    def test_draft_pool_capacity_still_covers_dcp_virtual_addresses(self):
+        configurator = KVCacheConfigurator.__new__(KVCacheConfigurator)
+        override = rc.get_context().override_server_args(page_size=128)
+        override.install()
+        self.addCleanup(override.restore)
+        for dcp_size in (1, 2, 4):
+            for is_draft in (False, True):
+                configurator.is_draft_worker = is_draft
+                with (
+                    self.subTest(dcp_size=dcp_size, is_draft=is_draft),
+                    rc.get_parallel().override(attn_dcp_size=dcp_size),
+                ):
+                    expected_scale = dcp_size if is_draft else 1
+                    self.assertEqual(configurator.loc_space_scale, expected_scale)
+                    self.assertEqual(configurator.pool_page_size, 128 * expected_scale)
 
     def test_gqa_qkv_loader_replicates_kv_within_dcp_group(self):
         hidden_size = 4

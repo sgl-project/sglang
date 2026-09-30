@@ -238,6 +238,27 @@ class TestLSECombineEdgeCases(CustomTestCase):
             triton_result.float().cpu(), expected.cpu(), atol=1e-2, rtol=1e-2
         )
 
+    def test_all_shards_empty_returns_softmax_identity(self):
+        """Graph-padding rows use O=0/LSE=-inf on every shard."""
+        from sglang.kernels.ops.attention.dcp_kernels import dcp_lse_combine_triton
+
+        partial_outputs = torch.randn(
+            2, 1, 1, 64, device=self.device, dtype=torch.bfloat16
+        )
+        partial_lses = torch.full(
+            (2, 1, 1), float("-inf"), device=self.device, dtype=torch.float32
+        )
+
+        output, lse = dcp_lse_combine_triton(
+            partial_outputs,
+            partial_lses,
+            is_lse_base_on_e=True,
+            return_lse=True,
+        )
+
+        self.assertTrue(torch.equal(output, torch.zeros_like(output)))
+        self.assertTrue(torch.isneginf(lse).all())
+
 
 class TestLSEBaseByBackend(CustomTestCase):
     """Which attention backends report LSE in natural log."""
@@ -253,6 +274,38 @@ class TestLSEBaseByBackend(CustomTestCase):
         self.assertFalse(is_mla_dcp_lse_base_on_e("tokenspeed_mla"))
         self.assertFalse(is_mla_dcp_lse_base_on_e("trtllm_mla"))
         self.assertFalse(is_mla_dcp_lse_base_on_e(None))
+
+
+class TestCPUReference(CustomTestCase):
+    def test_nan_lse_handled(self):
+        from sglang.kernels.ops.attention.dcp_kernels import _lse_weighted_combine_cpu
+
+        N, B, H, D = 2, 1, 1, 8
+        outputs = torch.randn(N, B, H, D)
+        lses = torch.tensor([[[5.0]], [[float("nan")]]])
+
+        result = _lse_weighted_combine_cpu(outputs, lses, is_lse_base_on_e=True)
+        self.assertFalse(torch.isnan(result).any())
+
+    def test_inf_lse_handled(self):
+        from sglang.kernels.ops.attention.dcp_kernels import _lse_weighted_combine_cpu
+
+        N, B, H, D = 2, 1, 1, 8
+        outputs = torch.randn(N, B, H, D)
+        lses = torch.tensor([[[5.0]], [[float("inf")]]])
+
+        result = _lse_weighted_combine_cpu(outputs, lses, is_lse_base_on_e=True)
+        self.assertFalse(torch.isnan(result).any())
+
+    def test_all_empty_lse_returns_zero(self):
+        from sglang.kernels.ops.attention.dcp_kernels import _lse_weighted_combine_cpu
+
+        outputs = torch.randn(2, 1, 1, 8)
+        lses = torch.full((2, 1, 1), float("-inf"))
+
+        result = _lse_weighted_combine_cpu(outputs, lses, is_lse_base_on_e=True)
+
+        self.assertTrue(torch.equal(result, torch.zeros_like(result)))
 
 
 class TestDCPA2AReduceWithCUDAGraphBuffers(CustomTestCase):
