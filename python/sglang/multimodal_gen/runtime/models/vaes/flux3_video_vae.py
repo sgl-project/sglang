@@ -34,6 +34,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels.ops.diffusion.sites.bitexact_gate import (
+    BitExactFusionGate,
+    tensors_equal,
+)
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.vaes.flux3_video import (
     Flux3VideoVAEArchConfig,
@@ -49,6 +53,10 @@ from sglang.multimodal_gen.runtime.models.vaes.flux3_neighborhood_attention impo
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+# First call checks torch.equal against eager RMSNorm + rotate-half, then the
+# fused kernel runs alone. A mismatch disables it and keeps the eager path.
+_VIDEO_QKV_GATE = BitExactFusionGate("FLUX 3 video VAE QKV norm+RoPE")
 
 _norm_layer = partial(nn.LayerNorm, eps=1e-5)
 
@@ -311,20 +319,61 @@ class Natten3D(nn.Module):
             self.q_norm = nn.RMSNorm(self.head_dim, eps=1e-5, elementwise_affine=False)
             self.k_norm = nn.RMSNorm(self.head_dim, eps=1e-5, elementwise_affine=False)
 
-    def _qkv(self, x: torch.Tensor):
+    def _prepare_qkv(
+        self, x: torch.Tensor, temporal_offset: int | torch.Tensor = 0
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         b, t, h, w, _ = x.shape
-        q, k, v = (
-            self.qkv(x).reshape(b, t, h, w, 3, self.num_heads, self.head_dim).unbind(4)
-        )
+        qkv = self.qkv(x).reshape(b, t, h, w, 3, self.num_heads, self.head_dim)
+        if (
+            self.qk_norm
+            and self.head_dim == 64
+            and b == 1
+            and self.q_norm.eps == self.k_norm.eps
+            and _VIDEO_QKV_GATE.can_attempt_once()
+        ):
+            from sglang.kernels.ops.diffusion import (
+                can_use_flux3_video_qknorm_rope,
+                flux3_video_qknorm_rope,
+            )
+
+            cos, sin = self.rope.cos_sin(
+                t, h, w, qkv.dtype, qkv.device, temporal_offset=temporal_offset
+            )
+            packed = qkv if qkv.is_contiguous() else qkv.contiguous()
+            if can_use_flux3_video_qknorm_rope(packed, cos, sin):
+                try:
+                    out = flux3_video_qknorm_rope(packed, cos, sin, eps=self.q_norm.eps)
+                except Exception as exc:
+                    _VIDEO_QKV_GATE.on_exception(exc, logger=logger)
+                else:
+                    if _VIDEO_QKV_GATE.verified:
+                        return out
+                    ref_q, ref_k, ref_v = self._eager_qkv(qkv, temporal_offset)
+                    return _VIDEO_QKV_GATE.accept_or_fallback(
+                        out,
+                        (ref_q, ref_k, ref_v),
+                        equal=tensors_equal,
+                        logger=logger,
+                        mismatch_msg=(
+                            "FLUX 3 video VAE QKV norm+RoPE is not bit-exact "
+                            "here; using eager"
+                        ),
+                    )
+        return self._eager_qkv(qkv, temporal_offset)
+
+    def _eager_qkv(
+        self, qkv: torch.Tensor, temporal_offset: int | torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        q, k, v = qkv.unbind(4)
         if self.qk_norm:
             q = self.q_norm(q)
             k = self.k_norm(k)
+        q, k = self.rope(q, k, temporal_offset=temporal_offset)
         return q, k, v
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, t, h, w, c = x.shape
-        q, k, v = self._qkv(x)
-        q, k = self.rope(q, k)
+        q, k, v = self._prepare_qkv(x)
         return self.proj(self._attend(q, k, v).reshape(b, t, h, w, c))
 
     def forward_region(
@@ -337,8 +386,7 @@ class Natten3D(nn.Module):
     ) -> torch.Tensor:
         """Attention over a temporal halo of a longer sequence; returns frames ``[output_start, output_end)``."""
         b, t, h, w, c = x.shape
-        q, k, v = self._qkv(x)
-        q, k = self.rope(q, k, temporal_offset=temporal_offset)
+        q, k, v = self._prepare_qkv(x, temporal_offset=temporal_offset)
         out = self._attend(q, k, v)[:, output_start:output_end]
         return self.proj(out.reshape(b, output_end - output_start, h, w, c))
 
