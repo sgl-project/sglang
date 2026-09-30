@@ -238,7 +238,9 @@ class KDATerminalRouteEvent:
             outcome = (
                 "cake_success"
                 if self.cake_success
-                else "triton_fallback" if self.triton_fallback else "fatal"
+                else "triton_fallback"
+                if self.triton_fallback
+                else "fatal"
             )
             raise ValueError(
                 "invalid KDA route reason for mode/outcome/funnel: "
@@ -611,7 +613,9 @@ def record_kda_terminal_route(
     graph_phase = (
         "capture"
         if capture_session is not None
-        else "replay" if replay_session is not None else "direct"
+        else "replay"
+        if replay_session is not None
+        else "direct"
     )
     event = KDATerminalRouteEvent(
         schema_version=KDA_ROUTE_SCHEMA_VERSION,

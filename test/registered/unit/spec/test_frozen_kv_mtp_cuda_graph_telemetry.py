@@ -51,12 +51,11 @@ class TestFrozenKVMTPKDATelemetryOwnership(unittest.TestCase):
             (False, False, False, other_gpu_backend),
         )
         for is_cpu, has_amx, is_blackwell, expected in cases:
-            with self.subTest(
-                is_cpu=is_cpu, has_amx=has_amx, is_blackwell=is_blackwell
-            ), patch.object(draft_utils, "is_cpu", return_value=is_cpu), patch.object(
-                draft_utils, "cpu_has_amx_support", return_value=has_amx
-            ), patch.object(
-                draft_utils, "is_blackwell", return_value=is_blackwell
+            with (
+                self.subTest(is_cpu=is_cpu, has_amx=has_amx, is_blackwell=is_blackwell),
+                patch.object(draft_utils, "is_cpu", return_value=is_cpu),
+                patch.object(draft_utils, "cpu_has_amx_support", return_value=has_amx),
+                patch.object(draft_utils, "is_blackwell", return_value=is_blackwell),
             ):
                 self.assertIs(
                     DraftBackendFactory._create_hybrid_linear_attn_decode_backend(
