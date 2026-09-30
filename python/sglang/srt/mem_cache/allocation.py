@@ -286,6 +286,35 @@ def _kv_shard_rotation_bases(
     return bases
 
 
+def ensure_mamba_capacity(
+    req_to_token_pool: ReqToTokenPool,
+    reqs: list[Req],
+    tree_cache: BasePrefixCache | None,
+) -> bool:
+    """Reclaim the Mamba slots needed before binding any request rows."""
+    if not isinstance(req_to_token_pool, HybridReqToTokenPool):
+        return True
+
+    # Byte-coordinated for the shared allocator; plain free slots otherwise.
+    allocator = req_to_token_pool.mamba_allocator
+    supports_mamba = tree_cache is not None and tree_cache.supports_mamba()
+    if supports_mamba:
+        factor = (
+            MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY
+            if req_to_token_pool.enable_mamba_extra_buffer_lazy
+            else MAMBA_STATE_PER_REQ_PREFIX_CACHE
+        )
+    else:
+        factor = MAMBA_STATE_PER_REQ_NO_CACHE
+    needed = len(reqs) * factor
+    available = allocator.schedulable_available_size()
+    if available < needed and supports_mamba:
+        tree_cache.evict_for_alloc(
+            EvictParams(num_tokens=0, mamba_num=needed - available)
+        )
+    return allocator.schedulable_available_size() >= needed
+
+
 def alloc_req_slots(
     req_to_token_pool: ReqToTokenPool,
     reqs: list[Req],
@@ -298,28 +327,12 @@ def alloc_req_slots(
     and should surface rather than be masked.
     """
     num_reqs = len(reqs)
-    if isinstance(req_to_token_pool, HybridReqToTokenPool):
-        # Byte-coordinated for the shared allocator (accounts for the peer full
-        # sub-pool's bytes); plain slot free count for the non-shared one.
-        mamba_available_size = (
-            req_to_token_pool.mamba_allocator.schedulable_available_size()
+    if not ensure_mamba_capacity(req_to_token_pool, reqs, tree_cache):
+        raise RuntimeError(
+            "alloc_req_slots runs out of Mamba state slots. "
+            "Please set a smaller number for `--max-running-requests`. "
+            f"{num_reqs=}, "
         )
-        # Eviction headroom factor: 3x (or lazy variant) for radix COW, 1x for chunk.
-        if tree_cache.supports_mamba():
-            factor = (
-                MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY
-                if req_to_token_pool.enable_mamba_extra_buffer_lazy
-                else MAMBA_STATE_PER_REQ_PREFIX_CACHE
-            )
-        else:
-            factor = MAMBA_STATE_PER_REQ_NO_CACHE
-        mamba_state_needed = num_reqs * factor
-        if mamba_available_size < mamba_state_needed:
-            if tree_cache is not None and tree_cache.supports_mamba():
-                mamba_num = max(0, mamba_state_needed - mamba_available_size)
-                tree_cache.evict_for_alloc(
-                    EvictParams(num_tokens=0, mamba_num=mamba_num)
-                )
     req_pool_indices = req_to_token_pool.alloc(reqs)
     if req_pool_indices is None:
         raise RuntimeError(
