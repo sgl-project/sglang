@@ -6,7 +6,7 @@ import torch
 from torch import nn
 
 from sglang.srt.layers.layer_boundary.layout import SumGroup
-from sglang.srt.layers.layer_boundary.residual.add_norm import ADD
+from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models import nemotron_h_mtp
@@ -34,9 +34,7 @@ class TestNemotronMTPReduction(CustomTestCase):
                 reduce = Mock(side_effect=lambda x: x * tp)
                 group = SimpleNamespace(all_reduce=reduce)
                 with (
-                    get_context().override_server_args(
-                        tp_size=tp, enable_dp_attention=True
-                    ),
+                    get_context().override_server_args(tp_size=tp),
                     get_flags().dp.override(enabled=True),
                     get_parallel().override(
                         attn_tp_group=group,
@@ -58,11 +56,9 @@ class TestNemotronMTPReduction(CustomTestCase):
                     ),
                     patch_communicator("get_moe_cp_size", return_value=1),
                     patch_communicator(
-                        "apply_flashinfer_allreduce_fusion", return_value=False
+                        "flashinfer_ar_fusion_applies", return_value=False
                     ),
-                    patch_communicator(
-                        "apply_aiter_all_reduce_fusion", return_value=False
-                    ),
+                    patch_communicator("aiter_ar_fusion_applies", return_value=False),
                 ):
                     layer = nemotron_h_mtp.NemotronHMTPMoEDecoderLayer.__new__(
                         nemotron_h_mtp.NemotronHMTPMoEDecoderLayer
@@ -79,8 +75,10 @@ class TestNemotronMTPReduction(CustomTestCase):
                     residual = torch.tensor([[7.0, 3.0], [5.0, 9.0]])
                     expected = partial * tp + residual
                     stream = ResidualStream(residual)
-                    hidden = stream.leave(
-                        partial, ADD, declared_sum=SumGroup.ATTN_TP if tp > 1 else None
+                    hidden = stream.record(
+                        partial,
+                        PLAIN_ADD,
+                        declared_sum=SumGroup.ATTN_TP if tp > 1 else None,
                     )
                     batch = SimpleNamespace(
                         forward_mode=ForwardMode.DECODE,

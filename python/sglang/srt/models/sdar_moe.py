@@ -59,7 +59,7 @@ from sglang.srt.models.utils import (
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
-from sglang.srt.utils import LazyValue, add_prefix, is_cuda, make_layers
+from sglang.srt.utils import LazyValue, add_prefix, is_cuda, make_pp_layers
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
@@ -117,7 +117,6 @@ class SDARMoeSparseMoeBlock(nn.Module):
 
         # Deepep / FuseEP support
         if get_moe_a2a_backend().is_deepep():
-            self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
                 config.num_experts + get_exec().moe.ep_num_redundant_experts
             )
@@ -360,10 +359,10 @@ class SDARMoeBlock(nn.Module):
         self.attn_boundary, self.ffn_boundary = make_stages(
             (declare_attn(), self.input_layernorm),
             (
-                declare_ffn(sparse=True, next_sparse=True),
+                declare_ffn(sparse=True, next_layer_sparse=True),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn(sparse=True, next_sparse=True)
+            previous=declare_ffn(sparse=True, next_layer_sparse=True)
             if layer_id != 0
             else None,
             terminal=layer_id == config.num_hidden_layers - 1,
@@ -423,7 +422,7 @@ class SDARMoeModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: SDARMoeBlock(
                 config=config,
@@ -432,8 +431,6 @@ class SDARMoeModel(nn.Module):
                 prefix=prefix,
                 alt_stream=alt_stream,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
 
@@ -481,7 +478,9 @@ class SDARMoeModel(nn.Module):
         hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
 
         if not forward_batch.forward_mode.is_idle():
-            hidden_states = residual_batch.norm(hidden_states, forward_batch, self.norm)
+            hidden_states = residual_batch.final_norm(
+                hidden_states, forward_batch, self.norm
+            )
         return hidden_states
 
 

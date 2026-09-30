@@ -59,6 +59,7 @@ from sglang.srt.model_executor.runner_utils import (
 )
 from sglang.srt.runtime_context import (
     get_exec,
+    get_parallel,
     get_spec,
     max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
@@ -296,7 +297,7 @@ class EagerRunner(BaseRunner):
             or forward_batch.forward_mode.is_target_verify()
         ):
             if (
-                model_runner.attn_dcp_size > 1
+                get_parallel().attn_dcp_size > 1
                 and hasattr(
                     model_runner.model, "prepare_context_parallel_metadata_for_dcp"
                 )
