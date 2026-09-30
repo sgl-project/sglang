@@ -999,6 +999,8 @@ class MambaPool:
 
     def clear_slots(self, indices: torch.Tensor):
         """Zero out mamba state at the given pool indices. Must run on forward stream."""
+        if (accepted := getattr(self, "kda_accepted_state", None)) is not None:
+            accepted.invalidate(indices)
         for sibling in self._slot_siblings:
             sibling.reset_slots(indices)
         if self._should_fuse_slot_ops():
@@ -1040,6 +1042,9 @@ class MambaPool:
         caps the donate to the last flush boundary. The dst cursor is reset to 0
         (the copied checkpoint has no pending ring entries).
         """
+        if (accepted := getattr(self, "kda_accepted_state", None)) is not None:
+            accepted.materialize(src_indices)
+            accepted.invalidate(dst_indices)
         if self.replayssm_write_pos is not None and self.debug_memory_pool:
             # Debug-only (syncs): catch any copy of an active, un-flushed slot.
             src_wp = self.replayssm_write_pos[src_indices]
@@ -1075,6 +1080,8 @@ class MambaPool:
             sibling.copy_slots(src_indices, dst_indices)
 
     def get_cpu_copy(self, indices):
+        if (accepted := getattr(self, "kda_accepted_state", None)) is not None:
+            accepted.materialize(indices)
         current_platform.synchronize()
         conv_cpu = [
             conv[:, indices].to("cpu", non_blocking=True)
@@ -1090,6 +1097,8 @@ class MambaPool:
         return conv_cpu, temporal_cpu
 
     def load_cpu_copy(self, mamba_cache_cpu, indices):
+        if (accepted := getattr(self, "kda_accepted_state", None)) is not None:
+            accepted.invalidate(indices)
         # The trailing element exists exactly when this instance registered siblings:
         # the pool that saved the copy is the pool that loads it.
         siblings_cpu = None
@@ -1665,6 +1674,10 @@ class HybridReqToTokenPool(ReqToTokenPool):
     ):
         mamba_index = req.kv.mamba_pool_idx
         assert mamba_index is not None, "double free? mamba_index is None"
+        if (
+            accepted := getattr(self.mamba_pool, "kda_accepted_state", None)
+        ) is not None:
+            accepted.materialize(mamba_index.unsqueeze(0))
         self.mamba_allocator.free(mamba_index.unsqueeze(0))
         req.kv.mamba_pool_idx = None
 
@@ -1721,8 +1734,19 @@ class HybridReqToTokenPool(ReqToTokenPool):
             req.kv.mamba_cow_src_index = None
             req.kv.mamba_needs_clear = False
 
+    def free_rows(self, indices: List[int]) -> None:
+        if (
+            accepted := getattr(self.mamba_pool, "kda_accepted_state", None)
+        ) is not None:
+            accepted.materialize(self.req_index_to_mamba_index_mapping[indices])
+        super().free_rows(indices)
+
     def clear(self):
         logger.info("Reset HybridReqToTokenPool")
+        if (
+            accepted := getattr(self.mamba_pool, "kda_accepted_state", None)
+        ) is not None:
+            accepted.invalidate()
         super().clear()
         self.mamba_allocator.clear()
         self.short_conv_pool.clear()
