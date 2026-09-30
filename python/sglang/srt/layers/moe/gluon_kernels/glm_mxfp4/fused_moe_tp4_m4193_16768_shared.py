@@ -620,7 +620,7 @@ def _finish(w2, w2_scale, work, local_experts):
     reduce_rows, reduce_columns = (32, 256)
     _shared_reduce[triton.cdiv(m, reduce_rows) * (h // reduce_columns),](work.aq, work.aqs, w2, w2_scale, work.offsets, work.parts, work.codes, work.headers, work.weights, work.inverse, work.output, m, h, work.intermediate, reduce_rows, reduce_columns, work.payload_pitch, 8, local_experts, enable_fp_fusion=False)
 
-def fused_moe(x, router, correction_bias, w13, w13_scale, w2, w2_scale, expert_start=0, routed_scaling_factor=2.5):
+def fused_moe(x, router, correction_bias, w13, w13_scale, w2, w2_scale, expert_start=0, routed_scaling_factor=2.5, fuse_shared_expert=False):
     intermediate = w13.shape[1] // 2
     local_experts = w13.shape[0] - 1
     assert w2.shape == (local_experts + 1, x.shape[1], intermediate // 2)
