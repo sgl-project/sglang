@@ -1,0 +1,40 @@
+{
+  "matched_requests": 20,
+  "baseline_completed_http_200": 20,
+  "baseline_client_rows": 19,
+  "baseline_state_first_last": [
+    6,
+    25
+  ],
+  "baseline_active_gib_first_last": [
+    2.92,
+    11.233
+  ],
+  "baseline_available_gib_first_last": [
+    13.74,
+    null
+  ],
+  "patched_state_first_last_20": [
+    1,
+    1
+  ],
+  "patched_active_gib_range_20": [
+    0.733,
+    0.801
+  ],
+  "patched_state_all_40": [
+    1,
+    1
+  ],
+  "patched_active_gib_range_all_40": [
+    0.733,
+    0.801
+  ],
+  "patched_available_gib_range_all_40": [
+    17.874,
+    17.913
+  ],
+  "baseline_latency_p50_ms_n19": 124.194,
+  "patched_latency_p50_ms_n20": 109.901,
+  "patched_latency_p95_ms_n20": 119.745
+}

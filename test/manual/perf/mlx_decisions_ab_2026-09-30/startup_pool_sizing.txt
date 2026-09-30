@@ -1,0 +1,9 @@
+Filtered startup log lines showing automatically sized token pools.
+
+[baseline]
+[2026-09-30 18:06:13] Auto-sized attention KV pool: sys_available=16.82 GB, mlx_limit=37.4 GB, mlx_used=0.30 GB, kv_budget=15.98 GB, bytes_per_slot=114688, pool_size=149630
+[2026-09-30 18:06:13] MLX stub: initialized minimal pools (max_total_num_tokens=149630, max_running_requests=1, zero GPU KV cache allocation)
+
+[patched]
+[2026-09-30 18:07:10] Auto-sized attention KV pool: sys_available=18.89 GB, mlx_limit=37.4 GB, mlx_used=0.30 GB, kv_budget=17.94 GB, bytes_per_slot=114688, pool_size=168005
+[2026-09-30 18:07:10] MLX stub: initialized minimal pools (max_total_num_tokens=168005, max_running_requests=1, zero GPU KV cache allocation)
