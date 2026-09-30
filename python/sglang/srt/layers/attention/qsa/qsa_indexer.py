@@ -487,6 +487,7 @@ class QSAIndexer(MultiPlatformOp):
         max_model_len: int,
         query_positions: torch.Tensor,
         sequence_lengths: torch.Tensor,
+        defer_expansion: bool = False,
     ) -> torch.Tensor:
         logits = qsa_mqa_decode(
             q,
@@ -511,6 +512,8 @@ class QSAIndexer(MultiPlatformOp):
             block_indices = qsa_fast_topk(
                 logits, row_starts, compressed_lengths, topk=self.block_topk
             )
+        if defer_expansion:
+            return block_indices
         return expand_qsa_block_indices(
             block_indices,
             query_positions,
@@ -613,6 +616,7 @@ class QSAIndexer(MultiPlatformOp):
                 max_model_len,
                 logical_positions,
                 indexer_metadata.get_seqlens_int32(),
+                defer_expansion=q.is_cuda and indexer_metadata.defer_block_expansion,
             )
 
         compressed_keys, row_starts, row_ends, sequence_lengths = (

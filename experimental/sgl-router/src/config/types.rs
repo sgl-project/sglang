@@ -62,6 +62,26 @@ pub enum ChatRoutingKind {
     Reorg,
 }
 
+/// Encode backend accepted by `--tokenizer-backend`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum TokenizerBackend {
+    /// Hugging Face `tokenizers`.
+    #[default]
+    #[value(name = "hf")]
+    Hf,
+    /// `fastokens` BPE encoding with Hugging Face decoding.
+    #[value(name = "fast")]
+    Fast,
+}
+
+/// Router tokenizer encode settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TokenizerConfig {
+    pub backend: TokenizerBackend,
+    /// L1 prefix-tokenization cache budget in MiB; 0 disables the cache.
+    pub l1_cache_mb: usize,
+}
+
 /// Routing strategies accepted by `--policy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum PolicyKind {
@@ -312,6 +332,8 @@ pub struct ModelConfig {
     /// Disable router-generated input IDs for this model; keep routing tokenization.
     /// Use when workers have rendering defaults or template stops the router cannot see.
     pub disable_input_ids_forwarding: bool,
+    /// Encode backend and L1 cache for router tokenization.
+    pub tokenizer: TokenizerConfig,
     pub policy: PolicyKind,
     /// Selection policy for the decode pool.
     pub decode_policy: DecodePolicyKind,
