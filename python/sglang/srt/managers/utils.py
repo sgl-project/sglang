@@ -75,6 +75,7 @@ class GenerationBatchResult:
     copy_done: Optional[torch.cuda.Event] = None
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[torch.Tensor] = None
+    speculative_num_steps: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
     # Padded row width in flattened speculative output. Existing algorithms
     # default to speculative_num_draft_tokens; linear UNO emits F + 1 columns.

@@ -57,6 +57,18 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
 
     cfg = resolving_view(server_args)
 
+    if cfg.pp_size > 1:
+        from sglang.srt.environ import envs
+
+        if (
+            envs.SGLANG_ENABLE_PP_SPEC.get()
+            and envs.SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND.get()
+        ):
+            return (
+                "SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND=1 is not supported "
+                "with pipeline parallel adaptive speculation"
+            )
+
     if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3"):
         return (
             f"speculative_algorithm={cfg.speculative_algorithm} "
@@ -304,13 +316,21 @@ class AdaptiveSpeculativeParams:
         return self._route(batch_size).current_steps
 
     def on_verify_complete(
-        self, num_correct_drafts_per_req: list[int], batch_size: int
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int,
+        executed_steps: int | None = None,
     ) -> int | None:
         """Feed verify results to the matching BS slot's EMA.
 
         Returns the new step if a switch is warranted, else ``None``.
         """
         params = self._route(batch_size)
+        if executed_steps is not None and executed_steps != params.current_steps:
+            # PP can return an older in-flight microbatch after this policy
+            # slot has switched. Its acceptance belongs to the old proposal
+            # width and must not update the new state's EMA.
+            return None
         if params.update(num_correct_drafts_per_req):
             return params.current_steps
         return None
