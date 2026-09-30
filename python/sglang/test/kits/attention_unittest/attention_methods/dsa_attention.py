@@ -341,7 +341,6 @@ class DSAMockModelRunner(ModelRunner):
             dsa_prefill_backend=dsa_prefill_backend,
             device=device,
             enable_deterministic_inference=False,
-            enable_dp_attention=False,
             enable_prefill_cp=False,
             enable_mis=False,
             is_embedding=False,

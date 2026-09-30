@@ -530,7 +530,7 @@ class ModelRunner:
             new_dp_size=join_effective_ep_size,
             new_dp_rank=global_ep_rank,
         )
-        get_context().override("elastic_ep.scale_join", dp_size=join_effective_ep_size)
+        get_parallel().override_permanently(num_dp_ranks=join_effective_ep_size)
         if self.eplb_manager is not None:
             self.eplb_manager.disable_rebalance(
                 "EPLB rebalance is disabled while elastic EP scale-up "
@@ -965,7 +965,7 @@ class ModelRunner:
             device=self.device,
             tp_group=(
                 get_parallel().attn_tp_group.cpu_group
-                if get_parallel().enable_dp_attention
+                if get_parallel().attn_dp_enabled
                 else get_parallel().tp_group.cpu_group
             ),
             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
@@ -1628,7 +1628,7 @@ class ModelRunner:
             forward_batch.prepare_mlp_sync_batch(self)
         else:
             forward_batch.prepare_attn_tp_scatter_input(self)
-        if self.lora_manager is not None and self.lora_manager.enable_dp_attention:
+        if self.lora_manager is not None and self.lora_manager.attn_dp_enabled:
             self.lora_manager.prepare_lora_batch(forward_batch)
 
         # Derive the LOCAL num_token_non_padded from the GLOBAL scalar. sharded is
@@ -2217,7 +2217,7 @@ class ModelRunner:
             new_dp_size=target_size,
             new_dp_rank=self._elastic_global_rank(),
         )
-        get_context().override("elastic_ep.scale", dp_size=target_size)
+        get_parallel().override_permanently(num_dp_ranks=target_size)
 
         recapture_cuda_graph = self._elastic_cuda_graph_enabled()
         if recapture_cuda_graph:

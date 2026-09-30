@@ -114,7 +114,7 @@ export const GLM47FlashDeployment = () => {
 
     // Strategy-specific parameters
     if (strategyArray.includes('dp')) {
-      cmd += ` \\\n   --dp 1 \\\n   --enable-dp-attention`;
+      cmd += ` \\\n   --attn-dp-size 1`;
     }
     if (strategyArray.includes('mtp')) {
 

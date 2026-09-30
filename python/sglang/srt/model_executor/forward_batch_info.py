@@ -1157,7 +1157,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # Init lora information
         if (
             model_runner.lora_manager is not None
-            and not model_runner.lora_manager.enable_dp_attention
+            and not model_runner.lora_manager.attn_dp_enabled
         ):
             # In the non-LoRA overlap loading case, we fetch LoRA adapters into the memory pool
             # as a batch, right before running the batch

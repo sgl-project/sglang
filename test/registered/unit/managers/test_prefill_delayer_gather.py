@@ -13,10 +13,8 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 TOPOLOGIES = {
     "tp": dict(tp_size=4),
     "attn_cp": dict(tp_size=4, attn_cp_size=2),
-    "dp_attention": dict(tp_size=4, dp_size=2, enable_dp_attention=True),
-    "dp_attention_attn_cp": dict(
-        tp_size=8, dp_size=2, attn_cp_size=2, enable_dp_attention=True
-    ),
+    "dp_attention": dict(tp_size=4, attn_dp_size=2),
+    "dp_attention_attn_cp": dict(tp_size=8, attn_dp_size=2, attn_cp_size=2),
 }
 
 
@@ -55,7 +53,7 @@ class TestPrefillDelayerGather(CustomTestCase):
                     waiting_queue_len=5,
                 )
                 parallel = get_parallel()
-                dp_groups = parallel.dp_size if parallel.enable_dp_attention else 1
+                dp_groups = parallel.num_dp_ranks if parallel.attn_dp_enabled else 1
                 ranks_per_dp_group = parallel.tp_size // dp_groups
                 local = torch.tensor([1, 0, 3, 4, 5])
                 expected = torch.stack(

@@ -3994,9 +3994,11 @@ def require_mlp_tp_gather(*, moe_a2a_backend=None):
     elif not isinstance(moe_a2a_backend, MoeA2ABackend):
         moe_a2a_backend = MoeA2ABackend(moe_a2a_backend)
 
-    # elastic-EP scale-up rewrites dp_size on the published config
-    if get_parallel().enable_dp_attention:
-        assert get_parallel().dp_size > 1, "dp_size must be greater than 1"
+    # elastic-EP scale-up widens num_dp_ranks on the published config
+    if get_parallel().attn_dp_enabled:
+        assert get_parallel().num_dp_ranks > 1, (
+            "attention DP needs more than one DP rank"
+        )
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import (
                 elastic_expanded_world_enabled,
@@ -4038,7 +4040,7 @@ def require_mlp_tp_gather(*, moe_a2a_backend=None):
         else:
             return (
                 get_parallel().moe_dense_tp_size
-                > get_parallel().tp_size // get_parallel().dp_size
+                > get_parallel().tp_size // get_parallel().num_dp_ranks
             )
     else:
         return False
@@ -4062,8 +4064,8 @@ def require_attn_tp_gather():
         not get_moe_a2a_backend().is_none()
         or get_parallel().moe_dense_tp_size is not None
     ):
-        if get_parallel().enable_dp_attention:
-            return get_parallel().dp_size < get_parallel().tp_size
+        if get_parallel().attn_dp_enabled:
+            return get_parallel().num_dp_ranks < get_parallel().tp_size
         else:
             return True
     else:
@@ -4076,7 +4078,7 @@ def require_gathered_buffer():
 
 def require_mlp_sync():
 
-    return get_parallel().enable_dp_attention or require_gathered_buffer()
+    return get_parallel().attn_dp_enabled or require_gathered_buffer()
 
 
 def get_cuda_graph_batch_size_alignment() -> int:

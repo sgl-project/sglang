@@ -515,8 +515,6 @@ class IpcModelLoader(BaseModelLoader):
             moe_dp_rank = parallel.moe_dp_rank
             moe_ep_rank = parallel.moe_ep_rank
 
-            dp_size = get_parallel().dp_size
-
             quant_method, quant_config = self._resolve_engine_quant(model_config)
 
             engine_config = CacheConfig(
@@ -530,12 +528,12 @@ class IpcModelLoader(BaseModelLoader):
                 tp_rank=tp_rank,
                 pp_size=pp_size,
                 pp_rank=pp_rank,
-                dp_size=dp_size,
+                dp_size=parallel.dp_size,
                 ep_size=ep_size,
                 moe_dp_size=moe_dp_size,
                 moe_dp_rank=moe_dp_rank,
                 moe_ep_rank=moe_ep_rank,
-                enable_dp_attention=parallel.enable_dp_attention,
+                attn_dp_size=parallel.attn_dp_size,
                 enable_dp_lm_head=parallel.enable_dp_lm_head,
                 attn_cp_size=parallel.attn_cp_size,
                 moe_dense_tp_size=parallel.moe_dense_tp_size,

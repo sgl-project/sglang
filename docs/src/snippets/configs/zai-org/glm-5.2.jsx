@@ -114,7 +114,7 @@ sgl-eval run aime25 \\
     // CP sizes auto-gate in the engine to the runtime derivation
     // attn_cp_size = tp/dp (a user-passed --attn-cp-size is overridden).
     // CP is single-machine only (tp_size <= 8). Interleave CP + DP-Attention
-    // currently fails the runtime's dp_size == 1 assert but is allowed here
+    // currently fails the runtime's attn_dp_size == 1 assert but is allowed here
     // with a warning (combined support is planned upstream).
     // Strategy knob: interleave (ex round-robin-split) is the layout verified
     // here and the default; zigzag (ex in-seq-split) is exposed as an
@@ -280,8 +280,7 @@ sgl-eval run aime25 \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-a2a-backend deepep",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 1",
@@ -303,8 +302,7 @@ sgl-eval run aime25 \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-a2a-backend deepep",
         "--mem-fraction-static 0.85",
         "--max-running-requests 256",
@@ -339,8 +337,7 @@ sgl-eval run aime25 \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-a2a-backend deepep",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 1",
@@ -362,8 +359,7 @@ sgl-eval run aime25 \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-a2a-backend deepep",
         "--mem-fraction-static 0.85",
         "--max-running-requests 256",
@@ -401,8 +397,7 @@ sgl-eval run aime25 \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend deepep",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 1",
@@ -425,8 +420,7 @@ sgl-eval run aime25 \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend deepep",
         "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
@@ -462,8 +456,7 @@ sgl-eval run aime25 \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-a2a-backend deepep",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 1",
@@ -483,8 +476,7 @@ sgl-eval run aime25 \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-a2a-backend deepep",
         "--mem-fraction-static 0.85",
         "--max-running-requests 256",
@@ -728,8 +720,7 @@ sgl-eval run aime25 \\
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--quantization modelopt_fp4",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         // Shorter draft (MTP 2-1-3) than low-latency's 5-1-6: at this concurrency the
         // verify overhead of a long draft outweighs the accept-length gain.
         "--speculative-algorithm EAGLE",
@@ -752,8 +743,7 @@ sgl-eval run aime25 \\
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--quantization modelopt_fp4",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--chunked-prefill-size 32768",
         "--mem-fraction-static 0.92",
         "--max-running-requests 512",
@@ -789,8 +779,7 @@ sgl-eval run aime25 \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--quantization modelopt_fp4",
         // Shorter draft (MTP 2-1-3) than low-latency's 5-1-6: at this concurrency the
         // verify overhead of a long draft outweighs the accept-length gain.
@@ -816,8 +805,7 @@ sgl-eval run aime25 \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--quantization modelopt_fp4",
         "--max-running-requests 1024",
         "--chunked-prefill-size 8192",
@@ -855,8 +843,7 @@ sgl-eval run aime25 \\
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--quantization modelopt_fp4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         // Shorter draft (MTP 2-1-3) than low-latency's 5-1-6: at this concurrency the
         // verify overhead of a long draft outweighs the accept-length gain.
         "--speculative-algorithm EAGLE",
@@ -878,8 +865,7 @@ sgl-eval run aime25 \\
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--quantization modelopt_fp4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--chunked-prefill-size 8192",
         "--mem-fraction-static 0.92",
         "--max-running-requests 512",

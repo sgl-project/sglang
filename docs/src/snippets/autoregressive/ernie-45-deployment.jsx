@@ -55,7 +55,7 @@ export const Ernie45Deployment = () => {
     }
 
     if (strategyArray.includes('dp') && modelsize === '300b') {
-      cmd += ` \\\n  --dp ${dpValue} \\\n  --enable-dp-attention`;
+      cmd += ` \\\n  --attn-dp-size ${dpValue}`;
     }
 
     if (strategyArray.includes('ep') && modelsize === '300b') {

@@ -60,8 +60,7 @@ def _published(stub):
     return get_context().override_server_args(
         # One attention replica per TP rank gives the stub's attention-DP width.
         tp_size=stub._attn_dp_size,
-        dp_size=stub._attn_dp_size,
-        enable_dp_attention=stub._attn_dp_size > 1,
+        attn_dp_size=stub._attn_dp_size,
         max_running_requests=stub._max_running_requests,
         max_mamba_cache_size=stub._max_mamba_cache_size,
         disable_radix_cache=stub._disable_radix_cache,

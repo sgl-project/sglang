@@ -18,7 +18,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 
 logger = logging.getLogger(__name__)
 
@@ -450,7 +450,7 @@ def handle_cache_compatibility(server_args: Any) -> None:
             raise NotImplementedError(
                 "LMCacheUnifiedRadixCache does not yet support speculative decoding"
             )
-        if cfg.enable_dp_attention:
+        if attn_dp_enabled_of(cfg):
             raise NotImplementedError(
                 "LMCacheUnifiedRadixCache does not yet support DP attention"
             )

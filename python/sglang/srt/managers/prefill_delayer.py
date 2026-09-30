@@ -106,9 +106,9 @@ class PrefillDelayer:
             f"queue_trigger_enabled={self._queue_trigger_enabled}"
         )
         parallel = get_parallel()
-        self.dp_size = parallel.dp_size
-        self.enable_dp_attention = parallel.enable_dp_attention
-        dp_size_dim = self.dp_size if self.enable_dp_attention else 1
+        self.num_dp_ranks = parallel.num_dp_ranks
+        self.attn_dp_enabled = parallel.attn_dp_enabled
+        dp_size_dim = self.num_dp_ranks if self.attn_dp_enabled else 1
 
         # Mirror scheduler_dp_attn_mixin's NCCL all-gather path: when the
         # env flag is on (or overlap scheduling is disabled), ride the NCCL
@@ -238,10 +238,10 @@ class PrefillDelayer:
                     **wait_info,
                 )
 
-            if not self.enable_dp_attention:
+            if not self.attn_dp_enabled:
                 max_running_requests = (
-                    max_running_requests + self.dp_size - 1
-                ) // self.dp_size
+                    max_running_requests + self.num_dp_ranks - 1
+                ) // self.num_dp_ranks
 
             global_running_batch_max = int(global_running_batch.max().item())
             global_max_prefill_bs_max = int(global_max_prefill_bs.max().item())
@@ -411,10 +411,10 @@ class PrefillDelayerSinglePassExecutor:
         waiting_queue_len: int,
     ) -> int:
         local_max_running_requests = max_running_requests
-        if not self._prefill_delayer.enable_dp_attention:
+        if not self._prefill_delayer.attn_dp_enabled:
             local_max_running_requests = (
-                max_running_requests + self._prefill_delayer.dp_size - 1
-            ) // self._prefill_delayer.dp_size
+                max_running_requests + self._prefill_delayer.num_dp_ranks - 1
+            ) // self._prefill_delayer.num_dp_ranks
 
         # The delayer negotiates before PrefillAdder materializes can_run_list,
         # so a rejected pass has no exact batch size. This upper bound is exact

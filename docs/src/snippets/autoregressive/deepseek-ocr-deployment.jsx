@@ -119,7 +119,7 @@ export const DeepSeekOCRDeployment = () => {
 
     // DP strategy
     if (strategyArray.includes('dp')) {
-      cmd += ` \\\n  --dp 1 \\\n  --enable-dp-attention`;
+      cmd += ` \\\n  --attn-dp-size 1`;
     }
 
     // EP strategy

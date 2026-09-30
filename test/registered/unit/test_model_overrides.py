@@ -62,6 +62,7 @@ class TestBoundaryParallelismResolution(CustomTestCase):
                     cp_strategy=None,
                     tp_size=4,
                     dp_size=1,
+                    attn_dp_size=1,
                     enable_aiter_allreduce_fusion=False,
                 ),
                 **options,
@@ -171,6 +172,8 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "page_size",
                     "moe_runner_backend",
                     "quantization",
+                    "dp_size",
+                    "attn_dp_size",
                     "enable_dp_attention",
                     "enable_attn_tp_input_scattered",
                     "enable_dp_lm_head",
@@ -588,7 +591,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         prefill_attention_backend=None,
         decode_attention_backend=None,
         disaggregation_mode="null",
-        enable_dp_attention=False,
+        attn_dp_size=1,
         enable_hierarchical_cache=False,
     ):
         args = SimpleNamespace(
@@ -596,7 +599,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             prefill_attention_backend=prefill_attention_backend,
             decode_attention_backend=decode_attention_backend,
             disaggregation_mode=disaggregation_mode,
-            enable_dp_attention=enable_dp_attention,
+            attn_dp_size=attn_dp_size,
+            ep_join_mode=None,
             enable_hierarchical_cache=enable_hierarchical_cache,
         )
         mixer_types = []
@@ -650,7 +654,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 ):
                     self._minicpm_overrides(
                         architecture,
-                        enable_dp_attention=True,
+                        attn_dp_size=2,
                     )
 
     def test_minicpm_rejects_hierarchical_cache_for_hybrid_models(self):
@@ -684,7 +688,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             prefill_attention_backend=None,
             decode_attention_backend=None,
             disaggregation_mode="null",
-            enable_dp_attention=False,
+            attn_dp_size=1,
+            ep_join_mode=None,
             enable_hierarchical_cache=False,
         )
         config = SimpleNamespace(
@@ -2354,7 +2359,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             defaults = dict(
                 flashinfer_allreduce_fusion_backend=None,
                 tp_size=2,
-                enable_dp_attention=False,
+                attn_dp_size=1,
+                ep_join_mode=None,
                 nnodes=1,
                 moe_a2a_backend="none",
                 enforce_disable_flashinfer_allreduce_fusion=False,
@@ -2390,9 +2396,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 _flashinfer_allreduce_fusion_auto_enable(_view(tp_size=1)), {}
             )
             self.assertEqual(
-                _flashinfer_allreduce_fusion_auto_enable(
-                    _view(enable_dp_attention=True)
-                ),
+                _flashinfer_allreduce_fusion_auto_enable(_view(attn_dp_size=2)),
                 {},
             )
             self.assertEqual(
@@ -3375,16 +3379,26 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
         self.assertEqual(
             _data_parallelism_defaults(
-                ResolvedView(SimpleNamespace(dp_size=1, ep_join_mode=None))
+                ResolvedView(
+                    SimpleNamespace(dp_size=1, attn_dp_size=1, ep_join_mode=None)
+                )
             ),
-            {"enable_dp_attention": False, "enable_dp_lm_head": False},
+            {"enable_dp_lm_head": False},
         )
-        self.assertEqual(
-            _data_parallelism_defaults(
-                ResolvedView(SimpleNamespace(dp_size=2, ep_join_mode=None))
-            ),
-            {},
-        )
+        for dp_size, attn_dp_size in ((2, 1), (1, 2)):
+            with self.subTest(dp_size=dp_size, attn_dp_size=attn_dp_size):
+                self.assertEqual(
+                    _data_parallelism_defaults(
+                        ResolvedView(
+                            SimpleNamespace(
+                                dp_size=dp_size,
+                                attn_dp_size=attn_dp_size,
+                                ep_join_mode=None,
+                            )
+                        )
+                    ),
+                    {},
+                )
 
         self.assertEqual(
             _a2a_ep_size(
@@ -3467,6 +3481,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                                 cp_strategy="zigzag",
                                 tp_size=8,
                                 dp_size=1,
+                                attn_dp_size=1,
                                 ep_size=1,
                                 moe_a2a_backend="none",
                                 kv_cache_dtype="auto",
@@ -3478,21 +3493,23 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                             {
                                 "attention_backend": "dsa",
                                 "page_size": 64,
-                                "enable_dp_attention": True,
+                                "attn_dp_size": 1,
+                                "dp_size": 1,
                                 "moe_dense_tp_size": 1,
                                 "moe_a2a_backend": "deepep",
                                 "ep_size": 8,
                                 "attn_cp_size": 8,
                             },
                         )
-                        # interleave CP with dp>1 must assert
+                        # interleave CP with attention DP must assert
                         with self.assertRaises(AssertionError):
                             _deepseek_family_overrides(
                                 _args(
                                     enable_prefill_cp=True,
                                     cp_strategy="interleave",
                                     tp_size=8,
-                                    dp_size=2,
+                                    dp_size=1,
+                                    attn_dp_size=2,
                                 ),
                                 None,
                             )
