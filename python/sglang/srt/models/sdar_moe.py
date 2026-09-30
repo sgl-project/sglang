@@ -360,10 +360,10 @@ class SDARMoeBlock(nn.Module):
         self.attn_boundary, self.ffn_boundary = make_stages(
             (declare_attn(), self.input_layernorm),
             (
-                declare_ffn(sparse=True, next_sparse=True),
+                declare_ffn(sparse=True, next_layer_sparse=True),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn(sparse=True, next_sparse=True)
+            previous=declare_ffn(sparse=True, next_layer_sparse=True)
             if layer_id != 0
             else None,
             terminal=layer_id == config.num_hidden_layers - 1,
@@ -481,7 +481,9 @@ class SDARMoeModel(nn.Module):
         hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
 
         if not forward_batch.forward_mode.is_idle():
-            hidden_states = residual_batch.norm(hidden_states, forward_batch, self.norm)
+            hidden_states = residual_batch.final_norm(
+                hidden_states, forward_batch, self.norm
+            )
         return hidden_states
 
 
