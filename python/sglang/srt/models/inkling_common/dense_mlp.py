@@ -209,6 +209,8 @@ class InklingBatchDenseMLP(nn.Module, FusedMoELoadingMixin):
             gemm1_alpha=None,
             gemm1_clamp_limit=None,
             is_gated=True,
+            moe_tp_size=self.moe_tp_size,
+            moe_tp_rank=self.moe_tp_rank,
         )
 
         FusedMoELoadingMixin.__init__(

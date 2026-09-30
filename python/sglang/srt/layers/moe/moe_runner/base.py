@@ -46,6 +46,12 @@ class MoeRunnerConfig:
     num_fused_shared_experts: Optional[int] = None
     params_dtype: Optional[torch.dtype] = None
     routing_method_type: Optional[RoutingMethodType] = None
+    # The layer's MoE placement. DWDP collapses EP to one rank after load
+    # (`FusedMoE.bind_full_expert_weights`).
+    moe_tp_size: int = 1
+    moe_tp_rank: int = 0
+    moe_ep_size: int = 1
+    moe_ep_rank: int = 0
 
     # Runner configuration
     activation: str = "silu"
