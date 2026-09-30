@@ -236,6 +236,11 @@ def startup_weight_load_overlap_of(cfg: Any) -> bool:
     return cfg.startup_weight_load_mode == "overlap"
 
 
+def should_attempt_startup_weight_load_overlap_of(cfg: Any) -> bool:
+    """Whether startup should check admission for deferred weight loading."""
+    return cfg.startup_weight_load_mode in ("overlap", "auto")
+
+
 def mamba_extra_buffer_of(cfg: Any) -> bool:
     """Return whether the resolved Mamba cache strategy requires an extra buffer."""
     return cfg.disable_radix_cache is False and cfg.mamba_radix_cache_strategy in (

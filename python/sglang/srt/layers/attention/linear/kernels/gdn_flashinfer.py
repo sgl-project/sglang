@@ -306,6 +306,10 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         self._aligned_parameter_cache[key] = (tensor, prepared)
         return prepared
 
+    def on_after_weight_load(self) -> None:
+        for source, prepared in self._aligned_parameter_cache.values():
+            prepared.copy_(source.detach().reshape(-1))
+
     def _prepare_gate_parameters(
         self,
         A_log: torch.Tensor,

@@ -94,6 +94,8 @@ class TestDefaultModelLoader(CustomTestCase):
                         ),
                         model,
                     )
+                    # Capture preparation found no optional parameters to restore.
+                    loader._startup_optional_parameter_values = ()
                     loader.commit_model_weights(
                         model=model,
                         model_config=model_config,

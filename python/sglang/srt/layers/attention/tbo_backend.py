@@ -168,6 +168,10 @@ class TboAttnBackend(AttentionBackend):
         for child in self.children:
             child.on_after_cuda_graph_warmup()
 
+    def on_after_weight_load(self) -> None:
+        for backend in (self.primary, *self.children):
+            backend.on_after_weight_load()
+
     def validate_elastic_cuda_graph_recapture(self) -> None:
         for backend in (self.primary, *self.children):
             backend.validate_elastic_cuda_graph_recapture()

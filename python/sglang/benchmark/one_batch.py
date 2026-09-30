@@ -94,7 +94,6 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import (
     SpawnRanks,
     get_device,
-    get_model,
     get_schedule,
     publish,
     spawn_world_rank,
@@ -334,14 +333,13 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
 
     _use_mlx = use_mlx()
     if _use_mlx:
-        from sglang.srt.hardware_backend.mlx.model_runner_stub import (
-            MlxModelRunnerStub,
-        )
+        from sglang.srt.hardware_backend.mlx.model_runner_stub import MlxModelRunnerStub
 
         model_runner = MlxModelRunnerStub(**runner_kwargs)
     else:
         model_runner = ModelRunner(**runner_kwargs)
-        if get_model().is_startup_weight_load_overlap:
+        startup_weight_load_active = model_runner.startup_weight_load is not None
+        if startup_weight_load_active:
             model_runner.start_startup_weight_load()
         model_runner.alloc_memory_pool()
         model_runner.init_attention_backends()
@@ -355,7 +353,7 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
 
             initialize_mamba_selective_state_update_backend(server_args)
         model_runner.init_cuda_graphs()
-        if get_model().is_startup_weight_load_overlap:
+        if startup_weight_load_active:
             model_runner.finalize_startup_weight_load()
     rank_print(f"max_total_num_tokens={model_runner.max_total_num_tokens}")
     tokenizer = get_tokenizer(
