@@ -34,9 +34,7 @@ class TestNemotronMTPReduction(CustomTestCase):
                 reduce = Mock(side_effect=lambda x: x * tp)
                 group = SimpleNamespace(all_reduce=reduce)
                 with (
-                    get_context().override_server_args(
-                        tp_size=tp, enable_dp_attention=True
-                    ),
+                    get_context().override_server_args(tp_size=tp),
                     get_flags().dp.override(enabled=True),
                     get_parallel().override(
                         attn_tp_group=group,

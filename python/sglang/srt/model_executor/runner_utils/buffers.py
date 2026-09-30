@@ -136,7 +136,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         hidden_size: int,
         next_token_logits_buffer: torch.Tensor,
         dtype: torch.dtype,
-        dp_size: int,
+        num_dp_ranks: int,
         pp_size: int,
         is_encoder_decoder: bool,
         require_mlp_tp_gather: bool,
@@ -207,9 +207,9 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 encoder_lens = None
 
             if require_mlp_tp_gather:
-                global_num_tokens_gpu = torch.zeros((dp_size,), dtype=torch.int32)
+                global_num_tokens_gpu = torch.zeros((num_dp_ranks,), dtype=torch.int32)
                 global_num_tokens_for_logprob_gpu = torch.zeros(
-                    (dp_size,), dtype=torch.int32
+                    (num_dp_ranks,), dtype=torch.int32
                 )
             else:
                 global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)

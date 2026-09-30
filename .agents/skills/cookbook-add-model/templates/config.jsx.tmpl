@@ -176,7 +176,7 @@ sgl-eval run gsm8k \\
   playgroundFeatures: {
 
     // ----- Card: "Attention Parallelism" -----  KEEP if the model exposes TP/CP/DP
-    // knobs. DP-Attention is a combined knob: value = DP degree AND toggles `--enable-dp-attention`.
+    // knobs. DP-Attention is a single knob: value = attention DP size, emitted as `--attn-dp-size N`.
     attention: {
       knobs: [
         { id: "tp", label: "TP", values: [
@@ -357,8 +357,7 @@ sgl-eval run gsm8k \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend deepep",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -403,8 +402,7 @@ sgl-eval run gsm8k \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 16",
-        "--dp 16",
-        "--enable-dp-attention",
+        "--attn-dp-size 16",
         "--moe-a2a-backend deepep",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
