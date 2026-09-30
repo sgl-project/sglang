@@ -957,16 +957,14 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         loc: torch.Tensor,
         dst_dtype: Optional[torch.dtype] = None,
     ):
-        """Read token-level MLA KV rows from the physical NPU paged layout."""
+        """Read token-level MLA KV rows in the pool's dtype."""
+        if dst_dtype is not None and dst_dtype != self.dtype:
+            raise ValueError("NPU MLA KV reads do not support dtype conversion.")
         layer_id = layer.layer_id
-        dst_dtype = dst_dtype or self.dtype
         cache_k = self.get_key_buffer(layer_id).view(-1, 1, self.kv_lora_rank)
         cache_v = self.get_value_buffer(layer_id).view(-1, 1, self.qk_rope_head_dim)
         cache_k = torch.index_select(cache_k, 0, loc)
         cache_v = torch.index_select(cache_v, 0, loc)
-        if cache_k.dtype != dst_dtype:
-            cache_k = cache_k.to(dst_dtype)
-            cache_v = cache_v.to(dst_dtype)
         return cache_k, cache_v
 
     def _set_fia_nz_kv_buffer(

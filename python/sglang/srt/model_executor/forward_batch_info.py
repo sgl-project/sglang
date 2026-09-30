@@ -733,8 +733,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # module. Import it from sglang.srt.layers.dcp.metadata if a runtime use is added.
     attn_dcp_metadata: Optional[DecodeContextParallelMetadata] = None
 
-    # Decode context parallel KV write mask used by HIP KV-store kernels.
-    # Ascend MLA remaps virtual write locations inside NPUMLATokenToKVPool.
+    # Decode context parallel KV write mask.
     dcp_kv_mask: Optional[torch.Tensor] = None
 
     # For ngram embedding
