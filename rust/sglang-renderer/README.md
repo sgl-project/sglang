@@ -9,14 +9,31 @@ work with an unmodified Rust server. It accepts both cumulative and incremental
 streaming responses, using the engine's configured format. Additional generate
 request fields or server behavior changes are deferred to separate PRs.
 
+The implementation is split into three packages.
+
+| Package | Responsibility |
+| --- | --- |
+| `sglang-renderer` | Rendering, tokenization, sampling validation, and tool/reasoning parsing over Dynamo crates |
+| `sglang-frontend` | Chat/completion API handling, render/tokenization routes, generation decoding, and response formatting |
+| `sglang-renderer-server` | The `sglang-renderer` executable, CLI, runtime, listener, HTTP engine client, health checks, and proxy fallback |
+
+The frontend library accepts a `GenerateTransport` implementation and provides
+routes for the host to mount. It does not bind a listener or create a runtime.
+The standalone application supplies the existing HTTP `/generate` transport.
+The Rust server still uses its existing frontend; migrating it to this library
+is a separate change.
+
 ## Build and run
 
 From the repository root, build the standalone renderer. Rendering and
 tokenization work without an engine; generation requires a running SGLang engine.
 
 ```sh
-cargo build --manifest-path rust/Cargo.toml -p sglang-renderer --release --features http --locked
+cargo build --manifest-path rust/Cargo.toml -p sglang-renderer-server --release --locked
 ```
+
+The executable and CLI flags are unchanged. The former `--features http` switch
+is no longer needed because the service has its own package.
 
 Start the engine in one terminal.
 

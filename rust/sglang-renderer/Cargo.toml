@@ -1,26 +1,9 @@
 [package]
 name = "sglang-renderer"
-description = "Reusable SGLang request preprocessing with an optional OpenAI frontend"
+description = "Reusable SGLang rendering and request preprocessing"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-
-[features]
-default = []
-http = [
-    "dep:axum",
-    "dep:clap",
-    "dep:reqwest",
-    "dep:tokio",
-    "dep:tracing-subscriber",
-    "hf-hub/rustls-tls",
-    "hf-hub/tokio",
-]
-
-[[bin]]
-name = "sglang-renderer"
-path = "src/main.rs"
-required-features = ["http"]
 
 [dependencies]
 async-stream = { workspace = true }
@@ -30,13 +13,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-tokio = { workspace = true, optional = true }
 uuid = { workspace = true }
 
-axum = { version = "0.8.9", features = ["json"], optional = true }
-clap = { version = "4", features = ["derive"], optional = true }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"], optional = true }
-tracing-subscriber = { workspace = true, optional = true }
 dynamo-parsers = "7.0.1"
 dynamo-protocols = "5.1.0"
 dynamo-renderer = "5.0.0"
@@ -51,4 +29,3 @@ dynamo-tokenizers = "1.7.0"
 tokio = { workspace = true }
 rmp-serde = "1"
 rmpv = { version = "1", features = ["with-serde"] }
-tower = { version = "0.5", features = ["util"] }

@@ -8,20 +8,15 @@ mod service;
 mod template;
 mod tokenizer;
 
-pub(crate) use chat::{ChatPreprocessor, LoweredChat, dynamo_parser_name};
-pub use chat::{ChatRequest, ReasoningEffort};
+pub(crate) use chat::dynamo_parser_name;
+pub use chat::{ChatPreprocessor, ChatRequest, LoweredChat, ReasoningEffort};
 pub use request::{
     GenerateRequest, GenerateRequestMetadata, GenerateSamplingParams, GenerationOptions,
     TextRequest, TokenIdsRequest,
 };
-pub(crate) use request::{GenerateRequestIdentity, TextRequestGroup};
+pub use request::{GenerateRequestIdentity, TextRequestGroup};
 pub use sampling::SamplingParams;
 pub use service::{PreparedChat, RendererService};
 pub(crate) use template::ChatFormatter;
-#[cfg(test)]
-pub(crate) fn load_test_chat_formatter(name: &str) -> ChatFormatter {
-    template::load_chat_formatter(None, None, Some(name)).unwrap()
-}
 pub use tokenizer::{DynamoTokenizer, TextTokenizer, load_tokenizer};
-#[cfg(feature = "http")]
-pub(crate) use tokenizer::{resolve_model_file, resolve_tokenizer_file};
+pub use tokenizer::{resolve_model_file, resolve_tokenizer_file};

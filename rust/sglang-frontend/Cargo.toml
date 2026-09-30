@@ -1,0 +1,23 @@
+[package]
+name = "sglang-frontend"
+description = "Shared SGLang API handling and generation response processing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sglang-renderer = { path = "../sglang-renderer" }
+async-stream = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+axum = { version = "0.8.9", features = ["json"] }
+dynamo-renderer = "5.1.2"
+dynamo-protocols = "5.1.0"
+dynamo-tokenizers = "1.7.0"
+
+[dev-dependencies]
+tokio = { workspace = true }
+tower = { version = "0.5", features = ["util"] }

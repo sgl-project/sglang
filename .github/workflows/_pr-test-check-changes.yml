@@ -100,10 +100,12 @@ jobs:
               - "scripts/ci/utils/*"
               - "test/**/!(*.md)"
               - "rust/*"
-              - "rust/!(sglang-renderer)/**"
+              - "rust/!(sglang-renderer|sglang-frontend|sglang-renderer-server)/**"
               - "proto/sglang/runtime/v1/sglang.proto"
             renderer:
               - "rust/sglang-renderer/**"
+              - "rust/sglang-frontend/**"
+              - "rust/sglang-renderer-server/**"
             simulator:
               - ".github/workflows/pr-test-extra.yml"
               - ".github/workflows/_pr-test-simulator-cpu.yml"

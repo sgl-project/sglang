@@ -65,7 +65,7 @@ pub struct TextRequest {
 /// options. Keeping those identities alongside one prompt lets preprocessing
 /// tokenize the prompt once before producing the individual engine requests.
 #[derive(Debug, Clone)]
-pub(crate) struct TextRequestGroup {
+pub struct TextRequestGroup {
     pub prompt: RenderedPrompt,
     pub add_special_tokens: bool,
     pub options: GenerationOptions,
@@ -73,7 +73,7 @@ pub(crate) struct TextRequestGroup {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct GenerateRequestIdentity {
+pub struct GenerateRequestIdentity {
     pub rid: String,
     pub metadata: GenerateRequestMetadata,
 }

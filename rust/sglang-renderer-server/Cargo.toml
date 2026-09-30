@@ -1,0 +1,30 @@
+[package]
+name = "sglang-renderer-server"
+description = "Standalone SGLang rendering and OpenAI frontend service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sglang-renderer"
+path = "src/main.rs"
+
+[dependencies]
+sglang-frontend = { path = "../sglang-frontend" }
+sglang-renderer = { path = "../sglang-renderer" }
+async-stream = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+axum = { version = "0.8.9", features = ["json"] }
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+hf-hub = { version = "0.4", default-features = false, features = ["rustls-tls", "tokio"] }
+
+[dev-dependencies]
+uuid = { workspace = true }
+dynamo-tokenizers = "1.7.0"
+tower = { version = "0.5", features = ["util"] }
