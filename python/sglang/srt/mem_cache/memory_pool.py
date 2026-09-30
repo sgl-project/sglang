@@ -53,6 +53,8 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.nvfp4_k_cache import (
     NVFP4_BYTES_PER_TOKEN as DSA_NVFP4_BYTES_PER_TOKEN,
+)
+from sglang.srt.layers.attention.dsa.nvfp4_k_cache import (
     dequantize_nvfp4_k_cache_paged,
     quantize_nvfp4_k_cache_into,
 )

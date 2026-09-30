@@ -79,7 +79,8 @@ static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::option
 }
 
 // The native GLM-5.2 cache has its own ABI; never infer it from the FP8 entry point.
-static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>> sgl_sparse_decode_fwd_nvfp4(
+static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
+sgl_sparse_decode_fwd_nvfp4(
     const at::Tensor& q,
     const at::Tensor& packed_kv,
     const at::Tensor& kv_global_scale,
@@ -91,10 +92,20 @@ static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::option
     int64_t d_v,
     double sm_scale) {
   return sparse_attn_decode_interface(
-      q, packed_kv, indices, topk_length, attn_sink, tile_scheduler_metadata,
-      num_splits, std::nullopt, std::nullopt, std::nullopt,
-      static_cast<int>(d_v), static_cast<float>(sm_scale),
-      std::optional<std::string>{"GLM52_NVFP4"}, kv_global_scale);
+      q,
+      packed_kv,
+      indices,
+      topk_length,
+      attn_sink,
+      tile_scheduler_metadata,
+      num_splits,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      static_cast<int>(d_v),
+      static_cast<float>(sm_scale),
+      std::optional<std::string>{"GLM52_NVFP4"},
+      kv_global_scale);
 }
 
 static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>> sgl_dense_decode_fwd(

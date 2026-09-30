@@ -519,8 +519,7 @@ class DeepseekSparseAttnBackend(
                 )
             if self.dsa_decode_impl != "flashmla_kv":
                 raise ValueError(
-                    "GLM-5.2 SM100 NVFP4 DSA requires "
-                    "--dsa-decode-backend=flashmla_kv"
+                    "GLM-5.2 SM100 NVFP4 DSA requires --dsa-decode-backend=flashmla_kv"
                 )
             if self.dsa_prefill_impl != "flashmla_sparse":
                 raise ValueError(

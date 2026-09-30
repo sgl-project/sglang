@@ -316,9 +316,7 @@ def test_glm52_nvfp4_repeated_single_kv_row():
 def test_glm52_nvfp4_all_invalid_indices_return_zero_output():
     _load_flashmla_extension()
     device = torch.device("cuda")
-    q = torch.zeros(
-        1, 1, LOCAL_Q_HEADS, QK_DIM, dtype=torch.bfloat16, device=device
-    )
+    q = torch.zeros(1, 1, LOCAL_Q_HEADS, QK_DIM, dtype=torch.bfloat16, device=device)
     cache = torch.zeros(
         1,
         PAGE_SIZE,
@@ -422,9 +420,7 @@ def test_glm52_nvfp4_sparse_decode_cuda_graph_external_metadata(b: int, sq: int)
     indices_kernel = indices.view(rows, 1, TOPK)
     # Graph capture uses dummy short sequence lengths (1..Sq) even though the
     # fixed sparse page table and scheduler retain the production top-k width.
-    row_lengths = torch.arange(
-        1, sq + 1, dtype=torch.int32, device=q.device
-    ).repeat(b)
+    row_lengths = torch.arange(1, sq + 1, dtype=torch.int32, device=q.device).repeat(b)
     scheduler_metadata, num_splits = (
         torch.ops.sgl_kernel.get_mla_decoding_metadata.default(
             row_lengths,
