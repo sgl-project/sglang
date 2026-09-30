@@ -28,7 +28,7 @@ CHILD_TOKENS = [20, 21, 22, 23]
 THIRD_TOKENS = [30, 31, 32, 33]
 
 
-def make_cache(allow_subagent_keepalive: bool):
+def make_cache(allow_subagent_keepalive: bool, tree_core_backend: str):
     """FULL-only, page_size=1, CPU cache with room for a handful of turns."""
     set_global_server_args_for_scheduler(ServerArgs(model_path="dummy", page_size=1))
     dtype = torch.float16
@@ -63,16 +63,20 @@ def make_cache(allow_subagent_keepalive: bool):
         eviction_policy="lru",
         allow_subagent_keepalive=allow_subagent_keepalive,
         tree_components=(ComponentType.FULL,),
+        tree_core_backend=tree_core_backend,
     )
-    return UnifiedRadixCache(params), allocator, req_pool
+    cache = UnifiedRadixCache(params)
+    assert cache._tree_core_backend == tree_core_backend
+    return cache, allocator, req_pool
 
 
 class SubagentKeepaliveTestBase(CustomTestCase):
     allow_subagent_keepalive = True
+    tree_core_backend = "python"
 
     def setUp(self):
         self.cache, self.allocator, self.req_pool = make_cache(
-            self.allow_subagent_keepalive
+            self.allow_subagent_keepalive, self.tree_core_backend
         )
         self._rid = 0
 
@@ -203,6 +207,14 @@ class TestSubagentKeepaliveDisabled(SubagentKeepaliveTestBase):
         # Same verdict as plain LRU: the flag changes nothing when it is off.
         self.assertEqual(self.match_len(PARENT_TOKENS), 0)
         self.assertEqual(self.match_len(CHILD_TOKENS), TURN_LEN)
+
+
+class TestSubagentKeepaliveEnabledRust(TestSubagentKeepaliveEnabled):
+    tree_core_backend = "rust"
+
+
+class TestSubagentKeepaliveDisabledRust(TestSubagentKeepaliveDisabled):
+    tree_core_backend = "rust"
 
 
 if __name__ == "__main__":

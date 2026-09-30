@@ -42,10 +42,12 @@ import contextlib
 import random
 import unittest
 import unittest.mock as mock
+from array import array
 from typing import Optional
 
 import msgspec
 import torch
+from unified_tree_core_inspector import UnifiedTreeCoreInspector
 
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator import (
@@ -63,6 +65,7 @@ from sglang.srt.mem_cache.l2_transfer import TransferCompletion
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
+from sglang.srt.mem_cache.unified_cache.tree_core_registry import _TREE_CORE_REGISTRY
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
@@ -306,6 +309,22 @@ def cpu_hicache_patches():
 # ---------------------------------------------------------------------------
 
 
+def _inspector_registry():
+    """Build either backend as its inspector, which slot_census reads through."""
+
+    def python_factory(params, components):
+        return UnifiedTreeCoreInspector(params, components)
+
+    def rust_factory(params, _components):
+        from rust_unified_tree_core_inspector import RustUnifiedTreeCoreInspector
+
+        return RustUnifiedTreeCoreInspector(params)
+
+    return mock.patch.dict(
+        _TREE_CORE_REGISTRY, {"python": python_factory, "rust": rust_factory}
+    )
+
+
 class HiCacheFixture:
     """A real UnifiedRadixCache with a real HiCache controller, on CPU.
 
@@ -325,6 +344,7 @@ class HiCacheFixture:
         allow_subagent_keepalive: bool = False,
         write_policy: str = "write_back",
         deferred_dma: bool = False,
+        tree_core_backend: str = "python",
     ):
         server_args = ServerArgs(
             model_path="dummy",
@@ -373,10 +393,12 @@ class HiCacheFixture:
             tree_components=(FULL,),
             hicache_serialize_load_back=serialize_load_back,
             allow_subagent_keepalive=allow_subagent_keepalive,
-            # slot_census walks the Python TreeCore's nodes.
-            tree_core_backend="python",
+            tree_core_backend=tree_core_backend,
         )
-        self.cache = UnifiedRadixCache(params)
+        # slot_census reads node values through the inspection interface.
+        with _inspector_registry():
+            self.cache = UnifiedRadixCache(params)
+        assert self.cache._tree_core_backend == tree_core_backend
         for patch in cpu_hicache_patches():
             stack.enter_context(patch)
         self.cache.init_hicache(server_args, params)
@@ -501,14 +523,14 @@ class HiCacheFixture:
         req = Req(
             rid=str(self._next_rid),
             origin_input_text="",
-            origin_input_ids=list(tokens),
+            origin_input_ids=array("q", tokens),
             sampling_params=SamplingParams(
                 temperature=0, max_new_tokens=MAX_NEW_TOKENS
             ),
             session_id=session_id,
         )
         self._next_rid += 1
-        req.output_ids = []
+        req.output_ids = array("q")
         req.parent_session_id = ""
         self.req_pool.alloc([req])
         return req
@@ -568,23 +590,19 @@ class HiCacheFixture:
 
     # -- conservation -------------------------------------------------------
 
-    def _tree_nodes(self):
-        stack = [self.cache.tree_core.root_node]
-        while stack:
-            node = stack.pop()
-            stack.extend(node.children.values())
-            if node is not self.cache.tree_core.root_node:
-                yield node
-
     def slot_census(self) -> tuple[int, int]:
         """(device, host) slots the tree currently owns."""
+        tree_core = self.cache.tree_core
         device = host = 0
-        for node in self._tree_nodes():
-            data = node.component_data[FULL]
-            if data.value is not None:
-                device += len(data.value)
-            if data.host_value is not None:
-                host += len(data.host_value)
+        for node_id in tree_core.get_all_node_ids():
+            if tree_core.is_root(node_id):
+                continue
+            value = tree_core.get_component_device_value(node_id, FULL)
+            if value is not None:
+                device += len(value)
+            host_value = tree_core.get_component_host_value(node_id, FULL)
+            if host_value is not None:
+                host += len(host_value)
         return device, host
 
     def conservation_error(self, request_held: int = 0) -> Optional[str]:
@@ -936,6 +954,8 @@ def growing_sessions(
 
 
 class HiCacheKVIntegrityTest(CustomTestCase):
+    tree_core_backend = "python"
+
     """A matched prefix must hold the KV it was cached under.
 
     Nothing else in this directory checks the bytes. A load-back that commits
@@ -948,7 +968,9 @@ class HiCacheKVIntegrityTest(CustomTestCase):
     def _drive(self, steps, *, sidecar: bool = False, **fixture_kwargs):
         """Run a workload; return (corruption, host-hit tokens, load-backs)."""
         with contextlib.ExitStack() as stack:
-            fixture = HiCacheFixture(stack, **fixture_kwargs)
+            fixture = HiCacheFixture(
+                stack, tree_core_backend=self.tree_core_backend, **fixture_kwargs
+            )
             if sidecar:
                 fixture.attach_sidecar()
             chain_lengths: list[int] = []
@@ -1104,7 +1126,12 @@ class HiCacheKVIntegrityTest(CustomTestCase):
         stay green. So plant a corrupted slot and require it to be named.
         """
         with contextlib.ExitStack() as stack:
-            fixture = HiCacheFixture(stack, device_size=32, host_ratio=2.0)
+            fixture = HiCacheFixture(
+                stack,
+                device_size=32,
+                host_ratio=2.0,
+                tree_core_backend=self.tree_core_backend,
+            )
             indices = fixture.allocator.alloc(4)
             tokens = [11, 22, 33, 44]
             fixture.stamp(indices, tokens)
@@ -1149,6 +1176,7 @@ class HiCacheKVIntegrityTest(CustomTestCase):
                         device_size=128,
                         host_ratio=1.6,
                         serialize_load_back=serialize,
+                        tree_core_backend=self.tree_core_backend,
                     )
                     fixture.attach_sidecar()
                     chains: list[int] = []
@@ -1182,6 +1210,8 @@ class HiCacheKVIntegrityTest(CustomTestCase):
 
 
 class SerializedLoadBackControllerTest(CustomTestCase):
+    tree_core_backend = "python"
+
     """The serialized path's contract with the real cache controller.
 
     ``test_serialized_load_back.py`` covers the same code against a fake
@@ -1203,7 +1233,11 @@ class SerializedLoadBackControllerTest(CustomTestCase):
         left-over ack would be miscounted by the next ``loading_check``."""
         with contextlib.ExitStack() as stack:
             fixture = HiCacheFixture(
-                stack, device_size=128, host_ratio=1.6, serialize_load_back=True
+                stack,
+                device_size=128,
+                host_ratio=1.6,
+                serialize_load_back=True,
+                tree_core_backend=self.tree_core_backend,
             )
             controller = fixture.cache.cache_controller
             saw_load_back = False
@@ -1225,7 +1259,11 @@ class SerializedLoadBackControllerTest(CustomTestCase):
         sooner than the batched path ever does."""
         with contextlib.ExitStack() as stack:
             fixture = HiCacheFixture(
-                stack, device_size=128, host_ratio=1.6, serialize_load_back=True
+                stack,
+                device_size=128,
+                host_ratio=1.6,
+                serialize_load_back=True,
+                tree_core_backend=self.tree_core_backend,
             )
             counter = fixture.cache.cache_controller.layer_done_counter
             producers = 0
@@ -1265,6 +1303,7 @@ class SerializedLoadBackControllerTest(CustomTestCase):
                     device_size=128,
                     host_ratio=1.6,
                     serialize_load_back=serialize,
+                    tree_core_backend=self.tree_core_backend,
                 )
                 total = 0
                 for step in self.STEPS:
@@ -1280,6 +1319,14 @@ class SerializedLoadBackControllerTest(CustomTestCase):
             f"{reused[False]} for the batched path; the split is supposed to "
             f"protect host copies, not cost them",
         )
+
+
+class HiCacheKVIntegrityRustTest(HiCacheKVIntegrityTest):
+    tree_core_backend = "rust"
+
+
+class SerializedLoadBackControllerRustTest(SerializedLoadBackControllerTest):
+    tree_core_backend = "rust"
 
 
 if __name__ == "__main__":
