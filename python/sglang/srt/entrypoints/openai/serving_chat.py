@@ -466,8 +466,6 @@ class OpenAIServingChat(OpenAIServingBase):
         return prompt_ids + encoded
 
     def _resolve_inline_system_support(self) -> bool:
-        """Whether the renderer that builds prompts keeps a mid-conversation
-        system message in place, so callers need not hoist it."""
         if self.chat_encoding_spec is not None:
             return chat_encoding.spec_supports_inline_system(self.chat_encoding_spec)
         if self.template_manager.chat_template_name is not None:

@@ -1627,9 +1627,8 @@ INLINE_SYSTEM_TEMPLATE = (
 def test_inline_instruction_keeps_history_prefix(
     encoding_spec, chat_template_name, jinja_template, preserve
 ):
-    """An appended developer instruction must stay in place when the renderer
-    that builds the prompt supports inline system messages; hoisting it into
-    the leading system message rewrites the prompt prefix and defeats KV reuse."""
+    """An appended developer instruction stays in place when the renderer supports
+    inline system; hoisting it rewrites the prompt prefix and defeats KV reuse."""
     publish(ServerArgs(model_path="dummy"), role="tokenizer")
     tokenizer_manager = MockTokenizerManager()
     tokenizer_manager.tokenizer.chat_template = jinja_template
