@@ -140,7 +140,6 @@ class DeepEPMoE(FusedMoE):
             and self.w13_weight.dtype == torch.bfloat16
             and get_moe_runner_backend().is_deep_gemm()
             and (get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_pplx())
-            and not _is_npu
             and not _is_hip
         ):
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM, (
