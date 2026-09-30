@@ -356,6 +356,7 @@ def test_apply_sm90_cutlass_matches_flashinfer_direct(
     here we just verify that ``apply`` calls the kernel with the right
     arguments (incl. input padding + output trim)."""
     import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass as fi_cutlass_mod
+    from sglang.srt.runtime_context import get_context
 
     # Bypass symmetric-memory / TP-group in the fused-func module, which is where
     # the kernel call lives.
@@ -380,9 +381,10 @@ def test_apply_sm90_cutlass_matches_flashinfer_direct(
     method = _build_method(num_experts, hidden, inter, layer=layer)
     method._process_weights_for_sm90_cutlass(layer)
 
-    out_sglang = method._apply_sm90_cutlass(
-        layer, _MockDispatchOutput(x.clone(), topk_w, topk_i)
-    ).hidden_states
+    with get_context().override_server_args():
+        out_sglang = method._apply_sm90_cutlass(
+            layer, _MockDispatchOutput(x.clone(), topk_w, topk_i)
+        ).hidden_states
 
     # ---- FlashInfer-direct reference using the same processed weights ----
     K_pad = method._padded_hidden
@@ -607,6 +609,7 @@ def test_apply_sm90_humming_matches_flashinfer_direct(
 ):
     """SGLang must forward the five Humming scales and enable the new kernel."""
     import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass as fi_cutlass_mod
+    from sglang.srt.runtime_context import get_context
 
     monkeypatch.setattr(
         fi_cutlass_mod, "use_symmetric_memory", lambda *a, **kw: nullcontext()
@@ -631,9 +634,10 @@ def test_apply_sm90_humming_matches_flashinfer_direct(
     layer.moe_ep_rank = ep_rank
     method = _build_method(num_experts, hidden, inter, layer=layer, use_humming=True)
     method._process_weights_for_sm90_cutlass(layer)
-    out_sglang = method._apply_sm90_cutlass(
-        layer, _MockDispatchOutput(x.clone(), topk_w, topk_i)
-    ).hidden_states
+    with get_context().override_server_args():
+        out_sglang = method._apply_sm90_cutlass(
+            layer, _MockDispatchOutput(x.clone(), topk_w, topk_i)
+        ).hidden_states
 
     padded_hidden = method._padded_hidden
     x_ref = (
@@ -790,9 +794,10 @@ def test_dsv4_apply_matches_flashinfer_direct(
 
     method.process_weights_after_loading(layer)
 
-    out_sglang = method.apply(
-        layer, _MockDispatchOutput(x.clone(), topk_w, topk_i)
-    ).hidden_states
+    with get_context().override_server_args():
+        out_sglang = method.apply(
+            layer, _MockDispatchOutput(x.clone(), topk_w, topk_i)
+        ).hidden_states
 
     # ---- Direct FlashInfer reference ----
     w13_s_u8 = w31_s.view(torch.uint8)
