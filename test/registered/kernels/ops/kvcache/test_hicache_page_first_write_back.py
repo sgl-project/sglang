@@ -274,9 +274,11 @@ def test_page_first_staged_write_back_mla(element_dim: int, page_count: int) -> 
 
 
 @pytest.mark.skipif(is_hip(), reason="cudaMemcpyBatchAsync write-back is CUDA-only.")
+@pytest.mark.parametrize("element_dim", MLA_ELEMENT_DIMS)
 @pytest.mark.parametrize("page_count", PAGE_COUNTS)
-def test_page_first_staged_write_back_mla_batch_copy(page_count: int) -> None:
-    element_dim = MLA_ELEMENT_DIMS[0]
+def test_page_first_staged_write_back_mla_batch_copy(
+    element_dim: int, page_count: int
+) -> None:
     layer_page_bytes = PAGE_SIZE * element_dim * torch.bfloat16.itemsize
     # Enough layers for a page to reach kLargeCopyThresholdBytes (128 KiB) in
     # staged_write_back.cuh, where write-back switches to cudaMemcpyBatchAsync.
