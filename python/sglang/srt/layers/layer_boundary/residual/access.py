@@ -19,16 +19,16 @@ import torch
 
 from sglang.srt.distributed import GroupCoordinator
 from sglang.srt.layers.layer_boundary.output import (
-    HandoffOutput,
+    DeferredFinalize,
     UnreducedOutput,
-    reduce_output,
+    complete_owed,
 )
 from sglang.srt.layers.layer_boundary.residual.stream import OwedOutput, ResidualStream
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 
 
 def buffer(
-    hidden_states: Union[torch.Tensor, UnreducedOutput, HandoffOutput],
+    hidden_states: Union[torch.Tensor, UnreducedOutput, DeferredFinalize],
 ) -> Optional[torch.Tensor]:
     """Storage that can be reused after prepare consumes the input. A finalize
     handoff has no reusable layer-output tensor. This does not complete or read
@@ -37,7 +37,7 @@ def buffer(
         return hidden_states.contribution.value
     if isinstance(hidden_states, UnreducedOutput):
         return hidden_states.partial
-    if isinstance(hidden_states, HandoffOutput):
+    if isinstance(hidden_states, DeferredFinalize):
         return None
     return hidden_states
 
@@ -48,7 +48,7 @@ def add_to_output(hidden_states, residual, extra: torch.Tensor) -> Tuple:
     hidden_states = (
         residual.complete(hidden_states)
         if isinstance(residual, ResidualStream)
-        else reduce_output(hidden_states)
+        else complete_owed(hidden_states)
     )
     hidden_states.add_(extra)
     return hidden_states, residual
@@ -59,10 +59,10 @@ def fold(hidden_states, residual):
     The following stage receives it with no outstanding residual addition."""
     stream = residual if isinstance(residual, ResidualStream) else None
     if stream is not None:
-        if stream.pending is not None and not stream.pending.update.adds_plainly:
+        if stream.pending is not None and not stream.pending.update.is_plain_add:
             raise NotImplementedError("fold requires a plain residual update")
-        hidden_states, residual = stream.finish(hidden_states)
-    hidden_states = reduce_output(hidden_states)
+        hidden_states, residual = stream.export(hidden_states)
+    hidden_states = complete_owed(hidden_states)
     if residual is not None:
         hidden_states = hidden_states + residual
     return (
@@ -77,33 +77,33 @@ def written(hidden_states):
     return hidden_states, ResidualStream(hidden_states)
 
 
-def finish_layer_stack(
-    hidden_states: Union[torch.Tensor, UnreducedOutput, HandoffOutput],
+def export_output(
+    hidden_states: Union[torch.Tensor, UnreducedOutput, DeferredFinalize],
     residual: Optional[torch.Tensor],
     forward_batch: ForwardBatch,
     *,
     final_norm_takes_handoff: bool = False,
     preserve_declared: bool = False,
-) -> Tuple[Union[torch.Tensor, HandoffOutput], Optional[torch.Tensor]]:
+) -> Tuple[Union[torch.Tensor, DeferredFinalize], Optional[torch.Tensor]]:
     """Complete what this layer left for a next layer, for callers that carry
     an explicit residual tensor or merge TBO microbatches. Stage-boundary
-    decoders use residual_batch.norm(), to_pp() or take_output() instead:
+    decoders use residual_batch.final_norm(), to_pp() or take_output() instead:
     to_pp() keeps a declared partial sum for the receiving from_pp(), which
     this helper would complete early. A final norm that does a producer's
     handoff together with its own work (``final_norm_takes_handoff``)
     receives it as it is."""
     if isinstance(residual, ResidualStream):
-        return residual.finish(
+        return residual.export(
             hidden_states,
             takes_handoff=final_norm_takes_handoff,
             preserve_declared=preserve_declared,
         )
-    if final_norm_takes_handoff and isinstance(hidden_states, HandoffOutput):
+    if final_norm_takes_handoff and isinstance(hidden_states, DeferredFinalize):
         return hidden_states, residual
-    return reduce_output(hidden_states), residual
+    return complete_owed(hidden_states), residual
 
 
-def norm_output(hidden_states, residual, norm, capture_output=None, **read_kwargs):
+def final_norm_pair(hidden_states, residual, norm, capture=None, **read_kwargs):
     """The final norm and an optional capture of the same updated residual.
 
     Keep add and norm together: normalizing a separately rounded residual is
@@ -111,12 +111,12 @@ def norm_output(hidden_states, residual, norm, capture_output=None, **read_kwarg
     capture callback owns retention of the borrowed residual storage.
     """
     if residual is None:
-        if capture_output is not None:
-            capture_output(hidden_states)
+        if capture is not None:
+            capture(hidden_states)
         return norm(hidden_states)
     hidden_states, residual = norm(hidden_states, residual, **read_kwargs)
-    if capture_output is not None:
-        capture_output(residual)
+    if capture is not None:
+        capture(residual)
     return hidden_states
 
 

@@ -1,8 +1,8 @@
 //! OpenAI-compatible generation endpoints.
 //!
 //! The HTTP adapter stays deliberately thin: Dynamo owns the standard OpenAI
-//! request and response primitives. Scheduler [`ChunkEvent`] values remain the one
-//! backend output type for both unary and streaming responses.
+//! request and response primitives. [`FrontendOutput`] remains the one backend
+//! output type for both unary and streaming responses.
 
 use axum::{Router, http::StatusCode, response::Response};
 use futures::StreamExt;
@@ -22,10 +22,11 @@ pub(super) use template::{ChatFormatter, ChatTemplateKwargs};
 
 use super::app::AppState;
 use super::frame::OutputAccumulator;
-use crate::frontend::{FrontendCall, FrontendError};
+use super::frontend_error_status;
+use crate::frontend::{
+    FrontendCall, FrontendError, FrontendEvent, FrontendOutput, FrontendRequest,
+};
 use crate::message::config::ServerArgs;
-use crate::message::request::GenerateRequest;
-use crate::message::response::{ChunkEvent, ResponseItem};
 use crate::tokenizer_manager::tokenizer;
 use crate::utils::response::error_response;
 
@@ -115,23 +116,21 @@ pub(super) fn openai_error(code: StatusCode, message: impl Into<String>, stream:
 }
 
 /// Drain one submitted request to its terminal output, fold frames, and map
-/// errors / validation aborts / truncation to `(status, message)` for the
-/// OpenAI error shape. The call owns cancellation and disarms itself.
-async fn collect_output(mut call: FrontendCall) -> Result<ChunkEvent, (StatusCode, String)> {
+/// semantic failures / truncation to `(status, message)` for the OpenAI error
+/// shape. The call owns cancellation and disarms itself.
+async fn collect_output(mut call: FrontendCall) -> Result<FrontendOutput, (StatusCode, String)> {
     let mut accumulator = OutputAccumulator::default();
     let output = loop {
         match call.recv().await {
-            Some(ResponseItem::Frame(output)) => accumulator.fold(&output),
-            Some(ResponseItem::Done(output)) => {
+            Some(FrontendEvent::Delta(output)) => accumulator.fold(&output),
+            Some(FrontendEvent::Finished(output)) => {
                 accumulator.fold(&output);
                 break accumulator.into_output();
             }
-            Some(ResponseItem::Error(error)) => {
-                let status = StatusCode::from_u16(error.http_status())
-                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            Some(FrontendEvent::Failed(error)) => {
+                let status = frontend_error_status(&error);
                 return Err((status, error.to_string()));
             }
-            Some(ResponseItem::Control(_)) | Some(ResponseItem::Data(_)) => {}
             None => {
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -140,22 +139,12 @@ async fn collect_output(mut call: FrontendCall) -> Result<ChunkEvent, (StatusCod
             }
         }
     };
-    if let Some((code, message)) = output
-        .finish_reason
-        .as_ref()
-        .and_then(|reason| reason.abort_status())
-    {
-        return Err((
-            StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-            message.to_owned(),
-        ));
-    }
     Ok(output)
 }
 
 async fn submit_generation(
     state: &AppState,
-    request: GenerateRequest,
+    request: FrontendRequest,
     stream: bool,
 ) -> Result<FrontendCall, Response> {
     match state.frontend.generate(request).await {
@@ -179,18 +168,14 @@ async fn submit_generation(
 fn indexed_decode_stream(
     index: usize,
     call: FrontendCall,
-) -> futures::stream::BoxStream<'static, (usize, Option<ResponseItem>)> {
+) -> futures::stream::BoxStream<'static, (usize, FrontendEvent)> {
     futures::stream::unfold((call, false), move |(mut call, finished)| async move {
         if finished {
             return None;
         }
-        match call.recv().await {
-            Some(item) => {
-                let finished = matches!(item, ResponseItem::Done(_) | ResponseItem::Error(_));
-                Some(((index, Some(item)), (call, finished)))
-            }
-            None => Some(((index, None), (call, true))),
-        }
+        let event = call.recv().await?;
+        let finished = event.is_terminal();
+        Some(((index, event), (call, finished)))
     })
     .boxed()
 }
