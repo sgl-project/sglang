@@ -17,7 +17,10 @@ import sys
 import pytest
 import torch
 
-from sglang.kernels.ops.attention.deepseek_v4_rope import fused_norm_rope_inplace_triton
+from sglang.kernels.ops.attention.deepseek_v4_rope import (
+    fused_norm_rope_inplace_triton,
+    precompute_freqs_cis,
+)
 from sglang.kernels.ops.attention.dsv4.compress import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
@@ -34,12 +37,8 @@ PAGE_SIZE = 64
 
 
 def _make_freqs(max_pos: int) -> torch.Tensor:
-    inv_freq = 1.0 / (
-        10000.0 ** (torch.arange(0, ROPE_DIM, 2, device="cuda").float() / ROPE_DIM)
-    )
-    t = torch.arange(max_pos, device="cuda").float()
-    angles = torch.outer(t, inv_freq)
-    return torch.polar(torch.ones_like(angles), angles)  # complex64 [max_pos, 32]
+    # The production table (base 10000, no YaRN), on the device the kernels run on.
+    return precompute_freqs_cis(ROPE_DIM, max_pos, 0, 10000, 1, 32, 1).to("cuda")
 
 
 def _reference_rows(kv, weight, eps, freqs, positions):
@@ -67,9 +66,9 @@ def test_uniform_fp8_store_decode_plan(num_rows):
     # half the rows sit on a window boundary (stored), half not (skipped)
     seq[::2] = (seq[::2] // RATIO).clamp(min=1) * RATIO
     seq[1::2] = (seq[1::2] // RATIO).clamp(min=1) * RATIO + 1
-    plan_i32 = torch.zeros(num_rows, 4, dtype=torch.int32, device="cuda")
-    plan_i32[:, 0] = seq
-    plan = CompressorDecodePlan(RATIO, plan_i32.view(torch.uint8))
+    plan = CompressorDecodePlan.generate_legacy(
+        RATIO, torch.arange(num_rows, device="cuda", dtype=torch.int64), seq.long()
+    )
     freqs = _make_freqs(8192 + RATIO)
     out_loc = torch.randperm(num_rows * 2, device="cuda")[:num_rows].to(torch.int64)
 

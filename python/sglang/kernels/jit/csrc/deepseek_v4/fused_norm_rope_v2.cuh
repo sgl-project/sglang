@@ -529,36 +529,27 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
 
   PDLTriggerSecondary<kUsePDL>();
 
-  // part 2: rope on the rope warp (BF16/uniform store), or per-warp FP8
-  // quant + store (packed layout).
-  if constexpr (kBf16Store || kUniformFp8Store) {
-    Float2 d = data;
-    if (warp_id == kRopeWarp) {
-      const auto x_real = data[0];
-      const auto x_imag = data[1];
-      const auto freq_real = freq[0];
-      const auto freq_imag = freq[1];
-      d[0] = x_real * freq_real - x_imag * freq_imag;
-      d[1] = x_real * freq_imag + x_imag * freq_real;
-    }
-    if constexpr (kUniformFp8Store) {
-      // BF16 round-trip to match the unfused path (Triton norm+rope emits
-      // bf16, then the pool store casts bf16 -> e4m3 at scale 1.0).
-      const auto x = cast<float>(cast<bf16_t>(d[0]));
-      const auto y = cast<float>(cast<bf16_t>(d[1]));
-      reinterpret_cast<fp8x2_e4m3_t*>(value_ptr)[tx] = pack_fp8(x, y);
-    } else {
-      reinterpret_cast<bf16x2_t*>(value_ptr)[tx] = cast<bf16x2_t>(fp32x2_t{d[0], d[1]});
-    }
-  } else if (warp_id == kRopeWarp) {
-    // Each rope-warp lane owns exactly one (real, imag) pair within the rope
-    // tail. Apply rotation, downcast to BF16, write to the slot's rope region.
+  // part 2: rope on the rope warp (each lane owns one (real, imag) pair of
+  // the rope tail), then the layout-specific store.
+  if (warp_id == kRopeWarp) {
     const auto x_real = data[0];
     const auto x_imag = data[1];
     const auto freq_real = freq[0];
     const auto freq_imag = freq[1];
     data[0] = x_real * freq_real - x_imag * freq_imag;
     data[1] = x_real * freq_imag + x_imag * freq_real;
+  }
+
+  if constexpr (kUniformFp8Store) {
+    // BF16 round-trip to match the unfused path (Triton norm+rope emits
+    // bf16, then the pool store casts bf16 -> e4m3 at scale 1.0).
+    const auto x = cast<float>(cast<bf16_t>(data[0]));
+    const auto y = cast<float>(cast<bf16_t>(data[1]));
+    reinterpret_cast<fp8x2_e4m3_t*>(value_ptr)[tx] = pack_fp8(x, y);
+  } else if constexpr (kBf16Store) {
+    reinterpret_cast<bf16x2_t*>(value_ptr)[tx] = cast<bf16x2_t>(fp32x2_t{data[0], data[1]});
+  } else if (warp_id == kRopeWarp) {
+    // Downcast the rotated pair to BF16 and write it to the slot's rope region.
     const auto result = cast<bf16x2_t>(fp32x2_t{data[0], data[1]});
     // out_loc indexes the rope pool directly: its rows are kRopeDim * 2 B wide no
     // matter how the nope pool is paged

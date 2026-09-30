@@ -802,6 +802,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         backend = object.__new__(DeepseekV4TrtllmAttnBackend)
         backend.trtllm_graph_output_buffer = torch.full((8, 2, 512), 7.0)
         backend.trtllm_eager_output_buffer = None
+        backend._padded_output_zeroed = None
 
         output = backend._padded_output_buffer(num_rows=8, num_real_rows=6, num_heads=2)
 
@@ -810,6 +811,15 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         )
         self.assertTrue(torch.all(output[:6] == 7))
         self.assertTrue(torch.all(output[6:] == 0))
+
+        # The tail is zeroed once per (buffer, rows, real rows): the kernel only
+        # ever writes [:real rows], so the other layers of the step skip the
+        # memset. A different shape re-zeroes.
+        output[6:] = 3
+        again = backend._padded_output_buffer(num_rows=8, num_real_rows=6, num_heads=2)
+        self.assertTrue(torch.all(again[6:] == 3))
+        other = backend._padded_output_buffer(num_rows=8, num_real_rows=5, num_heads=2)
+        self.assertTrue(torch.all(other[5:] == 0))
 
     def test_trtllm_prefill_slices_padding_in_dense_token_layout(self):
         from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
@@ -833,6 +843,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         backend.trtllm_workspace_buffer = torch.empty(1, dtype=torch.int8)
         backend.trtllm_graph_output_buffer = torch.full((8, 2, 512), 7.0)
         backend.trtllm_eager_output_buffer = None
+        backend._padded_output_zeroed = None
         backend._trtllm_kv_cache_views = lambda _layer_id, _ratio: (
             torch.empty(1),
             torch.empty(1),
