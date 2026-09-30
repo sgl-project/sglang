@@ -54,7 +54,7 @@ def sparse_moe_input(rows):
             "is_moe_input_scattered_across_dp_ranks", return_value=local
         ),
         patch_communicator("is_enable_moe_cp_allgather", return_value=rows == "moe_cp"),
-        patch_communicator("_gathers_over_attention_cp", return_value=False),
+        patch_communicator("_cp_gathers_over_attn_cp", return_value=False),
     ):
         yield
 

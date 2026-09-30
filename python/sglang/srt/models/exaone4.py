@@ -6,6 +6,16 @@ from torch import nn
 from transformers import Exaone4Config
 
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.layer_boundary import (
+    declare_attn,
+    declare_ffn,
+    make_stages,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+from sglang.srt.layers.layer_boundary.residual.post_norm import (
+    PLAIN_READOUT,
+    PostNormAdd,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -142,6 +152,7 @@ class Exaone4Attention(nn.Module):
             output_size=hidden_size,
             bias=bias_o_proj,
             quant_config=quant_config,
+            reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
@@ -263,39 +274,49 @@ class Exaone4DecoderLayer(nn.Module):
         self.post_feedforward_layernorm = RMSNorm(
             self.hidden_size, eps=config.rms_norm_eps
         )
+        # Post-LN: each stage reads the residual as it is, and its output is
+        # normalized before it is added. The layer writes the FFN's itself.
+        ffn_update = PostNormAdd(self.post_feedforward_layernorm, applied_at_exit=True)
+        self.attn_boundary, self.ffn_boundary = make_stages(
+            (
+                declare_attn(
+                    read=PLAIN_READOUT,
+                    update=PostNormAdd(self.post_attention_layernorm),
+                ),
+                None,
+            ),
+            (
+                declare_ffn(
+                    sparse=False,
+                    next_layer_sparse=False,
+                    read=PLAIN_READOUT,
+                    update=ffn_update,
+                ),
+                None,
+            ),
+            previous=declare_ffn(update=ffn_update) if layer_id != 0 else None,
+            terminal=layer_id == config.num_hidden_layers - 1,
+        )
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-
-        if residual is None:
-            residual = hidden_states
-
+    ) -> torch.Tensor:
         # Self Attention
+        hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
 
-        # Use post-LN
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = hidden_states + residual
-        residual = hidden_states
-
         # Fully Connected
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         hidden_states = self.mlp(hidden_states)
-
-        # Use post-LN
-        hidden_states = self.post_feedforward_layernorm(hidden_states)
-        hidden_states = hidden_states + residual
-        residual = hidden_states
-
-        return hidden_states, residual
+        return self.ffn_boundary.finish_complete_output(hidden_states, forward_batch)
 
 
 class Exaone4Model(nn.Module):
@@ -353,30 +374,18 @@ class Exaone4Model(nn.Module):
                 hidden_states = self.get_input_embeddings(input_ids)
             else:
                 hidden_states = input_embeds
-            residual = None
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
 
-        for i in range(len(self.layers)):
-            layer = self.layers[i]
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                forward_batch,
-                residual,
-            )
+        for i in range(self.start_layer, self.end_layer):
+            hidden_states = self.layers[i](positions, hidden_states, forward_batch)
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
-        else:
-            hidden_states = self.norm(hidden_states)
-        return hidden_states
+            return residual_batch.to_pp(hidden_states, forward_batch)
+        return residual_batch.final_norm(hidden_states, forward_batch, self.norm)
 
 
 class Exaone4ForCausalLM(nn.Module):
@@ -497,6 +506,7 @@ class Exaone4ForCausalLM(nn.Module):
         start, end = split_interval
         # embed
         if start == 0:
+            residual_batch.start(forward_batch)
             if input_embeds is None:
                 forward_batch.hidden_states = self.model.embed_tokens(input_ids)
             else:
@@ -504,19 +514,17 @@ class Exaone4ForCausalLM(nn.Module):
         # decoder layer
         for i in range(start, end):
             layer = self.model.layers[i]
-            forward_batch.hidden_states, forward_batch.residual = layer(
+            forward_batch.hidden_states = layer(
                 positions,
                 forward_batch.hidden_states,
                 forward_batch,
-                forward_batch.residual,
             )
 
         if end == self.model.config.num_hidden_layers:
             # norm
-            hidden_states, _ = self.model.norm(
-                forward_batch.hidden_states, forward_batch.residual
+            forward_batch.hidden_states = residual_batch.final_norm(
+                forward_batch.hidden_states, forward_batch, self.model.norm
             )
-            forward_batch.hidden_states = hidden_states
             # logits process
             result = self.logits_processor(
                 input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
