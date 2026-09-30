@@ -603,21 +603,11 @@ export const config = {
           values: [
             null,
             {
-              // 950PR/DT Series only: the recipe runs attention DP size 1
-              // (attn-TP 32), unlike A3's 4.
-              value: 1,
-              hide: { hw: ["b300", "gb300", "b200", "gb200", "h200", "h100", "mi350x", "mi355x", "a3"] },
-            },
-            {
               value: false,
               get disable() { return [
                 {
                   when: { hw: ["a3"] },
                   reason: "Only DP-Attention=4 (2 on Prefill) is supported on this recipe.",
-                },
-                {
-                  when: { hw: ["a5"] },
-                  reason: "Only DP-Attention=1 is supported on this recipe.",
                 },
               ]; },
             },
@@ -632,7 +622,7 @@ export const config = {
                 },
                 {
                   when: { hw: ["a5"] },
-                  reason: "Only DP-Attention=1 is supported on this recipe.",
+                  reason: "This recipe runs without DP-Attention.",
                 },
               ]; },
             },
@@ -641,7 +631,7 @@ export const config = {
               get disable() { return [
                 {
                   when: { hw: ["a5"] },
-                  reason: "Only DP-Attention=1 is supported on this recipe.",
+                  reason: "This recipe runs without DP-Attention.",
                 },
                 {
                   when: { hw: ["a3"], pdMode: ["prefill"] },
@@ -658,7 +648,7 @@ export const config = {
                 },
                 {
                   when: { hw: ["a5"] },
-                  reason: "Only DP-Attention=1 is supported on this recipe.",
+                  reason: "This recipe runs without DP-Attention.",
                 },
                 {
                   when: { hw: ["b300", "gb300"] },
@@ -680,7 +670,7 @@ export const config = {
                 },
                 {
                   when: { hw: ["a5"] },
-                  reason: "Only DP-Attention=1 is supported on this recipe.",
+                  reason: "This recipe runs without DP-Attention.",
                 },
                 {
                   when: { hw: ["b300", "gb300"] },
@@ -2670,8 +2660,8 @@ export const config = {
       // Ascend 950PR/DT Series: 4 nodes × 8 cards, one rank per card (TP32).
       // Unified PD, Balanced, DSPARK-only, with the product-line kernels armed
       // per env: FIAS V2 BSND for the DSpark target-verify/draft attention
-      // paths and the fine-grained dual-stream MoE overlap. Attention DP size
-      // is 1 (attn-TP 32), and the shared experts / dense MLP shard across
+      // paths and the fine-grained dual-stream MoE overlap. It runs without
+      // attention DP (attn-TP 32), and the shared experts / dense MLP shard across
       // attention-TP through the server flags (--shared-experts-tp-size 4).
       // Checkpoint: the official Moonshot MXFP4 build (moonshotai/Kimi-K3,
       // fetched from ModelScope by SGLANG_USE_MODELSCOPE=1 above). Its routed
@@ -2727,7 +2717,6 @@ export const config = {
         "--device npu",
         "--dtype bfloat16",
         "--tp-size 32",
-        "--attn-dp-size 1",
         "--enable-dp-lm-head",
         "--mem-fraction-static 0.9",
         "--chunked-prefill-size 8192",

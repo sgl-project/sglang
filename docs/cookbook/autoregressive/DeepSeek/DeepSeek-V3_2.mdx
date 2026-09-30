@@ -475,7 +475,7 @@ sglang_args=($sglang_args)
 sglang "${sglang_args[@]}" 2>&1 | tee $LOG_DIR/$RANK.log
 ```
 
-**CP + PP + EP + DP**
+**CP + PP + EP**
 
 `CP` is currently enabled with `PP=2` on Hopper platform and we can reduce TP=16 to TP=8 from standalone deployment:
 
@@ -483,7 +483,7 @@ sglang "${sglang_args[@]}" 2>&1 | tee $LOG_DIR/$RANK.log
 # verified on Hopper platform
 sglang_args=$(echo serve \
   --model-path $MAPPED_MODEL_PATH \
-  --nccl-init $MASTER_ADDR:$MASTER_PORT --nnodes 2 --node-rank $RANK --tp 8 --pp-size 2 --attn-dp-size 1 \
+  --nccl-init $MASTER_ADDR:$MASTER_PORT --nnodes 2 --node-rank $RANK --tp 8 --pp-size 2 \
   --moe-a2a-backend deepep --ep-size 16  \
   --page-size 128 \
   --chunked-prefill-size 16384 \
@@ -499,7 +499,7 @@ sglang_args=$(echo serve \
   --context-length 65536 \
   --allow-auto-truncate --enable-metrics \
   --tool-call-parser deepseekv32 --reasoning-parser deepseek-v3 \
-  --served-model-name DeepSeek-V3.2-dsa-pp-cp-ep-dp
+  --served-model-name DeepSeek-V3.2-dsa-pp-cp-ep
 )
 
 sglang_args=($sglang_args)
@@ -509,14 +509,10 @@ sglang "${sglang_args[@]}" 2>&1 | tee $LOG_DIR/$RANK.log
 
 **fp8 KV + CP + PP**
 
-FP8 KV reduces the memory footprint. For DeepSeek V3.2, combine it with interleave CP and PP while keeping `--attn-dp-size 1`:
+FP8 KV reduces the memory footprint. For DeepSeek V3.2, combine it with interleave CP and PP, without attention DP:
 
 ```shell Command
 # verified in Hopper platform
-dp_config=" \
-  --attn-dp-size 1 \
-"
-
 cp_config=" \
   --enable-prefill-cp \
   --cp-strategy interleave \
@@ -526,7 +522,6 @@ cp_config=" \
 sglang_args=$(echo serve \
   --model-path $MAPPED_MODEL_PATH \
   --nccl-init $MASTER_ADDR:$MASTER_PORT --nnodes 2 --node-rank $RANK --tp 8 --pp-size 2 --pp-async-batch-depth 1 \
-  $dp_config \
   --trust-remote-code --host "0.0.0.0" --port 30000 \
   --log-requests \
   --context-length 65536 --max-running-requests 128 \
