@@ -170,6 +170,8 @@ def free_kv_row_segments(
 
 
 def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
+    """Publish what the running request has computed so far, unless it is
+    barred from the tree."""
     if req.skip_radix_cache_insert:
         return
 

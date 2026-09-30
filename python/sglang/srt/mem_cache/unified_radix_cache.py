@@ -1078,7 +1078,6 @@ class UnifiedRadixCache(BasePrefixCache):
                     key=prompt_key,
                     value=values[: len(prompt_key)],
                     prev_prefix_len=len(prompt_key),
-                    record_end=False,
                     priority=insert_params.priority + 1,
                 )
             )

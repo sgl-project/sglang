@@ -267,7 +267,6 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         prepare_params = component.prepare_for_caching_req.call_args.kwargs[
             "insert_params"
         ]
-        self.assertFalse(prepare_params.record_end)
         self.assertEqual(prepare_params.prev_prefix_len, 2)
         component.free_out_of_window_slots.assert_called_once_with(
             req, 3, prepare_params

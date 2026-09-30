@@ -5,10 +5,10 @@ Verifies that inc_lock_ref / dec_lock_ref are balanced across the four
 transfer scenarios identified in PR #19746:
 
 1. Incremental transfer & success (prefix match > 0)
-   inc_lock_ref(pop_preallocated) -> dec+inc(checkpoint_req) -> dec(cache_finished_req)
+   inc_lock_ref(pop_preallocated) -> dec+inc(checkpoint_req) -> dec(release_kv_cache)
 
 2. Full transfer & success (prefix match == 0, full KV transferred)
-   inc_lock_ref(get_new_prebuilt_batch) -> dec+inc(checkpoint_req) -> dec(cache_finished_req)
+   inc_lock_ref(get_new_prebuilt_batch) -> dec+inc(checkpoint_req) -> dec(release_kv_cache)
 
 3. Incremental transfer & failure (prefix match > 0, transfer fails)
    inc_lock_ref(pop_preallocated) -> dec(unpin via release_kv_cache is_insert=False)
