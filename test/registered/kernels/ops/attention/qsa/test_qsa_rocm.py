@@ -119,3 +119,7 @@ def test_qsa_hip_aiter_varlen_matches_torch_reference():
         scores = torch.einsum("hd,khd->hk", q[row].float(), keys) * scale
         expected = torch.einsum("hk,khd->hd", scores.softmax(dim=-1), values)
         torch.testing.assert_close(out[row].float(), expected, atol=2e-2, rtol=2e-2)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
