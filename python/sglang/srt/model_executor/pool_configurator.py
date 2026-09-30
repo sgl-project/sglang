@@ -321,12 +321,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
             from sglang.srt.mem_cache.kv_cache_configurator import (
                 calculate_mla_kv_cache_dim,
+                is_packed_mla_kv_cache,
             )
 
             cell_size = (
                 calculate_mla_kv_cache_dim(
                     model_config=model_config,
                     kv_cache_dtype=kv_cache_dtype,
+                    packed=is_packed_mla_kv_cache(kv_cache_dtype),
                 )
                 * effective_num_layers
                 * kv_size
@@ -498,13 +500,22 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             DSATokenToKVPool.index_k_with_scale_buffer_dtype
         )
         if _is_npu:
+            from sglang.srt.hardware_backend.npu.kv_capability import (
+                resolve_npu_kv_capability,
+            )
             from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
-            dtype = kvc.kv_cache_dtype
-            # GPU sizing above assumes FP8 indexers; NPU also needs BF16 sizing.
-            if dtype != torch.float8_e4m3fn:
-                indexer_size_per_token = index_head_dim
-                element_size = torch._utils._element_size(dtype)
+            # Mirror NPUMLATokenToKVPool: index K in the indexer dtype, plus one
+            # scale per token when the indexer is quantized.
+            capability = resolve_npu_kv_capability(kvc.kv_cache_dtype)
+            indexer_size_per_token = index_head_dim * torch._utils._element_size(
+                capability.indexer_kv_dtype
+            )
+            if capability.indexer_quant:
+                indexer_size_per_token += torch._utils._element_size(
+                    capability.indexer_scale_dtype
+                )
+            element_size = 1
             if not is_npu_arch35():
                 allocate_all_layers = True
         memory_config = get_memory()
@@ -607,12 +618,14 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             # MLA pool sizing uses latent dimensions rather than MHA heads.
             from sglang.srt.mem_cache.kv_cache_configurator import (
                 calculate_mla_kv_cache_dim,
+                is_packed_mla_kv_cache,
             )
 
             self._full_per_token = (
                 calculate_mla_kv_cache_dim(
                     model_config=model_config,
                     kv_cache_dtype=kv_cache_dtype,
+                    packed=is_packed_mla_kv_cache(kv_cache_dtype),
                 )
                 * kv_size
             )

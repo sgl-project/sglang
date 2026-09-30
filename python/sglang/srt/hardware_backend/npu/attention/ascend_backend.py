@@ -23,6 +23,7 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
+from sglang.srt.hardware_backend.npu.kv_capability import resolve_npu_kv_capability
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_sparse_context_len,
     is_sparsity_driven_kv_offload_enabled,
@@ -334,6 +335,7 @@ class AscendAttnBackend(AttentionBackend):
         self.page_size = model_runner.page_size
         self.model_dtype = model_runner.model_config.dtype
         self.kv_cache_dtype = model_runner.kv_cache_dtype
+        self.kv_capability = resolve_npu_kv_capability(self.kv_cache_dtype)
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         if self.use_mla:
             self.kv_lora_rank = model_runner.model_config.kv_lora_rank
@@ -1438,7 +1440,7 @@ class AscendAttnBackend(AttentionBackend):
                     speculative_num_draft_tokens=self.speculative_num_draft_tokens,
                     scaling=layer.scaling,
                 )
-            if self.kv_cache_dtype == torch.float8_e4m3fn:
+            if self.kv_capability.main_kv_packed:
                 assert q_nope.dtype == q_pe.dtype == torch.bfloat16
                 packed = k_nope.view(torch.float8_e4m3fn)
                 attn_out = torch_npu.npu_kv_quant_sparse_flash_attention(
