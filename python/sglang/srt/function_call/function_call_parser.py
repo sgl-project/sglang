@@ -117,7 +117,10 @@ class FunctionCallParser:
         tool_call_parser: str,
         tokenizer=None,
         prefix: str = "",
+        constrained: bool = False,
     ):
+        self.tools = tools
+        self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
         detector_class = self.ToolCallParserEnum.get(tool_call_parser)
         if detector_class:
             kwargs = {}
@@ -125,15 +128,17 @@ class FunctionCallParser:
                 sig = inspect.signature(detector_class)
                 if "tokenizer" in sig.parameters:
                     kwargs["tokenizer"] = tokenizer
-            if prefix and issubclass(detector_class, ResponseTemplateToolDetector):
-                kwargs["prefix"] = prefix
+            if issubclass(detector_class, ResponseTemplateToolDetector):
+                if prefix:
+                    kwargs["prefix"] = prefix
+                kwargs["constrained"] = constrained
+                # Forced calls are parsed in the format of the tag for these tools.
+                kwargs["tools"] = self.structural_tag_tools()
             detector = detector_class(**kwargs)
         else:
             raise ValueError(f"Unsupported tool_call_parser: {tool_call_parser}")
 
         self.detector = detector
-        self.tools = tools
-        self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
 
     def has_tool_call(self, text: str) -> bool:
         """
@@ -261,6 +266,18 @@ class FunctionCallParser:
             at_least_one=at_least_one,
         )
 
+    def structural_tag_tools(self) -> List[Tool]:
+        """The tools as structural tags constrain them: all strict at the
+        PARAMETER strict level."""
+        if self.tool_strict_level < ToolStrictLevel.PARAMETER or not self.tools:
+            return self.tools
+        return [
+            tool.model_copy(
+                update={"function": tool.function.model_copy(update={"strict": True})}
+            )
+            for tool in self.tools
+        ]
+
     def get_structure_constraint(
         self,
         tool_choice: Union[ToolChoice, Literal["auto", "required"]],
@@ -287,9 +304,13 @@ class FunctionCallParser:
             any(tool.function.strict for tool in self.tools)
             or self.tool_strict_level >= ToolStrictLevel.FUNCTION
         )
+        structural_tag_tools = self.structural_tag_tools()
         if isinstance(self.detector, ResponseTemplateToolDetector):
             should_constrain_auto = self.detector.validate_structure_constraint_request(
-                self.tools, tool_choice, should_constrain_auto
+                tools=structural_tag_tools,
+                tool_choice=tool_choice,
+                parallel_tool_calls=parallel_tool_calls,
+                strict_requested=should_constrain_auto,
             )
 
         # Highest priority: model-native structural_tag when available.
@@ -304,18 +325,6 @@ class FunctionCallParser:
                     return ("structural_tag", structural_tag)
 
             if is_required or should_constrain_auto:
-                structural_tag_tools = self.tools
-                if self.tool_strict_level >= ToolStrictLevel.PARAMETER:
-                    structural_tag_tools = [
-                        tool.model_copy(
-                            update={
-                                "function": tool.function.model_copy(
-                                    update={"strict": True}
-                                )
-                            }
-                        )
-                        for tool in self.tools
-                    ]
                 structural_tag = self.detector.get_structural_tag(
                     tools=structural_tag_tools,
                     thinking_mode=thinking_mode,

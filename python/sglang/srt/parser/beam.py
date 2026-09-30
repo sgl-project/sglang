@@ -9,21 +9,27 @@ BEAM_RESPONSE_TEMPLATE: dict[str, Any] = {
     "start_anchor_pattern": r"<\|start\|>assistant",
     "fields": {
         "thinking": {
-            "open": "<|channel|>analysis<|message|>",
-            "close": "<|end|><|start|>assistant",
+            "open_pattern": (
+                r"(?:^<\|channel\|>analysis<\|message\|>"
+                r"|<\|start\|>assistant<\|channel\|>analysis<\|message\|>)"
+            ),
+            "close": "<|end|>",
             "content": "text",
         },
         "content": {
-            "open": "<|channel|>final<|message|>",
-            # `<|call|>` is a stop token, so a grammar that lets the answer end
-            # cannot keep it from ending the answer.
-            "close": ["<|return|>", "<|end|>", "<|call|>"],
+            "open_pattern": (
+                r"(?:<\|channel\|>final<\|message\|>"
+                r"|<\|start\|>assistant<\|channel\|>final<\|message\|>)"
+            ),
+            "close": ["<|return|>", "<|end|>"],
             "content": "text",
         },
         "tool_calls": {
             "open_pattern": (
-                r"(?:<\|start\|>assistant)? to=(?P<name>[a-zA-Z_][a-zA-Z0-9_.-]*)"
-                r"<\|channel\|>analysis <\|constrain\|>xml<\|message\|>"
+                r"(?:<\|start\|>assistant )?to="
+                r"(?P<name>[a-zA-Z_][a-zA-Z0-9_.-]*)"
+                r"<\|channel\|>analysis"
+                r"(?: <\|constrain\|>xml)?<\|message\|>"
             ),
             "close": ["<|end|>", "<|call|>"],
             "repeats": True,
@@ -31,7 +37,7 @@ BEAM_RESPONSE_TEMPLATE: dict[str, Any] = {
             "content_args": {
                 "tag_pattern": (
                     r'<rfl:parameter name="(?P<key>[^"]+)">'
-                    r"\n(?P<value>.*?)\n</rfl:parameter>"
+                    r"\n?(?P<value>.*?)\n?</rfl:parameter>"
                 ),
                 "value_parser": {
                     "name": "text",
@@ -52,4 +58,5 @@ BEAM_RESPONSE_TEMPLATE: dict[str, Any] = {
 
 class BeamReasoningDetector(ResponseTemplateReasoningDetector):
     response_template = BEAM_RESPONSE_TEMPLATE
+    _default_think_start = "<|channel|>analysis<|message|>"
     reasoning_default = "always"

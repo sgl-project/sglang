@@ -2218,6 +2218,8 @@ class ReasoningParser:
                 kwargs["prefix"] = prefix
             if isinstance(request, (ChatCompletionRequest, ResponsesRequest)):
                 kwargs["grammar_start"] = request._response_parser_grammar_start
+                kwargs["tools"] = request.tools
+                kwargs["constrained"] = request._response_parser_tool_grammar
 
         self.detector = detector_class(**kwargs)
 

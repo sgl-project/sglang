@@ -20,7 +20,14 @@ import copy
 import json
 from typing import Any
 
-from .content_parsers import STREAMABLE_PARSERS, process_field
+import regex as re
+
+from .content_parsers import (
+    STREAMABLE_PARSERS,
+    _json_advance,
+    _json_tag,
+    process_field,
+)
 from .response_templates import (
     ResponseTemplate,
     ResponseTemplateField,
@@ -149,6 +156,7 @@ class ResponseParser:
         prefix: str | None = None,
         *,
         tools: list[dict] | None = None,
+        constrained: bool = False,
     ):
         self._spec = load_response_template(response_template)
         if prefix is None:
@@ -160,12 +168,18 @@ class ResponseParser:
             )
         # Maps tool name -> schema `properties`, used to cast parsed tool-call arguments
         self._tool_params: dict[str, dict] = {}
+        # Tool name -> schema `properties` of strict tools, whose non-string arguments a grammar may hold to JSON
+        self._strict_params: dict[str, dict] = {}
         for tool in tools or []:
             fn = tool.get("function", tool) if isinstance(tool, dict) else None
             if isinstance(fn, dict) and isinstance(fn.get("name"), str):
                 parameters = fn.get("parameters")
                 properties = parameters.get("properties") if isinstance(parameters, dict) else None
                 self._tool_params[fn["name"]] = properties if isinstance(properties, dict) else {}
+                if fn.get("strict"):
+                    self._strict_params[fn["name"]] = self._tool_params[fn["name"]]
+        # A grammar keeps tool-call bodies well-formed, so a closer inside one of their JSON strings or tags is content.
+        self._constrained = constrained
         self._buffer: str = ""
         self._pos: int = 0
         self._output: dict[str, Any] = copy.deepcopy(self._spec.defaults)
@@ -178,6 +192,9 @@ class ResponseParser:
         self._captures: dict[str, str] = {}
         self._body: str = ""
         self._opened: bool = False
+        # Where the open region's body starts, and the scan of it for closers inside its content
+        self._region_start: int = 0
+        self._content_scan: dict | None = None
         self._finalized: bool = False
         self._prefix_len: int = 0
         self._malformed_fields: set[str] = set()
@@ -333,6 +350,8 @@ class ResponseParser:
                 m = pattern.search(self._buffer, self._pos)
             else:
                 m = pattern.search(self._buffer, self._pos, partial=True)
+            while self._constrained and kind == "close" and m is not None and not m.partial and self._inside_content(field, m.start()):
+                m = pattern.search(self._buffer, m.start() + 1, partial=not eos)
             if m is None:
                 continue
             if not eos and (m.partial or self._can_grow(kind, field, m)):
@@ -347,6 +366,58 @@ class ResponseParser:
         if best is not None and best[2].start() >= hold_start:
             best = None
         return best, hold_start
+
+    def _inside_content(self, field: ResponseTemplateField, end: int) -> bool:
+        """Scan incrementally to distinguish call closers from JSON strings and parameter heads."""
+        if self._content_scan is None:
+            self._content_scan = {"tags_end": self._region_start, "head": None, "pos": self._region_start, "string": False}
+        scan, buffer = self._content_scan, self._buffer
+        if field.content == "json" and not field.content_args:
+            return not _json_advance(buffer, scan, end)
+        if field.content != "xml-inline":
+            return False
+        tag_pattern = field.content_args["tag_pattern"]
+        try:
+            tag, head = re.compile(tag_pattern, re.DOTALL), re.compile(tag_pattern[: tag_pattern.index("(?P<value>")], re.DOTALL)
+        except (ValueError, re.error):
+            return False
+        json_keys = self._json_keys(field)
+        while True:
+            if scan["head"] is not None:  # inside the JSON value of the tag starting at scan["head"]
+                # A literal holds no string, so its tag end rather than JSON completion ends it.
+                if not _json_advance(buffer, scan, end) and ("json_start" not in scan or buffer[scan["json_start"]] in '"[{'):
+                    return True
+                m = _json_tag(tag, buffer, scan["head"], scan["value"], end)
+                if m is None:
+                    return False
+                scan["tags_end"], scan["head"] = m.end(), None
+                continue
+            m = head.search(buffer, scan["tags_end"], end, partial=True)
+            if m is None or m.start() == end:
+                return False
+            if m.partial:
+                return True
+            if m.groupdict().get("key") in json_keys:
+                scan.update(head=m.start(), value=m.end(), pos=m.end(), string=False, json_done=False)
+                scan.pop("json_start", None)
+                continue
+            m = tag.match(buffer, m.start(), end)
+            if m is None:
+                return False
+            scan["tags_end"] = m.end()
+
+    def _json_keys(self, field: ResponseTemplateField) -> frozenset:
+        """JSON-valued parameters of the current constrained strict tool."""
+        if not self._constrained or field.content != "xml-inline":
+            return frozenset()
+        properties = self._strict_params.get(self._captures.get("name"))
+        if not properties:
+            return frozenset()
+        json_values = (field.content_args.get("value_parser") or {}).get("name") == "json"
+        return frozenset(
+            key for key, schema in properties.items()
+            if json_values or ((types := _schema_types(schema)) and "string" not in types)
+        )
 
     def _can_grow(self, kind: str, field: ResponseTemplateField, m: Any) -> bool:
         r"""Whether a *complete* match ending at the current buffer edge could still
@@ -380,6 +451,7 @@ class ResponseParser:
         if not self._opened:
             events.append({"type": "region_open", "field": self._current, "start": self._pos, "end": self._pos})
             self._opened = True
+            self._region_start = self._pos
         self._body += text
         # Prefix bytes held back as a possible delimiter belong to the prompt, not the chunk.
         text = text[max(0, self._prefix_len - self._pos) :]
@@ -390,6 +462,7 @@ class ResponseParser:
     def _open_explicit(self, events: list[dict], field: ResponseTemplateField, m: Any) -> None:
         self._current = field.name
         self._captures = {k: v for k, v in m.groupdict().items() if v is not None}
+        self._region_start = m.end()
         self._body = ""
         self._opened = True
         events.append(
@@ -405,9 +478,11 @@ class ResponseParser:
             return
         field = self._spec.fields[self._current]
         try:
-            value = process_field(self._body, field, self._captures)
+            value = process_field(self._body, field, self._captures, self._json_keys(field))
             if self._tool_params:
-                value = self._coerce_tool_calls(value)
+                value_parser = field.content_args.get("value_parser") or {}
+                json_values = field.content == "json" or value_parser.get("name") == "json"
+                value = self._coerce_tool_calls(value, json_values=json_values)
             if field.join is not None and not isinstance(value, str):
                 raise ValueError(
                     f"Field '{field.name}': 'join' requires each match to parse to a string, "
@@ -430,9 +505,11 @@ class ResponseParser:
         events.append({"type": "region_close", "field": self._current, "start": close_start, "end": close_end, "value": value})
         self._reset_to_implicit()
 
-    def _coerce_tool_calls(self, value: Any) -> Any:
+    def _coerce_tool_calls(self, value: Any, json_values: bool = False) -> Any:
+        """Cast string arguments to their declared types. With `json_values`, the arguments were decoded from
+        JSON, where a string is explicit: it stays a string wherever the schema allows one."""
         if isinstance(value, list):
-            return [self._coerce_tool_calls(item) for item in value]
+            return [self._coerce_tool_calls(item, json_values) for item in value]
         fn = value.get("function") if isinstance(value, dict) else None
         if not isinstance(fn, dict):
             return value
@@ -442,6 +519,8 @@ class ResponseParser:
         if properties := self._tool_params.get(name):
             for key, argument in arguments.items():
                 if key not in properties or not (types := _schema_types(properties[key])):
+                    continue
+                if json_values and "string" in types:
                     continue
                 if isinstance(argument, str):
                     arguments[key] = _coerce(argument, types)
@@ -453,6 +532,8 @@ class ResponseParser:
     def _reset_to_implicit(self) -> None:
         self._current = self._implicit_name
         self._captures = {}
+        self._region_start = self._pos
+        self._content_scan = None
         self._body = ""
         self._opened = False
 # fmt: on

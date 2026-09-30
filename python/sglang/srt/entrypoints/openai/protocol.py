@@ -844,6 +844,7 @@ def _has_message_level_tools(messages: Any) -> bool:
 class ChatCompletionRequest(BaseModel):
     _response_parser_prefix: str = PrivateAttr(default="")
     _response_parser_grammar_start: Optional[str] = PrivateAttr(default=None)
+    _response_parser_tool_grammar: bool = PrivateAttr(default=False)
 
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
@@ -1605,6 +1606,7 @@ class ResponsesRequest(BaseModel):
 
     _response_parser_prefix: str = PrivateAttr(default="")
     _response_parser_grammar_start: Optional[str] = PrivateAttr(default=None)
+    _response_parser_tool_grammar: bool = PrivateAttr(default=False)
 
     # Core OpenAI API fields (ordered by official documentation)
     background: Optional[bool] = False
@@ -2055,6 +2057,10 @@ class MessageProcessingResult:
     skip_special_tokens: bool = True
     require_reasoning: bool = False
     reasoning_end_token_ids: Optional[List[int]] = None
+    # The tool-call constraint is the response template's own grammar.
+    template_tool_call_grammar: bool = False
+    # The tool-call constraint for output that starts the assistant message.
+    message_start_tool_call_constraint: Optional[ToolCallConstraint] = None
     uses_response_template: bool = False
 
 

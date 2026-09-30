@@ -496,7 +496,25 @@ class OpenAIServingResponses(OpenAIServingChat):
                 processed_messages is not None
                 and processed_messages.uses_response_template
             ):
-                self._set_response_parser_context(request, adapted_request)
+                try:
+                    self._set_response_parser_context(
+                        request,
+                        adapted_request,
+                        tools=(
+                            self._response_tools_to_chat_tools(request)
+                            if self.tool_call_parser and request.tool_choice != "none"
+                            else []
+                        ),
+                        tool_call_constraint=processed_messages.tool_call_constraint,
+                        template_tool_call_grammar=(
+                            processed_messages.template_tool_call_grammar
+                        ),
+                        message_start_tool_call_constraint=(
+                            processed_messages.message_start_tool_call_constraint
+                        ),
+                    )
+                except ValueError as e:
+                    return self.create_error_response(str(e))
 
             # Store the input messages
             if request.store:
@@ -700,16 +718,14 @@ class OpenAIServingResponses(OpenAIServingChat):
                 if request.is_include_output_logprobs() and isinstance(meta_info, dict)
                 else None
             )
+            generated = final_res["text"]
+            finish = (
+                meta_info.get("finish_reason") if isinstance(meta_info, dict) else None
+            )
             output = self._make_response_output_items(
                 request,
-                self._drop_kept_tool_close(
-                    final_res["text"],
-                    (
-                        meta_info.get("finish_reason")
-                        if isinstance(meta_info, dict)
-                        else None
-                    ),
-                    request,
+                self._settle_response_template_stop(
+                    generated, finish, request, generated
                 ),
                 tokenizer,
                 output_logprobs=output_logprobs,
@@ -922,6 +938,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 self.tool_call_parser,
                 tokenizer=self.tokenizer_manager.tokenizer,
                 prefix=request._response_parser_prefix,
+                constrained=request._response_parser_tool_grammar,
             )
             detector_owns_format = (
                 parser.detector.supports_structural_tag()
@@ -2072,6 +2089,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     self.tool_call_parser,
                     tokenizer=self.tokenizer_manager.tokenizer,
                     prefix=request._response_parser_prefix,
+                    constrained=request._response_parser_tool_grammar,
                 )
                 detector_owns_format = self._tool_parser_owns_format(probe)
             if is_required and not detector_owns_format:
@@ -2082,6 +2100,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     self.tool_call_parser,
                     tokenizer=self.tokenizer_manager.tokenizer,
                     prefix=request._response_parser_prefix,
+                    constrained=request._response_parser_tool_grammar,
                 )
         reasoning_parser_obj: Optional[ReasoningParser] = None
         if self.reasoning_parser:
@@ -2125,6 +2144,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         flushed = False
         stream_offset = 0
         incremental = get_serving().incremental_streaming_output
+        generated_parts: list[str] = []
 
         def _open_reasoning_item() -> str:
             nonlocal current_output_index
@@ -2330,12 +2350,18 @@ class OpenAIServingResponses(OpenAIServingChat):
                 text = chunk.get("text", "") or ""
                 if incremental:
                     delta = text
+                    if (
+                        request._response_parser_grammar_start is not None
+                        or request._response_parser_tool_grammar
+                    ):
+                        generated_parts.append(delta)
                 else:
                     delta = text[stream_offset:]
                     stream_offset = len(text)
                 if finish_reason is not None:
-                    delta = self._drop_kept_tool_close(
-                        delta, finish_reason, request, text
+                    generated = "".join(generated_parts) if incremental else text
+                    delta = self._settle_response_template_stop(
+                        delta, finish_reason, request, generated
                     )
                 if not delta and finish_reason is None:
                     continue

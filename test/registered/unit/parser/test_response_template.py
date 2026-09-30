@@ -6,6 +6,9 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from xgrammar import Grammar
+from xgrammar.testing import _is_grammar_accept_string
+
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     Function,
@@ -21,6 +24,7 @@ from sglang.srt.parser.reasoning_parser import Gemma4Detector as Gemma4Reasoning
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.response_template import (
     GRAMMAR_AFTER_REASONING,
+    GRAMMAR_AT_ANSWER,
     GRAMMAR_FROM_START,
     ResponseTemplateReasoningDetector,
     ResponseTemplateToolDetector,
@@ -542,10 +546,15 @@ class TestResponseTemplateAdapters(CustomTestCase):
             (None, "<think>Plan</think>" + plain, ("Plan", "")),
             (
                 GRAMMAR_AFTER_REASONING,
+                "<think>Plan</think>" + delimited,
+                ("Plan", delimited),
+            ),
+            (
+                GRAMMAR_AT_ANSWER,
                 "<think>Plan</think><answer>" + delimited,
                 ("Plan", delimited),
             ),
-            (GRAMMAR_AFTER_REASONING, "<think>Plan</think>" + call, ("Plan", call)),
+            (GRAMMAR_AT_ANSWER, "<think>Plan</think>" + call, ("Plan", call)),
             (GRAMMAR_FROM_START, delimited, ("", delimited)),
         )
         for grammar_start, output, expected in cases:
@@ -687,20 +696,81 @@ class TestResponseTemplateAdapters(CustomTestCase):
         self.assertTrue(detector.thinks_internally)
         self.assertEqual(detector.reasoning_default, "always")
 
-    def test_literal_content_opener_extends_think_end_token(self):
-        literal = copy.deepcopy(GEMMA4_RESPONSE_TEMPLATE)
-        literal["fields"]["content"]["open"] = "<|channel>final\n"
-        pattern = copy.deepcopy(GEMMA4_RESPONSE_TEMPLATE)
-        pattern["fields"]["content"]["open_pattern"] = r"<\|channel>(?:final)\n"
+    def test_json_after_reasoning_is_framed_as_the_answer(self):
+        """JSON started at the reasoning end must not skip the answer opener, unless a
+        call starts."""
+        detector = ResponseTemplateReasoningDetector(
+            response_template=DELIMITED_TEMPLATE
+        )
+        call = '<call:get_weather>{"days": 3}</call>'
+        declared = ["get_weather"]
+        cases = [
+            (declared, '<answer>{"a": 1}', True),
+            (declared, '<answer>{"a": 1}</answer>', False),
+            (declared, '{"a": 1}', False),
+            (declared, "<answer>not json", False),
+            (declared, call, True),
+            ([], call, False),
+            (declared, "<call:get_time>{}</call>", False),
+            # An answer after the calls is JSON too; a call's own text is not.
+            (declared, call + '<answer>{"a": 1}', True),
+            (declared, call + '<answer>{"a": 1}</answer>', False),
+            (declared, call + "<answer>not json", False),
+            (declared, '<call:get_weather>{"city": "<answer>Paris"}</call>', True),
+        ]
 
-        def think_end(template):
-            return ResponseTemplateReasoningDetector(
-                response_template=template
-            ).think_end_token
+        self.assertEqual(detector.think_end_token, "</think>")
+        for tool_names, text, expected in cases:
+            with self.subTest(tool_names=tool_names, text=text):
+                tag = detector.json_answer_structural_tag(
+                    {"type": "object"}, tool_names=tool_names
+                )
+                grammar = Grammar.from_structural_tag(json.dumps(tag))
+                self.assertIs(_is_grammar_accept_string(grammar, text), expected)
+        with self.assertRaisesRegex(ValueError, "cannot be encoded"):
+            detector.json_answer_structural_tag(
+                {"type": "object"}, tool_names=["get weather"]
+            )
 
-        self.assertEqual(think_end(GEMMA4_RESPONSE_TEMPLATE), "<channel|>")
-        self.assertEqual(think_end(literal), "<channel|><|channel>final\n")
-        self.assertEqual(think_end(pattern), "<channel|>")
+    def test_message_start_call_opens_as_the_parser_opens_it(self):
+        """A message-start call must not continue the anchor in a form the parser does
+        not open."""
+        template = copy.deepcopy(DELIMITED_TEMPLATE)
+        template["fields"]["tool_calls"]["open_pattern"] = (
+            r"<assistant><call:(?P<name>\w+)>"
+        )
+        detector = ResponseTemplateToolDetector(
+            response_template=template, prefix="<assistant>"
+        )
+        call = '<call:get_weather>{"days": 3}</call>'
+
+        tag = detector.get_structural_tag(
+            tools=[_tool()], tool_choice="required", message_start=True
+        )
+        grammar = Grammar.from_structural_tag(tag.model_dump_json())
+        parsed = detector.detect_and_parse("<assistant>" + call, [_tool()])
+
+        self.assertFalse(_is_grammar_accept_string(grammar, call))
+        self.assertTrue(_is_grammar_accept_string(grammar, "<assistant>" + call))
+        self.assertEqual(
+            [(call.name, json.loads(call.parameters)) for call in parsed.calls],
+            [("get_weather", {"days": 3})],
+        )
+
+    def test_message_start_call_opener_may_nest_its_name(self):
+        template = copy.deepcopy(DELIMITED_TEMPLATE)
+        template["fields"]["tool_calls"]["open_pattern"] = r"(?:<call:(?P<name>\w+)>)"
+        detector = ResponseTemplateToolDetector(
+            response_template=template, prefix="<assistant>"
+        )
+        call = '<call:get_weather>{"days": 3}</call>'
+
+        tag = detector.get_structural_tag(
+            tools=[_tool()], tool_choice="required", message_start=True
+        )
+        grammar = Grammar.from_structural_tag(tag.model_dump_json())
+
+        self.assertTrue(_is_grammar_accept_string(grammar, call))
 
     def test_transform_each_tool_region_emits_all_calls(self):
         template = {
@@ -1078,19 +1148,37 @@ class TestResponseTemplateAdapters(CustomTestCase):
         self.assertEqual(closed.normal_text, "")
         self.assertEqual(closed.calls, [])
 
-    def test_unforced_tool_guarantees_are_left_unconstrained(self):
-        tokenizer = SimpleNamespace(response_template=GEMMA4_RESPONSE_TEMPLATE)
-        tool = _tool()
-        tool.function.strict = True
-        parser = FunctionCallParser(
-            tools=[tool],
-            tool_call_parser="response_template",
-            tokenizer=tokenizer,
-        )
+    def test_automatic_tool_guarantees_are_enforced_or_rejected(self):
+        """Strict or single automatic calls must not go unenforced: they get the grammar
+        or fail."""
+        strict_tool = _tool()
+        strict_tool.function.strict = True
+        call = '<call:get_weather>{"days": 3}</call>'
+        for requested, tools, parallel in (
+            ("strict tools", [strict_tool], True),
+            ("parallel_tool_calls=False", [_tool()], False),
+        ):
+            with self.subTest(requested):
+                kind, tag = FunctionCallParser(
+                    tools=tools,
+                    tool_call_parser="response_template",
+                    tokenizer=SimpleNamespace(response_template=DELIMITED_TEMPLATE),
+                ).get_structure_constraint("auto", parallel_tool_calls=parallel)
+                grammar = Grammar.from_structural_tag(tag.model_dump_json())
+                self.assertEqual(kind, "structural_tag")
+                self.assertIs(_is_grammar_accept_string(grammar, call + call), parallel)
 
-        self.assertIsNone(
-            parser.get_structure_constraint("auto", parallel_tool_calls=False)
-        )
+                parser = FunctionCallParser(
+                    tools=tools,
+                    tool_call_parser="response_template",
+                    tokenizer=SimpleNamespace(
+                        response_template=GEMMA4_RESPONSE_TEMPLATE
+                    ),
+                )
+                with self.assertRaisesRegex(ValueError, requested):
+                    parser.get_structure_constraint(
+                        "auto", parallel_tool_calls=parallel
+                    )
 
     def test_required_and_named_tools_use_generic_json_schema(self):
         tokenizer = SimpleNamespace(response_template=GEMMA4_RESPONSE_TEMPLATE)
@@ -1119,6 +1207,20 @@ class TestResponseTemplateAdapters(CustomTestCase):
             strict_parser.get_structure_constraint("required")[0],
             "json_schema",
         )
+
+        # A tool the native format cannot carry keeps forced calls on the JSON
+        # array, and the parser must then expect it too.
+        untyped = _tool()
+        untyped.function.parameters["properties"]["days"] = {
+            "$ref": "https://example.com/days.json"
+        }
+        parser = FunctionCallParser(
+            tools=[untyped],
+            tool_call_parser="response_template",
+            tokenizer=SimpleNamespace(response_template=XML_TOOL_TEMPLATE),
+        )
+        self.assertEqual(parser.get_structure_constraint("required")[0], "json_schema")
+        self.assertFalse(parser.detector.supports_structural_tag())
 
 
 if __name__ == "__main__":
