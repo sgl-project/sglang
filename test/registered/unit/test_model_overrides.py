@@ -49,6 +49,100 @@ class _FakeArgs:
     metadata_but_not_overridable: A[bool, Arg(help="z")] = False
 
 
+class TestBoundaryParallelismResolution(CustomTestCase):
+    def config(self, **options):
+        return SimpleNamespace(
+            **dict(
+                dict(
+                    model_path="dummy",
+                    attn_cp_size=1,
+                    enable_prefill_cp=False,
+                    enable_attn_tp_input_scattered=False,
+                    moe_dp_size=1,
+                    cp_strategy=None,
+                    tp_size=4,
+                    dp_size=1,
+                    enable_aiter_allreduce_fusion=False,
+                ),
+                **options,
+            )
+        )
+
+    def test_input_scattered_is_resolved_only_for_forwards_without_the_scope(self):
+        from sglang.srt.arg_groups.overrides import resolving_view
+        from sglang.srt.arg_groups.parallel_hook import handle_context_parallelism
+
+        for model_type in (
+            "nemotron_h",
+            "nemotron_h_puzzle",
+            "longcat_flash",
+            "deepseek_v3",
+        ):
+            with self.subTest(model_type=model_type):
+                cfg = self.config(enable_attn_tp_input_scattered=True)
+                model = SimpleNamespace(
+                    hf_config=SimpleNamespace(architectures=["TestModel"]),
+                    hf_text_config=SimpleNamespace(model_type=model_type),
+                )
+                with (
+                    patch("sglang.srt.arg_groups.parallel_hook.run_hook"),
+                    patch(
+                        "sglang.srt.arg_groups.parallel_hook.model_config_of",
+                        return_value=model,
+                    ),
+                    patch("sglang.srt.layers.cp.base.init_cp_strategy"),
+                ):
+                    handle_context_parallelism(cfg)
+                self.assertTrue(cfg.enable_attn_tp_input_scattered)
+                self.assertEqual(
+                    resolving_view(cfg).enable_attn_tp_input_scattered,
+                    model_type == "deepseek_v3",
+                )
+
+    def test_context_parallel_model_support(self):
+        from sglang.srt.arg_groups.parallel_hook import handle_context_parallelism
+
+        cases = (
+            ("nemotron_h", 2, False, "Nemotron-H.*--attn-cp-size"),
+            ("nemotron_h_puzzle", 2, True, "Nemotron-H.*--attn-cp-size"),
+            ("longcat_flash", 2, True, "LongCat-Flash.*--enable-prefill-cp"),
+            ("nemotron_h", 1, False, None),
+            ("longcat_flash", 1, True, None),
+            ("longcat_flash", 2, False, None),
+            ("deepseek_v3", 2, True, None),
+        )
+        for model_type, cp_size, prefill, error in cases:
+            with self.subTest(model_type=model_type, cp_size=cp_size, prefill=prefill):
+                cfg = self.config(
+                    attn_cp_size=cp_size,
+                    enable_prefill_cp=prefill,
+                    cp_strategy="interleave" if prefill else None,
+                )
+                model = SimpleNamespace(
+                    hf_config=SimpleNamespace(architectures=["TestModel"]),
+                    hf_text_config=SimpleNamespace(model_type=model_type),
+                )
+                with (
+                    patch("sglang.srt.arg_groups.parallel_hook.run_hook"),
+                    patch(
+                        "sglang.srt.arg_groups.parallel_hook.model_config_of",
+                        return_value=model,
+                    ),
+                    patch("sglang.srt.layers.cp.base.init_cp_strategy") as init_cp,
+                ):
+                    if error is not None:
+                        with self.assertRaisesRegex(ValueError, error):
+                            handle_context_parallelism(cfg)
+                        init_cp.assert_not_called()
+                    else:
+                        handle_context_parallelism(cfg)
+                        init_cp.assert_called_once_with(
+                            enable_prefill_cp=prefill,
+                            cp_size=cp_size,
+                            cp_strategy=cfg.cp_strategy,
+                        )
+
+
 class TestModelOverridableWhitelist(CustomTestCase):
     def test_whitelist_derivation_from_annotated_metadata(self):
         self.assertEqual(
@@ -78,6 +172,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "moe_runner_backend",
                     "quantization",
                     "enable_dp_attention",
+                    "enable_attn_tp_input_scattered",
                     "enable_dp_lm_head",
                     "enable_tp_lm_head_all_to_all",
                     "moe_a2a_backend",
@@ -100,12 +195,15 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "dsa_decode_backend",
                     "dsv4_attn_backend",
                     "dsa_topk_backend",
+                    "enable_dsa_fused_indexer",
                     "prefill_attention_backend",
                     "decode_attention_backend",
                     "flashinfer_allreduce_fusion_backend",
                     "fp8_gemm_runner_backend",
                     "fp4_gemm_runner_backend",
                     "disable_custom_all_reduce",
+                    "boundary_reduction",
+                    "speculative_boundary_reduction",
                     "enable_aiter_allreduce_fusion",
                     "disable_aiter_allreduce_fusion_in_prefill",
                     "disable_aiter_allreduce_fusion_in_decode",
@@ -119,6 +217,119 @@ class TestModelOverridableWhitelist(CustomTestCase):
                 }
             ),
         )
+
+
+class TestBoundaryReductionDefaults(CustomTestCase):
+    def test_defaults_wrappers_and_explicit_policies_reach_runtime(self):
+        from unittest.mock import patch
+
+        from sglang.srt.arg_groups.boundary_reduction import resolve_boundary_reduction
+        from sglang.srt.arg_groups.overrides import run_post_process_pass
+        from sglang.srt.runtime_context import (
+            get_exec,
+            get_spec,
+            publish,
+            reset_context,
+        )
+        from sglang.srt.server_args import ServerArgs
+
+        cases = [
+            (SimpleNamespace(architectures=[architecture]), default)
+            for architecture, default in (
+                ("Qwen3ForCausalLM", "ar"),
+                ("Qwen3Model", "ar"),
+                ("MossVLForConditionalGeneration", "ar"),
+                ("BailingMoELinearForCausalLM", "rsv"),
+                ("BailingMoeV2_5ForCausalLM", "rsv"),
+                ("LongcatFlashForCausalLM", "rsv"),
+                ("LongcatFlashForCausalLMNextN", "rsv"),
+                ("Step3VLForConditionalGeneration", "rsv"),
+                ("MiMoV2ForCausalLM", "rs+rsv"),
+                ("Qwen3MoeForCausalLM", "rs+rsv"),
+                ("OtherModel", "rs+rsv"),
+            )
+        ]
+        for key in ("text_config", "llm_config"):
+            for backbone, expected in (("qwen3", "ar"), ("qwen3_moe", "rs+rsv")):
+                cases.append(
+                    (
+                        SimpleNamespace(**{key: SimpleNamespace(model_type=backbone)}),
+                        expected,
+                    )
+                )
+        cases.append(
+            (
+                SimpleNamespace(
+                    get_text_config=lambda: SimpleNamespace(model_type="qwen3")
+                ),
+                "ar",
+            )
+        )
+        for config, default in cases:
+            for requested in ("auto", "ar", "rs", "rsv", "rs+rsv"):
+                with self.subTest(config=config, requested=requested):
+                    reset_context()
+                    try:
+                        args = ServerArgs(
+                            model_path="local-model", boundary_reduction=requested
+                        )
+                        args._model_config = SimpleNamespace(hf_config=config)
+                        with patch(
+                            "sglang.srt.arg_groups.pipeline.run_resolution_pipeline",
+                            side_effect=lambda record: run_post_process_pass(
+                                record, resolve_boundary_reduction
+                            ),
+                        ):
+                            publish(args, role="test")
+                        expected = default if requested == "auto" else requested
+                        self.assertEqual(get_exec().comm.boundary_reduction, expected)
+                        self.assertEqual(
+                            get_spec().speculative_boundary_reduction, expected
+                        )
+                        self.assertEqual(args.boundary_reduction, requested)
+                    finally:
+                        reset_context()
+
+    def test_independent_draft_and_mtp_resolution(self):
+        from unittest.mock import patch
+
+        from sglang.srt.arg_groups.boundary_reduction import resolve_boundary_reduction
+        from sglang.srt.arg_groups.overrides import (
+            resolving_view,
+            run_post_process_pass,
+        )
+        from sglang.srt.server_args import ServerArgs
+
+        for same_model in (False, True):
+            for requested in ("auto", "ar", "rs", "rsv", "rs+rsv"):
+                args = ServerArgs(
+                    model_path="target",
+                    boundary_reduction=requested,
+                    speculative_algorithm="EAGLE",
+                    speculative_draft_model_path="target" if same_model else "draft",
+                )
+                args._model_config = SimpleNamespace(
+                    hf_config=SimpleNamespace(architectures=["MiMoV2ForCausalLM"])
+                )
+                with patch(
+                    "sglang.srt.utils.hf_transformers_utils.get_config",
+                    return_value=SimpleNamespace(model_type="qwen3"),
+                ) as load:
+                    run_post_process_pass(args, resolve_boundary_reduction)
+                resolved = resolving_view(args)
+                self.assertEqual(
+                    resolved.boundary_reduction,
+                    "rs+rsv" if requested == "auto" else requested,
+                )
+                self.assertEqual(
+                    resolved.speculative_boundary_reduction,
+                    ("rs+rsv" if same_model else "ar")
+                    if requested == "auto"
+                    else requested,
+                )
+                self.assertEqual(
+                    load.call_count, int(requested == "auto" and not same_model)
+                )
 
 
 class TestDSparkCheckpointConfig(CustomTestCase):
@@ -717,6 +928,38 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertFalse(
                 self._resolved(self._construct(*qwen4), "ple_offload_embedding")
             )
+
+    def test_qwen4_fp8_indexer_dtype_platform_gate(self):
+        """fp8_e4m3 needs CUDA SM90/SM100 and a compressed QSA indexer. The bf16
+        spellings never consult the platform."""
+        qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
+        compressed = {
+            "indexer_n_heads": 4,
+            "indexer_kv_heads": 1,
+            "indexer_head_dim": 128,
+            "indexer_budget": 2048,
+            "indexer_compress_ratio": 4,
+        }
+        with override_platform(is_cuda=True, is_sm100=True):
+            sa = self._construct(
+                *qwen4, config_extra=compressed, qsa_indexer_dtype="fp8_e4m3"
+            )
+            self.assertEqual(self._resolved(sa, "qsa_indexer_dtype"), "fp8_e4m3")
+            # No compressed indexer fields: no QSA profile, nothing to store in fp8.
+            with self.assertRaisesRegex(ValueError, "compressed QSA indexer"):
+                self._construct(*qwen4, qsa_indexer_dtype="fp8_e4m3")
+        with override_platform(
+            is_cuda=False, is_hip=True, is_sm90=False, is_sm100=False
+        ):
+            with self.assertRaisesRegex(ValueError, "SM90/SM100"):
+                self._construct(
+                    *qwen4, config_extra=compressed, qsa_indexer_dtype="fp8_e4m3"
+                )
+            for name in ("auto", "bfloat16"):
+                sa = self._construct(
+                    *qwen4, config_extra=compressed, qsa_indexer_dtype=name
+                )
+                self.assertEqual(self._resolved(sa, "qsa_indexer_dtype"), name)
 
     def test_minimax_m2_enables_tf32_matmul(self):
         sa = self._construct("MiniMaxM2ForCausalLM", "llama")
