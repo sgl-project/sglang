@@ -26,6 +26,16 @@ runs:
           const { owner, repo } = context.repo;
           const issueUrl = `https://github.com/${owner}/${repo}/issues/${MAINTENANCE_ISSUE}`;
 
+          // Bound each attempt, including retries and pagination, to 30 seconds.
+          // Keep the runner's proxy-aware fetch and create a fresh signal per attempt.
+          const fetch = github.request.endpoint.DEFAULTS.request.fetch;
+          const request = {
+            fetch: (url, options) => fetch(url, {
+              ...options,
+              signal: AbortSignal.timeout(30_000),
+            }),
+          };
+
           async function block(lines) {
             const msg = lines.join('\n');
             await core.summary.addRaw(msg + '\n').write();
@@ -42,7 +52,7 @@ runs:
           // CI proceeds with a warning (outage, missing token scope).
           let issue;
           try {
-            ({ data: issue } = await github.rest.issues.get({ owner, repo, issue_number: MAINTENANCE_ISSUE }));
+            ({ data: issue } = await github.rest.issues.get({ owner, repo, issue_number: MAINTENANCE_ISSUE, request }));
           } catch (e) {
             core.warning(`Could not fetch issue #${MAINTENANCE_ISSUE} (${e.status ?? e.message}); fail-open, proceeding with CI.`);
             return;
@@ -82,7 +92,7 @@ runs:
           if (pr) {
             let labels = [];
             try {
-              labels = await github.paginate(github.rest.issues.listLabelsOnIssue,
+              labels = await github.paginate(github.rest.issues.listLabelsOnIssue.defaults({ request }),
                 { owner, repo, issue_number: pr.number, per_page: 100 });
             } catch (e) {
               core.warning(`Could not read labels of PR #${pr.number} (${e.status ?? e.message}); assuming no bypass label.`);
@@ -102,7 +112,7 @@ runs:
               let status = 'UNKNOWN';
               try {
                 ({ data: { status } } = await github.rest.repos.compareCommitsWithBasehead(
-                  { owner, repo, basehead: `${minBaseSha}...${pr.head.sha}`, per_page: 1 }));
+                  { owner, repo, basehead: `${minBaseSha}...${pr.head.sha}`, per_page: 1, request }));
               } catch (e) {
                 core.warning(`Compare API failed (${e.status ?? e.message}).`);
               }
