@@ -17,8 +17,6 @@ ARG SG_LANG_KERNEL_REPO=https://github.com/sgl-project/sgl-kernel-xpu.git
 ARG SG_LANG_KERNEL_BRANCH=main
 # wheel: prebuilt sglang-kernel-xpu pinned in pyproject_xpu.toml; source: build SG_LANG_KERNEL_BRANCH.
 ARG SG_LANG_KERNEL_SOURCE=wheel
-# AOT target for source builds (bmg | cri); set explicitly since no GPU is visible during docker build.
-ARG SG_LANG_KERNEL_TARGET=bmg
 
 USER root
 
@@ -81,25 +79,20 @@ WORKDIR /sgl-workspace
 RUN pip install --no-cache-dir torch==2.14.0+xpu torchvision==0.29.0+xpu torchaudio==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu && \
     pip install --no-cache-dir msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser einops tabulate --root-user-action=ignore
 
-# SG_LANG_KERNEL_SOURCE=source points the sglang-kernel-xpu dependency at the kernel repo;
-# --no-build-isolation so the kernel's CMake finds the installed torch.
+# SG_LANG_KERNEL_SOURCE=source points the sglang-kernel-xpu dependency at the kernel repo.
 RUN echo "Cloning ${SG_LANG_BRANCH} from ${SG_LANG_REPO}" && \
     git clone --branch ${SG_LANG_BRANCH} --single-branch ${SG_LANG_REPO} sglang && \
     git -C sglang fetch --tags --force origin && \
     cd sglang && cd python && \
-    pip_build_args="" && \
     if [ "${SG_LANG_KERNEL_SOURCE}" = "source" ]; then \
-        echo "Building sgl-kernel-xpu ${SG_LANG_KERNEL_BRANCH} from ${SG_LANG_KERNEL_REPO} for ${SG_LANG_KERNEL_TARGET}" && \
+        echo "Building sgl-kernel-xpu ${SG_LANG_KERNEL_BRANCH} from ${SG_LANG_KERNEL_REPO}" && \
         sed -i -E "s|\"sglang-kernel-xpu @ [^\"]*\"|\"sglang-kernel-xpu @ git+${SG_LANG_KERNEL_REPO}@${SG_LANG_KERNEL_BRANCH}\"|" pyproject_xpu.toml && \
-        grep -q "sglang-kernel-xpu @ git+" pyproject_xpu.toml && \
-        pip install --no-cache-dir "setuptools>=61.0" "setuptools-rust>=1.10" "setuptools-scm>=8.0" wheel "scikit-build-core>=0.10" cmake ninja && \
-        export SKBUILD_CMAKE_DEFINE="DPCPP_SYCL_TARGET=${SG_LANG_KERNEL_TARGET}" && \
-        pip_build_args="-v --no-build-isolation"; \
+        grep -q "sglang-kernel-xpu @ git+" pyproject_xpu.toml; \
     elif [ "${SG_LANG_KERNEL_SOURCE}" != "wheel" ]; then \
         echo "Invalid SG_LANG_KERNEL_SOURCE=${SG_LANG_KERNEL_SOURCE} (expected wheel or source)" && exit 1; \
     fi && \
     cp pyproject_xpu.toml pyproject.toml && \
-    pip install --no-cache-dir ${pip_build_args} ".[dev,diffusion]" --extra-index-url https://download.pytorch.org/whl/xpu && \
+    pip install --no-cache-dir ".[dev,diffusion]" --extra-index-url https://download.pytorch.org/whl/xpu && \
     pip install --no-cache-dir --no-deps xgrammar==0.1.33
 
 # Install torch_memory_saver for release/resume_memory_occupation ("memory saver").
