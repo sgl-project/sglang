@@ -54,7 +54,12 @@ class TestCargoWorkspace(CustomTestCase):
             f"rust workspace manifest not found at {RUST_WORKSPACE}",
         )
 
-        self._run_cargo(["test", "--workspace"], cwd=RUST_WORKSPACE)
+        # `--workspace` alone builds sglang-renderer without its non-default
+        # `http` feature, which gates the HTTP frontend and its tests.
+        self._run_cargo(
+            ["test", "--workspace", "--features", "sglang-renderer/http"],
+            cwd=RUST_WORKSPACE,
+        )
 
 
 if __name__ == "__main__":
