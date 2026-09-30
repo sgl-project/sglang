@@ -328,7 +328,6 @@ def _resolve_ffmpeg_exe() -> str:
     except Exception:
         pass
 
-
     ffmpeg_ok = False
     if ffmpeg_exe:
         if os.path.isabs(ffmpeg_exe):
