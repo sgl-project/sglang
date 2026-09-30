@@ -1,4 +1,4 @@
-"""Correctness tests for the Blackwell CuTe DSL FP8 dual GEMM."""
+"""Correctness tests for the Blackwell CuTe DSL dual GEMM."""
 
 import unittest
 from unittest.mock import patch
@@ -68,6 +68,30 @@ def _reference(
     return scaled_fp8_quant(activation, scale=output_scale)
 
 
+def _make_float_inputs(dtype, seed):
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    return (
+        torch.randn(
+            (1, _HIDDEN_SIZE),
+            device="cuda",
+            dtype=dtype,
+            generator=generator,
+        )
+        * 0.25,
+        torch.randn(
+            (2 * _INTERMEDIATE_SIZE, _HIDDEN_SIZE),
+            device="cuda",
+            dtype=dtype,
+            generator=generator,
+        )
+        * 0.25,
+    )
+
+
+def _float_reference(x, gate_up_weight):
+    return silu_and_mul(torch.nn.functional.linear(x, gate_up_weight))
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestCuteDSLDualGemm(CustomTestCase):
     @classmethod
@@ -125,6 +149,21 @@ class TestCuteDSLDualGemm(CustomTestCase):
             rtol=5e-2,
             atol=5e-2,
         )
+
+    def _check_float(self, dtype, seed):
+        from sglang.kernels.ops.gemm import dual_gemm_swiglu
+
+        x, gate_up_weight = _make_float_inputs(dtype, seed)
+        actual = dual_gemm_swiglu(x, gate_up_weight)
+        expected = _float_reference(x, gate_up_weight)
+        self.assertEqual(actual.dtype, dtype)
+        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2.5e-1)
+
+    def test_bf16(self):
+        self._check_float(torch.bfloat16, seed=20261006)
+
+    def test_fp16(self):
+        self._check_float(torch.float16, seed=20261007)
 
     def test_fp8_dynamic(self):
         self._check(dynamic_quant=True, seed=20261008)

@@ -167,6 +167,19 @@ _FP8_SCALED_MM = register_fused_op(Fp8ScaledMMOp(), __name__, "_FP8_SCALED_MM")
 
 register_kernel(
     KernelSpec(
+        op="gemm.dual_gemm_swiglu",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.gemm.cutedsl_dual_gemm:dual_gemm_swiglu",
+        capabilities=_SM10X,
+        format_signature=FormatSignature(
+            supported_dtypes=("bfloat16", "float16"),
+            description="BF16/FP16 gate/up dual GEMM followed by SwiGLU",
+        ),
+        description="Blackwell TMA/tcgen05 fused dual GEMM and activation.",
+    )
+)
+register_kernel(
+    KernelSpec(
         op="gemm.dual_gemm_swiglu_fp8",
         backend=KernelBackend.CUTE_DSL,
         target="sglang.kernels.ops.gemm.cutedsl_dual_gemm:dual_gemm_swiglu_fp8",
@@ -320,6 +333,16 @@ def dual_gemm_swiglu_fp8(
     )
 
 
+def dual_gemm_swiglu(
+    x: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+) -> torch.Tensor:
+    """Fuse BF16/FP16 gate/up projections followed by SwiGLU."""
+    return get_kernel("gemm.dual_gemm_swiglu", KernelBackend.CUTE_DSL)(
+        x, gate_up_weight
+    )
+
+
 def bmm_fp8(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -421,6 +444,7 @@ __all__ = [
     "Fp8ScaledMMOp",
     "bmm_fp8",
     "dsv3_fused_a_gemm",
+    "dual_gemm_swiglu",
     "dual_gemm_swiglu_fp8",
     "fp8_scaled_mm",
     "kimi_k3_tiny_gemm",

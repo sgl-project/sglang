@@ -1,14 +1,18 @@
-"""Benchmark fused FP8 dual GEMM against SGLang's production operator chain."""
+"""Benchmark CuTe DSL dual GEMM against SGLang's production operator chains."""
 
 import torch
 
 from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.ops.activation import silu_and_mul
-from sglang.kernels.ops.gemm import dual_gemm_swiglu_fp8, fp8_scaled_mm
+from sglang.kernels.ops.gemm import (
+    dual_gemm_swiglu,
+    dual_gemm_swiglu_fp8,
+    fp8_scaled_mm,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="nightly", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=60, stage="nightly", runner_config="4-gpu-b200")
 
 
 def _sglang_dual_gemm(
@@ -42,7 +46,7 @@ def _sglang_dual_gemm(
 )
 @marker.parametrize("quantization", ["dynamic", "static"])
 @marker.benchmark("impl", ["cutedsl", "sglang"], unit="us")
-def benchmark(
+def benchmark_fp8(
     num_tokens,
     hidden_size,
     intermediate_size,
@@ -96,5 +100,51 @@ def benchmark(
     )
 
 
+def _sglang_float_dual_gemm(x, gate_up_weight):
+    return silu_and_mul(torch.nn.functional.linear(x, gate_up_weight))
+
+
+@marker.parametrize(
+    "num_tokens,hidden_size,intermediate_size",
+    [
+        (1, 128, 128),
+        (1, 2048, 11008),
+        (1, 4096, 14336),  # Llama 3 8B
+        (1, 3584, 18944),  # Qwen 2 7B
+    ],
+)
+@marker.parametrize("dtype", [torch.bfloat16, torch.float16])
+@marker.benchmark("impl", ["cutedsl", "sglang"], unit="us")
+def benchmark_fp16(
+    num_tokens,
+    hidden_size,
+    intermediate_size,
+    dtype,
+    impl,
+):
+    generator = torch.Generator(device="cuda").manual_seed(20261010)
+    x = (
+        torch.randn(
+            (num_tokens, hidden_size),
+            device="cuda",
+            dtype=dtype,
+            generator=generator,
+        )
+        * 0.25
+    )
+    gate_up_weight = (
+        torch.randn(
+            (2 * intermediate_size, hidden_size),
+            device="cuda",
+            dtype=dtype,
+            generator=generator,
+        )
+        * 0.25
+    )
+    fn = dual_gemm_swiglu if impl == "cutedsl" else _sglang_float_dual_gemm
+    return marker.do_bench(fn, input_args=(x, gate_up_weight))
+
+
 if __name__ == "__main__":
-    benchmark.run()
+    benchmark_fp8.run()
+    benchmark_fp16.run()

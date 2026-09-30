@@ -1,17 +1,19 @@
-"""Blackwell FP8 dual GEMM, SwiGLU, and activation quantization.
+"""Blackwell dual GEMM and SwiGLU fusion.
 
 The operator computes::
 
-    gate = fp8_gemm(x, gate_weight)
-    up = fp8_gemm(x, up_weight)
+    gate = gemm(x, gate_weight)
+    up = gemm(x, up_weight)
     activation = silu(gate) * up
-    activation_fp8, activation_scale = quantize_fp8(activation)
+
+BF16 and FP16 inputs return ``activation`` in the input dtype. FP8 inputs add
+static or dynamic per-token quantization and return
+``activation_fp8, activation_scale``.
 
 ``gate_up_weight`` stores ``[gate; up]`` along dimension zero.  The kernel is
 specialized for single-token transformer decode.  Each CTA owns 64 or 128
 intermediate features and issues both tcgen05 MMAs from one TMA-loaded input
-tile.  Static quantization writes FP8 directly.  Dynamic quantization reduces
-the activation maximum at three levels:
+tile. Dynamic FP8 quantization reduces the activation maximum at three levels:
 
 * lanes reduce within each warp;
 * warp leaders reduce within the CTA;
@@ -50,7 +52,7 @@ _NARROW_CTA_SMEM_BYTES = 112 * 1024
 # The two-CTA variants pair adjacent feature CTAs into one cluster MMA.  SM100
 # requires at least 16 token columns for a two-CTA MMA; single-token decode
 # therefore predicates the unused columns.
-_DUAL_GEMM_TACTICS: tuple[tuple[int, int, int, int, bool], ...] = (
+_FP8_TACTICS: tuple[tuple[int, int, int, int, bool], ...] = (
     # K=128, six stages.
     (128, 8, 128, 6, False),  # 0: one wave for Llama 3 8B
     (64, 8, 128, 6, False),  # 1: two resident CTAs/SM for wider intermediates
@@ -63,21 +65,31 @@ _DUAL_GEMM_TACTICS: tuple[tuple[int, int, int, int, bool], ...] = (
     (128, 16, 256, 3, True),  # 7
 )
 
+# Two-byte inputs use K=128 and three stages to retain the same shared-memory
+# footprint and CTA residency as FP8 K=256/stage-3 tactics.
+_FLOAT16_TACTICS: tuple[tuple[int, int, int, int, bool], ...] = (
+    (128, 8, 128, 3, False),  # 0
+    (64, 8, 128, 3, False),  # 1
+    (64, 16, 128, 3, True),  # 2
+    (128, 16, 128, 3, True),  # 3
+)
+
 _COMPILED_DUAL_GEMM: dict[tuple[object, ...], object] = {}
 
 
-def _resolve_tactic(tactic: int) -> tuple[int, int, int, int, bool]:
-    if tactic < 0 or tactic >= len(_DUAL_GEMM_TACTICS):
-        raise ValueError(
-            f"dual GEMM tactic {tactic} out of range [0, {len(_DUAL_GEMM_TACTICS)})"
-        )
-    return _DUAL_GEMM_TACTICS[tactic]
+def _resolve_tactic(
+    tactic: int, quantize_output: bool
+) -> tuple[int, int, int, int, bool]:
+    tactics = _FP8_TACTICS if quantize_output else _FLOAT16_TACTICS
+    if tactic < 0 or tactic >= len(tactics):
+        raise ValueError(f"dual GEMM tactic {tactic} out of range [0, {len(tactics)})")
+    return tactics[tactic]
 
 
-def _pick_tactic(intermediate_size: int, multiprocessor_count: int) -> int:
-    """Choose a measured single-token tactic from the output grid shape."""
-    wide_feature_tiles = intermediate_size // _DUAL_GEMM_TACTICS[0][0]
-    narrow_feature_tiles = intermediate_size // _DUAL_GEMM_TACTICS[1][0]
+def _pick_fp8_tactic(intermediate_size: int, multiprocessor_count: int) -> int:
+    """Choose a measured FP8 single-token tactic from the output grid shape."""
+    wide_feature_tiles = intermediate_size // _FP8_TACTICS[0][0]
+    narrow_feature_tiles = intermediate_size // _FP8_TACTICS[1][0]
     if narrow_feature_tiles < multiprocessor_count:
         # Tiny grids do not expose enough parallelism to repay a second CTA.
         return 0
@@ -92,12 +104,29 @@ def _pick_tactic(intermediate_size: int, multiprocessor_count: int) -> int:
     return 5
 
 
-class BlackwellFp8DualGemmKernel:
-    """Persistent-style warp-specialized FP8 dual projection for SM10x."""
+def _pick_float16_tactic(intermediate_size: int, multiprocessor_count: int) -> int:
+    """Choose a measured BF16/FP16 single-token tactic."""
+    wide_feature_tiles = intermediate_size // _FLOAT16_TACTICS[0][0]
+    narrow_feature_tiles = intermediate_size // _FLOAT16_TACTICS[1][0]
+    if narrow_feature_tiles < multiprocessor_count:
+        return 0
+    if wide_feature_tiles >= multiprocessor_count:
+        # Qwen-sized projections benefit from pairing 64-feature CTAs.
+        return 2
+    if wide_feature_tiles * 4 >= multiprocessor_count * 3:
+        # Llama-sized projections have enough parallel 128-feature CTAs.
+        return 0
+    return 1
+
+
+class BlackwellDualGemmKernel:
+    """Persistent-style warp-specialized dual projection for SM10x."""
 
     def __init__(
         self,
         intermediate_size: int,
+        element_type,
+        quantize_output: bool,
         dynamic_quant: bool,
         cta_features: int,
         cta_tokens: int,
@@ -106,7 +135,8 @@ class BlackwellFp8DualGemmKernel:
         use_2cta: bool,
     ) -> None:
         self.intermediate_size = intermediate_size
-        self.dynamic_quant = dynamic_quant
+        self.quantize_output = quantize_output
+        self.dynamic_quant = quantize_output and dynamic_quant
         self.cta_m = cta_features
         self.cta_n = cta_tokens
         self.cta_k = cta_reduction
@@ -114,9 +144,11 @@ class BlackwellFp8DualGemmKernel:
         self.use_2cta = use_2cta
         self.threads = _THREADS
         self.feature_tiles = cute.ceil_div(intermediate_size, self.cta_m)
-        self.element_type = cutlass.Float8E4M3FN
+        self.element_type = element_type
         self.accumulator_type = cutlass.Float32
-        self.activation_type = cutlass.BFloat16
+        self.activation_type = (
+            cutlass.BFloat16 if quantize_output else self.element_type
+        )
         if use_2cta:
             self.cluster_shape = (2, 1, 1)
             self.cta_group = tcgen05.CtaGroup.TWO
@@ -135,9 +167,15 @@ class BlackwellFp8DualGemmKernel:
         )
 
     def __repr__(self) -> str:
-        quantization = "dynamic" if self.dynamic_quant else "static"
+        quantization = (
+            "dynamic"
+            if self.dynamic_quant
+            else "static"
+            if self.quantize_output
+            else "unquantized"
+        )
         return (
-            "BlackwellFp8DualGemmKernel"
+            "BlackwellDualGemmKernel"
             f"_i{self.intermediate_size}_m{self.cta_m}_n{self.cta_n}_k{self.cta_k}"
             f"_s{self.stages}_2cta{int(self.use_2cta)}_{quantization}"
         )
@@ -413,7 +451,7 @@ class BlackwellFp8DualGemmKernel:
         ).to(self.activation_type)
 
     @cute.experimental.jit
-    def activation_quant_epilogue(
+    def activation_epilogue(
         self,
         warp: cutlass.Int32,
         tid: cutlass.Int32,
@@ -431,38 +469,42 @@ class BlackwellFp8DualGemmKernel:
         warp_maxima: cute.Tensor,
         shared_scale: cute.Tensor,
     ):
-        """All warps: apply SwiGLU, reduce amax, and emit quantized FP8."""
+        """All warps: apply SwiGLU, then store or quantize the result."""
         cute.arch.sync_threads()
 
         feature = feature_tile * self.cta_m + tid
         local_amax = cutlass.Float32(0.0)
-        activation = cutlass.BFloat16(0.0)
+        activation = self.activation_type(0.0)
 
         if tid < self.cta_m and feature < self.intermediate_size:
-            input_scale = x_scale[0].to(cutlass.Float32)
+            gate_value = gate_tile[tid, 0].to(cutlass.Float32)
+            up_value = up_tile[tid, 0].to(cutlass.Float32)
 
-            if cutlass.const_expr(gate_up_weight_scale.shape[0] == 1):
-                gate_scale = gate_up_weight_scale[0].to(cutlass.Float32)
-                up_scale = gate_scale
-            else:
-                gate_scale = gate_up_weight_scale[feature].to(cutlass.Float32)
-                up_scale = gate_up_weight_scale[feature + self.intermediate_size].to(
-                    cutlass.Float32
-                )
+            if cutlass.const_expr(self.quantize_output):
+                input_scale = x_scale[0].to(cutlass.Float32)
 
-            gate_value = (
-                gate_tile[tid, 0].to(cutlass.Float32) * input_scale * gate_scale
-            )
-            up_value = up_tile[tid, 0].to(cutlass.Float32) * input_scale * up_scale
+                if cutlass.const_expr(gate_up_weight_scale.shape[0] == 1):
+                    gate_scale = gate_up_weight_scale[0].to(cutlass.Float32)
+                    up_scale = gate_scale
+                else:
+                    gate_scale = gate_up_weight_scale[feature].to(cutlass.Float32)
+                    up_scale = gate_up_weight_scale[
+                        feature + self.intermediate_size
+                    ].to(cutlass.Float32)
 
-            # Match the production FP8 GEMM contract: both projection outputs
-            # are rounded to BF16 before the activation kernel consumes them.
+                gate_value *= input_scale * gate_scale
+                up_value *= input_scale * up_scale
+
+            # Match the unfused operator chain: projection outputs round to
+            # the activation dtype before the activation consumes them.
             gate_value = gate_value.to(self.activation_type).to(cutlass.Float32)
             up_value = up_value.to(self.activation_type).to(cutlass.Float32)
 
             activation = self.silu_and_mul(gate_value, up_value)
 
-            if cutlass.const_expr(self.dynamic_quant):
+            if cutlass.const_expr(not self.quantize_output):
+                output[feature, 0, 0] = activation
+            elif cutlass.const_expr(self.dynamic_quant):
                 local_amax = cute.math.absf(activation.to(cutlass.Float32))
             else:
                 scale = supplied_scale[0].to(cutlass.Float32)
@@ -475,7 +517,7 @@ class BlackwellFp8DualGemmKernel:
 
                 output[feature, 0, 0] = quantized.to(self.element_type)
 
-        if cutlass.const_expr(self.dynamic_quant):
+        if cutlass.const_expr(self.quantize_output and self.dynamic_quant):
             # Level 1: warp reduction.
             warp_amax = cute.arch.warp_reduction_max(local_amax)
 
@@ -554,7 +596,7 @@ class BlackwellFp8DualGemmKernel:
                     quantized = cutlass.Float32(-_FP8_MAX)
 
                 output[feature, 0, 0] = quantized.to(self.element_type)
-        else:
+        elif cutlass.const_expr(self.quantize_output):
             if feature_tile == 0 and tid == 0:
                 output_scale[0] = supplied_scale[0]
 
@@ -795,7 +837,7 @@ class BlackwellFp8DualGemmKernel:
                 tid - 128,
             )
 
-        self.activation_quant_epilogue(
+        self.activation_epilogue(
             warp,
             tid,
             lane,
@@ -916,6 +958,36 @@ def _validate_inputs(
     return hidden_size, intermediate_size
 
 
+def _validate_float16_inputs(
+    x: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+) -> tuple[int, int]:
+    if x.device.type != "cuda" or gate_up_weight.device != x.device:
+        raise ValueError("x and gate_up_weight must be on the same CUDA device")
+    if x.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError("x must use bfloat16 or float16")
+    if gate_up_weight.dtype != x.dtype:
+        raise ValueError("x and gate_up_weight must have the same dtype")
+    if x.ndim != 2 or gate_up_weight.ndim != 2:
+        raise ValueError("x and gate_up_weight must be 2-D")
+    if x.stride(1) != 1 or gate_up_weight.stride(1) != 1:
+        raise ValueError("x and gate_up_weight must be contiguous along K")
+
+    num_tokens, hidden_size = x.shape
+    packed_intermediate_size, weight_hidden_size = gate_up_weight.shape
+    if num_tokens != 1:
+        raise ValueError("the SM100 dual GEMM currently supports one token")
+    if packed_intermediate_size % 2:
+        raise ValueError("gate_up_weight.shape[0] must be even")
+
+    intermediate_size = packed_intermediate_size // 2
+    if weight_hidden_size != hidden_size:
+        raise ValueError("gate_up_weight.shape[1] must equal x.shape[1]")
+    if hidden_size % 128 or intermediate_size % 128:
+        raise ValueError("hidden_size and intermediate_size must be multiples of 128")
+    return hidden_size, intermediate_size
+
+
 def _dual_gemm_swiglu_fp8_run(
     x: torch.Tensor,
     gate_up_weight: torch.Tensor,
@@ -936,9 +1008,11 @@ def _dual_gemm_swiglu_fp8_run(
     ).multi_processor_count
 
     if tactic < 0:
-        tactic = _pick_tactic(intermediate_size, multiprocessor_count)
+        tactic = _pick_fp8_tactic(intermediate_size, multiprocessor_count)
 
-    cta_features, cta_tokens, cta_reduction, stages, use_2cta = _resolve_tactic(tactic)
+    cta_features, cta_tokens, cta_reduction, stages, use_2cta = _resolve_tactic(
+        tactic, True
+    )
     resident_ctas_per_sm = 2 if cta_features == 64 and not use_2cta else 1
     feature_tiles = intermediate_size // cta_features
 
@@ -1004,8 +1078,10 @@ def _dual_gemm_swiglu_fp8_run(
     )
 
     if compiled is None:
-        kernel = BlackwellFp8DualGemmKernel(
+        kernel = BlackwellDualGemmKernel(
             intermediate_size=intermediate_size,
+            element_type=cutlass.Float8E4M3FN,
+            quantize_output=True,
             dynamic_quant=dynamic_quant,
             cta_features=cta_features,
             cta_tokens=cta_tokens,
@@ -1019,6 +1095,89 @@ def _dual_gemm_swiglu_fp8_run(
     compiled(*arguments)
 
     return quantized, result_scale
+
+
+def _dual_gemm_swiglu_run(
+    x: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    tactic: int = -1,
+) -> torch.Tensor:
+    if not is_sm100_supported():
+        raise RuntimeError("CuTe DSL dual GEMM requires an SM10x GPU")
+
+    hidden_size, intermediate_size = _validate_float16_inputs(x, gate_up_weight)
+    multiprocessor_count = torch.cuda.get_device_properties(
+        x.device
+    ).multi_processor_count
+    if tactic < 0:
+        tactic = _pick_float16_tactic(intermediate_size, multiprocessor_count)
+
+    cta_features, cta_tokens, cta_reduction, stages, use_2cta = _resolve_tactic(
+        tactic, False
+    )
+    element_type = cutlass.BFloat16 if x.dtype == torch.bfloat16 else cutlass.Float16
+    output = torch.empty((1, intermediate_size), dtype=x.dtype, device=x.device)
+    stream = cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
+    x_3d = x.unsqueeze(0)
+    gate_weight, up_weight = gate_up_weight.chunk(2, dim=0)
+    gate_3d = gate_weight.unsqueeze(0)
+    up_3d = up_weight.unsqueeze(0)
+    output_3d = output.unsqueeze(0)
+
+    key = (
+        "sm100",
+        "unquantized",
+        x.dtype,
+        x.device,
+        hidden_size,
+        intermediate_size,
+        tactic,
+    )
+    output_cute = _cute_tensor_dynamic(output_3d)
+    arguments = (
+        _cute_tensor_dynamic(x_3d),
+        _cute_tensor_dynamic(gate_3d),
+        _cute_tensor_dynamic(up_3d),
+        output_cute,
+        output_cute,
+        output_cute,
+        output_cute,
+        output_cute,
+        output_cute,
+        output_cute,
+        stream,
+    )
+
+    compiled = _COMPILED_DUAL_GEMM.get(key)
+    if compiled is None:
+        kernel = BlackwellDualGemmKernel(
+            intermediate_size=intermediate_size,
+            element_type=element_type,
+            quantize_output=False,
+            dynamic_quant=False,
+            cta_features=cta_features,
+            cta_tokens=cta_tokens,
+            cta_reduction=cta_reduction,
+            stages=stages,
+            use_2cta=use_2cta,
+        )
+        compiled = cute_ext.compile(_dual_gemm_sm100_wrapper, kernel, *arguments)
+        _COMPILED_DUAL_GEMM[key] = compiled
+
+    compiled(*arguments)
+    return output
+
+
+def _dual_gemm_swiglu_fake(
+    x: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    tactic: int = -1,
+) -> torch.Tensor:
+    return torch.empty(
+        (x.shape[0], gate_up_weight.shape[0] // 2),
+        dtype=x.dtype,
+        device=x.device,
+    )
 
 
 def _dual_gemm_swiglu_fp8_fake(
@@ -1049,6 +1208,14 @@ direct_register_custom_op(
 )
 
 
+direct_register_custom_op(
+    op_name="cutedsl_dual_gemm_swiglu",
+    op_func=_dual_gemm_swiglu_run,
+    mutates_args=[],
+    fake_impl=_dual_gemm_swiglu_fake,
+)
+
+
 def can_use_dual_gemm(
     num_tokens: int,
     hidden_size: int,
@@ -1067,6 +1234,24 @@ def can_use_dual_gemm(
         and intermediate_size % 128 == 0
         and is_sm100_supported()
     )
+
+
+@debug_kernel_api
+def dual_gemm_swiglu(
+    x: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+) -> torch.Tensor:
+    """Run BF16/FP16 gate/up projections followed by SwiGLU."""
+    return _dual_gemm_swiglu_with_tactic(x, gate_up_weight, -1)
+
+
+def _dual_gemm_swiglu_with_tactic(
+    x: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    tactic: int,
+) -> torch.Tensor:
+    """Testing/tuning entry point; production callers use the auto picker."""
+    return torch.ops.sglang.cutedsl_dual_gemm_swiglu(x, gate_up_weight, tactic)
 
 
 @debug_kernel_api
