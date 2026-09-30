@@ -1281,23 +1281,43 @@ class KimiK3MoE(nn.Module):
 
     @cached_property
     def _route_quant_fuse_eligible(self) -> bool:
-        """Whether to stage routed_input for the fused route+pack+quant launch
-        (route_quant_handoff). Only the trtllm-gen SiTU runner with mxfp8
-        activations consumes the staged quant, so only that runner stages."""
+        """Whether to stage routed_input for a fused route+quant launch.
+
+        CUDA stages for the trtllm-gen SiTU runner. HIP stages when the radix
+        router and AITER_SITUV2_A4W4 are both on; the runner consumes that
+        MXFP4 only on prequant GEMM buckets.
+        """
         from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
 
         method = self.experts.quant_method
-        return (
+        flashinfer = (
             isinstance(method, Mxfp4MoEMethod)
             and method.use_flashinfer
             and not method.use_marlin
             and method.flashinfer_mxfp4_moe_precision == "default"
             and self.experts.moe_runner_config.activation == "situ"
         )
+        if flashinfer:
+            return True
+        # HIP radix router quantizes the staged row in the same launch.
+        # Consumption is limited to a4w4 prequant buckets; f16in stays bf16.
+        return (
+            _is_hip
+            and envs.SGLANG_K3_RADIX4_TOPK.get()
+            and os.environ.get("AITER_SITUV2_A4W4", "0") == "1"
+            and isinstance(method, Mxfp4MoEMethod)
+            and self.experts.moe_runner_config.activation == "situ"
+        )
 
     def _forward_routed(self, hidden_states, router_logits, routed_input, latent):
         if self._route_quant_fuse_eligible:
-            route_quant_handoff.stage(routed_input)
+            route_quant_handoff.stage(
+                routed_input,
+                moe_inter_dim=getattr(
+                    self.experts, "intermediate_size_per_partition", None
+                ),
+                num_experts=getattr(self.experts, "num_experts", None),
+            )
         try:
             topk_output = self.topk(hidden_states, router_logits)
             with zero_copy_context.set_moe_output(latent):
@@ -1313,7 +1333,13 @@ class KimiK3MoE(nn.Module):
         expanded_idx_to_permuted_idx, expert_weights) for the finalize-fused
         all-reduce."""
         if self._route_quant_fuse_eligible:
-            route_quant_handoff.stage(routed_input)
+            route_quant_handoff.stage(
+                routed_input,
+                moe_inter_dim=getattr(
+                    self.experts, "intermediate_size_per_partition", None
+                ),
+                num_experts=getattr(self.experts, "num_experts", None),
+            )
         try:
             topk_output = self.topk(hidden_states, router_logits)
             return self.experts.forward_deferred_finalize(routed_input, topk_output)

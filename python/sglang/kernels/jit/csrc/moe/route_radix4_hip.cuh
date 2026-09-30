@@ -42,6 +42,8 @@
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
 
+#include <sgl_kernel/deepseek_v4/fp4_utils.cuh>
+
 #include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
@@ -185,7 +187,7 @@ SGL_DEVICE void stage_wave_sum(float v, int lane, int wid, float* out) {
 }  // namespace radix4
 
 template <typename T, int EXPERTS, int TOPK, int BLOCK>
-__global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ const RouteRadix4Params params) {
+__device__ void route_radix4_body(const RouteRadix4Params params) {
   constexpr int WAVE = static_cast<int>(kRadix4Wave);
   constexpr int NWAVE = BLOCK / WAVE;
   constexpr int VPT = (EXPERTS + BLOCK - 1) / BLOCK;
@@ -208,28 +210,52 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
 
   float sig[VPT];
   uint32_t key[VPT];
-  // BLOCK * VPT overshoots EXPERTS; hence the mask.
-  uint32_t valid = (VPT >= 32) ? 0xffffffffu : ((1u << VPT) - 1u);
+  // 896 experts, four contiguous per thread, so threads 0..223 cover the row
+  // exactly and a thread's four bf16 values are one 8-byte load. Threads
+  // 224..255 stay in the block so the DPP reductions and barriers still see
+  // whole waves; they contribute nothing.
+  uint32_t valid = (tid < (EXPERTS / VPT)) ? ((1u << VPT) - 1u) : 0u;
 
-  // Read the scores and the bias and compute sig[i] and key[i]: sig[i] is the
-  // sigmoid without the bias and is what gets emitted, key[i] is sigmoid + bias
-  // and is used to rank. Also accumulate the bitwise OR and AND of every key,
-  // needed at diff below.
   uint32_t or_all = 0u, and_all = 0xffffffffu;
-#pragma unroll
-  for (int i = 0; i < VPT; ++i) {
-    const int e = tid + i * BLOCK;
-    if (e < EXPERTS) {
-      const float x = radix4::load_score(srow, e);
+  const bool vec8 = ((reinterpret_cast<uintptr_t>(srow) | reinterpret_cast<uintptr_t>(sbias)) & 7u) == 0u;
+  if (tid < EXPERTS / VPT) {
+    auto consume = [&](int i, float x, float b) {
       const float g = __builtin_amdgcn_rcpf(1.0f + exp2f(-kAiterSigmoidLog2E * x));
       sig[i] = g;
-      key[i] = radix4::rank_key(g + radix4::load_score(sbias, e));
+      key[i] = radix4::rank_key(g + b);
       or_all |= key[i];
       and_all &= key[i];
+    };
+    if constexpr (std::is_same_v<T, bf16_t>) {
+      if (vec8) {
+        const uint2 sv = *reinterpret_cast<const uint2*>(reinterpret_cast<const uint16_t*>(srow) + tid * VPT);
+        const uint2 bv = *reinterpret_cast<const uint2*>(reinterpret_cast<const uint16_t*>(sbias) + tid * VPT);
+        const uint32_t sp[2] = {sv.x, sv.y};
+        const uint32_t bp[2] = {bv.x, bv.y};
+#pragma unroll
+        for (int p = 0; p < 2; ++p) {
+          consume(2 * p, __uint_as_float((sp[p] & 0xffffu) << 16), __uint_as_float((bp[p] & 0xffffu) << 16));
+          consume(2 * p + 1, __uint_as_float(sp[p] & 0xffff0000u), __uint_as_float(bp[p] & 0xffff0000u));
+        }
+      } else {
+#pragma unroll
+        for (int i = 0; i < VPT; ++i) {
+          const int e = tid * VPT + i;
+          consume(i, radix4::load_score(srow, e), radix4::load_score(sbias, e));
+        }
+      }
     } else {
+#pragma unroll
+      for (int i = 0; i < VPT; ++i) {
+        const int e = tid * VPT + i;
+        consume(i, radix4::load_score(srow, e), radix4::load_score(sbias, e));
+      }
+    }
+  } else {
+#pragma unroll
+    for (int i = 0; i < VPT; ++i) {
       sig[i] = 0.0f;
       key[i] = 0u;
-      valid &= ~(1u << i);
     }
   }
   uint32_t alive = valid;
@@ -377,7 +403,7 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
         const int pos = atomicAdd(&s_cnt, 1);
         if (pos < TOPK) {
           s_w[pos] = sig[i];
-          s_id[pos] = tid + i * BLOCK;
+          s_id[pos] = tid * VPT + i;
           s_key[pos] = key[i];
           wsum += sig[i];
         }
@@ -402,7 +428,7 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
     for (int i = 0; i < VPT; ++i) {
       if (((valid >> i) & 1u) && (key[i] & pmask) == pivot) {
         eqm |= 1u << i;
-        const uint32_t p = radix4::tie_priority(tid + i * BLOCK);
+        const uint32_t p = radix4::tie_priority(tid * VPT + i);
         atomicOr(&s_tie[p >> 6], 1ull << (p & 63));
       }
     }
@@ -413,7 +439,7 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
 #pragma unroll
     for (int i = 0; i < VPT; ++i) {
       if (!((valid >> i) & 1u)) continue;
-      const int e = tid + i * BLOCK;
+      const int e = tid * VPT + i;
       const bool tied = ((eqm >> i) & 1u) != 0u;
       const bool taken =
           (key[i] & pmask) > pivot || (tied && radix4::tie_rank<TIE_WORDS>(s_tie, radix4::tie_priority(e)) < need);
@@ -463,6 +489,115 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
     const size_t o = static_cast<size_t>(token) * params.stride_out + rank;
     params.out_w[o] = s_w[tid] * scale;
     params.out_i[o] = id;
+  }
+}
+
+template <typename T, int EXPERTS, int TOPK, int BLOCK>
+__global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ const RouteRadix4Params params) {
+  route_radix4_body<T, EXPERTS, TOPK, BLOCK>(params);
+}
+
+// One MXFP4 pass over the token row. It does not read the route outputs, so it
+// occupies the other block of the same launch and the launch takes as long as
+// the slower block. Group 32, ue8m0 round-up of amax/6, e2m1 with the low
+// nibble first. 3584 / 32 = 112 groups.
+inline constexpr int kMxfp4Hidden = 3584;
+inline constexpr int kMxfp4Group = 32;
+inline constexpr int kMxfp4Groups = kMxfp4Hidden / kMxfp4Group;
+
+__device__ float mxfp4_e8m0_scale(float amax) {
+  const uint32_t u32 = __float_as_uint(amax * (1.0f / 6.0f));
+  uint32_t exponent = (u32 >> 23) & 0xffu;
+  if (exponent < 0xffu && (u32 & 0x7fffffu)) exponent += 1u;
+  return __uint_as_float(exponent << 23);
+}
+
+__device__ __forceinline__ uint32_t bf16_pair_absmax(uint32_t x) {
+  return max(x & 0x7fffu, (x >> 16) & 0x7fffu);
+}
+
+__device__ __forceinline__ uint32_t cvt_fp4_word(uint32_t p0, uint32_t p1, uint32_t p2, uint32_t p3, float dq) {
+#if defined(__gfx950__)
+  // The scale operand is the dequant scale. The instruction divides by it.
+  auto as_bf16x2 = [](uint32_t bits) {
+    __hip_bfloat162 v;
+    __builtin_memcpy(&v, &bits, sizeof(v));
+    return v;
+  };
+  uint32_t pk = 0;
+  pk = __builtin_amdgcn_cvt_scalef32_pk_fp4_bf16(pk, as_bf16x2(p0), dq, 0);
+  pk = __builtin_amdgcn_cvt_scalef32_pk_fp4_bf16(pk, as_bf16x2(p1), dq, 1);
+  pk = __builtin_amdgcn_cvt_scalef32_pk_fp4_bf16(pk, as_bf16x2(p2), dq, 2);
+  pk = __builtin_amdgcn_cvt_scalef32_pk_fp4_bf16(pk, as_bf16x2(p3), dq, 3);
+  return pk;
+#else
+  auto nib = [&](uint32_t pair) {
+    const float a = __uint_as_float((pair & 0xffffu) << 16) * __builtin_amdgcn_rcpf(dq);
+    const float b = __uint_as_float(pair & 0xffff0000u) * __builtin_amdgcn_rcpf(dq);
+    return static_cast<uint8_t>(deepseek_v4::fp4::e2m1x2_code(fp32x2_t{a, b}));
+  };
+  return static_cast<uint32_t>(nib(p0)) | (static_cast<uint32_t>(nib(p1)) << 8) |
+         (static_cast<uint32_t>(nib(p2)) << 16) | (static_cast<uint32_t>(nib(p3)) << 24);
+#endif
+}
+
+__device__ void quant_mxfp4_token(const bf16_t* row, uint8_t* dst, uint8_t* scale) {
+  const int g = static_cast<int>(threadIdx.x);
+  if (g >= kMxfp4Groups) return;
+  const uint32_t* v = reinterpret_cast<const uint32_t*>(reinterpret_cast<const uint16_t*>(row) + g * kMxfp4Group);
+  uint32_t p0 = v[0], p1 = v[1], p2 = v[2], p3 = v[3];
+  uint32_t p4 = v[4], p5 = v[5], p6 = v[6], p7 = v[7];
+  uint32_t p8 = v[8], p9 = v[9], p10 = v[10], p11 = v[11];
+  uint32_t p12 = v[12], p13 = v[13], p14 = v[14], p15 = v[15];
+  uint32_t am = bf16_pair_absmax(p0);
+  am = max(am, bf16_pair_absmax(p1));
+  am = max(am, bf16_pair_absmax(p2));
+  am = max(am, bf16_pair_absmax(p3));
+  am = max(am, bf16_pair_absmax(p4));
+  am = max(am, bf16_pair_absmax(p5));
+  am = max(am, bf16_pair_absmax(p6));
+  am = max(am, bf16_pair_absmax(p7));
+  am = max(am, bf16_pair_absmax(p8));
+  am = max(am, bf16_pair_absmax(p9));
+  am = max(am, bf16_pair_absmax(p10));
+  am = max(am, bf16_pair_absmax(p11));
+  am = max(am, bf16_pair_absmax(p12));
+  am = max(am, bf16_pair_absmax(p13));
+  am = max(am, bf16_pair_absmax(p14));
+  am = max(am, bf16_pair_absmax(p15));
+  // aiter's MXFP4 kernel floors a group amax at 1e-10, including an all-zero
+  // group, then applies the same round-up. A special scale of 127 would not
+  // match that byte.
+  const float amax = fmaxf(__uint_as_float(am << 16), 1e-10f);
+  const float dq = mxfp4_e8m0_scale(amax);
+  scale[g] = static_cast<uint8_t>(__float_as_uint(dq) >> 23);
+  uint32_t* out = reinterpret_cast<uint32_t*>(dst + g * (kMxfp4Group / 2));
+  out[0] = cvt_fp4_word(p0, p1, p2, p3, dq);
+  out[1] = cvt_fp4_word(p4, p5, p6, p7, dq);
+  out[2] = cvt_fp4_word(p8, p9, p10, p11, dq);
+  out[3] = cvt_fp4_word(p12, p13, p14, p15, dq);
+}
+
+struct RouteQuantHipParams {
+  RouteRadix4Params route;
+  const bf16_t* x;
+  uint32_t x_stride;
+  uint8_t* out_fp4;
+  uint8_t* out_scale;
+  uint32_t num_tokens;
+};
+
+template <int BLOCK>
+__global__
+__launch_bounds__(BLOCK) void route_quant_fused_hip_kernel(__grid_constant__ const RouteQuantHipParams params) {
+  if (blockIdx.x < params.num_tokens) {
+    route_radix4_body<bf16_t, 896, 16, BLOCK>(params.route);
+  } else {
+    const uint32_t token = blockIdx.x - params.num_tokens;
+    quant_mxfp4_token(
+        params.x + static_cast<size_t>(token) * params.x_stride,
+        params.out_fp4 + static_cast<size_t>(token) * (kMxfp4Hidden / 2),
+        params.out_scale + static_cast<size_t>(token) * kMxfp4Groups);
   }
 }
 
@@ -521,6 +656,61 @@ struct RouteRadix4Kernel {
     } else {
       LaunchKernel(M, kBlock, device)(route_radix4_kernel<fp32_t, kExperts, kTopK, kBlock>, params);
     }
+  }
+};
+
+struct RouteQuantFusedHipKernel {
+  static void
+  run(const tvm::ffi::TensorView scores,
+      const tvm::ffi::TensorView bias,
+      const tvm::ffi::TensorView x,
+      const tvm::ffi::TensorView out_w,
+      const tvm::ffi::TensorView out_i,
+      const tvm::ffi::TensorView out_fp4,
+      const tvm::ffi::TensorView out_scale,
+      int64_t topk,
+      double routed_scaling_factor,
+      bool renormalize) {
+    using namespace host;
+
+    auto M_ = SymbolicSize{"num_tokens"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
+
+    TensorMatcher({M_, kRadix4NumExperts})
+        .with_dtype<bf16_t>()
+        .with_device(device_)
+        .with_strides({-1, 1})
+        .verify(scores);
+    TensorMatcher({kRadix4NumExperts}).with_dtype<bf16_t>().with_device(device_).verify(bias);
+    TensorMatcher({M_, kMxfp4Hidden}).with_dtype<bf16_t>().with_device(device_).with_strides({-1, 1}).verify(x);
+    TensorMatcher({M_, kRadix4TopK}).with_dtype<fp32_t>().with_device(device_).verify(out_w);
+    TensorMatcher({M_, kRadix4TopK}).with_dtype<int32_t>().with_device(device_).verify(out_i);
+    TensorMatcher({M_, kMxfp4Hidden / 2}).with_dtype<uint8_t>().with_device(device_).verify(out_fp4);
+    TensorMatcher({M_, kMxfp4Groups}).with_dtype<uint8_t>().with_device(device_).verify(out_scale);
+
+    const auto M = static_cast<uint32_t>(M_.unwrap());
+    RuntimeCheck(topk == kRadix4TopK && M > 0 && M <= 1024, "fused route covers K3 only");
+    const auto stride_x = static_cast<uint32_t>(x.stride(0));
+    RuntimeCheck((stride_x % 2u) == 0u, "MXFP4 row must be 4-byte aligned");
+
+    RouteQuantHipParams params{};
+    params.route.scores = static_cast<const bf16_t*>(scores.data_ptr());
+    params.route.bias = static_cast<const bf16_t*>(bias.data_ptr());
+    params.route.out_w = static_cast<float*>(out_w.data_ptr());
+    params.route.out_i = static_cast<int32_t*>(out_i.data_ptr());
+    params.route.stride_scores = static_cast<uint32_t>(scores.stride(0));
+    params.route.stride_out = static_cast<uint32_t>(out_w.stride(0));
+    params.route.renormalize = renormalize;
+    params.route.routed_scaling_factor = static_cast<float>(routed_scaling_factor);
+    params.x = static_cast<const bf16_t*>(x.data_ptr());
+    params.x_stride = stride_x;
+    params.out_fp4 = static_cast<uint8_t*>(out_fp4.data_ptr());
+    params.out_scale = static_cast<uint8_t*>(out_scale.data_ptr());
+    params.num_tokens = M;
+
+    constexpr auto kBlock = static_cast<int>(kRadix4Block);
+    LaunchKernel(2 * M, kBlock, device_.unwrap())(route_quant_fused_hip_kernel<kBlock>, params);
   }
 };
 
