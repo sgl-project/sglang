@@ -466,8 +466,7 @@ class JetNemotronDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> torch.Tensor:
         # Self Attention
         residual = hidden_states
 
@@ -490,7 +489,29 @@ class JetNemotronDecoderLayer(nn.Module):
 
         hidden_states = residual + hidden_states
 
-        return hidden_states, None
+        return hidden_states
+
+
+class JetNemotronModel(Qwen2Model):
+    """Each decoder layer adds its own residual, so the stack runs without a
+    residual stream and ends with the final norm alone."""
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if input_embeds is None:
+            hidden_states = self.embed_tokens(input_ids)
+        else:
+            hidden_states = input_embeds
+        for i in range(self.start_layer, self.end_layer):
+            hidden_states = self.layers[i](positions, hidden_states, forward_batch)
+        if hidden_states.shape[0] != 0:
+            hidden_states = self.norm(hidden_states)
+        return hidden_states
 
 
 class JetNemotronForCausalLM(nn.Module):
@@ -505,7 +526,7 @@ class JetNemotronForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
 
-        self.model = Qwen2Model(
+        self.model = JetNemotronModel(
             config,
             quant_config=quant_config,
             prefix=add_prefix("model", prefix),
