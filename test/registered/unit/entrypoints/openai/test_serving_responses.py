@@ -1619,6 +1619,7 @@ INLINE_SYSTEM_TEMPLATE = (
     "encoding_spec, chat_template_name, jinja_template, preserve",
     [
         ("kimi_k3", None, None, True),
+        ("dsv32", None, INLINE_SYSTEM_TEMPLATE, False),
         (None, None, INLINE_SYSTEM_TEMPLATE, True),
         (None, "llama-3", INLINE_SYSTEM_TEMPLATE, False),
         (None, None, "{{ messages[0]['content'] }}", False),
@@ -1661,6 +1662,7 @@ def test_inline_instruction_keeps_history_prefix(
         assert after[len(before)]["role"] == "system"
         assert "New instruction" in after[len(before)]["content"]
     else:
+        assert [m["role"] for m in after].count("system") == 1
         assert "New instruction" in after[0]["content"]
 
 
