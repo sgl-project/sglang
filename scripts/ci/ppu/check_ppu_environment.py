@@ -6,7 +6,6 @@ import re
 import shutil
 import stat
 import subprocess
-import sys
 import traceback
 from pathlib import Path
 
@@ -173,14 +172,7 @@ def main() -> int:
         check_ppu_sdk()
         visible = check_torch_compute()
         check_visibility_consistency(reported, visible)
-    except CheckFailure as error:
-        print(f"ERROR: {error}", file=sys.stderr)
-        return 1
-    except Exception as error:
-        print(
-            f"ERROR: unexpected preflight failure ({type(error).__name__}): {error}",
-            file=sys.stderr,
-        )
+    except Exception:
         traceback.print_exc()
         return 1
 
