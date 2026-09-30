@@ -461,6 +461,8 @@ class MambaPoolHost(HostKVCache):
             )
             dst.index_copy_(0, dst_indices.to(dst.device), staged)
             return
+        # XPU: transfer_kv_mamba_{pf_lf,lf_pf} are CUDA-JIT (tvm_ffi + nvcc)
+        # and are not portable; fall through to the sgl_kernel direct path.        
         if io_backend == "kernel" and not _is_xpu:
             item_size = MambaPoolHost._item_size_per_index(dst)
             # Mamba JIT kernel expects all index tensors on CUDA.
@@ -544,6 +546,8 @@ class MambaPoolHost(HostKVCache):
                 can_use_jit=can_use_jit,
             )
             return
+        # XPU: transfer_kv_mamba_{pf_lf,lf_pf} are CUDA-JIT (tvm_ffi + nvcc)
+        # and are not portable; fall through to the sgl_kernel direct path.
         if io_backend == "kernel" and not _is_xpu:
             item_size = MambaPoolHost._item_size_per_index(src_layers[0])
             transfer_kv_mamba_lf_pf(
