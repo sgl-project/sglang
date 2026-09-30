@@ -106,11 +106,11 @@ def _select_routes(L, Bias, Sorted, Weights, Counts, Jobs, expert_start, M: gl.c
         available &= e != idx
         score = gl.where(e == idx, -float('inf'), score)
     owned = (selected_id >= expert_start) & (selected_id < expert_start + LOCAL_EXPERTS)
-    selected_id = gl.where(owned, selected_id - expert_start, LOCAL_EXPERTS)
-    ticket = gl.atomic_add(Counts + selected_id, 1, sem='relaxed')
-    gl.store(Sorted + selected_id * (triton.cdiv(M, TM) * TM) + ticket, m * 8 + rank)
+    selected_id = gl.where(owned, selected_id - expert_start, 0)
+    ticket = gl.atomic_add(Counts + selected_id, 1, owned, sem='relaxed')
+    gl.store(Sorted + selected_id * (triton.cdiv(M, TM) * TM) + ticket, m * 8 + rank, owned)
     gl.store(Weights + m * 8 + rank, gl.where(owned, selected_prob / total * SCALE, 0.0))
-    publish = ticket % TM == 0
+    publish = owned & (ticket % TM == 0)
     job = gl.atomic_add(Counts + 256 + gl.zeros_like(rank), 1, publish, sem='relaxed')
     gl.store(Jobs + job, selected_id | ticket // TM << 9, publish)
 
@@ -304,7 +304,13 @@ def _reduce_parts(P, Y, Weights, M: gl.constexpr, H: gl.constexpr, HAS_SHARED: g
         route = m * 8 + rank
         weight = gl.load(Weights + route)
         address = route * 128 + inner
-        contribution = gl.amd.cdna4.buffer_load(part_base, address, cache='.cg').to(gl.float32)
+        contribution = gl.amd.cdna4.buffer_load(
+            part_base,
+            address,
+            mask=weight != 0.0,
+            other=0.0,
+            cache='.cg',
+        ).to(gl.float32)
         value += contribution * weight
     if HAS_SHARED:
         value += gl.load(Y + m * H + h).to(gl.float32)

@@ -69,11 +69,7 @@ def _pack_scale(value: torch.Tensor) -> torch.Tensor:
 
 def _kernel_name(total_tp: int, ep_size: int, is_nextn: bool, m: int) -> str:
     if total_tp == 4 or ep_size > 1:
-        # The exact-M specialization assumes the full 256-expert TP layout.
-        # With EP, its local-expert schedule can index beyond the 64/128-expert
-        # bank during graph capture.  The general low-M kernel covers these
-        # shapes and keeps all routing local to the rank's expert range.
-        if ep_size == 1 and m in (32, 64):
+        if m in (32, 64):
             return "fused_moe_tp4_m32_64"
         if 1 <= m <= 64:
             return "fused_moe_tp4_m1_16"
