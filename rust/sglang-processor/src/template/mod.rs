@@ -283,11 +283,3 @@ pub enum TemplateError {
 
 use self::legacy::LegacyFormatter;
 pub use self::loader::load_chat_formatter;
-
-#[cfg(test)]
-use self::{
-    builtins::builtin_template, legacy::LegacySpec, loader::infer_legacy_template_from_model_path,
-};
-
-#[cfg(test)]
-mod tests;

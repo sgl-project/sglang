@@ -132,7 +132,7 @@ impl ThinkingTemplates {
     }
 }
 
-pub(super) fn detect_thinking_policy(template: &str) -> ThinkingPolicy {
+fn detect_thinking_policy(template: &str) -> ThinkingPolicy {
     if template.contains("<|channel|>")
         || ((!template.contains("enable_thinking") && !template.contains("thinking"))
             && (template.contains(r"<|im_start|>assistant\n<think>\n")
@@ -293,5 +293,98 @@ fn jinja_bool(value: &str) -> Option<bool> {
         "true" | "True" => Some(true),
         "false" | "False" => Some(false),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ThinkingPolicy, detect_thinking_policy};
+
+    #[test]
+    fn thinking_toggle_detection_matches_template_defaults() {
+        assert_eq!(
+            detect_thinking_policy(
+                "{% if enable_thinking is not defined %}{% set enable_thinking = true %}{% endif %}"
+            ),
+            ThinkingPolicy::TemplateToggle {
+                key: "enable_thinking",
+                default_enabled: true,
+            }
+        );
+        assert_eq!(
+            detect_thinking_policy(
+                "{% if not thinking is defined %}{% set thinking = false %}{% endif %}"
+            ),
+            ThinkingPolicy::TemplateToggle {
+                key: "thinking",
+                default_enabled: false,
+            }
+        );
+        assert_eq!(
+            detect_thinking_policy("{{ messages }}"),
+            ThinkingPolicy::Unknown
+        );
+    }
+
+    #[test]
+    fn thinking_default_filters_match_python_semantics() {
+        let cases = [
+            ("{{ enable_thinking | d(true) }}", true),
+            ("{{ enable_thinking|default(false) }}", false),
+            ("{{ enable_thinking | default(true, false) }}", true),
+            ("{{ enable_thinking | default(false, true) }}", false),
+            (
+                "{{ enable_thinking | default(false, boolean=true) }}",
+                false,
+            ),
+            (
+                "{% if enable_thinking | default(false) %}x{% endif %}",
+                false,
+            ),
+        ];
+        for (template, default_enabled) in cases {
+            assert_eq!(
+                detect_thinking_policy(template),
+                ThinkingPolicy::TemplateToggle {
+                    key: "enable_thinking",
+                    default_enabled,
+                },
+                "{template}"
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_detection_ignores_non_executable_toggle_text() {
+        for template in [
+            "{# {{ enable_thinking | default(false) }} #}{{ enable_thinking | default(true) }}",
+            "{% raw %}{{ enable_thinking | default(false) }}{% endraw %}{{ enable_thinking | default(true) }}",
+            "{{ 'enable_thinking | default(false)' }}{{ enable_thinking | default(true) }}",
+        ] {
+            assert_eq!(
+                detect_thinking_policy(template),
+                ThinkingPolicy::TemplateToggle {
+                    key: "enable_thinking",
+                    default_enabled: true,
+                },
+                "{template}"
+            );
+        }
+        assert_eq!(
+            detect_thinking_policy("{{ enable_thinking | default(true, true) }}"),
+            ThinkingPolicy::Unknown
+        );
+        assert_eq!(
+            detect_thinking_policy("{% if enable_thinking %}think{% endif %}"),
+            ThinkingPolicy::Unknown
+        );
+    }
+
+    #[test]
+    fn channel_templates_are_always_on() {
+        assert_eq!(
+            detect_thinking_policy("<|start|>assistant<|channel|>analysis<|message|>"),
+            ThinkingPolicy::Always
+        );
     }
 }

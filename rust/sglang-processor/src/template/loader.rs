@@ -123,7 +123,7 @@ pub fn load_chat_formatter(
 /// built-in template from the model path, optionally consulting the model's
 /// `config.json` `model_type`. `None` when nothing matches — the HF template
 /// is the fallback then, as in Python.
-pub(super) fn infer_legacy_template_from_model_path(
+fn infer_legacy_template_from_model_path(
     model_path: &str,
     model_type: Option<&str>,
 ) -> Option<LegacySpec> {
@@ -343,4 +343,178 @@ fn parse_legacy_template(value: &Value, path: &Path) -> Result<LegacySpec, Templ
         stop_str,
         ..Default::default()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use dynamo_protocols::types::CreateChatCompletionRequest;
+
+    use super::super::{ChatFormatter, ChatFormatterOptions, TemplateError, select_chat_formatter};
+    use super::{infer_legacy_template_from_model_path, load_chat_formatter};
+
+    fn request() -> CreateChatCompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "test",
+            "messages": [
+                {"role": "system", "content": "Be concise."},
+                {"role": "user", "content": "Hello"}
+            ]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn json_legacy_template_is_rendered_natively() {
+        let base = std::env::temp_dir().join(format!(
+            "sglang-openai-template-base-{}-test.json",
+            std::process::id()
+        ));
+        let legacy = base.with_file_name("sglang-openai-template-legacy.json");
+        std::fs::write(&base, r#"{"chat_template":"unused"}"#).unwrap();
+        std::fs::write(
+            &legacy,
+            r#"{
+                "name": "test-legacy",
+                "system": "System",
+                "system_message": "default",
+                "user": "USER",
+                "assistant": "ASSISTANT",
+                "sep_style": "ADD_COLON_SINGLE",
+                "sep": "\n",
+                "stop_str": "<stop>"
+            }"#,
+        )
+        .unwrap();
+
+        let formatter = load_chat_formatter(
+            Some(base.to_str().unwrap()),
+            None,
+            None,
+            Some(legacy.to_str().unwrap()),
+        )
+        .unwrap();
+        let rendered = formatter.render(&request()).unwrap();
+        assert_eq!(rendered, "System\nBe concise.\nUSER: Hello\nASSISTANT:");
+
+        let _ = std::fs::remove_file(base);
+        let _ = std::fs::remove_file(legacy);
+    }
+
+    /// A built-in `--chat-template` name resolves without any tokenizer config.
+    #[test]
+    fn builtin_argument_works_without_tokenizer_config() {
+        let formatter = load_chat_formatter(None, None, None, Some("chatml")).unwrap();
+        let ChatFormatter::Legacy(formatter) = &formatter else {
+            panic!("expected a legacy formatter");
+        };
+        assert_eq!(formatter.spec.name, "chatml");
+    }
+
+    /// Python `load_chat_template`: without `--chat-template`, the model path
+    /// infers a legacy template before the HF fallback — so a legacy model
+    /// with no `chat_template` in its config still gets one, and even a config
+    /// that HAS one loses to the inference.
+    #[test]
+    fn model_path_inference_precedes_tokenizer_config() {
+        let base = std::env::temp_dir().join(format!(
+            "sglang-openai-template-infer-{}-test.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &base,
+            r#"{"tokenizer_class":"LlamaTokenizer","chat_template":"{{messages}}"}"#,
+        )
+        .unwrap();
+
+        // Path matcher: vicuna/llava-v1.5-style paths.
+        let formatter = load_chat_formatter(
+            Some(base.to_str().unwrap()),
+            Some("models/vicuna-7b-v1.5"),
+            None,
+            None,
+        )
+        .unwrap();
+        let ChatFormatter::Legacy(formatter) = &formatter else {
+            panic!("expected a legacy formatter");
+        };
+        assert_eq!(formatter.spec.name, "vicuna_v1.1");
+        // No config at all + path matcher.
+        let formatter = load_chat_formatter(None, Some("deepseek-vl2-7b"), None, None).unwrap();
+        let ChatFormatter::Legacy(formatter) = &formatter else {
+            panic!("expected a legacy formatter");
+        };
+        assert_eq!(formatter.spec.name, "deepseek-vl2");
+
+        // Model-type matcher.
+        let formatter =
+            load_chat_formatter(None, Some("models/opaque"), Some("phi4mm"), None).unwrap();
+        let ChatFormatter::Legacy(formatter) = &formatter else {
+            panic!("expected a legacy formatter");
+        };
+        assert_eq!(formatter.spec.name, "phi-4-mm");
+
+        // `select_chat_formatter` reads the model type from `<model_path>/config.json`.
+        let model_dir = std::env::temp_dir().join(format!(
+            "sglang-openai-template-infer-model-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(
+            model_dir.join("config.json"),
+            r#"{"model_type":"phi4mm","architectures":["Phi4MMForCausalLM"]}"#,
+        )
+        .unwrap();
+        let (formatter, error) = select_chat_formatter(&ChatFormatterOptions {
+            tokenizer_path: model_dir.to_str().unwrap().into(),
+            model_path: model_dir.to_str().unwrap().into(),
+            ..Default::default()
+        });
+        assert!(error.is_none(), "{error:?}");
+        let Some(ChatFormatter::Legacy(formatter)) = &formatter else {
+            panic!("expected a legacy formatter");
+        };
+        assert_eq!(formatter.spec.name, "phi-4-mm");
+
+        let _ = std::fs::remove_file(&base);
+        let _ = std::fs::remove_dir_all(model_dir);
+    }
+
+    /// Every name the model-path matchers can produce must exist in the
+    /// built-in table (parity guard for `MODEL_TYPE_TO_TEMPLATE`).
+    #[test]
+    fn inferred_template_names_resolve_to_builtins() {
+        for model_path in [
+            "points-7b-chat",
+            "moss-vl",
+            "moss2-vl",
+            "internvl-2.5",
+            "janus-pro",
+            "vicuna-7b",
+            "llava-v1.5-7b",
+            "deepseek-vl2-small",
+            "llava-v1.6-34b",
+            "minicpm-v-2.6",
+            "minicpm-o-4.5",
+            "phi-4-multimodal",
+            "deepseek-ocr",
+            "unlimited-ocr",
+            "paddleocr-vl",
+            "whisper",
+        ] {
+            let spec = infer_legacy_template_from_model_path(model_path, None)
+                .unwrap_or_else(|| panic!("no inference for {model_path}"));
+            let _ = spec;
+        }
+    }
+
+    /// MiniCPM 4.6+ must NOT fall back to the legacy template; with no config
+    /// and nothing else to try, that surfaces as the missing-config error.
+    #[test]
+    fn minicpm_4_6_skips_legacy_inference() {
+        assert!(infer_legacy_template_from_model_path("minicpm-v-4.6", None).is_none());
+        assert!(matches!(
+            load_chat_formatter(None, Some("minicpm-v-4.6"), None, None),
+            Err(TemplateError::MissingConfig)
+        ));
+    }
 }
