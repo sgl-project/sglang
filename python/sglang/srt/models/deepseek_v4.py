@@ -1787,10 +1787,9 @@ class MQALayer(MqaAttentionBase):
             envs.SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY.get()
             and forward_batch.forward_mode.is_target_verify()
         )
-        # fp8 verify packs like prefill but keeps verify's store timing: the pair
-        # lands in the caller's buffers and the backend writes the ring off the
-        # per-token slot map before attention. Keyed off those buffers the same
-        # way fuse_prefill is, so the two arms cannot disagree about the layout.
+        # Keep verify's caller-owned packed outputs. AITER still writes these
+        # buffers alongside the ring; returning kv=None below skips the backend
+        # scatter independently of whether the kernel emits a packed K pair.
         fuse_verify_fp8 = (
             fuse_verify
             and unified
@@ -1839,31 +1838,7 @@ class MQALayer(MqaAttentionBase):
 
             token_to_kv_pool = get_token_to_kv_pool()
             swa_rope_cache = None
-            if unified and fuse_verify:
-                # Target-verify runs through the unified_kv decode path. The
-                # backend writes the current chunk's KV into the ring *before*
-                # attention (save_kv_cache=True -> store_swa_into_unified ahead
-                # of runtime.decode), and per-token causal index streams -- built
-                # once per step in the backend metadata -- keep each draft query
-                # attending only to positions up to itself. Causal masking among
-                # the draft tokens comes from those index streams, not from store
-                # timing. So this path skips only the fused kernel's *own* store
-                # and returns kv, letting that existing causally-indexed backend
-                # store run unchanged; we fuse just the norm+RoPE. swa_loc is not
-                # computed -- it only addresses the kernel store this path drops.
-                #
-                # kv is a strided slice of qkv_a and the ring store requires a
-                # contiguous buffer, so materialise it before the kernel norms
-                # it in place. The unfused path pays the same copy inside
-                # _compute_kv_bf16.
-                #
-                # Under fp8 the kernel writes the packed pair to the caller's
-                # buffers rather than norming kv in place, and the same backend
-                # store takes that pair -- only the row format changes.
-                kv = kv.contiguous()
-                swa_cache, swa_loc = None, None
-                swa_page_size, bf16_store = 1, not fuse_verify_fp8
-            elif unified and fuse_prefill:
+            if unified and fuse_prefill:
                 # No pools, so the kernel norms + RoPEs + packs and writes no
                 # ring row. It must not: those rows are this fwd's extend region
                 # and the prefix pool has to stay as attention expects to find
@@ -1875,6 +1850,11 @@ class MQALayer(MqaAttentionBase):
                 # does not norm in place -- and it takes the row stride as an
                 # argument, so materialising it was a copy on every fp8 layer.
             elif unified:
+                # Target-verify shares this arm: its ring rows are addressed by the
+                # same swa_loc, and the store still lands before attention because
+                # the fused kernel runs during the q/kv projection. Causal masking
+                # among the draft tokens comes from the backend's per-token index
+                # streams, not from store timing.
                 swa_cache = token_to_kv_pool.get_unified_kv(self.layer_id)
                 # swa_loc is layer-independent; computed once per forward by the
                 # backend and cached on the metadata (read here by every layer).
@@ -1919,19 +1899,16 @@ class MQALayer(MqaAttentionBase):
                 k_rope_out=k_rope_out if (fuse_prefill or fuse_verify_fp8) else None,
                 q_rope_out=q_rope_out,
             )
-            # On the verify path the kernel normed + RoPE'd kv in place and wrote
-            # nothing, so hand it back: the caller feeds it to attention as the
-            # current chunk (attn_k = kv) and save_kv_cache = kv is not None lets
-            # the backend do its normal causally-indexed store into the ring
-            # before the decode kernel runs -- exactly as the unfused path did.
-            if unified and (fuse_prefill or fuse_verify_fp8):
+            if unified and fuse_prefill:
                 # The packed nope half rides out on the kv slot -- attention
                 # takes it as attn_k and save_kv_cache stays on so the backend
-                # does the ring write. Its rope half went to the caller's buffer,
-                # which has no second return slot here. Prefill's write lands
-                # after attention, verify's before it; both read this pair.
+                # does the ring write after attention. Its rope half went to the
+                # caller's buffer, which has no second return slot here.
                 kv = k_nope_out
-            elif not (unified and fuse_verify):
+            else:
+                # Ring row already written by the kernel; save_kv_cache is
+                # `kv is not None`, so this is what makes the backend skip its
+                # own store.
                 kv = None
 
             if not unified and use_cp:
@@ -2219,6 +2196,10 @@ class MQALayer(MqaAttentionBase):
                 (x.shape[0], self.n_local_heads, rope_pool.shape[-1])
             )
             if unified_fp8_prefill or unified_fp8_verify:
+                # Both paths retain caller-owned K outputs. Verify also writes
+                # the ring in the fused kernel and returns kv=None to skip the
+                # backend scatter. AITER would allocate these outputs internally
+                # if omitted; removing them needs a separate kernel change.
                 k_nope = nope_pool.new_empty((x.shape[0], nope_pool.shape[-1]))
                 k_rope = rope_pool.new_empty((x.shape[0], rope_pool.shape[-1]))
             kernel_num_heads = self.n_local_heads
@@ -2310,12 +2291,12 @@ class MQALayer(MqaAttentionBase):
             )
 
         # save_kv_cache = kv is not None selects who writes the ring. When kv is
-        # None the store was already fused into _forward_prepare* (decode) or
-        # done inline, so the backend skips its own store_cache; pass `q` as a
-        # sentinel for the `k is v` assert (attention won't read it once
-        # save_kv_cache=False). When kv is not None (target-verify, or DSA-CP),
-        # _forward_prepare* deliberately left the store off and the backend does
-        # its normal causally-indexed store from attn_k = kv.
+        # None the store was already fused into _forward_prepare* (decode and
+        # target-verify) or done inline, so the backend skips its own
+        # store_cache; pass `q` as a sentinel for the `k is v` assert (attention
+        # won't read it once save_kv_cache=False). When kv is not None (unified
+        # prefill, or DSA-CP), _forward_prepare* deliberately left the store off
+        # and the backend does its own store from attn_k = kv.
         attn_k = kv if kv is not None else q
 
         if unified:
