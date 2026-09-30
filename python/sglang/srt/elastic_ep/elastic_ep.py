@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Callable, Iterator, List, Optional
 import msgspec
 import torch
 
-from sglang.srt.distributed import get_world_group, parallel_state
+from sglang.srt.distributed import parallel_state
 from sglang.srt.distributed.utils import get_global_tcp_store
 from sglang.srt.eplb.expert_location import (
     broadcast_global_expert_location_metadata_in_place,
@@ -537,5 +537,5 @@ def maybe_rebalance_after_rank_fault(*, eplb_manager: EPLBManager) -> bool:
         except StopIteration:
             break
     # Ranks may finish expert rebalance far apart; wait to avoid new EP timeouts.
-    get_world_group().barrier()
+    get_parallel().world_group.barrier()
     return True

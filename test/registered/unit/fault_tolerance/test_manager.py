@@ -1,3 +1,4 @@
+import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -42,3 +43,7 @@ def test_protocol_and_state_contract():
     assert "last_ft_request_id" not in status["engines"][0]
     manager._finish_submitted_apply("request-2", "failed")
     assert manager.status()[1]["ft_error"] == "failed"
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
