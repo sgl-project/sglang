@@ -1,6 +1,6 @@
 """CPU unit test for the DSA-CP token-shard plan.
 
-Pins ``plan_dsa_cp_shard`` (``layers/attention/dsa/dsa_cp_layout.py``). DSA-CP
+Pins ``plan_dsa_token_shard`` (``layers/attention/dsa/dsa_token_shard_layout.py``). DSA-CP
 cuts an extend batch's TOKENS across the attention-TP group, so a rank computes
 every head for its slice instead of its own heads for every token. The cut is by
 position, not by request, and at a 13,855-token tail over 16 ranks a request
@@ -16,15 +16,15 @@ requires the two to agree, over the served shapes, every small batch
 exhaustively, and random large ragged ones.
 
 Usage:
-    python -m pytest test_dsa_cp_shard_plan.py -v
-    python test_dsa_cp_shard_plan.py
+    python -m pytest test_dsa_token_shard_plan.py -v
+    python test_dsa_token_shard_plan.py
 """
 
 import itertools
 import random
 import unittest
 
-from sglang.srt.layers.attention.dsa.dsa_cp_layout import plan_dsa_cp_shard
+from sglang.srt.layers.attention.dsa.dsa_token_shard_layout import plan_dsa_token_shard
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -57,14 +57,14 @@ def _brute(extend_seq_lens, seq_lens, tp_size, tp_rank):
     return query_lens, key_lens
 
 
-class TestDsaCpShardPlan(CustomTestCase):
+class TestDsaTokenShardPlan(CustomTestCase):
     def _check(self, extend_seq_lens, seq_lens, tp_size, label=""):
         num_tokens = sum(extend_seq_lens)
         rows = -(-num_tokens // tp_size)
         covered = [0] * num_tokens
 
         for rank in range(tp_size):
-            plan = plan_dsa_cp_shard(extend_seq_lens, seq_lens, tp_size, rank)
+            plan = plan_dsa_token_shard(extend_seq_lens, seq_lens, tp_size, rank)
             want_q, want_k = _brute(extend_seq_lens, seq_lens, tp_size, rank)
 
             self.assertEqual(plan.query_lens, want_q, f"{label} rank={rank} query")
@@ -94,14 +94,14 @@ class TestDsaCpShardPlan(CustomTestCase):
     def test_a_key_length_is_the_last_tokens_not_the_first(self):
         # The operator walks back from the last query row (right-down causal),
         # so handing it the first token's span would truncate every other row.
-        plan = plan_dsa_cp_shard([8], [108], 4, 0)
+        plan = plan_dsa_token_shard([8], [108], 4, 0)
         self.assertEqual(plan.query_lens, [2])
         self.assertEqual(plan.key_lens, [102])  # prefix 100 + 2 tokens, not + 1
 
     def test_requests_outside_the_slice_are_dropped_entirely(self):
         # A length without a query row is a span the operator would read for
         # nothing, so it must be zero rather than the request's true length.
-        plan = plan_dsa_cp_shard([2, 2, 2, 2], [102, 202, 302, 402], 4, 2)
+        plan = plan_dsa_token_shard([2, 2, 2, 2], [102, 202, 302, 402], 4, 2)
         self.assertEqual(plan.query_lens, [0, 0, 2, 0])
         self.assertEqual(plan.key_lens, [0, 0, 302, 0])
 
@@ -128,7 +128,7 @@ class TestDsaCpShardPlan(CustomTestCase):
     def test_fewer_tokens_than_ranks(self):
         # Legal to plan, even though the runtime gate declines it: ranks past
         # the tokens get an empty slice rather than a negative one.
-        plan = plan_dsa_cp_shard([3], [103], 16, 9)
+        plan = plan_dsa_token_shard([3], [103], 16, 9)
         self.assertEqual(plan.rows, 1)
         self.assertEqual(plan.num_local_tokens, 0)
         self.assertTrue(plan.is_empty())
@@ -136,9 +136,9 @@ class TestDsaCpShardPlan(CustomTestCase):
 
     def test_mismatched_metadata_raises_rather_than_guesses(self):
         with self.assertRaises(AssertionError):
-            plan_dsa_cp_shard([5, 9], [105], 4, 0)
+            plan_dsa_token_shard([5, 9], [105], 4, 0)
         with self.assertRaises(AssertionError):
-            plan_dsa_cp_shard([5], [105], 4, 4)
+            plan_dsa_token_shard([5], [105], 4, 4)
 
 
 if __name__ == "__main__":

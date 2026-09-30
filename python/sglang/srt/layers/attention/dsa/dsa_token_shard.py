@@ -14,15 +14,15 @@
 
 """Runtime gate and tensor plumbing for DSA-CP token sharding.
 
-The arithmetic lives in ``dsa_cp_layout`` on purpose: everything here needs the
+The arithmetic lives in ``dsa_token_shard_layout`` on purpose: everything here needs the
 runtime topology and real tensors, while the layout is plain integers and can
 be replayed against a brute-force reference with no torch at all.
 
 **Only the query path is sharded here, not the whole attention block.** The
 exchange happens after ``q_b_proj`` and the absorb through ``w_kc``: the rank
 swaps "my heads for every token" for "every head for my tokens"
-(``dsa_cp_redistribute_heads``) and undoes it after attention
-(``dsa_cp_restore_tokens``), before ``w_vc``. Nothing slices ``q_lora`` -- an
+(``dsa_token_shard_redistribute_heads``) and undoes it after attention
+(``dsa_token_shard_restore_tokens``), before ``w_vc``. Nothing slices ``q_lora`` -- an
 earlier version of this docstring said it did, which hid the cost below.
 
 What travels is therefore the 512-wide absorbed latent and its output, each a
@@ -38,7 +38,7 @@ full width, so the older indexer-only query sharding
 than conflicting: it shards the indexer and gathers the top-k back, and this
 takes its own slice of that result. Both pick the *same* rows, so that gather
 is pure overhead whenever the two run together (W2). The agreement they rely on
-is pinned by ``test/registered/dcp/test_dsa_cp_indexer_row_agreement.py``.
+is pinned by ``test/registered/dcp/test_dsa_token_shard_indexer_row_agreement.py``.
 
 What is given up is the saving on the K-side projections, which run full width
 today anyway. What is kept is the reason for the exercise: sparse attention is
@@ -52,10 +52,10 @@ from typing import TYPE_CHECKING, Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa.dsa_cp_layout import (
-    DsaCpPlan,
+from sglang.srt.layers.attention.dsa.dsa_token_shard_layout import (
+    DsaTokenShardPlan,
     cumulative,
-    plan_dsa_cp_shard,
+    plan_dsa_token_shard,
 )
 from sglang.srt.layers.dcp.layout import dcp_crop_free_extend
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
@@ -67,24 +67,24 @@ if TYPE_CHECKING:
 
 
 @lru_cache(maxsize=1)
-def _dsa_cp_flag() -> bool:
-    """``SGLANG_NPU_ENABLE_DSA_CP``, resolved against MLAPO. Cached per process.
+def _dsa_token_shard_flag() -> bool:
+    """``SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD``, resolved against MLAPO. Cached per process.
 
     Not a module-level read. That ran at import, before any test could set the
     variable, so no test could reach the off path -- and the conditional gates
     this feature may grow will need exactly that. Still resolved once: the flag
     decides whether the full-head RadixAttention is built, which happens at model
     construction, so it must not change mid-run. Tests call
-    ``reset_dsa_cp_flags()``.
+    ``reset_dsa_token_shard_flags()``.
     """
-    enabled = envs.SGLANG_NPU_ENABLE_DSA_CP.get()
+    enabled = envs.SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD.get()
     if enabled and envs.SGLANG_NPU_USE_MLAPO.get():
         # The fused MLA preprocess writes the KV cache at a slot mapping DSA-CP
         # has already sliced. DSA-CP defaults on, so it yields unless both were
         # set explicitly.
-        if envs.SGLANG_NPU_ENABLE_DSA_CP.is_set():
+        if envs.SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD.is_set():
             raise ValueError(
-                "SGLANG_NPU_ENABLE_DSA_CP does not compose with "
+                "SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD does not compose with "
                 "SGLANG_NPU_USE_MLAPO. The fused MLA preprocess writes the KV "
                 "cache itself, at a slot mapping DSA-CP has already sliced."
             )
@@ -98,16 +98,16 @@ def _dsa_cp_flag() -> bool:
 
 
 @lru_cache(maxsize=1)
-def _dsa_cp_multi_request_flag() -> bool:
-    return envs.SGLANG_NPU_ENABLE_DSA_CP_MULTI_REQUEST.get()
+def _dsa_token_shard_multi_request_flag() -> bool:
+    return envs.SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD_MULTI_REQUEST.get()
 
 
 @lru_cache(maxsize=1)
-def _dsa_cp_narrow_a2a_flag() -> bool:
-    return envs.SGLANG_NPU_ENABLE_DSA_CP_NARROW_A2A.get()
+def _dsa_token_shard_narrow_a2a_flag() -> bool:
+    return envs.SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD_NARROW_A2A.get()
 
 
-def dsa_cp_narrow_a2a_enabled() -> bool:
+def dsa_token_shard_narrow_a2a_enabled() -> bool:
     """Whether to exchange the query before the ``w_kc`` absorb, not after it.
 
     DSA-CP swaps heads for tokens after ``q_b_proj`` and the absorb, so the wire
@@ -129,10 +129,10 @@ def dsa_cp_narrow_a2a_enabled() -> bool:
     charges the attention-TP communicator on its first sizeable collective.
     ``DSA_CP_HANDOFF_2026-09-24.md`` section 8 has the tables.
     """
-    return _dsa_cp_narrow_a2a_flag() and dsa_cp_enabled()
+    return _dsa_token_shard_narrow_a2a_flag() and dsa_token_shard_enabled()
 
 
-def dsa_cp_attach_full_kv_b(self_attn) -> None:
+def dsa_token_shard_attach_full_kv_b(self_attn) -> None:
     """Give this layer the whole attention-TP group's ``w_kc`` and ``w_vc``.
 
     Called once per layer from the weight loader, after it has split
@@ -143,7 +143,9 @@ def dsa_cp_attach_full_kv_b(self_attn) -> None:
     weights: the quantized layouts carry scale tensors that would have to be
     gathered with them.
     """
-    if not dsa_cp_narrow_a2a_enabled() or not getattr(self_attn, "use_dsa", False):
+    if not dsa_token_shard_narrow_a2a_enabled() or not getattr(
+        self_attn, "use_dsa", False
+    ):
         return
     w_kc = getattr(self_attn, "w_kc", None)
     w_vc = getattr(self_attn, "w_vc", None)
@@ -183,17 +185,17 @@ def dsa_cp_attach_full_kv_b(self_attn) -> None:
     )
 
 
-def reset_dsa_cp_flags() -> None:
+def reset_dsa_token_shard_flags() -> None:
     """Re-read the DSA-CP env flags. For tests; never call this while serving."""
-    _dsa_cp_flag.cache_clear()
-    _dsa_cp_multi_request_flag.cache_clear()
-    _dsa_cp_narrow_a2a_flag.cache_clear()
+    _dsa_token_shard_flag.cache_clear()
+    _dsa_token_shard_multi_request_flag.cache_clear()
+    _dsa_token_shard_narrow_a2a_flag.cache_clear()
 
 
-def dsa_cp_multi_request_enabled() -> bool:
+def dsa_token_shard_multi_request_enabled() -> bool:
     """Whether DSA-CP also shards batches carrying more than one request.
 
-    The restriction was never about the query arithmetic -- ``plan_dsa_cp_shard``
+    The restriction was never about the query arithmetic -- ``plan_dsa_token_shard``
     already handles a slice that straddles request boundaries. It was about
     ``actual_seq_lengths_kv``: DSA-CP shortened each request's entry so the
     operator's causal crop would align, and because those lengths are
@@ -209,7 +211,7 @@ def dsa_cp_multi_request_enabled() -> bool:
     When on, this applies to single-request extends too, deliberately -- one
     convention rather than two, and it can be tested on an ordinary tail.
     """
-    return _dsa_cp_multi_request_flag()
+    return _dsa_token_shard_multi_request_flag()
 
 
 class _Missing:
@@ -219,7 +221,7 @@ class _Missing:
 _MISSING = _Missing()
 
 
-def dsa_cp_enabled() -> bool:
+def dsa_token_shard_enabled() -> bool:
     """Whether DSA-CP is on for this process. Read at model build AND forward.
 
     Both sides must agree, so both ask here rather than reading the env var
@@ -232,13 +234,13 @@ def dsa_cp_enabled() -> bool:
     module is dead weight registered with the attention backend. Harmless while
     the flag defaulted off; not something to discover by flipping the default.
     """
-    return _dsa_cp_flag() and is_npu() and get_parallel().attn_tp_size > 1
+    return _dsa_token_shard_flag() and is_npu() and get_parallel().attn_tp_size > 1
 
 
-def get_dsa_cp_plan(
+def get_dsa_token_shard_plan(
     forward_batch: "ForwardBatch",
     index_topk: Optional[int] = None,
-) -> Optional[DsaCpPlan]:
+) -> Optional[DsaTokenShardPlan]:
     """This forward's token slice for this rank, or None if DSA-CP is off here.
 
     Built once per forward and cached on the batch: the split is by token
@@ -254,19 +256,21 @@ def get_dsa_cp_plan(
     Every refusal is logged once. The indexer-sharding bug this supersedes cost
     four weeks precisely because its refusal was silent.
     """
-    if not _dsa_cp_flag():
+    if not _dsa_token_shard_flag():
         return None
 
-    cached = getattr(forward_batch, "npu_dsa_cp_plan", _MISSING)
+    cached = getattr(forward_batch, "npu_dsa_token_shard_plan", _MISSING)
     if cached is not _MISSING:
         return cached
 
-    plan = _build_dsa_cp_plan(forward_batch, index_topk)
-    forward_batch.npu_dsa_cp_plan = plan
+    plan = _build_dsa_token_shard_plan(forward_batch, index_topk)
+    forward_batch.npu_dsa_token_shard_plan = plan
     return plan
 
 
-def _build_dsa_cp_plan(forward_batch, index_topk=None) -> Optional[DsaCpPlan]:
+def _build_dsa_token_shard_plan(
+    forward_batch, index_topk=None
+) -> Optional[DsaTokenShardPlan]:
     parallel = get_parallel()
     if parallel.attn_tp_size <= 1:
         print_info_once("DSA-CP is off: attention TP size is 1, nothing to shard")
@@ -300,7 +304,7 @@ def _build_dsa_cp_plan(forward_batch, index_topk=None) -> Optional[DsaCpPlan]:
         print_info_once("DSA-CP is off: this extend carries no CPU length metadata")
         return None
 
-    plan = plan_dsa_cp_shard(
+    plan = plan_dsa_token_shard(
         extend_lens,
         [p + e for p, e in zip(prefix_lens, extend_lens)],
         parallel.attn_tp_size,
@@ -308,7 +312,7 @@ def _build_dsa_cp_plan(forward_batch, index_topk=None) -> Optional[DsaCpPlan]:
     )
     multi_request = sum(1 for n in extend_lens if n > 0) > 1
     # The lift applies only where the causal crop is not load-bearing.
-    lift_applies = _dsa_cp_multi_request_flag() and dcp_crop_free_extend(
+    lift_applies = _dsa_token_shard_multi_request_flag() and dcp_crop_free_extend(
         forward_batch, index_topk
     )
     if not lift_applies and multi_request:
@@ -318,7 +322,7 @@ def _build_dsa_cp_plan(forward_batch, index_topk=None) -> Optional[DsaCpPlan]:
             "DSA-CP is off for multi-request extends "
             f"({sum(1 for n in extend_lens if n > 0)} requests here); the "
             "cumulative KV lengths it would need describe the buffer's own "
-            "request boundaries. SGLANG_NPU_ENABLE_DSA_CP_MULTI_REQUEST lifts this"
+            "request boundaries. SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD_MULTI_REQUEST lifts this"
         )
         return None
 
@@ -340,8 +344,8 @@ def _build_dsa_cp_plan(forward_batch, index_topk=None) -> Optional[DsaCpPlan]:
     return plan
 
 
-def dsa_cp_cumulative_lens(
-    forward_batch: "ForwardBatch", plan: DsaCpPlan, device: torch.device
+def dsa_token_shard_cumulative_lens(
+    forward_batch: "ForwardBatch", plan: DsaTokenShardPlan, device: torch.device
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """The operator's two length vectors as device tensors, built ONCE per forward.
 
@@ -359,17 +363,17 @@ def dsa_cp_cumulative_lens(
     ``int32`` on the query's device, which is what both call sites ask for, so
     their ``.to()`` is a no-op rather than another copy.
     """
-    cached = getattr(forward_batch, "npu_dsa_cp_cu_lens", None)
+    cached = getattr(forward_batch, "npu_dsa_token_shard_cu_lens", None)
     if cached is None:
         cached = (
             torch.tensor(cumulative(plan.query_lens), dtype=torch.int32, device=device),
             torch.tensor(cumulative(plan.key_lens), dtype=torch.int32, device=device),
         )
-        forward_batch.npu_dsa_cp_cu_lens = cached
+        forward_batch.npu_dsa_token_shard_cu_lens = cached
     return cached
 
 
-def dsa_cp_slice(x: torch.Tensor, plan: DsaCpPlan) -> torch.Tensor:
+def dsa_token_shard_slice(x: torch.Tensor, plan: DsaTokenShardPlan) -> torch.Tensor:
     """This rank's ``plan.rows`` rows of a full-width, token-major tensor.
 
     Always returns exactly ``rows`` rows, padding the tail when the slice runs
@@ -386,7 +390,9 @@ def dsa_cp_slice(x: torch.Tensor, plan: DsaCpPlan) -> torch.Tensor:
     return torch.cat([sliced, pad], dim=0)
 
 
-def dsa_cp_redistribute_heads(x: torch.Tensor, plan: DsaCpPlan) -> torch.Tensor:
+def dsa_token_shard_redistribute_heads(
+    x: torch.Tensor, plan: DsaTokenShardPlan
+) -> torch.Tensor:
     """``[num_tokens, h, d]`` -> ``[rows, h * tp_size, d]``, by all-to-all.
 
     Turns "my heads for every token" into "every head for my tokens". Nothing
@@ -421,8 +427,8 @@ def dsa_cp_redistribute_heads(x: torch.Tensor, plan: DsaCpPlan) -> torch.Tensor:
     return recv.permute(1, 0, 2, 3).reshape(plan.rows, tp * h, d)
 
 
-def dsa_cp_restore_tokens(
-    x: torch.Tensor, plan: DsaCpPlan, num_rows: int
+def dsa_token_shard_restore_tokens(
+    x: torch.Tensor, plan: DsaTokenShardPlan, num_rows: int
 ) -> torch.Tensor:
     """``[rows, h * tp_size, d]`` -> ``[num_rows, h, d]``. Inverse of the above.
 
@@ -430,7 +436,7 @@ def dsa_cp_restore_tokens(
     communicator -- expects this rank's own heads for the whole batch, so the
     sharding is undone here rather than propagated.
 
-    ``num_rows`` must be the width handed to ``dsa_cp_redistribute_heads``: a
+    ``num_rows`` must be the width handed to ``dsa_token_shard_redistribute_heads``: a
     width that arrives padded must leave padded, or the next layer's KV write
     indexes a narrower tensor than its slot map describes. It is required
     rather than defaulted because defaulting it is what broke this.

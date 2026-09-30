@@ -14,14 +14,14 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_mla_preprocess_enabled,
 )
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-from sglang.srt.layers.attention.dsa.dsa_cp import (
-    dsa_cp_narrow_a2a_enabled,
-    dsa_cp_redistribute_heads,
-    dsa_cp_restore_tokens,
-    dsa_cp_slice,
-    get_dsa_cp_plan,
-)
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import scattered_to_tp_attn_full
+from sglang.srt.layers.attention.dsa.dsa_token_shard import (
+    dsa_token_shard_narrow_a2a_enabled,
+    dsa_token_shard_redistribute_heads,
+    dsa_token_shard_restore_tokens,
+    dsa_token_shard_slice,
+    get_dsa_token_shard_plan,
+)
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
 )
@@ -392,7 +392,7 @@ def _apply_interleaved_rope_with_half_output(rotary_emb, positions, q_pe, k_pe):
     return q_pe, k_pe
 
 
-def _dsa_cp_narrow_plan(m: "DeepseekV2AttentionMLA", forward_batch):
+def _dsa_token_shard_narrow_plan(m: "DeepseekV2AttentionMLA", forward_batch):
     """This forward's DSA-CP plan when the narrow exchange applies, else None.
 
     The exchange moves to before the ``w_kc`` absorb, so one all-to-all carries
@@ -402,11 +402,11 @@ def _dsa_cp_narrow_plan(m: "DeepseekV2AttentionMLA", forward_batch):
     are absent and this returns None, putting the layer back on the wide path
     with no other change.
     """
-    if not dsa_cp_narrow_a2a_enabled():
+    if not dsa_token_shard_narrow_a2a_enabled():
         return None
     if getattr(m, "w_kc_full", None) is None or getattr(m, "w_vc_full", None) is None:
         return None
-    return get_dsa_cp_plan(forward_batch)
+    return get_dsa_token_shard_plan(forward_batch)
 
 
 def forward_dsa_prepare_npu(
@@ -420,7 +420,7 @@ def forward_dsa_prepare_npu(
 ):
     dynamic_scale = None
     # Resolved here so the core can read the cached plan back.
-    get_dsa_cp_plan(
+    get_dsa_token_shard_plan(
         forward_batch,
         m.indexer.index_topk if m.indexer is not None else None,
     )
@@ -513,7 +513,7 @@ def forward_dsa_prepare_npu(
         # Under the narrow exchange the absorb is DEFERRED, not skipped: it runs
         # after the all-to-all, below. Doing it here would widen q_nope from 192
         # to 512 before it goes on the wire.
-        narrow_plan = _dsa_cp_narrow_plan(m, forward_batch)
+        narrow_plan = _dsa_token_shard_narrow_plan(m, forward_batch)
         if narrow_plan is None:
             q_nope_out = torch_npu.npu_transpose_batchmatmul(
                 q_nope,
@@ -544,8 +544,8 @@ def forward_dsa_prepare_npu(
             # original row count, which may be padded past num_tokens, is no
             # longer recoverable from the tensors, and restoring to a narrower
             # one hands the next layer a tensor smaller than its slot map says.
-            forward_batch.npu_dsa_cp_input_rows = q_nope.shape[0]
-            q_swapped = dsa_cp_redistribute_heads(
+            forward_batch.npu_dsa_token_shard_input_rows = q_nope.shape[0]
+            q_swapped = dsa_token_shard_redistribute_heads(
                 torch.cat([q_nope, q_pe], dim=-1), narrow_plan
             )
             q_nope, q_pe = q_swapped.split(
@@ -821,32 +821,34 @@ def forward_dsa_core_npu(
         )
     else:
         attn_mqa = m.attn_mqa
-        dsa_cp_plan = get_dsa_cp_plan(forward_batch)
-        if dsa_cp_plan is not None and (
-            topk_indices is None or m.attn_mqa_for_dsa_cp is None
+        dsa_token_shard_plan = get_dsa_token_shard_plan(forward_batch)
+        if dsa_token_shard_plan is not None and (
+            topk_indices is None or m.attn_mqa_for_dsa_token_shard is None
         ):
             # Same condition builds both, so a mismatch is a wiring bug.
             raise RuntimeError(
                 "DSA-CP planned this forward but the layer is not set up for "
-                f"it: attn_mqa_for_dsa_cp={m.attn_mqa_for_dsa_cp is not None}, "
+                f"it: attn_mqa_for_dsa_token_shard={m.attn_mqa_for_dsa_token_shard is not None}, "
                 f"topk_indices={topk_indices is not None}"
             )
         narrow_a2a = (
-            dsa_cp_plan is not None
-            and _dsa_cp_narrow_plan(m, forward_batch) is not None
+            dsa_token_shard_plan is not None
+            and _dsa_token_shard_narrow_plan(m, forward_batch) is not None
         )
-        if dsa_cp_plan is not None:
+        if dsa_token_shard_plan is not None:
             # DSA-CP: swap "my heads for every token" for "every head for my
             # tokens", which divides the per-query top-k KV read. k_nope/k_pe
             # stay full width, and the padded row count must be handed back.
             if narrow_a2a:
                 # prepare already swapped, before the absorb, so q_nope_out and
                 # q_pe arrive [rows, all heads, d] with the width to restore to.
-                dsa_cp_rows = forward_batch.npu_dsa_cp_input_rows
+                dsa_token_shard_rows = forward_batch.npu_dsa_token_shard_input_rows
             else:
-                dsa_cp_rows = q_nope_out.shape[0]
-                q_nope_out = dsa_cp_redistribute_heads(q_nope_out, dsa_cp_plan)
-                q_pe = dsa_cp_redistribute_heads(q_pe, dsa_cp_plan)
+                dsa_token_shard_rows = q_nope_out.shape[0]
+                q_nope_out = dsa_token_shard_redistribute_heads(
+                    q_nope_out, dsa_token_shard_plan
+                )
+                q_pe = dsa_token_shard_redistribute_heads(q_pe, dsa_token_shard_plan)
             # This rank's rows of the top-k. A separate name is load-bearing:
             # topk_indices is returned for the next layer to reuse, so rebinding
             # it here would hand that layer a slice of a slice.
@@ -855,16 +857,18 @@ def forward_dsa_core_npu(
                 # all-gather, so there is nothing left to cut. Checked rather
                 # than assumed: a full-width tensor here would give every rank
                 # but 0 the wrong rows, with no shape error downstream.
-                if topk_indices.shape[0] != dsa_cp_plan.rows:
+                if topk_indices.shape[0] != dsa_token_shard_plan.rows:
                     raise RuntimeError(
                         "top-k is marked local to this rank but carries "
                         f"{topk_indices.shape[0]} rows, not the plan's "
-                        f"{dsa_cp_plan.rows}"
+                        f"{dsa_token_shard_plan.rows}"
                     )
                 attn_topk_indices = topk_indices
             else:
-                attn_topk_indices = dsa_cp_slice(topk_indices, dsa_cp_plan)
-            attn_mqa = m.attn_mqa_for_dsa_cp
+                attn_topk_indices = dsa_token_shard_slice(
+                    topk_indices, dsa_token_shard_plan
+                )
+            attn_mqa = m.attn_mqa_for_dsa_token_shard
         else:
             attn_topk_indices = topk_indices
         attn_output = attn_mqa(
@@ -877,8 +881,10 @@ def forward_dsa_core_npu(
             k_rope=k_pe.contiguous(),
             topk_indices=attn_topk_indices,
         )
-        if dsa_cp_plan is not None:
-            attn_output = attn_output.reshape(dsa_cp_plan.rows, -1, m.kv_lora_rank)
+        if dsa_token_shard_plan is not None:
+            attn_output = attn_output.reshape(
+                dsa_token_shard_plan.rows, -1, m.kv_lora_rank
+            )
             if narrow_a2a:
                 # Take the head output down to v_head_dim BEFORE the return leg.
                 # w_vc_full, not w_vc: this rank holds every head right now.
@@ -892,10 +898,10 @@ def forward_dsa_core_npu(
                 w_vc_applied = True
             # Undo the swap: everything downstream expects this rank's own heads
             # for the whole batch.
-            attn_output = dsa_cp_restore_tokens(
+            attn_output = dsa_token_shard_restore_tokens(
                 attn_output,
-                dsa_cp_plan,
-                dsa_cp_rows,
+                dsa_token_shard_plan,
+                dsa_token_shard_rows,
             )
     if dcp_extend:
         # Drop the reference so a later forward cannot read a stale gather; the

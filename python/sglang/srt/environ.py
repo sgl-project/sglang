@@ -995,11 +995,11 @@ class Envs:
     # DSA prefill: shard the attention block's tokens across attention-TP, so
     # every rank computes every head for its own slice, with the query
     # redistributed by all-to-all. Consumes no ranks, so it composes with DCP.
-    SGLANG_NPU_ENABLE_DSA_CP = EnvBool(True)
+    SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD = EnvBool(True)
     # DSA-CP: also shard batches carrying more than one request, by passing
     # full per-request KV lengths and dropping the operator's causal crop.
     # Only engages where every request's prefix reaches index_topk.
-    SGLANG_NPU_ENABLE_DSA_CP_MULTI_REQUEST = EnvBool(True)
+    SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD_MULTI_REQUEST = EnvBool(True)
     # DSA-CP: exchange the query BEFORE the w_kc absorb and take the head output
     # through w_vc BEFORE the return leg, so the wire carries 256-wide tensors
     # instead of the 512-wide latent, in two collectives instead of three. Needs
@@ -1011,7 +1011,7 @@ class Envs:
     # DSA_CP_HANDOFF_2026-09-24.md section 8; the legs were separately
     # switchable while that was being measured and neither is worth running
     # alone.
-    SGLANG_NPU_ENABLE_DSA_CP_NARROW_A2A = EnvBool(False)
+    SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD_NARROW_A2A = EnvBool(False)
     # DCP extend on NPU: log each extend forward's peak device memory, per rank.
     SGLANG_DEBUG_NPU_DCP_EXTEND_MEMORY = EnvBool(False)
     # DCP extend on NPU: gathered rows per prefix-gather collective, which caps

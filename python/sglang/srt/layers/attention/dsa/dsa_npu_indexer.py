@@ -7,7 +7,7 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa.dsa_cp import get_dsa_cp_plan
+from sglang.srt.layers.attention.dsa.dsa_token_shard import get_dsa_token_shard_plan
 from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
@@ -32,7 +32,7 @@ def _shard_indexer_queries() -> bool:
     """``SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING``. Cached per process.
 
     A function, not a module-level read, for the same reason as
-    ``dsa_cp._dsa_cp_flag``: an import-time read lands before any test can set
+    ``dsa_token_shard._dsa_token_shard_flag``: an import-time read lands before any test can set
     the variable. Tests call ``reset_indexer_shard_flag()``.
     """
     return envs.SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING.get()
@@ -150,7 +150,7 @@ class _IndexerQueryShard:
         straight back to ``[local_start, local_end)``, the range this rank
         already holds. Both planners compute ``rows = ceil(total / tp_size)``
         and ``start = rank * rows``, which
-        ``test/registered/dcp/test_dsa_cp_indexer_row_agreement.py`` pins --
+        ``test/registered/dcp/test_dsa_token_shard_indexer_row_agreement.py`` pins --
         that agreement was incidental while the gather hid it, and skipping the
         gather makes it load-bearing.
 
@@ -159,10 +159,10 @@ class _IndexerQueryShard:
         which is the tensor the skip-topk layers pass along, and a layer that
         declines to shard rewrites it to False before its own attention runs.
 
-        Rows past ``num_real`` are zeroed to match what ``dsa_cp_slice`` pads,
+        Rows past ``num_real`` are zeroed to match what ``dsa_token_shard_slice`` pads,
         keeping the result bitwise identical rather than merely equivalent.
         """
-        plan = get_dsa_cp_plan(forward_batch)
+        plan = get_dsa_token_shard_plan(forward_batch)
         local = plan is not None
         if local and (plan.rows != self.rows or plan.local_start != self.start):
             # Cannot happen while the row-agreement test passes. Gather anyway

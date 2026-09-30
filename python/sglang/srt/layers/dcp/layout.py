@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 @lru_cache(maxsize=1)
 def _dcp_page_interleave_flag() -> bool:
     # Cached, not read at import: a module-level read happens before any test
-    # can set the variable. Same reason as _dsa_cp_flag.
+    # can set the variable. Same reason as _dsa_token_shard_flag.
     return envs.SGLANG_NPU_DCP_PAGE_INTERLEAVE.get()
 
 

@@ -28,10 +28,10 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     is_sparsity_driven_kv_offload_enabled,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.dsa.dsa_cp import (
-    dsa_cp_cumulative_lens,
-    dsa_cp_multi_request_enabled,
-    get_dsa_cp_plan,
+from sglang.srt.layers.attention.dsa.dsa_token_shard import (
+    dsa_token_shard_cumulative_lens,
+    dsa_token_shard_multi_request_enabled,
+    get_dsa_token_shard_plan,
 )
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dcp.layout import (
@@ -1414,16 +1414,18 @@ class AscendAttnBackend(AttentionBackend):
 
         # DSA-CP replaces both length vectors. Built once per forward: they do
         # not vary by layer, and each build is a blocking host-to-device copy.
-        dsa_cp_plan = get_dsa_cp_plan(forward_batch)
-        dsa_cp_qlen = dsa_cp_kvlen = None
-        if dsa_cp_plan is not None:
-            dsa_cp_qlen, dsa_cp_kvlen = dsa_cp_cumulative_lens(
-                forward_batch, dsa_cp_plan, q.device
+        dsa_token_shard_plan = get_dsa_token_shard_plan(forward_batch)
+        dsa_token_shard_qlen = dsa_token_shard_kvlen = None
+        if dsa_token_shard_plan is not None:
+            dsa_token_shard_qlen, dsa_token_shard_kvlen = (
+                dsa_token_shard_cumulative_lens(
+                    forward_batch, dsa_token_shard_plan, q.device
+                )
             )
 
         if is_prefill:
-            if dsa_cp_qlen is not None:
-                actual_seq_qlen = dsa_cp_qlen
+            if dsa_token_shard_qlen is not None:
+                actual_seq_qlen = dsa_token_shard_qlen
             elif self.forward_metadata.actual_seq_lengths_q is not None:
                 actual_seq_qlen = self.forward_metadata.actual_seq_lengths_q
             else:
@@ -1537,8 +1539,8 @@ class AscendAttnBackend(AttentionBackend):
                 block_table = None
                 seq_lengths_kv = dcp_meta.dcp_kv_indptr[1:]
                 if (
-                    dsa_cp_plan is not None
-                    and dsa_cp_multi_request_enabled()
+                    dsa_token_shard_plan is not None
+                    and dsa_token_shard_multi_request_enabled()
                     and dcp_crop_free_extend(
                         forward_batch,
                         topk_indices.shape[-1] if topk_indices is not None else None,
@@ -1549,11 +1551,11 @@ class AscendAttnBackend(AttentionBackend):
                     # existed for. dcp_crop_free_extend has checked the bound.
                     sparse_mode = 0
                 else:
-                    if dsa_cp_plan is not None:
+                    if dsa_token_shard_plan is not None:
                         # This rank's queries end partway through the request.
                         # Cumulative lengths double as request boundaries, so
                         # shortening is only safe for a single request.
-                        seq_lengths_kv = dsa_cp_kvlen
+                        seq_lengths_kv = dsa_token_shard_kvlen
                     sparse_mode = 3
                 # layout_kv must equal layout_query unless it is PA_BSND.
                 layout_kv = "TND"

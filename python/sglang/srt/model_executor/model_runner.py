@@ -928,9 +928,9 @@ class ModelRunner:
         # Anything that takes memory *before* the pool is sized shrinks it, and
         # these are the ones this branch adds. Named because the pool line alone
         # gives no clue which knob bought the shortfall.
-        if envs.SGLANG_NPU_ENABLE_DSA_CP_NARROW_A2A.get():
+        if envs.SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD_NARROW_A2A.get():
             extra = (
-                " SGLANG_NPU_ENABLE_DSA_CP_NARROW_A2A is set, which holds the "
+                " SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD_NARROW_A2A is set, which holds the "
                 "full w_kc and w_vc on every rank and is measured at several GiB "
                 "per rank; unset it to get that back."
             )

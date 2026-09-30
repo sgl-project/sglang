@@ -4,7 +4,7 @@ Two planners, written separately, in modules that do not import each other:
 
 * ``plan_indexer_query_shard`` (``layers/attention/dsa/dsa_npu_indexer.py``)
   picks which indexer query rows a rank scores.
-* ``plan_dsa_cp_shard`` (``layers/attention/dsa/dsa_cp_layout.py``) picks which
+* ``plan_dsa_token_shard`` (``layers/attention/dsa/dsa_token_shard_layout.py``) picks which
   attention query rows the same rank computes.
 
 Both take ``ceil(sum(extend_lens) / tp_size)`` rows starting at
@@ -31,8 +31,8 @@ the whole split rather than the row range alone: per-request query counts and
 per-request key lengths too, since both features hand those to operators.
 
 Usage:
-    python -m pytest test_dsa_cp_indexer_row_agreement.py -v
-    python test_dsa_cp_indexer_row_agreement.py
+    python -m pytest test_dsa_token_shard_indexer_row_agreement.py -v
+    python test_dsa_token_shard_indexer_row_agreement.py
 """
 
 import itertools
@@ -42,12 +42,12 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.layers.attention.dsa import dsa_cp as dsa_cp_module
-from sglang.srt.layers.attention.dsa.dsa_cp_layout import plan_dsa_cp_shard
+from sglang.srt.layers.attention.dsa import dsa_token_shard as dsa_token_shard_module
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
     _IndexerQueryShard,
     plan_indexer_query_shard,
 )
+from sglang.srt.layers.attention.dsa.dsa_token_shard_layout import plan_dsa_token_shard
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -69,7 +69,7 @@ def _cumulative(values):
     return out
 
 
-class TestStageAAndDsaCpAgree(CustomTestCase):
+class TestStageAAndDsaTokenShardAgree(CustomTestCase):
     def _check(self, prefix_lens, extend_lens, tp_size, label=""):
         seq_lens = [p + e for p, e in zip(prefix_lens, extend_lens)]
 
@@ -77,7 +77,7 @@ class TestStageAAndDsaCpAgree(CustomTestCase):
             start, rows, num_real, cum_query_lens, key_lens = plan_indexer_query_shard(
                 prefix_lens, extend_lens, tp_size, tp_rank
             )
-            plan = plan_dsa_cp_shard(extend_lens, seq_lens, tp_size, tp_rank)
+            plan = plan_dsa_token_shard(extend_lens, seq_lens, tp_size, tp_rank)
 
             where = f"{label} rank={tp_rank}/{tp_size}"
 
@@ -162,7 +162,7 @@ class TestStageAAndDsaCpAgree(CustomTestCase):
         for total in (1, 15, 16, 17, 1557, 13855, 16384):
             for tp_size in TP_SIZES:
                 plans = [
-                    plan_dsa_cp_shard([total], [total], tp_size, r)
+                    plan_dsa_token_shard([total], [total], tp_size, r)
                     for r in range(tp_size)
                 ]
                 padded = [r for r, p in enumerate(plans) if p.num_local_tokens < p.rows]
@@ -178,10 +178,10 @@ class TestStageAAndDsaCpAgree(CustomTestCase):
 
 
 class _FakeBatch:
-    """Just enough ForwardBatch for ``get_dsa_cp_plan`` to read its cache."""
+    """Just enough ForwardBatch for ``get_dsa_token_shard_plan`` to read its cache."""
 
     def __init__(self, plan):
-        self.npu_dsa_cp_plan = plan
+        self.npu_dsa_token_shard_plan = plan
 
 
 def _shard_for(extend_lens, prefix_lens, tp_size, tp_rank):
@@ -218,7 +218,7 @@ class TestW2LocalTopk(CustomTestCase):
         plan = (
             None
             if plan_rank is None
-            else plan_dsa_cp_shard(
+            else plan_dsa_token_shard(
                 extend_lens,
                 [p + e for p, e in zip(prefix_lens, extend_lens)],
                 tp_size,
@@ -243,19 +243,21 @@ class TestW2LocalTopk(CustomTestCase):
         # The flag is a cached function now (merge blocker 8), so patch the
         # function rather than a module global.
         with (
-            mock.patch.object(dsa_cp_module, "_dsa_cp_flag", lambda: True),
+            mock.patch.object(
+                dsa_token_shard_module, "_dsa_token_shard_flag", lambda: True
+            ),
             mock.patch.object(_IndexerQueryShard, "gather", _fake_gather),
         ):
             out = shard.resolve(topk, sum(extend_lens), batch)
         return out, batch.npu_indexer_topk_is_local, seen["gathered"], shard
 
-    def test_gathers_when_dsa_cp_is_not_running(self):
+    def test_gathers_when_dsa_token_shard_is_not_running(self):
         """No plan means attention reads full width, so the gather must happen."""
         out, local, gathered, _ = self._resolve([16384], [0], 16, 3, plan_rank=None)
         self.assertFalse(local)
         self.assertTrue(gathered, "dropped the gather with DSA-CP off")
 
-    def test_skips_the_gather_when_dsa_cp_planned_the_same_rows(self):
+    def test_skips_the_gather_when_dsa_token_shard_planned_the_same_rows(self):
         for tp_size in TP_SIZES:
             for tp_rank in range(tp_size):
                 for extend_lens, prefix_lens in (
@@ -277,7 +279,7 @@ class TestW2LocalTopk(CustomTestCase):
                         self.assertEqual(out.shape[0], shard.rows)
 
     def test_padding_rows_are_zeroed_exactly_as_the_gather_path_leaves_them(self):
-        """``dsa_cp_slice`` zero-pads, so the local path must too -- bitwise.
+        """``dsa_token_shard_slice`` zero-pads, so the local path must too -- bitwise.
 
         Two shapes that actually produce padding, from the arithmetic rather
         than from assumption:
@@ -381,13 +383,13 @@ class TestW3EarlySlice(CustomTestCase):
 class TestFlagsAreReachable(CustomTestCase):
     """Merge blocker 8: the feature flags were read at import.
 
-    ``_enable_dsa_cp = envs.SGLANG_NPU_ENABLE_DSA_CP.get()`` ran before any test
+    ``_enable_dsa_token_shard = envs.SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD.get()`` ran before any test
     could set the variable, so the off path was unreachable from a test and the
     on path was whatever the CI environment happened to have. Both are now cached
     functions with an explicit reset, and this is what proves it.
     """
 
-    def test_dsa_cp_flag_follows_the_environment_after_a_reset(self):
+    def test_dsa_token_shard_flag_follows_the_environment_after_a_reset(self):
         from sglang.srt.environ import envs
 
         # MLAPO pinned off: with both set the flag deliberately raises, and
@@ -396,12 +398,14 @@ class TestFlagsAreReachable(CustomTestCase):
             for value in (False, True):
                 with (
                     envs.SGLANG_NPU_USE_MLAPO.override(False),
-                    envs.SGLANG_NPU_ENABLE_DSA_CP.override(value),
+                    envs.SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD.override(value),
                 ):
-                    dsa_cp_module.reset_dsa_cp_flags()
-                    self.assertEqual(dsa_cp_module._dsa_cp_flag(), value)
+                    dsa_token_shard_module.reset_dsa_token_shard_flags()
+                    self.assertEqual(
+                        dsa_token_shard_module._dsa_token_shard_flag(), value
+                    )
         finally:
-            dsa_cp_module.reset_dsa_cp_flags()
+            dsa_token_shard_module.reset_dsa_token_shard_flags()
 
     def test_indexer_shard_flag_follows_the_environment_after_a_reset(self):
         from sglang.srt.environ import envs
@@ -419,17 +423,17 @@ class TestFlagsAreReachable(CustomTestCase):
         """Cached on purpose: it decides whether a module is built at load time."""
         from sglang.srt.environ import envs
 
-        dsa_cp_module.reset_dsa_cp_flags()
+        dsa_token_shard_module.reset_dsa_token_shard_flags()
         with envs.SGLANG_NPU_USE_MLAPO.override(False):
-            with envs.SGLANG_NPU_ENABLE_DSA_CP.override(True):
-                first = dsa_cp_module._dsa_cp_flag()
-            with envs.SGLANG_NPU_ENABLE_DSA_CP.override(False):
+            with envs.SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD.override(True):
+                first = dsa_token_shard_module._dsa_token_shard_flag()
+            with envs.SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD.override(False):
                 self.assertEqual(
-                    dsa_cp_module._dsa_cp_flag(),
+                    dsa_token_shard_module._dsa_token_shard_flag(),
                     first,
                     "the flag changed mid-run without a reset",
                 )
-        dsa_cp_module.reset_dsa_cp_flags()
+        dsa_token_shard_module.reset_dsa_token_shard_flags()
 
 
 if __name__ == "__main__":

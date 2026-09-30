@@ -5,7 +5,7 @@ DSA-CP swaps "my heads for every token" for "every head for my tokens" after
 absorbed latent in and the 512-wide attention output back. Both are linear
 functions of narrower tensors beside them: q is 256 wide out of ``q_b_proj``
 and the head output is ``v_head_dim`` 256.
-``SGLANG_NPU_ENABLE_DSA_CP_NARROW_A2A`` moves the inbound exchange to the
+``SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD_NARROW_A2A`` moves the inbound exchange to the
 narrow side and ``..._OUTPUT`` the return leg; the two are independent.
 
 **The claim this file pins:** deferring the absorb past the exchange changes
@@ -21,8 +21,8 @@ neither when it is off, which no test of results can see -- both paths compute
 the same answer -- and which costs 28 MB per layer.
 
 Usage:
-    python -m pytest test_dsa_cp_narrow_a2a.py -v
-    python test_dsa_cp_narrow_a2a.py
+    python -m pytest test_dsa_token_shard_narrow_a2a.py -v
+    python test_dsa_token_shard_narrow_a2a.py
 """
 
 import unittest
@@ -145,7 +145,7 @@ class TestGatheredWeightLayout(CustomTestCase):
     A3 tp16 the feature cost 4.05 GiB of KV pool against 2.13 GiB of live
     weights.
 
-    ``dsa_cp_attach_full_kv_b`` now gathers in the PHYSICAL layout and takes the
+    ``dsa_token_shard_attach_full_kv_b`` now gathers in the PHYSICAL layout and takes the
     logical view back, which costs neither. These tests pin the two facts that
     makes possible.
     """
@@ -209,7 +209,9 @@ class TestTheGatherFollowsTheFlag(CustomTestCase):
     HEADS, NOPE, LORA, VDIM = 2, 6, 5, 4
 
     def _attach(self, narrow):
-        from sglang.srt.layers.attention.dsa import dsa_cp as dsa_cp_module
+        from sglang.srt.layers.attention.dsa import (
+            dsa_token_shard as dsa_token_shard_module,
+        )
 
         class _Attn:
             use_dsa = True
@@ -233,15 +235,17 @@ class TestTheGatherFollowsTheFlag(CustomTestCase):
         parallel.attn_tp_size = self.TP
         with (
             mock.patch.object(
-                dsa_cp_module, "dsa_cp_narrow_a2a_enabled", lambda: narrow
+                dsa_token_shard_module,
+                "dsa_token_shard_narrow_a2a_enabled",
+                lambda: narrow,
             ),
-            mock.patch.object(dsa_cp_module, "get_parallel", lambda: parallel),
+            mock.patch.object(dsa_token_shard_module, "get_parallel", lambda: parallel),
             mock.patch(
                 "sglang.srt.layers.dp_attention.attn_tp_all_gather_into_tensor",
                 _fake_all_gather,
             ),
         ):
-            dsa_cp_module.dsa_cp_attach_full_kv_b(attn)
+            dsa_token_shard_module.dsa_token_shard_attach_full_kv_b(attn)
         return attn, calls
 
     def test_on_gathers_both_weights(self):
@@ -269,16 +273,24 @@ class TestTheGatherFollowsTheFlag(CustomTestCase):
         )
         self.assertEqual(attn.w_kc_full.stride()[1:], attn.w_kc.stride()[1:])
 
-    def test_it_still_needs_dsa_cp_itself(self):
+    def test_it_still_needs_dsa_token_shard_itself(self):
         """The narrow exchange rearranges DSA-CP's own exchange, so with DSA-CP
         off there is nothing to rearrange and the weights would be pure cost."""
-        from sglang.srt.layers.attention.dsa import dsa_cp as dsa_cp_module
+        from sglang.srt.layers.attention.dsa import (
+            dsa_token_shard as dsa_token_shard_module,
+        )
 
         with (
-            mock.patch.object(dsa_cp_module, "_dsa_cp_narrow_a2a_flag", lambda: True),
-            mock.patch.object(dsa_cp_module, "dsa_cp_enabled", lambda: False),
+            mock.patch.object(
+                dsa_token_shard_module, "_dsa_token_shard_narrow_a2a_flag", lambda: True
+            ),
+            mock.patch.object(
+                dsa_token_shard_module, "dsa_token_shard_enabled", lambda: False
+            ),
         ):
-            self.assertFalse(dsa_cp_module.dsa_cp_narrow_a2a_enabled())
+            self.assertFalse(
+                dsa_token_shard_module.dsa_token_shard_narrow_a2a_enabled()
+            )
 
 
 if __name__ == "__main__":

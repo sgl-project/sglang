@@ -25,7 +25,9 @@ from transformers import PretrainedConfig
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.attention.dsa.dsa_cp import dsa_cp_attach_full_kv_b
+from sglang.srt.layers.attention.dsa.dsa_token_shard import (
+    dsa_token_shard_attach_full_kv_b,
+)
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import (
@@ -774,10 +776,10 @@ class DeepseekV2WeightLoaderMixin:
                     self_attn.w_vc = (
                         self_attn.w_vc.to(torch.bfloat16) * self_attn.w_scale
                     )
-                # A no-op unless SGLANG_NPU_ENABLE_DSA_CP_NARROW_A2A is set, and
+                # A no-op unless SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD_NARROW_A2A is set, and
                 # placed here because it reads the two matrices this branch has
                 # just finished laying out. It does not modify them.
-                dsa_cp_attach_full_kv_b(self_attn)
+                dsa_token_shard_attach_full_kv_b(self_attn)
             else:
                 num_tiles_k = self_attn.qk_nope_head_dim // weight_block_size[1]
                 num_tiles_n = self_attn.v_head_dim // weight_block_size[0]

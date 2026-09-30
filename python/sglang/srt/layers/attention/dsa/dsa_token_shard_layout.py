@@ -31,14 +31,14 @@ point, because the clamp arithmetic below is where a ragged batch goes wrong and
 the failure is silent (attention reads the wrong span and still returns
 plausible text).
 
-Named for vLLM-Ascend's ``enable_dsa_cp``
+Named for vLLM-Ascend's ``enable_dsa_token_shard``
 (``vllm_ascend/attention/context_parallel/sfa_cp.py``), whose scheme this is.
 """
 
 from typing import List, NamedTuple, Sequence
 
 
-class DsaCpPlan(NamedTuple):
+class DsaTokenShardPlan(NamedTuple):
     """One attention-TP rank's token slice of an extend batch.
 
     ``rows`` is the slice width and is the same on every rank, which is what
@@ -72,12 +72,12 @@ class DsaCpPlan(NamedTuple):
         return self.num_local_tokens == 0
 
 
-def plan_dsa_cp_shard(
+def plan_dsa_token_shard(
     extend_seq_lens: Sequence[int],
     seq_lens: Sequence[int],
     tp_size: int,
     tp_rank: int,
-) -> DsaCpPlan:
+) -> DsaTokenShardPlan:
     """Plan one rank's token slice of an extend batch.
 
     ``extend_seq_lens[i]`` is how many new tokens request i contributes to this
@@ -135,7 +135,7 @@ def plan_dsa_cp_shard(
         key_lens.append(max(0, seq_len - (end - req_local_end)) if n else 0)
         start = end
 
-    return DsaCpPlan(
+    return DsaTokenShardPlan(
         num_tokens=num_tokens,
         num_tokens_pad=num_tokens_pad,
         rows=rows,
