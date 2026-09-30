@@ -26,6 +26,7 @@ from sglang.srt.models.beam import (
     BeamMoE,
     apply_attention_gate,
     apply_ssmax,
+    compute_ssmax_scale,
     depth_scaled_residual,
 )
 from sglang.srt.runtime_context import get_context, get_parallel
@@ -295,14 +296,16 @@ class TestBeamNumerics(CustomTestCase):
         ).unsqueeze(-1)
         expected = (query.float() * scale).bfloat16()
 
-        actual = apply_ssmax(query, positions)
+        actual = apply_ssmax(query, compute_ssmax_scale(positions))
 
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
         self.assertFalse(torch.equal(expected, query * scale.bfloat16()))
         # Chunking and cached decode must retain the supplied absolute positions.
         for start, end in ((0, 3), (3, 6), (6, 7)):
             torch.testing.assert_close(
-                apply_ssmax(query[start:end], positions[start:end]),
+                apply_ssmax(
+                    query[start:end], compute_ssmax_scale(positions[start:end])
+                ),
                 actual[start:end],
                 atol=0,
                 rtol=0,

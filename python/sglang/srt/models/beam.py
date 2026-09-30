@@ -19,6 +19,7 @@ import torch
 from torch import nn
 
 from sglang.kernels.fused_op import get_fused_op_backend
+from sglang.kernels.ops.attention.log_scaling_tau import apply_log_scaling_tau
 from sglang.kernels.ops.diffusion.rope.qknorm_rope_jit import (
     can_use_fused_inplace_qknorm_rope,
     fused_inplace_qknorm_rope,
@@ -59,15 +60,22 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import add_prefix, is_cuda, make_layers, set_weight_attrs
 
 _is_cuda = is_cuda()
 
 
-def apply_ssmax(q: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-    """Scale Q using absolute positions, rounding only after multiplication."""
-    scale = torch.exp(0.1 * torch.log1p((positions.float() + 1) / 2048))
+def compute_ssmax_scale(positions: torch.Tensor) -> torch.Tensor:
+    return torch.exp(0.1 * torch.log1p((positions.float() + 1) / 2048))
+
+
+def apply_ssmax(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Scale Q rows by an FP32 scale, rounding only after multiplication."""
+    if q.is_cuda and not torch.compiler.is_compiling():
+        # One launch with the same FP32 product and single rounding.
+        return apply_log_scaling_tau(q, scale)
     return (q.float() * scale.unsqueeze(-1)).to(q.dtype)
 
 
@@ -336,6 +344,7 @@ class BeamAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        ssmax_scale: torch.Tensor | None,
     ):
         if hidden_states.shape[0] == 0:
             return hidden_states
@@ -344,12 +353,11 @@ class BeamAttention(nn.Module):
         if self.use_fused_qk_norm_rope:
             self._fused_qk_norm_rope(positions, q, k)
         else:
-            q = self.q_norm(q.reshape(-1, self.head_dim)).view(-1, self.q_size)
-            k = self.k_norm(k.reshape(-1, self.head_dim)).view(-1, self.kv_size)
+            q, k = apply_qk_norm(q, k, self.q_norm, self.k_norm, self.head_dim)
             if self.rotary_emb is not None:
                 q, k = self.rotary_emb(positions, q, k)
             else:
-                q = apply_ssmax(q, positions)
+                q = apply_ssmax(q, ssmax_scale)
         attention_output = self.attn(q, k, v, forward_batch)
         gate, _ = self.gate_proj(hidden_states)
         attention_output = apply_attention_gate(
@@ -411,10 +419,13 @@ class BeamDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        ssmax_scale: torch.Tensor | None,
     ):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(positions, hidden_states, forward_batch)
+        hidden_states = self.self_attn(
+            positions, hidden_states, forward_batch, ssmax_scale
+        )
         hidden_states = depth_scaled_residual(
             self.post_attention_layernorm(hidden_states),
             residual,
@@ -468,6 +479,10 @@ class BeamModel(nn.Module):
             if self.pp_group.is_last_rank
             else PPMissingLayer()
         )
+        self.has_full_attention = any(
+            config.layer_types[layer_id] == "full_attention"
+            for layer_id in range(self.start_layer, self.end_layer)
+        )
 
     def forward(
         self,
@@ -483,9 +498,11 @@ class BeamModel(nn.Module):
             )
         else:
             hidden_states = pp_proxy_tensors["hidden_states"]
+        # Positions are shared by every full-attention layer of this stage.
+        scale = compute_ssmax_scale(positions) if self.has_full_attention else None
         for layer_id in range(self.start_layer, self.end_layer):
             hidden_states = self.layers[layer_id](
-                positions, hidden_states, forward_batch
+                positions, hidden_states, forward_batch, scale
             )
         if not self.pp_group.is_last_rank:
             return PPProxyTensors({"hidden_states": hidden_states})
