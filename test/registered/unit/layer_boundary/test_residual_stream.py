@@ -17,6 +17,7 @@ from sglang.srt.layers.layer_boundary import (
     bind_entry,
 )
 from sglang.srt.layers.layer_boundary.contracts import BatchVariant, StageKind
+from sglang.srt.layers.layer_boundary.fusions.cutedsl import MoeDeferredFinalize
 from sglang.srt.layers.layer_boundary.output import UnreducedOutput
 from sglang.srt.layers.layer_boundary.residual.access import add_to_output
 from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
@@ -427,6 +428,16 @@ class TestResidualStream(CustomTestCase):
         """A stream's record, complete, snapshot and write trace under fullgraph."""
         group = SimpleNamespace(all_reduce=lambda x: x * 2)
 
+        def finalize(rows):
+            return MoeDeferredFinalize(
+                routed_output=rows,
+                expert_weights=rows,
+                permuted_indices=rows,
+                gated_shared_output=rows,
+                m=rows.shape[0],
+                finish=lambda: rows * 5,
+            )
+
         def layers(hidden, residual):
             stream = ResidualStream(residual)
             for _ in range(2):
@@ -437,7 +448,9 @@ class TestResidualStream(CustomTestCase):
                 )
                 captured = stream.snapshot(owed)
                 _, residual = stream.input(owed)
-                hidden = stream.write(stream.complete(owed) + residual) + captured
+                residual = stream.write(stream.complete(owed) + residual)
+                owed = stream.record(finalize(residual + captured), PLAIN_ADD)
+                hidden = stream.write(stream.complete(owed) + residual)
             return hidden
 
         with patch(

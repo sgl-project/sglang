@@ -75,12 +75,14 @@ class UnreducedOutput:
         return self.group.all_reduce(self.partial)
 
 
-class DeferredFinalize(msgspec.Struct, frozen=True):
+class DeferredFinalize:
     """A layer output that still owes work only its producer knows how to do (a
     MoE's finalize and sum), left for the next layer's input or for a terminal
     norm that accepts it (residual_batch.final_norm(finalize_norm=...)). A fused kernel
     there may do that work together with its own; anything else passes it
     through complete_owed(), which calls ``complete()``."""
+
+    __slots__ = ()
 
     def complete(self) -> torch.Tensor:
         """Do the owed work, unfused, and return the complete output."""
