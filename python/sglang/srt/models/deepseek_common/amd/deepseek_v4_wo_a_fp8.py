@@ -230,6 +230,24 @@ def apply_wo_a_fp8_mxscale_fused_invrope(
     )
 
 
+def apply_wo_a_fp8_mxscale_prequant(
+    o_fp8: torch.Tensor,
+    o_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    """fp8 ``wo_a`` on ``quant_wo_a_act_mxfp8``-layout operands flattened per
+    token (fp8 ``[T, G*D]``, e8m0 ``[T, G*D/128]``). Returns bf16 ``[T, G, R]``."""
+    T, G = o_fp8.shape[0], weight.shape[0]
+    return _batched_gemm_a8w8_mxscale(
+        o_fp8.view(T, G, -1),
+        weight,
+        o_scale.view(T, G, -1),
+        weight_scale,
+        dtype=torch.bfloat16,
+    )
+
+
 def _is_power_of_two(scale: torch.Tensor) -> bool:
     """True when every fp32 scale is an exact power of two (zero mantissa)."""
     bits = scale.detach().float().contiguous().view(torch.int32)
@@ -287,6 +305,7 @@ def wo_a_weight_scale_to_e8m0(
 __all__ = [
     "WO_A_MXFP8_GROUP_SIZE",
     "apply_wo_a_fp8_mxscale",
+    "apply_wo_a_fp8_mxscale_prequant",
     "is_wo_a_fp8_mxscale_supported",
     "quant_wo_a_act_mxfp8",
     "wo_a_weight_scale_to_e8m0",

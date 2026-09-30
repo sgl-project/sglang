@@ -424,11 +424,13 @@ _wo_a_aiter_batched_gemm_disabled = False
 # ``None`` here means the platform keeps the bf16 absorb GEMM.
 _wo_a_fp8_mxscale = None
 _wo_a_fp8_mxscale_fused_invrope = None
+_wo_a_fp8_mxscale_prequant = None
 _wo_a_weight_scale_to_e8m0 = None
 if _is_hip:
     from sglang.srt.models.deepseek_common.amd.deepseek_v4_wo_a_fp8 import (
         apply_wo_a_fp8_mxscale,
         apply_wo_a_fp8_mxscale_fused_invrope,
+        apply_wo_a_fp8_mxscale_prequant,
         is_wo_a_fp8_fused_invrope_supported,
         is_wo_a_fp8_mxscale_supported,
         wo_a_weight_scale_to_e8m0,
@@ -444,6 +446,7 @@ if _is_hip:
             and is_wo_a_fp8_fused_invrope_supported()
         ):
             _wo_a_fp8_mxscale_fused_invrope = apply_wo_a_fp8_mxscale_fused_invrope
+        _wo_a_fp8_mxscale_prequant = apply_wo_a_fp8_mxscale_prequant
 
 
 @functools.lru_cache(maxsize=1)
@@ -979,6 +982,27 @@ class MqaAttentionBase(nn.Module):
 
         # Other FlashMLA implementations retain their existing padded shape.
         return 64 if self.n_local_heads <= 64 else self.n_heads
+
+    def _wo_a_quant_freqs(
+        self, forward_batch: ForwardBatch, q_rope: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        """Rope table when the fp8 unified_kv decode (aiter FlyDSL) should also
+        do the inverse RoPE and the wo_a mxfp8 quant; else None."""
+        mode = forward_batch.forward_mode
+        if q_rope is None or not (mode.is_decode() or mode.is_target_verify()):
+            return None
+        if not hasattr(self, "_wo_a_freqs"):
+            from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
+
+            fused = (
+                _wo_a_fp8_mxscale_prequant is not None
+                and self.wo_a_fp8
+                and runtime.flydsl_decode_supported(q_rope.shape[1])
+            )
+            self._wo_a_freqs = (
+                torch.view_as_real(self.freqs_cis).flatten(1) if fused else None
+            )
+        return self._wo_a_freqs
 
     def _local_attn_sink(self, kernel_num_heads: Optional[int] = None) -> torch.Tensor:
         if self.attn_tp_size == 1:
@@ -2318,8 +2342,9 @@ class MQALayer(MqaAttentionBase):
         # its normal causally-indexed store from attn_k = kv.
         attn_k = kv if kv is not None else q
 
+        wo_a_quant_freqs = None
         if unified:
-            # only the HIP radix backend takes these two; passing them always would
+            # only the HIP radix backend takes these; passing them always would
             # leave non-ROCm depending on the **_ in its forward() to drop them, and
             # no test on that side would notice if the **_ went away
             rope_kwargs = {}
@@ -2327,6 +2352,9 @@ class MQALayer(MqaAttentionBase):
                 rope_kwargs["q_rope"] = q_rope
             if k_rope is not None:
                 rope_kwargs["k_rope"] = k_rope
+            wo_a_quant_freqs = self._wo_a_quant_freqs(forward_batch, q_rope)
+            if wo_a_quant_freqs is not None:
+                rope_kwargs["wo_a_quant_freqs"] = wo_a_quant_freqs
             o = attn_backend.forward(
                 q=q_out if q_out is not None else q,
                 k=attn_k,
@@ -2366,7 +2394,15 @@ class MQALayer(MqaAttentionBase):
                     save_kv_cache=save_kv_cache,
                 )
             o = o[:, tp_slice, :]
-        if (
+        if wo_a_quant_freqs is not None:
+            # the decode already returned the wo_a mxfp8 (codes, scales)
+            G = self.n_local_groups
+            o = _wo_a_fp8_mxscale_prequant(
+                *o,
+                self.wo_a.weight.view(G, self.o_lora_rank, -1),
+                self.wo_a.weight_scale_inv.data,
+            )
+        elif (
             self.wo_a_fp8
             and _wo_a_fp8_mxscale_fused_invrope is not None
             and not _is_npu
