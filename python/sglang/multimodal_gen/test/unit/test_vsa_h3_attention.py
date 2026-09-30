@@ -170,6 +170,8 @@ def test_topk_tile_list_semantics() -> None:
     [(29, 528, 0.8), (0, 64, 0.9), (30, 1541, 0.05)],
 )
 def test_topk_list_kernel_matches_sorted_topk(num_prefix, num_video, sparsity) -> None:
+    """The unsorted-top-k list kernel must emit the sorted lists and leave its
+    scratch mask zeroed for the next layer."""
     from sglang.multimodal_gen.runtime.layers.attention.backends.vsa_h3_kernels import (
         vsa_h3_topk_lists,
     )

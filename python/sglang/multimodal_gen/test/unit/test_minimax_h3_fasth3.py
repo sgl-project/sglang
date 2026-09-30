@@ -79,6 +79,8 @@ def test_fasth3_sampling_defaults_and_task_rejection() -> None:
 
 
 def test_fasth3_dmd_schedule_matches_trained_rungs() -> None:
+    """The distilled rungs are shifted exactly once, as FastVideo serves them, and
+    a wrong step count or non-decreasing rungs are rejected."""
     metadata = MiniMaxH3ReleaseMetadata.from_model_index(
         {
             "_minimax_h3": {

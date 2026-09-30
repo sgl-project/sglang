@@ -353,8 +353,7 @@ class MiniMaxH3SamplingParams(SamplingParams):
 
 @dataclass
 class FastH3SamplingParams(MiniMaxH3SamplingParams):
-    """FastH3 8-Step V2: nine sigma grid points, i.e. the eight distilled DiT
-    forwards on the checkpoint's trained DMD rungs."""
+    """FastH3 8-Step V2: nine sigma grid points, i.e. eight DiT forwards on the trained DMD rungs."""
 
     num_inference_steps: int = 9
     quality: str = "extra-high"

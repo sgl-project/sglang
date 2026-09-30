@@ -55,6 +55,7 @@ def _reference(q, k, v, q2k_idx, q2k_num, block_sizes, sm_scale):
 
 @pytest.mark.parametrize("batch,heads,num_blocks,max_kv", [(1, 2, 6, 4), (2, 3, 10, 7)])
 def test_matches_masked_reference(batch, heads, num_blocks, max_kv):
+    """Empty lists, zero-size and ragged tiles must match the masked fp32 reference."""
     generator = torch.Generator(device="cuda").manual_seed(3)
     d, s = 128, num_blocks * BLOCK
     q, k, v = (
@@ -92,6 +93,7 @@ def test_matches_masked_reference(batch, heads, num_blocks, max_kv):
 
 
 def test_rejects_odd_tile_count():
+    """An odd tile count must raise instead of reading past the paired query tile."""
     q = torch.randn(1, 1, 3 * BLOCK, 128, device="cuda", dtype=torch.bfloat16)
     idx = torch.zeros(3, 1, device="cuda", dtype=torch.int32)
     num = torch.ones(3, device="cuda", dtype=torch.int32)
