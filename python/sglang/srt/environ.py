@@ -922,7 +922,9 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
-    SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("tilelang")
+    # ROCm decode attention kernel: auto (aiter_sparse on gfx950, tilelang elsewhere) |
+    # aiter_sparse | tilelang | triton | torch | comparison | unified_kv_triton
+    SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
     SGLANG_AMD_USE_FLYDSL_MEGA_MOE = EnvBool(False)
     SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR = EnvInt(8192)
