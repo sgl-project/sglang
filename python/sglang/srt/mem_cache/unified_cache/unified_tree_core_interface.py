@@ -179,6 +179,14 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def is_write_through_compatible(self) -> bool:
+        """Whether current host ownership satisfies write-through invariants.
+
+        Read-only; the caller must have drained in-flight cache operations.
+        """
+        ...
+
+    @abstractmethod
     def is_backuped(self, node_id: NodeId) -> bool:
         """Whether the node's KV is already backed up to host."""
         ...

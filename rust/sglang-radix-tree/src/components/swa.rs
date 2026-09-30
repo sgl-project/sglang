@@ -848,12 +848,22 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             if tracker[&SWA] >= num_tokens {
                 break;
             }
+            // Host-transfer completion can perturb the rank-local SWA LRU even
+            // when every rank has the same logical candidates. Snapshot the
+            // eligible walk, then canonicalize it by external node handle.
+            // Rank-consensus-controlled tree mutations keep those handles
+            // aligned while the LRU links themselves may differ.
+            let mut candidates = Vec::new();
             let mut next = Self::next_host_unlocked_device_lru_node(tree_core, None);
             while let Some(node_id) = next {
+                candidates.push(node_id);
+                next = Self::next_host_unlocked_device_lru_node(tree_core, Some(node_id));
+            }
+            candidates.sort_unstable_by_key(|&node_id| tree_core.arena.node(node_id).id);
+            for node_id in candidates {
                 if tracker[&SWA] >= num_tokens {
                     break;
                 }
-                next = Self::next_host_unlocked_device_lru_node(tree_core, Some(node_id));
                 if spare_imminent_demotes && tree_core.evictable_device_leaves.contains(node_id) {
                     continue;
                 }

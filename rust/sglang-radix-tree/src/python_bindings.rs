@@ -1829,6 +1829,10 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         Ok(())
     }
 
+    fn is_write_through_compatible(&self, py: Python<'_>) -> bool {
+        py.allow_threads(|| self.core().is_write_through_compatible())
+    }
+
     /// Set the write-back (vs write-through) policy; decided at HiCache init.
     fn set_is_write_back(&self, py: Python<'_>, is_write_back: bool) {
         py.allow_threads(|| self.core().is_write_back = is_write_back);
@@ -3010,6 +3014,10 @@ macro_rules! tree_core_binding {
                 params: &DecLockRefParamsBinding,
             ) -> PyResult<()> {
                 self.inner.dec_host_lock_ref(py, node_id, params)
+            }
+
+            fn is_write_through_compatible(&self, py: Python<'_>) -> bool {
+                self.inner.is_write_through_compatible(py)
             }
 
             /// Set the write-back (vs write-through) policy; decided at HiCache init.

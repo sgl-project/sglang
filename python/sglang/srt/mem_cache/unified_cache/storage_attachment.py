@@ -75,6 +75,23 @@ class StorageAttachment:
                 "launch with --enable-hierarchical-cache to attach a backend.",
             )
 
+        # Write-back can retain auxiliary host rows without FULL, or backed
+        # descendants below an unbacked FULL ancestor. Those states are invalid
+        # for write-through insertion and eviction. Check before changing any
+        # policy, including on the same-backend update and re-attach paths.
+        if (
+            cache.is_write_back
+            and cache.host_memory_mode != "buffer_only"
+            and hicache_write_policy in ("write_through", "write_through_selective")
+            and not cache.tree_core.is_write_through_compatible()
+        ):
+            return (
+                False,
+                "Cannot switch HiCache from write_back to write_through while "
+                "the cache has host data without its FULL prefix. "
+                "Flush the cache before changing the write policy.",
+            )
+
         if cache.enable_storage:
             current_backend = controller.storage_backend_type
             if current_backend != storage_backend:

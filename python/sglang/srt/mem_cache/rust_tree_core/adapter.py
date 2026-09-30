@@ -867,6 +867,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     ) -> tuple[Optional[str], Optional[str]]:
         return self._binding.prefetch_anchor_info(node_id)
 
+    def is_write_through_compatible(self) -> bool:
+        return self._binding.is_write_through_compatible()
+
     def is_backuped(self, node_id: NodeId) -> bool:
         return self._binding.node_backuped(node_id)
 

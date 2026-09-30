@@ -3141,8 +3141,14 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             });
         }
 
-        // Walk cursor: atoms of `key` already matched (also the running prefix length).
+        // Walk cursor: atoms of `key` already matched structurally.
         let mut matched_length = 0;
+        // For write-through, only a leading already-host-resident prefix is a
+        // duplicate that the caller may free. Structurally matching device-only
+        // nodes consume fresh host indices and must not contribute to this count.
+        let mut host_prefix_len = 0;
+        let mut refilled_unbacked_node = false;
+        let mut inserted_host_node = None;
         let mut cache_actions: Vec<CacheAction> = Vec::new();
         while matched_length < total_len {
             let Some(child_id) = self.arena.child_on_page_in_namespace(
@@ -3154,6 +3160,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             };
             node_id = child_id;
             self.touch_node_(node_id);
+            let matched_start = matched_length;
             let node = self.arena.node(node_id);
             let prefix_len = key.match_len(matched_length, &node.key, self.page_size);
             let node_key_len = node.key.atom_len();
@@ -3166,13 +3173,50 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     cache_actions.push(action);
                 }
             }
+
+            if !self.is_write_back {
+                if self.arena.node(node_id).has_host_value(FULL) {
+                    assert!(
+                        !refilled_unbacked_node,
+                        "insert_host: write-through path has a backed node below an unbacked node"
+                    );
+                    host_prefix_len = matched_length;
+                    continue;
+                }
+
+                refilled_unbacked_node = true;
+                self.arena.set_host_value(
+                    node_id,
+                    FULL,
+                    host_value
+                        .narrow(0, matched_start as i64, prefix_len as i64)
+                        .copy(),
+                );
+                if self.arena.node(node_id).hash_value.is_none() {
+                    let first_page = matched_start / self.page_size;
+                    let last_page = matched_length / self.page_size;
+                    self.arena.node_mut(node_id).hash_value =
+                        Some(hash_value[first_page..last_page].to_vec());
+                }
+                self.update_evictable_leaf_sets_(node_id);
+                if let Some(parent_id) = self.arena.node(node_id).try_parent() {
+                    self.update_evictable_leaf_sets_(parent_id);
+                }
+                self.update_full_coexisting_host_tracking_(node_id);
+                self.record_store_event_(node_id, StorageMedium::Cpu, /* session_id = */ None);
+                inserted_host_node = Some(self.arena.node(node_id).id);
+            }
         }
 
         let mut result = InsertResult {
-            prefix_len: matched_length,
+            prefix_len: if self.is_write_back {
+                matched_length
+            } else {
+                host_prefix_len
+            },
             total_len,
             last_device_node_id: None,
-            inserted_host_node: None,
+            inserted_host_node,
             host_insert_dropped: false,
             mamba_exist: false,
             swa_branch_inserted: false,
@@ -3181,7 +3225,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         };
         if matched_length == total_len {
             let node = self.arena.node(node_id);
-            if !node.is_root() && node.has_host_value(FULL) {
+            if result.inserted_host_node.is_none() && !node.is_root() && node.has_host_value(FULL) {
                 result.inserted_host_node = Some(self.arena.node(node_id).id);
             }
             return Ok(result);
@@ -4068,6 +4112,31 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.assert_component_enabled_(component_type);
         Ok(!self.arena.has_device_value(node_idx, component_type)
             && self.arena.has_host_value(node_idx, component_type))
+    }
+
+    /// Read-only check of the host invariants required by write-through.
+    /// The administrative caller must first drain in-flight cache operations.
+    pub fn is_write_through_compatible(&self) -> bool {
+        for node_id in self.collect_all_nodes_() {
+            let node = self.arena.node(node_id);
+            if node.is_root() {
+                continue;
+            }
+            if !node.has_host_value(FULL) {
+                if self.components.iter().any(|component| {
+                    let ct = component.component_type();
+                    ct != FULL && node.has_host_value(ct)
+                }) {
+                    return false;
+                }
+            } else {
+                let parent = self.arena.node(node.parent());
+                if !parent.is_root() && !parent.has_host_value(FULL) {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// Verify tree-structure, leaf-set, LRU, size, and ongoing-op invariants; raise
