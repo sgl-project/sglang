@@ -1004,6 +1004,19 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         src_kv = self.kv_args.unified_kv_layout
         src_state = self.kv_args.unified_state_layout
         unequal_tp = self.attn_tp_size != peer.dst_attn_tp_size
+        if self.dcp_size > 1 or peer.dst_dcp_size > 1:
+            if (
+                self.dcp_size != peer.dst_dcp_size
+                or self.dcp_rank != peer.dst_dcp_rank
+                or unequal_tp
+                or not self.is_hybrid_mla_backend
+                or src_kv is None
+                or peer.dst_unified_kv_layout is None
+            ):
+                raise RuntimeError(
+                    "Unified PD with DCP requires hybrid MLA, equal attention TP, "
+                    "and matching DCP sizes/ranks; DCP relayout is not supported"
+                )
         if unequal_tp:
             if not (
                 self.is_hybrid_mla_backend
@@ -2594,6 +2607,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
                     decode_kv_args = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
+                    self._validate_unified_peer_layout(decode_kv_args)
                     decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
                         decode_kv_args.dst_dcp_size,
                         decode_kv_args.dst_dcp_rank,

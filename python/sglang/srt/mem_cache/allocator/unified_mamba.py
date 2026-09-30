@@ -300,17 +300,21 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def translate_kv_indices_for_transfer(
         self, kv_indices: torch.Tensor
     ) -> torch.Tensor:
-        """Virtual TOKEN ids -> PHYSICAL token ids for the PD transfer engine.
-        PHYSICAL, not kernel-facing: the transfer registers page ENVELOPES (see
-        `UnifiedMLATokenToKVPool.get_contiguous_buf_infos`)."""
-        # Defensive: `_validate_unified_memory_dcp` rejects this pairing at
-        # argument validation, so reaching it means a config path got past that.
-        assert get_parallel().attn_dcp_size == 1, (
-            "PD-disaggregation transfer with the unified memory pool does not "
-            "support decode context parallelism: the transfer ships whole page "
-            "envelopes, which hold only this rank's shard of each widened page."
-        )
-        return self.full_attn_allocator.translate_kv_loc(kv_indices.to(torch.int64))
+        """Virtual token IDs -> physical token IDs in the transfer coordinate space.
+
+        Under DCP each local stored row represents DCP_SIZE logical token IDs.
+        Collapse to local rows before the v2p lookup, then widen the physical
+        IDs again. The existing page-index conversion divides by the widened
+        allocator page size, yielding physical page IDs (never kernel IDs).
+        Keep one ID per logical token so chunk and prefix slicing stay aligned.
+        """
+        dcp_size = get_parallel().attn_dcp_size
+        logical = kv_indices.to(torch.int64)
+        if dcp_size == 1:
+            return self.full_attn_allocator.translate_kv_loc(logical)
+        local_rows = torch.div(logical, dcp_size, rounding_mode="floor")
+        physical = self.full_attn_allocator.translate_kv_loc(local_rows)
+        return physical * dcp_size + logical % dcp_size
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         """Retraction backup for the FULL + mamba pair.

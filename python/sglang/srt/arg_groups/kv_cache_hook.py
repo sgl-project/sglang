@@ -630,15 +630,10 @@ def _validate_unified_memory_dcp(server_args: Any) -> None:
         "UnifiedSWATokenToKVPoolAllocator does not widen its virtual id "
         "space, and the full->swa mapping is not DCP-sharded."
     )
-    cfg = resolving_view(server_args)
-    assert cfg.disaggregation_mode == "null", (
-        "--enable-unified-memory with decode context parallelism "
-        "(--dcp-size > 1) does not support PD disaggregation: the transfer "
-        "ships whole page envelopes, which under DCP hold only this rank's "
-        "shard of each widened page. Rejected here rather than at the first KV "
-        "transfer, where translate_kv_indices_for_transfer would abort a "
-        "server that had already booted."
-    )
+    # PD accepts matching DCP sizes/ranks only. Peer topology is checked when
+    # its registration arrives; the local guard cannot know the remote sizes.
+    # handle_unified_memory_pool still requires Mooncake, PP1, no speculation,
+    # and lazy compaction for every PD node.
     # The trtllm_mla family builds its DCP block table through the pool's v2p
     # gather (create_mla_kv_page_table_for_dcp), so it speaks the same
     # two-stage contract as flashinfer.
