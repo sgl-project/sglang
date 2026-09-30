@@ -244,9 +244,6 @@ class Exaone4DecoderLayer(nn.Module):
 
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
 
-        self.attn_tp_size = get_parallel().attn_tp_size
-        self.attn_tp_rank = get_parallel().attn_tp_rank
-
         self.self_attn = Exaone4Attention(
             config=config,
             hidden_size=self.hidden_size,

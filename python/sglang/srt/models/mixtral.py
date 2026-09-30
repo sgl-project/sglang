@@ -77,7 +77,6 @@ class MixtralMoE(nn.Module):
         layer_id: int,
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
-        tp_size: Optional[int] = None,
         prefix: str = "",
     ):
         super().__init__()

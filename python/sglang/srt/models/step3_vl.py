@@ -192,9 +192,7 @@ class Step3TextAttention(nn.Module):
         attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
-        self.all_tp_rank = get_parallel().tp_rank
         self.total_num_heads = num_heads
-        self.attn_tp_rank = attn_tp_rank
         self.layer_id = layer_id
         assert self.total_num_heads % attn_tp_size == 0
         self.num_heads = self.total_num_heads // attn_tp_size

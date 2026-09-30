@@ -98,7 +98,6 @@ class Llama4MoE(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.tp_size = get_parallel().tp_size
         self.top_k = config.num_experts_per_tok
         self.device_module = torch.get_device_module()
 
@@ -385,8 +384,6 @@ class Llama4DecoderLayer(nn.Module):
         rope_theta = config.rope_parameters["rope_theta"]
         rope_scaling = config.rope_parameters
         max_position_embeddings = config.max_position_embeddings
-        self.attn_tp_size = get_parallel().attn_tp_size
-        self.attn_tp_rank = get_parallel().attn_tp_rank
 
         self.self_attn = Llama4Attention(
             config=config,

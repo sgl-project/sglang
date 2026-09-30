@@ -99,7 +99,6 @@ class SDARAttention(nn.Module):
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
         self.total_num_heads = config.num_attention_heads
-        self.tp_size = get_parallel().tp_size
         attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 

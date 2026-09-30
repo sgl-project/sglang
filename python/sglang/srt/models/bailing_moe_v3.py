@@ -317,7 +317,6 @@ class BailingMLP(nn.Module):
         self.config = config
         self.swiglu_limit = swiglu_limit
         self.tp_size = tp_size if tp_size is not None else get_parallel().tp_size
-        self.tp_rank = tp_rank if tp_rank is not None else get_parallel().tp_rank
 
         self.intermediate_size = intermediate_size
         self.padded_intermediate_size = padded_intermediate_size or intermediate_size
@@ -465,10 +464,8 @@ class BailingMoE(nn.Module):
         self.alt_stream = alt_stream
 
         self.tp_size = get_parallel().tp_size
-        self.tp_rank = get_parallel().tp_rank
         self.moe_ep_size = get_parallel().moe_ep_size
         self.moe_tp_size = get_parallel().moe_tp_size
-        self.moe_tp_rank = get_parallel().moe_tp_rank
 
         self.top_k = config.num_experts_per_tok
         self.norm_expert_prob = getattr(config, "norm_topk_prob", False)
@@ -1425,7 +1422,6 @@ class BailingMoeV3ForCausalLM(nn.Module):
         self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
-        self.tp_size = get_parallel().tp_size
 
         # Determine num_fused_shared_experts
         self.determine_num_fused_shared_experts()

@@ -70,7 +70,6 @@ class DbrxRouter(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.tp_size = get_parallel().tp_size
         self.num_total_experts = config.ffn_config.moe_num_experts
         self.d_model = config.d_model
         self.layer = ReplicatedLinear(
@@ -244,7 +243,6 @@ class DbrxAttention(nn.Module):
         )
 
         tp_world_size = get_parallel().tp_size
-        self.tp_size = tp_world_size
         assert self.total_num_heads % tp_world_size == 0
         self.num_heads = self.total_num_heads // tp_world_size
         if self.total_num_kv_heads >= tp_world_size:

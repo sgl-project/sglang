@@ -118,7 +118,6 @@ class Grok1MoE(nn.Module):
         intermediate_size: int,
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
-        tp_size: Optional[int] = None,
         reduce_results: bool = True,
         use_presharded_weights: bool = False,
         inplace: bool = True,

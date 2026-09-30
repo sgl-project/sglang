@@ -969,7 +969,6 @@ class XllmSparseMoeBlock(nn.Module):
             self.shared_experts = None
 
         if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mori():
-            self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
                 config.num_experts + get_exec().moe.ep_num_redundant_experts
             )
@@ -1447,9 +1446,6 @@ class XllmDecoderLayer(nn.Module):
         rope_head_dim = getattr(config, "rope_head_dim", head_dim)
 
         self.layer_id = layer_id
-
-        self.attn_tp_size = get_parallel().attn_tp_size
-        self.attn_tp_rank = get_parallel().attn_tp_rank
 
         # Determine if this layer is sparse (MoE) or dense
         mlp_only_layers = getattr(config, "mlp_only_layers", [])

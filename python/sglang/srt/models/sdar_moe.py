@@ -117,7 +117,6 @@ class SDARMoeSparseMoeBlock(nn.Module):
 
         # Deepep / FuseEP support
         if get_moe_a2a_backend().is_deepep():
-            self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
                 config.num_experts + get_exec().moe.ep_num_redundant_experts
             )

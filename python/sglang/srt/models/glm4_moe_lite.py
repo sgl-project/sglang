@@ -850,7 +850,6 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         super().__init__()
         config.moe_layer_freq = 1
         self.config = config
-        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.pp_group = get_parallel().pp_group
         self.determine_num_fused_shared_experts()

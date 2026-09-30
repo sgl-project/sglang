@@ -1834,7 +1834,6 @@ class Dots3LanguageModelForCausalLM(nn.Module):
 
         self.pp_group = get_parallel().pp_group
         self.config = config
-        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.determine_num_fused_shared_experts()
         self.model = Dots3Model(
@@ -2716,7 +2715,6 @@ class DotsNoteOmniForConditionalGeneration(nn.Module):
         )
         language_model = self.thinker.language_model
         self.pp_group = language_model.pp_group
-        self.tp_size = language_model.tp_size
         self.quant_config = language_model.quant_config
         self.num_fused_shared_experts = language_model.num_fused_shared_experts
         self.forward = self.thinker.forward
