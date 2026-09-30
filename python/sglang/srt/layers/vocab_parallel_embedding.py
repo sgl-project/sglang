@@ -647,13 +647,12 @@ class ParallelLMHead(VocabParallelEmbedding):
 
         # We only support pack LMHead if it's not quantized.
         if _is_cpu and _is_cpu_amx_available:
+            is_skip_pack = get_exec().features.enable_fp32_lm_head or use_fp32_lm_head
             if (
-                not (
-                    get_exec().features.enable_fp32_lm_head
-                    or use_fp32_lm_head
-                )
+                not is_skip_pack
                 and hasattr(self, "weight")
-                and self.weight.dtype in [
+                and self.weight.dtype
+                in [
                     torch.bfloat16,
                     torch.float16,
                 ]
