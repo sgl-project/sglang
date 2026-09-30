@@ -42,6 +42,24 @@ python -m sglang.launch_server \
 
 Prefer the AWS credential chain over putting secrets in the command line.
 
+## Tuning
+
+- **Page size.** Each KV page is one object, so `--page-size` sets the object size and the number
+  of S3 requests per prefix. Small pages turn a long prefix into many small GETs, where per-request
+  overhead dominates. Start with `--page-size 64` or larger.
+- **Prefetch threshold.** A prefetch from SeaweedFS pays off only when loading the prefix is faster
+  than recomputing it, which depends on the model, the GPU, the prefix length and the bandwidth to
+  SeaweedFS. The default `prefetch_threshold` of 256 tokens is low for a remote store; measure
+  time-to-first-token with and without the cache for a few prefix lengths and set the threshold at
+  the break-even point, for example:
+
+  ```bash
+  --hicache-storage-backend-extra-config '{"endpoint": "http://seaweedfs-s3:8333", "prefetch_threshold": 8192}'
+  ```
+
+  `prefetch_threshold`, `prefetch_timeout_base` and `prefetch_timeout_per_ki_token` are read by
+  SGLang's cache controller, not by this backend.
+
 ## Object layout
 
 Objects are named `<prefix>/<model>/<rank scope>/<page hash>`:
