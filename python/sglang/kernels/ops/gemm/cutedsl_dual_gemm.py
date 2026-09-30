@@ -1030,7 +1030,10 @@ def _dual_gemm_swiglu_fp8_run(
     )
 
     if dynamic_quant:
-        result_scale = torch.empty((1, 1), dtype=torch.float32, device=x.device)
+        # With one token, dynamic per-token and per-tensor scaling are
+        # numerically equivalent.  Return a 1-D scalar scale so downstream FP8
+        # GEMMs can use their fused per-tensor scaling path.
+        result_scale = torch.empty((1,), dtype=torch.float32, device=x.device)
         if feature_tiles == 1:
             global_amax = result_scale
             completion_counter = torch.empty((1,), dtype=torch.int32, device=x.device)
@@ -1039,7 +1042,7 @@ def _dual_gemm_swiglu_fp8_run(
             completion_counter = torch.zeros((1,), dtype=torch.int32, device=x.device)
         supplied_scale = x_scale
     else:
-        result_scale = torch.empty((1, 1), dtype=torch.float32, device=x.device)
+        result_scale = torch.empty((1,), dtype=torch.float32, device=x.device)
         global_amax = result_scale
         completion_counter = torch.empty((1,), dtype=torch.int32, device=x.device)
         supplied_scale = output_scale.reshape(-1)
@@ -1196,7 +1199,7 @@ def _dual_gemm_swiglu_fp8_fake(
             dtype=torch.float8_e4m3fn,
             device=x.device,
         ),
-        torch.empty((x.shape[0], 1), dtype=torch.float32, device=x.device),
+        torch.empty((1,), dtype=torch.float32, device=x.device),
     )
 
 
@@ -1265,8 +1268,10 @@ def dual_gemm_swiglu_fp8(
     """Run FP8 gate/up projections, SwiGLU, and static or dynamic FP8 quant.
 
     ``output_scale=None`` selects dynamic per-token quantization.  Supplying a
-    scalar ``output_scale`` selects static quantization.  Shape eligibility is
-    intentionally the responsibility of the caller.
+    scalar ``output_scale`` selects static quantization.  The single-token
+    specialization returns its scale as a one-element 1-D tensor so it is also
+    consumable as a per-tensor scale.  Shape eligibility is intentionally the
+    responsibility of the caller.
     """
     return _dual_gemm_swiglu_fp8_with_tactic(
         x,

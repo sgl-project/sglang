@@ -52,8 +52,15 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, is_cuda, is_npu, is_xpu, make_layers
+from sglang.srt.runtime_context import get_forward, get_parallel
+from sglang.srt.utils import (
+    add_prefix,
+    get_bool_env_var,
+    is_cuda,
+    is_npu,
+    is_xpu,
+    make_layers,
+)
 from sglang.utils import get_exception_traceback
 
 _is_cuda = is_cuda()
@@ -105,14 +112,114 @@ class LlamaMLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        self.dual_gemm_mode = self._select_dual_gemm_mode(hidden_size)
+
+    def _select_dual_gemm_mode(self, hidden_size: int) -> Optional[str]:
+        if not get_bool_env_var("SGLANG_ENABLE_DUAL_GEMM"):
+            return None
+
+        if not _is_cuda:
+            return None
+
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        gate_up_method = self.gate_up_proj.quant_method
+        if isinstance(gate_up_method, UnquantizedLinearMethod):
+            mode = (
+                "float16"
+                if self.gate_up_proj.params_dtype in (torch.bfloat16, torch.float16)
+                else None
+            )
+        else:
+            from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+                CompressedTensorsLinearMethod,
+            )
+            from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+                CompressedTensorsW8A8Fp8,
+            )
+            from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+
+            fp8_layers = (self.gate_up_proj, self.down_proj)
+            native_fp8 = all(
+                isinstance(layer.quant_method, Fp8LinearMethod)
+                and not (
+                    layer.quant_method.block_quant
+                    or layer.quant_method.use_marlin
+                    or layer.quant_method.use_mxfp8
+                )
+                for layer in fp8_layers
+            )
+            compressed_fp8 = all(
+                isinstance(layer.quant_method, CompressedTensorsLinearMethod)
+                and isinstance(layer.scheme, CompressedTensorsW8A8Fp8)
+                and layer.scheme.weight_block_size is None
+                for layer in fp8_layers
+            )
+            mode = (
+                "fp8"
+                if self.gate_up_proj.params_dtype in (torch.bfloat16, torch.float16)
+                and (native_fp8 or compressed_fp8)
+                else None
+            )
+
+        from sglang.kernels.ops.gemm.cutedsl_dual_gemm import can_use_dual_gemm
+
+        local_intermediate_size = self.gate_up_proj.output_partition_sizes[0]
+        return (
+            mode if can_use_dual_gemm(1, hidden_size, local_intermediate_size) else None
+        )
+
+    def _apply_dual_gemm(self, x: torch.Tensor):
+        if self.dual_gemm_mode == "float16":
+            from sglang.kernels.ops.gemm import dual_gemm_swiglu
+
+            return dual_gemm_swiglu(x, self.gate_up_proj.weight)
+
+        from sglang.kernels.ops.gemm import dual_gemm_swiglu_fp8
+
+        if isinstance(x, tuple):
+            quantized_x, x_scale = x[:2]
+            output_dtype = x[2] if len(x) > 2 else torch.bfloat16
+        else:
+            from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
+
+            output_dtype = x.dtype
+            quantized_x, x_scale = scaled_fp8_quant(
+                x,
+                self.gate_up_proj.input_scale,
+                use_per_token_if_dynamic=True,
+            )
+
+        quantized_activation, activation_scale = dual_gemm_swiglu_fp8(
+            quantized_x,
+            self.gate_up_proj.weight.T,
+            x_scale,
+            self.gate_up_proj.weight_scale,
+            self.down_proj.input_scale,
+        )
+        # Fp8LinearMethod consumes this tuple without quantizing the activation
+        # again.  The original dtype controls the down projection's output type.
+        return quantized_activation, activation_scale, output_dtype
 
     def forward(
         self,
         x,
         forward_batch=None,
     ):
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        # Token count is the only shape unavailable during construction. LoRA
+        # wrappers and sequence parallelism must retain their projection calls.
+        input_tensor = x[0] if isinstance(x, tuple) else x
+
+        if (
+            self.dual_gemm_mode is not None
+            and input_tensor.shape[0] == 1
+            and not (self.gate_up_proj.tp_size > 1 and get_forward().sp_active)
+        ):
+            x = self._apply_dual_gemm(x)
+        else:
+            gate_up, _ = self.gate_up_proj(x)
+            x = self.act_fn(gate_up)
+
         x, _ = self.down_proj(x)
         return x
 
