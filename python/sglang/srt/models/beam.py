@@ -18,6 +18,12 @@ from typing import Iterable, Optional, Tuple
 import torch
 from torch import nn
 
+from sglang.kernels.fused_op import get_fused_op_backend
+from sglang.kernels.ops.diffusion.rope.qknorm_rope_jit import (
+    can_use_fused_inplace_qknorm_rope,
+    fused_inplace_qknorm_rope,
+)
+from sglang.kernels.spec import KernelBackend
 from sglang.srt.configs.beam import BeamConfig
 from sglang.srt.distributed import (
     get_pp_group,
@@ -54,7 +60,9 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_exec, get_parallel
-from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
+from sglang.srt.utils import add_prefix, is_cuda, make_layers, set_weight_attrs
+
+_is_cuda = is_cuda()
 
 
 def apply_ssmax(q: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
@@ -81,6 +89,21 @@ def depth_scaled_residual(
     branch = branch * branch_scale
     residual = residual * residual_scale
     return branch + residual
+
+
+def _can_fuse_qk_norm_rope(head_dim: int) -> bool:
+    # The forced torch backend keeps the unfused reference path.
+    return (
+        _is_cuda
+        and get_fused_op_backend() != KernelBackend.TORCH
+        and can_use_fused_inplace_qknorm_rope(
+            head_dim=head_dim,
+            rope_dim=head_dim,
+            is_neox=True,
+            dtype=torch.get_default_dtype(),
+            round_norm_before_rope=True,
+        )
+    )
 
 
 class BeamRotaryEmbedding(RotaryEmbedding):
@@ -270,6 +293,9 @@ class BeamAttention(nn.Module):
             if self.apply_rope
             else None
         )
+        self.use_fused_qk_norm_rope = self.apply_rope and _can_fuse_qk_norm_rope(
+            self.head_dim
+        )
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -278,6 +304,25 @@ class BeamAttention(nn.Module):
             layer_id=layer_id,
             sliding_window_size=self.sliding_window,
             prefix=add_prefix("attn", prefix),
+        )
+
+    def _fused_qk_norm_rope(
+        self, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor
+    ) -> None:
+        # In place on the packed QKV views. Rounding the norm to the activation
+        # dtype before the FP32 rotation matches RMSNorm followed by RoPE.
+        fused_inplace_qknorm_rope(
+            q=q.view(-1, self.num_heads, self.head_dim),
+            k=k.view(-1, self.num_kv_heads, self.head_dim),
+            q_weight=self.q_norm.weight,
+            k_weight=self.k_norm.weight,
+            cos_sin_cache=self.rotary_emb.cos_sin_cache,
+            positions=positions,
+            is_neox=True,
+            eps=self.q_norm.variance_epsilon,
+            head_dim=self.head_dim,
+            rope_dim=self.head_dim,
+            round_norm_before_rope=True,
         )
 
     def load_gate_bias(self, param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -296,12 +341,15 @@ class BeamAttention(nn.Module):
             return hidden_states
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q = self.q_norm(q.reshape(-1, self.head_dim)).view(-1, self.q_size)
-        k = self.k_norm(k.reshape(-1, self.head_dim)).view(-1, self.kv_size)
-        if self.rotary_emb is not None:
-            q, k = self.rotary_emb(positions, q, k)
+        if self.use_fused_qk_norm_rope:
+            self._fused_qk_norm_rope(positions, q, k)
         else:
-            q = apply_ssmax(q, positions)
+            q = self.q_norm(q.reshape(-1, self.head_dim)).view(-1, self.q_size)
+            k = self.k_norm(k.reshape(-1, self.head_dim)).view(-1, self.kv_size)
+            if self.rotary_emb is not None:
+                q, k = self.rotary_emb(positions, q, k)
+            else:
+                q = apply_ssmax(q, positions)
         attention_output = self.attn(q, k, v, forward_batch)
         gate, _ = self.gate_proj(hidden_states)
         attention_output = apply_attention_gate(
