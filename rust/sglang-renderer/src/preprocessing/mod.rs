@@ -9,6 +9,7 @@ mod tokenizer;
 
 pub(crate) use chat::{ChatPreprocessor, LoweredChat};
 pub use chat::{ChatRequest, ReasoningEffort};
+pub use regex::RegexPattern;
 pub use request::{
     GenerateRequest, GenerateRequestMetadata, GenerateSamplingParams, GenerationOptions,
     TextRequest, TokenIdsRequest,

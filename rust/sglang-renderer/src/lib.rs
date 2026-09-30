@@ -27,6 +27,7 @@ pub use error::{
 };
 pub use launcher::run_cli;
 pub(crate) use preprocessing::ChatFormatter;
+pub use preprocessing::RegexPattern;
 pub(crate) use preprocessing::{ChatPreprocessor, LoweredChat};
 pub use preprocessing::{
     ChatRequest, DynamoTokenizer, PreparedChat, ReasoningEffort, RendererService, SamplingParams,
