@@ -1287,6 +1287,14 @@ class Glm4MoeForCausalLM(nn.Module):
 class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
     fused_shared_experts_architecture = "GlmMoeDsaForCausalLM"
 
+    def determine_num_fused_shared_experts(self):
+        # The GLM target Gluon kernels consume the rank-local appended shared
+        # expert directly. Keep the generic DeepSeek Gluon+EP guard scoped to
+        # models whose kernels have not implemented that ABI.
+        self.num_fused_shared_experts = (
+            0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
+        )
+
 
 class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
     # GLM-5.2's MTP layer index differs from DeepSeek's (61), so the inherited
