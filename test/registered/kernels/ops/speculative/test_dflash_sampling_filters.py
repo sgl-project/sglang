@@ -1,11 +1,12 @@
 """Regression tests for DFlash and DSpark sampling-filter semantics."""
 
+import sys
 from types import SimpleNamespace
 
 import pytest
 import torch
-
 from sglang.srt.speculative.dflash_utils import build_dflash_verify_target_probs
+from sglang.srt.speculative.uno_utils import _build_sparse_target_support_tensors
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -40,3 +41,33 @@ def test_filtered_support_matches_joint_top_k_top_p_support(use_sparse_topk):
     expected_probs = torch.zeros_like(original_probs)
     expected_probs[0, :4] = original_probs[0, :4] / original_probs[0, :4].sum()
     torch.testing.assert_close(filtered_probs, expected_probs)
+
+
+def test_uno_compact_support_matches_joint_top_k_top_p_support():
+    original_probs = torch.tensor(
+        [[0.35, 0.25, 0.20, 0.05, 0.03, 0.03, 0.03, 0.03, 0.03]],
+        device="cuda",
+    )
+
+    support_ids, support_probs = _build_sparse_target_support_tensors(
+        next_token_logits=original_probs.log(),
+        temperatures=torch.ones((1, 1), device="cuda"),
+        top_ks=torch.tensor([4], dtype=torch.int32, device="cuda"),
+        top_ps=torch.tensor([0.82], device="cuda"),
+        batch_size=1,
+        forward_width=1,
+        max_top_k=4,
+    )
+
+    torch.testing.assert_close(
+        support_ids,
+        torch.tensor([[[0, 1, 2, 3]]], dtype=support_ids.dtype, device="cuda"),
+    )
+    torch.testing.assert_close(
+        support_probs,
+        (original_probs[:, :4] / original_probs[:, :4].sum()).view(1, 1, 4),
+    )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
