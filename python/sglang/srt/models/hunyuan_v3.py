@@ -41,7 +41,7 @@ from sglang.srt.managers.schedule_batch import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
+from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -80,10 +80,7 @@ class HYV3FeedForward(nn.Module):
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
-        if gate_up.device.type == "cpu":
-            out = self.act_fn.forward_native(gate_up)
-        else:
-            out = self.act_fn(gate_up)
+        out = self.act_fn(gate_up)
         out, _ = self.down_proj(out)
         return out
 
@@ -289,12 +286,8 @@ class HYV3Attention(nn.Module):
         )
         if self.use_qk_norm:
             rms_norm_eps = getattr(config, "rms_norm_eps", 1e-5)
-            self.q_norm = RMSNorm(
-                self.head_dim, rms_norm_eps, cast_x_before_out_mul=True
-            )
-            self.k_norm = RMSNorm(
-                self.head_dim, rms_norm_eps, cast_x_before_out_mul=True
-            )
+            self.q_norm = RMSNorm(self.head_dim, rms_norm_eps)
+            self.k_norm = RMSNorm(self.head_dim, rms_norm_eps)
 
         # HPC-Ops FP8 attention path: the fused QKNorm+RoPE+FP8-quant+StoreKV
         # op replaces the norm/rope/KV-write below and produces the
@@ -397,16 +390,8 @@ class HYV3DecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
         )
-        self.input_layernorm = RMSNorm(
-            config.hidden_size,
-            config.rms_norm_eps,
-            cast_x_before_out_mul=True,
-        )
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size,
-            config.rms_norm_eps,
-            cast_x_before_out_mul=True,
-        )
+        self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
         first_k_dense_replace = getattr(config, "first_k_dense_replace", 0)
         if layer_id < first_k_dense_replace:
@@ -483,9 +468,7 @@ class HYV3Model(nn.Module):
                 for i in range(config.num_hidden_layers)
             ]
         )
-        self.norm = RMSNorm(
-            config.hidden_size, config.rms_norm_eps, cast_x_before_out_mul=True
-        )
+        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
     @torch.no_grad()
     def forward(
@@ -526,10 +509,7 @@ class HYV3ForCausalLM(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=f"{prefix}.lm_head",
-            use_fp32_lm_head=(
-                get_exec().features.enable_fp32_lm_head
-                or getattr(config, "enable_lm_head_fp32", False)
-            ),
+            use_fp32_lm_head=getattr(config, "enable_lm_head_fp32", False),
         )
         if getattr(self.config, "tie_word_embeddings", False):
             self.lm_head.weight = self.model.embed_tokens.weight
