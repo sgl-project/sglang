@@ -36,7 +36,6 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
         # block, sigma_shift_scales): the schedule constants are a MODEL
         # serving contract — fl2va and ref2va use video 12 / audio 3 by default.
         self.sigma_shift_scales = sigma_shift_scales
-        # Trained DMD rungs of a distilled release; None keeps the uniform grid.
         self.dmd_denoising_steps = dmd_denoising_steps
         self._pdd_config = None
         pdd_heads = envs.SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS
@@ -86,7 +85,6 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
             plan.default_flow_shift,
             plan.default_audio_flow_shift,
             self.freeze_for_dedup(self.sigma_shift_scales),
-            self.dmd_denoising_steps,
         )
 
     def _apply_pdd_schedule(self, batch: Req) -> None:
