@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.configs.model_config import (
@@ -17,7 +18,28 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 
-SPARSE_KV_DEVICE_CACHE_WINDOW_COUNT = 2
+SPARSE_KV_DEVICE_CACHE_UNIT_SIZE = 2048
+SPARSE_KV_DEVICE_CACHE_CAPACITIES = tuple(
+    factor * SPARSE_KV_DEVICE_CACHE_UNIT_SIZE for factor in range(1, 5)
+)
+
+
+def get_sparsity_driven_kv_offload_device_cache_capacity() -> int:
+    """Return the per-request device KV capacity configured by the user."""
+    env_field = envs.SGLANG_NPU_SPARSE_KV_DEVICE_CACHE_FACTOR
+    env_name = env_field.name
+    raw_factor = os.getenv(env_name, str(env_field.default))
+    try:
+        factor = env_field.parse(raw_factor)
+    except ValueError as exc:
+        raise ValueError(
+            f"{env_name} must be an integer in [1, 4], got {raw_factor!r}."
+        ) from exc
+    if factor < 1 or factor > 4:
+        raise ValueError(
+            f"{env_name} must be an integer in [1, 4], got {factor}."
+        )
+    return factor * SPARSE_KV_DEVICE_CACHE_UNIT_SIZE
 
 
 def is_sparsity_driven_kv_offload_enabled(
@@ -112,9 +134,10 @@ def get_sparsity_driven_kv_offload_fixed_memory_size(
     """Return the fixed device-KV allocation made by the sparse KV manager.
 
     In addition to the token-scaled index pool, ``SparseKVCacheManager`` keeps
-    two sparse-context windows of full MLA KV for every request and layer. The
-    request-to-token pool has one extra padding row, which the manager also
-    allocates, so it must be included in the memory budget.
+    a configurable full-MLA-KV cache for every request and layer. Its capacity
+    is ``SGLANG_NPU_SPARSE_KV_DEVICE_CACHE_FACTOR * 2048``. The request-to-token
+    pool has one extra padding row, which the manager also allocates, so it must
+    be included in the memory budget.
     """
     if not is_sparsity_driven_kv_offload_enabled(
         model_config=model_config,
@@ -131,12 +154,10 @@ def get_sparsity_driven_kv_offload_fixed_memory_size(
             f"{max_running_requests_per_worker}."
         )
 
-    sparse_context_len = get_sparsity_driven_kv_offload_sparse_context_len(
-        model_config=model_config
-    )
-    device_cache_capacity = (
-        SPARSE_KV_DEVICE_CACHE_WINDOW_COUNT * sparse_context_len
-    )
+    # Preserve model-side validation even though device capacity is configured
+    # independently from the sparse attention window.
+    get_sparsity_driven_kv_offload_sparse_context_len(model_config=model_config)
+    device_cache_capacity = get_sparsity_driven_kv_offload_device_cache_capacity()
     kv_head_dim = int(model_config.kv_lora_rank) + int(
         model_config.qk_rope_head_dim
     )

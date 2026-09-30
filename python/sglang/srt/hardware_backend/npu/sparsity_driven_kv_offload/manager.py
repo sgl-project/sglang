@@ -17,7 +17,8 @@ from sgl_kernel_npu.sparsity_driven_kv_offload import (
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
-    SPARSE_KV_DEVICE_CACHE_WINDOW_COUNT,
+    SPARSE_KV_DEVICE_CACHE_CAPACITIES,
+    get_sparsity_driven_kv_offload_device_cache_capacity,
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import (
@@ -96,11 +97,10 @@ class SparseKVCacheManager:
                 "SparseKVCacheManager requires a positive sparse_context_len, "
                 f"got {self.sparse_context_len}."
             )
-        # Sparse attention consumes only sparse_context_len entries. The device
-        # cache keeps one additional window so entries not selected in the
-        # current step can survive according to LRU order.
+        # The device cache capacity is configured independently from the sparse
+        # attention window as k * 2048, where k is restricted to [1, 4].
         self.device_cache_capacity = (
-            SPARSE_KV_DEVICE_CACHE_WINDOW_COUNT * self.sparse_context_len
+            get_sparsity_driven_kv_offload_device_cache_capacity()
         )
         self.device = req_to_token_pool.device
         paged_kv_cache = token_to_kv_pool_allocator.get_kvcache()
@@ -946,10 +946,13 @@ class SparseKVCacheManager:
                     "Top-k and request batch sizes differ: "
                     f"topk_batch={batch_size}, request_batch={request_count}."
                 )
-            if topk_len != 2048 or self.device_cache_capacity != 4096:
+            if (
+                topk_len != 2048
+                or self.device_cache_capacity not in SPARSE_KV_DEVICE_CACHE_CAPACITIES
+            ):
                 raise RuntimeError(
-                    "The fused timestamp-LRU kernel currently requires "
-                    "topk_len=2048 and device_cache_capacity=4096, got "
+                    "The fused timestamp-LRU kernel requires topk_len=2048 and "
+                    "device_cache_capacity in {2048, 4096, 6144, 8192}, got "
                     f"topk_len={topk_len} and "
                     f"device_cache_capacity={self.device_cache_capacity}."
                 )

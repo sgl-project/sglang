@@ -665,6 +665,8 @@ class Envs:
     SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD = EnvBool(False)
     SGLANG_NPU_LOG_SPARSE_KV_CACHE_STATS = EnvBool(False)
     SGLANG_NPU_SPARSE_KV_PROBATION_AGE = EnvInt(4)
+    # Sparse KV device cache capacity is this factor multiplied by 2048.
+    SGLANG_NPU_SPARSE_KV_DEVICE_CACHE_FACTOR = EnvInt(2)
     # Forward native implementation for activation gelu tanh for model Skywork-Reward-Gemma-2-27B-v0.2
     SGLANG_NPU_FORWARD_NATIVE_GELUTANH = EnvBool(False)
     # Forward native implementation for gemma rms norm for model Skywork-Reward-Gemma-2-27B-v0.2
