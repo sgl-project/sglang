@@ -12,6 +12,11 @@ enum PoolJob {
         request: Box<TextRequest>,
         reply: oneshot::Sender<Result<TokenIdsRequest, Error>>,
     },
+    Detokenize {
+        token_ids: Vec<u32>,
+        skip_special_tokens: bool,
+        reply: oneshot::Sender<Result<String, Error>>,
+    },
     Stop,
 }
 
@@ -61,6 +66,14 @@ impl PooledTokenizer {
                                         tokenize_text_request(*request, tokenizer.as_ref());
                                     let _ = reply.send(result);
                                 }
+                                PoolJob::Detokenize {
+                                    token_ids,
+                                    skip_special_tokens,
+                                    reply,
+                                } => {
+                                    let result = tokenizer.decode(&token_ids, skip_special_tokens);
+                                    let _ = reply.send(result);
+                                }
                                 PoolJob::Stop => break,
                             }
                         }
@@ -89,6 +102,23 @@ impl PooledTokenizer {
         .map_err(|_| Error::Unavailable)?;
         result.await.map_err(|_| Error::WorkerDropped)?
     }
+
+    pub(crate) async fn detokenize(
+        &self,
+        token_ids: Vec<u32>,
+        skip_special_tokens: bool,
+    ) -> Result<String, Error> {
+        let jobs = self.inner.jobs.clone();
+        let (reply, result) = oneshot::channel();
+        jobs.send_async(PoolJob::Detokenize {
+            token_ids,
+            skip_special_tokens,
+            reply,
+        })
+        .await
+        .map_err(|_| Error::Unavailable)?;
+        result.await.map_err(|_| Error::WorkerDropped)?
+    }
 }
 
 /// Pluggable text→token-ids backend. `Send + Sync` so one instance is shared
@@ -106,6 +136,13 @@ pub trait TextTokenizer: Send + Sync {
             .map(|segment| segment.text)
             .collect::<String>();
         self.encode(&text, add_special_tokens)
+    }
+
+    /// Decode token IDs back to text. Encode-only backends keep the default.
+    fn decode(&self, _token_ids: &[u32], _skip_special_tokens: bool) -> Result<String, Error> {
+        Err(Error::Internal(
+            "the configured tokenizer does not support decoding".into(),
+        ))
     }
 }
 
@@ -331,6 +368,14 @@ impl TextTokenizer for DynamoTokenizer {
         .encode_segments(segments)
         .map_err(|error| Error::Tokenize(error.to_string()))?;
         Ok(encoding.token_ids().iter().map(|&id| id as i32).collect())
+    }
+
+    fn decode(&self, token_ids: &[u32], skip_special_tokens: bool) -> Result<String, Error> {
+        // `add_special_tokens` only affects encoding, so either handle decodes.
+        self.without_specials
+            .decode(token_ids, skip_special_tokens)
+            .map(String::from)
+            .map_err(|error| Error::Request(format!("Error decoding tokens: {error}")))
     }
 }
 

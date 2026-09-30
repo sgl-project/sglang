@@ -97,6 +97,16 @@ async fn binary_starts_without_an_engine_and_serves_only_preprocessing() {
     let tokenized: Value = tokenized.json().await.unwrap();
     assert!(tokenized["count"].as_u64().is_some_and(|count| count > 0));
 
+    let detokenized = client
+        .post(format!("{origin}/v1/detokenize"))
+        .json(&json!({"tokens": tokenized["tokens"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(detokenized.status(), StatusCode::OK);
+    let detokenized: Value = detokenized.json().await.unwrap();
+    assert_eq!(detokenized["text"], json!("hello"));
+
     let completion = json!({"model": "model", "prompt": "hello"});
     let rendered = client
         .post(format!("{origin}/v1/completions/render"))

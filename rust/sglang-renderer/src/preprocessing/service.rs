@@ -101,6 +101,30 @@ impl RendererService {
         Ok(self.tokenizer.tokenize(request).await?.input_ids)
     }
 
+    pub async fn detokenize(
+        &self,
+        token_ids: crate::TokenIds,
+        skip_special_tokens: bool,
+    ) -> Result<String, RendererError> {
+        let vocab_size = self.config.limits.vocab_size;
+        let token_ids = token_ids
+            .into_iter()
+            .map(|id| {
+                u32::try_from(id)
+                    .ok()
+                    .filter(|&id| u64::from(id) < vocab_size)
+                    .ok_or_else(|| {
+                        RendererError::Validation(format!(
+                            "tokens contains out-of-vocabulary token id {id}; valid range is [0, {vocab_size})"
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.tokenizer
+            .detokenize(token_ids, skip_special_tokens)
+            .await
+    }
+
     pub async fn tokenize_chat(
         &self,
         request: ChatRequest,
