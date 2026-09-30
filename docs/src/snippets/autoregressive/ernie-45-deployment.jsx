@@ -14,7 +14,8 @@ export const Ernie45Deployment = () => {
       items: [
         { id: 'mi300x', label: 'MI300X', default: true },
         { id: 'mi325x', label: 'MI325X', default: false },
-        { id: 'mi355x', label: 'MI355X', default: false }
+        { id: 'mi355x', label: 'MI355X', default: false },
+        { id: 'xeon', label: 'XEON', default: false }
       ]
     },
     strategy: {
@@ -23,8 +24,8 @@ export const Ernie45Deployment = () => {
       type: 'checkbox',
       items: [
         { id: 'tp', label: 'TP', subtitle: 'Tensor Parallel', default: true, required: true },
-        { id: 'dp', label: 'DP', subtitle: 'Data Parallel', default: false, disabledWhen: (values) => values.modelsize === '21b' },
-        { id: 'ep', label: 'EP', subtitle: 'Expert Parallel', default: false, disabledWhen: (values) => values.modelsize === '21b' }
+        { id: 'dp', label: 'DP', subtitle: 'Data Parallel', default: false, disabledWhen: (values) => values.modelsize === '21b' || values.hardware === 'xeon' },
+        { id: 'ep', label: 'EP', subtitle: 'Expert Parallel', default: false, disabledWhen: (values) => values.modelsize === '21b' || values.hardware === 'xeon' }
       ]
     }
   };
@@ -46,7 +47,12 @@ export const Ernie45Deployment = () => {
     let cmd = 'python3 -m sglang.launch_server \\\n';
     cmd += `  --model-path ${modelPath}`;
 
-    const tpValue = modelsize === '300b' ? 8 : 1;
+    const isXeon = hardware === 'xeon';
+    if (isXeon) {
+      cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
+    }
+
+    const tpValue = isXeon ? 6 : (modelsize === '300b' ? 8 : 1);
     const dpValue = modelsize === '300b' ? 8 : null;
     const epValue = modelsize === '300b' ? 8 : null;
 
@@ -54,11 +60,11 @@ export const Ernie45Deployment = () => {
       cmd += ` \\\n  --tp ${tpValue}`;
     }
 
-    if (strategyArray.includes('dp') && modelsize === '300b') {
+    if (strategyArray.includes('dp') && modelsize === '300b' && !isXeon) {
       cmd += ` \\\n  --dp ${dpValue} \\\n  --enable-dp-attention`;
     }
 
-    if (strategyArray.includes('ep') && modelsize === '300b') {
+    if (strategyArray.includes('ep') && modelsize === '300b' && !isXeon) {
       cmd += ` \\\n  --ep ${epValue}`;
     }
 

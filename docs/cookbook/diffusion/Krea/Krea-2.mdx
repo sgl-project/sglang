@@ -31,6 +31,12 @@ This section covers deploying Krea-2-Turbo for fast, high-quality image generati
 
 ### 3.1 Basic Configuration
 
+Intel Xeon CPU deployment is supported with `SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu` and the selected Krea-2 checkpoint.
+
+```bash Command
+SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu sglang serve --model-path krea/Krea-2-Turbo
+```
+
 Krea-2-Turbo generates high-quality images in only 8 inference steps. Launch the server with:
 
 ```bash Command
