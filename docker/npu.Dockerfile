@@ -75,11 +75,6 @@ ENV LANGUAGE=en_US:en
 ENV LC_ALL=en_US.UTF-8
 
 ### Install MemFabric and MemCache
-# 直接从 pip 源安装，不再从 OBS 桶下载 wheel（pip 会按 TARGETARCH 自动选 aarch64/x86_64 的包）。
-# 构建机不在 NPU 环境里，mfcli 无法自行识别芯片型号，所以必须显式传 --soc-version：
-#   DEVICE_TYPE=950 -> A5
-#   DEVICE_TYPE=a3  -> A3
-# 其他取值直接失败，避免装成不匹配的内核模块。
 RUN set -eux; \
     case "$DEVICE_TYPE" in \
       950) MF_SOC_VERSION="A5" ;; \
@@ -89,7 +84,7 @@ RUN set -eux; \
     esac; \
     ${PIP_INSTALL} memfabric-hybrid==${MF_VERSION}; \
     mfcli kernel install --soc-version "$MF_SOC_VERSION"; \
-    ${PIP_INSTALL} memcache-hybrid==${MF_VERSION} --no-deps
+    ${PIP_INSTALL} memcache-hybrid==${MF_VERSION}
 
 ### Install memfabric-zbal
 RUN if [ "$DEVICE_TYPE" = "950" ]; then ZBAL_PKG="memfabric-zbal==${ZBAL_VERSION_950}"; \
