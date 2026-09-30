@@ -272,6 +272,143 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
     assert worker.draft_model.lm_head is None
 
 
+@pytest.mark.parametrize("sample_route", ["selector", "lilicorr"])
+def test_worker_skips_graph_folded_sampler_above_capture_limit(sample_route):
+    """A batch above the captured graph limit must use the eager sampler.
+
+    max-running-requests can exceed cuda-graph-max-bs-decode.  Such a batch is
+    valid, but staging it into graph-sized static buffers would overflow them
+    before the model runner gets a chance to fall back to eager execution.
+    """
+    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+
+    staged = []
+    sampler = SimpleNamespace(
+        max_bs=8,
+        stage_sampling_params=lambda **kwargs: staged.append(kwargs),
+    )
+    worker = SimpleNamespace(
+        _draft_sampler=sampler,
+        selector=object() if sample_route == "selector" else None,
+        lilicorr=object() if sample_route == "lilicorr" else None,
+    )
+    batch = SimpleNamespace(sampling_info=object())
+
+    assert worker_mod.DFlashWorkerV2._prepare_draft_sampler(worker, batch=batch, bs=8)
+    assert staged == [{"bs": 8, "sampling_info": batch.sampling_info}]
+
+    assert not worker_mod.DFlashWorkerV2._prepare_draft_sampler(
+        worker, batch=batch, bs=9
+    )
+    assert len(staged) == 1
+
+
+@pytest.mark.parametrize("sampler_kind", ["greedy", "selector", "domino"])
+@pytest.mark.parametrize("bs", [8, 9, 10])
+def test_worker_checks_real_draft_sampler_capacity(sampler_kind, bs):
+    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+
+    weight = torch.empty(16, 4)
+    selector = None
+    if sampler_kind == "greedy":
+        sampler = worker_mod._DflashDraftSampler(
+            weight=weight, block_size=4, num_org=16, org_vocab_start=0, max_bs=8
+        )
+    elif sampler_kind == "selector":
+        selector = SimpleNamespace(top_k=2)
+        sampler = worker_mod._SelectorDraftSampler(
+            draft_model=SimpleNamespace(candidate_selector=selector),
+            block_size=4,
+            max_bs=8,
+            device="cpu",
+            sampling_enabled=True,
+        )
+    else:
+        sampler = worker_mod._DominoDraftSampler(
+            target_embedding=None,
+            lm_head_weight=weight,
+            prefix_gru=None,
+            embed_proj=None,
+            vocab_size=16,
+            block_size=4,
+            shift_label=False,
+            max_bs=8,
+            candidate_pool_size=0,
+        )
+
+    worker = SimpleNamespace(_draft_sampler=sampler, selector=selector, lilicorr=None)
+    batch = SimpleNamespace(
+        sampling_info=SimpleNamespace(
+            top_ks=torch.ones(bs, dtype=torch.int32),
+            temperatures=torch.full((bs, 1), 0.7),
+        )
+    )
+    assert worker_mod.DFlashWorkerV2._prepare_draft_sampler(
+        worker, batch=batch, bs=bs
+    ) == (bs <= 8)
+    assert sampler.out.numel() == 8 * 3
+    if selector is not None and bs > 8:
+        torch.testing.assert_close(sampler.temperatures, torch.ones(8))
+        assert sampler.greedy_mask.all()
+
+
+def test_worker_without_graph_folded_sampler_stays_eager():
+    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+
+    worker = SimpleNamespace(_draft_sampler=None, selector=None)
+    assert not worker_mod.DFlashWorkerV2._prepare_draft_sampler(
+        worker, batch=SimpleNamespace(sampling_info=None), bs=9
+    )
+
+
+def test_worker_stages_lilicorr_sampling_only_within_capture_limit():
+    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+    from sglang.srt.speculative.lilicorr_utils import LiLiCorrDraftSampler
+
+    class Head(torch.nn.Module):
+        candidate_topk = 2
+
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(4))
+
+        def build_token_table(self, embed_tokens):
+            return None
+
+    sampler = LiLiCorrDraftSampler(
+        head=Head(),
+        embed_tokens=None,
+        lm_head=None,
+        block_size=4,
+        max_bs=8,
+        anchor_features=4,
+        sampling_enabled=True,
+    )
+    worker = SimpleNamespace(_draft_sampler=sampler, selector=None, lilicorr=object())
+    batch = SimpleNamespace(
+        sampling_info=SimpleNamespace(
+            top_ks=torch.full((8,), 4),
+            temperatures=torch.full((8, 1), 0.7),
+        )
+    )
+
+    assert worker_mod.DFlashWorkerV2._prepare_draft_sampler(worker, batch=batch, bs=8)
+    torch.testing.assert_close(sampler.temperatures, torch.full((8,), 0.7))
+    assert not sampler.greedy_mask.any()
+
+    larger_batch = SimpleNamespace(
+        sampling_info=SimpleNamespace(
+            top_ks=torch.full((9,), 4),
+            temperatures=torch.full((9, 1), 0.4),
+        )
+    )
+    assert not worker_mod.DFlashWorkerV2._prepare_draft_sampler(
+        worker, batch=larger_batch, bs=9
+    )
+    torch.testing.assert_close(sampler.temperatures, torch.full((8,), 0.7))
+    assert not sampler.greedy_mask.any()
+
+
 def test_lilicorr_sampling_falls_back_when_the_device_cannot_accept_it(monkeypatch):
     from sglang.srt.speculative import dflash_worker_v2 as worker_mod
 
