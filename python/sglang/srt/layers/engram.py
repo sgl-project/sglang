@@ -239,6 +239,11 @@ class EngramHasher(nn.Module):
         self.image_token_id: Optional[int] = None
         self.history: Optional[torch.Tensor] = None
         self.pad_row = 0
+        # typing only
+        self.token_map: torch.Tensor
+        self.multipliers: torch.Tensor
+        self.primes: torch.Tensor
+        self.offsets: torch.Tensor
 
     def init_history(self, num_req_slots: int, device) -> None:
         """Allocate oldest-first history with a spare row for graph padding."""
@@ -309,7 +314,13 @@ class EngramHasher(nn.Module):
             )
             lens = forward_batch.extend_seq_lens.to(torch.int64)
             starts = forward_batch.extend_start_loc.to(torch.int64)
-            row = torch.repeat_interleave(torch.arange(bs, device=device), lens)
+            lens_cpu = forward_batch.extend_seq_lens_cpu
+            row = torch.repeat_interleave(
+                torch.arange(bs, device=device),
+                lens,
+                # The host total skips the device sum's sync.
+                output_size=sum(lens_cpu) if lens_cpu is not None else None,
+            )
             num_real = row.shape[0]
             kmode = MODE_EXTEND
             if forward_batch.engram_history is not None:

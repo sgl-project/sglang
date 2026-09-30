@@ -82,7 +82,6 @@ from sglang.srt.layers.attention.dsv4.v41_indexer import (
     CapturedPrefillInputs,
     DecodeInputs,
     PrefillInputs,
-    Selection,
     has_dense_fp4_indexer,
     is_sm100_or_newer,
     make_candidate_indexer,
@@ -122,6 +121,7 @@ from sglang.srt.speculative.ragged_verify import (
     resolve_ragged_verify_layout,
 )
 from sglang.srt.utils import ceil_align, is_cuda, is_xpu
+from sglang.srt.utils.common import async_h2d
 
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
@@ -2803,6 +2803,22 @@ class DeepseekV4AttnBackend(
             self._low_ratio_compress_fused(
                 layer, x, req, pos, draft_len=self.speculative_num_draft_tokens
             )
+        elif (
+            layer.compressor.use_fused_compress
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and forward_batch.extend_start_loc is not None
+        ):
+            # DP padding extends extend_seq_lens but not extend_start_loc, whose
+            # length is the request count; padded rows belong to no request.
+            start_loc = forward_batch.extend_start_loc
+            seq_lens = forward_batch.extend_seq_lens[: start_loc.shape[0]]
+            self._low_ratio_compress_fused(
+                layer,
+                x,
+                req,
+                pos,
+                extend_offsets=(start_loc.to(torch.int32), seq_lens.to(torch.int32)),
+            )
         else:
             self._low_ratio_compress_torch(
                 layer,
@@ -2872,13 +2888,18 @@ class DeepseekV4AttnBackend(
             fuse_index_store=is_sm100_or_newer(),
         )
 
-    def _low_ratio_compress_fused(self, layer, x, req, pos, *, draft_len=1) -> None:
+    def _low_ratio_compress_fused(
+        self, layer, x, req, pos, *, draft_len=1, extend_offsets=None
+    ) -> None:
+        """Decode or target-verify; an extend batch passes ``extend_offsets``, the int32
+        (first row, row count) of each request."""
         from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import (
             index_k_norm_rope_pack_store,
         )
         from sglang.kernels.ops.attention.dsv4.low_ratio_compress import (
             c1_decode_norm_rope_store,
             c2_decode_norm_rope_store,
+            c2_prefill_norm_rope_store,
         )
 
         pool = self.token_to_kv_pool
@@ -2911,7 +2932,7 @@ class DeepseekV4AttnBackend(
             # CompressStatePool stores each request's pending pairs in a position ring.
             # KVAndScore rows use | kv | score |, addressed as req * ring_size + pos % ring_size.
             state = pool.get_attention_compress_states(layer_id)
-            latent = c2_decode_norm_rope_store(
+            args = (
                 compressor.project_fused(x),
                 state.kv_score_buffer.kv_score,
                 compressor.norm.weight.data,
@@ -2921,11 +2942,23 @@ class DeepseekV4AttnBackend(
                 compressor.norm.eps,
                 freqs_cis,
                 kv_cache,
-                page_size=page_size,
-                ring_size=state.ring_size,
-                draft_len=draft_len,
-                layout=kv_layout,
             )
+            if extend_offsets is None:
+                latent = c2_decode_norm_rope_store(
+                    *args,
+                    page_size=page_size,
+                    ring_size=state.ring_size,
+                    draft_len=draft_len,
+                    layout=kv_layout,
+                )
+            else:
+                latent = c2_prefill_norm_rope_store(
+                    *args,
+                    *extend_offsets,
+                    page_size=page_size,
+                    ring_size=state.ring_size,
+                    layout=kv_layout,
+                )
             out_loc = core.c2_out_loc
 
         indexer = layer.indexer
@@ -3084,7 +3117,6 @@ class DeepseekV4AttnBackend(
         is_source = layer.indexer.is_candidate_source
         is_consumer = layer.indexer.uses_candidates
         ratio = layer.compress_ratio
-        out = self._get_low_ratio_selection(ratio)
         published = self.forward_metadata.candidate_metadata
         mode = forward_batch.forward_mode
         if mode.is_decode() or mode.is_target_verify():
@@ -3102,27 +3134,28 @@ class DeepseekV4AttnBackend(
                 layer, x, q_lora, req, pos, mode
             )
             if is_source:
-                published = self.decode_candidates.publish_decode(inputs, out)
+                published = self.decode_candidates.publish_decode(inputs)
                 self._publish_candidate_metadata(published)
             elif is_consumer:
-                self.decode_candidates.consume_decode(inputs, published, out)
+                self.decode_candidates.consume_decode(inputs, published)
             else:
-                self.full_topk_indexer.topk_decode(inputs, out)
+                self.full_topk_indexer.topk_decode(inputs)
         else:
             inputs = self._make_low_ratio_prefill_indexer_inputs(
                 layer, x, q_lora, req, pos, forward_batch, rows_per_request
             )
             if is_source:
-                published = self.prefill_candidates.publish_prefill(inputs, out)
+                published = self.prefill_candidates.publish_prefill(inputs)
                 self._publish_candidate_metadata(published)
             elif is_consumer:
-                self.prefill_candidates.consume_prefill(inputs, published, out)
+                self.prefill_candidates.consume_prefill(inputs, published)
             else:
-                self.full_topk_indexer.topk_prefill(inputs, out)
+                self.full_topk_indexer.topk_prefill(inputs)
 
     def _low_ratio_index_topk_captured(self, layer, projected_q, projected_w) -> None:
         ratio = layer.compress_ratio
         indexer = layer.indexer
+        core = self.forward_metadata.core_metadata
         metadata = (
             self.forward_metadata.c1_indexer_metadata
             if ratio == 1
@@ -3141,16 +3174,10 @@ class DeepseekV4AttnBackend(
             q=projected_q,
             weights=projected_w,
             paged_metadata=metadata,
+            out_page_indices=core.sparse_page_indices(ratio),
+            out_raw_indices=core.sparse_raw_indices(ratio),
         )
-        out = self._get_low_ratio_selection(ratio)
-        self.full_topk_indexer.topk_prefill_captured(inputs, out)
-
-    def _get_low_ratio_selection(self, compress_ratio: int) -> Selection:
-        core = self.forward_metadata.core_metadata
-        return Selection(
-            page_indices=core.sparse_page_indices(compress_ratio),
-            raw_indices=core.sparse_raw_indices(compress_ratio),
-        )
+        self.full_topk_indexer.topk_prefill_captured(inputs)
 
     def _make_low_ratio_decode_indexer_inputs(self, layer, x, q_lora, req, pos, mode):
         ratio = layer.compress_ratio
@@ -3171,6 +3198,9 @@ class DeepseekV4AttnBackend(
             req_rows=req,
             paged_metadata=metadata,
             is_verify=mode.is_target_verify(),
+            out_page_indices=self.forward_metadata.core_metadata.sparse_page_indices(
+                ratio
+            ),
         )
 
     def _make_low_ratio_prefill_indexer_inputs(
@@ -3183,9 +3213,10 @@ class DeepseekV4AttnBackend(
         forward_batch,
         rows_per_request,
     ) -> PrefillInputs:
+        core = self.forward_metadata.core_metadata
         tail = self.forward_metadata.late_layer_tail
         if rows_per_request is not None:
-            rows_per_request_device = torch.tensor(
+            rows_per_request_device = async_h2d(
                 rows_per_request, dtype=torch.int32, device=x.device
             )
         elif tail is not None:
@@ -3204,10 +3235,29 @@ class DeepseekV4AttnBackend(
             positions=pos,
             req_rows=req,
             req_pool_indices=forward_batch.req_pool_indices,
-            kv_page_table=self.forward_metadata.core_metadata.page_table,
+            kv_page_table=core.page_table,
             seq_lens_cpu=_as_int_list(forward_batch.seq_lens_cpu),
             rows_per_request=rows_per_request,
             rows_per_request_device=rows_per_request_device,
+            out_raw_indices=core.sparse_raw_indices(layer.compress_ratio),
+            out_page_indices=(
+                core.sparse_page_indices(layer.compress_ratio)
+                if self._low_ratio_prefill_reads_page_indices(forward_batch)
+                else None
+            ),
+        )
+
+    def _low_ratio_prefill_reads_page_indices(self, forward_batch: ForwardBatch):
+        # The negation of the sparse-prefill gate in forward(), which reads only
+        # raw_indices; the query-count clause is dropped, so this errs to True.
+        return (
+            self.trtllm_attn
+            or not forward_batch.forward_mode.is_extend_without_speculative()
+            or get_platform().is_sm120
+            or self.tail_forward_metadata is not None
+            or self.forward_metadata.late_layer_tail is not None
+            or self.token_to_kv_pool.request_window is not None
+            or not envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
         )
 
     def _publish_candidate_metadata(self, published: Optional[CandidateMetadata]):
