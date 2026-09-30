@@ -7,18 +7,13 @@ from contextlib import contextmanager, nullcontext
 
 import torch
 
-from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
     quality_allows_kernel_fusions,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import (
     get_replica_group,
     model_parallel_is_initialized,
-)
-from sglang.multimodal_gen.runtime.entrypoints.streaming_video_encoder import (
-    start_streaming_video_encoder,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
@@ -197,66 +192,6 @@ def _canonical_visual_video_frames(
     return frames
 
 
-def _streaming_output_path(batch: Req, server_args: ServerArgs) -> str | None:
-    """MP4 path the worker's direct save will write for this request, if the
-    decoded frames can be H.264-encoded while later chunks still decode."""
-    if (
-        not batch.save_output
-        or not batch.return_file_paths_only
-        or batch.return_raw_frames
-        or batch.data_type != DataType.VIDEO
-        or batch.num_outputs_per_prompt != 1
-        or batch.enable_frame_interpolation
-        or batch.enable_upscaling
-        or batch.extra.get("dynamic_batch_output_paths") is not None
-        or server_args.enable_torch_compile
-        or type(server_args.pipeline_config).post_decoding
-        is not PipelineConfig.post_decoding
-    ):
-        return None
-    if model_parallel_is_initialized() and get_replica_group().rank_in_group != 0:
-        return None
-    return batch.output_file_path(1, 0)
-
-
-class _StreamingFrameSink:
-    """Reverts, crops and encodes each decoded chunk as the final output would."""
-
-    def __init__(self, *, batch: Req, save_file_path: str) -> None:
-        self._batch = batch
-        self._save_file_path = save_file_path
-        self.video_vae = None
-        self.encoder = None
-        self._unavailable = False
-
-    def __call__(self, part: torch.Tensor) -> None:
-        if self._unavailable:
-            return
-        frames = self.video_vae.processor.revert_tensor(part)
-        frames = _crop_to_target_canvas(self._batch, frames)
-        if self.encoder is None:
-            self.encoder = start_streaming_video_encoder(
-                save_file_path=self._save_file_path,
-                width=int(frames.shape[-1]),
-                height=int(frames.shape[-2]),
-                fps=int(self._batch.fps),
-                output_compression=self._batch.output_compression,
-            )
-            if self.encoder is None:
-                self._unavailable = True
-                return
-        self.encoder.push(frames[0])
-
-
-@contextmanager
-def _installed_frame_sink(video_vae, sink: _StreamingFrameSink | None):
-    video_vae._sgl_frame_sink = sink
-    try:
-        yield
-    finally:
-        video_vae._sgl_frame_sink = None
-
-
 def _canonical_output_audio_waveform(
     audio_waveform: torch.Tensor, *, batch_size: int
 ) -> torch.Tensor:
@@ -425,28 +360,6 @@ class MiniMaxH3DecodingStage(DecodingStage):
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
-        save_file_path = _streaming_output_path(batch, server_args)
-        frame_sink = (
-            None
-            if save_file_path is None
-            else _StreamingFrameSink(batch=batch, save_file_path=save_file_path)
-        )
-        try:
-            output = self._decode_outputs(batch, server_args, frame_sink)
-        except BaseException:
-            if frame_sink is not None and frame_sink.encoder is not None:
-                frame_sink.encoder.abort()
-            raise
-        if frame_sink is not None:
-            output.streaming_encoder = frame_sink.encoder
-        return output
-
-    def _decode_outputs(
-        self,
-        batch: Req,
-        server_args: ServerArgs,
-        frame_sink: _StreamingFrameSink | None,
-    ) -> OutputBatch:
         _minimax_h3_decoder_task(batch)
         visual_latent = _required_tensor(batch.latents, "batch.latents")
         audio_latent = _required_tensor(batch.audio_latents, "batch.audio_latents")
@@ -466,8 +379,6 @@ class MiniMaxH3DecodingStage(DecodingStage):
             if selected_video_vae is None:
                 raise RuntimeError("video_vae became unavailable during decode")
             self.video_vae = selected_video_vae
-            if frame_sink is not None:
-                frame_sink.video_vae = selected_video_vae
             if selected_video_vae.training:
                 selected_video_vae.eval()
             visual_arch_config = server_args.pipeline_config.vae_config.arch_config
@@ -498,7 +409,6 @@ class MiniMaxH3DecodingStage(DecodingStage):
                         selected_video_vae,
                         quality_allows_kernel_fusions(batch.sampling_params.quality),
                     ),
-                    _installed_frame_sink(selected_video_vae, frame_sink),
                     set_forward_context(current_timestep=0, attn_metadata=None),
                 ):
                     visual_frames = video_decode(visual_decode_latent)

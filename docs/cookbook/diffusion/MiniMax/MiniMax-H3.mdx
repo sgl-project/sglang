@@ -887,12 +887,6 @@ VAEs keep their own backends. Ulysses sequence parallelism is supported. See
 `torch_sdpa`, ...) also runs on the FastH3 weights without VSA flags, and
 `sglang generate` takes the same flags as `sglang serve`.
 
-Every MiniMax-H3 pipeline H.264-encodes a served MP4 while the VAE is still
-decoding: each finished temporal chunk is streamed to libx264, and the save
-only muxes the audio track. The frames are those of the one-pass encode, which
-other outputs (several videos per request, frame interpolation, upscaling,
-`torch.compile`) still use.
-
 Measured latencies for the 4× GB300 recipe are in
 [FastH3 on GB300](#fasth3-on-gb300).
 
@@ -1610,7 +1604,10 @@ python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
 A 4× GB300 host served [FastH3](#6-fasth3-8-step-distilled) with the VSA-H3
 recipe above (1344×768 at 24 fps with audio, `task: "t2va"`,
 `num_inference_steps: 9`, the default `quality: "extra-high"` and sparsity 0.8,
-eager BF16, Ulysses4, `NCCL_NVLS_ENABLE=0`). The workload is 72 requests at
+eager BF16, Ulysses4, `NCCL_NVLS_ENABLE=0`), measured with the MP4 encoded
+while the VAE decodes
+([sgl-project/sglang#41819](https://github.com/sgl-project/sglang/pull/41819)).
+The workload is 72 requests at
 concurrency 1 after one warm request per shape: six scene families, 1,000- and
 10,000-token prompts, 5 / 10 / 15 s, two seeds, every prompt unique so no
 conditioning cache hits. E2E is the client wall clock from submission to the

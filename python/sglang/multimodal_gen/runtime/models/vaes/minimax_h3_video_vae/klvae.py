@@ -170,8 +170,6 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         self.stack_tiling = kwargs.get("stack_tiling", False)
         # Installed by the quality-gated CUDA fast path; stacks tiles when open.
         self._sgl_stack_tiles_gate = None
-        # Called with each finished output frame chunk [B, C, t, H, W], in order.
-        self._sgl_frame_sink = None
         self.tile_size = kwargs.get("tile_size", 256)
         self.tile_overlap_min = kwargs.get("tile_overlap_min", 64)
         self.decoder_tile_size = kwargs.get("decoder_tile_size", self.tile_size)
@@ -708,8 +706,6 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                     part[:, :, :copy_frames, :, :]
                 )
                 write_pos += copy_frames
-                if self._sgl_frame_sink is not None:
-                    self._sgl_frame_sink(part[:, :, :copy_frames, :, :])
             dropped_frames += part_frames - copy_frames
 
         for i in range(num_chunks):
