@@ -28,6 +28,8 @@ from sglang.kernels.ops.diffusion import (
     can_use_flux2_gated_resnorm,
     can_use_flux2_strided_qknorm_rope,
     can_use_fused_layernorm_modulate,
+    can_use_xpu_gated_resnorm,
+    can_use_xpu_layernorm_modulate,
     flux2_gated_resnorm_raw,
     flux2_nvfp4_swiglu_quant_active,
     flux2_strided_qknorm_rope,
@@ -37,9 +39,12 @@ from sglang.kernels.ops.diffusion import (
     is_plain_layer_norm,
     mark_flux2_nvfp4_swiglu_quant_site,
     residual_gate_add,
+    tensors_equal,
     try_flux2_token_cat_fp8,
     try_flux2_token_cat_nvfp4,
     try_fused_flux2_qkv_epilogue,
+    xpu_gated_resnorm,
+    xpu_layernorm_modulate,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
@@ -98,6 +103,11 @@ _get_qkv_projections = get_qkv_projections
 _FLUX2_LN_MOD = BitExactFusionGate("FLUX.2 fused LN+modulate", per_signature=True)
 _FLUX2_LN_MOD_SIGS = _FLUX2_LN_MOD.verified_sigs
 assert _FLUX2_LN_MOD_SIGS is not None
+# The CUDA gated-resnorm kernel is exact by construction; the XPU one replicates
+# torch-xpu's LayerNorm and is verified once per signature like LN+modulate.
+_FLUX2_XPU_GATED_RESNORM = BitExactFusionGate(
+    "FLUX.2 fused gated residual+LN+modulate (XPU)", per_signature=True
+)
 _FLUX2_SWIGLU = BitExactFusionGate("FLUX.2 fused SwiGLU", per_signature=True)
 _FLUX2_SWIGLU_SIGS = _FLUX2_SWIGLU.verified_sigs
 assert _FLUX2_SWIGLU_SIGS is not None
@@ -262,9 +272,24 @@ def _materialize_gated_residual(pending: PendingGatedResidual) -> torch.Tensor:
 def _defer_gated_residual(
     residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
 ) -> torch.Tensor | PendingGatedResidual:
-    if can_defer_flux2_gated_residual(residual, update, gate):
+    if can_defer_flux2_gated_residual(residual, update, gate) or _can_defer_xpu(
+        residual, update, gate
+    ):
         return residual, update, gate
     return residual_gate_add(residual, update, gate)
+
+
+def _can_defer_xpu(
+    residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
+) -> bool:
+    # The consuming norm's scale/shift are not known yet; the gate row stands in
+    # for their layout, and _flux2_gated_resnorm falls back if they differ.
+    return (
+        residual.is_xpu
+        and not torch.compiler.is_compiling()
+        and not _FLUX2_XPU_GATED_RESNORM.disabled
+        and can_use_xpu_gated_resnorm(residual, update, gate, gate, gate)
+    )
 
 
 def _flux2_derive_rope_tensors(
@@ -306,9 +331,55 @@ def _flux2_gated_resnorm(
         residual, update, gate, scale, shift
     ):
         return flux2_gated_resnorm_raw(residual, update, gate, scale, shift, norm.eps)
+    if residual.is_xpu and is_plain_layer_norm(norm, residual.shape[-1]):
+        fused = _xpu_gated_resnorm(norm, residual, update, gate, scale, shift)
+        if fused is not None:
+            return fused
 
     residual = residual_gate_add(residual, update, gate)
     return _flux2_norm_modulate(norm, residual, scale, shift), residual
+
+
+def _xpu_gated_resnorm(
+    norm: nn.Module,
+    residual: torch.Tensor,
+    update: torch.Tensor,
+    gate: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    """Bit-exact single-kernel ``r = residual + update * gate; LN(r) * (1 + scale) + shift``."""
+    if (
+        torch.compiler.is_compiling()
+        or _FLUX2_XPU_GATED_RESNORM.disabled
+        or not can_use_xpu_gated_resnorm(residual, update, gate, scale, shift)
+    ):
+        return None
+    # Exactness depends on the reduction width and row layouts, not on row count.
+    sig = (residual.dtype, residual.device, residual.shape[-1], norm.eps)
+    verified = _FLUX2_XPU_GATED_RESNORM.is_verified(sig)
+    if not verified and torch.xpu.is_current_stream_capturing():
+        return None
+    try:
+        out = xpu_gated_resnorm(residual, update, gate, scale, shift, norm.eps)
+    except Exception as exc:
+        _FLUX2_XPU_GATED_RESNORM.on_exception(exc, logger=logger)
+        return None
+    if verified:
+        return out
+    ref_residual = residual_gate_add(residual, update, gate)
+    ref = (norm(ref_residual) * (1 + scale) + shift, ref_residual)
+    return _FLUX2_XPU_GATED_RESNORM.accept_or_fallback(
+        out,
+        ref,
+        sig=sig,
+        equal=tensors_equal,
+        logger=logger,
+        mismatch_msg=(
+            "FLUX.2 fused XPU gated residual+LN+modulate fast path is not "
+            "bit-exact on this platform; falling back to eager"
+        ),
+    )
 
 
 def _can_use_nvfp4_swiglu_quant_fusion(capability: Any) -> bool:
@@ -371,10 +442,11 @@ def _flux2_norm_modulate(
 
     scale_row = scale.squeeze(1) if scale.dim() == 3 and scale.shape[1] == 1 else scale
     shift_row = shift.squeeze(1) if shift.dim() == 3 and shift.shape[1] == 1 else shift
+    use_xpu = x.is_xpu and can_use_xpu_layernorm_modulate(x, scale_row, shift_row)
     if (
         _FLUX2_LN_MOD.disabled
         or not is_plain_layer_norm(norm, x.shape[-1])
-        or not can_use_fused_layernorm_modulate(x, scale_row, shift_row)
+        or not (use_xpu or can_use_fused_layernorm_modulate(x, scale_row, shift_row))
     ):
         return norm(x) * (1 + scale) + shift
 
@@ -392,11 +464,12 @@ def _flux2_norm_modulate(
         norm.eps,
     )
     verified = sig in _FLUX2_LN_MOD_SIGS
-    if not verified and torch.cuda.is_current_stream_capturing():
+    if not verified and torch.get_device_module(x.device).is_current_stream_capturing():
         return norm(x) * (1 + scale) + shift
+    kernel = xpu_layernorm_modulate if use_xpu else fused_layernorm_modulate_raw
     try:
         # Direct dispatch avoids custom-op overhead on this eager-only path.
-        out = fused_layernorm_modulate_raw(x, scale_row, shift_row, norm.eps)
+        out = kernel(x, scale_row, shift_row, norm.eps)
     except Exception as exc:
         _FLUX2_LN_MOD.on_exception(exc, logger=logger)
         return norm(x) * (1 + scale) + shift
