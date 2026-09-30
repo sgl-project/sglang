@@ -190,6 +190,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             req_to_token=torch.arange(8).unsqueeze(0)
         )
         manager.page_size = 1
+        manager.is_eagle = False
         manager.offload_stride = 1
         manager.request_counter = 0
         manager.tp_world_size = tp_world_size

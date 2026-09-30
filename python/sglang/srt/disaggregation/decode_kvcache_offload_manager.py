@@ -29,13 +29,16 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedSWAKVPool
-from sglang.srt.mem_cache.utils import storage_namespace_seed
+from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.runtime_context import (
     get_memory,
     get_schedule,
     get_serving,
+    get_spec,
 )
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -67,6 +70,11 @@ class DecodeKVCacheOffloadManager:
             )
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
+        # Same flag as the prefill tree's bigram keys; the tree's Mamba exemption
+        # never applies because decode offload rejects Mamba pools.
+        self.is_eagle = SpeculativeAlgorithm.from_string(
+            get_spec().speculative_algorithm
+        ).is_eagle()
 
         hicache_storage_backend_extra_config = {}
         if get_memory().hicache_storage_backend_extra_config:
@@ -156,7 +164,9 @@ class DecodeKVCacheOffloadManager:
 
     def _prefill_offloaded_len(self, req: Req) -> int:
         # Page-aligned prompt length; the prefill instance offloaded this part.
-        return len(req.origin_input_ids) // self.page_size * self.page_size
+        # A bigram key over N prompt tokens has N - 1 entries.
+        prompt_key_len = len(req.origin_input_ids) - int(self.is_eagle)
+        return prompt_key_len // self.page_size * self.page_size
 
     def has_inflight_device_transfer(self) -> bool:
         """Whether a device-to-host copy may still read unified KV pages."""
@@ -198,19 +208,21 @@ class DecodeKVCacheOffloadManager:
             return False
 
         # Prefill side offloads page-aligned origin_input_ids, decode side offloads the incremental part
-        all_tokens = req.origin_input_ids + req.output_ids[:-1]
+        # output_ids[-1] has no KV yet; it only serves as the bigram lookahead.
+        all_tokens = req.origin_input_ids + req.output_ids
+        lookahead = int(self.is_eagle)
         prefill_offloaded_len = self._prefill_offloaded_len(req)
         state = self.offloaded_state.get(req)
         if state is None:
             prefill_hashes = self._compute_prefix_hash(
-                req, req.origin_input_ids[:prefill_offloaded_len]
+                req, req.origin_input_ids[: prefill_offloaded_len + lookahead]
             )
             last_prefill_hash = (
                 prefill_hashes[-1] if prefill_offloaded_len > 0 else None
             )
             state = OffloadedState(last_hash=last_prefill_hash)
             self.offloaded_state[req] = state
-        incremental_total = len(all_tokens) - prefill_offloaded_len
+        incremental_total = len(all_tokens) - 1 - prefill_offloaded_len
         incremental_new = incremental_total - state.inc_len
         incremental_aligned_len = (
             incremental_new // self.offload_stride * self.offload_stride
@@ -222,7 +234,7 @@ class DecodeKVCacheOffloadManager:
         # Extract incremental tokens and indices for the newly available chunk
         start = prefill_offloaded_len + state.inc_len
         end = start + incremental_aligned_len
-        incremental_tokens = all_tokens[start:end]
+        incremental_tokens = all_tokens[start : end + lookahead]
         incremental_indices = token_indices[start:end].to(torch.int64)
         device_indices, pool_transfers = self._resolve_offload_transfers(
             incremental_indices
@@ -401,15 +413,15 @@ class DecodeKVCacheOffloadManager:
         )
         return page_hashes[-1] if len(page_hashes) > 0 else prior_hash
 
-    def _compute_prefix_hash(self, req: Req, tokens, prior_hash=""):
+    def _compute_prefix_hash(self, req: Req, tokens, prior_hash=None):
         """Match prefill storage hashes."""
-        page_hashes = []
-        last_hash = prior_hash or storage_namespace_seed(req.extra_key, req.cache_salt)
-        for offset in range(0, len(tokens), self.page_size):
-            page_tokens = tokens[offset : offset + self.page_size]
-            last_hash = self.cache_controller.get_hash_str(page_tokens, last_hash)
-            page_hashes.append(last_hash)
-        return page_hashes
+        key = RadixKey(
+            tokens,
+            req.extra_key,
+            is_bigram=self.is_eagle,
+            cache_salt=req.cache_salt,
+        )
+        return get_storage_hash_str(key, prior_hash, page_size=self.page_size)
 
     def finalize_release_on_finish(self, req: Req):
         """Free any remaining tail KV that was not offloaded due to non-aligned length."""
