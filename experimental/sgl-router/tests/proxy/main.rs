@@ -22,6 +22,7 @@ mod pd_bootstrap_injection;
 mod pd_load_monitor;
 mod pd_pool_isolation;
 mod pd_transfer_group;
+mod responses_api;
 mod roundrobin_input_ids;
 mod sampling_overrides;
 mod sticky_input_ids;

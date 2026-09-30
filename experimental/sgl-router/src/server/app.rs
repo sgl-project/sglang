@@ -358,6 +358,37 @@ async fn access_log_and_record(
     resp
 }
 
+fn route_error(status: StatusCode, code: &'static str, message: String) -> Response {
+    use axum::response::IntoResponse;
+    (
+        status,
+        axum::Json(serde_json::json!({
+            "error": {"type": "invalid_request_error", "code": code, "message": message}
+        })),
+    )
+        .into_response()
+}
+
+async fn unmatched_route(uri: axum::http::Uri) -> Response {
+    route_error(
+        StatusCode::NOT_FOUND,
+        "not_found",
+        format!(
+            "no route for path `{}`; supported endpoints are /v1/chat/completions, \
+             /v1/responses, /v1/models, /v1/tokenize and /v1/detokenize",
+            uri.path()
+        ),
+    )
+}
+
+async fn method_not_allowed(method: axum::http::Method, uri: axum::http::Uri) -> Response {
+    route_error(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method_not_allowed",
+        format!("method {method} is not allowed on `{}`", uri.path()),
+    )
+}
+
 pub fn build_router(ctx: Arc<AppContext>) -> Router {
     let router = Router::new()
         .route("/healthz", get(crate::server::routes::health::healthz))
@@ -378,6 +409,12 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
         .route(
             "/v1/chat/completions",
             post(crate::server::routes::chat::chat_completions)
+                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(middleware::from_fn(log_413)),
+        )
+        .route(
+            "/v1/responses",
+            post(crate::server::routes::responses::responses)
                 .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
                 .layer(middleware::from_fn(log_413)),
         )
@@ -427,6 +464,12 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
     );
 
     router
+        // Unknown paths and wrong methods answer with the same structured
+        // `{"error": {...}}` envelope as every other error, instead of axum's
+        // empty-body default — clients (and API acceptance suites) expect a
+        // message saying what went wrong.
+        .fallback(unmatched_route)
+        .method_not_allowed_fallback(method_not_allowed)
         // Convert a handler panic into a 500 response. hyper otherwise catches
         // the panic and drops the connection WITHOUT a Response, so the failure
         // never reaches the `access_log_and_record` middleware below and is

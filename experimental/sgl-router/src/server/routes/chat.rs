@@ -248,7 +248,7 @@ pub(crate) async fn chat_completions(
 /// counting to the outermost `access_log_and_record` middleware (see
 /// [`crate::server::app`]). It still records auxiliary metrics (TTFT, request
 /// duration, stale-request, ingress-tokenize errors) and emits diagnostic logs.
-async fn chat_completions_inner(
+pub(crate) async fn chat_completions_inner(
     ctx: Arc<AppContext>,
     headers: HeaderMap,
     phase: Option<Arc<RequestPhaseCell>>,
