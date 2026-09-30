@@ -5299,6 +5299,52 @@ class Scheduler(
 
         return GetInternalStateReqOutput(internal_state=msgspec_to_builtins(ret))
 
+    def _has_active_sampling_mask_request(self) -> bool:
+        """Whether any unfinished request holding a sampling mask is queued or
+        running, including PP micro-batches and PD decode queues."""
+        active_batches = [self.running_batch, self.last_batch]
+        active_batches.extend(getattr(self, "running_mbs", ()))
+        active_batches.extend(getattr(self, "mbs", ()))
+        active_batches.extend(getattr(self, "last_mbs", ()))
+        has_active_mask_request = any(
+            req.return_sampling_mask and not req.finished()
+            for batch in active_batches
+            if batch is not None
+            for req in batch.reqs
+        )
+        has_active_mask_request |= any(
+            req.return_sampling_mask and not req.finished()
+            for req in self.waiting_queue
+        )
+        has_active_mask_request |= any(
+            req.return_sampling_mask and not req.finished()
+            for req in self.grammar_manager.grammar_queue
+        )
+        has_active_mask_request |= (
+            self.chunked_req is not None
+            and self.chunked_req.return_sampling_mask
+            and not self.chunked_req.finished()
+        )
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            prealloc_queue = self.disagg_decode_prealloc_queue
+            decode_reqs = [
+                *prealloc_queue.queue,
+                *prealloc_queue.pending_reqs,
+                *self.disagg_decode_transfer_queue.queue,
+            ]
+            has_active_mask_request |= any(
+                decode_req.req.return_sampling_mask and not decode_req.req.finished()
+                for decode_req in decode_reqs
+            )
+            has_active_mask_request |= any(
+                req.return_sampling_mask and not req.finished()
+                for req in (
+                    *prealloc_queue.retracted_queue,
+                    *prealloc_queue.held_rebootstrap_reqs,
+                )
+            )
+        return has_active_mask_request
+
     def set_internal_state(self, recv_req: SetInternalStateReq):
         server_args_dict = recv_req.server_args
         args_allow_update = set(
@@ -5334,49 +5380,7 @@ class Scheduler(
                 and self.spec_algorithm.is_dflash()
                 and float(v) != 1.0
             ):
-                active_batches = [self.running_batch, self.last_batch]
-                active_batches.extend(getattr(self, "running_mbs", ()))
-                active_batches.extend(getattr(self, "mbs", ()))
-                active_batches.extend(getattr(self, "last_mbs", ()))
-                has_active_mask_request = any(
-                    req.return_sampling_mask and not req.finished()
-                    for batch in active_batches
-                    if batch is not None
-                    for req in batch.reqs
-                )
-                has_active_mask_request |= any(
-                    req.return_sampling_mask and not req.finished()
-                    for req in self.waiting_queue
-                )
-                has_active_mask_request |= any(
-                    req.return_sampling_mask and not req.finished()
-                    for req in self.grammar_manager.grammar_queue
-                )
-                has_active_mask_request |= (
-                    self.chunked_req is not None
-                    and self.chunked_req.return_sampling_mask
-                    and not self.chunked_req.finished()
-                )
-                if self.disaggregation_mode == DisaggregationMode.DECODE:
-                    prealloc_queue = self.disagg_decode_prealloc_queue
-                    decode_reqs = [
-                        *prealloc_queue.queue,
-                        *prealloc_queue.pending_reqs,
-                        *self.disagg_decode_transfer_queue.queue,
-                    ]
-                    has_active_mask_request |= any(
-                        decode_req.req.return_sampling_mask
-                        and not decode_req.req.finished()
-                        for decode_req in decode_reqs
-                    )
-                    has_active_mask_request |= any(
-                        req.return_sampling_mask and not req.finished()
-                        for req in (
-                            *prealloc_queue.retracted_queue,
-                            *prealloc_queue.held_rebootstrap_reqs,
-                        )
-                    )
-                if has_active_mask_request:
+                if self._has_active_sampling_mask_request():
                     logging.warning(
                         f"Updating {k} is rejected while DFlash sampling-mask "
                         "requests are active."
