@@ -2791,7 +2791,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     linear_attn_decode_backend=None,
                     linear_attn_prefill_backend=None,
                 ),
-                "KimiK3ForConditionalGeneration",
+                SimpleNamespace(architectures=["KimiK3ForConditionalGeneration"]),
             )
         )
         self.assertTrue(
@@ -2801,7 +2801,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     linear_attn_decode_backend="cake",
                     linear_attn_prefill_backend="triton",
                 ),
-                "KimiK3ForConditionalGeneration",
+                SimpleNamespace(architectures=["KimiK3ForConditionalGeneration"]),
             )
         )
         self.assertFalse(
@@ -2811,7 +2811,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     linear_attn_decode_backend="cake",
                     linear_attn_prefill_backend="cutedsl",
                 ),
-                "KimiK3ForConditionalGeneration",
+                SimpleNamespace(architectures=["KimiK3ForConditionalGeneration"]),
             )
         )
         cake_k3 = _mamba_radix_cache_resolution(
