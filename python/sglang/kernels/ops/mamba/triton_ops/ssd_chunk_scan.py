@@ -152,7 +152,7 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
             {
                 "BLOCK_SIZE_M": ("chunk_size",),
                 "BLOCK_SIZE_N": ("hdim",),
-                "BLOCK_SIZE_K": ("chunk_size", "dstate"),
+                "BLOCK_SIZE_K": ("chunk_size",),
             }
         )
     },

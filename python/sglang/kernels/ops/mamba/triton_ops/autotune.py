@@ -30,16 +30,15 @@ def prune_oversized_tiles(
         # Triton splits the launch into positional args and kwargs; a dimension
         # can arrive through either.
         args = {**kwargs, **named_args}
-        caps = {
-            block: triton.next_power_of_2(min(args[dim] for dim in dims))
-            for block, dims in tiled_dims.items()
-        }
+        caps = {}
+        for block, dims in tiled_dims.items():
+            cap = triton.next_power_of_2(min(args[dim] for dim in dims))
+            caps[block] = max(cap, min(c.kwargs[block] for c in configs))
         keep = [
             config
             for config in configs
             if all(config.kwargs[block] <= cap for block, cap in caps.items())
         ]
-        # Every config over-tiles a problem smaller than the narrowest tile.
         return keep or [min(configs, key=_tile_footprint)]
 
     return early_config_prune
