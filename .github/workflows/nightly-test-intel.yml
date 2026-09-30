@@ -2,8 +2,10 @@ name: Nightly Test (Intel)
 
 on:
   schedule:
-    # 22:15 IST (UTC+5:30) → 16:45 UTC daily.
-    - cron: '45 16 * * *'
+    # 22:30 IST (UTC+5:30) → 17:00 UTC daily: release-nightly-xpu-1-gpu.
+    - cron: '0 17 * * *'
+    # 01:00 IST (UTC+5:30) → 19:30 UTC daily: main-nightly-xpu-*.
+    - cron: '30 19 * * *'
   push:
     branches:
       - main
@@ -30,13 +32,13 @@ on:
         default: true
 
 concurrency:
-  group: nightly-test-intel-${{ github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id) || inputs.ref && format('caller-{0}', github.run_id) || github.ref }}
+  group: nightly-test-intel-${{ github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id) || inputs.ref && format('caller-{0}', github.run_id) || format('{0}-{1}', github.ref, github.event.schedule) }}
   cancel-in-progress: ${{ !inputs.ref && github.event_name != 'workflow_call' && github.event_name != 'workflow_dispatch' }}
 
 jobs:
   main-nightly-xpu-1-gpu:
     # sglang main + sgl-kernel-xpu main.
-    if: github.repository == 'sgl-project/sglang'
+    if: github.repository == 'sgl-project/sglang' && github.event.schedule != '0 17 * * *'
     runs-on: intel-bmg-nightly
     env:
       DOCKERHUB_INTEL_USERNAME: ${{ secrets.DOCKERHUB_INTEL_USERNAME }}
@@ -144,7 +146,7 @@ jobs:
 
   main-nightly-xpu-2-gpu:
     # sglang main + sgl-kernel-xpu main.
-    if: github.repository == 'sgl-project/sglang'
+    if: github.repository == 'sgl-project/sglang' && github.event.schedule != '0 17 * * *'
     runs-on: intel-bmg-nightly
     env:
       DOCKERHUB_INTEL_USERNAME: ${{ secrets.DOCKERHUB_INTEL_USERNAME }}
@@ -241,7 +243,7 @@ jobs:
 
   main-nightly-xpu-4-gpu:
     # sglang main + sgl-kernel-xpu main.
-    if: github.repository == 'sgl-project/sglang'
+    if: github.repository == 'sgl-project/sglang' && github.event.schedule != '0 17 * * *'
     runs-on: intel-bmg-nightly
     env:
       DOCKERHUB_INTEL_USERNAME: ${{ secrets.DOCKERHUB_INTEL_USERNAME }}
@@ -338,7 +340,7 @@ jobs:
 
   main-nightly-xpu-8-gpu:
     # sglang main + sgl-kernel-xpu main.
-    if: github.repository == 'sgl-project/sglang'
+    if: github.repository == 'sgl-project/sglang' && github.event.schedule != '0 17 * * *'
     runs-on: intel-bmg-nightly
     env:
       DOCKERHUB_INTEL_USERNAME: ${{ secrets.DOCKERHUB_INTEL_USERNAME }}
@@ -435,7 +437,7 @@ jobs:
 
   release-nightly-xpu-1-gpu:
     # sglang main + prebuilt sgl-kernel-xpu wheel: PR CI suites plus release-nightly-xpu-1-gpu.
-    if: github.repository == 'sgl-project/sglang'
+    if: github.repository == 'sgl-project/sglang' && github.event.schedule != '30 19 * * *'
     runs-on: intel-bmg-nightly
     # Two suites back to back (~5h est. incl. setup) exceed the 360-min default.
     timeout-minutes: 600
