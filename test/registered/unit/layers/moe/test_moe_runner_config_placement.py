@@ -42,6 +42,8 @@ def _layer(monkeypatch) -> FusedMoE:
             moe_tp_rank=1,
             tp_size=4,
             tp_rank=3,
+            attn_tp_size=4,
+            attn_tp_rank=3,
         ),
     ):
         return FusedMoE(
@@ -88,6 +90,7 @@ def test_cutlass_passes_the_runner_config_placement(monkeypatch) -> None:
     hidden_states = torch.zeros(2, 4, dtype=torch.bfloat16)
     dispatch_output = SimpleNamespace(
         hidden_states=hidden_states,
+        hidden_states_scale=None,
         topk_output=SimpleNamespace(
             topk_weights=torch.ones(2, 1),
             topk_ids=torch.zeros(2, 1, dtype=torch.int64),
