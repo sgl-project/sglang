@@ -89,13 +89,17 @@ class TestSmallMFp8ProjGfx950(CustomTestCase):
             {"qscheme": "per_channel"}, {"qscheme": "per_channel", "is_dynamic": True}
         )
         fwd = types.SimpleNamespace(sp_active=False)
+        # weight is [K, N] after Quark loading; TP4 o_proj (N, K) = (4096, 2048)
+        o_proj = types.SimpleNamespace(scheme=scheme, weight=torch.empty(2048, 4096))
+        other = types.SimpleNamespace(scheme=scheme, weight=torch.empty(2048, 1024))
         with patch.object(qwen3_5, "get_forward", return_value=fwd):
             fp8_in = qwen3_5._fp8_tuple_input
-            self.assertTrue(fp8_in(types.SimpleNamespace(scheme=scheme), 40))
-            self.assertFalse(fp8_in(types.SimpleNamespace(scheme=scheme), 41))
+            self.assertTrue(fp8_in(o_proj, 36))
+            self.assertFalse(fp8_in(o_proj, 37))
+            self.assertFalse(fp8_in(other, 4))  # shape outside SHAPES
             self.assertFalse(fp8_in(torch.nn.Linear(8, 8), 4))  # BF16 MTP layer
             with patch.dict(os.environ, _OFF):
-                self.assertFalse(fp8_in(types.SimpleNamespace(scheme=scheme), 4))
+                self.assertFalse(fp8_in(o_proj, 4))
 
     def producers(self, t, trial=0, tp=4):
         from sglang.kernels.ops.attention.fla.layernorm_gated import (

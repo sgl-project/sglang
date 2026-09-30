@@ -63,7 +63,7 @@ def smallm_fp8_gemm_enabled() -> bool:
     return _mod is not False
 
 
-def _config(M, N, K):
+def smallm_fp8_gemm_config(M, N, K):
     for max_m, *cfg in SHAPES.get((N, K), ()):
         if M <= max_m:
             return cfg
@@ -76,7 +76,7 @@ def smallm_fp8_gemm_supported(XQ, WQ, x_scale, dtype) -> bool:
         XQ.dim() == 2
         and XQ.dtype == WQ.dtype == torch.float8_e4m3fn
         and dtype == torch.bfloat16
-        and _config(XQ.shape[0], *WQ.shape) is not None
+        and smallm_fp8_gemm_config(XQ.shape[0], *WQ.shape) is not None
         and XQ.shape[1] == WQ.shape[1]
         and XQ.stride(1) == 1
         and WQ.is_contiguous()
@@ -90,7 +90,7 @@ def smallm_fp8_gemm_supported(XQ, WQ, x_scale, dtype) -> bool:
 def smallm_fp8_gemm(XQ, WQ, x_scale, w_scale, dtype):
     """Drop-in for aiter gemm_a8w8_bpreshuffle where smallm_fp8_gemm_supported(); w_scale fp32 [N, 1]."""
     (M, K), N = XQ.shape, WQ.shape[0]
-    nt, steps, waves, xlds = cfg = _config(M, N, K)
+    nt, steps, waves, xlds = cfg = smallm_fp8_gemm_config(M, N, K)
     mt = (M + 15) // 16
     kernel = _kernels.get((mt, *cfg))
     if kernel is None:

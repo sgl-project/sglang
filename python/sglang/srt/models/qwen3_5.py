@@ -156,7 +156,10 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     from aiter.tuned_gemm import tgemm
 
-    from sglang.kernels.ops.gemm.smallm_fp8_gfx950 import smallm_fp8_gemm_enabled
+    from sglang.kernels.ops.gemm.smallm_fp8_gfx950 import (
+        smallm_fp8_gemm_config,
+        smallm_fp8_gemm_enabled,
+    )
 _hip_use_alt_stream = get_bool_env_var("SGLANG_ALT_STREAM") and _is_hip
 _gdn_use_alt_stream = _is_cuda or (
     get_bool_env_var("SGLANG_GDN_QKVZ_BA_ALT_STREAM", "False") and _hip_use_alt_stream
@@ -282,10 +285,11 @@ def _fp8_tuple_input(linear: nn.Module, num_tokens: int) -> bool:
     scheme = getattr(linear, "scheme", None)
     return (
         _use_aiter
-        and 1 <= num_tokens <= 40
+        and num_tokens > 0
         and type(scheme).__name__ == "QuarkW8A8Fp8"
         and scheme.per_token
         and scheme.weight_qscheme == "per_channel"
+        and smallm_fp8_gemm_config(num_tokens, *linear.weight.shape[::-1]) is not None
         and not torch.compiler.is_compiling()
         and not get_forward().sp_active
         and smallm_fp8_gemm_enabled()
