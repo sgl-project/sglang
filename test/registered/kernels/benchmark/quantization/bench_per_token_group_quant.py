@@ -1,3 +1,5 @@
+import torch
+
 from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.jit.benchmark.utils import create_empty, create_random
 from sglang.kernels.ops.quantization.fp8_kernel import (
@@ -73,5 +75,36 @@ def benchmark(group_size: int, layout: str, num_tokens: int, impl: str):
     )
 
 
+@marker.parametrize(
+    "num_tokens", [1, 2, 3, 4, 5, 127, 128, 129, 2048], ci_vals=[1, 4, 129]
+)
+@marker.parametrize("hidden", [4096, 12288], ci_vals=[4096])
+@marker.benchmark("impl", ["separate_fill", "fused_padding"])
+def benchmark_row_padding(num_tokens: int, hidden: int, impl: str):
+    x = create_random(num_tokens, hidden)
+    padded = (num_tokens + 3) // 4 * 4
+    q = create_empty(padded, hidden, dtype=fp8_dtype)
+    s = create_empty(hidden // 128, padded, dtype=torch.float32).T
+
+    def quantize(x, q, s):
+        if impl == "separate_fill":
+            per_token_group_quant(x, q[:num_tokens], s[:num_tokens])
+            if padded != num_tokens:
+                q[num_tokens:].zero_()
+                s[num_tokens:].zero_()
+        else:
+            per_token_group_quant(x, q, s)
+
+    return marker.do_bench(
+        quantize,
+        input_args=(x, q, s),
+        memory_args=(x,),
+        memory_output=(q, s),
+        # Rotate inputs AND output buffers between graph iterations (cold L2).
+        graph_clone_args="all",
+    )
+
+
 if __name__ == "__main__":
     benchmark.run()
+    benchmark_row_padding.run()
