@@ -137,20 +137,23 @@ def make_cache(
     req_pool = ReqToTokenPool(
         size=8, max_context_len=1024, device="cpu", enable_memory_saver=False
     )
-    return UnifiedRadixCache(
-        params=CacheInitParams(
-            disable=False,
-            req_to_token_pool=req_pool,
-            token_to_kv_pool_allocator=allocator,
-            page_size=page_size,
-            eviction_policy=policy,
-            enable_session_radix_cache=enable_session,
-            tree_components=(ComponentType.FULL,),
-            component_registry_override=(
-                {ComponentType.FULL: LegacyFullComponent} if legacy else None
-            ),
+    # The heap lives in the Python TreeCore; pin it so the suite does not pick
+    # up the process-wide backend default.
+    with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("python"):
+        return UnifiedRadixCache(
+            params=CacheInitParams(
+                disable=False,
+                req_to_token_pool=req_pool,
+                token_to_kv_pool_allocator=allocator,
+                page_size=page_size,
+                eviction_policy=policy,
+                enable_session_radix_cache=enable_session,
+                tree_components=(ComponentType.FULL,),
+                component_registry_override=(
+                    {ComponentType.FULL: LegacyFullComponent} if legacy else None
+                ),
+            )
         )
-    )
 
 
 def node_path(core, node) -> tuple:
