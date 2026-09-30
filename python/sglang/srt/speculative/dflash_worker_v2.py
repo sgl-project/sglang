@@ -234,12 +234,6 @@ def _build_dflash_sampling_mask_capture(
         return_sampling_masks=list(sampling_info.return_sampling_masks or []),
         max_top_k=sampling_info.sampling_mask_max_top_k,
         support_capture_indices=sampling_info.sampling_support_logprobs_capture_indices,
-        # Thresholds are read live each step and can change at runtime via
-        # set_internal_state, so the check must happen here, not at admission.
-        exact_target_policy=(
-            get_spec().speculative_accept_threshold_single == 1.0
-            and get_spec().speculative_accept_threshold_acc == 1.0
-        ),
     )
 
 
