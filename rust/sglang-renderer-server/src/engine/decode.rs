@@ -2,7 +2,7 @@
 
 use super::{internal, invalid};
 use crate::{GenerationOutput, GenerationOutputExtras, TokenLogprob};
-use sglang_processor::{GenerateRequest, ResponseError, TokenIds};
+use sglang_processor::{GenerateRequest, ResponseError, TokenIds, dynamo_tokenizers};
 
 use super::{GenerationFinishReason, GenerationStream, MatchedStop, TokenStream};
 use futures::StreamExt;

@@ -1,6 +1,6 @@
 //! OpenAI request preparation and typed response construction.
 
-use dynamo_protocols::types::CompletionUsage;
+use sglang_processor::dynamo_protocols::types::CompletionUsage;
 use sglang_processor::{RendererService, ResponseError};
 
 pub(crate) mod chat;

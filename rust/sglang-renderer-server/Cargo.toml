@@ -24,10 +24,6 @@ uuid = { workspace = true }
 axum = { version = "0.8.9", features = ["json"] }
 clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
-dynamo-parsers = "7.0.1"
-dynamo-protocols = "5.1.0"
-dynamo-renderer = "5.0.0"
-dynamo-tokenizers = "1.7.0"
 hf-hub = { version = "0.4", default-features = false, features = ["rustls-tls", "tokio"] }
 
 [dev-dependencies]

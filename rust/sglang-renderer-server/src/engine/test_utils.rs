@@ -1,4 +1,5 @@
 use crate::{PositionLogprobs, TokenLogprob};
+use sglang_processor::dynamo_tokenizers;
 
 fn logprob(token_id: i32, logprob: f32) -> TokenLogprob {
     TokenLogprob {

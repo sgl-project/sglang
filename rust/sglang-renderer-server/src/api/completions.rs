@@ -16,9 +16,9 @@ use super::{
     },
     unix_seconds_u32,
 };
-use dynamo_protocols::types::{CompletionUsage, Prompt};
 use futures::StreamExt;
 use serde::Serialize;
+use sglang_processor::dynamo_protocols::types::{CompletionUsage, Prompt};
 use sglang_processor::{GenerateRequest, RendererError, RendererService, ResponseError};
 
 pub(crate) struct SubmittedChoice {

@@ -6,7 +6,9 @@ use crate::{
     GenerationFinishReason, GenerationOutput, GenerationOutputExtras, GenerationStream,
     engine::response::merge_indexed,
 };
-use dynamo_protocols::types::{
+use futures::StreamExt;
+use serde::Serialize;
+use sglang_processor::dynamo_protocols::types::{
     ChatChoice, ChatChoiceLogprobs, ChatChoiceStream, ChatCompletionMessageContent,
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
     ChatCompletionResponseMessage, ChatCompletionStreamResponseDelta,
@@ -15,8 +17,6 @@ use dynamo_protocols::types::{
     FinishReason as OpenAIFinishReason, FunctionCall, FunctionCallStream, FunctionType, Role,
     ServiceTier as ChatServiceTier, TopLogprobs,
 };
-use futures::StreamExt;
-use serde::Serialize;
 use sglang_processor::{
     ChatEvent, ChatFinishReason, ChatResponseProcessor, ChatToolCallDelta, DecodedChatEvent,
     PreparedChat, RendererService, ResponseError, ResponseErrorKind,

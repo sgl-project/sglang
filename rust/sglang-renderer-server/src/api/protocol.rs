@@ -2,19 +2,19 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use dynamo_protocols::types::{
+use serde::Deserialize;
+use serde_json::Value;
+use sglang_processor::dynamo_protocols::types::{
     ChatCompletionAudio, ChatCompletionFunctionCall, ChatCompletionFunctions,
     ChatCompletionRequestMessage, ChatCompletionStreamOptions, ChatCompletionTool,
     ChatCompletionToolChoiceOption, PredictionContent, Prompt, ResponseFormat, ServiceTier, Stop,
     WebSearchOptions,
 };
-use serde::Deserialize;
-use serde_json::Value;
 
 use sglang_processor::{
     ChatRequest, GenerateRequestIdentity, GenerateRequestMetadata, GenerationOptions, OneOrMany,
     ReasoningEffort, RendererConfig, RendererError, SamplingDefaults, SamplingParams,
-    TextRequestGroup, TokenIds, TokenIdsRequest,
+    TextRequestGroup, TokenIds, TokenIdsRequest, dynamo_renderer,
 };
 
 const MAX_OPENAI_CHOICES: usize = 4096;

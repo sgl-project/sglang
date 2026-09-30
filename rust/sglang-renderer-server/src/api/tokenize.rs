@@ -1,11 +1,11 @@
 //! SGLang-compatible prompt and chat tokenization.
 
-use dynamo_protocols::types::{
-    ChatCompletionRequestMessage, ChatCompletionTool, ChatCompletionToolChoiceOption,
-};
 use futures::future::try_join_all;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sglang_processor::dynamo_protocols::types::{
+    ChatCompletionRequestMessage, ChatCompletionTool, ChatCompletionToolChoiceOption,
+};
 
 use sglang_processor::{
     ChatRequest, GenerateRequestMetadata, OneOrMany, ReasoningEffort, RendererError,

@@ -31,3 +31,9 @@ pub use preprocessing::{
     GenerateRequestIdentity, TextRequestGroup, resolve_model_file, resolve_tokenizer_file,
 };
 pub use types::{OneOrMany, TokenIds};
+
+// Dynamo crates whose types appear in this crate's public API. Hosts use these
+// re-exports so their Dynamo versions always match the processor's.
+pub use dynamo_protocols;
+pub use dynamo_renderer;
+pub use dynamo_tokenizers;
