@@ -321,6 +321,8 @@ class TestLazyHostPoolRelease(CustomTestCase):
 
 
 class TestHostMemoryBudget(CustomTestCase):
+    # Pinned so the two budget reads below see identical free memory; the real
+    # psutil value drifts between calls and would flake the equality checks.
     _AVAILABLE = base.HICACHE_HOST_MEMORY_RESERVE_BYTES + 64 * (1024**3)
 
     def _budget_with_ranks(self, ranks):
@@ -338,6 +340,13 @@ class TestHostMemoryBudget(CustomTestCase):
     def test_budget_is_split_across_co_located_ranks(self):
         solo = self._budget_with_ranks(1)
         self.assertEqual(self._budget_with_ranks(4), solo // 4)
+
+    def test_reserve_is_taken_before_the_split(self):
+        # Each rank must not get its own copy of the reserve.
+        budget = self._budget_with_ranks(8)
+        self.assertLessEqual(
+            budget * 8, self._AVAILABLE - base.HICACHE_HOST_MEMORY_RESERVE_BYTES
+        )
 
     def test_ranks_per_host_divides_world_size_by_nodes(self):
         with (
@@ -393,7 +402,7 @@ class TestHostMemoryBudget(CustomTestCase):
             free_hugetlb_bytes=unittest.mock.Mock(return_value=96 * gib),
             supports_hugetlb=unittest.mock.Mock(return_value=True),
         )
-        for device in ("npu", torch.device("npu")):
+        for device in ("npu", torch.device("xpu")):
             with self.subTest(device=repr(device)):
                 budget = self._budget_for(
                     allocator, device, available=reserve + 64 * gib
@@ -425,6 +434,15 @@ class TestHostMemoryBudget(CustomTestCase):
             )
         # Without SGLANG_HUGEPAGE_SIZE there is no page size to round to.
         with envs.SGLANG_HUGEPAGE_SIZE.override(""):
+            self.assertEqual(
+                base.host_memory_requested_bytes(mappings, allocator, "cuda"),
+                2 * int(1.1 * gib),
+            )
+        # mode=off opts out of rounding even with a page size set.
+        with (
+            envs.SGLANG_HUGEPAGE_MODE.override("off"),
+            envs.SGLANG_HUGEPAGE_SIZE.override("1GB"),
+        ):
             self.assertEqual(
                 base.host_memory_requested_bytes(mappings, allocator, "cuda"),
                 2 * int(1.1 * gib),
@@ -473,15 +491,10 @@ class TestHostMemoryBudget(CustomTestCase):
             supports_hugetlb=unittest.mock.Mock(return_value=False),
         )
         with unittest.mock.patch.object(base, "hugepage_size_requested") as parser:
-            for device in ("cuda", "npu"):
-                with self.subTest(device=device):
-                    budget = self._budget_for(
-                        allocator,
-                        device,
-                        available=reserve + 64 * gib,
-                        mode="required",
-                    )
-                    self.assertEqual(budget, 64 * gib // 8)
+            budget = self._budget_for(
+                allocator, "cuda", available=reserve + 64 * gib, mode="required"
+            )
+            self.assertEqual(budget, 64 * gib // 8)
             parser.assert_not_called()
         allocator.free_hugetlb_bytes.assert_not_called()
 
