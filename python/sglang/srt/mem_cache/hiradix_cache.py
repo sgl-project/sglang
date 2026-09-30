@@ -88,6 +88,7 @@ class HiRadixCache(RadixCache):
                 server_args.hicache_kvtc_params,
                 server_args.hicache_kvtc_k_cr,
                 server_args.hicache_kvtc_v_cr,
+                server_args.hicache_kvtc_quant_disable,
                 rotary_emb=params.rotary_embeddings,
                 tp_rank=params.tp_cache_group.rank(),
                 tp_size=params.tp_cache_group.size(),
