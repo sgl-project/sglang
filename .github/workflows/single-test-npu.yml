@@ -17,7 +17,7 @@ concurrency:
 jobs:
   single-node-poc:
     name: single-node-poc
-    runs-on: linux-amd64-a5-2
+    runs-on: linux-amd64-a5-4
     container:
       image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-950-B072
     steps:
