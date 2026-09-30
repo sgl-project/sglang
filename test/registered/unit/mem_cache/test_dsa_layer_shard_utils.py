@@ -118,6 +118,38 @@ class TestDSALayerShardUtils(CustomTestCase):
             self.assertTrue(torch.equal(buf, owner_kv[layer_id]))
             self.assertEqual(pool.remote_kv_layer_id, layer_id)
 
+    def test_mla_write_forwards_layer_id_to_base_writer(self):
+        writes = []
+        layer_id = 7
+        loc = torch.tensor([1], dtype=torch.int64)
+        nope = torch.zeros(1, 1, 8)
+        rope = torch.zeros(1, 1, 2)
+        local_buffer = torch.empty(2, 1, 10)
+
+        def write(actual_layer_id, dst, actual_loc, actual_nope, actual_rope):
+            writes.append((actual_layer_id, dst, actual_loc, actual_nope, actual_rope))
+
+        pool = SimpleNamespace(
+            size=1,
+            page_size=1,
+            start_layer=layer_id,
+            pending_remote_kv_layer_id=None,
+            remote_kv_layer_id=None,
+            kv_buffer=[local_buffer],
+            _is_layer_owned=lambda _: True,
+            _write_mla_kv_buffer=write,
+        )
+        layer = SimpleNamespace(layer_id=layer_id)
+
+        LayerSplitDSATokenToKVPool.set_mla_kv_buffer(pool, layer, loc, nope, rope)
+
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(writes[0][0], layer_id)
+        self.assertIs(writes[0][1], local_buffer)
+        self.assertIs(writes[0][2], loc)
+        self.assertIs(writes[0][3], nope)
+        self.assertIs(writes[0][4], rope)
+
 
 if __name__ == "__main__":
     unittest.main()

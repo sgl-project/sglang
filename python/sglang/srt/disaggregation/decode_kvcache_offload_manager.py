@@ -117,6 +117,12 @@ class DecodeKVCacheOffloadManager:
                 kv_pool=self.kv_cache,
                 page_size=self.page_size,
                 use_mla=isinstance(self.kv_cache, MLATokenToKVPool),
+                # Packed NVFP4 rows are 416 raw bytes rather than QK=576.
+                override_kv_cache_dim=(
+                    self.kv_cache.kv_cache_dim
+                    if isinstance(self.kv_cache, MLATokenToKVPool)
+                    else None
+                ),
             )
             self.cache_controller = HiCacheController(
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,

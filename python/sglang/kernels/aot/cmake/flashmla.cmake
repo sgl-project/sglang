@@ -1,9 +1,10 @@
 # flash_mla
-# DeepSeek v4.1 kernels, 528 B/token caches read as V4.1 by default (sgl-project/FlashMLA@3620b63).
+# FlashMLA fork: V4.1 and GLM-5.2 NVFP4 sparse decode (draft fork PR #16).
+# Pin the fork PR head for draft integration; promote to sgl after model validation.
 FetchContent_Declare(
     repo-flashmla
-    URL      https://${GITHUB_ARTIFACTORY}/sgl-project/FlashMLA/archive/3620b63fc4ebe33950c50e1b7701b6607f44150e.tar.gz
-    URL_HASH SHA256=7d7f9819bc1b121ef8226281de7265cd97be0cbe15d6450575fc8e3f241041a2
+    URL      https://${GITHUB_ARTIFACTORY}/sgl-project/FlashMLA/archive/f7d49d040c262f18b9973fe8cd5352669def43e8.tar.gz
+    URL_HASH SHA256=5bd63a71fd5b1c502bf80105d82f074618740469c301de9fbfdf39bddad91f81
 )
 FetchContent_Populate(repo-flashmla)
 
@@ -138,7 +139,9 @@ if(FLASHMLA_ENABLE_SM100)
         ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k576.cu
         ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_k512.cu
 
-        # sm100 sparse decode.
+        # sm100 sparse decode; GLM-5.2 specialization lives in the pinned fork.
+        ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/decode/sparse/head64/instantiations/glm52_nvfp4_h64.cu
+        ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/decode/sparse/head64/instantiations/glm52_nvfp4_h64_no_split.cu
         ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/decode/sparse/head64/instantiations/v32_h64.cu
         ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/decode/sparse/head64/instantiations/v32_h64_no_split.cu
         ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/decode/sparse/head64/instantiations/v32_no_rope_h64.cu

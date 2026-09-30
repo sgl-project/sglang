@@ -123,6 +123,52 @@ class _FinishedEvent:
         pass
 
 
+class TestDecodeOffloadHostPool(unittest.TestCase):
+    def test_mla_host_pool_preserves_device_row_width(self):
+        kv_cache = object.__new__(MLATokenToKVPool)
+        kv_cache.kv_cache_dim = 416
+        allocator = MagicMock()
+        allocator.get_kvcache.return_value = kv_cache
+        server_args = SimpleNamespace(
+            page_size=64,
+            hicache_ratio=2.0,
+            hicache_size=0,
+            hicache_mem_layout="layer_first",
+            hicache_storage_backend_extra_config=None,
+            hicache_io_backend="kernel",
+            hicache_storage_backend=None,
+            served_model_name="test",
+        )
+
+        with (
+            patch(
+                "sglang.srt.disaggregation.decode_kvcache_offload_manager."
+                "build_kv_host_pool"
+            ) as build_host_pool,
+            patch(
+                "sglang.srt.disaggregation.decode_kvcache_offload_manager."
+                "HiCacheController"
+            ),
+            patch(
+                "sglang.srt.disaggregation.decode_kvcache_offload_manager."
+                "get_schedule",
+                return_value=SimpleNamespace(page_size=64),
+            ),
+            patch("torch.distributed.get_world_size", return_value=1),
+        ):
+            DecodeKVCacheOffloadManager(
+                req_to_token_pool=MagicMock(),
+                token_to_kv_pool_allocator=allocator,
+                tp_group=MagicMock(),
+                tree_cache=MagicMock(),
+                server_args=server_args,
+            )
+
+        self.assertEqual(
+            build_host_pool.call_args.kwargs["override_kv_cache_dim"], 416
+        )
+
+
 class TestReleaseFinishedReq(unittest.TestCase):
     """Tests for _release_finished_req overallocation cleanup."""
 
