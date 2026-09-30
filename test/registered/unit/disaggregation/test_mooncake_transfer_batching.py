@@ -8,7 +8,10 @@ from unittest.mock import MagicMock, call, patch
 import numpy as np
 
 from sglang.srt.disaggregation.base.conn import StateType
-from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
+from sglang.srt.disaggregation.mooncake.conn import (
+    MooncakeKVManager,
+    build_minimax_index_k_transfer_blocks,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -135,8 +138,192 @@ class TestMooncakeTransferBatching(unittest.TestCase):
 
 
 class TestMiniMaxStateTransfer(CustomTestCase):
-    def test_index_truncates_but_dense_rejects_mismatched_page_lists(self):
-        """Legacy index transfers copy the common prefix; incomplete dense KV must fail."""
+    def test_index_k_tp1_2_4_8_elects_writers_and_fans_out_replicas(self):
+        global_heads, page_size, head_bytes = 4, 2, 4
+        for src_tp in (1, 2, 4, 8):
+            src_heads = global_heads // min(src_tp, global_heads)
+            src_replicas = src_tp // min(src_tp, global_heads)
+            for dst_tp in (1, 2, 4, 8):
+                dst_heads = global_heads // min(dst_tp, global_heads)
+                dst_replicas = dst_tp // min(dst_tp, global_heads)
+                for dst_rank in range(dst_tp):
+                    nonempty_src_ranks = []
+                    for src_rank in range(src_tp):
+                        blocks = build_minimax_index_k_transfer_blocks(
+                            src_data_ptrs=[1000],
+                            src_data_lens=[1024],
+                            src_item_lens=[page_size * src_heads * head_bytes],
+                            src_layer_ids=[7],
+                            src_indices=[1],
+                            dst_data_ptrs=[2000],
+                            dst_data_lens=[1024],
+                            dst_item_lens=[page_size * dst_heads * head_bytes],
+                            dst_layer_ids=[7],
+                            dst_indices=[2],
+                            page_size=page_size,
+                            src_attn_tp_size=src_tp,
+                            src_tp_rank=src_rank,
+                            dst_attn_tp_size=dst_tp,
+                            dst_tp_rank=dst_rank,
+                            src_index_head_num=src_heads,
+                            dst_index_head_num=dst_heads,
+                            global_index_head_num=global_heads,
+                        )
+                        if blocks:
+                            nonempty_src_ranks.append(src_rank)
+                    dst_start = (dst_rank // dst_replicas) * dst_heads
+                    expected_writers = [
+                        src_rank
+                        for src_rank in range(0, src_tp, src_replicas)
+                        if max((src_rank // src_replicas) * src_heads, dst_start)
+                        < min(
+                            (src_rank // src_replicas + 1) * src_heads,
+                            dst_start + dst_heads,
+                        )
+                    ]
+                    with self.subTest(src_tp=src_tp, dst_tp=dst_tp, dst_rank=dst_rank):
+                        self.assertEqual(nonempty_src_ranks, expected_writers)
+
+    def test_index_k_maps_subheads_and_global_layers(self):
+        blocks = build_minimax_index_k_transfer_blocks(
+            src_data_ptrs=[1000],
+            src_data_lens=[160],
+            src_item_lens=[16],
+            src_layer_ids=[61],
+            src_indices=[1],
+            dst_data_ptrs=[2000, 3000],
+            dst_data_lens=[80, 80],
+            dst_item_lens=[8, 8],
+            dst_layer_ids=[2, 61],
+            dst_indices=[2],
+            page_size=2,
+            src_attn_tp_size=2,
+            src_tp_rank=0,
+            dst_attn_tp_size=4,
+            dst_tp_rank=1,
+            src_index_head_num=2,
+            dst_index_head_num=1,
+            global_index_head_num=4,
+        )
+        self.assertEqual(blocks, [(1020, 3016, 4), (1028, 3020, 4)])
+
+    def test_index_k_rejects_invalid_layout_and_bounds(self):
+        common = dict(
+            src_data_ptrs=[1000],
+            src_data_lens=[16],
+            src_item_lens=[8],
+            src_layer_ids=[7],
+            src_indices=[1],
+            dst_data_ptrs=[2000],
+            dst_data_lens=[24],
+            dst_item_lens=[8],
+            dst_layer_ids=[7],
+            dst_indices=[2],
+            page_size=2,
+            src_attn_tp_size=4,
+            src_tp_rank=0,
+            dst_attn_tp_size=4,
+            dst_tp_rank=0,
+            src_index_head_num=1,
+            dst_index_head_num=1,
+            global_index_head_num=4,
+        )
+        for field, value, message in (
+            ("src_item_lens", [7], "item length"),
+            ("dst_data_lens", [16], "destination index"),
+            ("src_index_head_num", 2, "logical head"),
+            ("global_index_head_num", 0, "global index head"),
+            ("layout", "hnd", "Unsupported"),
+            ("layout", "packed", "Unsupported"),
+        ):
+            with self.subTest(field=field):
+                kwargs = dict(common)
+                kwargs[field] = value
+                with self.assertRaisesRegex((RuntimeError, ValueError), message):
+                    build_minimax_index_k_transfer_blocks(**kwargs)
+
+    def test_index_k_rejects_duplicate_or_missing_layers(self):
+        common = dict(
+            src_data_ptrs=[1000, 1100],
+            src_data_lens=[80, 80],
+            src_item_lens=[8, 8],
+            src_layer_ids=[7, 7],
+            src_indices=[1],
+            dst_data_ptrs=[2000, 2100],
+            dst_data_lens=[80, 80],
+            dst_item_lens=[8, 8],
+            dst_layer_ids=[7, 7],
+            dst_indices=[2],
+            page_size=2,
+            src_attn_tp_size=4,
+            src_tp_rank=0,
+            dst_attn_tp_size=4,
+            dst_tp_rank=0,
+            src_index_head_num=1,
+            dst_index_head_num=1,
+            global_index_head_num=4,
+        )
+        with self.assertRaisesRegex(RuntimeError, "duplicate.*layer"):
+            build_minimax_index_k_transfer_blocks(**common)
+
+        common.update(src_layer_ids=[7, 8], dst_layer_ids=[7, 9])
+        with self.assertRaisesRegex(RuntimeError, "missing.*layer 8"):
+            build_minimax_index_k_transfer_blocks(**common)
+
+    def test_index_k_equal_tp_rejects_one_sided_layout_metadata(self):
+        for tp_size in (1, 2):
+            for src_is_new in (False, True):
+                manager = MooncakeKVManager.__new__(MooncakeKVManager)
+                manager.kv_args = SimpleNamespace(
+                    state_types=[StateType.MINIMAX_INDEX_K],
+                    state_data_ptrs=[[1000]],
+                    state_data_lens=[[1024]],
+                    state_item_lens=[[32 // tp_size]],
+                    state_dim_per_tensor=[[]],
+                    state_layer_ids=[[7]],
+                    page_size=2,
+                    engine_rank=0,
+                )
+                if src_is_new:
+                    manager.kv_args.minimax_index_head_num = 4 // tp_size
+                    manager.kv_args.minimax_global_index_head_num = 4
+                    manager.kv_args.minimax_index_k_layout = "nhd"
+                manager.attn_tp_size = tp_size
+                manager.pp_size = 1
+                manager.is_mla_backend = manager.is_hybrid_mla_backend = False
+                manager._transfer_data = MagicMock(return_value=0)
+                manager._send_kvcache_generic = MagicMock(return_value=0)
+                peer = SimpleNamespace(
+                    dst_state_data_ptrs=[[2000]],
+                    dst_state_data_lens=[[1024]],
+                    dst_state_item_lens=[[32 // tp_size]],
+                    dst_state_dim_per_tensor=[[]],
+                    dst_state_layer_ids=[[7]],
+                    dst_attn_tp_size=tp_size,
+                    dst_tp_rank=0,
+                    dst_page_size=2,
+                )
+                if not src_is_new:
+                    peer.dst_minimax_index_head_num = 4 // tp_size
+                    peer.dst_minimax_global_index_head_num = 4
+                    peer.dst_minimax_index_k_layout = "nhd"
+                with self.subTest(tp_size=tp_size, src_is_new=src_is_new):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "layout metadata.*both peers"
+                    ):
+                        manager.maybe_send_extra(
+                            req=SimpleNamespace(
+                                mooncake_session_id="cpu", dst_state_indices=[[2]]
+                            ),
+                            prefill_state_indices=[[1]],
+                            executor=None,
+                            target_rank_registration_info=peer,
+                        )
+                    manager._transfer_data.assert_not_called()
+                    manager._send_kvcache_generic.assert_not_called()
+
+    def test_minimax_states_reject_mismatched_page_lists(self):
+        """Incomplete MiniMax state must fail instead of copying a prefix."""
 
         def copy_bytes(session, sources, destinations, lengths):
             for src, dst, length in zip(sources, destinations, lengths, strict=True):
@@ -176,9 +363,7 @@ class TestMiniMaxStateTransfer(CustomTestCase):
                         executor=None,
                         target_rank_registration_info=peer,
                     )
-                    if state == StateType.MINIMAX_DENSE_KV and len(src_pages) != len(
-                        dst_pages
-                    ):
+                    if len(src_pages) != len(dst_pages):
                         with self.assertRaisesRegex(
                             RuntimeError, "state index length mismatch"
                         ):

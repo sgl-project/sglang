@@ -978,9 +978,12 @@ def build_kv_layer_ids(
     Returns [] for pools that cannot report ids, leaving the peers on positional
     pairing.
     """
-    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+    from sglang.srt.mem_cache.memory_pool import (
+        HybridLinearKVPool,
+        MiniMaxSparseKVPool,
+    )
 
-    if not isinstance(token_to_kv_pool, HybridLinearKVPool):
+    if not isinstance(token_to_kv_pool, (HybridLinearKVPool, MiniMaxSparseKVPool)):
         return []
     layer_ids = token_to_kv_pool.get_kv_layer_ids()
     if draft_token_to_kv_pool is None:
@@ -1060,12 +1063,39 @@ def build_staging_slot_metadata(
     Returns (k_buffers, v_buffers, slot_layer_ids), or None for a pool that has
     no contiguous K/V tensors to stage.
     """
-    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
+    from sglang.srt.mem_cache.memory_pool import (
+        HybridLinearKVPool,
+        MHATokenToKVPool,
+        MiniMaxSparseKVPool,
+    )
 
     # A hybrid pool keeps its contiguous K/V tensors on the inner full-attention
-    # pool, and the draft pool is wrapped the same way.
+    # pool, and the draft pool is wrapped the same way. MiniMax registers only
+    # the transferable main-KV layers, so select those tensors from main_pool.
+    minimax_target_indices = None
     if isinstance(kv_pool, HybridLinearKVPool):
         kv_pool = kv_pool.full_kv_pool
+    elif isinstance(kv_pool, MiniMaxSparseKVPool):
+        num_target = len(kv_layer_ids) - num_draft_entries
+        if num_target < 0 or num_target % 2:
+            raise RuntimeError("MiniMax staging requires complete K/V layer-id pairs")
+        target_ids = list(kv_layer_ids[: num_target // 2])
+        if target_ids != list(kv_layer_ids[num_target // 2 : num_target]):
+            raise RuntimeError("MiniMax staging K/V layer-id layouts differ")
+        if len(kv_pool.main_kv_layer_ids) != len(kv_pool.main_pool.k_buffer):
+            raise RuntimeError(
+                "MiniMax main_pool buffers do not match global layer ids"
+            )
+        positions = {
+            layer_id: index for index, layer_id in enumerate(kv_pool.main_kv_layer_ids)
+        }
+        try:
+            minimax_target_indices = [positions[layer_id] for layer_id in target_ids]
+        except KeyError as exc:
+            raise RuntimeError(
+                f"MiniMax staging layer {exc.args[0]} is absent from main_pool"
+            ) from exc
+        kv_pool = kv_pool.main_pool
     if isinstance(draft_kv_pool, HybridLinearKVPool):
         draft_kv_pool = draft_kv_pool.full_kv_pool
     if not isinstance(kv_pool, MHATokenToKVPool):
@@ -1074,8 +1104,13 @@ def build_staging_slot_metadata(
     ids = list(kv_layer_ids or [])
     num_target = len(ids) - num_draft_entries
     half = num_target // 2
-    k_buffers, k_ids = list(kv_pool.k_buffer), ids[:half]
-    v_buffers, v_ids = list(kv_pool.v_buffer), ids[half:num_target]
+    if minimax_target_indices is None:
+        k_buffers = list(kv_pool.k_buffer)
+        v_buffers = list(kv_pool.v_buffer)
+    else:
+        k_buffers = [kv_pool.k_buffer[index] for index in minimax_target_indices]
+        v_buffers = [kv_pool.v_buffer[index] for index in minimax_target_indices]
+    k_ids, v_ids = ids[:half], ids[half:num_target]
 
     draft_half = num_draft_entries // 2
     if draft_half:
@@ -1302,6 +1337,8 @@ def get_kv_transfer_buf_infos(pool):
     from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 
     if isinstance(pool, MiniMaxSparseKVPool):
+        if pool.dense_pool is None:
+            return pool.get_contiguous_buf_infos()
         return pool.get_sparse_kv_buf_infos()
     return pool.get_contiguous_buf_infos()
 
@@ -1333,6 +1370,9 @@ def setup_state_kv_args(
     kv_args.state_dim_per_tensor = []
     kv_args.state_slice_outer_counts = []
     kv_args.state_layer_ids = []
+    kv_args.minimax_index_head_num = 0
+    kv_args.minimax_global_index_head_num = 0
+    kv_args.minimax_index_k_layout = ""
     kv_args.is_hybrid_mla_backend = False
     kv_args.state_conv_shard_groups = []
     # V4's KVCache is organized by compression-ratio buckets rather than by layer.
@@ -1370,12 +1410,27 @@ def setup_state_kv_args(
             )
         if token_to_kv_pool.index_k_pool is not None:
             dp, dl, il = token_to_kv_pool.get_index_k_state_buf_infos()
-            append_state_component(kv_args, StateType.MINIMAX_INDEX_K, dp, dl, il)
-        append_state_component(
-            kv_args,
-            StateType.MINIMAX_DENSE_KV,
-            *token_to_kv_pool.get_dense_kv_state_buf_infos(),
-        )
+            append_state_component(
+                kv_args,
+                StateType.MINIMAX_INDEX_K,
+                dp,
+                dl,
+                il,
+                layer_ids=list(token_to_kv_pool.index_k_layer_id_mapping),
+            )
+            kv_args.minimax_index_head_num = token_to_kv_pool.index_head_num
+            kv_args.minimax_global_index_head_num = (
+                token_to_kv_pool.global_index_head_num
+            )
+            kv_args.minimax_index_k_layout = "nhd"
+        if token_to_kv_pool.dense_pool is not None:
+            dense_layer_ids = sorted(token_to_kv_pool._dense_layer_ids)
+            append_state_component(
+                kv_args,
+                StateType.MINIMAX_DENSE_KV,
+                *token_to_kv_pool.get_dense_kv_state_buf_infos(),
+                layer_ids=dense_layer_ids * 2,
+            )
     elif hasattr(token_to_kv_pool, "get_state_buf_infos"):
         data_ptrs, data_lens, item_lens = token_to_kv_pool.get_state_buf_infos()
 
