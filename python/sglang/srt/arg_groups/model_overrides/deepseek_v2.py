@@ -1,7 +1,4 @@
-"""Config-time override declarations for deepseek_v2.
-
-Architectures: DeepseekV32ForCausalLM, DeepseekV3ForCausalLM, Dots3NoteForCausalLM, Glm5NextForConditionalGeneration, GlmMoeDsaForCausalLM, HYV4ForCausalLM, HYV4ForCausalLMNextN, KimiK25ForConditionalGeneration, LongcatFlashForCausalLM, LongcatFlashForCausalLMNextN, MistralLarge3ForCausalLM, PixtralForConditionalGeneration.
-"""
+"""Config-time override declarations for deepseek_v2."""
 
 import logging
 from typing import Any, Dict
@@ -32,11 +29,7 @@ logger = logging.getLogger(__name__)
     "Dots3NoteForCausalLM",
 )
 def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
-    """Order-safe declarations of the DeepSeek/DSA branch. The CP parallel
-    writes (enable_dp_attention/ep_size/moe_a2a_backend have post-monolith
-    writers), the kv-cache/split-backend defaults, the quant/moe block (read
-    before it by _set_default_dsa_kv_cache_dtype) and the env writes stay in
-    the branch."""
+    """Declare DeepSeek/DSA defaults; ordered CP, KV-cache, and MoE passes run in model_hook."""
     cfg = resolving_view(server_args)
     from sglang.srt.configs.model_config import (
         is_deepseek_dsa,
@@ -109,8 +102,8 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                     "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
                 )
                 # Note(kpham-sgl): Keep attn_tp_size == 1 under DSA CP.
-                # DSACPLayerCommunicator does not all-reduce attention-TP
-                # partial o_proj outputs before replicated dense FFNs.
+                # The DSA / MLA CP gather and reduce-scatter
+                # (the dsa_cp_* helpers in adapters/context_parallel.py) assume it.
                 attn_cp_size = cfg.tp_size // cfg.dp_size
                 overrides["attn_cp_size"] = attn_cp_size
                 logger.warning(
@@ -174,8 +167,8 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                 "For MLA CP, we have the following restrictions: moe_dense_tp_size == 1, moe_a2a_backend == deepep, ep_size == tp_size, batch_size == 1"
             )
             # FIXME(kpham-sgl): Keep attn_tp_size == 1 under MLA CP.
-            # DSACPLayerCommunicator does not all-reduce attention-TP
-            # partial o_proj outputs before replicated dense FFNs.
+            # The DSA / MLA CP gather and reduce-scatter
+            # (the dsa_cp_* helpers in adapters/context_parallel.py) assume it.
             attn_cp_size = cfg.tp_size // cfg.dp_size
             overrides["attn_cp_size"] = attn_cp_size
             logger.warning(

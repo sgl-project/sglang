@@ -88,10 +88,7 @@ class StandaloneDraftWorker(EagleDraftWorker):
 
         # Alias for better readability
         self.draft_runner = self.draft_worker.model_runner
-        # The draft runner is built outside any tensor-parallel scope, so it
-        # carries the target's topology: entering the scope later swaps the
-        # communicator without making this process a draft with an attention
-        # replica of its own. It still gathers with the target's replicas.
+        # Retain the target's attention topology when swapping TP groups.
         self.draft_owns_attention = False
         self.draft_tp_context = (
             draft_tp_context if get_parallel().enable_dp_attention else empty_context

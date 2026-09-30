@@ -95,7 +95,6 @@ from sglang.srt.runtime_context import (
     SpawnRanks,
     get_device,
     get_model,
-    get_parallel,
     get_schedule,
     publish,
     spawn_world_rank,
@@ -278,7 +277,6 @@ class BenchArgs:
         )
         parser.add_argument(
             "--profile-prefix",
-            "--profile-filename-prefix",  # deprecated alias, kept for back-compat
             dest="profile_prefix",
             type=str,
             default=BenchArgs.profile_prefix,
@@ -327,13 +325,12 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
         server_args=server_args,
     )
 
-    # Phase two: this entry has no scheduler to run it.
     bootstrap.init_parallel_runtime(
         server_args=server_args,
-        model_config=model_config,
         device=get_device().device,
         dist_port=port_args.nccl_port,
     )
+    bootstrap.init_layer_runtime(model_config=model_config)
 
     _use_mlx = use_mlx()
     if _use_mlx:
@@ -545,10 +542,6 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
         prepare_mlp_sync_batch_raw(
             batch,
             model_runner=model_runner,
-            dp_size=get_parallel().dp_size,
-            attn_tp_size=get_parallel().attn_tp_size,
-            attn_cp_size=model_runner.attn_cp_size,
-            tp_group=model_runner.tp_group,
             get_idle_batch=None,
             disable_cuda_graph=cuda_graph_fully_disabled(),
             require_mlp_tp_gather=require_mlp_tp_gather(),
@@ -910,13 +903,7 @@ def latency_test(
     initialize_fp4_gemm_config()
 
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
-        parallel = get_parallel()
-        set_gpu_proc_affinity(
-            parallel.pp_size,
-            parallel.tp_size,
-            parallel.nnodes,
-            tp_rank,
-        )
+        set_gpu_proc_affinity(tp_rank)
 
     # Configure the logger
     configure_logger(server_args, prefix=f" TP{tp_rank}")

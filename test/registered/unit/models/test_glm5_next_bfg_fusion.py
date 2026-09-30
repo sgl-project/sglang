@@ -83,9 +83,6 @@ class TestGlm5NextBfgFusion(unittest.TestCase):
             for attn_tp, rank in ((1, 0), (2, 0), (2, 1)):
                 with (
                     self.subTest(route=expected_route, attn_tp=attn_tp, rank=rank),
-                    # A width is a whole topology: the attention triple has
-                    # to factor `tp_size`, and this process has to sit where
-                    # the triple puts it.
                     get_parallel().override(
                         tp_size=4,
                         tp_rank=rank,
