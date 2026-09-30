@@ -167,12 +167,10 @@ def maybe_optimize_minimax_h3_vae(vae: nn.Module) -> nn.Module:
 
     gate = VaeFastPathGate()
     install_fast_attention(eligible, gate)
-    # batched tiles are gated: a larger GEMM M may select different kernels than per-tile decode
-    vae._sgl_stack_tiles_gate = gate
     register_vae_fast_path_gate(vae, gate)
     logger.info(
         "MiniMax-H3 VAE: installed quality-gated fast path (%d QK RMSNorm+RoPE "
-        "fusions, cuDNN SDPA, batched decoder tiles).",
+        "fusions, cuDNN SDPA).",
         len(eligible),
     )
     return vae

@@ -30,6 +30,7 @@ from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.base_module 
     RotaryEmbeddingND,
 )
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.vit_utils import (
+    apply_rotary_pos_emb_qk,
     create_token_ids,
     prepare_rotary_pos_emb,
 )
@@ -145,9 +146,10 @@ def test_vit_fast_path_is_gated_and_matches_reference():
 
 
 @requires_cuda
-def test_vit_fused_qknorm_rope_batched_tiles_match_per_tile():
-    """Stacked decoder tiles share one RoPE row and run the fused kernel over
-    the flattened batch, bit-identical to one tile at a time."""
+def test_vit_rope_batched_tiles_match_per_tile():
+    """Stacked decoder tiles share one RoPE row; the fused (quality) and native
+    (lossless) RoPE kernels over the flattened batch are bit-identical to one
+    tile at a time."""
     from types import SimpleNamespace
 
     from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_vae_cuda_opt import (
@@ -175,6 +177,13 @@ def test_vit_fused_qknorm_rope_batched_tiles_match_per_tile():
     query, key, _ = qkv.chunk(3, dim=-1)
     assert _fused_qknorm_rope(attn, query, key, batched_rotary)
     assert torch.equal(qkv, per_tile)
+
+    query, key, _ = qkv.chunk(3, dim=-1)
+    batched = apply_rotary_pos_emb_qk(query, key, batched_rotary)
+    for tile in range(tiles):
+        query, key, _ = qkv[tile : tile + 1].chunk(3, dim=-1)
+        for got, want in zip(batched, apply_rotary_pos_emb_qk(query, key, rotary)):
+            assert torch.equal(got[tile : tile + 1], want)
 
 
 def test_audio_vae_attention_defaults_to_local_sdpa_and_allows_fa():

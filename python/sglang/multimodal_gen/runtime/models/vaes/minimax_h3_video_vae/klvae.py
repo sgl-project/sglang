@@ -168,8 +168,6 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         self.encoder_tiling = kwargs.get("encoder_tiling", False)
         self.decoder_tiling = kwargs.get("decoder_tiling", False)
         self.stack_tiling = kwargs.get("stack_tiling", False)
-        # Installed by the quality-gated CUDA fast path; stacks tiles when open.
-        self._sgl_stack_tiles_gate = None
         self.tile_size = kwargs.get("tile_size", 256)
         self.tile_overlap_min = kwargs.get("tile_overlap_min", 64)
         self.decoder_tile_size = kwargs.get("decoder_tile_size", self.tile_size)
@@ -484,10 +482,9 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         local_tile_indices = self._local_tile_indices(
             num_tiles, tile_rank, tile_world_size
         )
-        stack_gate = self._sgl_stack_tiles_gate
-        stack_tiling = (
-            self.stack_tiling or (stack_gate is not None and stack_gate.enabled)
-        ) and not (self.training and getattr(self.decoder, "mask_enabled", False))
+        stack_tiling = self.stack_tiling and not (
+            self.training and getattr(self.decoder, "mask_enabled", False)
+        )
         decoded_tasks = self._run_tile_tasks(
             z_tiles, local_tile_indices, self.decode, stack_tiling
         )

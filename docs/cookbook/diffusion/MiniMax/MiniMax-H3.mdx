@@ -870,8 +870,11 @@ shifted once per modality, as FastVideo runs them). Any other step count is
 rejected. The trained sparsity 0.8 is the default; `--attention-backend-config
 '{"VSA_sparsity": ...}'` overrides it. FastH3 requests default to
 `quality: "extra-high"`, which fuses the VAE decoder's per-head QK RMSNorm and
-RoPE, runs its attention on cuDNN SDPA, and decodes each GPU's spatial tiles as
-one batch; `quality: "lossless"` keeps the reference decode.
+RoPE and runs its attention on cuDNN SDPA; `quality: "lossless"` keeps the
+reference decoder kernels. At every quality level FastH3 decodes each GPU's
+spatial VAE tiles as one batch rather than one at a time, which changes GEMM
+shapes and so the output at rounding level; base MiniMax-H3 decodes tile by
+tile.
 
 `video_sparse_attn_h3` (VSA-H3) is the trained sparse policy: in-tree
 block-sparse kernels (FastVideo's native tcgen05 forward on SM100 / SM103, a
@@ -1004,8 +1007,8 @@ levels:
 - `"extra-high"`: includes the global fusion-only tier but does not enable
   Cache-DiT or another approximate optimization. The denoise path is the same
   as `lossless`; VAE decode fuses the ViT decoder's per-head QK RMSNorm and
-  RoPE into one launch, runs its attention on cuDNN SDPA and decodes each
-  GPU's spatial tiles as one batch (rounding-level differences only).
+  RoPE into one launch and runs its attention on cuDNN SDPA (rounding-level
+  differences only).
 - `"high"`: the audited accelerated path. Quality is guaranteed (the audited
   Cache-DiT configuration measures SSIM 0.931 / PSNR 28.16 dB against
   `lossless`), but output is no longer bit-identical to the reference.
@@ -1053,9 +1056,8 @@ omitting the field is equivalent.
 <Tab title="extra-high">
 
 The global fusion-only tier. It does not enable MiniMax-H3 Cache-DiT and
-follows the same H3 denoise path as `lossless`; only the VAE decoder differs:
-fused QK RMSNorm + RoPE, cuDNN SDPA attention, and each GPU's spatial tiles
-decoded as one batch.
+follows the same H3 denoise path as `lossless`; only the VAE decoder's fused
+QK RMSNorm + RoPE and cuDNN SDPA attention differ.
 
 ```json Request field
 {
@@ -1085,7 +1087,7 @@ The measured trade-off is:
 | `quality` | Mean <br />inference <br />latency | Speedup | SSIM vs <br />lossless | PSNR vs <br />lossless | Expected <br />trade-off |
 | --- | ---: | ---: | ---: | ---: | --- |
 | `lossless` | 75.10 s | 1.00× | 1.000 | exact | Native reference path |
-| `extra-high` | Not separately measured | — | Same H3 denoise path | Same H3 denoise path | Fusion-only tier; VAE decode fuses QK RMSNorm + RoPE, uses cuDNN SDPA and batches spatial tiles (rounding-level differences) |
+| `extra-high` | Not separately measured | — | Same H3 denoise path | Same H3 denoise path | Fusion-only tier; VAE decode fuses QK RMSNorm + RoPE and uses cuDNN SDPA (rounding-level differences) |
 | `high` | 53.70 s | 1.40× | 0.931 | 28.16 dB | Smallest same-seed visual change |
 
 These numbers use 1344×768, 124-frame, 24 fps T2VA with 50 inference steps,

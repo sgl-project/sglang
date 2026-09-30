@@ -342,6 +342,7 @@ class FastH3PipelineConfig(MiniMaxH3PipelineConfig):
 
     def __post_init__(self) -> None:
         self.dit_config.arch_config.has_gate_compress = True
+        self.vae_config.stack_tiling = True
 
     def validate_quality_deployment(self, server_args) -> None:
         raise ValueError(
