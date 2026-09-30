@@ -78,7 +78,7 @@ from sglang.srt.entrypoints.decision.protocol import (
     DecisionsRouteRequest,
     JevRequest,
 )
-from sglang.srt.entrypoints.decision.serving import DecisionModelServing
+from sglang.srt.entrypoints.decision.request_id import TypesafeRequestIdMiddleware
 from sglang.srt.entrypoints.engine import (
     Engine,
     init_tokenizer_manager,
@@ -361,9 +361,6 @@ async def lifespan(fast_api_app: FastAPI):
     fast_api_app.state.systemone_serving = SystemOneServing(
         fast_api_app.state.openai_serving_chat
     )
-    fast_api_app.state.decision_model_serving = DecisionModelServing(
-        _global_state.tokenizer_manager
-    )
 
     # Launch tool server
     tool_server = None
@@ -492,6 +489,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(TypesafeRequestIdMiddleware)
 
 if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
     from sglang.srt.entrypoints.http_request_decompression import (
@@ -617,7 +615,6 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
     return ORJSONResponse(content=error.model_dump(), status_code=exc.status_code)
 
 
-TYPESAFE_REQUEST_ID_HEADER = "x-typesafe-request-id"
 # /v1/decisions validation tags a Jev body's errors after "body".
 _JEV_BODY_LOC = ("body", "jev")
 
@@ -655,12 +652,10 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             }
             for error in errors
         ]
-        response = ORJSONResponse(
+        return ORJSONResponse(
             status_code=HTTPStatus.UNPROCESSABLE_ENTITY.value,
             content={"detail": jsonable_encoder(detail)},
         )
-        response.headers[TYPESAFE_REQUEST_ID_HEADER] = _typesafe_request_id(request)
-        return response
 
     exc_str = str(exc)
     errors_str = str(exc.errors())
@@ -1988,13 +1983,8 @@ async def v1_decisions_request(request: DecisionsRouteRequest, raw_request: Requ
 
     A body with a state, or with questions keyed by field name, is a Jev request for a decision model checkpoint.
     """
-    if isinstance(request, JevRequest):
-        return await jev_decisions(request, raw_request)
-    return _with_typesafe_request_id(
-        await raw_request.app.state.openai_serving_decisions.handle_request(
-            request, raw_request
-        ),
-        raw_request,
+    return await raw_request.app.state.openai_serving_decisions.handle_request(
+        request, raw_request
     )
 
 
@@ -2119,8 +2109,8 @@ async def systemone_decisions(raw_request: Request):
 
     A decision model checkpoint answers with its own trained protocol instead.
     """
-    state = raw_request.app.state
-    decision_model = state.decision_model_serving.family is not None
+    serving = raw_request.app.state.systemone_serving
+    decision_model = serving.trained_decisions.family is not None
     model = JevRequest if decision_model else SystemOneRequest
     try:
         body = await raw_request.json()
@@ -2134,22 +2124,14 @@ async def systemone_decisions(raw_request: Request):
         raise RequestValidationError(
             [{**error, "loc": ("body", *error["loc"])} for error in e.errors()]
         ) from e
-    if decision_model:
-        return await jev_decisions(request, raw_request)
-    return _with_typesafe_request_id(
-        await state.systemone_serving.handle_request(request, raw_request),
-        raw_request,
-    )
+    return await serving.handle_request(request, raw_request)
 
 
 @app.post("/v1/jev", dependencies=[Depends(validate_json_request)])
 async def jev_decisions(request: JevRequest, raw_request: Request):
     """Decision model checkpoints: every field's answer read at its readout position in one prefill."""
-    return _with_typesafe_request_id(
-        await raw_request.app.state.decision_model_serving.handle_request(
-            request, raw_request
-        ),
-        raw_request,
+    return await raw_request.app.state.openai_serving_decisions.handle_request(
+        request, raw_request
     )
 
 
@@ -2158,16 +2140,6 @@ def _untagged_loc(loc) -> tuple:
     if loc[:2] == _JEV_BODY_LOC:
         return ("body", *loc[2:])
     return loc
-
-
-def _typesafe_request_id(raw_request: Request) -> str:
-    return raw_request.headers.get(TYPESAFE_REQUEST_ID_HEADER) or uuid.uuid4().hex
-
-
-def _with_typesafe_request_id(response, raw_request: Request):
-    if isinstance(response, Response):
-        response.headers[TYPESAFE_REQUEST_ID_HEADER] = _typesafe_request_id(raw_request)
-    return response
 
 
 ## SageMaker API
