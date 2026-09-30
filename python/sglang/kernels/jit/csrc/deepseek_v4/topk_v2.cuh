@@ -800,7 +800,6 @@ struct TopKSplit : impl::TopKRadixBase<12> {
   }
 };
 
-template <bool kPDL>
 TOPK_KERNEL void topk_split_hist(const __grid_constant__ TopKPagedParams params, const SplitWorkspace ws) {
   device::enable_smem_spilling();
   const auto row = blockIdx.x;
@@ -817,11 +816,10 @@ TOPK_KERNEL void topk_split_hist(const __grid_constant__ TopKPagedParams params,
   __shared__ impl::MaxSmem<TopKSplit::Smem> smem;
   const auto chunk = TopKSplit::chunk_of(problem.seq_len, rank, ws.split);
   auto* row_hist = ws.hist + static_cast<size_t>(row) * TopKSplit::kHistSize;
-  device::PDLWaitPrimary<kPDL>();
   TopKSplit::histogram_chunk(problem, chunk, row_hist, reinterpret_cast<TopKSplit::Smem*>(&smem));
 }
 
-template <bool kPDL, TopKMode kMode>
+template <TopKMode kMode>
 TOPK_KERNEL void topk_split_select(const __grid_constant__ TopKPagedParams params, const SplitWorkspace ws) {
   device::enable_smem_spilling();
   const auto row = blockIdx.x;
@@ -837,15 +835,14 @@ TOPK_KERNEL void topk_split_select(const __grid_constant__ TopKPagedParams param
     if (rank != 0) return;
     __shared__ int32_t s_topk_indices[kNeedStaging ? kMaxTopK : 1];
     if (problem.seq_len <= problem.topk) {
-      return trivial_transform<kPDL, kMode>(problem, params.get_transform(row));
+      return trivial_transform<false, kMode>(problem, params.get_transform(row));
     }
     if constexpr (kNeedStaging) problem.out = s_topk_indices;
     if (problem.seq_len <= kReg4MaxSeqLen) {
-      Register4::forward<kPDL>(problem, &smem);
+      Register4::forward<false>(problem, &smem);
     } else {
-      Streaming::forward<kPDL>(problem, &smem);
+      Streaming::forward<false>(problem, &smem);
     }
-    device::PDLTriggerSecondary<kPDL>();
     if constexpr (kNeedStaging) {
       __syncthreads();
       paged_transform<kMode>(problem, params.get_output_ptr(row), params.get_transform(row));
@@ -864,7 +861,6 @@ TOPK_KERNEL void topk_split_select(const __grid_constant__ TopKPagedParams param
 
   TopKSplit::clear_row(row_hist);
   TopKSplit::finish_ties(problem, ties, split_smem);
-  device::PDLTriggerSecondary<kPDL>();
   if constexpr (kNeedStaging) {
     // problem.out is already the destination, and paged_transform reads every
     // slot into registers before writing any, so transforming in place is safe.
@@ -1145,10 +1141,10 @@ struct TopKKernel {
       if (const auto [split, split_ws] = split_plan(batch_size, max_seq_len, device); split >= kSplitMin) {
         LaunchKernel({batch_size, split}, kBlockSize, device)
             .config({.use_pdl = false})
-            .launch(topk_split_hist<false>, params, split_ws);
+            .launch(topk_split_hist, params, split_ws);
         LaunchKernel({batch_size, split}, kBlockSize, device)
             .config({.use_pdl = false})
-            .launch(topk_split_select<false, kMode>, params, split_ws);
+            .launch(topk_split_select<kMode>, params, split_ws);
         return;
       }
 #endif
