@@ -1,8 +1,8 @@
-use sglang_processor::{ChatTemplateConfig, OneOrMany, load_chat_support};
+use sglang_processor::{ChatFormatterOptions, OneOrMany, select_chat_formatter};
 
 #[test]
 fn built_in_template_is_selected_through_the_public_api() {
-    let (formatter, error) = load_chat_support(&ChatTemplateConfig {
+    let (formatter, error) = select_chat_formatter(&ChatFormatterOptions {
         tokenizer_path: ".".into(),
         chat_template: Some("chatml".into()),
         ..Default::default()

@@ -510,7 +510,7 @@ fn chat_tool_definitions(request: &ChatRequest) -> Vec<ToolDefinition> {
         .collect()
 }
 
-use sglang_processor::dynamo_parser_name;
+use sglang_processor::dynamo_tool_parser_name;
 
 fn dynamo_tool_choice(choice: &Option<ChatCompletionToolChoiceOption>) -> DynamoToolChoice {
     match choice {
@@ -547,7 +547,7 @@ fn apply_tool_constraint(
     let Some(parser) = parser else {
         return Ok(());
     };
-    let parser = dynamo_parser_name(parser);
+    let parser = dynamo_tool_parser_name(parser);
     let config = get_tool_parser_map()
         .get(parser)
         .ok_or_else(|| format!("tool-call parser `{parser}` is not supported by Dynamo"))?;

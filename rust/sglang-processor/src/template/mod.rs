@@ -38,9 +38,9 @@ use self::{
 
 mod deepseek_v4;
 mod kimi_k25;
-mod select;
+mod selection;
 
-pub use self::select::{ChatTemplateConfig, load_chat_support};
+pub use self::selection::{ChatFormatterOptions, select_chat_formatter};
 
 const SUPPORTED_STYLES: &[&str] = &[
     "ADD_COLON_SINGLE",
@@ -1797,9 +1797,9 @@ mod tests {
     };
 
     use super::{
-        ChatFormatter, ChatTemplateConfig, LegacyFormatter, LegacySpec, OneOrMany, TemplateError,
+        ChatFormatter, ChatFormatterOptions, LegacyFormatter, LegacySpec, OneOrMany, TemplateError,
         ThinkingPolicy, builtin_template, detect_thinking_policy,
-        infer_legacy_template_from_model_path, load_chat_formatter, load_chat_support,
+        infer_legacy_template_from_model_path, load_chat_formatter, select_chat_formatter,
     };
 
     fn request() -> CreateChatCompletionRequest {
@@ -2353,7 +2353,7 @@ mod tests {
         };
         assert_eq!(formatter.spec.name, "phi-4-mm");
 
-        // `load_chat_support` reads the model type from `<model_path>/config.json`.
+        // `select_chat_formatter` reads the model type from `<model_path>/config.json`.
         let model_dir = std::env::temp_dir().join(format!(
             "sglang-openai-template-infer-model-{}",
             std::process::id()
@@ -2364,7 +2364,7 @@ mod tests {
             r#"{"model_type":"phi4mm","architectures":["Phi4MMForCausalLM"]}"#,
         )
         .unwrap();
-        let (formatter, error) = load_chat_support(&ChatTemplateConfig {
+        let (formatter, error) = select_chat_formatter(&ChatFormatterOptions {
             tokenizer_path: model_dir.to_str().unwrap().into(),
             model_path: model_dir.to_str().unwrap().into(),
             ..Default::default()

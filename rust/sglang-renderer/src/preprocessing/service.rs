@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use futures::future::try_join_all;
-use sglang_processor::ChatTemplateConfig;
+use sglang_processor::ChatFormatterOptions;
 
 use super::tokenizer::{
     PooledTokenizer, TextTokenizer, check_total_tokens, validate_request_id, validate_text_request,
@@ -187,7 +187,7 @@ impl RendererService {
 }
 
 fn load_chat_support(config: &RendererConfig) -> (Option<ChatFormatter>, Option<String>) {
-    sglang_processor::load_chat_support(&ChatTemplateConfig {
+    sglang_processor::select_chat_formatter(&ChatFormatterOptions {
         tokenizer_path: config.tokenizer_path.clone(),
         model_path: config.model_path.clone(),
         revision: config.revision.clone(),

@@ -1,49 +1,22 @@
-//! Tokenizer loading and encoding over Dynamo tokenizers.
+//! Model file resolution from local paths and the HF hub cache.
 
 use std::path::{Path, PathBuf};
 
-use crate::ProcessorError as Error;
-
-/// Pluggable text→token-ids backend. `Send + Sync` so one instance is shared
-/// (read-only) across all pinned workers.
-pub trait TextTokenizer: Send + Sync {
-    fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<i32>, Error>;
-
-    fn encode_segments(
-        &self,
-        segments: &[dynamo_tokenizers::EncodeSegment<'_>],
-        add_special_tokens: bool,
-    ) -> Result<Vec<i32>, Error> {
-        let text = segments
-            .iter()
-            .map(|segment| segment.text)
-            .collect::<String>();
-        self.encode(&text, add_special_tokens)
+/// Resolve a model file from the tokenizer source: a dir → `dir/<file>`, a file →
+/// its sibling, else an HF Hub repo id → the local cache. `None` if not found.
+pub fn resolve_model_file(path: &str, revision: Option<&str>, filename: &str) -> Option<String> {
+    let p = Path::new(path);
+    if p.is_dir() {
+        let f = p.join(filename);
+        return f.is_file().then(|| f.to_string_lossy().into_owned());
     }
-}
-
-/// Load the tokenizer shared (Arc-backed) by the encode pool and detok shards.
-/// `tokenizer_path` is a tokenizer file, a model dir, or an HF Hub repo id
-/// (resolved from the local cache — no network).
-pub fn load_tokenizer(
-    tokenizer_path: Option<&str>,
-    revision: Option<&str>,
-    add_special_tokens: bool,
-) -> Result<dynamo_tokenizers::Tokenizer, String> {
-    let path =
-        tokenizer_path.ok_or_else(|| "no tokenizer configured: set tokenizer_path".to_string())?;
-    let file = resolve_tokenizer_file(path, revision).ok_or_else(|| {
-        format!(
-            "no supported tokenizer file found for '{path}' (expected tokenizer.json, tiktoken.model, or *.tiktoken)"
-        )
-    })?;
-    let tokenizer = dynamo_tokenizers::Tokenizer::from_file_with_options(
-        &file,
-        dynamo_tokenizers::TokenizerOptions { add_special_tokens },
-    )
-    .map_err(|e| format!("tokenizer load failed ({file}): {e}"))?;
-    tracing::info!(%path, "loaded tokenizer");
-    Ok(tokenizer)
+    if p.is_file() {
+        // `path` is a file (e.g. `tokenizer.json`); look for the sibling.
+        let f = p.parent()?.join(filename);
+        return f.is_file().then(|| f.to_string_lossy().into_owned());
+    }
+    // Not a local path → HF Hub repo id (offline cache lookup).
+    resolve_from_hub_cache(path, revision, filename)
 }
 
 /// Resolve the tokenizer source used by the renderer.
@@ -58,7 +31,7 @@ pub fn resolve_tokenizer_file(path: &str, revision: Option<&str>) -> Option<Stri
 
 /// Resolve a dedicated Hugging Face chat-template file when the template is
 /// not embedded in `tokenizer_config.json`.
-pub fn resolve_chat_template_file(path: &str, revision: Option<&str>) -> Option<String> {
+pub(crate) fn resolve_chat_template_file(path: &str, revision: Option<&str>) -> Option<String> {
     let directory = model_directory(path, revision)?;
     discover_chat_template_in_dir(&directory).map(|path| path.to_string_lossy().into_owned())
 }
@@ -154,23 +127,6 @@ fn is_supported_tokenizer_file(path: &Path) -> bool {
         })
 }
 
-/// Resolve a model file from the tokenizer source: a dir → `dir/<file>`, a file →
-/// its sibling, else an HF Hub repo id → the local cache. `None` if not found.
-pub fn resolve_model_file(path: &str, revision: Option<&str>, filename: &str) -> Option<String> {
-    let p = Path::new(path);
-    if p.is_dir() {
-        let f = p.join(filename);
-        return f.is_file().then(|| f.to_string_lossy().into_owned());
-    }
-    if p.is_file() {
-        // `path` is a file (e.g. `tokenizer.json`); look for the sibling.
-        let f = p.parent()?.join(filename);
-        return f.is_file().then(|| f.to_string_lossy().into_owned());
-    }
-    // Not a local path → HF Hub repo id (offline cache lookup).
-    resolve_from_hub_cache(path, revision, filename)
-}
-
 /// Locate a file for an HF Hub repo id in the local cache. Offline —
 /// the scheduler pre-downloads the model. `None` if not cached.
 fn resolve_from_hub_cache(repo_id: &str, revision: Option<&str>, filename: &str) -> Option<String> {
@@ -196,55 +152,6 @@ fn cache_repo(repo_id: &str, revision: Option<&str>) -> hf_hub::CacheRepo {
         RepoType::Model,
         revision.unwrap_or("main").to_string(),
     ))
-}
-
-/// Real tokenizer over two already-loaded dynamo handles. Dynamo fixes
-/// `add_special_tokens` when loading, so selecting the mode at request time
-/// requires one handle for each setting.
-pub struct DynamoTokenizer {
-    without_specials: dynamo_tokenizers::Tokenizer,
-    with_specials: dynamo_tokenizers::Tokenizer,
-}
-
-impl DynamoTokenizer {
-    pub fn new(
-        without_specials: dynamo_tokenizers::Tokenizer,
-        with_specials: dynamo_tokenizers::Tokenizer,
-    ) -> Self {
-        Self {
-            without_specials,
-            with_specials,
-        }
-    }
-}
-
-impl TextTokenizer for DynamoTokenizer {
-    fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<i32>, Error> {
-        let encoding = if add_special_tokens {
-            &self.with_specials
-        } else {
-            &self.without_specials
-        }
-        .encode(text)
-        .map_err(|e| Error::Tokenize(e.to_string()))?;
-        // Vocab ids are non-negative and fit in i32.
-        Ok(encoding.token_ids().iter().map(|&id| id as i32).collect())
-    }
-
-    fn encode_segments(
-        &self,
-        segments: &[dynamo_tokenizers::EncodeSegment<'_>],
-        add_special_tokens: bool,
-    ) -> Result<Vec<i32>, Error> {
-        let encoding = if add_special_tokens {
-            &self.with_specials
-        } else {
-            &self.without_specials
-        }
-        .encode_segments(segments)
-        .map_err(|error| Error::Tokenize(error.to_string()))?;
-        Ok(encoding.token_ids().iter().map(|&id| id as i32).collect())
-    }
 }
 
 #[cfg(test)]

@@ -6,7 +6,6 @@
 //! responsibilities. HTTP and future gRPC adapters consume these semantic
 //! events without reimplementing parser behavior.
 
-use crate::parsers::dynamo_parser_name;
 use std::pin::Pin;
 
 use dynamo_parsers::ToolDefinition;
@@ -24,6 +23,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::ProcessorError;
+use crate::tool_parser::dynamo_tool_parser_name;
 
 /// Engine-neutral terminal reason understood by chat response processing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -252,7 +252,7 @@ impl ChatResponseProcessor {
         };
 
         let post_tool_terminal_markers = self.tool_parser.as_deref().map_or(&[][..], |parser| {
-            match dynamo_parser_name(parser) {
+            match dynamo_tool_parser_name(parser) {
                 "qwen25" => &["<|im_end|>"],
                 "glm47" => &["<|user|>", "<|endoftext|>", "<|observation|>"],
                 _ => &[],
@@ -262,7 +262,7 @@ impl ChatResponseProcessor {
             Box<dyn Stream<Item = Annotated<CreateChatCompletionStreamResponse>> + Send>,
         > = if let Some(parser) = self.tool_parser {
             Box::pin(apply_tool_calling_jail(
-                Some(dynamo_parser_name(&parser).to_owned()),
+                Some(dynamo_tool_parser_name(&parser).to_owned()),
                 self.tool_choice,
                 self.tools,
                 self.uses_tool_call_structural_tag,
