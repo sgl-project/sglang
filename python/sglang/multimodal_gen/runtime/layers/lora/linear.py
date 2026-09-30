@@ -144,7 +144,7 @@ class BaseLayerWithLoRA(nn.Module):
             lora_B = self.lora_B.to_local()
             lora_A = self.lora_A.to_local()
 
-        input_parallel = self.base_layer.parallel_input(input)
+        input_parallel = self.base_layer.parallel_input(x)
         output_parallel, output_bias = self.base_layer.apply_quant_method(
             input_parallel, self.base_layer.bias
         )
