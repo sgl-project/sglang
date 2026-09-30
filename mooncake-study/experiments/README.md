@@ -28,7 +28,7 @@ stopped and reaped before test execution, then resumed afterward:
 ```bash
 LAB=/gpfs/users/fuxuanwei-1/dspark-maas-lab
 python3 "$LAB/bin/gpu_worker.py" --state-dir "$LAB/state" submit \
-  --cwd "$LAB/sglang" --timeout-seconds 600 \
+  --cwd "$LAB/sglang" --timeout-seconds 900 \
   --env "PYTHONPATH=$LAB/sglang/python" \
   --env "PATH=$LAB/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
   -- "$LAB/venvs/capture/bin/python" \
@@ -66,8 +66,9 @@ each request/batch; it is not a saturation or throughput benchmark.
 The overlap observer follows actual forward input tokens and preserves the first
 KV observation for each position, because later Radix prefix dedup can change the
 physical mapping. It reads raw vocabulary scores before serving-side processing.
-Its synchronous reads are test-only. Ordinary AR capture supports default overlap
-scheduling; static DSpark capture still requires `--disable-overlap-schedule`.
+Its synchronous reads are test-only. Ordinary AR and static DSpark capture both
+support default overlap scheduling. Speculative observation also follows actual
+verify inputs and model-accepted output prefixes, since CPU output IDs can lag.
 
 `diagnose_qwen3_kv.py` compares HF eager/SDPA and BF16/FP32 without any Mooncake
 or capture code. Reloading each dtype is intentional: casting an entire model
@@ -77,13 +78,17 @@ capture check. No real training, cross-node RDMA or performance SLO is certified
 by these experiments.
 
 The runtime test also exports synthetic `DSparkTargetKVDraftModel` checkpoints
-from a retrieved sample's teacher/KV contract. Two additional servers check
-ordinary and CUDA-graph speculative generation, including a two-request batch,
-both verify accept/reject branches and continued serving after management API
-rejections. A test-only observer compares projected draft KV against per-layer
-reference math and checks actual graph replay with no target hidden capture.
+from a retrieved sample's teacher/KV contract. Four additional servers check
+ordinary and CUDA-graph speculative generation with and without overlap,
+including batches, both verify accept/reject branches and continued serving
+after management API rejections. A test-only observer compares projected draft
+KV against per-layer reference math and checks actual graph replay with no
+target hidden capture.
+The overlap pair also checks three-request graph padding, exact Host capacity
+and streamed abort while verify results are pending. The abort helper waits for
+fenced Catalog failure and reservation recycling, and rejects quarantined slots.
 The fixture's forced proposal weights are not a trained draft. This extends the
-same command above; allow 600 seconds and retain the job log for evidence.
+same command above; allow 900 seconds and retain the job log for evidence.
 
 Focused regressions:
 

@@ -11,8 +11,10 @@ from sglang.srt.training_capture.coordinator import CaptureCoordinator
 
 _sequence = itertools.count()
 _token_prefixes = {}
+_verify_frames = {}
 _after_forward = CaptureCoordinator.after_forward
 _after_verify_forward = CaptureCoordinator.after_verify_forward
+_after_verify_accept = CaptureCoordinator.after_verify_accept
 
 
 def observe(
@@ -30,6 +32,8 @@ def observe(
         else Path(coordinator.config.journal_directory).parent
     ) / "capture-reference"
     root.mkdir(exist_ok=True)
+    if width is not None:
+        _verify_frames[id(coordinator)] = []
     offset = 0
     for row, req in enumerate(batch.reqs):
         count = width or (
@@ -64,7 +68,13 @@ def observe(
             start = end
             region = slice(row * width, (row + 1) * width)
             slots = forward_batch.out_cache_loc[region]
-            tokens = tokens[:start] + forward_batch.input_ids[region].tolist()
+            history = _token_prefixes[req.rid]
+            assert len(history) >= start
+            verify_tokens = forward_batch.input_ids[region].tolist()
+            tokens = history[:start] + verify_tokens
+            _verify_frames[id(coordinator)].append(
+                (req.rid, row, start, verify_tokens[0])
+            )
             predictions = list(range(start + 1, start + width + 1))
             logits = logits_output.next_token_logits[region]
         # Read all raw vocabulary scores. The test computes its own top-k and
@@ -112,9 +122,23 @@ def after_verify_forward(self, batch, forward_batch, logits_output, **kwargs):
     return _after_verify_forward(self, batch, forward_batch, logits_output, **kwargs)
 
 
+def after_verify_accept(self, ticket, *, commit_lens, out_tokens):
+    result = _after_verify_accept(
+        self, ticket, commit_lens=commit_lens, out_tokens=out_tokens
+    )
+    counts, outputs = commit_lens.tolist(), out_tokens.tolist()
+    for rid, row, start, anchor in _verify_frames.pop(id(self), []):
+        history = _token_prefixes[rid]
+        if start < len(history):
+            assert history[start] == anchor
+        _token_prefixes[rid] = history[:start] + [anchor] + outputs[row][: counts[row]]
+    return result
+
+
 def install_capture_observer():
     CaptureCoordinator.after_forward = after_forward
     CaptureCoordinator.after_verify_forward = after_verify_forward
+    CaptureCoordinator.after_verify_accept = after_verify_accept
 
 
 def check_capture_snapshot(

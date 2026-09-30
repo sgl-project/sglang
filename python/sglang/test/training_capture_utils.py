@@ -1,8 +1,10 @@
 """Synthetic snapshot fixtures shared by unit and Store integration tests."""
 
 import ctypes
+import time
 from types import SimpleNamespace
 
+import requests
 import torch
 
 from sglang.srt.training_capture.protocol import (
@@ -82,10 +84,87 @@ def read_snapshot(store, publication):
     return manifest, packed
 
 
+def exercise_capture_abort(test, *, url, rid, prompt, max_new_tokens):
+    """Cancel a live stream and require a fenced failure without publication."""
+    state = requests.get(url + "/server_info", timeout=10).json()["internal_states"][0][
+        "training_capture"
+    ]
+    previous_admitted = state["counters"].get("admitted", 0)
+    with test.catalog.condition:
+        previous_publications = len(test.catalog.publications)
+        previous_failures = {
+            capture_id
+            for capture_id, record in test.catalog.captures.items()
+            if record["state"] == "FAILED"
+        }
+    with requests.post(
+        url + "/generate",
+        json={
+            "rid": rid,
+            "input_ids": prompt,
+            "stream": True,
+            "sampling_params": {
+                "temperature": 0,
+                "max_new_tokens": max_new_tokens,
+                "ignore_eos": True,
+                "logit_bias": {"100": 100.0},
+            },
+        },
+        stream=True,
+        timeout=120,
+    ) as response:
+        test.assertEqual(
+            response.status_code,
+            200,
+            response.text if response.status_code != 200 else "",
+        )
+        for line in response.iter_lines(chunk_size=1):
+            if line.startswith(b"data: ") and line != b"data: [DONE]":
+                status = requests.post(
+                    url + "/abort_request", json={"rid": rid}, timeout=20
+                )
+                test.assertEqual(status.status_code, 200, status.text)
+                break
+        else:
+            test.fail("stream ended without any output before abort")
+    with test.catalog.condition:
+        test.assertTrue(
+            test.catalog.condition.wait_for(
+                lambda: any(
+                    capture_id not in previous_failures
+                    and record["state"] == "FAILED"
+                    and record.get("reason") == "request_aborted_or_retracted"
+                    for capture_id, record in test.catalog.captures.items()
+                ),
+                timeout=20,
+            ),
+            "aborted capture did not finish its fenced Catalog failure",
+        )
+        test.assertEqual(len(test.catalog.publications), previous_publications)
+    deadline = time.monotonic() + 20
+    while True:
+        state = requests.get(url + "/server_info", timeout=10).json()[
+            "internal_states"
+        ][0]["training_capture"]
+        if state["states"].get("available", 0) == state["reservations"]:
+            break
+        test.assertLess(time.monotonic(), deadline, state)
+        time.sleep(0.05)
+    test.assertEqual(state["counters"].get("admitted", 0), previous_admitted + 1)
+    test.assertGreater(
+        state["counters"].get("failed_request_aborted_or_retracted", 0), 0
+    )
+    test.assertEqual(state["host_pool"]["quarantined"], 0)
+    return state
+
+
 class VerifyCaptureFixture:
-    def __init__(self, coordinator, request):
+    def __init__(self, coordinator, request, *, prefill_pending=False):
+        from sglang.srt.training_capture.coordinator import CaptureBatch, CaptureStep
+
         self.coordinator, self.request = coordinator, request
         coordinator.capture_mode = "speculative_accepted_target_path"
+        coordinator.enable_overlap = prefill_pending
         coordinator.before_forward([request])
         self.record = request.training_capture_context
         for index, buffer in enumerate(coordinator.exporter.buffers.values()):
@@ -97,8 +176,10 @@ class VerifyCaptureFixture:
         context.record_teacher(
             capture_teacher(self.prefill_logits, 256), row=0, position=2
         )
-        context.commit_token(position=2, token_id=10)
-        request.output_ids.append(10)
+        self.prefill_result = CaptureBatch((CaptureStep(request, self.record, 2),))
+        if not prefill_pending:
+            context.commit_token(position=2, token_id=10)
+            request.output_ids.append(10)
 
     def forward(self, *, inputs=(10, 20, 30, 40), prefix=2, selected_row=0):
         requests = [CaptureTestRequest("not-selected")] * selected_row + [self.request]

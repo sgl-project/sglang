@@ -35,6 +35,7 @@ class RequestCaptureContext:
         self.slot = slot
         self.prompt_length = len(prompt_ids)
         self.token_ids = list(prompt_ids)
+        self.pending_tokens = {}
         self.max_tokens = max_tokens
         self.vocab_size = vocab_size
         self.kv_end = 0
@@ -154,7 +155,35 @@ class RequestCaptureContext:
             raise ContractError("accepted token has no matching teacher row")
         if not 0 <= token_id < self.vocab_size:
             raise ContractError("accepted token outside target vocabulary")
+        if (
+            position in self.pending_tokens
+            and self.pending_tokens[position] != token_id
+        ):
+            raise ContractError("scheduler token differs from the observed target path")
         self.token_ids.append(token_id)
+        self.pending_tokens.pop(position, None)
+
+    def observe_tokens(self, *, position: int, tokens: list[int]):
+        """Preserve the model's path until delayed scheduler results confirm it."""
+        self._collecting()
+        if position < 0:
+            raise ContractError("observed token position must be nonnegative")
+        for offset, token in enumerate(tokens):
+            index = position + offset
+            if index >= self.max_tokens:
+                break
+            if not 0 <= token < self.vocab_size:
+                raise ContractError("observed token outside target vocabulary")
+            if index < len(self.token_ids):
+                if self.token_ids[index] != token:
+                    raise ContractError("observed path differs from committed tokens")
+            elif index in self.pending_tokens:
+                if self.pending_tokens[index] != token:
+                    raise ContractError("observed target path changed before commit")
+            elif index == len(self.token_ids) + len(self.pending_tokens):
+                self.pending_tokens[index] = token
+            else:
+                raise ContractError("observed target path contains a gap")
 
     def seal(self, stop_reason: str):
         self._collecting()

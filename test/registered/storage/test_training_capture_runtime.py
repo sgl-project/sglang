@@ -335,6 +335,16 @@ class TestTrainingCaptureRuntime(CustomTestCase):
                 responses=responses,
                 cuda_graph=cuda_graph,
             )
+        for cuda_graph in (False, True):
+            exercise_target_kv_draft(
+                self,
+                model_path=self.model_path,
+                directory=self.temporary.name,
+                samples=samples,
+                responses=responses,
+                cuda_graph=cuda_graph,
+                enable_overlap=True,
+            )
         self.check_reference(samples)
 
     def check_graph_replay(self, samples):

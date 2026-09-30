@@ -186,6 +186,65 @@ class TestCaptureCoordinator(CustomTestCase):
         for name, source in fixture.sources.items():
             torch.testing.assert_close(tensors[name], source[[7, 3, 6]], rtol=0, atol=0)
 
+    def test_spec_overlap_confirms_pending_prefill_and_verify_tokens(self):
+        self.wait_until(lambda: len(self.coordinator.available) == 1)
+        req = CaptureTestRequest("spec-overlap", 5)
+        fixture = VerifyCaptureFixture(self.coordinator, req, prefill_pending=True)
+        first = fixture.accept(fixture.forward(), [[20, 30, 55, 0]], [3])
+        self.assertEqual(fixture.record.context.token_ids, [3, 4])
+        self.assertEqual(
+            fixture.record.context.pending_tokens, {2: 10, 3: 20, 4: 30, 5: 55}
+        )
+        req.output_ids = [10]
+        self.coordinator.after_result(fixture.prefill_result)
+        second = fixture.accept(
+            fixture.forward(inputs=(55, 60, 70, 80), prefix=5), [[90, 0, 0, 0]], [1]
+        )
+        req.output_ids = [10, 20, 30, 55]
+        self.coordinator.after_result(first)
+        self.assertEqual(fixture.record.context.pending_tokens, {6: 90})
+        fixture.finish([10, 20, 30, 55, 90], 5)
+        self.coordinator.after_result(second)
+        _, tensors = read_snapshot(self.store, self.catalog.wait_publications(1)[0])
+        self.assertEqual(tensors["token_ids"].tolist(), [3, 4, 10, 20, 30, 55, 90])
+        self.assertEqual(tensors["logits_positions"].tolist(), list(range(2, 7)))
+        self.assertEqual(tensors["kv_valid"].tolist(), [1] * 6 + [0])
+
+    def test_spec_overlap_skips_lookahead_beyond_capacity_without_losing_sample(self):
+        self.wait_until(lambda: len(self.coordinator.available) == 1)
+        req = CaptureTestRequest("spec-capacity", 6)
+        fixture = VerifyCaptureFixture(self.coordinator, req, prefill_pending=True)
+        first = fixture.accept(fixture.forward(), [[20, 30, 40, 50]], [4])
+        req.output_ids = [10]
+        self.coordinator.after_result(fixture.prefill_result)
+        second = fixture.accept(
+            fixture.forward(inputs=(50, 60, 70, 80), prefix=6), [[60, 70, 80, 90]], [4]
+        )
+        req.output_ids = [10, 20, 30, 40, 50]
+        self.coordinator.after_result(first)
+        self.assertIsNone(fixture.forward(inputs=(90, 100, 110, 120), prefix=10))
+        self.assertEqual(fixture.record.context.pending_tokens, {7: 60})
+        fixture.finish([10, 20, 30, 40, 50, 60, 70, 80, 90], 6)
+        self.coordinator.after_result(second)
+        _, tensors = read_snapshot(self.store, self.catalog.wait_publications(1)[0])
+        self.assertEqual(tensors["token_ids"].tolist(), [3, 4, 10, 20, 30, 40, 50, 60])
+        self.assertEqual(tensors["kv_valid"].tolist(), [1] * 8)
+        self.assertEqual(tensors["teacher_topk_logits"].shape[0], 6)
+
+    def test_spec_overlap_cpu_token_mismatch_fails_capture(self):
+        self.wait_until(lambda: len(self.coordinator.available) == 1)
+        req = self.request("wrong-cpu-token")
+        fixture = VerifyCaptureFixture(self.coordinator, req, prefill_pending=True)
+        fixture.accept(fixture.forward(), [[55, 0, 0, 0]], [1])
+        req.output_ids = [11]
+        self.coordinator.after_result(fixture.prefill_result)
+        self.wait_until(lambda: fixture.record.state == "done")
+        self.assertEqual(
+            self.catalog.captures[fixture.record.lease.capture_id]["reason"],
+            "token_alignment_failed",
+        )
+        self.assertFalse(self.catalog.publications)
+
     def test_verify_length_truncation_keeps_final_computed_kv(self):
         self.wait_until(lambda: len(self.coordinator.available) == 1)
         fixture = VerifyCaptureFixture(self.coordinator, self.request("length"))

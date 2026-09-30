@@ -1448,6 +1448,9 @@ class Scheduler(
         else:
             attn_backends = (self.tp_worker.model_runner.attn_backend,)
         needs_cpu_seq_lens = decide_needs_cpu_seq_lens(self.server_args, attn_backends)
+        # Worker-side KV projection/capture can need the mirror even when the
+        # attention backend consumes device lengths exclusively.
+        needs_cpu_seq_lens |= getattr(self.draft_worker, "needs_cpu_seq_lens", False)
         needs_confidence_relay = decide_needs_confidence_relay(self.server_args)
         self.future_map = self.spec_algorithm.create_future_map(
             self.device,

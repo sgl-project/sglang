@@ -15,6 +15,7 @@ from transformers import AutoTokenizer
 from sglang.srt.utils import kill_process_tree
 from sglang.test import test_utils
 from sglang.test.dspark_capture_observer import check_capture_snapshot
+from sglang.test.training_capture_utils import exercise_capture_abort
 
 
 def exercise_overlap_capture(
@@ -206,65 +207,13 @@ def exercise_overlap_capture(
 
         abort_id = f"abort-overlap-{cuda_graph}"
         wait_admission(1)
-        with test.catalog.condition:
-            previous_aborts = sum(
-                record.get("reason") == "request_aborted_or_retracted"
-                for record in test.catalog.captures.values()
-            )
-        with requests.post(
-            url + "/generate",
-            json={
-                "rid": abort_id,
-                "input_ids": prompt[:8],
-                "stream": True,
-                "sampling_params": {
-                    "temperature": 0,
-                    "max_new_tokens": 168,
-                    "ignore_eos": True,
-                    "logit_bias": {"100": 100.0},
-                },
-            },
-            stream=True,
-            timeout=120,
-        ) as response:
-            test.assertEqual(
-                response.status_code,
-                200,
-                response.text if response.status_code != 200 else "",
-            )
-            for line in response.iter_lines():
-                if line.startswith(b"data: ") and line != b"data: [DONE]":
-                    status = requests.post(
-                        url + "/abort_request", json={"rid": abort_id}, timeout=20
-                    )
-                    test.assertEqual(status.status_code, 200, status.text)
-                    break
-            else:
-                test.fail("stream ended without any output before abort")
-        deadline = time.monotonic() + 20
-        while True:
-            state = requests.get(url + "/server_info", timeout=10).json()[
-                "internal_states"
-            ][0]["training_capture"]
-            if state["counters"].get("failed_request_aborted_or_retracted", 0):
-                break
-            test.assertLess(time.monotonic(), deadline, state)
-            time.sleep(0.05)
-        with test.catalog.condition:
-            test.assertTrue(
-                test.catalog.condition.wait_for(
-                    lambda: (
-                        sum(
-                            record.get("reason") == "request_aborted_or_retracted"
-                            and record["state"] == "FAILED"
-                            for record in test.catalog.captures.values()
-                        )
-                        > previous_aborts
-                    ),
-                    timeout=20,
-                ),
-                "aborted capture did not finish its fenced Catalog failure",
-            )
+        state = exercise_capture_abort(
+            test,
+            url=url,
+            rid=abort_id,
+            prompt=prompt[:8],
+            max_new_tokens=168,
+        )
         test.assertEqual(
             len(test.catalog.publications), first_publication + len(results)
         )

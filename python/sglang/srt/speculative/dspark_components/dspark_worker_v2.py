@@ -22,7 +22,6 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_lora,
     get_parallel,
-    get_schedule,
     get_serving,
     get_spec,
 )
@@ -148,13 +147,12 @@ class DSparkWorkerV2(BaseSpecWorker):
                 parallel.tp_size != 1
                 or parallel.pp_size != 1
                 or parallel.dp_size != 1
-                or not get_schedule().disable_overlap_schedule
                 or get_disagg().disaggregation_mode != "null"
                 or get_lora().enable_lora
             ):
                 raise ValueError(
                     "target-KV DSpark currently requires TP=PP=DP=1, "
-                    "--disable-overlap-schedule, no disaggregation and no LoRA"
+                    "no disaggregation and no LoRA"
                 )
             self._capture_hidden_mode = CaptureHiddenMode.NULL
         self._draft_sampler = None
@@ -461,6 +459,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             return self._forward_prefill(batch, on_publish)
 
         return self._forward_decode(batch, on_publish, grammar_barrier)
+
+    @property
+    def needs_cpu_seq_lens(self):
+        return (
+            self._target_kv_contract is not None
+            or self.target_worker.training_capture is not None
+        )
 
     def _forward_prefill(
         self, batch: ScheduleBatch, on_publish

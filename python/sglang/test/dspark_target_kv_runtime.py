@@ -3,6 +3,7 @@
 import json
 import socket
 import sys
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -24,6 +25,7 @@ from sglang.srt.training_capture.protocol import digest_bytes
 from sglang.srt.utils import kill_process_tree
 from sglang.test import test_utils
 from sglang.test.dspark_capture_observer import check_capture_snapshot
+from sglang.test.training_capture_utils import exercise_capture_abort
 
 
 def export_synthetic_kv_draft(model_path, destination, manifest, tensors):
@@ -101,9 +103,9 @@ def export_synthetic_kv_draft(model_path, destination, manifest, tensors):
 
 
 def exercise_target_kv_draft(
-    test, *, model_path, directory, samples, responses, cuda_graph
+    test, *, model_path, directory, samples, responses, cuda_graph, enable_overlap=False
 ):
-    destination = Path(directory) / f"synthetic-kv-draft-{cuda_graph}"
+    destination = Path(directory) / f"synthetic-kv-draft-{cuda_graph}-{enable_overlap}"
     export_synthetic_kv_draft(model_path, destination, *samples[1])
     first_publication = len(test.catalog.publications)
     results = []
@@ -117,6 +119,17 @@ def exercise_target_kv_draft(
             [sys.executable, "-m", "sglang.test.dspark_target_kv_server"] + command[2:],
             *args,
         )
+
+    def wait_admission(count=1):
+        deadline = time.monotonic() + 20
+        while True:
+            state = requests.get(url + "/server_info", timeout=10).json()[
+                "internal_states"
+            ][0]["training_capture"]
+            if state["states"].get("available", 0) >= count:
+                return
+            test.assertLess(time.monotonic(), deadline, state)
+            time.sleep(0.05)
 
     with (
         patch.dict("os.environ", {"SGLANG_RAGGED_VERIFY_MODE": "static"}),
@@ -133,7 +146,7 @@ def exercise_target_kv_draft(
                 "DSPARK",
                 "--speculative-draft-model-path",
                 str(destination),
-                "--disable-overlap-schedule",
+                *([] if enable_overlap else ["--disable-overlap-schedule"]),
                 "--skip-server-warmup",
                 "--attention-backend",
                 "triton",
@@ -169,6 +182,7 @@ def exercise_target_kv_draft(
         for index, ((manifest, tensors), baseline) in enumerate(
             zip(samples, responses, strict=True)
         ):
+            wait_admission()
             params = {
                 "temperature": 0,
                 "max_new_tokens": manifest.sequence.response_length,
@@ -192,29 +206,33 @@ def exercise_target_kv_draft(
             test.assertEqual(actual["output_ids"], baseline["output_ids"])
             if index:
                 test.assertGreater(actual["meta_info"]["cached_tokens"], 0)
+        batch_indices = [1, 2, 1] if enable_overlap else [1, 2]
+        wait_admission(len(batch_indices))
         batched = requests.post(
             url + "/generate",
             json={
                 "input_ids": [
-                    sample[1]["token_ids"][: sample[0].sequence.prompt_length].tolist()
-                    for sample in samples[1:]
+                    samples[index][1]["token_ids"][
+                        : samples[index][0].sequence.prompt_length
+                    ].tolist()
+                    for index in batch_indices
                 ],
                 "sampling_params": [
-                    {"temperature": 0, "max_new_tokens": 4, "ignore_eos": True},
                     {
                         "temperature": 0,
-                        "max_new_tokens": 3,
+                        "max_new_tokens": len(responses[index]["output_ids"]),
                         "ignore_eos": True,
-                        "logit_bias": {"100": 100.0},
-                    },
+                        **({"logit_bias": {"100": 100.0}} if index == 2 else {}),
+                    }
+                    for index in batch_indices
                 ],
             },
             timeout=120,
         )
         test.assertEqual(batched.status_code, 200, batched.text)
-        for actual, baseline in zip(batched.json(), responses[1:], strict=True):
+        for actual, index in zip(batched.json(), batch_indices, strict=True):
             results.append(actual)
-            test.assertEqual(actual["output_ids"], baseline["output_ids"])
+            test.assertEqual(actual["output_ids"], responses[index]["output_ids"])
         from transformers import AutoTokenizer
 
         tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
@@ -256,6 +274,7 @@ def exercise_target_kv_draft(
             ),
         )
         for name, params in extra_cases:
+            wait_admission()
             response = requests.post(
                 url + "/generate",
                 json={
@@ -278,6 +297,25 @@ def exercise_target_kv_draft(
                 test.assertEqual(actual["meta_info"]["finish_reason"]["type"], "stop")
             elif name == "grammar":
                 test.assertRegex(actual["text"], r"^[0-9]{12}$")
+        if enable_overlap:
+            wait_admission()
+            response = requests.post(
+                url + "/generate",
+                json={
+                    "input_ids": [100, 200, 300, 400] * 63,
+                    "sampling_params": {
+                        "temperature": 0,
+                        "max_new_tokens": 4,
+                        "ignore_eos": True,
+                        "logit_bias": {"100": 100.0},
+                    },
+                },
+                timeout=120,
+            )
+            test.assertEqual(response.status_code, 200, response.text)
+            actual = response.json()
+            test.assertEqual(actual["output_ids"], [100] * 4)
+            results.append(actual)
         publications = test.catalog.wait_publications(
             first_publication + len(results), timeout=30
         )[first_publication:]
@@ -295,6 +333,19 @@ def exercise_target_kv_draft(
         )
         for manifest, tensors in captured:
             check_capture_snapshot(test, manifest, tensors, references)
+        if enable_overlap:
+            test.assertTrue(any(row["result_lag"] > 0 for row in references))
+            test.assertTrue(any(row["batch_size"] == 3 for row in references))
+            if cuda_graph:
+                test.assertTrue(
+                    any(
+                        row["batch_size"] == 3 and row["cuda_graph"]
+                        for row in references
+                    )
+                )
+            test.assertTrue(
+                any(manifest.sequence.total_length == 256 for manifest, _ in captured)
+            )
         test.assertIn(
             "eos", [manifest.sequence.stop_reason for manifest, _ in captured]
         )
@@ -304,6 +355,10 @@ def exercise_target_kv_draft(
         capture_state = requests.get(url + "/server_info", timeout=10).json()[
             "internal_states"
         ][0]["training_capture"]
+        test.assertEqual(capture_state["enable_overlap"], enable_overlap)
+        test.assertEqual(
+            capture_state["counters"].get("admitted", 0), len(results), capture_state
+        )
         test.assertGreater(
             capture_state["counters"].get("speculative_verify_forwards", 0),
             0,
@@ -320,12 +375,27 @@ def exercise_target_kv_draft(
                 0,
                 capture_state,
             )
+        if enable_overlap:
+            wait_admission()
+            capture_state = exercise_capture_abort(
+                test,
+                url=url,
+                rid=f"abort-dspark-overlap-{cuda_graph}",
+                prompt=samples[0][1]["token_ids"][:8].tolist(),
+                max_new_tokens=248,
+            )
+            test.assertEqual(
+                len(test.catalog.publications), first_publication + len(results)
+            )
         print(
             json.dumps(
                 {
                     "speculative_capture": capture_state,
                     "samples": len(captured),
                     "cuda_graph_enabled": cuda_graph,
+                    "overlap_enabled": enable_overlap,
+                    "aborted": enable_overlap,
+                    "padded_graph": enable_overlap and cuda_graph,
                 }
             ),
             flush=True,
@@ -352,3 +422,5 @@ def exercise_target_kv_draft(
     finally:
         kill_process_tree(server.pid)
         server.wait(timeout=20)
+    for publication in publications:
+        test.read_sample(publication)

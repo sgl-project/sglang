@@ -99,8 +99,7 @@ class TestCaptureConfiguration(CustomTestCase):
         ):
             validate_capture_server_args(self.args)
             self.args.disable_overlap_schedule = False
-            with self.assertRaisesRegex(ValueError, "speculative overlap scheduling"):
-                validate_capture_server_args(self.args)
+            validate_capture_server_args(self.args)
             self.args.disable_overlap_schedule = True
             for mode in ("compact", "cap-accept"):
                 with (

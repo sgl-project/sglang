@@ -118,10 +118,11 @@ checkpoint variant; changing the target also requires a matching draft contract.
 
 ## Runtime Scope
 
-Current capability gates require one target/draft GPU, TP=PP=DP=1, synchronous
-scheduling, dense unquantized NHD target/draft pools, no LoRA or PD, and standard
-RoPE. Target identity binding currently supports Qwen3, Qwen2 and Llama text
-models; real-model evidence currently covers Qwen3-0.6B only. Static verify
+Current capability gates require one target/draft GPU, TP=PP=DP=1, dense
+unquantized NHD target/draft pools, no LoRA or PD, and standard RoPE. Synchronous
+scheduling and normal overlap are supported. Target identity binding currently
+supports Qwen3, Qwen2 and Llama text models; real-model evidence currently covers
+Qwen3-0.6B only. Static verify
 supports ordinary execution and decode/verify CUDA graphs. Target hidden-state
 capture is disabled for both ordinary execution and graph construction.
 
@@ -132,7 +133,6 @@ SGLANG_RAGGED_VERIFY_MODE=static python -m sglang.launch_server \
   --model-path /models/target \
   --speculative-algorithm DSPARK \
   --speculative-draft-model-path /models/kv-draft \
-  --disable-overlap-schedule \
   --attention-backend triton \
   --speculative-draft-attention-backend triton
 ```
@@ -140,7 +140,8 @@ SGLANG_RAGGED_VERIFY_MODE=static python -m sglang.launch_server \
 The checkpoint's golden-fixture/acceptance metadata is recorded and validated
 structurally; startup does not execute or certify a SpecForge validation report.
 Full training/serving backbone and logits parity, quality/throughput gates,
-parallel topology, overlap, PD, RDMA and production rollout remain open.
+parallel topology, non-static verification, PD, RDMA and production rollout
+remain open.
 
 ## Online Capture
 
@@ -172,6 +173,22 @@ has valid KV; an unforwarded bonus has `kv_valid=0`. No target forward is added
 to fill missing KV or regenerate teacher scores. Capture failures invalidate the
 sample through the existing writer cleanup path.
 
+With overlap, a verify result can precede CPU processing of prefill or the
+previous verify result. The request context preserves an ordered, bounded set of
+pending model tokens, including the anchor and next bonus. Later CPU commits must
+match those tokens; a mismatch fails the sample. Only CPU-confirmed tokens enter
+the sealed snapshot. Stop/grammar/length processing may discard a pending suffix.
+A lookahead verify starting beyond Host capacity is skipped while its previous
+result can still finish and publish the sample. At the last possible position,
+KV is copied without retaining a teacher prediction outside the sample.
+
+`DSparkWorkerV2.needs_cpu_seq_lens` declares that KV projection or capture needs
+the host sequence-length mirror. The scheduler combines this requirement with
+the attention backends' requirements when constructing `FutureMap`. This keeps
+the prefix length current even with a backend such as Triton that otherwise
+uses only device lengths. All projection and capture copies remain on the
+ordered forward stream; the latest capture event fences writer ownership.
+
 ## Verification
 
 `test/registered/unit/spec/test_dspark_target_kv.py` covers contracts, codec math,
@@ -192,5 +209,9 @@ the reference path independently of the collector's acceptance ticket. Readback
 checks raw scores, top-128 membership, LSE, masks, positions and KV validity.
 The live cases include stochastic sampling, repetition/frequency penalties,
 minimum output length, stop tokens, EOS and constrained regex generation.
+Both synchronous and overlap scheduling run with ordinary execution and CUDA
+graphs. The overlap driver also checks exact Host capacity, a three-request batch
+padded to a four-row graph, and streamed cancellation with fenced Catalog failure
+and Host-slot recycling. Completed snapshots are re-read after each producer exits.
 See [implementation evidence](IMPLEMENTATION_STATUS.md) for exact completed runs
 and limits. The runtime Catalog remains a test double, and transport is TCP.

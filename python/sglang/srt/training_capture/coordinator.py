@@ -503,6 +503,8 @@ class CaptureCoordinator:
             )
             for row, req in enumerate(batch.reqs)
             if req.training_capture_context is not None
+            and int(batch.seq_lens_cpu[row])
+            < req.training_capture_context.context.max_tokens
         )
         if not steps:
             return None
@@ -539,6 +541,8 @@ class CaptureCoordinator:
                 width=width,
             )
             self._count("speculative_verify_forwards")
+            if self.enable_overlap:
+                self._count("overlap_forwards")
             self._count(
                 "cuda_graph_forwards" if can_run_cuda_graph else "eager_forwards"
             )
@@ -572,12 +576,17 @@ class CaptureCoordinator:
             context = record.context
             try:
                 count = counts[step.batch_row]
+                observed_end = len(context.token_ids) + len(context.pending_tokens)
+                first_overlap_anchor = (
+                    self.enable_overlap
+                    and start == context.prompt_length
+                    and observed_end == start
+                )
                 if (
                     record.invalid_reason
                     or not 1 <= count <= ticket.width
                     or start != context.kv_end
-                    or len(context.token_ids) != start + 1
-                    or inputs[selected_row][0] != context.token_ids[-1]
+                    or (observed_end != start + 1 and not first_overlap_anchor)
                     or positions[selected_row]
                     != list(range(start, start + ticket.width))
                     or outputs[step.batch_row][: count - 1]
@@ -588,6 +597,10 @@ class CaptureCoordinator:
                     )
                 kv_count = min(count, context.max_tokens - start)
                 teacher_count = min(count, context.max_tokens - start - 1)
+                context.observe_tokens(
+                    position=start,
+                    tokens=[inputs[selected_row][0]] + outputs[step.batch_row][:count],
+                )
                 context.export_kv(
                     self.exporter,
                     ticket.cache_locs[selected_row, :kv_count],
@@ -596,12 +609,13 @@ class CaptureCoordinator:
                 context.record_positions(
                     ticket.positions[selected_row, :kv_count], start=start
                 )
-                context.record_teacher_range(
-                    ticket.teacher,
-                    row=selected_row * ticket.width,
-                    position=start + 1,
-                    count=teacher_count,
-                )
+                if teacher_count:
+                    context.record_teacher_range(
+                        ticket.teacher,
+                        row=selected_row * ticket.width,
+                        position=start + 1,
+                        count=teacher_count,
+                    )
                 steps.append(CaptureStep(req, record, None))
                 self._count("speculative_commits_copied")
             except Exception:  # noqa: BLE001 - Capture failure must not stop serving.
