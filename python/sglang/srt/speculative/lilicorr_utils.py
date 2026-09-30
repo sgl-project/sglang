@@ -193,7 +193,7 @@ def propose_lilicorr_block(
     )
     candidate_tokens = candidate_tokens.view(bs, slots, int(head.candidate_topk))
 
-    feat = int(head.context_proj.in_features)
+    feat = int(head.context_proj.input_size)
     if anchor is None or int(anchor.shape[0]) != bs:
         # The batch resized since the anchor write; score invalid rather than misaligned.
         anchor_hidden = torch.zeros(
@@ -258,7 +258,7 @@ class LiLiCorrDraftSampler:
 
         # From the head, not from lm_head.weight: a quantized head's weight is packed,
         # so its dtype is not the dtype these buffers carry.
-        anchor_row = next(head.parameters())
+        anchor_row = head.slot_embedding
         device, dtype = anchor_row.device, anchor_row.dtype
         max_rows = self.max_bs * self.slots
 
@@ -395,7 +395,7 @@ def build_lilicorr_draft_sampler(
     max_bs = batch_sizes[-1]
 
     reject_added_vocab(lm_head)
-    parameter = next(head.parameters())
+    parameter = head.slot_embedding
     head.materialize_inference_buffers(parameter.device, parameter.dtype)
 
     sampler = LiLiCorrDraftSampler(
@@ -404,7 +404,7 @@ def build_lilicorr_draft_sampler(
         lm_head=lm_head,
         block_size=int(block_size),
         max_bs=int(max_bs),
-        anchor_features=int(draft_model.fc.out_features),
+        anchor_features=int(draft_model.fc.output_size),
         sampling_enabled=sampling_enabled,
     )
     logger.info(

@@ -667,11 +667,7 @@ class DFlashDraftModel(nn.Module):
                     attention_conv=grouped_conv(),
                     mlp_conv=grouped_conv(),
                     quant_config=quant_config,
-                    prefix=(
-                        (f"{prefix}.layers.{i}" if prefix else f"layers.{i}")
-                        if self.is_nemotron_35_draft
-                        else ""
-                    ),
+                    prefix=f"{prefix}.layers.{i}" if prefix else f"layers.{i}",
                 )
                 for i in range(num_layers)
             ]
@@ -693,19 +689,13 @@ class DFlashDraftModel(nn.Module):
         num_context_features = len(target_layer_ids)
 
         self.num_context_features = int(num_context_features)
-        if self.is_nemotron_35_draft:
-            fc_prefix = f"{prefix}.fc" if prefix else "fc"
-            self.fc = ReplicatedLinear(
-                self.num_context_features * hidden_size,
-                hidden_size,
-                bias=False,
-                quant_config=quant_config,
-                prefix=fc_prefix,
-            )
-        else:
-            self.fc = nn.Linear(
-                self.num_context_features * hidden_size, hidden_size, bias=False
-            )
+        self.fc = ReplicatedLinear(
+            self.num_context_features * hidden_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.fc" if prefix else "fc",
+        )
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
         # The model loader calls load_weights() before set_block_size(). Build
@@ -763,9 +753,7 @@ class DFlashDraftModel(nn.Module):
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Project concatenated target-layer hidden states into draft hidden_size."""
-        expected = int(
-            self.fc.input_size if self.is_nemotron_35_draft else self.fc.in_features
-        )
+        expected = int(self.fc.input_size)
         if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
             raise ValueError(
                 "DFLASH target_hidden feature dim mismatch. "
@@ -775,9 +763,7 @@ class DFlashDraftModel(nn.Module):
                 "This usually means the target model is capturing a different number of layer features than "
                 "the draft checkpoint/config expects."
             )
-        projected = self.fc(target_hidden)
-        if self.is_nemotron_35_draft:
-            projected = projected[0]
+        projected, _ = self.fc(target_hidden)
         return self.hidden_norm(projected)
 
     @torch.no_grad()
@@ -1013,9 +999,7 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
         return layer.input_layernorm(ctx_hidden)
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
-        expected = int(
-            self.fc.input_size if self.is_nemotron_35_draft else self.fc.in_features
-        )
+        expected = int(self.fc.input_size)
         if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
             raise ValueError(
                 "Laguna DFLASH target_hidden feature dim mismatch. "
@@ -1027,16 +1011,14 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
         num_slices = int(self.num_context_features)
         slice_size = int(target_hidden.shape[-1]) // num_slices
         slices = target_hidden.view(target_hidden.shape[0], num_slices, slice_size)
-        compute_dtype = self.fc.weight.dtype
+        compute_dtype = self.hidden_norm.weight.dtype
         if slices.dtype != compute_dtype:
             slices = slices.to(compute_dtype)
         normed = torch.empty_like(slices)
         for i, norm in enumerate(self.aux_hidden_norms):
             normed[:, i, :] = norm(slices[:, i, :])
         fused = normed.reshape(target_hidden.shape[0], -1)
-        projected = self.fc(fused)
-        if self.is_nemotron_35_draft:
-            projected = projected[0]
+        projected, _ = self.fc(fused)
         return self.hidden_norm(projected)
 
 
