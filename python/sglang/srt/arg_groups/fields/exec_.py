@@ -443,7 +443,7 @@ class ExecMamba(msgspec.Struct):
     kda_cake_prefill_precision: A[
         str,
         Arg(
-            help="Compute precision of the exported Cake KDA prefill (--linear-attn-prefill-backend cake): 'bf16' (default) runs the BF16 tensor-core export; 'tf32' runs the TF32 export (FP32 state pool required, BF16 checkpoints, bounded gates only) for higher accuracy at lower throughput.",
+            help="Compute precision of the exported Cake KDA prefill (--linear-attn-prefill-backend cake): 'bf16' (default) runs the BF16 tensor-core export; 'tf32' runs the TF32 export (FP32 state pool required, BF16 checkpoints, bounded gates only; layers with an unbounded softplus gate such as Kimi-Linear fall back to the Triton prefill) for higher accuracy at lower throughput.",
             choices=["bf16", "tf32"],
         ),
     ] = "bf16"

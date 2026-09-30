@@ -171,7 +171,8 @@ def test_kda_prefill_prepared_export_matches_triton(num_heads, seq_lens):
 )
 def test_kda_prefill_prepared_tf32_export_matches_triton(num_heads, seq_lens):
     """``--kda-cake-prefill-precision tf32`` runs the TF32 prepared export on
-    the same FP32 state pool and matches Triton within the BF16 tolerance."""
+    the same FP32 state pool (bounded gate) and matches Triton within the BF16
+    tolerance."""
     if kda_flashinfer_module._flashinfer_prepare_tf32_kda_prefill is None:
         pytest.skip("installed FlashInfer lacks prepare_tf32_kda_prefill")
     torch.manual_seed(1000 + num_heads + sum(seq_lens))
@@ -190,6 +191,36 @@ def test_kda_prefill_prepared_tf32_export_matches_triton(num_heads, seq_lens):
         kernel = CakeKDAKernel()
         assert kernel.cake_prefill_precision == "tf32"
         output_cake = _extend(kernel, data, state_cake, seq_lens)
+    _assert_close("output", output_cake, output_triton)
+    idx = data["cache_indices"].long()
+    _assert_close(
+        "final_state", state_cake[idx], state_triton[idx], atol=1e-2, rtol=1e-2
+    )
+
+
+def test_kda_prefill_tf32_precision_hands_unbounded_gates_to_triton():
+    """The TF32 export ships no unbounded-gate module without checkpoint rows,
+    so ``--kda-cake-prefill-precision tf32`` runs the Triton prefill for an
+    unbounded softplus gate (``lower_bound=None``, Kimi-Linear) instead of
+    raising inside the exported call."""
+    if kda_flashinfer_module._flashinfer_prepare_tf32_kda_prefill is None:
+        pytest.skip("installed FlashInfer lacks prepare_tf32_kda_prefill")
+    torch.manual_seed(1234)
+    seq_lens = [96]
+    data = _make_inputs(seq_lens, 16)
+    state_triton = data["state"].clone()
+    state_cake = data["state"].clone()
+    output_triton = _extend(
+        TritonKDAKernel(), data, state_triton, seq_lens, lower_bound=None
+    )
+    with patch.dict(os.environ, {"SGLANG_KDA_CAKE_PREFILL_PRECISION": "tf32"}):
+        kernel = CakeKDAKernel()
+        assert kernel.cake_prefill_precision == "tf32"
+        with patch.object(
+            CakeKDAKernel, "_extend_triton", wraps=kernel._extend_triton
+        ) as triton_prefill:
+            output_cake = _extend(kernel, data, state_cake, seq_lens, lower_bound=None)
+    assert triton_prefill.call_count == 1
     _assert_close("output", output_cake, output_triton)
     idx = data["cache_indices"].long()
     _assert_close(

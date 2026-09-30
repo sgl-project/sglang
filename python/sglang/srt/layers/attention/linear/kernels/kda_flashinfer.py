@@ -54,6 +54,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# One-time notice that the TF32 prepared export hands unbounded gates to Triton.
+_tf32_unbounded_gate_warned = False
+
 # ---------------------------------------------------------------------------
 # Lazy import for the FlashInfer KDA kernel
 # ---------------------------------------------------------------------------
@@ -367,7 +370,7 @@ def _cake_prefill_gate_bound_ok(
 ) -> bool:
     """Bounded gate: finite negative lower bound. The prepared BF16 export also
     serves the unbounded softplus gate (``lower_bound=None``, e.g. Kimi-Linear);
-    the recurrent_kda facade does not."""
+    the TF32 export (bounded-gate modules only) and the facade do not."""
     if lower_bound is None:
         # The exported BF16 schedules decay each 64-token chunk from
         # tile-anchored floored gate prefixes (integer power-of-two anchors per
@@ -1325,7 +1328,10 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
                 state_checkpoint_cu_starts=state_checkpoint_cu_starts,
                 num_state_checkpoints=num_state_checkpoints,
                 state_checkpoint_every_n_tokens=state_checkpoint_every_n_tokens,
-                # Only the BF16 export serves the unbounded softplus gate.
+                # The prepared BF16 export serves the unbounded softplus gate.
+                # The TF32 export ships unbounded-gate modules only for its
+                # checkpoint-writing specialisations, so the TF32 route admits
+                # bounded gates only; the recurrent_kda facade admits neither.
                 allow_unbounded_gate=(
                     use_prepared_export and self.cake_prefill_precision == "bf16"
                 ),
@@ -1345,6 +1351,19 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
             raise
 
         if not admission.eligible:
+            global _tf32_unbounded_gate_warned
+            if (
+                lower_bound is None
+                and use_prepared_export
+                and self.cake_prefill_precision == "tf32"
+                and not _tf32_unbounded_gate_warned
+            ):
+                _tf32_unbounded_gate_warned = True
+                logger.warning(
+                    "--kda-cake-prefill-precision tf32: the TF32 prepared export "
+                    "serves bounded gates only; layers with an unbounded softplus "
+                    "gate (lower_bound=None) run the Triton prefill kernel."
+                )
             try:
                 output = self._extend_triton(q, k, v, g, beta, **fallback_kwargs)
             except Exception as exc:
