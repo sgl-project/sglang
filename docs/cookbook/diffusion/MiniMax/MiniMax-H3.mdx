@@ -897,8 +897,7 @@ SGLang checks it against the checkpoint's scheduler configs at load time:
   forward.
 
 Any other step count, and any `flow_shift` or `audio_flow_shift` that differs
-from the trained shifts, is rejected. Measured latencies are in
-[FastH3 8-Step V2 on H200](#fasth3-8-step-v2-on-h200).
+from the trained shifts, is rejected.
 
 `--minimax-h3-adaln-online true` drops the 24.2 GiB of `adaln_proj` weights
 from each GPU and produces byte-identical output. Pass `--warmup-steps 9`
