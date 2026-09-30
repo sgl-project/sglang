@@ -2498,6 +2498,7 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
 
 
 class TestKv4Compatibility(unittest.TestCase):
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
     def test_dsa_nvfp4_is_allowed_by_generic_mla_gate(self):
         args = ServerArgs(
             model_path="dummy",
@@ -2505,16 +2506,15 @@ class TestKv4Compatibility(unittest.TestCase):
             kv_cache_dtype="nvfp4",
         )
         with (
-            patch.object(args, "use_mla_backend", return_value=True),
-            patch.object(
-                args,
-                "_resolved_attention_backends",
+            patch(
+                "sglang.srt.arg_groups.kv_cache_hook.use_mla_backend", return_value=True
+            ),
+            patch(
+                "sglang.srt.arg_groups.kv_cache_hook.attention_backends_of",
                 return_value=("dsa", "dsa"),
             ),
-            patch.object(server_args_module, "is_cuda", return_value=True),
-            patch.object(server_args_module, "is_sm100_supported", return_value=True),
         ):
-            args._handle_kv4_compatibility()
+            handle_kv4_compatibility(args)
 
 
 class TestCudaGraphConfigDataclassAccess(CustomTestCase):

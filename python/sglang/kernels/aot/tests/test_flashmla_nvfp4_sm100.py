@@ -431,7 +431,8 @@ def test_glm52_nvfp4_sparse_decode_cuda_graph_external_metadata(b: int, sq: int)
             TOPK,
         )
     )
-    assert scheduler_metadata.shape[0] == 148
+    # Scheduler partition count depends on the GPU's available SM count.
+    assert scheduler_metadata.ndim == 2 and scheduler_metadata.shape[0] > 0
     for _ in range(3):
         torch.ops.sgl_kernel.sparse_decode_fwd_nvfp4.default(
             q_kernel,
