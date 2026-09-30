@@ -1264,7 +1264,13 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
             TritonKDAKernel,
         )
 
-        return TritonKDAKernel().extend(q, k, v, g, torch.sigmoid(beta), **kwargs)
+        # Mirror the Triton prefill backend exactly: the model hands that
+        # backend ``beta.float().sigmoid()`` (fp32 probabilities), while the
+        # Cake route receives the raw bf16 logits. Rounding the probabilities
+        # to bf16 here made every fallback prefill differ from
+        # ``--linear-attn-prefill-backend triton`` (served Kimi-Linear:
+        # mean |Δ input logprob| up to 0.06, greedy divergences).
+        return TritonKDAKernel().extend(q, k, v, g, beta.float().sigmoid(), **kwargs)
 
     def extend(
         self,
