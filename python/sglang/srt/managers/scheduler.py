@@ -610,7 +610,6 @@ class Scheduler(
                         lambda c=cache_controller: not c.has_inflight_device_transfers()
                     )
         self.emit_metrics_constants()
-        self.maybe_init_hccl_dp_prewarm()
 
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
@@ -743,16 +742,17 @@ class Scheduler(
         ):
             return
 
+        tp_group = get_parallel().tp_group
         rank = (
             get_parallel().dp_rank
             if get_parallel().dp_rank is not None
-            else self.tp_group.rank_in_group
+            else tp_group.rank_in_group
         )
         logger.info("HCCL DP prewarm start: rank=%s", rank)
         _prewarm_hccl_group(
-            device=self.tp_group.device,
-            group=self.tp_group.device_group,
-            device_module=self.tp_group.device_module,
+            device=tp_group.device,
+            group=tp_group.device_group,
+            device_module=tp_group.device_module,
         )
         logger.info("HCCL DP prewarm done: rank=%s", rank)
 
@@ -1098,6 +1098,9 @@ class Scheduler(
         tic = time.perf_counter()
         self.init_memory_pools()
         self.kv_cache_allocation_time = time.perf_counter() - tic
+
+        # Complete lazy HCCL initialization before the first DSV4 metadata call.
+        self.maybe_init_hccl_dp_prewarm()
 
         self.init_all_attention_backends()
         self.init_all_cuda_graphs()

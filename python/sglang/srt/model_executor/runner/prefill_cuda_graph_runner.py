@@ -324,6 +324,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         assert capture_tokens is not None, "cuda_graph_config[prefill].bs is not set"
         self.capture_num_tokens = sorted(capture_tokens)
         assert self.capture_num_tokens, "cuda_graph_config[prefill].bs is empty"
+        if getattr(
+            model_runner.attn_backend, "can_run_prefill_cuda_graph", None
+        ) is not None:
+            model_runner.attn_backend._dsv4_prefill_capture_num_tokens = tuple(
+                self.capture_num_tokens
+            )
 
         # --- runner bounds --------------------------------------------
         self.max_num_tokens = max(self.capture_num_tokens)
@@ -1529,6 +1535,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     req_lens=shape_inputs["extend_seq_lens"],
                 )
             forward_batch = self.model_runner.prepare_dummy_forward_batch(forward_batch)
+            if isinstance(self.backend, BreakableCudaGraphBackend):
+                prepare_capture = getattr(
+                    self.model_runner.attn_backend,
+                    "prepare_prefill_graph_capture_batch",
+                    None,
+                )
+                if prepare_capture is not None:
+                    prepare_capture(forward_batch)
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
         return forward_batch, self.model_runner.attn_backend
 
@@ -1806,6 +1820,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             orig_seq_lens=forward_batch.orig_seq_lens,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
             out_cache_loc=out_cache_loc,
+            out_cache_loc_dsv4=forward_batch.out_cache_loc_dsv4,
             seq_lens_sum=forward_batch.seq_lens_sum,
             mamba_track_indices=mamba_track_indices,
             mamba_track_mask=mamba_track_mask,
