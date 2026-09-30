@@ -3987,6 +3987,15 @@ class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):
                 self.assertNotIn("NCCL_GRAPH_REGISTER", os.environ)
 
 
+class TestMemorySaverNcclGraphRegister(unittest.TestCase):
+    def test_pausable_graphs_preserve_default_registration(self):
+        with patch.dict(os.environ, {"SGLANG_MEMORY_SAVER_CUDA_GRAPH": "1"}):
+            os.environ.pop("NCCL_GRAPH_REGISTER", None)
+            args = ServerArgs(model_path="dummy", enable_memory_saver=True)
+            parallel_hook.handle_data_parallelism(args)
+            self.assertNotIn("NCCL_GRAPH_REGISTER", os.environ)
+
+
 class TestDcpCommBackendDefault(CustomTestCase):
     def _resolved(self, **fields):
         args = ServerArgs(model_path="dummy", tp_size=8, **fields)

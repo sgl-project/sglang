@@ -54,6 +54,8 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.platforms.device_mixin import _DEVICE_TO_DISTRIBUTED_BACKEND
 from sglang.srt.runtime_context import (
     derive_parallel_widths,
+    get_context,
+    get_exec,
     get_global_dwdp_manager,
     get_parallel,
     set_global_dwdp_manager,
@@ -468,6 +470,10 @@ class GroupCoordinator:
                 group=self.cpu_group,
                 device=self.device,
                 is_symmetric_memory_enabled=self.is_symmetric_memory_enabled(),
+                enable_memory_saver=(
+                    get_context().is_config_namespace_published("exec")
+                    and get_exec().features.enable_memory_saver
+                ),
             )
 
         self.pymscclpp_comm: Optional[PyMscclppCommunicator] = None

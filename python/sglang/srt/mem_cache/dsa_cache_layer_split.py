@@ -262,6 +262,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         self.layer_broadcast_comm = PyNcclCommunicator(
             group=cp_group.cpu_group,
             device=cp_group.device,
+            enable_memory_saver=self.memory_saver_adapter.enabled,
         )
         logger.info(
             "Initialized dedicated layer-shard broadcast NCCL communicator: "

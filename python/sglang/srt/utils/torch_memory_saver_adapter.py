@@ -2,7 +2,7 @@ import logging
 from abc import ABC
 from contextlib import contextmanager
 
-from sglang.srt.utils.common import is_xpu
+from sglang.srt.utils.common import is_cuda, is_xpu
 
 try:
     import torch_memory_saver
@@ -47,6 +47,12 @@ class TorchMemorySaverAdapter(ABC):
                     "via `pip3 install torch-memory-saver`. "
                 )
             raise import_error
+        if enable and is_cuda() and not hasattr(_memory_saver, "keep_resident"):
+            raise RuntimeError(
+                "CUDA memory saver requires a torch-memory-saver build with "
+                "keep_resident support for NCCL graph buffers. Upgrade both "
+                "the Python package and its native library."
+            )
         return (
             _TorchMemorySaverAdapterReal() if enable else _TorchMemorySaverAdapterNoop()
         )
@@ -68,6 +74,9 @@ class TorchMemorySaverAdapter(ABC):
         raise NotImplementedError
 
     def disable(self):
+        raise NotImplementedError
+
+    def keep_resident(self, tensor):
         raise NotImplementedError
 
     def pause(self, tag: str):
@@ -125,6 +134,9 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
     def disable(self):
         return _memory_saver.disable()
 
+    def keep_resident(self, tensor):
+        return _memory_saver.keep_resident(tensor)
+
     def pause(self, tag: str):
         return _memory_saver.pause(tag=tag)
 
@@ -152,6 +164,9 @@ class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
     @contextmanager
     def disable(self):
         yield
+
+    def keep_resident(self, tensor):
+        return 0
 
     def pause(self, tag: str):
         pass

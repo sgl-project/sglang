@@ -128,7 +128,9 @@ class PageInterleaveKVPoolMixin:
         # Dedicated communicator + stream so the layer-ahead gathers never
         # interleave with the group's main collectives.
         self.kv_gather_comm: PyNcclCommunicator = PyNcclCommunicator(
-            group=shard_group.cpu_group, device=shard_group.device
+            group=shard_group.cpu_group,
+            device=shard_group.device,
+            enable_memory_saver=self.memory_saver_adapter.enabled,
         )
         self.kv_gather_stream = self.device_module.Stream()
 

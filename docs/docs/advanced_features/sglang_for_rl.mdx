@@ -29,6 +29,14 @@ Under the hood, the RL team uses CUDA-graph-aware weight offload via [torch_memo
 
 ### Server flag
 
+On NVIDIA CUDA, use a `torch_memory_saver` build with `keep_resident` support,
+and upgrade its Python package and native library together. With NCCL graph
+registration enabled, SGLang keeps captured PyNccl send/receive allocations
+resident across sleep/wake so their physical backing stays valid. Residency
+applies to the entire allocator block, including tensors sharing it; budget
+for these blocks to remain on the GPU until the allocator frees them. Other
+memory remains eligible for offload.
+
 Enable memory saver support when launching the server:
 
 ```text Output
@@ -59,7 +67,7 @@ Enable memory saver support when launching the server:
   <tbody>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`tags`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Which memory regions to release. If omitted, all are released.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Which memory regions to release. If omitted, all regions are selected; resident communication allocations remain on the GPU.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: list[str], values: `kv_cache`, `weights`</td>
     </tr>

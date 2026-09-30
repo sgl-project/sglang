@@ -3,6 +3,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/device_communicators/pynccl.py
 
 import logging
+import os
 from contextlib import contextmanager
 from typing import Optional, Union
 
@@ -22,7 +23,7 @@ from sglang.srt.distributed.device_communicators.pynccl_wrapper import (
     ncclUniqueId,
 )
 from sglang.srt.distributed.utils import StatelessProcessGroup
-from sglang.srt.utils.common import get_current_device_stream_fast
+from sglang.srt.utils.common import get_current_device_stream_fast, is_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,7 @@ class PyNcclCommunicator:
         device: Union[int, str, torch.device],
         library_path: Optional[str] = None,
         is_symmetric_memory_enabled: bool = False,
+        enable_memory_saver: bool = False,
     ):
         """
         Args:
@@ -44,6 +46,7 @@ class PyNcclCommunicator:
             library_path: the path to the NCCL library. If None, it will
                 use the default library path.
             is_symmetric_memory_enabled: whether symmetric memory is enabled.
+            enable_memory_saver: keep captured TMS communication buffers resident.
         It is the caller's responsibility to make sure each communicator
         is bind to a unique device.
         """
@@ -60,6 +63,17 @@ class PyNcclCommunicator:
             self.world_size = group.world_size
 
         self.group = group
+        self._memory_saver = None
+        if (
+            enable_memory_saver
+            and is_cuda()
+            and os.environ.get("NCCL_GRAPH_REGISTER") != "0"
+        ):
+            from sglang.srt.utils.torch_memory_saver_adapter import (
+                TorchMemorySaverAdapter,
+            )
+
+            self._memory_saver = TorchMemorySaverAdapter.create(enable=True)
 
         # if world_size == 1, no need to create communicator
         if self.world_size == 1:
@@ -140,6 +154,12 @@ class PyNcclCommunicator:
         """Return the current device stream used for NCCL calls."""
         return get_current_device_stream_fast()
 
+    def _keep_graph_buffers_resident(self, *tensors: torch.Tensor):
+        if self._memory_saver is not None and torch.cuda.is_current_stream_capturing():
+            # NCCL graph registrations retain the physical backing across replays.
+            for tensor in tensors:
+                self._memory_saver.keep_resident(tensor)
+
     def all_reduce(self, tensor: torch.Tensor, op: ReduceOp = ReduceOp.SUM):
         if self.disabled:
             return
@@ -150,6 +170,7 @@ class PyNcclCommunicator:
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {tensor.device}"
         )
+        self._keep_graph_buffers_resident(tensor)
         stream = self._resolve_stream()
         self.nccl.ncclAllReduce(
             buffer_type(tensor.data_ptr()),
@@ -177,6 +198,7 @@ class PyNcclCommunicator:
         if out_tensor is None:
             out_tensor = torch.empty_like(in_tensor)
 
+        self._keep_graph_buffers_resident(in_tensor, out_tensor)
         stream = self._resolve_stream()
         self.nccl.ncclAllReduce(
             buffer_type(in_tensor.data_ptr()),  # sendbuff
@@ -204,6 +226,7 @@ class PyNcclCommunicator:
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {input_tensor.device}"
         )
+        self._keep_graph_buffers_resident(input_tensor, output_tensor)
         stream = self._resolve_stream()
 
         if sizes is not None:
@@ -249,6 +272,7 @@ class PyNcclCommunicator:
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {input_tensor.device}"
         )
+        self._keep_graph_buffers_resident(input_tensor, output_tensor)
         stream = self._resolve_stream()
 
         if sizes is not None:
@@ -287,6 +311,7 @@ class PyNcclCommunicator:
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {tensor.device}"
         )
+        self._keep_graph_buffers_resident(tensor)
         stream = self._resolve_stream()
         self.nccl.ncclSend(
             buffer_type(tensor.data_ptr()),
@@ -304,6 +329,7 @@ class PyNcclCommunicator:
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {tensor.device}"
         )
+        self._keep_graph_buffers_resident(tensor)
         stream = self._resolve_stream()
         self.nccl.ncclRecv(
             buffer_type(tensor.data_ptr()),
@@ -334,6 +360,7 @@ class PyNcclCommunicator:
             f"this nccl communicator is created to work on {self.device}, "
             f"but the output tensor is on {output_tensor.device}"
         )
+        self._keep_graph_buffers_resident(input_tensor, output_tensor)
         stream = self._resolve_stream()
         # Equal-split all-to-all: fail loudly instead of silently truncating the tail.
         assert input_tensor.numel() == output_tensor.numel(), (
@@ -375,6 +402,7 @@ class PyNcclCommunicator:
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {tensor.device}"
         )
+        self._keep_graph_buffers_resident(tensor)
         stream = self._resolve_stream()
 
         if src == self.rank:
