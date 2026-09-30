@@ -2984,15 +2984,9 @@ class Scheduler(
                 self._reject_sampling_mask_request(req, error_msg)
                 return
 
-        if req.return_sampling_mask and get_exec().kernel.sampling_backend == "ascend":
-            # The ascend backend samples from logits directly and never builds the
-            # top-k/top-p support, so it cannot produce a sampling mask.
-            error_msg = (
-                "return_sampling_mask is not supported with the ascend "
-                "sampling backend."
-            )
-            self._reject_sampling_mask_request(req, error_msg)
-            return
+        # The ascend sampling backend is supported: it exports the post-filter
+        # weights of its fused kernels so the sampler can build the same mask as
+        # the other backends. See Sampler._build_ascend_sampling_mask_capture.
 
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:

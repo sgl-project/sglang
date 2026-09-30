@@ -316,6 +316,225 @@ class TestSamplingMaskCapture(CustomTestCase):
         self.assertIsNone(output.next_token_sampling_mask_idx[2])
 
 
+class TestAscendSamplingMaskCapture(CustomTestCase):
+    """Ascend (NPU) sampling-mask support.
+
+    The Ascend backend samples straight from temperature-scaled logits through a
+    fused kernel, so the mask has to come from the post-filter weights that kernel
+    exported instead of being replayed afterwards. These tests pin that export
+    contract on the torch fallback branch of
+    ``top_k_top_p_min_p_sampling_from_logits_ascend``, which runs on any device
+    once torch_npu's fused op is hidden.
+
+    End-to-end coverage on an NPU host lives in
+    ``test/registered/npu/basic_function/backends/test_npu_sampling_mask.py``.
+    """
+
+    def setUp(self):
+        self.sampler = Sampler.__new__(Sampler)
+        torch.nn.Module.__init__(self.sampler)
+        self.sampler.use_ascend_backend = True
+        self.sampler.sampling_mask_max_tokens = 4096
+        self.sampler.tp_sync_group = None
+        self.sampler.cp_sync_group = None
+
+    @staticmethod
+    def _sampling_info(
+        batch_size, top_k, top_p, min_p=0.0, need_min_p=False, requested_rows=None
+    ):
+        if requested_rows is None:
+            requested_rows = range(batch_size)
+        return SimpleNamespace(
+            sampling_seed=None,
+            need_top_k_sampling=True,
+            need_top_p_sampling=True,
+            need_min_p_sampling=need_min_p,
+            top_ks=torch.full((batch_size,), top_k, dtype=torch.int32),
+            top_ps=torch.full((batch_size,), top_p),
+            min_ps=torch.full((batch_size,), min_p),
+            temperatures=torch.ones(batch_size, 1),
+            npu_top_k_top_p_eligible=False,
+            sampling_mask_batch_indices=torch.tensor(
+                list(requested_rows), dtype=torch.long
+            ),
+        )
+
+    def _materialize(self, sampled, capture, sampling_info):
+        """Run the scheduler's host-materialization step over a captured batch."""
+        requested_rows = sampling_info.sampling_mask_batch_indices.tolist()
+        output = LogitsProcessorOutput(
+            next_token_logits=None,
+            sampling_mask_output=self.sampler._build_sampling_mask_output(
+                sampled,
+                capture,
+                support_capture_indices=None,
+            ),
+        )
+        output.sampling_mask_output.map_device_tensors(lambda tensor: tensor.cpu())
+        SchedulerBatchResultProcessor.materialize_sampling_mask_output(
+            [
+                SimpleNamespace(
+                    return_sampling_mask=i in requested_rows,
+                    sampling_logprobs_mode="selected",
+                )
+                for i in range(sampled.numel())
+            ],
+            output,
+        )
+        return output
+
+    @patch.object(sampler_module, "torch_npu", SimpleNamespace(), create=True)
+    def test_forward_ascend_backend_returns_mask_capture(self):
+        batch_size, vocab_size, top_k = 2, 16, 4
+        torch.manual_seed(0)
+        logits = torch.randn(batch_size, vocab_size)
+        sampling_info = self._sampling_info(batch_size, top_k, top_p=0.95)
+
+        sampled, logprobs, capture = self.sampler._forward_ascend_backend(
+            logits.clone(),
+            sampling_info,
+            simple_sampling_case=False,
+            return_logprob=False,
+            positions=torch.zeros(batch_size, dtype=torch.int64),
+            return_sampling_mask=True,
+        )
+
+        self.assertIsNone(logprobs)
+        self.assertIsNotNone(capture)
+        self.assertEqual(capture.batch_rows.tolist(), [0, 1])
+        self.assertEqual(tuple(capture.weights.shape), (batch_size, vocab_size))
+        self.assertIsNone(capture.token_ids)
+
+        output = self._materialize(sampled, capture, sampling_info)
+        for row in range(batch_size):
+            mask = output.next_token_sampling_mask_idx[row].tolist()
+            weights = capture.weights[row]
+            support = weights > 0
+            # The mask is duplicate-free, bounded by top_k and, most importantly,
+            # contains the token the kernel actually drew.
+            self.assertEqual(len(mask), len(set(mask)))
+            self.assertLessEqual(len(mask), top_k)
+            self.assertIn(int(sampled[row]), mask)
+            self.assertTrue(bool(support[int(sampled[row])]))
+            # Support is packed in descending weight order, so the mask must be the
+            # top-weighted entries of the exported row, in that same order.
+            self.assertEqual(mask, weights.topk(len(mask)).indices.tolist())
+            # Truncated entries are exact zeros so weights > 0 is the support.
+            self.assertEqual(int((~support).sum()), vocab_size - len(mask))
+            # Logprob contract: log(p_selected / sum(p_support)).
+            expected = math.log(
+                float(weights[int(sampled[row])]) / float(weights[support].sum())
+            )
+            self.assertAlmostEqual(
+                float(output.next_token_sampling_logprobs[row][0]), expected, places=5
+            )
+
+    @patch.object(sampler_module, "torch_npu", SimpleNamespace(), create=True)
+    def test_ascend_capture_only_materializes_requested_rows(self):
+        batch_size, vocab_size, top_k = 4, 16, 4
+        torch.manual_seed(0)
+        logits = torch.randn(batch_size, vocab_size)
+        requested_rows = [1, 3]
+        sampling_info = self._sampling_info(
+            batch_size,
+            top_k,
+            top_p=0.95,
+            requested_rows=requested_rows,
+        )
+
+        sampled, _, capture = self.sampler._forward_ascend_backend(
+            logits.clone(),
+            sampling_info,
+            simple_sampling_case=False,
+            return_logprob=False,
+            positions=torch.zeros(batch_size, dtype=torch.int64),
+            return_sampling_mask=True,
+        )
+
+        self.assertIsNotNone(capture)
+        self.assertEqual(capture.batch_rows.tolist(), requested_rows)
+        self.assertEqual(
+            tuple(capture.weights.shape), (len(requested_rows), vocab_size)
+        )
+
+        output = self._materialize(sampled, capture, sampling_info)
+        for row in range(batch_size):
+            if row in requested_rows:
+                self.assertIn(
+                    int(sampled[row]), output.next_token_sampling_mask_idx[row]
+                )
+                self.assertIsNotNone(output.next_token_sampling_logprobs[row])
+            else:
+                self.assertIsNone(output.next_token_sampling_mask_idx[row])
+                self.assertIsNone(output.next_token_sampling_logprobs[row])
+
+    def test_ascend_capture_repairs_sampled_token_outside_exported_support(self):
+        # A one-ulp disagreement between the kernel's internal softmax and the
+        # exported weights must not report the drawn token as outside its own
+        # support, so the drawn column is forced positive.
+        filtered_probs = torch.tensor([[0.5, 0.0, 0.5, 0.0]])
+        sampled = torch.tensor([1], dtype=torch.int32)
+        sampling_info = self._sampling_info(1, top_k=2, top_p=1.0)
+
+        capture = self.sampler._build_ascend_sampling_mask_capture(
+            filtered_probs, sampled, sampling_info
+        )
+        self.assertGreater(float(capture.weights[0, 1]), 0.0)
+
+        output = self._materialize(sampled, capture, sampling_info)
+        self.assertIn(1, output.next_token_sampling_mask_idx[0].tolist())
+        self.assertIsNotNone(output.next_token_sampling_logprobs[0])
+
+    @patch.object(sampler_module, "torch_npu", SimpleNamespace(), create=True)
+    def test_ascend_export_is_vocab_ordered(self):
+        batch_size, vocab_size, top_k = 1, 12, 3
+        torch.manual_seed(0)
+        logits = torch.randn(batch_size, vocab_size)
+        top_ks = torch.full((batch_size,), top_k, dtype=torch.int32)
+        top_ps = torch.ones(batch_size)
+
+        sampled, filtered_probs = (
+            sampler_module.top_k_top_p_min_p_sampling_from_logits_ascend(
+                logits.clone(),
+                top_ks,
+                top_ps,
+                torch.zeros(batch_size),
+                False,
+                None,
+                torch.zeros(batch_size, dtype=torch.int64),
+                return_filtered_probs=True,
+            )
+        )
+
+        # Vocab order is what lets the mask builder read the column index as the
+        # token id, so compare against the top-k computed in token order.
+        expected_ids = torch.softmax(logits, dim=-1).topk(top_k, dim=-1).indices[0]
+        support_ids = (filtered_probs[0] > 0).nonzero(as_tuple=True)[0]
+        self.assertEqual(sorted(support_ids.tolist()), sorted(expected_ids.tolist()))
+        self.assertEqual(tuple(filtered_probs.shape), (batch_size, vocab_size))
+        self.assertIn(int(sampled[0]), support_ids.tolist())
+
+    @patch.object(sampler_module, "torch_npu", SimpleNamespace(), create=True)
+    def test_ascend_export_is_opt_in(self):
+        batch_size, vocab_size, top_k = 1, 8, 2
+        torch.manual_seed(0)
+        logits = torch.randn(batch_size, vocab_size)
+
+        sampled = sampler_module.top_k_top_p_min_p_sampling_from_logits_ascend(
+            logits.clone(),
+            torch.full((batch_size,), top_k, dtype=torch.int32),
+            torch.ones(batch_size),
+            torch.zeros(batch_size),
+            False,
+            None,
+            torch.zeros(batch_size, dtype=torch.int64),
+        )
+
+        # Without the opt-in the caller gets the bare token IDs back, so nothing
+        # extra is materialized and existing callers keep working unchanged.
+        self.assertEqual(tuple(sampled.shape), (batch_size,))
+
+
 class SamplingMaskTestMixin:
     @classmethod
     def _launch_server(cls, other_args=()):
