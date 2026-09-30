@@ -13,6 +13,7 @@
 # ==============================================================================
 """Residual access for one layer-stack invocation or TBO microbatch."""
 
+from sglang.srt.layers.layer_boundary.output import complete_owed
 from sglang.srt.layers.layer_boundary.residual import access
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
@@ -135,13 +136,24 @@ def snapshot(hidden_states, forward_batch):
 
 
 def add_to_output(hidden_states, forward_batch, extra):
-    output, _ = access.add_to_output(hidden_states, stream_of(forward_batch), extra)
-    return output
+    """Complete the output before adding an extra contribution exactly once.
+    Leave its residual update for the next prepare call."""
+    hidden_states = stream_of(forward_batch).complete(hidden_states)
+    hidden_states.add_(extra)
+    return hidden_states
 
 
 def fold(hidden_states, forward_batch):
-    output, _ = access.fold(hidden_states, stream_of(forward_batch))
-    return output
+    """Finish a plain layer output and fold its residual into a complete value.
+    The following stage receives it with no outstanding residual addition."""
+    stream = stream_of(forward_batch)
+    if stream.pending is not None and not stream.pending.update.is_plain_add:
+        raise NotImplementedError("fold requires a plain residual update")
+    hidden_states, residual = stream.export(hidden_states)
+    hidden_states = complete_owed(hidden_states)
+    if residual is not None:
+        hidden_states = hidden_states + residual
+    return stream.write(hidden_states)
 
 
 def set_written(hidden_states, forward_batch):

@@ -17,7 +17,6 @@ from sglang.srt.layers.layer_boundary import ops as transport_ops
 from sglang.srt.layers.layer_boundary import prepare as comm_ops
 from sglang.srt.layers.layer_boundary.contracts import BatchVariant
 from sglang.srt.layers.layer_boundary.ops import keep_output
-from sglang.srt.layers.layer_boundary.residual.access import export_output
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.runtime_context import get_forward
 from sglang.test.boundary_fixtures import (
@@ -319,13 +318,10 @@ class TestReduceOutput(CustomTestCase):
                     hidden_states = torch.ones(3, 4)
                 hidden_states, _ = finish_exit(ffn_exit, hidden_states, residual)
 
-                hidden_states, residual_out = export_output(
-                    hidden_states, residual, object()
-                )
+                hidden_states = complete_owed(hidden_states)
                 self.assertEqual(self.all_reduce.call_count, int(fuse))
                 expected = 3.0 if fuse else 2.0  # all-reduce stub / postprocess stub
                 torch.testing.assert_close(hidden_states, torch.full((3, 4), expected))
-                self.assertIs(residual_out, residual)
 
 
 class TestSelectFfnCompletion(CustomTestCase):
