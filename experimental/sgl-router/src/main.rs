@@ -6,8 +6,8 @@ use clap::Parser;
 use sgl_kv_indexer::{GrpcPrefixIndex, PrefixIndex, PrefixIndexConfig};
 use sgl_router::{
     config::{
-        CachePrefixProvider, ChatRoutingKind, Cli, Config, KvIndexerEndpointConfig, LogFormat,
-        PolicyKind,
+        CachePrefixProvider, ChatRoutingKind, Cli, Config, DiscoveryBackend,
+        KvIndexerEndpointConfig, LogFormat, PolicyKind,
     },
     discovery::{spawn_discovery, ModelId},
     policies::{
@@ -109,6 +109,10 @@ async fn main() -> Result<()> {
 
     // Track this router's local view of in-flight requests.
     let (local_inflight_requests, inflight_cleanup) = start_local_inflight_tracker(&config);
+
+    // Started before worker discovery so the peer set is populated early. The
+    // registry's `synced` flag separates "not delivered yet" from "no siblings".
+    start_peer_watch(&config, &engine_state).await;
 
     // Discovery feeds worker changes to the manager, which maintains this routing catalog.
     let worker_registry = Arc::new(WorkerRegistry::default());
@@ -262,6 +266,43 @@ fn start_local_inflight_tracker(
     let sweep_interval = Duration::from_secs((timeout_secs / 10).clamp(1, 60));
     let inflight_cleanup = spawn_janitor(Arc::clone(&local_inflight_requests), sweep_interval);
     (local_inflight_requests, inflight_cleanup)
+}
+
+/// Watch the EndpointSlices of this router's own Service to keep the peer
+/// registry current.
+///
+/// A no-op unless a peer selector is set and this router maintains its own tree
+/// (no external Indexer). The CLI already rejects that combination; this keeps
+/// the invariant local.
+async fn start_peer_watch(config: &Config, engine_state: &Arc<KvEventIndex>) {
+    let DiscoveryBackend::K8s(k8s) = &config.discovery else {
+        return;
+    };
+    let Some(selector) = k8s.peer_selector.as_ref() else {
+        return;
+    };
+    if engine_state.snapshot_source().is_none() {
+        return;
+    }
+    let family = sgl_router::discovery::k8s::peer_address_family(&config.server.host);
+    // Non-fatal: routing does not depend on peer discovery.
+    if let Err(e) = sgl_router::discovery::k8s::spawn_peer_watch(
+        k8s.namespace.clone(),
+        selector.clone(),
+        engine_state.peers(),
+        family,
+        i32::from(config.server.port),
+    )
+    .await
+    {
+        // Only client construction fails here; RBAC is not checked until the
+        // watch's first LIST, and a denial there is logged by the watch itself.
+        tracing::error!(
+            error = %e,
+            "kv-bootstrap: peer watch failed to start (no usable Kubernetes client \
+             config); the peer set stays unsynced",
+        );
+    }
 }
 
 async fn start_worker_discovery_and_manager(
