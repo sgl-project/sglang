@@ -274,8 +274,10 @@ def qsa_sparse_attention(
     v_cache: torch.Tensor,
     token_slots: torch.Tensor,
     softmax_scale: Optional[float] = None,
+    *,
+    allow_npu_prefill: bool = False,
 ) -> torch.Tensor:
-    """Torch reference for sparse GQA over physical token slots."""
+    """Sparse GQA over physical slots, with an opt-in eager NPU prefill path."""
 
     if q.ndim != 3 or k_cache.ndim != 3 or v_cache.ndim != 3:
         raise ValueError("q, k_cache and v_cache must be rank-3 tensors")
@@ -288,6 +290,19 @@ def qsa_sparse_attention(
         raise ValueError("Q/K/V head dimensions must match")
     if q.shape[1] % k_cache.shape[1] != 0:
         raise ValueError("query heads must be divisible by KV heads")
+    if allow_npu_prefill and q.device.type == "npu":
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_NPU_QSA_NATIVE_PREFILL.get():
+            from sglang.srt.layers.attention.qsa.native_npu import (
+                try_qsa_native_prefill,
+            )
+
+            output = try_qsa_native_prefill(
+                q, k_cache, v_cache, token_slots, softmax_scale
+            )
+            if output is not None:
+                return output
     return qsa_sparse_attention_reference(
         q, k_cache, v_cache, token_slots, softmax_scale
     )
