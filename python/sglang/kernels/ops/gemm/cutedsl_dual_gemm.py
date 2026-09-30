@@ -7,17 +7,18 @@ The operator computes::
     activation = silu(gate) * up
 
 BF16 and FP16 inputs return ``activation`` in the input dtype. FP8 inputs add
-static or dynamic per-token quantization and return
+static or dynamic, per-tensor or per-token quantization and return
 ``activation_fp8, activation_scale``.
 
 ``gate_up_weight`` stores ``[gate; up]`` along dimension zero.  The kernel is
-specialized for single-token transformer decode.  Each CTA owns 64 or 128
-intermediate features and issues both tcgen05 MMAs from one TMA-loaded input
-tile. Dynamic FP8 quantization reduces the activation maximum at three levels:
+specialized for small-batch transformer decode. Each CTA owns 64 or 128
+intermediate features and up to sixteen tokens, and issues both tcgen05 MMAs
+from one TMA-loaded input tile. Dynamic FP8 quantization reduces the activation
+maximum at three levels:
 
 * lanes reduce within each warp;
 * warp leaders reduce within the CTA;
-* CTA leaders atomically reduce into a token-wide global maximum.
+* CTA leaders atomically reduce into token-wide or tensor-wide global maxima.
 
 The launch is bounded to its guaranteed one- or two-CTA-per-SM residency.  That
 makes its release/acquire grid barrier safe: after the global maximum, every CTA
@@ -28,6 +29,7 @@ quantization kernel.
 
 from __future__ import annotations
 
+from enum import IntEnum
 from typing import Optional
 
 import cuda.bindings.driver as cuda
@@ -47,10 +49,33 @@ from sglang.srt.utils.common import direct_register_custom_op
 _THREADS = 256
 _FP8_MAX = 448.0
 _NARROW_CTA_SMEM_BYTES = 112 * 1024
+MAX_DUAL_GEMM_DECODE_TOKENS = 16
+MAX_DUAL_GEMM_INTERMEDIATE_SIZE = 18944
+
+
+class DualGemmQuantMode(IntEnum):
+    STATIC_PER_TENSOR = 0
+    STATIC_PER_TOKEN = 1
+    DYNAMIC_PER_TENSOR = 2
+    DYNAMIC_PER_TOKEN = 3
+    UNQUANT = 4
+
+    @property
+    def is_quantized(self) -> bool:
+        return self is not self.UNQUANT
+
+    @property
+    def is_dynamic(self) -> bool:
+        return self in (self.DYNAMIC_PER_TENSOR, self.DYNAMIC_PER_TOKEN)
+
+    @property
+    def is_per_token(self) -> bool:
+        return self in (self.STATIC_PER_TOKEN, self.DYNAMIC_PER_TOKEN)
+
 
 # (CTA features, MMA token columns, K tile, pipeline stages, use two-CTA MMA).
 # The two-CTA variants pair adjacent feature CTAs into one cluster MMA.  SM100
-# requires at least 16 token columns for a two-CTA MMA; single-token decode
+# requires at least 16 token columns for a two-CTA MMA; small-batch decode
 # therefore predicates the unused columns.
 _FP8_TACTICS: tuple[tuple[int, int, int, int, bool], ...] = (
     # K=128, six stages.
@@ -86,36 +111,135 @@ def _resolve_tactic(
     return tactics[tactic]
 
 
-def _pick_fp8_tactic(intermediate_size: int, multiprocessor_count: int) -> int:
-    """Choose a measured FP8 single-token tactic from the output grid shape."""
-    wide_feature_tiles = intermediate_size // _FP8_TACTICS[0][0]
-    narrow_feature_tiles = intermediate_size // _FP8_TACTICS[1][0]
-    if narrow_feature_tiles < multiprocessor_count:
-        # Tiny grids do not expose enough parallelism to repay a second CTA.
+def _pick_fp8_tactic(
+    num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    multiprocessor_count: int,
+    quant_mode: DualGemmQuantMode,
+) -> int:
+    """Choose an FP8 tactic measured on B200 small-batch decode shapes."""
+    wide_feature_tiles = cute.ceil_div(intermediate_size, 128)
+
+    # For grids below half a wave, paired 64-feature CTAs make the best use of
+    # otherwise idle SMs. This wins for every batch size and quantization mode.
+    if wide_feature_tiles * 2 <= multiprocessor_count:
+        return 2
+
+    # Between half and three quarters of a wave, a 128-feature K=128 tile wins.
+    # BS9-16 needs the 16-column two-CTA form; dynamic quantization favors the
+    # wide variant because its grid barrier must remain resident.
+    if wide_feature_tiles * 4 <= multiprocessor_count * 3:
+        if num_tokens > 8:
+            return 3 if quant_mode.is_dynamic else 2
         return 0
-    if (
-        wide_feature_tiles < multiprocessor_count
-        and wide_feature_tiles * 4 >= multiprocessor_count * 3
-    ):
-        # Llama's 14,336 features have enough 128-feature CTAs to use the wider
-        # K=256 tile without materially underfilling the machine.
+
+    # At roughly three quarters of a wave, the hidden reduction determines
+    # whether K=128 or K=256 repays its pipeline overhead. The measured K=256
+    # regime begins at H=2048, with exceptions at H=3072 and H=3584.
+    if wide_feature_tiles < multiprocessor_count:
+        use_k256 = hidden_size == 2048 or hidden_size >= 4096
+        if not use_k256:
+            if num_tokens > 8:
+                if quant_mode.is_dynamic:
+                    if hidden_size == 3584:
+                        return 5 if quant_mode.is_per_token else 1
+                    return 3 if quant_mode.is_per_token else 1
+                return 5 if hidden_size == 3584 else 2
+            if not quant_mode.is_dynamic:
+                if hidden_size == 3584 and num_tokens in (1, 4):
+                    return 1
+                return 0
+            if quant_mode.is_dynamic and hidden_size % 1024:
+                return 1
+            return 0
+
+        if hidden_size == 2048 and num_tokens > 8:
+            if not quant_mode.is_dynamic:
+                return 2
+            return 7 if quant_mode.is_per_token else 1
+
+        if not quant_mode.is_dynamic:
+            if hidden_size >= 5120 and num_tokens in (1, 4):
+                return 4
+            return 6 if hidden_size >= 4096 else 4
+
+        if hidden_size >= 8192:
+            if num_tokens in (1, 2):
+                return 4
+            if num_tokens == 4:
+                return 7
+            if num_tokens > 8 and quant_mode.is_per_token:
+                return 7
+            return 5
+        if hidden_size >= 5120:
+            return 5
+        if num_tokens > 8:
+            return 7
+        if hidden_size == 4096 and num_tokens in (2, 4):
+            return 5
         return 4
-    # Mid-sized grids and Qwen's 18,944 features favor two resident 64x8 CTAs.
+
+    # A full wave of 128-feature CTAs is also two full resident waves of the
+    # narrow tactic. Qwen-sized and wider projections consistently favor K=256
+    # with 64 features per CTA. The paired form only helps BS16 at H=4096.
+    if (
+        wide_feature_tiles == multiprocessor_count
+        and num_tokens > 8
+        and hidden_size == 4096
+    ):
+        return 7 if quant_mode.is_dynamic else 6
     return 5
 
 
-def _pick_float16_tactic(intermediate_size: int, multiprocessor_count: int) -> int:
-    """Choose a measured BF16/FP16 single-token tactic."""
-    wide_feature_tiles = intermediate_size // _FLOAT16_TACTICS[0][0]
-    narrow_feature_tiles = intermediate_size // _FLOAT16_TACTICS[1][0]
-    if narrow_feature_tiles < multiprocessor_count:
-        return 0
-    if wide_feature_tiles >= multiprocessor_count:
-        # Qwen-sized projections benefit from pairing 64-feature CTAs.
+def _pick_float16_tactic(
+    num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    multiprocessor_count: int,
+    input_dtype: torch.dtype,
+) -> int:
+    """Choose a measured BF16/FP16 small-batch tactic."""
+    wide_feature_tiles = cute.ceil_div(intermediate_size, 128)
+
+    # The paired tactic wins decisively for very small projections. A narrow
+    # one-CTA band follows before the paired tactic wins again up to 3/4 wave.
+    if wide_feature_tiles * 4 <= multiprocessor_count:
         return 2
-    if wide_feature_tiles * 4 >= multiprocessor_count * 3:
-        # Llama-sized projections have enough parallel 128-feature CTAs.
+    if wide_feature_tiles * 5 <= multiprocessor_count * 2:
+        return 1
+    if wide_feature_tiles * 4 <= multiprocessor_count * 3:
+        return 2
+
+    if wide_feature_tiles < multiprocessor_count:
+        if hidden_size >= 8192:
+            if input_dtype == torch.float16 and num_tokens > 8:
+                return 0
+            return 2
+        if hidden_size == 4096 and input_dtype == torch.bfloat16:
+            return 2
         return 0
+
+    # Once the output grid reaches a full wave, two resident 64-feature CTAs
+    # generally hide the long weight stream best. FP16 at exactly one wave and
+    # power-of-two hidden sizes is the repeatable exception.
+    if (
+        wide_feature_tiles * 4 < multiprocessor_count * 5
+        and input_dtype == torch.float16
+        and hidden_size % 4096 == 0
+    ):
+        return 2
+    if (
+        wide_feature_tiles == multiprocessor_count
+        and input_dtype == torch.bfloat16
+        and hidden_size == 4096
+        and num_tokens in (2, 4)
+    ):
+        return 2
+    if hidden_size == 5120 and num_tokens == 4 and input_dtype == torch.float16:
+        return 2
+    if hidden_size >= 8192 and num_tokens == 8:
+        return 2
     return 1
 
 
@@ -124,19 +248,23 @@ class BlackwellDualGemmKernel:
 
     def __init__(
         self,
+        num_tokens: int,
         intermediate_size: int,
         element_type,
         quantize_output: bool,
-        dynamic_quant: bool,
+        quant_mode: DualGemmQuantMode,
         cta_features: int,
         cta_tokens: int,
         cta_reduction: int,
         stages: int,
         use_2cta: bool,
     ) -> None:
+        self.num_tokens = num_tokens
         self.intermediate_size = intermediate_size
         self.quantize_output = quantize_output
-        self.dynamic_quant = quantize_output and dynamic_quant
+        self.quant_mode = quant_mode
+        self.dynamic_quant = quantize_output and quant_mode.is_dynamic
+        self.per_token_quant = quantize_output and quant_mode.is_per_token
         self.cta_m = cta_features
         self.cta_n = cta_tokens
         self.cta_k = cta_reduction
@@ -174,10 +302,17 @@ class BlackwellDualGemmKernel:
             if self.quantize_output
             else "unquantized"
         )
+        granularity = (
+            f"_{'token' if self.per_token_quant else 'tensor'}"
+            if self.quantize_output
+            else ""
+        )
         return (
             "BlackwellDualGemmKernel"
-            f"_i{self.intermediate_size}_m{self.cta_m}_n{self.cta_n}_k{self.cta_k}"
+            f"_t{self.num_tokens}_i{self.intermediate_size}"
+            f"_m{self.cta_m}_n{self.cta_n}_k{self.cta_k}"
             f"_s{self.stages}_2cta{int(self.use_2cta)}_{quantization}"
+            f"{granularity}"
         )
 
     @cute.experimental.jit
@@ -466,108 +601,214 @@ class BlackwellDualGemmKernel:
         global_amax: cute.Tensor,
         supplied_scale: cute.Tensor,
         completion_counter: cute.Tensor,
-        warp_maxima: cute.Tensor,
         shared_scale: cute.Tensor,
     ):
         """All warps: apply SwiGLU, then store or quantize the result."""
         cute.arch.sync_threads()
 
-        feature = feature_tile * self.cta_m + tid
-        local_amax = cutlass.Float32(0.0)
-        activation = self.activation_type(0.0)
+        if cutlass.const_expr(not self.dynamic_quant and self.num_tokens <= 8):
+            static_feature = feature_tile * self.cta_m + tid
+            if tid < self.cta_m and static_feature < self.intermediate_size:
+                for static_token in cutlass.range_constexpr(self.num_tokens):
+                    static_gate = gate_tile[tid, static_token].to(cutlass.Float32)
+                    static_up = up_tile[tid, static_token].to(cutlass.Float32)
 
-        if tid < self.cta_m and feature < self.intermediate_size:
-            gate_value = gate_tile[tid, 0].to(cutlass.Float32)
-            up_value = up_tile[tid, 0].to(cutlass.Float32)
+                    if cutlass.const_expr(self.quantize_output):
+                        static_input_scale_idx = (
+                            static_token if x_scale.shape[0] != 1 else cutlass.Int32(0)
+                        )
+                        static_input_scale = x_scale[static_input_scale_idx].to(
+                            cutlass.Float32
+                        )
+                        if cutlass.const_expr(gate_up_weight_scale.shape[0] == 1):
+                            static_gate_scale = gate_up_weight_scale[0].to(
+                                cutlass.Float32
+                            )
+                            static_up_scale = static_gate_scale
+                        else:
+                            static_gate_scale = gate_up_weight_scale[static_feature].to(
+                                cutlass.Float32
+                            )
+                            static_up_scale = gate_up_weight_scale[
+                                static_feature + self.intermediate_size
+                            ].to(cutlass.Float32)
+                        static_gate *= static_input_scale * static_gate_scale
+                        static_up *= static_input_scale * static_up_scale
+
+                    static_gate = static_gate.to(self.activation_type).to(
+                        cutlass.Float32
+                    )
+                    static_up = static_up.to(self.activation_type).to(cutlass.Float32)
+                    static_activation = self.silu_and_mul(static_gate, static_up)
+
+                    if cutlass.const_expr(not self.quantize_output):
+                        output[static_feature, static_token, 0] = static_activation
+                    else:
+                        static_scale_idx = (
+                            static_token if self.per_token_quant else cutlass.Int32(0)
+                        )
+                        static_quantized = (
+                            static_activation.to(cutlass.Float32)
+                            / supplied_scale[static_scale_idx]
+                        )
+                        if static_quantized > cutlass.Float32(_FP8_MAX):
+                            static_quantized = cutlass.Float32(_FP8_MAX)
+                        if static_quantized < cutlass.Float32(-_FP8_MAX):
+                            static_quantized = cutlass.Float32(-_FP8_MAX)
+                        output[static_feature, static_token, 0] = static_quantized.to(
+                            self.element_type
+                        )
 
             if cutlass.const_expr(self.quantize_output):
-                input_scale = x_scale[0].to(cutlass.Float32)
+                if feature_tile == 0 and warp == 0:
+                    if cutlass.const_expr(self.per_token_quant):
+                        if lane < self.num_tokens:
+                            output_scale[lane] = supplied_scale[lane]
+                    elif lane == 0:
+                        output_scale[0] = supplied_scale[0]
+            return
 
-                if cutlass.const_expr(gate_up_weight_scale.shape[0] == 1):
-                    gate_scale = gate_up_weight_scale[0].to(cutlass.Float32)
-                    up_scale = gate_scale
-                else:
-                    gate_scale = gate_up_weight_scale[feature].to(cutlass.Float32)
-                    up_scale = gate_up_weight_scale[
-                        feature + self.intermediate_size
-                    ].to(cutlass.Float32)
+        num_warps = self.threads // 32
+        token_rounds = cute.ceil_div(self.num_tokens, num_warps)
+        feature_groups = self.cta_m // 32
+        activations = cute_ext.allocate(
+            self.activation_type,
+            cute.AddressSpace.rmem,
+            cute.make_layout((token_rounds, feature_groups)),
+            alignment=16,
+        )
 
-                gate_value *= input_scale * gate_scale
-                up_value *= input_scale * up_scale
+        # Assign one token to each warp. For BS9-16, every warp processes a
+        # second token. Lanes walk the CTA's feature rows, so each token needs
+        # only a warp reduction rather than a serialized CTA-wide reduction.
+        for token_round in cutlass.range_constexpr(token_rounds):
+            token = warp + token_round * num_warps
+            if token < self.num_tokens:
+                token_amax = cutlass.Float32(0.0)
+                for feature_group in cutlass.range_constexpr(feature_groups):
+                    local_feature = lane + feature_group * 32
+                    feature = feature_tile * self.cta_m + local_feature
+                    gate_value = gate_tile[local_feature, token].to(cutlass.Float32)
+                    up_value = up_tile[local_feature, token].to(cutlass.Float32)
 
-            # Match the unfused operator chain: projection outputs round to
-            # the activation dtype before the activation consumes them.
-            gate_value = gate_value.to(self.activation_type).to(cutlass.Float32)
-            up_value = up_value.to(self.activation_type).to(cutlass.Float32)
+                    if cutlass.const_expr(self.quantize_output):
+                        input_scale_idx = (
+                            token if x_scale.shape[0] != 1 else cutlass.Int32(0)
+                        )
+                        input_scale = x_scale[input_scale_idx].to(cutlass.Float32)
 
-            activation = self.silu_and_mul(gate_value, up_value)
+                        if cutlass.const_expr(gate_up_weight_scale.shape[0] == 1):
+                            gate_scale = gate_up_weight_scale[0].to(cutlass.Float32)
+                            up_scale = gate_scale
+                        else:
+                            gate_scale = gate_up_weight_scale[feature].to(
+                                cutlass.Float32
+                            )
+                            up_scale = gate_up_weight_scale[
+                                feature + self.intermediate_size
+                            ].to(cutlass.Float32)
 
-            if cutlass.const_expr(not self.quantize_output):
-                output[feature, 0, 0] = activation
-            elif cutlass.const_expr(self.dynamic_quant):
-                local_amax = cute.math.absf(activation.to(cutlass.Float32))
-            else:
-                scale = supplied_scale[0].to(cutlass.Float32)
-                quantized = activation.to(cutlass.Float32) / scale
+                        gate_value *= input_scale * gate_scale
+                        up_value *= input_scale * up_scale
 
-                if quantized > cutlass.Float32(_FP8_MAX):
-                    quantized = cutlass.Float32(_FP8_MAX)
-                if quantized < cutlass.Float32(-_FP8_MAX):
-                    quantized = cutlass.Float32(-_FP8_MAX)
+                    # Match the unfused operator chain: projection outputs
+                    # round before SwiGLU consumes them.
+                    gate_value = gate_value.to(self.activation_type).to(cutlass.Float32)
+                    up_value = up_value.to(self.activation_type).to(cutlass.Float32)
+                    activation = self.silu_and_mul(gate_value, up_value)
+                    activations[token_round, feature_group] = activation
 
-                output[feature, 0, 0] = quantized.to(self.element_type)
+                    if cutlass.const_expr(self.dynamic_quant):
+                        abs_activation = cute.math.absf(activation.to(cutlass.Float32))
+                        if abs_activation > token_amax:
+                            token_amax = abs_activation
+                    elif cutlass.const_expr(not self.quantize_output):
+                        output[feature, token, 0] = activation
+                    else:
+                        scale_idx = token if self.per_token_quant else cutlass.Int32(0)
+                        scale = supplied_scale[scale_idx].to(cutlass.Float32)
+                        quantized = activation.to(cutlass.Float32) / scale
+                        if quantized > cutlass.Float32(_FP8_MAX):
+                            quantized = cutlass.Float32(_FP8_MAX)
+                        if quantized < cutlass.Float32(-_FP8_MAX):
+                            quantized = cutlass.Float32(-_FP8_MAX)
+                        output[feature, token, 0] = quantized.to(self.element_type)
+
+                if cutlass.const_expr(self.dynamic_quant):
+                    token_amax = cute.arch.warp_reduction_max(token_amax)
+                    if lane == 0:
+                        shared_scale[token] = token_amax
 
         if cutlass.const_expr(self.quantize_output and self.dynamic_quant):
-            # Level 1: warp reduction.
-            warp_amax = cute.arch.warp_reduction_max(local_amax)
-
-            if lane == 0:
-                warp_maxima[warp] = warp_amax
             cute.arch.sync_threads()
 
-            # Level 2: CTA reduction by warp 0.
-            if warp == 0:
-                cta_amax = (
-                    warp_maxima[lane]
-                    if lane < self.threads // 32
-                    else cutlass.Float32(0.0)
-                )
-                cta_amax = cute.arch.warp_reduction_max(cta_amax)
-
-                if lane == 0:
-                    if cutlass.const_expr(self.feature_tiles == 1):
-                        scale = cta_amax / cutlass.Float32(_FP8_MAX)
-
+            if cutlass.const_expr(self.feature_tiles == 1):
+                if cutlass.const_expr(self.per_token_quant):
+                    if warp == 0 and lane < self.num_tokens:
+                        scale = shared_scale[lane] / cutlass.Float32(_FP8_MAX)
                         if scale == cutlass.Float32(0.0):
                             scale = cutlass.Float32(1.0)
-
-                        shared_scale[0] = scale
-                        output_scale[0] = scale
-                    else:
-                        # Level 3: global reduction. Release/acquire ordering
-                        # on the counter publishes every CTA's amax.
-                        cute.arch.atomic_fmax(
-                            global_amax.iterator,
-                            cta_amax,
-                            sign_bit=False,
-                            sem="acq_rel",
-                            scope="gpu",
+                        shared_scale[lane] = scale
+                        output_scale[lane] = scale
+                else:
+                    if warp == 0:
+                        amax = (
+                            shared_scale[lane]
+                            if lane < self.num_tokens
+                            else cutlass.Float32(0.0)
                         )
-                        cute.arch.fence_acq_rel_gpu()
-                        cute.arch.atomic_add(
-                            completion_counter.iterator,
-                            cutlass.Int32(1),
-                            sem="acq_rel",
-                            scope="gpu",
-                        )
-            if cutlass.const_expr(self.feature_tiles == 1):
+                        amax = cute.arch.warp_reduction_max(amax)
+                        if lane == 0:
+                            scale = amax / cutlass.Float32(_FP8_MAX)
+                            if scale == cutlass.Float32(0.0):
+                                scale = cutlass.Float32(1.0)
+                            shared_scale[0] = scale
+                            output_scale[0] = scale
                 cute.arch.sync_threads()
-            if cutlass.const_expr(self.feature_tiles > 1):
-                # The host bounds the grid to guaranteed residency, so this
-                # barrier cannot wait on a CTA that has not been scheduled.
-                if tid == 0:
-                    completed = cutlass.Int32(0)
+            else:
+                # Level 3: publish one CTA maximum per output scale, then use
+                # one counter as the release/acquire grid barrier.
+                if warp == 0:
+                    if cutlass.const_expr(self.per_token_quant):
+                        if lane < self.num_tokens:
+                            cute.arch.atomic_fmax(
+                                global_amax.iterator + lane,
+                                shared_scale[lane],
+                                sign_bit=False,
+                                sem="acq_rel",
+                                scope="gpu",
+                            )
+                    else:
+                        cta_amax = (
+                            shared_scale[lane]
+                            if lane < self.num_tokens
+                            else cutlass.Float32(0.0)
+                        )
+                        cta_amax = cute.arch.warp_reduction_max(cta_amax)
+                        if lane == 0:
+                            cute.arch.atomic_fmax(
+                                global_amax.iterator,
+                                cta_amax,
+                                sign_bit=False,
+                                sem="acq_rel",
+                                scope="gpu",
+                            )
+                # Publish every lane's atomic before the CTA leader signals
+                # completion to other resident CTAs.
+                cute.arch.sync_threads()
 
+                if tid == 0:
+                    cute.arch.fence_acq_rel_gpu()
+                    cute.arch.atomic_add(
+                        completion_counter.iterator,
+                        cutlass.Int32(1),
+                        sem="acq_rel",
+                        scope="gpu",
+                    )
+
+                    # The host bounds the grid to guaranteed residency, so
+                    # this cannot wait on a CTA that has not been scheduled.
+                    completed = cutlass.Int32(0)
                     while completed < self.feature_tiles:
                         completed = cute.arch.atomic_add(
                             completion_counter.iterator,
@@ -575,30 +816,51 @@ class BlackwellDualGemmKernel:
                             sem="acquire",
                             scope="gpu",
                         )
-                    scale = global_amax[0].to(cutlass.Float32) / cutlass.Float32(
-                        _FP8_MAX
-                    )
 
-                    if scale == cutlass.Float32(0.0):
-                        scale = cutlass.Float32(1.0)
-                    shared_scale[0] = scale
-
-                    if feature_tile == 0:
-                        output_scale[0] = scale
+                    if cutlass.const_expr(self.per_token_quant):
+                        for token in cutlass.range_constexpr(self.num_tokens):
+                            scale = global_amax[token].to(
+                                cutlass.Float32
+                            ) / cutlass.Float32(_FP8_MAX)
+                            if scale == cutlass.Float32(0.0):
+                                scale = cutlass.Float32(1.0)
+                            shared_scale[token] = scale
+                            if feature_tile == 0:
+                                output_scale[token] = scale
+                    else:
+                        scale = global_amax[0].to(cutlass.Float32) / cutlass.Float32(
+                            _FP8_MAX
+                        )
+                        if scale == cutlass.Float32(0.0):
+                            scale = cutlass.Float32(1.0)
+                        shared_scale[0] = scale
+                        if feature_tile == 0:
+                            output_scale[0] = scale
                 cute.arch.sync_threads()
-            scale = shared_scale[0]
-            if tid < self.cta_m and feature < self.intermediate_size:
-                quantized = activation.to(cutlass.Float32) / scale
 
-                if quantized > cutlass.Float32(_FP8_MAX):
-                    quantized = cutlass.Float32(_FP8_MAX)
-                if quantized < cutlass.Float32(-_FP8_MAX):
-                    quantized = cutlass.Float32(-_FP8_MAX)
-
-                output[feature, 0, 0] = quantized.to(self.element_type)
+            for token_round in cutlass.range_constexpr(token_rounds):
+                token = warp + token_round * num_warps
+                if token < self.num_tokens:
+                    scale_idx = token if self.per_token_quant else cutlass.Int32(0)
+                    for feature_group in cutlass.range_constexpr(feature_groups):
+                        local_feature = lane + feature_group * 32
+                        feature = feature_tile * self.cta_m + local_feature
+                        quantized = (
+                            activations[token_round, feature_group].to(cutlass.Float32)
+                            / shared_scale[scale_idx]
+                        )
+                        if quantized > cutlass.Float32(_FP8_MAX):
+                            quantized = cutlass.Float32(_FP8_MAX)
+                        if quantized < cutlass.Float32(-_FP8_MAX):
+                            quantized = cutlass.Float32(-_FP8_MAX)
+                        output[feature, token, 0] = quantized.to(self.element_type)
         elif cutlass.const_expr(self.quantize_output):
-            if feature_tile == 0 and tid == 0:
-                output_scale[0] = supplied_scale[0]
+            if feature_tile == 0 and warp == 0:
+                if cutlass.const_expr(self.per_token_quant):
+                    if lane < self.num_tokens:
+                        output_scale[lane] = supplied_scale[lane]
+                elif lane == 0:
+                    output_scale[0] = supplied_scale[0]
 
     @cute.experimental.jit
     def __call__(
@@ -715,17 +977,11 @@ class BlackwellDualGemmKernel:
             accumulator_tile_layout,
             alignment=128,
         )
-        warp_maxima = cute_ext.allocate(
-            cutlass.Float32,
-            cute.AddressSpace.smem,
-            cute.make_layout(self.threads // 32),
-            alignment=16,
-        )
         shared_scale = cute_ext.allocate(
             cutlass.Float32,
             cute.AddressSpace.smem,
-            cute.make_layout(1),
-            alignment=4,
+            cute.make_layout(self.num_tokens),
+            alignment=16,
         )
         full_storage = cute_ext.allocate(
             cutlass.Int64,
@@ -851,7 +1107,6 @@ class BlackwellDualGemmKernel:
             global_amax,
             supplied_scale,
             completion_counter,
-            warp_maxima,
             shared_scale,
         )
 
@@ -917,7 +1172,7 @@ def _validate_inputs(
     x_scale: torch.Tensor,
     gate_up_weight_scale: torch.Tensor,
     output_scale: Optional[torch.Tensor],
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     if x.device.type != "cuda" or gate_up_weight.device != x.device:
         raise ValueError("x and gate_up_weight must be on the same CUDA device")
     if x.dtype != torch.float8_e4m3fn or gate_up_weight.dtype != x.dtype:
@@ -928,8 +1183,10 @@ def _validate_inputs(
         raise ValueError("x and gate_up_weight must be contiguous along K")
     num_tokens, hidden_size = x.shape
     packed_intermediate_size, weight_hidden_size = gate_up_weight.shape
-    if num_tokens != 1:
-        raise ValueError("the SM100 dual GEMM currently supports one token")
+    if not 1 <= num_tokens <= MAX_DUAL_GEMM_DECODE_TOKENS:
+        raise ValueError(
+            f"the SM100 dual GEMM supports 1 to {MAX_DUAL_GEMM_DECODE_TOKENS} tokens"
+        )
     if packed_intermediate_size % 2:
         raise ValueError("gate_up_weight.shape[0] must be even")
     intermediate_size = packed_intermediate_size // 2
@@ -949,19 +1206,20 @@ def _validate_inputs(
             raise ValueError(f"{name} must be float32 on x.device")
         if scale.numel() not in valid_sizes:
             raise ValueError(f"{name} must contain one of {valid_sizes} values")
-    if output_scale is not None and (
-        output_scale.device != x.device
-        or output_scale.dtype != torch.float32
-        or output_scale.numel() != 1
-    ):
-        raise ValueError("output_scale must be a scalar float32 tensor on x.device")
-    return hidden_size, intermediate_size
+    if output_scale is not None:
+        if output_scale.device != x.device or output_scale.dtype != torch.float32:
+            raise ValueError("output_scale must be float32 on x.device")
+        if output_scale.numel() not in (1, num_tokens):
+            raise ValueError(
+                "output_scale must contain one scale or one scale per token"
+            )
+    return num_tokens, hidden_size, intermediate_size
 
 
 def _validate_float16_inputs(
     x: torch.Tensor,
     gate_up_weight: torch.Tensor,
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     if x.device.type != "cuda" or gate_up_weight.device != x.device:
         raise ValueError("x and gate_up_weight must be on the same CUDA device")
     if x.dtype not in (torch.bfloat16, torch.float16):
@@ -975,8 +1233,10 @@ def _validate_float16_inputs(
 
     num_tokens, hidden_size = x.shape
     packed_intermediate_size, weight_hidden_size = gate_up_weight.shape
-    if num_tokens != 1:
-        raise ValueError("the SM100 dual GEMM currently supports one token")
+    if not 1 <= num_tokens <= MAX_DUAL_GEMM_DECODE_TOKENS:
+        raise ValueError(
+            f"the SM100 dual GEMM supports 1 to {MAX_DUAL_GEMM_DECODE_TOKENS} tokens"
+        )
     if packed_intermediate_size % 2:
         raise ValueError("gate_up_weight.shape[0] must be even")
 
@@ -985,7 +1245,7 @@ def _validate_float16_inputs(
         raise ValueError("gate_up_weight.shape[1] must equal x.shape[1]")
     if hidden_size % 128 or intermediate_size % 128:
         raise ValueError("hidden_size and intermediate_size must be multiples of 128")
-    return hidden_size, intermediate_size
+    return num_tokens, hidden_size, intermediate_size
 
 
 def _dual_gemm_swiglu_fp8_run(
@@ -994,21 +1254,41 @@ def _dual_gemm_swiglu_fp8_run(
     x_scale: torch.Tensor,
     gate_up_weight_scale: torch.Tensor,
     output_scale: Optional[torch.Tensor] = None,
+    quant_mode: int = int(DualGemmQuantMode.DYNAMIC_PER_TOKEN),
     tactic: int = -1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if not is_sm100_supported():
         raise RuntimeError("CuTe DSL dual GEMM requires an SM10x GPU")
 
-    hidden_size, intermediate_size = _validate_inputs(
+    num_tokens, hidden_size, intermediate_size = _validate_inputs(
         x, gate_up_weight, x_scale, gate_up_weight_scale, output_scale
     )
-    dynamic_quant = output_scale is None
+    quant_mode = DualGemmQuantMode(quant_mode)
+    if not quant_mode.is_quantized:
+        raise ValueError("UNQUANT is not valid for the FP8 dual GEMM")
+    dynamic_quant = quant_mode.is_dynamic
+    per_token_quant = quant_mode.is_per_token
+    if dynamic_quant != (output_scale is None):
+        expected = "None" if dynamic_quant else "a scale tensor"
+        raise ValueError(f"output_scale must be {expected} for {quant_mode.name}")
+    if not dynamic_quant:
+        expected_scales = num_tokens if per_token_quant else 1
+        if output_scale.numel() != expected_scales:
+            raise ValueError(
+                f"{quant_mode.name} requires {expected_scales} output scale value(s)"
+            )
     multiprocessor_count = torch.cuda.get_device_properties(
         x.device
     ).multi_processor_count
 
     if tactic < 0:
-        tactic = _pick_fp8_tactic(intermediate_size, multiprocessor_count)
+        tactic = _pick_fp8_tactic(
+            num_tokens,
+            hidden_size,
+            intermediate_size,
+            multiprocessor_count,
+            quant_mode,
+        )
 
     cta_features, cta_tokens, cta_reduction, stages, use_2cta = _resolve_tactic(
         tactic, True
@@ -1026,24 +1306,32 @@ def _dual_gemm_swiglu_fp8_run(
     x_scale = x_scale.reshape(-1)
     gate_up_weight_scale = gate_up_weight_scale.reshape(-1)
     quantized = torch.empty(
-        (1, intermediate_size), dtype=torch.float8_e4m3fn, device=x.device
+        (num_tokens, intermediate_size), dtype=torch.float8_e4m3fn, device=x.device
     )
+    scale_count = num_tokens if per_token_quant else 1
+    result_scale_shape = (num_tokens, 1) if per_token_quant and num_tokens > 1 else (1,)
 
     if dynamic_quant:
         # With one token, dynamic per-token and per-tensor scaling are
-        # numerically equivalent.  Return a 1-D scalar scale so downstream FP8
+        # numerically equivalent. Return a 1-D scalar scale so downstream FP8
         # GEMMs can use their fused per-tensor scaling path.
-        result_scale = torch.empty((1,), dtype=torch.float32, device=x.device)
+        result_scale = torch.empty(
+            result_scale_shape, dtype=torch.float32, device=x.device
+        )
         if feature_tiles == 1:
-            global_amax = result_scale
+            global_amax = result_scale.reshape(-1)
             completion_counter = torch.empty((1,), dtype=torch.int32, device=x.device)
         else:
-            global_amax = torch.zeros((1,), dtype=torch.float32, device=x.device)
+            global_amax = torch.zeros(
+                (scale_count,), dtype=torch.float32, device=x.device
+            )
             completion_counter = torch.zeros((1,), dtype=torch.int32, device=x.device)
         supplied_scale = x_scale
     else:
-        result_scale = torch.empty((1,), dtype=torch.float32, device=x.device)
-        global_amax = result_scale
+        result_scale = torch.empty(
+            result_scale_shape, dtype=torch.float32, device=x.device
+        )
+        global_amax = result_scale.reshape(-1)
         completion_counter = torch.empty((1,), dtype=torch.int32, device=x.device)
         supplied_scale = output_scale.reshape(-1)
 
@@ -1056,10 +1344,12 @@ def _dual_gemm_swiglu_fp8_run(
 
     key = (
         "sm100",
-        dynamic_quant,
+        quant_mode,
         x.device,
         hidden_size,
         intermediate_size,
+        num_tokens,
+        per_token_quant,
         tactic,
         tuple(x_scale.shape),
         tuple(gate_up_weight_scale.shape),
@@ -1073,7 +1363,7 @@ def _dual_gemm_swiglu_fp8_run(
         _cute_tensor_dynamic(output_3d),
         _cute_tensor(x_scale),
         _cute_tensor(gate_up_weight_scale),
-        _cute_tensor(result_scale),
+        _cute_tensor(result_scale.reshape(-1)),
         _cute_tensor(global_amax),
         _cute_tensor(supplied_scale),
         _cute_tensor(completion_counter),
@@ -1082,10 +1372,11 @@ def _dual_gemm_swiglu_fp8_run(
 
     if compiled is None:
         kernel = BlackwellDualGemmKernel(
+            num_tokens=num_tokens,
             intermediate_size=intermediate_size,
             element_type=cutlass.Float8E4M3FN,
             quantize_output=True,
-            dynamic_quant=dynamic_quant,
+            quant_mode=quant_mode,
             cta_features=cta_features,
             cta_tokens=cta_tokens,
             cta_reduction=cta_reduction,
@@ -1108,18 +1399,28 @@ def _dual_gemm_swiglu_run(
     if not is_sm100_supported():
         raise RuntimeError("CuTe DSL dual GEMM requires an SM10x GPU")
 
-    hidden_size, intermediate_size = _validate_float16_inputs(x, gate_up_weight)
+    num_tokens, hidden_size, intermediate_size = _validate_float16_inputs(
+        x, gate_up_weight
+    )
     multiprocessor_count = torch.cuda.get_device_properties(
         x.device
     ).multi_processor_count
     if tactic < 0:
-        tactic = _pick_float16_tactic(intermediate_size, multiprocessor_count)
+        tactic = _pick_float16_tactic(
+            num_tokens,
+            hidden_size,
+            intermediate_size,
+            multiprocessor_count,
+            x.dtype,
+        )
 
     cta_features, cta_tokens, cta_reduction, stages, use_2cta = _resolve_tactic(
         tactic, False
     )
     element_type = cutlass.BFloat16 if x.dtype == torch.bfloat16 else cutlass.Float16
-    output = torch.empty((1, intermediate_size), dtype=x.dtype, device=x.device)
+    output = torch.empty(
+        (num_tokens, intermediate_size), dtype=x.dtype, device=x.device
+    )
     stream = cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
     x_3d = x.unsqueeze(0)
     gate_weight, up_weight = gate_up_weight.chunk(2, dim=0)
@@ -1134,6 +1435,7 @@ def _dual_gemm_swiglu_run(
         x.device,
         hidden_size,
         intermediate_size,
+        num_tokens,
         tactic,
     )
     output_cute = _cute_tensor_dynamic(output_3d)
@@ -1154,10 +1456,11 @@ def _dual_gemm_swiglu_run(
     compiled = _COMPILED_DUAL_GEMM.get(key)
     if compiled is None:
         kernel = BlackwellDualGemmKernel(
+            num_tokens=num_tokens,
             intermediate_size=intermediate_size,
             element_type=element_type,
             quantize_output=False,
-            dynamic_quant=False,
+            quant_mode=DualGemmQuantMode.UNQUANT,
             cta_features=cta_features,
             cta_tokens=cta_tokens,
             cta_reduction=cta_reduction,
@@ -1189,9 +1492,12 @@ def _dual_gemm_swiglu_fp8_fake(
     x_scale,
     gate_up_weight_scale,
     output_scale=None,
+    quant_mode=int(DualGemmQuantMode.DYNAMIC_PER_TOKEN),
     tactic=-1,
 ):
     intermediate_size = gate_up_weight.shape[0] // 2
+    per_token_quant = DualGemmQuantMode(quant_mode).is_per_token
+    scale_shape = (x.shape[0], 1) if per_token_quant and x.shape[0] > 1 else (1,)
 
     return (
         torch.empty(
@@ -1199,7 +1505,7 @@ def _dual_gemm_swiglu_fp8_fake(
             dtype=torch.float8_e4m3fn,
             device=x.device,
         ),
-        torch.empty((1,), dtype=torch.float32, device=x.device),
+        torch.empty(scale_shape, dtype=torch.float32, device=x.device),
     )
 
 
@@ -1224,15 +1530,15 @@ def can_use_dual_gemm(
     hidden_size: int,
     intermediate_size: int,
 ) -> bool:
-    """Return whether dimensions fit the single-token dual GEMM contract.
+    """Return whether dimensions fit the small-batch dual GEMM contract.
 
     The modeling layer owns quantization-policy gating; this predicate checks
     both the SM100 requirement and the fused kernel's shape contract.
     """
     return (
-        num_tokens == 1
+        1 <= num_tokens <= MAX_DUAL_GEMM_DECODE_TOKENS
         and hidden_size > 0
-        and intermediate_size > 0
+        and 0 < intermediate_size <= MAX_DUAL_GEMM_INTERMEDIATE_SIZE
         and hidden_size % 128 == 0
         and intermediate_size % 128 == 0
         and is_sm100_supported()
@@ -1264,14 +1570,15 @@ def dual_gemm_swiglu_fp8(
     x_scale: torch.Tensor,
     gate_up_weight_scale: torch.Tensor,
     output_scale: Optional[torch.Tensor] = None,
+    quant_mode: DualGemmQuantMode = DualGemmQuantMode.DYNAMIC_PER_TOKEN,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run FP8 gate/up projections, SwiGLU, and static or dynamic FP8 quant.
 
-    ``output_scale=None`` selects dynamic per-token quantization.  Supplying a
-    scalar ``output_scale`` selects static quantization.  The single-token
-    specialization returns its scale as a one-element 1-D tensor so it is also
-    consumable as a per-tensor scale.  Shape eligibility is intentionally the
-    responsibility of the caller.
+    ``quant_mode`` independently selects static versus dynamic and per-tensor
+    versus per-token scaling. Static modes require ``output_scale``; dynamic
+    modes require it to be ``None``. A single-token result always uses shape
+    ``(1,)`` so downstream FP8 GEMMs can consume it as a per-tensor scale.
+    Shape eligibility is intentionally the responsibility of the caller.
     """
     return _dual_gemm_swiglu_fp8_with_tactic(
         x,
@@ -1279,6 +1586,7 @@ def dual_gemm_swiglu_fp8(
         x_scale,
         gate_up_weight_scale,
         output_scale,
+        quant_mode,
         -1,
     )
 
@@ -1289,6 +1597,7 @@ def _dual_gemm_swiglu_fp8_with_tactic(
     x_scale: torch.Tensor,
     gate_up_weight_scale: torch.Tensor,
     output_scale: Optional[torch.Tensor],
+    quant_mode: DualGemmQuantMode,
     tactic: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Testing/tuning entry point; production callers use the auto picker."""
@@ -1298,5 +1607,6 @@ def _dual_gemm_swiglu_fp8_with_tactic(
         x_scale,
         gate_up_weight_scale,
         output_scale,
+        int(quant_mode),
         tactic,
     )

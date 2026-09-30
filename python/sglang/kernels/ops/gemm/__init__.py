@@ -17,6 +17,8 @@ from sglang.kernels.spec import (
 if TYPE_CHECKING:
     import torch
 
+    from sglang.kernels.ops.gemm.cutedsl_dual_gemm import DualGemmQuantMode
+
 _CUDA = frozenset({CapabilityRequirement.CUDA})
 _SM90 = frozenset({CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))})
 _SM120 = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 0))})
@@ -188,7 +190,7 @@ register_kernel(
             supported_dtypes=("float8_e4m3fn",),
             description=(
                 "FP8 gate/up dual GEMM, SwiGLU, and static or dynamic "
-                "per-token FP8 activation quantization"
+                "per-tensor or per-token FP8 activation quantization"
             ),
         ),
         description="Blackwell TMA/tcgen05 fused dual GEMM and quantization.",
@@ -322,14 +324,20 @@ def dual_gemm_swiglu_fp8(
     x_scale: torch.Tensor,
     gate_up_weight_scale: torch.Tensor,
     output_scale: Optional[torch.Tensor] = None,
+    quant_mode: Optional["DualGemmQuantMode"] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fuse FP8 gate/up projections, SwiGLU, and activation quantization."""
+    if quant_mode is None:
+        from .cutedsl_dual_gemm import DualGemmQuantMode
+
+        quant_mode = DualGemmQuantMode.DYNAMIC_PER_TOKEN
     return get_kernel("gemm.dual_gemm_swiglu_fp8", KernelBackend.CUTE_DSL)(
         x,
         gate_up_weight,
         x_scale,
         gate_up_weight_scale,
         output_scale,
+        quant_mode,
     )
 
 

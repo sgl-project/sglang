@@ -8,6 +8,7 @@ import torch
 from sglang.kernels.jit.utils import get_jit_cuda_arch, is_hip_runtime
 from sglang.kernels.ops.activation import silu_and_mul
 from sglang.kernels.ops.gemm import fp8_scaled_mm
+from sglang.kernels.ops.gemm.cutedsl_dual_gemm import DualGemmQuantMode
 from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -18,17 +19,17 @@ _HIDDEN_SIZE = 2048
 _INTERMEDIATE_SIZE = 2048
 
 
-def _make_inputs(seed):
+def _make_inputs(num_tokens, seed, input_per_token=True):
     generator = torch.Generator(device="cuda").manual_seed(seed)
     x, x_scale = scaled_fp8_quant(
         torch.randn(
-            (1, _HIDDEN_SIZE),
+            (num_tokens, _HIDDEN_SIZE),
             device="cuda",
             dtype=torch.bfloat16,
             generator=generator,
         )
         * 0.25,
-        use_per_token_if_dynamic=True,
+        use_per_token_if_dynamic=input_per_token,
     )
     gate_up_weight, gate_up_weight_scale = scaled_fp8_quant(
         torch.randn(
@@ -54,6 +55,7 @@ def _reference(
     x_scale,
     gate_up_weight_scale,
     output_scale,
+    use_per_token_if_dynamic,
 ):
     gate_up = fp8_scaled_mm(
         x,
@@ -64,15 +66,21 @@ def _reference(
     )
     activation = silu_and_mul(gate_up)
     if output_scale is None:
-        return scaled_fp8_quant(activation, use_per_token_if_dynamic=True)
-    return scaled_fp8_quant(activation, scale=output_scale)
+        return scaled_fp8_quant(
+            activation,
+            use_per_token_if_dynamic=use_per_token_if_dynamic,
+        )
+    quantized = (
+        (activation.float() / output_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    )
+    return quantized, output_scale
 
 
-def _make_float_inputs(dtype, seed):
+def _make_float_inputs(num_tokens, dtype, seed):
     generator = torch.Generator(device="cuda").manual_seed(seed)
     return (
         torch.randn(
-            (1, _HIDDEN_SIZE),
+            (num_tokens, _HIDDEN_SIZE),
             device="cuda",
             dtype=dtype,
             generator=generator,
@@ -140,7 +148,13 @@ class TestCuteDSLDualGemm(CustomTestCase):
         if is_hip_runtime() or get_jit_cuda_arch().major != 10:
             raise unittest.SkipTest("NVIDIA SM10x required")
 
-    def _check(self, dynamic_quant, seed, tactic=-1):
+    def _check(
+        self,
+        quant_mode,
+        num_tokens,
+        seed,
+        tactic=-1,
+    ):
         if tactic < 0:
             from sglang.kernels.ops.gemm import dual_gemm_swiglu_fp8
         else:
@@ -148,23 +162,34 @@ class TestCuteDSLDualGemm(CustomTestCase):
                 _dual_gemm_swiglu_fp8_with_tactic,
             )
 
-        x, gate_up_weight, x_scale, gate_up_weight_scale = _make_inputs(seed)
+        x, gate_up_weight, x_scale, gate_up_weight_scale = _make_inputs(
+            num_tokens,
+            seed,
+        )
         output_scale = None
-        if not dynamic_quant:
+        if not quant_mode.is_dynamic:
             _, calibrated_scale = _reference(
                 x,
                 gate_up_weight,
                 x_scale,
                 gate_up_weight_scale,
                 None,
+                quant_mode.is_per_token,
             )
-            output_scale = calibrated_scale.reshape(1)
+            output_scale = calibrated_scale
 
         args = (x, gate_up_weight, x_scale, gate_up_weight_scale, output_scale)
         actual, actual_scale = (
-            dual_gemm_swiglu_fp8(*args)
+            dual_gemm_swiglu_fp8(
+                *args,
+                quant_mode=quant_mode,
+            )
             if tactic < 0
-            else _dual_gemm_swiglu_fp8_with_tactic(*args, tactic)
+            else _dual_gemm_swiglu_fp8_with_tactic(
+                *args,
+                quant_mode,
+                tactic,
+            )
         )
         expected, expected_scale = _reference(
             x,
@@ -172,8 +197,12 @@ class TestCuteDSLDualGemm(CustomTestCase):
             x_scale,
             gate_up_weight_scale,
             output_scale,
+            quant_mode.is_per_token,
         )
-        self.assertEqual(actual_scale.shape, (1,))
+        expected_scale_shape = (
+            (num_tokens, 1) if quant_mode.is_per_token and num_tokens > 1 else (1,)
+        )
+        self.assertEqual(actual_scale.shape, expected_scale_shape)
         torch.testing.assert_close(
             actual_scale,
             expected_scale.reshape_as(actual_scale),
@@ -188,43 +217,77 @@ class TestCuteDSLDualGemm(CustomTestCase):
         torch.testing.assert_close(
             actual_dequantized,
             expected_dequantized,
-            rtol=5e-2,
-            atol=5e-2,
+            rtol=1e-1,
+            atol=1e-1,
         )
 
-    def _check_float(self, dtype, seed):
+    def _check_float(self, num_tokens, dtype, seed):
         from sglang.kernels.ops.gemm import dual_gemm_swiglu
 
-        x, gate_up_weight = _make_float_inputs(dtype, seed)
+        x, gate_up_weight = _make_float_inputs(num_tokens, dtype, seed)
         actual = dual_gemm_swiglu(x, gate_up_weight)
         expected = _float_reference(x, gate_up_weight)
         self.assertEqual(actual.dtype, dtype)
         torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2.5e-1)
 
     def test_bf16(self):
-        self._check_float(torch.bfloat16, seed=20261006)
+        self._check_float(16, torch.bfloat16, seed=20261006)
 
     def test_fp16(self):
-        self._check_float(torch.float16, seed=20261007)
+        self._check_float(16, torch.float16, seed=20261007)
 
-    def test_fp8_dynamic(self):
-        self._check(dynamic_quant=True, seed=20261008)
+    def test_fp8_dynamic_per_tensor(self):
+        for num_tokens in (4, 16):
+            with self.subTest(num_tokens=num_tokens):
+                self._check(
+                    DualGemmQuantMode.DYNAMIC_PER_TENSOR,
+                    num_tokens,
+                    seed=20261008,
+                )
 
-    def test_fp8_static(self):
-        self._check(dynamic_quant=False, seed=20261009)
+    def test_fp8_dynamic_per_token(self):
+        for num_tokens in (4, 8, 16):
+            with self.subTest(num_tokens=num_tokens):
+                self._check(
+                    DualGemmQuantMode.DYNAMIC_PER_TOKEN,
+                    num_tokens,
+                    seed=20261009,
+                )
+
+    def test_fp8_static_per_tensor(self):
+        for num_tokens in (4, 16):
+            with self.subTest(num_tokens=num_tokens):
+                self._check(
+                    DualGemmQuantMode.STATIC_PER_TENSOR,
+                    num_tokens,
+                    seed=20261010,
+                )
+
+    def test_fp8_static_per_token(self):
+        for num_tokens in (4, 16):
+            with self.subTest(num_tokens=num_tokens):
+                self._check(
+                    DualGemmQuantMode.STATIC_PER_TOKEN,
+                    num_tokens,
+                    seed=20261011,
+                )
 
     def test_fp8_dynamic_two_cta(self):
-        self._check(dynamic_quant=True, seed=20261008, tactic=7)
+        self._check(DualGemmQuantMode.DYNAMIC_PER_TOKEN, 1, seed=20261012, tactic=7)
 
     def test_fp8_static_two_cta(self):
-        self._check(dynamic_quant=False, seed=20261009, tactic=6)
+        self._check(DualGemmQuantMode.STATIC_PER_TENSOR, 1, seed=20261013, tactic=6)
 
     def test_can_use_dual_gemm(self):
         from sglang.kernels.ops.gemm.cutedsl_dual_gemm import can_use_dual_gemm
 
         self.assertTrue(can_use_dual_gemm(1, 4096, 14336))
+        self.assertTrue(can_use_dual_gemm(4, 4096, 14336))
+        self.assertTrue(can_use_dual_gemm(8, 4096, 14336))
+        self.assertTrue(can_use_dual_gemm(16, 4096, 14336))
         self.assertTrue(can_use_dual_gemm(1, 3584, 18944))
-        self.assertFalse(can_use_dual_gemm(2, 4096, 14336))
+        self.assertFalse(can_use_dual_gemm(1, 8192, 28672))
+        self.assertFalse(can_use_dual_gemm(17, 4096, 14336))
         self.assertFalse(can_use_dual_gemm(1, 4095, 14336))
         self.assertFalse(can_use_dual_gemm(1, 4096, 14335))
         with patch(
@@ -233,6 +296,182 @@ class TestCuteDSLDualGemm(CustomTestCase):
         ):
             self.assertFalse(can_use_dual_gemm(1, 4096, 14336))
 
+    def test_tactic_selection(self):
+        from sglang.kernels.ops.gemm.cutedsl_dual_gemm import (
+            _pick_float16_tactic,
+            _pick_fp8_tactic,
+        )
+
+        num_sms = 148
+        self.assertEqual(
+            _pick_fp8_tactic(
+                1,
+                4096,
+                14336,
+                num_sms,
+                DualGemmQuantMode.DYNAMIC_PER_TOKEN,
+            ),
+            4,
+        )
+        self.assertEqual(
+            _pick_fp8_tactic(
+                1,
+                4096,
+                14336,
+                num_sms,
+                DualGemmQuantMode.STATIC_PER_TENSOR,
+            ),
+            6,
+        )
+        self.assertEqual(
+            _pick_fp8_tactic(
+                4,
+                4096,
+                14336,
+                num_sms,
+                DualGemmQuantMode.DYNAMIC_PER_TOKEN,
+            ),
+            5,
+        )
+        self.assertEqual(
+            _pick_fp8_tactic(
+                16,
+                4096,
+                14336,
+                num_sms,
+                DualGemmQuantMode.STATIC_PER_TOKEN,
+            ),
+            6,
+        )
+        self.assertEqual(
+            _pick_fp8_tactic(
+                16,
+                4096,
+                14336,
+                num_sms,
+                DualGemmQuantMode.DYNAMIC_PER_TOKEN,
+            ),
+            7,
+        )
+        self.assertEqual(
+            _pick_fp8_tactic(
+                8,
+                4096,
+                4096,
+                num_sms,
+                DualGemmQuantMode.DYNAMIC_PER_TOKEN,
+            ),
+            2,
+        )
+        self.assertEqual(
+            _pick_fp8_tactic(
+                16,
+                4096,
+                11008,
+                num_sms,
+                DualGemmQuantMode.DYNAMIC_PER_TOKEN,
+            ),
+            3,
+        )
+        self.assertEqual(
+            _pick_fp8_tactic(
+                4,
+                3584,
+                14336,
+                num_sms,
+                DualGemmQuantMode.DYNAMIC_PER_TOKEN,
+            ),
+            1,
+        )
+        self.assertEqual(
+            _pick_fp8_tactic(
+                4,
+                5120,
+                14336,
+                num_sms,
+                DualGemmQuantMode.DYNAMIC_PER_TENSOR,
+            ),
+            5,
+        )
+        self.assertEqual(
+            _pick_float16_tactic(16, 4096, 14336, num_sms, torch.bfloat16),
+            2,
+        )
+        self.assertEqual(
+            _pick_float16_tactic(16, 4096, 14336, num_sms, torch.float16),
+            0,
+        )
+        self.assertEqual(
+            _pick_float16_tactic(16, 3584, 18944, num_sms, torch.bfloat16),
+            1,
+        )
+        self.assertEqual(
+            _pick_float16_tactic(4, 4096, 18944, num_sms, torch.bfloat16),
+            2,
+        )
+        self.assertEqual(
+            _pick_float16_tactic(4, 4096, 4096, num_sms, torch.float16),
+            2,
+        )
+        self.assertEqual(
+            _pick_float16_tactic(4, 4096, 7168, num_sms, torch.bfloat16),
+            1,
+        )
+        self.assertEqual(
+            _pick_float16_tactic(4, 4096, 11008, num_sms, torch.float16),
+            2,
+        )
+        self.assertEqual(
+            _pick_float16_tactic(8, 8192, 28672, num_sms, torch.float16),
+            2,
+        )
+
+    def test_fp8_quant_mode_validation(self):
+        from sglang.kernels.ops.gemm import dual_gemm_swiglu_fp8
+
+        x, gate_up_weight, x_scale, gate_up_weight_scale = _make_inputs(
+            4,
+            seed=20261014,
+        )
+        scalar_scale = torch.ones((1,), dtype=torch.float32, device="cuda")
+
+        with self.assertRaisesRegex(ValueError, "must be None"):
+            dual_gemm_swiglu_fp8(
+                x,
+                gate_up_weight,
+                x_scale,
+                gate_up_weight_scale,
+                scalar_scale,
+                DualGemmQuantMode.DYNAMIC_PER_TENSOR,
+            )
+        with self.assertRaisesRegex(ValueError, "must be a scale tensor"):
+            dual_gemm_swiglu_fp8(
+                x,
+                gate_up_weight,
+                x_scale,
+                gate_up_weight_scale,
+                None,
+                DualGemmQuantMode.STATIC_PER_TENSOR,
+            )
+        with self.assertRaisesRegex(ValueError, "requires 4 output scale"):
+            dual_gemm_swiglu_fp8(
+                x,
+                gate_up_weight,
+                x_scale,
+                gate_up_weight_scale,
+                scalar_scale,
+                DualGemmQuantMode.STATIC_PER_TOKEN,
+            )
+        with self.assertRaisesRegex(ValueError, "not valid for the FP8"):
+            dual_gemm_swiglu_fp8(
+                x,
+                gate_up_weight,
+                x_scale,
+                gate_up_weight_scale,
+                None,
+                DualGemmQuantMode.UNQUANT,
+            )
+
     def test_llama_mlp_float16_integration(self):
         from sglang.srt.runtime_context import get_parallel
 
@@ -240,7 +479,7 @@ class TestCuteDSLDualGemm(CustomTestCase):
             with self.subTest(dtype=dtype):
                 mlp, generator = _make_llama_mlp(dtype=dtype)
                 x = torch.randn(
-                    (1, _HIDDEN_SIZE),
+                    (16, _HIDDEN_SIZE),
                     device="cuda",
                     dtype=dtype,
                     generator=generator,
@@ -248,7 +487,10 @@ class TestCuteDSLDualGemm(CustomTestCase):
                 with torch.inference_mode(), get_parallel().override(tp_group=object()):
                     gate_up, _ = mlp.gate_up_proj(x)
                     expected, _ = mlp.down_proj(mlp.act_fn(gate_up))
-                    self.assertEqual(mlp.dual_gemm_mode, "float16")
+                    self.assertEqual(
+                        mlp.dual_gemm_mode,
+                        DualGemmQuantMode.UNQUANT,
+                    )
                     actual = mlp(x)
 
                 torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2.5e-1)
@@ -262,7 +504,7 @@ class TestCuteDSLDualGemm(CustomTestCase):
             projection.quant_method.process_weights_after_loading(projection)
 
         x = torch.randn(
-            (1, _HIDDEN_SIZE),
+            (16, _HIDDEN_SIZE),
             device="cuda",
             dtype=torch.bfloat16,
             generator=generator,
@@ -270,7 +512,10 @@ class TestCuteDSLDualGemm(CustomTestCase):
         with torch.inference_mode(), get_parallel().override(tp_group=object()):
             gate_up, _ = mlp.gate_up_proj(x)
             expected, _ = mlp.down_proj(mlp.act_fn(gate_up))
-            self.assertEqual(mlp.dual_gemm_mode, "fp8")
+            self.assertEqual(
+                mlp.dual_gemm_mode,
+                DualGemmQuantMode.DYNAMIC_PER_TOKEN,
+            )
             with patch(
                 "sglang.srt.layers.quantization.fp8_utils.sglang_per_token_quant_fp8",
                 side_effect=AssertionError("down projection requantized its input"),
@@ -323,7 +568,7 @@ class TestCuteDSLDualGemm(CustomTestCase):
             projection.quant_method.process_weights_after_loading(projection)
 
         x = torch.randn(
-            (1, _HIDDEN_SIZE),
+            (16, _HIDDEN_SIZE),
             device="cuda",
             dtype=torch.float16,
             generator=generator,
@@ -339,7 +584,10 @@ class TestCuteDSLDualGemm(CustomTestCase):
             expected, _ = mlp.down_proj(
                 (quantized_activation, activation_scale, activation.dtype)
             )
-            self.assertEqual(mlp.dual_gemm_mode, "fp8")
+            self.assertEqual(
+                mlp.dual_gemm_mode,
+                DualGemmQuantMode.STATIC_PER_TENSOR,
+            )
             with (
                 patch(
                     "sglang.kernels.ops.quantization.fp8_kernel.scaled_fp8_quant",

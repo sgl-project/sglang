@@ -19,7 +19,7 @@
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
 import logging
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -62,6 +62,9 @@ from sglang.srt.utils import (
     make_layers,
 )
 from sglang.utils import get_exception_traceback
+
+if TYPE_CHECKING:
+    from sglang.kernels.ops.gemm.cutedsl_dual_gemm import DualGemmQuantMode
 
 _is_cuda = is_cuda()
 _is_xpu = is_xpu()
@@ -112,21 +115,23 @@ class LlamaMLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        self.dual_gemm_max_tokens = 0
         self.dual_gemm_mode = self._select_dual_gemm_mode(hidden_size)
 
-    def _select_dual_gemm_mode(self, hidden_size: int) -> Optional[str]:
+    def _select_dual_gemm_mode(self, hidden_size: int) -> Optional["DualGemmQuantMode"]:
         if not get_bool_env_var("SGLANG_ENABLE_DUAL_GEMM"):
             return None
 
         if not _is_cuda:
             return None
 
+        from sglang.kernels.ops.gemm.cutedsl_dual_gemm import DualGemmQuantMode
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
         gate_up_method = self.gate_up_proj.quant_method
         if isinstance(gate_up_method, UnquantizedLinearMethod):
             mode = (
-                "float16"
+                DualGemmQuantMode.UNQUANT
                 if self.gate_up_proj.params_dtype in (torch.bfloat16, torch.float16)
                 else None
             )
@@ -155,22 +160,38 @@ class LlamaMLP(nn.Module):
                 and layer.scheme.weight_block_size is None
                 for layer in fp8_layers
             )
-            mode = (
-                "fp8"
-                if self.gate_up_proj.params_dtype in (torch.bfloat16, torch.float16)
-                and (native_fp8 or compressed_fp8)
-                else None
-            )
+            if self.gate_up_proj.params_dtype in (
+                torch.bfloat16,
+                torch.float16,
+            ) and (native_fp8 or compressed_fp8):
+                mode = (
+                    DualGemmQuantMode.DYNAMIC_PER_TOKEN
+                    if getattr(self.down_proj, "input_scale", None) is None
+                    else DualGemmQuantMode.STATIC_PER_TENSOR
+                )
+            else:
+                mode = None
 
-        from sglang.kernels.ops.gemm.cutedsl_dual_gemm import can_use_dual_gemm
+        if mode is None:
+            return None
 
-        local_intermediate_size = self.gate_up_proj.output_partition_sizes[0]
-        return (
-            mode if can_use_dual_gemm(1, hidden_size, local_intermediate_size) else None
+        from sglang.kernels.ops.gemm.cutedsl_dual_gemm import (
+            MAX_DUAL_GEMM_DECODE_TOKENS,
+            can_use_dual_gemm,
         )
 
+        local_intermediate_size = self.gate_up_proj.output_partition_sizes[0]
+        if can_use_dual_gemm(
+            MAX_DUAL_GEMM_DECODE_TOKENS,
+            hidden_size,
+            local_intermediate_size,
+        ):
+            self.dual_gemm_max_tokens = MAX_DUAL_GEMM_DECODE_TOKENS
+            return mode
+        return None
+
     def _apply_dual_gemm(self, x: torch.Tensor):
-        if self.dual_gemm_mode == "float16":
+        if not self.dual_gemm_mode.is_quantized:
             from sglang.kernels.ops.gemm import dual_gemm_swiglu
 
             return dual_gemm_swiglu(x, self.gate_up_proj.weight)
@@ -196,6 +217,7 @@ class LlamaMLP(nn.Module):
             x_scale,
             self.gate_up_proj.weight_scale,
             self.down_proj.input_scale,
+            quant_mode=self.dual_gemm_mode,
         )
         # Fp8LinearMethod consumes this tuple without quantizing the activation
         # again.  The original dtype controls the down projection's output type.
@@ -212,7 +234,7 @@ class LlamaMLP(nn.Module):
 
         if (
             self.dual_gemm_mode is not None
-            and input_tensor.shape[0] == 1
+            and 1 <= input_tensor.shape[0] <= self.dual_gemm_max_tokens
             and not (self.gate_up_proj.tp_size > 1 and get_forward().sp_active)
         ):
             x = self._apply_dual_gemm(x)
