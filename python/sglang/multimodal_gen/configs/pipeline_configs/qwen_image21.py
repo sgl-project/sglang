@@ -27,6 +27,10 @@ class QwenImage21PipelineConfig(ImagePipelineConfig):
     text_encoder_configs: tuple = field(default_factory=lambda: (Qwen3VLConfig(),))
     text_encoder_precisions: tuple[str, ...] = ("bf16",)
 
+    def supports_dynamic_batching(self):
+        # the scheduler excludes reference-image requests from cross-request merging
+        return True
+
     def prepare_sigmas(self, sigmas, num_inference_steps):
         return self._prepare_sigmas(sigmas, num_inference_steps)
 
@@ -82,3 +86,17 @@ class QwenImage21PipelineConfig(ImagePipelineConfig):
 
     def preprocess_condition_image(self, image, **kwargs):
         return image
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.qwenimage21 import (
+        QwenImage21SamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=QwenImage21SamplingParams,
+        pipeline_config_cls=QwenImage21PipelineConfig,
+        hf_model_paths=["Qwen/Qwen-Image-2.1"],
+        model_detectors=[lambda hf_id: "qwen-image-2.1" in hf_id.lower()],
+    )

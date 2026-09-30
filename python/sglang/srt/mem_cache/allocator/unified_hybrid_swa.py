@@ -152,6 +152,21 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
             full_allocator=self.full_attn_allocator,
             swa_allocator=self.swa_attn_allocator,
         )
+        # Size host pools in tokens; sub-pool `size` counts kernel-facing rows.
+        kvcache.full_kv_pool.host_capacity_tokens = self._size_full
+        kvcache.swa_kv_pool.host_capacity_tokens = self._size_swa
+        for name, pool in (
+            ("full", kvcache.full_kv_pool),
+            ("swa", kvcache.swa_kv_pool),
+        ):
+            pool.host_capacity_bytes = (
+                pool.host_capacity_tokens * unified_buffer.spec(name).entry_bytes()
+            )
+        # Full-attention transfers use virtual IDs. SWA transfers already use
+        # kernel-facing IDs from translate_loc_from_full_to_swa.
+        kvcache.full_kv_pool.host_transfer_translate = (
+            self.full_attn_allocator.translate_kv_loc_for_kernel
+        )
 
         self.free_group = None
         self.free_page_reps_group: Optional[List[torch.Tensor]] = None
@@ -326,6 +341,43 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
             slot="disagg_move_gate",
             gate=gate,
             feature="PD disaggregation",
+            lazy_compaction=self.lazy_compaction,
+        )
+
+    def bind_swa_for_loaded_rows(
+        self, full_token_ids: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """Bind SWA pages to resident or newly loaded full-attention virtual IDs.
+
+        Bind before translating: unbound pages translate to the padding sink.
+        Return kernel-facing IDs, or None if capacity cannot be reclaimed.
+        """
+        ids = full_token_ids.to(torch.int64)
+        if ids.numel() == 0:
+            return ids
+        ps = self.page_size
+        pages = torch.unique(ids // ps)
+        # Tombstones (-1) and the padding sink (0) both need a physical binding.
+        unbound = pages[self.swa_attn_allocator.virtual_to_physical[pages] <= 0]
+        need = int(unbound.numel()) * ps
+        if need:
+            if need > self.swa_available_size():
+                return None
+            if (
+                need > self.swa_attn_allocator.available_size()
+                and not _relieve_for_alloc(self.swa_attn_allocator, need)
+            ):
+                return None
+            self.swa_attn_allocator.alloc_with_virtual(unbound)
+        return self.translate_loc_from_full_to_swa(ids)
+
+    def set_host_transfer_move_gate(self, gate: Callable[[], bool]) -> None:
+        """Block page relocation while host transfers use resolved device indices."""
+        install_move_gate(
+            self._move_gate_targets(),
+            slot="host_transfer_move_gate",
+            gate=gate,
+            feature="HiCache",
             lazy_compaction=self.lazy_compaction,
         )
 
@@ -648,8 +700,7 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
     def set_full_to_swa_mapping(
         self, full_indices: torch.Tensor, swa_indices: torch.Tensor
     ) -> None:
-        """No-op stub for HiCache load-back: in shared mode the swa v2p IS the
-        mapping, and HiCache for shared SWA is out of scope."""
+        """Binding load-back rows already updates the shared SWA v2p mapping."""
         return
 
     def clear_full_to_swa_mapping(self, full_indices: torch.Tensor) -> None:
@@ -999,7 +1050,7 @@ class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
 
     def _compaction_allowed(self) -> bool:
         return all(
-            allocator.disagg_move_gate is None or allocator.disagg_move_gate()
+            not allocator.moves_blocked()
             for allocator in (self.full_attn_allocator, self.swa_attn_allocator)
         )
 

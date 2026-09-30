@@ -197,6 +197,9 @@ class QwenImage21RMS_norm(nn.Module):
 
 class QwenImage21Upsample(nn.Upsample):
     def forward(self, x):
+        # Nearest interpolation copies values; no FP32 arithmetic is needed.
+        if self.mode == "nearest-exact" and x.dtype in (torch.float16, torch.bfloat16):
+            return super().forward(x)
         return super().forward(x.float()).type_as(x)
 
 
