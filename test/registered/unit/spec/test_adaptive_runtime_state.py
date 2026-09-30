@@ -1,8 +1,10 @@
 import unittest
+from unittest.mock import patch
 
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
     SpecRuntimeState,
+    _broadcast_profile_latency_from_tp_rank0,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -57,7 +59,10 @@ class _FakePolicy:
         return 1 if batch_size >= 8 else 3
 
     def on_verify_complete(
-        self, num_correct_drafts_per_req: list[int], batch_size: int
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int,
+        num_steps: int | None = None,
     ) -> int | None:
         return self.feedback_step
 
@@ -66,8 +71,70 @@ class _FakePolicy:
             return None
         return [batch_size for batch_size in self.cuda_graph_bs if batch_size <= step]
 
+    def on_state_activated(self, steps: int) -> None:
+        pass
+
 
 class TestAdaptiveController(unittest.TestCase):
+    def test_from_config_selects_policy(self):
+        worker = _FakeWorker()
+
+        for strategy, policy_path, expected_keyword in (
+            (
+                "ema",
+                "sglang.srt.speculative.adaptive_spec_params.AdaptiveSpeculativeParams",
+                "cfg_path",
+            ),
+            (
+                "throughput_aware",
+                "sglang.srt.speculative.throughput_aware_controller.ThroughputAwarePolicy",
+                "config_path",
+            ),
+        ):
+            with (
+                self.subTest(strategy=strategy),
+                patch(
+                    "sglang.srt.speculative.adaptive_spec_params.resolve_adaptive_strategy",
+                    return_value=strategy,
+                ),
+                patch(policy_path, return_value=_FakePolicy()) as policy_cls,
+            ):
+                controller = AdaptiveController.from_config(
+                    worker,
+                    initial_steps=3,
+                    config_path="adaptive.json",
+                )
+
+            self.assertIsInstance(controller, AdaptiveController)
+            policy_cls.assert_called_once_with(
+                initial_steps=3,
+                **{expected_keyword: "adaptive.json"},
+            )
+
+    def test_profile_latency_uses_tp_group_broadcast(self):
+        class FakeTPGroup:
+            device = "cpu"
+
+            def __init__(self):
+                self.src = None
+
+            def broadcast(self, value, src=0):
+                self.src = src
+                value.fill_(7.5)
+
+        tp_group = FakeTPGroup()
+        with (
+            patch(
+                "sglang.srt.distributed.model_parallel_is_initialized",
+                return_value=True,
+            ),
+            patch("sglang.srt.distributed.get_tp_group", return_value=tp_group),
+        ):
+            value = _broadcast_profile_latency_from_tp_rank0(2.5)
+
+        self.assertEqual(tp_group.src, 0)
+        self.assertEqual(value, 7.5)
+
     def test_injected_policy_builds_pruned_states_and_applies_initial_state(self):
         worker = _FakeWorker(initial_steps=3)
         policy = _FakePolicy()
