@@ -2721,9 +2721,11 @@ class DeepseekV2DecoderLayer(nn.Module):
         post_attention_layernorm: nn.Module,
         qkv_latent_func: Optional[Callable],
         output=None,
+        attn_output=None,
     ):
         """The stage boundaries for this layer's norms; they choose their
-        steps from them at construction."""
+        steps from them at construction. ``attn_output`` and ``output``: the
+        attention's and the FFN's output transforms, if any."""
         fusions = None
         if (
             not get_parallel().enable_prefill_cp
@@ -2736,7 +2738,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             fusions = CuteDSLFusion()
         attn_boundary, ffn_boundary = make_stages(
             (
-                declare_attn(),
+                declare_attn(output_transform=attn_output),
                 input_layernorm,
                 {"qkv_latent_func": qkv_latent_func, "fusions": fusions},
             ),
