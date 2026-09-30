@@ -1,0 +1,220 @@
+{
+  "schema_version": 1,
+  "payload_format": "maas_target_kv_v1",
+  "contract_id": "maas-target-kv-top128-v1",
+  "state": "READY",
+  "input_mode": "target_kv",
+  "dataset_id": "synthetic-demo",
+  "sample_id": "sample-001",
+  "generation_id": "gen-001",
+  "created_at": "2026-09-30T00:00:00Z",
+  "teacher": {
+    "model_id": "synthetic-dense-target",
+    "weights_revision": "synthetic-immutable-weights-v1",
+    "adapter_revision": null,
+    "tokenizer_revision": "synthetic-immutable-vocab-v1",
+    "fingerprint_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "vocab_size": 256,
+    "output_transform": "identity"
+  },
+  "sequence": {
+    "prompt_length": 2,
+    "response_length": 3,
+    "total_length": 5,
+    "stop_reason": "length",
+    "loss_mask_policy": "current_response_include_eos",
+    "stop_token_policy": "preserve_internal_accepted_tokens",
+    "position_ids_semantics": "actual_target_positions"
+  },
+  "kv": {
+    "codec": "dense_bf16_post_rope_v1",
+    "dtype": "bfloat16",
+    "layout": "token_head_dim",
+    "layer_numbering": "target_attention_layer_zero_based",
+    "selected_layer_ids": [3],
+    "layers": [
+      { "layer_id": 3, "num_kv_heads": 2, "key_head_dim": 4, "value_head_dim": 4 }
+    ],
+    "source_k_stage": "post_rope",
+    "source_k_norm": "none",
+    "rope_config": {
+      "type": "default",
+      "theta": 10000.0,
+      "rotary_dim": 4,
+      "interleaved": false,
+      "scaling": null
+    },
+    "rope_config_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "storage_chunk_tokens": 4,
+    "source_page_size": 2,
+    "validity_policy": "all_selected_layers_per_valid_token"
+  },
+  "logits": {
+    "top_k": 128,
+    "dtype": "float32",
+    "semantics": "model_output_before_serving_processors",
+    "normalization": "full_vocabulary_logsumexp",
+    "lse_temperature": 1.0,
+    "row_alignment": "predicts_token_at_logits_position",
+    "vocab_ids": "global_unpadded"
+  },
+  "topology": {
+    "tp_size": 1,
+    "pp_size": 1,
+    "aux_owner": "dp0-pp0-tp0",
+    "owners": ["dp0-pp0-tp0"]
+  },
+  "provenance": {
+    "capture_mode": "autoregressive",
+    "producer_revision": "proposed-capture-build-v1",
+    "capture_config_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "sampling_config": { "temperature": 0.8, "top_p": 0.95, "max_new_tokens": 3 },
+    "trace_id": "synthetic-trace-001"
+  },
+  "objects": [
+    {
+      "object_id": "aux-token-ids",
+      "name": "token_ids",
+      "kind": "aux",
+      "key": "draft-data/synthetic-demo/sample-001/gen-001/aux/token_ids",
+      "dtype": "int32",
+      "shape": [5],
+      "nbytes": 20,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "owner_id": "dp0-pp0-tp0",
+      "byte_order": "little",
+      "contiguous": true
+    },
+    {
+      "object_id": "aux-position-ids",
+      "name": "position_ids",
+      "kind": "aux",
+      "key": "draft-data/synthetic-demo/sample-001/gen-001/aux/position_ids",
+      "dtype": "int64",
+      "shape": [5],
+      "nbytes": 40,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "owner_id": "dp0-pp0-tp0",
+      "byte_order": "little",
+      "contiguous": true
+    },
+    {
+      "object_id": "aux-loss-mask",
+      "name": "loss_mask",
+      "kind": "aux",
+      "key": "draft-data/synthetic-demo/sample-001/gen-001/aux/loss_mask",
+      "dtype": "uint8",
+      "shape": [5],
+      "nbytes": 5,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "owner_id": "dp0-pp0-tp0",
+      "byte_order": "little",
+      "contiguous": true
+    },
+    {
+      "object_id": "aux-kv-valid",
+      "name": "kv_valid",
+      "kind": "aux",
+      "key": "draft-data/synthetic-demo/sample-001/gen-001/aux/kv_valid",
+      "dtype": "uint8",
+      "shape": [5],
+      "nbytes": 5,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "owner_id": "dp0-pp0-tp0",
+      "byte_order": "little",
+      "contiguous": true
+    },
+    {
+      "object_id": "aux-logits-positions",
+      "name": "logits_positions",
+      "kind": "aux",
+      "key": "draft-data/synthetic-demo/sample-001/gen-001/aux/logits_positions",
+      "dtype": "int32",
+      "shape": [3],
+      "nbytes": 12,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "owner_id": "dp0-pp0-tp0",
+      "byte_order": "little",
+      "contiguous": true
+    },
+    {
+      "object_id": "aux-teacher-topk-ids",
+      "name": "teacher_topk_ids",
+      "kind": "aux",
+      "key": "draft-data/synthetic-demo/sample-001/gen-001/aux/teacher_topk_ids",
+      "dtype": "int32",
+      "shape": [3, 128],
+      "nbytes": 1536,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "owner_id": "dp0-pp0-tp0",
+      "byte_order": "little",
+      "contiguous": true
+    },
+    {
+      "object_id": "aux-teacher-topk-logits",
+      "name": "teacher_topk_logits",
+      "kind": "aux",
+      "key": "draft-data/synthetic-demo/sample-001/gen-001/aux/teacher_topk_logits",
+      "dtype": "float32",
+      "shape": [3, 128],
+      "nbytes": 1536,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "owner_id": "dp0-pp0-tp0",
+      "byte_order": "little",
+      "contiguous": true
+    },
+    {
+      "object_id": "aux-teacher-logsumexp",
+      "name": "teacher_logsumexp",
+      "kind": "aux",
+      "key": "draft-data/synthetic-demo/sample-001/gen-001/aux/teacher_logsumexp",
+      "dtype": "float32",
+      "shape": [3],
+      "nbytes": 12,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "owner_id": "dp0-pp0-tp0",
+      "byte_order": "little",
+      "contiguous": true
+    },
+    {
+      "object_id": "kv-3-dp0-pp0-tp0-0-k",
+      "name": "target_k.3",
+      "kind": "kv",
+      "key": "draft-data/synthetic-demo/sample-001/gen-001/kv/3/dp0-pp0-tp0/0/k",
+      "dtype": "bfloat16",
+      "shape": [4, 2, 4],
+      "nbytes": 64,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "owner_id": "dp0-pp0-tp0",
+      "byte_order": "little",
+      "contiguous": true,
+      "layer_id": 3,
+      "component": "k",
+      "token_range": [0, 4],
+      "head_range": [0, 2]
+    },
+    {
+      "object_id": "kv-3-dp0-pp0-tp0-0-v",
+      "name": "target_v.3",
+      "kind": "kv",
+      "key": "draft-data/synthetic-demo/sample-001/gen-001/kv/3/dp0-pp0-tp0/0/v",
+      "dtype": "bfloat16",
+      "shape": [4, 2, 4],
+      "nbytes": 64,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "owner_id": "dp0-pp0-tp0",
+      "byte_order": "little",
+      "contiguous": true,
+      "layer_id": 3,
+      "component": "v",
+      "token_range": [0, 4],
+      "head_range": [0, 2]
+    }
+  ],
+  "total_tensor_bytes": 3294,
+  "extensions": {
+    "example_only": true,
+    "checksums_are_placeholders": true,
+    "note": "No tensor objects accompany this example. Intended kv_valid is [1,1,1,1,0]; logits_positions is [2,3,4]."
+  }
+}

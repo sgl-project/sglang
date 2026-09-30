@@ -1,0 +1,279 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:sglang-mooncake-specforge:training-manifest:1",
+  "title": "MaaS Selected Target KV and Raw Top-128 Teacher Manifest",
+  "description": "Proposed protocol, not an existing upstream API. Cross-object coverage, tensor contents, checksums and compatibility require semantic validation.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "payload_format", "contract_id", "state", "input_mode",
+    "dataset_id", "sample_id", "generation_id", "created_at", "teacher",
+    "sequence", "kv", "logits", "topology", "provenance", "objects",
+    "total_tensor_bytes"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "payload_format": { "const": "maas_target_kv_v1" },
+    "contract_id": { "$ref": "#/$defs/identifier" },
+    "state": { "const": "READY" },
+    "input_mode": { "const": "target_kv" },
+    "dataset_id": { "$ref": "#/$defs/identifier" },
+    "sample_id": { "$ref": "#/$defs/identifier" },
+    "generation_id": { "$ref": "#/$defs/identifier" },
+    "created_at": { "type": "string", "format": "date-time" },
+    "teacher": { "$ref": "#/$defs/teacher" },
+    "sequence": { "$ref": "#/$defs/sequence" },
+    "kv": { "$ref": "#/$defs/kv" },
+    "logits": { "$ref": "#/$defs/logits" },
+    "topology": { "$ref": "#/$defs/topology" },
+    "provenance": { "$ref": "#/$defs/provenance" },
+    "objects": {
+      "type": "array",
+      "minItems": 10,
+      "items": { "$ref": "#/$defs/tensorObject" }
+    },
+    "total_tensor_bytes": { "type": "integer", "minimum": 1 },
+    "extensions": {
+      "type": "object",
+      "description": "Optional noncritical metadata only. Required decoding semantics must be versioned in the main contract."
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "nonempty": { "type": "string", "minLength": 1 },
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "vectorShape": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1,
+      "items": { "type": "integer", "minimum": 1 }
+    },
+    "top128Shape": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "prefixItems": [
+        { "type": "integer", "minimum": 1 },
+        { "const": 128 }
+      ],
+      "items": false
+    },
+    "range": {
+      "type": "array",
+      "description": "Half-open [start, end). Semantic validation requires end > start.",
+      "prefixItems": [
+        { "type": "integer", "minimum": 0 },
+        { "type": "integer", "minimum": 1 }
+      ],
+      "items": false,
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "teacher": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "model_id", "weights_revision", "adapter_revision", "tokenizer_revision",
+        "fingerprint_sha256", "vocab_size", "output_transform"
+      ],
+      "properties": {
+        "model_id": { "$ref": "#/$defs/nonempty" },
+        "weights_revision": { "$ref": "#/$defs/nonempty" },
+        "adapter_revision": { "type": ["string", "null"], "minLength": 1 },
+        "tokenizer_revision": { "$ref": "#/$defs/nonempty" },
+        "fingerprint_sha256": { "$ref": "#/$defs/sha256" },
+        "vocab_size": { "type": "integer", "minimum": 128, "maximum": 2147483647 },
+        "output_transform": { "$ref": "#/$defs/nonempty" }
+      }
+    },
+    "sequence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "prompt_length", "response_length", "total_length", "stop_reason",
+        "loss_mask_policy", "stop_token_policy", "position_ids_semantics"
+      ],
+      "properties": {
+        "prompt_length": { "type": "integer", "minimum": 1 },
+        "response_length": { "type": "integer", "minimum": 1 },
+        "total_length": { "type": "integer", "minimum": 2, "maximum": 2147483647 },
+        "stop_reason": { "enum": ["eos", "stop_token", "stop_string", "length"] },
+        "loss_mask_policy": { "enum": ["current_response_include_eos", "current_response_exclude_eos"] },
+        "stop_token_policy": { "const": "preserve_internal_accepted_tokens" },
+        "position_ids_semantics": { "const": "actual_target_positions" }
+      }
+    },
+    "kv": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "codec", "dtype", "layout", "layer_numbering", "selected_layer_ids",
+        "layers", "source_k_stage", "source_k_norm", "rope_config",
+        "rope_config_sha256", "storage_chunk_tokens", "source_page_size",
+        "validity_policy"
+      ],
+      "properties": {
+        "codec": { "enum": ["dense_bf16_post_rope_v1", "dense_fp16_post_rope_v1", "dense_bf16_pre_rope_v1", "dense_fp16_pre_rope_v1"] },
+        "dtype": { "enum": ["bfloat16", "float16"] },
+        "layout": { "const": "token_head_dim" },
+        "layer_numbering": { "const": "target_attention_layer_zero_based" },
+        "selected_layer_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "integer", "minimum": 0 }
+        },
+        "layers": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["layer_id", "num_kv_heads", "key_head_dim", "value_head_dim"],
+            "properties": {
+              "layer_id": { "type": "integer", "minimum": 0 },
+              "num_kv_heads": { "type": "integer", "minimum": 1 },
+              "key_head_dim": { "type": "integer", "minimum": 1 },
+              "value_head_dim": { "type": "integer", "minimum": 1 }
+            }
+          }
+        },
+        "source_k_stage": { "enum": ["pre_rope", "post_rope"] },
+        "source_k_norm": { "$ref": "#/$defs/nonempty" },
+        "rope_config": {
+          "type": "object",
+          "description": "Exact resolved parameters, including variant, rotary dimension, interleaving and scaling. Codec-specific validation is mandatory."
+        },
+        "rope_config_sha256": { "$ref": "#/$defs/sha256" },
+        "storage_chunk_tokens": { "type": "integer", "minimum": 1 },
+        "source_page_size": { "type": "integer", "minimum": 1 },
+        "validity_policy": { "const": "all_selected_layers_per_valid_token" }
+      }
+    },
+    "logits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["top_k", "dtype", "semantics", "normalization", "lse_temperature", "row_alignment", "vocab_ids"],
+      "properties": {
+        "top_k": { "const": 128 },
+        "dtype": { "const": "float32" },
+        "semantics": { "const": "model_output_before_serving_processors" },
+        "normalization": { "const": "full_vocabulary_logsumexp" },
+        "lse_temperature": { "const": 1.0 },
+        "row_alignment": { "const": "predicts_token_at_logits_position" },
+        "vocab_ids": { "const": "global_unpadded" }
+      }
+    },
+    "topology": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tp_size", "pp_size", "aux_owner", "owners"],
+      "properties": {
+        "tp_size": { "type": "integer", "minimum": 1 },
+        "pp_size": { "type": "integer", "minimum": 1 },
+        "aux_owner": { "$ref": "#/$defs/identifier" },
+        "owners": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/identifier" }
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["capture_mode", "producer_revision", "capture_config_sha256", "sampling_config", "trace_id"],
+      "properties": {
+        "capture_mode": { "enum": ["autoregressive", "speculative_accepted_target_path", "pd_autoregressive", "pd_speculative_accepted_target_path"] },
+        "producer_revision": { "$ref": "#/$defs/nonempty" },
+        "capture_config_sha256": { "$ref": "#/$defs/sha256" },
+        "sampling_config": { "type": "object" },
+        "trace_id": { "$ref": "#/$defs/identifier" }
+      }
+    },
+    "tensorObject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["object_id", "name", "kind", "key", "dtype", "shape", "nbytes", "sha256", "owner_id", "byte_order", "contiguous"],
+      "properties": {
+        "object_id": { "$ref": "#/$defs/identifier" },
+        "name": { "$ref": "#/$defs/nonempty" },
+        "kind": { "enum": ["aux", "kv"] },
+        "key": { "type": "string", "minLength": 1, "pattern": "^draft-data/" },
+        "dtype": { "enum": ["int32", "int64", "uint8", "float32", "bfloat16", "float16"] },
+        "shape": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "integer", "minimum": 1 }
+        },
+        "nbytes": { "type": "integer", "minimum": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "owner_id": { "$ref": "#/$defs/identifier" },
+        "byte_order": { "const": "little" },
+        "contiguous": { "const": true },
+        "layer_id": { "type": "integer", "minimum": 0 },
+        "component": { "enum": ["k", "v"] },
+        "token_range": { "$ref": "#/$defs/range" },
+        "head_range": { "$ref": "#/$defs/range" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "kv" } } },
+          "then": {
+            "required": ["layer_id", "component", "token_range", "head_range"],
+            "properties": {
+              "dtype": { "enum": ["bfloat16", "float16"] },
+              "shape": { "minItems": 3, "maxItems": 3 },
+              "name": { "pattern": "^target_[kv]\\.[0-9]+$" }
+            }
+          },
+          "else": {
+            "properties": {
+              "name": { "enum": ["token_ids", "position_ids", "loss_mask", "kv_valid", "logits_positions", "teacher_topk_ids", "teacher_topk_logits", "teacher_logsumexp"] }
+            },
+            "allOf": [
+              {
+                "if": { "properties": { "name": { "enum": ["token_ids", "logits_positions"] } } },
+                "then": { "properties": { "dtype": { "const": "int32" }, "shape": { "$ref": "#/$defs/vectorShape" } } }
+              },
+              {
+                "if": { "properties": { "name": { "const": "position_ids" } } },
+                "then": { "properties": { "dtype": { "const": "int64" }, "shape": { "$ref": "#/$defs/vectorShape" } } }
+              },
+              {
+                "if": { "properties": { "name": { "enum": ["loss_mask", "kv_valid"] } } },
+                "then": { "properties": { "dtype": { "const": "uint8" }, "shape": { "$ref": "#/$defs/vectorShape" } } }
+              },
+              {
+                "if": { "properties": { "name": { "const": "teacher_topk_ids" } } },
+                "then": { "properties": { "dtype": { "const": "int32" }, "shape": { "$ref": "#/$defs/top128Shape" } } }
+              },
+              {
+                "if": { "properties": { "name": { "const": "teacher_topk_logits" } } },
+                "then": { "properties": { "dtype": { "const": "float32" }, "shape": { "$ref": "#/$defs/top128Shape" } } }
+              },
+              {
+                "if": { "properties": { "name": { "const": "teacher_logsumexp" } } },
+                "then": { "properties": { "dtype": { "const": "float32" }, "shape": { "$ref": "#/$defs/vectorShape" } } }
+              }
+            ],
+            "not": {
+              "anyOf": [
+                { "required": ["layer_id"] },
+                { "required": ["component"] },
+                { "required": ["token_range"] },
+                { "required": ["head_range"] }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}
