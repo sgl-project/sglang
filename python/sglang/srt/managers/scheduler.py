@@ -142,6 +142,7 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
+    FaultToleranceCommandReqInput,
     FinishReasonDict,
     FlushCacheReqInput,
     FreezeGCReq,
@@ -278,6 +279,7 @@ from sglang.srt.managers.scheduler_components.request_receiver import (
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
+from sglang.srt.managers.scheduler_ft_mixin import SchedulerFaultToleranceMixin
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.managers.utils import (
@@ -438,6 +440,7 @@ class Scheduler(
     SchedulerDisaggregationPrefillMixin,
     SchedulerMultiplexMixin,
     SchedulerPPMixin,
+    SchedulerFaultToleranceMixin,
     SchedulerDllmMixin,
     SchedulerMlxOverlapMixin,
 ):
@@ -1301,6 +1304,7 @@ class Scheduler(
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
         self._engine_paused = False
+        self.init_fault_tolerance()
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = get_schedule().chunked_prefill_size
@@ -1809,6 +1813,7 @@ class Scheduler(
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
+                (FaultToleranceCommandReqInput, self.handle_fault_tolerance_command),
                 (ConfigureLoggingReq, self.configure_logging),
                 (ScaleElasticEPReqInput, self.handle_scale_elastic_ep),
                 (DumperControlReqInput, self.handle_dumper_control),
@@ -1887,7 +1892,10 @@ class Scheduler(
         self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
         with self.device_module.StreamContext(self.schedule_stream):
             self.metrics_reporter.start_scheduler_time_accounting()
-            dispatch_event_loop(self)
+            if get_parallel().enable_fault_tolerance:
+                self._run_event_loop_fault_tolerance(dispatch_event_loop)
+            else:
+                dispatch_event_loop(self)
 
     def _apply_war_barrier(self):
         # WAR: keep later schedule_stream writes behind this forward's shared reads.
@@ -1911,6 +1919,7 @@ class Scheduler(
 
             # Receive requests
             self.ingest_requests()
+            self._check_ft_pause_deadline()
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
@@ -1955,6 +1964,7 @@ class Scheduler(
 
             # Receive requests
             self.ingest_requests()
+            self._check_ft_pause_deadline()
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
