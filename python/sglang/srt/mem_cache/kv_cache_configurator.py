@@ -91,6 +91,10 @@ from sglang.srt.runtime_context import (
     pre_capture_activation_reserve_mb,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.ragged_verify import (
+    RaggedVerifyMode,
+    read_ragged_verify_mode,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import (
     cpu_has_amx_support,
@@ -1166,28 +1170,25 @@ class KVCacheConfigurator:
         return req_to_token_pool
 
     def _gdn_replayssm_spec_fold(self) -> bool:
-        """Whether GDN spec verify uses fold-every-commit (DSPARK/DFLASH).
-
-        Those workers commit through update_mamba_state_after_mtp_verify, which
-        folds the accepted window into ``temporal``; the compact-replay cursors
-        used by the generic spec_utils commit are not driven there. KDA folds
-        on that path already, so any other model would scatter a None
-        ``intermediate_ssm`` and is rejected.
-        """
-        from sglang.srt.speculative.ragged_verify import (
-            RaggedVerifyMode,
-            read_ragged_verify_mode,
-        )
-
+        # DSPARK/DFLASH commit through update_mamba_state_after_mtp_verify, which
+        # folds (KDA, or GDN here); it does not drive GDN compact-replay cursors.
         if not get_exec().mamba.enable_linear_replayssm_spec:
             return False
-        algo = (get_spec().speculative_algorithm or "").upper()
-        if algo not in ("DSPARK", "DFLASH") or self.hybrid_kda_config is not None:
+        if (
+            not self.spec_algorithm.is_dflash_family()
+            or self.hybrid_kda_config is not None
+        ):
             return False
         if self.hybrid_gdn_config is None:
             raise ValueError(
                 "--enable-linear-replayssm-spec with DSPARK/DFLASH requires a KDA "
                 "or GDN model."
+            )
+        if _is_npu or get_memory().enable_unified_memory:
+            # The Ascend backend and the unified pool keep per-draft intermediate states.
+            raise ValueError(
+                "--enable-linear-replayssm-spec with DSPARK/DFLASH on a GDN model is "
+                "not supported on NPU or with --enable-unified-memory."
             )
         if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
             # The GDN ring-write verify kernels do not take the ragged layout.
@@ -2454,8 +2455,8 @@ class KVCacheConfigurator:
         # no longer reserves the (1 + D/ratio) intermediate factor -- the whole
         # budget goes to persistent slots (K sized like non-spec), which is how the
         # freed ~9GB turns into higher max_running.
-        # The ring is not part of mamba_cache_per_req. GDN replay is fixed-size
-        # request scratch; KDA replay remains attached to each mamba slot.
+        # The ring is not part of mamba_cache_per_req. GDN compact replay is fixed-size
+        # request scratch; KDA replay and the DSPARK/DFLASH GDN fold stay per mamba slot.
         replayssm_active = get_exec().mamba.enable_linear_replayssm_spec and (
             self.hybrid_gdn_config is not None or self.hybrid_kda_config is not None
         )

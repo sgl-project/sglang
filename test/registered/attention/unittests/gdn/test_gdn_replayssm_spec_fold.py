@@ -9,7 +9,7 @@ exact.
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import torch
 
@@ -31,6 +31,8 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 )
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.memory_pool import MambaPool
+from sglang.srt.runtime_context import get_context, get_memory
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -507,26 +509,18 @@ class TestGdnReplayssmSpecFoldDflashCommit(CustomTestCase):
 class TestGdnReplayssmSpecFoldGate(CustomTestCase):
     """Which models and workers get the GDN fold."""
 
-    def _decide(self, *, algo, gdn, kda, enabled=True):
-        configurator = SimpleNamespace(
-            hybrid_gdn_config=object() if gdn else None,
-            hybrid_kda_config=object() if kda else None,
-        )
-        exec_cfg = SimpleNamespace(
-            mamba=SimpleNamespace(enable_linear_replayssm_spec=enabled)
-        )
-        module = "sglang.srt.mem_cache.kv_cache_configurator"
-        with (
-            patch(f"{module}.get_exec", return_value=exec_cfg),
-            patch(
-                f"{module}.get_spec",
-                return_value=SimpleNamespace(speculative_algorithm=algo),
-            ),
-        ):
-            return KVCacheConfigurator._gdn_replayssm_spec_fold(configurator)
+    def _decide(self, *, algo, gdn, kda, enabled=True, unified=False):
+        # The gate reads the published config plus these per-runner fields.
+        configurator = KVCacheConfigurator.__new__(KVCacheConfigurator)
+        configurator.spec_algorithm = SpeculativeAlgorithm.from_string(algo)
+        configurator.hybrid_gdn_config = object() if gdn else None
+        configurator.hybrid_kda_config = object() if kda else None
+        with get_context().override_server_args(enable_linear_replayssm_spec=enabled):
+            with get_memory().override(enable_unified_memory=unified):
+                return configurator._gdn_replayssm_spec_fold()
 
     def test_gate(self):
-        for algo in ("DFLASH", "DSPARK", "dflash"):
+        for algo in ("DFLASH", "DSPARK"):
             self.assertTrue(self._decide(algo=algo, gdn=True, kda=False))
         self.assertFalse(
             self._decide(algo="DFLASH", gdn=True, kda=False, enabled=False)
@@ -538,11 +532,16 @@ class TestGdnReplayssmSpecFoldGate(CustomTestCase):
         self.assertFalse(self._decide(algo="DFLASH", gdn=False, kda=True))
         with self.assertRaises(ValueError):
             self._decide(algo="DFLASH", gdn=False, kda=False)
+
+    def test_gate_rejects_unsupported_layouts(self):
         # The GDN ring-write verify has no ragged layout.
         for mode in ("cap-accept", "compact"):
             with envs.SGLANG_RAGGED_VERIFY_MODE.override(mode):
                 with self.assertRaises(ValueError):
                     self._decide(algo="DFLASH", gdn=True, kda=False)
+        # The unified pool keeps per-draft intermediate states.
+        with self.assertRaises(ValueError):
+            self._decide(algo="DFLASH", gdn=True, kda=False, unified=True)
 
 
 if __name__ == "__main__":

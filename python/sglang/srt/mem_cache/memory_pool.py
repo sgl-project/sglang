@@ -665,7 +665,8 @@ class MambaPool:
                 # GDN speculative replay is request-lifetime scratch. Size it by
                 # active requests instead of every persistent radix-cache slot.
                 # The fold rings are indexed by mamba slot (like the checkpoint),
-                # so they follow the pool size.
+                # so they follow the pool size. TODO: index them by verify row; with
+                # radix cache on, most slots are cached or tracking and never verify.
                 num_slots = (
                     spec_state_size + 1
                     if enable_linear_replayssm_spec
@@ -719,10 +720,8 @@ class MambaPool:
                 # KDA, and GDN under DSPARK/DFLASH, use raw-input fold-every-commit.
                 # GDN compact replay materializes its d/k/g history directly and
                 # needs no duplicate ring.
-                if enable_linear_replayssm_spec and (
-                    cache_params.is_kda or self.replayssm_spec_fold
-                ):
-                    if cache_params.is_kda or not self.replayssm_spec_fold:
+                if self.replayssm_spec_fold:
+                    if cache_params.is_kda:
                         # Backstop for the KDA ring invariants; this pool is
                         # sized with the final adaptive-aware draft maximum.
                         if L & (L - 1) != 0:
