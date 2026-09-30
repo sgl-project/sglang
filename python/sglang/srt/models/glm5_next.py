@@ -1185,8 +1185,6 @@ class Glm5NextModel(nn.Module):
             )
 
         if not self.pp_group.is_last_rank:
-            if self.config.mhc:
-                return PPProxyTensors({"hidden_states": hidden_states})
             return residual_batch.to_pp(hidden_states, forward_batch)
         else:
             hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
