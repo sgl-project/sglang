@@ -1207,7 +1207,7 @@ class SchedulerBatchResultProcessor:
         )
         num_accept_tokens = (
             None
-            if getattr(sampling_output, "num_accept_tokens", None) is None
+            if sampling_output.num_accept_tokens is None
             else sampling_output.num_accept_tokens.tolist()
         )
         assert num_accept_tokens is None or len(batch_indices) == len(num_accept_tokens)
