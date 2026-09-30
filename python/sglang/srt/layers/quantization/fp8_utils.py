@@ -1338,6 +1338,11 @@ def aiter_w8a8_block_fp8_linear(
     # assert input_scale is None
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
+    output_dtype = torch.bfloat16 if input_scale is not None else input.dtype
+    # DP-attention idle ranks run zero-token forwards (eager has no padded graph
+    # bucket); CK blockscale GEMM fails M == 0 with invalid configuration argument.
+    if input_2d.shape[0] == 0:
+        return input.new_empty(output_shape, dtype=output_dtype)
 
     # dense linears converted from MXFP8 carry a rowwise-fp8 copy; its ptpc GEMM
     # beats the block-fp8 GEMMs at decode-sized M
@@ -1411,15 +1416,13 @@ def aiter_w8a8_block_fp8_linear(
         weight,
         x_scale,
         weight_scale,
-        dtype=torch.bfloat16 if input_scale is not None else input.dtype,
+        dtype=output_dtype,
     )
 
     if bias is not None:
         output += bias
 
-    return output.to(
-        dtype=torch.bfloat16 if input_scale is not None else input_2d.dtype
-    ).view(*output_shape)
+    return output.to(dtype=output_dtype).view(*output_shape)
 
 
 def triton_w8a8_block_fp8_linear(

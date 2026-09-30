@@ -6,26 +6,37 @@ from types import SimpleNamespace
 import torch
 import torch.distributed as dist
 
+import sglang.srt.layers.dp_attention as dp_attention
 import sglang.srt.layers.moe.token_dispatcher.moriep as adapter
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.token_dispatcher.moriep import (
+    round_logical_recv_rows,
+)
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
 
 
-def _expert_output(dispatched, fp4_enabled: bool, fp4_lookup=None):
-    if not fp4_enabled:
-        return dispatched.hidden_states
+def _expert_output(dispatched, dispatch: str, fp4_lookup=None):
+    if dispatch == "bf16":
+        output = dispatched.hidden_states
+        return output[: dispatched.recv_cap] if dispatched.recv_cap > 0 else output
 
-    packed = dispatched.hidden_states.view(torch.uint8)
-    nibbles = torch.stack((packed & 0xF, packed >> 4), dim=-1).flatten(-2)
-    values = fp4_lookup[nibbles.long()]
-    scales = dispatched.hidden_states_scale.repeat_interleave(32, dim=1).float()
+    if dispatch == "fp4":
+        packed = dispatched.hidden_states.view(torch.uint8)
+        nibbles = torch.stack((packed & 0xF, packed >> 4), dim=-1).flatten(-2)
+        values = fp4_lookup[nibbles.long()]
+    else:
+        values = dispatched.hidden_states.float()
+    # fp8 uses fp32 scales per 128 columns; fp4 and mxfp8 use e8m0 per 32.
+    block = 128 if dispatch == "fp8" else 32
+    scales = dispatched.hidden_states_scale.float().repeat_interleave(block, dim=1)
     output = (values * scales[:, : values.shape[1]]).to(torch.bfloat16)
     valid_rows = (
         torch.arange(output.shape[0], device=output.device)
         < dispatched.num_recv_tokens_per_expert.reshape(-1)[0]
     )
-    return torch.where(valid_rows[:, None], output, torch.zeros_like(output))
+    output = torch.where(valid_rows[:, None], output, torch.zeros_like(output))
+    return output[: dispatched.recv_cap] if dispatched.recv_cap > 0 else output
 
 
 class _Group:
@@ -63,7 +74,14 @@ def main():
     experts_per_rank = int(os.environ.get("EPR", "48"))
     num_experts = world_size * experts_per_rank
     tokens = int(os.environ.get("TOKENS", "64"))
-    fp4_enabled = os.environ.get("FP4", "0") == "1"
+    # DISPATCH / COMBINE map to SGLANG_MORI_DISPATCH_DTYPE / SGLANG_MORI_COMBINE_DTYPE.
+    dispatch = os.environ.get(
+        "DISPATCH", "fp4" if os.environ.get("FP4", "0") == "1" else "bf16"
+    )
+    combine = os.environ.get("COMBINE", "bf16")
+    os.environ["SGLANG_MORI_DISPATCH_DTYPE"] = dispatch
+    os.environ["SGLANG_MORI_COMBINE_DTYPE"] = combine
+    fp4_enabled = dispatch == "fp4"
     fp4_lookup = (
         torch.tensor(
             [
@@ -93,11 +111,39 @@ def main():
     if os.environ.get("EMPTY_LAST_RANK", "0") == "1" and rank == world_size - 1:
         tokens = 0
 
+    # ATTN_TP > 1 models attention TP: each DP group's TOKENS * (group + 1) rows
+    # are tensor_split over its attention-TP ranks, as the model does before MoE.
+    attn_tp_size = int(os.environ.get("ATTN_TP", "1"))
+    attn_dp_size = world_size // attn_tp_size
+    attn_dp_rank, attn_tp_rank = divmod(rank, attn_tp_size)
+    if attn_tp_size == 1:
+        sender_rows = [None] * world_size
+        dist.all_gather_object(sender_rows, tokens)
+    else:
+        sender_rows = [tokens * (group + 1) for group in range(attn_dp_size)]
+        tokens = (
+            torch.empty(sender_rows[attn_dp_rank], device="cpu")
+            .tensor_split(attn_tp_size)[attn_tp_rank]
+            .numel()
+        )
+    # STALE_ROWS models DSpark draft forwards that keep the target step's metadata.
+    stale_rows = os.environ.get("STALE_ROWS")
+    metadata_rows = [int(stale_rows)] if stale_rows else sender_rows
+    dp_attention.set_dp_buffer_len(sum(sender_rows), tokens, False, metadata_rows)
+
     adapter.is_tbo_enabled = lambda: False
     adapter.get_parallel = lambda: SimpleNamespace(
         moe_ep_size=world_size,
         moe_ep_rank=rank,
-        world_rank=rank,
+        tp_size=world_size,
+        attn_dp_size=attn_dp_size,
+        attn_dp_rank=attn_dp_rank,
+        attn_tp_size=attn_tp_size,
+        attn_tp_rank=attn_tp_rank,
+        attn_cp_size=1,
+        moe_tp_size=1,
+        moe_dp_size=1,
+        launch_world_rank=rank,
     )
     group = _Group(dist.group.WORLD)
     envs.SGLANG_MORI_EP_VERSION.set("epv2")
@@ -119,7 +165,12 @@ def main():
         tokens, hidden_size, generator=generator, dtype=torch.bfloat16
     ).cuda()
     if os.environ.get("SKEWED", "0") == "1":
-        topk_ids = torch.arange(topk, dtype=torch.int32).repeat(tokens, 1).cuda()
+        first_expert = int(os.environ.get("SKEW_RANK", "0")) * experts_per_rank
+        topk_ids = (
+            torch.arange(first_expert, first_expert + topk, dtype=torch.int32)
+            .repeat(tokens, 1)
+            .cuda()
+        )
     else:
         topk_ids = torch.randint(
             0,
@@ -134,9 +185,30 @@ def main():
     topk_output = StandardTopKOutput(topk_weights, topk_ids, None)
 
     dispatched = dispatcher.dispatch(hidden, topk_output)
+    impl = dispatcher._get_impl()
+    assert impl.dispatch_dtype.name == dispatch, (impl.dispatch_dtype, dispatch)
+    assert impl.combine_dtype.name == combine, (impl.combine_dtype, combine)
+    expected_cap = 0
+    if impl._manual_recv_cap > 0:
+        expected_cap = min(impl._manual_recv_cap, impl.mori_op.cfg.effective_max_recv)
+    elif impl._trim_recv:
+        cluster_rows = (
+            sum(sender_rows)
+            if attn_dp_size > 1
+            else attn_tp_size * tokens + attn_tp_rank
+        )
+        expected_cap = impl.mori_op.cfg.effective_max_recv
+        if 0 < cluster_rows < expected_cap:
+            expected_cap = round_logical_recv_rows(
+                cluster_rows, pow2_buckets=impl._recv_cap_pow2_buckets
+            )
+    assert dispatched.recv_cap == expected_cap
+    recv_rows = int(dispatched.num_recv_tokens_per_expert.reshape(-1)[0].item())
+    assert recv_rows <= sum(sender_rows), (recv_rows, sender_rows)
+    assert expected_cap == 0 or recv_rows <= expected_cap, (recv_rows, expected_cap)
     combined = dispatcher.combine(
         (
-            _expert_output(dispatched, fp4_enabled, fp4_lookup),
+            _expert_output(dispatched, dispatch, fp4_lookup),
             dispatched.topk_ids,
             dispatched.topk_weights,
         )
@@ -147,7 +219,13 @@ def main():
     expected = (
         _expected_unique_destinations(topk_ids, experts_per_rank) * hidden.float().cpu()
     ).to(torch.bfloat16)
-    tolerance = 6e-1 if fp4_enabled else 2e-2
+    # Arbitrary bounds: fp4 keeps ~1 mantissa bit, e4m3 keeps 3 (per quantization hop).
+    if fp4_enabled:
+        tolerance = 6e-1
+    elif dispatch != "bf16" or combine != "bf16":
+        tolerance = 1.5e-1
+    else:
+        tolerance = 2e-2
     error = (combined.float().cpu() - expected.float()).abs()
     ok = torch.allclose(
         combined.float().cpu(), expected.float(), atol=tolerance, rtol=tolerance
@@ -160,8 +238,11 @@ def main():
             f"{'PASS' if failures.item() == 0 else 'FAIL'} "
             f"tokens={tokens} hidden={hidden_size} topk={topk} "
             f"skewed={os.environ.get('SKEWED', '0')} "
-            f"empty_last_rank={os.environ.get('EMPTY_LAST_RANK', '0')}",
-            f"fp4={fp4_enabled}",
+            f"empty_last_rank={os.environ.get('EMPTY_LAST_RANK', '0')} "
+            f"attn_tp={attn_tp_size} sender_rows={sender_rows} stale_rows={stale_rows} "
+            f"recv_cap={dispatched.recv_cap}",
+            f"dispatch={dispatch} combine={combine} "
+            f"combine_mode={impl.mori_op.cfg.combine_mode}",
             f"mean_abs_error={error.mean().item():.6f}",
             f"max_abs_error={error.max().item() if error.numel() else 0:.6f}",
             flush=True,
@@ -174,7 +255,7 @@ def main():
             graph_dispatched = dispatcher.dispatch(hidden, topk_output)
             graph_combined = dispatcher.combine(
                 (
-                    _expert_output(graph_dispatched, fp4_enabled, fp4_lookup),
+                    _expert_output(graph_dispatched, dispatch, fp4_lookup),
                     graph_dispatched.topk_ids,
                     graph_dispatched.topk_weights,
                 )
@@ -197,7 +278,7 @@ def main():
         eager_dispatched = dispatcher.dispatch(hidden, topk_output)
         eager_after_graph = dispatcher.combine(
             (
-                _expert_output(eager_dispatched, fp4_enabled, fp4_lookup),
+                _expert_output(eager_dispatched, dispatch, fp4_lookup),
                 eager_dispatched.topk_ids,
                 eager_dispatched.topk_weights,
             )

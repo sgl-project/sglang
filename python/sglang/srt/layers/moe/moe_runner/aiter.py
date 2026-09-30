@@ -22,9 +22,8 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_post_permute,
     register_pre_permute,
 )
-from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_a2a_backend
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_gfx95_supported
+from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.utils import get_bool_env_var, is_gfx95_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.base import CombineInput
@@ -161,76 +160,6 @@ def _aiter_fused_moe_supports_output() -> bool:
     from aiter.fused_moe import fused_moe
 
     return "output" in inspect.signature(fused_moe).parameters
-
-
-_RECV_BOUND_LOGGED: set[tuple[str, int]] = set()
-_RECV_BOUND_WARNED = False
-
-
-def _warn_recv_bound_unavailable() -> None:
-    global _RECV_BOUND_WARNED
-    if not _RECV_BOUND_WARNED:
-        _RECV_BOUND_WARNED = True
-        logger.warning(
-            "The per-rank DP token counts do not cover every mori sender, "
-            "so the receive fan-in is unknown; "
-            "leaving the receive buffer unbounded."
-        )
-
-
-def _mori_decode_recv_bound(recv_rows: int, topk: int) -> int:
-    """Return a conservative receive-row bound for MORI EP, or 0 to skip trimming."""
-    if not envs.SGLANG_MORI_RECV_BOUND.get():
-        return 0
-
-    is_epv2 = get_moe_a2a_backend().is_mori_epv2()
-    if not is_epv2:
-        from sglang.srt.layers.dp_attention import get_is_extend_in_batch
-
-        if get_is_extend_in_batch():
-            return 0
-
-    if is_epv2:
-        from sglang.srt.model_executor.runner import get_is_capture_mode
-
-        if not get_is_capture_mode():
-            return 0
-
-    from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
-
-    per_rank_tokens = get_dp_global_num_tokens()
-    parallel = get_parallel()
-    ep_size = parallel.moe_ep_size
-    if not per_rank_tokens or len(per_rank_tokens) < ep_size:
-        _warn_recv_bound_unavailable()
-        return 0
-
-    max_tokens = sum(per_rank_tokens)
-    bound = max_tokens * topk
-    if is_epv2:
-        bound = max(32, 1 << (bound - 1).bit_length())
-    # Never grow the tensor, and nothing to do when there is nothing to trim.
-    if not 0 < bound < recv_rows:
-        return 0
-
-    backend = "mori-epv2" if is_epv2 else "mori"
-    log_rank = parallel.launch_world_rank
-    key = (backend, bound)
-    if log_rank == 0 and key not in _RECV_BOUND_LOGGED:
-        first = not any(name == key[0] for name, _ in _RECV_BOUND_LOGGED)
-        _RECV_BOUND_LOGGED.add(key)
-        log = logger.info if first else logger.debug
-        log(
-            "%s recv bound active: %d rows -> %d "
-            "(dp_tokens=%d ep=%d topk=%d); per-tier values at DEBUG",
-            backend,
-            recv_rows,
-            bound,
-            max_tokens,
-            ep_size,
-            topk,
-        )
-    return bound
 
 
 class AiterRunnerCore(MoeRunnerCore):
@@ -486,13 +415,7 @@ def _pre_permute_deepep_to_aiter(
         num_local_tokens = dispatch_output.num_recv_tokens_per_expert
         output_dtype = dispatch_output.out_dtype
         output = getattr(dispatch_output, "expert_output", None)
-        mori_max = getattr(dispatch_output, "recv_cap", None)
-        if mori_max is None:
-            mori_max = get_int_env_var("SGLANG_MORI_MOE_MAX_INPUT_TOKENS", 0)
-            if mori_max <= 0:
-                mori_max = _mori_decode_recv_bound(
-                    hidden_states.shape[0], topk_ids.shape[-1]
-                )
+        mori_max = dispatch_output.recv_cap
 
         # Truncate dispatch tensors to the configured cap; MORI EP combine only
         # reads [0, totalRecvTokenNum), so the truncated result needs no

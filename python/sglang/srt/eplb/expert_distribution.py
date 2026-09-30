@@ -1095,9 +1095,14 @@ class _InfiniteBuffer(_Buffer):
         device = self._buffer.device
 
         if self._size == curr_buffer_size:
-            new_buffer = torch.zeros(
-                (2 * curr_buffer_size, *self._item_shape), dtype=dtype, device=device
-            )
+            # Growth can happen inside a caller's inference_mode (e.g. DSpark draft);
+            # an inference tensor buffer would reject later appends made outside it.
+            with torch.inference_mode(False):
+                new_buffer = torch.zeros(
+                    (2 * curr_buffer_size, *self._item_shape),
+                    dtype=dtype,
+                    device=device,
+                )
             new_buffer[:curr_buffer_size] = self._buffer
             self._buffer = new_buffer
 
