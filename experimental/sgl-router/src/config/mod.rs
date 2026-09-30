@@ -71,6 +71,13 @@ impl Config {
                 ms <= MAX_KV_BOOTSTRAP_TIMEOUT_MS,
                 "--kv-bootstrap-timeout-ms {ms} exceeds the {MAX_KV_BOOTSTRAP_TIMEOUT_MS}ms ceiling"
             );
+            let cap = cache.bootstrap_fetch_timeout_cap_ms;
+            ensure!(
+                (MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS..=MAX_KV_BOOTSTRAP_TIMEOUT_MS)
+                    .contains(&cap),
+                "--kv-bootstrap-fetch-timeout-cap-ms {cap} is out of range \
+                 ({MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS}..={MAX_KV_BOOTSTRAP_TIMEOUT_MS}ms)"
+            );
         }
         match &self.discovery {
             DiscoveryBackend::StaticUrls(s) => {
@@ -238,6 +245,7 @@ mod tests {
                 id: model_id.into(),
                 tokenizer_path: "/tmp/tok.json".into(),
                 disable_input_ids_forwarding: false,
+                tokenizer: Default::default(),
                 policy: PolicyKind::RoundRobin,
                 decode_policy: DecodePolicyKind::PowerOfTwo,
                 bucket_config: None,
