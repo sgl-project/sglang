@@ -109,10 +109,37 @@ def handle_mxfp8_kv_cache_compatibility(server_args: Any) -> None:
         )
 
 
+def _handle_ultraquant_compatibility(cfg: Any, server_args: Any) -> None:
+    """UltraQuant stores keys rotated, so it needs its own attention backend."""
+    prefill_backend, decode_backend = attention_backends_of(resolved_view(server_args))
+    uses_ultraquant_kv = cfg.kv_cache_dtype == "ultraquant_4bit"
+    backends = {prefill_backend, decode_backend}
+
+    if uses_ultraquant_kv and backends != {"ultraquant"}:
+        raise ValueError(
+            "--kv-cache-dtype=ultraquant_4bit requires the ultraquant attention "
+            "backend for both prefill and decode, because UltraQuant stores keys "
+            "Hadamard-rotated. Pass --attention-backend ultraquant. Got prefill="
+            f"{prefill_backend!r}, decode={decode_backend!r}."
+        )
+    if "ultraquant" in backends and not uses_ultraquant_kv:
+        raise ValueError(
+            "--attention-backend ultraquant only reads an UltraQuant KV cache. "
+            "Pass --kv-cache-dtype ultraquant_4bit, or choose another attention "
+            f"backend. Got --kv-cache-dtype={cfg.kv_cache_dtype!r}."
+        )
+    if uses_ultraquant_kv and not get_platform().is_hip:
+        raise ValueError(
+            "--kv-cache-dtype=ultraquant_4bit is currently validated only on ROCm."
+        )
+
+
 def handle_kv4_compatibility(server_args: Any) -> None:
     """Check FP4 KV cache compatibility with the attention backend"""
 
     cfg = resolving_view(server_args)
+
+    _handle_ultraquant_compatibility(cfg, server_args)
 
     if cfg.kv_cache_dtype not in ("nvfp4", "fp4_mx_block16"):
         return

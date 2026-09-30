@@ -62,7 +62,7 @@ def configure_kv_cache_dtype(
         kv_cache_dtype = torch.float8_e4m3fn
     elif server_args_kv_cache_dtype in ("bf16", "bfloat16"):
         kv_cache_dtype = torch.bfloat16
-    elif server_args_kv_cache_dtype in ("nvfp4", "fp4_mx_block16"):
+    elif server_args_kv_cache_dtype in ("nvfp4", "fp4_mx_block16", "ultraquant_4bit"):
         if hasattr(torch, "float4_e2m1fn_x2"):
             kv_cache_dtype = torch.float4_e2m1fn_x2
             logger.warning(
@@ -73,7 +73,7 @@ def configure_kv_cache_dtype(
             raise ValueError(
                 f"--kv-cache-dtype={server_args_kv_cache_dtype} requires "
                 "torch.float4_e2m1fn_x2 support. Please use PyTorch 2.8.0+ "
-                "with CUDA 12.8+."
+                "with CUDA 12.8+ or ROCm 7.0+."
             )
     else:
         raise ValueError(f"Unsupported kv_cache_dtype: {server_args_kv_cache_dtype}.")

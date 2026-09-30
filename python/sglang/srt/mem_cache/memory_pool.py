@@ -4247,6 +4247,9 @@ class HybridLinearKVPool(KVCache):
             )
 
     def get_v_head_dim(self):
+        # Packed FP4 value buffers are narrower than the head dim they hold.
+        if isinstance(self.full_kv_pool, MHATokenToKVPool):
+            return self.full_kv_pool.get_v_head_dim()
         # Use start_layer to handle pipeline parallelism where layer 0
         # may not be present in this stage's buffer.
         return self.full_kv_pool.get_value_buffer(self.full_kv_pool.start_layer).shape[

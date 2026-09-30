@@ -541,5 +541,28 @@ class TestFP4MXBlock16KVQuantizeUtil(CustomTestCase):
         self.assertLess(rel_error, 0.5)
 
 
+class TestUltraQuantKVCacheMethod(CustomTestCase):
+    def test_pool_cap_fits_32bit_buffer_offset(self):
+        """The largest pool the recipe allows must be one the FlyDSL decode can address.
+
+        Pools are allocated with a padding page past the token capacity, and every
+        code buffer is reached through a 32-bit buffer offset.
+        """
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            UltraQuantKVCacheMethod,
+        )
+        from sglang.srt.layers.quantization.ultraquant_tensor import code_bytes
+
+        head_dim = 256
+        for kv_head_num, page_size in ((1, 1), (2, 1), (4, 64)):
+            with self.subTest(kv_head_num=kv_head_num, page_size=page_size):
+                row_bytes = kv_head_num * code_bytes(head_dim)
+                cap = UltraQuantKVCacheMethod.max_pool_tokens(
+                    kv_head_num, head_dim, page_size
+                )
+                self.assertLessEqual((cap + page_size) * row_bytes, 0xFFFFFFFF)
+                self.assertGreater((cap + page_size + 1) * row_bytes, 0xFFFFFFFF)
+
+
 if __name__ == "__main__":
     unittest.main()
