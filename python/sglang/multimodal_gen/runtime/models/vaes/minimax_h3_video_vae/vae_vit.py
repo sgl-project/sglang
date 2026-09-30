@@ -28,6 +28,22 @@ def _cuda_autocast_disabled(tensor: torch.Tensor):
     return torch.autocast("cuda", enabled=False) if tensor.is_cuda else nullcontext()
 
 
+def _expand_rotary_batch(rotary_pos_emb, batch: int):
+    """Broadcast a batch-1 rotary cache across stacked spatial tiles."""
+    cos, sin, *extra = rotary_pos_emb
+    if cos.shape[0] == batch:
+        return rotary_pos_emb
+    if cos.shape[0] != 1:
+        raise ValueError(
+            f"MiniMax H3 VAE rotary cache batch must be 1 or {batch}, got {cos.shape[0]}"
+        )
+    return (
+        cos.expand(batch, -1, -1, -1),
+        sin.expand(batch, -1, -1, -1),
+        *extra,
+    )
+
+
 def _pack_tensors_3d(tensors, patch_size, patch_size_t):
     batch_size, num_channels_tensors, temporal, height, width = tensors.shape
 
@@ -326,10 +342,15 @@ class ViT3DDecoder(ViTBase):
         if cache_hit:
             rotary_pos_emb = cache_record[2]
         else:
+            # Every stacked tile has the same coordinates, so one rotary
+            # table is broadcast across the batch. That keeps the fused
+            # NeoX kernel, which indexes a single sequence, on the batched path.
             rotary_pos_emb = prepare_rotary_pos_emb(
-                self.pos_embed(img_ids),
+                self.pos_embed(img_ids[:1]),
                 dtype=rotary_dtype,
             )
+            if B > 1:
+                rotary_pos_emb = _expand_rotary_batch(rotary_pos_emb, B)
             if cache_enabled:
                 self._rotary_pos_emb_cache = (
                     cache_key,

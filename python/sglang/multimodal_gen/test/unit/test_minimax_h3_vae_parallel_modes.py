@@ -24,6 +24,9 @@ from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.attention im
     Attention,
     _apply_qk_norm,
 )
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.vit_utils import (
+    apply_rotary_pos_emb_qk,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
@@ -129,8 +132,7 @@ def test_audio_snake_first_call_matches_repeated_calls():
         [
             sys.executable,
             "-c",
-            textwrap.dedent(
-                """
+            textwrap.dedent("""
                 import torch
                 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_audio_vae.audio_vae import Snake1d
 
@@ -146,9 +148,40 @@ def test_audio_snake_first_call_matches_repeated_calls():
                         torch.testing.assert_close(activation(x), first, rtol=0, atol=0)
                     torch.testing.assert_close(x, original_x, rtol=0, atol=0)
                     torch.testing.assert_close(activation.alpha, original_alpha, rtol=0, atol=0)
-                """
-            ),
+                """),
         ],
         check=True,
         timeout=120,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_batched_neox_rope_matches_per_tile_rows():
+    from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.vit_utils import (
+        prepare_rotary_pos_emb,
+    )
+
+    cos = torch.randn(1, 5, 1, 8, device="cuda", dtype=torch.float16)
+    sin = torch.randn(1, 5, 1, 8, device="cuda", dtype=torch.float16)
+    packed = prepare_rotary_pos_emb((cos, sin), dtype=torch.float16)
+    query = torch.randn(3, 5, 2, 16, device="cuda", dtype=torch.float16)
+    key = torch.randn(3, 5, 2, 16, device="cuda", dtype=torch.float16)
+    expanded = (
+        packed[0].expand(3, -1, -1, -1),
+        packed[1].expand(3, -1, -1, -1),
+        *packed[2:],
+    )
+    batched_q, batched_k = apply_rotary_pos_emb_qk(query.clone(), key.clone(), expanded)
+    rows_q = []
+    rows_k = []
+    for index in range(3):
+        row_q, row_k = apply_rotary_pos_emb_qk(
+            query[index : index + 1],
+            key[index : index + 1],
+            packed,
+        )
+        rows_q.append(row_q)
+        rows_k.append(row_k)
+
+    torch.testing.assert_close(batched_q, torch.cat(rows_q, dim=0))
+    torch.testing.assert_close(batched_k, torch.cat(rows_k, dim=0))
