@@ -93,6 +93,14 @@ class TestTboFilterBatchMarker(CustomTestCase):
                 child = _filter(parent, lo=0, hi=4)
                 self.assertEqual(child.defer_logits_to_eager, deferred)
 
+    def test_filter_batch_drops_aux_hidden_states_buffer(self):
+        """Decode graph capture sets the shared aux output on the parent before
+        the TBO split; children must not inherit it."""
+        parent = _make_target_verify_batch(8)
+        parent.aux_hidden_states_buffer = torch.empty(8, 12)
+        child = _filter(parent, lo=0, hi=4)
+        self.assertIsNone(child.aux_hidden_states_buffer)
+
 
 def _make_valued_batch(bs: int) -> ForwardBatch:
     # Distinct per-position values so a filtered slice is unambiguous.
