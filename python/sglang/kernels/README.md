@@ -26,7 +26,7 @@ sglang/kernels/
 
 Operator groups (all populated): `activation`, `attention`, `communication`,
 `diffusion`, `elementwise`, `embeddings`, `gemm`, `grammar`, `kv_canary`,
-`kvcache`, `layernorm`, `lplb`, `mamba`, `memory`, `moe`, `quantization`,
+`kvcache`, `layernorm`, `lplb`, `mamba`, `memory`, `mm`, `moe`, `quantization`,
 `sampling`, `speculative`.
 
 Place model-specific implementations and tuning data inside the corresponding
@@ -36,9 +36,32 @@ under `ops/`.
 As of the RFC #29630 finale (#32072) the legacy `sglang.jit_kernel` package has
 been **removed**: its shared build/runtime infra moved to `sglang.kernels.jit`
 and each JIT-backed operator into its group as
-`sglang.kernels.ops.<group>._jit_<op>`. Tests and benchmarks live under
+`sglang.kernels.ops.<group>.<op>` (the old `_jit_` filename prefix was removed
+in #32148). Tests and benchmarks live under
 `test/registered/kernels/` (`ops/<group>/` for tests, `benchmark/<group>/` for
-benchmarks); shared test helpers are in `sglang.test.kernels`.
+benchmarks); shared test helpers are in `sglang.test.kernels`. Standalone scripts
+that are not CI-registered belong in `test/manual/kernels/`, outside the shipped
+operator package. Keep vendored upstream trees under their existing maintenance
+policy.
+
+Classify the public computation, not the model that first used it: expert
+routing belongs in `moe`, matrix multiplication (including quantized GEMM and
+its tuning data) in `gemm`, and attention index selection in `attention`.
+Keep a fused operation intact; an attention kernel that fuses RoPE with a
+projection may stay in `attention`. A model name inside a logical group is fine.
+
+Runtime integration that owns process groups, symmetric buffers, or model
+dispatch stays in `srt`; the K3 communication adapters live in
+`srt/layers/communication/`, while their callable kernels live in
+`kernels/ops/communication/`. Tests of this runtime state belong with the
+runtime subsystem, even when they need a GPU. Kernel inventory/dispatch tests
+belong in `test/registered/unit/kernels/`.
+
+When moving an operator, update its callers, lazy `KernelSpec` targets and op
+ids, tests, benchmark imports, and tuning-data paths together. Preserve CI
+stage/runner registrations and test cases when splitting files. See the
+[kernel organization skill](../../../.claude/skills/kernel-organization/SKILL.md)
+for the review checklist.
 
 ## How it works
 

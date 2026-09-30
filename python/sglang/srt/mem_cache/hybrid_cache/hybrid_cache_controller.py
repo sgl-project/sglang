@@ -100,6 +100,27 @@ class PPPrefetchState:
     consumed: bool = False
 
 
+def _trailing_chain_groups(
+    prefix_keys: Optional[List[str]],
+    span_hashes: List[str],
+    transfers: list[PoolTransfer],
+) -> list[tuple[HiCacheStorageExtraInfo, list[PoolTransfer]]]:
+    """One extra_info per tail length so prefix_keys + keys stays contiguous."""
+    if prefix_keys is None:
+        return [(HiCacheStorageExtraInfo(prefix_keys=None), transfers)]
+    groups: dict[int, list[PoolTransfer]] = {}
+    for transfer in transfers:
+        covered = len(span_hashes) - len(transfer.keys or ())
+        groups.setdefault(covered, []).append(transfer)
+    return [
+        (
+            HiCacheStorageExtraInfo(prefix_keys=prefix_keys + span_hashes[:covered]),
+            group,
+        )
+        for covered, group in groups.items()
+    ]
+
+
 class StorageOperation(BaseStorageOperation):
     def __init__(
         self,
@@ -1286,10 +1307,15 @@ class HybridCacheController(BaseHiCacheController):
             )
             self._sync_trailing_keys(transfers_nonkv, sidecar_hashes, sidecar_hit_pages)
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=operation.prefix_keys)
-            results = self.storage_backend.batch_get_v2(
-                transfers_nonkv, extra_info=extra_info
-            )
+            results = {}
+            for extra_info, transfers in _trailing_chain_groups(
+                operation.prefix_keys,
+                sidecar_hashes,
+                transfers_nonkv,
+            ):
+                results.update(
+                    self.storage_backend.batch_get_v2(transfers, extra_info=extra_info)
+                )
             pool_hits = count_pool_hits(results)
         # Emit PrefetchAck to prefetch_sync_queue, even the operation has been canceled by the
         # scheduler thread.  The prefetch sync thread expects the same number of PrefetchAck objects
@@ -1335,10 +1361,13 @@ class HybridCacheController(BaseHiCacheController):
         if backup_transfers:
             self._resolve_sidecar_kv_derived_pool_transfers(operation)
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=operation.prefix_keys)
-            results = self.storage_backend.batch_set_v2(
-                backup_transfers, extra_info=extra_info
-            )
+            results = {}
+            for extra_info, transfers in _trailing_chain_groups(
+                operation.prefix_keys, operation.hash_value, backup_transfers
+            ):
+                results.update(
+                    self.storage_backend.batch_set_v2(transfers, extra_info=extra_info)
+                )
             pool_hits = count_pool_hits(results)
             operation.pool_storage_result.update_extra_pool_hit_pages(pool_hits)
 

@@ -115,7 +115,6 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         # Fields the parent's capture() reads:
         self.device = model_runner.device
         self.device_module = torch.get_device_module(self.device)
-        self.tp_size = model_runner.tp_size
         self.attn_dp_size = deployment_attn_dp_size()
         self.pp_size = get_parallel().pp_size
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
@@ -340,7 +339,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
         if self.require_mlp_sync:
             is_bs_supported = (
-                is_bs_supported and forward_batch.can_run_decode_cuda_graph
+                is_bs_supported
+                and forward_batch.can_run_decode_cuda_graph
+                and forward_batch.can_run_dp_draft_cuda_graph
             )
 
         return is_bs_supported

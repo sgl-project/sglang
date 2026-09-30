@@ -29,6 +29,8 @@ from sglang.srt.managers.schedule_batch import (  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache  # noqa: E402
+from sglang.srt.observability import req_time_stats
+from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
 from sglang.srt.runtime_context import get_context, publish, reset_context  # noqa: E402
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -97,6 +99,22 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
             req, is_retracted=False
         )
         req.time_stats.set_decode_prealloc_queue_entry_time.assert_called_once()
+
+    def test_decode_retraction_queue_time_excludes_decoding_before_it(self):
+        """After a PD-decode retraction, queue_time counts waits, not earlier decoding."""
+        scheduler = self._new_scheduler(DisaggregationMode.DECODE)
+        req = self._new_req(priority=0)
+        stats = SchedulerReqTimeStats(disagg_mode=DisaggregationMode.DECODE)
+        req.time_stats = stats
+        t0 = 1000.0
+        stats.set_wait_queue_entry_time(t0)
+        stats.set_forward_entry_time(t0 + 0.1)
+
+        with patch.object(req_time_stats.time, "perf_counter", return_value=t0 + 10.0):
+            scheduler._add_request_to_queue(req, is_retracted=True)
+        stats.set_forward_entry_time(t0 + 12.0)
+
+        self.assertAlmostEqual(stats.get_queueing_time(), 0.1 + 2.0)
 
     def test_priority_disabled_abort_validation_applies_to_decode_mode(self):
         scheduler = self._new_scheduler(DisaggregationMode.DECODE)
@@ -188,7 +206,6 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
             kv=SimpleNamespace(
                 req_pool_idx=1,
                 cache_protected_len=2,
-                swa_evicted_seqlen=1,
             ),
             prefix_indices=torch.tensor([8, 9], dtype=torch.int64),
             priority=3,
