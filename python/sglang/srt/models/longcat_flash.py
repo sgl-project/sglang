@@ -438,10 +438,10 @@ class LongcatFlashDecoderLayer(nn.Module):
                 {"qkv_latent_func": self.self_attn[0].prepare_qkv_latent},
             ),
             (
-                declare_ffn(sparse=True, next_sparse=True),
+                declare_ffn(sparse=True, next_layer_sparse=True),
                 self.post_attention_layernorm[0],
             ),
-            previous=declare_ffn(sparse=True, next_sparse=True)
+            previous=declare_ffn(sparse=True, next_layer_sparse=True)
             if self.layer_id != 0
             else None,
             terminal=self.layer_id == config.num_hidden_layers - 1,
@@ -642,7 +642,7 @@ class LongcatFlashModel(nn.Module):
                     topk_indices,
                 )
 
-        hidden_states = residual_batch.norm(
+        hidden_states = residual_batch.final_norm(
             hidden_states, forward_batch, self.norm, skip_empty=True
         )
 
