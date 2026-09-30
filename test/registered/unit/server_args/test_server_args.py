@@ -2345,6 +2345,29 @@ class TestAdaptiveSpecArgs(CustomTestCase):
         self.assertEqual(resolution_result(args, "speculative_num_steps"), 3)
         self.assertEqual(resolution_result(args, "speculative_num_draft_tokens"), 4)
 
+    def test_dflash_adaptive_keeps_the_block_as_draft_token_capacity(self):
+        """DFLASH drafts its whole block at every adaptive verify width, so the
+        draft-token capacity (KV reserve, pools) stays at the block size instead
+        of following the EAGLE step candidates."""
+        args = ServerArgs(model_path="dummy")
+        args.speculative_algorithm = "DFLASH"
+        args.speculative_draft_model_path = "dummy-draft"
+        args.speculative_draft_attention_backend = "fa3"
+        args.speculative_dflash_block_size = 16
+        args.speculative_adaptive = True
+        args.device = "cuda"
+        draft_config = SimpleNamespace(architectures=["DFlashDraftModel"])
+        with patch(
+            "sglang.srt.utils.hf_transformers_utils.get_config",
+            return_value=draft_config,
+        ):
+            handle_speculative_decoding(args)
+            self.assertEqual(max_speculative_num_draft_tokens(args), 16)
+
+        self.assertTrue(resolution_result(args, "speculative_adaptive"))
+        self.assertEqual(resolution_result(args, "speculative_num_steps"), 1)
+        self.assertEqual(resolution_result(args, "speculative_num_draft_tokens"), 16)
+
 
 class TestWaterfillArgs(CustomTestCase):
     def test_waterfill_enforces_shared_experts_fusion(self):

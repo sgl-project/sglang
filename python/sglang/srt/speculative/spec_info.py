@@ -273,7 +273,8 @@ class SpeculativeAlgorithm(Enum):
         cfg = resolving_view(server_args)
         if cfg.speculative_num_draft_tokens is None:
             return None
-        if not cfg.speculative_adaptive:
+        # DFLASH drafts its full block at every verify width.
+        if not cfg.speculative_adaptive or self.is_dflash():
             return cfg.speculative_num_draft_tokens
 
         from sglang.srt.speculative.adaptive_spec_params import (

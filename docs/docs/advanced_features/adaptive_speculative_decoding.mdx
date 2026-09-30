@@ -9,9 +9,9 @@ It is designed for workloads whose accept length changes over time, where one st
 
 ## Current support
 
-- Only `--speculative-algorithm EAGLE` or `EAGLE3`
-- Only `--speculative-eagle-topk 1`
-- If either condition is not met, SGLang falls back to static speculative settings
+- `--speculative-algorithm EAGLE` or `EAGLE3` with `--speculative-eagle-topk 1`: adaptive draft steps, described below
+- `--speculative-algorithm DFLASH` on NVIDIA CUDA: adaptive verify width, see [DFLASH: adaptive verify width](#dflash-adaptive-verify-width)
+- Otherwise SGLang falls back to static speculative settings
 
 ## Why adaptive steps help
 
@@ -267,3 +267,20 @@ Uses wider ladders with ceiling rule to cap speculation at high BS. Best for mod
 ### Custom per-model config
 
 For the best performance, benchmark your specific model across batch sizes with different static `num_steps` values, then build a per-BS config that matches each range's optimal step. A well-tuned per-model config might outperform the generic presets above.
+
+## DFLASH: adaptive verify width
+
+DFLASH drafts a whole block per step and the target verifies all of it. At low batch sizes the extra verify rows are nearly free and raise acceptance; at high batch sizes the verify is compute-bound and most rows are rejected. With `--speculative-adaptive`, DFLASH keeps drafting its full block and verifies a batch-size-dependent prefix: a slot's `candidate_steps` value `s` verifies the first `s` drafted tokens (verify width `s + 1`). Verification stays exact, so outputs are unchanged.
+
+Without a config file, DFLASH uses the full block below batch size 12 and half of it from 12. For a block of 16 that is:
+
+```json
+{
+  "1":  {"candidate_steps": [15]},
+  "12": {"candidate_steps": [7]}
+}
+```
+
+Use one value per slot for pure batch-size routing; `s` must satisfy `1 <= s < block size`. On H200, these tiers were neutral at 1 and 8 concurrent requests and +4-18% at 16 and +18-37% at 32 over a static block of 16 (Qwen3.5-4B and Qwen3-8B DFLASH drafts).
+
+Domino and LiLiCorr drafts and `--cuda-graph-backend-prefill full` are not supported. Accept-rate metrics count the whole drafted block, so they read lower while a truncated tier is active; accept length is exact.

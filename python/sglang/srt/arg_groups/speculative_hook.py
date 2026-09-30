@@ -1279,6 +1279,9 @@ def _maybe_disable_adaptive(server_args: ServerArgs) -> None:
 
 def _init_adaptive_speculative_params(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
+    if cfg.speculative_algorithm == "DFLASH":
+        # _handle_dflash resolves the block (the widest tier); the worker checks its tiers.
+        return
     from sglang.srt.speculative.adaptive_spec_params import (
         resolve_candidate_steps_from_config,
     )

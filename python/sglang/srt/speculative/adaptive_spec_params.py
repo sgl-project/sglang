@@ -1,6 +1,7 @@
 """Adaptive speculative decoding parameters.
 
 Adjusts speculative_num_steps at runtime based on observed acceptance lengths.
+For DFLASH, a step count s verifies the first s drafted tokens (verify width s + 1).
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
 )
 from sglang.srt.runtime_context import attn_dp_enabled_of
-from sglang.srt.utils import log_info_on_rank0
+from sglang.srt.utils import is_hip, log_info_on_rank0
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -52,16 +53,30 @@ DEFAULT_ADAPTIVE_CONFIG: dict[str, dict] = {
 }
 
 
+def dflash_default_adaptive_config(block_size: int) -> dict[str, dict]:
+    """DFLASH tiers: verify the full block at low batch sizes, half of it from 12."""
+    # Measured on H200 (Qwen3.5-4B, Qwen3-8B, block 16): switching to 8 of 16 at
+    # batch 12 is neutral at 8 concurrent requests and +6-35% at 16-32.
+    config = {"1": {"candidate_steps": [block_size - 1]}}
+    if block_size >= 4:
+        config["12"] = {"candidate_steps": [block_size // 2 - 1]}
+    return config
+
+
 def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
     """Return why adaptive spec cannot run under the given server args, or None if supported."""
 
     cfg = resolving_view(server_args)
 
-    if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3"):
+    if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3", "DFLASH"):
         return (
             f"speculative_algorithm={cfg.speculative_algorithm} "
-            "(only EAGLE/EAGLE3 are supported)"
+            "(only EAGLE/EAGLE3/DFLASH are supported)"
         )
+    if cfg.speculative_algorithm == "DFLASH" and (
+        is_hip() or not cfg.device.startswith("cuda")
+    ):
+        return "DFLASH adaptive verify width is validated on NVIDIA CUDA only"
     if cfg.speculative_eagle_topk is not None and cfg.speculative_eagle_topk != 1:
         return (
             f"speculative_eagle_topk={cfg.speculative_eagle_topk} "
@@ -92,14 +107,18 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
 
 def _load_adaptive_config(
     cfg_path: str | None,
+    default_config: dict[str, dict] | None = None,
 ) -> tuple[dict, dict[int, dict]]:
     """Load and validate adaptive config.
 
-    Uses ``DEFAULT_ADAPTIVE_CONFIG`` when *cfg_path* is ``None``.
+    Uses *default_config* (``DEFAULT_ADAPTIVE_CONFIG`` if unset) when *cfg_path*
+    is ``None``.
     """
     if cfg_path is not None:
         with open(cfg_path) as f:
             cfg = json.load(f)
+    elif default_config is not None:
+        cfg = default_config
     else:
         cfg = DEFAULT_ADAPTIVE_CONFIG
 
@@ -272,8 +291,9 @@ class AdaptiveSpeculativeParams:
         self,
         initial_steps: int,
         cfg_path: str | None = None,
+        default_config: dict[str, dict] | None = None,
     ):
-        cfg, bs_entries = _load_adaptive_config(cfg_path)
+        cfg, bs_entries = _load_adaptive_config(cfg_path, default_config=default_config)
         self._bs_list: list[int] = sorted(bs_entries)
         self._slots: dict[int, AdaptiveStepSlot] = {}
         self._cuda_graph_bs: list[int] | None = None

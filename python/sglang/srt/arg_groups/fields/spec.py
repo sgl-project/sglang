@@ -218,7 +218,7 @@ class Spec(msgspec.Struct):
     ] = False
     speculative_adaptive: A[
         bool,
-        "Enable adaptive speculative decoding that dynamically adjusts num_steps based on acceptance rate.",
+        "Enable adaptive speculative decoding that dynamically adjusts num_steps based on acceptance rate. For DFLASH, picks the verify width from the batch size (step count s verifies the first s drafted tokens).",
     ] = False
     speculative_adaptive_config: A[
         Optional[str],
