@@ -1020,7 +1020,7 @@ class MossVLSelfAttentionDecoderLayer(nn.Module):
         self.attn_boundary, self.ffn_boundary = make_stages(
             (declare_attn(), self.input_layernorm),
             (
-                declare_ffn(sparse=False, next_sparse=False),
+                declare_ffn(sparse=False, next_layer_sparse=False),
                 self.post_attention_layernorm,
             ),
             previous=declare_ffn() if layer_id != 0 else None,
@@ -1120,7 +1120,9 @@ class MossVLTextModel(nn.Module):
                         positions=positions,
                         vision_position_ids=vision_position_ids,
                     )
-                    hidden_states = residual_batch.written(hidden_states, forward_batch)
+                    hidden_states = residual_batch.set_written(
+                        hidden_states, forward_batch
+                    )
             elif isinstance(decoder_layer, MossVLSelfAttentionDecoderLayer):
                 hidden_states = decoder_layer(
                     positions=positions,
@@ -1130,7 +1132,9 @@ class MossVLTextModel(nn.Module):
             else:
                 raise ValueError(f"Unknown decoder layer type {type(decoder_layer)}")
 
-        hidden_states = residual_batch.norm(hidden_states, forward_batch, self.norm)
+        hidden_states = residual_batch.final_norm(
+            hidden_states, forward_batch, self.norm
+        )
         return hidden_states
 
 
