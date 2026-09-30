@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
     get_exec,
+    get_parallel,
     get_schedule,
     get_spec,
 )
@@ -67,7 +68,7 @@ class XPUAttentionBackend(AttentionBackend):
         self.num_attention_heads = (
             model_runner.model_config.hf_text_config.num_attention_heads
         )
-        self.tp_size = model_runner.tp_size
+        self.tp_size = get_parallel().tp_size
         assert self.num_attention_heads % self.tp_size == 0
         self.num_local_heads = self.num_attention_heads // self.tp_size
         self.device = model_runner.device

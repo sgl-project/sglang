@@ -62,6 +62,7 @@ class TestBoundaryParallelismResolution(CustomTestCase):
                     cp_strategy=None,
                     tp_size=4,
                     dp_size=1,
+                    attn_dp_size=1,
                     enable_aiter_allreduce_fusion=False,
                 ),
                 **options,
@@ -171,6 +172,8 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "page_size",
                     "moe_runner_backend",
                     "quantization",
+                    "dp_size",
+                    "attn_dp_size",
                     "enable_dp_attention",
                     "enable_attn_tp_input_scattered",
                     "enable_dp_lm_head",
@@ -195,6 +198,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "dsa_decode_backend",
                     "dsv4_attn_backend",
                     "dsa_topk_backend",
+                    "enable_dsa_fused_indexer",
                     "prefill_attention_backend",
                     "decode_attention_backend",
                     "flashinfer_allreduce_fusion_backend",
@@ -588,7 +592,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         prefill_attention_backend=None,
         decode_attention_backend=None,
         disaggregation_mode="null",
-        enable_dp_attention=False,
+        attn_dp_size=1,
         enable_hierarchical_cache=False,
     ):
         args = SimpleNamespace(
@@ -596,7 +600,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             prefill_attention_backend=prefill_attention_backend,
             decode_attention_backend=decode_attention_backend,
             disaggregation_mode=disaggregation_mode,
-            enable_dp_attention=enable_dp_attention,
+            attn_dp_size=attn_dp_size,
+            ep_join_mode=None,
             enable_hierarchical_cache=enable_hierarchical_cache,
         )
         mixer_types = []
@@ -650,7 +655,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 ):
                     self._minicpm_overrides(
                         architecture,
-                        enable_dp_attention=True,
+                        attn_dp_size=2,
                     )
 
     def test_minicpm_rejects_hierarchical_cache_for_hybrid_models(self):
@@ -684,7 +689,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             prefill_attention_backend=None,
             decode_attention_backend=None,
             disaggregation_mode="null",
-            enable_dp_attention=False,
+            attn_dp_size=1,
+            ep_join_mode=None,
             enable_hierarchical_cache=False,
         )
         config = SimpleNamespace(
@@ -928,6 +934,38 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 self._resolved(self._construct(*qwen4), "ple_offload_embedding")
             )
 
+    def test_qwen4_fp8_indexer_dtype_platform_gate(self):
+        """fp8_e4m3 needs CUDA SM90/SM100 and a compressed QSA indexer. The bf16
+        spellings never consult the platform."""
+        qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
+        compressed = {
+            "indexer_n_heads": 4,
+            "indexer_kv_heads": 1,
+            "indexer_head_dim": 128,
+            "indexer_budget": 2048,
+            "indexer_compress_ratio": 4,
+        }
+        with override_platform(is_cuda=True, is_sm100=True):
+            sa = self._construct(
+                *qwen4, config_extra=compressed, qsa_indexer_dtype="fp8_e4m3"
+            )
+            self.assertEqual(self._resolved(sa, "qsa_indexer_dtype"), "fp8_e4m3")
+            # No compressed indexer fields: no QSA profile, nothing to store in fp8.
+            with self.assertRaisesRegex(ValueError, "compressed QSA indexer"):
+                self._construct(*qwen4, qsa_indexer_dtype="fp8_e4m3")
+        with override_platform(
+            is_cuda=False, is_hip=True, is_sm90=False, is_sm100=False
+        ):
+            with self.assertRaisesRegex(ValueError, "SM90/SM100"):
+                self._construct(
+                    *qwen4, config_extra=compressed, qsa_indexer_dtype="fp8_e4m3"
+                )
+            for name in ("auto", "bfloat16"):
+                sa = self._construct(
+                    *qwen4, config_extra=compressed, qsa_indexer_dtype=name
+                )
+                self.assertEqual(self._resolved(sa, "qsa_indexer_dtype"), name)
+
     def test_minimax_m2_enables_tf32_matmul(self):
         sa = self._construct("MiniMaxM2ForCausalLM", "llama")
         self.assertTrue(self._resolved(sa, "enable_tf32_matmul"))
@@ -1121,27 +1159,48 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
             self.assertEqual(_mimo_v2_overrides(_args(), None), {})
 
-    def test_mimo_v2_sm100_fp8_pins_flashinfer_trtllm_moe(self):
-        """Blackwell FP8 must not be left on the triton fused-MoE runner."""
+    def test_mimo_v2_sm100_defaults(self):
         from sglang.srt.arg_groups.model_overrides.mimo_v2 import _mimo_v2_overrides
 
         def _args(**kw):
-            defaults = dict(speculative_algorithm=None, moe_runner_backend="auto")
+            defaults = dict(
+                speculative_algorithm=None,
+                moe_runner_backend="auto",
+                attention_backend=None,
+                prefill_attention_backend=None,
+                decode_attention_backend=None,
+            )
             defaults.update(kw)
             return SimpleNamespace(**defaults)
 
         with override_platform(is_sm100=True):
             self.assertEqual(
                 _mimo_v2_overrides(_args(), _hf("fp8")),
-                {"moe_runner_backend": "flashinfer_trtllm"},
+                {"attention_backend": "fa4", "moe_runner_backend": "flashinfer_trtllm"},
             )
             # An explicit user choice is never overwritten.
             self.assertEqual(
-                _mimo_v2_overrides(_args(moe_runner_backend="triton"), _hf("fp8")), {}
+                _mimo_v2_overrides(_args(moe_runner_backend="triton"), _hf("fp8")),
+                {"attention_backend": "fa4"},
             )
             # FP4 checkpoints run through flashinfer_mxfp4, so they must not be
             # pinned to flashinfer_trtllm.
-            self.assertEqual(_mimo_v2_overrides(_args(), _hf("mxfp4")), {})
+            self.assertEqual(
+                _mimo_v2_overrides(_args(), _hf("mxfp4")),
+                {"attention_backend": "fa4"},
+            )
+            for field in (
+                "attention_backend",
+                "prefill_attention_backend",
+                "decode_attention_backend",
+            ):
+                self.assertEqual(
+                    _mimo_v2_overrides(
+                        _args(moe_runner_backend="triton", **{field: "triton"}),
+                        _hf("fp8"),
+                    ),
+                    {},
+                )
 
     def test_mimo_v2_family_is_registered(self):
         with override_platform(is_sm100=False):
@@ -2354,7 +2413,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             defaults = dict(
                 flashinfer_allreduce_fusion_backend=None,
                 tp_size=2,
-                enable_dp_attention=False,
+                attn_dp_size=1,
+                ep_join_mode=None,
                 nnodes=1,
                 moe_a2a_backend="none",
                 enforce_disable_flashinfer_allreduce_fusion=False,
@@ -2390,9 +2450,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 _flashinfer_allreduce_fusion_auto_enable(_view(tp_size=1)), {}
             )
             self.assertEqual(
-                _flashinfer_allreduce_fusion_auto_enable(
-                    _view(enable_dp_attention=True)
-                ),
+                _flashinfer_allreduce_fusion_auto_enable(_view(attn_dp_size=2)),
                 {},
             )
             self.assertEqual(
@@ -3375,16 +3433,26 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
         self.assertEqual(
             _data_parallelism_defaults(
-                ResolvedView(SimpleNamespace(dp_size=1, ep_join_mode=None))
+                ResolvedView(
+                    SimpleNamespace(dp_size=1, attn_dp_size=1, ep_join_mode=None)
+                )
             ),
-            {"enable_dp_attention": False, "enable_dp_lm_head": False},
+            {"enable_dp_lm_head": False},
         )
-        self.assertEqual(
-            _data_parallelism_defaults(
-                ResolvedView(SimpleNamespace(dp_size=2, ep_join_mode=None))
-            ),
-            {},
-        )
+        for dp_size, attn_dp_size in ((2, 1), (1, 2)):
+            with self.subTest(dp_size=dp_size, attn_dp_size=attn_dp_size):
+                self.assertEqual(
+                    _data_parallelism_defaults(
+                        ResolvedView(
+                            SimpleNamespace(
+                                dp_size=dp_size,
+                                attn_dp_size=attn_dp_size,
+                                ep_join_mode=None,
+                            )
+                        )
+                    ),
+                    {},
+                )
 
         self.assertEqual(
             _a2a_ep_size(
@@ -3467,6 +3535,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                                 cp_strategy="zigzag",
                                 tp_size=8,
                                 dp_size=1,
+                                attn_dp_size=1,
                                 ep_size=1,
                                 moe_a2a_backend="none",
                                 kv_cache_dtype="auto",
@@ -3478,21 +3547,23 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                             {
                                 "attention_backend": "dsa",
                                 "page_size": 64,
-                                "enable_dp_attention": True,
+                                "attn_dp_size": 1,
+                                "dp_size": 1,
                                 "moe_dense_tp_size": 1,
                                 "moe_a2a_backend": "deepep",
                                 "ep_size": 8,
                                 "attn_cp_size": 8,
                             },
                         )
-                        # interleave CP with dp>1 must assert
+                        # interleave CP with attention DP must assert
                         with self.assertRaises(AssertionError):
                             _deepseek_family_overrides(
                                 _args(
                                     enable_prefill_cp=True,
                                     cp_strategy="interleave",
                                     tp_size=8,
-                                    dp_size=2,
+                                    dp_size=1,
+                                    attn_dp_size=2,
                                 ),
                                 None,
                             )

@@ -112,7 +112,6 @@ def _compute_world_size() -> int:
     will hold the process groups, so there is nothing live to ask.
     """
     return compute_world_size(
-        enable_dp_attention=get_parallel().enable_dp_attention,
         dp_size=get_parallel().dp_size,
         tp_size=get_parallel().tp_size,
         pp_size=get_parallel().pp_size,
@@ -274,10 +273,10 @@ class RayEngine(Engine):
             )
 
             parallel = get_parallel()
-            if parallel.enable_dp_attention:
+            if parallel.attn_dp_enabled:
                 total_gpus = parallel.tp_size * parallel.pp_size
             else:
-                total_gpus = parallel.dp_size * parallel.tp_size * parallel.pp_size
+                total_gpus = parallel.num_dp_ranks * parallel.tp_size * parallel.pp_size
 
             nnodes = parallel.nnodes
             gpus_per_node = total_gpus // nnodes
@@ -318,7 +317,7 @@ class RayEngine(Engine):
             rank0_bundle_idx = int(indices_str.split(",")[0]) if indices_str else 0
             rank0_node_ip = _get_bundle_node_ip(pg, rank0_bundle_idx)
 
-        if get_parallel().dp_size == 1:
+        if get_parallel().num_dp_ranks == 1:
             dist_init_addr = f"{rank0_node_ip}:{port_args.nccl_port}"
             logger.info(f"dist_init_addr: {dist_init_addr}")
 
@@ -448,17 +447,17 @@ class RayEngine(Engine):
         )
 
         parallel = get_parallel()
-        if parallel.enable_dp_attention:
+        if parallel.attn_dp_enabled:
             # DP attention folds DP into TP — total GPUs = tp_size * pp_size
             total_gpus = parallel.tp_size * parallel.pp_size
         else:
-            total_gpus = parallel.dp_size * parallel.tp_size * parallel.pp_size
+            total_gpus = parallel.num_dp_ranks * parallel.tp_size * parallel.pp_size
         gpus_per_node = total_gpus // parallel.nnodes
         logger.info(
             f"Ray DP cluster: {parallel.nnodes} nodes, "
             f"{gpus_per_node} GPUs/node, dp_size={parallel.dp_size}, "
-            f"tp_size={parallel.tp_size}, pp_size={parallel.pp_size}, "
-            f"enable_dp_attention={parallel.enable_dp_attention}"
+            f"attn_dp_size={parallel.attn_dp_size}, "
+            f"tp_size={parallel.tp_size}, pp_size={parallel.pp_size}"
         )
 
         # Declared on the record itself so `PortArgs.init_new()` can compute

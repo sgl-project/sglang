@@ -30,9 +30,8 @@ NEMOTRON_3_SUPER_NVFP4_ARGS = [
 ]
 
 DP_ATTENTION_EP_ARGS = [
-    "--dp-size",
+    "--attn-dp-size",
     "4",
-    "--enable-dp-attention",
     "--enable-dp-lm-head",
     "--ep-size",
     "4",

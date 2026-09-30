@@ -12,12 +12,7 @@ import { config } from '/src/snippets/configs/inclusionAI/ming-image.jsx';
 
 ## 1. Quick start
 
-Install the dependencies, then this integration from its source checkout:
-
-```bash Installation
-uv pip install "sglang[diffusion]" --prerelease=allow
-uv pip install -e "python[diffusion]" --no-deps
-```
+Use a nightly Docker image containing this integration, or install from source, following the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation). Run the commands below inside that environment.
 
 Choose **Design** for generation or editing and **Design-Layer** for decomposition.
 The two checkpoints require separate servers. Start with one H200 on Linux/CUDA;
