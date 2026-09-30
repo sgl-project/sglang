@@ -10,6 +10,9 @@ class SpeculativeSamplingMaskCapture(msgspec.Struct):
     max_top_k: int
     greedy_mask: torch.Tensor | None = None
     support_capture_indices: torch.Tensor | None = None
+    # False when acceptance did not sample exactly from target_probs (e.g.
+    # relaxed thresholds); every captured row is then reported INVALID.
+    exact_target_policy: bool = True
 
     def build_output(
         self,
@@ -85,7 +88,7 @@ class SpeculativeSamplingMaskCapture(msgspec.Struct):
                     )
 
         statuses = torch.where(
-            torch.isfinite(selected_logprobs),
+            torch.isfinite(selected_logprobs) & self.exact_target_policy,
             int(SamplingMaskStatus.OK),
             int(SamplingMaskStatus.INVALID),
         ).to(torch.int8)

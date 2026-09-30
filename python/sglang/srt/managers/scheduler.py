@@ -5412,6 +5412,25 @@ class Scheduler(
                     and self.chunked_req.return_sampling_mask
                     and not self.chunked_req.finished()
                 )
+                if self.disaggregation_mode == DisaggregationMode.DECODE:
+                    prealloc_queue = self.disagg_decode_prealloc_queue
+                    decode_reqs = [
+                        *prealloc_queue.queue,
+                        *prealloc_queue.pending_reqs,
+                        *self.disagg_decode_transfer_queue.queue,
+                    ]
+                    has_active_mask_request |= any(
+                        decode_req.req.return_sampling_mask
+                        and not decode_req.req.finished()
+                        for decode_req in decode_reqs
+                    )
+                    has_active_mask_request |= any(
+                        req.return_sampling_mask and not req.finished()
+                        for req in (
+                            *prealloc_queue.retracted_queue,
+                            *prealloc_queue.held_rebootstrap_reqs,
+                        )
+                    )
                 if has_active_mask_request:
                     logging.warning(
                         f"Updating {k} is rejected while DFlash sampling-mask "
