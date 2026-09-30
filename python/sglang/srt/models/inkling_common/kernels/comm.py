@@ -7,9 +7,8 @@ import msgspec
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.forward_context import (
-    is_in_full_prefill_graph,
-    is_in_prefill_graph,
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
 )
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import is_cuda
@@ -716,7 +715,7 @@ def scattered_ar_sconv_fusable(
     # Prefill scope: the BCG runner's eager-break sites are not wired (its
     # baked flags would disagree with the break bodies), so it falls back
     # to the unfused chain. The FULL prefill CUDA-graph
-    # backend (context.full_graph -- the whole model captured uniformly) IS
+    # backend (the whole model captured uniformly) IS
     # supported: the kernel is capture-safe (barrier epochs advance across
     # replays; validated capture+replay) and all its metadata (qsl/si/
     # cache_mask/safe_idx/track rows) is recomputed in-graph from the
@@ -725,7 +724,7 @@ def scattered_ar_sconv_fusable(
     # [:raw]), and sentinel request slots have qlen == 0 so the in-kernel
     # cache update/track skip them.
 
-    if is_in_prefill_graph() and not is_in_full_prefill_graph():
+    if is_in_breakable_cuda_graph() and fm.is_extend_without_speculative():
         return False
     comm = group.torch_symm_mem_comm
     if (
@@ -1053,7 +1052,7 @@ def fullwidth_ar_sconv_fusable(
     # pieces can't carry the cross-layer producer contract; the FULL prefill
     # CUDA-graph backend is supported (capture-safe kernel, in-graph metadata).
 
-    if is_in_prefill_graph() and not is_in_full_prefill_graph():
+    if is_in_breakable_cuda_graph():
         return False
     comm = group.torch_symm_mem_comm
     if (

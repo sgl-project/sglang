@@ -22,16 +22,13 @@ from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import DSANPUIndexerMixin
-from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
-    GRAPH_WEIGHTS_PROJ_LORA_ERROR,
-)
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
 )
 from sglang.srt.layers.attention.dsa.utils import (
     aiter_can_use_preshuffle_paged_mqa,
+    is_dsa_bcg_prefill,
     is_dsa_enable_prefill_cp,
-    is_graph_dsa_split_op_surface,
 )
 from sglang.srt.layers.attention.graph_variants import DSA_DENSE
 from sglang.srt.layers.attention.mqa_logits_utils import (
@@ -138,12 +135,20 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
 
+GRAPH_WEIGHTS_PROJ_LORA_ERROR = (
+    "DSA indexer weights_proj LoRA is incompatible with "
+    "breakable CUDA graph; remove the explicit "
+    "prefill cuda-graph backend override or drop "
+    "indexer.weights_proj from the LoRA target modules."
+)
+
+
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
 
 if _is_cuda or _is_hip:
-    # Plain-torch graph helpers: usable wherever the split-op surface is.
-    from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
+    # Head-gate custom ops support torch.compile on CUDA and HIP.
+    from sglang.srt.layers.attention.dsa.head_gate import (
         logits_head_gate_graph,
         scale_head_gate_graph,
     )
@@ -1680,10 +1685,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             q_fp8, weights = self._fused_q_prepare_and_store(
                 x, q_lora, positions, forward_batch, layer_id, act_quant
             )
-        elif (
-            is_graph_dsa_split_op_surface(forward_batch)
-            and not self.dsa_enable_prefill_cp
-        ):
+        elif is_dsa_bcg_prefill(forward_batch) and not self.dsa_enable_prefill_cp:
             # Default path for non-CP prefill under PCG/BCG: run the whole indexer
             # (q/k proj, head gate, k-cache store, topk) as a single eager split op
             # instead of capturing it piecemeal in the graph. The split op is

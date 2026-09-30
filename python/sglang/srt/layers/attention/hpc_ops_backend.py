@@ -45,10 +45,11 @@ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
-    is_in_prefill_graph,
+    is_in_full_prefill_graph,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
+    is_in_breakable_cuda_graph,
 )
 
 if TYPE_CHECKING:
@@ -406,7 +407,13 @@ class HPCOpsAttnBackend(AttentionBackend):
             device=qkv.device,
         )
 
-        if is_extend and is_in_prefill_graph():
+        if is_extend and (
+            is_in_full_prefill_graph()
+            or (
+                is_in_breakable_cuda_graph()
+                and forward_batch.forward_mode.is_extend_without_speculative()
+            )
+        ):
             self._eager_rope_store_kv(
                 qkv,
                 cos_sin_cache,

@@ -44,8 +44,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Track first occurrence of each fallback warning to avoid log spam.
-
 
 def resolve_decode_backend(
     cuda_graph_runner: BaseCudaGraphRunner,

@@ -132,15 +132,12 @@ def is_dsa_prefill_cp_interleave():
 is_dsa_prefill_cp_round_robin_split = is_dsa_prefill_cp_interleave
 
 
-# Structural surface where the graph DSA split-op dispatch (DSA indexer) and the
-# MLA BMM-into-attention fusion apply: a non-speculative extend (prefill) running
-# inside a piecewise/breakable CUDA graph. Both fusions are now on by default on
-# this surface (no feature flag); each adds its own extra carve-outs at its call
-# site (e.g. the indexer also excludes DSA prefill context parallelism).
-def is_graph_dsa_split_op_surface(forward_batch: "ForwardBatch") -> bool:
+# CUDA BCG prefill enables the DSA indexer eager region and MLA BMM-attention
+# fusion. Each caller applies its own additional eligibility checks.
+def is_dsa_bcg_prefill(forward_batch: "ForwardBatch") -> bool:
     return (
         is_cuda()
-        and (is_in_breakable_cuda_graph())
+        and is_in_breakable_cuda_graph()
         and forward_batch.forward_mode.is_extend_without_speculative()
     )
 

@@ -36,7 +36,6 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.forward_context import is_in_prefill_graph
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
     is_in_breakable_cuda_graph,
@@ -474,7 +473,10 @@ class InklingDecoderLayer(nn.Module):
             return hidden_states, residual
 
         # Prefill replay rebinds the group's forward_batch to the live prepared batch.
-        if is_in_breakable_cuda_graph() and is_in_prefill_graph():
+        if (
+            is_in_breakable_cuda_graph()
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
             # BCG prefill path: the AR fusion is decode-only, so partials never
             # reach (or leave) this branch.
             assert not prev_mlp_partial and not fuse_ar_sconv and not fuse_attn_ar
@@ -913,7 +915,10 @@ class InklingCausalLLM(nn.Module):
                 )
             # Match the per-layer prefill eager region.
             scattered = self.layers[-1].scattered_sconv
-            if is_in_breakable_cuda_graph() and is_in_prefill_graph():
+            if (
+                is_in_breakable_cuda_graph()
+                and forward_batch.forward_mode.is_extend_without_speculative()
+            ):
                 # Under scattered sconv the input is the last MoE's [T, H/P]
                 # shard; the break's output buffer is post-all-gather [T, H].
                 out_shape = (

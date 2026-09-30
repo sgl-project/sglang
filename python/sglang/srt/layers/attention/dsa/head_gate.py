@@ -8,13 +8,6 @@ from sglang.srt.utils.custom_op import register_custom_op
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 
-GRAPH_WEIGHTS_PROJ_LORA_ERROR = (
-    "DSA indexer weights_proj LoRA is incompatible with "
-    "breakable CUDA graph; remove the explicit "
-    "prefill cuda-graph backend override or drop "
-    "indexer.weights_proj from the LoRA target modules."
-)
-
 
 if _is_cuda or _is_hip:
 

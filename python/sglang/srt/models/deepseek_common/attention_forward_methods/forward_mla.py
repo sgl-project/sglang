@@ -13,7 +13,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.attention.dsa.utils import is_graph_dsa_split_op_surface
+from sglang.srt.layers.attention.dsa.utils import is_dsa_bcg_prefill
 from sglang.srt.layers.attention.dsa_backend import prepare_kv_for_attention
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mla_extend,
@@ -36,7 +36,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
-    is_in_prefill_graph,
+    is_in_full_prefill_graph,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -153,10 +153,9 @@ class DeepseekMLAForwardMixin:
     ) -> bool:
         if getattr(self, "_kimi_split_gguf_kv_b", False):
             return False
-        # Shared activation surface with the DSA indexer graph dispatch
-        # (in piecewise/breakable graph + non-speculative extend). Like the indexer
-        # dispatch, this fusion is on by default on that surface.
-        if not is_graph_dsa_split_op_surface(forward_batch):
+        # Like the DSA indexer eager region, this fusion is enabled for
+        # non-speculative CUDA BCG prefill.
+        if not is_dsa_bcg_prefill(forward_batch):
             return False
         if not self.use_dsa:
             return False
@@ -247,11 +246,7 @@ class DeepseekMLAForwardMixin:
             return None
         # Graph/compile surfaces run their own dispatch; the python-side
         # stash handshake is eager-only.
-        if is_graph_dsa_split_op_surface(forward_batch):
-            return None
-        if is_in_prefill_graph():
-            return None
-        if is_in_breakable_cuda_graph():
+        if is_in_breakable_cuda_graph() or is_in_full_prefill_graph():
             return None
         if get_is_capture_mode():
             return None

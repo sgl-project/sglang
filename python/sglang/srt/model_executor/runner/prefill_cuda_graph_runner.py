@@ -683,7 +683,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         with forward_context(
             ForwardContext(
                 attn_backend=self.model_runner.attn_backend,
-                prefill_graph=True,
                 full_graph=self._is_full_backend,
                 raw_num_tokens=raw_num_tokens,
             )

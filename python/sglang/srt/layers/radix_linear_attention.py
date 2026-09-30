@@ -22,10 +22,11 @@ from torch import nn
 
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
-    is_in_prefill_graph,
+    is_in_full_prefill_graph,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
+    is_in_breakable_cuda_graph,
 )
 
 if TYPE_CHECKING:
@@ -82,7 +83,13 @@ class RadixLinearAttention(nn.Module):
         b: torch.Tensor,
     ) -> torch.Tensor:
         is_extend = forward_batch.forward_mode.is_extend()
-        if is_extend and is_in_prefill_graph():
+        if is_extend and (
+            is_in_full_prefill_graph()
+            or (
+                is_in_breakable_cuda_graph()
+                and forward_batch.forward_mode.is_extend_without_speculative()
+            )
+        ):
             # Output shape from linear attention: (1, seq_len, num_v_heads, head_v_dim)
             seq_len = mixed_qkv.shape[0]
             output = torch.empty(

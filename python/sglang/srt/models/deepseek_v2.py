@@ -905,7 +905,7 @@ class DeepseekV2MoE(nn.Module):
     def _can_dual_stream_graph(self, hidden_states: torch.Tensor) -> bool:
         return (
             _enable_pcg_dsv2_dual_stream
-            and (is_in_breakable_cuda_graph())
+            and is_in_breakable_cuda_graph()
             and get_moe_runner_backend().is_flashinfer_trtllm()
             and self.alt_stream is not None
             and self.num_fused_shared_experts == 0

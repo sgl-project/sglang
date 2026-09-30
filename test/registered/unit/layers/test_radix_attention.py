@@ -49,7 +49,9 @@ def test_dense_outputs_padding_and_lse(breakable, return_lse, tokens):
     with (
         forward_context(
             ForwardContext(
-                SimpleNamespace(forward=attention), True, not breakable, tokens
+                SimpleNamespace(forward=attention),
+                full_graph=not breakable,
+                raw_num_tokens=tokens,
             )
         ),
         patch(
@@ -89,7 +91,9 @@ def test_extra_kwargs_and_exception_restore():
         raise RuntimeError("backend failed")
 
     with forward_context(
-        ForwardContext(SimpleNamespace(forward=attention), True, True, 2)
+        ForwardContext(
+            SimpleNamespace(forward=attention), full_graph=True, raw_num_tokens=2
+        )
     ):
         with pytest.raises(RuntimeError, match="backend failed"):
             layer(
@@ -126,7 +130,9 @@ def test_sparse_full_graph_two_outputs(tokens, has_index_value):
         )
 
     with forward_context(
-        ForwardContext(SimpleNamespace(forward=attention), True, True, tokens)
+        ForwardContext(
+            SimpleNamespace(forward=attention), full_graph=True, raw_num_tokens=tokens
+        )
     ):
         index_output, output = layer(q, q, q, batch, idx_q=idx, idx_k=idx)
     assert output.shape == (4, 6) and index_output.shape == (4, 2)
@@ -163,7 +169,7 @@ def test_output_dtype_follows_values():
     backend = SimpleNamespace(
         forward=lambda q, k, v, *args, **kwargs: torch.ones_like(v)
     )
-    with forward_context(ForwardContext(backend, True, True, 2)):
+    with forward_context(ForwardContext(backend, full_graph=True, raw_num_tokens=2)):
         assert layer(q, q, v, batch).dtype == torch.bfloat16
 
 
@@ -194,7 +200,7 @@ def test_attention_replay_uses_live_batch_and_static_output_buffers(return_lse):
     )
     backend = SimpleNamespace(forward=attention)
     with (
-        forward_context(ForwardContext(backend, True, False, 2)),
+        forward_context(ForwardContext(backend, raw_num_tokens=2)),
         patch(
             "sglang.srt.layers.radix_attention.is_in_breakable_cuda_graph",
             return_value=True,
@@ -207,7 +213,7 @@ def test_attention_replay_uses_live_batch_and_static_output_buffers(return_lse):
             bcg._current_capture_var.reset(token)
     output, lse = result if return_lse else (result, None)
     pointer = output.data_ptr()
-    with forward_context(ForwardContext(backend, True, False, 1)):
+    with forward_context(ForwardContext(backend, raw_num_tokens=1)):
         graph._break_fns[0](live_batch)
     assert seen == [captured_batch, live_batch]
     assert output.data_ptr() == pointer

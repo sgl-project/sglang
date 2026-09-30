@@ -36,7 +36,6 @@ class ForwardContext:
 
     attn_backend: AttentionBackend
     # Runner-owned graph policy; no module registries or hidden batch lookup.
-    prefill_graph: bool = False
     full_graph: bool = False
     raw_num_tokens: Optional[int] = None
 
@@ -83,10 +82,6 @@ def forward_context(ctx: ForwardContext):
         yield
     finally:
         set_forward_context(prev)
-
-
-def is_in_prefill_graph() -> bool:
-    return _current is not None and _current.prefill_graph
 
 
 def is_in_full_prefill_graph() -> bool:

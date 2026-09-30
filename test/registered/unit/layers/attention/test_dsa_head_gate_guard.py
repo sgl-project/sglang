@@ -19,23 +19,23 @@ class TestDsaHeadGateGuard(CustomTestCase):
     """
 
     def test_definition_and_import_agree(self):
-        from sglang.srt.layers.attention.dsa import dsa_indexer, dsa_prefill_cuda_graph
+        from sglang.srt.layers.attention.dsa import dsa_indexer, head_gate
 
         for name in HELPERS:
             with self.subTest(helper=name):
                 self.assertEqual(
-                    hasattr(dsa_prefill_cuda_graph, name),
-                    hasattr(dsa_indexer, name),
+                    name in vars(head_gate),
+                    name in vars(dsa_indexer),
                     f"{name} is defined on one side of the guard but not the other",
                 )
 
     def test_helpers_exist_on_cuda_and_hip(self):
-        from sglang.srt.layers.attention.dsa import dsa_prefill_cuda_graph
+        from sglang.srt.layers.attention.dsa import head_gate
 
         expected = is_cuda() or is_hip()
         for name in HELPERS:
             with self.subTest(helper=name):
-                self.assertEqual(hasattr(dsa_prefill_cuda_graph, name), expected)
+                self.assertEqual(name in vars(head_gate), expected)
 
 
 if __name__ == "__main__":

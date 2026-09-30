@@ -305,7 +305,6 @@ def _run_split_op_extend_case(
         forward_context(
             ForwardContext(
                 attn_backend=split_fixture.backend,
-                prefill_graph=True,
                 full_graph=not breakable,
                 raw_num_tokens=raw_num_tokens,
             )
