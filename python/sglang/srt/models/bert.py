@@ -484,4 +484,29 @@ class BertForSequenceClassification(nn.Module):
         return self.pooler(hidden_states, forward_batch)
 
 
-EntryClass = [BertModel, Contriever, BertForSequenceClassification]
+class BertForMaskedLM(BertModel):
+    """Serve a masked-LM checkpoint (e.g. google-bert/bert-base-uncased) for embeddings.
+
+    The encoder is identical to BertModel; only the checkpoint layout differs --
+    encoder weights carry a `bert.` prefix, the MLM and next-sentence heads under
+    `cls.` are unused here, and the original TF export named every LayerNorm
+    scale/offset `gamma`/`beta` instead of `weight`/`bias`.
+    """
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
+        def encoder_weights():
+            for name, weight in weights:
+                if name.startswith("cls."):
+                    continue
+                if name.startswith("bert."):
+                    name = name[len("bert.") :]
+                if name.endswith("LayerNorm.gamma"):
+                    name = name[: -len("gamma")] + "weight"
+                elif name.endswith("LayerNorm.beta"):
+                    name = name[: -len("beta")] + "bias"
+                yield (name, weight)
+
+        return super().load_weights(encoder_weights())
+
+
+EntryClass = [BertModel, Contriever, BertForSequenceClassification, BertForMaskedLM]
