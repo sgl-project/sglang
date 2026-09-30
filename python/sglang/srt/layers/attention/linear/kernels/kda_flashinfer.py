@@ -1823,6 +1823,10 @@ class CakeKDAKernel(FlashInferKDAKernel):
     uses_state_checkpoints = True
     uses_cake_prefill = True
     supports_packed_decode = True
+    # The exported packed decode is the Kimi-K3 contract (bounded gate, 12
+    # packed heads); decode() takes lower_bound on both the Cake and the
+    # Triton fallback path.
+    supports_bounded_gate_decode = True
     supports_cake_route_telemetry = True
 
     def __init__(self):

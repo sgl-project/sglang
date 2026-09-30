@@ -23,6 +23,12 @@ class LinearAttnKernelBase(ABC):
     # tracked batches loudly (NotImplementedError) keep the default False.
     supports_track_state_snapshot: bool = False
 
+    # True when decode() implements the bounded ("safe") gate, i.e. honors a
+    # finite ``lower_bound`` (Kimi-K3: gate_lower_bound=-5.0). The dispatcher
+    # refuses bounded-gate decode on kernels that keep the default False
+    # instead of letting them silently run the unbounded softplus gate.
+    supports_bounded_gate_decode: bool = False
+
     @abstractmethod
     def decode(
         self,
