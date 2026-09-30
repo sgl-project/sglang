@@ -455,6 +455,16 @@ def is_dp_attention_enabled() -> bool:
     return get_flags().dp.enabled
 
 
+def get_dp_tp_group() -> GroupCoordinator:
+    """The TP ranks that run one DP rank's batch: the attention-TP group with
+    attention DP, otherwise the whole TP group.
+
+    Attention-CP peers of a DP rank are members only in the second case.
+    """
+    parallel = get_parallel()
+    return parallel.attn_tp_group if parallel.attn_dp_enabled else parallel.tp_group
+
+
 def is_allocation_symmetric() -> bool:
     return not is_dp_attention_enabled() or is_dp_max_padding()
 
