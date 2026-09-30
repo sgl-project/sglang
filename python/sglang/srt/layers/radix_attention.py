@@ -129,7 +129,9 @@ class RadixAttention(nn.Module):
         self.scaling = scaling
         self.layer_id = layer_id
         self.logit_cap = logit_cap
-        self.sliding_window_size = sliding_window_size or -1
+        self.sliding_window_size = (
+            -1 if sliding_window_size is None else sliding_window_size
+        )
         self.is_cross_attention = is_cross_attention
         self.use_irope = use_irope
         self.use_prefill_attention_wrapper = use_prefill_attention_wrapper

@@ -305,13 +305,16 @@ def build_kv_cache(
 
     retraction_backup = resolve_decode_retraction_backup(tp_worker=tp_worker)
 
+    from sglang.srt.configs.transformers_backend import (
+        transformers_requires_full_sequence,
+    )
+
     disable_radix_cache = get_memory().disable_radix_cache or (
-        model_config.is_multimodal and uses_transformers_backend
+        uses_transformers_backend and transformers_requires_full_sequence(model_config)
     )
     if disable_radix_cache and not get_memory().disable_radix_cache:
         logger.warning(
-            "Radix cache is disabled for multimodal models with the "
-            "Transformers backend to avoid multimodal prefix-cache mismatches."
+            "Radix cache is disabled because this Transformers task requires a complete sequence."
         )
 
     # Decode-side radix cache supports SWA only through the unified tree, whose

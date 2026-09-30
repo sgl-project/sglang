@@ -1,12 +1,16 @@
+from __future__ import annotations
+
 import logging
 from dataclasses import dataclass
 from enum import Enum
-from typing import Iterable, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
 
@@ -260,6 +264,7 @@ def get_default_hidden_dim(
 
 def get_normalized_target_modules(
     target_modules: Union[str, Iterable[str]],
+    base_model: Optional[torch.nn.Module] = None,
 ) -> set[str]:
     """
     Mapping a list of target module name to names of the normalized LoRA weights.
@@ -270,6 +275,10 @@ def get_normalized_target_modules(
     should use :func:`auto_detect_lora_target_modules` to resolve the shorthand
     against the loaded base model.
     """
+    resolver = getattr(base_model, "get_lora_target_modules", None)
+    if resolver is not None:
+        return resolver(target_modules)
+
     # Handle PEFT shorthand strings — return {"all"} as sentinel.
     # Callers can resolve to concrete names via auto_detect_lora_target_modules().
     if isinstance(target_modules, str):
@@ -417,7 +426,7 @@ _KNOWN_LORA_TARGET_MODULES = frozenset(
 )
 
 
-def auto_detect_lora_target_modules(model: "torch.nn.Module") -> set:
+def auto_detect_lora_target_modules(model: torch.nn.Module) -> set:
     """Discover LoRA-compatible modules by inspecting the base model.
 
     Walks the model graph and returns the set of *normalized* target-module
@@ -425,6 +434,10 @@ def auto_detect_lora_target_modules(model: "torch.nn.Module") -> set:
     can handle.  This is used to resolve PEFT shorthands like ``"all-linear"``
     without requiring the user to enumerate modules on the CLI.
     """
+    resolver = getattr(model, "get_lora_target_modules", None)
+    if resolver is not None:
+        return resolver("all-linear")
+
     from sglang.srt.layers.linear import LinearBase
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
     from sglang.srt.layers.vocab_parallel_embedding import (

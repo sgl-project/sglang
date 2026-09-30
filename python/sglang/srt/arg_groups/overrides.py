@@ -1063,6 +1063,17 @@ def _attention_backend_default(view: Any) -> dict:
 
 
 @register_post_process
+def _transformers_mla_paged_prefill(view: Any) -> dict:
+    if (
+        view.model_impl == "transformers"
+        and not view.flashinfer_mla_disable_ragged
+        and use_mla_backend(view)
+    ):
+        return {"flashinfer_mla_disable_ragged": True}
+    return {}
+
+
+@register_post_process
 def _mla_backend_page_constraints(view: Any) -> dict:
     """Resolve MLA/TRTLLM page-size constraints, chaining adjustments on the local value."""
     page_size = view.page_size

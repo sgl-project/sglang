@@ -101,6 +101,20 @@ def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
             model_runner.is_draft_worker and model_runner.draft_attention_backend
         ),
     )
+    validate_backend = getattr(model_runner.model, "validate_attention_backend", None)
+    if validate_backend is not None:
+        validate_backend(resolved.prefill, resolved.decode)
+    if getattr(model_runner.model, "uses_native_mla", False):
+        from sglang.srt.models.transformers.mla import validate_mla_backend_options
+
+        validate_mla_backend_options(
+            resolved.prefill,
+            resolved.decode,
+            kv_cache_dtype=server_args.kv_cache_dtype,
+            dcp_enabled=get_parallel().attn_cp_size > 1,
+            enable_dp_attention=get_parallel().enable_dp_attention,
+            enable_lora=server_args.enable_lora,
+        )
 
     if get_disagg().enable_pdmux:
         attn_backend = _build_resolved_backend(

@@ -79,6 +79,9 @@ def _is_sequence_classification_model(architectures: list[str]) -> bool:
 def _get_transformers_backend_arch(
     model_config: ModelConfig, architectures: list[str]
 ) -> str:
+    from sglang.srt.configs.transformers_task import resolve_transformers_task
+
+    resolve_transformers_task(model_config)
     is_pooling = not model_config.is_generation
     is_multimodal = model_config.is_multimodal or (
         model_config.hf_config is not model_config.hf_text_config
@@ -132,6 +135,7 @@ def resolve_transformers_arch(model_config: ModelConfig, architectures: list[str
                     module, model_config.model_path, revision=model_config.revision
                 )
                 for name, module in sorted(auto_map.items(), key=lambda x: x[0])
+                if getattr(model_config, "trust_remote_code", False)
             }
         except Exception as e:
             logger.warning(
@@ -171,12 +175,9 @@ def resolve_transformers_arch(model_config: ModelConfig, architectures: list[str
             if hasattr(model_module, "is_backend_compatible") and (
                 not model_module.is_backend_compatible()
             ):
-                logger.warning(
+                raise ValueError(
                     "The Transformers implementation of %s reports it is not "
-                    "backend-compatible (_supports_attention_backend=False). "
-                    "Proceeding anyway because --model-impl=transformers was "
-                    "explicitly requested. The model may not work correctly.",
-                    arch,
+                    "backend-compatible (_supports_attention_backend=False)." % arch
                 )
         if model_config.model_impl == ModelImpl.AUTO:
             if hasattr(model_module, "is_backend_compatible") and (

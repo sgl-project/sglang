@@ -52,7 +52,7 @@ class TestEmbeddingModelSpec(unittest.TestCase):
         matrix = embedding_support_matrix()
         by_architecture = {row["architecture"]: row for row in matrix}
 
-        self.assertEqual(len(matrix), 7)
+        self.assertEqual(len(matrix), 9)
         self.assertEqual(by_architecture["BertModel"]["family"], "bert")
         self.assertEqual(by_architecture["BertModel"]["attention"], "bidirectional")
         self.assertTrue(by_architecture["CLIPModel"]["supports_multimodal"])

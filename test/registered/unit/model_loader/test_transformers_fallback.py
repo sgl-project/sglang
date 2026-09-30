@@ -55,13 +55,15 @@ class TestTransformersFallbackSkipSubstrs(CustomTestCase):
             pass
 
         with (
-            get_parallel().override(pp_group=SimpleNamespace()),
+            get_parallel().override(
+                pp_group=SimpleNamespace(), tp_size=1, attn_tp_size=1
+            ),
             patch(
-                "sglang.srt.models.transformers.get_hf_text_config",
+                "sglang.srt.models.transformers.base.get_hf_text_config",
                 return_value=SimpleNamespace(),
             ),
             patch(
-                "sglang.srt.models.transformers._resolve_attention_backend_model_cls",
+                "sglang.srt.models.transformers.base._resolve_attention_backend_model_cls",
                 side_effect=_Stop,
             ),
             self.assertRaises(_Stop),

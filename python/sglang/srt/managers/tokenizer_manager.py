@@ -1288,7 +1288,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         input_token_num += self.num_reserved_tokens
 
         # Validate input length
-        if input_token_num >= self.context_len:
+        max_input_tokens = self.context_len - (
+            0 if isinstance(obj, EmbeddingReqInput) else 1
+        )
+        if input_token_num > max_input_tokens:
             if self.allow_auto_truncate:
                 logger.warning(
                     f"The input ({input_token_num} tokens) is longer than the "

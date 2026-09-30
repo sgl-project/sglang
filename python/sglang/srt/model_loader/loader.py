@@ -295,6 +295,8 @@ def _initialize_model(
         "config": model_config.hf_config,
         "quant_config": quant_config,
     }
+    if getattr(model_class, "supports_model_config", False):
+        kwargs["model_config"] = model_config
 
     # Only add sparse head kwargs if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
     if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set():

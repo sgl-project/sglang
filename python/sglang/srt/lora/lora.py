@@ -116,7 +116,7 @@ class LoRAAdapter(nn.Module):
             )
             if not isinstance(inner, FusedMoE):
                 continue
-            layer_id = get_layer_id(name)
+            layer_id = getattr(base_model, "get_lora_layer_id", get_layer_id)(name)
             if layer_id is not None:
                 gated_map[layer_id] = bool(inner.moe_runner_config.is_gated)
         return gated_map
@@ -164,8 +164,12 @@ class LoRAAdapter(nn.Module):
     def _process_weight(self, name: str, loaded_weight: torch.Tensor):
         from sglang.srt.lora.utils import get_normalized_target_modules
 
+        name_resolver = getattr(self.base_model, "normalize_lora_weight_name", None)
+        if name_resolver is not None:
+            name = name_resolver(name)
+
         normalized_target_modules = get_normalized_target_modules(
-            self.config.target_modules
+            self.config.target_modules, self.base_model
         )
 
         # Remap PEFT "unembed_tokens" key to "lm_head" so the weight is
@@ -173,7 +177,7 @@ class LoRAAdapter(nn.Module):
         if "unembed_tokens" in name:
             name = name.replace("unembed_tokens", "lm_head")
 
-        layer_id = get_layer_id(name)
+        layer_id = getattr(self.base_model, "get_lora_layer_id", get_layer_id)(name)
         if layer_id is not None:
             self.layers[layer_id].weights[name] = loaded_weight.cpu()
         elif "embed_tokens" in name or "lm_head" in name:
@@ -200,6 +204,11 @@ class LoRAAdapter(nn.Module):
             )
 
     def _normalize_weights(self):
+        normalizer = getattr(self.base_model, "normalize_lora_weights", None)
+        if normalizer is not None:
+            for layer_index, layer in enumerate(self.layers):
+                normalizer(layer.weights, layer_index)
+            return
         for layer in self.layers:
             weight_names = list(layer.weights.keys())
             self.normalize_qkv_proj(weight_names, layer.weights)

@@ -161,7 +161,11 @@ def install_torch_compiled(
         raise TypeError("module.__class__.forward must be callable")
     original_code = unbound_fwd.__code__
 
-    dyn_map = dynamic_arg_dims or _infer_dynamic_arg_dims_from_annotations(unbound_fwd)
+    dyn_map = (
+        dynamic_arg_dims
+        or getattr(module, "torch_compile_dynamic_arg_dims", None)
+        or _infer_dynamic_arg_dims_from_annotations(unbound_fwd)
+    )
 
     if backend_factory is None:
         from sglang.srt.compilation.backend import SGLangBackend
@@ -208,7 +212,13 @@ def install_torch_compiled(
                 val = ba.arguments[name]
                 if val is not None:
                     _mark_dynamic_on_value(val, dims)
-        _mark_dynamic_forward_batch(ba.arguments.get("forward_batch"))
+        batch = ba.arguments.get("forward_batch")
+        if batch is None:
+            for name, parameter in sig.parameters.items():
+                if parameter.kind == inspect.Parameter.VAR_KEYWORD:
+                    batch = ba.arguments.get(name, {}).get("forward_batch")
+                    break
+        _mark_dynamic_forward_batch(batch)
 
         # Avoid cross-instance cache reuse
         torch._dynamo.eval_frame.remove_from_cache(unbound_fwd.__code__)

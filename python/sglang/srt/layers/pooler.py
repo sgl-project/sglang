@@ -11,8 +11,6 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
-from sglang.srt.layers.activation import get_cross_encoder_activation_function
-
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -64,13 +62,12 @@ def pool_hidden_states(
         first_token_flat_indices[1:] += torch.cumsum(prompt_lens, dim=0)[:-1]
         return hidden_states[first_token_flat_indices]
     elif pooling_type == PoolingType.MEAN:
-        prompt_lens = forward_batch.extend_seq_lens
-        end_indices = torch.cumsum(prompt_lens, dim=0) - 1
-        cumulative_hidden_states = torch.cumsum(hidden_states, dim=0)
-        sums = cumulative_hidden_states[end_indices]
-        preceding_sums = torch.zeros_like(sums)
-        preceding_sums[1:] = cumulative_hidden_states[end_indices[:-1]]
-        return (sums - preceding_sums) / prompt_lens.unsqueeze(-1)
+        lengths = forward_batch.extend_seq_lens
+        padding = (hidden_states.shape[0] - lengths.sum()).to(lengths.dtype)
+        lengths = torch.cat([lengths, padding.reshape(1)])
+        return torch.segment_reduce(hidden_states.float(), "mean", lengths=lengths)[
+            :-1
+        ].to(hidden_states.dtype)
     else:
         raise ValueError(f"Unsupported pooling type: {pooling_type}")
 
@@ -295,6 +292,8 @@ class CrossEncodingPooler(nn.Module):
         super().__init__()
         self.classifier = classifier
         self.pooler = pooler
+        from sglang.srt.layers.activation import get_cross_encoder_activation_function
+
         self.default_activation_function = get_cross_encoder_activation_function(config)
 
     def forward(

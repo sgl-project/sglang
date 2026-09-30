@@ -569,15 +569,24 @@ class OpenAIServingRerank(OpenAIServingBase):
         for idx, item in enumerate(ret):
             if isinstance(item, dict):
                 score_val = item.get("embedding")
-                # Some rerank/reward models return scalar score as embedding[0].
                 if isinstance(score_val, list):
-                    if len(score_val) == 0 or not isinstance(
-                        score_val[0], (int, float)
+                    if (
+                        len(score_val) != 1
+                        or isinstance(score_val[0], bool)
+                        or not isinstance(score_val[0], (int, float))
                     ):
                         raise ValueError(
                             f"Invalid embedding score for rerank at index {idx}: {score_val!r}"
                         )
                     score_val = float(score_val[0])
+                if (
+                    isinstance(score_val, bool)
+                    or not isinstance(score_val, (int, float))
+                    or not math.isfinite(score_val)
+                ):
+                    raise ValueError(
+                        f"Rerank requires one finite scalar score per document, received {score_val!r} at index {idx}"
+                    )
                 responses.append(
                     RerankResponse(
                         score=float(score_val),
