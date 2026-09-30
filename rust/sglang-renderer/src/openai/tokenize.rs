@@ -1,14 +1,13 @@
 //! SGLang-compatible prompt and chat tokenization.
 
+use dynamo_protocols::types::{
+    ChatCompletionRequestMessage, ChatCompletionTool, ChatCompletionToolChoiceOption,
+};
 use futures::future::try_join_all;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sglang_processor::dynamo_protocols::types::{
-    ChatCompletionRequestMessage, ChatCompletionTool, ChatCompletionToolChoiceOption,
-};
-use sglang_processor::{ChatRequest, ReasoningEffort};
 
-use crate::{OneOrMany, RendererError, RendererService, ResponseError, ResponseErrorKind};
+use crate::{ChatRequest, OneOrMany, ReasoningEffort, RendererService, ResponseError};
 
 use super::protocol::normalize_reasoning_inputs;
 
@@ -20,7 +19,7 @@ pub(crate) async fn tokenize(
     let has_messages = request.messages.is_some();
     if has_prompt == has_messages {
         return Err(ResponseError {
-            kind: ResponseErrorKind::InvalidRequest,
+            kind: crate::ResponseErrorKind::InvalidRequest,
             message: "Exactly one of 'prompt' or 'messages' must be provided.".into(),
         });
     }
@@ -82,7 +81,7 @@ pub(crate) struct TokenizeRequest {
 }
 
 impl TokenizeRequest {
-    fn into_chat(mut self, served_model: &str) -> Result<ChatRequest, RendererError> {
+    fn into_chat(mut self, served_model: &str) -> Result<ChatRequest, crate::RendererError> {
         normalize_reasoning_inputs(
             &mut self.reasoning_effort,
             self.reasoning.take(),
@@ -93,6 +92,7 @@ impl TokenizeRequest {
             return Err(format!("The model `{model}` does not exist").into());
         }
         Ok(ChatRequest {
+            rid: "tokenize".into(),
             model,
             messages: self
                 .messages
@@ -104,7 +104,13 @@ impl TokenizeRequest {
             reasoning_effort: self.reasoning_effort,
             continue_final_message: self.continue_final_message,
             chat_template_args: self.chat_template_kwargs,
+            sampling_params: Default::default(),
+            choice_count: 1,
+            stream: false,
+            return_logprob: false,
+            top_logprobs_num: 0,
             parallel_tool_calls: true,
+            metadata: crate::GenerateRequestMetadata::default(),
         })
     }
 }

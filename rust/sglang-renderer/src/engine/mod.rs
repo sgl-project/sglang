@@ -2,7 +2,7 @@
 
 use futures::{StreamExt, TryStreamExt, future::BoxFuture};
 
-use crate::{GenerateRequest, ResponseError, ResponseErrorKind};
+use crate::{GenerateRequest, ResponseError};
 
 mod decode;
 mod http;
@@ -71,14 +71,14 @@ impl GenerationService {
 
 fn invalid(message: impl Into<String>) -> ResponseError {
     ResponseError {
-        kind: ResponseErrorKind::InvalidRequest,
+        kind: crate::ResponseErrorKind::InvalidRequest,
         message: message.into(),
     }
 }
 
 fn internal(message: impl Into<String>) -> ResponseError {
     ResponseError {
-        kind: ResponseErrorKind::Internal,
+        kind: crate::ResponseErrorKind::Internal,
         message: message.into(),
     }
 }

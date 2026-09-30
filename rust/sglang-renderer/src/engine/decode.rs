@@ -5,7 +5,6 @@ use crate::{
     GenerateRequest, GenerationOutput, GenerationOutputExtras, ResponseError, TokenIds,
     TokenLogprob,
 };
-use sglang_processor::dynamo_tokenizers;
 
 use super::{GenerationFinishReason, GenerationStream, MatchedStop, TokenStream};
 use futures::StreamExt;

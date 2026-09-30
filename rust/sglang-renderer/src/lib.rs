@@ -1,8 +1,11 @@
-//! Standalone SGLang renderer service: OpenAI routes, request preparation,
-//! and the SGLang HTTP `/generate` engine client over `sglang-processor`.
+//! Reusable request preprocessing for SGLang.
 //!
-//! Temporary: see README.md. Protocol adapters own middleware and framing;
-//! shared services own submission policy and decoding.
+//! The core renders normalized chat requests, lowers textual completions,
+//! tokenizes prompts, and produces the token-in contract consumed by SGLang.
+//! OpenAI operations and generation decoding are independent of transport.
+//! Templates, tokenizer loading, and output parsing come from `sglang-processor`.
+//! Protocol adapters own middleware and framing; shared services own request
+//! preparation, submission policy, and decoding.
 
 mod config;
 mod engine;
@@ -14,17 +17,27 @@ mod preprocessing;
 mod runtime;
 mod types;
 
-pub(crate) use config::{RendererConfig, RendererLimits, SamplingDefaults};
+pub use config::{RendererConfig, RendererLimits, SamplingDefaults};
 pub(crate) use engine::{
     GenerationFinishReason, GenerationOutput, GenerationOutputExtras, GenerationStream,
     MatchedStop, PositionLogprobs, TokenLogprob,
 };
-pub(crate) use error::{RendererError, ResponseError, ResponseErrorKind, UpstreamErrorCode};
-pub use launcher::run_cli;
-pub(crate) use preprocessing::{
-    ChatGenerateRequest, GenerateRequest, GenerateRequestIdentity, GenerateRequestMetadata,
-    GenerationOptions, PreparedChat, RendererService, SamplingParams, TextRequest,
-    TextRequestGroup, TokenIdsRequest,
+pub use error::{
+    RendererError, RendererErrorKind, ResponseError, ResponseErrorKind, UpstreamErrorCode,
 };
-pub(crate) use runtime::{RendererRuntimeConfig, serve};
-pub(crate) use types::{OneOrMany, TokenIds};
+pub use launcher::run_cli;
+pub(crate) use preprocessing::ChatFormatter;
+pub(crate) use preprocessing::{ChatPreprocessor, LoweredChat};
+pub use preprocessing::{
+    ChatRequest, DynamoTokenizer, PreparedChat, ReasoningEffort, RendererService, SamplingParams,
+    TextTokenizer, load_tokenizer,
+};
+pub use preprocessing::{
+    GenerateRequest, GenerateRequestMetadata, GenerateSamplingParams, GenerationOptions,
+    TextRequest, TokenIdsRequest,
+};
+pub use runtime::{RendererRuntimeConfig, serve};
+pub use sglang_processor::{
+    ChatEvent, ChatFinishReason, ChatResponseProcessor, ChatToolCallDelta, DecodedChatEvent,
+};
+pub use types::{OneOrMany, TokenIds};

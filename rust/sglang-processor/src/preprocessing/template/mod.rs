@@ -25,12 +25,12 @@ use thiserror::Error;
 
 /// Legacy stop strings: a single separator-style stop or a list of stops.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum OneOrMany<T> {
+pub enum OneOrMany<T> {
     One(T),
     Many(Vec<T>),
 }
 
-pub(crate) use self::deepseek_v4::DeepSeekV4Profile;
+pub use self::deepseek_v4::DeepSeekV4Profile;
 use self::{
     deepseek_v4::dynamo_reasoning_effort,
     kimi_k25::{deep_sort, encode_tools_to_typescript},
@@ -40,7 +40,7 @@ mod deepseek_v4;
 mod kimi_k25;
 mod select;
 
-pub(crate) use self::select::load_chat_support;
+pub use self::select::{ChatTemplateConfig, load_chat_support};
 
 const SUPPORTED_STYLES: &[&str] = &[
     "ADD_COLON_SINGLE",
@@ -75,7 +75,7 @@ const SUPPORTED_STYLES: &[&str] = &[
 /// A chat prompt formatter: either the model's HuggingFace Jinja template or a
 /// legacy SGLang conversation template.
 #[derive(Clone)]
-pub(crate) enum ChatFormatter {
+pub enum ChatFormatter {
     HuggingFace {
         formatter: PromptFormatter,
         thinking: ThinkingTemplates,
@@ -154,7 +154,7 @@ impl ThinkingPolicy {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct ThinkingTemplates {
+pub struct ThinkingTemplates {
     default: ThinkingPolicy,
     tool_use: Option<ThinkingPolicy>,
 }
@@ -392,7 +392,7 @@ impl ChatFormatter {
 
     /// Render the request while preserving tokenizer trust boundaries required
     /// by native formatters such as Kimi K3.
-    pub(super) fn render_prompt(
+    pub fn render_prompt(
         &self,
         request: &dyn OAIChatLikeRequest,
     ) -> Result<RenderedPrompt, TemplateError> {
@@ -440,7 +440,7 @@ impl ChatFormatter {
     /// (`str | list[str] | None`). Legacy/builtin templates define them (e.g.
     /// chatml's `<|im_end|>`); the HuggingFace renderer carries none, matching
     /// Python's jinja path, which keeps only the request's own stops.
-    pub(super) fn stop_strs(&self) -> Option<OneOrMany<String>> {
+    pub fn stop_strs(&self) -> Option<OneOrMany<String>> {
         match self {
             ChatFormatter::HuggingFace { .. }
             | ChatFormatter::KimiK25 { .. }
@@ -451,7 +451,7 @@ impl ChatFormatter {
 
     /// Resolve the template's effective thinking mode and materialize its
     /// default under the exact kwarg the template consumes.
-    pub(super) fn resolve_thinking(
+    pub fn resolve_thinking(
         &self,
         args: &mut Option<HashMap<String, Value>>,
         tools_enabled: bool,
@@ -1133,7 +1133,7 @@ fn extract_assistant_text(
 }
 
 #[derive(Debug, Error)]
-pub(super) enum TemplateError {
+pub enum TemplateError {
     #[error("failed to read {kind} `{path}`: {source}")]
     Read {
         kind: &'static str,
@@ -1202,7 +1202,7 @@ pub(super) enum TemplateError {
     UnsupportedRole { role: &'static str },
 }
 
-pub(super) fn load_chat_formatter(
+pub fn load_chat_formatter(
     config_file: Option<&str>,
     model_path: Option<&str>,
     chat_template_arg: Option<&str>,
@@ -1435,13 +1435,13 @@ fn formatter_from_config(config: &Value) -> Result<ChatFormatter, TemplateError>
     })
 }
 
-#[cfg(test)]
-pub(super) fn test_hugging_face_formatter(template: &str) -> ChatFormatter {
+#[cfg(feature = "test-support")]
+pub fn test_hugging_face_formatter(template: &str) -> ChatFormatter {
     formatter_from_config(&serde_json::json!({"chat_template": template})).unwrap()
 }
 
-#[cfg(test)]
-pub(super) fn test_hugging_face_formatter_from_config(config: Value) -> ChatFormatter {
+#[cfg(feature = "test-support")]
+pub fn test_hugging_face_formatter_from_config(config: Value) -> ChatFormatter {
     formatter_from_config(&config).unwrap()
 }
 

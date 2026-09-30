@@ -2,8 +2,8 @@
 
 use std::collections::BTreeMap;
 
+use dynamo_renderer::RenderedPrompt;
 use serde::{Deserialize, Serialize};
-use sglang_processor::dynamo_renderer::RenderedPrompt;
 
 use crate::{SamplingParams, TokenIds};
 
@@ -65,7 +65,7 @@ pub struct TextRequest {
 /// options. Keeping those identities alongside one prompt lets preprocessing
 /// tokenize the prompt once before producing the individual engine requests.
 #[derive(Debug, Clone)]
-pub struct TextRequestGroup {
+pub(crate) struct TextRequestGroup {
     pub prompt: RenderedPrompt,
     pub add_special_tokens: bool,
     pub options: GenerationOptions,
@@ -73,7 +73,7 @@ pub struct TextRequestGroup {
 }
 
 #[derive(Debug, Clone)]
-pub struct GenerateRequestIdentity {
+pub(crate) struct GenerateRequestIdentity {
     pub rid: String,
     pub metadata: GenerateRequestMetadata,
 }
@@ -121,6 +121,11 @@ impl TextRequest {
             options,
             metadata: GenerateRequestMetadata::default(),
         }
+    }
+
+    pub fn with_metadata(mut self, metadata: GenerateRequestMetadata) -> Self {
+        self.metadata = metadata;
+        self
     }
 }
 

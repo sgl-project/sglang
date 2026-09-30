@@ -90,8 +90,8 @@ mod tests {
     };
     use tower::ServiceExt;
 
-    use crate::{RendererConfig, RendererLimits, SamplingDefaults};
-    use sglang_processor::{ProcessorError, TextTokenizer};
+    use crate::{RendererConfig, RendererLimits, SamplingDefaults, TextTokenizer};
+    use sglang_processor::ProcessorError;
 
     struct WordTokenizer;
 

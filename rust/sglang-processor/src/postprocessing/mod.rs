@@ -23,7 +23,6 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::ProcessorError;
-use crate::preprocessing::dynamo_parser_name;
 
 /// Engine-neutral terminal reason understood by chat response processing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,7 +94,7 @@ pub struct ChatResponseProcessor {
 }
 
 impl ChatResponseProcessor {
-    pub(crate) fn new(
+    pub fn new(
         tool_parser: Option<String>,
         reasoning_parser: Option<String>,
         tools: Option<Vec<ToolDefinition>>,
@@ -118,7 +117,7 @@ impl ChatResponseProcessor {
         }
     }
 
-    pub(crate) fn with_reasoning_state(mut self, reasoning_state: Option<bool>) -> Self {
+    pub fn with_reasoning_state(mut self, reasoning_state: Option<bool>) -> Self {
         for choice in &mut self.choices {
             choice.reasoning.initial_reasoning = reasoning_state;
         }
@@ -501,6 +500,16 @@ impl ReasoningStreamSplitter {
         };
         let tail = parser.finish_reasoning_stream();
         (tail.reasoning_text, tail.normal_text)
+    }
+}
+
+/// Map SGLang parser aliases onto Dynamo's parser names.
+pub fn dynamo_parser_name(parser: &str) -> &str {
+    match parser {
+        "llama3" => "llama3_json",
+        "qwen" => "qwen25",
+        "glm" | "glm45" => "glm47",
+        other => other,
     }
 }
 

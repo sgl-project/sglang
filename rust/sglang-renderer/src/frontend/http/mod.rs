@@ -4,12 +4,8 @@ use std::sync::Arc;
 
 use axum::Router;
 
-use crate::{
-    RendererService,
-    engine::HttpGenerateClient,
-    openai::OpenAIService,
-    openai::protocol::{ChatCompletionRequest, CompletionRequest},
-};
+use crate::engine::HttpGenerateClient;
+use crate::openai::OpenAIService;
 
 mod chat;
 mod completions;
@@ -22,6 +18,8 @@ mod tokenize;
 #[cfg(test)]
 mod tests;
 
+use crate::openai::protocol::{ChatCompletionRequest, CompletionRequest};
+
 const DEFAULT_REQUEST_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 
 pub(crate) fn inference_routes(frontend: OpenAIService) -> Router<()> {
@@ -31,7 +29,7 @@ pub(crate) fn inference_routes(frontend: OpenAIService) -> Router<()> {
         .with_state(Arc::new(frontend))
 }
 
-fn renderer_routes(renderer: Arc<RendererService>) -> Router<()> {
+fn renderer_routes(renderer: Arc<crate::RendererService>) -> Router<()> {
     render::routes(renderer.clone()).merge(tokenize::routes(renderer))
 }
 
@@ -52,7 +50,7 @@ pub(crate) fn standalone_routes(
     with_request_body_limit(routes)
 }
 
-pub(crate) fn render_only_routes(renderer: Arc<RendererService>) -> Router<()> {
+pub(crate) fn render_only_routes(renderer: Arc<crate::RendererService>) -> Router<()> {
     let routes = renderer_routes(renderer).merge(render::health_route());
     with_request_body_limit(routes)
 }

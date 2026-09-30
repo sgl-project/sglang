@@ -4,7 +4,7 @@ use crate::{
     RendererError as Error, RendererLimits, SamplingParams, TextRequest, TokenIds, TokenIdsRequest,
 };
 use futures::channel::oneshot;
-use sglang_processor::TextTokenizer;
+pub(crate) use sglang_processor::TextTokenizer;
 use std::sync::{Arc, Mutex};
 
 enum PoolJob {

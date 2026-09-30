@@ -6,7 +6,7 @@ use async_stream::stream;
 use futures::{StreamExt, future::BoxFuture};
 
 use super::{GenerateTransport, TokenStream, internal};
-use crate::{GenerateRequest, ResponseError, ResponseErrorKind, UpstreamErrorCode};
+use crate::{GenerateRequest, ResponseError};
 use protocol::{engine_error_message, normalize_engine_output, parse_engine_frame};
 
 mod protocol;
@@ -17,7 +17,7 @@ const ENGINE_HEALTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn unavailable(message: impl Into<String>) -> ResponseError {
     ResponseError {
-        kind: ResponseErrorKind::Unavailable,
+        kind: crate::ResponseErrorKind::Unavailable,
         message: message.into(),
     }
 }
@@ -104,7 +104,9 @@ impl GenerateTransport for HttpGenerateClient {
             if !status.is_success() {
                 let body = response.text().await.unwrap_or_default();
                 return Err(ResponseError {
-                    kind: ResponseErrorKind::Upstream(UpstreamErrorCode::Http(status.as_u16())),
+                    kind: crate::ResponseErrorKind::Upstream(crate::UpstreamErrorCode::Http(
+                        status.as_u16(),
+                    )),
                     message: engine_error_message(&body)
                         .unwrap_or_else(|| format!("engine returned HTTP {status}")),
                 });
@@ -202,10 +204,8 @@ fn event_end(bytes: &[u8]) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        GenerationOptions, ResponseErrorKind, TokenIds, TokenIdsRequest,
-        engine::test_utils::tiny_tokenizer,
-    };
+    use crate::engine::test_utils::tiny_tokenizer;
+    use crate::{GenerationOptions, TokenIds, TokenIdsRequest};
     use axum::{
         Json, Router,
         extract::State,
@@ -431,7 +431,7 @@ mod tests {
                 .await;
             if let Some(message) = error_message {
                 let error = events.last().unwrap().as_ref().unwrap_err();
-                assert_eq!(error.kind, ResponseErrorKind::Internal);
+                assert_eq!(error.kind, crate::ResponseErrorKind::Internal);
                 assert!(
                     error.message.starts_with(message),
                     "{case}: {}",

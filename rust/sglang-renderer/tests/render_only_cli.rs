@@ -1,3 +1,5 @@
+// Keep the inner attribute off the first line so shebang lint does not misclassify it.
+
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 

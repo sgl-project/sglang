@@ -18,8 +18,13 @@ use dynamo_renderer::{
 use minijinja::Value;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use super::template::{ChatFormatter, OneOrMany, load_chat_support};
-use crate::{ChatResponseProcessor, ProcessorError};
+use crate::ChatResponseProcessor;
+use crate::{
+    ChatFormatter, GenerateRequestMetadata, GenerationOptions, OneOrMany, RendererConfig,
+    RendererError, SamplingParams, TextRequest,
+};
+
+use super::{GenerateRequestIdentity, TextRequestGroup};
 
 /// SGLang reasoning effort, including Inkling's fine-grained numeric form.
 #[derive(Debug, Clone, PartialEq)]
@@ -35,7 +40,7 @@ pub enum ReasoningEffort {
 }
 
 impl ReasoningEffort {
-    pub const fn disables_thinking(&self) -> bool {
+    pub(crate) const fn disables_thinking(&self) -> bool {
         matches!(self, Self::None)
     }
 
@@ -116,24 +121,14 @@ fn numeric_reasoning_effort(value: f64) -> Result<ReasoningEffort, String> {
     Ok(ReasoningEffort::Numeric(value))
 }
 
-/// Chat template sources and parser selection for one served model.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct ChatConfig {
-    pub tokenizer_path: String,
-    pub model_path: String,
-    pub revision: Option<String>,
-    pub chat_template: Option<String>,
-    pub tool_call_parser: Option<String>,
-    pub reasoning_parser: Option<String>,
-    pub default_chat_template_kwargs: HashMap<String, serde_json::Value>,
-}
-
-/// Normalized chat input to template rendering.
+/// Renderer-owned normalized chat state.
 ///
 /// Message and tool values remain Dynamo OpenAI protocol types until
-/// [`ChatPreprocessor`] applies the model chat template.
+/// [`ChatPreprocessor`] applies the model chat template and lowers the request
+/// to the same [`TextRequest`] consumed by text completions.
 #[derive(Debug, Clone)]
 pub struct ChatRequest {
+    pub rid: String,
     pub model: String,
     pub messages: Vec<ChatCompletionRequestMessage>,
     pub tools: Option<Vec<ChatCompletionTool>>,
@@ -142,7 +137,13 @@ pub struct ChatRequest {
     pub reasoning_effort: Option<ReasoningEffort>,
     pub continue_final_message: bool,
     pub chat_template_args: Option<HashMap<String, serde_json::Value>>,
+    pub sampling_params: SamplingParams,
+    pub choice_count: usize,
+    pub stream: bool,
+    pub return_logprob: bool,
+    pub top_logprobs_num: i64,
     pub parallel_tool_calls: bool,
+    pub metadata: GenerateRequestMetadata,
 }
 
 impl OAIChatLikeRequest for ChatRequest {
@@ -187,56 +188,10 @@ impl OAIChatLikeRequest for ChatRequest {
     }
 }
 
-/// Grammar constraint that keeps generated tool calls parseable.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ToolConstraint {
-    StructuralTag(String),
-    JsonSchema(String),
-}
-
-/// A rendered chat prompt plus the generation settings and output state it
-/// implies. Hosts apply the settings to their own sampling parameters.
-pub struct RenderedChat {
-    pub prompt: RenderedPrompt,
-    /// Template stop strings, which precede the request's own stops.
-    pub template_stops: Option<Vec<String>>,
-    pub tool_constraint: Option<ToolConstraint>,
-    /// Tool-call parsing is active, so special tokens must stay in the output.
-    pub tool_calls_enabled: bool,
-    pub require_reasoning: bool,
-    response: ResponseState,
-}
-
-struct ResponseState {
-    tool_call_parser: Option<String>,
-    reasoning_parser: Option<String>,
-    tools: Vec<ToolDefinition>,
-    tool_choice: Option<ChatCompletionToolChoiceOption>,
-    parallel_tool_calls: bool,
-    reasoning_state: Option<bool>,
-}
-
-impl RenderedChat {
-    /// Build the output processor for `choice_count` choices of the submitted
-    /// request. `uses_tool_call_structural_tag` reports whether that request
-    /// carries a structural tag.
-    pub fn response_processor(
-        &self,
-        choice_count: usize,
-        uses_tool_call_structural_tag: bool,
-    ) -> ChatResponseProcessor {
-        let response = &self.response;
-        ChatResponseProcessor::new(
-            response.tool_call_parser.clone(),
-            response.reasoning_parser.clone(),
-            (!response.tools.is_empty()).then(|| response.tools.clone()),
-            response.tool_choice.clone(),
-            uses_tool_call_structural_tag,
-            response.parallel_tool_calls,
-            choice_count,
-        )
-        .with_reasoning_state(response.reasoning_state)
-    }
+/// Chat-to-text result plus the state needed to interpret generated output.
+pub(crate) struct LoweredChat {
+    pub text_requests: Vec<TextRequestGroup>,
+    pub response_processor: ChatResponseProcessor,
 }
 
 struct RenderPreparation {
@@ -255,14 +210,7 @@ pub struct ChatPreprocessor {
 }
 
 impl ChatPreprocessor {
-    /// Load the model's chat template. Template-loading errors are reported
-    /// when a chat request is processed.
-    pub fn load(config: &ChatConfig) -> Self {
-        let (formatter, formatter_error) = load_chat_support(config);
-        Self::new(config, formatter).with_formatter_error(formatter_error)
-    }
-
-    pub(crate) fn new(config: &ChatConfig, formatter: Option<ChatFormatter>) -> Self {
+    pub(crate) fn new(config: &RendererConfig, formatter: Option<ChatFormatter>) -> Self {
         Self {
             formatter,
             formatter_error: None,
@@ -277,59 +225,88 @@ impl ChatPreprocessor {
         self
     }
 
-    pub fn preprocess(&self, mut request: ChatRequest) -> Result<RenderedChat, ProcessorError> {
+    pub fn preprocess(&self, mut request: ChatRequest) -> Result<LoweredChat, RendererError> {
         let preparation = self.prepare_for_render(&mut request)?;
-        let template_stops = self
-            .formatter
-            .as_ref()
-            .and_then(ChatFormatter::stop_strs)
-            .map(|stops| match stops {
-                OneOrMany::One(stop) => vec![stop],
-                OneOrMany::Many(stops) => stops,
-            });
+        merge_template_stops(&mut request.sampling_params, self.formatter.as_ref());
 
         let tool_choice = dynamo_tool_choice(&request.tool_choice);
         let tools = chat_tool_definitions(&request);
         let parser =
             resolve_chat_parser(self.tool_call_parser.as_deref(), preparation.tools_enabled)?;
-        let tool_constraint = tool_constraint(
+        if parser.is_some() {
+            request.sampling_params.skip_special_tokens = false;
+        }
+        apply_tool_constraint(
+            &mut request.sampling_params,
             parser.as_deref(),
             &tool_choice,
             &tools,
             Some(request.parallel_tool_calls),
         )?;
         let prompt = self.render(&request)?;
+        let uses_tool_call_structural_tag = request.sampling_params.structural_tag.is_some();
 
-        Ok(RenderedChat {
-            prompt,
-            template_stops,
-            tool_constraint,
-            tool_calls_enabled: parser.is_some(),
+        let options = GenerationOptions {
+            sampling_params: request.sampling_params.clone(),
             require_reasoning: preparation.require_reasoning,
-            response: ResponseState {
-                tool_call_parser: parser,
-                reasoning_parser: self.reasoning_parser.clone(),
-                tools,
-                tool_choice: request.tool_choice,
-                parallel_tool_calls: request.parallel_tool_calls,
-                reasoning_state: preparation.reasoning_state,
-            },
+            stream: request.stream,
+            return_logprob: request.return_logprob,
+            logprob_start_len: -1,
+            top_logprobs_num: request.top_logprobs_num,
+            return_text_in_logprobs: request.return_logprob.then_some(true),
+            ..Default::default()
+        };
+        let mut choices = Vec::with_capacity(request.choice_count);
+        for index in 0..request.choice_count {
+            choices.push(GenerateRequestIdentity {
+                rid: format!("{}-{index}", request.rid),
+                metadata: request.metadata.clone(),
+            });
+        }
+        let text_requests = vec![TextRequestGroup {
+            prompt,
+            add_special_tokens: false,
+            options,
+            requests: choices,
+        }];
+
+        let response_processor = ChatResponseProcessor::new(
+            parser,
+            self.reasoning_parser.clone(),
+            (!tools.is_empty()).then_some(tools),
+            request.tool_choice,
+            uses_tool_call_structural_tag,
+            request.parallel_tool_calls,
+            request.choice_count,
+        )
+        .with_reasoning_state(preparation.reasoning_state);
+        Ok(LoweredChat {
+            text_requests,
+            response_processor,
         })
     }
 
     /// Render chat for tokenization without creating generation/output state.
-    pub fn render_prompt(
-        &self,
-        mut request: ChatRequest,
-    ) -> Result<RenderedPrompt, ProcessorError> {
-        self.prepare_for_render(&mut request)?;
-        self.render(&request)
+    pub fn lower_to_text(&self, mut request: ChatRequest) -> Result<TextRequest, RendererError> {
+        let preparation = self.prepare_for_render(&mut request)?;
+        let prompt = self.render(&request)?;
+        Ok(TextRequest::rendered(
+            request.rid,
+            prompt,
+            false,
+            GenerationOptions {
+                sampling_params: request.sampling_params,
+                require_reasoning: preparation.require_reasoning,
+                ..Default::default()
+            },
+        )
+        .with_metadata(request.metadata))
     }
 
     fn prepare_for_render(
         &self,
         request: &mut ChatRequest,
-    ) -> Result<RenderPreparation, ProcessorError> {
+    ) -> Result<RenderPreparation, RendererError> {
         validate_chat(request)?;
         self.normalize_template_args(request);
         let tool_choice = dynamo_tool_choice(&request.tool_choice);
@@ -373,9 +350,9 @@ impl ChatPreprocessor {
         request.chat_template_args = (!args.is_empty()).then_some(args);
     }
 
-    fn render(&self, request: &ChatRequest) -> Result<RenderedPrompt, ProcessorError> {
+    fn render(&self, request: &ChatRequest) -> Result<RenderedPrompt, RendererError> {
         let formatter = self.formatter.as_ref().ok_or_else(|| {
-            ProcessorError::from(
+            RendererError::from(
                 self.formatter_error
                     .clone()
                     .unwrap_or_else(|| "this model has no usable chat template".to_owned()),
@@ -425,13 +402,13 @@ fn prepare_continuation(request: &mut ChatRequest) -> Option<String> {
 fn truncate_continuation(
     prompt: RenderedPrompt,
     final_message: &str,
-) -> Result<RenderedPrompt, ProcessorError> {
+) -> Result<RenderedPrompt, RendererError> {
     let text = prompt.as_str();
     let tag_location = text
         .rfind(CONTINUE_FINAL_MESSAGE_TAG.trim_end())
         .filter(|_| text.contains(final_message.trim()))
         .ok_or_else(|| {
-            ProcessorError::from(
+            RendererError::from(
                 "continue_final_message is set but the final message does not appear in the rendered prompt",
             )
         })?;
@@ -465,9 +442,12 @@ fn truncate_rendered_prompt(prompt: &RenderedPrompt, truncate_at: usize) -> Rend
     RenderedPrompt::segmented(truncated)
 }
 
-fn validate_chat(request: &ChatRequest) -> Result<(), ProcessorError> {
+fn validate_chat(request: &ChatRequest) -> Result<(), RendererError> {
     if request.messages.is_empty() {
         return Err("messages cannot be empty".into());
+    }
+    if request.choice_count == 0 {
+        return Err("choice_count must be at least 1".into());
     }
     if serde_json::to_value(&request.messages).is_ok_and(|messages| contains_media(&messages)) {
         return Err("image, audio, video, and file message content is not supported".into());
@@ -490,10 +470,27 @@ fn contains_media(value: &serde_json::Value) -> bool {
     }
 }
 
+fn merge_template_stops(sampling: &mut SamplingParams, formatter: Option<&ChatFormatter>) {
+    let Some(template_stops) = formatter.and_then(ChatFormatter::stop_strs) else {
+        return;
+    };
+    let mut stops = match template_stops {
+        sglang_processor::OneOrMany::One(stop) => vec![stop],
+        sglang_processor::OneOrMany::Many(stops) => stops,
+    };
+    if let Some(request_stops) = sampling.stop.take() {
+        match request_stops {
+            OneOrMany::One(stop) => stops.push(stop),
+            OneOrMany::Many(request_stops) => stops.extend(request_stops),
+        }
+    }
+    sampling.stop = Some(OneOrMany::Many(stops));
+}
+
 fn resolve_chat_parser(
     configured_parser: Option<&str>,
     tools_enabled: bool,
-) -> Result<Option<String>, ProcessorError> {
+) -> Result<Option<String>, RendererError> {
     if tools_enabled && configured_parser.is_none() {
         return Err("tool calls require --tool-call-parser".into());
     }
@@ -513,14 +510,7 @@ fn chat_tool_definitions(request: &ChatRequest) -> Vec<ToolDefinition> {
         .collect()
 }
 
-pub(crate) fn dynamo_parser_name(parser: &str) -> &str {
-    match parser {
-        "llama3" => "llama3_json",
-        "qwen" => "qwen25",
-        "glm" | "glm45" => "glm47",
-        other => other,
-    }
-}
+use sglang_processor::dynamo_parser_name;
 
 fn dynamo_tool_choice(choice: &Option<ChatCompletionToolChoiceOption>) -> DynamoToolChoice {
     match choice {
@@ -533,14 +523,15 @@ fn dynamo_tool_choice(choice: &Option<ChatCompletionToolChoiceOption>) -> Dynamo
     }
 }
 
-fn tool_constraint(
+fn apply_tool_constraint(
+    sampling: &mut SamplingParams,
     parser: Option<&str>,
     tool_choice: &DynamoToolChoice,
     tools: &[ToolDefinition],
     parallel_tool_calls: Option<bool>,
-) -> Result<Option<ToolConstraint>, String> {
+) -> Result<(), String> {
     if *tool_choice == DynamoToolChoice::None {
-        return Ok(None);
+        return Ok(());
     }
     if *tool_choice == DynamoToolChoice::Required && tools.is_empty() {
         return Err("tool_choice is \"required\" but tools is empty".into());
@@ -554,7 +545,7 @@ fn tool_constraint(
     }
 
     let Some(parser) = parser else {
-        return Ok(None);
+        return Ok(());
     };
     let parser = dynamo_parser_name(parser);
     let config = get_tool_parser_map()
@@ -586,7 +577,8 @@ fn tool_constraint(
             })
             .map_err(|error| error.to_string())?
     {
-        return Ok(Some(ToolConstraint::StructuralTag(tag.to_string())));
+        sampling.structural_tag = Some(tag.to_string());
+        return Ok(());
     }
 
     if matches!(
@@ -627,14 +619,15 @@ fn tool_constraint(
         if parallel_tool_calls == Some(false) {
             schema["maxItems"] = serde_json::json!(1);
         }
-        return Ok(Some(ToolConstraint::JsonSchema(schema.to_string())));
+        sampling.json_schema = Some(schema.to_string());
     }
-    Ok(None)
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{RendererLimits, SamplingDefaults};
     use dynamo_protocols::types::{
         ChatCompletionNamedToolChoice, ChatCompletionToolType, FunctionName,
     };
@@ -653,6 +646,7 @@ mod tests {
 
     fn chat_request(tool_choice: Option<ChatCompletionToolChoiceOption>) -> ChatRequest {
         ChatRequest {
+            rid: "chatcmpl-test".into(),
             model: "model".into(),
             messages: serde_json::from_value(serde_json::json!([
                 {"role": "user", "content": "hello"}
@@ -673,7 +667,13 @@ mod tests {
             reasoning_effort: None,
             continue_final_message: false,
             chat_template_args: None,
+            sampling_params: SamplingParams::default(),
+            choice_count: 1,
+            stream: false,
+            return_logprob: false,
+            top_logprobs_num: 0,
             parallel_tool_calls: true,
+            metadata: GenerateRequestMetadata::default(),
         }
     }
 
@@ -681,8 +681,7 @@ mod tests {
         chat_preprocessor_with(
             Some("llama3"),
             None,
-            crate::preprocessing::template::load_chat_formatter(None, None, Some("chatml"))
-                .unwrap(),
+            sglang_processor::load_chat_formatter(None, None, Some("chatml")).unwrap(),
         )
     }
 
@@ -691,12 +690,24 @@ mod tests {
         reasoning_parser: Option<&str>,
         formatter: ChatFormatter,
     ) -> ChatPreprocessor {
-        let config = ChatConfig {
+        let config = RendererConfig {
+            served_model_name: "model".into(),
             tokenizer_path: ".".into(),
+            revision: None,
+            model_path: String::new(),
             chat_template: Some("chatml".into()),
             tool_call_parser: tool_call_parser.map(str::to_owned),
             reasoning_parser: reasoning_parser.map(str::to_owned),
-            ..Default::default()
+            default_chat_template_kwargs: Default::default(),
+            stream_response_default_include_usage: false,
+            default_sampling_params: SamplingDefaults::default(),
+            limits: RendererLimits {
+                vocab_size: 128,
+                context_len: 128,
+                num_reserved_tokens: 0,
+                allow_auto_truncate: false,
+                enable_return_hidden_states: false,
+            },
         };
         ChatPreprocessor::new(&config, Some(formatter))
     }
@@ -725,7 +736,9 @@ mod tests {
 
     #[test]
     fn required_choice_builds_a_single_call_constraint() {
-        let constraint = tool_constraint(
+        let mut sampling = SamplingParams::default();
+        apply_tool_constraint(
+            &mut sampling,
             Some("llama3"),
             &DynamoToolChoice::Required,
             &[tool("get_weather", false), tool("get_time", false)],
@@ -733,23 +746,23 @@ mod tests {
         )
         .unwrap();
 
-        let Some(ToolConstraint::JsonSchema(schema)) = constraint else {
-            panic!("expected a JSON schema constraint, got {constraint:?}");
-        };
-        let schema: serde_json::Value = serde_json::from_str(&schema).unwrap();
+        let schema: serde_json::Value =
+            serde_json::from_str(sampling.json_schema.as_deref().unwrap()).unwrap();
         assert_eq!(schema["minItems"], 1);
         assert_eq!(schema["maxItems"], 1);
     }
 
     #[test]
     fn invalid_tool_choices_are_rejected_before_generation() {
+        let mut sampling = SamplingParams::default();
         assert!(
-            tool_constraint(None, &DynamoToolChoice::Required, &[], None)
+            apply_tool_constraint(&mut sampling, None, &DynamoToolChoice::Required, &[], None,)
                 .unwrap_err()
                 .contains("required")
         );
         assert!(
-            tool_constraint(
+            apply_tool_constraint(
+                &mut sampling,
                 None,
                 &DynamoToolChoice::Named("missing".into()),
                 &[tool("get_weather", false)],
@@ -762,23 +775,37 @@ mod tests {
 
     #[test]
     fn tool_parsing_preserves_special_tokens_for_output_processing() {
-        let chat = chat_preprocessor().preprocess(chat_request(None)).unwrap();
+        let mut request = chat_request(None);
+        request.sampling_params.skip_special_tokens = true;
 
-        assert!(chat.tool_calls_enabled);
+        let chat = chat_preprocessor().preprocess(request).unwrap();
+
+        assert!(
+            !chat.text_requests[0]
+                .options
+                .sampling_params
+                .skip_special_tokens
+        );
     }
 
     #[test]
     fn tool_choice_none_keeps_the_requested_special_token_behavior() {
-        let chat = chat_preprocessor()
-            .preprocess(chat_request(Some(ChatCompletionToolChoiceOption::None)))
-            .unwrap();
+        let mut request = chat_request(Some(ChatCompletionToolChoiceOption::None));
+        request.sampling_params.skip_special_tokens = true;
 
-        assert!(!chat.tool_calls_enabled);
+        let chat = chat_preprocessor().preprocess(request).unwrap();
+
+        assert!(
+            chat.text_requests[0]
+                .options
+                .sampling_params
+                .skip_special_tokens
+        );
     }
 
     #[test]
     fn qwen_required_tools_forward_effective_template_thinking() {
-        let formatter = crate::preprocessing::template::test_hugging_face_formatter(
+        let formatter = sglang_processor::test_hugging_face_formatter(
             "{% if enable_thinking is not defined %}{% set enable_thinking = true %}{% endif %}{{ enable_thinking }}",
         );
         let preprocessor = chat_preprocessor_with(Some("qwen"), Some("qwen3"), formatter);
@@ -786,7 +813,7 @@ mod tests {
         let enabled = preprocessor
             .preprocess(chat_request(Some(ChatCompletionToolChoiceOption::Required)))
             .unwrap();
-        assert!(enabled.require_reasoning);
+        assert!(enabled.text_requests[0].options.require_reasoning);
 
         let mut disabled_request = chat_request(Some(ChatCompletionToolChoiceOption::Required));
         disabled_request.reasoning_effort = Some(ReasoningEffort::Max);
@@ -795,31 +822,33 @@ mod tests {
             serde_json::Value::Bool(false),
         )]));
         let disabled = preprocessor.preprocess(disabled_request).unwrap();
-        assert!(!disabled.require_reasoning);
+        assert!(!disabled.text_requests[0].options.require_reasoning);
     }
 
     #[test]
     fn thinking_policy_uses_the_effective_tool_template() {
-        let formatter = crate::preprocessing::template::test_hugging_face_formatter_from_config(
-            serde_json::json!({
+        let formatter =
+            sglang_processor::test_hugging_face_formatter_from_config(serde_json::json!({
                 "chat_template": [
                     {"default": "{{ enable_thinking | default(false) }}"},
                     {"tool_use": "{{ enable_thinking | default(true) }}"}
                 ]
-            }),
-        );
+            }));
         let preprocessor = chat_preprocessor_with(Some("qwen"), Some("qwen3"), formatter);
 
         let mut no_tools = chat_request(None);
         no_tools.tools = None;
-        assert!(!preprocessor.preprocess(no_tools).unwrap().require_reasoning);
+        assert!(
+            !preprocessor.preprocess(no_tools).unwrap().text_requests[0]
+                .options
+                .require_reasoning
+        );
 
         let mut empty_tools = chat_request(None);
         empty_tools.tools = Some(Vec::new());
         assert!(
-            !preprocessor
-                .preprocess(empty_tools)
-                .unwrap()
+            !preprocessor.preprocess(empty_tools).unwrap().text_requests[0]
+                .options
                 .require_reasoning
         );
 
@@ -827,19 +856,23 @@ mod tests {
             !preprocessor
                 .preprocess(chat_request(Some(ChatCompletionToolChoiceOption::None)))
                 .unwrap()
+                .text_requests[0]
+                .options
                 .require_reasoning
         );
         assert!(
             preprocessor
                 .preprocess(chat_request(Some(ChatCompletionToolChoiceOption::Required)))
                 .unwrap()
+                .text_requests[0]
+                .options
                 .require_reasoning
         );
     }
 
     #[test]
     fn always_on_channel_template_requires_reasoning() {
-        let formatter = crate::preprocessing::template::test_hugging_face_formatter(
+        let formatter = sglang_processor::test_hugging_face_formatter(
             "<|start|>assistant<|channel|>analysis<|message|>",
         );
         let preprocessor = chat_preprocessor_with(None, Some("gpt-oss"), formatter);
@@ -858,6 +891,6 @@ mod tests {
 
         let lowered = preprocessor.preprocess(request).unwrap();
 
-        assert!(lowered.require_reasoning);
+        assert!(lowered.text_requests[0].options.require_reasoning);
     }
 }

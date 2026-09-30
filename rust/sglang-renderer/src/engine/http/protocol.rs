@@ -1,9 +1,10 @@
 //! SGLang engine frame parsing and normalization into generation deltas.
 
 use super::internal;
+use crate::engine::TokenDelta;
 use crate::{
     GenerationFinishReason, GenerationOutputExtras, MatchedStop, PositionLogprobs, ResponseError,
-    ResponseErrorKind, TokenIds, TokenLogprob, UpstreamErrorCode, engine::TokenDelta,
+    TokenIds, TokenLogprob,
 };
 use serde::Deserialize;
 
@@ -74,7 +75,9 @@ fn default_error_code() -> u16 {
 pub(super) fn parse_engine_frame(payload: &str) -> Result<TokenDelta, ResponseError> {
     if let Ok(error) = serde_json::from_str::<EngineErrorEnvelope>(payload) {
         return Err(ResponseError {
-            kind: ResponseErrorKind::Upstream(UpstreamErrorCode::Http(error.error.code)),
+            kind: crate::ResponseErrorKind::Upstream(crate::UpstreamErrorCode::Http(
+                error.error.code,
+            )),
             message: error.error.message,
         });
     }
@@ -85,7 +88,7 @@ pub(super) fn parse_engine_frame(payload: &str) -> Result<TokenDelta, ResponseEr
         && let Some(status_code) = reason.status_code
     {
         return Err(ResponseError {
-            kind: ResponseErrorKind::Upstream(UpstreamErrorCode::Http(status_code)),
+            kind: crate::ResponseErrorKind::Upstream(crate::UpstreamErrorCode::Http(status_code)),
             message: reason
                 .message
                 .clone()
@@ -272,7 +275,7 @@ pub(super) fn engine_error_message(body: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ResponseErrorKind, UpstreamErrorCode, engine::test_utils::position};
+    use crate::engine::test_utils::position;
 
     #[test]
     fn engine_frame_maps_tokens_usage_finish_and_logprobs() {
@@ -344,7 +347,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_eq!(error.kind, ResponseErrorKind::Internal);
+        assert_eq!(error.kind, crate::ResponseErrorKind::Internal);
         assert_eq!(
             error.message,
             "engine returned 1 output top-logprob positions for 2 selected-token positions"
@@ -359,7 +362,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             error.kind,
-            ResponseErrorKind::Upstream(UpstreamErrorCode::Http(400))
+            crate::ResponseErrorKind::Upstream(crate::UpstreamErrorCode::Http(400))
         );
         assert_eq!(error.message, "too long");
     }
@@ -373,7 +376,7 @@ mod tests {
 
         assert_eq!(
             error.kind,
-            ResponseErrorKind::Upstream(UpstreamErrorCode::Http(503))
+            crate::ResponseErrorKind::Upstream(crate::UpstreamErrorCode::Http(503))
         );
         assert_eq!(error.message, "out of memory");
     }
@@ -445,7 +448,7 @@ mod tests {
 
         let error = normalize_engine_output(&mut output, &mut emitted_tokens).unwrap_err();
 
-        assert_eq!(error.kind, ResponseErrorKind::Internal);
+        assert_eq!(error.kind, crate::ResponseErrorKind::Internal);
         assert!(error.message.contains("2 output token IDs"));
         assert_eq!(emitted_tokens, 2);
     }

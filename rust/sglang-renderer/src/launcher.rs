@@ -9,8 +9,8 @@ use hf_hub::api::tokio::{ApiBuilder, ApiRepo};
 use hf_hub::{Cache, Repo, RepoType};
 use serde_json::Value;
 
+use crate::preprocessing::{resolve_model_file, resolve_tokenizer_file};
 use crate::{RendererConfig, RendererLimits, RendererRuntimeConfig, SamplingDefaults, serve};
-use sglang_processor::{resolve_model_file, resolve_tokenizer_file};
 
 const DEFAULT_CONTEXT_LEN: u64 = 2048;
 
@@ -217,6 +217,7 @@ impl DirectArgs {
 
         Ok(RendererRuntimeConfig {
             http_addr: self.http_addr,
+            http_workers: self.http_workers,
             tokenizer_workers: self.tokenizer_workers,
             queue_capacity: self.queue_capacity,
             engine_url: self.engine_url,

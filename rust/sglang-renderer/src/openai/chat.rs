@@ -3,13 +3,11 @@
 use std::collections::BTreeMap;
 
 use crate::{
+    ChatEvent, ChatFinishReason, ChatResponseProcessor, ChatToolCallDelta, DecodedChatEvent,
     GenerationFinishReason, GenerationOutput, GenerationOutputExtras, GenerationStream,
-    PreparedChat, RendererService, ResponseError, ResponseErrorKind,
-    engine::response::merge_indexed,
+    ResponseError,
 };
-use futures::StreamExt;
-use serde::Serialize;
-use sglang_processor::dynamo_protocols::types::{
+use dynamo_protocols::types::{
     ChatChoice, ChatChoiceLogprobs, ChatChoiceStream, ChatCompletionMessageContent,
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
     ChatCompletionResponseMessage, ChatCompletionStreamResponseDelta,
@@ -18,12 +16,12 @@ use sglang_processor::dynamo_protocols::types::{
     FinishReason as OpenAIFinishReason, FunctionCall, FunctionCallStream, FunctionType, Role,
     ServiceTier as ChatServiceTier, TopLogprobs,
 };
-use sglang_processor::{
-    ChatEvent, ChatFinishReason, ChatResponseProcessor, ChatToolCallDelta, DecodedChatEvent,
-};
+use futures::StreamExt;
+use serde::Serialize;
 
 use super::protocol::{ChatCompletionRequest, lower_chat_request};
 use super::{completion_usage, unix_seconds_u32};
+use crate::engine::response::merge_indexed;
 
 pub(crate) struct ChatResponseContext {
     pub(crate) response_id: String,
@@ -35,9 +33,9 @@ pub(crate) struct ChatResponseContext {
 }
 
 pub(crate) async fn prepare_request(
-    renderer: &RendererService,
+    renderer: &crate::RendererService,
     request: ChatCompletionRequest,
-) -> Result<(String, PreparedChat), ResponseError> {
+) -> Result<(String, crate::PreparedChat), ResponseError> {
     let (response_id, request) = lower_chat_request(renderer.config(), request)?;
     let chat = renderer.prepare_chat(request).await?;
     Ok((response_id, chat))
@@ -74,7 +72,7 @@ pub(crate) async fn unary_chat(
             }) => {
                 let Some(choice) = accumulated.get_mut(choice) else {
                     return Err(ResponseError {
-                        kind: ResponseErrorKind::Internal,
+                        kind: crate::ResponseErrorKind::Internal,
                         message: "chat response choice is out of range".into(),
                     });
                 };
@@ -582,28 +580,14 @@ impl super::OpenAIService {
 #[cfg(test)]
 mod tests {
     use super::{ChatResponseContext, chat_event_stream, chat_logprobs, unary_chat};
+    use crate::openai::protocol::ChatCompletionRequest;
+    use crate::openai::protocol::{chat_sampling_params, lower_chat_request};
+    use crate::openai::test_utils::{chat_submitted, chunk};
     use crate::{
-        GenerationOutputExtras, PositionLogprobs, RendererConfig, RendererLimits, RendererService,
-        ResponseError, ResponseErrorKind, SamplingDefaults, TokenLogprob, UpstreamErrorCode,
-        openai::protocol::ChatCompletionRequest,
-        openai::protocol::{chat_sampling_params, lower_chat_request},
-        openai::test_utils::{chat_submitted, chunk},
+        ChatPreprocessor, GenerationOutputExtras, PositionLogprobs, RendererConfig, RendererLimits,
+        ResponseError, SamplingDefaults, TokenLogprob,
     };
     use futures::{FutureExt, StreamExt};
-    use sglang_processor::{ChatResponseProcessor, ProcessorError, TextTokenizer};
-    use std::sync::Arc;
-
-    struct WordTokenizer;
-
-    impl TextTokenizer for WordTokenizer {
-        fn encode(
-            &self,
-            text: &str,
-            _add_special_tokens: bool,
-        ) -> Result<Vec<i32>, ProcessorError> {
-            Ok(text.split_whitespace().map(|_| 7).collect())
-        }
-    }
 
     fn request() -> ChatCompletionRequest {
         serde_json::from_value(serde_json::json!({
@@ -613,10 +597,10 @@ mod tests {
         .unwrap()
     }
 
-    async fn response_processor(
+    fn response_processor(
         reasoning_parser: Option<&str>,
         choices: usize,
-    ) -> ChatResponseProcessor {
+    ) -> crate::ChatResponseProcessor {
         let config = RendererConfig {
             model_path: String::new(),
             served_model_name: "model".into(),
@@ -643,11 +627,13 @@ mod tests {
         }))
         .unwrap();
         let (_, chat) = lower_chat_request(&config, request).unwrap();
-        RendererService::with_tokenizer(config, Arc::new(WordTokenizer), 1, 1)
-            .prepare_chat(chat)
-            .await
-            .unwrap()
-            .response_processor
+        ChatPreprocessor::new(
+            &config,
+            Some(crate::preprocessing::load_test_chat_formatter("chatml")),
+        )
+        .preprocess(chat)
+        .unwrap()
+        .response_processor
     }
 
     fn wire_context(include_usage: bool) -> ChatResponseContext {
@@ -760,7 +746,7 @@ mod tests {
 
         let response = unary_chat(
             vec![choice0, choice1],
-            response_processor(None, 2).await,
+            response_processor(None, 2),
             "chatcmpl-test".into(),
             "model".into(),
             1,
@@ -785,7 +771,7 @@ mod tests {
 
         let response = unary_chat(
             vec![choice],
-            response_processor(Some("deepseek-r1"), 1).await,
+            response_processor(Some("deepseek-r1"), 1),
             "chatcmpl-test".into(),
             "model".into(),
             1,
@@ -813,7 +799,7 @@ mod tests {
 
         let stream = chat_event_stream(
             vec![choice],
-            response_processor(Some("deepseek-r1"), 1).await,
+            response_processor(Some("deepseek-r1"), 1),
             wire_context(true),
         );
         futures::pin_mut!(stream);
@@ -851,7 +837,7 @@ mod tests {
 
         let stream = chat_event_stream(
             vec![choice],
-            response_processor(None, 1).await,
+            response_processor(None, 1),
             wire_context(true),
         );
         futures::pin_mut!(stream);
@@ -879,7 +865,7 @@ mod tests {
         let (choice, tx) = chat_submitted(0);
         let stream = chat_event_stream(
             vec![choice],
-            response_processor(None, 1).await,
+            response_processor(None, 1),
             wire_context(false),
         );
         futures::pin_mut!(stream);
@@ -899,13 +885,13 @@ mod tests {
         let (choice1, tx1) = chat_submitted(1);
         let stream = chat_event_stream(
             vec![choice0, choice1],
-            response_processor(None, 2).await,
+            response_processor(None, 2),
             wire_context(true),
         );
         futures::pin_mut!(stream);
 
         tx0.send(Err(ResponseError {
-            kind: ResponseErrorKind::Upstream(UpstreamErrorCode::Http(429)),
+            kind: crate::ResponseErrorKind::Upstream(crate::UpstreamErrorCode::Http(429)),
             message: "out of memory".into(),
         }))
         .await
@@ -913,7 +899,7 @@ mod tests {
         let error = stream.next().await.unwrap().unwrap_err();
         assert_eq!(
             error.kind,
-            ResponseErrorKind::Upstream(UpstreamErrorCode::Http(429))
+            crate::ResponseErrorKind::Upstream(crate::UpstreamErrorCode::Http(429))
         );
         assert_eq!(error.message, "out of memory");
 

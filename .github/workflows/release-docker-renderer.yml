@@ -5,8 +5,8 @@ on:
     branches: [main]
     tags: ["v[0-9]+.*"]
     paths:
-      - "rust/sglang-processor/**"
       - "rust/sglang-renderer/**"
+      - "rust/sglang-processor/**"
       - "rust/Cargo.toml"
       - "rust/Cargo.lock"
       - "rust/rust-toolchain.toml"
