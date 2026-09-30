@@ -1260,7 +1260,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     def moe_num_token_non_padded(self) -> Optional[torch.Tensor]:
         """Bound for masking a sparse MoE's padded rows, or None when the MoE
         input is a gathered buffer whose real rows are not a prefix of it."""
-        from sglang.srt.layers.layer_boundary import moe_cp_gathers_sparse_moe_input
+        from sglang.srt.layers.layer_boundary import batch_gathers_over_moe_cp
         from sglang.srt.layers.moe.utils import is_moe_input_scattered_across_dp_ranks
 
         if self.num_token_non_padded is None:
@@ -1269,7 +1269,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if is_moe_input_scattered_across_dp_ranks():
             # a2a dispatch, FP4 all-gather and dwdp all route the local shard.
             return self.num_token_non_padded
-        if moe_cp_gathers_sparse_moe_input(self):
+        if batch_gathers_over_moe_cp(self):
             return None
         # DSA / MLA CP all-gather across attention CP on a prefill, which leaves
         # the real rows zigzag-permuted rather than in a prefix.
