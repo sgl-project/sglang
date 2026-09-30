@@ -203,6 +203,93 @@ class TestKdaPrefill(CustomTestCase):
             atol=3e-2,
         )
 
+    @torch.inference_mode()
+    def test_ptx_without_lower_bound_matches_triton(self):
+        """Without a gate lower bound (Kimi-Linear) the kernel's per-chunk decay
+        overflows to NaN; prefill must still return Triton's result."""
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (
+            10,
+            3,
+        ):
+            self.skipTest("PTX KDA prefill requires GB300")
+
+        def run(kernel):
+            # Fresh inputs per call: Triton may mutate them.
+            q, k, v, gate, beta, _, dt_bias, state = _inputs(3, seq_len=256)
+            out = kernel.extend(
+                q=q,
+                k=k,
+                v=v,
+                g=gate,
+                beta=beta,
+                ssm_states=state,
+                cache_indices=torch.zeros(1, device="cuda", dtype=torch.int32),
+                query_start_loc=torch.tensor(
+                    [0, 256], device="cuda", dtype=torch.int32
+                ),
+                # exp(A_log) ~ 200, the top of Kimi-Linear-48B's first KDA layer.
+                A_log=torch.full((q.shape[2],), 5.3, device="cuda"),
+                dt_bias=dt_bias,
+                lower_bound=None,
+                beta_is_raw=True,
+                extend_seq_lens_cpu=[256],
+            )
+            return out, state
+
+        actual, actual_state = run(PtxKDAKernel())
+        expected, expected_state = run(TritonKDAKernel())
+        self.assertTrue(torch.isfinite(actual).all())
+        torch.testing.assert_close(
+            actual.float(), expected.float(), rtol=2e-2, atol=3e-2
+        )
+        torch.testing.assert_close(actual_state, expected_state, rtol=2e-2, atol=3e-2)
+
+    @torch.inference_mode()
+    def test_ptx_workspace_memory_is_bounded(self):
+        """Each new (tokens, sequences) shape gets a kernel workspace, and serving
+        sees a new shape almost every batch: the device memory they hold must stay
+        bounded instead of growing with every shape seen."""
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (
+            10,
+            3,
+        ):
+            self.skipTest("PTX KDA prefill requires GB300")
+        q, k, v, gate, beta, a_log, dt_bias, _ = _inputs(4, seq_len=2048)
+        num_heads, chunks = q.shape[2], 2048 // 64
+        retained = []
+        prev = torch.cuda.memory_allocated()
+        for num_seqs in range(1, 17):
+            base, extra = divmod(chunks, num_seqs)
+            lens = [64 * (base + (i < extra)) for i in range(num_seqs)]
+            cu_cpu = torch.tensor([0, *lens], dtype=torch.int32).cumsum(0).int()
+            out, final_state = ptx_chunk_kda_fwd(
+                q=q,
+                k=k,
+                v=v,
+                g=gate,
+                beta=beta,
+                scale=q.shape[-1] ** -0.5,
+                initial_state=torch.zeros(num_seqs, num_heads, 128, 128, device="cuda"),
+                output_final_state=True,
+                cu_seqlens=cu_cpu.cuda(),
+                cu_seqlens_cpu=cu_cpu,
+                safe_gate=True,
+                lower_bound=-5.0,
+                use_gate_in_kernel=True,
+                A_log=a_log,
+                dt_bias=dt_bias,
+                use_qk_l2norm_in_kernel=True,
+                use_beta_sigmoid_in_kernel=True,
+            )[:2]
+            del out, final_state
+            torch.cuda.synchronize()
+            now = torch.cuda.memory_allocated()
+            retained.append(now - prev)
+            prev = now
+        # An unbounded cache keeps one more workspace per shape, 12 over the last
+        # 12 shapes; a bounded one holds a few whatever it held before the test.
+        self.assertLess(sum(retained[4:]), 4 * max(retained))
+
 
 if __name__ == "__main__":
     unittest.main()

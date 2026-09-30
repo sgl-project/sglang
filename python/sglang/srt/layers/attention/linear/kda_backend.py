@@ -793,6 +793,28 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         return core_attn_out
 
+    def _convolve_prefill(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        mixed_qkv: torch.Tensor,
+        conv_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        # Depthwise conv is channel-independent, so one packed call over the
+        # full qkv width matches the decode path and saves two kernel launches.
+        return causal_conv1d_fn(
+            mixed_qkv.transpose(0, 1),
+            layer.conv_weights,
+            layer.bias,
+            activation="silu",
+            conv_states=conv_states,
+            has_initial_state=forward_batch.extend_prefix_lens > 0,
+            cache_indices=cache_indices,
+            query_start_loc=self.forward_metadata.query_start_loc,
+            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+        ).transpose(0, 1)
+
     def forward_extend(
         self,
         layer: RadixLinearAttention,
@@ -820,7 +842,6 @@ class KDAAttnBackend(MambaAttnBackendBase):
             raise RuntimeError(
                 "extend_prefix_lens cannot be None in non-TARGET_VERIFY mode."
             )
-        has_initial_state = forward_batch.extend_prefix_lens > 0
 
         physical_num_tokens = mixed_qkv.shape[0]
         logical_num_tokens = self.forward_metadata.logical_num_tokens
@@ -841,19 +862,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 self.forward_metadata.conv_states_mask_indices
             ] = mixed_qkv[self.forward_metadata.track_conv_indices]
 
-        # Depthwise conv is channel-independent, so one packed call over the
-        # full qkv width matches the decode path and saves two kernel launches.
-        qkv = causal_conv1d_fn(
-            mixed_qkv.transpose(0, 1),
-            layer.conv_weights,
-            layer.bias,
-            activation="silu",
-            conv_states=conv_states,
-            has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        ).transpose(0, 1)
+        qkv = self._convolve_prefill(
+            layer, forward_batch, mixed_qkv, conv_states, cache_indices
+        )
         q, k, v = qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
 
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
@@ -907,6 +918,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
             lower_bound=layer.lower_bound,
             beta_is_raw=gate_was_flat,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            extend_prefix_lens=forward_batch.extend_prefix_lens,
+            layer_id=layer.layer_id,
             # draft_extend_v2 must stay rollback-able, so kernels that commit state
             # in place (e.g. FlashKDA) must not run for it.
             is_spec_decode=forward_batch.forward_mode.is_draft_extend_v2(),

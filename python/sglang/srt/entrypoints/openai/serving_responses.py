@@ -1081,6 +1081,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 chat_tools,
                 self.tool_call_parser,
                 tokenizer=self.tokenizer_manager.tokenizer,
+                tool_choice=tool_choice,
             )
             detector_owns_format = self._tool_parser_owns_format(parser)
             should_try_native = not is_required or detector_owns_format
@@ -1166,10 +1167,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     @staticmethod
     def _tool_parser_owns_format(parser: FunctionCallParser) -> bool:
-        return (
-            parser.detector.supports_structural_tag()
-            or parser.detector.parses_required_natively()
-        )
+        return parser.owns_tool_format()
 
     @staticmethod
     def _chat_tool_choice(tool_choice: Any) -> Any:
@@ -2011,6 +2009,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     chat_tools,
                     self.tool_call_parser,
                     tokenizer=self.tokenizer_manager.tokenizer,
+                    tool_choice=tool_choice,
                 )
                 detector_owns_format = self._tool_parser_owns_format(probe)
             if is_required and not detector_owns_format:
@@ -2020,6 +2019,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     chat_tools,
                     self.tool_call_parser,
                     tokenizer=self.tokenizer_manager.tokenizer,
+                    tool_choice=tool_choice,
                 )
         reasoning_parser_obj: Optional[ReasoningParser] = None
         if self.reasoning_parser:
