@@ -304,9 +304,11 @@ class UnifiedRadixCache(BasePrefixCache):
             # l3_actual_read_tokens (post-IO) is explainable in-dict.
             "host_alloc_failed": 0,
             "read_failed": 0,
-            "l3_read_failed_tokens": 0,
+            "l3_expected_tokens": 0,
             "l3_actual_read_tokens": 0,
             "timeout": 0,
+            "full_kv_discards": 0,
+            "aux_kv_discards": 0,
         }
 
         # Cumulative transfer-outcome counters for the non-prefetch tiers
@@ -2285,6 +2287,12 @@ class UnifiedRadixCache(BasePrefixCache):
                     result="failed",
                     reason="timeout",
                     rid=operation.request_id,
+                    tokens=len(operation.hash_value) * self.page_size,
+                    duration_ms=(time.monotonic() - operation.start_time) * 1000,
+                    extra=(
+                        f"storage_hit_count={operation.storage_hit_count}, "
+                        f"req_tokens={operation.stats_requested_tokens}"
+                    ),
                 )
                 stats = self._prefetch_outcome_stats
                 stats["timeout"] += 1
@@ -2371,6 +2379,11 @@ class UnifiedRadixCache(BasePrefixCache):
         if not should_terminate:
             return False
 
+        stats = self._prefetch_outcome_stats
+        expected_tokens = len(operation.hash_value) * self.page_size
+        stats["l3_expected_tokens"] += expected_tokens
+        if operation.prefetch_read_failed:
+            stats["read_failed"] += 1
         self.cache_controller.terminate_prefetch(operation)
         if operation.host_indices is None:
             self.storage_prefetch_retries.poll_miss(request.rid)
@@ -2395,12 +2408,6 @@ class UnifiedRadixCache(BasePrefixCache):
         # terminate) and record the actual L3 read so demand vs actual is
         # reconcilable. hash_value was truncated to the allocated hit length
         # before IO, so len(hash_value) * page_size is the expected read.
-        stats = self._prefetch_outcome_stats
-        expected_tokens = len(hash_value) * self.page_size
-        if operation.prefetch_read_failed:
-            stats["read_failed"] += 1
-        stats["l3_read_failed_tokens"] += max(0, expected_tokens - completed_tokens)
-        stats["l3_actual_read_tokens"] += completed_tokens
         (
             last_host_node_id,
             prefetch_key,
@@ -2439,6 +2446,7 @@ class UnifiedRadixCache(BasePrefixCache):
         ):
             self.storage_metrics_collector.log_prefetched_tokens(completed_tokens)
 
+        self._prefetch_outcome_stats["l3_actual_read_tokens"] += completed_tokens
         if self.buffer_pipeline is not None:
             # No graft: release the rank-local tail beyond the synced usable
             # length, then park the bounce for admission-time consumption.
@@ -2610,6 +2618,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 expected_tokens,
                 keep_pages,
             )
+            stats = self._prefetch_outcome_stats
+            if completed_tokens != expected_tokens:
+                stats["full_kv_discards"] += 1
+            else:
+                stats["aux_kv_discards"] += 1
             return False
         return True
 
@@ -3053,8 +3066,8 @@ class UnifiedRadixCache(BasePrefixCache):
                     result="revoke",
                     reason="host_mem_alloc_failed",
                     rid=request.rid,
-                    tokens=operation.storage_hit_count,
-                    extra=f"Revoking prefetch for request due to host memory allocation failure. available={cc.mem_pool_host.available_size()}",
+                    tokens=len(operation.token_ids),
+                    extra=f"Revoking prefetch for request due to host memory allocation failure.storage_hit_count={operation.storage_hit_count}, available={cc.mem_pool_host.available_size()}",
                 )
                 self._prefetch_outcome_stats["host_alloc_failed"] += 1
                 if buffer_mode:

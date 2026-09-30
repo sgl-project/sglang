@@ -204,6 +204,13 @@ class RequestStage:
         metrics_is_observed=True,
     )
 
+    # HiCache storage prefetch (L3 -> L2)
+    PREFETCH = RequestStageConfig(
+        "prefetch",
+        level=1,
+        metrics_is_observed=True,
+    )
+
     # speculative decode
     SPEC_DRAFT = RequestStageConfig(
         "spec_draft",
@@ -639,6 +646,11 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     last_forward_entry_time: float = 0.0
     last_prefill_finished_time: float = 0.0
     run_batch_cpu_start_time: float = 0.0
+    # HiCache storage prefetch (L3 -> L2), recorded via time.perf_counter()
+    prefetch_start_time: float = 0.0
+    # End-to-end prefetch latency, captured once at observe time (start is
+    # cleared after observe, so convert_to_duration reads this snapshot).
+    prefetch_duration: float = 0.0
 
     # speculative decoding
     spec_draft_start_time: float = 0.0
@@ -725,6 +737,8 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         self.last_prefill_finished_time = 0.0
         self.last_chunked_prefill_finish_time = 0.0
         self.queue_duration_s = 0.0
+        self.prefetch_start_time = 0.0
+        self.prefetch_duration = 0.0
 
     def set_wait_queue_entry_time(self, ts=None):
         ts = ts or time.perf_counter()
@@ -1000,6 +1014,31 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         )
         self.trace_slice(stage, self.prefill_transfer_queue_entry_time, ts)
 
+    def reset_prefetch_start_time(self):
+        """Clear any stale prefetch start from a prior round (retract/retry)."""
+        self.prefetch_start_time = 0.0
+        self.prefetch_duration = 0.0
+
+    def set_prefetch_start_time(self, ts=None):
+        ts = ts or time.perf_counter()
+        self.prefetch_start_time = ts
+
+    def observe_prefetch_stage_finish(self, ts=None):
+        """Observe the prefetch stage latency exactly once.
+
+        No-op if prefetch was never issued (prefetch_start_time == 0) or
+        already observed (reset to 0 after the first observe).  Idempotent
+        across repeated ``check_prefetch_progress`` calls returning True.
+        """
+        ts = ts or time.perf_counter()
+        if self.prefetch_start_time > 0.0:
+            stage = RequestStage.PREFETCH
+            latency = ts - self.prefetch_start_time
+            self.observe_per_stage_req_latency(stage, latency)
+            self.trace_slice(stage, self.prefetch_start_time, ts)
+            self.prefetch_duration = latency
+            self.prefetch_start_time = 0.0
+
     def set_decode_prealloc_queue_entry_time(self, ts=None):
         ts = ts or time.perf_counter()
         self.decode_prealloc_queue_entry_time = ts
@@ -1044,6 +1083,16 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     def get_queueing_time(self) -> float:
         return self.queue_duration_s
 
+    def _prefetch_duration_field(self) -> str:
+        """Format the prefetch stage duration for the time-stats log line.
+
+        Empty when no prefetch was issued, so deployments without HiCache
+        don't get a noisy ``prefetch_duration=0.00ms`` field.
+        """
+        if self.prefetch_duration > 0.0:
+            return f"prefetch_duration={self.format_duration(self.prefetch_duration)}, "
+        return ""
+
     def convert_to_duration(self) -> str:
         if self.disagg_mode == DisaggregationMode.NULL:
             queue_duration = self.get_queueing_time()
@@ -1056,7 +1105,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                     f"queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0"
                 )
 
-            return f"queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, entry_time={self.format_wallclock(self.wait_queue_entry_time)}"
+            return f"{self._prefetch_duration_field()}queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, entry_time={self.format_wallclock(self.wait_queue_entry_time)}"
         elif self.disagg_mode == DisaggregationMode.PREFILL:
             bootstrap_queue_duration = self.duration_between(
                 self.prefill_bootstrap_queue_entry_time, self.wait_queue_entry_time
@@ -1096,6 +1145,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 bootstrap_fields = f"bootstrap_queue_duration={self.format_duration(bootstrap_queue_duration)}, "
 
             return (
+                f"{self._prefetch_duration_field()}"
                 f"{bootstrap_fields}"
                 f"queue_duration={self.format_duration(queue_duration)}, "
                 f"forward_duration={self.format_duration(forward_duration)}, "
@@ -1149,6 +1199,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 prealloc_fields = f"prealloc_queue_duration={self.format_duration(prealloc_duration)}, "
 
             return (
+                f"{self._prefetch_duration_field()}"
                 f"{prealloc_fields}"
                 f"transfer_duration={self.format_duration(transfer_duration)}, "
                 f"queue_duration={self.format_duration(queue_duration)}, "

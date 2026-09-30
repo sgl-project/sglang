@@ -4252,16 +4252,10 @@ class UnifiedRadixCacheSuite:
         self.assertEqual((stats["attempts"], stats["issued"]), (1, 1))
         self.assertEqual(stats["l3_demand_requests"], 1)
         # One page short-read: classified as a read failure, the unread page
-        # charged to l3_read_failed_tokens, actual read excludes it.
         self.assertEqual(stats["read_failed"], 1)
-        self.assertEqual(stats["l3_read_failed_tokens"], self.cfg.page_size)
+        self.assertEqual(stats["l3_expected_tokens"], len(seq))
         self.assertEqual(stats["l3_actual_read_tokens"], len(seq) - self.cfg.page_size)
         self.assertEqual(stats["host_alloc_failed"], 0)
-        # Actual + failed tokens reconciles to the expected hit read.
-        self.assertEqual(
-            stats["l3_actual_read_tokens"] + stats["l3_read_failed_tokens"],
-            len(seq),
-        )
 
     def test_buffer_only_cache_salt_uses_the_request_namespace(self):
         self._skip_unsupported_hicache_test()

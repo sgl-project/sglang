@@ -2130,9 +2130,11 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             "l3_miss_tokens",
             "host_alloc_failed",
             "read_failed",
-            "l3_read_failed_tokens",
+            "l3_expected_tokens",
             "l3_actual_read_tokens",
             "timeout",
+            "full_kv_discards",
+            "aux_kv_discards",
         ):
             current = max(float(prefetch_stats.get(outcome, 0)), 0.0)
             previous = self._last_prefetch_outcome.get(outcome, 0.0)
