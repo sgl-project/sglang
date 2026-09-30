@@ -113,6 +113,9 @@ pub struct ChatRenderOpts {
     /// mirrored by the built-in dsv4 encoder, ignored by Jinja and by K3.
     pub dsv4_parts: ChatRenderOptsDsv4Parts,
     pub kimi_k3: kimi_k3::RenderOpts,
+    /// Request-level inputs of the generic Jinja path (`tool_choice`,
+    /// `reasoning_effort` + `chat_template_kwargs`); ignored by dsv4 and K3.
+    pub jinja: chat_template::JinjaRenderOpts,
 }
 
 // Deliberately NO `Default` impl: the only sensible body would be `chat()`, and
@@ -137,6 +140,7 @@ impl ChatRenderOpts {
             dsv4: dsv4::RenderOpts::chat(),
             dsv4_parts: ChatRenderOptsDsv4Parts::default(),
             kimi_k3: kimi_k3::RenderOpts::default(),
+            jinja: chat_template::JinjaRenderOpts::default(),
         }
     }
 
@@ -165,6 +169,7 @@ impl ChatRenderOpts {
                     == Some(true),
             },
             kimi_k3: kimi_k3::resolve_render_opts(request),
+            jinja: chat_template::JinjaRenderOpts::resolve(request),
         }
     }
 }
@@ -202,9 +207,11 @@ impl ChatEncoder {
     /// The DeepSeek-V4 encoder renders `tools` (see [`dsv4::render_messages`]) so
     /// cache-aware routing matches the engine's cached blocks for tool traffic,
     /// and it threads the request-level `parts` (`task`, `continue_final_message`;
-    /// see [`dsv4::render_request`]). The Jinja path does not yet thread
-    /// `tools`/`parts` (a tools-carrying request there still routes on the
-    /// no-tools rendering); adding per-model Jinja tool rendering is future work.
+    /// see [`dsv4::render_request`]). The Jinja encoder threads `tools` and the
+    /// request's `tool_choice` / `reasoning_effort` / `chat_template_kwargs`
+    /// the way the engine's generic Jinja path does (see
+    /// [`ChatTemplate::render`]); it has no `parts` (`task` /
+    /// `continue_final_message`) handling.
     fn render(
         &self,
         messages: &serde_json::Value,
@@ -212,10 +219,7 @@ impl ChatEncoder {
         opts: &ChatRenderOpts,
     ) -> Result<(String, Option<String>)> {
         match self {
-            // The Jinja path does not thread thinking-mode/tools/parts yet
-            // (future work); it ignores `opts` and renders the model's default
-            // template.
-            ChatEncoder::Jinja(t) => t.render(messages).map(|s| (s, None)),
+            ChatEncoder::Jinja(t) => t.render(messages, tools, &opts.jinja).map(|s| (s, None)),
             ChatEncoder::DeepSeekV4 => {
                 dsv4::render_request(messages, tools, opts.dsv4, opts.dsv4_parts())
                     .map_err(anyhow::Error::from)
@@ -242,7 +246,7 @@ impl ChatEncoder {
         opts: &ChatRenderOpts,
     ) -> Result<String> {
         match self {
-            ChatEncoder::Jinja(t) => t.render(messages),
+            ChatEncoder::Jinja(t) => t.render(messages, tools, &opts.jinja),
             ChatEncoder::DeepSeekV4 => Ok(dsv4::render_messages(messages, tools, opts.dsv4)),
             // As in `render`: K3 has no single-string form, so the segment path
             // in `encode_chat_plain` handles it before reaching here.
@@ -2434,5 +2438,61 @@ mod tests {
         eprintln!(
             "l1 counters: hits={hits} misses={misses} cached_tokens={cached_tok} encoded_tokens={encoded_tok}"
         );
+    }
+
+    /// Engine parity for the generic Jinja encoder, against a LIVE engine.
+    ///
+    /// `SGL_ROUTER_JINJA_PARITY_DIR` holds the model's `tokenizer.json` and
+    /// `tokenizer_config.json`, `requests.json` (`{case: chat request body}`)
+    /// and `engine_ids.json` (`{case: {"ids": [...]}}`, the engine's
+    /// `return_prompt_token_ids` for each body). Every case must tokenize to the
+    /// engine's ids exactly: a divergent prefix is a missed cache hit on every
+    /// request of that shape. Ignored by default — the fixtures are per-model
+    /// and may be private.
+    #[test]
+    #[ignore]
+    fn jinja_engine_parity_from_env() {
+        let Ok(dir) = std::env::var("SGL_ROUTER_JINJA_PARITY_DIR") else {
+            eprintln!("SGL_ROUTER_JINJA_PARITY_DIR unset; skipping");
+            return;
+        };
+        let read = |f: &str| -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(format!("{dir}/{f}")).unwrap()).unwrap()
+        };
+        let tk = adapter::load(&format!("{dir}/tokenizer.json")).unwrap();
+        let reg = TokenizerRegistry::default();
+        reg.inner
+            .insert("m".into(), TokenizerShards::shared(Arc::clone(&tk)));
+        reg.attach_chat_template_for_test("m", &read("tokenizer_config.json"));
+        let requests = read("requests.json");
+        let engine = read("engine_ids.json");
+
+        let mut failures = Vec::new();
+        for (case, req) in requests.as_object().unwrap() {
+            let want: Vec<u32> = serde_json::from_value(engine[case]["ids"].clone()).unwrap();
+            let opts = ChatRenderOpts::resolve(req);
+            let got = reg.encode_chat("m", &req["messages"], req.get("tools"), &opts);
+            match got {
+                Some(got) if got == want => eprintln!("OK   {case} ({} ids)", got.len()),
+                Some(got) => {
+                    let at = got.iter().zip(&want).take_while(|(a, b)| a == b).count();
+                    let ctx = |ids: &[u32]| {
+                        let lo = at.saturating_sub(8);
+                        let hi = (at + 12).min(ids.len());
+                        adapter::decode_complete(&tk, &ids[lo..hi], false).unwrap_or_default()
+                    };
+                    eprintln!(
+                        "DIFF {case}: router {} vs engine {} ids, first diff at {at}\n  router: {:?}\n  engine: {:?}",
+                        got.len(), want.len(), ctx(&got), ctx(&want)
+                    );
+                    failures.push(case.clone());
+                }
+                None => {
+                    eprintln!("FAIL {case}: router could not render (raw-text fallback)");
+                    failures.push(case.clone());
+                }
+            }
+        }
+        assert!(failures.is_empty(), "engine parity failed for {failures:?}");
     }
 }

@@ -2070,7 +2070,7 @@ fn input_ids_safe_to_forward_dsv4(value: &serde_json::Value) -> bool {
 /// them (the common case); a model whose engine does not would diverge by a
 /// leading special.
 fn input_ids_safe_to_forward(value: &serde_json::Value) -> bool {
-    if request_has_tools(value) || request_is_multimodal(value) {
+    if request_has_tools(value) || request_has_tool_history(value) || request_is_multimodal(value) {
         return false;
     }
     // Fields that steer the engine's template tokenization but which the
@@ -2253,6 +2253,27 @@ fn request_has_tools(value: &serde_json::Value) -> bool {
         .get("messages")
         .and_then(|m| m.as_array())
         .is_some_and(|msgs| msgs.iter().any(|m| nonempty_in(m, "tools")))
+}
+
+/// Whether the conversation history carries tool traffic: an assistant turn
+/// with non-empty `tool_calls`, or a `tool` / `function` result turn. The Jinja
+/// encoder renders these for ROUTING (it mirrors the engine's arguments
+/// normalization), but forwarded `input_ids` become the model's actual input,
+/// so tool history stays engine-tokenized — the conservative side of
+/// [`input_ids_safe_to_forward`].
+fn request_has_tool_history(value: &serde_json::Value) -> bool {
+    value
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .is_some_and(|msgs| {
+            msgs.iter().any(|m| {
+                let role = m.get("role").and_then(|r| r.as_str());
+                matches!(role, Some("tool") | Some("function"))
+                    || m.get("tool_calls")
+                        .and_then(|t| t.as_array())
+                        .is_some_and(|t| !t.is_empty())
+            })
+        })
 }
 
 /// Whether any message carries non-string (array / multimodal) content. A text
@@ -3779,6 +3800,30 @@ mod tests {
         ));
         assert!(!request_has_tools(&serde_json::json!({"tools":[]})));
         assert!(!request_has_tools(&serde_json::json!({"messages":[]})));
+    }
+
+    /// Tool history (assistant `tool_calls`, tool results) keeps `input_ids`
+    /// engine-side even when the request carries no top-level `tools`.
+    #[test]
+    fn tool_history_is_not_forwarded() {
+        let with_calls = serde_json::json!({"messages":[
+            {"role":"user","content":"hi"},
+            {"role":"assistant","content":"","tool_calls":[
+                {"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]},
+            {"role":"tool","tool_call_id":"c1","content":"ok"},
+            {"role":"user","content":"next"}
+        ]});
+        assert!(request_has_tool_history(&with_calls));
+        assert!(!input_ids_safe_to_forward(&with_calls));
+
+        let empty_calls = serde_json::json!({"messages":[
+            {"role":"assistant","content":"a","tool_calls":[]},
+            {"role":"user","content":"b"}
+        ]});
+        assert!(!request_has_tool_history(&empty_calls));
+        assert!(!request_has_tool_history(&serde_json::json!({"messages":[
+            {"role":"user","content":"plain"}
+        ]})));
     }
 
     /// Array (multimodal) message content is detected so the caller omits
