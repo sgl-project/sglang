@@ -29,7 +29,11 @@ def maybe_publish_prefill_shared_read_done(
     """Publish prefill read-done after compliant metadata initialization."""
     if not envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.get():
         return
-    if forward_batch.forward_mode != ForwardMode.EXTEND:
+    # MIXED only for a verify-merged mixed step; main's own mixed step stays off.
+    if (
+        forward_batch.forward_mode != ForwardMode.EXTEND
+        and getattr(forward_batch, "mixed_num_prefill_tokens", None) is None
+    ):
         return
     # The record lands right after replay prep, so PRE_REPLAY only.
     declared = model_runner.attn_backend.shared_read_ends(forward_batch.forward_mode)

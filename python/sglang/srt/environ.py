@@ -653,6 +653,17 @@ class Envs:
     SGLANG_FORCE_COARSE_WAR_BARRIER = EnvBool(False)
     # Enable prefill read-done publication after compliant metadata initialization.
     SGLANG_ENABLE_PREFILL_WAR_READ_DONE = EnvBool(False)
+    # DSPARK + --enable-mixed-chunk: running requests draft and verify inside the
+    # prefill step (verify-merged mixed step) instead of a 1-token decode.
+    SGLANG_DSPARK_VERIFY_MERGED_MIXED = EnvBool(False)
+    # DeepSeek-V4 verify-merged mixed step: copy only this rank's TP-local attention
+    # heads into the output buffer; the padded heads are left stale (the model reads
+    # only the TP slice).
+    SGLANG_DSV4_ATTN_OUTPUT_TP_LOCAL_COPY = EnvBool(False)
+    # DeepSeek-V4 C4 indexer under the breakable prefill graph: logits + top-k of all
+    # prefill rows in one ragged non-paged launch per layer, in an eager section;
+    # verify rows keep the paged kernel.
+    SGLANG_DSV4_INDEXER_EAGER_RAGGED = EnvBool(False)
     # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,
     # since process_batch_result_prefill discards next_token_ids for those anyway.
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)

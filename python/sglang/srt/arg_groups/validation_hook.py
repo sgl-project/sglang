@@ -19,7 +19,7 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
 )
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import torch_release
+from sglang.srt.utils.common import print_warning_once, torch_release
 from sglang.srt.utils.runai_utils import is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
@@ -85,6 +85,40 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
         "parallelism: allocatable slots per microbatch are bounded by "
         "pp-max-micro-batch-size, so the threshold may never be reached"
     )
+
+
+def verify_merged_mixed_enabled(server_args: Any) -> bool:
+    """Whether mixed steps run DSPARK's verify-merged path.
+
+    Needs SGLANG_DSPARK_VERIFY_MERGED_MIXED, DSPARK and --enable-mixed-chunk;
+    unsupported setups warn and keep the default 1-token decode of running rows.
+    """
+    if not envs.SGLANG_DSPARK_VERIFY_MERGED_MIXED.get():
+        return False
+    cfg = resolved_view(server_args)
+    unsupported = [
+        name
+        for name, bad in (
+            (
+                "a non-DSPARK speculative algorithm",
+                (cfg.speculative_algorithm or "").upper() != "DSPARK",
+            ),
+            ("mixed chunk disabled", not cfg.enable_mixed_chunk),
+            ("DP attention", cfg.enable_dp_attention),
+            ("pipeline parallelism", cfg.pp_size > 1),
+            ("decoder SWA bounded replay", cfg.enable_decoder_swa_bounded_replay),
+            ("two-batch overlap", cfg.enable_two_batch_overlap),
+        )
+        if bad
+    ]
+    if unsupported:
+        # Called by the scheduler and the attention backend: warn once.
+        print_warning_once(
+            f"SGLANG_DSPARK_VERIFY_MERGED_MIXED ignored ({', '.join(unsupported)}); "
+            "mixed steps keep the 1-token decode of running requests."
+        )
+        return False
+    return True
 
 
 def check_server_args(server_args: Any):

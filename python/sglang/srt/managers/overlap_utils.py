@@ -532,6 +532,25 @@ class FutureMap:
                 self.publish_ready.synchronize()
             else:
                 self.publish_ready.wait()
+        n = batch.num_prefill_rows
+        if batch.forward_mode.is_mixed() and n is not None:
+            # Verify-merged mixed step: only the running (tail) rows have a
+            # relayed length. Their exact committed lengths stay on the device
+            # (the worker builds positions from them, no D2H); the host mirror
+            # takes an upper bound, as kv_committed_len lags by at most one
+            # verify of W tokens. Prefill rows keep their scheduled lengths.
+            width = int(get_spec().speculative_num_draft_tokens)
+            batch.seq_lens = torch.cat([batch.seq_lens[:n], self.new_seq_lens_buf[fi]])
+            head_cpu = torch.tensor(
+                [p + e for p, e in zip(batch.prefix_lens[:n], batch.extend_lens[:n])],
+                dtype=torch.int64,
+            )
+            tail_cpu = torch.tensor(
+                [p + width for p in batch.prefix_lens[n:]], dtype=torch.int64
+            )
+            batch.seq_lens_cpu = torch.cat([head_cpu, tail_cpu])
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+            return
         batch.seq_lens = self.new_seq_lens_buf[fi]
 
         if not self.needs_cpu_seq_lens:

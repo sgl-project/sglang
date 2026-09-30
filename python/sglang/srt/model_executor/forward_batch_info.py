@@ -621,6 +621,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     sampling_info: SamplingBatchInfo = None
     # Speculative decoding
     spec_info: Optional[SpecInput] = None
+    # Verify-merged mixed step: logits rows to keep (each prefill row's last
+    # token + every verify position), and the leading prefill population
+    # (rows / tokens) for the attention split. None otherwise.
+    mixed_logits_select_index: Optional[torch.Tensor] = None
+    mixed_num_prefill_rows: Optional[int] = None
+    mixed_num_prefill_tokens: Optional[int] = None
+    # Attention output slice the DeepSeek-V4 layer publishes for that split.
+    attn_output_buffer: Optional[torch.Tensor] = None
+    # DeepSeek-V4 eager ragged C4 indexer: this step's row plan, built by its
+    # first C4 layer and reused by the others.
+    ragged_indexer_plan: Optional[object] = None
 
     # === Derived from ScheduleBatch.reqs ===
     # For LoRA

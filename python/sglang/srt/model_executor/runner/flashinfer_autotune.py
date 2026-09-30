@@ -376,16 +376,18 @@ def maybe_flashinfer_autotune_extend(
     is_pd_prefill_target = (
         get_disagg().disaggregation_mode == "prefill" and not mr.is_draft_worker
     )
-    if not mr.is_generation or (
-        mr.spec_algorithm.is_speculative() and not is_pd_prefill_target
-    ):
-        # Ordinary speculative runners force TARGET_VERIFY; PD prefill targets
-        # have no draft-side state and preserve the requested EXTEND mode.
+    if not mr.is_generation or mr.is_draft_worker:
+        # Speculative targets keep the requested EXTEND mode in _dummy_run;
+        # the draft worker is skipped.
         return
     # Multimodal generation wrappers can still run this text-only EXTEND dummy;
     # an incompatible model should fail the explicit opt-in visibly.
 
-    if mr.attn_backend.extend_dummy_seqs_capped_by_req_pool:
+    if mr.attn_backend.extend_dummy_seqs_capped_by_req_pool or (
+        mr.spec_algorithm.is_speculative() and not is_pd_prefill_target
+    ):
+        # Speculative targets are packed too, keeping page-table indexing in
+        # range (e.g. DSV4); PD prefill targets keep the unpacked dummy.
         pool_size = mr.req_to_token_pool.size
         num_tokens_per_req = (num_tokens + pool_size - 1) // pool_size
     else:

@@ -490,7 +490,14 @@ class BaseRunner(ABC):
         _is_pd_prefill_target = (
             get_disagg().disaggregation_mode == "prefill" and not mr.is_draft_worker
         )
-        if mr.spec_algorithm.is_speculative() and not _is_pd_prefill_target:
+        # The FlashInfer extend autotune (the only caller passing
+        # extend_num_tokens_per_req) keeps EXTEND on a speculative target too.
+        _is_extend_autotune_target = (
+            extend_num_tokens_per_req is not None and not mr.is_draft_worker
+        )
+        if mr.spec_algorithm.is_speculative() and not (
+            _is_pd_prefill_target or _is_extend_autotune_target
+        ):
             if mr.is_draft_worker:
                 assert mr.spec_algorithm.supports_target_verify_for_draft(), (
                     "This should not happen"
@@ -498,12 +505,9 @@ class BaseRunner(ABC):
             capture_forward_mode = ForwardMode.TARGET_VERIFY
             num_tokens_per_req = mr.decode_num_tokens_per_req()
         if extend_num_tokens_per_req is not None:
-            assert capture_forward_mode == ForwardMode.EXTEND and (
-                not mr.spec_algorithm.is_speculative() or _is_pd_prefill_target
-            ), (
-                "extend_num_tokens_per_req requires an ordinary or PD-prefill "
-                "target EXTEND dummy"
-            )
+            assert (
+                capture_forward_mode == ForwardMode.EXTEND and not mr.is_draft_worker
+            ), "extend_num_tokens_per_req requires a non-draft EXTEND dummy"
             num_tokens_per_req = extend_num_tokens_per_req
 
         num_tokens = batch_size * num_tokens_per_req
