@@ -62,6 +62,56 @@ class TestSchedulerUnoRequestValidation(CustomTestCase):
         scheduler.init_req_max_new_tokens.assert_called_once_with(req)
         scheduler._add_request_to_queue.assert_called_once_with(req)
 
+    def test_mlx_logprob_requires_sampling_before_admission(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.enable_session_radix_cache = False
+        scheduler.model_config = SimpleNamespace(
+            hf_eos_token_id={1},
+            vocab_size=128,
+        )
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
+        scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
+        scheduler.tokenizer = None
+        scheduler.dllm_config = None
+        scheduler._maybe_namespace_elastic_radix_cache = MagicMock()
+        scheduler.spec_algorithm = SimpleNamespace(
+            is_dflash_family=lambda: False,
+            is_uno=lambda: False,
+        )
+        scheduler.init_req_max_new_tokens = MagicMock()
+        scheduler._add_request_to_queue = MagicMock()
+
+        recv_req = MagicMock(
+            session_params=None,
+            session_id=None,
+            input_embeds=None,
+            bootstrap_port=1,
+            return_logprob=True,
+            logprob_start_len=-1,
+            token_ids_logprob=None,
+            mm_inputs=None,
+        )
+        req = MagicMock(return_logprob=True, return_sampling_mask=False)
+        with (
+            patch(
+                "sglang.srt.managers.scheduler.BeamCoordinator.request_beam_width",
+                return_value=1,
+            ),
+            patch("sglang.srt.managers.scheduler.Req", return_value=req),
+            patch("sglang.srt.managers.scheduler.use_mlx", return_value=True),
+            patch(
+                "sglang.srt.managers.scheduler.get_device",
+                return_value=SimpleNamespace(mlx_enable_sampling=False),
+            ),
+        ):
+            scheduler.handle_generate_request(recv_req)
+
+        req.set_finish_with_abort.assert_called_once_with(
+            "Output logprobs on the MLX backend require --mlx-enable-sampling."
+        )
+        scheduler.init_req_max_new_tokens.assert_called_once_with(req)
+        scheduler._add_request_to_queue.assert_called_once_with(req)
+
 
 if __name__ == "__main__":
     unittest.main()
