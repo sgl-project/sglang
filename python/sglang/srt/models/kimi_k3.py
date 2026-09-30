@@ -534,6 +534,19 @@ class KimiK3MoE(nn.Module):
                 "got a checkpoint with different constants"
             )
 
+        # ROCm: aiter MegaMoEV2 replaces the routed-expert call on the MoRI a2a
+        # path (dispatch + GEMM1 + SiTU / GEMM2 + combine in two kernels).
+        from sglang.srt.layers.moe.mega_moe_aiter_k3 import use_aiter_mega_moe
+
+        self._use_aiter_mega_moe = use_aiter_mega_moe()
+        self.config_situ_beta = config.activation_situ_beta
+        self.config_situ_linear_beta = config.activation_situ_linear_beta
+        if self._use_aiter_mega_moe:
+            assert get_moe_a2a_backend().is_mori(), (
+                "SGLANG_AMD_USE_FLYDSL_MEGA_MOE needs --moe-a2a-backend mori"
+            )
+            assert self.use_latent_moe and config.hidden_act == "situ"
+
         # EP a2a backends (megamoe / DeepEP / Mooncake / Ascend-FuseEP / MoRI)
         # move each row to its experts directly, so the MoE region can consume
         # whatever rows this rank holds — an SP-MoE token shard (attn_tp > 1) or
@@ -858,6 +871,32 @@ class KimiK3MoE(nn.Module):
                 y.mul_(self.routed_scaling_factor)
         return y
 
+    def _forward_aiter_mega_experts(
+        self, routed_input: torch.Tensor, topk_output
+    ) -> torch.Tensor:
+        """ROCm counterpart of `_forward_mega_experts` on aiter MegaMoEV2.
+        The result aliases the shared combine buffer, so it must be consumed
+        (`_reduce_latent`) before the next MoE layer runs."""
+        from sglang.srt.layers.moe.mega_moe_aiter_k3 import forward_routed_experts
+
+        y = forward_routed_experts(
+            self.experts,
+            routed_input,
+            topk_output,
+            model_dim=self.moe_hidden_size,
+            inter_dim=self._mega_intermediate_size,
+            topk=self._mega_top_k,
+            situ_beta=float(self.config_situ_beta),
+            situ_linear_beta=float(self.config_situ_linear_beta),
+        )
+        if not self.experts.should_fuse_routed_scaling_factor_in_topk:
+            if (
+                self.routed_scaling_factor is not None
+                and self.routed_scaling_factor != 1.0
+            ):
+                y = y * self.routed_scaling_factor
+        return y
+
     def _latent_norm(self, latent: torch.Tensor) -> torch.Tensor:
         if self.routed_expert_norm is None:
             return latent
@@ -1093,11 +1132,12 @@ class KimiK3MoE(nn.Module):
                 routed_input = hidden_states.new_empty((0, self.moe_hidden_size))
             else:
                 routed_input, _ = self.routed_expert_down_proj(hidden_states)
-        expert_output = (
-            self._forward_mega_experts(routed_input, topk_output)
-            if self._use_mega_moe
-            else self.experts(routed_input, topk_output)
-        )
+        if self._use_mega_moe:
+            expert_output = self._forward_mega_experts(routed_input, topk_output)
+        elif self._use_aiter_mega_moe:
+            expert_output = self._forward_aiter_mega_experts(routed_input, topk_output)
+        else:
+            expert_output = self.experts(routed_input, topk_output)
         if expert_output.shape[0] == 0:
             # The EP combine returns one row per source token.  Keep the
             # source-side empty result while avoiding empty RMSNorm/up-proj
