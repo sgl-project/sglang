@@ -113,6 +113,7 @@ class Llama4MoE(nn.Module):
 
         self.topk = TopK(
             top_k=self.top_k,
+            layer_id=layer_id,
             renormalize=False,
             custom_routing_function=Llama4MoE.custom_routing_function,
         )
@@ -431,11 +432,13 @@ class Llama4DecoderLayer(nn.Module):
             (
                 declare_ffn(
                     sparse=is_moe_layer,
-                    next_sparse=is_next_moe_layer,
+                    next_layer_sparse=is_next_moe_layer,
                 ),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn(sparse=is_previous_moe_layer, next_sparse=is_moe_layer)
+            previous=declare_ffn(
+                sparse=is_previous_moe_layer, next_layer_sparse=is_moe_layer
+            )
             if layer_id != 0
             else None,
             terminal=layer_id == config.num_hidden_layers - 1,
@@ -460,7 +463,7 @@ class Llama4DecoderLayer(nn.Module):
         capture_output=None,
     ) -> torch.Tensor:
         hidden_states = self.attn_boundary.prepare(
-            hidden_states, forward_batch, capture_output=capture_output
+            hidden_states, forward_batch, capture=capture_output
         )
 
         if hidden_states.shape[0] != 0:
@@ -537,7 +540,9 @@ class Llama4Model(nn.Module):
 
         hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
         if not forward_batch.forward_mode.is_idle():
-            hidden_states = residual_batch.norm(hidden_states, forward_batch, self.norm)
+            hidden_states = residual_batch.final_norm(
+                hidden_states, forward_batch, self.norm
+            )
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -577,7 +582,7 @@ class Llama4ForCausalLM(LlamaForCausalLM):
             )
         if end != self.model.config.num_hidden_layers:
             return None
-        forward_batch.hidden_states = residual_batch.norm(
+        forward_batch.hidden_states = residual_batch.final_norm(
             forward_batch.hidden_states, forward_batch, self.model.norm
         )
         return self.logits_processor(
