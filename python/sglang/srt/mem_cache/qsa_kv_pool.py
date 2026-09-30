@@ -74,8 +74,8 @@ class QSATokenToKVPool(HybridLinearKVPool):
                 "compressed QSA requires a paged full-KV cache with the page "
                 "a multiple of the compress ratio (compressed slots are "
                 f"full_slot // ratio): page_size={page_size}, "
-                f"ratio={qsa_compress_ratio}. With MambaRadixCache this "
-                "needs the mamba extra-buffer strategy or "
+                f"ratio={qsa_compress_ratio}. This needs the mamba "
+                "extra-buffer strategy or "
                 "--disable-radix-cache (see the Qwen4-Exp arg overrides)."
             )
         # super().__init__ computes mem_usage via the overridden get_kv_size_bytes,

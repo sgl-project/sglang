@@ -23,11 +23,15 @@ import torch
 from torch import nn
 
 from sglang.srt.distributed import (
-    get_pp_group,
     get_pp_indices,
 )
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.layer_boundary.residual.access import (
+    finish_layer_stack,
+    from_pp,
+    snapshot,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -324,7 +328,7 @@ class Qwen2Model(nn.Module):
         self.config = config
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -409,15 +413,12 @@ class Qwen2Model(nn.Module):
             residual = None
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states, residual = from_pp(pp_proxy_tensors)
 
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             if i in self.layers_to_capture:
-                aux_hidden_states.append(
-                    hidden_states + residual if residual is not None else hidden_states
-                )
+                aux_hidden_states.append(snapshot(hidden_states, residual))
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
@@ -425,6 +426,10 @@ class Qwen2Model(nn.Module):
                 forward_batch,
                 residual,
             )
+
+        hidden_states, residual = finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
@@ -495,7 +500,7 @@ class Qwen2ForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         self.model = Qwen2Model(

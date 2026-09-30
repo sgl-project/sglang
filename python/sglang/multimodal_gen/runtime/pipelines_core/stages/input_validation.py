@@ -15,6 +15,7 @@ from PIL import Image
 from sglang.multimodal_gen.configs.pipeline_configs import WanI2V480PConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
+from sglang.multimodal_gen.configs.task_type import get_request_task_type
 from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
     expand_request_outputs,
 )
@@ -77,6 +78,9 @@ class InputValidationStage(PipelineStage):
         super().__init__()
         self.vae_image_processor = vae_image_processor
 
+    def load_condition_image(self, image):
+        return load_image(image)
+
     def iter_sequential_requests(
         self, batch: Req, server_args: ServerArgs
     ) -> Iterator[Req]:
@@ -87,13 +91,15 @@ class InputValidationStage(PipelineStage):
         if num_outputs == 1:
             return iter((batch,))
 
-        return iter(
-            expand_request_outputs(
-                batch,
-                reuse_parent_trace_ctx=True,
-                preserve_parent_metrics=True,
-            )
+        outputs = expand_request_outputs(
+            batch,
+            reuse_parent_trace_ctx=True,
+            preserve_parent_metrics=True,
         )
+        # expansion resets generators after this stage has already validated them
+        for output in outputs:
+            self._generate_seeds(output, server_args)
+        return iter(outputs)
 
     @staticmethod
     def _calculate_dimensions_from_area(
@@ -187,8 +193,10 @@ class InputValidationStage(PipelineStage):
         NOTE: condition image resizing is only allowed in InputValidationStage
         """
         if batch.condition_image is not None and (
-            server_args.pipeline_config.task_type == ModelTaskType.I2I
-            or server_args.pipeline_config.task_type == ModelTaskType.TI2I
+            get_request_task_type(batch, server_args.pipeline_config)
+            == ModelTaskType.I2I
+            or get_request_task_type(batch, server_args.pipeline_config)
+            == ModelTaskType.TI2I
         ):
             # calculate new condition image size
             if not isinstance(batch.condition_image, list):
@@ -230,7 +238,10 @@ class InputValidationStage(PipelineStage):
                 batch.width = width
                 batch.height = height
 
-        elif server_args.pipeline_config.task_type == ModelTaskType.TI2V:
+        elif (
+            get_request_task_type(batch, server_args.pipeline_config)
+            == ModelTaskType.TI2V
+        ):
             if server_args.pipeline_config.skip_input_image_preprocess:
                 return
             # duplicate with vae_image_processor
@@ -355,7 +366,8 @@ class InputValidationStage(PipelineStage):
         self._generate_seeds(batch, server_args)
 
         if (
-            server_args.pipeline_config.task_type == ModelTaskType.I2M
+            get_request_task_type(batch, server_args.pipeline_config)
+            == ModelTaskType.I2M
             and batch.num_inference_steps is None
             and hasattr(server_args.pipeline_config, "shape_num_inference_steps")
         ):
@@ -365,7 +377,8 @@ class InputValidationStage(PipelineStage):
 
         # Ensure prompt is properly formatted (I2M can be image-only)
         if (
-            server_args.pipeline_config.task_type != ModelTaskType.I2M
+            get_request_task_type(batch, server_args.pipeline_config)
+            != ModelTaskType.I2M
             and batch.prompt is None
             and batch.prompt_embeds is None
         ):
@@ -429,7 +442,7 @@ class InputValidationStage(PipelineStage):
                     if path.endswith(".mp4"):
                         image = load_video(path)[0]
                     else:
-                        image = load_image(path)
+                        image = self.load_condition_image(path)
                     batch.condition_image.append(image)
 
                 # Use the first image for size reference
@@ -443,7 +456,7 @@ class InputValidationStage(PipelineStage):
                 if batch.image_path.endswith(".mp4"):
                     image = load_video(batch.image_path)[0]
                 else:
-                    image = load_image(batch.image_path)
+                    image = self.load_condition_image(batch.image_path)
                 batch.condition_image = image
                 condition_image_width, condition_image_height = (
                     image.width,
@@ -451,7 +464,10 @@ class InputValidationStage(PipelineStage):
                 )
                 batch.original_condition_image_size = image.size
 
-            if server_args.pipeline_config.task_type != ModelTaskType.I2M:
+            if (
+                get_request_task_type(batch, server_args.pipeline_config)
+                != ModelTaskType.I2M
+            ):
                 self.preprocess_condition_image(
                     batch, server_args, condition_image_width, condition_image_height
                 )
@@ -487,7 +503,10 @@ class InputValidationStage(PipelineStage):
         result.add_check(
             "num_videos_per_prompt", batch.num_outputs_per_prompt, V.positive_int
         )
-        if server_args.pipeline_config.task_type != ModelTaskType.I2M:
+        if (
+            get_request_task_type(batch, server_args.pipeline_config)
+            != ModelTaskType.I2M
+        ):
             result.add_check(
                 "prompt_or_embeds",
                 None,
@@ -497,7 +516,10 @@ class InputValidationStage(PipelineStage):
                 ),
             )
 
-        if server_args.pipeline_config.task_type != ModelTaskType.I2M:
+        if (
+            get_request_task_type(batch, server_args.pipeline_config)
+            != ModelTaskType.I2M
+        ):
             result.add_check(
                 "num_inference_steps", batch.num_inference_steps, V.positive_int
             )
