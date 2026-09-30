@@ -126,7 +126,8 @@ This section provides deployment configurations optimized for different hardware
 - Speculative decoding (MTP) can significantly reduce latency for interactive use cases.
 - **H100 / B200 / B300 FP8:** Add `--enable-symm-mem` to enable NCCL symmetric memory for faster collectives and better performance under multi-GPU settings. It only helps when tp > 1, so on B200/B300 it applies to the 397B-A17B FP8 recipe (tp=4); the 122B-A10B and 35B-A3B FP8 recipes are single-GPU there.
 - **AMD GPUs (MI300X / MI325X / MI355X):** Use `SGLANG_USE_AITER=1` and `SGLANG_USE_AITER_UNIFIED_ATTN=1` with `--attention-backend aiter`, which requires `--page-size 16` and can also enable `--enable-aiter-allreduce-fusion`. Additionally set `AITER_FLYDSL_FORCE=1` to force the AITER FlyDSL MoE kernels and `SGLANG_MAMBA_SSM_DTYPE=bfloat16` to store the Mamba SSM state in bfloat16 (instead of the default float32). For the **MXFP4 checkpoint on MI355X**, set `ROCM_QUICK_REDUCE_QUANTIZATION=INT4` to route multi-GPU collectives through INT4-quantized ROCm quick all-reduce, and drop `--enable-aiter-allreduce-fusion` (the two are mutually exclusive; quick all-reduce is preferred for this recipe).
-- **KV cache offloading (MXFP4 on MI355X):** Selecting **Host DRAM (HiCache)** adds a host-memory tier below the device KV cache, which lets long-context agentic workloads keep more prefix cached and reach higher concurrency than the device KV pool alone allows. It emits `--enable-hierarchical-cache --hicache-ratio 1.5 --hicache-write-policy write_through --hicache-io-backend kernel --hicache-mem-layout page_first`. HiCache extends the radix cache, so the generated command drops `--disable-radix-cache` — the two options are mutually exclusive and SGLang rejects them together at startup. `--hicache-ratio 1.5` sizes the host tier at 1.5x the device KV cache, so make sure the node has that much free CPU DRAM per server on top of the model weights. Leave this **Disabled** for fixed-length throughput serving, where the extra host traffic buys nothing.
+- **KV cache offloading (MXFP4 and 397B FP8 on MI355X):** Selecting **Host DRAM (HiCache)** adds a host-memory tier below the device KV cache, which lets long-context agentic workloads keep more prefix cached and reach higher concurrency than the device KV pool alone allows. On MXFP4 it emits `--enable-hierarchical-cache --hicache-ratio 1.5 --hicache-write-policy write_through --hicache-io-backend kernel --hicache-mem-layout page_first`. HiCache extends the radix cache, so the generated command drops `--disable-radix-cache` — the two options are mutually exclusive and SGLang rejects them together at startup. `--hicache-ratio 1.5` sizes the host tier at 1.5x the device KV cache, so make sure the node has that much free CPU DRAM per server on top of the model weights. Leave this **Disabled** for fixed-length throughput serving, where the extra host traffic buys nothing.
+- **397B FP8 on MI355X, long-context agentic serving:** Selecting **Host DRAM (HiCache)** for the FP8 checkpoint switches the command to the agentic recipe: `--tp 4` instead of the tp=2 that merely fits the weights, `--hicache-write-policy write_through_selective` so non-reusable blocks are not written down to the host tier, and `--kv-cache-dtype fp8_e4m3` to halve device KV bytes. Unlike the MXFP4 recipe this arm keeps `--enable-aiter-allreduce-fusion` and does not set `ROCM_QUICK_REDUCE_QUANTIZATION`. Read the FP8 KV cache warning below before using it for reasoning-heavy work.
 - **Watchdog timeout:** Increase `--watchdog-timeout` to `1200` or higher for this large model, as weight loading can take significant time.
 - **Mamba Radix Cache**: Qwen3.5's hybrid Gated Delta Networks architecture supports two mamba scheduling strategies via `--mamba-radix-cache-strategy`:
   - **V1 (`no_buffer`)**: Default. No overlap scheduler, lower memory usage. Required for AMD MI GPUs.
@@ -156,7 +157,7 @@ This section provides deployment configurations optimized for different hardware
         - **B300 (275GB)** runs with tp=2.
         - **MI300X (192GB)** runs with tp=4.
         - **MI325X (256GB)** runs with tp=2.
-        - **MI355X (288GB)** runs with tp=2.
+        - **MI355X (288GB)** runs with tp=2 (use tp=4 for long-context agentic serving, where the device KV pool has to feed a host-DRAM tier).
     - **FP4**: The FP4 quantized model requires ~250GB for weights, cutting memory by almost 4x. NVFP4 ([nvidia/Qwen3.5-397B-A17B-NVFP4-V2](https://huggingface.co/nvidia/Qwen3.5-397B-A17B-NVFP4-V2)) requires B200/B300 (Blackwell architecture); AMD provides an MXFP4 checkpoint with FP8 attention ([amd/Qwen3.5-397B-A17B-MXFP4-AttnFP8-V2](https://huggingface.co/amd/Qwen3.5-397B-A17B-MXFP4-AttnFP8-V2)) for MI355X.
         - **B200 (183GB)** runs with tp=4 (tp=2 with expert parallelism 2 when MTP is enabled). (NVFP4)
         - **B300 (275GB)** runs with tp=2. (NVFP4)
@@ -219,14 +220,14 @@ This section provides deployment configurations optimized for different hardware
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MI355X</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>288GB</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>4</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2 / 4 (agentic)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>2 / 4 (MXFP4)</td>
     </tr>
   </tbody>
 </table>
 
 <Warning>
-**FP8 KV Cache**: `--kv-cache-dtype fp8_e4m3` quantizes the KV cache to FP8 at runtime. Since these FP8 model checkpoints do not include pre-calibrated KV cache scaling factors, SGLang defaults to a scale of 1.0, which may cause noticeable accuracy degradation on reasoning-heavy tasks. It is emitted only for the MXFP4-on-MI355X recipe, where it is part of the tuned configuration; for every other combination the generated commands leave it out, so add it manually only if memory constraints require the trade-off.
+**FP8 KV Cache**: `--kv-cache-dtype fp8_e4m3` quantizes the KV cache to FP8 at runtime. Since these FP8 model checkpoints do not include pre-calibrated KV cache scaling factors, SGLang defaults to a scale of 1.0, which may cause noticeable accuracy degradation on reasoning-heavy tasks. It is emitted for the MXFP4-on-MI355X recipe and for the 397B FP8-on-MI355X agentic recipe (Host DRAM / HiCache selected), where it is part of the tuned configuration; for every other combination the generated commands leave it out, so add it manually only if memory constraints require the trade-off.
 </Warning>
 
 - **Xeon CPU service configuration**: Please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
