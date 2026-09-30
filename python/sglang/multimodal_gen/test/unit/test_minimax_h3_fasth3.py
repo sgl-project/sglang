@@ -95,10 +95,14 @@ def test_fasth3_dmd_schedule_matches_trained_rungs() -> None:
     assert metadata.dmd_denoising_steps == DMD_STEPS
     # FastVideo's _set_dmd_schedule output for the video / audio shifts 10 / 3
     served = {
-        10.0: [0.9999, 0.985788, 0.967575, 0.943168, 0.909091]
-        + [0.857143, 0.769231, 0.588235, 0.0],
-        3.0: [0.999666, 0.954148, 0.89952, 0.83274, 0.75]
-        + [0.642857, 0.5, 0.3, 0.0],
+        10.0: [
+            *(0.9999, 0.985788, 0.967575, 0.943168, 0.909091),
+            *(0.857143, 0.769231, 0.588235, 0.0),
+        ],
+        3.0: [
+            *(0.999666, 0.954148, 0.89952, 0.83274, 0.75),
+            *(0.642857, 0.5, 0.3, 0.0),
+        ],
     }
     for shift, expected in served.items():
         sigmas = minimax_h3_time_shift_sigmas(

@@ -295,7 +295,9 @@ class _Workspace:
     ) -> None:
         n_tiles = meta.num_tiles
         self.n_tiles = n_tiles
-        self.use_sm100_kernel = can_use_vsa_block_sparse_sm100(device.index, dtype, head_dim)
+        self.use_sm100_kernel = can_use_vsa_block_sparse_sm100(
+            device.index, dtype, head_dim
+        )
         n_tiles_padded = n_tiles + (n_tiles % 2 if self.use_sm100_kernel else 0)
         seq_pad = n_tiles_padded * VSA_H3_TILE_ELEMS
         self.key = _workspace_key(meta, heads, head_dim, has_gate, dtype, device)
@@ -315,7 +317,9 @@ class _Workspace:
             (heads, n_tiles_padded, n_tiles), dtype=torch.int32, device=device
         )
         self.dense_index[:, :n_tiles] = all_tiles
-        self.dense_num = torch.zeros((heads, n_tiles_padded), dtype=torch.int32, device=device)
+        self.dense_num = torch.zeros(
+            (heads, n_tiles_padded), dtype=torch.int32, device=device
+        )
         self.dense_num[:, :n_tiles] = n_tiles
         self.q2k_index = self.dense_index.clone()
         self.q2k_num = self.dense_num.clone()

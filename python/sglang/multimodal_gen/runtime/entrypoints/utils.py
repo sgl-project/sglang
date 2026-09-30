@@ -1087,6 +1087,7 @@ def save_outputs(
         else outputs
     )
     save_file_paths = [build_output_path(idx) for idx in range(len(outputs))]
+    single_output_encoder = streaming_encoder if len(outputs) == 1 else None
     parallel_results = None
     if (
         data_type == DataType.VIDEO
@@ -1139,7 +1140,7 @@ def save_outputs(
                         fps=fps,
                         audio_sample_rate=audio_sample_rate,
                         output_compression=output_compression,
-                        streaming_encoder=streaming_encoder if len(outputs) == 1 else None,
+                        streaming_encoder=single_output_encoder,
                     )
                 if direct_saved:
                     if samples_out is not None:
