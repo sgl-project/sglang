@@ -80,24 +80,28 @@ def _resolve_elastic_world_dp_size(
     live_dp_size = dp_gather_width()
     effective_ep_size = ElasticEPStateManager.get_effective_ep_size()
     # Query live membership because elastic joins can expand WORLD.
+    from sglang.srt.elastic_ep.topology import attn_replica_size
+
+    replica_size = attn_replica_size()
     world_size = torch.distributed.get_world_size(group)
 
-    if live_dp_size != effective_ep_size:
+    if live_dp_size * replica_size != effective_ep_size:
         raise RuntimeError(
             "[Elastic EP] WORLD MLP sync dp_size is out of sync: "
             f"rank={torch.distributed.get_rank(group)} "
-            f"live_dp_size={live_dp_size} "
-            f"effective_ep_size={effective_ep_size} "
+            f"live_dp_size={live_dp_size} effective_ep_size={effective_ep_size} "
+            f"attn_replica_size={replica_size} "
             f"world_size={world_size} server_args_dp_size={dp_size} "
             f"local_num_tokens={local_num_tokens} "
             f"local_forward_mode={local_forward_mode}"
         )
-    if live_dp_size > world_size:
+    if effective_ep_size > world_size:
         raise RuntimeError(
-            "[Elastic EP] WORLD MLP sync dp_size exceeds WORLD size: "
+            "[Elastic EP] WORLD MLP sync EP size exceeds WORLD size: "
             f"rank={torch.distributed.get_rank(group)} "
             f"live_dp_size={live_dp_size} world_size={world_size} "
-            f"effective_ep_size={effective_ep_size}"
+            f"effective_ep_size={effective_ep_size} "
+            f"attn_replica_size={replica_size}"
         )
 
     return live_dp_size

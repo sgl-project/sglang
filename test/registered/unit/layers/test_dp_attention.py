@@ -15,7 +15,7 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_dp_buffer_len_from_batch,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -39,7 +39,7 @@ class TestSetDpBufferLenFromBatch(unittest.TestCase):
 
     def test_publishes_the_padded_list_and_this_ranks_entry(self):
         batch = _batch()
-        with get_parallel().override(attn_dp_rank=1):
+        with get_parallel().override(attn_dp_rank=1, attn_dp_size=2):
             set_dp_buffer_len_from_batch(batch)
         self.assertEqual(get_global_dp_buffer_len(), 8)
         self.assertEqual(get_local_dp_buffer_len(), 4)
@@ -56,7 +56,7 @@ class TestSetDpBufferLenFromBatch(unittest.TestCase):
             global_num_tokens_padded_cpu=None,
             dp_padding_mode=DpPaddingMode.SUM_LEN,
         )
-        with get_parallel().override(attn_dp_rank=0):
+        with get_parallel().override(attn_dp_rank=0, attn_dp_size=2):
             set_dp_buffer_len_from_batch(batch)
         self.assertEqual(get_local_dp_buffer_len(), 3)
         self.assertFalse(is_dp_max_padding())
@@ -73,6 +73,31 @@ class TestSetDpBufferLenFromBatch(unittest.TestCase):
         with get_parallel().override(attn_dp_rank=1):
             set_dp_buffer_len_from_batch(batch)
         self.assertEqual(get_local_dp_buffer_len(), 3)
+
+    def test_elastic_joiner_uses_its_expanded_world_slot(self):
+        batch = _batch(
+            global_dp_buffer_len=4,
+            global_num_tokens_cpu=[3, 1, 0],
+            global_num_tokens_padded_cpu=None,
+            global_num_tokens_gpu=torch.tensor([3, 1, 0]),
+            dp_padding_mode=DpPaddingMode.SUM_LEN,
+        )
+        with (
+            get_flags().dp.override(
+                use_world_group_for_gather=True,
+                joiner_skip_all_gather=False,
+            ),
+            get_parallel().override(
+                dp_size=3,
+                tp_rank=0,
+                ep_join_rank_offset=4,
+                attn_tp_size=2,
+                attn_cp_size=1,
+                attn_dp_rank=0,
+            ),
+        ):
+            set_dp_buffer_len_from_batch(batch)
+        self.assertEqual(get_local_dp_buffer_len(), 0)
 
 
 if __name__ == "__main__":

@@ -20,6 +20,10 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.elastic_ep.topology import (
+    attn_replica_size,
+    physical_ep_rank_to_dp_rank,
+)
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     derive_attention_ranks,
@@ -96,16 +100,20 @@ def dp_slot_in(per_rank) -> int:
 def dp_gather_slot() -> int:
     """Return this process's index in the DP gather.
 
-    After elastic scale-up, use the TP rank plus the join offset; otherwise
-    use the attention-DP rank. Inside a draft scope that owns its attention,
-    it is still the slot in the target's gather (see patch_tensor_parallel_group).
+    After elastic scale-up, convert the physical EP rank (the TP rank plus the
+    join offset) to its logical attention-DP replica; otherwise use the local
+    attention-DP rank. Inside a draft scope that owns its attention, it is still
+    the slot in the target's gather (see patch_tensor_parallel_group).
     """
     scoped = get_flags().dp.scoped_gather_slot
     if scoped is not None:
         return scoped
     parallel = get_parallel()
     if world_dp_gather_enabled():
-        return parallel.tp_rank + parallel.ep_join_rank_offset
+        return physical_ep_rank_to_dp_rank(
+            parallel.tp_rank + parallel.ep_join_rank_offset,
+            attn_replica_size(),
+        )
     return parallel.attn_dp_rank
 
 
@@ -361,7 +369,7 @@ def set_dp_buffer_len_from_batch(forward_batch: ForwardBatch) -> None:
     global_num_tokens = forward_batch.global_num_tokens_padded_cpu
     if global_num_tokens is None:
         global_num_tokens = forward_batch.global_num_tokens_cpu
-    dp_rank = get_parallel().attn_dp_rank if len(global_num_tokens) > 1 else 0
+    dp_rank = dp_slot_in(global_num_tokens)
     set_dp_buffer_len(
         forward_batch.global_dp_buffer_len,
         global_num_tokens[dp_rank],
