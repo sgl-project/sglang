@@ -324,12 +324,13 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
             assert dispatch_out.weights is not None
             assert dispatch_out.layout.num_tokens_per_rank is not None
             assert dispatch_out.combine_input_buffer is not None
+            active_rows = self.num_ranks * active_capacity
             return MSCCLPPRankMajorLLDispatchOutput(
-                hidden_states=dispatch_out.tokens,
+                hidden_states=dispatch_out.tokens[:active_rows],
                 hidden_states_scale=hidden_states_scale,
                 topk_output=StandardTopKOutput(
-                    dispatch_out.weights,
-                    dispatch_out.topk_ids,
+                    dispatch_out.weights[:active_rows],
+                    dispatch_out.topk_ids[:active_rows],
                     topk_output.router_logits,
                 ),
                 expert_output_buffer=dispatch_out.combine_input_buffer,
