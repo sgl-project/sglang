@@ -136,166 +136,114 @@ def test_config_field_conflicts_with_deprecated_flag(tmp_path, field, flag_value
         ).resolve_once()
 
 
-def test_default_key_source_validation(tmp_path, monkeypatch):
-    config_path = tmp_path / "watermark.json"
-    _write_config(config_path)
+_KEY = "0123456789abcdef"
+_KEY_B = "fedcba9876543210"
 
-    server_args = ServerArgs(
-        model_path="dummy",
-        watermark_config=str(config_path),
-    )
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        pytest.param(
+            {"enable_watermark": False, "watermark_key": _KEY},
+            "require --enable-watermark",
+            id="key-without-capability",
+        ),
+        pytest.param(
+            {"enable_watermark": False, "watermark_enforce_all": True},
+            "require --enable-watermark",
+            id="mode-without-capability",
+        ),
+        pytest.param(
+            {"disaggregation_mode": "decode"},
+            "not supported with PD disaggregation",
+            id="pd-disaggregation",
+        ),
+        pytest.param(
+            {"dllm_algorithm": "LowConfidence"},
+            "not supported with diffusion LLM",
+            id="diffusion-llm",
+        ),
+        pytest.param(
+            {"speculative_algorithm": "DFLASH"},
+            "supports speculative algorithms",
+            id="unsupported-spec",
+        ),
+        pytest.param(
+            {
+                "speculative_algorithm": "EAGLE",
+                "speculative_use_rejection_sampling": True,
+            },
+            "speculative-use-rejection-sampling",
+            id="rejection-sampling",
+        ),
+        pytest.param(
+            {"pp_size": 2, "speculative_algorithm": "EAGLE"},
+            "pipeline-parallel speculative decoding",
+            id="pp-spec",
+        ),
+        pytest.param(
+            {"watermark_key_b": _KEY_B, "watermark_mixing_probability": 0.0},
+            "strictly between 0 and 1",
+            id="mixing-lower",
+        ),
+        pytest.param(
+            {"watermark_key_b": _KEY_B, "watermark_mixing_probability": 1.0},
+            "strictly between 0 and 1",
+            id="mixing-upper",
+        ),
+        pytest.param(
+            {"watermark_mixing_probability": 0.25},
+            "requires key_b",
+            id="mixing-without-key-b",
+        ),
+        pytest.param(
+            {"watermark_max_probability": 0.0},
+            "greater than 0 and at most 1",
+            id="max-probability-lower",
+        ),
+        pytest.param(
+            {"watermark_max_probability": 1.01},
+            "greater than 0 and at most 1",
+            id="max-probability-upper",
+        ),
+        pytest.param(
+            {"watermark_key": None, "watermark_key_b": _KEY_B},
+            "key_b requires a server key",
+            id="key-b-without-key",
+        ),
+        pytest.param(
+            {"watermark_key": None, "watermark_default_enabled": True},
+            "require a server key",
+            id="default-enabled-without-key",
+        ),
+        pytest.param(
+            {"watermark_key": None, "watermark_enforce_all": True},
+            "require a server key",
+            id="enforce-all-without-key",
+        ),
+    ],
+)
+def test_startup_validation_fails_closed(overrides, match):
+    kwargs = {
+        "model_path": "dummy",
+        "device": "cuda",
+        "enable_watermark": True,
+        "watermark_key": _KEY,
+        **overrides,
+    }
+    server_args = ServerArgs(**kwargs)
     server_args.resolve_once()
-    with pytest.raises(ValueError, match="require --enable-watermark"):
+    with pytest.raises(ValueError, match=match):
         check_watermark_server_args(server_args)
 
-    server_args = ServerArgs(
-        model_path="dummy",
-        device="cuda",
-        enable_watermark=True,
-        watermark_key="0123456789abcdef",
-        disaggregation_mode="decode",
-    )
-    server_args.resolve_once()
-    with pytest.raises(ValueError, match="not supported with PD disaggregation"):
-        check_watermark_server_args(server_args)
 
+def test_rust_server_is_rejected(monkeypatch):
     server_args = ServerArgs(
-        model_path="dummy",
-        device="cuda",
-        enable_watermark=True,
-        watermark_key="0123456789abcdef",
-        dllm_algorithm="LowConfidence",
-    )
-    server_args.resolve_once()
-    with pytest.raises(ValueError, match="not supported with diffusion LLM"):
-        check_watermark_server_args(server_args)
-
-    server_args = ServerArgs(
-        model_path="dummy",
-        device="cuda",
-        enable_watermark=True,
-        watermark_key="0123456789abcdef",
-        speculative_algorithm="DFLASH",
-    )
-    server_args.resolve_once()
-    with pytest.raises(ValueError, match="supports speculative algorithms"):
-        check_watermark_server_args(server_args)
-
-    server_args = ServerArgs(
-        model_path="dummy",
-        device="cuda",
-        enable_watermark=True,
-        watermark_key="0123456789abcdef",
-        speculative_algorithm="EAGLE",
-        speculative_use_rejection_sampling=True,
-    )
-    server_args.resolve_once()
-    with pytest.raises(ValueError, match="speculative-use-rejection-sampling"):
-        check_watermark_server_args(server_args)
-
-    server_args = ServerArgs(
-        model_path="dummy",
-        device="cuda",
-        enable_watermark=True,
-        watermark_key="0123456789abcdef",
+        model_path="dummy", device="cuda", enable_watermark=True, watermark_key=_KEY
     )
     server_args.resolve_once()
     monkeypatch.setenv("SGLANG_RUST_SERVER", "1")
     with pytest.raises(ValueError, match="not supported with SGLANG_RUST_SERVER"):
-        check_watermark_server_args(server_args)
-
-
-def test_pipeline_parallel_speculative_watermark_is_rejected():
-    server_args = ServerArgs(
-        model_path="dummy",
-        device="cuda",
-        enable_watermark=True,
-        watermark_key="0123456789abcdef",
-        pp_size=2,
-        speculative_algorithm="EAGLE",
-    )
-    server_args.resolve_once()
-
-    with pytest.raises(ValueError, match="pipeline-parallel speculative decoding"):
-        check_watermark_server_args(server_args)
-
-
-@pytest.mark.parametrize("mixing_probability", [0.0, 1.0])
-def test_dual_key_mixing_probability_is_open_interval(mixing_probability):
-    server_args = ServerArgs(
-        model_path="dummy",
-        device="cuda",
-        enable_watermark=True,
-        watermark_key="0123456789abcdef",
-        watermark_key_b="fedcba9876543210",
-        watermark_mixing_probability=mixing_probability,
-    )
-    server_args.resolve_once()
-    with pytest.raises(ValueError, match="strictly between 0 and 1"):
-        check_watermark_server_args(server_args)
-
-
-@pytest.mark.parametrize("max_probability", [0.0, 1.01])
-def test_watermark_max_probability_is_validated(max_probability):
-    server_args = ServerArgs(
-        model_path="dummy",
-        device="cuda",
-        enable_watermark=True,
-        watermark_key="0123456789abcdef",
-        watermark_max_probability=max_probability,
-    )
-    server_args.resolve_once()
-    with pytest.raises(ValueError, match="greater than 0 and at most 1"):
-        check_watermark_server_args(server_args)
-
-
-def test_dual_key_requires_complete_server_config():
-    server_args = ServerArgs(
-        model_path="dummy",
-        device="cuda",
-        enable_watermark=True,
-        watermark_key_b="fedcba9876543210",
-    )
-    server_args.resolve_once()
-    with pytest.raises(ValueError, match="key_b requires a server key"):
-        check_watermark_server_args(server_args)
-
-    server_args = ServerArgs(
-        model_path="dummy",
-        device="cuda",
-        enable_watermark=True,
-        watermark_key="0123456789abcdef",
-        watermark_mixing_probability=0.25,
-    )
-    server_args.resolve_once()
-    with pytest.raises(ValueError, match="requires key_b"):
-        check_watermark_server_args(server_args)
-
-
-@pytest.mark.parametrize(
-    "mode_flag",
-    ["watermark_default_enabled", "watermark_enforce_all"],
-)
-def test_default_modes_require_server_key(mode_flag):
-    server_args = ServerArgs(
-        model_path="dummy",
-        device="cuda",
-        enable_watermark=True,
-        **{mode_flag: True},
-    )
-    server_args.resolve_once()
-    with pytest.raises(ValueError, match="require a server key"):
-        check_watermark_server_args(server_args)
-
-
-@pytest.mark.parametrize(
-    "mode_flag",
-    ["watermark_default_enabled", "watermark_enforce_all"],
-)
-def test_default_modes_require_watermark_capability(mode_flag):
-    server_args = ServerArgs(model_path="dummy", **{mode_flag: True})
-    server_args.resolve_once()
-    with pytest.raises(ValueError, match="require --enable-watermark"):
         check_watermark_server_args(server_args)
 
 

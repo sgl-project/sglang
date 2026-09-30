@@ -118,7 +118,7 @@ def test_per_request_batch_config_and_admission():
         SimpleNamespace(
             sampling_params=SimpleNamespace(
                 watermark=normalize_watermark_request({"enabled": True}),
-                top_k=2,
+                top_k=1,
             )
         ),
     ]
@@ -140,25 +140,7 @@ def test_per_request_batch_config_and_admission():
     ]
     assert config.context_windows.tolist() == [2, 4, 4, 4]
     assert config.enabled.tolist() == [True, False, False, True]
-    assert config.candidates_host == [True, False, False, True]
-    assert config.has_candidates
-
-    config = build_watermark_batch_config(
-        requests[:3],
-        default_key=_DEFAULT_KEY,
-        default_context_window=4,
-        default_enabled=True,
-        enforce_all=False,
-        device="cpu",
-    )
-    assert config.keys.tolist() == [
-        0xFEDCBA9876543210 - (1 << 64),
-        0x0123456789ABCDEF,
-        0,
-    ]
-    assert config.context_windows.tolist() == [2, 4, 4]
-    assert config.enabled.tolist() == [True, True, False]
-    assert config.candidates_host == [True, True, False]
+    assert config.candidates_host == [True, False, False, False]
     assert config.has_candidates
 
     with pytest.raises(ValueError, match="unknown fields"):

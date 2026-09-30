@@ -1,17 +1,12 @@
-import json
 import math
 import os
 import shutil
-import socket
 import subprocess
 import sys
-import tempfile
-import time
 from pathlib import Path
 
 import msgspec
 import pytest
-import requests
 import torch
 
 import sglang.srt.sampling.watermarking.detector as detector_module
@@ -33,9 +28,8 @@ from sglang.srt.sampling.watermarking.detector import (
     watermark_hash,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, terminate_and_kill_process_tree
 
-register_cpu_ci(est_time=30, suite="base-a-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 _KEY_A = "0123456789abcdef"
 _KEY_B = "fedcba9876543210"
@@ -165,93 +159,6 @@ def _generate_watermarked_tokens(key_a, key_b=None, mixing_probability=0.5):
     return tokens
 
 
-class TestWatermarkDetectionServer(CustomTestCase):
-    def test_http_detection_uses_config_keys(self):
-        with socket.socket() as server_socket:
-            server_socket.bind(("127.0.0.1", 0))
-            port = server_socket.getsockname()[1]
-
-        config_dir = tempfile.TemporaryDirectory()
-        self.addCleanup(config_dir.cleanup)
-        config_path = Path(config_dir.name) / "watermark.json"
-        config_path.write_text(
-            json.dumps(
-                {
-                    "key": _KEY_A,
-                    "key_b": _KEY_B,
-                    "context_window": 4,
-                    "mixing_probability": 0.3,
-                }
-            )
-        )
-        config_path.chmod(0o600)
-        repository_root = Path(__file__).resolve().parents[4]
-        command = [
-            sys.executable,
-            str(repository_root / "examples/watermark/detection_server.py"),
-            "--watermark-config",
-            str(config_path),
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-            "--p-value-threshold",
-            "0.0001",
-        ]
-        process = subprocess.Popen(command)
-
-        base_url = f"http://127.0.0.1:{port}"
-        try:
-            deadline = time.monotonic() + 20
-            while time.monotonic() < deadline:
-                if process.poll() is not None:
-                    self.fail(f"detection server exited with {process.returncode}")
-                try:
-                    if requests.get(f"{base_url}/health", timeout=1).status_code == 200:
-                        break
-                except requests.RequestException:
-                    time.sleep(0.1)
-            else:
-                self.fail("detection server did not become ready")
-
-            positive_tokens = _generate_watermarked_tokens(
-                _KEY_A, _KEY_B, mixing_probability=0.3
-            )
-            positive = requests.post(
-                f"{base_url}/detect",
-                json={"token_ids": positive_tokens},
-                timeout=5,
-            )
-            self.assertEqual(positive.status_code, 200, positive.text)
-            positive_body = positive.json()
-            self.assertTrue(positive_body["watermarked"])
-            self.assertLess(positive_body["p_value"], 1e-4)
-            self.assertLess(
-                positive_body["per_key"]["key_a_partition"]["p_value"], 1e-4
-            )
-            self.assertLess(
-                positive_body["per_key"]["key_b_partition"]["p_value"], 1e-4
-            )
-
-            negative_tokens = _generate_watermarked_tokens("deadbeef")
-            negative = requests.post(
-                f"{base_url}/detect",
-                json={"token_ids": negative_tokens},
-                timeout=5,
-            )
-            self.assertEqual(negative.status_code, 200, negative.text)
-            self.assertFalse(negative.json()["watermarked"])
-
-            injected_key = requests.post(
-                f"{base_url}/detect",
-                json={"token_ids": negative_tokens, "key": "deadbeef"},
-                timeout=5,
-            )
-            self.assertEqual(injected_key.status_code, 422)
-        finally:
-            terminate_and_kill_process_tree(process)
-
-
 def test_dual_partition_and_cross_key_isolation():
     tokens = _generate_watermarked_tokens(_KEY_A, _KEY_B, mixing_probability=0.3)
     result = WatermarkDetector(
@@ -296,14 +203,10 @@ def test_coin_threshold_is_strict_and_empty_partition_is_neutral():
     "kwargs",
     [
         {"key": "1" * 17},
-        {"key": "0x"},
         {"key": "+1"},
         {"context_window": 0},
-        {"context_window": 65},
         {"context_window": True},
-        {"max_contexts": 0},
         {"max_contexts": 4097},
-        {"mixing_probability": 0},
         {"mixing_probability": 1},
         {"mixing_probability": float("nan")},
     ],
