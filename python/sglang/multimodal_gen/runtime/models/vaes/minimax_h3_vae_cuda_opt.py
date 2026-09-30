@@ -46,7 +46,12 @@ def _fused_qknorm_rope(self, query, key, rotary_pos_emb) -> bool:
         return False
     cache, positions = native
     if not can_use_fused_inplace_qknorm_rope(
-        self.dim_head, cache.shape[1], True, query.dtype, cache.dtype, True
+        head_dim=self.dim_head,
+        rope_dim=cache.shape[1],
+        is_neox=True,
+        dtype=query.dtype,
+        cache_dtype=cache.dtype,
+        round_norm_before_rope=True,
     ):
         return False
     weight = self._sgl_unit_weight
@@ -128,7 +133,7 @@ def _attn_fast_compatible(attn: nn.Module) -> bool:
     )
 
 
-def install_fast_attention(
+def _install_fast_attention(
     attn_modules: list[nn.Module], gate: VaeFastPathGate
 ) -> None:
     for attn in attn_modules:
@@ -166,7 +171,7 @@ def maybe_optimize_minimax_h3_vae(vae: nn.Module) -> nn.Module:
         return vae
 
     gate = VaeFastPathGate()
-    install_fast_attention(eligible, gate)
+    _install_fast_attention(eligible, gate)
     register_vae_fast_path_gate(vae, gate)
     logger.info(
         "MiniMax-H3 VAE: installed quality-gated fast path (%d QK RMSNorm+RoPE "

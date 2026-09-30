@@ -838,8 +838,8 @@ class CudaPlatformBase(Platform):
 
     @classmethod
     def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:
-        """Install the quality-gated FLUX.2 / AutoencoderKL / Wan / Qwen-Image / MiniMax-H3
-        VAE decoder fast paths.
+        """Install the quality-gated FLUX.2 / AutoencoderKL / Wan / Qwen-Image /
+        MiniMax-H3 VAE decoder fast paths.
 
         Requests with quality="extra-high" or "high" run the fast paths; the
         "lossless" default runs the original module path bit-for-bit. See

@@ -241,6 +241,7 @@ def _topk_tile_lists(
     prefix = num_prefix_tiles
     keep = _compute_topk(sparsity, num_video_tiles)
     video_rows = scores[:, prefix:, :]
+    # serving takes vsa_h3_topk_lists for this branch; it stays as its reference
     if exempt or prefix == 0:
         picked = video_rows[:, :, prefix:].topk(keep, dim=-1).indices + prefix
         picked = picked.sort(dim=-1).values
@@ -478,10 +479,9 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
         ``return_compress`` returns the compression branch's ``[H, n_tiles, D]``
         output instead of folding it, for ``vsa_h3_fold_gate`` after the
         caller's collectives."""
-        if return_compress and (gate_compress is not None or attn_metadata is None):
-            raise ValueError(
-                "return_compress replaces gate_compress and needs VSA-H3 metadata"
-            )
+        assert not return_compress or (
+            gate_compress is None and attn_metadata is not None
+        ), "return_compress replaces gate_compress and needs VSA-H3 metadata"
         if self.layer_idx is None or attn_metadata is None:
             if attn_metadata is None and self.layer_idx is not None:
                 raise RuntimeError(

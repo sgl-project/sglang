@@ -317,7 +317,7 @@ def _system_ffmpeg_with_libx264() -> Optional[str]:
 
 
 def _resolve_ffmpeg_exe() -> str:
-    # imageio's bundled static ffmpeg is old and encodes H.264 much slower
+    # imageio-ffmpeg's bundled 4.2.2 converts rgb24->yuv420p ~20x slower on aarch64
     ffmpeg_exe = _system_ffmpeg_with_libx264()
     if ffmpeg_exe is not None:
         return ffmpeg_exe

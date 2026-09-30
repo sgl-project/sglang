@@ -4,6 +4,7 @@
 import subprocess
 import sys
 import textwrap
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -18,6 +19,11 @@ from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import VaeFastPath
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3 import MiniMaxH3VideoVAE
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_audio_vae.audio_vae import (
     CausalAttention,
+)
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_vae_cuda_opt import (
+    _attn_fast_compatible,
+    _fused_qknorm_rope,
+    _install_fast_attention,
 )
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import (
     AutoencoderKLLegacy,
@@ -108,11 +114,6 @@ def test_vit_qk_norm_supports_affine_free_rmsnorm():
 def test_vit_fast_path_is_gated_and_matches_reference():
     """Gate closed: bit-identical to the original forward. Gate open: the fused
     qk-norm+RoPE kernel and cuDNN SDPA run and match to rounding level."""
-    from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_vae_cuda_opt import (
-        _attn_fast_compatible,
-        install_fast_attention,
-    )
-
     device = torch.device("cuda")
     dtype = torch.float16
     heads, dim_head, rope_dim = 4, 64, 48
@@ -136,12 +137,12 @@ def test_vit_fast_path_is_gated_and_matches_reference():
     ):
         reference = attention(hidden, rotary)
         gate = VaeFastPathGate()
-        install_fast_attention([attention], gate)
+        _install_fast_attention([attention], gate)
         assert torch.equal(attention(hidden, rotary), reference)
         gate.enabled = True
         fused = attention(hidden, rotary)
-    assert attention._sgl_unit_weight is not None
-    assert attention._sgl_cudnn_failed is False
+    assert attention._sgl_unit_weight is not None, "fused qk-norm+RoPE did not run"
+    assert attention._sgl_cudnn_failed is False, "cuDNN SDPA fell back"
     torch.testing.assert_close(fused, reference, atol=2e-2, rtol=1e-2)
 
 
@@ -150,12 +151,6 @@ def test_vit_rope_batched_tiles_match_per_tile():
     """Stacked decoder tiles share one RoPE row; the fused (quality) and native
     (lossless) RoPE kernels over the flattened batch are bit-identical to one
     tile at a time."""
-    from types import SimpleNamespace
-
-    from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_vae_cuda_opt import (
-        _fused_qknorm_rope,
-    )
-
     device, dtype = torch.device("cuda"), torch.float16
     tiles, heads, dim_head, rope_dim = 3, 4, 64, 48
     pos_embed = RotaryEmbeddingND(rope_dim, 100.0, n_dim=3, use_angle=True).to(device)

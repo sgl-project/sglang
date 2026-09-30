@@ -698,9 +698,9 @@ def _minimax_h3_attention_core_impl(
             if attention.prefix.startswith("blocks.")
             else None
         )
-        # fold the gate on this rank's row shard after the output all-to-all; it is never exchanged
+        # the gate stays on this rank's row shard; fold it after the output all-to-all
         fold_after_exchange = ulysses_active and gate_compress is not None
-        out = attention._attention_impl.forward_varlen(
+        attn_result = attention._attention_impl.forward_varlen(
             q,
             k,
             v,
@@ -712,7 +712,9 @@ def _minimax_h3_attention_core_impl(
             return_compress=fold_after_exchange,
         )
         if fold_after_exchange:
-            out, out_compress = out
+            out, out_compress = attn_result
+        else:
+            out = attn_result
         if ulysses_active:
             out = _usp_output_all_to_all(out[None], head_dim=2)[0]
         if fold_after_exchange:
