@@ -1412,11 +1412,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ):
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
 
-            if (
-                get_parallel().pp_size > 1
-                and not batch.forward_mode.is_idle()
-                and self.speculative_num_steps > 0
-            ):
+            is_pp_decode = (
+                get_parallel().pp_size > 1 and not batch.forward_mode.is_idle()
+            )
+            if is_pp_decode and self.adaptive_controller is not None:
+                self._select_pp_next_draft_state(batch, batch_output)
+
+            if is_pp_decode and self.speculative_num_steps > 0:
                 # PP tail-draft: draft the NEXT round's chain now — earlier
                 # stages must have the tokens before running their half of the
                 # next verify forward, so drafting cannot wait for the next
@@ -1452,6 +1454,36 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch_output.next_verify_top_scores_index = top_scores_index.clone()
 
             return batch_output
+
+    def _select_pp_next_draft_state(
+        self, batch: ScheduleBatch, batch_output: GenerationBatchResult
+    ) -> None:
+        """Select the state that produces the next PP proposal.
+
+        The current proposal has already been verified and draft KV has been
+        extended under its owning state. PP tail-draft is therefore the first
+        point where a new adaptive state can take effect without discarding or
+        relabelling an existing proposal.
+        """
+        if batch_output.accept_lens is None:
+            raise RuntimeError("PP adaptive verify result is missing accept_lens")
+        executed_steps = batch_output.speculative_num_steps
+        if executed_steps is None:
+            raise RuntimeError("PP adaptive verify result is missing executed steps")
+
+        accept_lens = batch_output.accept_lens.to("cpu").tolist()
+        num_non_draft = batch_output.num_non_draft_tokens_per_req
+        num_correct_drafts = [length - num_non_draft for length in accept_lens]
+        batch_size = len(batch.reqs)
+
+        self.adaptive_controller.on_verify_complete(
+            num_correct_drafts,
+            batch_size=batch_size,
+            executed_steps=executed_steps,
+        )
+        next_steps = self.adaptive_controller.activate_step_by_batch(batch_size)
+        batch_output.next_speculative_num_steps = next_steps
+        batch_output.next_speculative_num_draft_tokens = next_steps + 1
 
     def _forward_prefill_batch(
         self, batch, on_publish=None, pp_proxy_tensors=None, coordination_plan=None
@@ -1666,20 +1698,17 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
 
     def on_verify_complete_cpu(
-        self,
-        num_correct_drafts_per_req: list[int],
-        batch_size: int = 0,
-        executed_steps: Optional[int] = None,
+        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
     ) -> None:
         if envs.SGLANG_ENABLE_PP_SPEC.get() and get_parallel().pp_size > 1:
-            # P0 owns the PP adaptive policy. The draft-host stage retains the
-            # same prebuilt state registry but follows the step relayed by P0.
+            # PP updates the draft-host policy before tail-draft, where it can
+            # choose the state that generates the next proposal. Do not feed
+            # the same verify result again during scheduler result processing.
             return
         if self.adaptive_controller is not None:
             self.adaptive_controller.on_verify_complete(
                 num_correct_drafts_per_req,
                 batch_size=batch_size,
-                executed_steps=executed_steps,
             )
 
     def activate_step_by_batch(self, batch_size: int) -> None:

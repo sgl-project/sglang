@@ -34,7 +34,6 @@ class PPAdaptiveTargetStateManager:
         self.model_runner = model_runner
         self.speculative_num_steps = get_spec().speculative_num_steps
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
-        self._pending_transition: Optional[int] = None
         self._controller = AdaptiveController(
             self,
             AdaptiveSpeculativeParams(
@@ -61,29 +60,6 @@ class PPAdaptiveTargetStateManager:
 
     def activate(self, speculative_num_steps: int) -> None:
         self._controller.activate_step(speculative_num_steps)
-
-    def select_for_batch(self, batch_size: int) -> int:
-        return self._controller.activate_step_by_batch(batch_size)
-
-    def observe(
-        self,
-        num_correct_drafts_per_req: list[int],
-        *,
-        batch_size: int,
-        executed_steps: Optional[int],
-    ) -> None:
-        new_step = self._controller.on_verify_complete(
-            num_correct_drafts_per_req,
-            batch_size=batch_size,
-            executed_steps=executed_steps,
-        )
-        if new_step is not None:
-            self._pending_transition = new_step
-
-    def pop_transition(self) -> Optional[int]:
-        step = self._pending_transition
-        self._pending_transition = None
-        return step
 
     # AdaptiveSpecWorker protocol used by AdaptiveController.
     def build_adaptive_runtime_state(
