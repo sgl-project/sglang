@@ -26,8 +26,8 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -278,29 +278,25 @@ def _cp_allgather_and_save_kv_npu(
         if not layer.is_cross_attention
         else forward_batch.encoder_out_cache_loc
     )
-    # Save original trailing shapes for reshape after gather.
-    k_tail = k.shape[1:]  # (tp_k_head_num, qk_head_dim)
-    v_tail = v.shape[1:]  # (tp_v_head_num, v_head_dim)
+    # CP v2: all-gather the rank-local K/V through the active CP strategy and
+    # write the full sequence to the KV pool. Same contract as the
+    # `cp_active` branch of flashattention_backend.
+    cp_strategy = get_cp_strategy()
+    if cp_strategy is None or cp_strategy.cp_size <= 1:
+        token_to_kv_pool.set_kv_buffer(
+            layer,
+            KVWriteLoc(cache_loc, swa_loc),
+            k,
+            v,
+        )
+        return
 
-    # Flatten trailing dims then concat → one all-gather instead of two.
-    # Works for GQA where tp_k_head_num != tp_v_head_num.
-    k_flat = k.contiguous().reshape(k.shape[0], -1)  # [S_local, k_feat]
-    v_flat = v.contiguous().reshape(v.shape[0], -1)  # [S_local, v_feat]
-    k_feat_size = k_flat.shape[-1]
-    kv_flat = torch.cat([k_flat, v_flat], dim=-1)  # [S_local, k_feat + v_feat]
-
-    kv_full = cp_all_gather_rerange_kv_cache(
-        kv_flat, cp_size, forward_batch, get_current_device_stream_fast()
-    )  # [S_full, k_feat + v_feat]
-
-    key_cache_full = kv_full[..., :k_feat_size].reshape(-1, *k_tail)
-    value_cache_full = kv_full[..., k_feat_size:].reshape(-1, *v_tail)
-
-    token_to_kv_pool.set_kv_buffer(
+    cp_strategy.materialize_full_kv(
+        forward_batch,
         layer,
-        KVWriteLoc(cache_loc, swa_loc),
-        key_cache_full,
-        value_cache_full,
+        k,
+        v,
+        swa_loc=swa_loc,
     )
 
 
@@ -1091,6 +1087,20 @@ class AscendAttnBackend(AttentionBackend):
         # Local tokens are laid out [all_seqs_prev, all_seqs_next]; split at
         # total_q_prev_tokens rather than the midpoint to support bs > 1.
         split = cp_meta.total_q_prev_tokens
+
+        # `q` is the physical CP shard: the model runner pads it up to
+        # per_rank_actual_token[0] rows, so it can hold more rows than this rank
+        # logically owns. FIA derives its tiling from the cumulative
+        # actual_seq_lengths, which only describes logical tokens, so the pad
+        # rows must be dropped here and re-appended on the output.
+        logical_tokens = split + int(cp_meta.total_q_next_tokens)
+        pad_rows = int(q.shape[0]) - logical_tokens
+        assert pad_rows >= 0, (
+            f"CP shard ({q.shape[0]} rows) is smaller than its logical token "
+            f"count ({logical_tokens})"
+        )
+        if pad_rows:
+            q = q[:logical_tokens]
         q_prev = (
             q[:split].contiguous().reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
         )
@@ -1140,6 +1150,11 @@ class AscendAttnBackend(AttentionBackend):
         )
 
         attn_out = torch.cat([attn_out_prev, attn_out_next], dim=0)
+        attn_out = torch.cat([attn_out_prev, attn_out_next], dim=0)
+        if pad_rows:
+            attn_out = torch.cat(
+                [attn_out, attn_out.new_zeros(pad_rows, *attn_out.shape[1:])], dim=0
+            )
         return attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_sparse(
