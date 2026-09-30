@@ -840,7 +840,8 @@ class PrefillAdder:
         multiply by `MAMBA_STATE_PER_REQ_PREFIX_CACHE`)."""
         if not self._mamba_slot_cost:
             return 0
-        return 0 if req.kv.holds_mamba else 1
+        slots = 0 if req.kv.holds_mamba else 1
+        return slots + req.mamba_host_hit_length
 
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
@@ -1351,6 +1352,17 @@ class PrefillAdder:
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
 
+        # A staged checkpoint needs a node slot as well as the request state.
+        # Rejection participates in staged lifecycle even before materialization.
+        mamba_slots = self._mamba_slots_for_req(req)
+        if self.rem_mamba_slots is not None and mamba_slots > self.rem_mamba_slots:
+            pipeline = self.tree_cache.buffer_pipeline
+            if pipeline is not None:
+                pipeline.defer_staged_admission(req, pool="mamba")
+            # A dropped hold still has this round's FULL-only splice prefix.
+            # End the attempt; init_next_round_input rebuilds it next round.
+            return AddReqResult.NO_TOKEN
+
         # Reserve page_size for page-alignment overhead: the paged allocator may
         # consume one extra page per request (see alloc_extend), which
         # _update_prefill_budget also deducts.
@@ -1365,7 +1377,6 @@ class PrefillAdder:
         # Shared Mamba pool: fold the mamba slots' shared-gap cost into
         # `total_tokens` so both `rem_total_tokens` gates reflect the joint budget.
         # Read before `init_load_back`; debit sites below reuse the value.
-        mamba_slots = self._mamba_slots_for_req(req)
         total_tokens += mamba_slots * self._mamba_slot_cost
 
         # The temporary pin excludes this prefix from the evictable budget.
