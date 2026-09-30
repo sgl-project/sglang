@@ -859,4 +859,8 @@ class ExaoneMoEForCausalLM(nn.Module):
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
-EntryClass = ExaoneMoEForCausalLM
+class ExaoneMoeForCausalLM(ExaoneMoEForCausalLM):
+    pass
+
+
+EntryClass = [ExaoneMoEForCausalLM, ExaoneMoeForCausalLM]

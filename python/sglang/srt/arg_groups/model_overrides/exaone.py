@@ -10,7 +10,7 @@ from sglang.srt.arg_groups.model_override_base import (
 logger = logging.getLogger(__name__)
 
 
-@_register_for("Exaone4ForCausalLM", "ExaoneMoEForCausalLM")
+@_register_for("Exaone4ForCausalLM", "ExaoneMoEForCausalLM", "ExaoneMoeForCausalLM")
 def _exaone_overrides(server_args: Any, hf_config: Any) -> dict:
     if hf_config.sliding_window_pattern is not None:
         logger.warning(
