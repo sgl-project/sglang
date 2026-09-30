@@ -53,19 +53,25 @@ class GPTQTritonLinearKernel:
         qweight = layer.qweight.data
         k = qweight.shape[0] * 8
 
-        # GPTQ qzeros are [G, N/8] with sequential nibbles; v1 stores zero - 1.
-        packed_zeros = layer.qzeros.data
-        if not self.use_v2_format:
-            nibbles = [((packed_zeros >> s) + 1) & 0xF for s in range(0, 32, 4)]
-            packed_zeros = functools.reduce(
-                torch.bitwise_or, (z << s for z, s in zip(nibbles, range(0, 32, 4)))
-            )
-        sym_word = sum(SYM_ZERO_POINT << s for s in range(0, 32, 4))
-        sym_word -= 1 << 32  # 0x88888888 as a signed int32
-        if bool((packed_zeros == sym_word).all()):
+        # Like Marlin, ignore qzeros for sym checkpoints: some AutoRound exports
+        # (e.g. Qwen3.6 MTP tensors) store them without the v1 "zero - 1" offset.
+        if getattr(self.quant_config, "sym", False):
             qzeros = None
         else:
-            qzeros = packed_zeros.t().contiguous()  # [N/8, G]
+            # GPTQ qzeros are [G, N/8] with sequential nibbles; v1 stores zero - 1.
+            packed_zeros = layer.qzeros.data
+            if not self.use_v2_format:
+                nibbles = [((packed_zeros >> s) + 1) & 0xF for s in range(0, 32, 4)]
+                packed_zeros = functools.reduce(
+                    torch.bitwise_or,
+                    (z << s for z, s in zip(nibbles, range(0, 32, 4))),
+                )
+            sym_word = sum(SYM_ZERO_POINT << s for s in range(0, 32, 4))
+            sym_word -= 1 << 32  # 0x88888888 as a signed int32
+            if bool((packed_zeros == sym_word).all()):
+                qzeros = None
+            else:
+                qzeros = packed_zeros.t().contiguous()  # [N/8, G]
 
         replace_parameter(layer, "qweight", repack_gptq_w4_to_skinny(qweight, k))
         replace_parameter(layer, "scales", layer.scales.data.t().contiguous())
