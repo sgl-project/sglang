@@ -1,3 +1,4 @@
+import os
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -247,10 +248,31 @@ class _NPUMoEMethodBase(FusedMoEMethodBase):
         self.quant_config = quant_config
 
     @staticmethod
-    def _set_dispatcher_output_dtype(layer: torch.nn.Module, dtype) -> None:
+    def _set_dispatcher_output_dtype(layer: torch.nn.Module, dtype: str) -> None:
         """Set dispatcher output dtype if the layer has a dispatcher."""
-        if hasattr(layer, "dispatcher"):
-            layer.dispatcher.set_quant_config({"dispatcher_output_dtype": dtype})
+        if not hasattr(layer, "dispatcher"):
+            return
+
+        from sglang.srt.layers.moe import get_moe_a2a_backend
+        from sglang.srt.runtime_context import get_parallel
+
+        # Ascend routing supports MXFP8, but MXFP4 must be quantized before GMM.
+        config = {"dispatcher_output_dtype": "bf16" if dtype == "mxfp4" else dtype}
+        if get_moe_a2a_backend().is_deepep() and dtype in ("mxfp4", "mxfp8"):
+            transport = os.environ.get("DEEP_USE_MODE", "default")
+            # Normal MXFP dispatch is intranode-only; alltoall has no MXFP mode.
+            config["normal_dispatcher_output_dtype"] = (
+                dtype
+                if get_parallel().nnodes == 1 and transport != "alltoall"
+                else "bf16"
+            )
+            config["low_latency_dispatcher_output_dtype"] = (
+                dtype
+                if transport != "alltoall"
+                and (dtype == "mxfp8" or transport == "default")
+                else "bf16"
+            )
+        layer.dispatcher.set_quant_config(config)
 
     @staticmethod
     def _validate_weight_prefix(layer: torch.nn.Module, weight_prefix: str) -> None:
@@ -308,17 +330,8 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
             weight.data, weight_scale.data
         )
 
-        # A5 DeepEP low-latency dispatch quantizes the valid received rows to
-        # MXFP8 and returns the matching E8M0 block scales.  Keep normal mode
-        # in BF16 because A5 MXFP8 normal dispatch is intranode-only; this also
-        # preserves multi-node prefill when ``deepep-mode=auto``.
-        if weight_prefix == "w13" and hasattr(layer, "dispatcher"):
-            layer.dispatcher.set_quant_config(
-                {
-                    "normal_dispatcher_output_dtype": "bf16",
-                    "low_latency_dispatcher_output_dtype": "mxfp8",
-                }
-            )
+        if weight_prefix == "w13":
+            self._set_dispatcher_output_dtype(layer, "mxfp8")
 
     def apply(
         self,
@@ -436,10 +449,8 @@ class NPUW4A4MXFP4MoEMethod(_NPUMoEMethodBase):
         ).transpose(1, 2)
         weight_scale.data = scale
 
-        # The refactored NPU dispatchers currently support BF16 and INT8.
-        # Keep dispatch in BF16 and quantize immediately before each GMM.
         if weight_prefix == "w13":
-            self._set_dispatcher_output_dtype(layer, "bf16")
+            self._set_dispatcher_output_dtype(layer, "mxfp4")
 
     def apply(
         self,
@@ -1075,9 +1086,9 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
 
     Where the *activation* quant happens depends on the dispatcher. On
     ``ascend_tp`` it comes for free from ``npu_moe_init_routing_v2(quant_mode=3)``,
-    which emits the e4m3 payload and e8m0 scale as part of routing. DeepEP has no
-    mxfp8 dispatch dtype, so it hands over bf16 and w13 quantises the hidden
-    states itself before gmm1.
+    which emits the e4m3 payload and e8m0 scale as part of routing. DeepEP also
+    emits MXFP8 where its transport supports it; otherwise w13 quantises the
+    BF16 hidden states before gmm1.
     """
 
     def __init__(self, weight_prefix: str):
@@ -1162,12 +1173,7 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
         )
 
         if weight_prefix == "w13":
-            from sglang.srt.layers.moe import get_moe_a2a_backend
-
-            # DeepEP has no mxfp8 entry in its dispatch dtype table, so let it
-            # keep sending bf16; apply_fused_gmm1_swiglu quantises instead.
-            dispatcher_dtype = "bf16" if get_moe_a2a_backend().is_deepep() else "mxfp8"
-            self._set_dispatcher_output_dtype(layer, dispatcher_dtype)
+            self._set_dispatcher_output_dtype(layer, "mxfp8")
 
     def apply_fused_gmm1_swiglu(
         self,
@@ -1184,7 +1190,7 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
         for MXFP8.
 
         ``pertoken_scale`` is None when the dispatcher handed over unquantised
-        hidden states (the DeepEP path), in which case the activation quant that
+        hidden states (the BF16 fallback), in which case the activation quant that
         ascend_tp fuses into routing is done here instead. Both dispatchers
         therefore reach the kernel below with the same e4m3 + e8m0 input.
         """
