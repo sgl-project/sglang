@@ -876,34 +876,42 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
 
 @torch.compile(dynamic=True, disable=is_npu())
 def multinomial_with_seed(
-    logprobs: torch.Tensor, seed: torch.Tensor, positions: torch.Tensor
+    logprobs: torch.Tensor,
+    seed: torch.Tensor,
+    positions: torch.Tensor,
+    token_ids: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
-    Samples n elements from an input tensor `inputs` of shape (n, m) using
-    a unique random seed for each row. This is a deterministic batched alternative to
-    `torch.multinomial`.
+    Sample one column per row from log scores using deterministic Gumbel noise.
 
     Args:
-        inputs: A float tensor of shape (n, m) representing n categorical
-                distributions with m categories each. The values are treated
-                as weights and do not need to sum to 1.
-        seed:   An integer tensor of shape (n,) containing the random seed
-                for each corresponding row in `inputs`.
-        positions: The positions of the tokens in the sequence. Used for deterministic sampling
-                to get the unique seed for each position.
+        logprobs: Log scores of shape (n, m).
+        seed: Integer seeds of shape (n,).
+        positions: Sequence positions of shape (n,).
+        token_ids: Original token IDs of shape (m,) for a compact vocabulary.
+            Defaults to column indices. The returned indices still refer to
+            columns in logprobs.
 
     Returns:
-        A tensor of shape (n,) where the i-th element is an index sampled
-        from the distribution in `inputs[i]` using `seed[i]`.
+        Sampled column indices of shape (n, 1).
     """
     n, m = logprobs.shape
     seed = seed.to(torch.uint64)
-    col_indices = torch.arange(m, device=logprobs.device)
+    col_indices = (
+        torch.arange(m, device=logprobs.device) if token_ids is None else token_ids
+    )
     hashed = murmur_hash32(seed, positions, col_indices)
 
     # NOTE (sehoon): it is critical to keep gumbel noise calculation in float64 to avoid numerical instability.
     # keeping logprobs in float64 is less critical, but we found it's still safer to keep it in float64.
-    x = hashed.to(torch.float64) / torch.iinfo(torch.uint32).max
+    if logprobs.device.type == "npu":
+        # Tensor.to(float64) silently demotes to float32 on Ascend.
+        noise_hashes = torch_npu.npu_dtype_cast(hashed, torch.float64)
+        scores = torch_npu.npu_dtype_cast(logprobs, torch.float64)
+    else:
+        noise_hashes = hashed.to(torch.float64)
+        scores = logprobs.to(torch.float64)
+    x = noise_hashes / torch.iinfo(torch.uint32).max
 
     # x is a uniform sample in [0, 1]. get gumbel noise from it.
     # which is equivalent to -log(-log(x))
@@ -914,7 +922,7 @@ def multinomial_with_seed(
     x.log_().neg_()  # -log(-log(x)) == gumbel noise
 
     # add gumbel noise to logprobs
-    x.add_(logprobs.to(torch.float64))
+    x.add_(scores)
 
     return torch.argmax(x, dim=1, keepdim=True)
 

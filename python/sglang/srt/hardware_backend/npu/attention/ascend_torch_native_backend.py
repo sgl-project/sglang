@@ -6,6 +6,8 @@ from typing import Optional
 import torch
 from torch.nn.functional import scaled_dot_product_attention
 
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
+
 
 class AscendTorchNativeAttnBackend:
     def __init__(self):
@@ -250,6 +252,49 @@ class AscendTorchNativeAttnBackend:
         Returns:
             output: [num_tokens, num_heads, head_size]
         """
+
+        # Only graph capture needs fixed KV shapes; eager keeps per-request spans.
+        if (
+            get_is_capture_mode()
+            and encoder_lens is not None
+            and logit_cap == 0
+            and not causal
+            and full_to_swa_mapping is None
+        ):
+            columns = torch.arange(req_to_token.shape[1], device=query.device)
+            if is_cross_attention:
+                starts = torch.zeros_like(seq_lens)
+                ends = encoder_lens
+            else:
+                starts = encoder_lens
+                ends = starts + seq_lens
+            valid = (columns[None, :] >= starts[:, None]) & (
+                columns[None, :] < ends[:, None]
+            )
+            token_ids = req_to_token[req_pool_indices.long()].long()
+            token_ids = torch.where(valid, token_ids, 0)
+            keys = (
+                k_cache[token_ids]
+                .masked_fill(~valid[:, :, None, None], 0)
+                .permute(0, 2, 1, 3)
+                .to(query.dtype)
+            )
+            values = (
+                v_cache[token_ids]
+                .masked_fill(~valid[:, :, None, None], 0)
+                .permute(0, 2, 1, 3)
+                .to(query.dtype)
+            )
+            result = scaled_dot_product_attention(
+                query.unsqueeze(2),
+                keys,
+                values,
+                attn_mask=valid[:, None, None, :],
+                scale=scaling,
+                enable_gqa=enable_gqa,
+            ).squeeze(2)
+            output.copy_(result)
+            return output
 
         # [num_tokens, num_heads, head_size] -> [num_heads, num_tokens, head_size]
         query = query.movedim(0, query.dim() - 2)

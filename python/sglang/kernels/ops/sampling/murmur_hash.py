@@ -9,8 +9,9 @@ def rotl32(x, r: tl.constexpr) -> tl.uint32:
     rotate left 32-bit integer x by r bits
     e.g. x = 01110001, r = 2 -> 11000101
     """
-    x = x.to(tl.uint64)
-    return ((x << r) | (x >> (32 - r))) & 0xFFFFFFFF
+    # Mask shifted bits to preserve logical shifts on Ascend Triton.
+    x = x.to(tl.uint32)
+    return ((x << r) | ((x >> (32 - r)) & ((1 << r) - 1))) & 0xFFFFFFFF
 
 
 @triton.jit
@@ -18,11 +19,11 @@ def fmix32(h: tl.uint32) -> tl.uint32:
     """
     final mix of 32-bit hash value for MurmurHash
     """
-    h ^= h >> 16
+    h ^= (h >> 16) & 0xFFFF
     h = (h * 0x85EBCA6B) & 0xFFFFFFFF
-    h ^= h >> 13
+    h ^= (h >> 13) & 0x7FFFF
     h = (h * 0xC2B2AE35) & 0xFFFFFFFF
-    h ^= h >> 16
+    h ^= (h >> 16) & 0xFFFF
     return h
 
 

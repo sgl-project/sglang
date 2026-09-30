@@ -4,6 +4,7 @@ Unit tests for sglang.srt.hardware_backend.npu.attention.ascend_torch_native_bac
 
 import math
 import unittest
+from unittest.mock import patch
 
 import torch
 from torch.nn.functional import scaled_dot_product_attention
@@ -11,6 +12,7 @@ from torch.nn.functional import scaled_dot_product_attention
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
     AscendTorchNativeAttnBackend,
 )
+from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=4, suite="stage-a-unit-test-npu")
@@ -813,6 +815,120 @@ class TestRunSdpaForwardDecode(unittest.TestCase):
             causal=False,
         )
         self.assertEqual(result.dtype, torch.float32)
+
+
+class TestEncoderDecoderGraphReplay(unittest.TestCase):
+    def test_eager_uses_only_each_requests_valid_span(self):
+        backend = AscendTorchNativeAttnBackend()
+        query = torch.randn(2, 2, 8)
+        keys = torch.randn(16, 2, 8)
+        values = torch.randn_like(keys)
+        table = torch.arange(16).reshape(2, 8)
+        requests = torch.tensor([0, 1], dtype=torch.int32)
+        lengths = torch.tensor([2, 3], dtype=torch.int32)
+        encoder_lengths = torch.tensor([3, 4], dtype=torch.int32)
+        for cross in (False, True):
+            with self.subTest(cross=cross), patch(
+                "sglang.srt.hardware_backend.npu.attention."
+                "ascend_torch_native_backend.scaled_dot_product_attention",
+                wraps=scaled_dot_product_attention,
+            ) as sdpa:
+                backend.run_sdpa_forward_decode(
+                    query,
+                    torch.empty_like(query),
+                    keys,
+                    values,
+                    table,
+                    requests,
+                    lengths,
+                    encoder_lens=encoder_lengths,
+                    is_cross_attention=cross,
+                )
+                # Eager must not materialize the whole request table for every layer.
+                self.assertEqual(
+                    [call.args[1].shape[-2] for call in sdpa.call_args_list],
+                    [3, 4] if cross else [2, 3],
+                )
+
+    @unittest.skipUnless(
+        hasattr(torch, "npu") and torch.npu.is_available(), "requires Ascend NPU"
+    )
+    def test_replay_updates_requests_lengths_and_padding(self):
+        for cross in (False, True):
+            for query_heads in (2, 4):
+                for batch_size in (1, 3):
+                    with self.subTest(cross=cross, heads=query_heads, batch=batch_size):
+                        self._check_replay(cross, query_heads, batch_size)
+
+    def _check_replay(self, cross, query_heads, batch_size):
+        torch.manual_seed(42)
+        device = "npu:0"
+        query = torch.randn(
+            batch_size, query_heads, 64, device=device, dtype=torch.float16
+        )
+        keys = torch.randn(128, 2, 64, device=device, dtype=torch.float16)
+        values = torch.randn_like(keys)
+        table = torch.randperm(128, device=device).reshape(4, 32).int()
+        # Padding must never be used as a cache index, even when it is invalid.
+        table[:, 24:] = -99999
+        requests = torch.arange(batch_size, device=device, dtype=torch.int64)
+        lengths = torch.full((batch_size,), 3, device=device, dtype=torch.int32)
+        encoder_lengths = torch.full((batch_size,), 7, device=device, dtype=torch.int32)
+        backend = AscendTorchNativeAttnBackend()
+        output = torch.empty_like(query)
+
+        def forward():
+            return backend.run_sdpa_forward_decode(
+                query,
+                output,
+                keys,
+                values,
+                table,
+                requests,
+                lengths,
+                encoder_lens=encoder_lengths,
+                is_cross_attention=cross,
+                scaling=64**-0.5,
+                enable_gqa=query_heads != 2,
+            )
+
+        with model_capture_mode():
+            for _ in range(3):
+                forward()
+            torch.npu.synchronize()
+            graph = torch.npu.NPUGraph()
+            with torch.npu.graph(graph):
+                forward()
+
+        for step in range(3):
+            requests.copy_((torch.arange(batch_size, device=device) + step) % 4)
+            lengths.fill_(3 + step)
+            encoder_lengths.fill_(7 + step)
+            if batch_size == 3:
+                lengths[-1] = 0
+                encoder_lengths[-1] = 0
+            query.add_(0.05)
+            graph.replay()
+            # Independent per-request SDPA reference uses only the valid span.
+            expected = torch.empty_like(query)
+            for row in range(batch_size):
+                encoder_length = int(encoder_lengths[row].item())
+                start = 0 if cross else encoder_length
+                end = encoder_length if cross else start + int(lengths[row].item())
+                indices = table[int(requests[row].item()), start:end].long()
+                expected[row] = (
+                    scaled_dot_product_attention(
+                        query[row].unsqueeze(0).unsqueeze(2),
+                        keys[indices].permute(1, 0, 2).unsqueeze(0),
+                        values[indices].permute(1, 0, 2).unsqueeze(0),
+                        scale=64**-0.5,
+                        enable_gqa=query_heads != 2,
+                    )
+                    .squeeze(0)
+                    .squeeze(1)
+                )
+            torch.testing.assert_close(output, expected, atol=0.002, rtol=0.002)
+            self.assertTrue(torch.isfinite(output).all().item())
 
 
 if __name__ == "__main__":

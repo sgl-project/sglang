@@ -133,6 +133,14 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         ):
             out = forward_fn()
 
+        # Updates must not wait for the ordinary launch queue to drain:
+        # a queued synchronizing op can itself be waiting for this graph's
+        # update event. Keep updates off that queue while preserving the
+        # graph's existing event ordering.
+        graph.graph_dispatch_mode.update_stream = torch.npu.SyncLaunchStream(
+            device=self._device_id
+        )
+
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
 
