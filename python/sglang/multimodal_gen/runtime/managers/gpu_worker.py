@@ -791,6 +791,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             if not current_platform.is_cpu():
                 torch.get_device_module().empty_cache()
         finally:
+            if output_batch is not None and output_batch.streamed_video is not None:
+                # no-op once the save adopted it; otherwise stops its ffmpeg
+                output_batch.streamed_video.abort()
+                output_batch.streamed_video = None
             # also runs on the propagate_forward_errors re-raise: a warmup
             # forward that never completed must still leave a failed record,
             # or the estimator would plan from the remaining partial data
@@ -1205,6 +1209,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             enable_upscaling=req.enable_upscaling,
             upscaling_model_path=req.upscaling_model_path,
             upscaling_scale=req.upscaling_scale,
+            streamed_video=output_batch.streamed_video,
         )
 
     def _save_group_output_paths(

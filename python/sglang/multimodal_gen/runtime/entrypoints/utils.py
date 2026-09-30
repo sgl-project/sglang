@@ -329,7 +329,6 @@ def _resolve_ffmpeg_exe() -> str:
     except Exception:
         pass
 
-
     ffmpeg_ok = False
     if ffmpeg_exe:
         if os.path.isabs(ffmpeg_exe):
@@ -358,6 +357,13 @@ def _x264_auto_thread_count(height: int) -> int:
     return min(cpu_limit, row_limit, 128)
 
 
+def _x264_crf(output_compression: Optional[int]) -> Optional[int]:
+    quality = output_compression / 10 if output_compression is not None else 5
+    if not 1 <= quality <= 10:
+        return None
+    return int((1 - quality / 10.0) * 51)
+
+
 def _cuda_video_conversion_chunk_frames(video: torch.Tensor) -> int:
     _, num_frames, height, width = video.shape
     temporary_bytes_per_frame = 3 * height * width * (video.element_size() + 2)
@@ -384,8 +390,12 @@ def _try_save_cuda_video_direct(
     fps: int,
     audio_sample_rate: Optional[int],
     output_compression: Optional[int],
+    streamed_video: Any = None,
 ) -> bool:
-    """Stream CUDA RGB chunks to ffmpeg through a registered memfd."""
+    """Stream CUDA RGB chunks to ffmpeg through a registered memfd.
+
+    ``streamed_video`` is a ``StreamingVideoEncoder`` that already encoded
+    these frames during decode; only its audio mux remains."""
     if not hasattr(os, "memfd_create") or not hasattr(os, "sendfile"):
         return False
 
@@ -406,12 +416,19 @@ def _try_save_cuda_video_direct(
         return False
 
     _, num_frames, height, width = video.shape
+    if streamed_video is not None and streamed_video.finish(
+        save_file_path=save_file_path,
+        num_frames=num_frames,
+        audio=audio,
+        audio_sample_rate=audio_sample_rate,
+        fps=fps,
+    ):
+        return True
     chunk_frames = _cuda_video_conversion_chunk_frames(video)
 
-    quality = output_compression / 10 if output_compression is not None else 5
-    if not 1 <= quality <= 10:
+    crf = _x264_crf(output_compression)
+    if crf is None:
         return False
-    crf = int((1 - quality / 10.0) * 51)
 
     audio_np = _normalize_audio_to_numpy(audio)
     tmp_wav_path = None
@@ -1059,6 +1076,7 @@ def save_outputs(
     enable_upscaling: bool = False,
     upscaling_model_path: Optional[str] = None,
     upscaling_scale: int = 4,
+    streamed_video: Any = None,
 ) -> list[str]:
     output_paths: list[str] = []
     samples = (
@@ -1122,6 +1140,7 @@ def save_outputs(
                         fps=fps,
                         audio_sample_rate=audio_sample_rate,
                         output_compression=output_compression,
+                        streamed_video=streamed_video if len(outputs) == 1 else None,
                     )
                 if direct_saved:
                     if samples_out is not None:
