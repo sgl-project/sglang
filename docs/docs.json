@@ -891,9 +891,9 @@
             "icon": "play",
             "pages": [
               "index",
-              "docs/get-started/install",
               "docs/get-started/quickstart",
-              "docs/basic_usage/send_request"
+              "docs/get-started/install",
+              "docs/get-started/examples"
             ]
           }
         ]
@@ -906,6 +906,7 @@
             "icon": "book-open",
             "pages": [
               "docs/basic_usage/overview",
+              "docs/basic_usage/send_request",
               {
                 "group": "OpenAI-Compatible APIs",
                 "pages": [
@@ -1026,7 +1027,8 @@
                 "pages": [
                   "docs/developer_guide/development_guide_using_docker",
                   "docs/developer_guide/development_jit_kernel_guide",
-                  "docs/developer_guide/quantization_contribution_guide"
+                  "docs/developer_guide/quantization_contribution_guide",
+                  "docs/developer_guide/layer_boundary"
                 ]
               },
               {
@@ -1630,6 +1632,13 @@
                     "tag": "NEW",
                     "pages": [
                       "cookbook/vla/OpenPI/Pi0.5"
+                    ]
+                  },
+                  {
+                    "group": "FLUX",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/vla/FLUX/FLUX-3-Action"
                     ]
                   }
                 ]
