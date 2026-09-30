@@ -27,6 +27,8 @@ from sglang.srt.managers.data_parallel_controller import (
     DataParallelController,
     DPBudget,
     LoadBalanceMethod,
+    _consistent_hash,
+    _select_consistent_hash_rank,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 
@@ -350,6 +352,243 @@ class TestRefreshLoadBudgetThrottle(CustomTestCase):
             after_burst,
             "a stale-timestamp snapshot must not wipe the speculative state",
         )
+
+
+# ---------------------------------------------------------------------------
+# consistent_hash load-balance method: pin + optional spill + optional repin.
+# Most tests drive the extracted pure decision `_select_consistent_hash_rank`;
+# a few drive `consistent_hash_scheduler` end to end for the wiring.
+# ---------------------------------------------------------------------------
+
+
+def _select(key, active, loads, *, spill=False, repin=True, gap=0.30, abs_floor=8192,
+            group_size=8, pin=None, cap=200000):
+    return _select_consistent_hash_rank(
+        key,
+        active,
+        loads,
+        enable_spill=spill,
+        enable_repin=repin,
+        gap_pct=gap,
+        abs_floor=abs_floor,
+        group_size=group_size,
+        session_pin={} if pin is None else pin,
+        session_pin_cap=cap,
+    )
+
+
+def _key_homing_to(rank, active):
+    """A session key whose consistent-hash home (over `active`) is `rank`."""
+    for i in range(1_000_000):
+        k = f"k{i}"
+        if active[_consistent_hash(k, len(active))] == rank:
+            return k
+    raise AssertionError(f"no key homing to {rank}")
+
+
+class TestConsistentHashPin(CustomTestCase):
+    def test_method_registered(self):
+        self.assertIs(
+            LoadBalanceMethod.from_str("consistent_hash"),
+            LoadBalanceMethod.CONSISTENT_HASH,
+        )
+
+    def test_pin_is_deterministic(self):
+        active = list(range(8))
+        self.assertEqual(
+            _select("sess-A", active, [0] * 8),
+            _select("sess-A", active, [0] * 8),
+        )
+
+    def test_pin_distributes_across_all_ranks(self):
+        active = list(range(8))
+        seen = {_select(f"s{i}", active, [0] * 8) for i in range(4000)}
+        self.assertEqual(seen, set(range(8)))
+
+    def test_pin_only_selects_active_ranks(self):
+        active = [1, 3, 5]
+        for i in range(500):
+            self.assertIn(_select(f"s{i}", active, [0] * 8), active)
+
+    def test_no_active_rank_returns_none(self):
+        self.assertIsNone(_select("x", [], [0] * 8))
+
+    def test_pin_stable_regardless_of_load_when_spill_off(self):
+        active = list(range(8))
+        key = _key_homing_to(0, active)
+        hot = [0] * 8
+        hot[0] = 10**9  # home massively loaded
+        self.assertEqual(_select(key, active, hot, spill=False), 0)
+
+
+class TestConsistentHashSpill(CustomTestCase):
+    def test_no_spill_when_balanced(self):
+        active = list(range(8))
+        key = _key_homing_to(3, active)
+        self.assertEqual(_select(key, active, [5000] * 8, spill=True), 3)
+
+    def test_spill_fires_under_imbalance(self):
+        active = list(range(8))
+        key = _key_homing_to(2, active)
+        loads = [0] * 8
+        loads[2] = 10**6  # home hot, others empty
+        target = _select(key, active, loads, spill=True)
+        self.assertNotEqual(target, 2)
+        self.assertIn(target, active)
+
+    def test_abs_floor_prevents_trivial_spill(self):
+        # home relatively bigger than min(=0) but below the abs floor -> no spill.
+        active = list(range(8))
+        key = _key_homing_to(0, active)
+        loads = [0] * 8
+        loads[0] = 100  # < abs floor 8192
+        self.assertEqual(_select(key, active, loads, spill=True), 0)
+
+    def test_gap_threshold_boundary(self):
+        active = list(range(8))
+        key = _key_homing_to(0, active)
+        # min=1000, gap=0.30, abs=0 -> threshold = 1300.
+        just_below = [1000] * 8
+        just_below[0] = 1300
+        self.assertEqual(
+            _select(key, active, just_below, spill=True, abs_floor=0), 0
+        )
+        just_above = [1000] * 8
+        just_above[0] = 1301
+        self.assertNotEqual(
+            _select(key, active, just_above, spill=True, abs_floor=0), 0
+        )
+
+    def test_anti_herding_spreads_spills(self):
+        # Many distinct sessions all homing to the same hot rank should not all
+        # land on one spill target (the speculative bump spreads them).
+        active = list(range(8))
+        pin = {}
+        loads = [0] * 8
+        loads[0] = 50000  # hot home; others start empty, bumped as we spill
+        targets = set()
+        placed = 0
+        for i in range(2000):
+            k = f"h{i}"
+            if active[_consistent_hash(k, 8)] != 0:
+                continue  # only sessions that home to the hot rank spill
+            targets.add(_select(k, active, loads, spill=True))
+            placed += 1
+            if placed >= 50:
+                break
+        self.assertGreater(len(targets), 1, "spills must spread across ranks")
+
+
+class TestConsistentHashSpillGroups(CustomTestCase):
+    def test_spill_never_crosses_node_group(self):
+        # dp16, group_size 8 -> node groups [0..7], [8..15]. A rank in group 0
+        # spills only within group 0, never to the (emptier) group 1.
+        active = list(range(16))
+        key = _key_homing_to(0, active)  # home 0, group 0
+        loads = [0] * 16
+        loads[0] = 10**6  # hot home
+        for r in range(1, 8):
+            loads[r] = 1000  # group-0 peers lightly loaded
+        # group 1 (8..15) is empty but must be ignored
+        target = _select(key, active, loads, spill=True, group_size=8)
+        self.assertLess(target, 8, "spill must stay in the home rank's node group")
+
+    def test_single_group_matches_global_spill(self):
+        # dp8 with default group_size 8 -> one group -> spill considers all ranks.
+        active = list(range(8))
+        key = _key_homing_to(4, active)
+        loads = [0] * 8
+        loads[4] = 10**6
+        target = _select(key, active, loads, spill=True, group_size=8)
+        self.assertNotEqual(target, 4)
+
+
+class TestConsistentHashRepin(CustomTestCase):
+    def test_repin_on_is_stateless_and_returns_home(self):
+        active = list(range(8))
+        key = _key_homing_to(2, active)
+        pin = {}
+        hot = [0] * 8
+        hot[2] = 10**6
+        spilled = _select(key, active, hot, spill=True, repin=True, pin=pin)
+        self.assertNotEqual(spilled, 2)
+        self.assertEqual(pin, {}, "repin=on keeps no per-session state")
+        # once the home rank drains, the same session returns to its CH home.
+        self.assertEqual(
+            _select(key, active, [0] * 8, spill=True, repin=True, pin=pin), 2
+        )
+
+    def test_repin_off_sticks_to_spilled_rank(self):
+        active = list(range(8))
+        key = _key_homing_to(2, active)
+        pin = {}
+        hot = [0] * 8
+        hot[2] = 10**6
+        spilled = _select(key, active, hot, spill=True, repin=False, pin=pin)
+        self.assertNotEqual(spilled, 2)
+        self.assertEqual(pin.get(key), spilled, "sticky mode records the spilled rank")
+        # even after the CH home drains, a sticky session stays on the spilled rank.
+        self.assertEqual(
+            _select(key, active, [0] * 8, spill=True, repin=False, pin=pin), spilled
+        )
+
+    def test_sticky_map_is_bounded(self):
+        active = list(range(8))
+        pin = {}
+        cap = 50
+        for i in range(5000):
+            k = f"sticky{i}"
+            if active[_consistent_hash(k, 8)] != 0:
+                continue  # only hot-home sessions spill and get pinned
+            hot = [0] * 8
+            hot[0] = 10**6
+            _select(k, active, hot, spill=True, repin=False, pin=pin, cap=cap)
+        self.assertLessEqual(len(pin), cap, "sticky map must stay bounded")
+
+
+class TestConsistentHashSchedulerWiring(CustomTestCase):
+    """End-to-end through consistent_hash_scheduler -> sock_send(worker)."""
+
+    def _ctl(self, dp_size, **cfg):
+        ctl = _make_controller(dp_size)
+        ctl.enable_dp_spill = cfg.get("spill", False)
+        ctl.enable_dp_repin = cfg.get("repin", True)
+        ctl.dp_spill_gap_pct = cfg.get("gap", 0.30)
+        ctl.dp_spill_abs = cfg.get("abs", 8192)
+        ctl.dp_spill_group_size = cfg.get("group", 8)
+        ctl._session_pin = {}
+        ctl._session_pin_cap = 200000
+        return ctl
+
+    def _req(self, session_id=None, rid="r", routed_dp_rank=None):
+        return SimpleNamespace(
+            session_id=session_id, rid=rid, routed_dp_rank=routed_dp_rank
+        )
+
+    def test_routes_session_to_its_hash_home(self):
+        ctl = self._ctl(8)
+        ctl.consistent_hash_scheduler(self._req(session_id="abc"))
+        home = _consistent_hash("abc", 8)
+        ctl.workers[home].send_pyobj.assert_called_once()
+        for i in range(8):
+            if i != home:
+                ctl.workers[i].send_pyobj.assert_not_called()
+
+    def test_same_session_routes_to_same_worker(self):
+        ctl = self._ctl(8)
+        for _ in range(3):
+            ctl.consistent_hash_scheduler(self._req(session_id="s"))
+        self.assertEqual(ctl.workers[_consistent_hash("s", 8)].send_pyobj.call_count, 3)
+
+    def test_routed_dp_rank_bypasses_consistent_hash(self):
+        ctl = self._ctl(8)
+        ctl.consistent_hash_scheduler(self._req(session_id="s", routed_dp_rank=5))
+        ctl.workers[5].send_pyobj.assert_called_once()
+
+    def test_falls_back_to_rid_without_session_id(self):
+        ctl = self._ctl(8)
+        ctl.consistent_hash_scheduler(self._req(session_id=None, rid="the-rid"))
+        ctl.workers[_consistent_hash("the-rid", 8)].send_pyobj.assert_called_once()
 
 
 if __name__ == "__main__":
