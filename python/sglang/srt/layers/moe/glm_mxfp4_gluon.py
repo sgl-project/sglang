@@ -69,9 +69,9 @@ def _pack_scale(value: torch.Tensor) -> torch.Tensor:
 
 def _kernel_name(total_tp: int, ep_size: int, is_nextn: bool, m: int) -> str:
     if total_tp == 4 or ep_size > 1:
-        if m in (32, 64):
+        if 17 <= m <= 64:
             return "fused_moe_tp4_m32_64"
-        if 1 <= m <= 64:
+        if 1 <= m <= 16:
             return "fused_moe_tp4_m1_16"
         if m <= 4192:
             return "fused_moe_tp4_m128_4192"
