@@ -367,7 +367,6 @@ class MockModelRunner(ModelRunner):
             dllm_algorithm=None,
             dllm_algorithm_config=None,
             dp_size=1,
-            enable_dp_attention=False,
             enable_deterministic_inference=False,
             enable_mis=False,
             is_embedding=False,

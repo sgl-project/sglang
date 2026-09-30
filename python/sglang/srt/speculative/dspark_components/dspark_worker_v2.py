@@ -165,7 +165,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         self._draft_is_moe = draft_is_deepseek_v4()
         self._draft_dp_context_enabled = (
-            get_parallel().enable_dp_attention and not self._draft_is_moe
+            get_parallel().attn_dp_enabled and not self._draft_is_moe
         )
         self._is_pd_prefill = get_disagg().disaggregation_mode == "prefill"
         self._decode_graph_allowed = (
@@ -173,7 +173,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             and not self._is_pd_prefill
         )
         if (
-            get_parallel().enable_dp_attention
+            get_parallel().attn_dp_enabled
             and self._draft_is_moe
             and get_parallel().attn_tp_size > 1
         ):
@@ -232,9 +232,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         parallel = get_parallel()
         self._tp_sync = SpecTpSync(
-            parallel.attn_tp_group
-            if parallel.enable_dp_attention
-            else parallel.tp_group
+            parallel.attn_tp_group if parallel.attn_dp_enabled else parallel.tp_group
         )
         self._draft_graph_group = (
             parallel.attn_tp_group
@@ -294,13 +292,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             tp_sync=self._tp_sync,
         )
         if (
-            get_parallel().enable_dp_attention
+            get_parallel().attn_dp_enabled
             and not self._draft_is_moe
             and self._verify_planner.is_compact_mode
             and self._decode_graph_allowed
         ):
             raise ValueError(
-                "DSpark dense-draft compact verify under --enable-dp-attention does not "
+                "DSpark dense-draft compact verify under attention DP does not "
                 "yet support cuda graph (idle DP groups cannot join the token-keyed "
                 "compact graph). Re-run with --disable-cuda-graph (eager is lossless), "
                 "or use SGLANG_RAGGED_VERIFY_MODE=static. The dsv4 (MoE) draft supports "
@@ -321,7 +319,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             mask_token_id=self._mask_token_id,
             draft_block_spec_info=self._draft_block_spec_info,
             tp_sync=self._tp_sync,
-            dp_moe_sync=self._draft_is_moe and get_parallel().enable_dp_attention,
+            dp_moe_sync=self._draft_is_moe and get_parallel().attn_dp_enabled,
         )
         self._verify_epilogue = None
         target_is_dsv41 = (
@@ -336,7 +334,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             target_is_dsv41
             and self._verify_planner.mode_value == "static"
             and self._draft_is_moe
-            and not get_parallel().enable_dp_attention
+            and not get_parallel().attn_dp_enabled
             and get_parallel().pp_size == 1
         )
         # ROCm (V4.1 target only): inside a HIP graph the accept-site TP broadcasts
@@ -628,7 +626,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> GenerationBatchResult:
         if batch.forward_mode.is_idle():
-            if get_parallel().enable_dp_attention:
+            if get_parallel().attn_dp_enabled:
                 self.target_worker.forward_batch_generation(
                     batch, capture_hidden_mode=CaptureHiddenMode.FULL
                 )
@@ -744,7 +742,7 @@ class DSparkWorkerV2(BaseSpecWorker):
     def _dp_verify_tier_num_tokens(self, batch: ScheduleBatch) -> Optional[int]:
         if not (
             self._draft_is_moe
-            and get_parallel().enable_dp_attention
+            and get_parallel().attn_dp_enabled
             and batch.global_num_tokens is not None
             and self._verify_planner.is_compact_mode
         ):
@@ -793,7 +791,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         global_num_reqs = (
             max(batch.global_num_tokens)
             if self._draft_is_moe
-            and get_parallel().enable_dp_attention
+            and get_parallel().attn_dp_enabled
             and batch.global_num_tokens is not None
             else None
         )
@@ -809,7 +807,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         if batch.forward_mode.is_idle():
             self._observers.note_idle_decode_step()
-            if get_parallel().enable_dp_attention:
+            if get_parallel().attn_dp_enabled:
                 if self._draft_is_moe:
                     self._proposer.run_idle_participation(batch)
                 if coordination_plan is not None:

@@ -619,7 +619,7 @@ class CPUGraphRunner:
         self.speculative_algorithm = get_spec().speculative_algorithm
         self.enable_profile_cuda_graph = get_exec().graph.enable_profile_cuda_graph
         self.tp_size = get_parallel().tp_size
-        self.dp_size = get_parallel().dp_size
+        self.num_dp_ranks = get_parallel().num_dp_ranks
         self.pp_size = get_parallel().pp_size
 
         self.capture_forward_mode = ForwardMode.DECODE
@@ -644,7 +644,7 @@ class CPUGraphRunner:
             "CPUGraphRunner does not support speculative inference yet."
         )
 
-        assert self.dp_size == 1, "CPUGraphRunner does not support DP yet."
+        assert self.num_dp_ranks == 1, "CPUGraphRunner does not support DP yet."
         assert self.pp_size == 1, "CPUGraphRunner does not support PP yet."
 
         # Batch sizes to capture

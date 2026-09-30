@@ -21,9 +21,7 @@ class TestDraftTpContext(CustomTestCase):
     """Draft work enters the attention-TP placement only when it owns attention."""
 
     def setUp(self):
-        topology = published_topology(
-            tp_size=4, dp_size=2, enable_dp_attention=True, ranks=dict(dp_rank=0)
-        )
+        topology = published_topology(tp_size=4, attn_dp_size=2, ranks=dict(dp_rank=0))
         topology.__enter__()
         self.addCleanup(topology.__exit__, None, None, None)
         self.whole_tp = _group(world_size=4, rank=0)

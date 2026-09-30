@@ -516,7 +516,7 @@ class Scheduler(
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
         self.enable_hisparse = get_memory().enable_hisparse
-        self.enable_dp_attention = get_parallel().enable_dp_attention
+        self.attn_dp_enabled = get_parallel().attn_dp_enabled
         self.enable_unified_memory = get_memory().enable_unified_memory
 
         # Init model configs
@@ -629,7 +629,7 @@ class Scheduler(
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 tp_group=(
                     self.attn_tp_cpu_group
-                    if self.enable_dp_attention
+                    if self.attn_dp_enabled
                     else self.tp_cpu_group
                 ),
                 tree_cache=self.tree_cache,
@@ -823,7 +823,7 @@ class Scheduler(
         try:
             self.load_snapshot_writer = create_load_snapshot_writer(
                 port_args,
-                get_parallel().dp_size,
+                get_parallel().num_dp_ranks,
                 dp_rank,
                 publish_interval=get_observability().load_snapshot_publish_interval,
             )
@@ -1216,9 +1216,7 @@ class Scheduler(
         # the base TP group. Entry rank is the local rank 0 in that group.
         # Use the CPU (gloo) group to broadcast VLM Python objects and avoid CUDA
         # stream/device coupling (#11910).
-        self.dp_tp_group = (
-            self.attn_tp_group if self.enable_dp_attention else self.tp_group
-        )
+        self.dp_tp_group = self.attn_tp_group if self.attn_dp_enabled else self.tp_group
         self.dp_tp_cpu_group = self.dp_tp_group.cpu_group
 
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
@@ -4646,9 +4644,7 @@ class Scheduler(
         return ret
 
     def _maybe_report_active_ranks(self) -> None:
-        if not (
-            self.enable_dp_attention and get_exec().moe.elastic_ep_backend is not None
-        ):
+        if not (self.attn_dp_enabled and get_exec().moe.elastic_ep_backend is not None):
             return
         from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 
@@ -5218,7 +5214,6 @@ class Scheduler(
         # readback reflects values changed via /set_internal_state, not startup.
         ret = get_context().resolved_server_args_dict()
         ret["world_size"] = compute_world_size(
-            enable_dp_attention=get_parallel().enable_dp_attention,
             dp_size=get_parallel().dp_size,
             tp_size=get_parallel().tp_size,
             pp_size=get_parallel().pp_size,
