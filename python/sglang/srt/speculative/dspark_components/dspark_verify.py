@@ -4,7 +4,6 @@ from typing import Optional
 
 import msgspec
 import torch
-
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
 )
@@ -39,6 +38,9 @@ from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     VerifyWindow,
     apply_logits_adjustments_strided,
+)
+from sglang.srt.speculative.dspark_components.dspark_target_kv_inject import (
+    TargetKVInjector,
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.speculative.spec_utils import (
@@ -82,7 +84,7 @@ class TargetVerifyExecutor:
         gamma: int,
         verify_num_draft_tokens: int,
         model_runner,
-        kv_injector: TargetHiddenKvInjector,
+        kv_injector: TargetHiddenKvInjector | TargetKVInjector,
         verify_epilogue=None,
         simulate_acc_len: float = 0.0,
     ) -> None:
@@ -91,6 +93,11 @@ class TargetVerifyExecutor:
         self.verify_num_draft_tokens = verify_num_draft_tokens
         self.model_runner = model_runner
         self.kv_injector = kv_injector
+        self.capture_hidden_mode = (
+            CaptureHiddenMode.NULL
+            if isinstance(kv_injector, TargetKVInjector)
+            else CaptureHiddenMode.FULL
+        )
         self.verify_epilogue = verify_epilogue
         self._verify_backend_self_adds_seq_lens_cache: Optional[bool] = None
         self._simulate_acc_len = float(simulate_acc_len)
@@ -197,7 +204,7 @@ class TargetVerifyExecutor:
             ),
             draft_token_num=self.verify_num_draft_tokens,
             custom_mask=None,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
+            capture_hidden_mode=self.capture_hidden_mode,
             ragged_verify_layout=idle_layout,
         )
         batch.out_cache_loc = torch.zeros(
@@ -242,7 +249,7 @@ class TargetVerifyExecutor:
             positions=positions_2d.reshape(-1),
             draft_token_num=verify_w,
             custom_mask=None,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
+            capture_hidden_mode=self.capture_hidden_mode,
         )
         batch.out_cache_loc = verify_cache_loc
         seq_lens_cpu_backup = batch.seq_lens_cpu
@@ -296,7 +303,7 @@ class TargetVerifyExecutor:
             can_run_cuda_graph=target_out.can_run_cuda_graph,
         )
 
-    def commit_hidden(
+    def commit_target_context(
         self,
         *,
         batch: ScheduleBatch,
@@ -308,6 +315,13 @@ class TargetVerifyExecutor:
         bs: int,
         run_compact: bool,
     ) -> None:
+        if isinstance(self.kv_injector, TargetKVInjector):
+            if run_compact:
+                raise RuntimeError("target-KV DSpark requires static verify")
+            self.kv_injector.inject_verify(
+                batch=batch, verify_window=verify_window, commit_lens=commit_lens
+            )
+            return
         if run_compact:
             self.kv_injector.inject_ragged(
                 batch=batch,
@@ -353,7 +367,7 @@ class TargetVerifyExecutor:
             positions=ragged_window.positions,
             draft_token_num=self.verify_num_draft_tokens,
             custom_mask=None,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
+            capture_hidden_mode=self.capture_hidden_mode,
             ragged_verify_layout=layout,
         )
         batch.out_cache_loc = ragged_window.verify_cache_loc

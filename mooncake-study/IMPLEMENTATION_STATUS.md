@@ -33,7 +33,7 @@ it does not redefine the goal as the modules already implemented.
 | Publication | Catalog producer client, manifest-last writer, durable metadata journal, fenced replay | Lost responses, failed puts, stale fences, missing/corrupt objects and identical retries tested; actual Catalog service is SpecForge-owned |
 | Runtime collection | Opt-in CLI config, capability gates, request ledger, prefill/decode hooks, invalidation and counters | Six real Qwen3-0.6B requests published through Mooncake; ordinary and CUDA graph replay executions pass |
 | Real model identity/parity | Weight/tokenizer artifact digests, actual selected-layer geometry, K norm and RoPE | Captured KV and teacher scores match online tensors exactly; full-vocabulary LSE matches within 1e-5; HF teacher logits pass numerical comparison, but cross-engine KV equivalence is not certified |
-| Draft serving | Not yet implemented | KV input checkpoint contract, injector, invalidation and training/serving parity |
+| Draft serving | Explicit KV-input architecture, contract, encoder, incremental injector and invalidation | Real Qwen3 target plus synthetic KV draft passes ordinary/batched/graph generation and per-layer projected-KV checks; full SpecForge backbone/logit parity remains open |
 | Deployment coverage | Not yet implemented | TP/PP, overlap, speculative/PD, RDMA and workload SLO gates remain open |
 
 Initial test evidence (shared lab state under
@@ -105,12 +105,73 @@ without increasing its tolerances. The required capture invariant is exact
 preservation of online tensors. This evidence does not establish equivalence
 between arbitrary target implementations or training/serving DSpark parity.
 
+## Target-KV Draft Serving
+
+The new `DSparkTargetKVDraftModel` is selected explicitly by architecture and
+`input_mode=target_kv`. The contract validates teacher identity, ordered layer
+geometry, standard RoPE, sequence alignment, CE/TV128 objective metadata and
+confidence policy. A shared differentiable encoder restores pre-RoPE K in FP32,
+concatenates ordered K/V features, projects, and normalizes. Shared-head scaling
+and softcap run once in FP32 before Markov correction. Checkpoint loading rejects
+missing, duplicate, foreign and partial-shard weights.
+
+Prefill reconstructs cached prefixes when needed; verification appends only
+the forwarded anchor and correct drafts. Projection temporaries are limited to
+1024 source rows per chunk. Request retraction and cache epochs invalidate
+projected state. Online weight replacement and memory release/resume return
+failure before mutation, with HTTP 400 propagated without killing the server.
+Ordinary execution and graph construction both disable target hidden capture
+for this input mode. Legacy hidden-input DSpark remains a separate path.
+
+See [the serving contract](TARGET_KV_DRAFT.md) and
+[generated checkpoint schema](training-data-contract/dspark-target-kv.schema.json).
+
+Evidence:
+
+- `01790805151196250369-780fa16868bd`: 14 contract, math, injection, weight-loader
+  and management-reply unit tests passed. Subsequent tests also cover bounded
+  projection and graph hidden-mode selection.
+- `01790804809714917227-81a47be911cd`: first real KV-input checkpoint startup,
+  three ordinary speculative requests and per-layer projected-KV checks passed.
+- `01790805223032022696-81ad9ecd1ea7`: extended ordinary execution passed,
+  including batch commit lengths `[1, 4]` and continued generation after rejected
+  management calls. The graph observer then caught an inherited FULL hidden
+  capture setting in graph construction. The setting was fixed at its source.
+- `01790805422847548067-6f1c53cfcfbe`: complete extended runtime test passed in
+  133.330s. It retains the six real Mooncake producer requests and adds five
+  KV-draft generation requests per execution mode: ordinary and CUDA graph.
+  Both modes exercise prefix hits, 128-token prefill chunks, request-slot reuse,
+  rejection, full draft acceptance and a batch with different commit lengths.
+  Graph mode records seven actual target-verify replays. Both modes have 15
+  observed projection calls, maximum K absolute error 0.0078125 and exact V
+  against the independent per-layer mathematical reference. All ten speculative
+  responses match the ordinary target's greedy outputs. Weight-update and
+  memory-control rejections leave the service usable.
+- `01790805713557099271-c9566028d673`: final focused regression passed with
+  103 tests and 74 subtests in 30.36s. This includes all 16 new target-KV unit
+  tests, existing capture tests, existing dense DSpark projection parity,
+  request IPC normalization, graph-runner helpers and legacy draft selection.
+  New modules pass Ruff; touched upstream files add no F/I diagnostics relative
+  to HEAD. `git diff --check` passes. An earlier regression submission failed
+  before collection because one unchanged test file was not staged in the GPU
+  workspace; staging the selected regression files resolved it.
+
+These checkpoints copy target backbone layers and use synthetic encoder/Markov
+weights. A forced proposal in the test fixture exercises both accept and reject
+branches; it is not trained or evidence of useful acceptance/throughput. The
+golden-fixture digest is contract metadata, not a certified SpecForge export.
+Full backbone/logit parity, training quality, fresh-instance rollback and
+production artifact validation remain open. Runtime gates still require static
+verify, one GPU, no overlap/PD/LoRA and dense unquantized pools. Speculative
+teacher/KV collection is separate P9 work and is still gated off.
+
 ## Next Implementation
 
 1. Broaden real-request coverage to batching, padded/prefill graphs, cancellation,
    retraction, cache eviction, weight replacement and saturated backpressure.
-2. Complete P8's SGLang KV-input DSpark checkpoint contract, injector, cache
-   invalidation and parity against the training-side contract.
+2. Complete P8's fixed-input backbone/logit parity against the training side,
+   exporter compatibility and artifact/quality validation. Broaden the runtime
+   lifecycle tests to cache eviction, cancellation and real request retraction.
 3. Complete P9's topology work: TP/PP, overlap, speculative accepted-token
    collection, PD transfer and cross-node RDMA. Existing capability gates do
    not constitute implementation of these paths.

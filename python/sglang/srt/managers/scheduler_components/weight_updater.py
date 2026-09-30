@@ -85,6 +85,16 @@ class SchedulerWeightUpdaterManager:
     offload_tags: set = field(default_factory=set)
     stashed_model_static_state: Any = None
 
+    def _target_kv_mutation_error(self, operation: str) -> str | None:
+        runner = _get_draft_model_runner(self.draft_worker)
+        if runner is None:
+            return
+        if runner.model_config.hf_config.architectures == ["DSparkTargetKVDraftModel"]:
+            return (
+                f"{operation} is unsupported for target-KV DSpark: deploy a new "
+                "service instance to bind target/draft weights and projected KV"
+            )
+
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
         if self.tp_worker.training_capture is not None:
@@ -111,6 +121,8 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
+        if message := self._target_kv_mutation_error("online weight replacement"):
+            return UpdateWeightFromDiskReqOutput(success=False, message=message)
         with self._observe_weight_load("disk"):
             success, message = self.tp_worker.update_weights_from_disk(recv_req)
             tp_success = success
@@ -142,6 +154,8 @@ class SchedulerWeightUpdaterManager:
         recv_req: UpdateWeightsFromDistributedReqInput,
     ) -> Tuple[bool, str]:
         """Update the online model parameter."""
+        if message := self._target_kv_mutation_error("online weight replacement"):
+            return UpdateWeightsFromDistributedReqOutput(success=False, message=message)
         with self._observe_weight_load("distributed"):
             success, message = self.tp_worker.update_weights_from_distributed(recv_req)
             if success:
@@ -154,6 +168,8 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors."""
+        if message := self._target_kv_mutation_error("online weight replacement"):
+            return UpdateWeightsFromTensorReqOutput(success=False, message=message)
         with self._observe_weight_load("tensor"):
             if recv_req.disable_draft_model:
                 worker = self.tp_worker
@@ -169,6 +185,8 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
+        if message := self._target_kv_mutation_error("online weight replacement"):
+            return UpdateWeightsFromIPCReqOutput(success=False, message=message)
         with self._observe_weight_load("ipc"):
             success, message = self.tp_worker.update_weights_from_ipc(recv_req)
             tp_success = success
@@ -204,6 +222,8 @@ class SchedulerWeightUpdaterManager:
             )
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
+        if message := self._target_kv_mutation_error("release_memory_occupation"):
+            return ReleaseMemoryOccupationReqOutput(success=False, message=message)
         assert (
             self.is_fully_idle()
         ), "release_memory_occupation should be called only when server is idle."
@@ -250,6 +270,8 @@ class SchedulerWeightUpdaterManager:
         return ReleaseMemoryOccupationReqOutput()
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
+        if message := self._target_kv_mutation_error("resume_memory_occupation"):
+            return ResumeMemoryOccupationReqOutput(success=False, message=message)
         tags = recv_req.tags
 
         if tags is None or len(tags) == 0:

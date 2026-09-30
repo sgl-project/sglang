@@ -787,7 +787,10 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
-        await self.release_memory_occupation_communicator(obj)
+        results = await self.release_memory_occupation_communicator(obj)
+        success, message = FanOutCommunicator.merge_results(results)
+        if not success:
+            raise ValueError(message)
 
     async def resume_memory_occupation(
         self: TokenizerManager,
@@ -795,7 +798,10 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
-        await self.resume_memory_occupation_communicator(obj)
+        results = await self.resume_memory_occupation_communicator(obj)
+        success, message = FanOutCommunicator.merge_results(results)
+        if not success:
+            raise ValueError(message)
 
     async def check_weights(
         self: TokenizerManager,

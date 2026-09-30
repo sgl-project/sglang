@@ -46,8 +46,45 @@ def artifact_digest(root: Path, names: list[str]) -> str:
     return digest_bytes(canonical_bytes(records))
 
 
+def local_safetensors_digest(root: Path) -> str:
+    index = root / "model.safetensors.index.json"
+    if index.exists():
+        index_data = json.loads(index.read_bytes())
+        weights = list(set(index_data["weight_map"].values())) + [index.name]
+    else:
+        weights = [p.name for p in root.glob("*.safetensors")]
+    if not weights:
+        raise ContractError("identity binding requires local safetensors artifacts")
+    return artifact_digest(root, weights + ["config.json"])
+
+
 def bind_contract(
     *, config: CaptureConfig, model, model_config, tokenizer_path: str, pool
+) -> tuple[TeacherIdentity, KVSpec]:
+    return bind_target_contract(
+        model_id=config.model_id,
+        selected_layer_ids=config.selected_layer_ids,
+        storage_chunk_tokens=config.storage_chunk_tokens,
+        expected_weights_revision=config.expected_weights_revision,
+        expected_tokenizer_revision=config.expected_tokenizer_revision,
+        model=model,
+        model_config=model_config,
+        tokenizer_path=tokenizer_path,
+        pool=pool,
+    )
+
+
+def bind_target_contract(
+    *,
+    model_id: str,
+    selected_layer_ids: list[int],
+    storage_chunk_tokens: int,
+    model,
+    model_config,
+    tokenizer_path: str,
+    pool,
+    expected_weights_revision: str | None = None,
+    expected_tokenizer_revision: str | None = None,
 ) -> tuple[TeacherIdentity, KVSpec]:
     from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 
@@ -69,7 +106,7 @@ def bind_contract(
     if model_config.vocab_size < 128:
         raise ContractError("capture requires at least 128 vocabulary entries")
     geometries, rope_configs, norms = [], [], []
-    for layer_id in config.selected_layer_ids:
+    for layer_id in selected_layer_ids:
         if not 0 <= layer_id < len(model.model.layers):
             raise ContractError("selected layer outside target model")
         attention = model.model.layers[layer_id].self_attn
@@ -110,27 +147,17 @@ def bind_contract(
     kv = KVSpec(
         codec=f"dense_{'bf16' if dtype == 'bfloat16' else 'fp16'}_post_rope_v1",
         dtype=dtype,
-        selected_layer_ids=config.selected_layer_ids,
+        selected_layer_ids=selected_layer_ids,
         layers=geometries,
         source_k_stage="post_rope",
         source_k_norm=norms[0],
         rope_config=rope_configs[0],
         rope_config_sha256=digest_bytes(canonical_bytes(rope_configs[0])),
-        storage_chunk_tokens=config.storage_chunk_tokens,
+        storage_chunk_tokens=storage_chunk_tokens,
         source_page_size=pool.page_size,
     )
     root = Path(model_config.model_path)
-    index = root / "model.safetensors.index.json"
-    if index.exists():
-        index_data = json.loads(index.read_bytes())
-        weights = list(set(index_data["weight_map"].values())) + [index.name]
-    else:
-        weights = [p.name for p in root.glob("*.safetensors")]
-    if not weights:
-        raise ContractError(
-            "capture requires local safetensors artifacts for weight identity"
-        )
-    weights_revision = artifact_digest(root, weights + ["config.json"])
+    weights_revision = local_safetensors_digest(root)
     tokenizer_root = Path(tokenizer_path)
     tokenizer_names = [
         name
@@ -150,10 +177,10 @@ def bind_contract(
     ):
         raise ContractError("capture requires local tokenizer artifacts")
     tokenizer_revision = artifact_digest(tokenizer_root, tokenizer_names)
-    if config.expected_weights_revision not in (
+    if expected_weights_revision not in (
         None,
         weights_revision,
-    ) or config.expected_tokenizer_revision not in (None, tokenizer_revision):
+    ) or expected_tokenizer_revision not in (None, tokenizer_revision):
         raise ContractError(
             "model/tokenizer artifacts differ from the configured immutable revisions"
         )
@@ -177,7 +204,7 @@ def bind_contract(
         )
     )
     teacher = TeacherIdentity(
-        model_id=config.model_id,
+        model_id=model_id,
         weights_revision=weights_revision,
         adapter_revision=None,
         tokenizer_revision=tokenizer_revision,

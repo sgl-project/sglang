@@ -33,7 +33,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase, popen_launch_server
 from sglang.test.training_capture_catalog import TestCaptureCatalog
 
-register_cuda_ci(est_time=180, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=240, stage="base-b", runner_config="1-gpu-small")
 
 MODEL_PATH = "Qwen/Qwen3-0.6B"
 ASSERT_HF_KV = False
@@ -311,6 +311,17 @@ class TestTrainingCaptureRuntime(CustomTestCase):
         for publication in self.catalog.wait_publications(3):
             self.read_sample(publication)
         self.check_graph_replay(samples)
+        from sglang.test.dspark_target_kv_runtime import exercise_target_kv_draft
+
+        for cuda_graph in (False, True):
+            exercise_target_kv_draft(
+                self,
+                model_path=self.model_path,
+                directory=self.temporary.name,
+                samples=samples,
+                responses=responses,
+                cuda_graph=cuda_graph,
+            )
         self.check_reference(samples)
 
     def check_graph_replay(self, samples):

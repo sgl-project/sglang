@@ -595,6 +595,25 @@ class DSparkDraftMixin:
         commit_lens: Optional[torch.Tensor] = None,
     ) -> None:
         ctx_hidden = self.project_target_hidden(target_hidden)
+        self.write_context_kv(
+            ctx_hidden=ctx_hidden,
+            pool=pool,
+            positions=positions,
+            cache_loc=cache_loc,
+            cache_loc_2d=cache_loc_2d,
+            commit_lens=commit_lens,
+        )
+
+    def write_context_kv(
+        self,
+        *,
+        ctx_hidden: torch.Tensor,
+        pool,
+        positions: torch.Tensor,
+        cache_loc: torch.Tensor,
+        cache_loc_2d: Optional[torch.Tensor] = None,
+        commit_lens: Optional[torch.Tensor] = None,
+    ) -> None:
 
         bundle = self._fused_kv_write_bundle(pool)
         if bundle is not None:

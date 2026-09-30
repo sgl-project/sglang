@@ -4,7 +4,6 @@ from dataclasses import replace
 from typing import Optional
 
 import torch
-
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
 )
@@ -18,7 +17,15 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     compute_position,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_lora,
+    get_parallel,
+    get_schedule,
+    get_serving,
+    get_spec,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -52,6 +59,12 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     alloc_verify_window,
     dp_global_verify_tier_num_tokens,
     idle_ragged_layout,
+)
+from sglang.srt.speculative.dspark_components.dspark_target_kv_contract import (
+    read_target_kv_draft_contract,
+)
+from sglang.srt.speculative.dspark_components.dspark_target_kv_inject import (
+    TargetKVInjector,
 )
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
@@ -125,6 +138,25 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner
         self.draft_model = bundle.draft_model
+        self._target_kv_contract = read_target_kv_draft_contract(
+            self.draft_model_runner.model_config.hf_config
+        )
+        self._capture_hidden_mode = CaptureHiddenMode.FULL
+        if self._target_kv_contract is not None:
+            parallel = get_parallel()
+            if (
+                parallel.tp_size != 1
+                or parallel.pp_size != 1
+                or parallel.dp_size != 1
+                or not get_schedule().disable_overlap_schedule
+                or get_disagg().disaggregation_mode != "null"
+                or get_lora().enable_lora
+            ):
+                raise ValueError(
+                    "target-KV DSpark currently requires TP=PP=DP=1, "
+                    "--disable-overlap-schedule, no disaggregation and no LoRA"
+                )
+            self._capture_hidden_mode = CaptureHiddenMode.NULL
         self._draft_sampler = None
         self._linear_accept_index_cache = None
 
@@ -206,14 +238,21 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "or use SGLANG_RAGGED_VERIFY_MODE=static. The dsv4 (MoE) draft supports "
                 "cuda graph under DP."
             )
-        self._kv_injector = TargetHiddenKvInjector(
-            draft_model=self.draft_model,
-            draft_model_runner=self.draft_model_runner,
-            model_runner=self.model_runner,
-            device=self.device,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-            block_pos_offsets=self._block_pos_offsets,
-        )
+        if self._target_kv_contract is not None:
+            self._kv_injector = TargetKVInjector(
+                draft_model=self.draft_model,
+                draft_model_runner=self.draft_model_runner,
+                model_runner=self.model_runner,
+            )
+        else:
+            self._kv_injector = TargetHiddenKvInjector(
+                draft_model=self.draft_model,
+                draft_model_runner=self.draft_model_runner,
+                model_runner=self.model_runner,
+                device=self.device,
+                verify_num_draft_tokens=self.verify_num_draft_tokens,
+                block_pos_offsets=self._block_pos_offsets,
+            )
         self._proposer = DraftBlockProposer(
             draft_model=self.draft_model,
             draft_model_runner=self.draft_model_runner,
@@ -330,6 +369,12 @@ class DSparkWorkerV2(BaseSpecWorker):
     def init_attention_backends(self):
         with self._draft_context():
             self._draft_worker.init_attention_backends()
+        if self._target_kv_contract is not None:
+            self._kv_injector.bind(
+                tokenizer_path=get_serving().tokenizer_path,
+                prediction_count=self.gamma,
+                mask_token_id=self._mask_token_id,
+            )
         self._need_mamba_verify_commit = mambaish_config(
             self.model_runner.model_config
         ) is not None and hasattr(
@@ -380,7 +425,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def clear_cache_pool(self):
-        pass
+        if self._target_kv_contract is not None:
+            self._kv_injector.invalidate_all()
 
     def set_dspark_forced_budget_frac(self, frac: Optional[float]) -> None:
         self._forced_budget_frac = frac
@@ -422,18 +468,28 @@ class DSparkWorkerV2(BaseSpecWorker):
         if batch.forward_mode.is_idle():
             if get_parallel().enable_dp_attention:
                 self.target_worker.forward_batch_generation(
-                    batch, capture_hidden_mode=CaptureHiddenMode.FULL
+                    batch, capture_hidden_mode=self._capture_hidden_mode
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
         batch_output = self.target_worker.forward_batch_generation(
-            batch, capture_hidden_mode=CaptureHiddenMode.FULL
+            batch, capture_hidden_mode=self._capture_hidden_mode
         )
         logits_output = batch_output.logits_output
         next_token_ids = batch_output.next_token_ids
         batch_output.new_seq_lens = batch.seq_lens
         if on_publish is not None:
             on_publish(batch_output.new_seq_lens)
+
+        if self._target_kv_contract is not None:
+            # Include cached target prefixes whose draft projection may have
+            # been evicted or may belong to a previous request.
+            self._kv_injector.ensure_context(batch)
+            batch_output.next_draft_input = make_next_draft_input(
+                bonus_tokens=next_token_ids,
+                new_seq_lens=batch.seq_lens,
+            )
+            return batch_output
 
         if logits_output.hidden_states is None:
             raise RuntimeError(
@@ -580,6 +636,8 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         sampling_info = batch.sampling_info
         with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
+            if self._target_kv_contract is not None:
+                self._kv_injector.ensure_context(batch)
             proposal = self._proposer.propose(
                 batch=batch,
                 draft_input=draft_input,
@@ -716,7 +774,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         folded_commit = folded_accept and epilogue.folds_commit
         if not folded_commit:
-            self._verify_executor.commit_hidden(
+            self._verify_executor.commit_target_context(
                 batch=batch,
                 layout=layout,
                 hidden_strided=hidden_strided,

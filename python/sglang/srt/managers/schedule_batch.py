@@ -872,6 +872,7 @@ class Req(ReqDllmMixin):
         self.training_capture_attempted = False
         self.training_capture_context = None
         self.training_capture_finalize = None
+        self.dspark_projected_context = None
         # Full untruncated sequence: origin + output (+ DLLM mask block).
         # Kept in sync by _refresh_fill_ids; admission only updates
         # extend_range, never mutates this array's length.
@@ -1671,6 +1672,7 @@ class Req(ReqDllmMixin):
             return
 
     def reset_for_retract(self):
+        self.dspark_projected_context = None
         # Increment retraction count before resetting other state. We should not reset this
         # since we are tracking the total number of retractions for each request.
         self.retraction_count += 1

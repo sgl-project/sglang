@@ -61,3 +61,24 @@ to BF16 would also narrow FP32 RoPE frequency buffers and invalidate the
 comparison. This numerical diagnostic is separate from the zero-error online
 capture check. No real training, cross-node RDMA or performance SLO is certified
 by these experiments.
+
+The runtime test also exports synthetic `DSparkTargetKVDraftModel` checkpoints
+from a retrieved sample's teacher/KV contract. Two additional servers check
+ordinary and CUDA-graph speculative generation, including a two-request batch,
+both verify accept/reject branches and continued serving after management API
+rejections. A test-only observer compares projected draft KV against per-layer
+reference math and checks actual graph replay with no target hidden capture.
+The fixture's forced proposal weights are not a trained draft. This extends the
+same command above; allow 600 seconds and retain the job log for evidence.
+
+Focused regressions:
+
+```bash
+python -m pytest -q \
+  test/registered/unit/spec/test_dspark_target_kv.py \
+  test/registered/unit/training_capture \
+  test/registered/spec/dspark/test_dspark_stacked_ctx_kv_parity.py \
+  test/registered/unit/managers/test_io_struct.py \
+  test/registered/unit/model_executor/runner/test_decode_cuda_graph_runner.py \
+  test/registered/spec/dspark/test_dspark_draft_path_default.py
+```
