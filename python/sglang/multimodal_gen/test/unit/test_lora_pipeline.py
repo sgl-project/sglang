@@ -7,6 +7,7 @@ import pytest
 import torch
 from prometheus_client import CollectorRegistry
 
+from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.lora.linear import (
     BaseLayerWithLoRA,
@@ -88,6 +89,35 @@ def test_worker_metrics_count_individual_adapters_in_multi_lora():
     ]
 
 
+@pytest.mark.parametrize("operation", ["set", "merge", "unmerge", "deactivate"])
+@torch.no_grad()
+def test_lora_mutations_preserve_independent_conditioning(operation):
+    layer = _make_layer()
+    pipeline = _make_pipeline(layer)
+    pipeline.modules["transformer"].add_module("linear", layer)
+    pipeline._temporarily_disable_offload = lambda *args, **kwargs: nullcontext([])
+    encoder = torch.nn.Linear(2, 2).eval()
+    cache = ConditioningCache(1024)
+    x = torch.ones(1, 2)
+    with patch(_RANK_PATCH, return_value=0):
+        pipeline.set_lora("adapter", merge_mode="dynamic")
+        cache.run(encoder, "forward", (x,), {}, lambda: encoder(x))
+        cache.run(layer, "forward", (x,), {}, lambda: x.clone())
+        if operation == "set":
+            pipeline.set_lora("adapter", strength=0.5, merge_mode="dynamic")
+        elif operation == "merge":
+            pipeline.merge_lora_weights()
+        elif operation == "unmerge":
+            pipeline.unmerge_lora_weights()
+        else:
+            pipeline.deactivate_lora_weights()
+        cached = cache.run(encoder, "forward", (x,), {}, lambda: encoder(x))
+        cache.run(layer, "forward", (x,), {}, lambda: x.clone())
+    torch.testing.assert_close(cached, encoder(x), rtol=0, atol=0)
+    assert cache.hits == 1
+    assert cache.misses == 3
+
+
 def test_merge_cache_only_accepts_cpu_backed_weights():
     pipeline = _make_pipeline(_make_layer())
     cpu_cache = pipeline._merge_cache_for(
@@ -116,6 +146,7 @@ def test_zero_copy_snapshot_is_limited_to_cpu_backed_layers():
     assert not _use_owned_base_snapshot(False, "cpu")
     assert not _use_owned_base_snapshot(False, "meta")
     assert _use_owned_base_snapshot(False, "cuda")
+    assert not _use_owned_base_snapshot(False, "cuda", numel=1)
     assert _use_owned_base_snapshot(True, "cpu")
 
     cpu_layer = wrap_with_lora_layer(
@@ -323,3 +354,21 @@ def test_lora_exact_file_url_needs_no_weight_name(tmp_path):
         "*.json",
         "adapter.safetensors",
     ]
+
+
+def test_view_merge_unmerges_by_inverse_without_owned_clone():
+    torch.manual_seed(0)
+    base = torch.nn.Linear(4, 4, bias=False)
+    original = base.weight.detach().clone()
+    layer = wrap_with_lora_layer(base, lora_rank=2, lora_alpha=2, snapshot_base=False)
+    assert layer is not None
+    assert layer._base_is_view
+    A = torch.randn(2, 4)
+    B = torch.randn(4, 2)
+    layer.set_lora_weights(A, B, strength=0.5, clear_existing=True, merge_weights=True)
+    assert layer.merged
+    assert layer._base_is_view
+    torch.testing.assert_close(layer.base_layer.weight, original + 0.5 * (B @ A))
+    layer.unmerge_lora_weights()
+    torch.testing.assert_close(layer.base_layer.weight, original)
+    assert not layer.merged

@@ -1,11 +1,12 @@
 from functools import lru_cache
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import triton
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import DpPaddingMode
+from sglang.srt.layers.dp_attention import DpPaddingMode, dp_slot_in
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
 )
@@ -184,10 +185,8 @@ def cal_padded_tokens(forward_batch: "ForwardBatch"):
         )
     if dp_padding_mode.is_max_len():
         tokens = max(global_num_tokens)
-    elif len(global_num_tokens) > 1:
-        tokens = global_num_tokens[get_parallel().attn_dp_rank]
     else:
-        tokens = global_num_tokens[0]
+        tokens = global_num_tokens[dp_slot_in(global_num_tokens)]
     if can_dsa_prefill_cp_interleave(forward_batch):
         tokens = ceil_div(tokens, attn_cp_size)
     return tokens
@@ -222,6 +221,25 @@ def dsa_use_prefill_cp(forward_batch, dsa_enable_prefill_cp=None):
         return True
     else:
         return False
+
+
+def maybe_prefetch_next_full_attention_kv(
+    forward_batch: "ForwardBatch",
+    next_full_attention_layer_id: Optional[int],
+) -> None:
+    """Prefetch (owner-broadcast) the next layer's DSA KV under layer split.
+
+    No-op unless the current batch runs DSA prefill-CP and the active KV pool is
+    a layer-sharded pool exposing ``prefetch_kv_buffer`` (i.e.
+    ``LayerSplitDSATokenToKVPool``). Kicking the broadcast off one layer ahead
+    overlaps it with the current layer's attention compute.
+    """
+    if next_full_attention_layer_id is None or not dsa_use_prefill_cp(forward_batch):
+        return
+
+    prefetch_kv_buffer = getattr(get_token_to_kv_pool(), "prefetch_kv_buffer", None)
+    if prefetch_kv_buffer is not None:
+        prefetch_kv_buffer(next_full_attention_layer_id)
 
 
 def fp8_mqa_logits_ceil_to_ue8m0(x: torch.Tensor) -> torch.Tensor:

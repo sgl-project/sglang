@@ -28,6 +28,7 @@ from sglang.kernels.ops.layernorm.fused_eh_norm import fused_eh_norm
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -215,22 +216,21 @@ class DeepseekModelNextN(nn.Module):
                 else:
                     hidden_states = self.eh_proj(eh_input)
 
-            residual = None
+            residual_batch.start(forward_batch)
             index_topk_share = IndexTopKShareState.from_mtp_carry(forward_batch)
             with get_global_expert_distribution_recorder().disable_this_region():
-                hidden_states, residual, topk_indices = self.decoder(
+                (hidden_states, topk_indices) = self.decoder(
                     positions,
                     hidden_states,
                     forward_batch,
-                    residual,
                     zero_allocator,
                     prev_topk_indices=index_topk_share.topk_indices,
                 )
+            hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
             if not forward_batch.forward_mode.is_idle():
-                if residual is not None:
-                    hidden_states, _ = self.shared_head.norm(hidden_states, residual)
-                else:
-                    hidden_states = self.shared_head.norm(hidden_states)
+                hidden_states = residual_batch.final_norm(
+                    hidden_states, forward_batch, self.shared_head.norm
+                )
 
             index_topk_share.update(topk_indices)
             index_topk_share.publish()
