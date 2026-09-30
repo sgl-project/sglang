@@ -14,6 +14,42 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestDefaultModelLoader(CustomTestCase):
+    def test_debug_memory_probes_preserve_online_quantization_cleanup(self):
+        for debug in (False, True):
+            for online in (False, True):
+                with self.subTest(debug=debug, online=online):
+                    model = Mock()
+                    model.quant_config = (
+                        SimpleNamespace(is_nvfp4_online=True, get_name=lambda: "nvfp4")
+                        if online
+                        else None
+                    )
+                    weights = iter(())
+                    with (
+                        patch.object(loader_mod, "is_cuda_alike", return_value=True),
+                        patch.object(
+                            loader_mod.logger, "isEnabledFor", return_value=debug
+                        ),
+                        patch.object(
+                            loader_mod, "get_available_gpu_memory", return_value=1.0
+                        ) as memory_probe,
+                        patch.object(torch.cuda, "current_device", return_value=0),
+                        patch.object(
+                            torch.cuda, "max_memory_allocated", return_value=0
+                        ) as peak_memory,
+                        patch.object(torch.cuda, "synchronize") as synchronize,
+                        patch.object(torch.cuda, "empty_cache") as empty_cache,
+                    ):
+                        DefaultModelLoader.load_weights_only(
+                            model, weights, torch.device("cuda")
+                        )
+
+                    model.load_weights.assert_called_once_with(weights)
+                    self.assertEqual(memory_probe.call_count, 2 if debug else 0)
+                    self.assertEqual(peak_memory.call_count, 1 if debug else 0)
+                    self.assertEqual(synchronize.call_count, 1 if online else 0)
+                    self.assertEqual(empty_cache.call_count, 1 if online else 0)
+
     def test_load_weights_only_precedes_postprocessing(self):
         events = []
         model = Mock()
