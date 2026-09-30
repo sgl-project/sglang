@@ -95,9 +95,10 @@ class RadixLinearAttention(nn.Module):
 
         Returns the post-gated-RMSNorm output (and marks this layer's stash
         consumed) when a covered kernel runs, else ``None`` so the caller runs
-        the ordinary split + conv + delta + norm chain. Declines the graph and
-        DP-padding envelopes handled specially in ``forward``; only the GDN
-        backend implements the kernel, so any other backend also declines.
+        the ordinary split + conv + delta + norm chain. Declines the piecewise
+        graph here; the backend declines the DP-padding envelope that ``forward``
+        trims specially (it has no trim of its own). Only the GDN backend
+        implements the kernel, so any other backend also declines.
         """
         if (
             not forward_batch.forward_mode.is_extend()

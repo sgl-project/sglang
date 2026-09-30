@@ -882,8 +882,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         return (core_attn_out, z) if return_z else core_attn_out
 
-    _aiter_gdn_prefill_reject_logged = False
-
     def try_fused_gdn_prefill(
         self,
         layer: RadixLinearAttention,
@@ -896,8 +894,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         Returns the *post-norm* output and marks the model's output-norm stash
         consumed, so the model skips its own gated RMSNorm. Falling short of the
         contract falls back rather than raising -- a capability, not a mode. Only
-        the plain varlen prefill is covered; MIS, target-verify and tracked-conv
-        batches decline.
+        the plain, fully-covered varlen prefill runs; MIS, target-verify,
+        tracked-conv and DP-padded batches decline.
         """
         stash = layer._gdn_onorm_args
         if stash is None:
@@ -910,6 +908,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
         forward_metadata = self.forward_metadata
         if forward_metadata.has_mamba_track_mask:
             return None
+        # The fused kernel has no DP-padding trim; decline a padded batch so it
+        # never folds pad rows into the state or leaves the output tail unwritten.
+        if not gdn_fused_prefill_aiter.prefill_rows_match_real_tokens(
+            num_rows=projected_qkvz.shape[0],
+            global_num_token_non_padded_cpu=forward_batch.global_num_token_non_padded_cpu,
+            extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+        ):
+            return None
         norm_weight, norm_eps, conv_bias = stash
 
         cache_indices = forward_metadata.mamba_cache_indices
@@ -919,7 +925,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         conv_states = mamba_cache.conv[0]
         ssm_states = mamba_cache.temporal
 
-        ok, reason = gdn_fused_prefill_aiter.covered(
+        ok, _ = gdn_fused_prefill_aiter.covered(
             projected_qkvz,
             projected_ba,
             conv_states,
@@ -929,15 +935,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
             has_initial_state,
             layer.conv_weights,
             conv_bias,
+            layer.A_log,
+            layer.dt_bias,
+            norm_weight,
             layer.activation,
             torch.float8_e4m3fn,
         )
         if not ok:
-            if not GDNAttnBackend._aiter_gdn_prefill_reject_logged:
-                rank0_log(
-                    f"AITER fused GDN prefill not covered, falling back: {reason}"
-                )
-                GDNAttnBackend._aiter_gdn_prefill_reject_logged = True
             return None
 
         normalized, _, _, quantized, scales = gdn_fused_prefill_aiter.run(

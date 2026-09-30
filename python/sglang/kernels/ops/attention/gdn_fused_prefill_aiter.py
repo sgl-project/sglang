@@ -88,14 +88,22 @@ def covered(
     has_initial_state: torch.Tensor,
     conv_weight: torch.Tensor,
     conv_bias: Optional[torch.Tensor],
+    A_log: Optional[torch.Tensor],
+    dt_bias: Optional[torch.Tensor],
+    norm_weight: Optional[torch.Tensor],
     activation: Optional[str],
     quant_dtype: Optional[torch.dtype],
 ) -> Tuple[bool, str]:
     """Per-call contract check. Returns ``(covered, reason)``.
 
     Delegates the tensor/shape/(tokens,batch) contract to AITER's own predicate
-    so the two cannot drift, and adds the one thing AITER cannot see: the model's
-    output-gate activation, which the kernel hard-codes to SiLU.
+    so the two cannot drift, then adds the parameters AITER's predicate does not
+    see: the model's output-gate activation (the kernel hard-codes SiLU) and the
+    per-head decay/norm vectors ``A_log``/``dt_bias``/``norm_weight``. The tiles
+    index those three straight off the pointer with no shape or dtype check, so a
+    wrong element count or a non-float dtype would read past the buffer or corrupt
+    the result -- verify them here so a mismatch falls back instead of the request
+    hitting a raise deep inside the kernel.
     """
     if activation not in ("silu", "swish"):
         return False, f"kernel fuses a SiLU output gate, model uses {activation!r}"
@@ -104,7 +112,7 @@ def covered(
     _, supported = _ops()
     if supported is None:
         return False, "aiter fused GDN prefill unavailable"
-    return supported(
+    ok, reason = supported(
         projected_qkvz,
         projected_ba,
         conv_state,
@@ -116,6 +124,68 @@ def covered(
         conv_bias,
         quant_dtype,
     )
+    if not ok:
+        return False, reason
+
+    # supported() has validated delta_state is rank-4 [caches, v_heads, hv, hk];
+    # A_log/dt_bias are per value head, norm_weight is per head channel.
+    v_heads, head_v_dim = delta_state.shape[1], delta_state.shape[2]
+    for name, tensor, count in (
+        ("A_log", A_log, v_heads),
+        ("dt_bias", dt_bias, v_heads),
+        ("norm_weight", norm_weight, head_v_dim),
+    ):
+        if tensor is None or tensor.dim() != 1 or tensor.numel() != count:
+            shape = None if tensor is None else tuple(tensor.shape)
+            return False, f"{name} must be 1-D [{count}], got {shape}"
+        if tensor.dtype not in (torch.float32, torch.bfloat16):
+            return False, f"{name} must be fp32 or bf16, got {tensor.dtype}"
+    return True, ""
+
+
+def out_proj_accepts_group128_fp8(quant_method) -> bool:
+    """Whether ``out_proj`` can consume the kernel's group-128 FP8 activations.
+
+    The epilogue emits per-head group-128 FP8 activations with fp32 ``[M, K//128]``
+    scales, which only a block-FP8 GEMM with a K-block of 128 reads directly. An
+    MXFP8 method wants group-32 ``e8m0`` scales instead, and any other K-block
+    mismatches the group size -- both must re-quantize the bf16 output, so decline
+    the direct feed for them.
+    """
+    from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+
+    if not isinstance(quant_method, Fp8LinearMethod):
+        return False
+    if not quant_method.block_quant or quant_method.use_mxfp8:
+        return False
+    block_size = quant_method.weight_block_size
+    return block_size is not None and block_size[-1] == 128
+
+
+def prefill_rows_match_real_tokens(
+    *,
+    num_rows: int,
+    global_num_token_non_padded_cpu: Optional[int],
+    extend_seq_lens_cpu: Optional[list],
+) -> bool:
+    """Whether every projected row is a real varlen token (no DP padding tail).
+
+    ``forward`` trims DP-synchronization padding before the unfused chain, but the
+    fused kernel runs on the full ``projected_qkvz`` while ``cu_seqlens`` covers
+    only the real tokens, so a padded batch would fold pad rows into the conv/SSM
+    state or leave the output tail uninitialized. Return ``False`` so the caller
+    declines whenever the real token count is below the row count. ``cu_seqlens``
+    is the cumsum of ``extend_seq_lens_cpu``, so its last entry equals the sum
+    here -- we compare on the host to avoid a per-layer device sync.
+    """
+    if (
+        global_num_token_non_padded_cpu is not None
+        and global_num_token_non_padded_cpu < num_rows
+    ):
+        return False
+    if extend_seq_lens_cpu is None:
+        return False
+    return sum(extend_seq_lens_cpu) == num_rows
 
 
 def run(

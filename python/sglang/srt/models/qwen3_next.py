@@ -283,14 +283,15 @@ class Qwen3GatedDeltaNet(nn.Module):
         # in a higher precision (FP8 models often store RMSNorm scales in fp32).
         self._gdn_fused_norm_weight = weight.to(torch.bfloat16).contiguous()
 
-        # If out_proj is block-FP8, feed it the kernel's per-head group-128 FP8
-        # activations directly (out_proj skips its own re-quant); else the model
-        # hands out_proj the bf16 normalized output and it quantizes as usual.
-        from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+        # If out_proj is a group-128 block-FP8 GEMM, feed it the kernel's per-head
+        # group-128 FP8 activations directly (out_proj skips its own re-quant);
+        # else the model hands out_proj the bf16 normalized output and it
+        # quantizes as usual. MXFP8 and other K-block sizes want different scales,
+        # so they take the bf16 path.
+        from sglang.kernels.ops.attention import gdn_fused_prefill_aiter
 
-        qm = self.out_proj.quant_method
-        self._gdn_out_proj_fp8 = isinstance(qm, Fp8LinearMethod) and getattr(
-            qm, "block_quant", False
+        self._gdn_out_proj_fp8 = gdn_fused_prefill_aiter.out_proj_accepts_group128_fp8(
+            self.out_proj.quant_method
         )
 
     @staticmethod
@@ -478,11 +479,15 @@ class Qwen3GatedDeltaNet(nn.Module):
             self.attn._gdn_onorm_args = None
             if self.attn._gdn_onorm_consumed and fused_out is not None:
                 # Already gated-RMSNormed by the kernel; go straight to out_proj.
+                # Take the FP8 stash and clear it so no later forward can read a
+                # stale (fp8, scales) pair or pin its buffers.
+                fp8_out = self.attn._gdn_fp8_out
+                self.attn._gdn_fp8_out = None
                 if self._gdn_out_proj_fp8:
                     # Feed the per-head group-128 FP8 activations straight in;
                     # the block-FP8 out_proj consumes (fp8, scales) without a
                     # second quantization pass.
-                    output, _ = self.out_proj(self.attn._gdn_fp8_out)
+                    output, _ = self.out_proj(fp8_out)
                 else:
                     core_attn_out = fused_out.reshape(*fused_out.shape[:-2], -1)
                     output, _ = self.out_proj(core_attn_out)
