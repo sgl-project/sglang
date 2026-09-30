@@ -3537,11 +3537,11 @@ class UnifiedRadixCache(BasePrefixCache):
         from, and for every non-unified_kv layout, whose SWA slots are
         content-stable.
 
-        DeepSeek-V4.1 decoder SWA bounded replay needs it too: the layers after
-        the last kv_source layer attend over only the last window of each
-        extend, so an extend shorter than the window truncates the first
-        sampled token's window. Holding one window back keeps every extend at
-        least a window long, on every layout and with or without a host pool.
+        DeepSeek-V4.1 decoder SWA bounded replay needs it too: late-layer window
+        KV is written only for the tail rows of an extend, and the cache cannot
+        differentiate which rows of a matched prefix were tails, so the layers
+        after the last kv_source layer have no usable window KV in the prefix.
+        Holding one window back keeps every hit extend at least a window long.
         """
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
