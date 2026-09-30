@@ -1748,6 +1748,46 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     or rc
                 )
             elif self._is_generic_kvcache_state_type(st):
+                if st == StateType.DSA and (
+                    any(n == 0 for n in src_item_lens)
+                    or any(n == 0 for n in dst_item_lens)
+                ):
+                    # Non-producer layers carry no index-K. A PP prefill stage
+                    # registers only its own layers while decode may register
+                    # the whole model, so align the spans the same way
+                    # get_mla_kv_ptrs_with_pp does before comparing anything --
+                    # otherwise the two elision patterns are simply offset.
+                    if len(dst_data_ptrs) != len(src_data_ptrs):
+                        span_start, span_end = self._mla_kv_entry_span_with_pp(
+                            len(src_data_ptrs)
+                        )
+                        dst_data_ptrs = dst_data_ptrs[span_start:span_end]
+                        dst_item_lens = dst_item_lens[span_start:span_end]
+                    if len(dst_data_ptrs) != len(src_data_ptrs):
+                        raise RuntimeError(
+                            "DSA indexer entry count still differs after PP "
+                            f"span alignment: prefill={len(src_data_ptrs)}, "
+                            f"decode={len(dst_data_ptrs)}"
+                        )
+                    mismatched = [
+                        (k, src_item_lens[k], dst_item_lens[k])
+                        for k in range(len(src_item_lens))
+                        if (src_item_lens[k] == 0) != (dst_item_lens[k] == 0)
+                    ]
+                    if mismatched:
+                        # One-sided elision means the peers disagree on which
+                        # layers produce index-K; transferring blind would drop
+                        # or mis-place indexer state.
+                        raise RuntimeError(
+                            "DSA index-K elided on only one PD peer for "
+                            f"entries {mismatched}: prefill and decode must "
+                            "agree on the producer-layer set"
+                        )
+                    keep = [k for k, n in enumerate(src_item_lens) if n != 0]
+                    src_data_ptrs = [src_data_ptrs[k] for k in keep]
+                    src_item_lens = [src_item_lens[k] for k in keep]
+                    dst_data_ptrs = [dst_data_ptrs[k] for k in keep]
+                    dst_item_lens = [dst_item_lens[k] for k in keep]
                 is_qwen4_qsa_state = st in (
                     StateType.QSA_PENDING,
                     StateType.QSA_COMPRESSED,
