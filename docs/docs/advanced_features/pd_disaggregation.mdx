@@ -534,6 +534,51 @@ python -m sglang.launch_server \
   --port 30000
 ```
 
+## UniFlow
+
+UniFlow is a transfer backend in which prefill writes the KV cache, aux data, and state directly into decode memory with one-sided puts.
+
+### Requirements
+
+The `uniflow` Python package, including its compiled `_core` extension, must be importable in both the prefill and decode server environments. Check each environment with:
+
+```bash
+python -c "import uniflow._core"
+```
+
+UniFlow chooses the transport for each transfer, and there is no override. KV and state move between GPUs of one node over XGMI/NVLink peer copies where UniFlow supports them, and otherwise over RDMA, falling back to TCP on a UniFlow build with TCP enabled. Aux data in host memory always uses RDMA or TCP, so even a single-node deployment needs an RDMA NIC, or a UniFlow build with TCP enabled and a routable (non-loopback) address.
+
+Tested on AMD Instinct MI350X GPUs (PyTorch built for ROCm 7.2); not tested on NVIDIA GPUs.
+
+### Usage
+
+Pass `--disaggregation-transfer-backend uniflow` to both the prefill and decode servers.
+
+### Llama Single Node
+
+This example runs prefill on GPU 0 and decode on GPU 1 of one node.
+
+```bash
+python -m sglang.launch_server \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --disaggregation-mode prefill \
+  --port 30000 \
+  --disaggregation-transfer-backend uniflow
+python -m sglang.launch_server \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --disaggregation-mode decode \
+  --port 30001 \
+  --base-gpu-id 1 \
+  --disaggregation-transfer-backend uniflow
+python -m sglang_router.launch_router --pd-disaggregation --prefill http://127.0.0.1:30000 --decode http://127.0.0.1:30001 --host 0.0.0.0 --port 8000
+```
+
+### Advanced Configuration
+
+`SGLANG_DISAGGREGATION_UNIFLOW_TRANSFER_TIMEOUT_MS` sets the completion deadline, in milliseconds, for each UniFlow put batch. The default is `30000`. KV, aux, and state data are separate batches, and a batch that misses the deadline fails the request. Prefill applies the deadline; both servers reject a value that is not positive.
+
+After a put fails or times out, only the RDMA transport waits for in-flight writes before prefill reports the failure. Over TCP or intra-node GPU peer copies, the write can still land after decode releases the request's pages. With `SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE` (on by default), decode on any transport releases an aborted request's pages without prefill's acknowledgment after `SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT` (default 30 seconds, the same as the default transfer timeout); with it off, decode releases them as soon as the request fails. Keep that timeout well above `SGLANG_DISAGGREGATION_UNIFLOW_TRANSFER_TIMEOUT_MS`.
+
 ## ASCEND
 
 ### Usage
