@@ -427,3 +427,59 @@ def vsa_h3_gate_add(
         HEAD_DIM=head_dim,
         BLOCK=VSA_H3_KERNEL_BLOCK,
     )
+
+
+@triton.jit
+def _topk_lists_kernel(
+    mask_ptr,
+    out_ptr,
+    num_video_tiles,
+    prefix,
+    stride_mh,
+    stride_mr,
+    stride_oh,
+    stride_or,
+    VIDEO_POW2: tl.constexpr,
+    PREFIX_BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    head = tl.program_id(1)
+    mask_row = mask_ptr + head * stride_mh + row * stride_mr
+    out_row = out_ptr + head * stride_oh + row * stride_or
+    cols = tl.arange(0, VIDEO_POW2)
+    in_range = cols < num_video_tiles
+    picked = tl.load(mask_row + cols, mask=in_range, other=0).to(tl.int32)
+    slot = tl.cumsum(picked, axis=0) - 1
+    tl.store(out_row + prefix + slot, cols + prefix, mask=in_range & (picked != 0))
+    # Leave the mask zeroed for the next layer's scatter.
+    tl.store(mask_row + cols, tl.zeros_like(picked).to(tl.int8), mask=in_range)
+    for start in tl.range(0, prefix, PREFIX_BLOCK):
+        prefix_cols = start + tl.arange(0, PREFIX_BLOCK)
+        tl.store(out_row + prefix_cols, prefix_cols, mask=prefix_cols < prefix)
+
+
+def vsa_h3_topk_lists(
+    picked: torch.Tensor, mask: torch.Tensor, out: torch.Tensor, num_prefix_tiles: int
+) -> None:
+    """Write ``[0, prefix) ++ sort(picked + prefix)`` into ``out[h, r, :]``.
+
+    ``picked`` [H, rows, keep] holds distinct video-tile indices in any order;
+    ``mask`` [H, rows, num_video_tiles] is an all-zero int8 scratch, left
+    zeroed; ``out`` [H, rows, >= prefix + keep] is int32."""
+    heads, rows, _ = picked.shape
+    num_video_tiles = mask.shape[-1]
+    assert mask.dtype == torch.int8 and mask.is_contiguous()
+    assert out.dtype == torch.int32 and out.stride(-1) == 1
+    mask.scatter_(-1, picked, 1)
+    _topk_lists_kernel[(rows, heads)](
+        mask,
+        out,
+        num_video_tiles,
+        num_prefix_tiles,
+        mask.stride(0),
+        mask.stride(1),
+        out.stride(0),
+        out.stride(1),
+        VIDEO_POW2=triton.next_power_of_2(num_video_tiles),
+        PREFIX_BLOCK=64,
+    )

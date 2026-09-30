@@ -164,6 +164,30 @@ def test_topk_tile_list_semantics() -> None:
     assert (_lists_to_mask(compete, n_tiles).sum(dim=-1) == keep + num_prefix).all()
 
 
+@requires_cuda
+@pytest.mark.parametrize(
+    "num_prefix, num_video, sparsity",
+    [(29, 528, 0.8), (0, 64, 0.9), (30, 1541, 0.05)],
+)
+def test_topk_list_kernel_matches_sorted_topk(num_prefix, num_video, sparsity) -> None:
+    from sglang.multimodal_gen.runtime.layers.attention.backends.vsa_h3_kernels import (
+        vsa_h3_topk_lists,
+    )
+
+    n_tiles = num_prefix + num_video
+    scores = torch.randn(HEADS, n_tiles, n_tiles, device="cuda")
+    reference = _topk_tile_lists(scores, num_prefix, num_video, sparsity, True)
+    keep = reference.shape[-1] - num_prefix
+    out = torch.full((HEADS, num_video, n_tiles), -1, dtype=torch.int32, device="cuda")
+    mask = torch.zeros(HEADS, num_video, num_video, dtype=torch.int8, device="cuda")
+    for _ in range(2):  # the scratch mask must come back zeroed
+        picked = scores[:, num_prefix:, num_prefix:].topk(keep, sorted=False).indices
+        vsa_h3_topk_lists(picked, mask, out, num_prefix)
+        assert torch.equal(out[..., : num_prefix + keep], reference)
+        assert not mask.any()
+    assert (out[..., num_prefix + keep :] == -1).all()
+
+
 def _masked_dense_reference(meta, used, q, k, v, gate, sparsity):
     """fp32 reference over the padded tile layout with the top-k tile mask."""
     n_tiles = meta.num_tiles

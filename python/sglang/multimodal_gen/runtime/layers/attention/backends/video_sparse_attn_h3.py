@@ -45,6 +45,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.vsa_h3_kernels impo
     vsa_h3_block_sparse_attn_forward,
     vsa_h3_gate_add,
     vsa_h3_pack_tiles,
+    vsa_h3_topk_lists,
     vsa_h3_untile,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
@@ -318,6 +319,11 @@ class _Workspace:
         self.dense_num[:, :n_tiles] = n_tiles
         self.q2k_index = self.dense_index.clone()
         self.q2k_num = self.dense_num.clone()
+        num_video_tiles = meta.num_video_tiles
+        # Zeroed scratch for the exempt top-k compaction; kept zero between uses.
+        self.topk_mask = torch.zeros(
+            (heads, num_video_tiles, num_video_tiles), dtype=torch.int8, device=device
+        )
 
     def sparse_lists(
         self, video_lists: torch.Tensor, num_prefix_tiles: int
@@ -385,6 +391,15 @@ def _select_kv_lists(
     keep = _compute_topk(sparsity, meta.num_video_tiles)
     if sparsity <= 0.0 or keep >= meta.num_video_tiles:
         return ws.dense_index, ws.dense_num
+    prefix = meta.num_prefix_tiles
+    if meta.exempt or prefix == 0:
+        # Same lists as _topk_tile_lists without sorting values or indices.
+        picked = scores[:, prefix:, prefix:].topk(keep, dim=-1, sorted=False).indices
+        vsa_h3_topk_lists(
+            picked, ws.topk_mask, ws.q2k_index[:, prefix : ws.n_tiles], prefix
+        )
+        ws.q2k_num[:, prefix : ws.n_tiles] = prefix + keep
+        return ws.q2k_index, ws.q2k_num
     return ws.sparse_lists(
         _topk_tile_lists(
             scores,
