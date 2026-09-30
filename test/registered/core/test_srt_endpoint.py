@@ -116,6 +116,35 @@ class TestSRTEndpoint(CustomTestCase):
             return_text=True,
         )
 
+    def test_trace_decode_token_ids_replay_end_to_end(self):
+        """The request path must preserve and replay every supplied token id."""
+        trace_token_ids = [1, 2, 3, 4]
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "Trace replay:",
+                "sampling_params": {
+                    "temperature": 0.8,
+                    "max_new_tokens": len(trace_token_ids),
+                    "trace_decode_token_ids": trace_token_ids,
+                },
+                "return_logprob": True,
+                "top_logprobs_num": 5,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        result = response.json()
+        meta_info = result["meta_info"]
+
+        self.assertEqual(meta_info["completion_tokens"], len(trace_token_ids))
+        self.assertEqual(
+            [entry[1] for entry in meta_info["output_token_logprobs"]],
+            trace_token_ids,
+        )
+        self.assertTrue(
+            all(entry[0] is not None for entry in meta_info["output_token_logprobs"])
+        )
+
     def test_logprob_start_len(self):
         logprob_start_len = 4
         new_tokens = 4

@@ -3609,6 +3609,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
 
+        # Replay progress is request-local and must advance with the decode
+        # batch, independently of model positions (which can be offset by
+        # prefixes, chunked prefill, or mixed batches).
+        self.sampling_info.advance_trace_decode_steps()
+
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.map_last_loc_to_buffer(
                 self.seq_lens,

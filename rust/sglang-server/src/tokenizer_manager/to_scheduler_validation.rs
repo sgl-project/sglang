@@ -136,6 +136,25 @@ pub(super) fn check_total_tokens(g: &mut GenerateRequest, limits: &Limits) -> Re
     let input_len =
         g.input_ids.as_ref().map_or(0, |ids| ids.len()) as u64 + limits.num_reserved_tokens;
 
+    if let Some(trace_decode_token_ids) = &mut g.sampling_params.trace_decode_token_ids {
+        let available_tokens = usize::try_from(max_req_len.saturating_sub(input_len))
+            .unwrap_or(usize::MAX);
+        trace_decode_token_ids.truncate(available_tokens);
+        if trace_decode_token_ids.is_empty() {
+            return Err(Error::Validation(
+                "trace_decode_token_ids has no tokens remaining after context-length truncation"
+                    .into(),
+            ));
+        }
+        let trace_len = i64::try_from(trace_decode_token_ids.len()).unwrap_or(i64::MAX);
+        g.sampling_params.max_new_tokens = Some(
+            g.sampling_params
+                .max_new_tokens
+                .map_or(trace_len, |max_new_tokens| max_new_tokens.min(trace_len)),
+        );
+        return Ok(());
+    }
+
     let Some(max_new_tokens) = g.sampling_params.max_new_tokens else {
         return Ok(()); // no cap requested → nothing to add to the input length
     };
