@@ -42,14 +42,12 @@ fn processing_a_request_spawns_no_worker_threads() {
     let out = process(
         family.as_ref(),
         MmInput {
-            text: None,
-            input_ids: Some(vec![7, 1, 8, 1, 9]),
+            input_ids: vec![7, 1, 8, 1, 9],
             images: vec![
                 ImageSource::Bytes(png(112, 112)),
                 ImageSource::Bytes(png(84, 140)),
             ],
         },
-        |_| Err("no tokenizer".into()),
     )
     .expect("request should succeed");
     assert_eq!(out.items.len(), 2);

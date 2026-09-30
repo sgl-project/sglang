@@ -41,10 +41,15 @@ from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs import LongcatFlashConfig
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.layer_boundary import (
+    declare_attn,
+    declare_ffn,
+    make_stages,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -149,6 +154,7 @@ class LongcatFlashDenseDecoderLayer(nn.Module):
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
+            reduce_results=True,
             prefix=add_prefix(f"mlps", prefix),
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -158,17 +164,15 @@ class LongcatFlashDenseDecoderLayer(nn.Module):
 
         self.attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
-        self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=self.layer_id,
-            num_layers=config.num_hidden_layers,
-            is_layer_sparse=False,
-            is_previous_layer_sparse=False,
-            is_next_layer_sparse=False,
-        )
-        self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
+
+        self.attn_boundary, self.ffn_boundary = make_stages(
+            (declare_attn(), self.input_layernorm),
+            (
+                declare_ffn(sparse=False, next_layer_sparse=False),
+                self.post_attention_layernorm,
+            ),
+            previous=declare_ffn() if self.layer_id != 0 else None,
+            terminal=self.layer_id == config.num_hidden_layers - 1,
         )
 
     def forward(
@@ -176,13 +180,10 @@ class LongcatFlashDenseDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
 
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
@@ -191,14 +192,13 @@ class LongcatFlashDenseDecoderLayer(nn.Module):
                 zero_allocator=zero_allocator,
             )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         hidden_states = self.mlp(hidden_states)
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
+        hidden_states = self.ffn_boundary.finish_complete_output(
+            hidden_states, forward_batch
         )
-        return hidden_states, residual
+        return hidden_states
 
 
 class LongcatFlashModelNextN(nn.Module):
@@ -268,17 +268,18 @@ class LongcatFlashModelNextN(nn.Module):
                 )
             )
 
-        residual = None
+        residual_batch.start(forward_batch)
         with get_global_expert_distribution_recorder().disable_this_region():
-            hidden_states, residual = self.decoder(
-                positions, hidden_states, forward_batch, residual, zero_allocator
+            hidden_states = self.decoder(
+                positions, hidden_states, forward_batch, zero_allocator
             )
 
+        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
+
         if not forward_batch.forward_mode.is_idle():
-            if residual is not None:
-                hidden_states, _ = self.final_layernorm(hidden_states, residual)
-            else:
-                hidden_states = self.final_layernorm(hidden_states)
+            hidden_states = residual_batch.final_norm(
+                hidden_states, forward_batch, self.final_layernorm
+            )
         return hidden_states
 
 

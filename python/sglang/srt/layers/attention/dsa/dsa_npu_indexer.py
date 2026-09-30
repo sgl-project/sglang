@@ -8,9 +8,9 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_cp import get_dsa_cp_plan
-from sglang.srt.layers.communicator import ScatterMode
 from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
+from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -227,7 +227,7 @@ def _build_indexer_query_shard(
 
 
 def _get_indexer_query_shard(
-    forward_batch: ForwardBatch, num_tokens: int, layer_scatter_modes
+    forward_batch: ForwardBatch, num_tokens: int
 ) -> Optional[_IndexerQueryShard]:
     """The query shard for a prefill indexer call, or None to score every row.
 
@@ -242,15 +242,12 @@ def _get_indexer_query_shard(
     Planned once per forward. Every input to the decision is identical across
     the attention-TP group, so all ranks take the collective or none do.
     """
-    if (
-        layer_scatter_modes is not None
-        and layer_scatter_modes.attn_mode != ScatterMode.TP_ATTN_FULL
-    ):
-        # The plan assumes this rank was handed the whole batch, which is what
-        # TP_ATTN_FULL means; any other mode would slice a slice.
+    if get_attn_tp_context().input_scattered:
+        # The plan assumes this rank was handed the whole batch; a
+        # scattered attention input would slice a slice.
         print_info_once(
-            "DSA indexer query sharding is off: attention scatter mode is "
-            f"{layer_scatter_modes.attn_mode}, not TP_ATTN_FULL"
+            "DSA indexer query sharding is off: the attention input "
+            "is scattered across the TP group"
         )
         return None
     if not hasattr(forward_batch, "npu_indexer_query_shard"):
@@ -281,7 +278,7 @@ class DSANPUIndexerMixin:
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         layer_id: int,
-        layer_scatter_modes=None,
+        input_on_attn_tp_slices: bool = False,
         dynamic_scale: torch.Tensor = None,
     ) -> torch.Tensor:
         if get_attn_backend().forward_metadata.seq_lens_cpu_int is None:
@@ -316,7 +313,7 @@ class DSANPUIndexerMixin:
             self.dsa_enable_prefill_cp and forward_batch.attn_cp_metadata is not None
         )
         shard = (
-            _get_indexer_query_shard(forward_batch, bs, layer_scatter_modes)
+            _get_indexer_query_shard(forward_batch, bs)
             if is_prefill and _shard_indexer_queries() and not uses_prefill_cp
             else None
         )
@@ -399,11 +396,7 @@ class DSANPUIndexerMixin:
 
             k_proj = self.wk(x)[0]  # [b, s, 7168] @ [7168, 128] = [b, s, 128]
             k = self.k_norm(k_proj)
-            if (
-                _use_ag_after_qlora
-                and layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
-                and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
-            ):
+            if _use_ag_after_qlora and input_on_attn_tp_slices:
                 k = scattered_to_tp_attn_full(k, forward_batch)
             k_pe, k_nope = torch.split(
                 k,
@@ -470,16 +463,31 @@ class DSANPUIndexerMixin:
                 torch.npu.current_stream(),
             )
 
+        indexer_cache_loc = forward_batch.out_cache_loc
+        parallel = get_parallel()
+        if (
+            parallel.dcp_enabled
+            and parallel.attn_dcp_size > 1
+            and not get_attn_backend().is_draft_worker
+        ):
+            indexer_cache_loc = (
+                get_attn_backend().forward_metadata.dcp_origin_out_cache_loc
+            )
+            assert indexer_cache_loc is not None, (
+                "NPU DSA+DCP requires allocator-global origin_out_cache_loc metadata"
+            )
+            assert indexer_cache_loc.shape[0] == positions.shape[0], (
+                "NPU DSA+DCP origin_out_cache_loc metadata has an incompatible "
+                f"length: {indexer_cache_loc.shape[0]} != {positions.shape[0]}"
+            )
         pool = get_token_to_kv_pool()
         use_quant_indexer = pool.index_k_scale_buffer is not None
         if use_quant_indexer:
             k, k_scale = _quantize_npu_indexer_activation(
                 k, pool.indexer_hadamard_128, pool.dtype
             )
-            pool.set_index_k_scale_buffer(
-                layer_id, forward_batch.out_cache_loc, k_scale
-            )
-        pool.set_index_k_buffer(layer_id, forward_batch.out_cache_loc, k)
+            pool.set_index_k_scale_buffer(layer_id, indexer_cache_loc, k_scale)
+        pool.set_index_k_buffer(layer_id, indexer_cache_loc, k)
         if is_prefill:
             if (
                 self.dsa_enable_prefill_cp
@@ -547,11 +555,7 @@ class DSANPUIndexerMixin:
             torch.npu.current_stream().wait_event(q_rope_event)
         if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
             torch.npu.current_stream().wait_event(weights_event)
-        if (
-            _use_ag_after_qlora
-            and layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
-            and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
-        ):
+        if _use_ag_after_qlora and input_on_attn_tp_slices:
             weights = scattered_to_tp_attn_full(weights, forward_batch)
         block_table = get_attn_backend().forward_metadata.block_tables
         if (

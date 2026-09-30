@@ -20,7 +20,6 @@ PR #25090 vs #14194):
   - cp_lse_ag_out_rs_mla: Triton (log2/exp2) correction / reduce-scatter
 """
 
-import warnings
 from typing import Optional
 
 import torch
@@ -41,36 +40,6 @@ from sglang.srt.utils import is_hip
 from sglang.srt.utils.common import is_fi_a2a_supported
 
 _is_hip = is_hip()
-
-
-def _warn_deprecated_dcp_accessor(name: str, replacement: str) -> None:
-    warnings.warn(
-        f"{name} is deprecated; use {replacement} instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-
-
-def dcp_enabled() -> bool:
-    """Deprecated: use ``get_parallel().dcp_enabled``."""
-    _warn_deprecated_dcp_accessor("dcp_enabled()", "get_parallel().dcp_enabled")
-    return get_parallel().dcp_enabled
-
-
-def get_attention_dcp_world_size() -> int:
-    """Deprecated: use ``get_parallel().attn_dcp_size``."""
-    _warn_deprecated_dcp_accessor(
-        "get_attention_dcp_world_size()", "get_parallel().attn_dcp_size"
-    )
-    return get_parallel().attn_dcp_size
-
-
-def get_attention_dcp_rank() -> int:
-    """Deprecated: use ``get_parallel().attn_dcp_rank``."""
-    _warn_deprecated_dcp_accessor(
-        "get_attention_dcp_rank()", "get_parallel().attn_dcp_rank"
-    )
-    return get_parallel().attn_dcp_rank
 
 
 def _ag_lse(cp_attn_lse: torch.Tensor, cp_group: GroupCoordinator) -> torch.Tensor:
@@ -152,6 +121,41 @@ def cp_lse_ag_out_rs_mla(
     )
     out = cp_group.reduce_scatter_along_dim(out, dim=0)
     return out.to(cp_attn_out.dtype)
+
+
+def cp_lse_ag_out_rs_mla_npu(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: GroupCoordinator,
+) -> torch.Tensor:
+    """Merge NPU DCP partial outputs and return the local head slice."""
+    if cp_group.world_size == 1:
+        return cp_attn_out
+
+    import torch_npu
+
+    batch_size, total_heads, head_dim = cp_attn_out.shape
+    world_size = cp_group.world_size
+    local_heads = total_heads // world_size
+    packed = torch.cat([cp_attn_out.float(), cp_attn_lse.float().unsqueeze(-1)], dim=-1)
+    packed = packed.permute(1, 2, 0).contiguous()
+    gathered = torch.empty_like(packed)
+    cp_group.all_to_all_single(gathered, packed)
+    # all_to_all_single splits the leading head dimension. After the exchange,
+    # the heads are grouped by source rank inside every token. Move that source
+    # rank in front before flattening tokens and local heads for the update op.
+    gathered = gathered.permute(2, 0, 1).contiguous()
+    gathered = (
+        gathered.view(batch_size, world_size, local_heads, head_dim + 1)
+        .permute(1, 0, 2, 3)
+        .contiguous()
+        .view(world_size, batch_size * local_heads, head_dim + 1)
+    )
+    out_flat, lse_flat = torch.split(gathered, [head_dim, 1], dim=-1)
+    merged, _ = torch_npu.npu_attention_update(
+        lse_flat.squeeze(-1).unbind(0), out_flat.unbind(0), 0
+    )
+    return merged.view(batch_size, local_heads, head_dim).to(cp_attn_out.dtype)
 
 
 def _all_gather_dcp_kv_cache(kv_a: torch.Tensor):

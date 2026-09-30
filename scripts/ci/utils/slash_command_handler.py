@@ -7,17 +7,15 @@ import sys
 import time
 import unicodedata
 from datetime import datetime, timezone
+from pathlib import Path
 
 import requests
 from github import Auth, Github
 
-# Import scripts/ci/runner_configs.py (sibling-up dir) for runner_config -> runs_on lookup.
+# Import scripts/ci/ modules (sibling-up dir): runner_configs and the rerun partitioner.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import partition_rerun_tests as _partition  # noqa: E402
 import runner_configs as _runner_configs  # noqa: E402
-
-# rerun-test workflow doesn't build sgl-kernel, so b200 stages always use the
-# non-kernel pool when resolving the `$b200_runner` sentinel from runner_configs.yml.
-_B200_DEFAULT_RUNNER = "4-gpu-b200"
 
 # install_script values from runner_configs.yml are passed verbatim into a
 # `bash ${{ inputs.install_script }}` step in rerun-test.yml. GHA expression
@@ -591,7 +589,7 @@ MULTIMODAL_TEST_DIR = "python/sglang/multimodal_gen/test"
 MULTIMODAL_PATH_TO_RUNNER = {
     "2_gpu": "2-gpu-h100",
     "2-gpu": "2-gpu-h100",
-    "b200": _B200_DEFAULT_RUNNER,
+    "b200": _partition.B200_RERUN_RUNNER,
 }
 MULTIMODAL_DEFAULT_RUNNER = "1-gpu-h100"
 
@@ -947,6 +945,13 @@ _OTHER_BACKEND_REGISTERS = {
 }
 
 
+# CPU suite suffix -> (hardware, workflow) for suites rerun-test.yml cannot run.
+_CPU_SUITE_POOLS = {
+    "-intel": ("Intel Xeon", "the pr-test-xeon.yml"),
+    "-arm64": ("arm64", "the pr-test-arm64.yml"),
+}
+
+
 def _extract_other_backends(content):
     """Return (backend labels, suite names) for every non-CUDA/CPU registration."""
     labels, suites = [], []
@@ -994,14 +999,9 @@ def _resolve_runner_config(rc, full_path, suite):
             f"passes this string verbatim into a shell step, so it must "
             f"match `scripts/ci/cuda/*.sh`.",
         )
-    runs_on = cfg.get("runs_on")
-    # Resolve $b200_runner sentinel: rerun-test never builds sgl-kernel,
-    # so always pick the non-kernel b200 pool.
-    if runs_on == "$b200_runner":
-        runs_on = _B200_DEFAULT_RUNNER
     return {
         "suite": suite,
-        "runner_label": runs_on,
+        "runner_label": _partition.resolve_runs_on(cfg),
         "install_script": install_script,
         "install_timeout": str(cfg["install_timeout"]),
         "rdma_devices": cfg.get("rdma_devices", ""),
@@ -1047,6 +1047,22 @@ def detect_suite(file_path_from_test):
     legacy_suites = _extract_legacy_suites(content)
 
     if re.search(r"^[^#\n]*register_cpu_ci\s*\(", content, re.MULTILINE):
+        cpu_suites = sorted(set(_extract_suites(content, "register_cpu_ci")))
+        if cpu_suites and not set(cpu_suites) & _partition.UBUNTU_CPU_SUITES:
+            suite = cpu_suites[0]
+            pool, workflow = next(
+                (v for k, v in _CPU_SUITE_POOLS.items() if suite.endswith(k)),
+                ("a dedicated CPU runner", "its own"),
+            )
+            return [
+                _dispatch_err(
+                    suite,
+                    f"`{full_path}` is registered for {pool} (suite `{suite}`), "
+                    f"not the ubuntu-latest CPU pool; rerun-test.yml has no job "
+                    f"for it. Rerun it with /rerun-failed-ci, or dispatch "
+                    f"{workflow} workflow manually.",
+                )
+            ]
         return [
             {
                 "suite": "cpu",
@@ -1133,18 +1149,18 @@ def _resolve_test_spec(test_spec):
             f"selector={test_selector}, runner={runner_label}, "
             f"command='{test_command}'"
         )
-        return [
-            {
-                "spec": test_spec,
-                "test_command": test_command,
-                "mode": "multimodal_gen",
-                "runs_on": runner_label,
-                "install_script": "",
-                "install_timeout": "",
-                "rdma_devices": "",
-                "error": None,
-            }
-        ]
+        entry = {
+            "spec": test_spec,
+            "test_command": test_command,
+            "mode": "multimodal_gen",
+            "runs_on": runner_label,
+            "install_script": "",
+            "install_timeout": "",
+            "rdma_devices": "",
+            "error": None,
+        }
+        err = _too_long_for_rerun(entry, resolved_path)
+        return [{"spec": test_spec, "error": err} if err else entry]
 
     test_command = resolved_path
     if test_selector:
@@ -1163,19 +1179,33 @@ def _resolve_test_spec(test_spec):
             f"rdma={info['rdma_devices']}, "
             f"command='{test_command}'"
         )
-        out.append(
-            {
-                "spec": test_spec,
-                "test_command": test_command,
-                "mode": mode,
-                "runs_on": info["runner_label"],
-                "install_script": info["install_script"],
-                "install_timeout": info["install_timeout"],
-                "rdma_devices": info["rdma_devices"],
-                "error": None,
-            }
-        )
+        entry = {
+            "spec": test_spec,
+            "test_command": test_command,
+            "mode": mode,
+            "runs_on": info["runner_label"],
+            "install_script": info["install_script"],
+            "install_timeout": info["install_timeout"],
+            "rdma_devices": info["rdma_devices"],
+            "error": None,
+        }
+        err = _too_long_for_rerun(entry, f"test/{resolved_path}")
+        out.append({"spec": test_spec, "error": err} if err else entry)
     return out
+
+
+def _too_long_for_rerun(entry, path):
+    est = _partition.estimate_seconds(
+        entry["test_command"], Path("."), entry["mode"], entry["runs_on"]
+    )
+    if est is None or est <= _partition.STEP_TIMEOUT_SECONDS:
+        return None
+    return (
+        f"`{path}` is estimated at {est:.0f}s on `{entry['runs_on']}`, longer than "
+        f"the {_partition.STEP_TIMEOUT_SECONDS // 60}-minute /rerun-test step limit, "
+        "so it can only time out there. Run it through its stage or nightly "
+        "workflow instead."
+    )
 
 
 def _dispatch_batch(

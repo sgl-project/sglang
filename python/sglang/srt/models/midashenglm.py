@@ -1,6 +1,7 @@
 import collections
 import collections.abc
 import logging
+from array import array
 from collections.abc import Callable, Sequence
 from typing import Iterable, List, Optional, Tuple, TypeAlias, cast
 
@@ -502,7 +503,7 @@ class MiDashengLMModel(nn.Module):
         self.logits_processor = self.language_model.logits_processor
         self.quant_config = quant_config
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         """Pad input IDs with multimodal tokens."""
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)

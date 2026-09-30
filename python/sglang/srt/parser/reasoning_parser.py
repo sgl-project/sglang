@@ -2,6 +2,8 @@ import inspect
 import re
 from typing import Dict, List, Optional, Tuple, Type
 
+from transformers import PreTrainedTokenizerBase
+
 from sglang.srt.entrypoints.openai.encoding_dsv4 import dsml_token as dsv4_dsml_token
 from sglang.srt.entrypoints.openai.encoding_dsv4 import eos_token as dsv4_eos_token
 from sglang.srt.entrypoints.openai.encoding_dsv4 import (
@@ -43,6 +45,7 @@ from sglang.srt.parser.inkling_tokenizer import (
     CONTENT_THINKING,
     END_MESSAGE,
     INKLING_CONTROL_TOKENS,
+    INKLING_SPECIAL_TOKEN_IDS,
     MESSAGE_MODEL,
 )
 
@@ -75,11 +78,15 @@ class BaseReasoningFormatDetector:
         thinks_internally: bool = False,
         reasoning_default: str = "always",
         force_nonempty_content: bool = False,
+        tool_start_at_line_start: bool = False,
     ):
         self.think_start_token = think_start_token
         self.think_end_token = think_end_token
         self.think_excluded_tokens = think_excluded_tokens
         self.tool_start_token = tool_start_token
+        # Only a tool_start_token that begins a line interrupts reasoning, so
+        # the model mentioning the tag mid-sentence does not end the block.
+        self.tool_start_at_line_start = tool_start_at_line_start
         self.force_reasoning = force_reasoning
         self._in_reasoning = force_reasoning
         self.stream_reasoning = stream_reasoning
@@ -87,6 +94,7 @@ class BaseReasoningFormatDetector:
         self.reasoning_default = reasoning_default
 
         self._buffer = ""
+        self._streamed_reasoning_tail = ""
         self.stripped_think_start = False
         self.think_start_self_label = ""
 
@@ -106,12 +114,32 @@ class BaseReasoningFormatDetector:
         if self.think_end_token in self.previous_content:
             self._in_reasoning = False
 
+    def get_think_end_token_ids(self, tokenizer: PreTrainedTokenizerBase) -> List[int]:
+        return tokenizer.encode(self.think_end_token, add_special_tokens=False)
+
     def _maybe_apply_force_nonempty_content(
         self, ret: StreamingParseResult
     ) -> StreamingParseResult:
         if self._force_nonempty_content and not ret.normal_text:
             ret.normal_text, ret.reasoning_text = ret.reasoning_text, ret.normal_text
         return ret
+
+    def _find_tool_start(self, text: str, preceded_by: str = "") -> int:
+        """Index of the first tool_start_token that interrupts reasoning, or -1.
+
+        `preceded_by` is the character just before `text`, for a streaming
+        buffer whose leading newline was already emitted as reasoning."""
+        if not self.tool_start_token:
+            return -1
+        idx = text.find(self.tool_start_token)
+        while idx != -1:
+            prev = text[idx - 1] if idx > 0 else preceded_by
+            # Nothing precedes the token at the absolute start of generation;
+            # that counts as line start too.
+            if not self.tool_start_at_line_start or prev in ("", "\n"):
+                return idx
+            idx = text.find(self.tool_start_token, idx + 1)
+        return -1
 
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         """
@@ -139,13 +167,8 @@ class BaseReasoningFormatDetector:
             and self.think_end_token not in self.previous_content
         ):
             # Check for tool_start_token interruption
-            if (
-                in_reasoning
-                and self.tool_start_token is not None
-                and self.tool_start_token in processed_text
-            ):
-                # Find the first occurrence of tool_start_token and split there
-                tool_idx = processed_text.find(self.tool_start_token)
+            tool_idx = self._find_tool_start(processed_text) if in_reasoning else -1
+            if tool_idx != -1:
                 reasoning_text = processed_text[:tool_idx]
                 # Preserve tool_start_token in normal text
                 normal_text = processed_text[tool_idx:]
@@ -153,7 +176,9 @@ class BaseReasoningFormatDetector:
                     normal_text=normal_text, reasoning_text=reasoning_text
                 )
             # Assume reasoning was truncated before end token
-            return StreamingParseResult(reasoning_text=processed_text)
+            return StreamingParseResult(
+                reasoning_text=self._strip_partial_tool_start(processed_text)
+            )
 
         # Extract reasoning content
         if self.think_end_token in processed_text:
@@ -228,8 +253,10 @@ class BaseReasoningFormatDetector:
         if self._in_reasoning:
             # Check for tool_start_token interruption. Streaming cannot see a
             # think_end_token that has not arrived yet; see the chunk_dependent test.
-            if self.tool_start_token and self.tool_start_token in current_text:
-                tool_idx = current_text.find(self.tool_start_token)
+            tool_idx = self._find_tool_start(
+                current_text, self._streamed_reasoning_tail
+            )
+            if tool_idx != -1:
                 reasoning_text = current_text[:tool_idx]
                 # Preserve tool_start_token in normal text
                 normal_text = current_text[tool_idx:]
@@ -251,9 +278,10 @@ class BaseReasoningFormatDetector:
                     for token in holdback_tokens
                 )
                 self._buffer = current_text[len(current_text) - holdback :]
-                return StreamingParseResult(
-                    reasoning_text=current_text[: len(current_text) - holdback]
-                )
+                reasoning_text = current_text[: len(current_text) - holdback]
+                if reasoning_text:
+                    self._streamed_reasoning_tail = reasoning_text[-1]
+                return StreamingParseResult(reasoning_text=reasoning_text)
             else:
                 return StreamingParseResult()
 
@@ -280,6 +308,21 @@ class BaseReasoningFormatDetector:
                 return i
         return 0
 
+    def _strip_partial_tool_start(self, text: str, preceded_by: str = "") -> str:
+        """Drop a trailing partial tool-start token that begins a line: generation
+        ended mid-tag, and flushing the fragment as reasoning would surface raw
+        markup to the client. `preceded_by` is as in `_find_tool_start`."""
+        if not self.tool_start_at_line_start or not text:
+            return text
+        n = self._ends_with_partial_token(text, self.tool_start_token or "")
+        if n == 0:
+            return text
+        start = len(text) - n
+        prev = text[start - 1] if start > 0 else preceded_by
+        if prev in ("", "\n"):
+            return text[:start]
+        return text
+
     def finish(self) -> StreamingParseResult:
         """Flush reasoning still buffered when the stream ends before the end token
         (e.g. max_tokens cut it short), instead of dropping it: the whole block under
@@ -295,6 +338,7 @@ class BaseReasoningFormatDetector:
         # Defensive: subclasses that fill _buffer themselves may not have stripped
         # the opening think token that _parse_streaming_increment_impl removes.
         buffer = self._strip_leading_think_start(self._buffer)
+        buffer = self._strip_partial_tool_start(buffer, self._streamed_reasoning_tail)
         self._buffer = ""
 
         if self._force_nonempty_content:
@@ -350,6 +394,38 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
             force_nonempty_content=force_nonempty_content,
         )
         # https://github.com/sgl-project/sglang/pull/3202#discussion_r1950153599
+
+
+class IQuestQ1ReasoningDetector(BaseReasoningFormatDetector):
+    @staticmethod
+    def thinking_enabled(chat_kwargs):
+        thinking = chat_kwargs.get("thinking")
+        enable_thinking = chat_kwargs.get("enable_thinking")
+        return (
+            True
+            if thinking is None and enable_thinking is None
+            else bool(thinking or enable_thinking)
+        )
+
+    def __init__(
+        self,
+        stream_reasoning=True,
+        force_reasoning=True,
+        continue_final_message=False,
+        previous_content="",
+        force_nonempty_content=False,
+    ):
+        super().__init__(
+            "<think>",
+            "</think>",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            force_nonempty_content=force_nonempty_content,
+            thinks_internally=True,
+            reasoning_default="enable_thinking",
+        )
 
 
 class Qwen3Detector(BaseReasoningFormatDetector):
@@ -1295,6 +1371,11 @@ class InklingDetector(BaseReasoningFormatDetector):
         self._pending_header = ""
         self._pending_reasoning = ""
 
+    def get_think_end_token_ids(self, tokenizer: PreTrainedTokenizerBase) -> List[int]:
+        del tokenizer
+        # Native framing IDs differ from encoding their printed names as plain text.
+        return [INKLING_SPECIAL_TOKEN_IDS[self.think_end_token]]
+
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         self._buffer = ""
         self._kind = None
@@ -1446,8 +1527,11 @@ class DeepSeekV4Detector(BaseReasoningFormatDetector):
             dsv4_thinking_start_token,
             dsv4_thinking_end_token,
             think_excluded_tokens=[dsv4_eos_token, dsv4_dsml_token],
-            # Leading "<" included: has_tool_call() matches on it.
-            tool_start_token=f"<{dsv4_dsml_token}",
+            # The reference parser splits reasoning at `\n\n<｜DSML｜tool_calls`;
+            # anchoring on the full tag at a line start keeps a mid-sentence
+            # mention of the tag inside reasoning from ending the block.
+            tool_start_token=f"<{dsv4_dsml_token}tool_calls>",
+            tool_start_at_line_start=True,
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
             continue_final_message=continue_final_message,
@@ -1456,6 +1540,15 @@ class DeepSeekV4Detector(BaseReasoningFormatDetector):
             reasoning_default="explicit_thinking",
             force_nonempty_content=force_nonempty_content,
         )
+
+
+class DeepSeekV41ReasoningDetector(DeepSeekV4Detector):
+    """V4.1 emits the calls block with a spaced tag name (`<｜DSML｜ calls>`),
+    so the unspaced V4 tool-start anchor never interrupts its reasoning."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.tool_start_token = f"<{dsv4_dsml_token} calls>"
 
 
 class _MimoDetector(Qwen3Detector):
@@ -2166,7 +2259,7 @@ class ReasoningParser:
         "deepseek-r1": DeepSeekR1Detector,
         "deepseek-v3": _DeepSeekV3Detector,
         "deepseek-v4": DeepSeekV4Detector,
-        "deepseek-v41": DeepSeekV4Detector,
+        "deepseek-v41": DeepSeekV41ReasoningDetector,
         "dots": Qwen3Detector,
         "glm45": Glm45Detector,
         "ling3": Ling3Detector,
@@ -2194,6 +2287,7 @@ class ReasoningParser:
         "gemma4": Gemma4Detector,
         "gigachat35": DeepSeekR1Detector,
         "inkling": InklingDetector,
+        "iquest_q1": IQuestQ1ReasoningDetector,
         "cohere_command4": CohereCommand4Detector,
     }
 
@@ -2214,6 +2308,13 @@ class ReasoningParser:
             raise ValueError(f"Unsupported model type: {model_type}")
 
         chat_template_kwargs = getattr(request, "chat_template_kwargs", None) or {}
+
+        if model_type.lower() == "iquest_q1" and (
+            request is not None or force_reasoning is None
+        ):
+            force_reasoning = IQuestQ1ReasoningDetector.thinking_enabled(
+                chat_template_kwargs
+            )
 
         # Special cases where we override force_reasoning
         if model_type.lower() in {
