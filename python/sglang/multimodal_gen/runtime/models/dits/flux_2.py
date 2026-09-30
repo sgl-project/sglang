@@ -28,6 +28,7 @@ from sglang.kernels.ops.diffusion import (
     can_use_flux2_gated_resnorm,
     can_use_flux2_strided_qknorm_rope,
     can_use_fused_layernorm_modulate,
+    can_use_fused_packed_silu_mul,
     flux2_gated_resnorm_raw,
     flux2_strided_qknorm_rope,
     fused_layernorm_modulate_fp8_quant_raw,
@@ -405,19 +406,9 @@ def _flux2_swiglu(x: torch.Tensor) -> torch.Tensor:
     # how the two packed halves are addressed and therefore need verification.
     sig = (x.dtype, x.device, x.shape[0], x.shape[-1], x.stride(-2), x.stride(-1))
     verified = sig in _FLUX2_SWIGLU_SIGS
-    can_fuse = (
-        not _FLUX2_SWIGLU.disabled
-        and (x.is_cuda or x.is_xpu)
-        and x.dtype is torch.bfloat16
-        and x.dim() == 3
-        and x.stride(-1) == 1
-        and x.stride(-2) >= x.shape[-1]
-        and x.stride(0) == x.shape[1] * x.stride(1)
-        and x.shape[-1] % 2 == 0
-        and x.numel() > 0
-    )
+    can_fuse = not _FLUX2_SWIGLU.disabled and can_use_fused_packed_silu_mul(x)
     # Per-signature verification may compare tensors and synchronize.  Never
-    # verify a new layout while a CUDA graph is being captured.
+    # verify a new layout while a device graph is being captured.
     if (
         can_fuse
         and not verified

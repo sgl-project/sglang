@@ -739,6 +739,7 @@ _EXPORTS: dict[str, str] = {
     # Activation-function fusions
     "fused_bias_glu": "activation.sana_conv_post_triton",
     "fused_bias_silu": "activation.sana_conv_post_triton",
+    "can_use_fused_packed_silu_mul": "activation.silu_mul_bitexact",
     "fused_packed_silu_mul_bitexact": "activation.silu_mul_bitexact",
     "fused_silu_mul_bitexact": "activation.silu_mul_bitexact",
     "can_use_fused_situ_softcap_mul": "activation.situ_softcap_mul_bitexact",
