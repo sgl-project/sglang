@@ -100,6 +100,14 @@ def _with_mtp_layer_mapping(
     }
 
 
+def _get_rank_local_dsa_indexer_layers(kv_pool: Any) -> list[int]:
+    layer_ids = list(kv_pool.hicache_indexer_layers)
+    if not kv_pool.layer_shard_enabled:
+        return layer_ids
+    owned_start, owned_end = kv_pool._owned_local_layer_range()
+    return [layer_id for layer_id in layer_ids if owned_start <= layer_id < owned_end]
+
+
 class _DeepSeekV4LayerMappings(NamedTuple):
     transfer_layer_id_max: int
     full: dict[int, int]
@@ -1356,6 +1364,7 @@ def build_anchor_sidecar_stack(
     use_mla: bool,
     override_kv_cache_dim: Optional[int] = None,
     sidecar_host_pool_factory: Callable[[Any], Any],
+    sidecar_layer_mapping: Optional[dict[int, int]] = None,
     prefetch_threshold: int = 256,
     model_name: Optional[str] = None,
     storage_backend_extra_config: Optional[dict] = None,
@@ -1372,11 +1381,18 @@ def build_anchor_sidecar_stack(
         override_kv_cache_dim=override_kv_cache_dim,
         mtp_draft_device_pools=mtp_draft_device_pools,
     )
-    sidecar_host_pool = sidecar_host_pool_factory(kv_host_pool)
+    if sidecar_layer_mapping is None:
+        sidecar_layer_mapping = full_layer_mapping.copy()
     # Expose packed MTP tail layers to the controller's flat transfer builder.
     if mtp_draft_device_pools:
         full_layer_mapping = _with_mtp_layer_mapping(
             full_layer_mapping,
+            transfer_layer_start=transfer_layer_id_max,
+            target_device_layer_num=kv_pool.layer_num,
+            draft_layer_num=len(mtp_draft_device_pools),
+        )
+        sidecar_layer_mapping = _with_mtp_layer_mapping(
+            sidecar_layer_mapping,
             transfer_layer_start=transfer_layer_id_max,
             target_device_layer_num=kv_pool.layer_num,
             draft_layer_num=len(mtp_draft_device_pools),
@@ -1391,15 +1407,19 @@ def build_anchor_sidecar_stack(
             is_anchor=True,
             packed_draft_device_pools=mtp_draft_device_pools,
         ),
-        build_pool_entry(
-            name=sidecar_pool_name,
-            host_pool=sidecar_host_pool,
-            device_pool=kv_pool,
-            layer_mapping=full_layer_mapping,
-            transfer_layer_id_max=transfer_layer_id_max + len(mtp_draft_device_pools),
-            packed_draft_device_pools=mtp_draft_device_pools,
-        ),
     ]
+    if sidecar_layer_mapping:
+        entries.append(
+            build_pool_entry(
+                name=sidecar_pool_name,
+                host_pool=sidecar_host_pool_factory(kv_host_pool),
+                device_pool=kv_pool,
+                layer_mapping=sidecar_layer_mapping,
+                transfer_layer_id_max=transfer_layer_id_max
+                + len(mtp_draft_device_pools),
+                packed_draft_device_pools=mtp_draft_device_pools,
+            )
+        )
     host_pool_group = HostPoolGroup(entries)
     cache_controller = HybridCacheController(
         params.token_to_kv_pool_allocator,
@@ -2012,6 +2032,8 @@ class _DsaStrategy(StackStrategy):
         full_kv_pool = kvcache
         use_mla = isinstance(kvcache, MLATokenToKVPool)
         full_layer_mapping = {i: i for i in range(full_kv_pool.layer_num)}
+        indexer_layers = _get_rank_local_dsa_indexer_layers(full_kv_pool)
+        indexer_layer_mapping = {layer_id: layer_id for layer_id in indexer_layers}
         host_pool_group, cache_controller = build_anchor_sidecar_stack(
             params=params,
             kv_pool=full_kv_pool,
@@ -2021,30 +2043,37 @@ class _DsaStrategy(StackStrategy):
             storage_backend=storage_backend,
             use_mla=use_mla,
             override_kv_cache_dim=full_kv_pool.kv_cache_dim,
+            sidecar_layer_mapping=indexer_layer_mapping,
             sidecar_host_pool_factory=lambda kv_host_pool: DSAIndexerPoolHost(
                 full_kv_pool,
                 kv_host_pool,
                 get_memory().hicache_mem_layout,
                 allocator_type=_get_allocator_type(),
+                device_layer_ids=indexer_layers,
             ),
             prefetch_threshold=prefetch_threshold,
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
         )
+        has_indexer_sidecar = PoolName.INDEXER in host_pool_group.entry_map
         return StackBuildResult(
             host_pool_group=host_pool_group,
             cache_controller=cache_controller,
             component_host_pools={
                 ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
             },
-            sidecars=[
-                SidecarPoolSpec(
-                    pool_name=PoolName.INDEXER,
-                    indices_from_pool=PoolName.KV,
-                ),
-            ],
-            pools_desc="KV + INDEXER",
+            sidecars=(
+                [
+                    SidecarPoolSpec(
+                        pool_name=PoolName.INDEXER,
+                        indices_from_pool=PoolName.KV,
+                    )
+                ]
+                if has_indexer_sidecar
+                else []
+            ),
+            pools_desc="KV + INDEXER" if has_indexer_sidecar else "KV",
         )
 
 
