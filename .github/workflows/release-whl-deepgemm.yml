@@ -117,7 +117,7 @@ jobs:
           - arch_label: sm100-aarch64
             runner: 4-gpu-gb300
             wheel_arch: aarch64
-            timeout: 60
+            timeout: 180
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.timeout }}
     steps:
