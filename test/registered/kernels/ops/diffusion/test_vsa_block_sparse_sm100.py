@@ -97,7 +97,7 @@ def test_rejects_odd_tile_count():
     idx = torch.zeros(3, 1, device="cuda", dtype=torch.int32)
     num = torch.ones(3, device="cuda", dtype=torch.int32)
     sizes = torch.full((3,), BLOCK, device="cuda", dtype=torch.int32)
-    with pytest.raises(Exception, match="even"):
+    with pytest.raises(RuntimeError, match="even"):
         vsa_block_sparse_sm100(q, q, q, idx, num, sizes, torch.empty_like(q), 0.1)
 
 
