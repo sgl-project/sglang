@@ -3,6 +3,7 @@
 import itertools
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -72,18 +73,11 @@ class TestUnifiedPendingEventBatches(CustomTestCase):
                 try:
                     setup_allocator_context()
                     if layout == 3:
-                        bundle, allocator, _ = build_tri_pool(
-                            lazy=True,
-                            page_size=page_size,
-                            temporal=(1, 4, 8),
-                            state_cache=False,
-                        )
+                        bundle, allocator = build_tri_pool(page_size=page_size)
                         states = allocator.mamba_allocator.alloc(8)
                         self.assertIsNotNone(states)
                     else:
-                        allocator, _ = build_swa_pool(
-                            occupancy=0, lazy=True, page_size=page_size
-                        )
+                        allocator = build_swa_pool(page_size=page_size)
                         bundle = SimpleNamespace(
                             token_to_kv_pool=allocator.get_kvcache()
                         )
@@ -118,7 +112,7 @@ class TestUnifiedPendingEventBatches(CustomTestCase):
                             cpu, device = member._pending_reuse[event]
                             self.assertEqual(set(cpu), sources)
                             self.assertEqual(len(cpu), len(sources))
-                            self.assertEqual(device.tolist(), cpu)
+                            self.assertEqual(torch.cat(device).tolist(), cpu)
 
                     def assert_payload():
                         for current, buf, ids, tag in _views(
@@ -211,6 +205,47 @@ class TestUnifiedPendingEventBatches(CustomTestCase):
                                 ids, buf, tag, generation=1
                             )
                         assert_payload()
+                finally:
+                    reset_context()
+
+    def test_gated_flush_still_returns_fired_sources(self):
+        """A closed move gate stops copies, not the release of fired sources."""
+        for page_size in (1, 4):
+            with self.subTest(page_size=page_size):
+                try:
+                    setup_allocator_context()
+                    allocator = build_swa_pool(page_size=page_size)
+                    slots = allocator.alloc(80 * page_size)
+                    self.assertIsNotNone(slots)
+                    member = allocator.full_attn_allocator
+                    event = _Event()
+                    member.set_latest_forward_done_event(event)
+                    member.set_inflight_forward(event, None)
+                    allocator.free(slots[10 * page_size : 11 * page_size])
+                    self.assertGreater(member._flush(urgent=False), 0)
+                    sources = set(member._pending_reuse_pages_cpu)
+                    self.assertTrue(sources)
+                    before = member.available_size()
+
+                    member.disagg_move_gate = lambda: False
+                    with patch.object(
+                        member._kvcache,
+                        "move_kv_cache",
+                        side_effect=AssertionError("gated flush copied"),
+                    ):
+                        # Unfired: even an urgent flush leaves them pending.
+                        self.assertEqual(member._flush(urgent=True), 0)
+                        self.assertEqual(member._pending_reuse_pages_cpu, sources)
+                        event.fired = True
+                        self.assertEqual(member.flush_opportunistic(), 0)
+
+                    self.assertFalse(member._pending_reuse)
+                    self.assertFalse(member._pending_reuse_pages_cpu)
+                    self.assertLessEqual(sources, set(member._free_phys_pages.tolist()))
+                    self.assertEqual(
+                        member.available_size(), before + len(sources) * page_size
+                    )
+                    self.assertEqual(allocator.verify_byte_accounting(), [])
                 finally:
                     reset_context()
 

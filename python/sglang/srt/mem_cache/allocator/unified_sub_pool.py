@@ -208,6 +208,18 @@ def _relieve_for_alloc(short_pool, need_tokens: int) -> bool:
     return need_tokens <= short_pool.available_size()
 
 
+def _drains_on_urgent_flush(neighbor) -> bool:
+    """Whether an urgent flush of this credited neighbor would release its holes.
+    The one input to the schedulable credit that the chain epoch does not cover:
+    a gate flips with no allocator write. A blocked neighbor cannot reclaim holes
+    to satisfy an allocation, so its holes earn no credit."""
+    return (
+        neighbor is not None
+        and neighbor.lazy_compaction
+        and not neighbor.moves_blocked()
+    )
+
+
 def _flush_deferred_free_group(
     allocator: BaseTokenToKVPoolAllocator,
     pending_groups: Sequence[Optional[Sequence[torch.Tensor]]],
@@ -383,11 +395,12 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self._free_phys_pages: torch.Tensor = torch.empty(
             0, dtype=torch.int64, device=device
         )
-        # One entry per event accumulates all pending batches; `cpu_list` updates
-        # the Set without sync; the retained GPU tensor avoids an H2D at drain.
+        # One entry per event, appended to by every batch pending on it:
+        # `cpu_list` drives the Set update (no sync); each batch's GPU tensor is
+        # kept alive so drain cats them all without an H2D.
         self._pending_reuse: Dict[
             torch.cuda.Event,
-            Tuple[List[int], torch.Tensor],
+            Tuple[List[int], List[torch.Tensor]],
         ] = {}
         # CPU mirror of `_pending_reuse` for O(1) membership in the survivor walk.
         self._pending_reuse_pages_cpu: Set[int] = set()
@@ -437,12 +450,10 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         # schedulers read them O(queue) times per step.
         self._avail_memo_epoch: Optional[int] = None
         self._avail_memo_tokens: int = 0
-        # (chain epoch, gate signature, schedulable tokens).
-        self._sched_gate_memo: Optional[Tuple[int, object, int]] = None
-        # (chain epoch, growth-side neighbor).
-        self._growth_neighbor_memo: Optional[
-            Tuple[int, Optional[MultiEndedAllocator]]
-        ] = None
+        self._sched_avail_memo_key: Optional[tuple] = None
+        self._sched_avail_memo_tokens: int = 0
+        # (chain epoch, `_credit_neighbors()`): the key's hot path skips the walk.
+        self._credit_neighbors_memo: Optional[tuple] = None
 
         self.clear()
 
@@ -606,10 +617,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         return out
 
     def _capacity_memo_violations(self) -> List[str]:
-        """Compare memos matching the current epoch and gate state with fresh values.
-
-        A mismatch can indicate a write that bypassed `_CapacityField`.
-        """
+        """Memo-coherence check: divergence from a fresh recompute means a
+        mutation bypassed `_CapacityField` (an in-place write). Empty == healthy."""
         out: List[str] = []
         epoch = self._chain_capacity_epoch()
         if self._avail_memo_epoch == epoch:
@@ -619,15 +628,15 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                     f"[{self.sub_pool_name}] stale available_size memo: "
                     f"cached={self._avail_memo_tokens}, actual={actual}"
                 )
-        m = self._sched_gate_memo
-        if m is not None and m[0] == epoch and m[1] == self._gate_memo_signature(epoch):
+        if self._sched_avail_memo_key == self._schedulable_capacity_key():
             actual = self._available_tokens(
                 extra_gap_bytes=self._peer_drainable_hole_bytes()
             )
-            if m[2] != actual:
+            if self._sched_avail_memo_tokens != actual:
                 out.append(
                     f"[{self.sub_pool_name}] stale schedulable_available_size "
-                    f"memo: cached={m[2]}, actual={actual}"
+                    f"memo: cached={self._sched_avail_memo_tokens}, "
+                    f"actual={actual}"
                 )
         return out
 
@@ -681,26 +690,11 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         return total
 
     def _growth_side_neighbor(self) -> Optional[MultiEndedAllocator]:
-        """Nearest non-transparent growth-side neighbor, cached by chain epoch.
-
-        Wiring and transparency changes invalidate the memo. Test stubs without
-        epoch state use an uncached walk.
-        """
-        m = self._growth_neighbor_memo
-        if m is not None:
-            try:
-                if m[0] == self._chain_capacity_epoch():
-                    return m[1]
-            except AttributeError:
-                pass  # duck-typed stub chain: memo unusable
+        """Nearest NON-transparent chain member on this pool's GROWTH side -- the
+        one whose compaction releases bytes reachable at this pool's frontier."""
         p = self.high_peer if self.grow_direction == "up" else self.low_peer
         while p is not None and p._is_frontier_transparent():
             p = p.high_peer if self.grow_direction == "up" else p.low_peer
-        try:
-            epoch = self._chain_capacity_epoch()
-        except AttributeError:
-            epoch = None  # duck-typed stub chain: skip memoization
-        self._growth_neighbor_memo = (epoch, p) if epoch is not None else None
         return p
 
     def _current_gap_bytes(self) -> int:
@@ -747,10 +741,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         awaits an event -- so the credit is realizable.
         """
         neighbor = self._growth_side_neighbor()
-        if neighbor is None or not neighbor.lazy_compaction:
-            return 0
-        if neighbor.moves_blocked():
-            # A blocked neighbor cannot reclaim holes to satisfy an allocation.
+        if not _drains_on_urgent_flush(neighbor):
             return 0
         return len(neighbor._free_phys_pages) * neighbor.entry_bytes_per_page
 
@@ -764,33 +755,35 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 return True
         return False
 
-    def _gate_memo_signature(self, epoch: int) -> object:
-        """Growth-side gate state, reusing the caller's epoch for neighbor lookup."""
-        m = self._growth_neighbor_memo
-        if m is not None and m[0] == epoch:
-            neighbor = m[1]
-        else:
-            neighbor = self._growth_side_neighbor()
-        if neighbor is None or not neighbor.lazy_compaction:
-            return True
-        return not neighbor.moves_blocked()
+    def _credit_neighbors(self) -> tuple:
+        """Chain members whose holes `schedulable_available_size` credits. Which
+        members these are depends only on epoch-tracked state."""
+        return (self._growth_side_neighbor(),)
+
+    def _schedulable_capacity_key(self) -> tuple:
+        """The chain epoch, which covers everything the schedulable view reads
+        except gate state, plus `_drains_on_urgent_flush` for each credited
+        neighbor. The neighbors are memoized on the epoch; their gates are read
+        live, since a gate flips with no allocator write."""
+        epoch = self._chain_capacity_epoch()
+        m = self._credit_neighbors_memo
+        if m is None or m[0] != epoch:
+            m = self._credit_neighbors_memo = (epoch, self._credit_neighbors())
+        (neighbor,) = m[1]
+        return epoch, _drains_on_urgent_flush(neighbor)
 
     def schedulable_available_size(self) -> int:
-        """Tokens allocatable after a neighbor urgent flush; alloc uses available_size.
+        """Tokens allocatable after flushing a neighbor, including reclaimable holes.
 
-        Cache by chain epoch and gate state: gates can flip without allocator
-        mutations, so the epoch alone cannot validate this view.
+        Allocation checks use available_size(). Cache by capacity and gate state.
         """
-        epoch = self._chain_capacity_epoch()
-        gate_key = self._gate_memo_signature(epoch)
-        m = self._sched_gate_memo
-        if m is not None and m[0] == epoch and m[1] == gate_key:
-            return m[2]
-        tokens = self._available_tokens(
-            extra_gap_bytes=self._peer_drainable_hole_bytes()
-        )
-        self._sched_gate_memo = (epoch, gate_key, tokens)
-        return tokens
+        key = self._schedulable_capacity_key()
+        if self._sched_avail_memo_key != key:
+            self._sched_avail_memo_tokens = self._available_tokens(
+                extra_gap_bytes=self._peer_drainable_hole_bytes()
+            )
+            self._sched_avail_memo_key = key
+        return self._sched_avail_memo_tokens
 
     def _flush_targets(self):
         """A band short on its OWN alloc asks only its growth-side neighbour to
@@ -1471,6 +1464,10 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         virtuals, record inverse history. Does NOT clear p2v[src] -- callers own
         vacated-region clearing. Returns the moved virtual page ids.
         """
+        # Every mover checks the gate first; this catches one that does not.
+        assert not self.moves_blocked(), (
+            f"[{self.sub_pool_name}] page copy while a move gate is closed"
+        )
         v_moved = self.physical_to_virtual[src_pages].clone()  # read pre-wipe
 
         # Expand to PHYSICAL token granularity (the move kernel is
@@ -1627,13 +1624,13 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         with record_function("MultiEndedAlloc._drain_pending_reuse"):
             ready_tensors: List[torch.Tensor] = []
             ready_entries: List[Tuple[torch.cuda.Event, List[int]]] = []
-            for event, (cpu_list, gpu_tensor) in self._pending_reuse.items():
+            for event, (cpu_list, gpu_batches) in self._pending_reuse.items():
                 if event is None or event.query():
-                    ready_tensors.append(gpu_tensor)
+                    ready_tensors.extend(gpu_batches)
                     ready_entries.append((event, cpu_list))
                 elif urgent:
                     torch.cuda.current_stream().wait_event(event)
-                    ready_tensors.append(gpu_tensor)
+                    ready_tensors.extend(gpu_batches)
                     ready_entries.append((event, cpu_list))
 
             for event, cpu_list in ready_entries:
@@ -1749,7 +1746,11 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         if not self.lazy_compaction:
             return 0
         if self.moves_blocked():
-            # Holes stay in the free list; the next flush picks them up.
+            # Holes stay in the free list; the next flush picks them up. Pending
+            # sources whose event has fired still rejoin it: that copies nothing,
+            # and until then they are missing from every capacity view.
+            # Non-urgent, so only sources that need no stream ordering return.
+            self._drain_pending_reuse(urgent=False)
             return 0
         self._wait_hicache_transfers()
         self._stats_n_flush_calls += 1
@@ -1914,6 +1915,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         """
         if not srcs:
             return
+        assert not self.moves_blocked(), (
+            f"[{self.sub_pool_name}] page copy while a move gate is closed"
+        )
         with record_function("MultiEndedAlloc._commit_move_batch"):
             src_pages_t = torch.tensor(srcs, dtype=torch.int64, device=self.device)
             dst_pages_t = torch.tensor(dsts, dtype=torch.int64, device=self.device)
@@ -1937,20 +1941,19 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             self.physical_to_virtual[dst_pages_t] = v_moveds_t
             self.physical_to_virtual.index_fill_(0, src_pages_t, -1)
             self._inverse_history.append((src_pages_t, dst_pages_t, v_moveds_t))
-            # Keep every batch associated with a pending forward event. Reuse
-            # page tensors at drain without another host-to-device transfer.
+            # Src disposition. Batches pending on the same event share its entry;
+            # `src_pages_t` is kept as that batch's GPU tensor (no second H2D at
+            # drain).
             event_fired = latest_event is None or latest_event.query()
             if event_fired:
                 released_fired.append(src_pages_t)
             else:
-                srcs_copy: List[int] = list(srcs)  # caller mutates `srcs`
-                previous = self._pending_reuse.get(latest_event)
-                if previous is not None:
-                    previous_srcs, previous_pages = previous
-                    srcs_copy = previous_srcs + srcs_copy
-                    src_pages_t = torch.cat([previous_pages, src_pages_t])
-                self._pending_reuse[latest_event] = (srcs_copy, src_pages_t)
-                self._pending_reuse_pages_cpu.update(srcs_copy)
+                cpu_list, gpu_batches = self._pending_reuse.setdefault(
+                    latest_event, ([], [])
+                )
+                cpu_list.extend(srcs)  # copies: the caller mutates `srcs`
+                gpu_batches.append(src_pages_t)
+                self._pending_reuse_pages_cpu.update(srcs)
 
     def flush_for_allocation(self) -> int:
         """Public urgent flush used by peer allocation-pressure recovery."""
@@ -2171,10 +2174,6 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
             f"FloatMultiEndedAllocator needs a 'float' sub-pool spec; got "
             f"{self.grow_direction!r}"
         )
-        # Per-side (chain epoch, neighbor) memos.
-        self._side_neighbor_memo: Dict[
-            str, Tuple[int, Optional[MultiEndedAllocator]]
-        ] = {}
 
     # -- span / frontier state --
 
@@ -2239,49 +2238,19 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
 
     # -- availability --
 
-    def _side_capacity_neighbor(self, side: str) -> Optional[MultiEndedAllocator]:
-        """Nearest non-transparent neighbor on this side, cached when epoch is available."""
-        try:
-            epoch = self._chain_capacity_epoch()
-        except AttributeError:
-            epoch = None  # duck-typed stub chain: skip memoization
-        m = self._side_neighbor_memo.get(side)
-        if epoch is not None and m is not None and m[0] == epoch:
-            return m[1]
+    def _side_neighbor(self, side: str) -> Optional[MultiEndedAllocator]:
+        """Nearest non-transparent member on ``side``, walking past transparent
+        members like the frontier walk."""
         p = self.low_peer if side == "low" else self.high_peer
         while p is not None and p._is_frontier_transparent():
             p = p.low_peer if side == "low" else p.high_peer
-        if epoch is not None:
-            self._side_neighbor_memo[side] = (epoch, p)
         return p
-
-    def _gate_memo_signature(self, epoch: int) -> object:
-        """Keep low/high gate states separate: each side contributes different capacity.
-
-        Reuse neighbor lookups while the epoch is unchanged.
-        """
-        sig = []
-        for side in ("low", "high"):
-            m = self._side_neighbor_memo.get(side)
-            p = (
-                m[1]
-                if (m is not None and m[0] == epoch)
-                else self._side_capacity_neighbor(side)
-            )
-            if p is None or not p.lazy_compaction:
-                sig.append(True)
-            else:
-                sig.append(not p.moves_blocked())
-        return tuple(sig)
 
     def _side_drainable_hole_bytes(self, side: str) -> int:
         """Realizable gap bytes an urgent flush of the neighbour on ``side``
-        would release, walking past transparent members like the frontier walk.
-        """
-        p = self._side_capacity_neighbor(side)
-        if p is None or not p.lazy_compaction:
-            return 0
-        if p.moves_blocked():
+        would release."""
+        p = self._side_neighbor(side)
+        if not _drains_on_urgent_flush(p):
             return 0
         return len(p._free_phys_pages) * p.entry_bytes_per_page
 
@@ -2294,6 +2263,20 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
             self._side_drainable_hole_bytes("low"),
             self._side_drainable_hole_bytes("high"),
         )
+
+    def _credit_neighbors(self) -> tuple:
+        return (self._side_neighbor("low"), self._side_neighbor("high"))
+
+    def _schedulable_capacity_key(self) -> tuple:
+        # The base key, per side and in order: `_available_tokens` credits each
+        # side on its own, so blocking the other side changes the result. Spelled
+        # out rather than looped; this runs O(queue) times per scheduler step.
+        epoch = self._chain_capacity_epoch()
+        m = self._credit_neighbors_memo
+        if m is None or m[0] != epoch:
+            m = self._credit_neighbors_memo = (epoch, self._credit_neighbors())
+        low, high = m[1]
+        return epoch, _drains_on_urgent_flush(low), _drains_on_urgent_flush(high)
 
     def _available_tokens(self, extra_gap_bytes: int = 0) -> int:
         gap_low, gap_high = self._gap_pages()
@@ -2498,27 +2481,24 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
         ``side`` boundary and the region bound on that side, relocating the
         minimum set of live boundary pages (holes-first destinations, then the far
         gap). Returns the bytes now open on ``side``; a result < ``min_bytes``
-        means the ask is unavailable now, including while movement is gated.
+        means the ask is impossible now or movement is gated, and state is then
+        unchanged.
         Scheduler-phase only; stream safety is owned HERE, not by the caller --
         the entry settles the in-flight forward before the first copy. Moves at
         most min(L_live, G) pages: every live page when the ask exceeds them.
         """
         assert side in ("low", "high"), f"side must be 'low'|'high'; got {side!r}"
+        epp = self.entry_bytes_per_page
+        gap_low, gap_high = self._gap_pages()
+        gap_side_bytes = (gap_low if side == "low" else gap_high) * epp
         if self.moves_blocked():
-            gap_low, gap_high = self._gap_pages()
-            return (gap_low if side == "low" else gap_high) * self.entry_bytes_per_page
+            # Nothing will be copied, so there is no forward to settle against.
+            return gap_side_bytes
         # Order the copies after the in-flight forward, or they carry pre-write
         # bytes; one wait covers read AND write (the event is post-forward).
         self._settle_inflight_forward()
-        epp = self.entry_bytes_per_page
         lo, hi = self._region_bounds_pages()
-        gap_low, gap_high = self._gap_pages()
-        gap_side_bytes = (gap_low if side == "low" else gap_high) * epp
-        if (
-            self.moves_blocked()
-            or gap_side_bytes >= min_bytes
-            or self._is_frontier_transparent()
-        ):
+        if gap_side_bytes >= min_bytes or self._is_frontier_transparent():
             return gap_side_bytes
 
         # Capacity: even packing every live page flush against the far side
@@ -2695,8 +2675,6 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
         movement is gated."""
         assert retreat_side in ("low", "high")
         if self.moves_blocked() or self._hole_pages() == 0:
-            return 0
-        if self.moves_blocked():
             return 0
         # Settle before the first copy -- see `make_room`.
         self._settle_inflight_forward()
