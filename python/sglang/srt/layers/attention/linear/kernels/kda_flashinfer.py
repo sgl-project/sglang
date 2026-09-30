@@ -923,7 +923,9 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
                 state_checkpoint_cu_starts=state_checkpoint_cu_starts,
                 state_checkpoint_every_n_tokens=state_checkpoint_every_n_tokens,
             )
-        plan_cache = self._cake_prefill_plan_cache()
+        # Only the BF16 export takes a plan cache; the TF32 entry point prepares
+        # and closes one launch per call.
+        plan_cache = self._cake_prefill_plan_cache() if precision == "bf16" else None
         prepare_kwargs = {}
         if plan_cache is not None:
             prepare_kwargs["plan_cache"] = plan_cache
