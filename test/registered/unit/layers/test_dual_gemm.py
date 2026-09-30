@@ -2,6 +2,7 @@
 
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -19,25 +20,7 @@ _HIDDEN_SIZE = 2048
 _INTERMEDIATE_SIZE = 2048
 
 
-def _make_llama_mlp(quant_config=None, dtype=torch.bfloat16):
-    from sglang.srt.models.llama import LlamaMLP
-
-    original_dtype = torch.get_default_dtype()
-    torch.set_default_dtype(dtype)
-    try:
-        with patch.dict(os.environ, {"SGLANG_ENABLE_DUAL_GEMM": "1"}):
-            mlp = LlamaMLP(
-                _HIDDEN_SIZE,
-                _INTERMEDIATE_SIZE,
-                "silu",
-                quant_config=quant_config,
-                reduce_results=False,
-                tp_rank=0,
-                tp_size=1,
-            ).cuda()
-    finally:
-        torch.set_default_dtype(original_dtype)
-
+def _initialize_mlp_weights(mlp, dtype):
     generator = torch.Generator(device="cuda").manual_seed(20261010)
     with torch.no_grad():
         mlp.gate_up_proj.weight.copy_(
@@ -59,6 +42,47 @@ def _make_llama_mlp(quant_config=None, dtype=torch.bfloat16):
             * 0.02
         )
     return mlp, generator
+
+
+def _make_llama_mlp(quant_config=None, dtype=torch.bfloat16):
+    from sglang.srt.models.llama import LlamaMLP
+
+    original_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    try:
+        with patch.dict(os.environ, {"SGLANG_ENABLE_DUAL_GEMM": "1"}):
+            mlp = LlamaMLP(
+                _HIDDEN_SIZE,
+                _INTERMEDIATE_SIZE,
+                "silu",
+                quant_config=quant_config,
+                reduce_results=False,
+                tp_rank=0,
+                tp_size=1,
+            ).cuda()
+    finally:
+        torch.set_default_dtype(original_dtype)
+    return _initialize_mlp_weights(mlp, dtype)
+
+
+def _make_qwen2_mlp(dtype=torch.bfloat16):
+    from sglang.srt.models.qwen2 import Qwen2MLP
+
+    original_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    try:
+        with (
+            patch.dict(os.environ, {"SGLANG_ENABLE_DUAL_GEMM": "1"}),
+            get_parallel().override(tp_rank=0, tp_size=1),
+        ):
+            mlp = Qwen2MLP(
+                _HIDDEN_SIZE,
+                _INTERMEDIATE_SIZE,
+                "silu",
+            ).cuda()
+    finally:
+        torch.set_default_dtype(original_dtype)
+    return _initialize_mlp_weights(mlp, dtype)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
@@ -107,6 +131,35 @@ class TestDualGemm(CustomTestCase):
                     actual = mlp(x)
 
                 torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2.5e-1)
+
+    def test_qwen2_integration(self):
+        """Qwen2 must route eligible MLP inputs through the shared layer."""
+        mlp, generator = _make_qwen2_mlp()
+        x = torch.randn(
+            (16, _HIDDEN_SIZE),
+            device="cuda",
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        execution = SimpleNamespace(
+            deterministic=SimpleNamespace(rl_on_policy_target=None)
+        )
+        with (
+            torch.inference_mode(),
+            get_parallel().override(tp_group=object()),
+            patch("sglang.srt.models.qwen2.get_exec", return_value=execution),
+        ):
+            gate_up, _ = mlp.gate_up_proj(x)
+            expected, _ = mlp.down_proj(mlp.act_fn(gate_up))
+            self.assertEqual(mlp.dual_gemm.mode, DualGemmQuantMode.UNQUANT)
+            with patch.object(
+                mlp.gate_up_proj,
+                "forward",
+                side_effect=AssertionError("Qwen2 used the unfused gate/up path"),
+            ):
+                actual = mlp(x)
+
+        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2.5e-1)
 
     def test_fp8_handoff_skips_down_quantization(self):
         from sglang.srt.layers.quantization.fp8 import Fp8Config
