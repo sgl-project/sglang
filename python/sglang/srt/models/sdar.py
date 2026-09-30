@@ -300,7 +300,7 @@ class SDARBlock(nn.Module):
             (
                 declare_ffn(
                     sparse=False,
-                    next_sparse=False,
+                    next_layer_sparse=False,
                 ),
                 self.post_attention_layernorm,
             ),
@@ -414,7 +414,7 @@ class SDARModel(nn.Module):
         else:
             hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
             if not forward_batch.forward_mode.is_idle():
-                hidden_states = residual_batch.norm(
+                hidden_states = residual_batch.final_norm(
                     hidden_states, forward_batch, self.norm
                 )
             return hidden_states
