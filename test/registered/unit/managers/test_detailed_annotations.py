@@ -4,11 +4,9 @@ The detailed-annotation aggregates are folded into SGLang's existing per-forward
 span (see ``sglang.srt.utils.profile_utils.build_step_span_name``): the
 per-phase ``sq``/``sqsq``/``sqsk``/``sk`` terms (with the context/generation split
 for MIXED) are appended and are self-contained, so ``sq`` is emitted even where it
-duplicates the base label's ``bs``/``toks``. This also covers the
-``detailed_annotations`` plumbing on ``ProfileReq``.
+duplicates the base label's ``bs``/``toks``.
 """
 
-import json
 import unittest
 from types import SimpleNamespace
 
@@ -17,7 +15,6 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.io_struct import ProfileReq
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.step_span_utils import (
     detailed_annotations_enabled,
@@ -152,7 +149,7 @@ class TestStepSpanDetailedAnnotations(CustomTestCase):
         )
         self.assertEqual(
             self._name(fb),
-            "step[TARGET_VERIFY bs=2 g_sq=6 g_sqsq=18 g_sqsk=90 g_sk=30]",
+            "step[VERIFY bs=2 g_sq=6 g_sqsq=18 g_sqsk=90 g_sk=30]",
         )
 
     def test_target_verify_without_cpu_mirror_falls_back_to_base(self):
@@ -162,7 +159,16 @@ class TestStepSpanDetailedAnnotations(CustomTestCase):
             seq_lens_cpu=None,
             num_tokens_per_req=3,
         )
-        self.assertEqual(self._name(fb), "step[TARGET_VERIFY bs=2]")
+        self.assertEqual(self._name(fb), "step[VERIFY bs=2]")
+
+    def test_draft_worker_prefixes_stage(self):
+        # A draft runner can run under TARGET_VERIFY; its span must read as
+        # the draft's, not the target's.
+        fb = _fb(ForwardMode.TARGET_VERIFY, batch_size=2)
+        self.assertEqual(
+            build_step_span_name(fb, detailed_annotations=False, is_draft_worker=True),
+            "step[DRAFT bs=2]",
+        )
 
     def test_draft_extend_v2_uses_extend_mirrors_with_context_prefix(self):
         # EAGLE/MTP draft-extend is extend-shaped
@@ -206,18 +212,6 @@ class TestStepSpanGating(CustomTestCase):
             extend_prefix_lens_cpu=[0],
         )
         self.assertEqual(build_step_span_name(fb), "step[EXTEND bs=1 toks=4]")
-
-
-class TestDetailedAnnotationPlumbing(CustomTestCase):
-    def test_default_is_false(self):
-        self.assertFalse(ProfileReq().detailed_annotations)
-
-    def test_json_round_trip(self):
-        req = ProfileReq(output_dir="/tmp/x", detailed_annotations=True)
-        payload = {"detailed_annotations": req.detailed_annotations}
-        parsed = json.loads(json.dumps(payload))
-        self.assertTrue(parsed["detailed_annotations"])
-        self.assertTrue(ProfileReq(**parsed).detailed_annotations)
 
 
 class TestDetailedAnnotationsToggle(CustomTestCase):

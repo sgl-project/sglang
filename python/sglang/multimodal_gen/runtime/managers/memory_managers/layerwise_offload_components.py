@@ -14,6 +14,13 @@ RESIDENCY_POLICY_LEADING = "leading"
 RESIDENCY_POLICY_STRIDED = "strided"
 RESIDENCY_POLICIES = (RESIDENCY_POLICY_LEADING, RESIDENCY_POLICY_STRIDED)
 
+# How long those layers stay. `forward`: placed when the component starts
+# running its layers for a request, released when it finishes, host copy kept.
+# `permanent`: placed at load, no host copy, never released.
+RESIDENCY_LIFETIME_FORWARD = "forward"
+RESIDENCY_LIFETIME_PERMANENT = "permanent"
+RESIDENCY_LIFETIMES = (RESIDENCY_LIFETIME_FORWARD, RESIDENCY_LIFETIME_PERMANENT)
+
 # Components whose layerwise policy has been validated as a better default than
 # component-level CPU offload when the user has not pinned their placement.
 LAYERWISE_OFFLOAD_DEFAULT_GROUP_COMPONENTS = (
