@@ -461,8 +461,8 @@ mod tests {
     use crate::{
         GenerationOutputExtras, PositionLogprobs, RendererService, ResponseError,
         ResponseErrorKind, TokenLogprob,
-        api::test_utils::{chunk, renderer_config, submitted},
         engine::{TokenDecoder, test_utils::tiny_tokenizer},
+        openai::test_utils::{chunk, renderer_config, submitted},
     };
     use futures::StreamExt;
     use sglang_processor::DynamoTokenizer;

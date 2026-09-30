@@ -3,7 +3,7 @@
 use super::error::{json_rejection_response, response_error};
 use crate::{
     RendererService,
-    api::tokenize::{TokenizeRequest, tokenize as tokenize_request},
+    openai::tokenize::{TokenizeRequest, tokenize as tokenize_request},
 };
 use axum::{
     Json, Router,

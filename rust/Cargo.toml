@@ -5,7 +5,7 @@ members = [
     "sglang-grpc",
     "sglang-mm",
     "sglang-processor",
-    "sglang-renderer-server",
+    "sglang-renderer",
     "sglang-server"
 ]
 exclude = ["sglang-radix-tree"]

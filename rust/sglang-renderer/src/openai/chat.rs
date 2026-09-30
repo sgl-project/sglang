@@ -585,9 +585,9 @@ mod tests {
     use crate::{
         GenerationOutputExtras, PositionLogprobs, RendererConfig, RendererLimits, RendererService,
         ResponseError, ResponseErrorKind, SamplingDefaults, TokenLogprob, UpstreamErrorCode,
-        api::protocol::ChatCompletionRequest,
-        api::protocol::{chat_sampling_params, lower_chat_request},
-        api::test_utils::{chat_submitted, chunk},
+        openai::protocol::ChatCompletionRequest,
+        openai::protocol::{chat_sampling_params, lower_chat_request},
+        openai::test_utils::{chat_submitted, chunk},
     };
     use futures::{FutureExt, StreamExt};
     use sglang_processor::{ChatResponseProcessor, ProcessorError, TextTokenizer};

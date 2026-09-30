@@ -1,11 +1,14 @@
-//! HTTP completion adapter.
+//! HTTP chat completion adapter.
 
 use super::{
-    CompletionRequest,
+    ChatCompletionRequest,
     error::{json_rejection_response, response_error},
     response::sse_response,
 };
-use crate::api::{OpenAIService, OperationResponse};
+use crate::{
+    openai::chat::serialize_chat_stream_response,
+    openai::{OpenAIService, OperationResponse},
+};
 use axum::{
     Json, Router,
     extract::{State, rejection::JsonRejection},
@@ -15,22 +18,22 @@ use axum::{
 use std::sync::Arc;
 
 pub(super) fn routes() -> Router<Arc<OpenAIService>> {
-    Router::new().route("/v1/completions", post(completions))
+    Router::new().route("/v1/chat/completions", post(chat_completions))
 }
 
-async fn completions(
+async fn chat_completions(
     State(state): State<Arc<OpenAIService>>,
-    body: Result<Json<CompletionRequest>, JsonRejection>,
+    body: Result<Json<ChatCompletionRequest>, JsonRejection>,
 ) -> Response {
     let request = match body {
         Ok(Json(request)) => request,
         Err(error) => return json_rejection_response(error),
     };
-    match state.complete(request).await {
+    match state.chat(request).await {
         Ok(OperationResponse::Unary(response)) => Json(response).into_response(),
-        Ok(OperationResponse::Stream(chunks)) => sse_response(chunks, |chunk| {
-            serde_json::to_string(&chunk).expect("OpenAI response must serialize")
-        }),
+        Ok(OperationResponse::Stream(chunks)) => {
+            sse_response(chunks, serialize_chat_stream_response)
+        }
         Err(error) => response_error(error),
     }
 }

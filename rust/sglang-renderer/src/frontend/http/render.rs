@@ -61,7 +61,7 @@ async fn render_chat(
         Ok(Json(request)) => request,
         Err(error) => return json_rejection_response(error),
     };
-    match crate::api::render::render_chat(&renderer, request).await {
+    match crate::openai::render::render_chat(&renderer, request).await {
         Ok(request) => Json(request).into_response(),
         Err(error) => response_error(error),
     }
@@ -75,7 +75,7 @@ async fn render_completions(
         Ok(Json(request)) => request,
         Err(error) => return json_rejection_response(error),
     };
-    match crate::api::render::render_completions(&renderer, request).await {
+    match crate::openai::render::render_completions(&renderer, request).await {
         Ok(requests) => Json(requests).into_response(),
         Err(error) => response_error(error),
     }

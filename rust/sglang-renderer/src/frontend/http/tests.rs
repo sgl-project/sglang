@@ -23,9 +23,9 @@ mod suite {
 
     use crate::{
         RendererService,
-        api::test_utils::renderer_config,
         engine::test_utils::tiny_tokenizer,
         engine::{GenerationService, TokenDecoder},
+        openai::test_utils::renderer_config,
     };
 
     use super::super::{

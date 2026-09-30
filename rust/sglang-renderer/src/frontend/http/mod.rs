@@ -6,9 +6,9 @@ use axum::Router;
 
 use crate::{
     RendererService,
-    api::OpenAIService,
-    api::protocol::{ChatCompletionRequest, CompletionRequest},
     engine::HttpGenerateClient,
+    openai::OpenAIService,
+    openai::protocol::{ChatCompletionRequest, CompletionRequest},
 };
 
 mod chat;

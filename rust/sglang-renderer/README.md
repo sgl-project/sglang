@@ -26,7 +26,7 @@ From the repository root, build the standalone renderer. Rendering and
 tokenization work without an engine; generation requires a running SGLang engine.
 
 ```sh
-cargo build --manifest-path rust/Cargo.toml -p sglang-renderer-server --release --locked
+cargo build --manifest-path rust/Cargo.toml -p sglang-renderer --release --locked
 ```
 
 Start the engine in one terminal.

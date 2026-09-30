@@ -6,7 +6,7 @@ on:
     tags: ["v[0-9]+.*"]
     paths:
       - "rust/sglang-processor/**"
-      - "rust/sglang-renderer-server/**"
+      - "rust/sglang-renderer/**"
       - "rust/Cargo.toml"
       - "rust/Cargo.lock"
       - "rust/rust-toolchain.toml"

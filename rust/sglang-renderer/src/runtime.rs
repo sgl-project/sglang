@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use crate::{
     RendererConfig, RendererService,
-    api::OpenAIService,
     engine::{GenerationService, HttpGenerateClient, TokenDecoder},
-    http::{hosted_routes, render_only_routes, standalone_routes},
+    frontend::http::{hosted_routes, render_only_routes, standalone_routes},
+    openai::OpenAIService,
 };
 use sglang_processor::{DynamoTokenizer, TextTokenizer, load_tokenizer};
 

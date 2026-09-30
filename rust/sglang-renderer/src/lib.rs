@@ -4,12 +4,12 @@
 //! Temporary: see README.md. Protocol adapters own middleware and framing;
 //! shared services own submission policy and decoding.
 
-mod api;
 mod config;
 mod engine;
 mod error;
-mod http;
+mod frontend;
 mod launcher;
+mod openai;
 mod preprocessing;
 mod runtime;
 mod types;
@@ -20,6 +20,7 @@ pub(crate) use engine::{
     MatchedStop, PositionLogprobs, TokenLogprob,
 };
 pub(crate) use error::{RendererError, ResponseError, ResponseErrorKind, UpstreamErrorCode};
+pub use launcher::run_cli;
 pub(crate) use preprocessing::{
     ChatGenerateRequest, GenerateRequest, GenerateRequestIdentity, GenerateRequestMetadata,
     GenerationOptions, PreparedChat, RendererService, SamplingParams, TextRequest,
@@ -27,12 +28,3 @@ pub(crate) use preprocessing::{
 };
 pub(crate) use runtime::{RendererRuntimeConfig, serve};
 pub(crate) use types::{OneOrMany, TokenIds};
-
-fn main() {
-    crate::launcher::run_cli().unwrap_or_else(|error| exit(error));
-}
-
-fn exit(message: impl std::fmt::Display) -> ! {
-    eprintln!("sglang-renderer: {message}");
-    std::process::exit(2)
-}
