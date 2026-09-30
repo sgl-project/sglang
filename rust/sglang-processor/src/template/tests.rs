@@ -5,10 +5,11 @@ use dynamo_protocols::types::{
     ChatCompletionRequestUserMessageContentPart, CreateChatCompletionRequest,
 };
 
+use super::thinking::{ThinkingPolicy, detect_thinking_policy};
 use super::{
     ChatFormatter, ChatFormatterOptions, LegacyFormatter, LegacySpec, OneOrMany, TemplateError,
-    ThinkingPolicy, builtin_template, detect_thinking_policy,
-    infer_legacy_template_from_model_path, load_chat_formatter, select_chat_formatter,
+    builtin_template, infer_legacy_template_from_model_path, load_chat_formatter,
+    select_chat_formatter,
 };
 
 fn request() -> CreateChatCompletionRequest {
