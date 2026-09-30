@@ -184,10 +184,6 @@ class LoRAInfo:
     experts_shared_outer_loras: bool = False
     cg_buffers: dict | None = None
 
-    fully_sharded: bool = False
-    tp_size: int = 1
-    tp_rank: int = 0
-    hidden_size: int = 0
     lora_use_virtual_experts: bool = False
 
 
@@ -391,7 +387,6 @@ def _add_lora_gate_up_delta(
             expand_num_warps=4,
             expand_num_stages=2,
             expand_split_k=1,
-            fully_sharded=lora_info.fully_sharded,
         )
 
 
@@ -423,12 +418,6 @@ def _add_lora_down_delta(
     down_lora_b = lora_info.down_lora_b_weights
     if lora_info.experts_shared_outer_loras and not lora_info.lora_use_virtual_experts:
         down_lora_b = down_lora_b.expand(-1, lora_info.num_experts, -1, -1)
-
-    if lora_info.fully_sharded and lora_info.tp_size > 1:
-        shard_size = lora_info.hidden_size // lora_info.tp_size
-        offset = shard_size * lora_info.tp_rank
-    else:
-        offset = 0
 
     if lora_info.lora_use_virtual_experts:
         merged_experts_fused_moe_lora_add(
@@ -474,8 +463,6 @@ def _add_lora_down_delta(
             expand_num_stages=2,
             expand_split_k=1,
             mul_routed_weight=True,
-            fully_sharded=lora_info.fully_sharded,
-            offset=offset,
         )
 
 
