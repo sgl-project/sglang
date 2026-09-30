@@ -48,7 +48,7 @@ def _router_projection(X, W, Y, M: gl.constexpr, K: gl.constexpr, SX: gl.constex
     gl.store(Y + rm[:, None] * 256 + cn[None, :], acc, rm[:, None] < M)
 
 @gluon.jit
-def _router(Logits, Bias, Ids, Weights, expert_start, LOCAL_EXPERTS: gl.constexpr, SCALE: gl.constexpr):
+def _router(Logits, Bias, Ids, Weights, Inverse, expert_start, LOCAL_EXPERTS: gl.constexpr, SCALE: gl.constexpr):
     layout: gl.constexpr = gl.BlockedLayout([1], [64], [1], [0])
     m = gl.program_id(0)
     e = gl.arange(0, 256, layout)
@@ -65,7 +65,8 @@ def _router(Logits, Bias, Ids, Weights, expert_start, LOCAL_EXPERTS: gl.constexp
             idx = gl.min(gl.where(available, e, 256), 0)
         index = gl.full((1,), idx, gl.int32, layout)
         prob = gl.sum(gl.gather(probability, index, 0), 0)
-        gl.store(Ids + m * 9 + j, idx)
+        local = (idx >= expert_start) & (idx < expert_start + LOCAL_EXPERTS)
+        gl.store(Ids + m * 9 + j, gl.where(local, idx, 257))
         selected = gl.where(e == j, prob, selected)
         selected_ids = gl.where(e == j, idx, selected_ids)
         total += prob
@@ -73,6 +74,7 @@ def _router(Logits, Bias, Ids, Weights, expert_start, LOCAL_EXPERTS: gl.constexp
         score = gl.where(e == idx, -float('inf'), score)
     owned = (selected_ids >= expert_start) & (selected_ids < expert_start + LOCAL_EXPERTS)
     gl.store(Weights + m * 8 + e, gl.where(owned, selected / total * SCALE, 0.0), e < 8)
+    gl.store(Inverse + m * 8 + e, 0, e < 8)
     gl.store(Ids + m * 9 + 8, 256)
 
 @gluon.jit
@@ -600,7 +602,7 @@ def _route_and_pack(x, router, correction_bias, work, w2_scale, expert_start, lo
         router_k = 256
     quantize_groups, quantize_values = (256, 32)
     _router_projection[triton.cdiv(m, router_rows), 256 // router_columns](x, router, work.logits, m, h, x.stride(0), router_rows, router_k, router_columns)
-    _router[m,](work.logits, correction_bias, work.ids, work.weights, expert_start, local_experts, routed_scaling_factor, num_warps=1)
+    _router[m,](work.logits, correction_bias, work.ids, work.weights, work.inverse, expert_start, local_experts, routed_scaling_factor, num_warps=1)
     _chunk_counts[max(work.chunks, triton.cdiv(work.capacity, 1024)),](work.ids, work.partial_counts, work.sorted_routes, work.experts, work.down_experts, work.routes, work.chunks, work.capacity, work.block_m, work.down_tiles)
     _chunk_prefix[257,](work.partial_counts, work.partial_counts, work.counts, work.chunks, triton.next_power_of_2(work.chunks))
     _build_expert_blocks[257,](work.counts, work.offsets, work.experts, work.down_experts, work.block_m, triton.next_power_of_2(triton.cdiv(m, work.block_m)), triton.next_power_of_2(triton.cdiv(m, 64)))

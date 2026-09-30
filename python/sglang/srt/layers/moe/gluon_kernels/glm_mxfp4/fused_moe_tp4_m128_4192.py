@@ -116,8 +116,8 @@ def _select_routes(L, Bias, Ids, Counts, expert_start, SHARDS: gl.constexpr, TIC
         selected_id = gl.where(e == j, idx, selected_id)
         available &= e != idx
         score = gl.where(e == idx, -float('inf'), score)
-    ticket = gl.atomic_add(Counts + m // 64 % SHARDS * 256 + selected_id, 1, e < 8, sem='relaxed')
     owned = (selected_id >= expert_start) & (selected_id < expert_start + LOCAL_EXPERTS)
+    ticket = gl.atomic_add(Counts + m // 64 % SHARDS * 256 + selected_id, 1, (e < 8) & owned, sem='relaxed')
     weight = gl.where(owned, selected_prob / total * SCALE, 0.0)
     record = (selected_id * TICKET_STRIDE + ticket).to(gl.uint64)
     record |= weight.to(gl.uint32, bitcast=True).to(gl.uint64) << 32
@@ -195,10 +195,11 @@ def _prepare_tickets(Codes, Counts, Sorted, UpInfo, Jobs, M: gl.constexpr, CHUNK
         offsets = (gl.associative_scan(tiles, 0, _add) - tiles) * BM
         offset = gl.gather(offsets, expert, 0)
         prefix = gl.gather(prefix_counts, expert, 0)
-        gl.store(Sorted + offset + prefix + ticket, route, route < M * 8)
+        active = (route < M * 8) & ((ticket_record >> 32).to(gl.uint32) != 0)
+        gl.store(Sorted + offset + prefix + ticket, route, active)
         record = (dense + prefix + ticket).to(gl.uint64)
         record |= ticket_record & 18446744069414584320
-        gl.store(Codes + route, record, route < M * 8)
+        gl.store(Codes + route, gl.where(active, record, 0), route < M * 8)
     else:
         e = pid - CHUNKS
         layout: gl.constexpr = gl.BlockedLayout([1], [64], [1], [0])
