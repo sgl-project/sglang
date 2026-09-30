@@ -14,10 +14,13 @@ use super::app::AppState;
 use super::frame::{
     OutputAccumulator, cumulative_frame_string, frame_value, stream_frame_string, tag_value,
 };
-use crate::frontend::{FrontendCall, FrontendError, HealthStatus};
+use super::frontend_error_status;
+use crate::frontend::{
+    FrontendCall, FrontendError, FrontendEvent, FrontendOutput, FrontendRequest, HealthStatus,
+};
+#[cfg(test)]
 use crate::message::ids::Rid;
-use crate::message::request::{GenerateBody, GenerateRequest};
-use crate::message::response::{ChunkEvent, ResponseItem};
+use crate::message::request::GenerateBody;
 use crate::utils::{
     environ,
     response::{error_response, error_value},
@@ -87,19 +90,7 @@ pub(super) fn native_error(code: StatusCode, message: &str, stream: bool) -> Res
 }
 
 fn native_frontend_error(error: FrontendError, stream: bool) -> Response {
-    match error {
-        FrontendError::Unavailable => {
-            native_error(StatusCode::SERVICE_UNAVAILABLE, &error.to_string(), stream)
-        }
-        FrontendError::InvalidArgument(_) => {
-            native_error(StatusCode::BAD_REQUEST, &error.to_string(), stream)
-        }
-        _ => native_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &error.to_string(),
-            stream,
-        ),
-    }
+    native_error(frontend_error_status(&error), &error.to_string(), stream)
 }
 
 /// `/health` + `/health_generate`. Both env knobs are resolved ONCE here, at
@@ -196,10 +187,9 @@ async fn generate(
     // payloads. `is_batch` = list form → the response is a JSON array.
     let (payloads, is_batch) = match body.into_requests() {
         Ok(v) => v,
-        // The error carries its own status (a bad batch is `Validation` → 400).
+        // Request normalization only returns validation failures.
         Err(e) => {
-            let code = StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::BAD_REQUEST);
-            return native_error(code, &e.to_string(), stream);
+            return native_error(StatusCode::BAD_REQUEST, &e.to_string(), stream);
         }
     };
     // Python starts APIServerReqTimeStats after request normalization and before
@@ -225,7 +215,7 @@ async fn generate(
 /// SSE frames or fold to one unary response.
 async fn generate_single(
     state: &AppState,
-    req: GenerateRequest,
+    req: FrontendRequest,
     stream: bool,
     timing: RequestTiming,
 ) -> Response {
@@ -235,7 +225,7 @@ async fn generate_single(
         Ok(call) => call,
         Err(error) => return native_frontend_error(error, stream),
     };
-    let rid = call.rid().clone();
+    let rid = call.public_id().to_owned();
     // Cumulative frames (SGLang default) vs per-step deltas.
     let incremental = state.server_args.incremental_streaming_output;
 
@@ -249,7 +239,7 @@ async fn generate_single(
     } else {
         // Unary: fold to the terminal and respond once. `FrontendCall` disarms
         // itself on a terminal item; truncation leaves it armed for drop cleanup.
-        let (status, value) = drain_unary(&mut call, rid.client_facing(), timing).await;
+        let (status, value) = drain_unary(&mut call, &rid, timing).await;
         (status, Json(value)).into_response()
     }
 }
@@ -263,41 +253,28 @@ async fn drain_unary(
     let mut acc = OutputAccumulator::default();
     while let Some(item) = call.recv().await {
         match item {
-            ResponseItem::Frame(out) => {
+            FrontendEvent::Delta(out) => {
                 timing.observe_first_output();
                 acc.fold(&out);
             }
-            ResponseItem::Done(out) => {
+            FrontendEvent::Finished(out) => {
                 timing.observe_first_output();
                 timing.finish();
                 acc.fold(&out);
                 let final_out = acc.into_output();
-                // A validation abort carries its own HTTP status + diagnostic.
-                if let Some((code, message)) = final_out
-                    .finish_reason
-                    .as_ref()
-                    .and_then(|f| f.abort_status())
-                {
-                    let status =
-                        StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    return (status, error_value(code, message));
-                }
                 let mut value = frame_value(&final_out, rid_str);
                 add_e2e_latency(&mut value, &timing);
                 return (StatusCode::OK, value);
             }
-            ResponseItem::Error(e) => {
+            FrontendEvent::Failed(error) => {
                 timing.finish();
-                let code = e.http_status();
-                let status =
-                    StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                return (status, error_value(code, &e.to_string()));
+                let status = frontend_error_status(&error);
+                return (status, error_value(status.as_u16(), &error.to_string()));
             }
-            ResponseItem::Control(_) | ResponseItem::Data(_) => continue, // never on `/generate`
         }
     }
-    // Sender dropped without a terminal item: the shard dropped this request (a
-    // truncation — a client disconnect would have dropped the handler future).
+    // Defensive fallback: FrontendCall normally turns premature runtime
+    // termination into a terminal Failed event before exposing stream end.
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         error_value(500, "response truncated before completion"),
@@ -312,7 +289,7 @@ async fn drain_unary(
 /// own `{ "error": … }` entry; the batch response is 200.
 async fn generate_batch(
     state: &AppState,
-    requests: Vec<GenerateRequest>,
+    requests: Vec<FrontendRequest>,
     stream: bool,
     timing: RequestTiming,
 ) -> Response {
@@ -341,7 +318,7 @@ async fn generate_batch(
         // its own terminal output promptly (important for per-item e2e_latency).
         let drained = futures::future::join_all(calls.into_iter().map(
             |(mut call, request_timing)| async move {
-                let client_rid = call.rid().client_facing().to_owned();
+                let client_rid = call.public_id().to_owned();
                 let (_status, value) = drain_unary(&mut call, &client_rid, request_timing).await;
                 value
             },
@@ -351,21 +328,20 @@ async fn generate_batch(
     }
 }
 
-/// Await the next item from `call`, then drain whatever queued behind it (so the caller
-/// can coalesce a backlog, as Python's `state.out_list` does), handing the call
-/// back for `FuturesUnordered` to re-poll. Empty result = channel closed.
+/// Await the next event from `call`, then drain whatever queued behind it (so the
+/// caller can coalesce a backlog, as Python's `state.out_list` does), handing the
+/// call back for `FuturesUnordered` to re-poll. An empty result means the semantic
+/// stream was already exhausted.
 async fn recv_indexed(
     index: usize,
     mut call: FrontendCall,
-) -> (usize, FrontendCall, Vec<ResponseItem>) {
+) -> (usize, FrontendCall, Vec<FrontendEvent>) {
     let mut items = Vec::new();
     match call.recv().await {
         Some(item) => items.push(item),
-        None => return (index, call, items), // closed
+        None => return (index, call, items), // already exhausted
     }
-    while let Ok(item) = call.try_recv() {
-        items.push(item);
-    }
+    call.drain_ready(&mut items);
     (index, call, items)
 }
 
@@ -381,9 +357,9 @@ fn generation_event_stream(
         use futures::StreamExt;
 
         let n = calls.len();
-        let rid_strs: Vec<Rid> = calls
+        let rid_strs: Vec<String> = calls
             .iter()
-            .map(|(call, _)| call.rid().clone())
+            .map(|(call, _)| call.public_id().to_owned())
             .collect();
         let mut timings: Vec<RequestTiming> = calls
             .iter()
@@ -404,8 +380,9 @@ fn generation_event_stream(
 
         while let Some((i, call, items)) = futs.next().await {
             if items.is_empty() {
-                // Channel closed with no terminal → truncation for this item;
-                // leave its rid armed so the scheduler work is aborted.
+                // Defensive fallback: a premature runtime close is normally a
+                // Failed event produced by FrontendCall. Keep this item's call
+                // armed if its semantic stream somehow ends unexpectedly.
                 yield tag_value(error_value(500, "response truncated before completion"), idx(i));
                 continue;
             }
@@ -418,48 +395,45 @@ fn generation_event_stream(
 
             for item in items {
                 match item {
-                    ResponseItem::Frame(out) => {
+                    FrontendEvent::Delta(out) => {
                         timings[i].observe_first_output();
                         accs[i].fold(&out);
                         if incremental {
-                            yield stream_frame_string(out, &accs[i], true, rid_strs[i].client_facing(), idx(i));
+                            yield stream_frame_string(out, &accs[i], true, &rid_strs[i], idx(i));
                         } else {
                             coalesced = true;
                         }
                     }
-                    ResponseItem::Done(out) => {
+                    FrontendEvent::Finished(out) => {
                         timings[i].observe_first_output();
                         timings[i].finish();
                         accs[i].fold(&out);
                         terminal = Some(out);
                     }
-                    ResponseItem::Error(e) => {
+                    FrontendEvent::Failed(error) => {
                         timings[i].finish();
-                        failed = Some(e);
+                        failed = Some(error);
                     }
-                    ResponseItem::Control(_) | ResponseItem::Data(_) => {} // never on /generate
                 }
             }
 
-            if let Some(e) = failed {
-                yield tag_value(error_value(e.http_status(), &e.to_string()), idx(i));
+            if let Some(error) = failed {
+                let status = frontend_error_status(&error);
+                yield tag_value(error_value(status.as_u16(), &error.to_string()), idx(i));
             } else if let Some(out) = terminal {
-                // A validation abort → an error object, not a frame. The final frame
-                // carries the full cumulative state, so any coalesced ones are moot.
-                yield match out.finish_reason.as_ref().and_then(|f| f.abort_status()) {
-                    Some((code, message)) => tag_value(error_value(code, message), idx(i)),
-                    None => terminal_stream_frame_string(
-                        out,
-                        &accs[i],
-                        incremental,
-                        rid_strs[i].client_facing(),
-                        idx(i),
-                        &timings[i],
-                    ),
-                };
+                // The final frame carries the full cumulative state, so any
+                // coalesced non-terminal frames are moot.
+                yield terminal_stream_frame_string(
+                    out,
+                    &accs[i],
+                    incremental,
+                    &rid_strs[i],
+                    idx(i),
+                    &timings[i],
+                );
             } else {
                 if coalesced {
-                    yield cumulative_frame_string(&accs[i], rid_strs[i].client_facing(), idx(i));
+                    yield cumulative_frame_string(&accs[i], &rid_strs[i], idx(i));
                 }
                 futs.push(recv_indexed(i, call)); // keep this item flowing
             }
@@ -471,7 +445,7 @@ fn generation_event_stream(
 /// Python's `e2e_latency` is `finished_time - created_time`, in seconds, and is
 /// attached only when the request finishes. The Rust native API owns the same
 /// lifecycle boundary, so it adds the value while handling the terminal egress
-/// item rather than putting API-only timing onto every scheduler `ChunkEvent`.
+/// item rather than putting API-only timing onto every shared frontend output.
 fn add_e2e_latency(value: &mut serde_json::Value, timing: &RequestTiming) {
     let (time_to_first_token, e2e_latency) = timing
         .terminal_latencies()
@@ -484,7 +458,7 @@ fn add_e2e_latency(value: &mut serde_json::Value, timing: &RequestTiming) {
 /// memoized fast path; the one terminal frame uses the Value path so it can carry
 /// the request-local `e2e_latency`, exactly as Python does.
 fn terminal_stream_frame_string(
-    out: ChunkEvent,
+    out: FrontendOutput,
     acc: &OutputAccumulator,
     incremental: bool,
     rid_str: &str,
@@ -500,7 +474,7 @@ fn terminal_stream_frame_string(
 mod tests {
     use super::*;
     use crate::message::request::RequestKind;
-    use crate::message::response::ChunkEvent;
+    use crate::message::response::{ChunkEvent, ResponseItem};
     use crate::tokenizer_manager::wiring::TmEvent;
     use crate::utils::error::Error;
     use axum::body::Body;
@@ -568,6 +542,7 @@ mod tests {
                     startup_ready: false,
                     is_disaggregation: false,
                     mm_limits: Default::default(),
+                    metadata: crate::frontend::FrontendMetadata::default(),
                 },
             ),
             server_args: Arc::new(crate::message::config::ServerArgs::default()),
@@ -593,6 +568,7 @@ mod tests {
                 startup_ready: true,
                 is_disaggregation: false,
                 mm_limits: Default::default(),
+                metadata: crate::frontend::FrontendMetadata::default(),
             },
         );
         let state = Arc::new(AppState {
@@ -825,6 +801,32 @@ mod tests {
         assert_eq!(stream.next().await.unwrap(), "[DONE]");
     }
 
+    #[tokio::test]
+    async fn scheduler_rejection_preserves_legacy_http_status() {
+        let (tx, rx) = mpsc::channel(8);
+        let calls = vec![timed_call(10, rx)];
+        let stream = generation_event_stream(calls, false, false);
+        futures::pin_mut!(stream);
+
+        tx.send(ResponseItem::Done(ChunkEvent {
+            finish_reason: serde_json::from_value(serde_json::json!({
+                "type": "abort",
+                "message": "media decode failed",
+                "status_code": 432,
+                "err_type": "BadRequestError"
+            }))
+            .unwrap(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+
+        let failure = parse(&stream.next().await.unwrap());
+        assert_eq!(failure["error"]["code"], 432);
+        assert_eq!(failure["error"]["message"], "media decode failed");
+        assert_eq!(stream.next().await.unwrap(), "[DONE]");
+    }
+
     /// `incremental=true`: each frame carries this step's **delta** text/output_ids,
     /// but `meta_info.completion_tokens` stays cumulative (matching Python).
     #[tokio::test]
@@ -903,6 +905,32 @@ mod tests {
         assert_eq!(v["text"], "abc!");
         assert_eq!(v["meta_info"]["finish_reason"]["type"], "length");
         assert_eq!(stream.next().await.unwrap(), "[DONE]");
+    }
+
+    /// A runtime close must not overtake output that was already queued. The
+    /// cumulative adapter first exposes the produced text, then reports the
+    /// truncation on the next event, preserving the Step 2 HTTP behavior.
+    #[tokio::test]
+    async fn cumulative_output_precedes_truncation_error() {
+        let (tx, rx) = mpsc::channel(8);
+        let calls = vec![timed_call(10, rx)];
+        let stream = generation_event_stream(calls, false, false);
+        futures::pin_mut!(stream);
+
+        tx.send(frame(10, "already-produced")).await.unwrap();
+        drop(tx);
+
+        let output = parse(&stream.next().await.unwrap());
+        assert_eq!(output["text"], "already-produced");
+
+        let failure = parse(&stream.next().await.unwrap());
+        assert_eq!(failure["error"]["code"], 500);
+        assert_eq!(
+            failure["error"]["message"],
+            "response truncated before completion"
+        );
+        assert_eq!(stream.next().await.unwrap(), "[DONE]");
+        assert!(stream.next().await.is_none());
     }
 
     /// Incremental frames are *deltas*, so a backlog must emit every one — dropping
