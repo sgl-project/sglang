@@ -249,6 +249,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         # in the backend, which falls back rather than raising.
         self._gdn_fused_prefill_ready = False
         self._gdn_fused_norm_weight = None
+        self._gdn_fused_dt_bias = None
         self._gdn_fused_conv_bias = None
         self._gdn_out_proj_fp8 = False
         if _is_hip:
@@ -279,9 +280,12 @@ class Qwen3GatedDeltaNet(nn.Module):
         if not self._gdn_fused_prefill_ready:
             return
         weight = self.norm.weight.data
-        # The kernel consumes a bf16 norm weight; cast if the checkpoint kept it
-        # in a higher precision (FP8 models often store RMSNorm scales in fp32).
+        # The kernel consumes a bf16 norm weight and a bf16 dt_bias; cast if the
+        # checkpoint kept them in a higher precision (FP8 models often store the
+        # RMSNorm scale and the GDN biases in fp32). A_log stays fp32 -- the kernel
+        # reads it at full precision for the exp(-exp(A_log)) decay.
         self._gdn_fused_norm_weight = weight.to(torch.bfloat16).contiguous()
+        self._gdn_fused_dt_bias = self.dt_bias.data.to(torch.bfloat16).contiguous()
 
         # If out_proj is a group-128 block-FP8 GEMM, feed it the kernel's per-head
         # group-128 FP8 activations directly (out_proj skips its own re-quant);
@@ -471,6 +475,7 @@ class Qwen3GatedDeltaNet(nn.Module):
                 self._gdn_fused_norm_weight,
                 self.layer_norm_epsilon,
                 self._gdn_fused_conv_bias,
+                self._gdn_fused_dt_bias,
             )
             self.attn._gdn_onorm_consumed = False
             fused_out = self.attn.try_fused_gdn_prefill(

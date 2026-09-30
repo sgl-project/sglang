@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -150,6 +151,91 @@ class TestCoveredEarlyDeclines(CustomTestCase):
         )
         self.assertFalse(ok)
         self.assertIn("conv bias", reason)
+
+
+class TestCoveredVectorDtypeContract(CustomTestCase):
+    """Once AITER's predicate passes, covered() fixes the per-vector dtype the
+    kernel indexes off the pointer: A_log fp32 (full-precision decay), dt_bias and
+    norm_weight bf16. Guards against loosening any of them back (e.g. an fp32
+    dt_bias that the kernel would reject) or drifting the element counts. _ops is
+    stubbed so AITER's own predicate is not needed on a CPU runner.
+    """
+
+    V_HEADS = 8
+    HEAD_V = 128
+
+    def _delta_state(self):
+        # covered() reads shape[1]=v_heads and shape[2]=head_v_dim off delta_state.
+        return torch.empty((1, self.V_HEADS, self.HEAD_V, self.HEAD_V))
+
+    def _covered(self, *, a_log, dt_bias, norm_weight):
+        t = torch.zeros(1)
+        with patch.object(
+            adapter, "_ops", return_value=(None, lambda *a, **k: (True, ""))
+        ):
+            return adapter.covered(
+                t,
+                t,
+                t,
+                self._delta_state(),
+                t,
+                t,
+                t,
+                t,
+                t,  # tensors up to conv_bias
+                a_log,
+                dt_bias,
+                norm_weight,
+                "silu",
+                torch.float8_e4m3fn,
+            )
+
+    def _vec(self, n, dtype):
+        return torch.zeros(n, dtype=dtype)
+
+    def test_real_contract_is_covered(self):
+        ok, reason = self._covered(
+            a_log=self._vec(self.V_HEADS, torch.float32),
+            dt_bias=self._vec(self.V_HEADS, torch.bfloat16),
+            norm_weight=self._vec(self.HEAD_V, torch.bfloat16),
+        )
+        self.assertTrue(ok, reason)
+
+    def test_fp32_dt_bias_declines(self):
+        ok, reason = self._covered(
+            a_log=self._vec(self.V_HEADS, torch.float32),
+            dt_bias=self._vec(self.V_HEADS, torch.float32),
+            norm_weight=self._vec(self.HEAD_V, torch.bfloat16),
+        )
+        self.assertFalse(ok)
+        self.assertIn("dt_bias", reason)
+
+    def test_bf16_a_log_declines(self):
+        ok, reason = self._covered(
+            a_log=self._vec(self.V_HEADS, torch.bfloat16),
+            dt_bias=self._vec(self.V_HEADS, torch.bfloat16),
+            norm_weight=self._vec(self.HEAD_V, torch.bfloat16),
+        )
+        self.assertFalse(ok)
+        self.assertIn("A_log", reason)
+
+    def test_fp32_norm_weight_declines(self):
+        ok, reason = self._covered(
+            a_log=self._vec(self.V_HEADS, torch.float32),
+            dt_bias=self._vec(self.V_HEADS, torch.bfloat16),
+            norm_weight=self._vec(self.HEAD_V, torch.float32),
+        )
+        self.assertFalse(ok)
+        self.assertIn("norm_weight", reason)
+
+    def test_wrong_element_count_declines(self):
+        ok, reason = self._covered(
+            a_log=self._vec(self.V_HEADS + 1, torch.float32),
+            dt_bias=self._vec(self.V_HEADS, torch.bfloat16),
+            norm_weight=self._vec(self.HEAD_V, torch.bfloat16),
+        )
+        self.assertFalse(ok)
+        self.assertIn("A_log", reason)
 
 
 if __name__ == "__main__":

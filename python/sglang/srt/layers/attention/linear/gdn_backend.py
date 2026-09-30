@@ -916,7 +916,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
         ):
             return None
-        norm_weight, norm_eps, conv_bias = stash
+        norm_weight, norm_eps, conv_bias, dt_bias = stash
 
         cache_indices = forward_metadata.mamba_cache_indices
         cu_seqlens = forward_metadata.query_start_loc
@@ -936,7 +936,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             layer.conv_weights,
             conv_bias,
             layer.A_log,
-            layer.dt_bias,
+            dt_bias,
             norm_weight,
             layer.activation,
             torch.float8_e4m3fn,
@@ -955,7 +955,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             conv_weight=layer.conv_weights,
             conv_bias=conv_bias,
             A_log=layer.A_log,
-            dt_bias=layer.dt_bias,
+            dt_bias=dt_bias,
             norm_weight=norm_weight,
             scale=layer.head_k_dim**-0.5,
             norm_eps=norm_eps,

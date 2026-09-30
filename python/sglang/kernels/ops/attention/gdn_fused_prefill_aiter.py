@@ -100,10 +100,11 @@ def covered(
     so the two cannot drift, then adds the parameters AITER's predicate does not
     see: the model's output-gate activation (the kernel hard-codes SiLU) and the
     per-head decay/norm vectors ``A_log``/``dt_bias``/``norm_weight``. The tiles
-    index those three straight off the pointer with no shape or dtype check, so a
-    wrong element count or a non-float dtype would read past the buffer or corrupt
-    the result -- verify them here so a mismatch falls back instead of the request
-    hitting a raise deep inside the kernel.
+    index those three straight off the pointer, so the kernel fixes their dtype --
+    ``A_log`` fp32 (read at full precision for the ``exp(-exp(A_log))`` decay),
+    ``dt_bias`` and ``norm_weight`` bf16 -- and a wrong element count or dtype
+    would read past the buffer or corrupt the result. Verify them here so a
+    mismatch falls back instead of the request hitting a raise deep in the kernel.
     """
     if activation not in ("silu", "swish"):
         return False, f"kernel fuses a SiLU output gate, model uses {activation!r}"
@@ -128,18 +129,19 @@ def covered(
         return False, reason
 
     # supported() has validated delta_state is rank-4 [caches, v_heads, hv, hk];
-    # A_log/dt_bias are per value head, norm_weight is per head channel.
+    # A_log/dt_bias are per value head, norm_weight is per head channel. The kernel
+    # fixes each dtype: A_log fp32, dt_bias and norm_weight bf16.
     v_heads, head_v_dim = delta_state.shape[1], delta_state.shape[2]
-    for name, tensor, count in (
-        ("A_log", A_log, v_heads),
-        ("dt_bias", dt_bias, v_heads),
-        ("norm_weight", norm_weight, head_v_dim),
+    for name, tensor, count, dtype in (
+        ("A_log", A_log, v_heads, torch.float32),
+        ("dt_bias", dt_bias, v_heads, torch.bfloat16),
+        ("norm_weight", norm_weight, head_v_dim, torch.bfloat16),
     ):
         if tensor is None or tensor.dim() != 1 or tensor.numel() != count:
             shape = None if tensor is None else tuple(tensor.shape)
             return False, f"{name} must be 1-D [{count}], got {shape}"
-        if tensor.dtype not in (torch.float32, torch.bfloat16):
-            return False, f"{name} must be fp32 or bf16, got {tensor.dtype}"
+        if tensor.dtype is not dtype:
+            return False, f"{name} must be {dtype} [{count}], got {tensor.dtype}"
     return True, ""
 
 
