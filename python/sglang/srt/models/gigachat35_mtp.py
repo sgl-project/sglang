@@ -122,7 +122,7 @@ class GigaChat35ModelNextN(nn.Module):
             hidden_states_before_norm = residual_batch.snapshot(
                 hidden_states, forward_batch
             )
-            hidden_states = residual_batch.norm(
+            hidden_states = residual_batch.final_norm(
                 hidden_states, forward_batch, self.shared_head.norm
             )
 
