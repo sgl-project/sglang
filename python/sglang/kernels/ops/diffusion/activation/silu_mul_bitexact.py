@@ -46,6 +46,7 @@ def _packed_silu_mul_kernel(
     x_ptr,
     num_rows,
     row_stride,
+    out_row_stride,
     D: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -57,7 +58,7 @@ def _packed_silu_mul_kernel(
     a = tl.load(x_ptr + row_base + cols, mask=mask, other=0.0).to(tl.float32)
     b = tl.load(x_ptr + row_base + D + cols, mask=mask, other=0.0).to(tl.float32)
     s = round_bf16_to_fp32(a * tl.sigmoid(a))
-    tl.store(out_ptr + row * D + cols, s * b, mask=mask)
+    tl.store(out_ptr + row * out_row_stride + cols, s * b, mask=mask)
 
 
 def can_use_fused_silu_mul(a: torch.Tensor, b: torch.Tensor) -> bool:
@@ -98,8 +99,14 @@ def fused_silu_mul_bitexact(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def fused_packed_silu_mul_bitexact(x: torch.Tensor) -> torch.Tensor:
-    """Bit-exact SwiGLU over a contiguous packed ``[..., 2 * D]`` input."""
+def fused_packed_silu_mul_bitexact(
+    x: torch.Tensor, out: torch.Tensor | None = None
+) -> torch.Tensor:
+    """Bit-exact SwiGLU over a contiguous packed ``[..., 2 * D]`` input.
+
+    ``out`` may be a column slice of a wider buffer (row-strided ``[..., D]``),
+    so the result can land directly inside the next GEMM's input.
+    """
     if not (
         (x.is_cuda or x.is_xpu)
         and x.dtype is torch.bfloat16
@@ -114,13 +121,23 @@ def fused_packed_silu_mul_bitexact(x: torch.Tensor) -> torch.Tensor:
     hidden = x.shape[-1] // 2
     rows = x.numel() // x.shape[-1]
     row_stride = x.stride(-2)
-    out = torch.empty((*x.shape[:-1], hidden), dtype=x.dtype, device=x.device)
+    if out is None:
+        out = torch.empty((*x.shape[:-1], hidden), dtype=x.dtype, device=x.device)
+    elif not (
+        out.shape == (*x.shape[:-1], hidden)
+        and out.dtype is x.dtype
+        and out.device == x.device
+        and out.stride(-1) == 1
+        and out.stride(0) == out.shape[1] * out.stride(1)
+    ):
+        raise RuntimeError("unsupported output for packed fused SiLU-mul")
     with torch.get_device_module(x.device).device(x.device):
         _packed_silu_mul_kernel[(rows, triton.cdiv(hidden, 1024))](
             out,
             x,
             rows,
             row_stride,
+            out.stride(-2),
             D=hidden,
             BLOCK=1024,
         )
