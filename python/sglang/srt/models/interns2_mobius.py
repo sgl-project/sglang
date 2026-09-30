@@ -323,7 +323,6 @@ class InternS2MobiusRoutedExpertBank(nn.Module):
     ) -> None:
         super().__init__()
         self.bank_id = bank_id
-        self.tp_size = get_parallel().tp_size
         self.num_experts = config.num_experts
         self.topk = TopK(
             top_k=config.num_experts_per_tok,

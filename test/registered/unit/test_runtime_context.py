@@ -2,7 +2,7 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=33, suite="base-a-test-cpu")
+register_cpu_ci(est_time=45, suite="base-a-test-cpu")
 
 import dataclasses
 import json
@@ -3026,6 +3026,81 @@ class TestTheDpSlotComesFromTheSequenceItIndexes(CustomTestCase):
         self.assertEqual(_calls_named(legal, "dp_gather_slot"), 0)
 
 
+class TestEveryParallelReadNamesAParallelField(CustomTestCase):
+    """Every ``get_parallel().<name>`` read in the package names a parallel field.
+
+    ``ParallelContext`` rejects an unknown name only when the read runs, so a
+    renamed or mistyped name on a path whose tests stub the context out ships
+    as an ``AttributeError``.
+    """
+
+    #: Reads of a name no parallel field declares yet, each with its reason.
+    UNDECLARED = {
+        # The KV-shard control plane's enable flag has no declared field;
+        # nothing calls that path yet.
+        ("srt/mem_cache/page_interleave.py", "enable_kv_cache_sharding"),
+    }
+
+    def _reads(self):
+        """Yield ``(path, line, name)`` for each attribute read off the context.
+
+        A read goes through ``get_parallel()`` directly or through a name the
+        file binds to it, as in ``parallel = get_parallel()``.
+        """
+        import ast as _ast
+
+        for path in _PACKAGE.rglob("*.py"):
+            tree = _ast.parse(path.read_text(encoding="utf-8-sig"))
+            relative = path.relative_to(_PACKAGE).as_posix()
+            bound = {
+                target.id
+                for node in _ast.walk(tree)
+                if isinstance(node, _ast.Assign)
+                and isinstance(node.value, _ast.Call)
+                and isinstance(node.value.func, _ast.Name)
+                and node.value.func.id == "get_parallel"
+                for target in node.targets
+                if isinstance(target, _ast.Name)
+            }
+            for node in _ast.walk(tree):
+                if not isinstance(node, _ast.Attribute):
+                    continue
+                value = node.value
+                direct = (
+                    isinstance(value, _ast.Call)
+                    and isinstance(value.func, _ast.Name)
+                    and value.func.id == "get_parallel"
+                )
+                if direct or (isinstance(value, _ast.Name) and value.id in bound):
+                    yield relative, node.lineno, node.attr
+
+    def test_every_read_names_a_declared_field(self):
+        from sglang.srt.runtime_context import ParallelContext, _parallel_fields
+
+        known = set(_parallel_fields()) | set(dir(ParallelContext))
+        reads = list(self._reads())
+        self.assertGreater(
+            len(reads), 100, "found almost no context reads; the census is broken"
+        )
+        offenders = sorted(
+            f"{path}:{line} get_parallel().{name}"
+            for path, line, name in reads
+            if name not in known
+            and not name.startswith("_")
+            and (path, name) not in self.UNDECLARED
+        )
+        self.assertEqual(
+            offenders,
+            [],
+            "these read a name the parallel context does not declare; read the "
+            "field under its current name:\n  " + "\n  ".join(offenders),
+        )
+        stale = self.UNDECLARED - {(path, name) for path, _, name in reads}
+        self.assertEqual(
+            stale, set(), f"these are listed as undeclared but no longer read: {stale}"
+        )
+
+
 class TestTheRetiredNamesAreGoneEverywhere(CustomTestCase):
     """Classify parallel getters and reject retired package imports."""
 
@@ -3187,7 +3262,7 @@ class TestNothingReadsThePlacementBeforeItIsFrozen(CustomTestCase):
     def test_no_method_called_before_the_freeze_reads_what_it_freezes(self):
         methods = self._model_runner()
         frozen = self._frozen_names(methods)
-        self.assertGreater(len(frozen), 5, "found no frozen names; census is broken")
+        self.assertIn("pp_group", frozen, "found no frozen group; census is broken")
         offenders = []
         for lineno, name in self._calls_before_the_freeze(methods):
             fn = methods.get(name)

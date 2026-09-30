@@ -1,5 +1,4 @@
 import logging
-from contextlib import nullcontext
 from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkable
 
 import torch
@@ -181,6 +180,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "MoE-under-DP all-reduce."
             )
 
+        # Inside the draft scope the context answers the draft's narrowed rank.
+        self._target_tp_rank = get_parallel().tp_rank
         with draft_pp_context(), self._draft_context():
             bundle = build_draft_tp_worker(
                 server_args=server_args,
@@ -238,7 +239,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             else parallel.tp_group
         )
 
-        if self.model_runner.tp_rank == 0:
+        if get_parallel().tp_rank == 0:
             logger.info(
                 "Initialized DSpark draft runner. attention_backend=%s, model=%s, "
                 "gamma=%s, verify_num_draft_tokens=%s, query_token_num=%s, "
@@ -261,7 +262,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
         if getattr(self.draft_model, "uses_own_vocab_modules", False):
-            if self.model_runner.tp_rank == 0:
+            if get_parallel().tp_rank == 0:
                 logger.info(
                     "DSpark draft uses its checkpoint-local embedding and LM head."
                 )
@@ -285,7 +286,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             gamma=self.gamma,
             model_runner=self.model_runner,
             device=self.device,
-            tp_rank=self.model_runner.tp_rank,
+            tp_rank=get_parallel().tp_rank,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             tp_sync=self._tp_sync,
         )
@@ -333,7 +334,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             and self._verify_planner.mode_value == "static"
             and self._draft_is_moe
             and not get_parallel().enable_dp_attention
-            and self.model_runner.pp_size == 1
+            and get_parallel().pp_size == 1
         )
         # ROCm (V4.1 target only): inside a HIP graph the accept-site TP broadcasts
         # need the group's pynccl communicator
@@ -399,7 +400,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             planner=self._verify_planner,
             gamma=self.gamma,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
-            tp_rank=self.model_runner.tp_rank,
+            tp_rank=get_parallel().tp_rank,
             device=self.device,
             simulate_acc_len=self._simulate_acc_len,
         )
@@ -431,9 +432,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         return getattr(self.target_worker, name)
 
     def _draft_context(self):
-        if self._draft_dp_context_enabled:
-            return draft_tp_context(get_parallel().attn_tp_group, owns_attention=True)
-        return nullcontext()
+        return draft_tp_context(self._draft_dp_context_enabled)
 
     def alloc_memory_pool(
         self,
@@ -459,7 +458,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_model=self.draft_model,
             is_deepseek_v4_draft=self._draft_is_moe,
         )
-        if self._target_hidden_projection_enabled and self.model_runner.tp_rank == 0:
+        if self._target_hidden_projection_enabled and get_parallel().tp_rank == 0:
             logger.info(
                 "DSpark prefill target-hidden projection runs before "
                 "sequence-parallel gather."
@@ -516,7 +515,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             gamma=self.gamma,
             max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
             device=self.device,
-            tp_rank=self.model_runner.tp_rank,
+            tp_rank=self._target_tp_rank,
             tp_sync=self._tp_sync,
             available_memory_gb=available_memory_gb,
             confidence_fn=(

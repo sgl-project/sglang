@@ -427,7 +427,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.moe_fusions = self.model_runner.moe_fusions
         self.dsa_indexers = getattr(self.model_runner, "dsa_indexers", None)
 
-        self.dp_size = get_parallel().dp_size
         self.require_mlp_tp_gather = require_mlp_tp_gather()
         self.require_attn_tp_gather = require_attn_tp_gather()
 
@@ -617,7 +616,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         # --- capture --------------------------------------------------
         self.device_module.synchronize()
-        self.model_runner.tp_group.barrier()
+        get_parallel().tp_group.barrier()
         self.capture()
 
         self.raw_num_tokens = 0

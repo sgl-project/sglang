@@ -894,7 +894,6 @@ class MossVLSelfAttention(nn.Module):
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.tp_size = get_parallel().tp_size
         self.total_num_heads = config.num_attention_heads
         attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size

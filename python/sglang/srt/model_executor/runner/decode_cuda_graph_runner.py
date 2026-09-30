@@ -267,8 +267,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.speculative_algorithm = get_spec().speculative_algorithm
         self.enable_profile_cuda_graph = get_exec().graph.enable_profile_cuda_graph
 
-        self.attn_tp_size = get_parallel().attn_tp_size
-        self.attn_tp_rank = get_parallel().attn_tp_rank
         # True if the DSA or MLA prefill-CP flavor is active. These flavors
         # feed a zigzag-split rank-local layout into the runner; MHA-arch
         # prefill CP (Qwen3/Qwen2 MoE via PR #18233) keeps an
@@ -1137,7 +1135,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         self.model_runner.model,
                         bs in self.compile_bs,
                         num_tokens=bs * self.captured_req_width,
-                        tp_group=self.model_runner.tp_group,
+                        tp_group=get_parallel().tp_group,
                     ) as forward:
                         self.capture_one_shape(
                             bs,
