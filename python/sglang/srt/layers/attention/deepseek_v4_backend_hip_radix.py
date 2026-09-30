@@ -889,7 +889,7 @@ class DeepseekV4HipRadixBackend(
             # guarded inside init_forward_metadata_prefill, not here
             need_compress=self.need_compress,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
-            compress_gpu_plan=ragged_layout is not None,
+            compress_gpu_plan=use_prefill_cuda_graph or ragged_layout is not None,
             extend_start_loc=extend_start_loc,
             attach_decode_streams=True,
             exact_num_tokens=exact_num_tokens,
