@@ -281,6 +281,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "Bit-exact rotate-half RoPE.",
     ),
     (
+        "diffusion.flux3_video_qknorm_rope",
+        KernelBackend.TRITON,
+        "rope.flux3_video_qknorm_rope_triton:flux3_video_qknorm_rope",
+        _CUDA,
+        "Bit-exact FLUX 3 video VAE QK RMSNorm + rotate-half RoPE, head dim 64.",
+    ),
+    (
         "diffusion.interleaved_rope_fp64",
         KernelBackend.JIT,
         "rope.interleaved_rope_fp64_jit:fused_interleaved_rope_fp64",
@@ -645,6 +652,8 @@ _EXPORTS: dict[str, str] = {
     "try_fused_qwen_qkv_epilogue": "rope.qwen_qkv_epilogue_jit",
     "can_use_fused_rope_rotate_half": "rope.rope_rotate_half_bitexact",
     "fused_rope_rotate_half_bitexact": "rope.rope_rotate_half_bitexact",
+    "can_use_flux3_video_qknorm_rope": "rope.flux3_video_qknorm_rope_triton",
+    "flux3_video_qknorm_rope": "rope.flux3_video_qknorm_rope_triton",
     "can_use_interleaved_rope_fp64": "rope.interleaved_rope_fp64_jit",
     "fused_interleaved_rope_fp64": "rope.interleaved_rope_fp64_jit",
     "can_use_helios_qk_rope": "rope.helios_qk_rope_jit",
