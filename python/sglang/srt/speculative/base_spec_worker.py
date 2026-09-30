@@ -125,7 +125,6 @@ class EagleDraftWorkerBase(ABC):
             f"got {self.speculative_num_draft_tokens} and {self.speculative_num_steps}"
         )
         num_steps = self.speculative_num_steps
-        sa = self.server_args
         decode_max_bs = (
             get_exec().graph.cuda_graph_config.decode.max_bs
             if get_exec().graph.cuda_graph_config is not None
@@ -319,7 +318,10 @@ class BaseSpecWorker(ABC):
             self.draft_worker.init_cuda_graphs()
 
     def on_verify_complete_cpu(
-        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int = 0,
+        executed_steps: Optional[int] = None,
     ) -> None:
         """Hook called after verify finishes and accept counts are on CPU.
 

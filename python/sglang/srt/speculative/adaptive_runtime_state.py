@@ -2,6 +2,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
+    import torch
+
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
     from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
@@ -33,6 +35,11 @@ class SpecRuntimeState:
     draft_extend_attn_backend: "AttentionBackend | None"
     cuda_graph_runner_for_draft_extend: "DecodeCudaGraphRunner | None"
 
+    # Top-k-one chain constants are state-owned so interleaved PP activation
+    # only swaps references and never allocates on the serving hot path.
+    topk1_parents_prealloc: "torch.Tensor | None" = None
+    topk1_score_indices_prealloc: "torch.Tensor | None" = None
+
 
 class AdaptiveSpecWorker(Protocol):
     """Protocol that a worker must implement to use AdaptiveController."""
@@ -60,7 +67,10 @@ class AdaptiveSpecPolicy(Protocol):
     def get_steps_for_batch(self, batch_size: int) -> int: ...
 
     def on_verify_complete(
-        self, num_correct_drafts_per_req: list[int], batch_size: int
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int,
+        executed_steps: int | None = None,
     ) -> int | None: ...
 
     def cuda_graph_bs_for_step(self, step: int) -> list[int] | None: ...
@@ -119,20 +129,36 @@ class AdaptiveController:
         # Start on the initial step.
         self._activate(self.worker.speculative_num_steps)
 
-    def activate_step_by_batch(self, batch_size: int) -> None:
+    def activate_step(self, speculative_num_steps: int) -> None:
+        """Activate a prebuilt state selected by an external protocol.
+
+        PP uses this entrypoint because the step belongs to the relayed
+        microbatch; consulting the process-local policy at launch time can
+        select a different state for another in-flight microbatch.
+        """
+        if speculative_num_steps != self.worker.speculative_num_steps:
+            self._activate(speculative_num_steps)
+
+    def activate_step_by_batch(self, batch_size: int) -> int:
         target = self.params.get_steps_for_batch(batch_size)
-        if target != self.worker.speculative_num_steps:
-            self._activate(target)
+        self.activate_step(target)
+        return target
 
     def on_verify_complete(
-        self, num_correct_drafts_per_req: list[int], batch_size: int
-    ) -> None:
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int,
+        executed_steps: int | None = None,
+    ) -> int | None:
         """Feed verify results; switch runtime state if the policy requests it."""
         new_step = self.params.on_verify_complete(
-            num_correct_drafts_per_req, batch_size
+            num_correct_drafts_per_req,
+            batch_size,
+            executed_steps=executed_steps,
         )
         if new_step is not None:
             self._activate(new_step)
+        return new_step
 
     def _activate(self, speculative_num_steps: int) -> None:
         state = self._states.get(speculative_num_steps)

@@ -36,11 +36,42 @@ class PPSpecRelayInput(SpecInput):
         tokens: torch.Tensor,
         parents: Optional[torch.Tensor] = None,
         top_scores: Optional[torch.Tensor] = None,
+        *,
+        speculative_num_steps: Optional[int] = None,
     ):
         super().__init__(SpecInputType.PP_SPEC_RELAY)
-        # [bs, num_draft_tokens], column 0 is the bonus token
-        self.rids = rids
+        if tokens.ndim != 2:
+            raise ValueError(
+                f"PP speculative relay tokens must be 2-D, got shape={tokens.shape}"
+            )
+        if tokens.shape[0] != len(rids):
+            raise ValueError(
+                "PP speculative relay row count must match rids: "
+                f"rows={tokens.shape[0]}, rids={len(rids)}"
+            )
+        if tokens.shape[1] < 1:
+            raise ValueError("PP speculative relay must contain a root token")
+        if (parents is None) != (top_scores is None):
+            raise ValueError(
+                "PP speculative topology requires both parents and top_scores"
+            )
+        for name, value in (("parents", parents), ("top_scores", top_scores)):
+            if value is not None and (value.ndim != 2 or value.shape[0] != len(rids)):
+                raise ValueError(
+                    f"PP speculative {name} rows must match rids: "
+                    f"shape={tuple(value.shape)}, rids={len(rids)}"
+                )
+
+        if speculative_num_steps is None:
+            # PP adaptive currently supports topk=1, where width = steps + 1.
+            speculative_num_steps = tokens.shape[1] - 1
+        if speculative_num_steps < 0:
+            raise ValueError("speculative_num_steps must be non-negative")
+
+        # [bs, logical_width], column 0 is the bonus token.
+        self.rids = list(rids)
         self.tokens = tokens
+        self.speculative_num_steps = speculative_num_steps
         # parent_list / top_scores_index, [bs, *]. None until the request has
         # been drafted for: its first decode after prefill carries zero drafts,
         # which are rejected whatever tree shape they hang on.
@@ -49,12 +80,20 @@ class PPSpecRelayInput(SpecInput):
 
     def __repr__(self) -> str:
         return (
-            f"PPSpecRelayInput(bs={len(self.rids)}, drafted={self.parents is not None})"
+            "PPSpecRelayInput("
+            f"bs={len(self.rids)}, steps={self.speculative_num_steps}, "
+            f"width={self.speculative_num_draft_tokens}, "
+            f"drafted={self.parents is not None})"
         )
 
     @classmethod
     def degenerate(
-        cls, rids: List[str], bonus_tokens: torch.Tensor, num_draft_tokens: int
+        cls,
+        rids: List[str],
+        bonus_tokens: torch.Tensor,
+        num_draft_tokens: int,
+        *,
+        speculative_num_steps: Optional[int] = None,
     ) -> PPSpecRelayInput:
         """A tree that proposes nothing: just the sampled token, padded with
         zeros. What a request carries out of prefill, before the last stage
@@ -65,7 +104,15 @@ class PPSpecRelayInput(SpecInput):
             device=bonus_tokens.device,
         )
         tokens[:, 0] = bonus_tokens.to(torch.int64)
-        return cls(rids=list(rids), tokens=tokens)
+        return cls(
+            rids=list(rids),
+            tokens=tokens,
+            speculative_num_steps=(
+                num_draft_tokens - 1
+                if speculative_num_steps is None
+                else speculative_num_steps
+            ),
+        )
 
     def filter_batch(
         self, new_indices: torch.Tensor, new_indices_cpu: Optional[List[int]] = None
@@ -83,7 +130,24 @@ class PPSpecRelayInput(SpecInput):
         if not self.rids:
             self.rids, self.tokens = list(other.rids), other.tokens
             self.parents, self.top_scores = other.parents, other.top_scores
+            self.speculative_num_steps = other.speculative_num_steps
             return
+        if self.configuration != other.configuration:
+            if other.parents is not None:
+                raise ValueError(
+                    "Cannot merge drafted PP speculative relays with different "
+                    f"configurations: current={self.configuration}, "
+                    f"other={other.configuration}"
+                )
+            # A just-prefilled batch only owns its sampled root. Re-encode
+            # those rows as degenerate proposals under the running
+            # microbatch's configuration before continuous-batch merge.
+            other = PPSpecRelayInput.degenerate(
+                rids=other.rids,
+                bonus_tokens=other.tokens[:, 0],
+                num_draft_tokens=self.speculative_num_draft_tokens,
+                speculative_num_steps=self.speculative_num_steps,
+            )
         self.rids = self.rids + list(other.rids)
         self.tokens = torch.cat([self.tokens, other.tokens])
         # A batch merging in from prefill has no topology yet; give it the
@@ -117,18 +181,40 @@ class PPSpecRelayInput(SpecInput):
             [r is None for r in rows], dtype=torch.bool, device=self.tokens.device
         )
         relayed_tokens = relayed.tokens.to(self.tokens.device)[take]
-        self.tokens = torch.where(keep.unsqueeze(1), self.tokens, relayed_tokens)
+        is_transition = self.configuration != relayed.configuration
+        if is_transition:
+            # Requests merged after the completed forward are absent from the
+            # relay. During a configuration transition retain their root token
+            # but discard old-width draft claims.
+            kept_tokens = torch.zeros(
+                (len(self.rids), relayed.speculative_num_draft_tokens),
+                dtype=self.tokens.dtype,
+                device=self.tokens.device,
+            )
+            kept_tokens[:, 0] = self.tokens[:, 0]
+        else:
+            kept_tokens = self.tokens
+        self.tokens = torch.where(keep.unsqueeze(1), kept_tokens, relayed_tokens)
+        self.speculative_num_steps = relayed.speculative_num_steps
         if relayed.parents is None:
+            if is_transition:
+                self.parents = self.top_scores = None
             return
         widths = relayed._widths()
+        if is_transition:
+            kept_parents = self._chain_parents(widths[0])
+            kept_top_scores = self._chain_top_scores(widths[1])
+        else:
+            kept_parents = self._parents_or_chain(widths)
+            kept_top_scores = self._top_scores_or_chain(widths)
         self.parents = torch.where(
             keep.unsqueeze(1),
-            self._parents_or_chain(widths),
+            kept_parents,
             relayed.parents.to(self.tokens.device)[take],
         )
         self.top_scores = torch.where(
             keep.unsqueeze(1),
-            self._top_scores_or_chain(widths),
+            kept_top_scores,
             relayed.top_scores.to(self.tokens.device)[take],
         )
 
@@ -144,6 +230,18 @@ class PPSpecRelayInput(SpecInput):
             tokens=self.tokens[take],
             parents=None if self.parents is None else self.parents[take],
             top_scores=None if self.top_scores is None else self.top_scores[take],
+            speculative_num_steps=self.speculative_num_steps,
+        )
+
+    @property
+    def speculative_num_draft_tokens(self) -> int:
+        return self.tokens.shape[1]
+
+    @property
+    def configuration(self) -> tuple[int, int]:
+        return (
+            self.speculative_num_steps,
+            self.speculative_num_draft_tokens,
         )
 
     def topology(self, *, fallback):
@@ -163,7 +261,9 @@ class PPSpecRelayInput(SpecInput):
     def _parents_or_chain(self, widths) -> torch.Tensor:
         if self.parents is not None:
             return self.parents
-        width = widths[0]
+        return self._chain_parents(widths[0])
+
+    def _chain_parents(self, width: int) -> torch.Tensor:
         return torch.arange(
             -1, width - 1, dtype=torch.long, device=self.tokens.device
         ).repeat(len(self.rids), 1)
@@ -171,7 +271,9 @@ class PPSpecRelayInput(SpecInput):
     def _top_scores_or_chain(self, widths) -> torch.Tensor:
         if self.top_scores is not None:
             return self.top_scores
-        width = widths[1]
+        return self._chain_top_scores(widths[1])
+
+    def _chain_top_scores(self, width: int) -> torch.Tensor:
         return torch.arange(width, dtype=torch.long, device=self.tokens.device).repeat(
             len(self.rids), 1
         )

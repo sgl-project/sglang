@@ -28,10 +28,22 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.observability.req_time_stats import set_time_batch
-from sglang.srt.runtime_context import get_disagg, get_parallel, get_spec
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_parallel,
+    get_spec,
+    max_speculative_num_draft_tokens,
+)
 from sglang.srt.sampling.sampling_observer_pp import (
     add_auxiliary_output_to_pp_tensors,
     pop_auxiliary_output_from_pp_tensors,
+)
+from sglang.srt.speculative.pp_spec_relay import PPSpecRelayInput
+from sglang.srt.speculative.pp_spec_wire import (
+    decode_relay,
+    encode_chain,
+    read_next_config,
+    write_next_config,
 )
 from sglang.srt.utils import DynamicGradMode, point_to_point_pyobj
 from sglang.srt.utils.common import is_npu, is_xpu
@@ -80,6 +92,10 @@ class PPBatchMetadata:
     # composition that actually ran the forward.
     fwd_batch: Optional[ScheduleBatch] = None
     verify_out_cache_loc: Optional[torch.Tensor] = None
+    # Configuration used by this submitted forward. Do not recover it from
+    # fwd_batch.spec_info: ScheduleBatch.copy() intentionally shallow-copies it.
+    spec_steps: Optional[int] = None
+    spec_num_draft_tokens: Optional[int] = None
 
 
 class SchedulerPPMixin:
@@ -188,8 +204,11 @@ class SchedulerPPMixin:
                         self._pp_process_batch_result(
                             process_target,
                             next_batch_result,
+                            live_batch=self.mbs[next_mb_id],
+                            pp_outputs=next_pp_outputs,
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
+                    self.mb_metadata[next_mb_id] = None
                 if not self.pp_group.is_last_rank:
                     if cur_batch:
                         self._pp_send_proxy_to_next_stage(result)
@@ -354,8 +373,11 @@ class SchedulerPPMixin:
                     self._pp_process_batch_result(
                         self.mbs[next_mb_id],
                         next_batch_result,
+                        live_batch=self.mbs[next_mb_id],
+                        pp_outputs=next_pp_outputs,
                     )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
+                    self.mb_metadata[next_mb_id] = None
 
                 if tmbs[next_mb_id] is not None:
                     self.process_disagg_prefill_inflight_queue(next_release_rids)
@@ -538,8 +560,11 @@ class SchedulerPPMixin:
                         self._pp_process_batch_result(
                             self.mbs[next_mb_id],
                             next_batch_result,
+                            live_batch=self.mbs[next_mb_id],
+                            pp_outputs=next_pp_outputs,
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
+                    self.mb_metadata[next_mb_id] = None
 
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
@@ -879,6 +904,23 @@ class SchedulerPPMixin:
             tensor_dict["spec_accept_lens"] = result.accept_lens
             tensor_dict["spec_new_seq_lens"] = result.new_seq_lens
             tensor_dict["spec_bonus_tokens"] = result.next_draft_input.bonus_tokens
+            executed_width = result.speculative_num_draft_tokens
+            if executed_width is None:
+                raise RuntimeError(
+                    "PP speculative verify result is missing its executed width"
+                )
+            # These are CPU metadata entries in send_tensor_dict, so reading
+            # them on the receiver does not add a device synchronization.
+            executed_steps = getattr(
+                batch.spec_info,
+                "speculative_num_steps",
+                get_spec().speculative_num_steps,
+            )
+            write_next_config(
+                tensor_dict,
+                steps=executed_steps,
+                width=executed_width,
+            )
             if (
                 result.accept_index is not None
                 and get_spec().speculative_eagle_topk > 1
@@ -889,11 +931,23 @@ class SchedulerPPMixin:
             if result.next_verify_chain is not None:
                 # Tail-drafted tree for the next verify round (root = bonus),
                 # with the topology its tokens were arranged by.
-                tensor_dict["spec_next_chain"] = result.next_verify_chain
-                tensor_dict["spec_next_parents"] = result.next_verify_parent_list
-                tensor_dict["spec_next_top_scores"] = (
-                    result.next_verify_top_scores_index
-                )
+                next_chain = result.next_verify_chain
+                if get_spec().speculative_adaptive:
+                    capacity = max_speculative_num_draft_tokens() or executed_width
+                    next_chain = encode_chain(
+                        next_chain,
+                        batch_size=len(batch.reqs),
+                        logical_width=executed_width,
+                        capacity=capacity,
+                    )
+                tensor_dict["spec_next_chain"] = next_chain
+                if not get_spec().speculative_adaptive:
+                    # Adaptive supports topk=1, whose topology is a static chain
+                    # reconstructed from the logical width on every stage.
+                    tensor_dict["spec_next_parents"] = result.next_verify_parent_list
+                    tensor_dict["spec_next_top_scores"] = (
+                        result.next_verify_top_scores_index
+                    )
 
         # Draft extend runs only on the last stage, but every rank needs its relayed
         # output to fill PD auxiliary buffers.
@@ -1090,6 +1144,11 @@ class SchedulerPPMixin:
             fwd_batch = (
                 mb_metadata.fwd_batch if mb_metadata.fwd_batch is not None else batch
             )
+            completed_width = mb_metadata.spec_num_draft_tokens
+            if completed_width is None:
+                raise RuntimeError(
+                    "PP speculative completed round is missing its executed width"
+                )
             new_seq_lens = pp_outputs["spec_new_seq_lens"]
             fwd_rids = [req.rid for req in fwd_batch.reqs]
             live_rids = [req.rid for req in batch.reqs]
@@ -1129,7 +1188,8 @@ class SchedulerPPMixin:
                 next_token_ids=pp_outputs["next_token_ids"].cpu(),
                 accept_lens=pp_outputs["spec_accept_lens"].cpu(),
                 new_seq_lens=new_seq_lens,
-                speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
+                speculative_num_steps=mb_metadata.spec_steps,
+                speculative_num_draft_tokens=completed_width,
                 extend_input_len_per_req=extend_input_len_per_req,
                 extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
                 can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
@@ -1173,19 +1233,39 @@ class SchedulerPPMixin:
             # round with a token the model never emitted. The decode rounds
             # relay their own state, so the future_map stash is skipped.
             if batch.contains_last_prefill_chunk:
-                from sglang.srt.speculative.pp_spec_relay import PPSpecRelayInput
-
                 fwd_batch = (
                     mb_metadata.fwd_batch
                     if mb_metadata.fwd_batch is not None
                     else batch
                 )
+                next_steps, next_width = read_next_config(pp_outputs.tensors)
+                if next_steps is None or next_width is None:
+                    selected = None
+                    if get_spec().speculative_adaptive:
+                        selected = self.model_worker.select_adaptive_step_for_batch(
+                            len(fwd_batch.reqs)
+                        )
+                    if selected is None:
+                        next_steps = get_spec().speculative_num_steps
+                        next_width = get_spec().speculative_num_draft_tokens
+                    else:
+                        next_steps = selected
+                        next_width = next_steps + 1
+                    # P0 publishes the initial decode configuration. Later
+                    # stages read these host metadata fields from the same
+                    # output-ring message instead of consulting local policy.
+                    write_next_config(
+                        pp_outputs.tensors,
+                        steps=next_steps,
+                        width=next_width,
+                    )
                 self._pp_spec_set_relay(
                     batch,
                     PPSpecRelayInput.degenerate(
                         rids=[req.rid for req in fwd_batch.reqs],
                         bonus_tokens=next_token_ids,
-                        num_draft_tokens=get_spec().speculative_num_draft_tokens,
+                        num_draft_tokens=next_width,
+                        speculative_num_steps=next_steps,
                     ),
                 )
         else:
@@ -1225,9 +1305,70 @@ class SchedulerPPMixin:
         return output_result
 
     def _pp_process_batch_result(
-        self: Scheduler, batch: ScheduleBatch, output_result: GenerationBatchResult
+        self: Scheduler,
+        batch: ScheduleBatch,
+        output_result: GenerationBatchResult,
+        *,
+        live_batch: Optional[ScheduleBatch] = None,
+        pp_outputs: Optional[PPProxyTensors] = None,
     ):
         self.process_batch_result(batch, output_result)
+        if (
+            not self._pp_spec_relay
+            or not get_spec().speculative_adaptive
+            or not self.pp_group.is_first_rank
+            or live_batch is None
+            or pp_outputs is None
+            or "spec_accept_lens" not in pp_outputs.tensors
+        ):
+            return
+        next_steps = self.model_worker.pop_adaptive_step_transition()
+        if next_steps is None:
+            return
+        old_next_steps, _ = read_next_config(pp_outputs.tensors)
+        if old_next_steps == next_steps:
+            return
+        self._pp_spec_apply_adaptive_transition(
+            fwd_batch=batch,
+            live_batch=live_batch,
+            pp_outputs=pp_outputs,
+            next_steps=next_steps,
+        )
+
+    def _pp_spec_apply_adaptive_transition(
+        self: Scheduler,
+        *,
+        fwd_batch: ScheduleBatch,
+        live_batch: ScheduleBatch,
+        pp_outputs: PPProxyTensors,
+        next_steps: int,
+    ) -> None:
+        """Replace an already drafted old-width proposal at P0.
+
+        The CPU policy runs after the last stage has tail-drafted. Relabelling
+        that proposal with a different width would be invalid, so transition
+        through a real degenerate proposal rooted at the sampled bonus token.
+        """
+        next_width = next_steps + 1
+        fwd_rids = [req.rid for req in fwd_batch.reqs]
+        transition = PPSpecRelayInput.degenerate(
+            rids=fwd_rids,
+            bonus_tokens=pp_outputs["spec_bonus_tokens"],
+            num_draft_tokens=next_width,
+            speculative_num_steps=next_steps,
+        )
+        self._pp_spec_set_relay(live_batch, transition)
+
+        write_next_config(
+            pp_outputs.tensors,
+            steps=next_steps,
+            width=next_width,
+        )
+        # Absence of a tail-drafted chain is the existing wire representation
+        # for a degenerate proposal. Downstream stages rebuild it from bonus.
+        pp_outputs.tensors.pop("spec_next_chain", None)
+        pp_outputs.tensors.pop("spec_next_parents", None)
+        pp_outputs.tensors.pop("spec_next_top_scores", None)
 
     def _pp_spec_compact_accept_kv(
         self: Scheduler,
@@ -1291,35 +1432,25 @@ class SchedulerPPMixin:
         The relayed rows are labelled with the composition that ran the
         forward; the live microbatch may have been recomposed since, so they
         are folded in by rid rather than by position."""
-        from sglang.srt.speculative.pp_spec_relay import PPSpecRelayInput
-
-        num_draft_tokens = get_spec().speculative_num_draft_tokens
-        chain = pp_outputs.tensors.get("spec_next_chain")
-        if chain is None:
-            # The last stage verified but skipped drafting (num_steps == 0
-            # keeps draft KV warm without proposing). The bonus token it
-            # sampled must still become the next round's root: keeping the
-            # old row would re-verify a token that was already accepted.
-            relayed = PPSpecRelayInput.degenerate(
-                rids=fwd_rids,
-                bonus_tokens=pp_outputs["spec_bonus_tokens"],
-                num_draft_tokens=num_draft_tokens,
-            )
-        else:
-            relayed = PPSpecRelayInput(
-                rids=fwd_rids,
-                tokens=chain.to(torch.int64).reshape(len(fwd_rids), num_draft_tokens),
-                parents=pp_outputs.tensors.get("spec_next_parents"),
-                top_scores=pp_outputs.tensors.get("spec_next_top_scores"),
-            )
+        num_steps, num_draft_tokens = read_next_config(pp_outputs.tensors)
+        if num_draft_tokens is None or num_steps is None:
+            # Backward-compatible fallback for output produced by a static PP
+            # peer without explicit adaptive metadata.
+            num_draft_tokens = get_spec().speculative_num_draft_tokens
+            num_steps = get_spec().speculative_num_steps
+        relayed = decode_relay(
+            rids=fwd_rids,
+            tensors=pp_outputs.tensors,
+            steps=num_steps,
+            logical_width=num_draft_tokens,
+            fixed_capacity=get_spec().speculative_adaptive,
+        )
         self._pp_spec_set_relay(batch, relayed)
 
     def _pp_spec_set_relay(self: Scheduler, batch: ScheduleBatch, relayed) -> None:
         """Attach rows labelled with the forward-time composition to the live
         batch: fold them into what the requests already carry, or relabel them
         into the live order when the batch carries nothing yet."""
-        from sglang.srt.speculative.pp_spec_relay import PPSpecRelayInput
-
         if isinstance(batch.spec_info, PPSpecRelayInput):
             batch.spec_info.adopt(relayed)
             return
@@ -1329,7 +1460,7 @@ class SchedulerPPMixin:
         )
 
     def _pp_spec_chain_topology(
-        self: Scheduler, bs: int, device: str
+        self: Scheduler, bs: int, device: str, steps: int, num_draft_tokens: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Build valid fallback topology using the tree kernel's row strides.
 
@@ -1338,15 +1469,12 @@ class SchedulerPPMixin:
         topk=1 reduces to a chain. Single-step drafts need no parent entries.
         """
         spec = get_spec()
-        num_steps = spec.speculative_num_steps
-        parent_width = (
-            spec.speculative_eagle_topk * (num_steps - 1) + 1 if num_steps > 1 else 0
-        )
+        parent_width = spec.speculative_eagle_topk * (steps - 1) + 1 if steps > 1 else 0
         parent_list = torch.arange(
             -1, parent_width - 1, dtype=torch.long, device=device
         ).repeat(bs, 1)
         top_scores_index = torch.arange(
-            spec.speculative_num_draft_tokens - 1, dtype=torch.long, device=device
+            num_draft_tokens - 1, dtype=torch.long, device=device
         ).repeat(bs, 1)
         return parent_list, top_scores_index
 
@@ -1366,15 +1494,19 @@ class SchedulerPPMixin:
             build_tree_kernel_efficient,
             default_tree_mask_mode,
         )
-        from sglang.srt.speculative.pp_spec_relay import PPSpecRelayInput
 
         spec = get_spec()
-        steps = spec.speculative_num_steps
-        num_draft_tokens = spec.speculative_num_draft_tokens
         bs = batch.batch_size()
         device = self.device
 
         if batch.forward_mode.is_idle() or bs == 0:
+            relay = batch.spec_info
+            steps = getattr(relay, "speculative_num_steps", spec.speculative_num_steps)
+            num_draft_tokens = getattr(
+                relay,
+                "speculative_num_draft_tokens",
+                spec.speculative_num_draft_tokens,
+            )
             batch.spec_info = EagleVerifyInput.create_idle_input(
                 topk=spec.speculative_eagle_topk,
                 spec_steps=steps,
@@ -1384,6 +1516,16 @@ class SchedulerPPMixin:
             return
 
         relay: PPSpecRelayInput = batch.spec_info
+        if not isinstance(relay, PPSpecRelayInput):
+            raise RuntimeError(
+                "PP speculative verify batch is missing PPSpecRelayInput, got "
+                f"{type(relay).__name__}"
+            )
+        steps = relay.speculative_num_steps
+        num_draft_tokens = relay.speculative_num_draft_tokens
+        if get_spec().speculative_adaptive:
+            self.model_worker.activate_speculative_step(steps)
+
         # The rows track the batch through filter / merge, but a recomposition
         # that bypasses those hooks would leave them labelled for a different
         # order, and the rebuild reads them positionally. Relabel rather than
@@ -1400,7 +1542,9 @@ class SchedulerPPMixin:
         # requests that have not been drafted for yet fall back to the chain
         # constants, and their zero drafts get rejected either way.
         parent_list, top_scores_index = relay.topology(
-            fallback=lambda: self._pp_spec_chain_topology(bs, device)
+            fallback=lambda: self._pp_spec_chain_topology(
+                bs, device, steps, num_draft_tokens
+            )
         )
         parent_list = parent_list.to(device=device, dtype=torch.long)
         top_scores_index = top_scores_index.to(device=device, dtype=torch.long)
@@ -1716,6 +1860,11 @@ class SchedulerPPMixin:
         mb_metadata: List[Optional[PPBatchMetadata]],
         last_rank_comm_queue: deque,
     ):
+        if mb_metadata[mb_id] is not None:
+            raise RuntimeError(
+                "PP microbatch metadata slot was reused before its result was "
+                f"consumed: mb_id={mb_id}"
+            )
         with torch.profiler.record_function("run_batch"):
             with self.forward_stream_ctx:
                 self._pp_wait_forward_dependencies()
@@ -1739,6 +1888,24 @@ class SchedulerPPMixin:
                         else None
                     ),
                     verify_out_cache_loc=result.spec_verify_out_cache_loc,
+                    spec_steps=(
+                        cur_batch.spec_info.speculative_num_steps
+                        if self._pp_spec_relay
+                        and hasattr(cur_batch.spec_info, "speculative_num_steps")
+                        else None
+                    ),
+                    spec_num_draft_tokens=(
+                        result.speculative_num_draft_tokens
+                        or (
+                            cur_batch.spec_info.speculative_num_draft_tokens
+                            if self._pp_spec_relay
+                            and hasattr(
+                                cur_batch.spec_info,
+                                "speculative_num_draft_tokens",
+                            )
+                            else None
+                        )
+                    ),
                 )
                 event = self.device_module.Event()
                 event.record(self.device_module.current_stream())
