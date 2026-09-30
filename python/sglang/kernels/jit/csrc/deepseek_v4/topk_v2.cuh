@@ -608,44 +608,9 @@ __global__ __launch_bounds__(kBlockSize, 1) void topk_plan_cluster(
 #endif  // SUPPORT_CLUSTER
 
 #ifdef USE_ROCM
-// ---------------------------------------------------------------------------
-// Split path (ROCm): one row across several blocks, cooperating through global
-// memory instead of a cluster.
-//
-// This is the CDNA answer to TopKCluster, not a port of it. The cluster path
-// needs thread-block clusters and distributed shared memory -- one cluster owns
-// a row, the ranks all-reduce their histograms over DSMEM and synchronise with
-// cluster.sync() -- and CDNA has neither primitive. What it does have is the
-// pattern v1's topk.hip already uses on this hardware: put the shared state in
-// global memory and let a kernel boundary be the barrier.
-//
-// Two launches, which is the fewest this can be done in without assuming the
-// blocks of a row are co-resident:
-//
-//   1. topk_split_hist    each rank histograms its own chunk and folds it into
-//                         the row's shared histogram with global atomics.
-//   2. topk_split_select  each rank reads that histogram, finds the threshold,
-//                         scans its chunk again and appends its candidates.
-//                         The last rank to arrive resolves the tie tail and
-//                         applies the page-table transform.
-//
-// Nothing spins: the epilogue runs in whichever block arrives last, so the path
-// makes no forward-progress assumption that a plain launch does not already
-// guarantee.
-//
-// The shared histogram is accumulated rather than given one plane per rank and
-// summed by the reader. Per-rank planes need no zeroing, which is tidier, but
-// the reader then walks `split` planes in a loop the compiler cannot software
-// pipeline, so it pays the memory latency `split` times over -- 23 us of a
-// 26 us kernel, measured. Accumulating costs a zeroed buffer instead, and the
-// epilogue block clears the row on its way out so the next launch finds it
-// clean (the allocation is zeroed once, for the first call).
-//
-// That reset makes the workspace single-stream state: two streams running this
-// path on one device would interleave their histograms. Every consumer runs the
-// model on one stream, and the counters below have the same shape of problem,
-// but it is the reason this scratch cannot simply be shared more widely.
-// ---------------------------------------------------------------------------
+// Split path (ROCm): no clusters/DSMEM on CDNA, so a row spans blocks over two launches with the
+// kernel boundary as the barrier: hist accumulates chunk histograms in global memory, select appends
+// candidates, and the last block resolves ties and re-zeroes the row (so the scratch is single-stream).
 
 constexpr uint32_t kSplitMax = 32;  ///< most blocks one row may take
 constexpr uint32_t kSplitMin = 4;   ///< fewest that pays for the second launch
@@ -731,15 +696,9 @@ struct TopKSplit : impl::TopKRadixBase<12> {
       row_hist[threadIdx.x * kHistItems + i] = 0;
   }
 
-  /// Scan this rank's chunk and append what clears the threshold.
-  ///
-  /// Counted in LDS first and committed with one global atomic per block per
-  /// class, the way the cluster path stages through `tmp_out`. Taking a slot
-  /// per candidate straight from the global counter looks tempting because the
-  /// above-threshold candidates are bounded by topk -- but the threshold bin
-  /// itself is not, and a bin holding a few thousand elements turns into a few
-  /// thousand serialized atomics on one address, which measured five times
-  /// slower than not splitting at all.
+  /// Scan this rank's chunk and append what clears the threshold. Staged in LDS
+  /// and committed with one global atomic per block: the threshold bin is
+  /// unbounded, and per-candidate global atomics serialize on one address.
   SGL_DEVICE static void select_chunk(
       const TopKProblem& problem,
       Chunk chunk,
@@ -810,10 +769,8 @@ struct TopKSplit : impl::TopKRadixBase<12> {
   SGL_DEVICE static bool arrive_last(SplitCounters* __restrict__ ctr, uint32_t split, Smem* smem) {
     __syncthreads();  // this block's appends are done and visible to thread 0
     if (threadIdx.x == 0) {
-      // Both fences belong to this thread alone. A device-scope fence on a
-      // multi-die part is a cross-L2 operation, and letting all 1024 threads
-      // issue one costs 8 us of a 26 us kernel; the __syncthreads above
-      // already gave thread 0 the rest of the block's writes to push out.
+      // Fences from thread 0 only: a device-scope fence is cross-L2 on a
+      // multi-die part, and the __syncthreads above already covers the block.
       __threadfence();  // release: the appends land before the arrival does
       const bool last = atomicAdd(&ctr->arrive, 1u) == split - 1;
       smem->is_last = last ? 1u : 0u;
@@ -829,10 +786,8 @@ struct TopKSplit : impl::TopKRadixBase<12> {
     return smem->is_last != 0;
   }
 
-  /// Fill the slots the threshold bin has to break ties for. handle_tie takes a
-  /// plain pointer, so it could read the workspace directly, but its ranking
-  /// pass is all-to-all over the candidates; staging them into LDS first keeps
-  /// that out of global memory.
+  /// Fill the slots the threshold bin has to break ties for, staging the ties
+  /// into LDS first since handle_tie's ranking pass is all-to-all.
   SGL_DEVICE static void finish_ties(const TopKProblem& problem, const impl::TieValue* ties, Smem* smem) {
     const auto tx = threadIdx.x;
     const auto above_count = smem->total_gt;
@@ -918,17 +873,9 @@ TOPK_KERNEL void topk_split_select(const __grid_constant__ TopKPagedParams param
   }
 }
 
-/// Per-device scratch for the split path, allocated once and never freed.
-///
-/// Never freed on purpose. Growing the buffer would be worse than wasteful: a
-/// HIP graph captured while an earlier allocation was current bakes that
-/// address into its kernel arguments, so releasing it leaves those graphs
-/// writing into memory the allocator has since handed to someone else -- the
-/// same hazard v1's topk.hip avoids by taking its scratch from the caching
-/// allocator per call. Allocating the worst case up front sidesteps both. The
-/// worst case is small because the path is only taken when rows * split fits
-/// the machine, so the histograms are bounded by the CU count and not by the
-/// batch: about 2 MB on a 256-CU part.
+/// Per-device scratch for the split path, sized for the worst case and never
+/// freed: HIP graphs bake the address into their kernel arguments. The gate
+/// bounds it by the CU count, not the batch -- about 2 MB on a 256-CU part.
 struct SplitResources {
   int cu = 0;
   uint32_t max_rows = 0;
@@ -983,11 +930,8 @@ inline const SplitResources& split_resources(int device_id) {
   return *slots[device_id];
 }
 
-/// How many blocks to give each row, and the scratch they share. Zero means the
-/// ordinary one-block-per-row dispatch.
-///
-/// Both bounds are measured: split_floor for how long the row has to be,
-/// kSplitBlocks for how far it is worth spreading.
+/// How many blocks to give each row (zero = one block per row) and their scratch.
+/// Both bounds are measured: split_floor for length, kSplitBlocks for spread.
 inline auto split_plan(uint32_t batch_size, uint32_t max_seq_len, DLDevice device)
     -> std::pair<uint32_t, SplitWorkspace> {
   const auto& res = split_resources(device.device_id);
