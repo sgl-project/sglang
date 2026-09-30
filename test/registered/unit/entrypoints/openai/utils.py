@@ -25,7 +25,10 @@ import json
 from typing import AsyncIterator
 from unittest.mock import Mock
 
-from sglang.srt.entrypoints.openai.protocol import RequestResponseMetadata
+from sglang.srt.entrypoints.openai.protocol import (
+    RequestResponseMetadata,
+    ResponsesResponse,
+)
 from sglang.srt.entrypoints.openai.serving_responses import OpenAIServingResponses
 from sglang.srt.runtime_context import get_context, publish
 from sglang.srt.server_args import ServerArgs
@@ -131,6 +134,16 @@ def find_completed_event(events: list[str]) -> dict:
         if lines and lines[0] == "event: response.completed":
             return json.loads(lines[1][len("data: ") :])
     raise AssertionError("response.completed event missing from stream")
+
+
+async def create_response_result(serving, request):
+    result = await serving.create_responses(request)
+    if request.stream:
+        payloads = event_payloads([event async for event in result])
+        assert payloads[0]["type"] == "response.created"
+        assert payloads[-1]["type"] == "response.completed"
+        return ResponsesResponse.model_validate(payloads[-1]["response"])
+    return result
 
 
 def engine_chunk(text, completion_tokens=1, *, finish=False):

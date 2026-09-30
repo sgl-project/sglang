@@ -45,6 +45,7 @@ from openai_harmony import (
 
 from sglang.srt.entrypoints.openai.protocol import (
     ReasoningEffortTier,
+    ResponseAdditionalTools,
     ResponseInputOutputItem,
     ResponseOutputMessage,
 )
@@ -153,6 +154,11 @@ def parse_response_input(
 ) -> Message:
     if not isinstance(response_msg, dict):
         response_msg = response_msg.model_dump()
+    if response_msg.get("type") == "additional_tools":
+        item = ResponseAdditionalTools.model_validate(response_msg)
+        if any(tool.type != "function" for tool in item.tools):
+            raise ValueError("Harmony additional_tools supports function tools only")
+        return get_developer_message(tools=item.tools)
     if "type" not in response_msg or response_msg["type"] == "message":
         role = response_msg["role"]
         content = response_msg["content"]

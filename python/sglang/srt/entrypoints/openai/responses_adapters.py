@@ -1,16 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Translations between Responses-API wire shapes and SGLang's chat internals.
-
-Two things the Responses API expresses that the chat-completions path has no
-representation for:
-
-* ``custom`` tools, whose payload is freeform text rather than JSON-object
-  arguments. Each is surfaced to the model as a function tool with a single
-  string property, and the resulting call is translated back into a
-  ``custom_tool_call``.
-* ``reasoning.encrypted_content``, the opaque blob a ``store=false`` client
-  replays to hand a reasoning trace back to the server.
-"""
+"""Translations between Responses-API wire shapes and SGLang's chat internals."""
 
 from __future__ import annotations
 
@@ -18,6 +7,8 @@ import base64
 import json
 import zlib
 from typing import Any, Dict, Optional, Set, Tuple
+
+from sglang.srt.entrypoints.openai.protocol import ResponseTool
 
 CUSTOM_TOOL_INPUT_KEY = "input"
 
@@ -68,8 +59,40 @@ def custom_tool_description(
     return "\n\n".join(parts) or None
 
 
+def expand_tool_namespaces(tools: list[ResponseTool]) -> list[ResponseTool]:
+    expanded = []
+    for tool in tools:
+        if tool.type != "namespace":
+            expanded.append(tool)
+            continue
+        for definition in tool.tools or []:
+            child = ResponseTool.model_validate(definition)
+            child.name = f"{tool.name}.{child.name}"
+            child.description = (
+                "\n\n".join(
+                    text for text in (tool.description, child.description) if text
+                )
+                or None
+            )
+            expanded.append(child)
+    return expanded
+
+
+def tool_call_identity(name: str, tools: list[ResponseTool]) -> dict[str, str]:
+    for tool in tools:
+        if tool.type == "namespace":
+            for child in tool.tools or []:
+                if name == f"{tool.name}.{child['name']}":
+                    return {"name": child["name"], "namespace": tool.name}
+    return {"name": name}
+
+
 def custom_tool_names(tools: Any) -> Set[str]:
-    return {tool.name for tool in tools or [] if tool.type == "custom" and tool.name}
+    return {
+        tool.name
+        for tool in expand_tool_namespaces(tools or [])
+        if tool.type == "custom" and tool.name
+    }
 
 
 def encode_custom_tool_input(payload: str) -> str:

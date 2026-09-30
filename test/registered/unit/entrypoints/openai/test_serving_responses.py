@@ -14,7 +14,13 @@ from openai.types.responses import (
 )
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 from openai_harmony import Conversation, Message, Role, ToolNamespaceConfig
-from utils import StreamFixture, engine_chunk, event_payloads, make_serving
+from utils import (
+    StreamFixture,
+    create_response_result,
+    engine_chunk,
+    event_payloads,
+    make_serving,
+)
 
 from sglang.srt.entrypoints.context import (
     HarmonyContext,
@@ -1379,16 +1385,6 @@ def response_serving():
         return serving
 
     return build
-
-
-async def create_response_result(serving, request):
-    result = await serving.create_responses(request)
-    if request.stream:
-        payloads = event_payloads([event async for event in result])
-        assert payloads[0]["type"] == "response.created"
-        assert payloads[-1]["type"] == "response.completed"
-        return ResponsesResponse.model_validate(payloads[-1]["response"])
-    return result
 
 
 def assert_response_error(response, param, message=STORE_DISABLED_MESSAGE, status=400):
