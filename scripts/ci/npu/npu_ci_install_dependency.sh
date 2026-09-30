@@ -66,9 +66,9 @@ ${PIP_INSTALL} memcache-hybrid==1.2.1
 
 ### Install memfabric-zbal
 if [ "${DEVICE_TYPE}" = "950" ]; then
-    ${PIP_INSTALL} memfabric-zbal==1.2.21004.post1 -i https://pypi.org/simple/
+    ${PIP_INSTALL} memfabric-zbal==1.2.21004.post1
 else
-    ${PIP_INSTALL} memfabric-zbal==1.1.3 -i https://pypi.org/simple/
+    ${PIP_INSTALL} memfabric-zbal==1.1.3
 fi
 
 ### Install SGLang Model Gateway
