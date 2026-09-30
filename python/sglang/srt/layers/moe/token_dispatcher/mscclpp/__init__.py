@@ -2,9 +2,7 @@
 
 from .dispatcher import MSCCLPPDispatcher
 from .utils import (
-    MSCCLPPCombineInput,
     MSCCLPPCombineInputBase,
-    MSCCLPPDispatchOutput,
     MSCCLPPDispatchOutputBase,
     MSCCLPPExpertMajorLLCombineInput,
     MSCCLPPExpertMajorLLDispatchOutput,
@@ -16,10 +14,8 @@ from .utils import (
 )
 
 __all__ = [
-    "MSCCLPPCombineInput",
     "MSCCLPPCombineInputBase",
     "MSCCLPPDispatcher",
-    "MSCCLPPDispatchOutput",
     "MSCCLPPDispatchOutputBase",
     "MSCCLPPExpertMajorLLCombineInput",
     "MSCCLPPExpertMajorLLDispatchOutput",

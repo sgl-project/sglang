@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional
+from typing import Optional
 
 import torch
 
@@ -19,7 +19,6 @@ from sglang.srt.layers.moe.topk import StandardTopKOutput
 class MSCCLPPOutputLayout(str, Enum):
     RANK_MAJOR = "rank_major"
     EXPERT_MAJOR = "expert_major"
-    TOKEN_MAJOR = "token_major"
 
 
 @dataclass(frozen=True)
@@ -36,30 +35,6 @@ class MSCCLPPDispatchOutputBase(ABC):
 
 
 @dataclass(frozen=True)
-class MSCCLPPDispatchOutput(MSCCLPPDispatchOutputBase):
-    """MSCCL++ high-throughput token-major dispatch output.
-
-    Fields map the public ``MoECommunicator.dispatch`` result:
-
-    * ``hidden_states``      -> ``recv_x``                       [num_recv_tokens, hidden]
-    * ``hidden_states_scale``-> ``recv_x_scales``               (optional, fp8 path)
-    * ``topk_output``        -> dispatched routing with global expert ids
-    * ``num_recv_tokens_per_expert`` -> per-local-expert recv counts
-
-    ``local_expert_start`` lets local-expert runners derive their id space from
-    the canonical global ids without storing a second routing tensor.
-    """
-
-    topk_output: StandardTopKOutput
-    num_recv_tokens_per_expert: List[int]
-    local_expert_start: int
-
-    @property
-    def format(self) -> DispatchOutputFormat:
-        return DispatchOutputFormat.MSCCLPP
-
-
-@dataclass(frozen=True)
 class MSCCLPPCombineInputBase(ABC):
     """Fields shared by all MSCCL++ combine layouts."""
 
@@ -69,15 +44,6 @@ class MSCCLPPCombineInputBase(ABC):
     @abstractmethod
     def format(self) -> CombineInputFormat:
         pass
-
-
-@dataclass(frozen=True)
-class MSCCLPPCombineInput(MSCCLPPCombineInputBase):
-    """High-throughput expert output consumed by handle-driven combine."""
-
-    @property
-    def format(self) -> CombineInputFormat:
-        return CombineInputFormat.MSCCLPP
 
 
 @dataclass(frozen=True)

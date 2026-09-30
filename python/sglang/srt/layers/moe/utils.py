@@ -282,37 +282,16 @@ class DeepEPMode(Enum):
 
 
 class MSCCLPPMode(Enum):
-    """Transport mode for the single ``mscclpp`` MoE a2a backend.
+    """MSCCL++ EP transport mode.
 
-    Mirrors DeepEP's two-mode design (``deepep`` backend + ``deepep_mode``):
-    one ``mscclpp`` a2a backend that runs either the high-throughput intranode
-    (``normal``) dispatcher or the low-latency (``low_latency``) dispatcher,
-    selected here instead of via separate a2a backends.
+    The configuration surface is retained so additional modes can be added
+    without introducing a new flag. LL is the only supported mode today.
     """
 
-    NORMAL = "normal"
     LOW_LATENCY = "low_latency"
-    AUTO = "auto"
-
-    def enable_normal(self) -> bool:
-        return self in (MSCCLPPMode.NORMAL, MSCCLPPMode.AUTO)
-
-    def enable_low_latency(self) -> bool:
-        return self in (MSCCLPPMode.LOW_LATENCY, MSCCLPPMode.AUTO)
-
-    def resolve(self, is_extend_in_batch: bool) -> MSCCLPPMode:
-        if self != MSCCLPPMode.AUTO:
-            return self
-        return MSCCLPPMode.NORMAL if is_extend_in_batch else MSCCLPPMode.LOW_LATENCY
-
-    def is_normal(self) -> bool:
-        return self == MSCCLPPMode.NORMAL
 
     def is_low_latency(self) -> bool:
         return self == MSCCLPPMode.LOW_LATENCY
-
-    def is_auto(self) -> bool:
-        return self == MSCCLPPMode.AUTO
 
 
 class DispatcherOutputDtype(Enum):
@@ -642,15 +621,15 @@ def get_deepep_mode() -> DeepEPMode:
 def get_mscclpp_mode() -> MSCCLPPMode:
     moe = get_flags().moe
     if moe.mscclpp_mode is None:
-        logger.warning("MSCCLPP_MODE is not initialized, using auto mode")
-        moe.mscclpp_mode = MSCCLPPMode.AUTO
+        logger.warning("MSCCLPP_MODE is not initialized, using low-latency mode")
+        moe.mscclpp_mode = MSCCLPPMode.LOW_LATENCY
     return moe.mscclpp_mode
 
 
 def is_mscclpp_ll_rank_major() -> bool:
     return (
         get_moe_a2a_backend().is_mscclpp()
-        and get_mscclpp_mode().enable_low_latency()
+        and get_mscclpp_mode().is_low_latency()
         and get_moe_runner_backend().is_flashinfer_cutlass()
     )
 
@@ -799,7 +778,12 @@ def post_experts_output_is_complete(*, is_tp_path: bool) -> bool:
     a2a = get_moe_a2a_backend()
     # The flashinfer and pplx combines, and the megamoe kernel's internal
     # combine, sum each token's expert outputs back to its source rank.
-    return a2a.is_flashinfer() or a2a.is_pplx() or a2a.is_flashinfer_megamoe() or get_moe_a2a_backend().is_mscclpp()
+    return (
+        a2a.is_flashinfer()
+        or a2a.is_pplx()
+        or a2a.is_flashinfer_megamoe()
+        or get_moe_a2a_backend().is_mscclpp()
+    )
 
 
 def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:

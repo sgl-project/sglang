@@ -1254,6 +1254,9 @@ class Envs:
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
     # MSCCL++ EP
     SGLANG_MSCCLPP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
+    # Launch shared experts after LL rank-major dispatch on the model's
+    # alternate stream so their GEMMs can overlap routed compute and combine.
+    SGLANG_MSCCLPP_LL_OVERLAP = EnvBool(False)
     # Force dynamic DeepEP Waterfill with runtime EP all-reduce instead of the
     # default static local-batch path.
     SGLANG_ENABLE_QWEN_DEEPEP_SHARED_OVERLAP = EnvBool(True)

@@ -20,8 +20,6 @@ from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.mscclpp import (
-        MSCCLPPCombineInput,
-        MSCCLPPDispatchOutput,
         MSCCLPPExpertMajorLLCombineInput,
         MSCCLPPExpertMajorLLDispatchOutput,
     )
@@ -345,98 +343,6 @@ def post_permute_triton_to_standard(
     )
 
 
-@register_pre_permute("mscclpp", "triton")
-def pre_permute_mscclpp_to_triton(
-    dispatch_output: MSCCLPPDispatchOutput,
-    quant_info: TritonMoeQuantInfo,
-    runner_config: MoeRunnerConfig,
-    running_state: dict,
-) -> TritonRunnerInput:
-    """Bridge an MSCCL++ EP dispatch output into the Triton fused-MoE runner.
-
-    The MSCCL++ EP *normal* dispatch leaves each rank with ``recv_x`` and a
-    canonical ``topk_output`` in global expert space. Triton consumes local
-    expert ids, so this adapter subtracts the dispatcher's local expert offset
-    while preserving ``-1`` slots whose expert lives on another rank. The
-    remaining token-major layout is exactly what the Triton kernel consumes.
-    ``TritonRunnerCore.run`` sets
-    ``filter_expert=True`` (global ``num_experts`` != ``num_local_experts``), so
-    the kernel skips the masked ``-1`` slots; it reduces over the top-k dim with
-    ``topk_weights`` to produce each rank's partial output. The remaining
-    cross-rank reduction is done later by the MSCCL++ combine.
-    """
-    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
-        _prepare_fused_moe_run,
-    )
-
-    hidden_states = dispatch_output.hidden_states
-    topk_output = dispatch_output.topk_output
-    topk_ids = torch.where(
-        topk_output.topk_ids >= 0,
-        topk_output.topk_ids - dispatch_output.local_expert_start,
-        topk_output.topk_ids,
-    ).to(torch.int32)
-    topk_weights = topk_output.topk_weights
-
-    (
-        config,
-        down_config,
-        down_moe_use_tma,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-    ) = _prepare_fused_moe_run(
-        hidden_states,
-        quant_info.w13_weight,
-        quant_info.w2_weight,
-        topk_ids,
-        use_fp8_w8a8=quant_info.use_fp8_w8a8,
-        use_int8_w8a8=quant_info.use_int8_w8a8,
-        use_int8_w8a16=quant_info.use_int8_w8a16,
-        use_int4_w4a16=quant_info.use_int4_w4a16,
-        per_channel_quant=quant_info.per_channel_quant,
-        block_shape=quant_info.block_shape,
-    )
-
-    running_state["config"] = config
-    running_state["down_config"] = down_config
-    running_state["down_moe_use_tma"] = down_moe_use_tma
-
-    return TritonRunnerInput(
-        hidden_states=hidden_states,
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
-        sorted_token_ids=sorted_token_ids,
-        expert_ids=expert_ids,
-        num_tokens_post_padded=num_tokens_post_padded,
-    )
-
-
-@register_post_permute("triton", "mscclpp")
-def post_permute_triton_to_mscclpp(
-    runner_output: TritonRunnerOutput,
-    quant_info: TritonMoeQuantInfo,
-    runner_config: MoeRunnerConfig,
-    running_state: dict,
-) -> MSCCLPPCombineInput:
-    """Package the Triton runner output for the MSCCL++ EP combine.
-
-    The Triton runner already applied ``topk_weights`` and
-    ``routed_scaling_factor`` while reducing the within-rank top-k copies, so
-    ``runner_output.hidden_states`` is each rank's per-recv-token partial result
-    ([num_recv_tokens, hidden]). It is handed straight to the MSCCL++ combine,
-    which sums those partials back to the source tokens across ranks; because the
-    weights are already baked in, that cross-rank combine must be an *unweighted*
-    sum. Routing and scatter metadata remain in the MSCCL++ dispatch handle.
-    """
-    from sglang.srt.layers.moe.token_dispatcher.mscclpp import MSCCLPPCombineInput
-
-    del quant_info, runner_config, running_state
-    return MSCCLPPCombineInput(
-        hidden_states=runner_output.hidden_states,
-    )
-
-
 @register_pre_permute("mscclpp_ll_expert_major", "triton")
 def pre_permute_mscclpp_expert_major_ll_to_triton(
     dispatch_output: MSCCLPPExpertMajorLLDispatchOutput,
@@ -510,6 +416,7 @@ def pre_permute_mscclpp_expert_major_ll_to_triton(
         config,
         down_config,
         down_moe_use_tma,
+        up_moe_use_tma,
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
@@ -529,6 +436,7 @@ def pre_permute_mscclpp_expert_major_ll_to_triton(
     running_state["config"] = config
     running_state["down_config"] = down_config
     running_state["down_moe_use_tma"] = down_moe_use_tma
+    running_state["up_moe_use_tma"] = up_moe_use_tma
     running_state["mscclpp_ll_shape"] = (
         num_local_experts,
         slots_per_expert,

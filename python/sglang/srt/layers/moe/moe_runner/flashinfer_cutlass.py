@@ -40,8 +40,6 @@ if TYPE_CHECKING:
         FlashinferDispatchOutput,
     )
     from sglang.srt.layers.moe.token_dispatcher.mscclpp import (
-        MSCCLPPCombineInput,
-        MSCCLPPDispatchOutput,
         MSCCLPPRankMajorLLCombineInput,
         MSCCLPPRankMajorLLDispatchOutput,
     )
@@ -400,37 +398,6 @@ class FlashInferCutlassRunnerCore(MoeRunnerCore):
     @property
     def runner_backend(self) -> MoeRunnerBackend:
         return MoeRunnerBackend.FLASHINFER_CUTLASS
-
-
-@register_pre_permute("mscclpp", "flashinfer_cutlass")
-def pre_permute_mscclpp_to_flashinfer_cutlass(
-    dispatch_output: MSCCLPPDispatchOutput,
-    quant_info: MoeQuantInfo,
-    runner_config: MoeRunnerConfig,
-    running_state: dict,
-) -> FlashInferCutlassRunnerInput:
-    del quant_info, runner_config, running_state
-    if dispatch_output.hidden_states.dim() != 2:
-        raise ValueError("MSCCL++ token-major dispatch tokens must be two-dimensional")
-
-    return FlashInferCutlassRunnerInput(
-        hidden_states=dispatch_output.hidden_states,
-        hidden_states_scale=dispatch_output.hidden_states_scale,
-        topk_output=dispatch_output.topk_output,
-    )
-
-
-@register_post_permute("flashinfer_cutlass", "mscclpp")
-def post_permute_flashinfer_cutlass_to_mscclpp(
-    runner_output: FlashInferCutlassRunnerOutput,
-    quant_info: MoeQuantInfo,
-    runner_config: MoeRunnerConfig,
-    running_state: dict,
-) -> MSCCLPPCombineInput:
-    del quant_info, runner_config, running_state
-    from sglang.srt.layers.moe.token_dispatcher.mscclpp import MSCCLPPCombineInput
-
-    return MSCCLPPCombineInput(hidden_states=runner_output.hidden_states)
 
 
 @register_pre_permute("mscclpp_ll_rank_major", "flashinfer_cutlass")

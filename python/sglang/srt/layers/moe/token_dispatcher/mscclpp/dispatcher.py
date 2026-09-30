@@ -8,23 +8,31 @@ from typing import TYPE_CHECKING, ClassVar, Optional
 
 import torch
 
+from sglang.srt.environ import envs
+from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
+from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
 from .utils import (
-    MSCCLPPCombineInput,
     MSCCLPPCombineInputBase,
-    MSCCLPPDispatchOutput,
     MSCCLPPDispatchOutputBase,
     MSCCLPPExpertMajorLLDispatchOutput,
     MSCCLPPOutputLayout,
     MSCCLPPRankMajorLLDispatchOutput,
 )
-from sglang.srt.layers.dp_attention import get_is_extend_in_batch
-from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
-from sglang.srt.layers.moe.topk import StandardTopKOutput
-from sglang.srt.layers.moe.utils import MSCCLPPMode
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKOutput
+
+
+def _resolve_ll_num_blocks(
+    output_layout: MSCCLPPOutputLayout, overlap_enabled: bool
+) -> Optional[tuple[int, int]]:
+    if output_layout == MSCCLPPOutputLayout.RANK_MAJOR and overlap_enabled:
+        # The shared-expert MLP runs concurrently on another stream. Keep the
+        # full dispatch grid, but leave SM headroom during combine for that work.
+        return 130, 32
+    return None
 
 
 class _MSCCLPPDispatcherImplBase(ABC):
@@ -39,252 +47,6 @@ class _MSCCLPPDispatcherImplBase(ABC):
     @abstractmethod
     def combine(self, combine_input: MSCCLPPCombineInputBase) -> torch.Tensor:
         pass
-
-
-class _MSCCLPPDispatcherImplHighThroughput(_MSCCLPPDispatcherImplBase):
-    """MSCCL++ high-throughput all-to-all dispatcher.
-
-    Eager execution uses token-major output with one row per
-    source-token/destination-rank pair. CUDA graphs use a separate bounded
-    rank-major communicator so notify and output shapes stay on-device and
-    fixed across replays.
-
-    Combine is an **unweighted** cross-rank sum: ``intranode_combine`` plain-sums
-    the hidden states and only reduces ``topk_weights`` into a separate (here
-    unused) tensor, so it never re-applies the routing weights. The weights must
-    already be folded in upstream -- the Triton runner does this during its
-    within-rank top-k reduction -- so dispatch -> Triton -> combine applies each
-    weight exactly once.
-
-    Routing changes every MoE invocation, so this wrapper intentionally does
-    not request the communicator's cached-layout path.
-    """
-
-    # One communicator and fixed receive pool per matching model geometry,
-    # capacity, and output layout. Per-layer handles remain on the instances.
-    _shared_resources: ClassVar[
-        dict[
-            tuple[object, int, int, int, int, int, int, str],
-            tuple[object, object, int],
-        ]
-    ] = {}
-
-    @classmethod
-    def _get_or_create_shared_resources(
-        cls,
-        group: torch.distributed.ProcessGroup,
-        num_experts: int,
-        num_local_experts: int,
-        hidden_size: int,
-        router_topk: int,
-        num_max_dispatch_tokens_per_rank: int,
-        num_sms: int,
-        output_layout: str,
-    ) -> tuple[object, object, int]:
-        if output_layout not in ("token_major", "rank_major"):
-            raise ValueError(
-                "MSCCL++ throughput output layout must be token_major or rank_major"
-            )
-        key = (
-            group,
-            num_experts,
-            num_local_experts,
-            hidden_size,
-            router_topk,
-            num_max_dispatch_tokens_per_rank,
-            num_sms,
-            output_layout,
-        )
-        cached = cls._shared_resources.get(key)
-        if cached is not None:
-            return cached
-
-        try:
-            from mscclpp import CommGroup
-            from mscclpp.ep import (
-                DispatchLayout,
-                MoECommunicator,
-                MoECommunicatorConfig,
-                MoEMode,
-            )
-        except ImportError as exc:  # pragma: no cover
-            raise ImportError(
-                "MSCCL++ EP is not available. Install an MSCCL++ build that "
-                "provides `mscclpp.ep`, then select the `mscclpp` MoE a2a backend."
-            ) from exc
-
-        ep_group = CommGroup(torch_group=group)
-        native_output_layout = (
-            DispatchLayout.TOKEN_MAJOR
-            if output_layout == "token_major"
-            else DispatchLayout.RANK_MAJOR
-        )
-        moe_comm = MoECommunicator(
-            MoECommunicatorConfig(
-                comm=ep_group,
-                device=torch.cuda.current_device(),
-                num_experts=num_experts,
-                num_local_experts=num_local_experts,
-                local_expert_start=ep_group.my_rank * num_local_experts,
-                hidden_size=hidden_size,
-                topk=router_topk,
-                max_tokens_per_rank=num_max_dispatch_tokens_per_rank,
-                mode=MoEMode.THROUGHPUT,
-                output_layout=native_output_layout,
-                num_blocks=num_sms,
-            )
-        )
-        if not moe_comm.is_available():
-            raise RuntimeError("MSCCL++ EP high-throughput runtime is unavailable")
-
-        resources = (ep_group, moe_comm, ep_group.nranks)
-        cls._shared_resources[key] = resources
-        return resources
-
-    def __init__(
-        self,
-        group: torch.distributed.ProcessGroup,
-        router_topk: int,
-        num_experts: int,
-        num_local_experts: int,
-        hidden_size: int,
-        params_dtype: torch.dtype,
-        num_sms: int = 20,
-    ):
-        from sglang.srt.environ import envs
-        from sglang.srt.runtime_context import (
-            cutedsl_moe_max_num_tokens,
-            get_parallel,
-        )
-
-        num_max_dispatch_tokens_per_rank = max(
-            envs.SGLANG_MSCCLPP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get(),
-            cutedsl_moe_max_num_tokens(),
-        )
-
-        self.router_topk = router_topk
-        self.num_experts = num_experts
-        self.num_local_experts = num_local_experts
-        self.hidden_size = hidden_size
-        self.params_dtype = params_dtype
-        self.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
-
-        (
-            self._ep_group,
-            self._moe_comm,
-            self.num_ranks,
-        ) = self._get_or_create_shared_resources(
-            group,
-            num_experts,
-            num_local_experts,
-            hidden_size,
-            router_topk,
-            num_max_dispatch_tokens_per_rank,
-            num_sms,
-            "token_major",
-        )
-
-        self._graph_moe_comm = None
-        decode_caps = _MSCCLPPDispatcherImplLowLatency._resolve_runtime_cuda_graph_caps(
-            int(get_parallel().attn_tp_size)
-        )
-        if decode_caps:
-            (
-                graph_ep_group,
-                self._graph_moe_comm,
-                graph_num_ranks,
-            ) = self._get_or_create_shared_resources(
-                group,
-                num_experts,
-                num_local_experts,
-                hidden_size,
-                router_topk,
-                max(decode_caps),
-                num_sms,
-                "rank_major",
-            )
-            if (
-                graph_ep_group.my_rank != self._ep_group.my_rank
-                or graph_num_ranks != self.num_ranks
-            ):
-                raise RuntimeError(
-                    "MSCCL++ eager and CUDA-graph communicators disagree on ranks"
-                )
-
-        self._combine_handle = None
-        self._active_moe_comm = None
-
-    def dispatch(
-        self,
-        hidden_states: torch.Tensor,
-        topk_output: TopKOutput,
-    ) -> MSCCLPPDispatchOutput:
-        capturing = torch.cuda.is_current_stream_capturing()
-        if (
-            self._graph_moe_comm is not None
-            and not self._graph_moe_comm.is_initialized()
-        ):
-            if capturing:
-                raise RuntimeError(
-                    "MSCCL++ throughput CUDA-graph communicator was not initialized "
-                    "during the graph warmup"
-                )
-            self._graph_moe_comm.initialize()
-        moe_comm = (
-            self._graph_moe_comm
-            if capturing and self._graph_moe_comm is not None
-            else self._moe_comm
-        )
-
-        topk_ids = topk_output.topk_ids.to(torch.int64).contiguous()
-        topk_weights = topk_output.topk_weights.to(torch.float32).contiguous()
-
-        dispatch_out, handle = moe_comm.dispatch(
-            hidden_states,
-            topk_ids,
-            topk_weights,
-        )
-        self._combine_handle = handle
-        self._active_moe_comm = moe_comm
-
-        assert dispatch_out.topk_ids is not None
-        assert dispatch_out.weights is not None
-        num_tokens_per_expert = dispatch_out.layout.num_tokens_per_expert
-        assert isinstance(num_tokens_per_expert, list)
-        hidden_states_scale = (
-            None if dispatch_out.quant is None else dispatch_out.quant.block_scales
-        )
-        local_topk_ids = dispatch_out.topk_ids
-        global_topk_ids = torch.where(
-            local_topk_ids >= 0,
-            local_topk_ids + self._ep_group.my_rank * self.num_local_experts,
-            local_topk_ids,
-        )
-
-        return MSCCLPPDispatchOutput(
-            hidden_states=dispatch_out.tokens,
-            hidden_states_scale=hidden_states_scale,
-            topk_output=StandardTopKOutput(
-                dispatch_out.weights,
-                global_topk_ids,
-                topk_output.router_logits,
-            ),
-            num_recv_tokens_per_expert=num_tokens_per_expert,
-            local_expert_start=self._ep_group.my_rank * self.num_local_experts,
-        )
-
-    def combine(self, combine_input: MSCCLPPCombineInput) -> torch.Tensor:
-        assert (
-            self._combine_handle is not None
-        ), "MSCCL++ high-throughput combine called before dispatch"
-        assert self._active_moe_comm is not None
-        combined_x = self._active_moe_comm.combine(
-            combine_input.hidden_states, self._combine_handle
-        )
-
-        self._combine_handle = None
-        self._active_moe_comm = None
-        return combined_x
 
 
 class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
@@ -307,7 +69,16 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
     # every MoE layer. Static buffer addresses are also required by CUDA graphs.
     _shared_resources: ClassVar[
         dict[
-            tuple[object, int, int, int, int, int, MSCCLPPOutputLayout],
+            tuple[
+                object,
+                int,
+                int,
+                int,
+                int,
+                int,
+                MSCCLPPOutputLayout,
+                Optional[tuple[int, int]],
+            ],
             tuple[object, object, Optional[torch.Tensor], int],
         ]
     ] = {}
@@ -412,6 +183,7 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
         router_topk: int,
         allocation_capacity: int,
         output_layout: MSCCLPPOutputLayout,
+        num_blocks: Optional[tuple[int, int]],
     ) -> tuple[object, object, Optional[torch.Tensor], int]:
         key = (
             group,
@@ -421,6 +193,7 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
             router_topk,
             allocation_capacity,
             output_layout,
+            num_blocks,
         )
         cached = cls._shared_resources.get(key)
         if cached is not None:
@@ -444,8 +217,6 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
         ep_group = CommGroup(torch_group=group)
         num_ranks = ep_group.nranks
 
-        if output_layout == MSCCLPPOutputLayout.TOKEN_MAJOR:
-            raise ValueError("TOKEN_MAJOR uses the MSCCL++ throughput runtime")
         if not hasattr(DispatchLayout, output_layout.name):
             raise RuntimeError(
                 f"MSCCL++ {output_layout.value} dispatch is unavailable; install "
@@ -466,6 +237,7 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
                 output_layout=native_output_layout,
                 invalid_token_expert_id=num_experts,
                 combine_mode=CombineMode.RANK_LOCAL_REDUCE,
+                num_blocks=num_blocks,
             )
         )
         if not moe_comm.is_available():
@@ -500,12 +272,6 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
     ):
         if not isinstance(output_layout, MSCCLPPOutputLayout):
             raise TypeError("output_layout must be an MSCCLPPOutputLayout")
-        if output_layout == MSCCLPPOutputLayout.TOKEN_MAJOR:
-            raise ValueError(
-                "TOKEN_MAJOR belongs to the MSCCL++ high-throughput implementation"
-            )
-
-        from sglang.srt.environ import envs
         from sglang.srt.runtime_context import get_parallel, get_schedule
 
         num_max_dispatch_tokens_per_rank = (
@@ -538,6 +304,11 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
         self.params_dtype = params_dtype
         self.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         self.output_layout = output_layout
+        self.overlap_enabled = (
+            output_layout == MSCCLPPOutputLayout.RANK_MAJOR
+            and envs.SGLANG_MSCCLPP_LL_OVERLAP.get()
+        )
+        num_blocks = _resolve_ll_num_blocks(output_layout, self.overlap_enabled)
 
         # Allocating these capacity-scaled resources per layer would OOM large
         # MoE models, so LL implementations with identical geometry share them.
@@ -554,6 +325,7 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
             router_topk,
             self._allocation_capacity,
             output_layout,
+            num_blocks,
         )
 
         # The DispatchHandle produced by dispatch and consumed by combine
@@ -665,9 +437,9 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
         )
 
     def combine(self, combine_input: MSCCLPPCombineInputBase) -> torch.Tensor:
-        assert (
-            self._combine_handle is not None
-        ), "MSCCL++ low-latency combine called before dispatch"
+        assert self._combine_handle is not None, (
+            "MSCCL++ low-latency combine called before dispatch"
+        )
 
         # The handle carries the layout-specific routing and scatter metadata.
         combined_x = self._moe_comm.combine(
@@ -679,7 +451,7 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
 
 
 class MSCCLPPDispatcher(BaseDispatcher):
-    """Select MSCCL++ throughput or low-latency transport for each batch."""
+    """MSCCL++ low-latency expert-parallel dispatcher."""
 
     def __init__(
         self,
@@ -689,52 +461,33 @@ class MSCCLPPDispatcher(BaseDispatcher):
         num_local_experts: int,
         hidden_size: int,
         params_dtype: torch.dtype,
-        mscclpp_mode: MSCCLPPMode = MSCCLPPMode.AUTO,
         output_layout: MSCCLPPOutputLayout = MSCCLPPOutputLayout.EXPERT_MAJOR,
-        num_sms: int = 20,
     ):
         super().__init__()
 
-        if not isinstance(mscclpp_mode, MSCCLPPMode):
-            raise TypeError("mscclpp_mode must be an MSCCLPPMode")
         if not isinstance(output_layout, MSCCLPPOutputLayout):
             raise TypeError("output_layout must be an MSCCLPPOutputLayout")
-        if output_layout == MSCCLPPOutputLayout.TOKEN_MAJOR:
-            raise ValueError(
-                "output_layout selects the low-latency layout and cannot be TOKEN_MAJOR"
-            )
 
-        self.mscclpp_mode = mscclpp_mode
         self.output_layout = output_layout
-        common_kwargs = dict(
+        self._low_latency_dispatcher = _MSCCLPPDispatcherImplLowLatency(
             group=group,
             router_topk=router_topk,
             num_experts=num_experts,
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             params_dtype=params_dtype,
+            output_layout=output_layout,
         )
-
-        if mscclpp_mode.enable_normal():
-            self._high_throughput_dispatcher = _MSCCLPPDispatcherImplHighThroughput(
-                num_sms=num_sms,
-                **common_kwargs,
-            )
-        if mscclpp_mode.enable_low_latency():
-            self._low_latency_dispatcher = _MSCCLPPDispatcherImplLowLatency(
-                output_layout=output_layout,
-                **common_kwargs,
-            )
 
         self._active_dispatcher: Optional[_MSCCLPPDispatcherImplBase] = None
 
     def _resolve_dispatcher(self) -> _MSCCLPPDispatcherImplBase:
-        mode = self.mscclpp_mode.resolve(get_is_extend_in_batch())
-        if mode.is_normal():
-            return self._high_throughput_dispatcher
-        if mode.is_low_latency():
-            return self._low_latency_dispatcher
-        raise ValueError(f"Invalid mscclpp_mode: {self.mscclpp_mode}")
+        return self._low_latency_dispatcher
+
+    @staticmethod
+    def clear_shared_resources() -> None:
+        """Release cached communicators after all dispatchers are no longer used."""
+        _MSCCLPPDispatcherImplLowLatency._shared_resources.clear()
 
     def dispatch(
         self,

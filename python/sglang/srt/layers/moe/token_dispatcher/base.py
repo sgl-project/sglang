@@ -31,8 +31,6 @@ if TYPE_CHECKING:
         DeepEPv2DispatchOutput,
         FlashinferCombineInput,
         FlashinferDispatchOutput,
-        MSCCLPPCombineInput,
-        MSCCLPPDispatchOutput,
         MSCCLPPExpertMajorLLCombineInput,
         MSCCLPPExpertMajorLLDispatchOutput,
         MSCCLPPLLCombineInput,
@@ -169,12 +167,6 @@ class DispatchOutputChecker:
         return dispatch_output.format.is_flashinfer()
 
     @staticmethod
-    def format_is_mscclpp(
-        dispatch_output: DispatchOutput,
-    ) -> TypeGuard[MSCCLPPDispatchOutput]:
-        return dispatch_output.format.is_mscclpp()
-
-    @staticmethod
     def format_is_mscclpp_ll(
         dispatch_output: DispatchOutput,
     ) -> TypeGuard[MSCCLPPLLDispatchOutput]:
@@ -205,7 +197,6 @@ class DispatchOutputFormat(Enum):
     FLASHINFER = "flashinfer"
     DEEPEP_V2 = "deepep_v2"
     ASCEND_TP = "ascend_tp"
-    MSCCLPP = "mscclpp"
     MSCCLPP_LL_EXPERT_MAJOR = "mscclpp_ll_expert_major"
     MSCCLPP_LL_RANK_MAJOR = "mscclpp_ll_rank_major"
 
@@ -229,9 +220,6 @@ class DispatchOutputFormat(Enum):
 
     def is_flashinfer(self) -> bool:
         return self == DispatchOutputFormat.FLASHINFER
-
-    def is_mscclpp(self) -> bool:
-        return self == DispatchOutputFormat.MSCCLPP
 
     def is_mscclpp_ll(self) -> bool:
         return self in [
@@ -313,12 +301,6 @@ class CombineInputChecker:
         return combine_input.format == CombineInputFormat.FLASHINFER
 
     @staticmethod
-    def format_is_mscclpp(
-        combine_input: CombineInput,
-    ) -> TypeGuard[MSCCLPPCombineInput]:
-        return combine_input.format == CombineInputFormat.MSCCLPP
-
-    @staticmethod
     def format_is_mscclpp_ll(
         combine_input: CombineInput,
     ) -> TypeGuard[MSCCLPPLLCombineInput]:
@@ -352,7 +334,6 @@ class CombineInputFormat(Enum):
     FLASHINFER = "flashinfer"
     DEEPEP_V2 = "deepep_v2"
     ASCEND_TP = "ascend_tp"
-    MSCCLPP = "mscclpp"
     MSCCLPP_LL_EXPERT_MAJOR = "mscclpp_ll_expert_major"
     MSCCLPP_LL_RANK_MAJOR = "mscclpp_ll_rank_major"
 

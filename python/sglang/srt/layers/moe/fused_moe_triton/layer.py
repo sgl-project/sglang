@@ -14,6 +14,7 @@ from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
 from sglang.srt.configs.moe_model_registry import model_requires_fp32_silu_mul
 from sglang.srt.distributed import (
+    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -27,7 +28,6 @@ from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
     get_moe_runner_backend,
-    get_mscclpp_mode,
 )
 from sglang.srt.layers.moe.kt_ep_wrapper import (
     KTEPWrapperMethod,
@@ -238,7 +238,6 @@ def create_moe_dispatcher(
             num_local_experts=moe_runner_config.num_local_experts,
             hidden_size=moe_runner_config.hidden_size,
             params_dtype=moe_runner_config.params_dtype,
-            mscclpp_mode=get_mscclpp_mode(),
             output_layout=(
                 MSCCLPPOutputLayout.RANK_MAJOR
                 if is_mscclpp_ll_rank_major()
