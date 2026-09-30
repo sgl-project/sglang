@@ -110,8 +110,12 @@ class _SharedPageEnvelopeHostBacking:
             )
         ]
 
+        self.allocator = get_allocator_from_storage(allocator_type)
+
         if host_size == 0 and host_to_device_ratio == 0:
-            total_bytes = host_memory_budget_bytes()
+            total_bytes = host_memory_budget_bytes(
+                allocator=self.allocator, device=device_buffers[0].device
+            )
         elif host_size > 0:
             total_bytes = max(nominal_view_bytes)
         else:
@@ -125,7 +129,9 @@ class _SharedPageEnvelopeHostBacking:
                 f"Unified host backing size must be positive: {total_bytes}"
             )
 
-        available_bytes = host_memory_budget_bytes(total_bytes)
+        available_bytes = host_memory_budget_bytes(
+            total_bytes, allocator=self.allocator, device=device_buffers[0].device
+        )
         if total_bytes > available_bytes:
             raise ValueError(
                 "Not enough host memory for unified page-envelope backing. "
@@ -171,7 +177,6 @@ class _SharedPageEnvelopeHostBacking:
             self._allocatable_bytes = only_side.page_num * only_side.page_bytes
 
         self.pin_memory = pin_memory
-        self.allocator = get_allocator_from_storage(allocator_type)
         self.lock = threading.RLock()
         alloc_func = ALLOC_MEMORY_FUNCS[device_buffers[0].device]
         self.raw = alloc_func(

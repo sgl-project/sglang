@@ -15,7 +15,14 @@ def _unescape_mount_path(value: str) -> str:
     return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), value)
 
 
-def _cgroup_memory_headroom(proc_root: Path = Path("/proc")) -> int | None:
+def _cgroup_headroom(
+    controller: str,
+    limits_v2: tuple[str, ...],
+    usage_v2: str,
+    limits_v1: tuple[str, ...],
+    usage_v1: str,
+    proc_root: Path = Path("/proc"),
+) -> int | None:
     memberships = {}
     try:
         cgroups = (proc_root / "self/cgroup").read_text()
@@ -27,7 +34,7 @@ def _cgroup_memory_headroom(proc_root: Path = Path("/proc")) -> int | None:
         _, controllers, path = line.split(":", 2)
         if not controllers:
             memberships["cgroup2"] = PurePosixPath(path)
-        elif "memory" in controllers.split(","):
+        elif controller in controllers.split(","):
             memberships["cgroup"] = PurePosixPath(path)
 
     headroom = None
@@ -37,7 +44,7 @@ def _cgroup_memory_headroom(proc_root: Path = Path("/proc")) -> int | None:
         filesystem, _, options = after.split()[:3]
         if filesystem not in memberships:
             continue
-        if filesystem == "cgroup" and "memory" not in options.split(","):
+        if filesystem == "cgroup" and controller not in options.split(","):
             continue
         fields = before.split()
         root = PurePosixPath(_unescape_mount_path(fields[3]))
@@ -52,25 +59,19 @@ def _cgroup_memory_headroom(proc_root: Path = Path("/proc")) -> int | None:
         else:
             continue
         if ".." in relative.parts:
-            raise ValueError(f"Cannot resolve cgroup memory path: {membership}")
+            raise ValueError(f"Cannot resolve cgroup {controller} path: {membership}")
         directory = mount / relative
         if not directory.is_dir():
             continue
         resolved = True
-        limits = (
-            ("memory.max", "memory.high")
-            if filesystem == "cgroup2"
-            else ("memory.limit_in_bytes",)
-        )
-        usage_name = (
-            "memory.current" if filesystem == "cgroup2" else "memory.usage_in_bytes"
-        )
+        limits = limits_v2 if filesystem == "cgroup2" else limits_v1
+        usage_name = usage_v2 if filesystem == "cgroup2" else usage_v1
         while True:
             for name in limits:
                 try:
                     value = (directory / name).read_text().strip()
                 except FileNotFoundError:
-                    # The hierarchy root may not have memory controller files.
+                    # The hierarchy root may not have controller files.
                     continue
                 if value == "max":
                     continue
@@ -85,9 +86,43 @@ def _cgroup_memory_headroom(proc_root: Path = Path("/proc")) -> int | None:
             directory = directory.parent
     if memberships and not resolved:
         raise RuntimeError(
-            "Cannot locate the process memory cgroup in mounted cgroup filesystems"
+            f"Cannot locate the process {controller} cgroup in mounted cgroup "
+            "filesystems"
         )
     return headroom
+
+
+def _cgroup_memory_headroom(proc_root: Path = Path("/proc")) -> int | None:
+    return _cgroup_headroom(
+        "memory",
+        ("memory.max", "memory.high"),
+        "memory.current",
+        ("memory.limit_in_bytes",),
+        "memory.usage_in_bytes",
+        proc_root,
+    )
+
+
+def cgroup_hugetlb_headroom_bytes(
+    page_size: int, proc_root: Path = Path("/proc")
+) -> int | None:
+    """Bytes the hugetlb allowed by the cgroup controller.
+
+    None when no limit applies (controller unmounted, or every ancestor unlimited).
+    """
+    if page_size % 1024**3 == 0:
+        label = f"{page_size // 1024**3}GB"
+    else:
+        label = f"{page_size // 1024**2}MB"
+    prefix = f"hugetlb.{label}"
+    return _cgroup_headroom(
+        "hugetlb",
+        (f"{prefix}.max",),
+        f"{prefix}.current",
+        (f"{prefix}.limit_in_bytes",),
+        f"{prefix}.usage_in_bytes",
+        proc_root,
+    )
 
 
 def available_host_memory_bytes() -> int:
