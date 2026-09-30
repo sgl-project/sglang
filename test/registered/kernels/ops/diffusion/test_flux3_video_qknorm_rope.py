@@ -1,5 +1,7 @@
 """Bit-exact FLUX 3 video VAE QKV RMSNorm + rotate-half RoPE."""
 
+import sys
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -94,3 +96,7 @@ def test_natten_prepare_qkv_matches_eager_and_reuses_rope_cache():
     again_cos, again_sin = block.rope.cos_sin(1, 8, 8, x.dtype, x.device)
     assert cos.data_ptr() == again_cos.data_ptr()
     assert sin.data_ptr() == again_sin.data_ptr()
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
