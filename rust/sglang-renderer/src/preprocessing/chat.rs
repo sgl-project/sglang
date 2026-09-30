@@ -17,11 +17,12 @@ use dynamo_renderer::{
 };
 use minijinja::Value;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::Value as JsonValue;
+use sglang_processor::{OneOrMany as ProcessorOneOrMany, dynamo_tool_parser_name};
 
-use crate::ChatResponseProcessor;
 use crate::{
-    ChatFormatter, GenerateRequestMetadata, GenerationOptions, OneOrMany, RendererConfig,
-    RendererError, SamplingParams, TextRequest,
+    ChatFormatter, ChatResponseProcessor, GenerateRequestMetadata, GenerationOptions, OneOrMany,
+    RendererConfig, RendererError, SamplingParams, TextRequest,
 };
 
 use super::{GenerateRequestIdentity, TextRequestGroup};
@@ -75,9 +76,9 @@ impl<'de> Deserialize<'de> for ReasoningEffort {
     where
         D: Deserializer<'de>,
     {
-        let value = serde_json::Value::deserialize(deserializer)?;
+        let value = JsonValue::deserialize(deserializer)?;
         match value {
-            serde_json::Value::String(value) => {
+            JsonValue::String(value) => {
                 let effort = match value.as_str() {
                     "none" => Some(Self::None),
                     "minimal" => Some(Self::Minimal),
@@ -96,13 +97,13 @@ impl<'de> Deserialize<'de> for ReasoningEffort {
                 })?;
                 numeric_reasoning_effort(numeric).map_err(serde::de::Error::custom)
             }
-            serde_json::Value::Number(value) => {
+            JsonValue::Number(value) => {
                 let numeric = value.as_f64().ok_or_else(|| {
                     serde::de::Error::custom("reasoning_effort must be a finite number")
                 })?;
                 numeric_reasoning_effort(numeric).map_err(serde::de::Error::custom)
             }
-            serde_json::Value::Bool(_) => Err(serde::de::Error::custom(
+            JsonValue::Bool(_) => Err(serde::de::Error::custom(
                 "reasoning_effort must not be a boolean",
             )),
             _ => Err(serde::de::Error::custom(
@@ -136,7 +137,7 @@ pub struct ChatRequest {
     pub response_format: Option<ResponseFormat>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub continue_final_message: bool,
-    pub chat_template_args: Option<HashMap<String, serde_json::Value>>,
+    pub chat_template_args: Option<HashMap<String, JsonValue>>,
     pub sampling_params: SamplingParams,
     pub choice_count: usize,
     pub stream: bool,
@@ -183,7 +184,7 @@ impl OAIChatLikeRequest for ChatRequest {
         !self.continue_final_message
     }
 
-    fn chat_template_args(&self) -> Option<&HashMap<String, serde_json::Value>> {
+    fn chat_template_args(&self) -> Option<&HashMap<String, JsonValue>> {
         self.chat_template_args.as_ref()
     }
 }
@@ -206,7 +207,7 @@ pub struct ChatPreprocessor {
     formatter_error: Option<String>,
     tool_call_parser: Option<String>,
     reasoning_parser: Option<String>,
-    default_chat_template_kwargs: HashMap<String, serde_json::Value>,
+    default_chat_template_kwargs: HashMap<String, JsonValue>,
 }
 
 impl ChatPreprocessor {
@@ -455,10 +456,10 @@ fn validate_chat(request: &ChatRequest) -> Result<(), RendererError> {
     Ok(())
 }
 
-fn contains_media(value: &serde_json::Value) -> bool {
+fn contains_media(value: &JsonValue) -> bool {
     match value {
-        serde_json::Value::Array(values) => values.iter().any(contains_media),
-        serde_json::Value::Object(object) => {
+        JsonValue::Array(values) => values.iter().any(contains_media),
+        JsonValue::Object(object) => {
             object.keys().any(|key| {
                 matches!(
                     key.as_str(),
@@ -475,8 +476,8 @@ fn merge_template_stops(sampling: &mut SamplingParams, formatter: Option<&ChatFo
         return;
     };
     let mut stops = match template_stops {
-        sglang_processor::OneOrMany::One(stop) => vec![stop],
-        sglang_processor::OneOrMany::Many(stops) => stops,
+        ProcessorOneOrMany::One(stop) => vec![stop],
+        ProcessorOneOrMany::Many(stops) => stops,
     };
     if let Some(request_stops) = sampling.stop.take() {
         match request_stops {
@@ -509,8 +510,6 @@ fn chat_tool_definitions(request: &ChatRequest) -> Vec<ToolDefinition> {
         })
         .collect()
 }
-
-use sglang_processor::dynamo_tool_parser_name;
 
 fn dynamo_tool_choice(choice: &Option<ChatCompletionToolChoiceOption>) -> DynamoToolChoice {
     match choice {
@@ -746,7 +745,7 @@ mod tests {
         )
         .unwrap();
 
-        let schema: serde_json::Value =
+        let schema: JsonValue =
             serde_json::from_str(sampling.json_schema.as_deref().unwrap()).unwrap();
         assert_eq!(schema["minItems"], 1);
         assert_eq!(schema["maxItems"], 1);
@@ -820,7 +819,7 @@ mod tests {
         disabled_request.reasoning_effort = Some(ReasoningEffort::Max);
         disabled_request.chat_template_args = Some(HashMap::from([(
             "enable_thinking".into(),
-            serde_json::Value::Bool(false),
+            JsonValue::Bool(false),
         )]));
         let disabled = preprocessor.preprocess(disabled_request).unwrap();
         assert!(!disabled.text_requests[0].options.require_reasoning);
