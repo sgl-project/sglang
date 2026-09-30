@@ -23,7 +23,7 @@ from sglang.srt.speculative.dspark_components.dspark_target_kv_contract import (
 from sglang.srt.training_capture.protocol import digest_bytes
 from sglang.srt.utils import kill_process_tree
 from sglang.test import test_utils
-from sglang.test.dspark_capture_observer import check_speculative_snapshot
+from sglang.test.dspark_capture_observer import check_capture_snapshot
 
 
 def export_synthetic_kv_draft(model_path, destination, manifest, tensors):
@@ -294,7 +294,7 @@ def exercise_target_kv_draft(
             [result["output_ids"] for result in results],
         )
         for manifest, tensors in captured:
-            check_speculative_snapshot(test, manifest, tensors, references)
+            check_capture_snapshot(test, manifest, tensors, references)
         test.assertIn(
             "eos", [manifest.sequence.stop_reason for manifest, _ in captured]
         )

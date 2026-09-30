@@ -402,6 +402,7 @@ class TpModelWorker(BaseTpWorker):
             tokenizer_path=get_serving().tokenizer_path,
             pool=self.model_runner.token_to_kv_pool,
             req_to_token=self.model_runner.req_to_token_pool,
+            enable_overlap=self.enable_overlap,
         )
 
     def alloc_memory_pool(

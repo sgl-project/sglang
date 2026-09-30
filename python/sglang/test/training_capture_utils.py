@@ -132,6 +132,38 @@ class VerifyCaptureFixture:
         self.coordinator.on_release(self.request)
 
 
+class OverlapCaptureFixture:
+    def __init__(self, coordinator, request):
+        self.coordinator, self.request = coordinator, request
+        coordinator.enable_overlap = True
+        request.req_pool_idx = 0
+        self.slots = torch.tensor([7, 3, 6, 1, 9, 5, 8, 2])
+        coordinator.req_to_token = SimpleNamespace(req_to_token=self.slots[None])
+        coordinator.before_forward([request])
+        self.record = request.training_capture_context
+        for index, buffer in enumerate(coordinator.exporter.buffers.values()):
+            buffer.copy_(torch.arange(buffer.numel()).view_as(buffer) + index * 256)
+        self.sources = {k: v.clone() for k, v in coordinator.exporter.buffers.items()}
+
+    def forward(self, end):
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        extend = end == 2
+        return self.coordinator.after_forward(
+            SimpleNamespace(
+                reqs=[self.request],
+                seq_lens_cpu=[end],
+                forward_mode=ForwardMode.EXTEND if extend else ForwardMode.DECODE,
+            ),
+            SimpleNamespace(
+                extend_seq_lens_cpu=[2],
+                positions=torch.arange(0 if extend else end - 1, end),
+            ),
+            SimpleNamespace(next_token_logits=torch.arange(256).float()[None] + end),
+            can_run_cuda_graph=False,
+        )
+
+
 def make_kv_spec():
     rope = {
         "type": "default",

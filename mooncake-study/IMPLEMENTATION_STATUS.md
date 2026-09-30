@@ -35,7 +35,8 @@ it does not redefine the goal as the modules already implemented.
 | Real model identity/parity | Weight/tokenizer artifact digests, actual selected-layer geometry, K norm and RoPE | Captured KV and teacher scores match online tensors exactly; full-vocabulary LSE matches within 1e-5; HF teacher logits pass numerical comparison, but cross-engine KV equivalence is not certified |
 | Draft serving | Explicit KV-input architecture, contract, encoder, incremental injector and invalidation | Real Qwen3 target plus synthetic KV draft passes ordinary/batched/graph generation and per-layer projected-KV checks; full SpecForge backbone/logit parity remains open |
 | Speculative collection | Static DSpark raw verify ticket, commit mapping and terminal truncation | Actual KV-input draft requests publish and read back through Mooncake in ordinary and graph modes; see evidence below |
-| Deployment coverage | Partial | TP/PP, overlap, non-static speculative verify, PD, RDMA and workload SLO gates remain open |
+| Overlap collection | AR lookahead ledger, capacity boundary and terminal trimming | Real ordinary/graph requests, padded batches, prefix remapping, delayed grammar and abort checks pass; speculative overlap remains open |
+| Deployment coverage | Partial | TP/PP, speculative overlap, non-static speculative verify, PD, RDMA and workload SLO gates remain open |
 
 Initial test evidence (shared lab state under
 `/gpfs/users/fuxuanwei-1/dspark-maas-lab/state`):
@@ -205,21 +206,84 @@ Evidence:
 
 The speculative observer independently reads the target pool and full vocabulary
 outputs before their reuse, then reconstructs the final path from returned token
-IDs. It does not use acceptance tickets, the KV exporter or captured top-k
+IDs. It does not use acceptance tickets, call the KV exporter or read captured top-k
 tensors. Unlike the earlier AR attention-input observer, this speculative KV
 reference reads the pool, so it verifies selection/copy/lifetime, not the
 attention backend's pool-write correctness. Test observers add synchronous work;
 these runs are correctness evidence, not SLO measurements. Catalog is still a
 test double and transport is TCP.
 
+## Autoregressive Overlap Collection
+
+The AR producer now accepts the normal overlap scheduler. `TpModelWorker` passes
+the actual overlap setting to the coordinator. Forward-stream capture can lead
+CPU result processing by one iteration: the next token's KV and prediction may
+already have been copied when the previous result finishes the request.
+Finalization trims the owned ranges to `output_ids_through_stop`; it retains a
+computed final token's KV without adding a target forward. At exact Host capacity,
+the lookahead's out-of-sample teacher row is skipped. A regressing output boundary
+fails capture instead of publishing stale tokens.
+
+Each context's latest CUDA event fences all its queued copies on the forward
+stream. The writer waits on that event before reading a sealed snapshot or
+reporting an aborted capture and recycling its Host slot. No ScheduleBatch is
+retained by the writer. `/server_info` reports `enable_overlap` and the
+`overlap_forwards` counter. Speculative overlap is still rejected separately.
+
+The shared test observer follows actual forward input tokens/positions, since
+`Req.output_ids` can lag in this mode. It preserves the first observed KV per
+logical position. `RadixCache.cache_unfinished_req` can subsequently replace
+duplicate-prefix slots; those canonical values can differ numerically across
+batch shapes. Re-reading a later mapping must not overwrite an earlier reference
+snapshot. The test records source slots and asserts real remapping occurs while
+the stored first observations remain exact, with no relaxed KV tolerance.
+
+Evidence:
+
+- `01790808100024882127-b3690db9c7bf`: 40 capture tests and 47 subtests passed
+  in 18.65s. New coordinator cases cover delayed result finalization, lookahead at
+  exact capacity and abort with pending results.
+- `01790808330614519203-7b105437c401`: focused regression passed with 114 tests
+  and 78 subtests in 20.68s. This includes the added CUDA test that queues two
+  capture steps on a forward stream, finalizes on the CPU and verifies the writer
+  waits for the latest copy event rather than the earlier step's event.
+- `01790808330481545652-b43afe6cb9c2`: the initial runtime driver submitted a
+  three-request batch without waiting for three spare capture reservations;
+  eight of nine expected samples published. The driver now waits for its required
+  admission capacity and asserts cumulative admission counts after each request.
+- `01790808583474243750-18ea6add90b5`: all nine AR overlap samples published.
+  The reference checker then exposed its own later-prefix overwrite at position
+  159. The checker now preserves first observations and tracks physical remaps.
+- `01790808873573886521-9c2ba12f38dc`: full runtime test passed in 218.712s.
+  It validates 42 snapshots: six ordinary AR, 18 overlap AR and 18 static DSpark.
+  Each overlap mode publishes nine completed samples, reports 43 capture forwards
+  including the aborted request, and confirms six logical positions changed
+  physical slots after their first observation. Graph mode executes 34 actual
+  replays, including a three-request batch padded to the four-row graph. Exact
+  capacity, EOS, delayed grammar sampling and one-step CPU result lag all pass.
+  Both streamed aborts reach fenced `FAILED` Catalog state and publish no sample.
+  Completed overlap snapshots remain readable after producer exit. The existing
+  speculative cases still pass with 24 graph replays in their graph mode.
+
+Changed capture code/tests pass Ruff F/I checks, added helpers pass full Ruff,
+and `git diff --check` passes. The original worktree's staged diff hash is
+unchanged. These results cover AR overlap on the resident H100 and Qwen3-0.6B;
+they do not certify speculative overlap or multi-rank ownership.
+
+These observers synchronously read raw outputs and pool rows to validate data;
+they do not establish overlap performance, latency SLOs or arbitrary-backend
+numerical equivalence. The production capture path still uses its asynchronous
+copies and background writer. Catalog remains a test double and Store transport
+remains TCP.
+
 ## Next Implementation
 
-1. Broaden real-request coverage to batching, padded/prefill graphs, cancellation,
-   retraction, cache eviction, weight replacement and saturated backpressure.
+1. Broaden real-request coverage to prefill graphs, real retraction, cache eviction,
+   target weight replacement, speculative cancellation and saturated backpressure.
 2. Complete P8's fixed-input backbone/logit parity against the training side,
    exporter compatibility and artifact/quality validation. Broaden the runtime
    lifecycle tests to cache eviction, cancellation and real request retraction.
-3. Complete P9's topology work: TP/PP, overlap, non-static speculative layouts,
+3. Complete P9's topology work: TP/PP, speculative overlap, non-static speculative layouts,
    PD transfer and cross-node RDMA. Existing capability gates do
    not constitute implementation of these paths.
 4. Complete P10's adaptive capture limits, metrics, capture-on/off SLO benchmarks

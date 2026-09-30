@@ -82,7 +82,15 @@ class VerifyCaptureBatch(msgspec.Struct, frozen=True):
 class CaptureCoordinator:
     @classmethod
     def create(
-        cls, *, config_path, model, model_config, tokenizer_path, pool, req_to_token
+        cls,
+        *,
+        config_path,
+        model,
+        model_config,
+        tokenizer_path,
+        pool,
+        req_to_token,
+        enable_overlap=False,
     ):
         if config_path is None:
             return None
@@ -125,6 +133,7 @@ class CaptureCoordinator:
                 req_to_token=req_to_token,
                 store=store,
                 catalog=catalog,
+                enable_overlap=enable_overlap,
                 capture_mode=(
                     "speculative_accepted_target_path"
                     if get_spec().speculative_algorithm == "DSPARK"
@@ -149,9 +158,11 @@ class CaptureCoordinator:
         catalog,
         pin_memory=True,
         capture_mode="autoregressive",
+        enable_overlap=False,
     ):
         self.config, self.teacher, self.kv = config, teacher, kv
         self.capture_mode = capture_mode
+        self.enable_overlap = enable_overlap
         self.exporter, self.req_to_token = exporter, req_to_token
         self.store, self.catalog = store, catalog
         self.pool = HostBufferPool(
@@ -198,6 +209,7 @@ class CaptureCoordinator:
             return {
                 "counters": dict(self.counters),
                 "disabled_reason": self.disabled_reason,
+                "enable_overlap": self.enable_overlap,
                 "reservations": len(self.records),
                 "states": dict(
                     Counter(record.state for record in self.records.values())
@@ -446,6 +458,10 @@ class CaptureCoordinator:
                         start=end - extend_len,
                     )
                     prediction = end if end >= context.prompt_length else None
+                    if self.enable_overlap and end == context.max_tokens:
+                        # This lookahead forwarded the last possible output token;
+                        # its prediction cannot belong to the bounded sample.
+                        prediction = None
                     steps.append(CaptureStep(req, record, prediction))
                     if prediction is not None:
                         teacher_indices.append(row)
@@ -470,6 +486,8 @@ class CaptureCoordinator:
                     if req.training_capture_context is record:
                         self._fail_request(req, record, "teacher_capture_failed")
         if steps:
+            if self.enable_overlap:
+                self._count("overlap_forwards")
             self._count(
                 "cuda_graph_forwards" if can_run_cuda_graph else "eager_forwards"
             )
@@ -594,6 +612,8 @@ class CaptureCoordinator:
         context = record.context
         committed = len(context.token_ids) - context.prompt_length
         outputs = req.output_ids_through_stop
+        if len(outputs) < committed:
+            raise ContractError("scheduler output regressed behind committed capture")
         for index in range(committed, len(outputs)):
             context.commit_token(
                 position=context.prompt_length + index,
@@ -641,7 +661,10 @@ class CaptureCoordinator:
             return
         try:
             self._commit(req, record)
-            if record.provenance.capture_mode == "speculative_accepted_target_path":
+            if (
+                self.enable_overlap
+                or record.provenance.capture_mode == "speculative_accepted_target_path"
+            ):
                 record.context.trim_terminal_prefix()
             if isinstance(req.finished_reason, FINISH_LENGTH):
                 reason = "length"

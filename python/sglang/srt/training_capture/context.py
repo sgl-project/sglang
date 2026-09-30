@@ -132,7 +132,7 @@ class RequestCaptureContext:
         self.teacher_rows += count
 
     def trim_terminal_prefix(self):
-        """Discard verify suffixes past the scheduler's final output boundary."""
+        """Discard lookahead/verify suffixes past the scheduler's output boundary."""
         self._collecting()
         n = len(self.token_ids)
         response_length = n - self.prompt_length

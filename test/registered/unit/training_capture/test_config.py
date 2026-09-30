@@ -56,6 +56,8 @@ class TestCaptureConfiguration(CustomTestCase):
 
     def test_plain_ar_and_disabled_mode(self):
         validate_capture_server_args(self.args)
+        self.args.disable_overlap_schedule = False
+        validate_capture_server_args(self.args)
         self.args.training_capture_config = None
         self.args.tp_size = 8
         self.args.disable_overlap_schedule = False
@@ -67,7 +69,6 @@ class TestCaptureConfiguration(CustomTestCase):
             "pp_size": 2,
             "dp_size": 2,
             "dcp_size": 2,
-            "disable_overlap_schedule": False,
             "speculative_algorithm": "DSpark",
             "disaggregation_mode": "decode",
             "enable_unified_memory": True,
@@ -97,6 +98,10 @@ class TestCaptureConfiguration(CustomTestCase):
             patch.object(envs.SGLANG_SIMULATE_ACC_LEN, "get", return_value=0),
         ):
             validate_capture_server_args(self.args)
+            self.args.disable_overlap_schedule = False
+            with self.assertRaisesRegex(ValueError, "speculative overlap scheduling"):
+                validate_capture_server_args(self.args)
+            self.args.disable_overlap_schedule = True
             for mode in ("compact", "cap-accept"):
                 with (
                     self.subTest(mode=mode),

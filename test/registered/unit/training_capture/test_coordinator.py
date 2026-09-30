@@ -19,6 +19,7 @@ from sglang.test.training_capture_utils import (
     BufferStore,
     CaptureTestRequest,
     FakeReplicateConfig,
+    OverlapCaptureFixture,
     VerifyCaptureFixture,
     make_snapshot,
     read_snapshot,
@@ -79,6 +80,80 @@ class TestCaptureCoordinator(CustomTestCase):
 
     def request(self, rid):
         return CaptureTestRequest(rid)
+
+    def test_overlap_finalizes_previous_result_with_owned_lookahead_kv(self):
+        from sglang.srt.managers.schedule_batch import FINISH_LENGTH
+
+        self.wait_until(lambda: len(self.coordinator.available) == 1)
+        req = CaptureTestRequest("lookahead", 1)
+        fixture = OverlapCaptureFixture(self.coordinator, req)
+        previous = fixture.forward(2)
+        lookahead = fixture.forward(3)
+        req.output_ids = [10]
+        req.finished_len = 1
+        req.finished_reason = FINISH_LENGTH(1)
+        self.coordinator.after_result(previous)
+        for source in self.coordinator.exporter.buffers.values():
+            source.zero_()
+        self.coordinator.after_result(lookahead)
+        manifest, tensors = read_snapshot(
+            self.store, self.catalog.wait_publications(1)[0]
+        )
+        self.assertEqual(manifest.sequence.response_length, 1)
+        self.assertEqual(tensors["token_ids"].tolist(), [3, 4, 10])
+        self.assertEqual(tensors["kv_valid"].tolist(), [1, 1, 1])
+        self.assertEqual(tensors["logits_positions"].tolist(), [2])
+        torch.testing.assert_close(
+            tensors["teacher_topk_logits"][0], torch.arange(255, 127, -1).float() + 2
+        )
+        for name, source in fixture.sources.items():
+            torch.testing.assert_close(
+                tensors[name], source[fixture.slots[:3]], rtol=0, atol=0
+            )
+
+    def test_overlap_at_exact_capacity_preserves_all_required_teacher_rows(self):
+        from sglang.srt.managers.schedule_batch import FINISH_LENGTH
+
+        self.wait_until(lambda: len(self.coordinator.available) == 1)
+        req = CaptureTestRequest("capacity", 6)
+        fixture = OverlapCaptureFixture(self.coordinator, req)
+        previous = fixture.forward(2)
+        for end in range(3, 9):
+            current = fixture.forward(end)
+            req.output_ids.append(end + 7)
+            if end == 8:
+                req.finished_len = 6
+                req.finished_reason = FINISH_LENGTH(6)
+            self.coordinator.after_result(previous)
+            previous = current
+        self.coordinator.after_result(previous)
+        manifest, tensors = read_snapshot(
+            self.store, self.catalog.wait_publications(1)[0]
+        )
+        self.assertEqual(manifest.sequence.total_length, 8)
+        self.assertEqual(tensors["token_ids"].tolist(), [3, 4, 10, 11, 12, 13, 14, 15])
+        self.assertEqual(tensors["logits_positions"].tolist(), list(range(2, 8)))
+        self.assertEqual(tensors["kv_valid"].tolist(), [1] * 8)
+        self.assertEqual(self.coordinator.stats()["counters"]["overlap_forwards"], 7)
+
+    def test_overlap_abort_with_pending_forward_never_publishes(self):
+        from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+        self.wait_until(lambda: len(self.coordinator.available) == 1)
+        req = self.request("aborted-lookahead")
+        fixture = OverlapCaptureFixture(self.coordinator, req)
+        previous = fixture.forward(2)
+        lookahead = fixture.forward(3)
+        req.finished_reason = FINISH_ABORT()
+        self.coordinator.on_release(req)
+        self.coordinator.after_result(previous)
+        self.coordinator.after_result(lookahead)
+        self.wait_until(lambda: fixture.record.state == "done")
+        self.assertFalse(self.catalog.publications)
+        self.assertEqual(
+            self.catalog.captures[fixture.record.lease.capture_id]["reason"],
+            "request_aborted_or_retracted",
+        )
 
     def test_verify_reject_owns_raw_teacher_and_only_committed_kv(self):
         self.wait_until(lambda: len(self.coordinator.available) == 1)

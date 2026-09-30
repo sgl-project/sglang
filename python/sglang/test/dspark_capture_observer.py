@@ -10,14 +10,35 @@ from sglang.srt.runtime_context import get_spec
 from sglang.srt.training_capture.coordinator import CaptureCoordinator
 
 _sequence = itertools.count()
+_token_prefixes = {}
 _after_forward = CaptureCoordinator.after_forward
 _after_verify_forward = CaptureCoordinator.after_verify_forward
 
 
-def observe(coordinator, batch, forward_batch, logits_output, width=None):
-    root = Path(get_spec().speculative_draft_model_path) / "capture-reference"
+def observe(
+    coordinator,
+    batch,
+    forward_batch,
+    logits_output,
+    width=None,
+    can_run_cuda_graph=False,
+):
+    draft_path = get_spec().speculative_draft_model_path
+    root = (
+        Path(draft_path)
+        if draft_path
+        else Path(coordinator.config.journal_directory).parent
+    ) / "capture-reference"
     root.mkdir(exist_ok=True)
+    offset = 0
     for row, req in enumerate(batch.reqs):
+        count = width or (
+            forward_batch.extend_seq_lens_cpu[row]
+            if batch.forward_mode.is_extend()
+            else 1
+        )
+        region = slice(offset, offset + count)
+        offset += count
         if req.training_capture_context is None:
             continue
         end = int(batch.seq_lens_cpu[row])
@@ -25,7 +46,18 @@ def observe(coordinator, batch, forward_batch, logits_output, width=None):
         if width is None:
             start = 0
             slots = coordinator.req_to_token.req_to_token[req.req_pool_idx, :end]
-            tokens = tokens[:end]
+            history = _token_prefixes.setdefault(req.rid, list(req.origin_input_ids))
+            for position, token in zip(
+                forward_batch.positions[region].tolist(),
+                forward_batch.input_ids[region].tolist(),
+                strict=True,
+            ):
+                if position == len(history):
+                    history.append(token)
+                else:
+                    assert history[position] == token
+            tokens = history[:end]
+            assert len(tokens) == end
             predictions = [end] if end >= len(req.origin_input_ids) else []
             logits = logits_output.next_token_logits[row : row + len(predictions)]
         else:
@@ -40,8 +72,12 @@ def observe(coordinator, batch, forward_batch, logits_output, width=None):
         torch.save(
             {
                 "trace_id": hashlib.sha256(req.rid.encode()).hexdigest(),
+                "result_lag": end - len(req.origin_input_ids) - len(req.output_ids),
+                "batch_size": len(batch.reqs),
+                "cuda_graph": can_run_cuda_graph,
                 "tokens": tokens,
                 "kv_start": start,
+                "kv_slots": slots.long().cpu(),
                 "kv": {
                     name: buffer[slots.long()].cpu()
                     for name, buffer in coordinator.exporter.buffers.items()
@@ -54,12 +90,25 @@ def observe(coordinator, batch, forward_batch, logits_output, width=None):
 
 
 def after_forward(self, batch, forward_batch, logits_output, **kwargs):
-    observe(self, batch, forward_batch, logits_output)
+    observe(
+        self,
+        batch,
+        forward_batch,
+        logits_output,
+        can_run_cuda_graph=kwargs.get("can_run_cuda_graph", False),
+    )
     return _after_forward(self, batch, forward_batch, logits_output, **kwargs)
 
 
 def after_verify_forward(self, batch, forward_batch, logits_output, **kwargs):
-    observe(self, batch, forward_batch, logits_output, width=kwargs["width"])
+    observe(
+        self,
+        batch,
+        forward_batch,
+        logits_output,
+        width=kwargs["width"],
+        can_run_cuda_graph=kwargs["can_run_cuda_graph"],
+    )
     return _after_verify_forward(self, batch, forward_batch, logits_output, **kwargs)
 
 
@@ -68,7 +117,14 @@ def install_capture_observer():
     CaptureCoordinator.after_verify_forward = after_verify_forward
 
 
-def check_speculative_snapshot(test, manifest, tensors, references):
+def check_capture_snapshot(
+    test,
+    manifest,
+    tensors,
+    references,
+    *,
+    capture_mode="speculative_accepted_target_path",
+):
     tokens = tensors["token_ids"].tolist()
     teacher, kv = {}, {}
     for item in references:
@@ -86,10 +142,12 @@ def check_speculative_snapshot(test, manifest, tensors, references):
                 position < len(tokens)
                 and item["tokens"][: position + 1] == tokens[: position + 1]
             ):
-                kv[position] = {name: value[row] for name, value in item["kv"].items()}
-    test.assertEqual(
-        manifest.provenance.capture_mode, "speculative_accepted_target_path"
-    )
+                # Prefix dedup may remap a row after it has been copied. The
+                # sample retains its first observation, just like draft context.
+                kv.setdefault(
+                    position, {name: value[row] for name, value in item["kv"].items()}
+                )
+    test.assertEqual(manifest.provenance.capture_mode, capture_mode)
     test.assertEqual(tensors["position_ids"].tolist(), list(range(len(tokens))))
     test.assertEqual(
         tensors["loss_mask"].tolist(),

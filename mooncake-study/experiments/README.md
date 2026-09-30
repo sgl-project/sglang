@@ -55,6 +55,20 @@ test snapshot lifetime. It starts one observed ordinary SGLang server and then
 one normal CUDA-graph SGLang server. Synthetic request tokens and temporary
 model-observer dumps stay inside the test's temporary directory.
 
+Two AR overlap servers then run with ordinary execution and decode CUDA graphs.
+They check one-iteration result lag, three-request batches padded to a four-row
+graph, prefix dedup/remapping, exact Host capacity, EOS, delayed grammar sampling
+and a streamed request aborted while results are pending. Each mode waits for the
+abort's fenced Catalog failure and reads its completed snapshots after producer
+exit. The correctness driver waits for enough spare capture reservations before
+each request/batch; it is not a saturation or throughput benchmark.
+
+The overlap observer follows actual forward input tokens and preserves the first
+KV observation for each position, because later Radix prefix dedup can change the
+physical mapping. It reads raw vocabulary scores before serving-side processing.
+Its synchronous reads are test-only. Ordinary AR capture supports default overlap
+scheduling; static DSpark capture still requires `--disable-overlap-schedule`.
+
 `diagnose_qwen3_kv.py` compares HF eager/SDPA and BF16/FP32 without any Mooncake
 or capture code. Reloading each dtype is intentional: casting an entire model
 to BF16 would also narrow FP32 RoPE frequency buffers and invalidate the
