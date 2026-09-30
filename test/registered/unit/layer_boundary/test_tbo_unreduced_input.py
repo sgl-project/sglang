@@ -9,7 +9,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.batch_overlap import two_batch_overlap as tbo
-from sglang.srt.layers.layer_boundary import ADD, Layout, UnreducedOutput
+from sglang.srt.layers.layer_boundary import PLAIN_ADD, Layout, UnreducedOutput
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.utils import empty_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -23,7 +23,9 @@ class TestTboEntryReducesItsInput(CustomTestCase):
         group = SimpleNamespace(all_reduce=lambda x: x * 2)
         residual = torch.ones(4, 3)
         stream = ResidualStream(residual)
-        hidden = stream.leave(UnreducedOutput(torch.ones(4, 3), group=group), ADD)
+        hidden = stream.record(
+            UnreducedOutput(torch.ones(4, 3), group=group), PLAIN_ADD
+        )
         batch = SimpleNamespace(residual_stream=stream, global_forward_mode=None)
         parts_seen = []
 
@@ -48,7 +50,7 @@ class TestTboEntryReducesItsInput(CustomTestCase):
                 state = part["forward_batch"].residual_stream
                 value = part["hidden_states"]
                 self.assertIsNot(state.pending, stream.pending)
-                self.assertIs(state.pending.update, ADD)
+                self.assertIs(state.pending.update, PLAIN_ADD)
                 with self.assertRaises(RuntimeError):
                     state.input(
                         inputs_arr[1 if part is inputs_arr[0] else 0]["hidden_states"]
@@ -56,7 +58,7 @@ class TestTboEntryReducesItsInput(CustomTestCase):
                 value, old_residual = state.input(value)
                 torch.testing.assert_close(value, torch.full((2, 3), 2.0))
                 state.write(value + old_residual)
-                part["hidden_states"] = state.leave(value * 5, ADD)
+                part["hidden_states"] = state.record(value * 5, PLAIN_ADD)
             return inputs_arr
 
         with (
@@ -93,7 +95,7 @@ class TestTboEntryReducesItsInput(CustomTestCase):
         self.assertTrue(
             all(part["forward_batch"].residual_stream is None for part in parts_seen)
         )
-        self.assertIs(output.pending.update, ADD)
+        self.assertIs(output.pending.update, PLAIN_ADD)
         self.assertIs(output.pending.value, merged)
         torch.testing.assert_close(merged, torch.full((4, 3), 10.0))
         torch.testing.assert_close(output.residual, torch.full((4, 3), 3.0))
