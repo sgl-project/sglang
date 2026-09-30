@@ -30,6 +30,9 @@ from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (  # noqa:
     CakeKDAKernel,
     _get_flashinfer_prepared_bf16_prefill,
 )
+from sglang.srt.layers.attention.linear.kernels import (  # noqa: E402
+    kda_flashinfer as kda_flashinfer_module,
+)
 from sglang.srt.layers.attention.linear.kernels.kda_triton import (  # noqa: E402
     TritonKDAKernel,
 )
@@ -156,6 +159,42 @@ def test_kda_prefill_prepared_export_matches_triton(num_heads, seq_lens):
     untouched = torch.ones(state_cake.shape[0], dtype=torch.bool, device="cuda")
     untouched[idx] = False
     assert torch.equal(state_cake[untouched], data["state"][untouched])
+
+
+@pytest.mark.parametrize(
+    "num_heads,seq_lens",
+    [
+        (16, [96]),
+        (8, [17, 64, 65, 127, 128, 255]),
+        (16, [8192]),
+    ],
+)
+def test_kda_prefill_prepared_tf32_export_matches_triton(num_heads, seq_lens):
+    """``--kda-cake-prefill-precision tf32`` runs the TF32 prepared export on
+    the same FP32 state pool and matches Triton within the BF16 tolerance."""
+    if kda_flashinfer_module._flashinfer_prepare_tf32_kda_prefill is None:
+        pytest.skip("installed FlashInfer lacks prepare_tf32_kda_prefill")
+    torch.manual_seed(1000 + num_heads + sum(seq_lens))
+    data = _make_inputs(seq_lens, num_heads)
+    state_triton = data["state"].clone()
+    state_cake = data["state"].clone()
+    output_triton = _extend(TritonKDAKernel(), data, state_triton, seq_lens)
+    with (
+        patch.dict(os.environ, {"SGLANG_KDA_CAKE_PREFILL_PRECISION": "tf32"}),
+        patch.object(
+            CakeKDAKernel,
+            "_extend_triton",
+            side_effect=AssertionError("prepared export must not fall back to Triton"),
+        ),
+    ):
+        kernel = CakeKDAKernel()
+        assert kernel.cake_prefill_precision == "tf32"
+        output_cake = _extend(kernel, data, state_cake, seq_lens)
+    _assert_close("output", output_cake, output_triton)
+    idx = data["cache_indices"].long()
+    _assert_close(
+        "final_state", state_cake[idx], state_triton[idx], atol=1e-2, rtol=1e-2
+    )
 
 
 def _export_has_fp32_checkpoints(lower_bound) -> bool:

@@ -193,6 +193,36 @@ def _cuda_device_capability(device: torch.device) -> tuple:
 
 _flashinfer_prepared_bf16_available: Optional[bool] = None
 _flashinfer_prepare_bf16_kda_prefill = None
+_flashinfer_prepare_tf32_kda_prefill = None
+_CAKE_PREFILL_PRECISIONS = ("bf16", "tf32")
+
+
+def _cake_prefill_precision() -> str:
+    """``bf16`` (default) or ``tf32``: the exported prepared-prefill precision.
+
+    ``SGLANG_KDA_CAKE_PREFILL_PRECISION`` (operator override; also the knob
+    for replay scripts and tests that run the kernel without a published
+    server-args context) wins over ``--kda-cake-prefill-precision`` from the
+    published exec namespace; the default is ``bf16``.  TF32 needs the
+    prepared export (no facade route), an FP32 state pool and a bounded gate;
+    it trades throughput for accuracy.
+    """
+    value = os.environ.get("SGLANG_KDA_CAKE_PREFILL_PRECISION")
+    if not value:
+        try:
+            from sglang.srt.runtime_context import get_exec
+
+            value = getattr(get_exec().mamba, "kda_cake_prefill_precision", None)
+        except Exception:
+            value = None
+    if not value:
+        value = "bf16"
+    value = str(value).strip().lower()
+    if value not in _CAKE_PREFILL_PRECISIONS:
+        raise ValueError(
+            f"kda_cake_prefill_precision must be bf16 or tf32, got {value!r}"
+        )
+    return value
 _flashinfer_kda_prefill_plan_cache_cls = None
 
 
@@ -240,6 +270,7 @@ def _get_flashinfer_prepared_bf16_prefill():
     346-row source/export campaign validated bitwise.
     """
     global _flashinfer_prepared_bf16_available, _flashinfer_prepare_bf16_kda_prefill
+    global _flashinfer_prepare_tf32_kda_prefill
     global _flashinfer_kda_prefill_plan_cache_cls
     global _flashinfer_kda_prefill_fp32_checkpoints
     if _flashinfer_prepared_bf16_available is None:
@@ -248,6 +279,11 @@ def _get_flashinfer_prepared_bf16_prefill():
             from flashinfer import kda_prefill as _kda_prefill_module
 
             _flashinfer_prepare_bf16_kda_prefill = prepare_bf16_kda_prefill
+            # Same prepared-call ABI on the TF32 export (BF16 q/k/v/out, FP32
+            # state, BF16 checkpoints); selected by --kda-cake-prefill-precision.
+            _flashinfer_prepare_tf32_kda_prefill = getattr(
+                _kda_prefill_module, "prepare_tf32_kda_prefill", None
+            )
             _flashinfer_prepared_bf16_available = True
             # FP32 intermediate states (FP32 chunk carrier + FP32 checkpoint
             # rows) exist only in FlashInfer builds whose module registry
@@ -438,6 +474,9 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
                     "backend; upgrade FlashInfer."
                 )
         self._backend = backend
+        self._cake_prefill_precision = (
+            _cake_prefill_precision() if backend == "cake" else "bf16"
+        )
         # Cache the per-layer constant gate-param prep (A_log/dt_bias reshape+cast),
         # keyed by tensor identity. Layer params are persistent weights so id() is
         # stable; this removes the per-call reshape/float/contiguous work.
@@ -450,6 +489,11 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         # a stable key — same lifetime argument as _gate_cache).
         self._state_contract_ok: set = set()
         logger.info("Using FlashInfer KDA kernel backend=%s", backend)
+
+    @property
+    def cake_prefill_precision(self) -> str:
+        """``bf16`` or ``tf32`` prepared export used by Cake prefill."""
+        return getattr(self, "_cake_prefill_precision", "bf16")
 
     def _check_state_stride_contract(self, ssm_states: torch.Tensor) -> None:
         """One-time (per pool view) check that ``ssm_states`` matches the
@@ -732,6 +776,25 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
 
     def _cake_prefill_uses_prepared_export(self, ssm_states: torch.Tensor) -> bool:
         policy = _cake_prefill_api_policy()
+        if self.cake_prefill_precision == "tf32":
+            # The TF32 export exists only as a prepared call.
+            if policy == "facade":
+                raise ValueError(
+                    "--kda-cake-prefill-precision tf32 requires the prepared export; "
+                    "SGLANG_KDA_CAKE_PREFILL_API=facade has no TF32 route"
+                )
+            available, _ = _get_flashinfer_prepared_bf16_prefill()
+            if not available or _flashinfer_prepare_tf32_kda_prefill is None:
+                raise RuntimeError(
+                    "--kda-cake-prefill-precision tf32 but the installed FlashInfer "
+                    "does not export prepare_tf32_kda_prefill"
+                )
+            if ssm_states.dtype != torch.float32:
+                raise ValueError(
+                    "--kda-cake-prefill-precision tf32 requires an FP32 state pool "
+                    f"(--mamba-ssm-dtype float32); got {ssm_states.dtype}"
+                )
+            return True
         if policy == "facade":
             return False
         available, _ = _get_flashinfer_prepared_bf16_prefill()
@@ -764,8 +827,23 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         state_checkpoint_cu_starts: Optional[torch.Tensor],
         state_checkpoint_every_n_tokens: int,
     ):
-        """Run the exported prepared BF16 prefill; returns (output, checkpoints, schedule)."""
-        _, prepare_bf16_kda_prefill = _get_flashinfer_prepared_bf16_prefill()
+        """Run the exported prepared prefill; returns (output, checkpoints, schedule).
+
+        ``--kda-cake-prefill-precision`` selects the BF16 (default) or TF32
+        export; both share the prepared-call ABI.
+        """
+        _get_flashinfer_prepared_bf16_prefill()
+        precision = self.cake_prefill_precision
+        prepare_kda_prefill = (
+            _flashinfer_prepare_tf32_kda_prefill
+            if precision == "tf32"
+            else _flashinfer_prepare_bf16_kda_prefill
+        )
+        if prepare_kda_prefill is None:
+            raise RuntimeError(
+                f"installed FlashInfer does not export the {precision.upper()} "
+                "prepared KDA prefill"
+            )
         # Upstream forward_extend runs one fused causal conv over the packed qkv
         # row and hands us ``split(dim=-1)`` views, i.e. [1, T, H, D] tensors whose
         # token stride is the full qkv width.  The prepared export reads such
@@ -807,9 +885,11 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         out = torch.empty_like(q)
         # Radix-cache resumes from these rows; the FP32 export keeps them at
         # the pool's precision and removes the BF16 -> FP32 conversion below.
+        # The TF32 export always writes BF16 checkpoint rows.
         checkpoint_dtype = (
             torch.float32
-            if _flashinfer_kda_prefill_fp32_checkpoints[0 if lower_bound is None else 1]
+            if precision == "bf16"
+            and _flashinfer_kda_prefill_fp32_checkpoints[0 if lower_bound is None else 1]
             else torch.bfloat16
         )
         state_checkpoints = (
@@ -837,7 +917,7 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         prepare_kwargs = {}
         if plan_cache is not None:
             prepare_kwargs["plan_cache"] = plan_cache
-        prepared = prepare_bf16_kda_prefill(
+        prepared = prepare_kda_prefill(
             q,
             k,
             v,
@@ -867,10 +947,14 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
             # Cached launches are owned by the plan cache and are rebound to
             # the next call's tensors; closing them would drop the workspace.
             prepared.launch()
-            return out, state_checkpoints, str(getattr(prepared, "schedule", "prepared_bf16"))
+            return (
+                out,
+                state_checkpoints,
+                str(getattr(prepared, "schedule", f"prepared_{precision}")),
+            )
         try:
             prepared.launch()
-            schedule = str(getattr(prepared, "schedule", "prepared_bf16"))
+            schedule = str(getattr(prepared, "schedule", f"prepared_{precision}"))
         finally:
             close = getattr(prepared, "close", None)
             if callable(close):
@@ -1213,7 +1297,10 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
                 state_checkpoint_cu_starts=state_checkpoint_cu_starts,
                 num_state_checkpoints=num_state_checkpoints,
                 state_checkpoint_every_n_tokens=state_checkpoint_every_n_tokens,
-                allow_unbounded_gate=use_prepared_export,
+                # Only the BF16 export serves the unbounded softplus gate.
+                allow_unbounded_gate=(
+                    use_prepared_export and self.cake_prefill_precision == "bf16"
+                ),
             )
         except Exception as exc:
             record_kda_terminal_route(
@@ -1339,7 +1426,7 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
                     triton_fallback=False,
                     fatal=False,
                     reason=admission.reason,
-                    detail=f"prepared_bf16:{schedule}",
+                    detail=f"prepared_{self.cake_prefill_precision}:{schedule}",
                 )
                 return result
             self._check_cake_state_contract(

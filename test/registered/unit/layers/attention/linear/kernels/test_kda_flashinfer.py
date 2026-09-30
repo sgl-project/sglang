@@ -1,5 +1,6 @@
 """CPU contract tests for the FlashInfer CAKE KDA adapter."""
 
+import os
 import sys
 import unittest
 from contextlib import ExitStack
@@ -1149,3 +1150,197 @@ class TestCakeKDAPackedDecodeAdapter(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCakePrefillPrecision(CustomTestCase):
+    """``--kda-cake-prefill-precision`` selects the BF16 or TF32 prepared export."""
+
+    def setUp(self):
+        self._saved = (
+            kda_flashinfer._flashinfer_prepared_bf16_available,
+            kda_flashinfer._flashinfer_prepare_bf16_kda_prefill,
+            kda_flashinfer._flashinfer_prepare_tf32_kda_prefill,
+            kda_flashinfer._flashinfer_kda_prefill_fp32_checkpoints,
+        )
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        (
+            kda_flashinfer._flashinfer_prepared_bf16_available,
+            kda_flashinfer._flashinfer_prepare_bf16_kda_prefill,
+            kda_flashinfer._flashinfer_prepare_tf32_kda_prefill,
+            kda_flashinfer._flashinfer_kda_prefill_fp32_checkpoints,
+        ) = self._saved
+
+    @staticmethod
+    def _kernel(precision: str) -> CakeKDAKernel:
+        kernel = object.__new__(CakeKDAKernel)
+        kernel._backend = "cake"
+        kernel._gate_cache = {}
+        kernel._cake_prefill_precision = precision
+        return kernel
+
+    @staticmethod
+    def _prefill_inputs():
+        torch.manual_seed(11)
+        tokens = 5
+        return {
+            "q": torch.randn(1, tokens, 12, 128, dtype=torch.bfloat16),
+            "k": torch.randn(1, tokens, 12, 128, dtype=torch.bfloat16),
+            "v": torch.randn(1, tokens, 12, 128, dtype=torch.bfloat16),
+            "g": torch.randn(1, tokens, 12, 128, dtype=torch.bfloat16),
+            "beta": torch.randn(1, tokens, 12, dtype=torch.bfloat16),
+            "cache_indices": torch.tensor([2, 0], dtype=torch.int32),
+            "query_start_loc": torch.tensor([0, 2, 5], dtype=torch.int32),
+            "A_log": torch.randn(1, 1, 12, 1, dtype=torch.float32),
+            "dt_bias": torch.randn(12 * 128, dtype=torch.float32),
+        }
+
+    def test_precision_defaults_to_bf16_and_env_overrides_the_server_arg(self):
+        env_unset = {
+            k: v
+            for k, v in os.environ.items()
+            if k != "SGLANG_KDA_CAKE_PREFILL_PRECISION"
+        }
+        with (
+            patch.dict(os.environ, env_unset, clear=True),
+            patch(
+                "sglang.srt.runtime_context.get_exec",
+                side_effect=RuntimeError("no published context"),
+            ),
+        ):
+            self.assertEqual(kda_flashinfer._cake_prefill_precision(), "bf16")
+        published = SimpleNamespace(
+            mamba=SimpleNamespace(kda_cake_prefill_precision="tf32")
+        )
+        with (
+            patch.dict(os.environ, env_unset, clear=True),
+            patch("sglang.srt.runtime_context.get_exec", return_value=published),
+        ):
+            self.assertEqual(kda_flashinfer._cake_prefill_precision(), "tf32")
+        with (
+            patch.dict(os.environ, {"SGLANG_KDA_CAKE_PREFILL_PRECISION": "bf16"}),
+            patch("sglang.srt.runtime_context.get_exec", return_value=published),
+        ):
+            self.assertEqual(kda_flashinfer._cake_prefill_precision(), "bf16")
+        with patch.dict(os.environ, {"SGLANG_KDA_CAKE_PREFILL_PRECISION": "fp8"}):
+            with self.assertRaises(ValueError):
+                kda_flashinfer._cake_prefill_precision()
+        # Kernels built without the constructor (older tests, replay tools) stay BF16.
+        self.assertEqual(object.__new__(CakeKDAKernel).cake_prefill_precision, "bf16")
+
+    def test_tf32_requires_the_prepared_export_and_an_fp32_pool(self):
+        kernel = self._kernel("tf32")
+        kda_flashinfer._flashinfer_prepared_bf16_available = True
+        kda_flashinfer._flashinfer_prepare_bf16_kda_prefill = Mock(name="bf16")
+        kda_flashinfer._flashinfer_prepare_tf32_kda_prefill = Mock(name="tf32")
+        pool = torch.zeros(2, 12, 128, 128, dtype=torch.float32)
+        with patch.dict(os.environ, {"SGLANG_KDA_CAKE_PREFILL_API": "facade"}):
+            with self.assertRaises(ValueError):
+                kernel._cake_prefill_uses_prepared_export(pool)
+        with patch.dict(os.environ, {"SGLANG_KDA_CAKE_PREFILL_API": "auto"}):
+            self.assertTrue(kernel._cake_prefill_uses_prepared_export(pool))
+            with self.assertRaises(ValueError):
+                kernel._cake_prefill_uses_prepared_export(pool.to(torch.bfloat16))
+            kda_flashinfer._flashinfer_prepare_tf32_kda_prefill = None
+            with self.assertRaises(RuntimeError):
+                kernel._cake_prefill_uses_prepared_export(pool)
+            # BF16 keeps the previous behaviour: auto follows the pool dtype.
+            bf16_kernel = self._kernel("bf16")
+            self.assertTrue(bf16_kernel._cake_prefill_uses_prepared_export(pool))
+            self.assertFalse(
+                bf16_kernel._cake_prefill_uses_prepared_export(pool.to(torch.bfloat16))
+            )
+
+    def _run_prepared(self, kernel, prepare_fn, *, fp32_checkpoints):
+        kda_flashinfer._flashinfer_prepared_bf16_available = True
+        kda_flashinfer._flashinfer_kda_prefill_fp32_checkpoints = (
+            fp32_checkpoints,
+            fp32_checkpoints,
+        )
+        inputs = self._prefill_inputs()
+        pool = torch.zeros(4, 12, 128, 128, dtype=torch.float32)
+        with (
+            patch.object(
+                kernel,
+                "_prep_gate_params",
+                return_value=(inputs["A_log"].reshape(-1), inputs["dt_bias"]),
+            ),
+            patch.object(kernel, "_check_cake_fp32_state_contract", return_value=None),
+            patch.object(kernel, "_cake_prefill_plan_cache", return_value=None),
+        ):
+            return kernel._extend_cake_prepared_bf16(
+                inputs["q"],
+                inputs["k"],
+                inputs["v"],
+                inputs["g"],
+                inputs["beta"],
+                ssm_states=pool,
+                cache_indices=inputs["cache_indices"],
+                query_start_loc_fi=inputs["query_start_loc"],
+                extend_seq_lens_cpu=[2, 3],
+                A_log=inputs["A_log"],
+                dt_bias=inputs["dt_bias"],
+                lower_bound=-5.0,
+                needs_checkpoints=True,
+                num_state_checkpoints=2,
+                state_checkpoint_cu_starts=torch.tensor([0, 1, 2], dtype=torch.int64),
+                state_checkpoint_every_n_tokens=64,
+            )
+
+    def test_tf32_selects_the_tf32_export_with_bf16_checkpoint_rows(self):
+        calls = {}
+
+        class FakePrepared:
+            schedule = "tf32_direct_m128"
+
+            def launch(self):
+                calls["launched"] = True
+
+            def close(self):
+                calls["closed"] = True
+
+        def fake_tf32(*args, **kwargs):
+            calls["kwargs"] = kwargs
+            return FakePrepared()
+
+        kda_flashinfer._flashinfer_prepare_bf16_kda_prefill = Mock(
+            side_effect=AssertionError("the BF16 export must not be prepared")
+        )
+        kda_flashinfer._flashinfer_prepare_tf32_kda_prefill = fake_tf32
+        out, checkpoints, schedule = self._run_prepared(
+            self._kernel("tf32"), fake_tf32, fp32_checkpoints=True
+        )
+        self.assertEqual(schedule, "tf32_direct_m128")
+        self.assertEqual(out.dtype, torch.bfloat16)
+        # The TF32 export writes BF16 checkpoint rows even where the BF16
+        # export would write FP32 ones.
+        self.assertEqual(checkpoints.dtype, torch.bfloat16)
+        self.assertIs(calls["kwargs"]["state_checkpoints"], checkpoints)
+        self.assertEqual(calls["kwargs"]["lower_bound"], -5.0)
+        self.assertTrue(calls["kwargs"]["beta_is_logit"])
+        self.assertTrue(calls["launched"] and calls["closed"])
+
+    def test_bf16_keeps_the_bf16_export_and_fp32_checkpoint_rows(self):
+        calls = {}
+
+        class FakePrepared:
+            schedule = "fused_m64_independent_dvsplit_fp32_state"
+
+            def launch(self):
+                calls["launched"] = True
+
+        def fake_bf16(*args, **kwargs):
+            calls["kwargs"] = kwargs
+            return FakePrepared()
+
+        kda_flashinfer._flashinfer_prepare_bf16_kda_prefill = fake_bf16
+        kda_flashinfer._flashinfer_prepare_tf32_kda_prefill = Mock(
+            side_effect=AssertionError("the TF32 export must not be prepared")
+        )
+        _, checkpoints, schedule = self._run_prepared(
+            self._kernel("bf16"), fake_bf16, fp32_checkpoints=True
+        )
+        self.assertEqual(schedule, "fused_m64_independent_dvsplit_fp32_state")
+        self.assertEqual(checkpoints.dtype, torch.float32)
+        self.assertIs(calls["kwargs"]["state_checkpoints"], checkpoints)
