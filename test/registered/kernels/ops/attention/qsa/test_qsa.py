@@ -1686,6 +1686,7 @@ def test_qsa_chunk_prefill_known_max_q_graph_replay(query_lens):
         ([1, 7], [31, 19]),
         ([17, 33], [23, 0]),
         ([2049, 3], [7, 40]),
+        ([2049, 3, 1], [7, 40, 0]),
     ],
 )
 def test_qsa_prefill_kv_packing(

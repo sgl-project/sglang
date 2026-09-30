@@ -290,15 +290,35 @@ def _pack_qsa_prefill_kv(
     HEADS: tl.constexpr,
     DIM: tl.constexpr,
     BLOCK: tl.constexpr,
+    TOTAL_K,
+    BS,
+    COMPACT: tl.constexpr,
 ):
-    batch = tl.program_id(1)
-    start = tl.load(cu_k + batch).to(tl.int64)
-    end = tl.load(cu_k + batch + 1).to(tl.int64)
     offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     token = offsets // (HEADS * DIM)
-    valid = token < end - start
-    req = tl.load(req_indices + batch).to(tl.int64)
-    dst = start * HEADS * DIM + offsets
+    if COMPACT:
+        valid = token < TOTAL_K
+        lo = tl.full((BLOCK,), 0, tl.int32)
+        hi = lo + BS
+        steps = BS
+        while steps > 0:
+            mid = (lo + hi + 1) // 2
+            start = tl.load(cu_k + mid).to(tl.int64)
+            after = token >= start
+            lo = tl.where(after, mid, lo)
+            hi = tl.where(after, hi, mid - 1)
+            steps = steps // 2
+        start = tl.load(cu_k + lo, valid, 0).to(tl.int64)
+        req = tl.load(req_indices + lo, valid, 0).to(tl.int64)
+        token = token - start
+        dst = offsets
+    else:
+        batch = tl.program_id(1)
+        start = tl.load(cu_k + batch).to(tl.int64)
+        end = tl.load(cu_k + batch + 1).to(tl.int64)
+        valid = token < end - start
+        req = tl.load(req_indices + batch).to(tl.int64)
+        dst = start * HEADS * DIM + offsets
     head = offsets // DIM % HEADS
     dim = offsets % DIM
     slot = tl.load(req_to_token + req * SR0 + token * SR1, valid, 0).to(tl.int64)
@@ -318,7 +338,14 @@ def pack_qsa_prefill_kv(
     packed_v = torch.empty(
         (total_k, heads, dim), dtype=output_dtype or v.dtype, device=v.device
     )
-    _pack_qsa_prefill_kv[(triton.cdiv(max_k * heads * dim, 1024), req_indices.numel())](
+    batch_size = req_indices.numel()
+    compact = max_k * batch_size > 2 * total_k
+    grid = (
+        (triton.cdiv(total_k * heads * dim, 1024),)
+        if compact
+        else (triton.cdiv(max_k * heads * dim, 1024), batch_size)
+    )
+    _pack_qsa_prefill_kv[grid](
         k,
         v,
         packed_k,
@@ -332,6 +359,9 @@ def pack_qsa_prefill_kv(
         HEADS=heads,
         DIM=dim,
         BLOCK=1024,
+        TOTAL_K=total_k,
+        BS=batch_size,
+        COMPACT=compact,
     )
     return packed_k, packed_v
 
