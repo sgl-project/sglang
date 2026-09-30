@@ -31,7 +31,6 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-from torch.distributed import ProcessGroup
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
@@ -381,7 +380,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         scheduler: Scheduler,
         transfer_queue: DecodeTransferQueue,
         tree_cache: BasePrefixCache,
-        gloo_group: ProcessGroup,
         gpu_id: int,
         bootstrap_port: int,
         max_total_num_tokens: int,
@@ -401,7 +399,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.tree_cache = tree_cache
         self.host_pool = None
         self.host_reserved_tokens = 0
-        self.gloo_group = gloo_group
+        self.gloo_group = parallel.attn_tp_group.cpu_group
         # Destinations visible to prefill but not yet on the transfer queue.
         self._num_published_destinations = 0
         self.tp_rank = parallel.tp_rank
@@ -2360,14 +2358,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def __init__(
         self,
-        gloo_group: ProcessGroup,
         req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator,
         metadata_buffers: MetadataBuffers,
         scheduler: Scheduler,
         tree_cache: BasePrefixCache,
     ):
         self.queue: List[DecodeRequest] = []
-        self.gloo_group = gloo_group
+        self.gloo_group = get_parallel().attn_tp_group.cpu_group
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.tp_rank = get_parallel().tp_rank
         self.metadata_buffers = metadata_buffers

@@ -76,12 +76,9 @@ class _NegotiateOutput(NamedTuple):
 class PrefillDelayer:
     def __init__(
         self,
-        cpu_group,
         max_delay_passes: int,
         token_usage_low_watermark: Optional[float],
         metrics_collector: Optional["SchedulerMetricsCollector"] = None,
-        device: Optional["torch.device"] = "cpu",
-        device_group=None,
         debug_log_enabled: bool = True,
     ):
         self._max_delay_passes = max_delay_passes
@@ -117,14 +114,12 @@ class PrefillDelayer:
             get_schedule().disable_overlap_schedule
             or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
         )
+        tp_group = parallel.tp_group
         if use_nccl:
-            assert device_group is not None, (
-                "device_group is required when using NCCL for PrefillDelayer all-gather"
-            )
-            self._gather_group = device_group
-            self._gather_device = device
+            self._gather_group = tp_group.device_group
+            self._gather_device = tp_group.device
         else:
-            self._gather_group = cpu_group
+            self._gather_group = tp_group.cpu_group
             self._gather_device = "cpu"
 
         # Fields packed per rank into the all-gather tensor: prefillable,

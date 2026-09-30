@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -41,9 +42,12 @@ class TestPrefillDelayerGather(CustomTestCase):
                     "sglang.srt.managers.prefill_delayer.all_gather_single",
                     side_effect=_all_gather_over_tp,
                 ),
+                get_parallel().override(
+                    tp_group=SimpleNamespace(cpu_group=None, device_group=None)
+                ),
             ):
                 delayer = PrefillDelayer(
-                    cpu_group=None, max_delay_passes=4, token_usage_low_watermark=None
+                    max_delay_passes=4, token_usage_low_watermark=None
                 )
                 info = delayer._gather_info(
                     local_prefillable=True,
