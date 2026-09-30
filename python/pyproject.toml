@@ -74,7 +74,7 @@ dependencies = [
   "regex",
   "requests",
   "scipy",
-  "sentencepiece",
+  "sentencepiece==0.2.1",  # 0.2.2 rejects null pieces in InternVL tokenizers.
   "setproctitle",
   "sgl-deep-ep==0.1.2",
   "sgl-deep-gemm==0.2.0",
