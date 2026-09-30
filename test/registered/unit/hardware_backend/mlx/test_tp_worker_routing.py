@@ -34,13 +34,20 @@ from __future__ import annotations
 import importlib.util
 import platform
 import unittest
+from array import array
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.managers.schedule_batch import ReqKvInfo
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
+from sglang.srt.managers.scheduler_components.batch_result_processor import (
+    SchedulerBatchResultProcessor,
+)
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_mlx_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -70,6 +77,14 @@ class _FakeRunner:
     # --- shared ---
     def has_request(self, rid):
         return rid in self._known
+
+    def remove_request(self, rid):
+        self.calls.append(("remove_request", rid))
+        self._known.discard(rid)
+        self._req_caches.pop(rid, None)
+
+    def store_auxiliary_state_for_request(self, rid):
+        pass
 
     def flush_all_decode_kv(self):
         pass
@@ -214,6 +229,7 @@ class TestMlxExtendRouting(CustomTestCase):
         worker = MlxTpModelWorker.__new__(MlxTpModelWorker)
         worker._mlx_runner = _FakeRunner(known_rids)
         worker._mlx_active_rids = set()
+        worker._mlx_finished_rids = set()
         # The sync entry point delegates to the async launch, which guards
         # pool creation behind this flag; forward_batch_generation has
         # already run it for real by the time either path is reached.
@@ -325,6 +341,189 @@ class TestMlxExtendRouting(CustomTestCase):
         self.assertEqual(runner.ops_for("p1"), ["prefill_start"])
         self.assertEqual(runner.ops_for("d1"), ["decode_start"])
         self.assertIsNotNone(launch.decode)  # pending mixed decode present
+
+
+def _finished_req(rid):
+    """Minimal Req stand-in for prepare_for_kv_cache_release."""
+    return SimpleNamespace(rid=rid, kv=SimpleNamespace(mamba_last_track_seqlen=None))
+
+
+@unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)
+class TestMlxFinishedRequestRelease(CustomTestCase):
+    """Finished prefills must release worker state before the next request wave."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._config = get_context().override_server_args(mlx_enable_sampling=False)
+        cls._config.install()
+        cls.addClassCleanup(cls._config.restore)
+
+    @staticmethod
+    def _worker(active_rids):
+        from sglang.srt.hardware_backend.mlx.tp_worker import MlxTpModelWorker
+
+        worker = MlxTpModelWorker.__new__(MlxTpModelWorker)
+        worker._mlx_runner = _FakeRunner(active_rids)
+        worker._mlx_active_rids = set(active_rids)
+        worker._mlx_finished_rids = set()
+        worker._mlx_pool_initialized = True
+        return worker
+
+    def test_finished_requests_released_on_extend_launch(self):
+        worker = self._worker({"a", "b"})
+        worker.prepare_for_kv_cache_release(_finished_req("a"))
+        worker.prepare_for_kv_cache_release(_finished_req("b"))
+
+        worker._cleanup_stale_rids(ForwardMode.EXTEND, {"c"})
+
+        self.assertFalse(worker._mlx_runner.has_request("a"))
+        self.assertFalse(worker._mlx_runner.has_request("b"))
+        self.assertEqual(worker._mlx_active_rids, {"c"})
+        self.assertEqual(worker._mlx_finished_rids, set())
+
+    def test_unfinished_requests_survive_extend_launch(self):
+        worker = self._worker({"a", "b"})
+        worker.prepare_for_kv_cache_release(_finished_req("a"))
+
+        worker._cleanup_stale_rids(ForwardMode.EXTEND, {"c"})
+
+        self.assertFalse(worker._mlx_runner.has_request("a"))
+        self.assertTrue(worker._mlx_runner.has_request("b"))
+        self.assertEqual(worker._mlx_active_rids, {"b", "c"})
+
+    def test_decode_launch_still_drops_silently_departed_requests(self):
+        # An abort leaves the batch without a finish notification; the
+        # decode-mode set difference must keep catching it.
+        worker = self._worker({"a", "b"})
+
+        worker._cleanup_stale_rids(ForwardMode.DECODE, {"b"})
+
+        self.assertFalse(worker._mlx_runner.has_request("a"))
+        self.assertTrue(worker._mlx_runner.has_request("b"))
+        self.assertEqual(worker._mlx_active_rids, {"b"})
+
+    def test_unknown_request_is_not_marked(self):
+        worker = self._worker({"a"})
+        worker.prepare_for_kv_cache_release(_finished_req("ghost"))
+        self.assertEqual(worker._mlx_finished_rids, set())
+
+    @staticmethod
+    def _req(rid, max_new_tokens=0):
+        # score_prompts (including Decisions) uses this prefill-only contract.
+        sampling_params = SamplingParams(max_new_tokens=max_new_tokens)
+        sampling_params.normalize(None)
+        return Req(
+            rid=rid,
+            origin_input_text="prompt",
+            origin_input_ids=array("q", [1, 2]),
+            sampling_params=sampling_params,
+            return_logprob=True,
+            token_ids_logprob=[3, 4],
+            vocab_size=128,
+        )
+
+    def _process_prefill(self, worker, reqs):
+        logprob_processor = Mock()
+        logprob_processor.calculate_num_input_logprobs.return_value = 0
+        processor = SchedulerBatchResultProcessor(
+            is_generation=True,
+            disaggregation_mode=None,
+            enable_overlap=False,
+            enable_overlap_mlx=False,
+            model_config=SimpleNamespace(think_end_ids=None),
+            token_to_kv_pool_allocator=Mock(),
+            tree_cache=None,
+            hisparse_coordinator=None,
+            req_to_token_pool=None,
+            decode_offload_manager=None,
+            metrics_collector=None,
+            metrics_reporter=Mock(),
+            draft_worker=None,
+            model_worker=worker,
+            logprob_result_processor=logprob_processor,
+            output_streamer=Mock(),
+            beam_coordinator=Mock(),
+            abort_request=Mock(),
+        )
+        batch = SimpleNamespace(
+            reqs=reqs,
+            forward_mode=ForwardMode.EXTEND,
+            decoding_reqs=[],
+            return_logprob=True,
+            return_hidden_states=False,
+            return_hidden_states_mode=CaptureHiddenMode.NULL,
+            spec_info=None,
+            prefill_stats=None,
+        )
+        result = SimpleNamespace(
+            copy_done=None,
+            auxiliary_host_output=None,
+            routed_experts_output=None,
+            indexer_topk_output=None,
+            logits_output=LogitsProcessorOutput(next_token_logits=None),
+            next_token_ids=torch.full((len(reqs),), 3, dtype=torch.int64),
+            extend_input_len_per_req=[2] * len(reqs),
+            extend_logprob_start_len_per_req=[1] * len(reqs),
+            grammar_advanced=False,
+            can_run_cuda_graph=False,
+        )
+
+        def release(req, *_args, **_kwargs):
+            # The notification must precede scheduler-side KV release, while
+            # auxiliary state still belongs to this request's pool row.
+            if hasattr(worker, "_mlx_finished_rids"):
+                self.assertIn(req.rid, worker._mlx_finished_rids)
+                self.assertTrue(worker._mlx_runner.has_request(req.rid))
+
+        module = "sglang.srt.managers.scheduler_components.batch_result_processor"
+        with (
+            patch(f"{module}.release_kv_cache", side_effect=release) as released,
+            patch(f"{module}.maybe_cache_unfinished_req"),
+        ):
+            processor.process_batch_result_prefill(batch, result)
+        return released
+
+    def test_prefill_only_waves_release_at_next_extend(self):
+        worker = self._worker(set())
+        for rid in ("a", "b", "c"):
+            worker._cleanup_stale_rids(ForwardMode.EXTEND, {rid})
+            self.assertFalse(worker._mlx_runner._known)
+            worker._mlx_runner._known.add(rid)  # the new prefill finalized
+            req = self._req(rid)
+
+            released = self._process_prefill(worker, [req])
+
+            self.assertTrue(req.finished())
+            self.assertEqual(req.finished_len, 0)
+            released.assert_called_once_with(req, None, is_insert=True)
+            self.assertEqual(worker._mlx_finished_rids, {rid})
+            # Reclamation remains deferred, preserving overlap safety.
+            self.assertEqual(worker._mlx_runner._known, {rid})
+
+    def test_generation_finished_during_prefill_is_marked(self):
+        worker = self._worker({"a"})
+        self._process_prefill(worker, [self._req("a", max_new_tokens=1)])
+        self.assertEqual(worker._mlx_finished_rids, {"a"})
+
+    def test_unfinished_and_middle_prefills_are_not_marked(self):
+        worker = self._worker({"unfinished", "middle"})
+        unfinished = self._req("unfinished", max_new_tokens=2)
+        middle = self._req("middle")
+        middle.inflight_middle_chunks = 1
+
+        released = self._process_prefill(worker, [unfinished, middle])
+
+        released.assert_not_called()
+        self.assertEqual(worker._mlx_finished_rids, set())
+        self.assertEqual(worker._mlx_runner._known, {"unfinished", "middle"})
+        self.assertFalse(unfinished.finished())
+        self.assertFalse(middle.finished())
+
+    def test_prefill_completion_without_worker_hook(self):
+        req = self._req("a")
+        released = self._process_prefill(SimpleNamespace(), [req])
+        self.assertTrue(req.finished())
+        released.assert_called_once_with(req, None, is_insert=True)
 
 
 if __name__ == "__main__":
