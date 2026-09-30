@@ -82,7 +82,7 @@ CLIP_MAX_NEW_TOKENS = int(
 
 
 @lru_cache(maxsize=1)
-def _use_exact_chunk_fill() -> bool:
+def use_exact_chunk_fill() -> bool:
     """Whether to charge the chunked-prefill compute budget in tokens (gfx95 only).
 
     Gated on gfx95 because that is where the win is: the aiter absorb bmm picks
@@ -648,7 +648,7 @@ class PrefillAdder:
         self.rem_chunk_tokens = rem_chunk_tokens
         self.chunked_req_limit: Optional[int] = None
         self.dllm_config = dllm_config
-        self.exact_chunk_fill = _use_exact_chunk_fill() and dllm_config is None
+        self.exact_chunk_fill = use_exact_chunk_fill() and dllm_config is None
 
         if self.dllm_config is not None:
             self._init_dllm_meta(dllm_config)

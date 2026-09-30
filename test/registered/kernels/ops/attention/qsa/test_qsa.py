@@ -44,6 +44,52 @@ BLOCK_TOPK = TOKEN_TOPK // COMPRESS_RATIO
 FINAL_TOPK = TOKEN_TOPK + COMPRESS_RATIO - 1
 
 
+def test_qsa_write_plan_tracks_group_crossing_extend_prefix():
+    """Plan math for a prefix that starts mid compression group.
+
+    The overwrite path is runtime-gated on exact chunk fill, which the plan
+    sees as ``track_prefix_members``. Drive that switch directly so the test
+    pins both sides on any platform: the crossing is recorded when a batch
+    asks for it, and nothing is computed when it does not.
+    """
+    token_slot_table = torch.arange(28, dtype=torch.int32).view(2, 14)
+    prefix_lens = torch.tensor([10, 0], dtype=torch.long)
+    extend_lens = torch.tensor([4, 8], dtype=torch.long)
+    sequence_lengths = prefix_lens + extend_lens
+    row_token_starts = torch.tensor([0, 4], dtype=torch.long)
+
+    def run(track_prefix_members):
+        return QwenSparseAttnBackend._qsa_write_plan(
+            token_slot_table=token_slot_table,
+            start_blocks=prefix_lens // COMPRESS_RATIO,
+            end_blocks=sequence_lengths // COMPRESS_RATIO,
+            capacity=5,
+            compress_ratio=COMPRESS_RATIO,
+            row_token_starts=row_token_starts,
+            prefix_lens=prefix_lens,
+            track_prefix_members=track_prefix_members,
+        )
+
+    (
+        _write_locs,
+        _group_positions,
+        rows,
+        member_rows,
+        prefix_members,
+    ) = run(True)
+
+    # Row 0's group [8, 12) starts two tokens before this forward. Rows 1's
+    # groups are wholly contained in its packed-token range [4, 12).
+    assert rows[:3].tolist() == [0, 1, 1]
+    assert member_rows[:3].tolist() == [-2, 4, 8]
+    assert prefix_members[:3].tolist() == [2, 0, 0]
+
+    # Batches that cannot cross pay nothing: same member_rows, no extra tensor.
+    _, _, _, aligned_member_rows, aligned_prefix_members = run(False)
+    assert aligned_member_rows.tolist() == member_rows.tolist()
+    assert aligned_prefix_members is None
+
+
 def test_qsa_chunk_prefill_accepts_fp8_cached_prefix():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9):
         pytest.skip("FP8-capable CUDA GPU required")
