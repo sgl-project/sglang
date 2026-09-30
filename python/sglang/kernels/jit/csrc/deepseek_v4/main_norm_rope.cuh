@@ -312,7 +312,6 @@ K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeF
   // e4m3 at per-tensor scale 1.0 into the uniform 512-byte-per-token pool
   // (trtllm backend), instead of the packed 584-byte FlashMLA layout.
   static_assert(!(kUniformStore && kLayout != deepseek_v4::KVLayout::V4), "the uniform fp8 store is a V4 cache");
-  constexpr int64_t kUniformPageBytes = kHeadDim << kPageBits;
   static_assert(kHeadDim == kFusedKBlockSize * kVecSize);
   static_assert(kRopeDim == kWarpThreads * kVecSize);
   static_assert(kHeadDim - kRopeDim == kRopeWarp * kWarpThreads * kVecSize);
@@ -417,40 +416,18 @@ K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeF
     return deepseek_v4::v41::store_row<kLayout>(row.data, row.scale, tx, v);
   }
 
-  // Uniform 512 B rows are paged by kUniformPageBytes and addressed directly; the V4
+  // Uniform 512 B rows are dense and addressed by out_loc directly; the V4
   // packed layout goes through the paged helper.
   uint8_t* value_ptr = nullptr;
   if constexpr (kUniformStore) {
-    const int64_t page = out_loc >> kPageBits;
-    const int64_t offset = out_loc & ((1 << kPageBits) - 1);
-    value_ptr = params.kvcache + page * kUniformPageBytes + offset * kHeadDim;
+    value_ptr = params.kvcache + static_cast<int64_t>(out_loc) * kHeadDim;
   } else {
     value_ptr = row.data;
   }
 
   PDLTriggerSecondary<kUsePDL>();
 
-  if constexpr (kUniformStore) {
-    // Uniform pool: every warp stores its 2 elems as plain e4m3 (rope warp
-    // applies RoPE first). BF16 round-trip to match the unfused path
-    // (Triton norm+rope emits bf16, then the pool store casts bf16 -> e4m3
-    // at per-tensor scale 1.0).
-    Float2 d = data;
-    if (warp_id == kRopeWarp) {
-      const auto x_real = data[0];
-      const auto x_imag = data[1];
-      const auto freq_real = freq[0];
-      const auto freq_imag = freq[1];
-      d[0] = x_real * freq_real - x_imag * freq_imag;
-      d[1] = x_real * freq_imag + x_imag * freq_real;
-    }
-    const auto x = cast<float>(cast<bf16_t>(d[0]));
-    const auto y = cast<float>(cast<bf16_t>(d[1]));
-    reinterpret_cast<fp8x2_e4m3_t*>(value_ptr)[tx] = pack_fp8(x, y);
-    return;
-  }
-
-  // part 2: rope on warp 7 (BF16 store), per-warp UE8M0 quant + store on warps 0..6.
+  // part 2: rope on warp 7, then the layout-specific store.
   if (warp_id == kRopeWarp) {
     const auto x_real = data[0];
     const auto x_imag = data[1];
@@ -458,6 +435,20 @@ K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeF
     const auto freq_imag = freq[1];
     data[0] = x_real * freq_real - x_imag * freq_imag;
     data[1] = x_real * freq_imag + x_imag * freq_real;
+  }
+
+  if constexpr (kUniformStore) {
+    // Uniform pool: every warp stores its 2 elems as plain e4m3. BF16
+    // round-trip to match the unfused path (Triton norm+rope emits bf16,
+    // then the pool store casts bf16 -> e4m3 at per-tensor scale 1.0).
+    const auto x = cast<float>(cast<bf16_t>(data[0]));
+    const auto y = cast<float>(cast<bf16_t>(data[1]));
+    reinterpret_cast<fp8x2_e4m3_t*>(value_ptr)[tx] = pack_fp8(x, y);
+    return;
+  }
+
+  // BF16 rope store on warp 7, per-warp UE8M0 quant + store on warps 0..6.
+  if (warp_id == kRopeWarp) {
     const auto result = cast<bf16x2_t>(fp32x2_t{data[0], data[1]});
     const auto rope_ptr = value_ptr + 448;
     reinterpret_cast<bf16x2_t*>(rope_ptr)[lane_id] = result;

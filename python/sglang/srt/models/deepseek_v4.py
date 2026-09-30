@@ -60,6 +60,9 @@ from sglang.srt.hardware_backend.npu.utils import (
     is_npu_arch35,
     use_npu_arch35_mxfp8_wo_a,
 )
+from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
+    is_dsv4_trtllm_attn_enabled,
+)
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
@@ -968,6 +971,9 @@ class MqaAttentionBase(nn.Module):
         )
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
         self.freqs_cis: torch.Tensor
+        # trtllm-gen sparse attention: q is consumed as e4m3 and the kernel
+        # takes per-rank head counts natively (no FlashMLA {64, 128} padding).
+        self._trtllm_attn = is_dsv4_trtllm_attn_enabled()
 
     @functools.cached_property
     def use_flashinfer_mxfp8_wo_b(self) -> bool:
@@ -981,11 +987,11 @@ class MqaAttentionBase(nn.Module):
             or getattr(self.wo_b, "block_fp8_mxfp8_ready", False)
         )
 
-    def _kernel_num_heads(self, num_tokens: int, attn_backend=None) -> int:
+    def _kernel_num_heads(self, num_tokens: int) -> int:
         if self.attn_tp_size == 1:
             return self.n_local_heads
 
-        if not getattr(attn_backend, "pads_tp_q_heads", True):
+        if self._trtllm_attn:
             # The trtllm-gen sparse kernel takes per-rank head counts natively
             # (verified bit-identical h=16 vs padded h=64), so it opts out of
             # the FlashMLA {64, 128} head padding entirely.
@@ -1382,13 +1388,9 @@ class MQALayer(MqaAttentionBase):
             # followed by .to(float8_e4m3fn)) instead of paying a separate
             # per-layer cast pass. Paths that pass a preallocated bf16
             # q_out (TP head padding) keep the backend-side cast.
-            fp8_out = getattr(self, "_q_fp8_out", None)
-            if fp8_out is None:
-                fp8_out = bool(getattr(get_attn_backend(), "trtllm_attn", False))
-                self._q_fp8_out = fp8_out
             q_out = torch.empty(
                 q.shape,
-                dtype=torch.float8_e4m3fn if fp8_out else q.dtype,
+                dtype=torch.float8_e4m3fn if self._trtllm_attn else q.dtype,
                 device=q.device,
             )
         # Fused warp-per-(token, head) rmsnorm-self + RoPE + write to q_out.
@@ -2299,7 +2301,7 @@ class MQALayer(MqaAttentionBase):
             kernel_num_heads = (
                 self.n_local_heads
                 if _is_hip and not unified and _hip.skip_head_pad(self)
-                else self._kernel_num_heads(x.shape[0], attn_backend)
+                else self._kernel_num_heads(x.shape[0])
             )
             if kernel_num_heads != self.n_local_heads:
                 # Backends without an exact-head specialization retain the existing
