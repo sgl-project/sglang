@@ -11,6 +11,7 @@ from fastapi import Request
 from fastapi.responses import ORJSONResponse
 
 from sglang.srt.entrypoints.openai.serving_decisions import (
+    EncodedQuestion,
     OpenAIServingDecisions,
     QuestionView,
     default_labels,
@@ -44,8 +45,10 @@ class SystemOneServing(OpenAIServingDecisions):
         return "systemone-"
 
     def _validate_request(self, request: SystemOneRequest) -> Optional[str]:
-        return self._validate_server(request.model) or self._validate_reasoning(
-            request.chat_template_kwargs
+        return (
+            self._validate_server(request.model)
+            or self._validate_images(request.images)
+            or self._validate_reasoning(request.chat_template_kwargs)
         )
 
     def _convert_to_internal_request(
@@ -53,7 +56,7 @@ class SystemOneServing(OpenAIServingDecisions):
         request: SystemOneRequest,
         raw_request: Request = None,
     ) -> Tuple[
-        Iterator[Tuple[List[int], List[int]]],
+        Iterator[EncodedQuestion],
         Tuple[SystemOneRequest, List[QuestionView]],
     ]:
         views = [_view(question) for question in request.questions.values()]
@@ -62,7 +65,7 @@ class SystemOneServing(OpenAIServingDecisions):
 
     def _encoded_systemone_questions(
         self, request: SystemOneRequest, views: List[QuestionView]
-    ) -> Iterator[Tuple[List[int], List[int]]]:
+    ) -> Iterator[EncodedQuestion]:
         """Prompt and label ids for each question, in request order."""
         text = render_text(request.state)
         chat_template_kwargs = self._chat_template_kwargs(request.chat_template_kwargs)
@@ -87,6 +90,7 @@ class SystemOneServing(OpenAIServingDecisions):
                     view=view,
                     labels=labels,
                     chat_template_kwargs=chat_template_kwargs,
+                    images=request.images,
                 )
             except ValueError as e:
                 raise ValueError(f"question {question_id!r}: {e}") from e
@@ -128,7 +132,7 @@ class SystemOneServing(OpenAIServingDecisions):
 
     async def _handle_non_streaming_request(
         self,
-        adapted_request: Iterator[Tuple[List[int], List[int]]],
+        adapted_request: Iterator[EncodedQuestion],
         processed: Tuple[SystemOneRequest, List[QuestionView]],
         raw_request: Request,
     ) -> ORJSONResponse:

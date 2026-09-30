@@ -13,6 +13,7 @@ from fastapi.responses import ORJSONResponse
 from transformers import PreTrainedTokenizerBase
 
 from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionMessageContentImageURL,
     DecisionAnswer,
     DecisionChoiceQuestion,
     DecisionQuestion,
@@ -25,13 +26,20 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.serving_chat import _CHAT_TEMPLATE_CLIENT_ERRORS
+from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.runtime_context import get_exec
+from sglang.srt.utils import ImageData
 
 if TYPE_CHECKING:
     from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+    from sglang.srt.multimodal.processors.base_processor import (
+        MultimodalSpecialTokens,
+    )
 
 logger = logging.getLogger(__name__)
+
+EncodedQuestion = Tuple[List[int], List[int], List[ImageData]]
 
 # Version of the server-owned prompt wording and answer labels.
 # Any change to a rendering /v1/decisions can produce needs a new version.
@@ -120,9 +128,15 @@ class OpenAIServingDecisions(OpenAIServingBase):
         return "decision-"
 
     def _validate_request(self, request: DecisionRequest) -> Optional[str]:
-        error = self._validate_server(request.model)
+        error = self._validate_server(request.model) or self._validate_images(
+            request.images
+        )
         if error is not None:
             return error
+        if request.images and request.return_prompt_token_ids:
+            return (
+                "return_prompt_token_ids cannot replay image inputs through /v1/score"
+            )
         version = request.prompt_format_version
         if version is not None and version != PROMPT_FORMAT_VERSION:
             return (
@@ -169,6 +183,25 @@ class OpenAIServingDecisions(OpenAIServingBase):
             )
         return None
 
+    def _validate_images(
+        self, images: List[ChatCompletionMessageContentImageURL]
+    ) -> Optional[str]:
+        if not images:
+            return None
+        if not self.tokenizer_manager.model_config.is_multimodal:
+            return (
+                f"{self.route} images require a model served with multimodal "
+                "input, and some vision models need --enable-multimodal"
+            )
+        if self.template_manager.jinja_template_content_format != "openai":
+            return f"{self.route} images require a chat template accepting image parts"
+        if self.tokenizer_manager.allow_auto_truncate:
+            return (
+                f"{self.route} images require --allow-auto-truncate to be disabled "
+                "to preserve the answer position after image processing"
+            )
+        return None
+
     def _validate_reasoning(
         self, chat_template_kwargs: Dict[str, Any]
     ) -> Optional[str]:
@@ -201,13 +234,11 @@ class OpenAIServingDecisions(OpenAIServingBase):
         self,
         request: DecisionRequest,
         raw_request: Request = None,
-    ) -> Tuple[Iterator[Tuple[List[int], List[int]]], DecisionRequest]:
+    ) -> Tuple[Iterator[EncodedQuestion], DecisionRequest]:
         # Lazy, so the handler can let other requests run between questions.
         return self._encoded_questions(request), request
 
-    def _encoded_questions(
-        self, request: DecisionRequest
-    ) -> Iterator[Tuple[List[int], List[int]]]:
+    def _encoded_questions(self, request: DecisionRequest) -> Iterator[EncodedQuestion]:
         """Prompt and label ids for each question, in request order."""
         text = render_text(request.input)
         chat_template_kwargs = self._chat_template_kwargs(request.chat_template_kwargs)
@@ -219,6 +250,7 @@ class OpenAIServingDecisions(OpenAIServingBase):
                     view=view,
                     labels=default_labels(view),
                     chat_template_kwargs=chat_template_kwargs,
+                    images=request.images,
                 )
             except ValueError as e:
                 raise ValueError(f"question {question.id!r}: {e}") from e
@@ -230,10 +262,46 @@ class OpenAIServingDecisions(OpenAIServingBase):
         view: QuestionView,
         labels: List[str],
         chat_template_kwargs: Dict[str, Any],
-    ) -> Tuple[List[int], List[int]]:
+        images: List[ChatCompletionMessageContentImageURL],
+    ) -> EncodedQuestion:
         tokenizer = self.tokenizer_manager.tokenizer
         content = _render_question(text=text, view=view, labels=labels)
-        prompt = self._apply_chat_template(content, chat_template_kwargs)
+        image_data = []
+        message_content = content
+        if images:
+            message = process_content_for_template_format(
+                {
+                    "role": "user",
+                    "content": [
+                        *(
+                            {"type": "image_url", "image_url": image.model_dump()}
+                            for image in images
+                        ),
+                        {"type": "text", "text": content},
+                    ],
+                },
+                self.template_manager.jinja_template_content_format,
+                image_data,
+                [],
+                [],
+                [],
+            )
+            message_content = message["content"]
+        prompt = self._apply_chat_template(message_content, chat_template_kwargs)
+        if images:
+            # Image marker metadata is an optional native processor capability.
+            tokens = getattr(self.tokenizer_manager.mm_processor, "mm_tokens", None)
+            if tokens is None or tokens.image_token_regex is None:
+                raise ValueError("images require a processor exposing image markers")
+            if _has_media_marker(content, tokens, tokenizer):
+                raise ValueError(
+                    "the input and questions must not contain multimodal marker "
+                    "text when images are attached"
+                )
+            if sum(1 for _ in tokens.image_token_regex.finditer(prompt)) != len(images):
+                raise ValueError(
+                    "the chat template must preserve one complete marker per image"
+                )
         if self.reasoning_markers is not None:
             # Look only after the message, whose last line is fixed text.
             closing = content.rsplit("\n", 1)[-1]
@@ -282,10 +350,10 @@ class OpenAIServingDecisions(OpenAIServingBase):
             labels=labels,
             added_tokens=self.added_tokens,
         )
-        return prompt_ids, label_ids
+        return prompt_ids, label_ids, image_data
 
     def _apply_chat_template(
-        self, content: str, chat_template_kwargs: Dict[str, Any]
+        self, content: str | List[Dict[str, Any]], chat_template_kwargs: Dict[str, Any]
     ) -> str:
         try:
             return self.tokenizer_manager.tokenizer.apply_chat_template(
@@ -315,12 +383,12 @@ class OpenAIServingDecisions(OpenAIServingBase):
 
     async def _score(
         self,
-        adapted_request: Iterator[Tuple[List[int], List[int]]],
+        adapted_request: Iterator[EncodedQuestion],
         raw_request: Request,
         temperature: float = 1.0,
     ):
         """Encode every question, then score them all in one call."""
-        prompts, label_token_ids = await _encode_all(adapted_request)
+        prompts, label_token_ids, image_data = await _encode_all(adapted_request)
         result = await self.tokenizer_manager.score_prompts(
             prompts=prompts,
             label_token_ids=label_token_ids,
@@ -328,12 +396,13 @@ class OpenAIServingDecisions(OpenAIServingBase):
             request=raw_request,
             temperature=temperature,
             return_token_logprobs=True,
+            image_data=image_data if any(image_data) else None,
         )
         return prompts, label_token_ids, result
 
     async def _handle_non_streaming_request(
         self,
-        adapted_request: Iterator[Tuple[List[int], List[int]]],
+        adapted_request: Iterator[EncodedQuestion],
         request: DecisionRequest,
         raw_request: Request,
     ) -> ORJSONResponse:
@@ -375,16 +444,30 @@ def render_text(value: Optional[DecisionText]) -> str:
 
 
 async def _encode_all(
-    encoded: Iterator[Tuple[List[int], List[int]]],
-) -> Tuple[List[List[int]], List[List[int]]]:
+    encoded: Iterator[EncodedQuestion],
+) -> Tuple[List[List[int]], List[List[int]], List[List[ImageData]]]:
     """Collect prompt and label ids, letting other requests run between questions."""
-    prompts, label_token_ids = [], []
-    for prompt_ids, label_ids in encoded:
+    prompts, label_token_ids, image_data = [], [], []
+    for prompt_ids, label_ids, images in encoded:
         prompts.append(prompt_ids)
         label_token_ids.append(label_ids)
+        image_data.append(images)
         # Each question renders and tokenizes the whole input on the event loop.
         await asyncio.sleep(0)
-    return prompts, label_token_ids
+    return prompts, label_token_ids, image_data
+
+
+def _has_media_marker(
+    text: str, tokens: MultimodalSpecialTokens, tokenizer: Any
+) -> bool:
+    """Whether text holds a processor media marker, which would misalign the images."""
+    if tokens.get_combined_regex().search(text):
+        return True
+    ids = [tokens.image_token_id, tokens.video_token_id, tokens.audio_token_id]
+    return any(
+        marker and marker in text
+        for marker in (tokenizer.decode([i]) for i in ids if i is not None)
+    )
 
 
 def _decision_view(question: DecisionQuestion) -> QuestionView:

@@ -1472,6 +1472,21 @@ DecisionText = Union[str, Dict[str, Any], List[Any]]
 RequiredDecisionText = Annotated[DecisionText, AfterValidator(_nonblank_decision_text)]
 
 
+def _to_image_url(
+    image: Union[ChatCompletionMessageContentImageURL, str],
+) -> ChatCompletionMessageContentImageURL:
+    if isinstance(image, str):
+        return ChatCompletionMessageContentImageURL(url=image)
+    return image
+
+
+# An image arrives as the chat image URL object or as its url alone, such as a
+# data URI or base64 bytes. A url alone is converted to the object as it validates.
+DecisionImage = Annotated[
+    Union[ChatCompletionMessageContentImageURL, str], AfterValidator(_to_image_url)
+]
+
+
 class DecisionOption(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1527,6 +1542,7 @@ class DecisionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     input: RequiredDecisionText
+    images: List[DecisionImage] = Field(default_factory=list)
     questions: List[DecisionQuestion] = Field(min_length=1)
     # Scales option probabilities only, not label_mass.
     temperature: float = Field(default=1.0, gt=0, allow_inf_nan=False)

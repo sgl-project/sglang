@@ -3,6 +3,7 @@
 import asyncio
 import json
 import math
+import re
 import string
 import unittest
 from types import SimpleNamespace
@@ -29,6 +30,8 @@ from sglang.srt.entrypoints.systemone.serving import (
     _view,
 )
 from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
+from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
+from sglang.srt.parser.jinja_template_utils import detect_jinja_template_content_format
 from sglang.srt.parser.template_detection import (
     ReasoningToggleConfig,
     detect_reasoning_parser,
@@ -75,7 +78,7 @@ def _by_id(request, question_id):
 def _encoded(handler, request):
     """Prompt and label ids for every question, as the handler scores them."""
     encoded, _ = handler._convert_to_internal_request(request)
-    prompts, label_ids = zip(*encoded)
+    prompts, label_ids, _ = zip(*encoded)
     return list(prompts), list(label_ids)
 
 
@@ -93,6 +96,7 @@ def _handler(
         reasoning_config = detected
     template_manager = SimpleNamespace(
         chat_template_name=None,
+        jinja_template_content_format=detect_jinja_template_content_format(template),
         reasoning_config=reasoning_config,
         suggested_reasoning_parser=detect_reasoning_parser(
             template, manager.tokenizer, detected, force_reasoning
@@ -147,10 +151,26 @@ class ScoringManager(TokenizerManagerScoreMixin):
         self.server_args = ServerArgs(model_path="dummy", **server_args)
         publish(self.server_args, role="test")
         self.tokenizer = tokenizer
+        self.allow_auto_truncate = self.server_args.allow_auto_truncate
         self.model_config = SimpleNamespace(
+            is_multimodal=True,
             hf_config=SimpleNamespace(
                 architectures=[architecture or "Qwen3_5MoeForConditionalGeneration"],
                 model_type="qwen3_5_moe",
+            ),
+        )
+        pad, video = (
+            tokenizer.encode(token, add_special_tokens=False)[0]
+            for token in ("<|image_pad|>", "<|video_pad|>")
+        )
+        self.mm_processor = SimpleNamespace(
+            mm_tokens=MultimodalSpecialTokens(
+                image_token="<|vision_start|><|image_pad|><|vision_end|>",
+                image_token_id=pad,
+                image_token_regex=re.compile(
+                    r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>|<image>"
+                ),
+                video_token_id=video,
             )
         )
         self.is_generation = is_generation
@@ -768,6 +788,158 @@ class TestDecisions(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(message, json.loads(response.body)["message"])
                 self.assertEqual(handler.tokenizer_manager.requests, [])
 
+    async def test_images_preserve_prompt_and_media_order_for_each_question(self):
+        images = [
+            {"url": "https://example.com/first.png", "detail": "high"},
+            {"url": "https://example.com/second.png", "max_dynamic_patch": 4},
+            "iVBORw0KGgo=",
+        ]
+        urls = [image if isinstance(image, str) else image["url"] for image in images]
+        marker = "<|vision_start|><|image_pad|><|vision_end|>"
+        for count in (1, 2, 3):
+            cases = (
+                (
+                    OpenAIServingDecisions,
+                    _request(
+                        "Visible scene",
+                        {
+                            "q1": _question("yes_no"),
+                            "q2": _question("score", ["a", "b"]),
+                        },
+                        images=images[:count],
+                    ),
+                ),
+                (
+                    SystemOneServing,
+                    _systemone_request(
+                        {
+                            "q1": {"type": "noul", "instructions": "Visible?"},
+                            "q2": {"type": "score", "criteria": ["a", "b"]},
+                        },
+                        images=images[:count],
+                    ),
+                ),
+            )
+            for serving_class, request in cases:
+                with self.subTest(route=serving_class.route, images=count):
+                    manager = ScoringManager(self.tokenizer)
+                    handler = _handler(manager, serving_class=serving_class)
+                    text_request = request.model_copy(update={"images": []})
+                    text_prompts, text_labels = _encoded(handler, text_request)
+                    response = await handler.handle_request(request, None)
+                    self.assertEqual(response.status_code, 200, response.body)
+                    self.assertEqual(len(manager.requests), 1)
+                    generated = manager.requests[0]
+                    self.assertEqual(generated.token_ids_logprob, text_labels)
+                    self.assertEqual(len(generated.image_data), 2)
+                    for index, media in enumerate(generated.image_data):
+                        self.assertEqual([item.url for item in media], urls[:count])
+                        self.assertEqual(media[0].detail, "high")
+                        if count > 1:
+                            self.assertEqual(media[1].max_dynamic_patch, 4)
+                        prompt = self.tokenizer.decode(generated.input_ids[index])
+                        self.assertEqual(prompt.count(marker), count)
+                        self.assertEqual(
+                            prompt.replace(marker, ""),
+                            self.tokenizer.decode(text_prompts[index]),
+                        )
+                        self.assertTrue(all(item.url not in prompt for item in media))
+
+    async def test_image_refusals_do_not_restrict_text_requests(self):
+        original_template = self.tokenizer.chat_template
+        self.addCleanup(setattr, self.tokenizer, "chat_template", original_template)
+        text_template = (
+            "{% for message in messages %}"
+            "{% if message['content'] is string %}{{ message['content'] }}"
+            "{% else %}{% for part in message['content'] %}"
+            "{% if part['type'] == 'text' %}{{ part['text'] }}{% endif %}"
+            "{% endfor %}{% endif %}{% endfor %}\nassistant\n\n"
+        )
+        overrides = {
+            "text-only override": text_template,
+            "bare image token override": "<|image_pad|>" + text_template,
+            "extra image group": original_template
+            + "<|vision_start|><|image_pad|><|vision_end|>",
+        }
+        for serving_class in (OpenAIServingDecisions, SystemOneServing):
+            cases = [
+                "--enable-multimodal",
+                "chat template accepting image parts",
+                "--allow-auto-truncate",
+                *overrides,
+                "absent image marker capability",
+                "multimodal marker text",
+            ]
+            if serving_class is OpenAIServingDecisions:
+                cases.append("return_prompt_token_ids")
+            for message in cases:
+                with self.subTest(route=serving_class.route, refusal=message):
+                    self.tokenizer.chat_template = original_template
+                    manager = ScoringManager(
+                        self.tokenizer,
+                        allow_auto_truncate=message == "--allow-auto-truncate",
+                    )
+                    if message == "--enable-multimodal":
+                        manager.model_config.is_multimodal = False
+                    if message == "chat template accepting image parts":
+                        self.tokenizer.chat_template = (
+                            "{{ messages[0]['content'] }}\nassistant\n\n"
+                        )
+                    processor = manager.mm_processor
+                    if message == "absent image marker capability":
+                        manager.mm_processor = SimpleNamespace()
+                    handler = _handler(manager, serving_class=serving_class)
+                    images = [{"url": "https://example.com/a.png"}]
+                    if serving_class is OpenAIServingDecisions:
+                        request = _request(
+                            "s",
+                            {"q": _question("yes_no")},
+                            images=images,
+                            return_prompt_token_ids=message
+                            == "return_prompt_token_ids",
+                        )
+                    else:
+                        request = _systemone_request(
+                            {"q": {"type": "noul", "instructions": "Visible?"}},
+                            images=images,
+                        )
+                    if message == "multimodal marker text":
+                        field = (
+                            "input"
+                            if serving_class is OpenAIServingDecisions
+                            else "state"
+                        )
+                        request = request.model_copy(update={field: "s <|image_pad|>"})
+                    expected = message
+                    if message in overrides:
+                        request.chat_template_kwargs = {
+                            "chat_template": overrides[message]
+                        }
+                        expected = "one complete marker per image"
+                    elif message == "absent image marker capability":
+                        expected = "processor exposing image markers"
+                    response = await handler.handle_request(request, None)
+                    self.assertEqual(response.status_code, 400)
+                    self.assertIn(expected, json.loads(response.body)["message"])
+                    self.assertEqual(manager.requests, [])
+                    text_request = request.model_copy(update={"images": []})
+                    response = await handler.handle_request(text_request, None)
+                    self.assertEqual(response.status_code, 200, response.body)
+                    self.assertEqual(manager.requests[0].image_data, [None])
+                    if (
+                        message in overrides
+                        or message == "absent image marker capability"
+                    ):
+                        manager.mm_processor = processor
+                        healthy = request.model_copy(
+                            update={"chat_template_kwargs": {}}
+                        )
+                        response = await handler.handle_request(healthy, None)
+                        self.assertEqual(response.status_code, 200, response.body)
+                        self.assertEqual(
+                            manager.requests[-1].image_data[0][0].url, images[0]["url"]
+                        )
+
     async def test_tokenizers_without_added_tokens_use_the_full_prompt(self):
         request = _request("s", {"q": _question("choice", {"a": None, "b": None})})
         plain = _handler(ScoringManager(PlainTokenizer(self.tokenizer)))
@@ -981,7 +1153,7 @@ class TestSystemOne(unittest.IsolatedAsyncioTestCase):
             {"q": {"type": "choice", "instructions": "Pick one", "criteria": criteria}}
         )
         encoded, _ = self._serving(manager)._convert_to_internal_request(request)
-        prompts, label_ids = zip(*encoded)
+        prompts, label_ids, _ = zip(*encoded)
         text = self.tokenizer.decode(prompts[0])
         self.assertIn("AA: option 0", text)
         self.assertNotIn("\nA: option 0", text)
