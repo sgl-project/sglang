@@ -38,7 +38,9 @@ class GptOssDetector(BaseFormatDetector):
 
     def has_tool_call(self, text: str) -> bool:
         """Check if text contains TypeScript-style function call markers."""
-        return self.bot_token in text
+        return self.bot_token in text or bool(
+            re.search(r"<\|channel\|>commentary\s+to=", text)
+        )
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """Parse TypeScript-style function calls from complete text."""
