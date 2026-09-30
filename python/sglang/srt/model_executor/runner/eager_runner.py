@@ -58,7 +58,9 @@ from sglang.srt.model_executor.runner_utils import (
     maybe_publish_prefill_shared_read_done,
 )
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_exec,
+    get_schedule,
     get_spec,
     max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
@@ -121,7 +123,15 @@ class EagerRunner(BaseRunner):
             max_bs *= get_spec().speculative_eagle_topk
         # Mirror prepare_mlp_sync_batch padding so the registry holds what load_batch copies.
         max_bs = get_eager_max_batch_size(max_bs)
-        prefill_ceiling = max(mr.max_total_num_tokens, max_prefill_buffer_tokens())
+        prefill_ceiling = max_prefill_buffer_tokens()
+        if (
+            get_disagg().disaggregation_mode == "decode"
+            and not get_disagg().enable_pdmux
+        ):
+            prefill_ceiling = 0
+        elif (get_schedule().chunked_prefill_size or 0) <= 0:
+            # Without chunking a single prefill may span the entire KV pool.
+            prefill_ceiling = max(prefill_ceiling, mr.max_total_num_tokens)
         max_num_token = max(prefill_ceiling, max_bs * num_tokens_per_req)
         if require_mlp_sync():
             from sglang.srt.layers.cp.padding import get_cp_padding_align_size
