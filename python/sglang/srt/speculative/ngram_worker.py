@@ -505,7 +505,8 @@ class NGRAMWorker(BaseSpecWorker):
                     accept_tokens,
                     accept_lens,
                 )
-            next_token_ids = accept_tokens.flatten()
+            accept_tokens = accept_tokens.flatten()
+            next_token_ids = accept_tokens
 
             # The KV mover expects drafts-only counts. NGRAM's
             # accept_lens includes the bonus token, matching scheduler output.
