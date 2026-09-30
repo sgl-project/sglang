@@ -949,10 +949,10 @@ class UnifiedMambaPool(MambaPool):
         MambaPool.copy_from(self, src_loc, tgt_loc)
 
     # -- PD state transfer (StateType.MAMBA) --
-    # The transfer item is the whole per-slot envelope, addressed as
-    # `raw_ptr + physical_slot * entry_bytes`. An envelope cannot be TP-resliced
-    # or PP-subset, so the per-tensor metadata below stays empty and both sides
-    # must build identical mamba specs (equal attn TP, pp=1).
+    # Register the raw allocation and keep whole-slot copies for matching peers.
+    # This entry spans all tensors, so its per-entry slice metadata stays empty.
+    # get_transfer_layout describes the pieces for unequal-TP copies without
+    # registering overlapping tensor views as separate contiguous buffers.
 
     def get_contiguous_buf_infos(self):
         # The address formula omits the anchor; a nonzero one would mis-address.
