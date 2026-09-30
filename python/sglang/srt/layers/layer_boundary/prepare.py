@@ -35,6 +35,7 @@ from sglang.srt.layers.layer_boundary.adapters.attention import (
     attn_tp_gather,
     attn_tp_slice,
     get_attn_tp_context,
+    tp_gather,
 )
 from sglang.srt.layers.layer_boundary.adapters.context_parallel import (
     attn_cp_gather,
@@ -70,7 +71,6 @@ from sglang.srt.layers.layer_boundary.ops import (
     dp_gather,
     dp_gather_sum,
     moe_cp_gather,
-    tp_gather,
 )
 
 

@@ -212,14 +212,6 @@ def move_rows(
     return hidden_states
 
 
-def tp_gather(hidden_states: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
-    # Input-scattered attention keeps the same number of tokens on every TP rank.
-    total_tokens = forward_batch.input_ids.shape[0]
-    output = hidden_states.new_empty((total_tokens, hidden_states.shape[-1]))
-    get_parallel().tp_group.all_gather_into_tensor(output, hidden_states)
-    return output
-
-
 def _dp_scatter_group() -> GroupCoordinator:
     parallel = get_parallel()
     if parallel.tp_size == parallel.attn_dp_size:

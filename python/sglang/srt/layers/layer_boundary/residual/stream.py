@@ -13,33 +13,14 @@
 # ==============================================================================
 """One forward's residual and its producer's outstanding contribution."""
 
-from typing import Callable, Optional, Union
+from typing import Optional, Union
 
 import msgspec
 import torch
 
-from sglang.srt.distributed import GroupCoordinator
 from sglang.srt.layers.layer_boundary.layout import SumGroup, _sum_group
 from sglang.srt.layers.layer_boundary.output import DeferredFinalize, UnreducedOutput
 from sglang.srt.layers.layer_boundary.residual import ResidualUpdate
-
-
-class DeferredSum(msgspec.Struct, frozen=True):
-    """Runtime reduction left by an exit decision.
-
-    Fields:
-        group: All-reduce group when no redistribution callable is supplied.
-        reduce_to_dp_local: Optional callable(value) returning a reduced
-            value on destination rows; takes precedence over group.
-    """
-
-    group: Optional[GroupCoordinator] = None
-    reduce_to_dp_local: Optional[Callable] = None
-
-    def complete(self, value):
-        if self.reduce_to_dp_local is not None:
-            return self.reduce_to_dp_local(value)
-        return self.group.all_reduce(value)
 
 
 class DeclaredSum(msgspec.Struct, frozen=True):
@@ -55,31 +36,29 @@ class Contribution(msgspec.Struct):
     """Own a producer's output, residual update and outstanding completion.
 
     Fields:
-        value: Contribution tensor, or None for an opaque finalize handoff.
+        value: Contribution tensor (an unreduced output's partial), or None
+            for an opaque finalize handoff.
         update: Producer operation to apply before the consumer reads input.
-        owed: Runtime sum, declared sum, producer-specific finalize, or None.
+        owed: The exit's unreduced output, a declared sum, a producer-specific
+            finalize, or None.
 
     Completing owed work clears owed but does not apply the residual update.
     """
 
     value: Optional[torch.Tensor]
     update: ResidualUpdate
-    owed: Union[DeferredSum, DeclaredSum, DeferredFinalize, None] = None
+    owed: Union[UnreducedOutput, DeclaredSum, DeferredFinalize, None] = None
 
     def for_boundary(self):
         # These forms are private inputs to the existing fused-kernel adapters.
-        if isinstance(self.owed, DeferredSum):
-            return UnreducedOutput(
-                self.value, self.owed.group, self.owed.reduce_to_dp_local
-            )
-        if isinstance(self.owed, DeferredFinalize):
+        if isinstance(self.owed, (UnreducedOutput, DeferredFinalize)):
             return self.owed
         return self.value
 
     def complete(self):
-        if isinstance(self.owed, (DeferredSum, DeclaredSum)):
+        if isinstance(self.owed, DeclaredSum):
             value = self.owed.complete(self.value)
-        elif isinstance(self.owed, DeferredFinalize):
+        elif self.owed is not None:
             value = self.owed.complete()
         else:
             return self.value
@@ -170,11 +149,7 @@ class ResidualStream:
                 raise RuntimeError("a declared sum cannot carry another completion")
             contribution = Contribution(output, update, DeclaredSum(declared_sum))
         elif isinstance(output, UnreducedOutput):
-            contribution = Contribution(
-                output.partial,
-                update,
-                DeferredSum(output.group, output.reduce_to_dp_local),
-            )
+            contribution = Contribution(output.partial, update, output)
         elif isinstance(output, DeferredFinalize):
             contribution = Contribution(None, update, output)
         else:
@@ -223,8 +198,12 @@ class ResidualStream:
             raise NotImplementedError("snapshot requires a plain residual update")
         if pending.owed is None:
             value = pending.value
-        elif isinstance(pending.owed, (DeferredSum, DeclaredSum)):
+        elif isinstance(pending.owed, DeclaredSum):
             value = pending.owed.complete(pending.value.clone())
+        elif isinstance(pending.owed, UnreducedOutput):
+            value = msgspec.structs.replace(
+                pending.owed, partial=pending.value.clone()
+            ).complete()
         else:
             raise NotImplementedError("a finalize handoff requires main-output capture")
         return value.clone() if self.residual is None else value + self.residual

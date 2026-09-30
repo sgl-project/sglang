@@ -20,6 +20,7 @@ from typing import Callable, Optional
 from sglang.srt.environ import envs
 from sglang.srt.layers.layer_boundary.adapters.attention import get_attn_tp_context
 from sglang.srt.layers.layer_boundary.boundary import (
+    ExitMove,
     _cp_moves,
     bind_entry,
     bind_exit,
@@ -194,38 +195,25 @@ class StagePlan:
                     input_rows=edges.incoming.need.layout,
                 )
             else:
-                into = bind_entry(
+                entry = bind_entry(
                     edges.incoming,
                     fusions=fused,
                     carried_fusions=carried,
                     cp_moves=edges.cp_moves,
                     enters_stack=enters_stack,
-                )
-                entry = EntryPath(
-                    prepare=into.prepare,
-                    input_rows=into.input_rows,
-                    input_move=into.input_move,
                     attn_input_adapter=edges.attn_input_adapter,
-                    capture_move=into.capture_move,
-                    capture_move_allocates=into.capture_move_allocates,
-                    preserves_residual=into.preserves_residual,
-                    declared_sum=edges.incoming.produced.group
-                    if edges.incoming.produced.always_partial
-                    else None,
                 )
             out = (
-                None
+                ExitMove()
                 if finishes_directly
                 else bind_exit(edges.outgoing, cp_moves=edges.cp_moves)
             )
             self.paths[variant] = StagePath(
                 entry=entry,
                 output=edges.outgoing.produced,
-                output_move=None if out is None else out.output_move,
-                returns_over_dp=out is not None and out.returns_over_dp,
-                output_move_completes_sum=False
-                if out is None
-                else out.output_move_completes_sum,
+                output_move=out.output_move,
+                output_move_completes_sum=out.output_move_completes_sum,
+                returns_over_dp=out.returns_over_dp,
             )
 
     @property
@@ -234,7 +222,8 @@ class StagePlan:
 
     @property
     def input_on_attn_tp_slices(self):
-        return TokenAxis.ATTN_TP in self.incoming_residual_rows.sharded
+        entry = self.paths[BatchVariant.ORDINARY].entry
+        return TokenAxis.ATTN_TP in entry.input_rows.sharded
 
     def variant_for(self, forward_batch):
         # The batch determines its rows; missing paths must not change them.
