@@ -5,10 +5,6 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[features]
-# Test-only formatter constructors for hosts' unit tests.
-test-support = []
-
 [dependencies]
 async-stream = { workspace = true }
 futures = { workspace = true }

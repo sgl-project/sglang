@@ -36,7 +36,6 @@ regex-syntax = "=0.8.11"
 dynamo-tokenizers = "1.7.0"
 
 [dev-dependencies]
-sglang-processor = { path = "../sglang-processor", features = ["test-support"] }
 rmp-serde = "1"
 rmpv = { version = "1", features = ["with-serde"] }
 tower = { version = "0.5", features = ["util"] }

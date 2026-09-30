@@ -1239,7 +1239,7 @@ pub fn load_chat_formatter(
     let mut config = parse_json(&config_text, config_path, "tokenizer config")?;
 
     let Some(argument) = chat_template_arg else {
-        return formatter_from_config(&config);
+        return ChatFormatter::from_tokenizer_config(&config);
     };
 
     let path = Path::new(argument);
@@ -1260,7 +1260,7 @@ pub fn load_chat_formatter(
             &mut config,
             Value::String(template.trim_matches('\n').replace("\\n", "\n")),
         )?;
-        return formatter_from_config(&config);
+        return ChatFormatter::from_tokenizer_config(&config);
     }
 
     let template_text = read_to_string(path, "chat template")?;
@@ -1270,10 +1270,10 @@ pub fn load_chat_formatter(
     // files carry Conversation fields and are translated below.
     if template.is_string() {
         set_chat_template(&mut config, template)?;
-        formatter_from_config(&config)
+        ChatFormatter::from_tokenizer_config(&config)
     } else if let Some(chat_template) = template.get("chat_template") {
         set_chat_template(&mut config, chat_template.clone())?;
-        formatter_from_config(&config)
+        ChatFormatter::from_tokenizer_config(&config)
     } else {
         Ok(ChatFormatter::Legacy(Box::new(LegacyFormatter {
             spec: parse_legacy_template(&template, path)?,
@@ -1400,35 +1400,29 @@ fn set_chat_template(config: &mut Value, chat_template: Value) -> Result<(), Tem
     Ok(())
 }
 
-fn formatter_from_config(config: &Value) -> Result<ChatFormatter, TemplateError> {
-    let thinking = ThinkingTemplates::from_config(config);
-    let template: ChatTemplate = serde_json::from_value(config.clone())
-        .map_err(|source| TemplateError::Config { source })?;
-    if template.chat_template.is_none() {
-        return Err(TemplateError::Missing);
+impl ChatFormatter {
+    /// Build the HuggingFace formatter from parsed `tokenizer_config.json`
+    /// contents, which must carry a `chat_template`.
+    pub fn from_tokenizer_config(config: &Value) -> Result<Self, TemplateError> {
+        let thinking = ThinkingTemplates::from_config(config);
+        let template: ChatTemplate = serde_json::from_value(config.clone())
+            .map_err(|source| TemplateError::Config { source })?;
+        if template.chat_template.is_none() {
+            return Err(TemplateError::Missing);
+        }
+        let formatter = PromptFormatter::from_parts(
+            template,
+            ContextMixins::new(&[PromptContextMixin::OaiChat]),
+            true,
+        )
+        .map_err(|error| TemplateError::Renderer {
+            message: error.to_string(),
+        })?;
+        Ok(Self::HuggingFace {
+            formatter,
+            thinking,
+        })
     }
-    let formatter = PromptFormatter::from_parts(
-        template,
-        ContextMixins::new(&[PromptContextMixin::OaiChat]),
-        true,
-    )
-    .map_err(|error| TemplateError::Renderer {
-        message: error.to_string(),
-    })?;
-    Ok(ChatFormatter::HuggingFace {
-        formatter,
-        thinking,
-    })
-}
-
-#[cfg(feature = "test-support")]
-pub fn test_hugging_face_formatter(template: &str) -> ChatFormatter {
-    formatter_from_config(&serde_json::json!({"chat_template": template})).unwrap()
-}
-
-#[cfg(feature = "test-support")]
-pub fn test_hugging_face_formatter_from_config(config: Value) -> ChatFormatter {
-    formatter_from_config(&config).unwrap()
 }
 
 /// Port of Python `_load_json_chat_template`: fields mirror `Conversation`

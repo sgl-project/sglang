@@ -23,8 +23,6 @@ pub use preprocessing::{
     DynamoTokenizer, TextTokenizer, load_tokenizer, resolve_chat_template_file, resolve_model_file,
     resolve_tokenizer_file,
 };
-#[cfg(feature = "test-support")]
-pub use preprocessing::{test_hugging_face_formatter, test_hugging_face_formatter_from_config};
 
 // Dynamo crates whose types appear in this crate's public API. Hosts use these
 // re-exports so their Dynamo versions always match the processor's.
