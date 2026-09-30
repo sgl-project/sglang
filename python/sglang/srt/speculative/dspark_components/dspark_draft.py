@@ -252,7 +252,11 @@ class DraftBlockProposer:
     ) -> DraftProposal:
         embed_module = unwrap_lora_layer(
             self.draft_model.embed_tokens
-            if not self.sample_from_anchor
+            if (
+                not self.sample_from_anchor
+                or getattr(self.draft_model, "_glm_dspark_quarot_config", None)
+                is not None
+            )
             else target_model.get_input_embeddings()
         )
         draft_sampler = self._draft_sampler
