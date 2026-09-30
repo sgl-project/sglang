@@ -379,7 +379,7 @@ class Qwen3DecoderLayer(nn.Module):
         self.attn_boundary, self.ffn_boundary = make_stages(
             (declare_attn(), self.input_layernorm),
             (
-                declare_ffn(sparse=False, next_sparse=False),
+                declare_ffn(sparse=False, next_layer_sparse=False),
                 self.post_attention_layernorm,
             ),
             previous=declare_ffn() if layer_id != 0 else None,
@@ -399,7 +399,7 @@ class Qwen3DecoderLayer(nn.Module):
             hidden_states,
             forward_batch,
             post_residual_addition=post_residual_addition,
-            capture_output=capture_output,
+            capture=capture_output,
         )
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
@@ -477,9 +477,9 @@ class Qwen3Model(Qwen2Model):
             )
         if not self.pp_group.is_last_rank:
             return residual_batch.to_pp(hidden_states, forward_batch)
-        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
-        if hidden_states.shape[0] != 0:
-            hidden_states = residual_batch.norm(hidden_states, forward_batch, self.norm)
+        hidden_states = residual_batch.final_norm(
+            hidden_states, forward_batch, self.norm, skip_empty=True
+        )
         return (
             (hidden_states, aux_hidden_states) if aux_hidden_states else hidden_states
         )
@@ -607,7 +607,7 @@ class Qwen3ForCausalLM(nn.Module):
             )
 
         if end == self.model.config.num_hidden_layers:
-            forward_batch.hidden_states = residual_batch.norm(
+            forward_batch.hidden_states = residual_batch.final_norm(
                 forward_batch.hidden_states, forward_batch, self.model.norm
             )
             # logits process
