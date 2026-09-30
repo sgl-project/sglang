@@ -519,9 +519,9 @@ def test_decode_api_rejects_invalid_input_rank() -> None:
 def test_fused_kda_backend_is_opt_in(monkeypatch):
     from sglang.kernels.ops.attention import kda_fused_decode_aiter_hip
 
-    monkeypatch.delenv("SGLANG_K3_KDA_FUSED_BACKEND", raising=False)
+    monkeypatch.delenv("SGLANG_ROCM_K3_KDA_FUSED_BACKEND", raising=False)
     assert not kda_fused_decode_aiter_hip.enabled()
-    monkeypatch.setenv("SGLANG_K3_KDA_FUSED_BACKEND", "aiter")
+    monkeypatch.setenv("SGLANG_ROCM_K3_KDA_FUSED_BACKEND", "aiter")
     assert kda_fused_decode_aiter_hip.enabled()
 
 
