@@ -860,6 +860,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
             lower_bound=layer.lower_bound,
+            layer_id=layer.layer_id,
         )
 
         self._track_mamba_state_decode(

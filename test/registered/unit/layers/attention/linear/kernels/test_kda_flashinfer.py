@@ -438,6 +438,196 @@ class TestCakeKDAPrefillCheckpointAdapter(CustomTestCase):
         self.assertTrue(torch.equal(h, torch.full_like(h, 3)))
 
 
+class TestCakeKDAFacadeRoute(CustomTestCase):
+    """The ``recurrent_kda(backend="cake")`` facade serves BF16 state pools."""
+
+    @staticmethod
+    def _kernel():
+        kernel = object.__new__(CakeKDAKernel)
+        kernel._backend = "cake"
+        kernel._gate_cache = {}
+        return kernel
+
+    @staticmethod
+    def _served_inputs():
+        # Serving hands the kernel split(dim=-1) views of one packed conv row.
+        torch.manual_seed(11)
+        tokens, heads, dim = 5, 12, 128
+        packed = torch.randn(1, tokens, 3 * heads * dim, dtype=torch.bfloat16)
+        q, k, v = (
+            part.unflatten(-1, (heads, dim))
+            for part in packed.split([heads * dim] * 3, dim=-1)
+        )
+        return {
+            "q": q,
+            "k": k,
+            "v": v,
+            "g": torch.randn(1, tokens, heads, dim, dtype=torch.bfloat16),
+            "beta": torch.randn(1, tokens, heads, dtype=torch.bfloat16),
+            "cache_indices": torch.tensor([2, 0], dtype=torch.int32),
+            "query_start_loc": torch.tensor([0, 2, 5], dtype=torch.int32),
+            "A_log": torch.randn(1, 1, heads, 1, dtype=torch.float32),
+            "dt_bias": torch.randn(heads * dim, dtype=torch.float32),
+        }
+
+    def _run(self, fake_recurrent_kda, triton_result=None):
+        kernel = self._kernel()
+        inputs = self._served_inputs()
+        state = torch.randn(4, 12, 128, 128, dtype=torch.bfloat16)
+        with (
+            patch.object(
+                kernel,
+                "_cake_prefill_admission",
+                return_value=CakePrefillAdmission(True, CakePrefillReason.ELIGIBLE),
+            ),
+            patch.object(kernel, "_cake_prefill_uses_prepared_export", return_value=False),
+            patch.object(kernel, "_extend_triton", return_value=triton_result) as triton,
+            patch.object(
+                kda_flashinfer,
+                "_get_flashinfer_kda_prefill_kernel",
+                return_value=(True, fake_recurrent_kda),
+            ),
+            patch.object(kda_flashinfer, "record_kda_terminal_route") as telemetry,
+        ):
+            output = kernel.extend(
+                **inputs, ssm_states=state, lower_bound=-5.0, layer_id=9
+            )
+        return inputs, output, triton, telemetry
+
+    def test_strided_served_views_are_repacked_for_the_facade(self):
+        calls = []
+
+        def fake_recurrent_kda(**kwargs):
+            calls.append(kwargs)
+            return torch.zeros_like(kwargs["v"]), kwargs["initial_state"]
+
+        inputs, _, triton, telemetry = self._run(fake_recurrent_kda)
+
+        self.assertEqual(len(calls), 1)
+        for name in ("q", "k", "v"):
+            self.assertFalse(inputs[name].is_contiguous())
+            self.assertTrue(calls[0][name].is_contiguous())
+            self.assertTrue(torch.equal(calls[0][name], inputs[name]))
+        triton.assert_not_called()
+        self.assertEqual(telemetry.call_count, 1)
+        event = telemetry.call_args.kwargs
+        self.assertEqual((event["mode"], event["layer_id"]), ("prefill", 9))
+        self.assertTrue(event["cake_success"])
+        self.assertEqual(event["reason"], CakePrefillReason.ELIGIBLE)
+
+    def test_facade_contract_refusal_is_a_declared_triton_fallback(self):
+        sentinel = object()
+
+        def refusing_recurrent_kda(**kwargs):
+            raise ValueError(
+                "backend='cake' does not support this recurrent_kda prefill contract"
+            )
+
+        _, output, triton, telemetry = self._run(refusing_recurrent_kda, sentinel)
+
+        self.assertIs(output, sentinel)
+        triton.assert_called_once()
+        self.assertEqual(telemetry.call_count, 1)
+        event = telemetry.call_args.kwargs
+        self.assertEqual(event["mode"], "prefill")
+        self.assertTrue(event["eligible"])
+        self.assertTrue(event["attempted_cake"])
+        self.assertFalse(event["cake_success"])
+        self.assertTrue(event["triton_fallback"])
+        self.assertFalse(event["fatal"])
+        self.assertEqual(event["reason"], CakePrefillReason.FACADE_CONTRACT)
+
+    def test_other_facade_errors_stay_fatal(self):
+        def failing_recurrent_kda(**kwargs):
+            raise ValueError("unrelated kernel failure")
+
+        with self.assertRaisesRegex(ValueError, "unrelated"):
+            self._run(failing_recurrent_kda)
+
+
+class TestCakeKDAPlainDecodeTelemetry(CustomTestCase):
+    """The bounded-gate decode reaches ``decode`` (not ``packed_decode``)."""
+
+    @staticmethod
+    def _kernel():
+        kernel = object.__new__(CakeKDAKernel)
+        kernel._backend = "cake"
+        return kernel
+
+    @staticmethod
+    def _decode_inputs(v_heads):
+        batch, heads, dim = 3, 12, 128
+        return dict(
+            q=torch.randn(1, batch, heads, dim, dtype=torch.bfloat16),
+            k=torch.randn(1, batch, heads, dim, dtype=torch.bfloat16),
+            v=torch.randn(1, batch, v_heads, dim, dtype=torch.bfloat16),
+            a=torch.randn(1, batch, heads, dim, dtype=torch.bfloat16),
+            b=torch.randn(1, batch, heads, dtype=torch.bfloat16),
+            A_log=torch.randn(heads, dtype=torch.float32),
+            dt_bias=torch.randn(heads * dim, dtype=torch.float32),
+            ssm_states=torch.zeros(4, v_heads, dim, dim, dtype=torch.bfloat16),
+            cache_indices=torch.tensor([1, 0, 3], dtype=torch.int32),
+            query_start_loc=torch.tensor([0, 1, 2, 3], dtype=torch.int32),
+            lower_bound=-5.0,
+            layer_id=4,
+        )
+
+    def test_cake_decode_records_a_success_event(self):
+        kernel = self._kernel()
+        sentinel = object()
+        with (
+            patch.object(kernel, "_decode_cake", return_value=sentinel) as cake,
+            patch.object(kda_flashinfer, "record_kda_terminal_route") as telemetry,
+        ):
+            output = kernel.decode(**self._decode_inputs(v_heads=12))
+
+        self.assertIs(output, sentinel)
+        cake.assert_called_once()
+        self.assertEqual(telemetry.call_count, 1)
+        event = telemetry.call_args.kwargs
+        self.assertEqual((event["mode"], event["layer_id"]), ("decode", 4))
+        self.assertTrue(event["cake_success"])
+        self.assertFalse(event["triton_fallback"])
+        self.assertEqual(event["reason"], CakePackedDecodeReason.ELIGIBLE)
+
+    def test_cake_decode_failure_is_fatal_and_re_raised(self):
+        kernel = self._kernel()
+        with (
+            patch.object(kernel, "_decode_cake", side_effect=RuntimeError("boom")),
+            patch.object(kda_flashinfer, "record_kda_terminal_route") as telemetry,
+            self.assertRaisesRegex(RuntimeError, "boom"),
+        ):
+            kernel.decode(**self._decode_inputs(v_heads=12))
+
+        event = telemetry.call_args.kwargs
+        self.assertEqual(event["mode"], "decode")
+        self.assertTrue(event["fatal"])
+        self.assertEqual(event["reason"], kda_route_telemetry.CAKE_DECODE_EXCEPTION)
+
+    def test_grouped_value_heads_declare_the_triton_fallback(self):
+        from sglang.srt.layers.attention.linear.kernels.kda_triton import (
+            TritonKDAKernel,
+        )
+
+        kernel = self._kernel()
+        sentinel = object()
+        with (
+            patch.object(TritonKDAKernel, "decode", return_value=sentinel) as triton,
+            patch.object(kernel, "_decode_cake") as cake,
+            patch.object(kda_flashinfer, "record_kda_terminal_route") as telemetry,
+        ):
+            output = kernel.decode(**self._decode_inputs(v_heads=6))
+
+        self.assertIs(output, sentinel)
+        triton.assert_called_once()
+        cake.assert_not_called()
+        event = telemetry.call_args.kwargs
+        self.assertEqual(event["mode"], "decode")
+        self.assertTrue(event["triton_fallback"])
+        self.assertFalse(event["fatal"])
+        self.assertEqual(event["reason"], CakePackedDecodeReason.GQA_HEADS)
+
+
 class TestCakeKDAIndexedStateAdapter(CustomTestCase):
     @staticmethod
     def _inputs(batch_size=2, num_heads=2, head_dim=4):

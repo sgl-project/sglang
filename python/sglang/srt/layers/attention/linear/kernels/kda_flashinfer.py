@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.layers.attention.linear.kda_route_telemetry import (
+    CAKE_DECODE_EXCEPTION,
     CAKE_PACKED_EXCEPTION,
     CAKE_PREFILL_EXCEPTION,
     PACKED_SELECTOR_EXCEPTION,
@@ -363,6 +364,16 @@ def _maybe_dump_kda_prefill_call(layer_id: int, **tensors) -> None:
     )
     torch.save(record, path)
     _kda_prefill_dump_count += 1
+
+
+_FACADE_CONTRACT_MESSAGE = "does not support this recurrent_kda prefill contract"
+
+
+def _is_facade_contract_error(exc: BaseException) -> bool:
+    """``recurrent_kda(backend="cake")`` refused the call at its own contract
+    check (strided operands, unsupported gate or state layout). That is a
+    declared Triton fallback for the layer, not a kernel failure."""
+    return isinstance(exc, ValueError) and _FACADE_CONTRACT_MESSAGE in str(exc)
 
 
 def _cake_prefill_gate_bound_ok(
@@ -1501,32 +1512,59 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
                 if needs_checkpoints
                 else None
             )
-            recurrent_result = recurrent_kda(
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
-                A_log=A_log_fi,
-                dt_bias=dt_bias_fi,
-                scale=None,
-                initial_state=ssm_states,
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
-                use_gate_in_kernel=True,
-                lower_bound=lower_bound,
-                cu_seqlens=query_start_loc_fi,
-                ssm_state_indices=cache_indices,
-                beta_is_logit=True,
-                state_checkpoints=state_checkpoints,
-                checkpoint_cu_starts=(
-                    state_checkpoint_cu_starts if needs_checkpoints else None
-                ),
-                checkpoint_every_n_tokens=(
-                    state_checkpoint_every_n_tokens if needs_checkpoints else 0
-                ),
-                backend="cake",
-            )
+            # The facade reads q/k/v only as contiguous [1, T, H, D] tensors.
+            # Serving hands us ``split(dim=-1)`` views of the fused-projection
+            # conv output (token stride = the full qkv width), so repack them
+            # here; one T*H*D BF16 copy per strided operand, like the prepared
+            # route's repack.
+            q_fi = q if q.is_contiguous() else q.contiguous()
+            k_fi = k if k.is_contiguous() else k.contiguous()
+            v_fi = v if v.is_contiguous() else v.contiguous()
+            try:
+                recurrent_result = recurrent_kda(
+                    q=q_fi,
+                    k=k_fi,
+                    v=v_fi,
+                    g=g,
+                    beta=beta,
+                    A_log=A_log_fi,
+                    dt_bias=dt_bias_fi,
+                    scale=None,
+                    initial_state=ssm_states,
+                    output_final_state=True,
+                    use_qk_l2norm_in_kernel=True,
+                    use_gate_in_kernel=True,
+                    lower_bound=lower_bound,
+                    cu_seqlens=query_start_loc_fi,
+                    ssm_state_indices=cache_indices,
+                    beta_is_logit=True,
+                    state_checkpoints=state_checkpoints,
+                    checkpoint_cu_starts=(
+                        state_checkpoint_cu_starts if needs_checkpoints else None
+                    ),
+                    checkpoint_every_n_tokens=(
+                        state_checkpoint_every_n_tokens if needs_checkpoints else 0
+                    ),
+                    backend="cake",
+                )
+            except ValueError as exc:
+                if not _is_facade_contract_error(exc):
+                    raise
+                # The facade declined the call before touching the state pool:
+                # serve the layer with the Triton prefill kernel and declare it.
+                output = self._extend_triton(q, k, v, g, beta, **fallback_kwargs)
+                record_kda_terminal_route(
+                    mode="prefill",
+                    layer_id=layer_id,
+                    eligible=True,
+                    attempted_cake=True,
+                    cake_success=False,
+                    triton_fallback=True,
+                    fatal=False,
+                    reason=CakePrefillReason.FACADE_CONTRACT,
+                    detail=stable_kda_exception_detail(exc),
+                )
+                return output
             if needs_checkpoints:
                 output, final_state, state_checkpoints = recurrent_result
             else:
@@ -1593,6 +1631,10 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         head_v_dim = v.shape[3]
 
         if self._backend == "cake":
+            # Route telemetry: the bounded-gate (Kimi-K3) decode reaches this
+            # plain entry point instead of ``packed_decode``; record the same
+            # terminal decision so served parity tests can assert the route.
+            layer_id = int(kwargs.get("layer_id", -1))
             if num_v_heads != num_heads:
                 # The exported kernel accepts GQA, but its recurrent state has
                 # not yet matched SGLang's Triton path at the BF16 promotion
@@ -1602,7 +1644,7 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
                     TritonKDAKernel,
                 )
 
-                return TritonKDAKernel().decode(
+                output = TritonKDAKernel().decode(
                     q,
                     k,
                     v,
@@ -1616,24 +1658,62 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
                     lower_bound=lower_bound,
                     **kwargs,
                 )
-            self._check_cake_state_contract(
-                ssm_states,
-                num_v_heads=num_v_heads,
-                head_v_dim=head_v_dim,
-                head_k_dim=head_k_dim,
+                record_kda_terminal_route(
+                    mode="decode",
+                    layer_id=layer_id,
+                    eligible=False,
+                    attempted_cake=False,
+                    cake_success=False,
+                    triton_fallback=True,
+                    fatal=False,
+                    reason=CakePackedDecodeReason.GQA_HEADS,
+                    detail=f"H={num_heads},HV={num_v_heads}",
+                )
+                return output
+            try:
+                self._check_cake_state_contract(
+                    ssm_states,
+                    num_v_heads=num_v_heads,
+                    head_v_dim=head_v_dim,
+                    head_k_dim=head_k_dim,
+                )
+                output = self._decode_cake(
+                    q,
+                    k,
+                    v,
+                    a,
+                    b,
+                    A_log=A_log,
+                    dt_bias=dt_bias,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    lower_bound=lower_bound,
+                )
+            except Exception as exc:
+                record_kda_terminal_route(
+                    mode="decode",
+                    layer_id=layer_id,
+                    eligible=True,
+                    attempted_cake=True,
+                    cake_success=False,
+                    triton_fallback=False,
+                    fatal=True,
+                    reason=CAKE_DECODE_EXCEPTION,
+                    detail=stable_kda_exception_detail(exc),
+                )
+                raise
+            record_kda_terminal_route(
+                mode="decode",
+                layer_id=layer_id,
+                eligible=True,
+                attempted_cake=True,
+                cake_success=True,
+                triton_fallback=False,
+                fatal=False,
+                reason=CakePackedDecodeReason.ELIGIBLE,
+                detail="plain_decode",
             )
-            return self._decode_cake(
-                q,
-                k,
-                v,
-                a,
-                b,
-                A_log=A_log,
-                dt_bias=dt_bias,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
-                lower_bound=lower_bound,
-            )
+            return output
 
         # The committed pool goes into the kernel as-is (in-place update); under
         # unified memory / page-major it is an envelope-strided view, which the

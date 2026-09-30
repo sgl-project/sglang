@@ -73,6 +73,9 @@ class CakePackedDecodeReason:
     CACHE_INDEX_UNVERIFIED = "cache_index_unverified"
     CACHE_INDEX_OOB = "cache_index_oob"
     CACHE_INDEX_DUPLICATE = "cache_index_duplicate"
+    # Plain (non-packed) decode: the exported kernel keeps H == HV; grouped
+    # value heads run the Triton decode kernel.
+    GQA_HEADS = "gqa_heads"
 
 
 class CakePrefillReason:
@@ -90,6 +93,9 @@ class CakePrefillReason:
     SHAPE_MISMATCH = "shape_mismatch"
     UNSUPPORTED_ARCH = "unsupported_arch"
     UNSUPPORTED_CONTRACT = "unsupported_contract"
+    # The recurrent_kda(backend="cake") facade (BF16 state pools) rejected the
+    # call at its own contract check; the layer ran the Triton prefill kernel.
+    FACADE_CONTRACT = "facade_contract"
 
 
 PREFILL_SELECTOR_EXCEPTION = "prefill_selector_exception"
@@ -97,6 +103,7 @@ PACKED_SELECTOR_EXCEPTION = "packed_selector_exception"
 TRITON_FALLBACK_EXCEPTION = "triton_fallback_exception"
 CAKE_PREFILL_EXCEPTION = "cake_prefill_exception"
 CAKE_PACKED_EXCEPTION = "cake_packed_exception"
+CAKE_DECODE_EXCEPTION = "cake_decode_exception"
 CUDA_GRAPH_CAPTURE_EXCEPTION = "cuda_graph_capture_exception"
 CUDA_GRAPH_PLAN_BIND_EXCEPTION = "cuda_graph_plan_bind_exception"
 CUDA_GRAPH_REPLAY_EXCEPTION = "cuda_graph_replay_exception"
@@ -115,6 +122,7 @@ _DECODE_FALLBACK_REASONS = frozenset(
         CakePackedDecodeReason.CACHE_INDEX_UNVERIFIED,
         CakePackedDecodeReason.CACHE_INDEX_OOB,
         CakePackedDecodeReason.CACHE_INDEX_DUPLICATE,
+        CakePackedDecodeReason.GQA_HEADS,
     )
 )
 _PREFILL_FALLBACK_REASONS = frozenset(
@@ -130,11 +138,12 @@ _PREFILL_FALLBACK_REASONS = frozenset(
         CakePrefillReason.SHAPE_MISMATCH,
         CakePrefillReason.UNSUPPORTED_ARCH,
         CakePrefillReason.UNSUPPORTED_CONTRACT,
+        CakePrefillReason.FACADE_CONTRACT,
     )
 )
 _DIRECT_FATAL_REASONS = {
     ("decode", 0): frozenset((PACKED_SELECTOR_EXCEPTION, TRITON_FALLBACK_EXCEPTION)),
-    ("decode", 1): frozenset((CAKE_PACKED_EXCEPTION,)),
+    ("decode", 1): frozenset((CAKE_PACKED_EXCEPTION, CAKE_DECODE_EXCEPTION)),
     ("prefill", 0): frozenset((PREFILL_SELECTOR_EXCEPTION, TRITON_FALLBACK_EXCEPTION)),
     ("prefill", 1): frozenset((CAKE_PREFILL_EXCEPTION,)),
 }
