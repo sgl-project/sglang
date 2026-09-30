@@ -1214,7 +1214,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HUGEPAGE_MODE</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Huge page allocation policy for mmap-backed host allocations. <code>off</code> uses normal pages, <code>prefer</code> tries huge pages and falls back to normal pages, and <code>required</code> uses only huge pages and fails immediately if they are unavailable. Allocators and devices that do not dispatch to mmap ignore this policy. When unset, the mode is <code>off</code> if no huge page size is configured and <code>prefer</code> otherwise.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Huge page allocation policy for mmap-backed host allocations. <code>off</code> uses normal pages, <code>prefer</code> tries huge pages and falls back to normal pages, and <code>required</code> uses only huge pages and fails immediately if they are unavailable. Allocators and devices that do not dispatch to mmap ignore this policy. NIXL DOCA_MEMOS requires <code>required</code> with <code>SGLANG_HUGEPAGE_SIZE=2MB</code>. When unset, the mode is <code>off</code> if no huge page size is configured and <code>prefer</code> otherwise.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set (backward-compatible inference)</td>
     </tr>
     <tr>
