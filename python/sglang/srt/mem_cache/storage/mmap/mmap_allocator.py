@@ -11,6 +11,7 @@ import weakref
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.host_memory import cgroup_hugetlb_headroom_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +112,8 @@ def hugetlb_pool_free_bytes() -> int:
     That is the pool of the size SGLANG_HUGEPAGE_SIZE names, provided the
     selected mode enables hugepages and libc is loadable. Read from sysfs,
     which reports every pool size (the whole hugetlb pool is excluded from
-    MemAvailable). Pages a mapping has reserved but not yet faulted in still
+    MemAvailable), and bounded by the hugetlb cgroup limit when one applies
+    (containers). Pages a mapping has reserved but not yet faulted in still
     count as free, so only ``free - resv`` can back a new mapping.
     """
     size = hugepage_size_requested()
@@ -126,7 +128,11 @@ def hugetlb_pool_free_bytes() -> int:
             "Cannot read the hugetlb pool at %s (%s); not crediting it.", pool_dir, e
         )
         return 0
-    return max(free - resv, 0) * size
+    free_bytes = max(free - resv, 0) * size
+    cgroup_headroom = cgroup_hugetlb_headroom_bytes(size)
+    if cgroup_headroom is not None:
+        free_bytes = min(free_bytes, cgroup_headroom)
+    return free_bytes
 
 
 def _mmap_page_size_and_flags(mode: str, hugepage_size: int) -> tuple[int, int]:

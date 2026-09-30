@@ -202,5 +202,67 @@ class TestHostMemory(unittest.TestCase):
                 self.assertEqual(self.available(allow_cgroup_fallback=True), 5000)
 
 
+class TestCgroupHugetlb(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.proc = self.root / "proc"
+        (self.proc / "self").mkdir(parents=True)
+        self.mount = self.root / "cgroup mount"
+        self.mount.mkdir()
+
+    def configure(self, membership="/task/engine", v1=False):
+        controllers = "hugetlb" if v1 else ""
+        (self.proc / "self/cgroup").write_text(f"0:{controllers}:{membership}\n")
+        filesystem = "cgroup" if v1 else "cgroup2"
+        options = "rw,hugetlb" if v1 else "rw"
+        escaped = str(self.mount).replace(" ", r"\040")
+        (self.proc / "self/mountinfo").write_text(
+            f"1 0 0:1 / {escaped} rw - {filesystem} cgroup {options}\n"
+        )
+
+    def hugetlb(self, path, usage, maximum="max", label="2MB", v1=False):
+        directory = self.mount / path
+        directory.mkdir(parents=True, exist_ok=True)
+        files = (
+            {
+                f"hugetlb.{label}.limit_in_bytes": maximum,
+                f"hugetlb.{label}.usage_in_bytes": usage,
+            }
+            if v1
+            else {
+                f"hugetlb.{label}.max": maximum,
+                f"hugetlb.{label}.current": usage,
+            }
+        )
+        for name, value in files.items():
+            (directory / name).write_text(str(value))
+
+    def headroom(self, page_size=2 * 1024**2):
+        return host_memory.cgroup_hugetlb_headroom_bytes(page_size, self.proc)
+
+    def test_v1_limits(self):
+        self.configure(v1=True)
+        self.hugetlb("task/engine", 100, 1000, v1=True)
+        self.assertEqual(self.headroom(), 900)
+
+    def test_v2_limits(self):
+        self.configure()
+        self.hugetlb("task/engine", 100, 1000)
+        self.hugetlb("task", 400, 1000)
+        self.assertEqual(self.headroom(), 600)
+
+    def test_controller_not_enabled(self):
+        self.configure()
+        (self.mount / "task/engine").mkdir(parents=True)
+        self.assertIsNone(self.headroom())
+
+    def test_page_size_selects_hugetlb_pool_label(self):
+        self.configure()
+        self.hugetlb("task/engine", 48, 2048, label="1GB")
+        self.assertEqual(self.headroom(1024**3), 2000)
+
+
 if __name__ == "__main__":
     unittest.main()
