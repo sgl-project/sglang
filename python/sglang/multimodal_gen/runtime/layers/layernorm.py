@@ -87,6 +87,17 @@ if not _is_cpu:
 _QK_NORM_ROPE_DICT: dict[tuple[int, bool], RotaryEmbedding] = {}
 
 
+def _is_packed_head_view(x: torch.Tensor) -> bool:
+    """[B, S, heads, head_dim] sliced out of a packed QKV row: dense heads, strided rows."""
+    return (
+        x.dim() == 4
+        and not x.is_contiguous()
+        and x.stride(-1) == 1
+        and x.stride(-2) == x.shape[-1]
+        and (x.shape[0] == 1 or x.stride(0) == x.shape[1] * x.stride(1))
+    )
+
+
 # Copied and adapted from sglang
 @CustomOp.register("rms_norm")
 class RMSNorm(CustomOp):
@@ -322,6 +333,17 @@ class RMSNorm(CustomOp):
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         shape = x.shape
+        # fp32 keeps the 2-D row path it took before.
+        if (
+            x.dtype != torch.float32
+            and residual is None
+            and self.variance_size_override is None
+            and _is_packed_head_view(x)
+        ):
+            # reshape(-1, head_dim) would copy the view; the XPU rmsnorm reads the
+            # strided [rows, heads, head_dim] layout directly.
+            x3 = x.view(-1, shape[-2], shape[-1])
+            return rmsnorm(x3, self.weight.data, self.variance_epsilon).view(shape)
         x = x.reshape(-1, shape[-1])
         if residual is not None:
             residual_shape = residual.shape
