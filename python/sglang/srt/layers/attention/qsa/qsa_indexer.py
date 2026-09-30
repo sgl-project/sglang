@@ -263,6 +263,7 @@ class QSAIndexer(MultiPlatformOp):
             logical_positions=logical_positions,
             compress_ratio=self.compress_ratio,
             is_extend=is_extend,
+            num_groups=metadata.token_to_kv_pool.qsa_num_groups,
         )
 
     def _group_ring_slots(
@@ -273,6 +274,7 @@ class QSAIndexer(MultiPlatformOp):
             group_end_positions=group_end_positions,
             sequence_ids=sequence_ids,
             compress_ratio=self.compress_ratio,
+            num_groups=metadata.token_to_kv_pool.qsa_num_groups,
         )
 
     def update_key_state_and_compress(

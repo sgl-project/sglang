@@ -46,6 +46,19 @@ class QSATokenToKVPool(HybridLinearKVPool):
         )
         return index_k_bytes // compress_ratio * num_layers
 
+    @staticmethod
+    def pending_ring_num_groups(
+        *, max_num_draft_tokens: int, compress_ratio: int
+    ) -> int:
+        """Groups the pending ring must hold so one verify window fits.
+
+        A forward writes every position of the window before any of them is
+        consumed, so the window must not wrap the ring onto itself.
+        """
+        if max_num_draft_tokens <= 0:
+            return 1
+        return max(1, -(-max_num_draft_tokens // compress_ratio))
+
     def __init__(
         self,
         *,
@@ -62,6 +75,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
         qsa_compress_ratio: int,
         qsa_token_topk: int,
         num_request_slots: int,
+        qsa_num_groups: int = 1,
         enable_memory_saver: bool = False,
         enable_kv_cache_copy: bool = False,
         start_layer: Optional[int] = None,
@@ -123,15 +137,23 @@ class QSATokenToKVPool(HybridLinearKVPool):
         self.qsa_compressed_page_size = page_size // self.qsa_compress_ratio
         self.qsa_compressed_capacity = -(state_size // -self.qsa_compress_ratio)
         # Pre-compression index-K state is a per-request ring, not a per-token cache:
-        # only the pending group's ``ratio`` members must survive a forward,
-        # addressed as ``req_pool_idx * ratio + position % ratio``.
+        # only the groups a forward may still touch must survive it, addressed as
+        # ``req_pool_idx * ratio * num_groups + group * ratio + position % ratio``.
         # Request slot 0 is never allocated, so rows [0, ratio) are the inert dump.
         if num_request_slots <= 0:
             raise ValueError(
                 f"QSA pending ring needs request slots, got {num_request_slots}"
             )
+        if qsa_num_groups < 1:
+            raise ValueError(f"QSA pending ring needs groups, got {qsa_num_groups}")
         self.qsa_num_request_slots = int(num_request_slots)
-        ring_slots = self.qsa_num_request_slots * self.qsa_compress_ratio
+        # A verify window of ``num_draft_tokens`` must fit without the ring
+        # wrapping onto itself, so this is ceil(draft_tokens / ratio) -- see
+        # QSATokenToKVPool.pending_ring_num_groups.
+        self.qsa_num_groups = int(qsa_num_groups)
+        ring_slots = (
+            self.qsa_num_request_slots * self.qsa_compress_ratio * self.qsa_num_groups
+        )
         # These buffers participate in Mooncake PD transfer just like the base
         # KV and Mamba pools.  Keep their allocation in the same memory-saver
         # and Mooncake custom-pool regions; otherwise MNNVL cannot resolve the
@@ -224,11 +246,11 @@ class QSATokenToKVPool(HybridLinearKVPool):
         buffer[loc.long()] = compressed_k.to(buffer.dtype)
 
     @staticmethod
-    def _get_paged_state_buf_infos(tensors, page_size: int):
+    def _get_paged_state_buf_infos(tensors, rows_per_item: int):
         return (
             [tensor.data_ptr() for tensor in tensors],
             [tensor.nbytes for tensor in tensors],
-            [tensor[0].nbytes * page_size for tensor in tensors],
+            [tensor[0].nbytes * rows_per_item for tensor in tensors],
         )
 
     def get_qsa_pending_state_buf_infos(self):
@@ -240,9 +262,11 @@ class QSATokenToKVPool(HybridLinearKVPool):
         if not self.full_attention_layer_id_mapping:
             return [], [], []
         tensors = [*self.qsa_key_state_buffer_pool, self.qsa_rope_position_buffer]
+        # The item is one request's whole ring, and the peer indexes it by
+        # req_pool_idx -- so this must track the ring's row count, not one group.
         return self._get_paged_state_buf_infos(
             tensors,
-            self.qsa_compress_ratio,
+            self.qsa_compress_ratio * self.qsa_num_groups,
         )
 
     def get_qsa_pending_state_layer_ids(self):
