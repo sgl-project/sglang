@@ -14,7 +14,6 @@ use crate::openai::OpenAIService;
 #[derive(Clone, Debug)]
 pub struct RendererRuntimeConfig {
     pub http_addr: SocketAddr,
-    pub http_workers: usize,
     pub tokenizer_workers: usize,
     pub queue_capacity: usize,
     /// Optional SGLang engine origin. When absent, inference routes are not mounted.

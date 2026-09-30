@@ -1,38 +1,20 @@
-//! Reusable request preprocessing for SGLang.
+//! Reusable request preprocessing for SGLang over the Dynamo frontend crates.
 //!
-//! The core renders normalized chat requests, lowers textual completions,
+//! The library renders normalized chat requests, lowers textual completions,
 //! tokenizes prompts, and produces the token-in contract consumed by SGLang.
-//! OpenAI operations and generation decoding are independent of transport.
-//! The optional `http` feature adds HTTP adapters, the SGLang HTTP engine client,
-//! and the process runtime. Protocol adapters own middleware and framing;
-//! shared services own request preparation, submission policy, and decoding.
+//! It also parses generated output into chat events. Hosts own their protocol
+//! handling, transport, and runtime.
 
 mod config;
-// Shared serving code is compiled without HTTP; production adapters are optional.
-#[cfg_attr(not(feature = "http"), allow(dead_code))]
-mod engine;
 mod error;
-mod frontend;
-#[cfg(feature = "http")]
-mod launcher;
-#[cfg_attr(not(feature = "http"), allow(dead_code))]
-mod openai;
 mod postprocessing;
 mod preprocessing;
-#[cfg(feature = "http")]
-mod runtime;
 mod types;
 
 pub use config::{RendererConfig, RendererLimits, SamplingDefaults};
-pub(crate) use engine::{
-    GenerationFinishReason, GenerationOutput, GenerationOutputExtras, GenerationStream,
-    MatchedStop, PositionLogprobs, TokenLogprob,
-};
 pub use error::{
     RendererError, RendererErrorKind, ResponseError, ResponseErrorKind, UpstreamErrorCode,
 };
-#[cfg(feature = "http")]
-pub use launcher::run_cli;
 pub use postprocessing::{
     ChatEvent, ChatFinishReason, ChatResponseProcessor, ChatToolCallDelta, DecodedChatEvent,
 };
@@ -48,6 +30,4 @@ pub use preprocessing::{
 pub use preprocessing::{
     GenerateRequestIdentity, TextRequestGroup, resolve_model_file, resolve_tokenizer_file,
 };
-#[cfg(feature = "http")]
-pub use runtime::{RendererRuntimeConfig, serve};
 pub use types::{OneOrMany, TokenIds};

@@ -218,7 +218,6 @@ impl DirectArgs {
 
         Ok(RendererRuntimeConfig {
             http_addr: self.http_addr,
-            http_workers: self.http_workers,
             tokenizer_workers: self.tokenizer_workers,
             queue_capacity: self.queue_capacity,
             engine_url: self.engine_url,
