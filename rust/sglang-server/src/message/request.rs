@@ -260,8 +260,7 @@ impl GenerateBody {
     /// prompt + `is_batch` (list form — a 1-element list is still a batch → JSON
     /// array response). The Rust counterpart of Python
     /// `GenerateReqInput.normalize_batch_and_arguments`; an invalid/inconsistent
-    /// batch is [`Error::Validation`], which the handler surfaces with the
-    /// variant's own status (400).
+    /// batch is [`Error::Validation`], which the HTTP adapter surfaces as 400.
     pub fn into_requests(self) -> Result<(Vec<GenerateRequest>, bool), Error> {
         let GenerateBody {
             rid,
@@ -653,8 +652,8 @@ fn extension_value_present(value: &rmpv::Value) -> bool {
 /// mutated lock-free). Common fields here; variant data in [`RequestKind`].
 #[derive(Debug)]
 pub struct Request {
-    /// Client-visible request id (uuid hex) — what the scheduler wire and
-    /// `meta_info.id` carry.
+    /// Runtime correlation ID. Client-provided IDs carry a private incarnation
+    /// suffix; adapters recover the public ID through `FrontendCall::public_id`.
     pub rid: Rid,
     pub state: RequestState,
     /// Back-channel to the client connection for response frames.
@@ -677,10 +676,10 @@ pub struct SchedulerRequest {
 /// response shape. Each owns its body, so generate/control fields stay type-separate.
 #[derive(Debug)]
 pub enum RequestKind {
-    /// `/generate`: tokenize (if needed) then push a `TokenizedGenerateReqInput`.
+    /// Generation: tokenize (if needed) then push a `TokenizedGenerateReqInput`.
     Generate(Box<GenerateRequest>),
-    /// A control endpoint (e.g. `/server_info`, `/health`): no tokenization, and
-    /// the response is a single non-streamed JSON result.
+    /// Internal runtime control operation: no tokenization, with one serialized
+    /// result that the frontend boundary converts into a typed response.
     Control(Box<ControlRequest>),
     /// Internal service call: decode a complete token-id sequence to text. Walks
     /// the same FSM as every request (validate → register → Queued), but the
@@ -691,11 +690,10 @@ pub enum RequestKind {
     Detokenize { token_ids: TokenIds },
 }
 
-/// A single in-flight `/generate` request (per-item from
-/// [`GenerateBody::into_requests`]),
+/// A single in-flight generation request (one item after adapter fan-out),
 /// serialized to the scheduler wire once tokenized (see `to_header_msgpack`). Not a
-/// wire type — built by `into_requests`/handlers, never (de)serialized; `input_ids` is
-/// client-supplied or filled by the Tokenizer stage.
+/// wire type — built by frontend adapters, never (de)serialized; `input_ids` is
+/// supplied by an adapter or filled by the Tokenizer stage.
 #[derive(Debug, Default)]
 pub struct GenerateRequest {
     /// This item's final rid: the client's (normalized per item by `into_requests`) or a
@@ -726,7 +724,7 @@ pub struct GenerateRequest {
     /// Sampling params (defaults when the client sent none, as in Python);
     /// normalized + verified, then serialized into the header.
     pub sampling_params: SamplingParams,
-    /// Whether the client asked for SSE streaming.
+    /// Whether the caller requested incremental output.
     pub stream: bool,
     /// Logprob / hidden-state options. This path bypasses the Python
     /// `TokenizerManager`, so `into_requests` replicates its scalar
