@@ -44,6 +44,9 @@
 //! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
 //! | `sgl_router_input_ids_forwarding_total` | Counter | `model_id`, `outcome` |
 //! | `sgl_router_sampling_contract_rejections_total` | Counter | `param` |
+//! | `sgl_router_tokenizer_l1_tokens_total` | Counter | `source` |
+//!
+//! The tokenizer series are rendered by [`crate::tokenizer::stats::TokenizerStats`].
 //!
 //! `sgl_router_cache_aware_decisions_total` records exactly one decision per
 //! cache-aware prefill selection that resolves a worker, so the labels sum to
@@ -90,11 +93,13 @@
 //!
 //! - `forwarded` — router-rendered `input_ids` replaced engine tokenization.
 //! - `disabled` — forwarding is off for the model (`--disable-input-ids-forwarding`,
-//!   or no chat formatter).
+//!   no chat formatter, or a renderer not verified against SGLang, such as
+//!   DeepSeek-V4.1).
 //! - `ineligible_multimodal` — the chat carries image, video, or audio content
 //!   parts, which only the engine's multimodal processor can tokenize.
 //! - `ineligible` — the forwarding guard excluded some other request shape
-//!   (tools, non-string content, caller `input_ids`, template controls, ...).
+//!   (tools, non-string content, caller `input_ids`, template controls, ...;
+//!   only caller `input_ids` on models that forward all text chats).
 //! - `tokenize_failed` — eligible, but ingress rendering failed (the same
 //!   requests `sgl_router_ingress_tokenize_errors_total` counts).
 //!
