@@ -16,6 +16,7 @@
 Using mistral-community/pixtral-12b as reference.
 """
 
+from array import array
 from dataclasses import dataclass, fields
 from typing import Iterable, List, Optional, Set, Tuple, Union
 
@@ -73,6 +74,16 @@ class VisionEncoderArgs:
 class PixtralForConditionalGeneration(nn.Module):
     merge_by_field_config = True
 
+    @staticmethod
+    def shared_experts_fusion_disable_reason(hf_config, quant_config):
+        text_config = hf_config.text_config
+        if getattr(text_config, "model_type", "") != "deepseek_v3":
+            # The GQA text config builds the dense Mistral backbone.
+            return None
+        return MistralLarge3ForCausalLM.shared_experts_fusion_disable_reason(
+            text_config, quant_config
+        )
+
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("image"):
@@ -127,7 +138,7 @@ class PixtralForConditionalGeneration(nn.Module):
             self.vision_args, dim=self.config.text_config.hidden_size
         )
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
@@ -848,7 +859,7 @@ class PixtralHFVisionModel(nn.Module):
 
     DEFAULT_IMAGE_TOKEN_ID = 10
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         return self.input_padder.pad_input_tokens(input_ids, mm_inputs)
 
     def __init__(

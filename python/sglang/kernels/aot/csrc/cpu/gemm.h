@@ -73,6 +73,26 @@ enum class CPUActMethod : int {
   gelu_and_mul = 2,
 };
 
+// swiglu is selected by its (alpha, limit) parameters rather than by name and
+// takes precedence; the name is still validated, so it cannot pass silently.
+inline CPUActMethod act_method_from_string(const std::optional<std::string>& activation, bool has_swiglu_params) {
+  const bool unnamed_or_silu = !activation.has_value() || activation.value() == "silu";
+  if (has_swiglu_params) {
+    TORCH_CHECK(
+        unnamed_or_silu || activation.value() == "swiglu",
+        "Unsupported activation with clamped swiglu parameters: ",
+        activation.value());
+    return CPUActMethod::swiglu;
+  }
+  if (unnamed_or_silu) {
+    return CPUActMethod::silu_and_mul;
+  }
+  if (activation.value() == "gelu") {
+    return CPUActMethod::gelu_and_mul;
+  }
+  TORCH_CHECK(false, "Unsupported activation: ", activation.value(), ". Supported: silu, gelu");
+}
+
 enum class CPUQuantMethod : int64_t { BF16 = 0, INT8_W8A8 = 1, FP8_W8A16 = 2, INT4_W4A8 = 3, MXFP4 = 4 };
 
 constexpr bool operator==(CPUQuantMethod a, int64_t b) {
@@ -304,6 +324,7 @@ void tinygemm_kernel(
     scalar_t* __restrict__ C,
     scalar_t* __restrict__ Btmp,
     float* __restrict__ Ctmp,
+    const float* __restrict__ Bbias,
     float scale,
     int64_t M,
     int64_t N,
@@ -311,7 +332,8 @@ void tinygemm_kernel(
     int64_t lda,
     int64_t ldb,
     int64_t ldc,
-    bool brg);
+    bool brg,
+    bool do_unpack = true);
 
 // mxfp4
 template <typename scalar_t>

@@ -7,7 +7,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
@@ -23,9 +22,8 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-# Unit tests run without distributed initialization. Backends that size buffers by
-# attention tensor-parallel degree should see the single-rank default.
-_parallel_override = get_parallel().override(attn_tp_size=1)
+# Use single-rank attention without distributed initialization.
+_parallel_override = get_parallel().override(attn_tp_size=1, attn_dcp_rank=0)
 _parallel_override.__enter__()
 
 DEFAULT_HEAD_DIM = 16
@@ -274,6 +272,7 @@ class TinyModelConfig:
         self.swa_v_head_dim = head_dim
         self.is_encoder_decoder = False
         self.is_multimodal = False
+        self.model_is_mrope = False
         self.is_generation = True
         self.quantization = None
         self.is_hybrid_swa = sliding_window_size is not None
@@ -298,9 +297,10 @@ class TinyModelConfig:
     def get_max_num_attention_heads(self) -> int:
         return self.num_attention_heads
 
-    def get_num_kv_heads(self, tp_size: int) -> int:
-        assert self.num_key_value_heads % tp_size == 0
-        return self.num_key_value_heads // tp_size
+    def get_num_kv_heads(self, tp_size: int, dcp_size: int = 1) -> int:
+        kv_tp_size = tp_size // dcp_size
+        assert self.num_key_value_heads % kv_tp_size == 0
+        return self.num_key_value_heads // kv_tp_size
 
 
 class MockModelRunner(ModelRunner):
@@ -322,6 +322,11 @@ class MockModelRunner(ModelRunner):
         self.dtype = dtype
         self.kv_cache_dtype = dtype
         self.kv_cache_dtype_str = "auto"
+        # This runner's own resolved backends (production stamps these in
+        # ModelRunner.initialize); a draft runner would carry its own.
+        self.prefill_attention_backend_str = case.backend
+        self.decode_attention_backend_str = case.backend
+        self.draft_attention_backend = None
         self.gpu_id = 0
         self.canary_manager = None
         self.page_size = case.page_size
@@ -329,8 +334,8 @@ class MockModelRunner(ModelRunner):
         self.tp_size = 1
         self.dp_size = 1
         self.pp_size = 1
-        self.ps = ParallelState.trivial()
         self.is_draft_worker = False
+        self.max_running_requests = pool_batch_size
         # trtllm_mha __init__ scans model.modules() for ENCODER_ONLY layers;
         # this dense mock declares none.
         self.model = nn.Module()
@@ -404,6 +409,7 @@ class MockModelRunner(ModelRunner):
             page_size=case.page_size,
             get_kvcache=lambda: self.token_to_kv_pool,
         )
+        self.init_kv_index_translator()
         self.attn_cp_size = 1
         self.attention_chunk_size = None
         self.hisparse_coordinator = None

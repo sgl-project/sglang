@@ -23,7 +23,7 @@
 
 #include <cstdint>
 
-namespace {
+namespace sglang {
 
 constexpr uint32_t kRpVec = 8;  // bf16x8 = 16 B
 constexpr uint32_t kRpBlock = 256;
@@ -142,4 +142,4 @@ void rel_proj_small_t(
   }
 }
 
-}  // namespace
+}  // namespace sglang

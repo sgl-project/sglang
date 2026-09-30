@@ -631,7 +631,7 @@ async def benchmark(args):
                 warm_out = await limited_request_func(warm_req, session, None)
                 warmup_pairs.append((warm_req, warm_out))
                 logger.info(
-                    f"Warmup {i+1}/{args.warmup_requests}: "
+                    f"Warmup {i + 1}/{args.warmup_requests}: "
                     f"latency={warm_out.latency:.2f}s, success={warm_out.success}"
                 )
 
@@ -727,12 +727,6 @@ async def benchmark(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Benchmark serving for diffusion models."
-    )
-    parser.add_argument(
-        "--backend",
-        type=str,
-        default=None,
-        help="DEPRECATED: --task is deprecated and will be ignored. The task will be inferred from --model.",
     )
     parser.add_argument(
         "--base-url",

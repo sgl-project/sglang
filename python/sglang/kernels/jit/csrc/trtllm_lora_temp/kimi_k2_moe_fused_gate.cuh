@@ -8,7 +8,7 @@
 #include <cfloat>
 #include <cstdint>
 
-namespace {
+namespace sglang {
 
 // Kimi K2 MoE fused gate, supports NUM_EXPERTS in {256 (MiMo V2 Flash), 384 (Kimi K2)}.
 // Routing (DeepSeek "noaux_tc" with num_expert_group = 1):
@@ -450,4 +450,4 @@ struct KimiK2MoEFusedGateKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

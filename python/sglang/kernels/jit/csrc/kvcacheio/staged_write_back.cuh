@@ -6,7 +6,7 @@
 #include <limits>
 #include <vector>
 
-namespace {
+namespace sglang {
 
 #if !defined(USE_ROCM) && defined(CUDA_VERSION) && CUDA_VERSION >= 12080
 #if CUDA_VERSION >= 13000
@@ -325,4 +325,4 @@ struct HiCacheStagedWriteBackKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

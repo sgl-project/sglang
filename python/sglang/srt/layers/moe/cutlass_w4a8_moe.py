@@ -425,6 +425,9 @@ def cutlass_w4a8_moe_deepep_normal(
         topk_weights,
         topk,
         c2.shape[1],
+        # DeepEP models apply routed_scaling_factor after the cross-rank
+        # combine, so this rank-local reduction must remain unscaled.
+        1.0,
         BLOCK_SIZE=512,
     )
 
@@ -453,6 +456,7 @@ def cutlass_w4a8_moe_deepep_ll(
     problem_sizes2: torch.Tensor,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
+    expected_m: Optional[int] = None,
 ) -> torch.Tensor:
     """
     This function computes a w4a8-quantized Mixture of Experts (MoE) layer
@@ -489,6 +493,8 @@ def cutlass_w4a8_moe_deepep_ll(
         Shape: scalar or [1, N]
     - apply_router_weight_on_input (bool): When true, the topk weights are
         applied directly on the inputs. This is only applicable when topk is 1.
+    - expected_m (Optional[int]): Dispatcher's expected rows per expert; a
+        requant launch hint only, any value is correct.
 
     Returns:
     - torch.Tensor: The fp8 output tensor after applying the MoE layer.
@@ -529,6 +535,7 @@ def cutlass_w4a8_moe_deepep_ll(
         masked_m=masked_m,
         output_scale=a1_scale,
         output=gateup_input,
+        expected_rows=expected_m,
     )
     c1 = torch.empty((num_experts, m, n * 2), device=device, dtype=torch.bfloat16)
     c2 = torch.empty((num_experts, m, k), device=device, dtype=torch.bfloat16)

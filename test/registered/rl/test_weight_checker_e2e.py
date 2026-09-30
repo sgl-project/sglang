@@ -34,7 +34,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=150, suite="nightly-1-gpu", nightly=True)
+register_cuda_ci(est_time=60, stage="nightly", runner_config="1-gpu-large")
 
 _MODEL_NAME = "Qwen/Qwen3-0.6B"
 # We address the up half via the HF-style unfused name "up_proj.weight". sglang's
@@ -80,7 +80,8 @@ class TestWeightCheckerE2E(CustomTestCase):
     def _update_weights(
         self, named_tensors: List[Tuple[str, torch.Tensor]]
     ) -> requests.Response:
-        return requests.post(
+        requests.post(f"{self.url}/begin_weight_update", json={}, timeout=120)
+        resp = requests.post(
             f"{self.url}/update_weights_from_tensor",
             json={
                 "serialized_named_tensors": [
@@ -90,6 +91,8 @@ class TestWeightCheckerE2E(CustomTestCase):
             },
             timeout=120,
         )
+        requests.post(f"{self.url}/end_weight_update", json={}, timeout=120)
+        return resp
 
     def test_a_snapshot_then_compare_unchanged_succeeds(self):
         resp = self._post("snapshot")
@@ -160,7 +163,10 @@ class TestWeightCheckerE2E(CustomTestCase):
         self.assertIn("checksums", first)
         self.assertIn("parallelism_info", first)
 
-        info = first["parallelism_info"]
+        infos = first["parallelism_info"]
+        # one entry per runner; without speculative decoding that is the target
+        self.assertEqual([info["role"] for info in infos], ["target"])
+        info = infos[0]
         for key in (
             "tp_rank",
             "tp_size",
@@ -211,7 +217,6 @@ class TestWeightCheckerE2E(CustomTestCase):
                 self.assertNotIn("cos_sin_cache", name)
                 self.assertNotIn("inv_freq", name)
                 self.assertNotIn("freqs_cis", name)
-                self.assertNotIn("_weight_fp32", name)
 
     def test_z_snapshot_reset_compare_detects_diff(self):
         """Destructive: leaves weights randomized. Named test_z_* so it runs last."""

@@ -4,50 +4,20 @@
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/model_executor/layers/quantization/base_config.py
 
 import inspect
-from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any
 
 import torch
-from torch import nn
 
-if TYPE_CHECKING:
-    from sglang.multimodal_gen.runtime.layers.quantization import QuantizationMethods
-else:
-    QuantizationMethods = str
+from sglang.srt.layers.quantization.base_config import (
+    QuantizationConfig as SRTQuantizationConfig,
+)
+from sglang.srt.layers.quantization.base_config import (
+    QuantizeMethodBase as SRTQuantizeMethodBase,
+)
 
 
-class QuantizeMethodBase(ABC):
-    """Base class for different quantized methods."""
-
-    @abstractmethod
-    def create_weights(
-        self, layer: torch.nn.Module, *weight_args, **extra_weight_attrs
-    ):
-        """Create weights for a layer.
-
-        The weights will be set as attributes of the layer."""
-        raise NotImplementedError
-
-    @abstractmethod
-    def apply(self, layer: torch.nn.Module, *args, **kwargs) -> torch.Tensor:
-        """Apply the weights in layer to the input tensor.
-
-        Expects create_weights to have been called before on the layer."""
-        raise NotImplementedError
-
-    # Not required functions
+class QuantizeMethodBase(SRTQuantizeMethodBase):
     def embedding(self, layer: torch.nn.Module, *args, **kwargs) -> torch.Tensor:
-        """Gather embeddings in the layer based on indices in the input tensor.
-
-        Expects create_weights to have been called before on the layer."""
         raise NotImplementedError
-
-    def process_weights_after_loading(self, layer: nn.Module) -> None:
-        """Process the weight after loading.
-
-        This can be used for example, to transpose weights for computation.
-        """
-        return
 
 
 def method_has_implemented_embedding(method_class: type[QuantizeMethodBase]) -> bool:
@@ -62,94 +32,27 @@ def method_has_implemented_embedding(method_class: type[QuantizeMethodBase]) -> 
     return class_embedding is not None and class_embedding is not base_embedding
 
 
-class QuantizationConfig(ABC):
-    """Base class for quantization configs."""
-
+class QuantizationConfig(SRTQuantizationConfig):
     # for quantization frameworks with a separate quantized model provided, e.g. Nunchaku
     quantized_model_path: str | None = None
+    checkpoint_uses_native_qkv_layout: bool = False
+    checkpoint_uses_comfy_quantization: bool = False
+    supports_srt_linear_layers: bool = False
+    supports_quantized_embeddings: bool = False
 
-    def __init__(self):
-        super().__init__()
-        # mapping is updated by models as they initialize
-        self.packed_modules_mapping: dict[str, list[str]] = dict()
+    def get_scaled_act_names(self) -> list[str]:
+        return []
 
-    @abstractmethod
-    def get_name(self) -> QuantizationMethods:
-        """Name of the quantization method."""
-        raise NotImplementedError
+    def supports_input_partition(
+        self, prefix: str, input_size_per_partition: int
+    ) -> bool:
+        """Whether a row-parallel shard preserves this format's input layout."""
+        return True
 
-    @abstractmethod
-    def get_supported_act_dtypes(self) -> list[torch.dtype]:
-        """List of supported activation dtypes."""
-        raise NotImplementedError
+    def quantizes_embedding(self, prefix: str) -> bool:
+        """Whether this checkpoint config owns the named embedding table."""
+        return False
 
-    @classmethod
-    @abstractmethod
-    def get_min_capability(cls) -> int:
-        """Minimum GPU capability to support the quantization method.
-
-        E.g., 70 for Volta, 75 for Turing, 80 for Ampere.
-        This requirement is due to the custom CUDA kernels used by the
-        quantization method.
-        """
-        raise NotImplementedError
-
-    @staticmethod
-    @abstractmethod
-    def get_config_filenames() -> list[str]:
-        """List of filenames to search for in the model directory."""
-        raise NotImplementedError
-
-    @classmethod
-    @abstractmethod
-    def from_config(cls, config: dict[str, Any]) -> "QuantizationConfig":
-        """Create a config class from the model's quantization config."""
-        raise NotImplementedError
-
-    @classmethod
-    def override_quantization_method(
-        cls, hf_quant_cfg, user_quant
-    ) -> QuantizationMethods | None:
-        """
-        Detects if this quantization method can support a given checkpoint
-        format by overriding the user specified quantization method --
-        this method should only be overwritten by subclasses in exceptional
-        circumstances
-        """
-        return None
-
-    @staticmethod
-    def get_from_keys(config: dict[str, Any], keys: list[str]) -> Any:
-        """Get a value from the model's quantization config."""
-        for key in keys:
-            if key in config:
-                return config[key]
-        raise ValueError(
-            f"Cannot find any of {keys} in the model's " "quantization config."
-        )
-
-    @staticmethod
-    def get_from_keys_or(config: dict[str, Any], keys: list[str], default: Any) -> Any:
-        """Get a optional value from the model's quantization config."""
-        try:
-            return QuantizationConfig.get_from_keys(config, keys)
-        except ValueError:
-            return default
-
-    @abstractmethod
-    def get_quant_method(
-        self, layer: torch.nn.Module, prefix: str
-    ) -> QuantizeMethodBase | None:
-        """Get the quantize method to use for the quantized layer.
-
-        Args:
-            layer: The layer for the quant method.
-            prefix: The full name of the layer in the state dict
-        Returns:
-            The quantize method. None if the given layer doesn't support quant
-            method.
-        """
-        raise NotImplementedError
-
-    def get_cache_scale(self, name: str) -> str | None:
-        return None
+    def remap_checkpoint_prefixes(self, param_names_mapping: dict) -> None:
+        """Translate checkpoint module names to the native model namespace."""
+        return

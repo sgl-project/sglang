@@ -1,0 +1,113 @@
+---
+title: "Encoder Parallelism"
+tag: "preserve"
+metatags:
+    description: "Configure how SGLang Diffusion spreads text and image encoding across GPUs: parallel folding, batch data-parallel encoding, or replication."
+---
+
+While the DiT denoises, the text and image encoders are idle — and while they
+encode, the whole DiT replica is idle. `--encoder-parallel` decides how native
+encoders use those otherwise-unused GPUs for the encoding stage. Folding applies
+to native text and image encoders; within-replica batch DP currently requires an
+explicitly supported native text encoder.
+
+```bash
+--encoder-parallel {auto,fold,dp,replicate}
+```
+
+| Mode | What it does | Use when |
+| --- | --- | --- |
+| `auto` | Picks folding or the existing layout for native text/image encoders, and batch DP for supported native text encoders | Default; you want the decision made per encoder |
+| `fold` | TP-shards the encoder weights across the idle DiT replica | One wide encoder dominates a single-request encode |
+| `dp` | Supported native text encoder copies split the prompt batch, then all-gather their outputs inside the replica | Throughput serving with `--batching-max-size > 1` |
+| `replicate` | Keeps the encoder on its DiT TP group and encodes redundantly across the other replica ranks | You want to disable folding and batch DP |
+
+The two accelerated modes are mutually exclusive per encoder: folding shards the
+weights for the lifetime of the loaded model, so a folded encoder cannot also be
+data-parallel.
+
+## Which Mode Wins
+
+Measured on H100 across T5 (hidden 4096), Qwen3 (2560), and CLIP-L (768) at
+batch 1–8 and replica sizes 2 and 4:
+
+- **Folding** pays when the encoder is wide enough that sharding its GEMMs beats
+  the per-layer all-reduce it adds. T5 gains; Qwen3 (+35%) and CLIP-L (+50%) get
+  slower, so folding is gated at hidden ≥ 4096. Its benefit also saturates as
+  the replica grows, since each rank's slice keeps shrinking.
+- **Data-parallel** pays only when the encode is compute-bound, which needs a
+  wide encoder (hidden ≥ 1024 — CLIP-L is slower at every batch and replica
+  measured) and more than one prompt in a single encode call.
+- **Replication** is the right answer whenever neither condition holds, which is
+  most single-request latency work.
+
+`auto` encodes exactly these rules, so prefer it unless you are pinning a
+configuration you measured yourself.
+
+## Numerics
+
+`replicate` matches single-GPU encoding bit-for-bit only when the encoder TP
+degree is one. Both the existing DiT TP layout and `fold` can reorder parallel
+reductions; they are mathematically equivalent but are not generally bitwise
+identical to a single-GPU kernel.
+
+`dp` is also not bitwise-identical: each encoder copy sees a smaller batch, so
+GEMM tiling can differ from the unsplit reference. It may compose with encoder
+TP: all ranks in one TP group receive the same batch slice, and corresponding TP
+ranks gather outputs across the orthogonal encoder-DP group. The result remains
+mathematically equivalent and deterministic for a fixed topology and batch
+shape, but long video sampling can amplify small floating-point differences.
+
+## Recommended Commands
+
+Throughput serving. A single encode call must carry more than one prompt for DP
+to engage, so raise the batching ceiling too; an encoder flag deliberately does
+not change DiT batching for you:
+
+```bash
+sglang serve \
+  --model-path Wan-AI/Wan2.2-TI2V-5B-Diffusers \
+  --model-type diffusion \
+  --num-gpus 2 \
+  --tp-size 1 \
+  --ulysses-degree 2 \
+  --encoder-parallel dp \
+  --batching-max-size 2
+```
+
+Single-request latency with one wide text encoder:
+
+```bash
+sglang serve \
+  --model-path Wan-AI/Wan2.2-TI2V-5B-Diffusers \
+  --model-type diffusion \
+  --num-gpus 4 \
+  --ulysses-degree 4 \
+  --encoder-parallel fold
+```
+
+Bit-exact reproducibility against a single-GPU reference:
+
+```bash
+sglang serve \
+  --model-path Qwen/Qwen-Image-2512 \
+  --model-type diffusion \
+  --num-gpus 2 \
+  --encoder-parallel replicate
+```
+
+## Interaction With Other Flags
+
+- **Tensor parallel**: encoder DP composes with TP. A TP group jointly encodes
+  one batch slice; the orthogonal ranks inside the same pipeline replica split
+  and gather the batch. A pure-TP replica has one encoder copy, so there is no
+  additional batch-DP degree.
+- **Data parallel**: encoder collectives never cross pipeline replicas. With
+  `--dp-size > 1`, each replica independently uses its own TP/SP/CFG ranks.
+- **Dynamic batching**: `dp` only pays with a wide batch. Selecting it does not
+  change `--batching-max-size`; configure that separately. See
+  [Inference Batching](./dynamic_batching).
+- **Sequence parallelism**: SP splits the DiT latent sequence. During encoding,
+  those ranks either hold encoder copies for batch DP or join a folded encoder.
+  See
+  [Sequence Parallelism](./ring_sp_performance).

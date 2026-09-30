@@ -44,6 +44,7 @@
 import copy
 import logging
 import math
+from array import array
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Tuple
 
@@ -88,7 +89,6 @@ class MaxImageTokenMeta:
 
 
 class KimiVLMultiModalProjector(nn.Module):
-
     def __init__(self, config: KimiVLConfig):
         super().__init__()
 
@@ -114,7 +114,21 @@ class KimiVLMultiModalProjector(nn.Module):
         return hidden_states
 
 
+def _language_model_config(config: KimiVLConfig):
+    text_config = copy.deepcopy(config.text_config)
+    text_config.architectures = ["DeepseekV2ForCausalLM"]
+    return text_config
+
+
 class KimiVLForConditionalGeneration(nn.Module):
+    @staticmethod
+    def shared_experts_fusion_disable_reason(hf_config, quant_config):
+        if hf_config.encoder_only:
+            return None
+        return DeepseekV2ForCausalLM.shared_experts_fusion_disable_reason(
+            _language_model_config(hf_config), quant_config
+        )
+
     def __init__(
         self,
         config: KimiVLConfig,
@@ -138,10 +152,8 @@ class KimiVLForConditionalGeneration(nn.Module):
 
         self.language_model = None
         if not config.encoder_only:
-            text_config = copy.deepcopy(config.text_config)
-            text_config.architectures = ["DeepseekV2ForCausalLM"]
             self.language_model = DeepseekV2ForCausalLM(
-                config=text_config,
+                config=_language_model_config(config),
                 quant_config=quant_config,
                 prefix=add_prefix("language_model", prefix),
             )
@@ -181,7 +193,7 @@ class KimiVLForConditionalGeneration(nn.Module):
         res = self.multi_modal_projector(image_features)
         return res
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
@@ -345,7 +357,7 @@ def get_spec_layer_idx_from_weight_name(
     ):
         layer_idx = config.num_hidden_layers
         for i in range(config.num_nextn_predict_layers):
-            if weight_name.startswith(f"model.layers.{layer_idx+i}."):
+            if weight_name.startswith(f"model.layers.{layer_idx + i}."):
                 return layer_idx + i
     return None
 

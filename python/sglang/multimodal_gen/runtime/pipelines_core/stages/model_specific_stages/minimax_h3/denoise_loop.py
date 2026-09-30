@@ -16,6 +16,16 @@ import torch
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MINIMAX_H3_ADALN_MODALITY_NUM,
 )
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_ring_ctx,
+    get_ulysses_ctx,
+)
+from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
+    AttentionMetadata,
+)
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    set_forward_context,
+)
 
 MINIMAX_H3_IMGVID_COND_TIMESTEP = 0.999
 # ref2va audio reference anchor timestep
@@ -24,6 +34,69 @@ MINIMAX_H3_AUDIO_REF_COND_TIMESTEP = 1.0
 # (24 * 1 * 2 * 2 = 96); audio rows carry the 32-dim audio latent.
 MINIMAX_H3_VIDEO_ROW_WIDTH = 96
 MINIMAX_H3_AUDIO_ROW_WIDTH = 32
+_MINIMAX_H3_SUBBLOCK_QUERY_BLOCK_SIZE = 64
+
+
+def _minimax_h3_subblock_video_query_indices(
+    packed: dict[str, torch.Tensor],
+    text_video_token_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Return packed video rows plus any Qwen rows marked as video."""
+    latent_video_pos = packed["video_pos"].view(-1).to(dtype=torch.long)
+    if text_video_token_mask is None:
+        return latent_video_pos
+    text_pos = packed["text_pos"].view(-1).to(dtype=torch.long)
+    text_video_token_mask = text_video_token_mask.view(-1).to(
+        device=text_pos.device,
+        dtype=torch.bool,
+    )
+    if text_video_token_mask.shape[0] != text_pos.shape[0]:
+        raise ValueError(
+            "text_video_token_mask must align with packed text rows "
+            f"({text_pos.shape[0]}), got {text_video_token_mask.shape[0]}"
+        )
+    return torch.cat([text_pos[text_video_token_mask], latent_video_pos])
+
+
+def _minimax_h3_subblock_sparse_query_block_mask(
+    video_query_indices: torch.Tensor,
+    *,
+    used_len: int,
+) -> torch.Tensor:
+    """Return True for pure-video 64-row Q blocks and False otherwise."""
+    if used_len < 0:
+        raise ValueError(f"used_len must be non-negative, got {used_len}")
+    if video_query_indices.ndim != 1:
+        raise ValueError(
+            f"video_query_indices must be rank 1, got {list(video_query_indices.shape)}"
+        )
+    video_query_indices = video_query_indices.to(dtype=torch.long)
+    if video_query_indices.numel():
+        first = int(video_query_indices.min())
+        last = int(video_query_indices.max())
+        if first < 0 or last >= used_len:
+            raise ValueError(
+                "video_query_indices must be first-segment-relative and in "
+                f"[0, {used_len}), got min={first}, max={last}"
+            )
+        if torch.unique(video_query_indices).numel() != video_query_indices.numel():
+            raise ValueError("video_query_indices must not contain duplicates")
+    block_size = _MINIMAX_H3_SUBBLOCK_QUERY_BLOCK_SIZE
+    num_query_blocks = -(-used_len // block_size)
+    video_rows_per_block = torch.bincount(
+        torch.div(video_query_indices, block_size, rounding_mode="floor"),
+        minlength=num_query_blocks,
+    )
+    block_ids = torch.arange(
+        num_query_blocks, device=video_query_indices.device, dtype=torch.long
+    )
+    real_rows_per_block = (used_len - block_ids * block_size).clamp(
+        min=0, max=block_size
+    )
+    # BSA is block-granular. Only blocks whose real rows are all video may use
+    # the sparse budget; mixed boundary blocks stay dense so their non-video
+    # rows retain exact attention in the single heterogeneous BSA call.
+    return video_rows_per_block == real_rows_per_block
 
 
 @torch.inference_mode()
@@ -46,18 +119,6 @@ def _minimax_h3_update_target_rows_(
     torch.add(state, velocity, out=state)
 
 
-def _ulysses_ctx() -> tuple[int, int]:
-    from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-        get_ulysses_parallel_rank,
-        get_ulysses_parallel_world_size,
-        model_parallel_is_initialized,
-    )
-
-    if not model_parallel_is_initialized():
-        return 1, 0
-    return get_ulysses_parallel_world_size(), get_ulysses_parallel_rank()
-
-
 def _build_local_embedding_layout(
     *,
     seq_len: int,
@@ -70,8 +131,8 @@ def _build_local_embedding_layout(
 ) -> dict[str, torch.Tensor | int]:
     if seq_len % world_size:
         raise ValueError(
-            f"packed seq_len {seq_len} not divisible by Ulysses world size "
-            f"{world_size}"
+            f"packed seq_len {seq_len} not divisible by the combined "
+            f"sequence-parallel world size {world_size}"
         )
     local_seq_len = seq_len // world_size
     row_start = rank * local_seq_len
@@ -103,7 +164,9 @@ class MiniMaxH3DenoiseBranch:
 
     `packed` is a minimax_h3_packed_sequence(...) result (or equivalent layout
     dict); `text_embeddings` is the branch's [text_len, 5120] hidden states;
-    `token_tags` must already carry any fl2va vision-span overrides.
+    `token_tags` must already carry any fl2va vision-span overrides, and
+    `video_query_indices` explicitly identifies the only rows eligible for
+    SubBlock sparsity.
     """
 
     def __init__(
@@ -113,6 +176,7 @@ class MiniMaxH3DenoiseBranch:
         text_embeddings: torch.Tensor,
         token_tags: torch.Tensor,
         device: torch.device,
+        video_query_indices: torch.Tensor | None = None,
     ) -> None:
         seq_len = int(packed["seq_len"])
         self.seq_len = seq_len
@@ -180,10 +244,27 @@ class MiniMaxH3DenoiseBranch:
             1, seq_len, MINIMAX_H3_AUDIO_ROW_WIDTH, dtype=torch.float32, device=device
         )
         text_pos_dev = text_pos.to(device)
-        ulysses_world_size, ulysses_rank = _ulysses_ctx()
+        ulysses_world_size, ulysses_rank = get_ulysses_ctx()
+        ring_world_size, ring_rank = get_ring_ctx()
+        # Combined SP-local rank/world size: the group coordinator lays out
+        # ring as the outer (slower-varying) dimension and Ulysses as the
+        # inner one (see set_seq_parallel_pg_by_sp_groups), so this matches
+        # minimax_h3.py's row_start = ring_rank*ring_chunk_len +
+        # ulysses_rank*local_seq_len exactly -- `_build_local_embedding_layout`
+        # below needs the same combined rank, not just the Ulysses component.
+        sp_world_size = ulysses_world_size * ring_world_size
+        sp_rank = ring_rank * ulysses_world_size + ulysses_rank
         token_tags_host = token_tags.view(-1).to(dtype=torch.long)
-        local_seq_len = seq_len // ulysses_world_size
-        local_row_start = ulysses_rank * local_seq_len
+        subblock_sparse_query_block_mask = (
+            _minimax_h3_subblock_sparse_query_block_mask(
+                video_query_indices.view(-1).to(dtype=torch.long),
+                used_len=int(cu[1]),
+            ).to(device)
+            if video_query_indices is not None
+            else None
+        )
+        local_seq_len = seq_len // sp_world_size
+        local_row_start = sp_rank * local_seq_len
         local_row_stop = local_row_start + local_seq_len
         self.local_row_slice = slice(local_row_start, local_row_stop)
         self.block_token_tags = (
@@ -210,8 +291,8 @@ class MiniMaxH3DenoiseBranch:
                 text_pos=text_pos,
                 img_pos=self.img_pos,
                 audio_pos=self.audio_pos,
-                world_size=ulysses_world_size,
-                rank=ulysses_rank,
+                world_size=sp_world_size,
+                rank=sp_rank,
                 device=device,
             ),
             "packed_seq_params": {
@@ -227,6 +308,10 @@ class MiniMaxH3DenoiseBranch:
                 "max_seqlen_q": text_len,
             },
         }
+        if subblock_sparse_query_block_mask is not None:
+            self.static_kwargs["subblock_sparse_query_block_mask"] = (
+                subblock_sparse_query_block_mask
+            )
 
     def forward_kwargs(
         self,
@@ -234,6 +319,7 @@ class MiniMaxH3DenoiseBranch:
         video_rows: torch.Tensor,
         audio_rows: torch.Tensor,
         step_timesteps: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        adaln_slot: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         x = self.x_buffer
         audio_x = self.audio_x_buffer
@@ -256,7 +342,7 @@ class MiniMaxH3DenoiseBranch:
                 0, self.audio_target_seq_idx, audio_rows[self.audio_target_slice]
             )
         unique_timesteps, inverse_indices, block_combined_indices = step_timesteps
-        return {
+        kwargs = {
             **self.static_kwargs,
             "x": x,
             "audio_x": audio_x,
@@ -264,6 +350,11 @@ class MiniMaxH3DenoiseBranch:
             "inverse_indices": inverse_indices,
             "block_combined_indices": block_combined_indices,
         }
+        if adaln_slot is not None:
+            # Device scalar, never a Python int: an int would key one breakable
+            # CUDA graph per slot value and go stale when LRU reuses the slot.
+            kwargs["adaln_cache_slot"] = adaln_slot
+        return kwargs
 
     def _expand_step_timesteps(
         self,
@@ -368,6 +459,7 @@ def minimax_h3_denoise_loop(
     device: torch.device,
     imgvid_cond_noise_aug_for_inference: float = MINIMAX_H3_IMGVID_COND_TIMESTEP,
     audio_cond_noise_aug_for_inference: float = MINIMAX_H3_AUDIO_REF_COND_TIMESTEP,
+    attn_metadata: AttentionMetadata | None = None,
     on_step: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
     step_profiler: Callable[[int], AbstractContextManager] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -448,6 +540,11 @@ def minimax_h3_denoise_loop(
         imgvid_cond_noise_aug=float(imgvid_cond_noise_aug_for_inference),
         audio_ref_cond_noise_aug=float(audio_cond_noise_aug_for_inference),
     )
+    # Every step's timesteps are settled by now. Rebuilding AdaLN reads all
+    # 24.2 GiB of adaln_proj whatever is missing, so fill the whole request in
+    # one pass here instead of topping up step by step inside the loop.
+    adaln_plan_slots = model.prepare_adaln_plans([entry[0] for entry in timestep_plan])
+
     # match the scheduler's device-fp32 math once, then reuse one denoised
     # scratch per modality instead of allocating intermediates every step
     video_sigmas = torch.tensor(sigmas_video, dtype=torch.float32, device=device)
@@ -470,8 +567,20 @@ def minimax_h3_denoise_loop(
                 video_rows=video_rows,
                 audio_rows=audio_rows,
                 step_timesteps=timestep_plan[step],
+                adaln_slot=(
+                    None if adaln_plan_slots is None else adaln_plan_slots[step]
+                ),
             )
-            with torch.inference_mode():
+            if attn_metadata is not None:
+                attn_metadata.current_timestep = step
+            if model_forward is None and attn_metadata is not None:
+                forward_cm: AbstractContextManager = set_forward_context(
+                    current_timestep=step,
+                    attn_metadata=attn_metadata,
+                )
+            else:
+                forward_cm = nullcontext()
+            with forward_cm, torch.inference_mode():
                 if model_forward is None:
                     v_video, v_audio = model(**fk)
                 else:

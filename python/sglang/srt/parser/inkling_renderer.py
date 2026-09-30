@@ -99,17 +99,26 @@ def render_inkling_messages(
             append_effort()
         role = _expect_role(message)
         if role == "tool":
-            tool_name = message.get("name") or tool_call_id_to_name.get(
-                message.get("tool_call_id") or "", ""
+            tool_name = str(
+                message.get("name")
+                or tool_call_id_to_name.get(message.get("tool_call_id") or "", "")
             )
-            _append_message(
-                input_ids,
-                tokenizer,
-                "tool",
-                "text",
-                _expect_string_content(message.get("content", "")),
-                author_name=str(tool_name),
-            )
+            # The MM processor harvests media from tool messages, so coercing content
+            # to one string would drop images and desync the placeholder count.
+            tool_parts = list(_iter_render_parts(message.get("content", "")))
+            if not tool_parts:
+                tool_parts = [("text", "")]  # else the answered tool_call dangles
+            for kind, text in tool_parts:
+                if kind == "thinking":
+                    raise ValueError("Inkling thinking parts require role='assistant'")
+                _append_message(
+                    input_ids,
+                    tokenizer,
+                    "tool",
+                    kind,
+                    text,
+                    author_name=tool_name,
+                )
             continue
 
         parts = list(_iter_render_parts(message.get("content", "")))
@@ -247,16 +256,6 @@ def _format_reasoning_effort(reasoning_effort: float) -> str:
     if not math.isfinite(value) or not 0.0 <= value <= 0.99:
         raise ValueError("Inkling reasoning_effort must be finite and in [0.0, 0.99]")
     return f"{round(value, 2):g}"
-
-
-def _expect_string_content(content: Any) -> str:
-    if content is None:
-        return ""
-    if not isinstance(content, str):
-        raise TypeError(
-            f"message content must be a string for this Inkling role, got {type(content).__name__}"
-        )
-    return content
 
 
 def _expect_role(message: Mapping[str, Any]) -> str:

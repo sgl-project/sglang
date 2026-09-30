@@ -33,7 +33,7 @@
 #include <cuda_fp8.h>
 #include <type_traits>
 
-namespace {
+namespace sglang {
 
 constexpr int kPadSlot = -1;
 constexpr uint32_t kVecElems = 8;
@@ -1438,4 +1438,4 @@ struct AttnPrologueExtendKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

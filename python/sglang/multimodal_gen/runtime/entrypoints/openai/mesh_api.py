@@ -19,6 +19,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
     generate_request_id,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     MeshGenerationsRequest,
     MeshListResponse,
@@ -54,6 +55,7 @@ def _build_sampling_params_from_request(
     server_args = get_global_server_args()
     sampling_kwargs: Dict[str, Any] = {
         "request_id": request_id,
+        "task_type": ModelTaskType.I2M,
         "prompt": req.prompt,
         "num_frames": 1,
         "image_path": [image_path] if image_path else None,
@@ -119,7 +121,7 @@ async def _dispatch_job_async(job_id: str, batch: Req) -> None:
         )
         await MESH_STORE.update_fields(job_id, update_fields)
     except Exception as e:
-        logger.error(f"{e}")
+        logger.exception("Mesh job %s failed", job_id)
         await MESH_STORE.update_fields(
             job_id, {"status": "failed", "error": {"message": str(e)}}
         )
@@ -229,24 +231,8 @@ async def list_meshes(
     limit: Optional[int] = Query(None, ge=1, le=100),
     order: Optional[str] = Query("desc"),
 ):
-    order = (order or "desc").lower()
-    if order not in ("asc", "desc"):
-        order = "desc"
-    jobs = await MESH_STORE.list_values()
-
-    reverse = order != "asc"
-    jobs.sort(key=lambda j: j.get("created_at", 0), reverse=reverse)
-
-    if after is not None:
-        try:
-            idx = next(i for i, j in enumerate(jobs) if j["id"] == after)
-            jobs = jobs[idx + 1 :]
-        except StopIteration:
-            jobs = []
-
-    if limit is not None:
-        jobs = jobs[:limit]
-    items = [MeshResponse(**j) for j in jobs]
+    jobs = await MESH_STORE.list_page(after=after, limit=limit, order=order)
+    items = [MeshResponse(**job) for job in jobs]
     return MeshListResponse(data=items)
 
 

@@ -22,6 +22,8 @@ class UpdateWeightFromTensorReqInput:
     """Request to update model weights from tensor payloads for diffusion models."""
 
     serialized_named_tensors: list[str | bytes]
+    # Physical GPU UUID each payload was exported from, one per payload.
+    payload_gpu_uuids: list[str] | None = None
     load_format: str | None = None
     target_modules: list[str] | None = None
     weight_update_mode: str | None = None

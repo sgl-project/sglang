@@ -17,13 +17,13 @@
 # limitations under the License.
 """Inference-only Dots-VL model compatible with HuggingFace weights."""
 
+from array import array
 from typing import Iterable, List, Optional, Tuple
 
 import torch
 from torch import nn
 
 from sglang.srt.configs.dots_vlm import DotsVLMConfig
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
@@ -33,12 +33,21 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
+from sglang.srt.runtime_context import get_parallel
 
 from .dots_vlm_vit import DotsVisionTransformer
 
 
 class DotsVLMForCausalLM(nn.Module):
     """DotsVLM model for sglang inference"""
+
+    @staticmethod
+    def shared_experts_fusion_disable_reason(hf_config, quant_config):
+        if hf_config.encoder_only:
+            return None
+        return DeepseekV2ForCausalLM.shared_experts_fusion_disable_reason(
+            hf_config.language_config, quant_config
+        )
 
     def __init__(
         self, config: DotsVLMConfig, quant_config: Optional[QuantizationConfig] = None
@@ -48,7 +57,7 @@ class DotsVLMForCausalLM(nn.Module):
         self.config = config
         self.image_token_id = config.im_span_id
         self.video_token_id = config.video_span_id
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if not config.encoder_only:
             self.language_model = DeepseekV2ForCausalLM(
@@ -124,7 +133,7 @@ class DotsVLMForCausalLM(nn.Module):
     def get_model_config_for_expert_location(cls, config):
         return DeepseekV2ForCausalLM.get_model_config_for_expert_location(config)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         """Pad input_ids with multimodal tokens"""
         # Get image token ID for padding pattern
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()

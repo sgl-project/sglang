@@ -75,7 +75,7 @@ class DotsVLMImageProcessor(BaseMultimodalProcessor):
             multimodal_tokens=self.mm_tokens,
         )
 
-        combined_mm_item, input_ids, _ = self.process_and_combine_mm_data(
+        combined_mm_item, input_ids, _ = await self.process_and_combine_mm_data_async(
             base_output, self.mm_tokens
         )
         if combined_mm_item is None:

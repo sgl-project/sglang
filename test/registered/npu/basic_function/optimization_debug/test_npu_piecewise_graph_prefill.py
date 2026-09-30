@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
     run_bench_one_batch,
 )
 
-register_npu_ci(est_time=400, suite="stage-b-test-1-npu-a2", nightly=False)
+register_npu_ci(est_time=400, suite="base-b-test-1-npu-a3")
 register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
 
@@ -27,7 +27,7 @@ class TestPiecewiseGraphPrefillCorrectness(GSM8KAscendMixin, CustomTestCase):
         0.8,
         "--attention-backend",
         "ascend",
-        "--cuda-graph-bs",
+        "--cuda-graph-bs-decode",
         128,
         "--cuda-graph-backend-prefill=tc_piecewise",
         "--cuda-graph-bs-prefill",

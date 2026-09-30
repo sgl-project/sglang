@@ -126,6 +126,13 @@ class WhisperAdapter(TranscriptionAdapter):
     TIMESTAMP_BASE_TOKEN_ID = 50365  # <|0.00|>
     TIMESTAMP_BASE_OFFSET = 0.02  # each token step = 0.02 s
 
+    @property
+    def max_audio_clip_s(self) -> Optional[float]:
+        # Whisper's encoder ingests a fixed 30 s window (3000 mel frames);
+        # the feature extractor truncates anything longer, so longer audio
+        # must be split into chunks before prompting.
+        return 30.0
+
     def build_sampling_params(self, request: TranscriptionRequest) -> dict:
         params: dict = {
             "temperature": request.temperature,
@@ -185,7 +192,7 @@ class WhisperAdapter(TranscriptionAdapter):
 
     @staticmethod
     def parse_fused_output(
-        text: str, *, ts_variant: bool = False
+        text: str, *, ts_variant: bool = False, strip: bool = True
     ) -> tuple[Optional[str], Optional[str]]:
         """Parse fused output into ``(language_code, user_visible_text)``.
 
@@ -209,9 +216,16 @@ class WhisperAdapter(TranscriptionAdapter):
         * ``(lang, visible)`` — prefix fully parsed. ``visible`` is the
           transcription with the forced prefix removed, any embedded
           special tokens (``<|X.XX|>``, ``<|endoftext|>``) scrubbed, and
-          surrounding whitespace trimmed. It grows monotonically across
-          streaming chunks because Whisper's special tokens detokenize
-          atomically, so callers can compute deltas against it directly.
+          (with ``strip=True``, the default) surrounding whitespace
+          trimmed. It grows monotonically across streaming chunks because
+          Whisper's special tokens detokenize atomically, so callers can
+          compute deltas against it directly.
+
+        ``strip=False`` preserves the model-emitted boundary whitespace.
+        Long-audio chunk stitching relies on it: a chunk's own leading
+        space (or its absence, for spaceless scripts like zh/ja/th) is the
+        correct separator at the chunk seam, so an artificial one must not
+        be invented after stripping.
         """
         pattern = _FUSED_PREFIX_RE_TS if ts_variant else _FUSED_PREFIX_RE_NOTS
         m = pattern.match(text)
@@ -225,7 +239,7 @@ class WhisperAdapter(TranscriptionAdapter):
         # are unwanted in the user-visible text (verbose_json gets its
         # segments from _parse_segments over output_ids instead).
         transcription = _SPECIAL_TOKEN_RE.sub("", transcription)
-        return m.group(1), transcription.strip()
+        return m.group(1), transcription.strip() if strip else transcription
 
     @staticmethod
     def strip_special_tokens(text: str) -> str:
@@ -260,9 +274,41 @@ class WhisperAdapter(TranscriptionAdapter):
             usage=usage,
         )
 
+    def build_verbose_response_chunked(
+        self,
+        request: TranscriptionRequest,
+        text: str,
+        rets: List[dict],
+        chunk_offsets_s: List[float],
+        tokenizer,
+        usage: TranscriptionUsage,
+    ) -> TranscriptionVerboseResponse:
+        segments: list[TranscriptionSegment] = []
+        for ret, offset_s in zip(rets, chunk_offsets_s):
+            _, part_segments = self._parse_segments(
+                ret.get("output_ids", []),
+                tokenizer,
+                time_offset_s=offset_s,
+                seg_id_start=len(segments),
+            )
+            segments.extend(part_segments)
+        return TranscriptionVerboseResponse(
+            language=request.language,
+            duration=round(request.audio_duration_s, 2),
+            # The serving layer already stitched model text using each
+            # chunk's emitted boundary whitespace. Reconstructing it from
+            # output_ids with an ASCII join corrupts spaceless scripts.
+            text=text,
+            segments=segments,
+            usage=usage,
+        )
+
     @staticmethod
     def _parse_segments(
-        output_ids: List[int], tokenizer
+        output_ids: List[int],
+        tokenizer,
+        time_offset_s: float = 0.0,
+        seg_id_start: int = 0,
     ) -> tuple[str, List[TranscriptionSegment]]:
         """Parse Whisper timestamp tokens from *output_ids* into segments.
 
@@ -273,6 +319,11 @@ class WhisperAdapter(TranscriptionAdapter):
 
         Each timestamp token marks the end of the current segment; its value
         also becomes the start of the next segment.
+
+        ``time_offset_s`` / ``seg_id_start`` shift segment times and ids for
+        audio that was split into chunks — timestamp tokens are relative to
+        the chunk's own 30 s window, so each chunk's segments are offset by
+        the chunk's start time within the original audio.
         """
         eos_token_id = getattr(tokenizer, "eos_token_id", 50257)
         ts_base = WhisperAdapter.TIMESTAMP_BASE_TOKEN_ID
@@ -281,12 +332,13 @@ class WhisperAdapter(TranscriptionAdapter):
         segments: list[TranscriptionSegment] = []
         full_text_parts: list[str] = []
         current_text_tokens: list[int] = []
-        current_start = 0.0  # First segment starts at 0.0 (from prompt <|0.00|>)
-        seg_id = 0
+        # First segment starts at the chunk start (prompt anchors <|0.00|>)
+        current_start = time_offset_s
+        seg_id = seg_id_start
 
         for token_id in output_ids:
             if token_id >= ts_base:
-                timestamp = (token_id - ts_base) * ts_step
+                timestamp = (token_id - ts_base) * ts_step + time_offset_s
 
                 if current_text_tokens:
                     seg_text = tokenizer.decode(

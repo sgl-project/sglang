@@ -21,7 +21,8 @@ from diffusers.models.autoencoders.vae import (
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from torch import nn
 
-from sglang.multimodal_gen.configs.models.vaes.flux import FluxVAEConfig
+from sglang.multimodal_gen.configs.models.vaes.base import VAEConfig
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_vae_encode
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -76,7 +77,7 @@ class AutoencoderKL(nn.Module, LayerwiseOffloadableModuleMixin):
 
     def __init__(
         self,
-        config: FluxVAEConfig,
+        config: VAEConfig,
     ):
         super().__init__()
         self.config = config
@@ -287,6 +288,7 @@ class AutoencoderKL(nn.Module, LayerwiseOffloadableModuleMixin):
 
         return enc
 
+    @cached_vae_encode
     def encode(
         self, x: torch.Tensor, return_dict: bool = True
     ) -> Union[AutoencoderKLOutput, Tuple[DiagonalGaussianDistribution]]:

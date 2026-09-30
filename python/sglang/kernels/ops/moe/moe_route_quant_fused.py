@@ -81,7 +81,7 @@ def covered(
         and x.shape[0] == scores.shape[0]
         and 0 < x.shape[0] <= _MAX_TOKENS
         and x.shape[1] == _HIDDEN
-        and x.dtype == torch.bfloat16
+        and x.dtype in (torch.bfloat16, torch.float32)
         and x.stride(1) == 1
         and x.data_ptr() % 32 == 0
         and (x.stride(0) * x.element_size()) % 32 == 0

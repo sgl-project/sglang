@@ -38,9 +38,9 @@ class TestInvariantsBasic(ScriptedTestCase):
         for _ in range(DEFAULT_MAX_STEPS):
             if r.is_chunking:
                 observed_chunking = True
-                assert (
-                    r.kv_pages > 0
-                ), f"kv_pages must be > 0 while is_chunking; got {r.kv_pages}"
+                assert r.kv_pages > 0, (
+                    f"kv_pages must be > 0 while is_chunking; got {r.kv_pages}"
+                )
             if r.finished:
                 break
             yield
@@ -63,9 +63,9 @@ class TestInvariantsBasic(ScriptedTestCase):
                     + comp.get("decode", [])
                     + comp.get("chunked", [])
                 )
-                assert (
-                    r.rid in all_rids
-                ), f"running but not in batch_composition: {comp}"
+                assert r.rid in all_rids, (
+                    f"running but not in batch_composition: {comp}"
+                )
             if r.finished:
                 return
             yield
@@ -157,9 +157,9 @@ class TestInvariantsBasic(ScriptedTestCase):
         t.flush_cache()
         yield
         final = t.engine_stats()
-        assert (
-            final["kv_pool_free"] >= baseline["kv_pool_free"]
-        ), f"KV leak: {baseline['kv_pool_free']} -> {final['kv_pool_free']}"
+        assert final["kv_pool_free"] >= baseline["kv_pool_free"], (
+            f"KV leak: {baseline['kv_pool_free']} -> {final['kv_pool_free']}"
+        )
         assert final["req_pool_free"] >= baseline["req_pool_free"]
 
     def test_long_lived_engine_reps_chunked(self):
@@ -212,9 +212,9 @@ class TestInvariantsBasic(ScriptedTestCase):
         t.flush_cache()
         yield
         final_kv = t.engine_stats()["kv_pool_free"]
-        assert (
-            final_kv >= baseline_kv
-        ), f"KV leak after sustained chunked load: {baseline_kv} -> {final_kv}"
+        assert final_kv >= baseline_kv, (
+            f"KV leak after sustained chunked load: {baseline_kv} -> {final_kv}"
+        )
 
     def test_round_robin_short_and_chunked(self):
         self.server.execute_script(self._script_round_robin_short_and_chunked)
@@ -356,9 +356,9 @@ class TestInvariantsBasic(ScriptedTestCase):
         )
         yield from run_until_finished(r)
         assert r.finished
-        assert (
-            r.chunks_done >= 2
-        ), f"VERY_LONG_PROMPT_LEN should chunk; got chunks_done={r.chunks_done}"
+        assert r.chunks_done >= 2, (
+            f"VERY_LONG_PROMPT_LEN should chunk; got chunks_done={r.chunks_done}"
+        )
         assert len(r.req.output_ids) == n, (
             f"ignore_eos=True + max_new_tokens={n} must produce exactly "
             f"{n} output tokens; got len(output_tokens)={len(r.req.output_ids)}"

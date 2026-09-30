@@ -3,8 +3,6 @@
 from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
-from sglang.multimodal_gen.configs.models.fsdp import is_layer
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
 @dataclass
@@ -37,13 +35,6 @@ class Ideogram4DiTArchConfig(DiTArchConfig):
                 3,
             ),
             r"^(layers\.\d+\.attention)\.to_out\.0\.(.*)$": r"\1.o.\2",
-        }
-    )
-    _fsdp_shard_conditions: list = field(default_factory=lambda: [is_layer])
-    _supported_attention_backends: set[AttentionBackendEnum] = field(
-        default_factory=lambda: {
-            AttentionBackendEnum.FA,
-            AttentionBackendEnum.TORCH_SDPA,
         }
     )
 

@@ -65,6 +65,8 @@ where `scale_factor * multiplier` can be computed at weight loading.
 
 #include "marlin_dtypes.cuh"
 
+namespace sglang {
+
 namespace device::marlin {
 
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
@@ -502,3 +504,5 @@ __device__ inline void dequant_fp8_scales<nv_bfloat162, host::kFE8M0fnu.id()>(in
 #endif
 
 }  // namespace device::marlin
+
+}  // namespace sglang

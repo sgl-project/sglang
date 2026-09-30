@@ -2,8 +2,25 @@ use std::collections::HashMap;
 
 use crate::proto;
 
+fn regex_escape_literal(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if matches!(
+            character,
+            '.' | '+' | '*' | '?' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
+}
+
 /// Convert proto SamplingParams to a serde_json map (used as Python dict via PyO3).
-fn sampling_params_to_map(params: &Option<proto::SamplingParams>) -> serde_json::Value {
+#[allow(deprecated)]
+fn sampling_params_to_map(
+    params: &Option<proto::SamplingParams>,
+) -> Result<serde_json::Value, String> {
     match params {
         Some(p) => {
             let mut map = serde_json::Map::new();
@@ -46,15 +63,90 @@ fn sampling_params_to_map(params: &Option<proto::SamplingParams>) -> serde_json:
             if let Some(v) = p.n {
                 map.insert("n".into(), serde_json::json!(v));
             }
-            if let Some(ref v) = p.json_schema {
-                map.insert("json_schema".into(), serde_json::json!(v));
+            if let Some(v) = p.seed {
+                map.insert("sampling_seed".into(), serde_json::json!(v));
             }
-            if let Some(ref v) = p.regex {
-                map.insert("regex".into(), serde_json::json!(v));
+            if p.guided_decoding.is_some() && (p.json_schema.is_some() || p.regex.is_some()) {
+                return Err(
+                    "legacy json_schema/regex cannot be combined with guided_decoding".into(),
+                );
             }
-            serde_json::Value::Object(map)
+            if let Some(guided) = p.guided_decoding.as_ref() {
+                use proto::guided_decoding::Constraint;
+                match guided.constraint.as_ref() {
+                    Some(Constraint::JsonSchema(value)) if !value.is_empty() => {
+                        map.insert("json_schema".into(), serde_json::json!(value));
+                    }
+                    Some(Constraint::Regex(value)) if !value.is_empty() => {
+                        map.insert("regex".into(), serde_json::json!(value));
+                    }
+                    Some(Constraint::Ebnf(value)) if !value.is_empty() => {
+                        map.insert("ebnf".into(), serde_json::json!(value));
+                    }
+                    Some(Constraint::Choice(choice))
+                        if !choice.values.is_empty()
+                            && choice.values.iter().all(|value| !value.is_empty()) =>
+                    {
+                        let alternatives = choice
+                            .values
+                            .iter()
+                            .map(|value| regex_escape_literal(value))
+                            .collect::<Vec<_>>()
+                            .join("|");
+                        map.insert(
+                            "regex".into(),
+                            serde_json::json!(format!("(?:{alternatives})")),
+                        );
+                    }
+                    Some(Constraint::StructuralTag(value)) if !value.is_empty() => {
+                        map.insert("structural_tag".into(), serde_json::json!(value));
+                    }
+                    Some(Constraint::Choice(_)) => {
+                        return Err("guided choice must contain only non-empty values".into());
+                    }
+                    Some(_) => return Err("guided decoding constraint must not be empty".into()),
+                    None => return Err("guided decoding constraint must be specified".into()),
+                }
+            } else {
+                if let Some(value) = p.json_schema.as_ref() {
+                    if value.is_empty() {
+                        return Err("legacy json_schema must not be empty".into());
+                    }
+                    map.insert("json_schema".into(), serde_json::json!(value));
+                }
+                if let Some(value) = p.regex.as_ref() {
+                    if value.is_empty() {
+                        return Err("legacy regex must not be empty".into());
+                    }
+                    map.insert("regex".into(), serde_json::json!(value));
+                }
+            }
+            Ok(serde_json::Value::Object(map))
         }
-        None => serde_json::Value::Object(serde_json::Map::new()),
+        None => Ok(serde_json::Value::Object(serde_json::Map::new())),
+    }
+}
+
+fn insert_generation_controls(
+    d: &mut HashMap<String, serde_json::Value>,
+    priority: Option<i32>,
+    require_reasoning: Option<bool>,
+    max_thinking_tokens: Option<u32>,
+) {
+    if let Some(priority) = priority {
+        d.insert("priority".into(), serde_json::json!(priority));
+    }
+    if let Some(require_reasoning) = require_reasoning {
+        d.insert(
+            "require_reasoning".into(),
+            serde_json::json!(require_reasoning),
+        );
+    }
+    if let Some(max_thinking_tokens) = max_thinking_tokens {
+        d.insert(
+            "max_thinking_tokens".into(),
+            serde_json::json!(max_thinking_tokens),
+        );
     }
 }
 
@@ -86,6 +178,69 @@ fn insert_disaggregated_params(
     }
 }
 
+fn prost_value_to_json(value: &prost_types::Value) -> serde_json::Value {
+    use prost_types::value::Kind;
+    match &value.kind {
+        None | Some(Kind::NullValue(_)) => serde_json::Value::Null,
+        Some(Kind::NumberValue(n)) => {
+            if n.fract() == 0.0 && *n >= i64::MIN as f64 && *n <= i64::MAX as f64 {
+                serde_json::json!(*n as i64)
+            } else {
+                serde_json::json!(n)
+            }
+        }
+        Some(Kind::StringValue(s)) => serde_json::json!(s),
+        Some(Kind::BoolValue(b)) => serde_json::json!(b),
+        Some(Kind::StructValue(s)) => prost_struct_to_json(s),
+        Some(Kind::ListValue(l)) => {
+            serde_json::Value::Array(l.values.iter().map(prost_value_to_json).collect())
+        }
+    }
+}
+
+fn prost_struct_to_json(s: &prost_types::Struct) -> serde_json::Value {
+    serde_json::Value::Object(
+        s.fields
+            .iter()
+            .map(|(k, v)| (k.clone(), prost_value_to_json(v)))
+            .collect(),
+    )
+}
+
+/// Forward the KV-hint envelope untouched. Action payloads are opaque here; the
+/// component implementing an `action_type` owns its schema.
+fn insert_kv_hints(
+    request: &mut HashMap<String, serde_json::Value>,
+    kv_hints: &Option<proto::KvHintsEnvelope>,
+) {
+    let Some(envelope) = kv_hints else {
+        return;
+    };
+    let actions: Vec<serde_json::Value> = envelope
+        .actions
+        .iter()
+        .map(|action| {
+            serde_json::json!({
+                "action_id": action.action_id,
+                "action_type": action.action_type,
+                "action_version": action.action_version,
+                "payload": action
+                    .payload
+                    .as_ref()
+                    .map_or_else(|| serde_json::json!({}), prost_struct_to_json),
+            })
+        })
+        .collect();
+    request.insert(
+        "kv_hints".into(),
+        serde_json::json!({
+            "protocol_version": envelope.protocol_version,
+            "message_id": envelope.message_id,
+            "actions": actions,
+        }),
+    );
+}
+
 fn now_timestamp() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -111,13 +266,13 @@ pub(crate) fn extract_model_path(json_info: &str) -> String {
 pub(crate) fn build_text_generate_dict(
     rid: &str,
     req: &proto::TextGenerateRequest,
-) -> HashMap<String, serde_json::Value> {
+) -> Result<HashMap<String, serde_json::Value>, String> {
     let mut d = HashMap::new();
     d.insert("rid".into(), serde_json::json!(rid));
     d.insert("text".into(), serde_json::json!(req.text));
     d.insert(
         "sampling_params".into(),
-        sampling_params_to_map(&req.sampling_params),
+        sampling_params_to_map(&req.sampling_params)?,
     );
     d.insert(
         "stream".into(),
@@ -151,25 +306,32 @@ pub(crate) fn build_text_generate_dict(
     if let Some(ref session_id) = req.session_id {
         d.insert("session_id".into(), serde_json::json!(session_id));
     }
+    insert_generation_controls(
+        &mut d,
+        req.priority,
+        req.require_reasoning,
+        req.max_thinking_tokens,
+    );
     insert_disaggregated_params(&mut d, &req.disaggregated_params);
+    insert_kv_hints(&mut d, &req.kv_hints);
     if let Some(trace) = trace_headers_to_json(&req.trace_headers) {
         d.insert("external_trace_header".into(), trace);
     }
     d.insert("received_time".into(), serde_json::json!(now_timestamp()));
-    d
+    Ok(d)
 }
 
 /// Build a request dict for GenerateReqInput from proto GenerateRequest (tokenized).
 pub(crate) fn build_generate_dict(
     rid: &str,
     req: &proto::GenerateRequest,
-) -> HashMap<String, serde_json::Value> {
+) -> Result<HashMap<String, serde_json::Value>, String> {
     let mut d = HashMap::new();
     d.insert("rid".into(), serde_json::json!(rid));
     d.insert("input_ids".into(), serde_json::json!(req.input_ids));
     d.insert(
         "sampling_params".into(),
-        sampling_params_to_map(&req.sampling_params),
+        sampling_params_to_map(&req.sampling_params)?,
     );
     d.insert(
         "stream".into(),
@@ -199,12 +361,19 @@ pub(crate) fn build_generate_dict(
     if let Some(ref session_id) = req.session_id {
         d.insert("session_id".into(), serde_json::json!(session_id));
     }
+    insert_generation_controls(
+        &mut d,
+        req.priority,
+        req.require_reasoning,
+        req.max_thinking_tokens,
+    );
     insert_disaggregated_params(&mut d, &req.disaggregated_params);
+    insert_kv_hints(&mut d, &req.kv_hints);
     if let Some(trace) = trace_headers_to_json(&req.trace_headers) {
         d.insert("external_trace_header".into(), trace);
     }
     d.insert("received_time".into(), serde_json::json!(now_timestamp()));
-    d
+    Ok(d)
 }
 
 /// Build a request dict for EmbeddingReqInput from proto TextEmbedRequest.
@@ -267,6 +436,7 @@ pub(crate) fn build_classify_dict(
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 
@@ -283,11 +453,15 @@ mod tests {
         };
 
         assert_eq!(
-            build_text_generate_dict("request-1", &text_req).get("session_id"),
+            build_text_generate_dict("request-1", &text_req)
+                .unwrap()
+                .get("session_id"),
             Some(&serde_json::json!("session-1"))
         );
         assert_eq!(
-            build_generate_dict("request-2", &token_req).get("session_id"),
+            build_generate_dict("request-2", &token_req)
+                .unwrap()
+                .get("session_id"),
             Some(&serde_json::json!("session-1"))
         );
     }
@@ -312,6 +486,7 @@ mod tests {
             build_text_generate_dict("request-1", &text_req),
             build_generate_dict("request-2", &token_req),
         ] {
+            let request = request.unwrap();
             assert_eq!(
                 request.get("bootstrap_host"),
                 Some(&serde_json::json!("10.0.0.1"))
@@ -330,13 +505,205 @@ mod tests {
     #[test]
     fn generate_dicts_omit_disaggregated_params_when_absent() {
         let text_request =
-            build_text_generate_dict("request-1", &proto::TextGenerateRequest::default());
-        let token_request = build_generate_dict("request-2", &proto::GenerateRequest::default());
+            build_text_generate_dict("request-1", &proto::TextGenerateRequest::default()).unwrap();
+        let token_request =
+            build_generate_dict("request-2", &proto::GenerateRequest::default()).unwrap();
 
         for request in [text_request, token_request] {
             assert!(!request.contains_key("bootstrap_host"));
             assert!(!request.contains_key("bootstrap_port"));
             assert!(!request.contains_key("bootstrap_room"));
+        }
+    }
+
+    #[test]
+    fn generate_dicts_forward_kv_hints_envelope() {
+        let payload = prost_types::Struct {
+            fields: [
+                (
+                    "endpoint".to_string(),
+                    prost_types::Value {
+                        kind: Some(prost_types::value::Kind::StringValue(
+                            "tcp://10.0.0.2:7000".to_string(),
+                        )),
+                    },
+                ),
+                (
+                    "block_hashes".to_string(),
+                    prost_types::Value {
+                        kind: Some(prost_types::value::Kind::ListValue(
+                            prost_types::ListValue {
+                                values: vec![prost_types::Value {
+                                    kind: Some(prost_types::value::Kind::NumberValue(7.0)),
+                                }],
+                            },
+                        )),
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let kv_hints = Some(proto::KvHintsEnvelope {
+            protocol_version: "0.1".to_string(),
+            message_id: "msg-1".to_string(),
+            actions: vec![proto::KvHintAction {
+                action_id: "a-1".to_string(),
+                action_type: "kv.example".to_string(),
+                action_version: "1.0".to_string(),
+                payload: Some(payload),
+            }],
+        });
+        let text_req = proto::TextGenerateRequest {
+            kv_hints: kv_hints.clone(),
+            ..Default::default()
+        };
+        let token_req = proto::GenerateRequest {
+            kv_hints,
+            ..Default::default()
+        };
+
+        for request in [
+            build_text_generate_dict("request-1", &text_req),
+            build_generate_dict("request-2", &token_req),
+        ] {
+            assert_eq!(
+                request.unwrap().get("kv_hints"),
+                Some(&serde_json::json!({
+                    "protocol_version": "0.1",
+                    "message_id": "msg-1",
+                    "actions": [{
+                        "action_id": "a-1",
+                        "action_type": "kv.example",
+                        "action_version": "1.0",
+                        // An integral number stays an integer: the Python side
+                        // decodes payloads into typed fields.
+                        "payload": {
+                            "endpoint": "tcp://10.0.0.2:7000",
+                            "block_hashes": [7],
+                        },
+                    }],
+                }))
+            );
+        }
+    }
+
+    #[test]
+    fn generate_dicts_omit_kv_hints_when_absent() {
+        let text_request =
+            build_text_generate_dict("request-1", &proto::TextGenerateRequest::default()).unwrap();
+        let token_request =
+            build_generate_dict("request-2", &proto::GenerateRequest::default()).unwrap();
+
+        for request in [text_request, token_request] {
+            assert!(!request.contains_key("kv_hints"));
+        }
+    }
+
+    #[test]
+    fn generate_dicts_preserve_optional_generation_controls() {
+        let sampling_params = proto::SamplingParams {
+            seed: Some(42),
+            ..Default::default()
+        };
+        let text_request = proto::TextGenerateRequest {
+            sampling_params: Some(sampling_params.clone()),
+            priority: Some(3),
+            require_reasoning: Some(false),
+            max_thinking_tokens: Some(128),
+            ..Default::default()
+        };
+        let token_request = proto::GenerateRequest {
+            sampling_params: Some(proto::SamplingParams {
+                seed: Some(42),
+                ..Default::default()
+            }),
+            priority: Some(3),
+            require_reasoning: Some(false),
+            max_thinking_tokens: Some(128),
+            ..Default::default()
+        };
+
+        for mapped in [
+            build_text_generate_dict("text-request", &text_request).unwrap(),
+            build_generate_dict("token-request", &token_request).unwrap(),
+        ] {
+            assert_eq!(mapped["priority"], serde_json::json!(3));
+            assert_eq!(mapped["require_reasoning"], serde_json::json!(false));
+            assert_eq!(mapped["max_thinking_tokens"], serde_json::json!(128));
+            assert_eq!(
+                mapped["sampling_params"]["sampling_seed"],
+                serde_json::json!(42)
+            );
+        }
+
+        for mapped in [
+            build_text_generate_dict("text-request", &Default::default()).unwrap(),
+            build_generate_dict("token-request", &Default::default()).unwrap(),
+        ] {
+            assert!(!mapped.contains_key("priority"));
+            assert!(!mapped.contains_key("require_reasoning"));
+            assert!(!mapped.contains_key("max_thinking_tokens"));
+        }
+    }
+
+    #[test]
+    fn guided_choice_maps_to_escaped_regex() {
+        let request = proto::GenerateRequest {
+            sampling_params: Some(proto::SamplingParams {
+                guided_decoding: Some(proto::GuidedDecoding {
+                    constraint: Some(proto::guided_decoding::Constraint::Choice(
+                        proto::ChoiceConstraint {
+                            values: vec!["a+b".into(), "x.y".into()],
+                        },
+                    )),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mapped = build_generate_dict("request", &request).unwrap();
+        assert_eq!(
+            mapped["sampling_params"]["regex"],
+            serde_json::json!("(?:a\\+b|x\\.y)")
+        );
+    }
+
+    #[test]
+    fn invalid_guidance_combinations_are_rejected() {
+        let conflicting = proto::GenerateRequest {
+            sampling_params: Some(proto::SamplingParams {
+                regex: Some("[a-z]+".into()),
+                guided_decoding: Some(proto::GuidedDecoding {
+                    constraint: Some(proto::guided_decoding::Constraint::Regex("[0-9]+".into())),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let empty_choice = proto::GenerateRequest {
+            sampling_params: Some(proto::SamplingParams {
+                guided_decoding: Some(proto::GuidedDecoding {
+                    constraint: Some(proto::guided_decoding::Constraint::Choice(
+                        proto::ChoiceConstraint { values: vec![] },
+                    )),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let empty_legacy_regex = proto::GenerateRequest {
+            sampling_params: Some(proto::SamplingParams {
+                regex: Some(String::new()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        for request in [conflicting, empty_choice, empty_legacy_regex] {
+            assert!(build_generate_dict("request", &request).is_err());
         }
     }
 }

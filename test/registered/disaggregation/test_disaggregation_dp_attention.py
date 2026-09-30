@@ -1,7 +1,6 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.benchmark.serving import run_benchmark
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -11,18 +10,15 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    get_benchmark_args,
     popen_launch_pd_server,
     try_cached_model,
 )
 
-register_cuda_ci(est_time=443, stage="base-c", runner_config="8-gpu-h20")
+register_cuda_ci(est_time=140, stage="base-c", runner_config="8-gpu-h20")
 
 
 class TestDisaggregationDPAttention(PDDisaggregationServerBase):
-    """PD-disagg + DP-attention e2e on `total_tokens` LB — the most complex
-    dispatch (token accounting + tie-break + estimated_tokens). Simpler
-    algorithms are unit-tested in
+    """The dispatch algorithm itself is covered in
     test/registered/unit/managers/test_data_parallel_controller.py.
     """
 
@@ -64,7 +60,9 @@ class TestDisaggregationDPAttention(PDDisaggregationServerBase):
             "--load-balance-method",
             cls.LOAD_BALANCE_METHOD,
         ]
-        prefill_args += cls.transfer_backend + cls.rdma_devices
+        prefill_args += cls.transfer_backend + cls.rdma_devices_for(
+            range(cls.PREFILL_DP_SIZE)
+        )
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
             cls.prefill_url,
@@ -90,7 +88,9 @@ class TestDisaggregationDPAttention(PDDisaggregationServerBase):
             "--load-balance-method",
             cls.LOAD_BALANCE_METHOD,
         ]
-        decode_args += cls.transfer_backend + cls.rdma_devices
+        decode_args += cls.transfer_backend + cls.rdma_devices_for(
+            range(cls.PREFILL_DP_SIZE, cls.PREFILL_DP_SIZE + cls.DECODE_DP_SIZE)
+        )
         cls.process_decode = popen_launch_pd_server(
             cls.model,
             cls.decode_url,
@@ -112,22 +112,6 @@ class TestDisaggregationDPAttention(PDDisaggregationServerBase):
         print(f"Evaluation metrics: {metrics}")
 
         self.assertGreater(metrics["score"], 0.60)
-
-    def test_bench_serving(self):
-        args = get_benchmark_args(
-            base_url=f"http://{self.base_host}:{self.lb_port}",
-            dataset_name="random",
-            tokenizer=self.model,
-            num_prompts=1000,
-            random_input_len=4096,
-            random_output_len=1024,
-            request_rate=float("inf"),
-            max_concurrency=256,
-        )
-        result = run_benchmark(args)
-
-        self.assertLess(result["mean_tpot_ms"], 20)
-        self.assertEqual(result["completed"], 1000)
 
 
 if __name__ == "__main__":

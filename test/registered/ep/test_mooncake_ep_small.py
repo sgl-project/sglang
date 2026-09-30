@@ -4,7 +4,6 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import get_rdma_devices_args
@@ -15,10 +14,16 @@ from sglang.test.test_utils import (
     CustomTestCase,
     is_in_ci,
     popen_launch_server,
+    terminate_and_kill_process_tree,
     try_cached_model,
 )
 
-register_cuda_ci(est_time=189, stage="base-c", runner_config="deepep-4-gpu-h100")
+register_cuda_ci(
+    est_time=189,
+    stage="base-c",
+    runner_config="4-gpu-h100",
+    disabled="Temporarily disabled until the next Mooncake release includes the PyTorch 2.13 collective forwarding fix.",
+)
 
 ib_devices = get_rdma_devices_args()
 
@@ -68,7 +73,7 @@ class TestTP(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process)
 
     def test_gsm8k(self):
         args = SimpleNamespace(

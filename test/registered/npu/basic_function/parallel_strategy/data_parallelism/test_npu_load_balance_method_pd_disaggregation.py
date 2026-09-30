@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 import requests
 
 from sglang.test.ascend.disaggregation_utils import TestDisaggregationBase
+from sglang.test.ascend.npu_eval_accuracy_kit import _is_pr_pipeline, run_npu_pr_smoke
 from sglang.test.ascend.test_ascend_utils import (
     QWEN3_30B_A3B_INSTRUCT_2507_WEIGHTS_PATH,
 )
@@ -22,7 +23,6 @@ from sglang.test.test_utils import (
     popen_launch_pd_server,
 )
 
-register_npu_ci(est_time=3600, suite="stage-b-test-16-npu-a3", nightly=False)
 register_npu_ci(est_time=3600, suite="nightly-16-npu-a3", nightly=True)
 
 load_balance_method_options = [
@@ -134,13 +134,16 @@ class BaseTestNPULoadBalanceMethodDPDisaggregation(TestDisaggregationBase):
         )
 
     def test_gsm8k(self):
+        if _is_pr_pipeline:
+            run_npu_pr_smoke(self.lb_url)
+            return
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
-            host=f"http://{self.url.hostname}",
+            host=self.url.hostname,
             port=int(self.url.port),
         )
 

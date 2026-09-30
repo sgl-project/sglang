@@ -37,6 +37,7 @@ from sglang.kernels.ops.communication.mp import register_comm_cleanup
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 
@@ -46,11 +47,7 @@ register_cuda_ci(
     runner_config="8-gpu-h200",
 )
 # Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
-register_cuda_ci(
-    est_time=300,
-    suite="nightly-kernel-8-gpu-h200",
-    nightly=True,
-)
+register_cuda_ci(est_time=110, stage="nightly", runner_config="8-gpu-h200")
 
 # ---------------------------------------------------------------------------
 # Test parameters
@@ -133,6 +130,7 @@ def _init_cpu_group_once() -> dist.ProcessGroup:
         local_rank=local_rank,
         backend="nccl",
     )
+    get_parallel().override_permanently(world_group=coord)
     atexit.register(dist.destroy_process_group)
     cpu_group = coord.cpu_group
     assert isinstance(cpu_group, dist.ProcessGroup)
