@@ -1713,6 +1713,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.pending_reqs = [
                 r for r in self.pending_reqs if id(r) not in failed_ids
             ]
+            for decode_req in failed_reqs:
+                if decode_req.req.kv.holds_mamba and not decode_req.req.kv.holds_kv:
+                    release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
@@ -2481,11 +2484,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # under the current weights and sampled a fresh handoff token, but when
         # there is a remembered boundary token we are *replaying* an
         # already-emitted token. Override the handoff with it, and skip
-        # re-committing a logprob for it -- it keeps its original behavior
-        # logprob from before the retract (we never re-score generated tokens
-        # under the new policy). A rebootstrap with no boundary token (retracted
-        # before emitting any output) falls through to the normal path so its
-        # first token and logprob are committed as usual.
+        # re-committing a logprob or sampling mask for it -- it keeps its original
+        # behavior logprob and sampling mask from before the retract (we never
+        # re-score generated tokens under the new policy). A rebootstrap with no
+        # boundary token (retracted before emitting any output) falls through to
+        # the normal path so its first token and logprob are committed as usual.
         replayed_boundary = (
             decode_req.is_rebootstrap
             and decode_req.req.pd_rebootstrap_forced_output_id is not None
@@ -2554,7 +2557,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     : decode_req.req.logprob.top_logprobs_num
                 ].tolist()
             )
-        if decode_req.req.return_sampling_mask:
+        if decode_req.req.return_sampling_mask and not replayed_boundary:
             assert output_token_sampling_mask_idx is not None, (
                 "sampling mask buffer disabled on decode side"
             )

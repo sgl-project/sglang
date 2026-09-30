@@ -152,6 +152,8 @@ NIGHTLY_SUITES = {
         "nightly-amd-8-gpu-mi35x-qwen38-mxfp4",
         "nightly-amd-8-gpu-mi35x-glm52-fp8",
         "nightly-amd-8-gpu-mi35x-glm53-flash",
+        "nightly-amd-accuracy-8-gpu-glm53",
+        "nightly-amd-8-gpu-mi35x-glm53",
         "nightly-amd-4-gpu",
         "nightly-amd-8-gpu",
         "nightly-amd-vlm",
