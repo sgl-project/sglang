@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import logging
 import os
@@ -194,7 +195,11 @@ def _numa_node_memory() -> dict[str, dict[str, int]]:
         except OSError:
             continue
         for line in lines:
-            match = re.search(r"\b(MemTotal|MemFree|MemUsed):\s+(\d+)\s+kB", line)
+            match = re.search(
+                r"\b(MemTotal|MemFree|MemUsed|MemAvailable|FilePages|"
+                r"SReclaimable|Mlocked|Unevictable):\s+(\d+)\s+kB",
+                line,
+            )
             if match:
                 values[f"{match[1].lower()}_bytes"] = int(match[2]) * 1024
         if values:
@@ -226,6 +231,85 @@ def _numa_bind_policies() -> list[str]:
     return sorted(policies)
 
 
+@lru_cache(maxsize=1)
+def _get_mempolicy_function():
+    """Use libnuma's syscall wrapper when available, without requiring it."""
+    try:
+        libnuma = ctypes.CDLL("libnuma.so.1", use_errno=True)
+        get_mempolicy = libnuma.get_mempolicy
+    except (OSError, AttributeError):
+        return None
+    get_mempolicy.argtypes = (
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_ulong),
+        ctypes.c_ulong,
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+    )
+    get_mempolicy.restype = ctypes.c_int
+    return get_mempolicy
+
+
+def _numa_task_policy() -> dict[str, object]:
+    """Read the calling thread's policy; numa_maps alone misses task policy."""
+    get_mempolicy = _get_mempolicy_function()
+    if get_mempolicy is None:
+        return {"error": "libnuma get_mempolicy unavailable"}
+
+    maxnode = 1024
+    word_bits = ctypes.sizeof(ctypes.c_ulong) * 8
+    nodemask = (ctypes.c_ulong * (maxnode // word_bits))()
+    mode = ctypes.c_int()
+    ctypes.set_errno(0)
+    if get_mempolicy(ctypes.byref(mode), nodemask, maxnode, None, 0) != 0:
+        return {"error": os.strerror(ctypes.get_errno())}
+
+    mode_id = mode.value & 0x3FFF  # Strip MPOL_F_STATIC_NODES/RELATIVE_NODES.
+    mode_name = {
+        0: "default",
+        1: "preferred",
+        2: "bind",
+        3: "interleave",
+        4: "local",
+        5: "preferred_many",
+        6: "weighted_interleave",
+    }.get(mode_id, "unknown")
+    nodes = [
+        node
+        for node in range(maxnode)
+        if nodemask[node // word_bits] & (1 << (node % word_bits))
+    ]
+    return {"mode": mode_name, "mode_id": mode.value, "nodes": nodes}
+
+
+@lru_cache(maxsize=1)
+def _sched_getcpu_function():
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        sched_getcpu = libc.sched_getcpu
+    except (OSError, AttributeError):
+        return None
+    sched_getcpu.argtypes = ()
+    sched_getcpu.restype = ctypes.c_int
+    return sched_getcpu
+
+
+def _current_cpu_numa_location() -> tuple[int | None, int | None]:
+    """Show the local node used by default/preferred-local allocation."""
+    sched_getcpu = _sched_getcpu_function()
+    if sched_getcpu is None:
+        return None, None
+    cpu = sched_getcpu()
+    if cpu < 0:
+        return None, None
+    for path in Path(f"/sys/devices/system/cpu/cpu{cpu}").glob("node[0-9]*"):
+        try:
+            return cpu, int(path.name.removeprefix("node"))
+        except ValueError:
+            pass
+    return cpu, None
+
+
 def _host_and_cgroup_snapshot() -> dict[str, object]:
     """Keep host-wide and cgroup usage separate; their denominators differ."""
     host_total = _meminfo_bytes("MemTotal")
@@ -251,6 +335,7 @@ def _host_and_cgroup_snapshot() -> dict[str, object]:
     effective_headroom = min(headrooms) if headrooms else None
     cgroup_events = _read_keyed_ints(cgroup / "memory.events")
     cgroup_stat = _read_keyed_ints(cgroup / "memory.stat")
+    current_cpu, current_cpu_node = _current_cpu_numa_location()
 
     snapshot = {
         "host_memory_total_bytes": host_total,
@@ -278,6 +363,8 @@ def _host_and_cgroup_snapshot() -> dict[str, object]:
         "cgroup_memory_failcnt": _read_int(cgroup / "memory.failcnt"),
         "cgroup_memory_anon_bytes": cgroup_stat.get("anon"),
         "cgroup_memory_file_bytes": cgroup_stat.get("file"),
+        "cgroup_memory_rss_bytes": cgroup_stat.get("rss"),
+        "cgroup_memory_cache_bytes": cgroup_stat.get("cache"),
         "cgroup_memory_unevictable_bytes": cgroup_stat.get("unevictable"),
         "effective_host_memory_headroom_bytes": effective_headroom,
         "effective_host_memory_limiter": (
@@ -293,6 +380,9 @@ def _host_and_cgroup_snapshot() -> dict[str, object]:
             "/proc/self/status", "Mems_allowed_list"
         ),
         "numa_bind_policies": _numa_bind_policies(),
+        "numa_task_policy": _numa_task_policy(),
+        "numa_current_cpu": current_cpu,
+        "numa_current_cpu_node": current_cpu_node,
     }
     if cgroup_headroom is not None:
         snapshot["cgroup_memory_headroom_bytes"] = cgroup_headroom
@@ -308,6 +398,8 @@ def _memory_snapshot() -> dict[str, object]:
         "process_rss": _read_proc_value("/proc/self/status", "VmRSS"),
         "process_rss_peak": _read_proc_value("/proc/self/status", "VmHWM"),
         "process_locked": _read_proc_value("/proc/self/status", "VmLck"),
+        "process_pinned": _read_proc_value("/proc/self/status", "VmPin"),
+        "native_thread_id": threading.get_native_id(),
         "ci_run_id": os.environ.get("GITHUB_RUN_ID"),
         "ci_job": os.environ.get("GITHUB_JOB"),
         "runner_name": os.environ.get("RUNNER_NAME"),
@@ -462,26 +554,39 @@ def trace_npu_pinned_host_allocation(
     ) or started - _last_log_time.get(site, float("-inf")) >= _LOG_INTERVAL_SECONDS
     context = {
         "site": site,
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "pid": os.getpid(),
         "rank": os.environ.get("RANK"),
         "local_rank": os.environ.get("LOCAL_RANK"),
         "call_count": count,
         "requested_bytes": requested_bytes,
+        "power_of_two_rounded_bytes": (
+            1 << (requested_bytes - 1).bit_length()
+            if requested_bytes is not None and requested_bytes > 0
+            else requested_bytes
+        ),
     }
     if details:
         context.update(details)
     if sampled:
         _last_log_time[site] = started
         logger.warning(
-            "NPU pinned host allocation before: %s", context | _memory_snapshot()
+            "NPU pinned host allocation before: %s",
+            context
+            | {"timestamp_utc": datetime.now(timezone.utc).isoformat()}
+            | _memory_snapshot(),
         )
 
     try:
         yield
     except Exception:
         logger.exception(
-            "NPU pinned host allocation failed: %s", context | _memory_snapshot()
+            "NPU pinned host allocation failed: %s",
+            context
+            | {
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+            }
+            | _memory_snapshot(),
         )
         raise
     else:
@@ -489,6 +594,9 @@ def trace_npu_pinned_host_allocation(
             logger.warning(
                 "NPU pinned host allocation after: %s",
                 context
-                | {"elapsed_seconds": round(time.monotonic() - started, 3)}
+                | {
+                    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                    "elapsed_seconds": round(time.monotonic() - started, 3),
+                }
                 | _memory_snapshot(),
             )
