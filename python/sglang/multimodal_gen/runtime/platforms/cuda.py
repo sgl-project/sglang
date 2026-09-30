@@ -516,6 +516,36 @@ class _FlashAttentionBackendResolver(_CudaAttentionBackendResolver):
         return AttentionBackendEnum.FA
 
 
+class _FP8FlashAttentionSM120BackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.FP8_FA_SM120
+
+    # CuTe-DSL mma.sync FP8 kernel written for SM120 (GeForce RTX 50 / RTX PRO
+    # Blackwell). Dense non-causal head_dim 128 only; the backend itself falls
+    # back to cuDNN SDPA for other calls.
+    @classmethod
+    def resolve(cls, platform) -> str | AttentionBackendEnum:
+        if platform.get_device_capability() != (12, 0):
+            logger.warning(
+                "fp8_fa_sm120 attention needs an SM120 device; falling back to cuDNN SDPA."
+            )
+            return AttentionBackendEnum.TORCH_CUDNN_SDPA
+        try:
+            import cutlass.cute  # noqa: F401
+            import triton  # noqa: F401
+
+            from sglang.multimodal_gen.runtime.layers.attention.backends.fp8_fa_sm120_attn import (  # noqa: F401
+                FP8FlashAttentionSM120Backend,
+            )
+
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.fp8_fa_sm120_attn.FP8FlashAttentionSM120Backend"
+        except ImportError as error:
+            logger.warning(
+                "fp8_fa_sm120 attention backend failed to import (%s); falling back to cuDNN SDPA.",
+                error,
+            )
+            return AttentionBackendEnum.TORCH_CUDNN_SDPA
+
+
 _CUDA_ATTENTION_BACKEND_RESOLVERS = {
     resolver.backend: resolver
     for resolver in (
@@ -539,6 +569,7 @@ _CUDA_ATTENTION_BACKEND_RESOLVERS = {
         _SubBlockSparseAttentionBackendResolver,
         _FlashAttention2BackendResolver,
         _FlashAttentionBackendResolver,
+        _FP8FlashAttentionSM120BackendResolver,
     )
 }
 
