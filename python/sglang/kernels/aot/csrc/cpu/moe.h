@@ -101,11 +101,6 @@ inline void sum_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ in
   }
 }
 
-inline at::vec::Vectorized<float> silu_for_moe(const at::vec::Vectorized<float>& x) {
-  const auto one = at::vec::Vectorized<float>(1.f);
-  return x / (one + x.neg().exp_u20());
-}
-
 // out = input + input2 * scale
 template <typename scalar_t, typename input_t>
 inline void add_mul_stub(
@@ -157,10 +152,8 @@ inline void silu_and_mul_stub(
   for (int64_t d = 0; d < size; d += bVec::size()) {
     auto [x0, x1] = load_float_vec2(input + d);
     auto [y0, y1] = load_float_vec2(input2 + d);
-    auto silu_vec = convert_from_float_ext<scalar_t>(silu_for_moe(x0), silu_for_moe(x1));
-    std::tie(x0, x1) = at::vec::convert_to_float(silu_vec);
-    x0 = x0 * y0;
-    x1 = x1 * y1;
+    x0 = fast_silu(x0) * y0;
+    x1 = fast_silu(x1) * y1;
     bVec out_vec = convert_from_float_ext<scalar_t>(x0, x1);
     out_vec.store(out + d);
   }
