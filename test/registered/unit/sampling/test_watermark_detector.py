@@ -1,9 +1,11 @@
+import json
 import math
 import os
 import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -13,7 +15,6 @@ import requests
 import torch
 
 import sglang.srt.sampling.watermarking.detector as detector_module
-from sglang.srt.environ import envs, exportable_env_vars
 from sglang.srt.sampling.watermarking import (
     WatermarkDetector,
     WatermarkStatistics,
@@ -165,15 +166,24 @@ def _generate_watermarked_tokens(key_a, key_b=None, mixing_probability=0.5):
 
 
 class TestWatermarkDetectionServer(CustomTestCase):
-    def test_http_detection_uses_environment_keys(self):
+    def test_http_detection_uses_config_keys(self):
         with socket.socket() as server_socket:
             server_socket.bind(("127.0.0.1", 0))
             port = server_socket.getsockname()[1]
 
+        config_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(config_dir.cleanup)
+        config_path = Path(config_dir.name) / "watermark.json"
+        config_path.write_text(
+            json.dumps({"key": _KEY_A, "key_b": _KEY_B, "context_window": 4})
+        )
+        config_path.chmod(0o600)
         repository_root = Path(__file__).resolve().parents[4]
         command = [
             sys.executable,
             str(repository_root / "examples/watermark/detection_server.py"),
+            "--watermark-config",
+            str(config_path),
             "--host",
             "127.0.0.1",
             "--port",
@@ -183,12 +193,7 @@ class TestWatermarkDetectionServer(CustomTestCase):
             "--p-value-threshold",
             "0.0001",
         ]
-        with envs.SGLANG_WATERMARK_KEY.override(_KEY_A):
-            with envs.SGLANG_WATERMARK_KEY_B.override(_KEY_B):
-                exported = exportable_env_vars()
-                self.assertNotIn("SGLANG_WATERMARK_KEY", exported)
-                self.assertNotIn("SGLANG_WATERMARK_KEY_B", exported)
-                process = subprocess.Popen(command)
+        process = subprocess.Popen(command)
 
         base_url = f"http://127.0.0.1:{port}"
         try:

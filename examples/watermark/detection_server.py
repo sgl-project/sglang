@@ -9,12 +9,12 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
-from sglang.srt.environ import envs
 from sglang.srt.sampling.watermarking import (
     WatermarkDetection,
     WatermarkDetector,
     WatermarkStatistics,
 )
+from sglang.srt.sampling.watermarking.config import load_watermark_config
 
 
 class DetectionRequest(BaseModel):
@@ -127,8 +127,8 @@ def probability(value: str) -> float:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--watermark-config", required=True)
     parser.add_argument("--tokenizer")
-    parser.add_argument("--context-window", type=int, default=4)
     parser.add_argument("--max-contexts", type=int, default=4096)
     parser.add_argument("--mixing-probability", type=probability, default=0.5)
     parser.add_argument("--p-value-threshold", type=probability, default=0.01)
@@ -138,14 +138,12 @@ def parse_args() -> argparse.Namespace:
 
 
 def main(args: argparse.Namespace) -> None:
-    key = envs.SGLANG_WATERMARK_KEY.get()
-    if key is None:
-        raise ValueError("SGLANG_WATERMARK_KEY must be set")
+    config = load_watermark_config(args.watermark_config)
     detector = WatermarkDetector(
-        key,
-        key_b=envs.SGLANG_WATERMARK_KEY_B.get(),
+        config.key,
+        key_b=config.key_b,
         mixing_probability=args.mixing_probability,
-        context_window=args.context_window,
+        context_window=config.context_window,
         max_contexts=args.max_contexts,
     )
     uvicorn.run(
