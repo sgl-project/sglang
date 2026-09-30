@@ -614,6 +614,11 @@ class VisionFlash4Attention(nn.Module):
         if forward_metadata is not None:
             cu_seqlens_gpu = forward_metadata.cu_seqlens
             max_seqlen = forward_metadata.max_seqlen
+        elif isinstance(cu_seqlens, list):
+            # ViT CUDA graph runners pass [cu_seqlens, max_seqlen]; models without
+            # a runner keep passing tensors even when the graph env var is set.
+            cu_seqlens_gpu = cu_seqlens[0]
+            max_seqlen = cu_seqlens[1]
         else:
             cu_seqlens_gpu = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
             cu_seqlens_gpu = cu_seqlens_gpu.to(dtype=torch.int32).to(q.device)
@@ -1272,7 +1277,7 @@ class VisionAttention(nn.Module):
 
         Platform defaults:
         - CUDA (Hopper SM90): "fa3"
-        - CUDA (Blackwell SM100): "fa4"
+        - CUDA (Blackwell SM100/SM103): "fa4"
         - CUDA (other): "triton_attn"
         - Ascend NPU: "ascend_attn"
         - Other platforms: device-specific optimized backend or "sdpa"
@@ -1290,10 +1295,10 @@ class VisionAttention(nn.Module):
         elif passed_backend is not None:
             backend = passed_backend
         elif is_cuda():
-            major, minor = get_device_capability()
+            major, _ = get_device_capability()
             if major == 9:
                 backend = "fa3"
-            elif major == 10 and minor != 3:
+            elif major == 10:
                 backend = "fa4"
             else:
                 backend = "triton_attn"
