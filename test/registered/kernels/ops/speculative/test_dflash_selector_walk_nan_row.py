@@ -1,33 +1,35 @@
-import os
-
-os.environ.setdefault("TRITON_INTERPRET", "1")
+import unittest
 
 import torch
 
 from sglang.kernels.ops.speculative.dflash import selector_walk_triton
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=30, suite="base-a-test-cpu")
+register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 def _walk(scores, greedy):
     batch, slots, top_k, _ = scores.shape
-    candidate_ids = torch.arange(batch * slots * top_k).view(batch, slots, top_k)
+    device = scores.device
+    candidate_ids = torch.arange(batch * slots * top_k, device=device).view(
+        batch, slots, top_k
+    )
     tokens, q_rows = selector_walk_triton(
         candidate_ids=candidate_ids,
         scores=scores,
-        uniforms=torch.full((batch, slots), 0.5),
-        temperatures=torch.ones(batch),
-        greedy_mask=torch.full((batch,), greedy, dtype=torch.bool),
+        uniforms=torch.full((batch, slots), 0.5, device=device),
+        temperatures=torch.ones(batch, device=device),
+        greedy_mask=torch.full((batch,), greedy, dtype=torch.bool, device=device),
     )
-    return candidate_ids, tokens, q_rows
+    return candidate_ids.cpu(), tokens.cpu(), q_rows.cpu()
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class TestDFlashSelectorWalkNanRow(CustomTestCase):
     def test_all_nan_greedy_row_stays_inside_its_candidate_row(self):
         batch, slots, top_k = 2, 3, 4
-        scores = torch.randn(batch, slots, top_k, top_k)
+        scores = torch.randn(batch, slots, top_k, top_k, device="cuda")
         scores[0] = float("nan")
         candidate_ids, tokens, q_rows = _walk(scores, greedy=True)
 
@@ -39,9 +41,10 @@ class TestDFlashSelectorWalkNanRow(CustomTestCase):
 
     def test_finite_greedy_row_matches_torch_argmax(self):
         batch, slots, top_k = 3, 4, 8
-        scores = torch.randn(batch, slots, top_k, top_k)
+        scores = torch.randn(batch, slots, top_k, top_k, device="cuda")
         scores[1, 2, :, :] = 0.0  # ties break to the left
         candidate_ids, tokens, q_rows = _walk(scores, greedy=True)
+        scores = scores.cpu()
 
         previous = torch.zeros(batch, dtype=torch.int64)
         for slot in range(slots):
@@ -58,6 +61,4 @@ class TestDFlashSelectorWalkNanRow(CustomTestCase):
 
 
 if __name__ == "__main__":
-    import unittest
-
     unittest.main()
