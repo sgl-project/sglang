@@ -1,24 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Chat completion SSE stream → Responses API SSE event stream.
-//!
-//! Event sequence (every event's `event:` name equals its `data.type`, and
-//! `sequence_number` starts at 0 and increases by one with no gaps):
-//!
-//! ```text
-//! response.created (status=in_progress)
-//! response.in_progress
-//! per output item, one at a time, in output order:
-//!   response.output_item.added
-//!   reasoning: content_part.added → reasoning_text.delta… → reasoning_text.done → content_part.done
-//!   message:   content_part.added → output_text.delta…    → output_text.done    → content_part.done
-//!   function:  function_call_arguments.delta…             → function_call_arguments.done
-//!   response.output_item.done
-//! response.completed | response.incomplete | response.failed
-//! ```
-//!
-//! No `data: [DONE]` sentinel — the Responses API has none.
+//! Chat SSE → Responses events: created, in_progress, one output item at a
+//! time (added … done), then completed | incomplete | failed.
 
 use serde_json::{json, Value};
 
@@ -26,10 +10,7 @@ use super::{
     function_call_item, message_item, new_id, now_secs, output_text_part, reasoning_item,
     response_object, set_incomplete_reason, usage_from_chat, EchoContext, Finish,
 };
-
-/// Cap on a single buffered SSE line (a chunk without a newline). Past it the
-/// line is dropped — the stream is corrupt at that point either way.
-const MAX_LINE_BYTES: usize = 16 << 20;
+use crate::protocol::{data_payload, write_event, LineBuffer, SseTransducer};
 
 enum Open {
     Reasoning {
@@ -52,13 +33,12 @@ enum Open {
     },
 }
 
-/// Stateful transducer; feed it upstream bytes, write out what it returns.
 pub struct ResponsesStream {
     echo: EchoContext,
     id: String,
     created_at: u64,
     seq: u64,
-    line: Vec<u8>,
+    lines: LineBuffer,
     started: bool,
     terminal: bool,
     open: Option<Open>,
@@ -74,7 +54,7 @@ impl ResponsesStream {
             id: new_id("resp"),
             created_at: now_secs(),
             seq: 0,
-            line: Vec::new(),
+            lines: LineBuffer::default(),
             started: false,
             terminal: false,
             open: None,
@@ -84,89 +64,11 @@ impl ResponsesStream {
         }
     }
 
-    /// Whether a terminal event (`completed` / `incomplete` / `failed`) has
-    /// been emitted. Everything fed afterwards is swallowed.
-    pub fn is_terminal(&self) -> bool {
-        self.terminal
-    }
-
-    /// Consume one upstream chunk (any split across SSE lines is fine).
-    pub fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
-        let mut out = Vec::new();
-        let mut rest = chunk;
-        while let Some(nl) = rest.iter().position(|&b| b == b'\n') {
-            if self.line.len() + nl <= MAX_LINE_BYTES {
-                self.line.extend_from_slice(&rest[..nl]);
-                let line = std::mem::take(&mut self.line);
-                self.handle_line(&line, &mut out);
-            } else {
-                self.line.clear();
-            }
-            rest = &rest[nl + 1..];
-        }
-        if self.line.len() + rest.len() <= MAX_LINE_BYTES {
-            self.line.extend_from_slice(rest);
-        } else {
-            self.line.clear();
-        }
-        out
-    }
-
-    /// Upstream ended cleanly: close the open item and emit the terminal
-    /// event. A stream that ended without a `finish_reason` did not finish
-    /// generating, so it is reported as failed rather than completed.
-    pub fn finish(&mut self) -> Vec<u8> {
-        let mut out = Vec::new();
-        if !self.line.is_empty() {
-            let line = std::mem::take(&mut self.line);
-            self.handle_line(&line, &mut out);
-        }
-        if self.terminal {
-            return out;
-        }
-        if self.finish_reason.is_none() {
-            self.emit_failed(
-                "upstream stream ended before the response completed",
-                &mut out,
-            );
-            return out;
-        }
-        let finish = Finish::from_chat(self.finish_reason.as_deref());
-        self.close_open(finish, &mut out);
-        let event = match finish {
-            Finish::Completed => "response.completed",
-            Finish::Incomplete(_) => "response.incomplete",
-        };
-        let mut resp = self.response(finish.status());
-        set_incomplete_reason(&mut resp, finish);
-        self.emit(event, json!({ "response": resp }), &mut out);
-        self.terminal = true;
-        out
-    }
-
-    /// Upstream failed mid-stream (transport error).
-    pub fn fail(&mut self, message: &str) -> Vec<u8> {
-        let mut out = Vec::new();
-        if !self.terminal {
-            self.emit_failed(message, &mut out);
-        }
-        out
-    }
-
     fn handle_line(&mut self, line: &[u8], out: &mut Vec<u8>) {
         if self.terminal {
             return;
         }
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        let Some(payload) = line.strip_prefix(b"data:") else {
-            return; // comments, `event:` lines, blank separators
-        };
-        let payload = payload.trim_ascii_start();
-        if payload == b"[DONE]" || payload.is_empty() {
-            return;
-        }
-        let Ok(chunk) = serde_json::from_slice::<Value>(payload) else {
-            tracing::debug!("responses stream: skipping non-JSON upstream data line");
+        let Some(chunk) = data_payload(line) else {
             return;
         };
         self.ensure_started(out);
@@ -340,7 +242,6 @@ impl ResponsesStream {
         }
     }
 
-    /// Emit the `*.done` events for the open item and move it to `output`.
     fn close_open(&mut self, finish: Finish, out: &mut Vec<u8>) {
         let Some(open) = self.open.take() else {
             return;
@@ -430,7 +331,6 @@ impl ResponsesStream {
 
     fn emit(&mut self, event: &str, mut data: Value, out: &mut Vec<u8>) {
         if let Value::Object(m) = &mut data {
-            // `type` and `sequence_number` lead, like the OpenAI wire format.
             let mut ordered = serde_json::Map::new();
             ordered.insert("type".into(), event.into());
             ordered.insert("sequence_number".into(), self.seq.into());
@@ -438,12 +338,57 @@ impl ResponsesStream {
             data = Value::Object(ordered);
         }
         self.seq += 1;
-        out.extend_from_slice(b"event: ");
-        out.extend_from_slice(event.as_bytes());
-        out.extend_from_slice(b"\ndata: ");
-        // Serializing a `Value` cannot fail.
-        serde_json::to_writer(&mut *out, &data).expect("serialize event");
-        out.extend_from_slice(b"\n\n");
+        write_event(out, event, &data);
+    }
+}
+
+impl SseTransducer for ResponsesStream {
+    fn is_terminal(&self) -> bool {
+        self.terminal
+    }
+
+    fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut lines = std::mem::take(&mut self.lines);
+        lines.push(chunk, |line| self.handle_line(line, &mut out));
+        self.lines = lines;
+        out
+    }
+
+    /// No `finish_reason` means generation did not finish: report failed.
+    fn finish(&mut self) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut lines = std::mem::take(&mut self.lines);
+        lines.flush(|line| self.handle_line(line, &mut out));
+        if self.terminal {
+            return out;
+        }
+        if self.finish_reason.is_none() {
+            self.emit_failed(
+                "upstream stream ended before the response completed",
+                &mut out,
+            );
+            return out;
+        }
+        let finish = Finish::from_chat(self.finish_reason.as_deref());
+        self.close_open(finish, &mut out);
+        let event = match finish {
+            Finish::Completed => "response.completed",
+            Finish::Incomplete(_) => "response.incomplete",
+        };
+        let mut resp = self.response(finish.status());
+        set_incomplete_reason(&mut resp, finish);
+        self.emit(event, json!({ "response": resp }), &mut out);
+        self.terminal = true;
+        out
+    }
+
+    fn fail(&mut self, message: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        if !self.terminal {
+            self.emit_failed(message, &mut out);
+        }
+        out
     }
 }
 
@@ -458,7 +403,6 @@ mod tests {
             .echo
     }
 
-    /// Parse emitted SSE into `(event, data)` pairs, asserting the framing.
     pub(crate) fn events(raw: &[u8]) -> Vec<(String, Value)> {
         let text = std::str::from_utf8(raw).unwrap();
         text.split("\n\n")
@@ -484,7 +428,6 @@ mod tests {
         let mut s = ResponsesStream::new(echo());
         let mut raw = Vec::new();
         for c in chunks {
-            // Split every chunk mid-line to exercise the line buffer.
             let (a, b) = c.as_bytes().split_at(c.len() / 2);
             raw.extend(s.feed(a));
             raw.extend(s.feed(b));

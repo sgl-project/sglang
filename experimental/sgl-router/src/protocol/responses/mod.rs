@@ -1,13 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! OpenAI Responses API (`/v1/responses`) on top of the chat pipeline.
-//!
-//! The router speaks chat to the engine: [`request::to_chat`] turns a
-//! Responses request into a chat request, the chat handler routes it exactly
-//! as it would a native one (PD bootstrap, ingress tokenize, cache-aware
-//! routing, abort), and [`response`] / [`stream`] turn the chat reply back
-//! into a Response object or the Responses SSE event sequence.
+//! OpenAI Responses API (`/v1/responses`) over chat completions.
 
 pub mod request;
 pub mod response;
@@ -28,9 +22,7 @@ pub(crate) fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Chat `usage` → Responses `usage`. The detail objects are always present
-/// (zero when the engine did not report them), so clients can read
-/// `input_tokens_details.cached_tokens` unconditionally.
+/// Chat `usage` → Responses `usage`; detail fields are always present.
 pub(crate) fn usage_from_chat(usage: Option<&Value>) -> Value {
     let int = |v: Option<&Value>| v.and_then(Value::as_u64).unwrap_or(0);
     let u = usage.filter(|u| u.is_object());
@@ -48,8 +40,7 @@ pub(crate) fn usage_from_chat(usage: Option<&Value>) -> Value {
         .unwrap_or(0);
     json!({
         "input_tokens": input,
-        // `cache_write_tokens` is required by current OpenAI SDK types; the
-        // engine does not report KV writes, so it is always 0.
+        // Required by the OpenAI SDK; the engine does not report it.
         "input_tokens_details": {"cached_tokens": cached, "cache_write_tokens": 0},
         "output_tokens": output,
         "output_tokens_details": {"reasoning_tokens": reasoning},
@@ -57,11 +48,9 @@ pub(crate) fn usage_from_chat(usage: Option<&Value>) -> Value {
     })
 }
 
-/// Terminal status of a finished generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Finish {
     Completed,
-    /// Carries `incomplete_details.reason`.
     Incomplete(&'static str),
 }
 
@@ -82,7 +71,6 @@ impl Finish {
     }
 }
 
-/// A Response object: the request echo plus the per-response fields.
 pub(crate) fn response_object(
     echo: &EchoContext,
     id: &str,
@@ -121,8 +109,6 @@ pub(crate) fn response_object(
     Value::Object(m)
 }
 
-/// Apply a [`Finish`] to a Response object built by [`response_object`]
-/// (sets the precise `incomplete_details.reason`).
 pub(crate) fn set_incomplete_reason(resp: &mut Value, finish: Finish) {
     if let Finish::Incomplete(reason) = finish {
         resp["incomplete_details"] = json!({ "reason": reason });
@@ -171,9 +157,7 @@ pub(crate) fn function_call_item(
     })
 }
 
-/// Re-wrap an engine error body into the `{"error": {...}}` envelope.
-/// sglang's chat errors are flat (`{"object":"error","message",…}`); a body
-/// that already has an `error` object, or is not JSON, is returned as-is.
+/// Re-wrap sglang's flat error body into `{"error": {...}}`; `None` = keep.
 pub fn wrap_error_body(body: &[u8], status: u16) -> Option<Vec<u8>> {
     let v: Value = serde_json::from_slice(body).ok()?;
     if v.get("error").is_some_and(Value::is_object) {

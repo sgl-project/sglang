@@ -18,6 +18,7 @@ mod graceful_shutdown;
 mod h2c_forward;
 mod header_forwarding;
 mod inbound_h2c;
+mod messages_api;
 mod pd_bootstrap_injection;
 mod pd_load_monitor;
 mod pd_pool_isolation;

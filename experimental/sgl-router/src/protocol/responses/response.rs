@@ -10,8 +10,7 @@ use super::{
     set_incomplete_reason, usage_from_chat, EchoContext, Finish,
 };
 
-/// Convert a `chat.completion` body. Output order follows the Responses
-/// API: reasoning first, then the assistant message, then function calls.
+/// Output order: reasoning, message, function calls.
 pub fn chat_to_response(chat: &Value, echo: &EchoContext) -> Value {
     let choice = chat.pointer("/choices/0");
     let message = choice.and_then(|c| c.get("message"));
@@ -40,8 +39,7 @@ pub fn chat_to_response(chat: &Value, echo: &EchoContext) -> Value {
         .and_then(Value::as_array)
         .filter(|t| !t.is_empty());
     let content = str_field("content");
-    // A reply with no tool calls always carries a message item, even when
-    // empty (e.g. truncated inside reasoning is the one exception below).
+    // Emit a message item unless there are tool calls or only reasoning.
     if content.is_some() || (tool_calls.is_none() && output.is_empty()) {
         output.push(message_item(
             &new_id("msg"),

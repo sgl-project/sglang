@@ -1,9 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! `POST /v1/responses` end to end: the Responses request the client sends,
-//! the chat request the engine receives, and the Response object / event
-//! stream the client gets back.
+//! `POST /v1/responses` end to end.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -102,7 +100,6 @@ async fn buffered_response_object() {
     assert_eq!(r["output"][0]["content"][0]["text"], "ok");
     assert!(r["usage"].is_object());
 
-    // What the engine saw: a chat request.
     let sent = captured(&mock);
     assert_eq!(
         sent["messages"],
@@ -170,7 +167,6 @@ async fn streaming_event_sequence() {
     assert_eq!(done["response"]["usage"]["total_tokens"], 8);
     assert!(!text.contains("[DONE]"));
 
-    // The engine was asked for usage without the client requesting it.
     assert_eq!(captured(&mock)["stream_options"]["include_usage"], true);
 }
 

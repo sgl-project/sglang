@@ -358,24 +358,34 @@ async fn access_log_and_record(
     resp
 }
 
-fn route_error(status: StatusCode, code: &'static str, message: String) -> Response {
+/// Anthropic envelope under `/v1/messages`, OpenAI elsewhere.
+fn route_error(path: &str, status: StatusCode, code: &'static str, message: String) -> Response {
     use axum::response::IntoResponse;
-    (
-        status,
-        axum::Json(serde_json::json!({
+    let body = if path.starts_with("/v1/messages") {
+        serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": crate::protocol::anthropic::error_type(status.as_u16()),
+                "message": message,
+            },
+        })
+    } else {
+        serde_json::json!({
             "error": {"type": "invalid_request_error", "code": code, "message": message}
-        })),
-    )
-        .into_response()
+        })
+    };
+    (status, axum::Json(body)).into_response()
 }
 
 async fn unmatched_route(uri: axum::http::Uri) -> Response {
     route_error(
+        uri.path(),
         StatusCode::NOT_FOUND,
         "not_found",
         format!(
             "no route for path `{}`; supported endpoints are /v1/chat/completions, \
-             /v1/responses, /v1/models, /v1/tokenize and /v1/detokenize",
+             /v1/responses, /v1/messages, /v1/messages/count_tokens, /v1/models, \
+             /v1/tokenize and /v1/detokenize",
             uri.path()
         ),
     )
@@ -383,6 +393,7 @@ async fn unmatched_route(uri: axum::http::Uri) -> Response {
 
 async fn method_not_allowed(method: axum::http::Method, uri: axum::http::Uri) -> Response {
     route_error(
+        uri.path(),
         StatusCode::METHOD_NOT_ALLOWED,
         "method_not_allowed",
         format!("method {method} is not allowed on `{}`", uri.path()),
@@ -409,6 +420,18 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
         .route(
             "/v1/chat/completions",
             post(crate::server::routes::chat::chat_completions)
+                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(middleware::from_fn(log_413)),
+        )
+        .route(
+            "/v1/messages",
+            post(crate::server::routes::messages::messages)
+                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(middleware::from_fn(log_413)),
+        )
+        .route(
+            "/v1/messages/count_tokens",
+            post(crate::server::routes::messages::count_tokens)
                 .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
                 .layer(middleware::from_fn(log_413)),
         )
@@ -464,10 +487,7 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
     );
 
     router
-        // Unknown paths and wrong methods answer with the same structured
-        // `{"error": {...}}` envelope as every other error, instead of axum's
-        // empty-body default — clients (and API acceptance suites) expect a
-        // message saying what went wrong.
+        // Structured error bodies instead of axum's empty 404 / 405.
         .fallback(unmatched_route)
         .method_not_allowed_fallback(method_not_allowed)
         // Convert a handler panic into a 500 response. hyper otherwise catches

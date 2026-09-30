@@ -1,30 +1,18 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! `/v1/responses` request → `/v1/chat/completions` request.
-//!
-//! Works on `serde_json::Value` rather than typed structs on purpose: a typed
-//! round-trip would silently drop every sglang extension the engine's chat
-//! endpoint accepts (`top_k`, `chat_template_kwargs`, `rid`, `video_url`
-//! parts, …). Fields this module does not consume are forwarded verbatim, so
-//! a Responses request can carry exactly what a chat request can.
-//!
-//! The item-merging rules (reasoning → the next assistant turn's
-//! `reasoning_content`, consecutive `function_call` items → one assistant
-//! message's `tool_calls`) follow dynamo's `convert_input_items_to_messages`,
-//! which encodes the Codex / Agents-SDK round-trip cases.
+//! Responses request → chat request. `Value`-based so unconsumed fields
+//! (sglang extensions) pass through; item merging follows dynamo.
 
 use serde_json::{json, Map, Value};
 
-/// Request fields echoed back on every Response object, plus the model name
-/// the client asked for.
+/// Request fields echoed on every Response object.
 #[derive(Debug, Clone)]
 pub struct EchoContext {
     pub model: String,
     pub fields: Map<String, Value>,
 }
 
-/// Outcome of converting one Responses request.
 #[derive(Debug)]
 pub struct Converted {
     pub chat: Value,
@@ -32,8 +20,7 @@ pub struct Converted {
     pub stream: bool,
 }
 
-/// Responses-only fields: consumed (translated or echoed) here and never
-/// forwarded to the engine as-is.
+/// Fields not forwarded as-is.
 const CONSUMED: &[&str] = &[
     "model",
     "input",
@@ -58,8 +45,7 @@ const CONSUMED: &[&str] = &[
     "prompt",
     "max_tool_calls",
     "top_logprobs",
-    // Chat fields a Responses request must not smuggle in: `messages` would
-    // replace the converted input, and `n` > 1 has no Responses rendering.
+    // Chat fields that would break the conversion.
     "messages",
     "n",
 ];
@@ -104,8 +90,7 @@ pub fn to_chat(req: Value) -> Result<Converted, String> {
     }
 
     let mut chat = Map::new();
-    // Forward everything this module does not own, first, so the explicit
-    // translations below win over a same-named passthrough field.
+    // Passthrough first so the translations below win.
     for (k, v) in &req {
         if !CONSUMED.contains(&k.as_str()) {
             chat.insert(k.clone(), v.clone());
@@ -115,7 +100,6 @@ pub fn to_chat(req: Value) -> Result<Converted, String> {
     chat.insert("messages".into(), Value::Array(messages));
     chat.insert("stream".into(), Value::Bool(stream));
     if stream {
-        // `response.completed` must carry usage without the client asking.
         let mut opts = match chat.remove("stream_options") {
             Some(Value::Object(o)) => o,
             _ => Map::new(),
@@ -157,8 +141,7 @@ pub fn to_chat(req: Value) -> Result<Converted, String> {
     })
 }
 
-/// The router keeps no response or conversation store, so anything that
-/// needs one is refused up front with a message saying what to send instead.
+/// The router stores nothing, so stateful features are refused.
 fn reject_stateful(req: &Map<String, Value>) -> Result<(), String> {
     let set = |k: &str| req.get(k).is_some_and(|v| !v.is_null());
     if set("previous_response_id") {
@@ -184,8 +167,7 @@ fn reject_stateful(req: &Map<String, Value>) -> Result<(), String> {
     Ok(())
 }
 
-/// Assistant turn being assembled from consecutive reasoning / assistant
-/// message / function_call items.
+/// Assistant turn built from consecutive reasoning / message / function_call items.
 #[derive(Default)]
 struct PendingAssistant {
     reasoning: Option<String>,
@@ -229,7 +211,6 @@ fn convert_items(items: &[Value], messages: &mut Vec<Value>) -> Result<(), Strin
         let Value::Object(obj) = item else {
             return Err(format!("input[{i}] must be an object"));
         };
-        // An item with a `role` and no `type` is an "easy input message".
         let typ = match obj.get("type").and_then(Value::as_str) {
             Some(t) => t,
             None if obj.contains_key("role") => "message",
@@ -247,7 +228,6 @@ fn convert_items(items: &[Value], messages: &mut Vec<Value>) -> Result<(), Strin
                     .ok_or_else(|| format!("input[{i}] is missing `content`"))?;
                 match role {
                     "assistant" => {
-                        // Text after a tool call starts a new assistant turn.
                         if !pending.tool_calls.is_empty() {
                             pending.flush(messages);
                         }
@@ -306,7 +286,7 @@ fn convert_items(items: &[Value], messages: &mut Vec<Value>) -> Result<(), Strin
                 }));
             }
             "reasoning" => {
-                // Reasoning belongs to the assistant turn that FOLLOWS it.
+                // Reasoning belongs to the following assistant turn.
                 if pending.content.is_some() || !pending.tool_calls.is_empty() {
                     pending.flush(messages);
                 }
@@ -331,8 +311,7 @@ fn convert_items(items: &[Value], messages: &mut Vec<Value>) -> Result<(), Strin
     Ok(())
 }
 
-/// Reasoning item text: raw `content[].text` when present, else the
-/// `summary[].text` a client echoed back.
+/// `content[].text`, else `summary[].text`.
 fn reasoning_text(obj: &Map<String, Value>) -> String {
     let join = |key: &str| -> String {
         obj.get(key)
@@ -354,8 +333,7 @@ fn reasoning_text(obj: &Map<String, Value>) -> String {
     }
 }
 
-/// Plain text of a content value (string, or text-like parts concatenated).
-/// Used where chat only takes a string: assistant turns and tool outputs.
+/// Content as plain text, for assistant turns and tool outputs.
 fn content_text(content: &Value, i: usize) -> Result<String, String> {
     match content {
         Value::String(s) => Ok(s.clone()),
@@ -385,8 +363,7 @@ fn content_text(content: &Value, i: usize) -> Result<String, String> {
     }
 }
 
-/// User / system / developer content → chat content. A lone text part
-/// collapses to a plain string; anything else stays a parts array.
+/// User / system / developer content → chat content.
 fn convert_content(content: &Value, i: usize) -> Result<Value, String> {
     let parts = match content {
         Value::String(_) => return Ok(content.clone()),
@@ -425,7 +402,6 @@ fn convert_content(content: &Value, i: usize) -> Result<Value, String> {
                     .ok_or_else(|| format!("input[{i}]: `input_video` is missing `video_url`"))?;
                 json!({"type": "video_url", "video_url": {"url": url}})
             }
-            // Chat-shaped parts are accepted as-is.
             "image_url" | "video_url" | "input_audio" => part.clone(),
             other => {
                 return Err(format!(
@@ -443,7 +419,6 @@ fn convert_content(content: &Value, i: usize) -> Result<Value, String> {
     Ok(Value::Array(out))
 }
 
-/// `"https://…"` or `{"url": "https://…"}`.
 fn url_field(v: Option<&Value>) -> Option<String> {
     match v? {
         Value::String(s) => Some(s.clone()),
@@ -466,7 +441,6 @@ fn convert_tools(tools: &Value) -> Result<Vec<Value>, String> {
                     "tools[{i}]: tool type `{typ}` is not supported; only `function` tools are"
                 ));
             }
-            // Already chat-shaped: `{type, function: {...}}`.
             if tool.get("function").is_some_and(Value::is_object) {
                 return Ok(tool.clone());
             }
@@ -505,7 +479,7 @@ fn convert_tool_choice(tc: &Value) -> Result<Value, String> {
                 })?;
                 Ok(json!({"type": "function", "function": {"name": name}}))
             }
-            // Lossy but safe: keep the mode, drop the allow-list.
+            // Keep the mode, drop the allow-list.
             Some("allowed_tools") => Ok(o
                 .get("mode")
                 .cloned()
@@ -519,8 +493,7 @@ fn convert_tool_choice(tc: &Value) -> Result<Value, String> {
     }
 }
 
-/// `text.format` → chat `response_format`. Unknown `type`s are forwarded so
-/// the engine rejects them with its own 400 rather than being dropped.
+/// `text.format` → `response_format`; unknown types go to the engine to reject.
 fn convert_text_format(text: &Value) -> Result<Option<Value>, String> {
     let Some(format) = text.get("format").filter(|v| !v.is_null()) else {
         return Ok(None);
@@ -544,8 +517,6 @@ fn convert_text_format(text: &Value) -> Result<Option<Value>, String> {
     }
 }
 
-/// `reasoning.effort` → chat `reasoning_effort`, in the engine's vocabulary
-/// (`none | low | medium | high | max`).
 fn convert_reasoning_effort(reasoning: &Value) -> Result<Option<&'static str>, String> {
     let Value::Object(r) = reasoning else {
         return Err("`reasoning` must be an object".into());
@@ -567,9 +538,7 @@ fn convert_reasoning_effort(reasoning: &Value) -> Result<Option<&'static str>, S
     }
 }
 
-/// Request parameters as the Response object reports them. Absent fields get
-/// the Responses API's documented defaults; sampling fields the client did
-/// not set stay `null` because the engine's model defaults apply, not 1.0.
+/// Unset sampling fields echo `null`: the engine's model defaults apply.
 fn echo_fields(req: &Map<String, Value>) -> Map<String, Value> {
     let get = |k: &str| req.get(k).filter(|v| !v.is_null()).cloned();
     let mut m = Map::new();
