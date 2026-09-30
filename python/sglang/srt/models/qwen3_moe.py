@@ -1099,9 +1099,6 @@ class Qwen3MoeForCausalLM(nn.Module):
                 )
 
         if end == self.model.config.num_hidden_layers:
-            forward_batch.hidden_states = residual_batch.complete_output(
-                forward_batch.hidden_states, forward_batch
-            )
             # norm
             hidden_states = residual_batch.final_norm(
                 forward_batch.hidden_states, forward_batch, self.model.norm
