@@ -26,12 +26,19 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
     deduplicated_tensor_tree_output_fields = ("timesteps", "sigmas")
     deduplicated_extra_tensor_tree_output_keys = (MINIMAX_H3_SIGMAS_EXTRA_KEY,)
 
-    def __init__(self, sigma_shift_scales=None) -> None:
+    def __init__(
+        self,
+        sigma_shift_scales=None,
+        sigma_rungs: tuple[int, ...] | None = None,
+    ) -> None:
         super().__init__()
         # Per-model sigma shift override (model_index.json "_minimax_h3" release
         # block, sigma_shift_scales): the schedule constants are a MODEL
         # serving contract — fl2va and ref2va use video 12 / audio 3 by default.
         self.sigma_shift_scales = sigma_shift_scales
+        # A distilled checkpoint's trained ladder replaces the uniform grid and
+        # pins both the grid size and the model shifts.
+        self.sigma_rungs = sigma_rungs
         self._pdd_config = None
         pdd_heads = envs.SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS
         if pdd_heads:
@@ -80,6 +87,7 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
             plan.default_flow_shift,
             plan.default_audio_flow_shift,
             self.freeze_for_dedup(self.sigma_shift_scales),
+            self.sigma_rungs,
         )
 
     def _apply_pdd_schedule(self, batch: Req) -> None:
@@ -197,6 +205,13 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
                 task_default=plan.default_audio_flow_shift,
             ),
         }
+        if self.sigma_rungs is not None:
+            batch.extra[MINIMAX_H3_SIGMAS_EXTRA_KEY] = self._rung_sigmas(
+                num_steps=requested_num_steps,
+                is_warmup=batch.is_warmup,
+                scales=scales,
+            )
+            return
         sigmas: dict[str, list[float]] = {}
         for modality in ("video", "audio"):
             sigmas[modality] = minimax_h3_time_shift_sigmas(
@@ -204,6 +219,39 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
                 shift_scale=scales[modality],
             )
         batch.extra[MINIMAX_H3_SIGMAS_EXTRA_KEY] = sigmas
+
+    def _rung_sigmas(
+        self, *, num_steps: int, is_warmup: bool, scales: dict[str, float]
+    ) -> dict[str, list[float]]:
+        """Shift the trained ladder; warmup keeps a prefix of the served grid."""
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
+            minimax_h3_rung_sigmas,
+        )
+
+        grid_points = len(self.sigma_rungs) + 1
+        if not is_warmup and num_steps != grid_points:
+            raise ValueError(
+                f"This checkpoint was distilled on {len(self.sigma_rungs)} rungs, "
+                f"so num_inference_steps must be {grid_points} sigma grid points; "
+                f"got {num_steps}"
+            )
+        trained = {
+            modality: float(self.sigma_shift_scales[modality])
+            for modality in ("video", "audio")
+        }
+        if scales != trained:
+            raise ValueError(
+                "This checkpoint's trained ladder only holds at its trained "
+                f"shifts {trained}; the request resolved to {scales}. Leave "
+                "flow_shift and audio_flow_shift unset."
+            )
+        keep = min(max(2, num_steps), grid_points)
+        return {
+            modality: minimax_h3_rung_sigmas(
+                rungs=self.sigma_rungs, shift_scale=scales[modality]
+            )[:keep]
+            for modality in ("video", "audio")
+        }
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()

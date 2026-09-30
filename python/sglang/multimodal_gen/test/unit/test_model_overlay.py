@@ -2,6 +2,8 @@
 
 import os
 
+import pytest
+
 from sglang.multimodal_gen.runtime.utils import model_overlay
 from sglang.multimodal_gen.runtime.utils.model_overlay import (
     _copytree_link_or_copy,
@@ -53,6 +55,15 @@ def test_rewriting_a_materialized_config_leaves_the_cache_blob_alone(
 
     assert config.read_text() == '{"source": true}'
     assert not os.path.islink(out / "config.json")
+
+
+def test_bundled_only_overlay_fails_loudly_when_not_installed():
+    # A bundled-only entry has no HF repo to fall back to.
+    spec = {"bundled_overlay_subdir": "not_installed"}
+    with pytest.raises(ValueError, match="missing from this SGLang installation"):
+        model_overlay.download_overlay_metadata(
+            "org/model", spec, snapshot_download_fn=None
+        )
 
 
 def test_large_files_are_still_shared_with_the_cache(tmp_path, monkeypatch):

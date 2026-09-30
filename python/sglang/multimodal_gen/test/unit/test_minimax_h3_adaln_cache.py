@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 import torch
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MINIMAX_H3_ADALN_MODALITY_NUM,
@@ -439,6 +440,83 @@ def test_online_cache_failed_rebuild_can_be_retried(tmp_path):
     _write_online_weights(tmp_path / "model.safetensors")
     cache.build([plan_a], embed=_embed)
     cache.lookup(plan_a)
+
+
+_DIFFUSERS_ARCH = replace(_ARCH, checkpoint_uses_diffusers_layout=True)
+
+
+def _diffusers_name(native_name: str) -> str:
+    if native_name.startswith("final_layer.adaln_proj.linear."):
+        return native_name.replace("final_layer.adaln_proj.linear.", "norm_out.linear.")
+    return "transformer_" + native_name
+
+
+def _write_diffusers_online_weights(tmp_path: Path, **extra: torch.Tensor) -> Path:
+    native_path = tmp_path / "native.safetensors"
+    _write_online_weights(native_path, scale=1.0)
+    tensors = {
+        _diffusers_name(name): tensor for name, tensor in load_file(native_path).items()
+    }
+    diffusers_path = tmp_path / "diffusers.safetensors"
+    save_file({**tensors, **extra}, diffusers_path)
+    return diffusers_path
+
+
+def test_online_cache_rebuilds_bit_exactly_from_a_diffusers_layout(tmp_path):
+    """Diffusers tensor names must resolve through the DiT checkpoint mapping."""
+    _ensure_single_process_parallel_runtime()
+    diffusers_path = _write_diffusers_online_weights(tmp_path)
+    plan = [torch.tensor([0.25, 0.5])]
+    caches = []
+    for arch, path in (
+        (_ARCH, tmp_path / "native.safetensors"),
+        (_DIFFUSERS_ARCH, diffusers_path),
+    ):
+        cache = MiniMaxH3AdalnCache(
+            arch, weight_files=[str(path)], max_plans=1, max_plan_width=2
+        )
+        cache.load(torch.device("cpu"))
+        cache.build(plan, embed=_embed)
+        caches.append(cache)
+
+    native, diffusers = caches
+    assert native.block_params.abs().sum() > 0
+    assert torch.equal(native.block_params, diffusers.block_params)
+    assert torch.equal(native.final_params, diffusers.final_params)
+
+
+def test_diffusers_layout_rebuild_source_must_resolve_every_tensor(tmp_path):
+    """A missing or ambiguous source fails at construction, not first request."""
+    _ensure_single_process_parallel_runtime()
+    diffusers_path = _write_diffusers_online_weights(tmp_path)
+    tensors = load_file(diffusers_path)
+    tensors.pop("norm_out.linear.bias")
+    save_file(tensors, diffusers_path)
+    with pytest.raises(ValueError, match="final_layer.adaln_proj.linear.bias"):
+        MiniMaxH3AdalnCache(_DIFFUSERS_ARCH, weight_files=[str(diffusers_path)])
+
+    ambiguous = _write_diffusers_online_weights(
+        tmp_path, **{"norm_out.folded_bias": torch.zeros(_FINAL_WIDTH)}
+    )
+    with pytest.raises(ValueError, match="single checkpoint tensor"):
+        MiniMaxH3AdalnCache(_DIFFUSERS_ARCH, weight_files=[str(ambiguous)])
+
+
+def test_adaln_key_filter_drops_the_diffusers_final_adaln():
+    from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
+        _minimax_h3_adaln_key_filter,
+    )
+
+    keep = _minimax_h3_adaln_key_filter(_DIFFUSERS_ARCH)
+    assert not keep("norm_out.linear.weight")
+    assert not keep("transformer_blocks.1.adaln_proj.linear.bias")
+    assert keep("norm_out.norm.weight")
+    assert keep("transformer_blocks.1.attn.to_q.weight")
+
+    native_keep = _minimax_h3_adaln_key_filter(_ARCH)
+    assert not native_keep("blocks.1.adaln_proj.linear.weight")
+    assert not native_keep("final_layer.adaln_proj.linear.bias")
+    assert native_keep("final_layer.norm.weight")
 
 
 def test_online_cache_width_rejection_preserves_resident_plans(tmp_path):

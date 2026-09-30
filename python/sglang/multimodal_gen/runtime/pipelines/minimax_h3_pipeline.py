@@ -5,9 +5,13 @@ import shutil
 from dataclasses import replace
 
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+    FastH3V2PipelineConfig,
     MiniMaxH3PipelineConfig,
 )
-from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
+from sglang.multimodal_gen.configs.sample.minimax_h3 import (
+    FastH3V2SamplingParams,
+    MiniMaxH3SamplingParams,
+)
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -22,6 +26,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     MiniMaxH3TextEncodingStage,
     MiniMaxH3TimestepPreparationStage,
     MiniMaxH3VisualEncodingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.fasth3_contract import (
+    FastH3InferenceContract,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.release_metadata import (
     MiniMaxH3PartitionAdmissionStage,
@@ -149,6 +156,12 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
             if release_metadata is not None
             else None
         )
+        sigma_rungs = (
+            release_metadata.sigma_rungs if release_metadata is not None else None
+        )
+        vsa_sparsity = (
+            release_metadata.vsa_sparsity if release_metadata is not None else None
+        )
         self.add_stage(InputValidationStage())
         if release_metadata is not None:
             self.add_stage(MiniMaxH3PartitionAdmissionStage(release_metadata))
@@ -175,12 +188,14 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_stage(
             MiniMaxH3TimestepPreparationStage(
                 sigma_shift_scales=sigma_shift_scales,
+                sigma_rungs=sigma_rungs,
             )
         )
         self.add_stage(
             MiniMaxH3DenoisingStage(
                 transformer=self.get_module("transformer"),
                 pipeline=self,
+                vsa_sparsity=vsa_sparsity,
             )
         )
         self.add_stage(
@@ -204,13 +219,28 @@ class FastH3Pipeline(MiniMaxH3Pipeline):
     """FastH3: 4-step DMD2-distilled MiniMax-H3 (t2va only).
 
     The flat single-partition repo is materialized into the base-H3 layout by
-    the bundled model overlay (see model_overlays/), so every stage, loader,
-    and admission path below is exactly the MiniMax-H3 one. There is no
-    FL2VA/Ref2VA partition layout to default into.
+    its registered model overlay, so every stage, loader, and admission path
+    below is exactly the MiniMax-H3 one. There is no FL2VA/Ref2VA partition
+    layout to default into.
     """
 
     pipeline_name = "FastH3Pipeline"
     default_model_subfolder = None
 
 
-EntryClass = [MiniMaxH3Pipeline, FastH3Pipeline]
+class FastH3V2Pipeline(FastH3Pipeline):
+    """FastH3 8-Step V2: the checkpoint's FastVideo inference contract binds
+    its trained rung ladder and VSA sparsity onto the release metadata."""
+
+    pipeline_name = "FastH3V2Pipeline"
+    pipeline_config_cls = FastH3V2PipelineConfig
+    sampling_params_cls = FastH3V2SamplingParams
+
+    def _load_config(self):
+        model_index = super()._load_config()
+        contract = FastH3InferenceContract.load(self.model_path)
+        self.release_metadata = contract.bind(self.release_metadata)
+        return model_index
+
+
+EntryClass = [MiniMaxH3Pipeline, FastH3Pipeline, FastH3V2Pipeline]

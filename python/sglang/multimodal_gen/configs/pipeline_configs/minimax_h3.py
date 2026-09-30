@@ -341,7 +341,7 @@ class FastH3PipelineConfig(MiniMaxH3PipelineConfig):
     def validate_quality_deployment(self, server_args) -> None:
         raise ValueError(
             'quality="high" is audited only for the base MiniMax-H3 50-step '
-            "4xH200 deployment; the FastH3 4-step distilled checkpoint has no "
+            "4xH200 deployment; the FastH3 distilled checkpoints have no "
             'audited high-quality deployment. Use quality="lossless".'
         )
 
@@ -355,12 +355,40 @@ class FastH3PipelineConfig(MiniMaxH3PipelineConfig):
         super().validate_server_args(server_args)
 
 
-__all__ = ["FastH3PipelineConfig", "MiniMaxH3PipelineConfig"]
+@dataclass
+class FastH3V2PipelineConfig(FastH3PipelineConfig):
+    """FastH3 8-Step V2: served with the VSA-H3 backend it was distilled with."""
+
+    def validate_server_args(self, server_args) -> None:
+        # an unset backend would resolve to dense FA, which skips the trained
+        # compression gate and is not the distilled model
+        if server_args.attention_backend is None and not (
+            server_args.component_attention_backends or {}
+        ).get("transformer"):
+            server_args.attention_backend = "video_sparse_attn_h3"
+        super().validate_server_args(server_args)
+
+
+__all__ = [
+    "FastH3PipelineConfig",
+    "FastH3V2PipelineConfig",
+    "MiniMaxH3PipelineConfig",
+]
+
+
+def _normalized_model_id(model_id: str) -> str:
+    return model_id.lower().replace("-", "").replace("_", "")
+
+
+def _is_fasth3_v2(model_id: str) -> bool:
+    normalized = _normalized_model_id(model_id)
+    return "fasth38stepv2" in normalized or "fasth3v2pipeline" in normalized
 
 
 def register():
     from sglang.multimodal_gen.configs.sample.minimax_h3 import (
         FastH3SamplingParams,
+        FastH3V2SamplingParams,
         MiniMaxH3SamplingParams,
     )
     from sglang.multimodal_gen.registry import register_configs
@@ -380,6 +408,14 @@ def register():
         ],
     )
     register_configs(
+        sampling_param_cls=FastH3V2SamplingParams,
+        pipeline_config_cls=FastH3V2PipelineConfig,
+        hf_model_paths=[
+            "FastVideo/FastVideo-FastH3-8-Step-V2",
+        ],
+        model_detectors=[_is_fasth3_v2],
+    )
+    register_configs(
         sampling_param_cls=FastH3SamplingParams,
         pipeline_config_cls=FastH3PipelineConfig,
         hf_model_paths=[
@@ -387,7 +423,8 @@ def register():
         ],
         model_detectors=[
             lambda model_id: (
-                "fasth3" in model_id.lower().replace("-", "").replace("_", "")
+                "fasth3" in _normalized_model_id(model_id)
+                and not _is_fasth3_v2(model_id)
             )
         ],
     )

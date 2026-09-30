@@ -1875,7 +1875,7 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         # rejected every source this cannot follow; anything else is a broken
         # call order rather than a deployment the cache can degrade through.
         self.validate_weight_update_source(weights_path=weights_path)
-        cache.weight_files = native_adaln_weight_files(weights_path)
+        cache.retarget_native(native_adaln_weight_files(weights_path))
         cache.invalidate()
 
     def _can_batch_block_adaln(self) -> bool:
