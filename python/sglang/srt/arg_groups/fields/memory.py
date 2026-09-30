@@ -214,17 +214,6 @@ class Memory(msgspec.Struct):
             choices=["mooncake", "mori"],
         ),
     ] = "mooncake"
-    mooncake_store_contributor: A[
-        bool,
-        Arg(
-            help=(
-                "Decode only: register this rank's host memory as passive "
-                "capacity in the Mooncake store the prefill ranks write to. "
-                "The rank mounts a segment but attaches no cache pool, so no "
-                "KV is read or written through it."
-            ),
-        ),
-    ] = False
     enable_linker_mla_dedup: A[
         bool,
         "Load replicated MLA KV on rank 0 and broadcast each layer with the Mooncake linker.",

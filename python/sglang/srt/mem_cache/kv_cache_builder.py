@@ -260,38 +260,49 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
     return backend
 
 
+def _decode_store_contribution_bytes(
+    *, disaggregation_mode: str, external_linker: bool
+) -> int:
+    if disaggregation_mode != "decode" or external_linker:
+        # Other roles, and a decode rank with a linker, mount through their cache.
+        return 0
+    # Decode keeps no store-backed cache; it lends memory only when sized like prefill.
+    if not envs.MOONCAKE_GLOBAL_SEGMENT_SIZE.is_set():
+        return 0
+    if envs.MOONCAKE_STANDALONE_STORAGE.get():
+        logger.info(
+            "Decode rank mounts no Mooncake segment: MOONCAKE_STANDALONE_STORAGE "
+            "leaves host capacity to the local store service."
+        )
+        return 0
+    if not envs.MOONCAKE_MASTER.is_set():
+        logger.warning(
+            "Ignoring MOONCAKE_GLOBAL_SEGMENT_SIZE on a decode rank: lending "
+            "capacity needs MOONCAKE_MASTER."
+        )
+        return 0
+
+    from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+        _parse_global_segment_size,
+    )
+
+    return max(0, _parse_global_segment_size(envs.MOONCAKE_GLOBAL_SEGMENT_SIZE.get()))
+
+
 def _maybe_create_decode_storage_contributor(
     *, server_args: ServerArgs, params
 ) -> object:
-    """Mount decode host memory into the Mooncake store without cache I/O.
-
-    Only ranks that link to the store mount a segment, and disaggregated decode
-    defaults to a chunk cache, so its host memory never joins the pool however
-    free it is. The contributor owns a segment but no cache pool, so no KV is
-    read or written through it. A decode rank holds no store configuration, so
-    the knob is the operator asserting that prefixes live in Mooncake.
-    """
-    if get_disagg().disaggregation_mode != "decode":
+    contribution_bytes = _decode_store_contribution_bytes(
+        disaggregation_mode=get_disagg().disaggregation_mode,
+        external_linker=get_memory().enable_unified_cache_external_linker,
+    )
+    if contribution_bytes == 0:
         return None
-    if not get_memory().mooncake_store_contributor:
-        return None
-    if not (envs.MOONCAKE_MASTER.is_set() or envs.MOONCAKE_CLIENT.is_set()):
-        raise ValueError(
-            "--mooncake-store-contributor needs MOONCAKE_MASTER or "
-            "MOONCAKE_CLIENT; the knob only applies where prefix pages are "
-            "stored in Mooncake."
-        )
 
     from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
-
-    try:
-        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
-            MooncakeStore,
-        )
-    except ImportError as exc:
-        raise ImportError(
-            "--mooncake-store-contributor needs the Mooncake store package."
-        ) from exc
+    from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+        MooncakeStore,
+    )
 
     parallel = get_parallel()
     storage_config = HiCacheStorageConfig(
@@ -306,10 +317,12 @@ def _maybe_create_decode_storage_contributor(
         is_page_first_layout=False,
         model_name=server_args.model_path,
     )
+    # A segment without a cache pool, so no KV is read or written through it.
     contributor = MooncakeStore(storage_config=storage_config, mem_pool=None)
     logger.info(
-        "Decode rank contributes store capacity: attn_tp_rank=%d/%d, "
-        "attn_cp_rank=%d/%d, pp_rank=%d/%d",
+        "Decode rank lends Mooncake capacity (MOONCAKE_GLOBAL_SEGMENT_SIZE=%d "
+        "bytes): attn_tp_rank=%d/%d, attn_cp_rank=%d/%d, pp_rank=%d/%d",
+        contribution_bytes,
         parallel.attn_tp_rank,
         parallel.attn_tp_size,
         params.attn_cp_rank,
