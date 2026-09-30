@@ -8,7 +8,6 @@ import unittest
 
 import numpy as np
 import torch
-
 from sglang.srt.configs import LocateAnythingConfig
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.locate_anything import (
@@ -244,7 +243,7 @@ class _StubVisionTower:
 def _bare_model(config):
     """A LocateAnythingForConditionalGeneration with a real projector but a
     stubbed vision tower, bypassing the distributed Qwen2 __init__."""
-    import torch.nn as nn
+    from torch import nn
 
     model = LocateAnythingForConditionalGeneration.__new__(
         LocateAnythingForConditionalGeneration

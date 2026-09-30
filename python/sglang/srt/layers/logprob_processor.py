@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+from collections.abc import Callable
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -32,11 +33,11 @@ class LogprobResult:
     onto LogitsProcessorOutput, so the IPC / D2H wire format stays unchanged.
     """
 
-    token_logprobs: Optional[torch.Tensor] = None
-    top_logprobs_val: Optional[List] = None
-    top_logprobs_idx: Optional[List] = None
-    token_ids_logprobs_val: Optional[List] = None
-    token_ids_logprobs_idx: Optional[List] = None
+    token_logprobs: torch.Tensor | None = None
+    top_logprobs_val: list | None = None
+    top_logprobs_idx: list | None = None
+    token_ids_logprobs_val: list | None = None
+    token_ids_logprobs_idx: list | None = None
 
     def write_input_to(self, logits_output: LogitsProcessorOutput) -> None:
         if self.token_logprobs is not None:
@@ -65,7 +66,7 @@ class LogprobResult:
 
 def compute_row_log_normalizer(
     logits: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-row ``(max, logsumexp - max)`` in fp32.
 
     Consumers compute ``logprob[i] = (logit[i] - max) - log_sum``, the same
@@ -85,9 +86,9 @@ def compute_row_log_normalizer(
 
 def get_top_logprobs_raw(
     logprobs: torch.Tensor,
-    top_logprobs_nums: List[int],
+    top_logprobs_nums: list[int],
     stage: LogprobStage,
-    extend_logprob_pruned_lens_cpu: Optional[List[int]] = None,
+    extend_logprob_pruned_lens_cpu: list[int] | None = None,
     no_copy_to_cpu: bool = False,
 ):
     max_k = max(top_logprobs_nums)
@@ -120,7 +121,7 @@ def get_top_logprobs_raw(
 
 def get_top_logprobs(
     logprobs: torch.Tensor,
-    top_logprobs_nums: List[int],
+    top_logprobs_nums: list[int],
     no_copy_to_cpu: bool = False,
 ):
     return get_top_logprobs_raw(
@@ -133,9 +134,9 @@ def get_top_logprobs(
 
 def get_token_ids_logprobs_raw(
     logprobs: torch.Tensor,
-    token_ids_logprobs_list: List[Optional[List[int]]],
+    token_ids_logprobs_list: list[list[int] | None],
     stage: LogprobStage,
-    extend_logprob_pruned_lens_cpu: Optional[List[int]] = None,
+    extend_logprob_pruned_lens_cpu: list[int] | None = None,
     no_copy_to_cpu: bool = False,
 ):
     vals, idxs = [], []
@@ -187,13 +188,13 @@ def get_token_ids_logprobs(logprobs, token_ids_logprobs, no_copy_to_cpu=False):
 
 def get_top_logprobs_chunk(
     logprobs: torch.Tensor,
-    top_k_nums: List[int],
-    pruned_lens: List[int],
-    top_logprobs_val: List,
-    top_logprobs_idx: List,
+    top_k_nums: list[int],
+    pruned_lens: list[int],
+    top_logprobs_val: list,
+    top_logprobs_idx: list,
     split_pruned_len: int,
-    log_normalizer: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    precomputed_topk: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    log_normalizer: tuple[torch.Tensor, torch.Tensor] | None = None,
+    precomputed_topk: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> int:
     """Get top-k logprobs for each sequence in the chunk.
 
@@ -274,12 +275,12 @@ def get_top_logprobs_chunk(
 
 def get_token_ids_logprobs_chunk(
     logprobs: torch.Tensor,
-    token_ids_logprobs: List[int],
-    pruned_lens: List[int],
-    token_ids_logprobs_val: List,
-    token_ids_logprobs_idx: List,
+    token_ids_logprobs: list[int],
+    pruned_lens: list[int],
+    token_ids_logprobs_val: list,
+    token_ids_logprobs_idx: list,
     split_pruned_len: int = 0,
-    log_normalizer: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    log_normalizer: tuple[torch.Tensor, torch.Tensor] | None = None,
 ):
     """Get token_ids logprobs for each sequence in the chunk.
 
@@ -354,8 +355,8 @@ def compute_spec_logprobs(
     logits_output: LogitsProcessorOutput,
     predict: torch.Tensor,
     *,
-    accept_index: Optional[torch.Tensor] = None,
-    chain_stride: Optional[int] = None,
+    accept_index: torch.Tensor | None = None,
+    chain_stride: int | None = None,
 ):
     assert (accept_index is None) != (
         chain_stride is None
@@ -460,14 +461,14 @@ class InputLogprobProcessor:
     def forward(
         self,
         pruned_states: torch.Tensor,
-        sample_indices: Optional[torch.Tensor],
+        sample_indices: torch.Tensor | None,
         input_logprob_indices: torch.Tensor,
         token_to_seq_idx: list[int],
         lm_head: VocabParallelEmbedding,
         get_logits_fn: Callable,
         logits_metadata: LogitsMetadata,
         skip_chunking_for_dp_attn: bool = False,
-    ) -> Tuple[LogprobResult, torch.Tensor]:
+    ) -> tuple[LogprobResult, torch.Tensor]:
         # Non-chunked = one chunk covering every row. DP-attention must stay
         # single-chunk: the collective schedule cannot depend on per-rank rows.
         if (
@@ -500,7 +501,7 @@ class InputLogprobProcessor:
         get_logits_fn: Callable,
         logits_metadata: LogitsMetadata,
         chunk_size: int,
-    ) -> Tuple[LogprobResult, torch.Tensor]:
+    ) -> tuple[LogprobResult, torch.Tensor]:
         """Compute input logprobs chunk by chunk to cap peak memory."""
         total_size = pruned_states.shape[0]
         num_chunks = (total_size + chunk_size - 1) // chunk_size
@@ -689,8 +690,8 @@ class InputLogprobProcessor:
 
 def get_token_ids_logprobs_batch_optimized(
     logprobs: torch.Tensor,
-    token_ids_logprobs: List[List[int]],
-) -> Tuple[List, List]:
+    token_ids_logprobs: list[list[int]],
+) -> tuple[list, list]:
     """
     Vectorized batch processing for token ID logprobs extraction.
 
@@ -787,8 +788,8 @@ class OutputLogprobProcessor:
     def compute_logprobs(
         self,
         logprobs: torch.Tensor,
-        top_logprobs_nums: List[int],
-        token_ids_logprobs: List[List[int]],
+        top_logprobs_nums: list[int],
+        token_ids_logprobs: list[list[int]],
         batch_next_token_ids: torch.Tensor,
     ) -> LogprobResult:
         # clamp to avoid -inf values
@@ -817,11 +818,11 @@ class OutputLogprobProcessor:
 
     def compute_logprobs_only(
         self,
-        next_token_logits: Optional[torch.Tensor],
-        top_logprobs_nums: List[int],
-        token_ids_logprobs: List[List[int]],
+        next_token_logits: torch.Tensor | None,
+        top_logprobs_nums: list[int],
+        token_ids_logprobs: list[list[int]],
         preprocess_fn: Callable[[torch.Tensor], torch.Tensor],
-    ) -> Optional[LogprobResult]:
+    ) -> LogprobResult | None:
         """
         Compute logprobs for requested token IDs without performing sampling.
 

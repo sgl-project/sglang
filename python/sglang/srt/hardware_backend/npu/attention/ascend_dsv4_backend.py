@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import math
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
@@ -100,16 +100,14 @@ def _build_explicit_state_block_table(
 class CompressorAscendBackendMixin:
 
     @staticmethod
-    def _to_cpu_int_list(values) -> Optional[list[int]]:
+    def _to_cpu_int_list(values) -> list[int] | None:
         if values is None:
             return None
         if isinstance(values, torch.Tensor):
             values = values.cpu().tolist()
         return [int(v) for v in values]
 
-    def _extend_prefix_lens_cpu(
-        self, forward_batch: ForwardBatch
-    ) -> Optional[list[int]]:
+    def _extend_prefix_lens_cpu(self, forward_batch: ForwardBatch) -> list[int] | None:
         prefix_lens = self._to_cpu_int_list(
             getattr(forward_batch, "extend_prefix_lens_cpu", None)
         )
@@ -271,7 +269,7 @@ class CompressorAscendBackendMixin:
         req_to_token_pool,
         out_cache_loc_dsv4,
         is_graph: bool = False,
-        seq_lens_max_override: Optional[int] = None,
+        seq_lens_max_override: int | None = None,
     ) -> dict:
         result: dict = {}
         req_pool = req_pool_indices
@@ -463,9 +461,9 @@ class CompressorAscendBackendMixin:
         compressor,
         kv: torch.Tensor,
         forward_batch: ForwardBatch,
-        override_loc: Optional[torch.Tensor] = None,
+        override_loc: torch.Tensor | None = None,
     ) -> None:
-        kv_scale: Optional[torch.Tensor] = None
+        kv_scale: torch.Tensor | None = None
         li_kv_dtype = getattr(compressor, "li_kv_dtype", "bf16")
         if li_kv_dtype == "int8" and compressor.is_in_indexer:
             kv, kv_scale = torch_npu.npu_dynamic_quant(kv)
@@ -636,7 +634,7 @@ class C4IndexerAscendBackendMixin:
             )
             if is_prefill:
                 start = 0 if i == 0 else int(end_pos[i - 1])
-                end = int(end_pos[i])
+                end = int(_end_token)
                 index_score = torch.einsum(
                     "shd,td->sht",
                     q[start:end, ...],
@@ -1069,7 +1067,7 @@ class DeepseekV4AscendAttnBackend(
             dst[:, c:].fill_(val)
 
     @staticmethod
-    def _copy_1d_with_zero_tail(dst: torch.Tensor, src: Optional[torch.Tensor]) -> None:
+    def _copy_1d_with_zero_tail(dst: torch.Tensor, src: torch.Tensor | None) -> None:
         if src is None:
             dst.zero_()
             return
@@ -1634,7 +1632,7 @@ class DeepseekV4AscendAttnBackend(
         forward_batch: ForwardBatch,
         *,
         compress_ratio: int = 0,
-        attn_sink: Optional[torch.Tensor] = None,
+        attn_sink: torch.Tensor | None = None,
         save_kv_cache: bool = True,
     ) -> torch.Tensor:
         if compress_ratio not in (0, 4, 128):
@@ -1660,7 +1658,7 @@ class DeepseekV4AscendAttnBackend(
         q: torch.Tensor,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
-        attn_sink: Optional[torch.Tensor],
+        attn_sink: torch.Tensor | None,
     ) -> torch.Tensor:
         fm = self.forward_metadata
         pool = self.token_to_kv_pool
@@ -1698,7 +1696,7 @@ class DeepseekV4AscendAttnBackend(
         q: torch.Tensor,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
-        attn_sink: Optional[torch.Tensor],
+        attn_sink: torch.Tensor | None,
         compress_ratio: int,
     ) -> torch.Tensor:
         fm = self.forward_metadata
@@ -1875,7 +1873,7 @@ class DeepseekV4AscendAttnBackend(
         dst[: indices.numel()].copy_(torch.gather(positions, 0, indices))
 
     def update_verify_buffers_to_fill_after_draft(
-        self, spec_info, cuda_graph_bs: Optional[int]
+        self, spec_info, cuda_graph_bs: int | None
     ):
         fm = self.forward_metadata
         positions = spec_info.positions
@@ -1909,7 +1907,7 @@ def _get_kv_indices(
     page_table: torch.Tensor,
     req_idx: int,
     seqlen: int,
-    page_size: Optional[int] = None,
+    page_size: int | None = None,
 ) -> torch.Tensor:
     logic_start = max(0, seqlen - kv_len)
     logic_end = seqlen

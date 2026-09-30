@@ -133,10 +133,9 @@ def _build_local_embedding_layout(
     row_stop = row_start + local_seq_len
 
     def local_ids(pos: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        source_ids = 
-            (pos >= row_start) & (pos < row_stop),
-            as_tuple=False,
-        .nonzero().view(-1)
+        source_ids = (
+            ((pos >= row_start) & (pos < row_stop)).nonzero(as_tuple=False).view(-1)
+        )
         return source_ids.to(device), pos.index_select(0, source_ids).to(device)
 
     text_source_start = min(row_start, int(text_pos.shape[0]))

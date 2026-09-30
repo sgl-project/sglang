@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, cast
 from unittest.mock import patch
 
 import torch
-
 from sglang.kernels.ops.kv_canary.verify import RealKvSource
 from sglang.srt.kv_canary.buffer_group import PoolKind
 from sglang.srt.kv_canary.perturb import (
@@ -67,11 +66,10 @@ class TestParseTargetGroupKind(CustomTestCase):
     def test_parse_target_group_kind_rejects_missing_or_any(self) -> None:
         """Verify target group kind parsing requires an explicit concrete group."""
         for raw in [None, "", "any", " Any "]:
-            with self.subTest(raw=raw):
-                with self.assertRaisesRegex(
-                    ValueError, "SGLANG_KV_CANARY_PERTURB_TARGET_GROUP"
-                ):
-                    _parse_target_group_kind(raw)
+            with self.subTest(raw=raw), self.assertRaisesRegex(
+                ValueError, "SGLANG_KV_CANARY_PERTURB_TARGET_GROUP"
+            ):
+                _parse_target_group_kind(raw)
 
     def test_from_env_allows_missing_target_when_real_kv_perturb_is_disabled(
         self,

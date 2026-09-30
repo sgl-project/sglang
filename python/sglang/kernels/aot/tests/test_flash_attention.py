@@ -2,7 +2,6 @@
 import itertools
 import math
 import sys
-from typing import Optional
 
 import pytest
 import torch
@@ -200,7 +199,7 @@ def attention_ref(
     v_descale=None,
     window_size=(-1, -1),  # -1 means infinite window size
     sink_token_length=0,
-    sinks: Optional[torch.Tensor] = None,
+    sinks: torch.Tensor | None = None,
     softcap=0.0,
     upcast=True,
     reorder_ops=False,

@@ -31,7 +31,7 @@ import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -115,7 +115,7 @@ _use_aiter = bool(envs.SGLANG_USE_AITER.get()) and _is_hip
 
 
 def conv_window_dedup_enabled(
-    is_npu: bool, is_cpu: bool, speculative_eagle_topk: Optional[int], is_kda: bool
+    is_npu: bool, is_cpu: bool, speculative_eagle_topk: int | None, is_kda: bool
 ) -> bool:
     """Whether the deduplicated sliding-window conv-intermediate layout is safe.
 
@@ -132,7 +132,7 @@ def conv_window_dedup_enabled(
     )
 
 
-def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
+def get_tensor_size_bytes(t: torch.Tensor | list[torch.Tensor]):
     if isinstance(t, list):
         return sum(get_tensor_size_bytes(x) for x in t)
     return np.prod(t.shape) * t.dtype.itemsize
@@ -148,8 +148,8 @@ def _set_kv_buffer_impl(
     store_dtype: torch.dtype,
     device_module: Any,
     size_limit: int,
-    alt_stream: Optional[torch.cuda.Stream] = None,
-    v_row_dim: Optional[int] = None,  # head_num * v_head_dim; defaults to row_dim
+    alt_stream: torch.cuda.Stream | None = None,
+    v_row_dim: int | None = None,  # head_num * v_head_dim; defaults to row_dim
 ) -> None:
     v_row_dim = row_dim if v_row_dim is None else v_row_dim
     row_bytes = row_dim * store_dtype.itemsize
@@ -289,7 +289,7 @@ class ReqToTokenPool:
     def available_size(self):
         return len(self.free_slots)
 
-    def alloc(self, reqs: list[Req]) -> Optional[List[int]]:
+    def alloc(self, reqs: list[Req]) -> list[int] | None:
         # Indices of reqs that already have a req_pool_idx and will reuse
         # their existing slot (e.g. chunked prefill continuing across chunks).
         reusing = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
@@ -369,7 +369,7 @@ class MambaPool:
 
     @dataclass(frozen=True, kw_only=True)
     class State:
-        conv: List[torch.Tensor]
+        conv: list[torch.Tensor]
         temporal: torch.Tensor
         # GDN ReplaySSM ring buffers (slice 1a). Only allocated when
         # `--enable-linear-replayssm` is set; otherwise None so the legacy path is
@@ -385,12 +385,12 @@ class MambaPool:
         # update at flush -- bit-identical to the recurrent baseline -- instead
         # of folding the chunked `d` records open-loop (which accumulates error
         # across flushes). See fla/gdn_replayssm_spec_decode.py.
-        replayssm_d: Optional[torch.Tensor] = None
-        replayssm_k: Optional[torch.Tensor] = None
-        replayssm_g: Optional[torch.Tensor] = None
-        replayssm_rawv: Optional[torch.Tensor] = None
-        replayssm_rawk: Optional[torch.Tensor] = None
-        replayssm_beta: Optional[torch.Tensor] = None
+        replayssm_d: torch.Tensor | None = None
+        replayssm_k: torch.Tensor | None = None
+        replayssm_g: torch.Tensor | None = None
+        replayssm_rawv: torch.Tensor | None = None
+        replayssm_rawk: torch.Tensor | None = None
+        replayssm_beta: torch.Tensor | None = None
 
         def at_layer_idx(self, layer: int):
             kwargs = {}
@@ -419,11 +419,11 @@ class MambaPool:
         # None under --enable-linear-replayssm-spec: the spec ring owns rollback
         # (verify writes ring records, commit moves cursors), so the per-draft
         # full-state snapshots are never produced or consumed.
-        intermediate_ssm: Optional[torch.Tensor]
-        intermediate_conv_window: List[torch.Tensor]
+        intermediate_ssm: torch.Tensor | None
+        intermediate_conv_window: list[torch.Tensor]
 
     def _detect_conv_window_axis(
-        self, conv_state_shape: List[Tuple[int, int]], win_len: int
+        self, conv_state_shape: list[tuple[int, int]], win_len: int
     ) -> int:
         """Prefer GDN's trailing axis when both match; mixed layer layouts cannot
         share one overlapping conv-window buffer.
@@ -453,12 +453,12 @@ class MambaPool:
     def _allocate_deduplicated_conv_window(
         self,
         *,
-        conv_shape: Tuple[int, int],
+        conv_shape: tuple[int, int],
         num_mamba_layers: int,
         spec_state_size: int,
         speculative_num_draft_tokens: int,
         conv_dtype: torch.dtype,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         window_axis = self.conv_window_axis % len(conv_shape)
         win = conv_shape[window_axis]
         physical_conv_shape = list(conv_shape)
@@ -496,11 +496,11 @@ class MambaPool:
         size: int,
         spec_state_size: int,
         cache_params: BaseLinearStateParams,
-        mamba_layer_ids: List[int],
+        mamba_layer_ids: list[int],
         device: str,
         enable_memory_saver: bool = False,
-        speculative_num_draft_tokens: Optional[int] = None,
-        speculative_eagle_topk: Optional[int] = None,
+        speculative_num_draft_tokens: int | None = None,
+        speculative_eagle_topk: int | None = None,
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
         envelope_layout: bool = False,
@@ -1199,13 +1199,13 @@ class HybridReqToTokenPool(ReqToTokenPool):
         device: str,
         enable_memory_saver: bool,
         cache_params: BaseLinearStateParams,
-        mamba_layer_ids: List[int],
+        mamba_layer_ids: list[int],
         enable_mamba_extra_buffer: bool,
         enable_mamba_extra_buffer_lazy: bool = False,
         speculative_num_draft_tokens: int = None,
-        speculative_eagle_topk: Optional[int] = None,
+        speculative_eagle_topk: int | None = None,
         enable_overlap_schedule: bool = True,
-        start_layer: Optional[int] = None,
+        start_layer: int | None = None,
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
@@ -1244,11 +1244,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
         mamba_size: int,
         mamba_spec_state_size: int,
         cache_params: BaseLinearStateParams,
-        mamba_layer_ids: List[int],
+        mamba_layer_ids: list[int],
         device: str,
         enable_mamba_extra_buffer: bool,
         speculative_num_draft_tokens: int = None,
-        speculative_eagle_topk: Optional[int] = None,
+        speculative_eagle_topk: int | None = None,
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
@@ -1312,7 +1312,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         enable_mamba_extra_buffer: bool,
         draft_model_idx: int,
         speculative_num_draft_tokens: int = None,
-        speculative_eagle_topk: Optional[int] = None,
+        speculative_eagle_topk: int | None = None,
     ) -> HybridReqToTokenPool:
         """Shallow copy that shares the req_to_token mapping but owns a fresh mamba
         pool keyed on a single draft layer. Used by multi-layer EAGLE draft workers:
@@ -1342,7 +1342,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
     # For chunk prefill req, we do not need to allocate mamba cache,
     # We could use allocated mamba cache instead.
-    def alloc(self, reqs: List[Req]) -> Optional[List[int]]:
+    def alloc(self, reqs: list[Req]) -> list[int] | None:
         select_index = super().alloc(reqs)
         if select_index is None:
             return None
@@ -1509,7 +1509,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         return mamba_value_donated
 
     def free_mamba_cache(
-        self, req: Req, mamba_ping_pong_track_buffer_to_keep: Optional[int] = None
+        self, req: Req, mamba_ping_pong_track_buffer_to_keep: int | None = None
     ):
         mamba_index = req.mamba_pool_idx
         assert mamba_index is not None, "double free? mamba_index is None"
@@ -1600,8 +1600,8 @@ class KVWriteLoc:
     """
 
     loc: torch.Tensor
-    swa_loc: Optional[torch.Tensor] = None
-    full_loc: Optional[torch.Tensor] = None
+    swa_loc: torch.Tensor | None = None
+    full_loc: torch.Tensor | None = None
 
     def __post_init__(self):
         # swa_loc / full_loc are resolved once at metadata-init from the full
@@ -1624,7 +1624,7 @@ class KvBufferDesc:
     """Byte-span math for one KV buffer laid out as rows of ``row_bytes`` holding
     ``tokens_per_row`` tokens each (a row = one token slot, or one whole page)."""
 
-    __slots__ = ("name", "shape", "row_bytes", "tokens_per_row")
+    __slots__ = ("name", "row_bytes", "shape", "tokens_per_row")
 
     def __init__(self, name: str, shape: tuple, *, row_bytes: int, tokens_per_row: int):
         self.name = name
@@ -1671,9 +1671,9 @@ class KVCache(abc.ABC):
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
-        start_layer: Optional[int] = None,
-        end_layer: Optional[int] = None,
-        allocation_label: Optional[str] = None,
+        start_layer: int | None = None,
+        end_layer: int | None = None,
+        allocation_label: str | None = None,
     ):
         self.size = size
         self.page_size = page_size
@@ -1732,7 +1732,7 @@ class KVCache(abc.ABC):
             )
             self.mem_usage = kv_size_GB
 
-    def get_kv_buffer_shape(self) -> Tuple[torch.Size, torch.Size]:
+    def get_kv_buffer_shape(self) -> tuple[torch.Size, torch.Size]:
         k_buffer, v_buffer = self.get_kv_buffer(self.start_layer)
         return k_buffer.shape, v_buffer.shape
 
@@ -1745,7 +1745,7 @@ class KVCache(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def get_kv_buffer(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError()
 
     @abc.abstractmethod
@@ -1800,18 +1800,18 @@ class MHATokenToKVPool(KVCache):
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
-        v_head_dim: Optional[int] = None,
-        swa_head_num: Optional[int] = None,
-        swa_head_dim: Optional[int] = None,
-        swa_v_head_dim: Optional[int] = None,
-        start_layer: Optional[int] = None,
-        end_layer: Optional[int] = None,
+        v_head_dim: int | None = None,
+        swa_head_num: int | None = None,
+        swa_head_dim: int | None = None,
+        swa_v_head_dim: int | None = None,
+        start_layer: int | None = None,
+        end_layer: int | None = None,
         enable_alt_stream: bool = True,
         enable_kv_cache_copy: bool = False,
-        kv_cache_layout: Optional[str] = None,
+        kv_cache_layout: str | None = None,
         quant_method=None,
         post_capture_active: bool = False,
-        allocation_label: Optional[str] = None,
+        allocation_label: str | None = None,
     ):
         self.k_buffer = None
         self.v_buffer = None
@@ -2367,10 +2367,10 @@ class MHATokenToKVPool(KVCache):
         loc_info,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
-        k_scale: Optional[float] = None,
-        v_scale: Optional[float] = None,
-        layer_id_override: Optional[int] = None,
-        dcp_kv_mask: Optional[torch.Tensor] = None,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
+        layer_id_override: int | None = None,
+        dcp_kv_mask: torch.Tensor | None = None,
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
         # Catch stale slot ids here instead of as illegal-addr / silent KV
@@ -2568,9 +2568,9 @@ class MHATokenToKVPool(KVCache):
         *,
         prepare_workspace: bool,
         use_ragged: bool,
-        k_cur: Optional[torch.Tensor] = None,
-        v_cur: Optional[torch.Tensor] = None,
-        layer_id_override: Optional[int] = None,
+        k_cur: torch.Tensor | None = None,
+        v_cur: torch.Tensor | None = None,
+        layer_id_override: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return the FlashInfer FP8 KV view for a quantized KV cache.
 
@@ -2620,7 +2620,7 @@ class MHATokenToKVPool(KVCache):
         req_pool_indices,
         seq_lens,
         *,
-        layer_id_override: Optional[int] = None,
+        layer_id_override: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if not self.is_quantized_kv_cache:
             raise RuntimeError(
@@ -2657,8 +2657,8 @@ class MHATokenToKVPool(KVCache):
         extend_prefix_lens_cpu,
         extend_seq_lens_cpu,
         page_size: int,
-        k_cur_fp8: Optional[torch.Tensor] = None,
-        v_cur_fp8: Optional[torch.Tensor] = None,
+        k_cur_fp8: torch.Tensor | None = None,
+        v_cur_fp8: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Build the shared FP8 workspace used by FlashInfer extend attention.
 
@@ -2744,9 +2744,9 @@ class MHATokenToKVPool(KVCache):
         commit_lens: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
-        k_scale: Optional[float] = None,
-        v_scale: Optional[float] = None,
-        layer_id_override: Optional[int] = None,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
+        layer_id_override: int | None = None,
     ):
         if layer_id_override is not None:
             layer_id = layer_id_override
@@ -3113,9 +3113,9 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
         loc_info,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
-        k_scale: Optional[float] = None,
-        v_scale: Optional[float] = None,
-        layer_id_override: Optional[int] = None,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
+        layer_id_override: int | None = None,
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MHA-FP4)")
@@ -3187,7 +3187,7 @@ class PageMajorMHATokenToKVPool(MHATokenToKVPool):
     def __init__(
         self,
         *args,
-        kv_cache_layout: Optional[str] = None,
+        kv_cache_layout: str | None = None,
         enable_kv_cache_copy: bool = False,
         **kwargs,
     ):
@@ -3452,7 +3452,7 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
     def _get_value_buffer(self, layer_id: int):
         return self.v_buffer[layer_id - self.start_layer]
 
-    def get_kv_scale_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def get_kv_scale_buffer(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
         idx = layer_id - self.start_layer
         return self.k_scale_buffer[idx], self.v_scale_buffer[idx]
 
@@ -3462,10 +3462,10 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
         loc_info,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
-        k_scale: Optional[torch.Tensor] = None,
-        v_scale: Optional[torch.Tensor] = None,
-        layer_id_override: Optional[int] = None,
-        dcp_kv_mask: Optional[torch.Tensor] = None,
+        k_scale: torch.Tensor | None = None,
+        v_scale: torch.Tensor | None = None,
+        layer_id_override: int | None = None,
+        dcp_kv_mask: torch.Tensor | None = None,
     ):
         if dcp_kv_mask is not None:
             raise NotImplementedError("MXFP8 KV cache does not support DCP KV masks.")
@@ -3696,7 +3696,7 @@ class HybridLinearKVPool(KVCache):
         page_size: int,
         head_num: int,
         head_dim: int,
-        full_attention_layer_ids: List[int],
+        full_attention_layer_ids: list[int],
         device: str,
         mamba_pool: MambaPool,
         enable_memory_saver: bool = False,
@@ -3705,12 +3705,12 @@ class HybridLinearKVPool(KVCache):
         use_mla: bool = False,
         kv_lora_rank: int = None,
         qk_rope_head_dim: int = None,
-        start_layer: Optional[int] = None,
-        full_kv_pool_class: Optional[type] = None,
+        start_layer: int | None = None,
+        full_kv_pool_class: type | None = None,
         quant_method=None,
         # When provided (shared-KV-pool path), use this pool for the
         # full-attention layers instead of constructing one internally.
-        full_kv_pool: Optional[KVCache] = None,
+        full_kv_pool: KVCache | None = None,
         post_capture_active: bool = False,
     ):
         self.size = size
@@ -3823,7 +3823,7 @@ class HybridLinearKVPool(KVCache):
     def get_kv_size_bytes(self):
         return self.full_kv_pool.get_kv_size_bytes()
 
-    def get_kv_buffer_shape(self) -> Tuple[torch.Size, torch.Size]:
+    def get_kv_buffer_shape(self) -> tuple[torch.Size, torch.Size]:
         # Hybrid layer ids are global model-layer ids, while the backing pool
         # is dense over only full-attention layers.  Shape discovery does not
         # need a global layer lookup, so delegate it to that backing pool.
@@ -3879,14 +3879,14 @@ class HybridLinearKVPool(KVCache):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
-    def get_key_buffer(self, layer_id: int, scale: Optional[float] = None):
+    def get_key_buffer(self, layer_id: int, scale: float | None = None):
         self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
         if scale is not None:
             return self.full_kv_pool.get_key_buffer(layer_id, scale)
         return self.full_kv_pool.get_key_buffer(layer_id)
 
-    def get_value_buffer(self, layer_id: int, scale: Optional[float] = None):
+    def get_value_buffer(self, layer_id: int, scale: float | None = None):
         self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
         if scale is not None:
@@ -3950,7 +3950,7 @@ class HybridLinearKVPool(KVCache):
         cache_v: torch.Tensor,
         k_scale: float = 1.0,
         v_scale: float = 1.0,
-        dcp_kv_mask: Optional[torch.Tensor] = None,
+        dcp_kv_mask: torch.Tensor | None = None,
     ):
         # Write-location info lives in the metadata (`KVWriteLoc`). `full_loc` is the
         # unified pool's pre-translated PHYSICAL loc (None for a static pool, where
@@ -4033,7 +4033,7 @@ class HybridLinearKVPool(KVCache):
         self,
         layer: RadixAttention,
         loc: torch.Tensor,
-        dst_dtype: Optional[torch.dtype] = None,
+        dst_dtype: torch.dtype | None = None,
     ):
         assert self.use_mla, "get_mla_kv_buffer called when use_mla is False"
         loc = self._full_translate(loc)
@@ -4052,10 +4052,10 @@ class MLATokenToKVPool(KVCache):
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
-        start_layer: Optional[int] = None,
-        end_layer: Optional[int] = None,
+        start_layer: int | None = None,
+        end_layer: int | None = None,
         use_dsa: bool = False,
-        override_kv_cache_dim: Optional[int] = None,
+        override_kv_cache_dim: int | None = None,
     ):
         super().__init__(
             size,
@@ -4160,7 +4160,7 @@ class MLATokenToKVPool(KVCache):
         loc_info,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
-        layer_id_override: Optional[int] = None,
+        layer_id_override: int | None = None,
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA)")
@@ -4239,7 +4239,7 @@ class MLATokenToKVPool(KVCache):
         loc: torch.Tensor,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
-        layer_id_override: Optional[int] = None,
+        layer_id_override: int | None = None,
     ):
         # loc is widened under DCP; the kernel divides by the world size itself.
         maybe_detect_oob(
@@ -4262,7 +4262,7 @@ class MLATokenToKVPool(KVCache):
         self,
         layer: RadixAttention,
         loc: torch.Tensor,
-        dst_dtype: Optional[torch.dtype] = None,
+        dst_dtype: torch.dtype | None = None,
     ):
         # get k nope and k rope from the kv buffer, and optionally cast them to dst_dtype.
         layer_id = layer.layer_id
@@ -4480,10 +4480,10 @@ class DSATokenToKVPool(MLATokenToKVPool):
         index_head_dim: int,
         enable_memory_saver: bool,
         kv_cache_dim: int,
-        start_layer: Optional[int] = None,
-        end_layer: Optional[int] = None,
-        index_buf_size: Optional[int] = None,
-        skip_topk_layers: Optional[List[bool]] = None,
+        start_layer: int | None = None,
+        end_layer: int | None = None,
+        index_buf_size: int | None = None,
+        skip_topk_layers: list[bool] | None = None,
     ):
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
@@ -4613,8 +4613,8 @@ class DSATokenToKVPool(MLATokenToKVPool):
 
 
 def move_kv_cache_native(
-    k_buffer: List[torch.Tensor],
-    v_buffer: List[torch.Tensor],
+    k_buffer: list[torch.Tensor],
+    v_buffer: list[torch.Tensor],
     tgt_loc: torch.Tensor,
     src_loc: torch.Tensor,
     page_size: int = 1,
@@ -4709,8 +4709,8 @@ class MHATokenToKOnlyPool(KVCache):
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
-        start_layer: Optional[int] = None,
-        end_layer: Optional[int] = None,
+        start_layer: int | None = None,
+        end_layer: int | None = None,
     ):
         super().__init__(
             size,
@@ -4770,7 +4770,7 @@ class MHATokenToKOnlyPool(KVCache):
     def get_value_buffer(self, layer_id: int) -> torch.Tensor:
         raise NotImplementedError("MHATokenToKOnlyPool does not allocate V")
 
-    def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def get_kv_buffer(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError("MHATokenToKOnlyPool does not allocate V")
 
     def set_kv_buffer(
@@ -4779,9 +4779,9 @@ class MHATokenToKOnlyPool(KVCache):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
-        k_scale: Optional[float] = None,
-        v_scale: Optional[float] = None,
-        layer_id_override: Optional[int] = None,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
+        layer_id_override: int | None = None,
     ) -> None:
         # Routed through MiniMaxSparseKVPool.set_index_k_buffer instead.
         raise NotImplementedError(
@@ -4803,14 +4803,14 @@ class MiniMaxSparseKVPool(KVCache):
         head_num: int,
         head_dim: int,
         idx_head_dim: int,
-        dense_layer_ids: List[int],
-        sparse_layer_ids: List[int],
+        dense_layer_ids: list[int],
+        sparse_layer_ids: list[int],
         device: str,
-        disable_value_sparse_layer_ids: Optional[List[int]] = None,
+        disable_value_sparse_layer_ids: list[int] | None = None,
         enable_memory_saver: bool = False,
-        index_dtype: Optional[torch.dtype] = None,
-        start_layer: Optional[int] = None,
-        end_layer: Optional[int] = None,
+        index_dtype: torch.dtype | None = None,
+        start_layer: int | None = None,
+        end_layer: int | None = None,
         main_pool_cls=MHATokenToKVPool,
         index_kv_pool_cls=MHATokenToKVPool,
         index_k_pool_cls=MHATokenToKOnlyPool,
@@ -4868,7 +4868,7 @@ class MiniMaxSparseKVPool(KVCache):
             end_layer=end_layer,
         )
 
-        self.index_kv_pool: Optional[MHATokenToKVPool] = (
+        self.index_kv_pool: MHATokenToKVPool | None = (
             index_kv_pool_cls(
                 size=size,
                 page_size=page_size,
@@ -4883,7 +4883,7 @@ class MiniMaxSparseKVPool(KVCache):
             else None
         )
 
-        self.index_k_pool: Optional[MHATokenToKOnlyPool] = (
+        self.index_k_pool: MHATokenToKOnlyPool | None = (
             index_k_pool_cls(
                 size=size,
                 page_size=page_size,
@@ -4935,11 +4935,11 @@ class MiniMaxSparseKVPool(KVCache):
         self._wait_for_layer(layer_id)
         return self.main_pool.get_value_buffer(layer_id)
 
-    def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def get_kv_buffer(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
         self._wait_for_layer(layer_id)
         return self.main_pool.get_kv_buffer(layer_id)
 
-    def get_index_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def get_index_kv_buffer(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
         self._wait_for_layer(layer_id)
         mapped_id = self.index_kv_layer_id_mapping.get(layer_id)
         if mapped_id is None:
@@ -4971,8 +4971,8 @@ class MiniMaxSparseKVPool(KVCache):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
-        k_scale: Optional[float] = None,
-        v_scale: Optional[float] = None,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
     ) -> None:
         """Write main K/V at `loc`. Works for any layer (dense or sparse).
 
@@ -4994,8 +4994,8 @@ class MiniMaxSparseKVPool(KVCache):
         loc: torch.Tensor,
         cache_idx_k: torch.Tensor,
         cache_idx_v: torch.Tensor,
-        k_scale: Optional[float] = None,
-        v_scale: Optional[float] = None,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
     ) -> None:
         mapped_id = self.index_kv_layer_id_mapping.get(layer.layer_id)
         if mapped_id is None:
@@ -5019,7 +5019,7 @@ class MiniMaxSparseKVPool(KVCache):
         layer: RadixAttention,
         loc: torch.Tensor,
         cache_idx_k: torch.Tensor,
-        k_scale: Optional[float] = None,
+        k_scale: float | None = None,
     ) -> None:
         mapped_id = self.index_k_layer_id_mapping.get(layer.layer_id)
         if mapped_id is None:
@@ -5066,11 +5066,11 @@ class MiniMaxSparseKVPool(KVCache):
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
         cache_idx_k: torch.Tensor,
-        cache_idx_v: Optional[torch.Tensor],
-        k_scale: Optional[float] = None,
-        v_scale: Optional[float] = None,
-        idx_k_scale: Optional[float] = None,
-        idx_v_scale: Optional[float] = None,
+        cache_idx_v: torch.Tensor | None,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
+        idx_k_scale: float | None = None,
+        idx_v_scale: float | None = None,
     ) -> None:
         """Store main K/V + index K (+ optional index V) for a sparse layer in
         one fused JIT launch, falling back to separate stores when not applicable."""

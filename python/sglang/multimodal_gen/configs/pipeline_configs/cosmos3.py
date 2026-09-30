@@ -26,7 +26,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
 COSMOS3_EDGE_BACKBONE_TYPE = "cosmos3_edge_nemotron_dense"
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def is_edge_checkpoint(model_path: str) -> bool:
     """Whether the checkpoint is the Edge (dense) variant.
 
@@ -47,7 +47,7 @@ def is_edge_checkpoint(model_path: str) -> bool:
     )
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _distilled_sampler_config(model_path: str) -> dict | None:
     """The fixed-step sampler config for a distilled checkpoint, else ``None``.
 

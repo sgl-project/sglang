@@ -1,7 +1,6 @@
 import math
 from contextlib import nullcontext
 from functools import wraps
-from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -374,18 +373,18 @@ def attention_ref(
     window_size=(None, None),
     attention_chunk=0,
     sink_token_length=0,
-    learnable_sink: Optional[torch.Tensor] = None,
+    learnable_sink: torch.Tensor | None = None,
     softcap=0.0,
     upcast=True,
     reorder_ops=False,
     intermediate_dtype=None,
     return_lse=False,
     gather_kv_indices=None,
-    rel_bias: Optional[torch.Tensor] = None,  # [b, seqlen_q, h, rel_extent]
-    cu_seqlens_q: Optional[torch.Tensor] = None,
-    cu_seqlens_k: Optional[torch.Tensor] = None,
-    seqused_q: Optional[torch.Tensor] = None,
-    seqused_k: Optional[torch.Tensor] = None,
+    rel_bias: torch.Tensor | None = None,  # [b, seqlen_q, h, rel_extent]
+    cu_seqlens_q: torch.Tensor | None = None,
+    cu_seqlens_k: torch.Tensor | None = None,
+    seqused_q: torch.Tensor | None = None,
+    seqused_k: torch.Tensor | None = None,
 ):
     assert v is not None
     has_qk = q is not None and k is not None

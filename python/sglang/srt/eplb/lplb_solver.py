@@ -1,5 +1,5 @@
-"""
-LPLBSolver — Linear-Programming Load Balancer for Expert Parallelism.
+﻿"""
+LPLBSolver â€” Linear-Programming Load Balancer for Expert Parallelism.
 
 Encapsulates LP matrix construction (offline, at init/rebalance) and
 per-batch solving (online, per MoE layer forward pass).
@@ -7,7 +7,7 @@ per-batch solving (online, per MoE layer forward pass).
 Design for DP-attention:
     Each EP rank counts its local tokens, then all ranks participate in an
     all-reduce to obtain identical global counts.  Every rank then solves
-    the same LP independently, producing the same log2phy_prob — no
+    the same LP independently, producing the same log2phy_prob â€” no
     broadcast is needed.  Empty-token ranks contribute zeros in the
     all-reduce so the collective never deadlocks.
 
@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 
 # LP dispatch requires every EP rank to call solver.solve() on every forward
-# pass (including empty-topk ranks under DP-attention) — the all-reduce inside
+# pass (including empty-topk ranks under DP-attention) â€” the all-reduce inside
 # would otherwise hang. Only the DeepSeek-v2 family and its subclasses route
 # empty-rank paths through solver.solve(); other MoE families would deadlock.
 _LPLB_SUPPORTED_MODEL_ARCHS: frozenset[str] = frozenset(
@@ -128,12 +128,10 @@ class LPLBSolver:
         # Separate single-copy vs replicated experts.
         # Stored as int64 so they can be used directly as index tensors in
         # _solve without per-call .long() casts (Tier 1 optimization).
-        self.log_single = logcnt == 1.nonzero().flatten().to(torch.int64)
+        self.log_single = (logcnt == 1).nonzero().flatten().to(torch.int64)
         self.phy_single = log2phy[self.log_single, 0].to(torch.int64)
-        self.log_replicated = logcnt > 1.nonzero().flatten().to(torch.int64)
-        self.phy_replicated = (
-            logcnt[phy2log] > 1.nonzero().flatten().to(torch.int64)
-        )
+        self.log_replicated = (logcnt > 1).nonzero().flatten().to(torch.int64)
+        self.phy_replicated = (logcnt[phy2log] > 1).nonzero().flatten().to(torch.int64)
 
         self.num_single = len(self.log_single)
         self.num_red_log = len(self.log_replicated)
@@ -196,7 +194,7 @@ class LPLBSolver:
         # into. All writes are contiguous full-tensor stores (no strided
         # ``out=`` semantics), so the reuse is safe under high concurrency.
         # Constructed lazily on the first solve() call (we don't know the
-        # device-side log2phy_prob shape until then) — see _solve.
+        # device-side log2phy_prob shape until then) â€” see _solve.
         self._A_full = torch.empty(nc, nv, dtype=torch.float32, device=device)
         self._A_full[:, : nv - 1].copy_(self.A_base)
         self._b = torch.empty(nc, dtype=torch.float32, device=device)
@@ -240,7 +238,7 @@ class LPLBSolver:
         )
 
         # Step 2: All-reduce to get global counts across all EP ranks.
-        # All EP ranks must participate — empty-token ranks contribute zeros.
+        # All EP ranks must participate â€” empty-token ranks contribute zeros.
         # After all-reduce, every rank has identical global_counts and solves
         # the same LP independently, so no broadcast is needed.
         # GroupCoordinator.all_reduce may be in-place (pynccl) or out-of-place
@@ -258,7 +256,7 @@ class LPLBSolver:
         """Three CUDA kernel launches replace ~14 torch ops.
 
         Pipeline (all writes go into pre-allocated buffers from __init__):
-            prep_lp_inputs → solve_ipm → extract_log2phy_prob
+            prep_lp_inputs â†’ solve_ipm â†’ extract_log2phy_prob
         Raises if the JIT CUDA backend is unavailable.
         """
         from sglang.kernels.ops.lplb import cuda_solver

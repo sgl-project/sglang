@@ -2287,25 +2287,24 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             )
 
         if local_embedding_layout is None:
-            text_source_ids = 
-                (text_pos >= row_start) & (text_pos < row_stop),
-                as_tuple=False,
-            .nonzero().view(-1)
+            text_source_ids = (
+                ((text_pos >= row_start) & (text_pos < row_stop))
+                .nonzero(as_tuple=False)
+                .view(-1)
+            )
             text_row_ids = text_pos.index_select(0, text_source_ids) - row_start
             img_global_ids = img_pos.index_select(
                 0,
-                
-                    (img_pos >= row_start) & (img_pos < row_stop),
-                    as_tuple=False,
-                .nonzero().view(-1),
+                ((img_pos >= row_start) & (img_pos < row_stop))
+                .nonzero(as_tuple=False)
+                .view(-1),
             )
             img_row_ids = img_global_ids - row_start
             audio_global_ids = audio_pos.index_select(
                 0,
-                
-                    (audio_pos >= row_start) & (audio_pos < row_stop),
-                    as_tuple=False,
-                .nonzero().view(-1),
+                ((audio_pos >= row_start) & (audio_pos < row_stop))
+                .nonzero(as_tuple=False)
+                .view(-1),
             )
             audio_row_ids = audio_global_ids - row_start
         else:

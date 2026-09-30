@@ -10,7 +10,6 @@ import pytest
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
-
 from sglang.kernels.ops.attention.flash_attention import (
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
