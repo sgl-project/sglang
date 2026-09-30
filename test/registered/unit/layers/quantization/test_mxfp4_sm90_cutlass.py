@@ -628,6 +628,9 @@ def test_apply_sm90_humming_matches_flashinfer_direct(
     layer.moe_ep_size = ep_size
     layer.moe_ep_rank = ep_rank
     method = _build_method(num_experts, hidden, inter, use_humming=True)
+    # The runner reads the layer's placement from its config.
+    method.runner.config.moe_ep_size = ep_size
+    method.runner.config.moe_ep_rank = ep_rank
     method._process_weights_for_sm90_cutlass(layer)
     out_sglang = method._apply_sm90_cutlass(
         layer, _MockDispatchOutput(x.clone(), topk_w, topk_i)
