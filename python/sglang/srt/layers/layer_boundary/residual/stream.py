@@ -13,33 +13,14 @@
 # ==============================================================================
 """One forward's residual and its producer's outstanding contribution."""
 
-from typing import Callable, Optional, Union
+from typing import Optional, Union
 
 import msgspec
 import torch
 
-from sglang.srt.distributed import GroupCoordinator
 from sglang.srt.layers.layer_boundary.layout import SumGroup, _sum_group
-from sglang.srt.layers.layer_boundary.output import HandoffOutput, UnreducedOutput
-from sglang.srt.layers.layer_boundary.residual import StageUpdate
-
-
-class CarriedSum(msgspec.Struct, frozen=True):
-    """Runtime reduction left by an exit decision.
-
-    Fields:
-        group: All-reduce group when no redistribution callable is supplied.
-        reduce_and_redistribute: Optional callable(value) returning a reduced
-            value on destination rows; takes precedence over group.
-    """
-
-    group: Optional[GroupCoordinator] = None
-    reduce_and_redistribute: Optional[Callable] = None
-
-    def complete(self, value):
-        if self.reduce_and_redistribute is not None:
-            return self.reduce_and_redistribute(value)
-        return self.group.all_reduce(value)
+from sglang.srt.layers.layer_boundary.output import DeferredFinalize, UnreducedOutput
+from sglang.srt.layers.layer_boundary.residual import ResidualUpdate
 
 
 class DeclaredSum(msgspec.Struct, frozen=True):
@@ -55,31 +36,29 @@ class Contribution(msgspec.Struct):
     """Own a producer's output, residual update and outstanding completion.
 
     Fields:
-        value: Contribution tensor, or None for an opaque finalize handoff.
+        value: Contribution tensor (an unreduced output's partial), or None
+            for an opaque finalize handoff.
         update: Producer operation to apply before the consumer reads input.
-        owed: Runtime sum, declared sum, producer-specific finalize, or None.
+        owed: The exit's unreduced output, a declared sum, a producer-specific
+            finalize, or None.
 
     Completing owed work clears owed but does not apply the residual update.
     """
 
     value: Optional[torch.Tensor]
-    update: StageUpdate
-    owed: Union[CarriedSum, DeclaredSum, HandoffOutput, None] = None
+    update: ResidualUpdate
+    owed: Union[UnreducedOutput, DeclaredSum, DeferredFinalize, None] = None
 
     def for_boundary(self):
         # These forms are private inputs to the existing fused-kernel adapters.
-        if isinstance(self.owed, CarriedSum):
-            return UnreducedOutput(
-                self.value, self.owed.group, self.owed.reduce_and_redistribute
-            )
-        if isinstance(self.owed, HandoffOutput):
+        if isinstance(self.owed, (UnreducedOutput, DeferredFinalize)):
             return self.owed
         return self.value
 
     def complete(self):
-        if isinstance(self.owed, (CarriedSum, DeclaredSum)):
+        if isinstance(self.owed, DeclaredSum):
             value = self.owed.complete(self.value)
-        elif isinstance(self.owed, HandoffOutput):
+        elif self.owed is not None:
             value = self.owed.complete()
         else:
             return self.value
@@ -123,7 +102,7 @@ class ResidualStream:
         self.pending = None
 
     @classmethod
-    def arrive(cls, hidden, residual, update, *, declared_sum=None):
+    def from_handoff(cls, hidden, residual, update, *, declared_sum=None):
         """Reconstruct a stream from a tensor handoff, including a TBO microbatch.
 
         Args:
@@ -139,7 +118,7 @@ class ResidualStream:
         stream = cls(residual)
         if residual is None:
             return stream.write(hidden), stream
-        return stream.leave(hidden, update, declared_sum=declared_sum), stream
+        return stream.record(hidden, update, declared_sum=declared_sum), stream
 
     def write(self, residual):
         if self.pending is not None:
@@ -150,11 +129,11 @@ class ResidualStream:
         self.pending = None
         return residual
 
-    def leave(self, output, update, *, declared_sum=None):
+    def record(self, output, update, *, declared_sum=None):
         """Record one producer contribution without applying its residual update.
 
         Args:
-            output: Complete tensor, UnreducedOutput, or producer-specific HandoffOutput.
+            output: Complete tensor, UnreducedOutput, or producer-specific DeferredFinalize.
             update: Producer operation that the next boundary must apply.
             declared_sum: SumGroup statically owed by a raw tensor, or None. Cannot
                 be combined with another output wrapper's completion contract.
@@ -170,12 +149,8 @@ class ResidualStream:
                 raise RuntimeError("a declared sum cannot carry another completion")
             contribution = Contribution(output, update, DeclaredSum(declared_sum))
         elif isinstance(output, UnreducedOutput):
-            contribution = Contribution(
-                output.partial,
-                update,
-                CarriedSum(output.group, output.reduce_and_redistribute),
-            )
-        elif isinstance(output, HandoffOutput):
+            contribution = Contribution(output.partial, update, output)
+        elif isinstance(output, DeferredFinalize):
             contribution = Contribution(None, update, output)
         else:
             contribution = Contribution(output, update)
@@ -207,7 +182,7 @@ class ResidualStream:
         if self.pending is not None:
             return self.pending.for_boundary(), self.residual
         # An initialized, written stream needs read only. An uninitialized
-        # stream still uses the first stage's enter operation.
+        # stream still uses the first stage's init_residual.
         return hidden, None
 
     def complete(self, hidden):
@@ -219,17 +194,21 @@ class ResidualStream:
         pending = self.pending
         if pending is None:
             return hidden.clone()
-        if not pending.update.adds_plainly:
+        if not pending.update.is_plain_add:
             raise NotImplementedError("snapshot requires a plain residual update")
         if pending.owed is None:
             value = pending.value
-        elif isinstance(pending.owed, (CarriedSum, DeclaredSum)):
+        elif isinstance(pending.owed, DeclaredSum):
             value = pending.owed.complete(pending.value.clone())
+        elif isinstance(pending.owed, UnreducedOutput):
+            value = msgspec.structs.replace(
+                pending.owed, partial=pending.value.clone()
+            ).complete()
         else:
             raise NotImplementedError("a finalize handoff requires main-output capture")
         return value.clone() if self.residual is None else value + self.residual
 
-    def finish(self, hidden, *, takes_handoff=False, preserve_declared=False):
+    def export(self, hidden, *, takes_handoff=False, preserve_declared=False):
         """Export the output/residual pair without closing or consuming the stream.
 
         Args:
@@ -248,6 +227,6 @@ class ResidualStream:
             return hidden, None
         if preserve_declared and isinstance(self.pending.owed, DeclaredSum):
             return self.pending.value, self.residual
-        if takes_handoff and isinstance(self.pending.owed, HandoffOutput):
+        if takes_handoff and isinstance(self.pending.owed, DeferredFinalize):
             return self.pending.owed, self.residual
         return self.pending.complete(), self.residual
