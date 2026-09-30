@@ -615,14 +615,16 @@ class DeepseekV2MoE(nn.Module):
         n_shared_experts = (
             0 if config.n_shared_experts is None else int(config.n_shared_experts)
         )
-        # For an EP1 target layer, Gluon reuses the normal 257-expert fused
-        # representation (256 routed + 1 shared), including its loader remap.
-        # EP layers keep shared-expert execution outside the routed-expert bank
-        # to avoid replicated EP computation/scaling, while NextN keeps its BF16
-        # shared expert native instead of packing it with the routed experts.
+        # GLM target kernels consume the appended shared slot for both EP1 and
+        # EP, while other Gluon EP implementations keep shared execution native.
+        # NextN always keeps its BF16 shared expert native.
         explicitly_disabled = is_shared_experts_fusion_disabled()
         gluon_requires_native_shared = get_moe_runner_backend().is_gluon() and (
-            self.moe_ep_size > 1 or is_nextn
+            is_nextn
+            or (
+                self.moe_ep_size > 1
+                and getattr(config, "model_type", None) != "glm_moe_dsa"
+            )
         )
         _fusion_disabled = explicitly_disabled or gluon_requires_native_shared
 
