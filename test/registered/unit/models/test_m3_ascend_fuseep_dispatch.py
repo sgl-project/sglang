@@ -11,16 +11,6 @@ All tests are CPU-only and run in CI without NPU hardware.
 
 from __future__ import annotations
 
-import sys
-import types
-
-# Ensure stub for optional C-extension tvm_ffi if not installed on the system
-if "tvm_ffi" not in sys.modules:
-    tvm_mock = types.ModuleType("tvm_ffi")
-    tvm_mock.Object = object
-    tvm_mock.Module = object
-    sys.modules["tvm_ffi"] = tvm_mock
-
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
