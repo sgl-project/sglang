@@ -337,9 +337,7 @@ def get_logprob_from_pp_outputs(
             selected_logprobs=next_pp_outputs["sampling_mask_selected_logprobs"],
             support_logprobs=next_pp_outputs["sampling_mask_support_logprobs"],
             statuses=next_pp_outputs["sampling_mask_statuses"],
-            num_accept_tokens=next_pp_outputs.tensors.get(
-                "sampling_mask_num_accept_tokens"
-            ),
+            num_accept_tokens=next_pp_outputs["sampling_mask_num_accept_tokens"],
         )
     logits_output = LogitsProcessorOutput(
         # Do not send logits and hidden states because they are large

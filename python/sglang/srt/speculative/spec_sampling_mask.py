@@ -90,7 +90,7 @@ class SpeculativeSamplingMaskCapture(msgspec.Struct):
         return cls(
             target_probs=target_probs,
             batch_indices=sampling_info.sampling_mask_batch_indices,
-            max_top_k=sampling_info.sampling_mask_max_top_k,
+            max_top_k=max(sampling_info.sampling_mask_top_ks),
             greedy_mask=greedy_mask,
             support_capture_indices=sampling_info.sampling_support_logprobs_capture_indices,
         )

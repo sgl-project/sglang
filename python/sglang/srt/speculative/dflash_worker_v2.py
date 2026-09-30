@@ -81,10 +81,10 @@ from sglang.srt.speculative.lilicorr_utils import (
     resolve_sampling_enabled,
     target_input_embeddings,
 )
-from sglang.srt.speculative.sampling_mask import (
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_sampling_mask import (
     SpeculativeSamplingMaskCapture,
 )
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
