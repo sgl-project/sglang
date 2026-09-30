@@ -385,6 +385,40 @@ class TestResidualStream(CustomTestCase):
         self.assertIs(stream.pending.value, completed)
         move.assert_called_once_with(self.partial)
 
+    def test_prepare_releases_the_consumed_contribution(self):
+        class Read:
+            norms_plainly = True
+
+            def update_and_read(self, update, value, residual, norm, **kwargs):
+                residual = update.update(value, residual)
+                return residual * 2, residual
+
+        rows = Layout(frozenset())
+        boundary = make_boundary(
+            EdgeDecl(StageOutput(rows), StageInput(rows, read=Read()), rows, rows)
+        )
+        steps = StageSteps(StageEntry(boundary.prepare, rows), StageOutput(rows), None)
+        stage = StageBoundary(
+            SimpleNamespace(norm=None),
+            declaration=SimpleNamespace(kind=StageKind.ATTENTION),
+        )
+        partial = torch.ones(4, 4)
+        partial_ref = weakref.ref(partial)
+        stream = ResidualStream(torch.full((2, 4), 3.0))
+        # The deferred DP completion: sum, then this rank's rows.
+        hidden = stream.leave(
+            UnreducedOutput(partial, reduce_and_redistribute=lambda x: x[:2] * 2),
+            ADD,
+        )
+        del partial
+        result, stream = stage._prepare(hidden, stream, None, steps)
+        torch.testing.assert_close(result, torch.full((2, 4), 10.0))
+        # The caller still holds the handle; it no longer keeps the partial.
+        self.assertIsInstance(hidden, OwedOutput)
+        self.assertIsNone(partial_ref())
+        with self.assertRaises(RuntimeError):
+            stream.input(hidden)
+
 
 class TestBatchStageOwnership(CustomTestCase):
     def test_terminal_norm_releases_layer_buffers(self):
