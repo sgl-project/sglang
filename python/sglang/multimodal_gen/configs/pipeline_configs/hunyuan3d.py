@@ -67,6 +67,7 @@ class Hunyuan3D2PipelineConfig(PipelineConfig):
     paint_render_size: int = 2048
     paint_texture_size: int = 2048
     paint_use_remesh: bool = True
+    paint_max_faces: int = 40000
     paint_save_glb: bool = True
     paint_turbo_mode: bool = False
 

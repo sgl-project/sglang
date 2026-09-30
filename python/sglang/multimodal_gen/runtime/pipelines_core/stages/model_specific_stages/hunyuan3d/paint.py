@@ -181,10 +181,13 @@ class Hunyuan3DPaintPreprocessStage(PipelineStage):
             ComponentUse(stage_name, "delight_vae", phase="decode"),
         ]
 
-    @staticmethod
-    def _unwrap_mesh(mesh: Any) -> Any:
+    def _unwrap_mesh(self, mesh: Any) -> Any:
         from sglang.multimodal_gen.runtime.utils.mesh3d_utils import mesh_uv_wrap
 
+        if self.config.paint_use_remesh and len(mesh.faces) > self.config.paint_max_faces:
+            mesh = mesh.simplify_quadric_decimation(
+                face_count=self.config.paint_max_faces
+            )
         return mesh_uv_wrap(mesh)
 
     @staticmethod
