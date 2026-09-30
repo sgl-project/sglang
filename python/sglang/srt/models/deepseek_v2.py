@@ -587,7 +587,16 @@ class DeepseekV2MoE(nn.Module):
         n_shared_experts = (
             0 if config.n_shared_experts is None else int(config.n_shared_experts)
         )
-        _fusion_disabled = is_shared_experts_fusion_disabled()
+        # For an EP1 target layer, Gluon reuses the normal 257-expert fused
+        # representation (256 routed + 1 shared), including its loader remap.
+        # EP layers keep shared-expert execution outside the routed-expert bank
+        # to avoid replicated EP computation/scaling, while NextN keeps its BF16
+        # shared expert native instead of packing it with the routed experts.
+        explicitly_disabled = is_shared_experts_fusion_disabled()
+        gluon_requires_native_shared = get_moe_runner_backend().is_gluon() and (
+            self.moe_ep_size > 1 or is_nextn
+        )
+        _fusion_disabled = explicitly_disabled or gluon_requires_native_shared
 
         # num_fused_shared_experts drives weight remapping in deepseek_weight_loader:
         # mlp.shared_experts → mlp.experts.256 when > 0.
@@ -623,7 +632,6 @@ class DeepseekV2MoE(nn.Module):
             and get_platform().is_blackwell
             and self.tp_size == 4
         )
-
         n_hash_layers = getattr(config, "num_hash_layers", 0)
         self.is_hash = layer_id < n_hash_layers and not (is_deepseek_v4 and is_nextn)
 
@@ -883,6 +891,19 @@ class DeepseekV2MoE(nn.Module):
         # forward (weights and runner are final by then). None = undecided.
         self._moe_quant_once: Optional[bool] = None
 
+        if get_moe_runner_backend().is_gluon():
+            if getattr(config, "model_type", None) != "glm_moe_dsa":
+                raise RuntimeError(
+                    "--moe-runner-backend gluon supports only GLM-5.2/5.3 "
+                    "Quark MXFP4 checkpoints"
+                )
+            from sglang.srt.layers.moe.glm_mxfp4_gluon import (
+                GlmMxfp4GluonMoeBackend,
+            )
+            from sglang.srt.layers.moe.gluon_backend import bind_gluon_moe_backend
+
+            bind_gluon_moe_backend(self, GlmMxfp4GluonMoeBackend())
+
     def get_moe_weights(self):
         # EPLB only rebalances physical routed experts. Fused shared expert
         # slots live after each rank's routed slots and must stay stable.
@@ -924,7 +945,31 @@ class DeepseekV2MoE(nn.Module):
         input_ids_global: Optional[torch.Tensor] = None,
         skip_shared_experts: bool = False,
     ) -> torch.Tensor:
+        from sglang.srt.layers.moe.gluon_backend import (
+            forward_gluon_moe,
+            should_use_gluon_moe,
+        )
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
+
+        num_token_non_padded = (
+            forward_batch.moe_num_token_non_padded()
+            if forward_batch is not None
+            else None
+        )
+        # Gluon is a strict whole-layer backend.  Select it before MegaMoE,
+        # DeepEP, or CUDA-graph dual-stream routing so none of those paths can
+        # bypass the bound implementation and silently execute native MoE.
+        if should_use_gluon_moe(self):
+            output = forward_gluon_moe(
+                self,
+                hidden_states,
+                gemm_output_zero_allocator=gemm_output_zero_allocator,
+                input_ids=input_ids,
+                input_ids_global=input_ids_global,
+                skip_shared_experts=skip_shared_experts,
+                num_token_non_padded=num_token_non_padded,
+            )
+            return self._finalize_normal_output(output, None)
 
         if should_use_mega_moe(self, hidden_states):
             return forward_mega_moe(
@@ -934,11 +979,6 @@ class DeepseekV2MoE(nn.Module):
                 input_ids_global=input_ids_global,
             )
 
-        num_token_non_padded = (
-            forward_batch.moe_num_token_non_padded()
-            if forward_batch is not None
-            else None
-        )
         if not self._enable_a2a_moe:
             if self._can_dual_stream_graph(hidden_states):
                 fwd = get_forward()
@@ -1235,6 +1275,34 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states += shared_output
         return final_hidden_states
 
+    def _finalize_normal_output(
+        self,
+        final_hidden_states: torch.Tensor,
+        shared_output: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if (
+            self.is_deepseek_v4
+            and self.tp_size > 1
+            and not should_skip_post_experts_all_reduce(is_tp_path=True)
+        ):
+            from sglang.srt.layers.moe.mhc_post_fusion import (
+                current_mhc_post_fusion,
+            )
+
+            mhc = current_mhc_post_fusion()
+            if mhc is not None:
+                mhc.start_stats_before_all_reduce()
+        final_hidden_states = post_experts_all_reduce(final_hidden_states)
+        # TP1 shared experts are replicated, so add them after all-reduce to
+        # avoid summing the same shared output once per TP rank.
+        if (
+            shared_output is not None
+            and self._shared_expert_tp1
+            and should_add_replicated_moe_output()
+        ):
+            final_hidden_states += shared_output
+        return final_hidden_states
+
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
@@ -1374,26 +1442,7 @@ class DeepseekV2MoE(nn.Module):
             self.routed_scaling_factor,
         )
 
-        if (
-            self.is_deepseek_v4
-            and self.tp_size > 1
-            and not should_skip_post_experts_all_reduce(is_tp_path=True)
-        ):
-            from sglang.srt.layers.moe.mhc_post_fusion import current_mhc_post_fusion
-
-            mhc = current_mhc_post_fusion()
-            if mhc is not None:
-                mhc.start_stats_before_all_reduce()
-        final_hidden_states = post_experts_all_reduce(final_hidden_states)
-        # TP1 shared experts are replicated, so add them after all-reduce to
-        # avoid summing the same shared output once per TP rank.
-        if (
-            shared_output is not None
-            and self._shared_expert_tp1
-            and should_add_replicated_moe_output()
-        ):
-            final_hidden_states += shared_output
-        return final_hidden_states
+        return self._finalize_normal_output(final_hidden_states, shared_output)
 
     def forward_cpu(
         self,
@@ -3317,7 +3366,10 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     def determine_num_fused_shared_experts(self):
         # The decision was installed by the loader; this only reads it.
         self.num_fused_shared_experts = (
-            0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
+            0
+            if is_shared_experts_fusion_disabled()
+            or (get_moe_runner_backend().is_gluon() and get_parallel().moe_ep_size > 1)
+            else self.config.n_shared_experts
         )
 
     def get_input_embeddings(self) -> nn.Embedding:
