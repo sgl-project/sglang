@@ -41,7 +41,6 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
     ColumnParallelLinear,
-    LinearBase,
     MergedColumnParallelLinear,
     MergedColumnParallelRepeatedLinear,
     QKVParallelLinear,
@@ -55,7 +54,6 @@ from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -360,10 +358,10 @@ class Glm5NextLinearAttention(nn.Module):
             "modelopt_fp8",
             "modelopt_fp4",
             "modelopt_mixed",
+            "quark",
         }:
             return False
 
-        probe = LinearBase(1, 1)
         source_projs = [
             proj
             for fused_proj in fused_projs
@@ -372,10 +370,7 @@ class Glm5NextLinearAttention(nn.Module):
         if "fused_qkvbfg_a_proj" in fused_projs:
             source_projs.append("qkv_proj")
         return all(
-            isinstance(
-                quant_config.get_quant_method(probe, prefix=f"{prefix}.{proj}"),
-                UnquantizedLinearMethod,
-            )
+            quant_config.is_linear_unquantized(f"{prefix}.{proj}")
             for proj in source_projs
         )
 
