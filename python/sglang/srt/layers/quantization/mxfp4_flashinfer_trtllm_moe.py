@@ -1,0 +1,600 @@
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
+
+import torch
+from torch.nn import Module
+from torch.nn.parameter import Parameter
+
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
+from sglang.srt.layers.dp_attention import is_allocation_symmetric
+from sglang.srt.layers.moe.utils import RoutingMethodType
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    get_platform,
+)
+from sglang.srt.utils import (
+    is_flashinfer_available,
+    log_info_on_rank0,
+    set_weight_attrs,
+)
+from sglang.srt.utils.common import next_power_of_2, print_warning_once
+
+_MXFP8_QUANTIZE_BACKEND = "cute-dsl" if get_platform().is_sm100 else "cuda"
+
+if is_flashinfer_available():
+    from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
+    from flashinfer.fp4_quantization import block_scale_interleave
+    from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
+    from flashinfer.fused_moe.core import (
+        _maybe_get_cached_w3_w1_permute_indices,
+        get_w2_permute_indices_with_cache,
+    )
+
+logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
+
+from sglang.srt.utils.common import get_bool_env_var
+
+_USE_OFFICIAL_SHUFFLE = get_bool_env_var(
+    "SGLANG_MXFP4_USE_OFFICIAL_SHUFFLE", default="true"
+)
+
+
+def _pad_intermediate_size(layer: Module) -> None:
+    intermediate_size = layer.w13_weight.shape[1] // 2
+    padded_size = (intermediate_size + 127) // 128 * 128
+    if padded_size == intermediate_size:
+        return
+
+    # Gate and up occupy separate halves; each needs its own zero tail.
+    for name, fill_value in (
+        ("w13_weight", 0),
+        ("w13_weight_scale_inv", 1),
+    ):
+        param = getattr(layer, name)
+        num_experts, _, width = param.shape
+        padded = torch.full(
+            (num_experts, 2 * padded_size, width),
+            fill_value,
+            dtype=param.dtype,
+            device=param.device,
+        )
+        padded[:, :intermediate_size] = param[:, :intermediate_size]
+        padded[:, padded_size : padded_size + intermediate_size] = param[
+            :, intermediate_size:
+        ]
+        param.data = padded
+
+    for name, elements_per_column, fill_value in (
+        ("w2_weight", 2, 0),
+        ("w2_weight_scale_inv", 32, 1),
+    ):
+        param = getattr(layer, name)
+        num_experts, hidden_size, width = param.shape
+        padded = torch.full(
+            (num_experts, hidden_size, padded_size // elements_per_column),
+            fill_value,
+            dtype=param.dtype,
+            device=param.device,
+        )
+        padded[:, :, :width] = param
+        param.data = padded
+
+    layer.intermediate_size_per_partition = padded_size
+    print_warning_once(
+        f"flashinfer_mxfp4 MoE padded the local intermediate size from "
+        f"{intermediate_size} to {padded_size} for 128-element kernel alignment "
+        "after TP weight loading. Padding adds unused channels and may waste "
+        "compute and memory. Use this TP MoE configuration with caution and "
+        "benchmark it against a TP/EP configuration that avoids padding."
+    )
+
+
+def routed_hidden_size(layer: Module) -> int:
+    """Hidden size the routed GEMM1 expects (uint8 weights hold two fp4/row)."""
+    w13 = layer.w13_weight
+    return w13.shape[2] * 2 if w13.dtype == torch.uint8 else w13.shape[2]
+
+
+class Mxfp8RoutedInputPreQuant(NamedTuple):
+    """MXFP8 linear-layout quant of the routed MoE input. ``ready`` is recorded on
+    the producing stream; the consumer must wait on it before the routed MoE op."""
+
+    x_q: torch.Tensor
+    x_sf: torch.Tensor
+    ready: Optional[torch.cuda.Event]
+
+
+class Mxfp4FlashinferTrtllmMoEMethod:
+    fuse_routed_scaling_factor_in_topk = True
+
+    def __init__(self, fp8_method, prefix: str):
+        self._fp8 = fp8_method
+        self.prefix = prefix
+        # precision=fp8 is an SM90 knob (Humming W4A8); this SM100 trtllm path
+        # already runs MXFP8 activations, so the flag is inert here rather than
+        # an error -- one config can move across hardware.
+        self.flashinfer_mxfp4_moe_precision = (
+            get_exec().moe.flashinfer_mxfp4_moe_precision
+        )
+
+    def create_moe_runner(self, layer, moe_runner_config):
+        self.moe_runner_config = moe_runner_config
+        # Applies flashinfer trtllm directly instead of going through a
+        # MoeRunner; FusedMoE still reads `.runner`, and this class is not a
+        # FusedMoEMethodBase subclass so it inherits no default.
+        self.runner = None
+
+        swiglu_limit = moe_runner_config.swiglu_limit
+        self._gemm1_clamp_limit_tensor = (
+            torch.full(
+                (layer.num_local_experts,),
+                swiglu_limit,
+                dtype=torch.float32,
+                device=layer.w13_weight.device,
+            )
+            if swiglu_limit is not None
+            else None
+        )
+
+    def create_weights(
+        self,
+        layer,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype,
+        **extra_weight_attrs,
+    ):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
+        fp4_block_k = 32
+
+        w13_weight = Parameter(
+            torch.empty(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size // 2,
+                dtype=torch.int8,
+            ),
+            requires_grad=False,
+        )
+        w2_weight = Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition // 2,
+                dtype=torch.int8,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+        layer.register_parameter("w2_weight", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        w13_weight_scale = Parameter(
+            torch.ones(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size // fp4_block_k,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+        w2_weight_scale = Parameter(
+            torch.ones(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition // fp4_block_k,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+        w13_weight_scale.format_ue8m0 = False
+        w2_weight_scale.format_ue8m0 = False
+        scale_attrs = dict(extra_weight_attrs)
+        scale_attrs["quant_method"] = FusedMoeWeightScaleSupported.BLOCK.value
+        layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
+        set_weight_attrs(w13_weight_scale, scale_attrs)
+        layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
+        set_weight_attrs(w2_weight_scale, scale_attrs)
+
+    def process_weights_after_loading(self, layer: Module) -> None:
+        from sglang.srt.layers.quantization.utils import reorder_w1w3_to_w3w1
+
+        self._fp8.process_weights_after_loading(layer)
+
+        if getattr(layer, "_mega_moe_weights_built", False):
+            return
+
+        _pad_intermediate_size(layer)
+
+        w13_w, w13_s = reorder_w1w3_to_w3w1(
+            layer.w13_weight.data, layer.w13_weight_scale_inv.data
+        )
+        layer.w13_weight = Parameter(w13_w, requires_grad=False)
+        layer.w13_weight_scale_inv = Parameter(w13_s, requires_grad=False)
+
+        log_info_on_rank0(
+            logger,
+            f"Shuffling FP4 expert weights for TRT-LLM MxFP4 kernel "
+            f"(layer: {self.prefix})...",
+        )
+
+        w13 = layer.w13_weight.data
+        w2 = layer.w2_weight.data
+        w13_scale = layer.w13_weight_scale_inv.data
+        w2_scale = layer.w2_weight_scale_inv.data
+        num_experts = w13.shape[0]
+
+        if w13_scale.dtype == torch.float32:
+            w13_scale = w13_scale.to(torch.float8_e8m0fnu)
+            w2_scale = w2_scale.to(torch.float8_e8m0fnu)
+
+        epilogue_tile_m = 128
+        g1_w, g1_s, g2_w, g2_s = [], [], [], []
+        if _USE_OFFICIAL_SHUFFLE:
+            cache: dict = {}
+            for i in range(num_experts):
+                w13_u8 = w13[i].view(torch.uint8)
+                w13_s_u8 = w13_scale[i].view(torch.uint8)
+                w2_u8 = w2[i].view(torch.uint8)
+                w2_s_u8 = w2_scale[i].view(torch.uint8)
+
+                perm = _maybe_get_cached_w3_w1_permute_indices(
+                    cache,
+                    w13_u8,
+                    epilogue_tile_m,
+                )
+                g1_w.append(w13_u8[perm.to(w13_u8.device)].contiguous())
+                perm_sf = _maybe_get_cached_w3_w1_permute_indices(
+                    cache,
+                    w13_s_u8,
+                    epilogue_tile_m,
+                    num_elts_per_sf=16,
+                )
+                g1_s.append(
+                    block_scale_interleave(
+                        w13_s_u8[perm_sf.to(w13_s_u8.device)].contiguous()
+                    )
+                )
+
+                perm = get_w2_permute_indices_with_cache(
+                    cache,
+                    w2_u8,
+                    epilogue_tile_m,
+                )
+                g2_w.append(w2_u8[perm.to(w2_u8.device)].contiguous())
+                perm_sf = get_w2_permute_indices_with_cache(
+                    cache,
+                    w2_s_u8,
+                    epilogue_tile_m,
+                    num_elts_per_sf=16,
+                )
+                g2_s.append(
+                    block_scale_interleave(
+                        w2_s_u8[perm_sf.to(w2_s_u8.device)].contiguous()
+                    )
+                )
+        else:
+            for i in range(num_experts):
+                g1_w.append(shuffle_matrix_a(w13[i].view(torch.uint8), epilogue_tile_m))
+                g1_s.append(
+                    shuffle_matrix_sf_a(w13_scale[i].view(torch.uint8), epilogue_tile_m)
+                )
+                g2_w.append(shuffle_matrix_a(w2[i].view(torch.uint8), epilogue_tile_m))
+                g2_s.append(
+                    shuffle_matrix_sf_a(w2_scale[i].view(torch.uint8), epilogue_tile_m)
+                )
+
+        layer.w13_weight = Parameter(torch.stack(g1_w), requires_grad=False)
+        layer.w13_weight_scale_inv = Parameter(
+            torch.stack(g1_s)
+            .view(torch.float8_e4m3fn)
+            .reshape(num_experts, w13.shape[1], -1),
+            requires_grad=False,
+        )
+        layer.w2_weight = Parameter(torch.stack(g2_w), requires_grad=False)
+        layer.w2_weight_scale_inv = Parameter(
+            torch.stack(g2_s)
+            .view(torch.float8_e4m3fn)
+            .reshape(num_experts, w2.shape[1], -1),
+            requires_grad=False,
+        )
+
+        self._register_static_scale_ones(layer)
+        torch.cuda.empty_cache()
+
+    def _register_static_scale_ones(self, layer: Module) -> None:
+        device = layer.w13_weight.device
+        for name in (
+            "output1_scale_scalar",
+            "output1_scale_gate_scalar",
+            "output2_scale_scalar",
+        ):
+            layer.register_buffer(
+                name,
+                torch.ones(layer.num_local_experts, device=device, dtype=torch.float32),
+                persistent=False,
+            )
+
+    def quantize_routed_input(
+        self, hidden_states: torch.Tensor, hidden_size: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """MXFP8 quant of the routed input, with the scale in the linear
+        [tokens, hidden // 32] layout the routed MoE op requires."""
+        from sglang.srt.layers.quantization.fp8_utils import flashinfer_mxfp8_quantize
+
+        x_quant, x_scale = flashinfer_mxfp8_quantize(
+            hidden_states,
+            False,
+            alignment=hidden_size,
+            backend=_MXFP8_QUANTIZE_BACKEND,
+        )
+        x_scale = x_scale.view(torch.float8_e4m3fn).reshape(
+            *hidden_states.shape[:-1], -1
+        )
+        return x_quant, x_scale
+
+    def apply(
+        self,
+        layer: Module,
+        dispatch_output: DispatchOutput,
+    ) -> CombineInput:
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+        from sglang.srt.layers.moe.topk import TopKOutputChecker
+
+        hidden_states = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+        pre_quant = getattr(dispatch_output, "hidden_states_pre_quant", None)
+
+        w13 = layer.w13_weight
+        w2 = layer.w2_weight
+        w13_scale = layer.w13_weight_scale_inv
+        w2_scale = layer.w2_weight_scale_inv
+
+        intermediate_size = w2.shape[2] * 2 if w2.dtype == torch.uint8 else w2.shape[2]
+        hidden_size = routed_hidden_size(layer)
+
+        num_local_experts = layer.num_local_experts
+        if w13_scale.dim() == 2:
+            w13_scale = w13_scale.reshape(num_local_experts, 2 * intermediate_size, -1)
+        if w2_scale.dim() == 2:
+            w2_scale = w2_scale.reshape(num_local_experts, hidden_size, -1)
+
+        if TopKOutputChecker.format_is_bypassed(topk_output):
+            raise NotImplementedError(
+                "the old code in this branch is WRONG. e.g. it does not consider HashTopK, and may miss args"
+            )
+        if not TopKOutputChecker.format_is_standard(topk_output):
+            raise ValueError(f"Unsupported topk output format: {topk_output.format}")
+
+        topk_ids = topk_output.topk_ids
+        topk_weights = topk_output.topk_weights
+
+        precision = self.flashinfer_mxfp4_moe_precision
+        input_ready: Optional[torch.cuda.Event] = None
+        if precision == "bf16":
+            assert hidden_states.dtype == torch.bfloat16
+            x_quant = hidden_states
+            x_scale = None
+            origin_dim = x_quant.shape[-1]
+            if hidden_size != origin_dim:
+                x_quant = torch.nn.functional.pad(
+                    x_quant,
+                    (0, hidden_size - origin_dim),
+                    mode="constant",
+                    value=0.0,
+                )
+        elif precision == "default":
+            if isinstance(pre_quant, Mxfp8RoutedInputPreQuant):
+                assert pre_quant.x_q.shape[0] == hidden_states.shape[0]
+                x_quant, x_scale, input_ready = pre_quant
+            else:
+                x_quant, x_scale = self.quantize_routed_input(
+                    hidden_states, hidden_size
+                )
+        else:
+            raise NotImplementedError(f"Unsupported mxfp4 moe precision: {precision}")
+
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+            _make_deferred_finalize_output,
+            is_deferred_finalize_enabled,
+            trtllm_moe_enable_pdl,
+        )
+
+        num_tokens = x_quant.shape[0]
+        # Deferred finalize returns the permuted GEMM2 output plus the routing
+        # triple instead of the finalized [T, hidden] tensor.
+        defer_finalize = is_deferred_finalize_enabled()
+        symm_output = None
+        # Preserve the ordinary output shape in the medium-batch autotuner
+        # cache key. The deferred ABI ignores this allocation and returns the
+        # expanded GEMM output for the separate fused finalize epilogue.
+        if not defer_finalize or 96 < num_tokens <= 384:
+            with use_symmetric_memory(
+                get_parallel().tp_group, disabled=not is_allocation_symmetric()
+            ):
+                out_hidden_size = (
+                    x_quant.shape[-1] * 2
+                    if x_quant.dtype == torch.uint8
+                    else x_quant.shape[-1]
+                )
+                symm_output = torch.empty(
+                    num_tokens,
+                    out_hidden_size,
+                    dtype=torch.bfloat16,
+                    device=x_quant.device,
+                )
+
+        if input_ready is not None:
+            # The op launches the routing kernel, so the join must precede it.
+            torch.cuda.current_stream().wait_event(input_ready)
+
+        result = trtllm_fp4_block_scale_routed_moe(
+            topk_ids=(topk_ids, topk_weights),
+            routing_bias=None,
+            hidden_states=x_quant,
+            hidden_states_scale=x_scale,
+            gemm1_weights=w13,
+            gemm1_weights_scale=w13_scale,
+            gemm1_bias=None,
+            gemm1_alpha=None,
+            gemm1_beta=None,
+            gemm1_clamp_limit=self._gemm1_clamp_limit_tensor,
+            gemm2_weights=w2,
+            gemm2_weights_scale=w2_scale,
+            gemm2_bias=None,
+            output1_scale_scalar=layer.output1_scale_scalar,
+            output1_scale_gate_scalar=layer.output1_scale_gate_scalar,
+            output2_scale_scalar=layer.output2_scale_scalar,
+            num_experts=layer.num_experts,
+            top_k=topk_ids.shape[1],
+            n_group=1,
+            topk_group=1,
+            intermediate_size=intermediate_size,
+            local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+            local_num_experts=num_local_experts,
+            routed_scaling_factor=1.0,
+            routing_method_type=int(RoutingMethodType.TopK),
+            do_finalize=not defer_finalize,
+            tune_max_num_tokens=next_power_of_2(num_tokens),
+            output=symm_output,
+            enable_pdl=trtllm_moe_enable_pdl(num_tokens),
+        )
+        if defer_finalize:
+            output = _make_deferred_finalize_output(result, top_k=topk_ids.shape[1])
+        else:
+            output = result[0]
+
+        return StandardCombineInput(hidden_states=output)
+
+
+def maybe_fuse_routed_scale_and_shared_add(
+    experts,
+    routed: torch.Tensor,
+    shared: torch.Tensor | None,
+    routed_scaling_factor: float,
+) -> torch.Tensor:
+    # When MxFP4 fusion is on, the upstream `routed *= scale` is skipped and
+    # the scaling is folded into the shared-add via `shared.add_(routed,
+    # alpha=scale)`. With no shared output, the missing scale is applied
+    # in-place. Otherwise `routed` is already scale-final and we just add
+    # `shared` (or pass through if there is none).
+    from sglang.srt.layers.quantization.expert_pack import ExpertPackMoEMethod
+    from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
+        Mxfp4FlashinferCutlassMoEMethod,
+    )
+    from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
+        Mxfp4MarlinMoEMethod,
+    )
+
+    fused = isinstance(
+        experts.quant_method,
+        (
+            Mxfp4FlashinferTrtllmMoEMethod,
+            Mxfp4FlashinferCutlassMoEMethod,
+            Mxfp4MarlinMoEMethod,
+            ExpertPackMoEMethod,
+        ),
+    )
+    if fused:
+        already_scaled = experts.should_fuse_routed_scaling_factor_in_topk
+        if shared is not None:
+            alpha = 1.0 if already_scaled else routed_scaling_factor
+            return shared.add_(routed, alpha=alpha)
+        if already_scaled:
+            return routed
+        return routed.mul_(routed_scaling_factor)
+    if shared is not None:
+        routed += shared
+    return routed
+
+
+# Fused finalize + shared add + TP all-reduce
+_fused_finalize_all_reduce_world_size: Optional[int] = None
+_fused_finalize_all_reduce_probed = False
+_fused_finalize_all_reduce_comm = None
+
+
+def _fused_finalize_all_reduce_comm_world_size() -> Optional[int]:
+    """Reserve a separate push plane for up to 384 rows of fused MoE output."""
+    global _fused_finalize_all_reduce_world_size, _fused_finalize_all_reduce_probed
+    global _fused_finalize_all_reduce_comm
+    if not _fused_finalize_all_reduce_probed:
+        # The eager warmup must initialize peer workspaces before capture.
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        _fused_finalize_all_reduce_probed = True
+        from sglang.kernels.ops.communication import all_reduce_fusion
+        from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+            CustomAllReduceV2,
+        )
+
+        ca_comm = get_parallel().tp_group.ca_comm
+        if isinstance(ca_comm, CustomAllReduceV2) and not ca_comm.disabled:
+            fused_comm = ca_comm
+            if ca_comm.world_size == 4:
+                from sglang.kernels.ops.communication.mp import register_comm_cleanup
+
+                fused_comm = CustomAllReduceV2(
+                    ca_comm.group,
+                    ca_comm.device,
+                    max_pull_size=0,
+                    max_pull_blocks=0,
+                    max_push_size=4 * 1024 * 1024,
+                    max_push_blocks=512,
+                )
+                register_comm_cleanup(fused_comm)
+            if fused_comm.disabled:
+                return None
+            _fused_finalize_all_reduce_comm = fused_comm
+            all_reduce_fusion.register_comm(fused_comm.obj)
+            _fused_finalize_all_reduce_world_size = fused_comm.world_size
+        else:
+            log_info_on_rank0(
+                logger,
+                "Fused MoE finalize: TP group has no "
+                "CustomAllReduceV2 push plane; keeping the unfused finalize path",
+            )
+    return _fused_finalize_all_reduce_world_size
+
+
+def should_use_fuse_finalize_all_reduce(
+    experts, num_tokens: int, hidden_dim: int
+) -> bool:
+    """Capability only; the batch-size policy cap lives at the call site. The
+    kernel never rescales, so the expert weights must carry the routed scaling."""
+    if not isinstance(experts.quant_method, Mxfp4FlashinferTrtllmMoEMethod):
+        return False
+    if experts.quant_method.flashinfer_mxfp4_moe_precision != "default":
+        return False
+    if not experts.should_fuse_routed_scaling_factor_in_topk:
+        return False
+    if num_tokens <= 0:
+        return False
+    if num_tokens > 96:
+        from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+
+        if is_batch_invariant_mode_enabled():
+            return False
+    from sglang.kernels.ops.communication import all_reduce_fusion
+
+    if not all_reduce_fusion.valid_cluster_sizes(hidden_dim):
+        return False
+    tp_group = get_parallel().tp_group
+    if _fused_finalize_all_reduce_comm_world_size() != tp_group.world_size:
+        return False
+    comm = _fused_finalize_all_reduce_comm
+    # Each token row owns a push phase counter on the epilogue's plane.
+    if num_tokens > comm.config.num_push_blocks:
+        return False
+    return all_reduce_fusion.fits_push_slot(comm.max_push_size, num_tokens, hidden_dim)

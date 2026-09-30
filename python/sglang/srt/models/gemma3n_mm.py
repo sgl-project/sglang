@@ -1,5 +1,6 @@
 import logging
 import re
+from array import array
 from functools import lru_cache
 from typing import Iterable, List, Optional, Set, Tuple, TypedDict, Union
 
@@ -243,9 +244,9 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
 
     def pad_input_ids(
         self,
-        input_ids: List[int],
+        input_ids: array,
         mm_inputs: MultimodalInputs,
-    ) -> List[int]:
+    ) -> array:
         """Pad input IDs with image and audio tokens."""
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
@@ -445,8 +446,8 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
             input_ids, hidden_states, self.language_model.embed_tokens, forward_batch
         )
 
-    def tie_weights(self):
-        return self.language_model.tie_weights()
+    def tie_weights(self, **kwargs):
+        return self.language_model.tie_weights(**kwargs)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

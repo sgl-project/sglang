@@ -23,11 +23,6 @@ from typing import Any, Dict, Iterable, Optional, Tuple, Union
 import torch
 from torch import nn
 
-from sglang.srt.distributed import (
-    get_pp_group,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
@@ -51,6 +46,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_layers
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -95,14 +91,10 @@ class Glm4MLP(nn.Module):
         self,
         x,
         forward_batch=None,
-        use_reduce_scatter: bool = False,
     ):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(
-            x,
-            skip_all_reduce=use_reduce_scatter,
-        )
+        x, _ = self.down_proj(x)
         return x
 
 
@@ -125,7 +117,7 @@ class Glm4Attention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -303,7 +295,7 @@ class Glm4Model(nn.Module):
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -397,8 +389,8 @@ class Glm4Model(nn.Module):
     # factors (or else raise an exception). Thus, handled exceptions should
     # make sure to leave KV cache scale factors in a known good (dummy) state
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
+        tp_size = get_parallel().tp_size
+        tp_rank = get_parallel().tp_rank
         for layer_idx, scaling_factor in kv_cache_scales_loader(
             quantization_param_path,
             tp_rank,
@@ -425,7 +417,7 @@ class Glm4ForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         self.model = Glm4Model(

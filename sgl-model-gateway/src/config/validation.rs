@@ -313,6 +313,22 @@ impl ConfigValidator {
             });
         }
 
+        if config.connect_timeout_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "connect_timeout_secs".to_string(),
+                value: config.connect_timeout_secs.to_string(),
+                reason: "Must be > 0".to_string(),
+            });
+        }
+
+        if config.tcp_keepalive_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "tcp_keepalive_secs".to_string(),
+                value: config.tcp_keepalive_secs.to_string(),
+                reason: "Must be > 0".to_string(),
+            });
+        }
+
         Ok(())
     }
 

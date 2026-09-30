@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/distributed/communication_op.py
 
 import torch
@@ -61,4 +62,6 @@ def cfg_model_parallel_all_reduce(
     op: torch._C._distributed_c10d.ReduceOp = torch._C._distributed_c10d.ReduceOp.SUM,
 ) -> torch.Tensor:
     """All-reduce the input tensor across CFG parallel group."""
+    if not input_.is_contiguous():
+        input_ = input_.contiguous()
     return get_cfg_group().all_reduce(input_, op=op)

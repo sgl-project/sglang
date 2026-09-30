@@ -28,7 +28,7 @@ pub mod worker_registry;
 pub mod worker_service;
 
 // Re-export commonly used types for convenience
-pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
 pub use error::{WorkerError, WorkerResult};
 pub use job_queue::{Job, JobQueue, JobQueueConfig};
 pub use model_card::{ModelCard, ProviderType};

@@ -3,15 +3,17 @@
 Two test classes, each with its own server instance:
 
   TestCausalLMScoringHTTP    — basic endpoint: schema defaults, response
-                               structure, error rejection (no MIS delimiter)
-  TestCausalLMMISScoringHTTP — MIS mode: validates --multi-item-scoring-delimiter
-                               CLI flag wiring and per-item output shape
+                               structure, error rejection (no MIS)
+  TestCausalLMMISScoringHTTP — MIS mode: validates --enable-mis CLI flag
+                               wiring and per-item output shape
 
 Engine-level correctness (numerical accuracy, batching, edge cases) lives in
 test_score_engine.py.  These tests focus on the HTTP integration seam:
 Pydantic schema defaults, FastAPI routing, and server argument wiring.
 """
 
+import math
+import os
 import unittest
 
 import requests
@@ -26,11 +28,9 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=70, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=94, stage="base-b", runner_config="1-gpu-small")
 
-_MODEL = DEFAULT_SMALL_MODEL_NAME_FOR_TEST  # Llama-3.2-1B-Instruct
-# <|eot_id|> for Llama-3.x Instruct — used as MIS delimiter
-_LLAMA3_EOT_TOKEN_ID = 128009
+_MODEL = os.environ.get("TEST_MODEL_NAME", DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
 
 
 # ---------------------------------------------------------------------------
@@ -41,7 +41,7 @@ _LLAMA3_EOT_TOKEN_ID = 128009
 class TestCausalLMScoringHTTP(CustomTestCase):
     """Validates /v1/score HTTP integration — schema, defaults, and error handling.
 
-    Starts a plain CausalLM server (no --multi-item-scoring-delimiter) to test
+    Starts a plain CausalLM server (no --enable-mis) to test
     the HTTP layer in isolation: response envelope shape, the apply_softmax
     default (False), and Pydantic validation errors on malformed input.
     """
@@ -137,14 +137,52 @@ class TestCausalLMScoringHTTP(CustomTestCase):
             with self.subTest(payload=list(payload.keys())):
                 self.assertGreaterEqual(self._post(payload).status_code, 400)
 
+    def test_calibrated_decisions(self):
+        response = self._post(
+            {
+                "query": [],
+                "items": [[1, 2, 3], [4, 5]],
+                "label_token_ids": [[32, 33], [34, 32, 33]],
+                "apply_softmax": True,
+                "temperature": 2.0,
+                "return_token_logprobs": True,
+            }
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual([len(row) for row in body["scores"]], [2, 3])
+        for scores, logprobs in zip(body["scores"], body["token_logprobs"]):
+            weights = [math.exp((x - max(logprobs)) / 2) for x in logprobs]
+            for actual, weight in zip(scores, weights):
+                self.assertAlmostEqual(actual, weight / sum(weights), places=6)
+        self.assertEqual(body["usage"]["completion_tokens"], 0)
+
+    def test_invalid_decision_options(self):
+        for extra in (
+            {"label_token_ids": [[1, 2]]},
+            {"label_token_ids": [[1], []]},
+            {"label_token_ids": [1, 1]},
+            {"temperature": 0},
+            {"temperature": 2.0},
+        ):
+            response = self._post(
+                {
+                    "query": "",
+                    "items": ["A", "B"],
+                    "label_token_ids": [1, 2],
+                    **extra,
+                }
+            )
+            self.assertIn(response.status_code, (400, 422), response.text)
+
 
 # ---------------------------------------------------------------------------
-# MIS scoring (with --multi-item-scoring-delimiter)
+# MIS scoring (with --enable-mis)
 # ---------------------------------------------------------------------------
 
 
 class TestCausalLMMISScoringHTTP(CustomTestCase):
-    """Validates /v1/score with --multi-item-scoring-delimiter.
+    """Validates /v1/score with --enable-mis.
 
     Confirms that the CLI flag is correctly wired into ServerArgs and that the
     endpoint returns one probability vector per item when items are
@@ -163,8 +201,9 @@ class TestCausalLMMISScoringHTTP(CustomTestCase):
                 "--disable-radix-cache",
                 "--chunked-prefill-size",
                 "-1",
-                "--multi-item-scoring-delimiter",
-                str(_LLAMA3_EOT_TOKEN_ID),
+                "--enable-mis",
+                "--attention-backend",
+                "flashinfer",
             ],
         )
 
@@ -202,6 +241,27 @@ class TestCausalLMMISScoringHTTP(CustomTestCase):
     def test_empty_items_returns_empty_scores(self):
         result = self._score("Test query", [], [1, 2])
         self.assertEqual(len(result["scores"]), 0)
+
+    def test_per_item_candidates(self):
+        labels = [[32, 33], [34, 32, 33]]
+        response = requests.post(
+            self.base_url + "/v1/score",
+            json={
+                "query": "Select an option:",
+                "items": ["A or B?", "A, B or C?"],
+                "label_token_ids": labels,
+                "apply_softmax": True,
+                "temperature": 2.0,
+                "return_token_logprobs": True,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual([len(row) for row in body["scores"]], [2, 3])
+        for scores, logprobs in zip(body["scores"], body["token_logprobs"]):
+            weights = [math.exp((x - max(logprobs)) / 2) for x in logprobs]
+            for actual, weight in zip(scores, weights):
+                self.assertAlmostEqual(actual, weight / sum(weights), places=6)
 
     def test_varying_item_counts(self):
         """1, 2, 4, and 6 items all return the correct number of score vectors."""

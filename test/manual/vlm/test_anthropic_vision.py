@@ -44,7 +44,7 @@ class TestAnthropicVision(CustomTestCase):
             other_args=[
                 "--trust-remote-code",
                 "--enable-multimodal",
-                "--cuda-graph-max-bs=4",
+                "--cuda-graph-max-bs-decode=4",
             ],
         )
         cls.messages_url = cls.base_url + "/v1/messages"

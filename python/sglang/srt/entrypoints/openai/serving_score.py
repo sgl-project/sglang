@@ -3,6 +3,7 @@ from typing import Union
 
 import torch
 from fastapi import Request
+from fastapi.responses import ORJSONResponse
 
 from sglang.srt.entrypoints.openai.protocol import (
     ErrorResponse,
@@ -66,6 +67,16 @@ class OpenAIServingScore(OpenAIServingBase):
                 else None
             )
 
+            # Resolve the extraction token to an id here (this process owns the
+            # tokenizer); score_request then scans for it and pools the head there.
+            score_extraction_token_id = None
+            if request.score_extraction_token is not None:
+                score_extraction_token_id = (
+                    self.tokenizer_manager._resolve_score_extraction_token_id(
+                        request.score_extraction_token
+                    )
+                )
+
             result = await self.tokenizer_manager.score_request(
                 query=request.query,
                 items=request.items,
@@ -75,18 +86,35 @@ class OpenAIServingScore(OpenAIServingBase):
                 embed_override_token_id=request.embed_override_token_id,
                 query_embed_overrides=query_embed_overrides,
                 item_embed_overrides=item_embed_overrides,
+                score_extraction_token_id=score_extraction_token_id,
                 request=raw_request,
+                return_pooled_hidden_states=request.return_pooled_hidden_states,
+                temperature=request.temperature,
+                return_token_logprobs=request.return_token_logprobs,
             )
+
+            # pooled_hidden_states is flat (pointwise / single-set setwise) or
+            # nested per item (multi-item setwise); convert tensors at any depth.
+            def _tensors_to_lists(value):
+                if value is None:
+                    return None
+                if isinstance(value, list):
+                    return [_tensors_to_lists(v) for v in value]
+                return value.tolist()
+
+            phs_as_lists = _tensors_to_lists(result.pooled_hidden_states)
 
             response = ScoringResponse(
                 scores=result.scores,
+                pooled_hidden_states=phs_as_lists,
+                token_logprobs=result.token_logprobs,
                 model=request.model,
                 usage=UsageInfo(
                     prompt_tokens=result.prompt_tokens,
                     total_tokens=result.prompt_tokens,
                 ),
             )
-            return response
+            return ORJSONResponse(content=response.model_dump())
 
         except ValueError as e:
             return self.create_error_response(str(e))

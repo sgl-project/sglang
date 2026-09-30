@@ -50,7 +50,6 @@ class TestDeepseekV31(unittest.TestCase):
                 DEEPSEEK_V31_MODEL_PATH,
                 tp_size=8,
                 extra_args=base_args + mtp_args,
-                env={"SGLANG_ENABLE_SPEC_V2": "1"},
                 variant="TP8+MTP",
             ),
         ]
@@ -62,7 +61,7 @@ class TestDeepseekV31(unittest.TestCase):
                 dataset="gsm8k", baseline_accuracy=0.935
             ),
             performance_params=PerformanceTestParams(
-                profile_dir="performance_profiles_deepseek_v31",
+                result_dir="performance_results_deepseek_v31",
             ),
         )
 

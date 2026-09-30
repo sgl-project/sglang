@@ -266,6 +266,8 @@ class FlowMatchEulerDiscreteScheduler(
         """
         one_minus_z = 1 - t
         scale_factor = one_minus_z[-1] / (1 - self.config.shift_terminal)
+        if scale_factor == 0:
+            return t
         stretched_t = 1 - (one_minus_z / scale_factor)
         return stretched_t
 
@@ -531,7 +533,12 @@ class FlowMatchEulerDiscreteScheduler(
         else:
             if self.config.stochastic_sampling:
                 x0 = sample - current_sigma * model_output
-                noise = torch.randn_like(sample)
+                noise = torch.randn(
+                    sample.shape,
+                    generator=generator,
+                    device=sample.device,
+                    dtype=sample.dtype,
+                )
                 prev_sample = (1.0 - next_sigma) * x0 + next_sigma * noise
             else:
                 prev_sample = sample + dt * model_output

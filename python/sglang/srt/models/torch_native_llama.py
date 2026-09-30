@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -28,10 +30,10 @@ device_mesh = torch.distributed.init_device_mesh("cuda", (tp_size,))
 tensor_parallel(model, device_mesh)
 ```
 
-An end-to-end example can be found in `python/sglang/bench_one_batch.py`.
+An end-to-end example can be found in `python/sglang/benchmark/one_batch.py`.
 You can run it with the following command:
 ```bash
-$ python3 -m sglang.bench_one_batch --correct \
+$ python3 -m sglang.benchmark.one_batch --correct \
   --model meta-llama/Meta-Llama-3-8B \
   --json-model-override-args '{"architectures": ["TorchNativeLlamaForCausalLM"]}' \
   --tensor-parallel-size 2 \
@@ -48,10 +50,6 @@ from torch import nn
 from torch.nn.parameter import Parameter
 from transformers import LlamaConfig
 
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
@@ -64,6 +62,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
 tp_size: Optional[int] = None
@@ -127,8 +126,7 @@ class LlamaMLP(nn.Module):
         self.down_proj = torch.nn.Linear(intermediate_size, hidden_size, bias=False)
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 
@@ -344,9 +342,9 @@ class LlamaModel(nn.Module):
 
         global tp_size, tp_rank
         if tp_size is None:
-            tp_size = get_tensor_model_parallel_world_size()
+            tp_size = get_parallel().tp_size
         if tp_rank is None:
-            tp_rank = get_tensor_model_parallel_rank()
+            tp_rank = get_parallel().tp_rank
 
         self.config = config
         self.padding_idx = config.pad_token_id

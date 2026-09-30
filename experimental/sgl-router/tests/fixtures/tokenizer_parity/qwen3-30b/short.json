@@ -1,0 +1,12 @@
+{
+  "model_id": "Qwen/Qwen3-30B-A3B",
+  "shape": "short",
+  "prompt_text": "Hello, world!",
+  "expected_token_ids": [
+    9707,
+    11,
+    1879,
+    0
+  ],
+  "skip_special_tokens": false
+}

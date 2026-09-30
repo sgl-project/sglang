@@ -11,7 +11,6 @@ import sys
 import time
 import traceback
 import urllib.request
-import warnings
 import weakref
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -30,11 +29,6 @@ from tqdm import tqdm
 from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
-
-KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: dict[str, str] = {
-    "hunyuan3d": "Hunyuan3D2Pipeline",
-    "flux.2-dev-nvfp4": "Flux2NvfpPipeline",
-}
 
 
 def load_diffusion_overlay_registry_from_env() -> dict[str, dict[str, Any]]:
@@ -72,14 +66,6 @@ def has_diffusion_overlay_registry_match(
         return False
     base_name = os.path.basename(os.path.normpath(model_path))
     return any(base_name == key.rsplit("/", 1)[-1] for key in registry)
-
-
-def is_known_non_diffusers_diffusion_model(model_path: str) -> bool:
-    model_path_lower = model_path.lower()
-    return any(
-        pattern in model_path_lower
-        for pattern in KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS
-    )
 
 
 def execute_once(func):
@@ -175,14 +161,6 @@ def dump_state_text(filename: str, states: list, mode: str = "w"):
 def normalize_base_url(host: str, port: int) -> str:
     from sglang.srt.utils.network import NetworkAddress
 
-    if host.startswith("http://") or host.startswith("https://"):
-        warnings.warn(
-            f"Including the scheme in --host ('{host}') is deprecated. "
-            f"Pass just the hostname (e.g. '127.0.0.1') instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return f"{host}:{port}"
     return NetworkAddress(host, port).to_url()
 
 
@@ -426,13 +404,16 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
     chunk_size = 1024  # Download in chunks of 1KB
 
     # Use tqdm to display the progress bar
-    with open(filename, "wb") as f, tqdm(
-        desc=filename,
-        total=total_size,
-        unit="B",
-        unit_scale=True,
-        unit_divisor=1024,
-    ) as bar:
+    with (
+        open(filename, "wb") as f,
+        tqdm(
+            desc=filename,
+            total=total_size,
+            unit="B",
+            unit_scale=True,
+            unit_divisor=1024,
+        ) as bar,
+    ):
         for chunk in response.iter_content(chunk_size=chunk_size):
             f.write(chunk)
             bar.update(len(chunk))

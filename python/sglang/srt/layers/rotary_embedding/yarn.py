@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import math
-from typing import Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 
 
@@ -62,6 +63,31 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     return 0.1 * mscale * math.log(scale) + 1.0
 
 
+def _extend_yarn_cache(
+    cache: torch.Tensor,
+    compute_inv_freq: Callable[[], torch.Tensor],
+    mscale: float,
+    needed_max_pos: int,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Return the extended cache and uncast rows for auxiliary tables.
+
+    A no-op returns the original cache and None without computing frequencies.
+    The caller supplies YaRN frequencies using its scaling factor and unchanged
+    correction-range bound, rather than the base extension's theta argument.
+    """
+    if needed_max_pos < cache.shape[0]:
+        return cache, None
+    align = envs.SGLANG_ROPE_CACHE_ALIGN.get()
+    new_len = ((needed_max_pos + align) // align) * align
+    inv_freq = compute_inv_freq().to(cache.device)
+    positions = torch.arange(
+        cache.shape[0], new_len, dtype=inv_freq.dtype, device=cache.device
+    )
+    freqs = torch.einsum("i,j->ij", positions, inv_freq)
+    rows = torch.cat((freqs.cos() * mscale, freqs.sin() * mscale), dim=-1)
+    return torch.cat((cache, rows.to(cache.dtype)), dim=0), rows
+
+
 class YaRNScalingRotaryEmbedding(RotaryEmbedding):
     """RotaryEmbedding extended with YaRN method.
 
@@ -83,6 +109,8 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
         beta_fast: int = 32,
         beta_slow: int = 1,
         truncate: bool = True,
+        mscale: float = None,
+        mscale_all_dim: float = None,
     ) -> None:
         self.scaling_factor = scaling_factor
         self.extrapolation_factor = extrapolation_factor
@@ -90,8 +118,18 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
         self.beta_fast = beta_fast
         self.beta_slow = beta_slow
         self.truncate = truncate
-        # Get n-d magnitude scaling corrected for interpolation
-        self.mscale = float(yarn_get_mscale_simple(self.scaling_factor) * attn_factor)
+
+        if mscale is not None and mscale_all_dim is not None:
+            # Match Hugging Face's YaRN RoPE scaling (supports mscale/mscale_all_dim)
+            self.mscale = float(
+                yarn_get_mscale(self.scaling_factor, mscale)
+                / yarn_get_mscale(self.scaling_factor, mscale_all_dim)
+            )
+        else:
+            # Get n-d magnitude scaling corrected for interpolation
+            self.mscale = float(yarn_get_mscale_simple(self.scaling_factor))
+        self.mscale *= attn_factor
+
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
@@ -121,6 +159,14 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
             + inv_freq_extrapolation * inv_freq_mask
         )
         return inv_freq
+
+    def _ensure_cos_sin_cache_length(self, needed_max_pos: int):
+        self.cos_sin_cache, _ = _extend_yarn_cache(
+            cache=self.cos_sin_cache,
+            compute_inv_freq=lambda: self._compute_inv_freq(self.scaling_factor),
+            mscale=self.mscale,
+            needed_max_pos=needed_max_pos,
+        )
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         inv_freq = self._compute_inv_freq(self.scaling_factor)

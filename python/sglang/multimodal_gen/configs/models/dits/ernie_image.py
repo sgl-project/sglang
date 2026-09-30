@@ -6,10 +6,6 @@ from typing import Tuple
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
 
 
-def _is_transformer_layer(n: str, m) -> bool:
-    return "layers" in n and str.isdigit(n.split(".")[-1])
-
-
 @dataclass
 class ErnieImageArchConfig(DiTArchConfig):
     patch_size: int = 1
@@ -32,10 +28,6 @@ class ErnieImageArchConfig(DiTArchConfig):
             r"(.*)\.mlp\.gate_proj\.(.*)": (r"\1.mlp.gate_up_proj.\2", 0, 2),
             r"(.*)\.mlp\.up_proj\.(.*)": (r"\1.mlp.gate_up_proj.\2", 1, 2),
         }
-    )
-
-    _fsdp_shard_conditions: list = field(
-        default_factory=lambda: [_is_transformer_layer]
     )
 
     def __post_init__(self):

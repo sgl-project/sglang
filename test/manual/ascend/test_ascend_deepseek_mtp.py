@@ -21,7 +21,6 @@ TEST_MODEL_MATRIX = {
 
 
 class TestAscendDeepSeekMTP(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.models = TEST_MODEL_MATRIX.keys()
@@ -53,7 +52,6 @@ class TestAscendDeepSeekMTP(CustomTestCase):
         ]
 
         envs.SGLANG_NPU_USE_MLAPO.set(True)
-        envs.SGLANG_ENABLE_SPEC_V2.set(True)
         envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.set(True)
 
     def test_a_gsm8k(self):
@@ -77,7 +75,7 @@ class TestAscendDeepSeekMTP(CustomTestCase):
                         num_questions=1319,
                         max_new_tokens=512,
                         parallel=128,
-                        host=f"http://{self.url.hostname}",
+                        host=self.url.hostname,
                         port=int(self.url.port),
                     )
 

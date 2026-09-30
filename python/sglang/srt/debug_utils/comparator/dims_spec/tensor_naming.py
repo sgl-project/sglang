@@ -6,6 +6,8 @@ import torch
 
 from sglang.srt.debug_utils.comparator.dims_spec.types import DimSpec
 
+_DIM_NAMES_ATTR = "_dim_names"
+
 
 def find_dim_index(dim_specs: list[DimSpec], name: str) -> Optional[int]:
     """Find index by name. Accepts both ``*``-form and ``___``-form for fused dims."""
@@ -15,11 +17,22 @@ def find_dim_index(dim_specs: list[DimSpec], name: str) -> Optional[int]:
     return None
 
 
+def get_dim_names(tensor: torch.Tensor) -> tuple[Optional[str], ...]:
+    """Get dimension names attached to a tensor.
+
+    Returns a tuple of ``None`` values if no names are attached.
+    """
+    names = getattr(tensor, _DIM_NAMES_ATTR, None)
+    if names is not None:
+        return names
+    return (None,) * tensor.ndim
+
+
 def resolve_dim_by_name(tensor: torch.Tensor, name: str) -> int:
-    if tensor.names[0] is None:
+    names = get_dim_names(tensor)
+    if names[0] is None:
         raise ValueError(f"Tensor has no names, cannot resolve {name!r}")
 
-    names: tuple[Optional[str], ...] = tensor.names
     try:
         return list(names).index(name)
     except ValueError:
@@ -33,8 +46,11 @@ def apply_dim_names(tensor: torch.Tensor, dim_names: list[str]) -> torch.Tensor:
             f"but dims string specifies {len(dim_names)} names {dim_names}. "
             f"Please fix the dims string in the dumper.dump() call to match the actual tensor shape."
         )
-    return tensor.refine_names(*dim_names)
+    view = torch.ops.aten.alias(tensor)
+    view._dim_names = tuple(dim_names)
+    return view
 
 
-def strip_dim_names(tensor: torch.Tensor) -> torch.Tensor:
-    return tensor.rename(None)
+def without_dim_names(tensor: torch.Tensor) -> torch.Tensor:
+    # Returns a new view without _dim_names; the original tensor is not modified.
+    return torch.ops.aten.alias(tensor)

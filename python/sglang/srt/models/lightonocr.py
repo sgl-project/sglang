@@ -31,6 +31,7 @@ References:
 - https://huggingface.co/lightonai/LightOnOCR-2-1B
 """
 
+from array import array
 from dataclasses import fields
 from typing import Iterable, List, Tuple
 
@@ -82,11 +83,12 @@ class LightOnOCRForConditionalGeneration(nn.Module):
 
         # Build VisionEncoderArgs from config
         vision_config = config.vision_config
+        config_dict = vision_config.to_dict()
+        if config_dict.get("rope_parameters"):
+            config_dict["rope_theta"] = config_dict["rope_parameters"].get("rope_theta")
         dataclass_fields = {field.name for field in fields(VisionEncoderArgs)}
         vision_args = {
-            key: value
-            for key, value in vision_config.to_dict().items()
-            if key in dataclass_fields
+            key: value for key, value in config_dict.items() if key in dataclass_fields
         }
         # LightOnOCR stores these at the top-level config
         if "image_token_id" not in vision_args:
@@ -124,7 +126,7 @@ class LightOnOCRForConditionalGeneration(nn.Module):
             quant_config=quant_config,
         )
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 

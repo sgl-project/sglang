@@ -9,15 +9,11 @@ from sglang.multimodal_gen.configs.models.encoders.base import (
     TextEncoderArchConfig,
     TextEncoderConfig,
 )
+from sglang.multimodal_gen.configs.models.fsdp import (
+    is_embeddings,
+    is_layer,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
-
-
-def _is_transformer_layer(n: str, m) -> bool:
-    return "layers" in n and str.isdigit(n.split(".")[-1])
-
-
-def _is_embeddings(n: str, m) -> bool:
-    return n.endswith("embeddings")
 
 
 @dataclass
@@ -53,7 +49,7 @@ class CLIPTextArchConfig(TextEncoderArchConfig):
         ]
     )
     _fsdp_shard_conditions: list = field(
-        default_factory=lambda: [_is_transformer_layer, _is_embeddings]
+        default_factory=lambda: [is_layer, is_embeddings]
     )
 
 

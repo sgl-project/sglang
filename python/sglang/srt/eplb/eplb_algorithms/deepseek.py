@@ -30,22 +30,25 @@ def balanced_packing(
         rank_in_pack = torch.zeros_like(weight, dtype=torch.int64)
         return pack_index, rank_in_pack
 
-    indices = weight.float().sort(-1, descending=True).indices.cpu()
-    pack_index = torch.full_like(weight, fill_value=-1, dtype=torch.int64, device="cpu")
-    rank_in_pack = torch.full_like(pack_index, fill_value=-1)
+    indices_list = weight.float().sort(-1, descending=True).indices.tolist()
+    weight_list = weight.tolist()
+    pack_index_list = [[-1] * num_groups for _ in range(num_layers)]
+    rank_in_pack_list = [[-1] * num_groups for _ in range(num_layers)]
     for i in range(num_layers):
         pack_weights = [0] * num_packs
         pack_items = [0] * num_packs
-        for group in indices[i]:
+        for group in indices_list[i]:
             pack = min(
-                (i for i in range(num_packs) if pack_items[i] < groups_per_pack),
+                (j for j in range(num_packs) if pack_items[j] < groups_per_pack),
                 key=pack_weights.__getitem__,
             )
             assert pack_items[pack] < groups_per_pack
-            pack_index[i, group] = pack
-            rank_in_pack[i, group] = pack_items[pack]
-            pack_weights[pack] += weight[i, group]
+            pack_index_list[i][group] = pack
+            rank_in_pack_list[i][group] = pack_items[pack]
+            pack_weights[pack] += weight_list[i][group]
             pack_items[pack] += 1
+    pack_index = torch.tensor(pack_index_list, dtype=torch.int64, device="cpu")
+    rank_in_pack = torch.tensor(rank_in_pack_list, dtype=torch.int64, device="cpu")
     return pack_index, rank_in_pack
 
 

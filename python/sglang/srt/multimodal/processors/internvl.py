@@ -20,6 +20,7 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultiModalProcessorOutput,
     MultimodalSpecialTokens,
 )
+from sglang.srt.runtime_context import get_model
 from sglang.srt.utils import get_device
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
@@ -135,7 +136,7 @@ class InternVLProcessor(BaseMultimodalProcessor):
         ).build(_image_processor)
 
         self.max_context_len = (
-            getattr(server_args, "context_length", None)
+            get_model().context_length
             or getattr(server_args, "max_context_len", None)
             or getattr(hf_config, "max_position_embeddings", None)
             or getattr(text_cfg, "max_position_embeddings", None)
@@ -310,7 +311,7 @@ class InternVLProcessor(BaseMultimodalProcessor):
                 videos=videos,
             )
         else:
-            base_output = self.load_mm_data(
+            base_output = await self.load_mm_data(
                 prompt=prompt,
                 image_data=image_data,
                 video_data=video_data,
@@ -318,7 +319,7 @@ class InternVLProcessor(BaseMultimodalProcessor):
                 discard_alpha_channel=True,
             )
 
-        mm_items, input_ids_tensor, ret = self.process_and_combine_mm_data(
+        mm_items, input_ids_tensor, ret = await self.process_and_combine_mm_data_async(
             base_output, self.mm_tokens
         )
 
@@ -423,7 +424,7 @@ class InternVLProcessor(BaseMultimodalProcessor):
             prompt.count(self.VIDEO_PLACEHOLDER_TOKEN),
         )
 
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             prompt=prompt,
             image_data=image_data,
             video_data=video_data,
@@ -562,7 +563,7 @@ class InternVLProcessor(BaseMultimodalProcessor):
                         + (self.VIDEO_CONTEXT_TOKEN * ctx_cnt)
                         + self.IMG_END
                     )
-                    frame_lines.append(f"Frame {i+1}: {frame_tokens}")
+                    frame_lines.append(f"Frame {i + 1}: {frame_tokens}")
                 video_tokens = "\n".join(frame_lines) + "\n"
                 input_text_updated = input_text_updated.replace(vid_ph, video_tokens, 1)
 
@@ -644,7 +645,7 @@ class InternVLProcessor(BaseMultimodalProcessor):
             prompt.count(self.IMG_CONTEXT),
         )
 
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             prompt=prompt,
             image_data=image_data,
             multimodal_tokens=self.mm_tokens_internlm2,  # expects <IMG_CONTEXT>

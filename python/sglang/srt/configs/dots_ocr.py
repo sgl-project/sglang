@@ -16,7 +16,7 @@ class DotsOCRConfig(Qwen2Config):
         video_token_id=151656,
         vision_config: Optional[dict] = None,
         *args,
-        **kwargs
+        **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.image_token_id = image_token_id
@@ -42,7 +42,7 @@ class DotsVLProcessor(Qwen2_5_VLProcessor):
         tokenizer=None,
         video_processor=None,
         chat_template=None,
-        **kwargs
+        **kwargs,
     ):
         if video_processor is None:
             video_processor = DummyVideoProcessor()

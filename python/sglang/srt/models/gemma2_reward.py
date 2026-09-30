@@ -53,15 +53,20 @@ class Gemma2ForSequenceClassification(nn.Module):
         input_embeds: torch.Tensor = None,
         get_embedding: bool = True,
     ) -> EmbeddingPoolerOutput:
-        assert (
-            get_embedding
-        ), "Gemma2ForSequenceClassification is only used for embedding"
+        assert get_embedding, (
+            "Gemma2ForSequenceClassification is only used for embedding"
+        )
 
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         last_token_hidden = self.pooler(hidden_states, forward_batch).embeddings
         scores = self.score(last_token_hidden)
 
-        return EmbeddingPoolerOutput(scores)
+        return EmbeddingPoolerOutput(
+            embeddings=scores,
+            pooled_hidden_states=(
+                last_token_hidden if forward_batch.return_pooled_hidden_states else None
+            ),
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         Gemma2ForCausalLM.load_weights(self, weights)

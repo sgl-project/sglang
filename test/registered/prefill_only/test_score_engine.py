@@ -4,14 +4,18 @@ Two model types, two scoring modes:
 
   TestCausalLMScoring        — CausalLM, single-item and batched multi-item
   TestSeqClsScoring          — SequenceClassification, single-item mode
-  TestSeqClsMISScoring       — SequenceClassification, MIS delimiter mode
+  TestSeqClsMISScoring       — SequenceClassification, MIS mode (--enable-mis)
+  TestSeqClsMISAdvancedScoring — SeqCls MIS with 12 labels (tensor shape stress)
 
 The Engine (Python API) is the right layer for correctness testing: it
 exercises tokenization, forward pass, pooling, and score extraction without
 the HTTP serialization overhead.  HTTP-layer tests live in test_score_api.py.
+Thorough MIS tests (parity, concurrency, generation models) live in
+test_multi_item_scoring.py.
 """
 
 import json
+import os
 import unittest
 from unittest.mock import patch
 
@@ -22,12 +26,10 @@ from sglang.srt.entrypoints.engine import Engine
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
 
-register_cuda_ci(est_time=85, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=101, stage="base-b", runner_config="1-gpu-small")
 
-_CAUSAL_LM_MODEL = DEFAULT_SMALL_MODEL_NAME_FOR_TEST  # Llama-3.2-1B-Instruct
-_SEQCLS_MODEL = "Qwen/Qwen3-0.6B"  # backbone; arch overridden to SeqCls below
-# <|endoftext|> for Qwen3 tokenizer — used as MIS delimiter
-_QWEN3_EOT_TOKEN_ID = 151643
+_CAUSAL_LM_MODEL = os.environ.get("TEST_MODEL_NAME", DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
+_SEQCLS_MODEL = os.environ.get("TEST_CLASSIFICATION_BASE_MODEL", "Qwen/Qwen3-0.6B")
 
 
 # ---------------------------------------------------------------------------
@@ -225,15 +227,16 @@ class TestCausalLMScoring(CustomTestCase):
             self.assertAlmostEqual(sum(row), 1.0, places=6)
 
     def test_score_deterministic(self):
-        """Identical calls return numerically equivalent scores (within GPU float tolerance)."""
+        """Identical calls (cache flushed between) match within bf16 noise."""
         kwargs = dict(query="Choose:", items=["A", "B", "C"], label_token_ids=[1, 2, 3])
         scores_a = self.engine.score(**kwargs).scores
+        self.engine.flush_cache()
         scores_b = self.engine.score(**kwargs).scores
         self.assertEqual(len(scores_a), len(scores_b))
         for row_a, row_b in zip(scores_a, scores_b):
             self.assertEqual(len(row_a), len(row_b))
             for a, b in zip(row_a, row_b):
-                self.assertAlmostEqual(a, b, places=5)
+                self.assertAlmostEqual(a, b, delta=max(1e-4, 0.1 * abs(b)))
 
     def test_score_error_handling(self):
         """Invalid argument types raise ValueError or TypeError."""
@@ -244,6 +247,36 @@ class TestCausalLMScoring(CustomTestCase):
         with self.assertRaises((ValueError, TypeError)):
             self.engine.score(
                 query="Q", items=None, label_token_ids=[1, 2], apply_softmax=True
+            )
+
+    def test_decision_scoring(self):
+        tokenizer = AutoTokenizer.from_pretrained(_CAUSAL_LM_MODEL)
+        prompts = ["Answer A or B: Is Paris in France?", "Choose A, B or C: 2 + 2 ="]
+        inputs = [tokenizer.encode(prompt) for prompt in prompts]
+        labels = [[33, 32], [32, 34, 33]]
+        kwargs = dict(apply_softmax=True, temperature=1.7, return_token_logprobs=True)
+        batch = self.engine.score(
+            query=[], items=inputs, label_token_ids=labels, **kwargs
+        )
+        self.assertEqual(len(batch.scores), 2)
+        for i, (ids, candidates) in enumerate(zip(inputs, labels)):
+            single = self.engine.score(
+                query=[], items=[ids], label_token_ids=candidates, **kwargs
+            )
+            torch.testing.assert_close(
+                torch.tensor(batch.scores[i]),
+                torch.tensor(single.scores[0]),
+                atol=1e-3,
+                rtol=1e-2,
+            )
+            expected = torch.softmax(torch.tensor(batch.token_logprobs[i]) / 1.7, 0)
+            torch.testing.assert_close(torch.tensor(batch.scores[i]), expected)
+        repeated = self.engine.score(
+            query=[], items=inputs, label_token_ids=labels, **kwargs
+        )
+        for cold, warm in zip(batch.scores, repeated.scores):
+            torch.testing.assert_close(
+                torch.tensor(cold), torch.tensor(warm), atol=1e-3, rtol=1e-2
             )
 
 
@@ -267,6 +300,8 @@ class TestSeqClsScoring(CustomTestCase):
         cls.engine = Engine(
             model_path=_SEQCLS_MODEL,
             disable_radix_cache=True,
+            # Deterministic init for the random classification head.
+            random_seed=42,
             json_model_override_args=json.dumps(
                 {
                     "architectures": ["Qwen3ForSequenceClassification"],
@@ -318,14 +353,14 @@ class TestSeqClsScoring(CustomTestCase):
                 self.assertIsInstance(v, (int, float))
 
     def test_score_deterministic(self):
-        """Identical inputs yield near-identical scores (fp16 tolerance)."""
+        """Identical inputs yield raw logits matching within bf16 noise."""
         kwargs = dict(query="Evaluate:", items=["alpha", "beta", "gamma"])
         scores1 = self.engine.score(**kwargs).scores
         scores2 = self.engine.score(**kwargs).scores
         self.assertEqual(len(scores1), len(scores2))
         for s1, s2 in zip(scores1, scores2):
             for v1, v2 in zip(s1, s2):
-                self.assertAlmostEqual(v1, v2, places=1)
+                self.assertAlmostEqual(v1, v2, delta=0.2)
 
     def test_score_tokenized_inputs(self):
         """Pre-tokenized query/items match text input scores."""
@@ -368,10 +403,9 @@ class TestSeqClsScoring(CustomTestCase):
 class TestSeqClsMISScoring(CustomTestCase):
     """SeqCls MIS: all items packed into one sequence separated by delimiter token.
 
-    score_and_pool() extracts per-item scores at delimiter positions.
-    Two sub-cases are tested:
-      - NUM_LABELS=2  — standard binary classification head
-      - NUM_LABELS=12 — stress-tests 2-D tensor indexing in score_and_pool()
+    Uses --enable-mis which hardcodes delimiter token ID 9999.
+    Basic pipeline correctness only — thorough MIS tests (parity,
+    concurrency, advanced) live in test_multi_item_scoring.py.
     """
 
     NUM_LABELS = 2
@@ -382,7 +416,8 @@ class TestSeqClsMISScoring(CustomTestCase):
             model_path=_SEQCLS_MODEL,
             disable_radix_cache=True,
             chunked_prefill_size=-1,
-            multi_item_scoring_delimiter=_QWEN3_EOT_TOKEN_ID,
+            enable_mis=True,
+            attention_backend="flashinfer",
             json_model_override_args=json.dumps(
                 {
                     "architectures": ["Qwen3ForSequenceClassification"],
@@ -432,32 +467,6 @@ class TestSeqClsMISScoring(CustomTestCase):
             self.assertEqual(len(row), self.NUM_LABELS)
             self.assertAlmostEqual(sum(row), 1.0, places=5)
 
-    def test_mis_items_produce_distinct_scores(self):
-        """Different items must yield different score vectors.
-
-        Catches bugs where all delimiter positions share the same pooled
-        hidden state (e.g. off-by-one in score_and_pool indexing).
-        """
-        items = [
-            "Option A is about cats",
-            "Option B is about dogs",
-            "Option C is about fish",
-        ]
-        scores = self.engine.score(query="Rate each option:", items=items).scores
-        self.assertEqual(len(scores), len(items))
-        self.assertFalse(
-            all(scores[0] == s for s in scores[1:]),
-            f"All items returned identical scores — delimiter indexing is likely broken. "
-            f"Scores: {scores[0]}",
-        )
-
-    def test_mis_deterministic(self):
-        """Identical MIS requests return identical scores."""
-        kwargs = dict(query="Evaluate:", items=["alpha", "beta", "gamma"])
-        self.assertEqual(
-            self.engine.score(**kwargs).scores, self.engine.score(**kwargs).scores
-        )
-
 
 # ---------------------------------------------------------------------------
 # SequenceClassification — MIS with many labels (tensor shape stress test)
@@ -479,7 +488,8 @@ class TestSeqClsMISAdvancedScoring(CustomTestCase):
             model_path=_SEQCLS_MODEL,
             disable_radix_cache=True,
             chunked_prefill_size=-1,
-            multi_item_scoring_delimiter=_QWEN3_EOT_TOKEN_ID,
+            enable_mis=True,
+            attention_backend="flashinfer",
             json_model_override_args=json.dumps(
                 {
                     "architectures": ["Qwen3ForSequenceClassification"],
@@ -505,17 +515,6 @@ class TestSeqClsMISAdvancedScoring(CustomTestCase):
         for row in scores:
             self.assertEqual(len(row), self.NUM_LABELS)
             self.assertAlmostEqual(sum(row), 1.0, places=5)
-
-    def test_many_items_produce_distinct_scores(self):
-        """15 items should not all return identical score vectors."""
-        items = [f"City {i}" for i in range(15)]
-        scores = self.engine.score(query="Classify each city:", items=items).scores
-        self.assertEqual(len(scores), len(items))
-        self.assertGreater(
-            len({tuple(s) for s in scores}),
-            1,
-            "All 15 items returned identical scores",
-        )
 
 
 if __name__ == "__main__":

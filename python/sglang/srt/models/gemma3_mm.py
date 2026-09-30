@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2025 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,6 +19,7 @@
 
 import logging
 import re
+from array import array
 from functools import lru_cache
 from typing import Iterable, List, Optional, Set, Tuple, TypedDict
 
@@ -38,6 +41,7 @@ from sglang.srt.managers.schedule_batch import (
     flatten_nested_list,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -198,9 +202,7 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
             self.language_model.logits_processor.logit_scale *= logit_scale
         self.post_init()
 
-    def pad_input_ids(
-        self, input_ids: List[int], image_inputs: MultimodalInputs
-    ) -> List[int]:
+    def pad_input_ids(self, input_ids: array, image_inputs: MultimodalInputs) -> array:
         """Pad input IDs with image tokens."""
         # Get special token IDs
         im_start_id: int = image_inputs.im_start_id
@@ -218,7 +220,7 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         mask_dtype: torch.dtype,
     ):
         """Prepare attention masks for multimodal inputs."""
-        if isinstance(forward_batch.attn_backend, TritonAttnBackend):
+        if isinstance(get_attn_backend(), TritonAttnBackend):
             assert forward_batch.forward_mode == ForwardMode.EXTEND
             bidirectional_attn_masks_list = []
             bidirectional_attn_mask_indptr = torch.zeros(
@@ -263,10 +265,10 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
                 bidirectional_attn_masks = torch.cat(
                     bidirectional_attn_masks_list, dim=0
                 )
-                forward_batch.attn_backend.forward_metadata.mask_indptr = (
+                get_attn_backend().forward_metadata.mask_indptr = (
                     bidirectional_attn_mask_indptr
                 )
-                forward_batch.attn_backend.forward_metadata.custom_mask = (
+                get_attn_backend().forward_metadata.custom_mask = (
                     bidirectional_attn_masks
                 )
 
@@ -479,6 +481,22 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
             # raise RuntimeError(
             #     f"Some weights are not initialized from checkpoints: {unloaded_params}")
         return loaded_params
+
+    def get_embed_and_head(self):
+        # For EAGLE3, we delegate to the language model which should have this method
+        # If the language model doesn't have lm_head (like EAGLE3), we return None for head
+        embed = self.language_model.get_embed()
+        if hasattr(self.language_model, "get_embed_and_head"):
+            return self.language_model.get_embed_and_head()
+        elif hasattr(self.language_model, "lm_head"):
+            return embed, self.language_model.lm_head.weight
+        else:
+            # For EAGLE3, head might not be needed
+            return embed, None
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        if hasattr(self.language_model, "set_eagle3_layers_to_capture"):
+            self.language_model.set_eagle3_layers_to_capture(layer_ids)
 
 
 EntryClass = Gemma3ForConditionalGeneration
