@@ -2594,8 +2594,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             # Set first_token_time on the first output batch.
             # This is the single write point for first_token_time.
+            first_output_time = None
             if state.time_stats.first_token_time == 0.0:
-                state.time_stats.set_first_token_time()
+                first_output_time = time.perf_counter()
+                state.time_stats.set_first_token_time(
+                    ts=self._get_scheduler_first_token_time(state, recv_obj, i)
+                    or first_output_time
+                )
+                state.time_stats.set_last_time(ts=first_output_time)
 
             if state.finished:
                 span_attrs = (
@@ -2603,7 +2609,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if state.time_stats.trace_ctx.tracing_enable
                     else None
                 )
-                state.time_stats.set_finished_time(span_attrs=span_attrs)
+                # Reuse the first batch's arrival time: a streaming request that
+                # finishes in its first output has no decode interval.
+                state.time_stats.set_finished_time(
+                    ts=first_output_time, span_attrs=span_attrs
+                )
                 meta_info["e2e_latency"] = state.time_stats.get_e2e_latency()
 
                 if get_spec().speculative_algorithm:
@@ -2651,6 +2661,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # handle_loop awaits next recv immediately
         for s in pending_notify.values():
             s.event.set()
+
+    @staticmethod
+    def _get_scheduler_first_token_time(
+        state: ReqState, recv_obj, i: int
+    ) -> Optional[float]:
+        # Non-streaming outputs are batched; use the scheduler's first-token time.
+        if getattr(state.obj, "stream", False) or recv_obj.time_stats is None:
+            return None
+        ts = recv_obj.time_stats[i].prefill_finished_time
+        if state.time_stats.created_time < ts <= time.perf_counter():
+            return ts
+        return None
 
     @staticmethod
     def _accumulate_request_meta_info(
@@ -3043,25 +3065,30 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             priority = getattr(state.obj, "priority", None)
             if priority is not None:
                 labels["priority"] = str(priority)
-        if (
-            not state.ttft_observed
-            and self.disaggregation_mode != DisaggregationMode.PREFILL
-        ):
-            state.ttft_observed = True
-            state.last_completion_tokens = completion_tokens
-            self.metrics_collector.observe_time_to_first_token(
-                labels,
-                state.time_stats.get_first_token_latency(),
-                stream=getattr(state.obj, "stream", False),
-            )
+        finish_type = (recv_obj.finished_reasons[i] or {}).get("type")
+        if not state.ttft_observed:
+            # PD prefill workers never observe TTFT, so they never reach ITL.
+            if (
+                finish_type != "abort"
+                and self.disaggregation_mode != DisaggregationMode.PREFILL
+            ):
+                state.ttft_observed = True
+                state.last_completion_tokens = completion_tokens
+                self.metrics_collector.observe_time_to_first_token(
+                    labels,
+                    state.time_stats.get_first_token_latency(),
+                    stream=getattr(state.obj, "stream", False),
+                )
         else:
             num_new_tokens = completion_tokens - state.last_completion_tokens
-            if num_new_tokens:
-                self.metrics_collector.observe_inter_token_latency(
-                    labels,
-                    state.time_stats.get_interval(),
-                    num_new_tokens,
-                )
+            self.metrics_collector.observe_inter_token_latency(
+                labels,
+                state.time_stats.get_interval(),
+                num_new_tokens,
+            )
+            if num_new_tokens != 0:
+                # On a decrease the collector drops the negative delta; restart
+                # the baseline from the new count.
                 state.time_stats.set_last_time()
                 state.last_completion_tokens = completion_tokens
 
@@ -3082,6 +3109,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 else 0
             )
 
+            # Aborts have a truncated decode period; PD prefill workers have none.
+            finish_reason = recv_obj.finished_reasons[i] or {}
+            time_per_output_token = (
+                state.time_stats.get_time_per_output_token(completion_tokens)
+                if self.disaggregation_mode != DisaggregationMode.PREFILL
+                and finish_reason.get("type") in ("stop", "length")
+                else None
+            )
+
             self.metrics_collector.observe_one_finished_request(
                 labels,
                 recv_obj.prompt_tokens[i],
@@ -3092,6 +3128,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 cached_tokens_details,
                 spec_verify_ct=spec_verify_ct,
                 is_streaming=getattr(state.obj, "stream", False),
+                time_per_output_token=time_per_output_token,
             )
 
     def dump_requests(self, state: ReqState, out_dict: dict):
