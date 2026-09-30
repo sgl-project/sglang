@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use tracing::{debug, info, warn};
 
-use super::fallback::fail_rank;
+use super::fallback::{fail_rank, resolve_gap};
 use super::{apply_batch, PumpState};
 use crate::state::kv_events::bootstrap::{BootstrapState, RankOutcome, VettedSnapshot};
 use crate::state::kv_events::tree::KvWorkerId;
@@ -108,7 +108,9 @@ pub(super) fn apply_snapshot(
                     "kv-bootstrap: sequence gap between snapshot and live stream; \
                      running cold to avoid stale cache entries",
                 );
-                fail_rank(st, held, &rank, false, RankOutcome::Gap);
+                // `held` still holds the queue: `resolve_gap` replays it after
+                // clearing, or keeps it for the retry's graft.
+                resolve_gap(st, held, &rank);
                 continue;
             }
             Some(_) => {}

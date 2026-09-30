@@ -44,7 +44,7 @@ class TokenAxis(Enum):
     ATTN_DP = auto()
     ATTN_CP = auto()
     # Each attention-TP rank holds a slice of its group's tokens.
-    ATTN_TP_SCATTER = auto()
+    ATTN_TP = auto()
 
 
 class Layout(msgspec.Struct, frozen=True):
@@ -78,11 +78,11 @@ class SumGroup(Enum):
     MOE_OUTPUT = auto()
 
 
-def enable_moe_dense_fully_dp():
+def is_dense_ffn_fully_dp():
     return get_parallel().moe_dense_tp_size == 1
 
 
-def _generic_prefill_cp_shards_tokens() -> bool:
+def _prefill_cp_shards_tokens() -> bool:
     """Whether the strategy prefill CP path shards prefill tokens across CP ranks."""
     parallel = get_parallel()
     return parallel.attn_cp_size > 1 and parallel.enable_prefill_cp
@@ -116,7 +116,7 @@ def moe_cp_gathered_rows(forward_batch: ForwardBatch) -> Optional[List[int]]:
     return None
 
 
-def sparse_moe_gathers_over_moe_cp() -> bool:
+def moe_gathers_over_moe_cp() -> bool:
     """Whether a sparse MoE's input is gathered over the MoE-CP group on a CP
     extend: a MoE on the TP group under GQA CP whose MoE-CP group is wider than
     the MoE's data-parallel groups. DSA and MLA CP gather over attention CP
@@ -124,17 +124,14 @@ def sparse_moe_gathers_over_moe_cp() -> bool:
     return (
         not is_moe_input_scattered_across_dp_ranks()
         and is_enable_moe_cp_allgather()
-        and not _gathers_over_attention_cp()
+        and not _cp_gathers_over_attn_cp()
     )
 
 
-def moe_cp_gathers_sparse_moe_input(forward_batch: ForwardBatch) -> bool:
+def batch_gathers_over_moe_cp(forward_batch: ForwardBatch) -> bool:
     """Whether a sparse MoE's input is gathered over the MoE-CP group on this
     batch: a CP extend, for a MoE that gathers there."""
-    return (
-        sparse_moe_gathers_over_moe_cp()
-        and moe_cp_gathered_rows(forward_batch) is not None
-    )
+    return moe_gathers_over_moe_cp() and moe_cp_gathered_rows(forward_batch) is not None
 
 
 def _cp_shard_token_rows(forward_batch: ForwardBatch) -> List[int]:
@@ -162,11 +159,11 @@ def token_axis_sizes(*, cp_active: bool = False) -> Dict[TokenAxis, int]:
     return {
         TokenAxis.ATTN_DP: parallel.attn_dp_size,
         TokenAxis.ATTN_CP: parallel.attn_cp_size if cp_active else 1,
-        TokenAxis.ATTN_TP_SCATTER: parallel.attn_tp_size,
+        TokenAxis.ATTN_TP: parallel.attn_tp_size,
     }
 
 
-def _gathers_over_attention_cp() -> bool:
+def _cp_gathers_over_attn_cp() -> bool:
     """Whether a CP extend gathers the FFN input over the attention-CP group in
     equal shards and takes the output back with a reduce-scatter there: DSA and
     MLA CP. GQA prefill CP gathers over the MoE-CP group instead."""
@@ -179,7 +176,7 @@ def _batch_shards_over_cp(forward_batch: ForwardBatch) -> bool:
     never read the CP predicates."""
     if not forward_batch.forward_mode.is_context_parallel_extend():
         return False
-    if _gathers_over_attention_cp():
+    if _cp_gathers_over_attn_cp():
         return dsa_use_prefill_cp(forward_batch) or is_mla_cp_active(forward_batch)
     return moe_cp_gathered_rows(forward_batch) is not None
 
