@@ -34,6 +34,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
+from sglang.srt.layers.moe import post_experts_output_is_complete
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
@@ -297,10 +298,6 @@ class SarvamMoESparseMoeBlock(nn.Module):
             and config.num_shared_experts > 0
         ):
             intermediate_size = config.moe_intermediate_size * config.num_shared_experts
-            if is_dense_ffn_fully_dp():
-                shared_tp_rank, shared_tp_size = 0, 1
-            else:
-                shared_tp_rank, shared_tp_size = None, None
             self.shared_experts = SarvamMoEMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=intermediate_size,
@@ -308,8 +305,13 @@ class SarvamMoESparseMoeBlock(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("shared_experts", prefix),
                 reduce_results=False,
-                tp_rank=shared_tp_rank,
-                tp_size=shared_tp_size,
+                # The shared output joins the routed output's TP sum; where that
+                # output is already complete on each rank, it is not TP-sharded.
+                **(
+                    dict(tp_rank=0, tp_size=1)
+                    if post_experts_output_is_complete(is_tp_path=True)
+                    else {}
+                ),
             )
         else:
             self.shared_experts = None
