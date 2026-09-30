@@ -6,7 +6,25 @@ PYTHON_ENV_FOR_EVALSCOPE=test_env_evalscope
 PYTHON_FOR_EVALSCOPE=${PYTHON_ENV_FOR_EVALSCOPE}/bin/python
 PIP_FOR_EVALSCOPE=${PYTHON_ENV_FOR_EVALSCOPE}/bin/pip
 EVALSCOPE_SOURCE_PATH=/root/.cache/.cache/evalscope
-pip_mirror_source="https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
+# Try mirrors in order: some runners get 403-blocked by a specific mirror,
+# so fall back to alternates and finally the official PyPI.
+pip_mirror_sources=(
+    "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
+    "https://mirrors.aliyun.com/pypi/simple"
+    "https://pypi.org/simple"
+)
+
+pip_install_with_fallback() {
+    for idx in "${pip_mirror_sources[@]}"; do
+        echo "Trying pip index: ${idx}"
+        if timeout ${EVALSCOPE_INSTALL_TIMEOUT} ${PIP_FOR_EVALSCOPE} install --retries 3 --timeout 60 "$@" -i "${idx}"; then
+            return 0
+        fi
+        echo "WARN: pip install failed with index ${idx}, trying next mirror..."
+    done
+    echo "ERROR: pip install failed on all mirror sources."
+    return 1
+}
 
 # Bound key deps so the resolver cannot fall back to ancient versions.
 EVALSCOPE_CONSTRAINTS=(
@@ -44,17 +62,11 @@ echo "===== Install evalscope in virtual env - Begin ====="
 if [ ! -d "${EVALSCOPE_SOURCE_PATH}" ]; then
     echo "The evalscope source does not exist: ${EVALSCOPE_SOURCE_PATH}."
     echo "Install evalscope online."
-    ${PIP_FOR_EVALSCOPE} install -U pip -i ${pip_mirror_source}
-    timeout ${EVALSCOPE_INSTALL_TIMEOUT} ${PIP_FOR_EVALSCOPE} install evalscope "${EVALSCOPE_CONSTRAINTS[@]}" -i ${pip_mirror_source} || {
-        echo "ERROR: evalscope install timed out after ${EVALSCOPE_INSTALL_TIMEOUT}s."
-        exit 1
-    }
+    pip_install_with_fallback -U pip || echo "WARN: pip self-upgrade failed, continue with existing pip"
+    pip_install_with_fallback evalscope "${EVALSCOPE_CONSTRAINTS[@]}"
 else
     echo "Install evalscope from local source: ${EVALSCOPE_SOURCE_PATH}"
-    ${PIP_FOR_EVALSCOPE} install -U pip -i ${pip_mirror_source}
-    timeout ${EVALSCOPE_INSTALL_TIMEOUT} ${PIP_FOR_EVALSCOPE} install -e ${EVALSCOPE_SOURCE_PATH} "${EVALSCOPE_CONSTRAINTS[@]}" -i ${pip_mirror_source} || {
-        echo "ERROR: evalscope install timed out after ${EVALSCOPE_INSTALL_TIMEOUT}s."
-        exit 1
-    }
+    pip_install_with_fallback -U pip || echo "WARN: pip self-upgrade failed, continue with existing pip"
+    pip_install_with_fallback -e ${EVALSCOPE_SOURCE_PATH} "${EVALSCOPE_CONSTRAINTS[@]}"
 fi
 echo "===== Install evalscope in virtual env - End ====="
