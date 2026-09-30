@@ -14,8 +14,8 @@ from sglang.srt.layers import layer_boundary as comm
 from sglang.srt.layers.layer_boundary import StageKind
 from sglang.srt.layers.layer_boundary import prepare as comm_ops
 from sglang.srt.layers.layer_boundary.contracts import BatchVariant
-from sglang.srt.layers.layer_boundary.fusions.allreduce import attention_fusions
-from sglang.srt.layers.layer_boundary.ops import identity_output
+from sglang.srt.layers.layer_boundary.fusions.allreduce import attn_input_fusions
+from sglang.srt.layers.layer_boundary.ops import keep_output
 from sglang.test.boundary_fixtures import prepare_input, stub_plan, stub_stage
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
@@ -53,33 +53,33 @@ def communicator(norm):
     c.norm = norm
     # A layer inside the stack: an absent residual was written back before.
     c.enters_stack = False
-    c._paths[BatchVariant.SEQUENCE_PARALLEL] = None
-    c._paths[BatchVariant.INPUT_SCATTERED] = None
-    c._paths[BatchVariant.CONTEXT_PARALLEL] = None
+    c.paths[BatchVariant.SEQUENCE_PARALLEL] = None
+    c.paths[BatchVariant.INPUT_SCATTERED] = None
+    c.paths[BatchVariant.CONTEXT_PARALLEL] = None
     c.qkv_latent_func = None
     # Construction picks the fused entries; call it under the platform patches.
-    c._attn_input_fusions = attention_fusions(c)
+    c._attn_input_fusions = attn_input_fusions(c)
     # A layer whose attention takes its input as it is and owes nothing on it.
-    c._paths[BatchVariant.ORDINARY] = comm.StageSteps(
-        entry=comm.StageEntry(
+    c.paths[BatchVariant.ORDINARY] = comm.StagePath(
+        entry=comm.EntryPath(
             prepare=partial(
-                comm_ops._consumer_step,
-                adds_plainly=True,
+                comm_ops._run_entry,
+                is_plain_add=True,
                 step=partial(
-                    comm_ops._read_input,
-                    layer_input=None,
+                    comm_ops._update_read,
+                    pre_move=None,
                     enters_stack=False,
-                    read=comm.NORM_QUANT_READ,
-                    update=comm.ADD,
+                    read=comm.NORM_QUANT_READOUT,
+                    update=comm.PLAIN_ADD,
                 ),
                 carried_fusions=c._attn_input_fusions,
             ),
             input_rows=comm.Layout(frozenset()),
             input_move=lambda hidden_states, **_: hidden_states,
-            handoff=comm_ops._hand_qkv_hook_its_input,
+            attn_input_adapter=comm_ops._attn_input_default,
         ),
-        output=comm.StageOutput(comm.Layout(frozenset())),
-        output_move=identity_output,
+        output=comm.OutputContract(comm.Layout(frozenset())),
+        output_move=keep_output,
     )
     return c
 
@@ -102,10 +102,10 @@ def platform(*, use_aiter=False, gfx95=False, fusion=False, kernel_group=True):
             patch_communicator("_use_aiter_bpreshuffle_gfx95", False, create=True)
         )
         stack.enter_context(
-            patch_communicator("apply_aiter_all_reduce_fusion", return_value=False)
+            patch_communicator("aiter_ar_fusion_applies", return_value=False)
         )
         stack.enter_context(
-            patch_communicator("apply_flashinfer_allreduce_fusion", return_value=fusion)
+            patch_communicator("flashinfer_ar_fusion_applies", return_value=fusion)
         )
         # The group the fused kernel reduces over.
         stack.enter_context(
@@ -248,7 +248,7 @@ class TestPrepareAttnSteps(CustomTestCase):
                 step = MagicMock(return_value=local)
                 hidden_states, residual = prepare_input(
                     stub_stage(communicator(norm), StageKind.ATTENTION),
-                    comm.UnreducedOutput(partial, reduce_and_redistribute=step),
+                    comm.UnreducedOutput(partial, reduce_to_dp_local=step),
                     torch.zeros(local_rows, 4),
                     None,
                 )
@@ -265,19 +265,19 @@ class TestPrepareAttnSteps(CustomTestCase):
         with platform(fusion=True) as (_, all_reduce, _):
             c = communicator(Norm())
             takes_anything = MagicMock(return_value=("fused", "fused"))
-            c._paths[BatchVariant.ORDINARY] = msgspec.structs.replace(
-                c._paths.get(BatchVariant.ORDINARY),
+            c.paths[BatchVariant.ORDINARY] = msgspec.structs.replace(
+                c.paths.get(BatchVariant.ORDINARY),
                 entry=msgspec.structs.replace(
-                    c._paths.get(BatchVariant.ORDINARY).entry,
+                    c.paths.get(BatchVariant.ORDINARY).entry,
                     prepare=partial(
-                        comm_ops._consumer_step,
-                        adds_plainly=True,
+                        comm_ops._run_entry,
+                        is_plain_add=True,
                         step=partial(
-                            comm_ops._read_input,
-                            layer_input=None,
+                            comm_ops._update_read,
+                            pre_move=None,
                             enters_stack=False,
-                            read=comm.NORM_QUANT_READ,
-                            update=comm.ADD,
+                            read=comm.NORM_QUANT_READOUT,
+                            update=comm.PLAIN_ADD,
                         ),
                         carried_fusions=(takes_anything,),
                     ),
@@ -287,7 +287,7 @@ class TestPrepareAttnSteps(CustomTestCase):
             step = MagicMock(return_value=torch.full((1, 4), 7.0))
             prepare_input(
                 stub_stage(c, StageKind.ATTENTION),
-                comm.UnreducedOutput(partial_sum, reduce_and_redistribute=step),
+                comm.UnreducedOutput(partial_sum, reduce_to_dp_local=step),
                 torch.zeros(1, 4),
                 None,
             )
@@ -300,7 +300,7 @@ class TestFusedReadForms(CustomTestCase):
     def test_consumer_form_and_backend_policy_are_both_required(self):
         from sglang.srt.layers.layer_boundary.residual.add_norm import (
             Fp8Input,
-            NormQuantRead,
+            NormQuantReadout,
         )
 
         for form in (None, Fp8Input.TUPLE, Fp8Input.TUPLE_AND_BF16):
@@ -324,8 +324,8 @@ class TestFusedReadForms(CustomTestCase):
                         ),
                     ):
                         plan = SimpleNamespace(norm=MagicMock(), fusions=None)
-                        (candidate,) = attention_fusions(
-                            plan, NormQuantRead(fp8_input=form)
+                        (candidate,) = attn_input_fusions(
+                            plan, NormQuantReadout(fp8_input=form)
                         )
                         expected = form is not None and enabled and not disabled_by_env
                         self.assertEqual(candidate.keywords["fuses_quant"], expected)
