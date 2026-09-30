@@ -1,6 +1,6 @@
 import logging
 from contextlib import nullcontext
-from typing import Callable, Optional, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkable
 
 import torch
 
@@ -32,6 +32,9 @@ from sglang.srt.runtime_context import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.speculative.dp_spec_prefill_coordination import (
+    DPSpecPrefillCoordinationPlan,
+)
 from sglang.srt.speculative.draft_worker_common import (
     build_block_pos_offsets,
     build_draft_tp_worker,
@@ -84,6 +87,9 @@ from sglang.srt.utils import (
     is_pin_memory_available,
 )
 
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.model_runner import ModelRunner
+
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
@@ -127,6 +133,9 @@ def _configure_target_hidden_projection(
 class DSparkWorkerV2(BaseSpecWorker):
     """Non-last PP stages run only the target; draft state belongs to the last stage."""
 
+    def weight_update_runners(self) -> list[tuple[str, "ModelRunner"]]:
+        return [("draft", self.draft_model_runner)] if self._hosts_draft else []
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -145,6 +154,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.page_size = get_schedule().page_size
         self.device = target_worker.device
         self._draft_worker = None
+        self.enable_dp_spec_prefill_coordination = (
+            envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
+        )
         self._hosts_draft = get_parallel().pp_group.is_last_rank
         if not self._hosts_draft:
             return
@@ -565,11 +577,45 @@ class DSparkWorkerV2(BaseSpecWorker):
                 on_publish(batch_output.new_seq_lens)
             return batch_output
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            if batch.is_extend_in_batch and self.enable_dp_spec_prefill_coordination:
+                plan = DPSpecPrefillCoordinationPlan(
+                    *batch.dp_spec_prefill_coordination_metadata,
+                    draft_width=self._proposer.query_token_num,
+                    verify_width=self.verify_num_draft_tokens,
+                )
+                if plan.heterogeneous:
+                    return self._forward_dp_spec_prefill_coordination(
+                        batch, plan, on_publish, grammar_barrier, pp_proxy_tensors
+                    )
             self._verify_planner.note_non_decode_step()
             self._observers.note_prefill_step()
             return self._forward_prefill(batch, on_publish, pp_proxy_tensors)
 
         return self._forward_decode(batch, on_publish, grammar_barrier)
+
+    def _forward_dp_spec_prefill_coordination(
+        self, batch, plan, on_publish, grammar_barrier, pp_proxy_tensors
+    ):
+        """Pair local prefill with peer verification after the shared draft pass."""
+        if not batch.forward_mode.is_extend():
+            return self._forward_decode(
+                batch, on_publish, grammar_barrier, coordination_plan=plan
+            )
+
+        rank = get_parallel().attn_dp_rank
+        target_local_only = len(batch.global_num_tokens) == 1
+        plan.apply(
+            batch,
+            "draft",
+            rank,
+            local_only=target_local_only or self._draft_dp_context_enabled,
+        )
+        with self._draft_context():
+            self._proposer.run_idle_participation(batch)
+        plan.apply(batch, "target", rank, local_only=target_local_only)
+        self._verify_planner.note_non_decode_step()
+        self._observers.note_prefill_step()
+        return self._forward_prefill(batch, on_publish, pp_proxy_tensors)
 
     def _forward_prefill(
         self,
@@ -726,7 +772,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def _forward_decode(
-        self, batch: ScheduleBatch, on_publish, grammar_barrier=None
+        self,
+        batch: ScheduleBatch,
+        on_publish,
+        grammar_barrier=None,
+        coordination_plan=None,
     ) -> GenerationBatchResult:
         if batch.spec_info is None:
             batch.spec_info = DFlashDraftInputV2.create_idle_input(device=self.device)
@@ -736,11 +786,32 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "DSpark spec-v2 expected DFlashDraftInputV2 state on the running batch."
             )
 
+        global_num_reqs = (
+            max(batch.global_num_tokens)
+            if self._draft_is_moe
+            and get_parallel().enable_dp_attention
+            and batch.global_num_tokens is not None
+            else None
+        )
+        if coordination_plan is not None:
+            rank = get_parallel().attn_dp_rank
+            target_local_only = len(batch.global_num_tokens) == 1
+            coordination_plan.apply(
+                batch,
+                "draft",
+                rank,
+                local_only=target_local_only or self._draft_dp_context_enabled,
+            )
+
         if batch.forward_mode.is_idle():
             self._observers.note_idle_decode_step()
             if get_parallel().enable_dp_attention:
                 if self._draft_is_moe:
                     self._proposer.run_idle_participation(batch)
+                if coordination_plan is not None:
+                    coordination_plan.apply(
+                        batch, "target", rank, local_only=target_local_only
+                    )
                 self._verify_executor.run_idle_participation(
                     batch=batch, idle_layout=self._idle_verify_ragged_layout(batch)
                 )
@@ -779,6 +850,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         draft_block_ids = proposal.draft_block_ids
         draft_block = proposal.draft_block
         draft_tokens = draft_block.draft_tokens
+        if coordination_plan is not None:
+            coordination_plan.apply(batch, "target", rank, local_only=target_local_only)
 
         confidence = proposal.confidence
         if confidence is None:
@@ -796,13 +869,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             req_pool_indices=batch.req_pool_indices,
         )
 
-        global_num_reqs = (
-            max(batch.global_num_tokens)
-            if self._draft_is_moe
-            and get_parallel().enable_dp_attention
-            and batch.global_num_tokens is not None
-            else None
-        )
         layout = self._verify_planner.schedule_layout(
             req_pool_indices=batch.req_pool_indices,
             prefix_lens=prefix_lens,
@@ -923,6 +989,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
         folded_commit = folded_accept and epilogue.folds_commit
+        # Consume in this step: every decode graph size shares one aux output,
+        # which the next target forward overwrites (resolve_aux_hidden_states_width).
         if not folded_commit:
             self._verify_executor.commit_hidden(
                 batch=batch,

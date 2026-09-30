@@ -193,6 +193,7 @@ class QSAIndexer(MultiPlatformOp):
                 self.q_layernorm.variance_epsilon,
                 self.rotary_emb.is_neox_style,
                 q_heads_padded=q_heads_padded,
+                out_dtype=pool.qsa_compressed_dtype,
             )
             return q, token_k, True
         q_raw = qk[:, : self.index_n_heads * self.index_head_dim]
@@ -200,6 +201,8 @@ class QSAIndexer(MultiPlatformOp):
             -1, self.index_n_heads, self.index_head_dim
         )
         q = self.apply_rope(positions, q)
+        if pool is not None:
+            q = q.to(pool.qsa_compressed_dtype)
         return q, token_k, False
 
     def normalize_compressed_keys(
@@ -487,6 +490,7 @@ class QSAIndexer(MultiPlatformOp):
         max_model_len: int,
         query_positions: torch.Tensor,
         sequence_lengths: torch.Tensor,
+        defer_expansion: bool = False,
     ) -> torch.Tensor:
         logits = qsa_mqa_decode(
             q,
@@ -498,7 +502,7 @@ class QSAIndexer(MultiPlatformOp):
         if logits.is_cuda and self.block_topk == 512:
             # Decode rows start at zero, so compressed lengths double as row lengths;
             # skip the generic zero-fill + subtract.
-            from sglang.kernels.ops.elementwise.fast_topk import fast_topk
+            from sglang.kernels.ops.attention.fast_topk import fast_topk
 
             block_indices = fast_topk(
                 logits,
@@ -511,6 +515,8 @@ class QSAIndexer(MultiPlatformOp):
             block_indices = qsa_fast_topk(
                 logits, row_starts, compressed_lengths, topk=self.block_topk
             )
+        if defer_expansion:
+            return block_indices
         return expand_qsa_block_indices(
             block_indices,
             query_positions,
@@ -519,13 +525,16 @@ class QSAIndexer(MultiPlatformOp):
             token_topk=self.token_topk,
         )
 
-    def forward_cuda(
+    def _forward_impl(
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         forward_batch,
         indexer_metadata,
     ) -> torch.Tensor:
+        """Portable orchestration shared by different platforms.
+        Fast paths are gated per platforms inside kernel calls.
+        """
         forward_mode = forward_batch.forward_mode
         is_target_verify = getattr(forward_mode, "is_target_verify", lambda: False)()
         is_draft_extend = getattr(forward_mode, "is_draft_extend_v2", lambda: False)()
@@ -610,6 +619,7 @@ class QSAIndexer(MultiPlatformOp):
                 max_model_len,
                 logical_positions,
                 indexer_metadata.get_seqlens_int32(),
+                defer_expansion=q.is_cuda and indexer_metadata.defer_block_expansion,
             )
 
         compressed_keys, row_starts, row_ends, sequence_lengths = (
@@ -626,6 +636,28 @@ class QSAIndexer(MultiPlatformOp):
             row_ends,
             logical_positions,
             row_sequence_lengths,
+        )
+
+    def forward_cuda(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch,
+        indexer_metadata,
+    ) -> torch.Tensor:
+        return self._forward_impl(
+            hidden_states, positions, forward_batch, indexer_metadata
+        )
+
+    def forward_xpu(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch,
+        indexer_metadata,
+    ) -> torch.Tensor:
+        return self._forward_impl(
+            hidden_states, positions, forward_batch, indexer_metadata
         )
 
 
