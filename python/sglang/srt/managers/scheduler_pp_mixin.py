@@ -204,8 +204,6 @@ class SchedulerPPMixin:
                         self._pp_process_batch_result(
                             process_target,
                             next_batch_result,
-                            live_batch=self.mbs[next_mb_id],
-                            pp_outputs=next_pp_outputs,
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
                     self.mb_metadata[next_mb_id] = None
@@ -373,8 +371,6 @@ class SchedulerPPMixin:
                     self._pp_process_batch_result(
                         self.mbs[next_mb_id],
                         next_batch_result,
-                        live_batch=self.mbs[next_mb_id],
-                        pp_outputs=next_pp_outputs,
                     )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
                     self.mb_metadata[next_mb_id] = None
@@ -560,8 +556,6 @@ class SchedulerPPMixin:
                         self._pp_process_batch_result(
                             self.mbs[next_mb_id],
                             next_batch_result,
-                            live_batch=self.mbs[next_mb_id],
-                            pp_outputs=next_pp_outputs,
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
                     self.mb_metadata[next_mb_id] = None
@@ -909,17 +903,27 @@ class SchedulerPPMixin:
                 raise RuntimeError(
                     "PP speculative verify result is missing its executed width"
                 )
+            executed_steps = result.speculative_num_steps
+            if executed_steps is None:
+                executed_steps = getattr(
+                    batch.spec_info,
+                    "speculative_num_steps",
+                    get_spec().speculative_num_steps,
+                )
+            next_steps = result.next_speculative_num_steps
+            next_width = result.next_speculative_num_draft_tokens
+            if (next_steps is None) != (next_width is None):
+                raise RuntimeError(
+                    "PP speculative next proposal has incomplete configuration"
+                )
+            if next_steps is None:
+                next_steps, next_width = executed_steps, executed_width
             # These are CPU metadata entries in send_tensor_dict, so reading
             # them on the receiver does not add a device synchronization.
-            executed_steps = getattr(
-                batch.spec_info,
-                "speculative_num_steps",
-                get_spec().speculative_num_steps,
-            )
             write_next_config(
                 tensor_dict,
-                steps=executed_steps,
-                width=executed_width,
+                steps=next_steps,
+                width=next_width,
             )
             if (
                 result.accept_index is not None
@@ -933,11 +937,11 @@ class SchedulerPPMixin:
                 # with the topology its tokens were arranged by.
                 next_chain = result.next_verify_chain
                 if get_spec().speculative_adaptive:
-                    capacity = max_speculative_num_draft_tokens() or executed_width
+                    capacity = max_speculative_num_draft_tokens() or next_width
                     next_chain = encode_chain(
                         next_chain,
                         batch_size=len(batch.reqs),
-                        logical_width=executed_width,
+                        logical_width=next_width,
                         capacity=capacity,
                     )
                 tensor_dict["spec_next_chain"] = next_chain
@@ -1240,20 +1244,10 @@ class SchedulerPPMixin:
                 )
                 next_steps, next_width = read_next_config(pp_outputs.tensors)
                 if next_steps is None or next_width is None:
-                    selected = None
-                    if get_spec().speculative_adaptive:
-                        selected = self.model_worker.select_adaptive_step_for_batch(
-                            len(fwd_batch.reqs)
-                        )
-                    if selected is None:
-                        next_steps = get_spec().speculative_num_steps
-                        next_width = get_spec().speculative_num_draft_tokens
-                    else:
-                        next_steps = selected
-                        next_width = next_steps + 1
-                    # P0 publishes the initial decode configuration. Later
-                    # stages read these host metadata fields from the same
-                    # output-ring message instead of consulting local policy.
+                    next_steps = get_spec().speculative_num_steps
+                    next_width = get_spec().speculative_num_draft_tokens
+                    # The first decode uses the configured initial state. Once
+                    # verify starts, the last stage publishes every next state.
                     write_next_config(
                         pp_outputs.tensors,
                         steps=next_steps,
@@ -1305,70 +1299,9 @@ class SchedulerPPMixin:
         return output_result
 
     def _pp_process_batch_result(
-        self: Scheduler,
-        batch: ScheduleBatch,
-        output_result: GenerationBatchResult,
-        *,
-        live_batch: Optional[ScheduleBatch] = None,
-        pp_outputs: Optional[PPProxyTensors] = None,
+        self: Scheduler, batch: ScheduleBatch, output_result: GenerationBatchResult
     ):
         self.process_batch_result(batch, output_result)
-        if (
-            not self._pp_spec_relay
-            or not get_spec().speculative_adaptive
-            or not self.pp_group.is_first_rank
-            or live_batch is None
-            or pp_outputs is None
-            or "spec_accept_lens" not in pp_outputs.tensors
-        ):
-            return
-        next_steps = self.model_worker.pop_adaptive_step_transition()
-        if next_steps is None:
-            return
-        old_next_steps, _ = read_next_config(pp_outputs.tensors)
-        if old_next_steps == next_steps:
-            return
-        self._pp_spec_apply_adaptive_transition(
-            fwd_batch=batch,
-            live_batch=live_batch,
-            pp_outputs=pp_outputs,
-            next_steps=next_steps,
-        )
-
-    def _pp_spec_apply_adaptive_transition(
-        self: Scheduler,
-        *,
-        fwd_batch: ScheduleBatch,
-        live_batch: ScheduleBatch,
-        pp_outputs: PPProxyTensors,
-        next_steps: int,
-    ) -> None:
-        """Replace an already drafted old-width proposal at P0.
-
-        The CPU policy runs after the last stage has tail-drafted. Relabelling
-        that proposal with a different width would be invalid, so transition
-        through a real degenerate proposal rooted at the sampled bonus token.
-        """
-        next_width = next_steps + 1
-        fwd_rids = [req.rid for req in fwd_batch.reqs]
-        transition = PPSpecRelayInput.degenerate(
-            rids=fwd_rids,
-            bonus_tokens=pp_outputs["spec_bonus_tokens"],
-            num_draft_tokens=next_width,
-            speculative_num_steps=next_steps,
-        )
-        self._pp_spec_set_relay(live_batch, transition)
-
-        write_next_config(
-            pp_outputs.tensors,
-            steps=next_steps,
-            width=next_width,
-        )
-        # Absence of a tail-drafted chain is the existing wire representation
-        # for a degenerate proposal. Downstream stages rebuild it from bonus.
-        pp_outputs.tensors.pop("spec_next_chain", None)
-        pp_outputs.tensors.pop("spec_next_parents", None)
-        pp_outputs.tensors.pop("spec_next_top_scores", None)
 
     def _pp_spec_compact_accept_kv(
         self: Scheduler,

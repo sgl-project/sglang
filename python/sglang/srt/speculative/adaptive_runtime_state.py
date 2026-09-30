@@ -149,7 +149,7 @@ class AdaptiveController:
         num_correct_drafts_per_req: list[int],
         batch_size: int,
         executed_steps: int | None = None,
-    ) -> int | None:
+    ) -> None:
         """Feed verify results; switch runtime state if the policy requests it."""
         new_step = self.params.on_verify_complete(
             num_correct_drafts_per_req,
@@ -158,7 +158,6 @@ class AdaptiveController:
         )
         if new_step is not None:
             self._activate(new_step)
-        return new_step
 
     def _activate(self, speculative_num_steps: int) -> None:
         state = self._states.get(speculative_num_steps)

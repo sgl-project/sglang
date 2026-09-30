@@ -229,10 +229,7 @@ class NGRAMWorker(BaseSpecWorker):
             )
 
     def on_verify_complete_cpu(
-        self,
-        num_correct_drafts_per_req: list[int],
-        batch_size: int = 0,
-        executed_steps: Optional[int] = None,
+        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
     ) -> None:
         # Signature must match BaseSpecWorker.on_verify_complete_cpu; the
         # result processor calls it with batch_size as a keyword argument.
