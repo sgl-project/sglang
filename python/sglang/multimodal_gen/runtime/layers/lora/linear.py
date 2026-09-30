@@ -150,22 +150,21 @@ class BaseLayerWithLoRA(nn.Module):
         )
 
         # TODO: Support multiple LoRA adapters when use not merged mode
-        if not self.merged:
-            lora_dtype = lora_A.dtype
-            input_lora = input_parallel.to(dtype=lora_dtype)
-            lora_A_sliced = self.slice_lora_a_weights(
-                lora_A.to(device=input_parallel.device, non_blocking=True)
-            )
-            lora_B_sliced = self.slice_lora_b_weights(
-                lora_B.to(device=input_parallel.device, non_blocking=True)
-            )
-            delta_parallel = _compute_lora_delta(
-                input_lora, lora_A_sliced, lora_B_sliced
-            )
-            if self.lora_alpha != self.lora_rank:
-                delta_parallel *= self.lora_alpha / self.lora_rank  # type: ignore
-            delta_parallel *= self.strength
-            output_parallel += delta_parallel.to(dtype=output_parallel.dtype)
+        lora_dtype = lora_A.dtype
+        input_lora = input_parallel.to(dtype=lora_dtype)
+        lora_A_sliced = self.slice_lora_a_weights(
+            lora_A.to(device=input_parallel.device, non_blocking=True)
+        )
+        lora_B_sliced = self.slice_lora_b_weights(
+            lora_B.to(device=input_parallel.device, non_blocking=True)
+        )
+        delta_parallel = _compute_lora_delta(
+            input_lora, lora_A_sliced, lora_B_sliced
+        )
+        if self.lora_alpha != self.lora_rank:
+            delta_parallel *= self.lora_alpha / self.lora_rank  # type: ignore
+        delta_parallel *= self.strength
+        output_parallel += delta_parallel.to(dtype=output_parallel.dtype)
 
         output = self.base_layer.collect_output(
             self._add_lora_output_offset(output_parallel)
@@ -731,6 +730,10 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         B = B[start_idx:end_idx, :]
         return B
 
+    @torch.compiler.disable
+    def _forward_with_delta(self, x: torch.Tensor) -> torch.Tensor:
+        return super()._forward_with_delta(x)
+
 
 class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
     def __init__(
@@ -827,6 +830,10 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
 
     def slice_lora_b_weights(self, B: torch.Tensor) -> torch.Tensor:
         return B
+
+    @torch.compiler.disable
+    def _forward_with_delta(self, x: torch.Tensor) -> torch.Tensor:
+        return super()._forward_with_delta(x)
 
 
 class LinearWithLoRA(BaseLayerWithLoRA):
