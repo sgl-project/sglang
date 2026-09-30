@@ -17,11 +17,6 @@ from einops import rearrange
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
-from sglang.srt.model_executor.cuda_graph_config import (
-    Backend,
-    Phase,
-    check_cuda_graph_backend,
-)
 from sglang.srt.utils import (
     cdiv,
     cpu_has_amx_support,
@@ -211,9 +206,7 @@ def _get_sm_count(device: torch.device) -> int:
 
 def calc_rows_per_block(M: int, device: torch.device) -> int:
     # Use a constant value when the row count must not affect kernel numerics.
-    if is_batch_invariant_mode_enabled() or check_cuda_graph_backend(
-        Phase.PREFILL, Backend.TC_PIECEWISE
-    ):
+    if is_batch_invariant_mode_enabled():
         return MAX_ROWS_PER_BLOCK
     sm_count = _get_sm_count(device)
     rows_per_block = next_power_of_2(cdiv(M, 2 * sm_count))

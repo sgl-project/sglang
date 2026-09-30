@@ -107,6 +107,9 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.mem_cache.deepseek_v4_compress_state import KVAndScore
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+)
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -246,58 +249,6 @@ def _maybe_precompute_flashmla_sched_meta(
     )
     flashmla_metadata.tile_scheduler_metadata = meta
     flashmla_metadata.num_splits = num_splits
-
-
-def _low_ratio_source_projections(layer, x, q_lora, positions, bufs):
-    from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-        get_tc_piecewise_forward_context,
-    )
-
-    real = (
-        get_tc_piecewise_forward_context().forward_batch.global_num_token_non_padded_cpu
-    )
-    if real is None:
-        real = x.shape[0]
-
-    # These GEMMs pick their algorithm by M, so at the bucket size the live rows
-    # differ from eager; everything downstream is row-independent.
-    def put(name, value):
-        buf = bufs[name]
-        buf[:real].copy_(value)
-        buf[real:].zero_()
-
-    if real == 0:
-        # An idle DP-attention rank replays on fabricated rows with no live
-        # token; a zero-row GEMM is a launch error, so only zero the buffers.
-        for buf in bufs.values():
-            buf.zero_()
-        return
-
-    if layer.compressor is not None:
-        kv, score = layer.compressor.project(x[:real])
-        put("kv", kv)
-        if score is not None:
-            put("score", score)
-    if layer.indexer is not None:
-        indexer = layer.indexer
-        put("q", indexer.queries(q_lora[:real], layer.freqs_cis[positions[:real]]))
-        put("w", indexer.head_weights(x[:real]))
-
-
-def _bcg_low_ratio_source_projections(*args):
-    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
-        eager_on_graph,
-    )
-
-    global _bcg_low_ratio_source_projections_fn
-    if _bcg_low_ratio_source_projections_fn is None:
-        _bcg_low_ratio_source_projections_fn = eager_on_graph(True)(
-            _low_ratio_source_projections
-        )
-    return _bcg_low_ratio_source_projections_fn(*args)
-
-
-_bcg_low_ratio_source_projections_fn = None
 
 
 def _as_int_list(values) -> Optional[List[int]]:
@@ -2735,7 +2686,9 @@ class DeepseekV4AttnBackend(
             and self._low_ratio_in_prefill_graph()
         ):
             bufs = self._source_projection_buffers(x.shape[0], layer.compress_ratio)
-            _bcg_low_ratio_source_projections(layer, x, q_lora, pos, bufs)
+            self._eager_low_ratio_source_projections(
+                layer, x, q_lora, pos, bufs, forward_batch
+            )
             if run_compressor and layer.compressor is not None:
                 self._low_ratio_compress_torch(
                     layer, x, req, pos, projected=(bufs["kv"], bufs.get("score"))
@@ -3998,6 +3951,39 @@ class DeepseekV4AttnBackend(
             page_index_aligned_size=PAGE_INDEX_ALIGNED_SIZE,
         )
         return swa_page_indices, swa_topk_lengths
+
+    @eager_on_graph
+    def _eager_low_ratio_source_projections(
+        self, layer, x, q_lora, positions, bufs, forward_batch
+    ):
+
+        real = forward_batch.global_num_token_non_padded_cpu
+        if real is None:
+            real = x.shape[0]
+
+        # These GEMMs pick their algorithm by M, so at the bucket size the live rows
+        # differ from eager; everything downstream is row-independent.
+        def put(name, value):
+            buf = bufs[name]
+            buf[:real].copy_(value)
+            buf[real:].zero_()
+
+        if real == 0:
+            # An idle DP-attention rank replays on fabricated rows with no live
+            # token; a zero-row GEMM is a launch error, so only zero the buffers.
+            for buf in bufs.values():
+                buf.zero_()
+            return
+
+        if layer.compressor is not None:
+            kv, score = layer.compressor.project(x[:real])
+            put("kv", kv)
+            if score is not None:
+                put("score", score)
+        if layer.indexer is not None:
+            indexer = layer.indexer
+            put("q", indexer.queries(q_lora[:real], layer.freqs_cis[positions[:real]]))
+            put("w", indexer.head_weights(x[:real]))
 
 
 class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):

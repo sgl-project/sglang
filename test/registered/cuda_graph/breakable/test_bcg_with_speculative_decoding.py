@@ -1,7 +1,5 @@
 """Test breakable CUDA graph (BCG) coexisting with EAGLE3 speculative
-decoding. Sibling of test_pcg_with_speculative_decoding.py — same
-target/draft pair, only flips the prefill backend from tc_piecewise to
-breakable. Verifies the draft-side BCG plumbing in PrefillCudaGraphRunner
+decoding. Verifies the draft-side BCG plumbing in PrefillCudaGraphRunner
 stays wired (capture_hidden_mode for EAGLE, static_draft_hidden_states
 buffer sized from the draft's fc input, EagleDraftInput at capture, and
 the load_batch refresh).

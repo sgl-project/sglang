@@ -84,6 +84,3 @@ class NPUSRTPlatform(NPUDeviceMixin, SRTPlatform):
     def support_cuda_graph(self) -> bool:
         # NPUGraphRunner in hardware_backend/npu/graph_runner
         return True
-
-    def support_piecewise_cuda_graph(self) -> bool:
-        return False

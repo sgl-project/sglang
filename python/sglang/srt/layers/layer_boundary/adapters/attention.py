@@ -29,11 +29,6 @@ from sglang.srt.layers.layer_boundary.layout import (
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.moe import get_moe_a2a_backend
-from sglang.srt.model_executor.cuda_graph_config import (
-    Backend,
-    Phase,
-    check_cuda_graph_backend,
-)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_forward, get_parallel, get_spec
 from sglang.srt.utils import is_cuda, is_npu
@@ -108,7 +103,6 @@ class AttnTpContext:
             and not is_dp_attention_enabled()
             and get_moe_a2a_backend().is_none()
             and not enable_moe_dense_fully_dp()
-            and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
             and get_spec().speculative_algorithm != "EAGLE3"
         )
         if get_parallel().enable_attn_tp_input_scattered:

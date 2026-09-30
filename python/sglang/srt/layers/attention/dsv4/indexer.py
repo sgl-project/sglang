@@ -48,9 +48,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-    is_in_tc_piecewise_cuda_graph,
-)
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -598,7 +595,6 @@ class C4IndexerBackendMixin:
         if (
             get_parallel().attn_cp_size != 1
             or self.hisparse_coordinator is not None
-            or is_in_tc_piecewise_cuda_graph()
             or is_in_breakable_cuda_graph()
         ):
             return False

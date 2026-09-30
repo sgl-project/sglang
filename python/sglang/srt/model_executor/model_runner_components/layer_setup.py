@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, NamedTuple, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import msgspec
 from torch import nn
@@ -9,30 +9,15 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
 
 
-class AttentionAndMoeLayers(NamedTuple):
-    attention_layers: list[Any]
-    moe_layers: list[Any]
-    moe_fusions: list[Any]
-    dsa_indexers: list[Any]
-    mha_companion_layers: list[Any]
-
-
 def _get_loop_num(hf_config: Any) -> int:
     # Nanbeige uses num_loops; IQuestLoopCoder uses loop_num.
     return int(getattr(hf_config, "loop_num", getattr(hf_config, "num_loops", 1)) or 1)
 
 
-def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
-    attention_layers: list[Any] = []
-    moe_layers: list[Any] = []
-    moe_fusions: list[Any] = []
-    dsa_indexers: list[Any] = []
-    mha_companion_layers: list[Any] = []
-
-    # Loop models (Nanbeige / IQuestLoopCoder) store one RadixAttention per loop
-    # in a ModuleList. Prefill CUDA graph indexes by layer_id, so expand and
-    # reorder to a dense [0..N) list.
-    has_loop_attn = False
+def compute_attention_layer_info(layer_model: Any) -> tuple[int, bool]:
+    """Count supported attention layers and detect MHA companions for graph gates."""
+    attention_layer_count = 0
+    has_mha_companion_layers = False
 
     layers = layer_model.layers
     if isinstance(layers, nn.ModuleDict):
@@ -69,56 +54,19 @@ def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
             if hasattr(layer.mixer, "attn"):
                 attn_layer = layer.mixer.attn
             elif hasattr(layer, "_forward_mamba"):
-                # Mamba layer with split op support - store the layer itself
+                # Mamba layer with graph support
                 attn_layer = layer
 
         if isinstance(attn_layer, nn.ModuleList):
-            attention_layers.extend(attn_layer)
-            mha_companion_layers.extend([mha_companion_layer] * len(attn_layer))
-            has_loop_attn = True
-        else:
-            # Keep these lists aligned with global layer ids. Pipeline-parallel
-            # models retain placeholders outside the local stage, while real
-            # attention modules use their global layer_id during graph replay.
-            attention_layers.append(attn_layer)
-            mha_companion_layers.append(mha_companion_layer)
+            # Loop models have one attention module for each execution of a block.
+            attention_layer_count += sum(attn is not None for attn in attn_layer)
+            if len(attn_layer) and mha_companion_layer is not None:
+                has_mha_companion_layers = True
+        elif attn_layer is not None:
+            attention_layer_count += 1
+            has_mha_companion_layers |= mha_companion_layer is not None
 
-        moe_block = None
-        moe_fusion = None
-        if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts"):
-            moe_block = layer.mlp.experts
-            moe_fusion = layer.mlp
-        if hasattr(layer, "block_sparse_moe") and hasattr(
-            layer.block_sparse_moe, "experts"
-        ):
-            moe_block = layer.block_sparse_moe.experts
-            moe_fusion = layer.block_sparse_moe
-        if hasattr(layer, "moe") and hasattr(layer.moe, "experts"):
-            moe_block = layer.moe.experts
-            moe_fusion = layer.moe
-        # For NemotronH MoE layers using 'mixer' attribute
-        if hasattr(layer, "mixer") and hasattr(layer.mixer, "experts"):
-            moe_block = layer.mixer.experts
-            moe_fusion = layer.mixer
-        moe_layers.append(moe_block)
-        moe_fusions.append(moe_fusion)
-        # NSA indexers (None for layers without NSA)
-        dsa_indexer = None
-        if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "indexer"):
-            dsa_indexer = layer.self_attn.indexer
-        dsa_indexers.append(dsa_indexer)
-
-    # Reorder so attention_layers[i] matches RadixAttention.layer_id.
-    if has_loop_attn:
-        attention_layers.sort(key=lambda x: x.layer_id)
-
-    return AttentionAndMoeLayers(
-        attention_layers,
-        moe_layers,
-        moe_fusions,
-        dsa_indexers,
-        mha_companion_layers,
-    )
+    return attention_layer_count, has_mha_companion_layers
 
 
 class _PPLayerRange(msgspec.Struct, frozen=True, kw_only=True):

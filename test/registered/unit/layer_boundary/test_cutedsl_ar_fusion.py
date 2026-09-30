@@ -458,11 +458,7 @@ def test_early_shared_load_touches_only_the_finalize_routes():
 
 
 def test_dual_stream_op_pins_the_deferral_off_under_a_deferring_caller():
-    """The op's Tensor schema cannot carry a handoff; the dispatcher would raise
-    "Unable to cast ... to Tensor"."""
-    from sglang.srt.models.deepseek_v2 import (  # noqa: F401  (registers the op)
-        dsv2_flashinfer_moe_dual_stream_graph,
-    )
+    """The captured dual-stream path returns tensors without deferred handoffs."""
 
     class _DeferRecordingMoE:
         def forward_normal_dual_stream(self, hidden_states):
@@ -471,17 +467,12 @@ def test_dual_stream_op_pins_the_deferral_off_under_a_deferring_caller():
 
     reset_context()
     fusion = _DeferRecordingMoE()
-    op = torch.ops.sglang.dsv2_flashinfer_moe_dual_stream_graph.default
-    # The CUDA key runs the real schema while the stub keeps tensors on CPU.
-    cuda_key = torch._C.DispatchKeySet(torch._C.DispatchKey.CUDA)
-    with (
-        get_forward().scoped(defer_moe_finalize=True),
-        patch(
-            "sglang.srt.models.deepseek_v2.get_tc_piecewise_forward_context",
-            return_value=SimpleNamespace(moe_fusions={0: fusion}),
-        ),
-    ):
-        out = op.redispatch(cuda_key, torch.zeros(4, 8), 0, True, False)
+    from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
+
+    with get_forward().scoped(defer_moe_finalize=True):
+        out = DeepseekV2MoE._forward_moe_dual_stream_graph(
+            fusion, torch.zeros(4, 8), True, False
+        )
         assert get_forward().defer_moe_finalize is True
 
     assert fusion.seen_defer is False

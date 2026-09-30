@@ -325,10 +325,6 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
             patch(f"{_INDEXER}.is_cuda", return_value=True),
             patch(f"{_INDEXER}.is_hip", return_value=False),
             get_parallel().override(attn_cp_size=1),
-            patch(
-                f"{_INDEXER}.is_in_tc_piecewise_cuda_graph",
-                return_value=overrides.get("piecewise_graph", False),
-            ),
             patch(f"{_INDEXER}.is_in_breakable_cuda_graph", return_value=False),
             patch("torch.cuda.is_current_stream_capturing", return_value=False),
         ):
@@ -353,7 +349,6 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
             {"batch_size": 20_000},
             {"tbo": (1, 2)},
             {"prefill_graph": True},
-            {"piecewise_graph": True},
             {"fp4": True},
         ):
             with self.subTest(case=case):
@@ -766,7 +761,6 @@ class TestPagedIndexerMetadataChunking(CustomTestCase):
                 patch(f"{_METADATA}.get_is_capture_mode", return_value=capture_mode),
                 patch("torch.cuda.is_current_stream_capturing", return_value=False),
                 patch(f"{_METADATA}.is_in_breakable_cuda_graph", return_value=False),
-                patch(f"{_METADATA}.is_in_tc_piecewise_cuda_graph", return_value=False),
                 patch(
                     f"{_METADATA}.mqa_logits_budget_bytes", return_value=4096
                 ) as budget,

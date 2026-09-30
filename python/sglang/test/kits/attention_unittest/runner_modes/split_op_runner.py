@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import Any, Callable
 
@@ -6,12 +7,6 @@ import torch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     enable_breakable_cuda_graph,
-)
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.context_manager import (
-    enable_tc_piecewise_cuda_graph as enable_piecewise_cuda_graph,
-)
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.context_manager import (
-    set_tc_piecewise_forward_context as piecewise_forward_context,
 )
 
 from ..attention_methods.dense_attention import DEFAULT_DEVICE as DENSE_DEFAULT_DEVICE
@@ -178,13 +173,13 @@ class SplitOpAdapter:
 
 def _check_extend_split_op_case(case) -> None:
     if not case.forward_mode.is_extend_without_speculative():
-        raise ValueError("PCG/BCG split-op coverage expects non-spec extend cases.")
+        raise ValueError("Full/BCG split-op coverage expects non-spec extend cases.")
 
 
 def _split_op_context(*, breakable: bool):
     if breakable:
         return enable_breakable_cuda_graph()
-    return enable_piecewise_cuda_graph()
+    return nullcontext()
 
 
 def _make_static_forward_batch(raw_batch, static_num_tokens: int, device: str):
@@ -274,7 +269,7 @@ def _run_split_op_extend_case(
         testcase,
         case,
         **build_kwargs,
-        disable_piecewise_cuda_graph=False,
+        disable_prefill_cuda_graph=False,
     )
     split_inputs = adapter.fixture_inputs(split_fixture)
     split_initial_state = adapter.clone_state(split_fixture)
@@ -307,13 +302,12 @@ def _run_split_op_extend_case(
     with (
         torch.no_grad(),
         _split_op_context(breakable=breakable),
-        forward_context(ForwardContext(attn_backend=split_fixture.backend)),
-        piecewise_forward_context(
-            static_batch,
-            adapter.attention_layers(split_fixture),
-            None,
-            [],
-            [],
+        forward_context(
+            ForwardContext(
+                attn_backend=split_fixture.backend,
+                full_graph=not breakable,
+                raw_num_tokens=raw_num_tokens,
+            )
         ),
     ):
         split_fixture.backend.init_forward_metadata(raw_batch)
@@ -475,7 +469,7 @@ def run_kda_split_op_extend_case(
     dtype: torch.dtype = KDA_DEFAULT_DTYPE,
     device: str = KDA_DEFAULT_DEVICE,
 ):
-    """KDA PCG/BCG split-op extend. Verifies the live-token slicing contract
+    """KDA Full/BCG split-op extend. Verifies the live-token slicing contract
     with a larger static token buffer, mirroring GDN's split_op coverage."""
     adapter = SplitOpAdapter(
         build_fixture=build_kda_attention_fixture,
@@ -521,7 +515,7 @@ def run_lightning_split_op_extend_case(
     dtype: torch.dtype = LIGHTNING_DEFAULT_DTYPE,
     device: str = LIGHTNING_DEFAULT_DEVICE,
 ):
-    """Lightning PCG/BCG split-op extend. Same pattern as KDA/GDN."""
+    """Lightning Full/BCG split-op extend. Same pattern as KDA/GDN."""
     adapter = SplitOpAdapter(
         build_fixture=build_lightning_attention_fixture,
         fixture_inputs=lightning_fixture_inputs,
@@ -564,7 +558,7 @@ def run_mamba2_split_op_extend_case(
     dtype: torch.dtype = MAMBA2_DEFAULT_DTYPE,
     device: str = MAMBA2_DEFAULT_DEVICE,
 ):
-    """Mamba2 PCG/BCG split-op extend. Same pattern as KDA. Mamba2's
+    """Mamba2 Full/BCG split-op extend. Same pattern as KDA. Mamba2's
     forward writes through an `empty_like(hidden_states)` buffer that
     short-circuits the RadixAttention dispatch path, so the per-head-vs-flat
     shape mismatch that blocks Lightning split-op doesn't apply."""

@@ -4,6 +4,7 @@ import copy
 import logging
 import re
 from array import array
+from contextlib import contextmanager
 from typing import Iterable, Optional, Set, Tuple
 
 import torch
@@ -20,7 +21,6 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.radix_attention import force_eager_attention
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -39,9 +39,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
     is_in_breakable_cuda_graph,
-)
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-    get_tc_piecewise_forward_context,
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.inkling_common.attn import (
@@ -149,6 +146,16 @@ def _is_unsupported_mm_weight_name(name: str) -> bool:
             "image.",
         )
     )
+
+
+@contextmanager
+def force_eager_attention(layer):
+    previous = layer.use_prefill_attention_wrapper
+    layer.use_prefill_attention_wrapper = False
+    try:
+        yield
+    finally:
+        layer.use_prefill_attention_wrapper = previous
 
 
 class InklingDecoderLayer(nn.Module):
@@ -264,8 +271,6 @@ class InklingDecoderLayer(nn.Module):
         # ONE eager break; only mlp_norm + MoE stay captured. Outside a capture
         # these wrappers just run inline. `_breakable_mlp_sconv` runs the final
         # layer's deferred mlp_sconv after the layer loop.
-        self._breakable_attn_group = eager_on_graph(True)(self._attn_group_impl)
-        self._breakable_mlp_sconv = eager_on_graph(True)(self._mlp_sconv_impl)
 
     def _attn_block(
         self,
@@ -361,11 +366,13 @@ class InklingDecoderLayer(nn.Module):
             # then restore the full buffer on forward_batch (shared across layers/replays).
             orig_out_cache_loc = forward_batch.out_cache_loc
             forward_batch.out_cache_loc = orig_out_cache_loc[: hs.shape[0]]
-            with force_eager_attention():
-                hs = self.attn(
-                    hs, positions, forward_batch, log_scaling_tau=log_scaling_tau
-                )
-            forward_batch.out_cache_loc = orig_out_cache_loc
+            try:
+                with force_eager_attention(self.attn.attn):
+                    hs = self.attn(
+                        hs, positions, forward_batch, log_scaling_tau=log_scaling_tau
+                    )
+            finally:
+                forward_batch.out_cache_loc = orig_out_cache_loc
         else:
             hs = self.attn(
                 hs,
@@ -387,7 +394,8 @@ class InklingDecoderLayer(nn.Module):
                 hs = all_gather_hidden(hs, self.attn_tp_group)
         return hs, res
 
-    def _attn_group_impl(
+    @eager_on_graph
+    def _eager_attn_group(
         self,
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
@@ -396,12 +404,12 @@ class InklingDecoderLayer(nn.Module):
         residual_out: torch.Tensor,
         prev_mlp_sconv: Optional[ShortConvolution],
         log_scaling_tau: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
     ) -> None:
         """Eager break: run `_attn_block` on the REAL (non-padded) tokens with the LIVE
         forward_batch and write the result into the padded output buffers. Mutates
         attn_out / residual_out and returns None (the eager_on_graph copy-back is
         per-tensor, not per-tuple, so outputs must be pre-allocated buffers)."""
-        forward_batch = get_tc_piecewise_forward_context().forward_batch
         n = forward_batch.global_num_token_non_padded_cpu
         # log_scaling_tau is per-token, so narrow it to match the real tokens too.
         hs, res = self._attn_block(
@@ -417,15 +425,16 @@ class InklingDecoderLayer(nn.Module):
         if attn_out.shape[0] != n:
             torch._foreach_zero_((attn_out[n:], residual_out[n:]))
 
-    def _mlp_sconv_impl(
+    @eager_on_graph
+    def _eager_mlp_sconv(
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         out: torch.Tensor,
+        forward_batch: ForwardBatch,
     ) -> None:
         """Eager break for the final layer's deferred mlp_sconv: run on the real
         tokens with the live forward_batch, write the padded output buffer."""
-        forward_batch = get_tc_piecewise_forward_context().forward_batch
         n = forward_batch.global_num_token_non_padded_cpu
         y = self.mlp_sconv(hidden_states[:n], positions[:n], forward_batch)
         if self.scattered_sconv:
@@ -463,30 +472,24 @@ class InklingDecoderLayer(nn.Module):
         if forward_batch.forward_mode.is_idle():
             return hidden_states, residual
 
-        # The eager group reads the LIVE forward_batch from the tc_piecewise context
-        # (the only hook evaluated at BCG replay time — the break's captured args are
-        # frozen at capture-bucket shapes). Only the prefill BCG runner installs that
-        # context; the decode breakable backend sets is_in_breakable_cuda_graph() but
-        # NOT the context, so gate on both and otherwise fall through to the inline
-        # path below (which uses the passed forward_batch — correct for decode).
+        # Prefill replay rebinds the group's forward_batch to the live prepared batch.
         if (
             is_in_breakable_cuda_graph()
-            and get_tc_piecewise_forward_context() is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
         ):
             # BCG prefill path: the AR fusion is decode-only, so partials never
             # reach (or leave) this branch.
             assert not prev_mlp_partial and not fuse_ar_sconv and not fuse_attn_ar
             # BCG: {prev mlp_sconv, attn_norm, attn, attn_sconv} run eagerly (one
-            # break under capture); mlp_norm + MoE stay captured. (The live
-            # forward_batch inside the break is read from the shared tc_piecewise
-            # context, which the prefill BCG runner populates at capture and replay.)
+            # break under capture); mlp_norm + MoE stay captured. The decorator
+            # supplies the live prepared forward_batch at replay.
             # Under scattered sconv the group's INPUT can be the previous layer's
             # [T, H/P] MoE shard while its OUTPUT is post-all-gather [T, H], so
             # size the output buffers explicitly (residual is always [T, H]).
             out_shape = (hidden_states.shape[0], self.attn_norm.weight.shape[0])
             attn_out = hidden_states.new_empty(out_shape)
             residual_out = hidden_states.new_empty(out_shape)
-            self._breakable_attn_group(
+            self._eager_attn_group(
                 hidden_states,
                 residual,
                 positions,
@@ -494,6 +497,7 @@ class InklingDecoderLayer(nn.Module):
                 residual_out,
                 prev_mlp_sconv,
                 log_scaling_tau,
+                forward_batch=forward_batch,
             )
             hidden_states, residual = self.mlp_norm(attn_out, residual_out)
             del attn_out
@@ -909,13 +913,11 @@ class InklingCausalLLM(nn.Module):
                     if self._dflash_layers_to_capture
                     else hidden_states
                 )
-            # Same gate as the per-layer group: the eager break needs the tc_piecewise
-            # context (installed only by the prefill BCG runner) to read the live
-            # forward_batch at replay; else run inline with the passed forward_batch.
+            # Match the per-layer prefill eager region.
             scattered = self.layers[-1].scattered_sconv
             if (
                 is_in_breakable_cuda_graph()
-                and get_tc_piecewise_forward_context() is not None
+                and forward_batch.forward_mode.is_extend_without_speculative()
             ):
                 # Under scattered sconv the input is the last MoE's [T, H/P]
                 # shard; the break's output buffer is post-all-gather [T, H].
@@ -925,8 +927,11 @@ class InklingCausalLLM(nn.Module):
                     else hidden_states.shape
                 )
                 mlp_sconv_out = hidden_states.new_empty(out_shape)
-                self.layers[-1]._breakable_mlp_sconv(
-                    hidden_states, positions, mlp_sconv_out
+                self.layers[-1]._eager_mlp_sconv(
+                    hidden_states,
+                    positions,
+                    mlp_sconv_out,
+                    forward_batch=forward_batch,
                 )
                 hidden_states = mlp_sconv_out
             else:

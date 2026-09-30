@@ -16,7 +16,7 @@
 Capture is wired: the captured batch reads `out_cache_loc` out of the registry
 slot, refilled before each replay from the already-rebound kernel-facing loc,
 and the read tables are refilled out-of-graph from the live v2p. So BREAKABLE
-(the CUDA default) and TC_PIECEWISE must be left alone -- an earlier gate
+(the CUDA default)  must be left alone -- an earlier gate
 disabled every prefill backend outright, which cost every unified run its
 prefill graph.
 
@@ -79,7 +79,7 @@ class TestUnifiedPrefillCudaGraphGate(unittest.TestCase):
     def test_non_full_prefill_backends_are_left_enabled(self):
         """BUG REGRESSION. Unified used to disable prefill capture outright, so
         the default BREAKABLE graph silently never ran."""
-        for backend in (Backend.BREAKABLE, Backend.TC_PIECEWISE):
+        for backend in (Backend.BREAKABLE,):
             for attn in (("fa4", "fa4"), ("triton", "triton")):
                 with self.subTest(prefill=backend, attn=attn):
                     cg = _run_handler(prefill_backend=backend, attention_backends=attn)

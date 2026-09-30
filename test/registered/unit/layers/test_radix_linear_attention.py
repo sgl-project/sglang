@@ -66,6 +66,57 @@ class _PhysicalAttentionBackend:
 
 
 class TestRadixLinearAttentionPadding(CustomTestCase):
+    def test_graph_dispatch_distinguishes_prefill_decode_and_verify(self):
+        layer = radix_linear_attention.RadixLinearAttention(
+            layer_id=0,
+            num_q_heads=1,
+            num_k_heads=1,
+            num_v_heads=2,
+            head_q_dim=4,
+            head_k_dim=4,
+            head_v_dim=4,
+        )
+        for mode, extend, verify in (
+            ("prefill", True, False),
+            ("decode", False, False),
+            ("verify", True, True),
+        ):
+            for breakable, full in ((False, False), (True, False), (False, True)):
+                batch = SimpleNamespace(
+                    forward_mode=SimpleNamespace(
+                        is_extend=lambda: extend,
+                        is_target_verify=lambda: verify,
+                        is_extend_without_speculative=lambda: extend and not verify,
+                    ),
+                    global_num_token_non_padded_cpu=3,
+                    out_cache_loc=torch.arange(3),
+                )
+                with (
+                    self.subTest(mode=mode, breakable=breakable, full=full),
+                    patch.object(
+                        radix_linear_attention,
+                        "is_in_breakable_cuda_graph",
+                        return_value=breakable,
+                    ),
+                    patch.object(
+                        radix_linear_attention,
+                        "is_in_full_prefill_graph",
+                        return_value=full,
+                    ),
+                    patch.object(
+                        radix_linear_attention,
+                        "get_attn_backend",
+                        return_value=_FakeAttentionBackend(),
+                    ),
+                    patch.object(layer, "_eager_linear_attention") as eager,
+                ):
+                    layer.forward(
+                        batch, torch.zeros(3, 8), torch.zeros(3, 2), torch.zeros(3, 2)
+                    )
+                    self.assertEqual(
+                        eager.called, extend and (full or (breakable and not verify))
+                    )
+
     def test_eager_padded_input_is_sliced_and_output_shape_is_restored(self):
         layer = radix_linear_attention.RadixLinearAttention(
             layer_id=0,
@@ -86,8 +137,8 @@ class TestRadixLinearAttentionPadding(CustomTestCase):
         with (
             patch.object(
                 radix_linear_attention,
-                "get_tc_piecewise_forward_context",
-                return_value=None,
+                "is_in_full_prefill_graph",
+                return_value=False,
             ),
             patch.object(
                 radix_linear_attention,
@@ -126,8 +177,8 @@ class TestRadixLinearAttentionPadding(CustomTestCase):
         with (
             patch.object(
                 radix_linear_attention,
-                "get_tc_piecewise_forward_context",
-                return_value=None,
+                "is_in_full_prefill_graph",
+                return_value=False,
             ),
             patch.object(
                 radix_linear_attention,
@@ -165,8 +216,8 @@ class TestRadixLinearAttentionPadding(CustomTestCase):
         with (
             patch.object(
                 radix_linear_attention,
-                "get_tc_piecewise_forward_context",
-                return_value=None,
+                "is_in_full_prefill_graph",
+                return_value=False,
             ),
             patch.object(
                 radix_linear_attention,
@@ -201,8 +252,8 @@ class TestRadixLinearAttentionPadding(CustomTestCase):
                 with (
                     patch.object(
                         radix_linear_attention,
-                        "get_tc_piecewise_forward_context",
-                        return_value=context,
+                        "is_in_full_prefill_graph",
+                        return_value=True,
                     ),
                     patch.object(
                         radix_linear_attention,
@@ -210,12 +261,13 @@ class TestRadixLinearAttentionPadding(CustomTestCase):
                         return_value=_FakeAttentionBackend(),
                     ),
                 ):
-                    radix_linear_attention._unified_linear_attention_with_output_impl(
+                    radix_linear_attention._linear_attention_with_output_impl(
                         mixed_qkv=torch.zeros((padded_num_tokens, 8)),
                         a=torch.zeros((padded_num_tokens, 2)),
                         b=torch.zeros((padded_num_tokens, 2)),
                         output=output,
-                        layer_id=0,
+                        attention_layer=context.attention_layers[0],
+                        forward_batch=forward_batch,
                     )
 
                 torch.testing.assert_close(output[:, :3], torch.full((1, 3, 2, 4), 5.0))

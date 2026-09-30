@@ -242,15 +242,10 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             model_config=SimpleNamespace(context_len=8192, num_hidden_layers=1),
             layer_info=SimpleNamespace(start_layer=0, end_layer=1),
             req_to_token_pool=SimpleNamespace(size=1),
-            get_cuda_graph_layers=lambda _layer_model: (
-                [object()],
-                [],
-                [],
-                [],
-                [None],
-            ),
         )
-        language_model = SimpleNamespace(layers=[object()])
+        language_model = SimpleNamespace(
+            layers=[SimpleNamespace(self_attn=SimpleNamespace(attn=object()))]
+        )
 
         with (
             patch.object(graph_setup, "check_cuda_graph_backend", return_value=False),
@@ -274,30 +269,6 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             )
 
         self.assertIs(capture.runner, prefill_runner)
-
-    def test_eagle_target_tc_piecewise_skips_last_mode_capture(self):
-        eager_runner = object()
-        # The server-side hidden-state ceiling and graph config are bag leaves.
-        override = get_context().override_server_args(
-            enable_return_hidden_states=True,
-            return_hidden_states_mode="last",
-            cuda_graph_config=SimpleNamespace(
-                prefill=SimpleNamespace(backend=Backend.TC_PIECEWISE)
-            ),
-        )
-        override.install()
-        self.addCleanup(override.restore)
-        model_runner = SimpleNamespace(
-            is_draft_worker=False,
-            spec_algorithm=SimpleNamespace(is_eagle=lambda: True),
-        )
-
-        capture = capture_prefill_graph(
-            model_runner=model_runner,
-            eager_runner=eager_runner,
-        )
-
-        self.assertIs(capture.runner, eager_runner)
 
     def test_pp_proxy_output_is_trimmed_to_raw_prefill_tokens(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)

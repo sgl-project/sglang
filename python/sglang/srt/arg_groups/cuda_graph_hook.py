@@ -22,14 +22,10 @@ from sglang.srt.model_executor.cuda_graph_config import (
     default_cuda_graph_config,
     with_phase,
 )
-from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
-    is_cpu,
-    is_mps,
     parse_connector_type,
 )
-from sglang.srt.utils.hf_transformers_utils import check_gguf_file
 
 logger = logging.getLogger(__name__)
 
@@ -84,11 +80,6 @@ def parse_cuda_graph_config(server_args: Any):
         _set(Phase.DECODE, "bs", cfg.cuda_graph_bs_decode)
     if cfg.cuda_graph_bs_prefill is not None:
         _set(Phase.PREFILL, "bs", cfg.cuda_graph_bs_prefill)
-    if cfg.cuda_graph_tc_compiler is not None:
-        # Written to both phases so the value is in place when TC_PIECEWISE
-        # decode is implemented; today decode ignores it.
-        _set(Phase.DECODE, "tc_compiler", cfg.cuda_graph_tc_compiler)
-        _set(Phase.PREFILL, "tc_compiler", cfg.cuda_graph_tc_compiler)
     if cfg.cuda_graph_prefill_max_context is not None:
         _set(
             Phase.PREFILL,
@@ -113,10 +104,8 @@ def parse_cuda_graph_config(server_args: Any):
 
 def apply_cuda_graph_compatibility(server_args: Any):
     """Auto-disable prefill cuda graph for incompatible configs.
-    Rules are split per backend — TcPiecewise and Breakable have
-    different constraints. Skipped when the user explicitly set the
-    prefill backend, whichever value they chose (the contract the removed
-    --enforce-piecewise-cuda-graph used to spell).
+    Breakable and Full have different constraints. Skip automatic selection
+    when the user explicitly sets the prefill backend.
     """
 
     cfg = resolving_view(server_args)
@@ -145,131 +134,11 @@ def apply_cuda_graph_compatibility(server_args: Any):
     # piecewise-allowlisted archs run their validated decoder prefill
     # there instead. Archs also on the breakable allowlist keep it --
     # this runs first, so piecewise would otherwise silently win.
-    if (
-        cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE
-        and model_config_of(server_args).is_multimodal_piecewise_cuda_graph_supported
-        and not model_config_of(
-            server_args
-        ).is_multimodal_breakable_cuda_graph_supported
-        # Keep trtllm_mla on the preferred breakable path, which now serves
-        # MLA by falling back to the flashinfer MLA impl for extend.
-        and attention_backends_of(resolved_view(server_args))[0] != "trtllm_mla"
-    ):
-        logger.info(
-            "Using tc_piecewise CUDA graph for validated multimodal decoder prefill."
-        )
-        declare_resolution(
-            server_args,
-            "_apply_cuda_graph_compatibility",
-            cuda_graph_config=with_phase(
-                cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.TC_PIECEWISE
-            ),
-        )
 
-    if cfg.cuda_graph_config.prefill.backend == Backend.TC_PIECEWISE:
-        disable_tc_piecewise_cudagraph_if_incompatible(server_args)
-    elif cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE:
+    if cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE:
         disable_breakable_cudagraph_if_incompatible(server_args)
     elif cfg.cuda_graph_config.prefill.backend == Backend.FULL:
         disable_full_prefill_cudagraph_if_incompatible(server_args)
-
-
-def disable_tc_piecewise_cudagraph_if_incompatible(server_args: Any):
-    """TcPiecewise (torch.compile + piecewise) is incompatible with
-    these configurations. Most are torch.compile / dynamo limitations.
-    """
-
-    cfg = resolving_view(server_args)
-
-    rules = [
-        (
-            "model-arch blacklist",
-            lambda: model_config_of(server_args).is_piecewise_cuda_graph_disabled_model,
-        ),
-        ("DP attention", lambda: resolved_view(server_args).enable_dp_attention),
-        ("full torch.compile mode", lambda: cfg.enable_torch_compile),
-        ("pipeline parallelism (pp_size > 1)", lambda: cfg.pp_size > 1),
-        (
-            "non-CUDA hardware (HIP/NPU/CPU/MPS/XPU)",
-            lambda: (
-                get_platform().is_hip
-                or get_platform().is_npu
-                or is_cpu()
-                or is_mps()
-                or get_platform().is_xpu
-            ),
-        ),
-        (
-            "OOT platform without piecewise support",
-            lambda: (
-                current_platform.is_out_of_tree()
-                and not current_platform.support_piecewise_cuda_graph()
-            ),
-        ),
-        (
-            "MoE A2A backend",
-            lambda: resolved_view(server_args).moe_a2a_backend != "none",
-        ),
-        # Dynamo blocks LoRA under tc_piecewise (per-batch LoRABatchInfo
-        # rebinds break guards); breakable/full support LoRA.
-        ("LoRA", lambda: bool(cfg.lora_paths) or cfg.enable_lora),
-        (
-            "multimodal model",
-            lambda: (
-                model_config_of(server_args).is_multimodal
-                and not model_config_of(
-                    server_args
-                ).is_multimodal_piecewise_cuda_graph_supported
-            ),
-        ),
-        (
-            "GGUF quantization",
-            lambda: (
-                cfg.load_format == "gguf"
-                or resolved_view(server_args).quantization == "gguf"
-                or check_gguf_file(cfg.model_path)
-            ),
-        ),
-        ("DLLM (diffusion LLM)", lambda: cfg.dllm_algorithm is not None),
-        (
-            "CPU offload / hierarchical cache",
-            lambda: cfg.cpu_offload_gb > 0 or cfg.enable_hierarchical_cache,
-        ),
-        (
-            "deterministic inference",
-            lambda: cfg.enable_deterministic_inference,
-        ),
-        ("PD disaggregation", lambda: cfg.disaggregation_mode != "null"),
-        ("symmetric memory", lambda: cfg.enable_symm_mem),
-        (
-            "expert distribution recorder",
-            lambda: (
-                cfg.enable_eplb or cfg.expert_distribution_recorder_mode is not None
-            ),
-        ),
-        (
-            "context parallel (attn_cp_size > 1)",
-            lambda: resolved_view(server_args).attn_cp_size > 1,
-        ),
-        ("CUDA graph debug mode", lambda: cfg.debug_cuda_graph),
-        # Capture builds a dummy extend forward with attn_dcp_metadata=None.
-        (
-            "decode context parallel (dcp_size > 1)",
-            lambda: cfg.dcp_size > 1,
-        ),
-    ]
-    for _name, predicate in rules:
-        if predicate():
-            declare_resolution(
-                server_args,
-                "_disable_tc_piecewise_cudagraph_if_incompatible",
-                cuda_graph_config=with_phase(
-                    cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
-                ),
-            )
-            # One decision, one declaration: every rule declares the same
-            # value, so a later match would only append a duplicate entry.
-            break
 
 
 def disable_breakable_cudagraph_if_incompatible(server_args: Any):
@@ -374,8 +243,7 @@ def disable_full_prefill_cudagraph_if_incompatible(server_args: Any):
 
 def disable_prefill_cuda_graph_for_deepseek_trtllm_mla(server_args: Any):
     """Disable prefill CUDA graph for dsr1 by default when using the trtllm_mla
-    attention backend. Under any captured prefill CUDA graph (tc_piecewise or
-    breakable) trtllm_mla falls back to FlashAttention for prefill and regresses
+    attention backend. Under any captured prefill CUDA graph trtllm_mla falls back to FlashAttention for prefill and regresses
     performance, so disable whichever prefill graph backend is in effect.
     """
 
@@ -397,7 +265,7 @@ def disable_prefill_cuda_graph_for_deepseek_trtllm_mla(server_args: Any):
         "Disabling prefill CUDA graph (%s) by default for the DeepSeek-V3 arch on "
         "the trtllm_mla attention backend (a captured prefill graph forces a "
         "FlashAttention fallback that regresses prefill). Set the prefill cuda graph "
-        "backend explicitly (e.g. --cuda-graph-backend-prefill tc_piecewise) to override.",
+        "backend explicitly (e.g. --cuda-graph-backend-prefill breakable) to override.",
         cfg.cuda_graph_config.prefill.backend,
     )
     declare_resolution(
@@ -545,7 +413,7 @@ def handle_cuda_graph_config(server_args: Any):
     if cfg.cuda_graph_config.prefill.backend == Backend.FULL:
         logger.warning(
             "cuda_graph_config[prefill].backend='full' is experimental. "
-            "Use breakable or tc_piecewise for production workloads."
+            "Use breakable for production workloads."
         )
 
 
@@ -622,7 +490,7 @@ def finalize_cuda_graph_prefill_max_context(server_args: Any) -> None:
 def generate_prefill_cuda_graph_batch_sizes(max_bs: int):
     """
     Generate the list of batch sizes for prefill CUDA graph capture
-    based on max_bs. For tc_piecewise prefill, bs carries the
+    based on max_bs. For prefill, bs carries the
     captured token count (one shape knob per phase).
     """
     capture_sizes = (

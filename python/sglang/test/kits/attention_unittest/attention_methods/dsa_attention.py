@@ -278,7 +278,7 @@ class DSAMockModelRunner(ModelRunner):
         max_context_len: int,
         head_dim: int,
         disable_cuda_graph: bool = True,
-        disable_piecewise_cuda_graph: bool = True,
+        disable_prefill_cuda_graph: bool = True,
         runner_batch_size: int | None = None,
         dsa_prefill_backend: str = "flashmla_auto",
         dsa_decode_backend: str = "flashmla_kv",
@@ -331,8 +331,8 @@ class DSAMockModelRunner(ModelRunner):
                 prefill=PhaseConfig(
                     backend=(
                         Backend.DISABLED
-                        if (disable_cuda_graph or disable_piecewise_cuda_graph)
-                        else Backend.TC_PIECEWISE
+                        if (disable_cuda_graph or disable_prefill_cuda_graph)
+                        else Backend.BREAKABLE
                     ),
                 ),
             ),
@@ -612,7 +612,7 @@ def build_dsa_attention_fixture(
     dtype: torch.dtype = torch.bfloat16,
     device: str = DEFAULT_DEVICE,
     disable_cuda_graph: bool = True,
-    disable_piecewise_cuda_graph: bool = True,
+    disable_prefill_cuda_graph: bool = True,
     runner_batch_size: int | None = None,
     dsa_prefill_backend: str = "flashmla_auto",
     dsa_decode_backend: str = "flashmla_kv",
@@ -642,7 +642,7 @@ def build_dsa_attention_fixture(
         max_context_len=max_context_len,
         head_dim=head_dim,
         disable_cuda_graph=disable_cuda_graph,
-        disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
+        disable_prefill_cuda_graph=disable_prefill_cuda_graph,
         runner_batch_size=runner_batch_size,
         dsa_prefill_backend=dsa_prefill_backend,
         dsa_decode_backend=dsa_decode_backend,
@@ -813,7 +813,7 @@ def build_dsa_sparse_attention_fixture(
     dtype: torch.dtype = torch.bfloat16,
     device: str = DEFAULT_DEVICE,
     disable_cuda_graph: bool = True,
-    disable_piecewise_cuda_graph: bool = True,
+    disable_prefill_cuda_graph: bool = True,
     runner_batch_size: int | None = None,
     dsa_prefill_backend: str = "flashmla_auto",
     dsa_decode_backend: str = "flashmla_kv",
@@ -852,7 +852,7 @@ def build_dsa_sparse_attention_fixture(
         max_context_len=max_context_len,
         head_dim=head_dim,
         disable_cuda_graph=disable_cuda_graph,
-        disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
+        disable_prefill_cuda_graph=disable_prefill_cuda_graph,
         runner_batch_size=runner_batch_size,
         dsa_prefill_backend=dsa_prefill_backend,
         dsa_decode_backend=dsa_decode_backend,

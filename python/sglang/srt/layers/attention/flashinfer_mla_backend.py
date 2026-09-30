@@ -36,9 +36,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
 )
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-    is_in_tc_piecewise_cuda_graph,
-)
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
@@ -441,13 +438,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             prefix_lens = forward_batch.extend_prefix_lens
             extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
             use_ragged = (
-                not get_exec().kernel.flashinfer_mla_disable_ragged
-                and extend_no_prefix
-                # Captured prefill (tc_piecewise or breakable) must use paged
-                # prefill: it stays compatible with prefix cache, and the ragged
-                # wrapper rejects the absorbed-MLA head dims (qk=576, vo=512).
-                and not is_in_tc_piecewise_cuda_graph()
-                and not is_in_breakable_cuda_graph()
+                (not get_exec().kernel.flashinfer_mla_disable_ragged)
+                and (extend_no_prefix)
+                and (not is_in_breakable_cuda_graph())
             )
 
             # build host indptr/len arrays for eager DRAFT_EXTEND_V2 fast plan path

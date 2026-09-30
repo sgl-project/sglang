@@ -7,7 +7,6 @@ import triton
 from torch import nn
 
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
-from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_qkvzba_split_reshape_cat,
 )
@@ -44,11 +43,6 @@ from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
-)
-from sglang.srt.model_executor.cuda_graph_config import (
-    Backend,
-    Phase,
-    check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner import get_is_capture_mode
@@ -196,32 +190,16 @@ class Qwen3GatedDeltaNet(nn.Module):
 
         set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})
         set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
-        self.norm = (
-            RMSNormGated(
-                self.head_v_dim,
-                eps=self.layer_norm_epsilon,
-                group_size=None,
-                norm_before_gate=True,
-                device=torch.get_device_module().current_device(),
-                dtype=config.torch_dtype,
-                **(
-                    {"activation": self.output_gate_type}
-                    if self.output_gate_type is not None
-                    else {}
-                ),
-            )
-            if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-            else FusedRMSNormGated(
-                self.head_v_dim,
-                eps=self.layer_norm_epsilon,
-                activation=(
-                    self.output_gate_type
-                    if self.output_gate_type is not None
-                    else self.activation
-                ),
-                device=torch.get_device_module().current_device(),
-                dtype=config.torch_dtype,
-            )
+        self.norm = FusedRMSNormGated(
+            self.head_v_dim,
+            eps=self.layer_norm_epsilon,
+            activation=(
+                self.output_gate_type
+                if self.output_gate_type is not None
+                else self.activation
+            ),
+            device=torch.get_device_module().current_device(),
+            dtype=config.torch_dtype,
         )
 
         self.out_proj = RowParallelLinear(
@@ -383,11 +361,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         return query, key, value, z, b, a
 
     def _forward_input_proj(self, hidden_states: torch.Tensor):
-        if (
-            _is_cpu
-            or _is_npu
-            or check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-        ):
+        if (_is_cpu) or (_is_npu):
             DUAL_STREAM_TOKEN_THRESHOLD = 0
         else:
             DUAL_STREAM_TOKEN_THRESHOLD = 1024

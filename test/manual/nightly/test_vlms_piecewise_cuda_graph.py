@@ -137,7 +137,7 @@ class TestVLMPiecewiseCudaGraph(CustomTestCase):
                     "--trust-remote-code",
                     "--cuda-graph-max-bs-prefill",
                     "8192",
-                    "--cuda-graph-backend-prefill=tc_piecewise",
+                    "--cuda-graph-backend-prefill=breakable",
                     "--tp=8",
                     "--cuda-graph-tc-compiler=eager",
                     "--disable-radix-cache",

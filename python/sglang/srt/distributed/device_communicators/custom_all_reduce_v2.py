@@ -42,9 +42,6 @@ from sglang.kernels.ops.communication.all_reduce import (
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-    is_in_tc_piecewise_cuda_graph,
-)
 from sglang.srt.utils.cuda_vmm_utils import (
     VmmGraphInputManager,
     compute_graph_capture_bases,
@@ -326,11 +323,7 @@ class CustomAllReduceV2:
         # hot path never reaches the cudart capture query. During capture,
         # warm-up runs execute immediately and must not consume a
         # graph_params row (it would be dereferenced before registration).
-        return (
-            self._graph_mode_allowed
-            and not is_in_tc_piecewise_cuda_graph()
-            and torch.cuda.is_current_stream_capturing()
-        )
+        return (self._graph_mode_allowed) and (torch.cuda.is_current_stream_capturing())
 
     def _pick_config(self, nbytes: int, can_use_graph: bool) -> AllReduceConfig | None:
         # TODO: refactor this along with the config file

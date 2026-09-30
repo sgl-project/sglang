@@ -1765,8 +1765,6 @@ def cutedsl_moe_max_num_tokens(server_args: Any) -> int:
         num_tokens_per_req = 1
     prefill_tokens = cfg.max_prefill_tokens
     cg_config = cfg.cuda_graph_config
-    if cg_config is not None and cg_config.prefill.backend == Backend.TC_PIECEWISE:
-        prefill_tokens = max(prefill_tokens, cg_config.prefill.max_bs or 0)
     decode_max_bs = (cg_config.decode.max_bs if cg_config is not None else 0) or 0
     decode_tokens = decode_max_bs * num_tokens_per_req
     return max(prefill_tokens, decode_tokens)
