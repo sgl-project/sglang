@@ -108,6 +108,11 @@ class ExitPolicy:
             forward_batch=forward_batch,
             dp_step=None,
             steps=steps,
+            output_move=(
+                steps.complete_output_move
+                if steps.output_move_completes_sum
+                else steps.output_move
+            ),
         )
         return self._record_output(
             hidden_states,
@@ -182,6 +187,7 @@ class ExitPolicy:
             forward_batch=forward_batch,
             dp_step=dp_step,
             steps=steps,
+            output_move=steps.output_move,
         )
         defer_moe_finalize = (
             self.plan.fusions is not None
@@ -244,6 +250,7 @@ class ExitPolicy:
         forward_batch: ForwardBatch,
         dp_step: Optional[Callable],
         steps,
+        output_move: Optional[Callable],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """This layer's postprocess, run with the attention-DP step already
         chosen: the move back to where the next layer reads the FFN output, then
@@ -255,7 +262,7 @@ class ExitPolicy:
                 dp_step or _dp_scatter_step, forward_batch, hidden_states
             )
         else:
-            hidden_states, residual = steps.output_move(
+            hidden_states, residual = output_move(
                 hidden_states=hidden_states,
                 residual=residual,
                 forward_batch=forward_batch,
