@@ -417,12 +417,16 @@ def _fuse_bmm_rope_cache(
     q_nope: torch.Tensor,
     forward_mode: ForwardMode,
     q_replicate_active: bool,
+    is_capture_mode: bool = False,
 ) -> bool:
-    """Keep fusion except at the standalone query route's target verify shapes."""
+    """Use standalone only for the qualified full-graph target verify shapes."""
     if q_replicate_active or not _can_fuse_bmm_rope_cat_and_cache(attn):
         return False
     return not (
-        forward_mode.is_target_verify()
+        is_capture_mode
+        and forward_mode.is_target_verify()
+        and get_exec().graph.cuda_graph_config is not None
+        and get_exec().graph.cuda_graph_config.decode.backend == "full"
         and _use_aiter_gfx950
         and not get_memory().enable_hisparse
         and get_exec().kernel.dsa_decode_backend == "tilelang"
@@ -430,7 +434,7 @@ def _fuse_bmm_rope_cache(
         and q_nope.shape[1:] == (8, 192)
         and attn.kv_lora_rank == 512
         and attn.kv_cache_dtype == "fp8_e4m3"
-        and 32 < q_nope.shape[0] <= 128
+        and q_nope.shape[0] in (64, 128)
     )
 
 
@@ -645,7 +649,11 @@ class DeepseekMLARocmForwardMixin:
         q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
 
         fuse_bmm_rope_cache = _fuse_bmm_rope_cache(
-            self, q_nope, forward_batch.forward_mode, q_replicate_active
+            self,
+            q_nope,
+            forward_batch.forward_mode,
+            q_replicate_active,
+            is_capture_mode=get_is_capture_mode(),
         )
 
         if q_replicate_active:

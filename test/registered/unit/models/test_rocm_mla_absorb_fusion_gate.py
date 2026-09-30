@@ -10,6 +10,7 @@ ForwardBatch to evaluate and so is not part of this predicate.
 """
 
 import unittest
+from functools import partial
 from types import SimpleNamespace
 
 import torch
@@ -64,11 +65,19 @@ class TestFusedAbsorbGate(CustomTestCase):
         self.addCleanup(setattr, forward_mla_rocm, "_use_aiter_gfx950", saved_gfx950)
         self._parallel = _patch_dcp(self, dcp_enabled=False)
         self._exec = SimpleNamespace(
-            kernel=SimpleNamespace(dsa_decode_backend="tilelang")
+            kernel=SimpleNamespace(dsa_decode_backend="tilelang"),
+            graph=SimpleNamespace(
+                cuda_graph_config=SimpleNamespace(
+                    decode=SimpleNamespace(backend="full")
+                )
+            ),
         )
         saved_exec = forward_mla_rocm.get_exec
         forward_mla_rocm.get_exec = lambda: self._exec
         self.addCleanup(setattr, forward_mla_rocm, "get_exec", saved_exec)
+        self._route = partial(
+            forward_mla_rocm._fuse_bmm_rope_cache, is_capture_mode=True
+        )
         self._memory = SimpleNamespace(enable_hisparse=False)
         saved_memory = forward_mla_rocm.get_memory
         forward_mla_rocm.get_memory = lambda: self._memory
@@ -78,21 +87,34 @@ class TestFusedAbsorbGate(CustomTestCase):
         for m in (4, 8, 16, 32, 33, 64, 65, 128, 129, 256, 512, 1024):
             with self.subTest(m=m):
                 self.assertEqual(
-                    forward_mla_rocm._fuse_bmm_rope_cache(
+                    self._route(
                         _attn(),
                         torch.empty(m, 8, 192, dtype=torch.bfloat16),
                         ForwardMode.TARGET_VERIFY,
                         False,
                     ),
-                    not (32 < m <= 128),
+                    m not in (64, 128),
                 )
+
+    def test_eager_and_other_graph_backends_keep_fusion(self):
+        q = torch.empty(64, 8, 192, dtype=torch.bfloat16)
+        self.assertTrue(
+            forward_mla_rocm._fuse_bmm_rope_cache(
+                _attn(), q, ForwardMode.TARGET_VERIFY, False, is_capture_mode=False
+            )
+        )
+        for backend in ("breakable", "tc_piecewise", "disabled"):
+            self._exec.graph.cuda_graph_config.decode.backend = backend
+            self.assertTrue(self._route(_attn(), q, ForwardMode.TARGET_VERIFY, False))
+        self._exec.graph.cuda_graph_config = None
+        self.assertTrue(self._route(_attn(), q, ForwardMode.TARGET_VERIFY, False))
 
     def test_other_forward_modes_keep_fusion(self):
         q = torch.empty(64, 8, 192, dtype=torch.bfloat16)
         for mode in ForwardMode:
             with self.subTest(mode=mode):
                 self.assertEqual(
-                    forward_mla_rocm._fuse_bmm_rope_cache(_attn(), q, mode, False),
+                    self._route(_attn(), q, mode, False),
                     mode != ForwardMode.TARGET_VERIFY,
                 )
 
@@ -106,7 +128,7 @@ class TestFusedAbsorbGate(CustomTestCase):
         ):
             with self.subTest(heads=heads, k=k, dtype=dtype, overrides=overrides):
                 self.assertTrue(
-                    forward_mla_rocm._fuse_bmm_rope_cache(
+                    self._route(
                         _attn(**overrides),
                         torch.empty(64, heads, k, dtype=dtype),
                         ForwardMode.TARGET_VERIFY,
@@ -115,7 +137,7 @@ class TestFusedAbsorbGate(CustomTestCase):
                 )
         self._exec.kernel.dsa_decode_backend = "triton"
         self.assertTrue(
-            forward_mla_rocm._fuse_bmm_rope_cache(
+            self._route(
                 _attn(),
                 torch.empty(64, 8, 192, dtype=torch.bfloat16),
                 ForwardMode.TARGET_VERIFY,
@@ -125,7 +147,7 @@ class TestFusedAbsorbGate(CustomTestCase):
 
     def test_unqualified_device_and_hisparse_keep_fusion(self):
         q = torch.empty(64, 8, 192, dtype=torch.bfloat16)
-        route = forward_mla_rocm._fuse_bmm_rope_cache
+        route = self._route
         forward_mla_rocm._use_aiter_gfx950 = False
         self.assertTrue(route(_attn(), q, ForwardMode.TARGET_VERIFY, False))
         forward_mla_rocm._use_aiter_gfx950 = True
@@ -134,7 +156,7 @@ class TestFusedAbsorbGate(CustomTestCase):
 
     def test_existing_fallbacks_still_win_over_the_row_policy(self):
         q = torch.empty(32, 8, 192, dtype=torch.bfloat16)
-        route = forward_mla_rocm._fuse_bmm_rope_cache
+        route = self._route
         self.assertFalse(route(_attn(), q, ForwardMode.TARGET_VERIFY, True))
         self._parallel.dcp_enabled = True
         self.assertFalse(route(_attn(), q, ForwardMode.TARGET_VERIFY, False))
