@@ -398,7 +398,10 @@ class _SinglePassGatherer(ABC):
         if get_exec().moe.expert_distribution_recorder_mode == "per_token":
             return _DetailSinglePassGatherer(expert_location_metadata, rank)
 
-        if get_exec().moe.moe_a2a_backend == "mori":
+        if (
+            get_exec().moe.moe_a2a_backend == "mori"
+            and envs.SGLANG_MORI_EP_VERSION.get() == "epv1"
+        ):
             return _DeepepLowLatencySinglePassGatherer(expert_location_metadata, rank)
 
         if get_exec().moe.expert_distribution_recorder_mode == "stat_approx":
@@ -1092,9 +1095,14 @@ class _InfiniteBuffer(_Buffer):
         device = self._buffer.device
 
         if self._size == curr_buffer_size:
-            new_buffer = torch.zeros(
-                (2 * curr_buffer_size, *self._item_shape), dtype=dtype, device=device
-            )
+            # Growth can happen inside a caller's inference_mode (e.g. DSpark draft);
+            # an inference tensor buffer would reject later appends made outside it.
+            with torch.inference_mode(False):
+                new_buffer = torch.zeros(
+                    (2 * curr_buffer_size, *self._item_shape),
+                    dtype=dtype,
+                    device=device,
+                )
             new_buffer[:curr_buffer_size] = self._buffer
             self._buffer = new_buffer
 

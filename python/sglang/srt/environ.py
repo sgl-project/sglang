@@ -859,6 +859,14 @@ class Envs:
     # and relies on the RDMA retry-exceeded timeout only.
     SGLANG_MORI_TRANSFER_TIMEOUT_MS = EnvInt(0)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
+    # Unset prefers epv2 and falls back to epv1 where EPv2 is unsupported (moe_hook).
+    SGLANG_MORI_EP_VERSION = EnvStr("epv2")
+    SGLANG_MORI_DISPATCH_DTYPE = EnvStr("auto")
+    # Hand AITER only ceil32(sum of per-rank DP tokens) rows of the MORI EP receive
+    # buffer; unproved layouts or metadata keep the full view. Forces DP-synced buckets.
+    SGLANG_MORI_RECV_BOUND = EnvBool(False)
+    # Unset sizes the cco window from the EPv2 arena of the op being built.
+    SGLANG_MORI_EPV2_PER_RANK_VMM_GB = EnvInt(None)
 
     # ===================================================================
     # AMD, ROCm, and AITER
