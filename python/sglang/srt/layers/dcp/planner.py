@@ -26,7 +26,7 @@ from sglang.kernels.ops.attention.dcp_kernels import (
 )
 from sglang.srt.layers.dcp.layout import (
     dcp_interleave_size,
-    localize_dcp_indices,
+    dcp_local_row,
     update_local_kv_lens_for_dcp,
 )
 from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
@@ -114,28 +114,21 @@ def prepare_decode_context_parallel_metadata(
         extend_prefix_lens_sum,
         parallel.dcp_size,
     )
-    # Prefix lengths are dcp_size-aligned (widened allocator page), so no nonzero().
+    # A prefix starts on a cycle boundary (the allocator page is a multiple of
+    # interleave * dcp_size), so this rank's share is a fixed slice, not a
+    # data-dependent selection -- no nonzero(). At interleave 1 both branches
+    # are the [rank::dcp_size] stride and `// dcp_size` this replaced.
     # `get_mla_kv_buffer` is a read door with the caller-translates contract.
-    #
-    # The allocator page is a multiple of interleave * dcp_size, so a prefix
-    # starts on a cycle boundary and this rank's share is a fixed slice of the
-    # array rather than a data-dependent selection. At interleave 1 the reshape
-    # is the [rank::dcp_size] stride this replaced, and localize_dcp_indices
-    # reduces to the `// dcp_size` that translate_dcp_read_ids applies.
     interleave = dcp_interleave_size()
     translator = get_attn_backend().kv_index_translator
     if interleave == 1:
         owned = dcp_prefix_kv_indices[parallel.dcp_rank :: parallel.dcp_size]
     else:
-        owned = (
-            dcp_prefix_kv_indices.view(-1, parallel.dcp_size, interleave)[
-                :, parallel.dcp_rank, :
-            ]
-            .reshape(-1)
-            .contiguous()
-        )
+        owned = dcp_prefix_kv_indices.view(-1, parallel.dcp_size, interleave)[
+            :, parallel.dcp_rank, :
+        ].reshape(-1)
     dcp_local_prefix_kv_indices = translator.translate_full_attn_ids(
-        localize_dcp_indices(owned, parallel.dcp_size, parallel.dcp_rank, interleave)
+        dcp_local_row(owned, parallel.dcp_size, interleave)
     )
     dcp_kv_buffer = torch.empty(
         (

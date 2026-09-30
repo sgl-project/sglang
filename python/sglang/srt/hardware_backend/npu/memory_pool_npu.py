@@ -6,6 +6,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import (
     dcp_interleave_size,
+    dcp_owner_and_row,
     localize_dcp_indices,
     plan_dcp_owner_write,
 )
@@ -753,15 +754,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def _copy_indices_for_buffer(self, indices, uses_global_slots):
         if uses_global_slots or self.dcp_size <= 1:
             return indices
-        # These index buffer ROWS, not pages, so the interleave is whatever
-        # this pool shards rows by -- not page_size unconditionally, which is
-        # what #37787 passed and what silently selects the wrong rows when the
-        # pool shards per token.
+        # Buffer ROWS, not pages, so this must be the pool's own interleave.
         local_indices = localize_dcp_indices(
-            indices,
-            self.dcp_size,
-            self.dcp_rank,
-            dcp_interleave_size(),
+            indices, self.dcp_size, self.dcp_rank, dcp_interleave_size()
         )
         return local_indices[local_indices >= 0]
 
@@ -1000,30 +995,17 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     ):
         """Redirect a DCP-widened loc so this rank's tokens land on its rows.
 
-        The allocator hands every rank the same *virtual* locations. The latent
-        KV is sharded, so a rank keeps the positions it owns and collapses them
-        into its own rows, following CUDA's contract from
-        kernels/ops/kvcache/mla_buffer.py:42::
-
-            is_valid = loc % DCP_WORLD_SIZE == DCP_RANK
-            loc      = loc // DCP_WORLD_SIZE
-
-        There the filter runs inside the store; here it cannot, because
+        CUDA filters inside the Triton store; here it cannot, because
         ``npu_scatter_nd_update_`` is a fused vendor operator with no body.
 
-        **At decode this rewrites the destination rather than dropping rows.**
-        A boolean index has a data-dependent output shape, so torch_npu
-        resolves it with ``aclnnNonzeroV2`` and must synchronize the stream,
-        which a captured stream refuses. So every row is written and the
-        non-owned ones are aimed at physical row 0. That row is never allocated
-        (the allocator seeds ``free_pages`` from 1), which is what CUDA's
-        ``reserved_skip_index`` reserves it for, and duplicate destinations are
-        fine because nothing reads those values.
+        Decode rewrites the destination rather than dropping rows: a boolean
+        index has a data-dependent shape, so torch_npu resolves it with
+        ``aclnnNonzeroV2`` and syncs the stream, which capture refuses.
+        Non-owned rows are aimed at physical row 0, which the allocator never
+        hands out (``free_pages`` starts at 1) and nothing reads.
 
-        **At extend it drops the rows instead**: extend is never captured, and
-        one forward's write location is a single tensor shared by all layers,
-        so the filter costs one synchronization per forward rather than one per
-        layer. ``plan_dcp_extend_write`` opens that window.
+        Extend drops them instead -- never captured, and one write location is
+        shared by every layer, so the filter costs one sync per forward.
         """
         dcp_size = get_parallel().attn_dcp_size
         # Bounds are checked against the widened space, as the CUDA pool does:
@@ -1045,17 +1027,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 cache_v.index_select(0, owned_idx),
             )
 
-        local = localize_dcp_indices(
+        # Static shape, no NonZero, no stream sync: capturable.
+        owned, dest = dcp_owner_and_row(
             loc, dcp_size, get_parallel().attn_dcp_rank, dcp_interleave_size()
         )
-        # Static shape, no NonZero, no stream sync: capturable. See the note
-        # above for why row 0 is the right place to send the rest. localize
-        # marks non-owned rows -1, which must not reach the store.
-        return (
-            torch.where(local >= 0, local, loc.new_zeros(())),
-            cache_k,
-            cache_v,
-        )
+        return torch.where(owned, dest, loc.new_zeros(())), cache_k, cache_v
 
     def plan_dcp_extend_write(self, loc: torch.Tensor) -> None:
         """Let this extend forward's KV write drop the rows this rank does not own.

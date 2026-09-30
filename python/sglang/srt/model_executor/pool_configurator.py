@@ -347,8 +347,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             if is_deepseek_dsa(model_config.hf_config):
                 # The index-K buffer is replicated under DCP while the latent KV
                 # shards, so this term is short by dcp_size without the scale.
-                # Ours multiplied here too, by dcp_index_buf_widening_factor;
-                # keeping both would have squared it, 256x at dcp16.
+                # Must stay in step with index_size in kv_cache_configurator;
+                # test_dcp_index_buf_budget pins that they agree.
                 indexer_cell_size = self._compute_dsa_indexer_cell_size(
                     kvc=kvc,
                     num_layers=num_layers,
@@ -472,8 +472,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         depend on it, and both were wrong before this predicate existed,
         because that pool differs from the CUDA ``DSATokenToKVPool`` twice over:
 
-        1. **It widens index-K under DCP.** It is the only builder that passes
-           ``index_buf_size=dcp_virtual_loc_extent(...)``, spanning the whole
+        1. **It widens index-K under DCP.** Its ``index_size`` spans the whole
            virtual loc space rather than one rank's shard.
         2. **It stores index-K unquantized.** Plain ``index_head_dim`` at the
            pool's own dtype, where the CUDA pool packs k-with-scale into uint8.

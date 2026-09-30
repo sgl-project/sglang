@@ -503,10 +503,9 @@ class AscendAttnBackend(AttentionBackend):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Build rank-local paged KV metadata for NPU DSA DCP.
 
-        The interleave must be the pool's, not ``page_size`` unconditionally:
-        the block TABLE is the same under either rule, since both stride by
-        ``page_size * dcp_size``, but the LENGTHS are not, and a length built
-        against the wrong partition points the operator past this rank's rows.
+        The interleave must be the pool's. The block TABLE is the same under
+        either rule -- both stride by ``page_size * dcp_size`` -- but the
+        LENGTHS are not, and a wrong one points the operator past this rank.
         """
         parallel = get_parallel()
         interleave = dcp_interleave_size()
@@ -1501,14 +1500,11 @@ class AscendAttnBackend(AttentionBackend):
             layout_kv = "PA_BSND"
 
             if dcp_decode:
-                # Upstream #37787 owns decode (npu/attention/dsa_dcp.py). It
-                # reads its own rank-local metadata off forward_metadata and
-                # ignores the block_table, seq_lengths_kv and sparse_mode the
-                # branches below compute, so it returns before they are set.
-                # Extend stays ours -- gathering the context beats gathering
-                # the query once the tail clears prefix/178, which at a 1M
-                # prefix is 5.6k tokens and we serve 16-32k. See
-                # p20_dcp_extend_cost_model.py.
+                # #37787 owns decode (dsa_dcp.py): it reads rank-local metadata
+                # off forward_metadata and ignores block_table/seq_lengths_kv/
+                # sparse_mode, so it returns before the branches below set them.
+                # Extend stays ours -- gathering the context beats gathering the
+                # query above a tail of prefix/178, and we serve well above it.
                 if self.kv_cache_dtype == torch.float8_e4m3fn:
                     raise NotImplementedError(
                         "FP8 KV cache with decode context parallelism is not "

@@ -5,27 +5,19 @@
               layers/dcp/layout.py::dcp_owner_count
               layers/dcp/layout.py::localize_dcp_indices
 
-A DCP rank holds every ``interleave_size``-sized run of positions whose block
-index is its rank. ``1`` is the historical rule and CUDA's -- its Triton store
-hardcodes ``loc % DCP_WORLD_SIZE == DCP_RANK`` -- and ``page_size`` is what
-upstream #37787 and vLLM-Ascend use on NPU.
+A rank holds every ``interleave_size``-run of positions whose block index is
+its rank: ``1`` is CUDA's rule and this branch's, ``page_size`` is #37787's and
+vLLM-Ascend's. Three claims:
 
-The two rules put the same number of rows on the same physical pages; only
-which positions live there changes. That makes the interesting claims:
-
-    1. at ``interleave_size == 1`` the generalized arithmetic reproduces the
-       old expressions EXACTLY, so turning the flag off is a true no-op;
-    2. the map ``position -> (rank, local row)`` is a bijection with dense
-       local rows under both, which is what lets a rank's shard be a
-       contiguous send with no holes;
+    1. at ``interleave_size == 1`` the arithmetic reproduces the old
+       expressions exactly, so the flag's off position is a true no-op;
+    2. ``position -> (rank, local row)`` is a bijection with dense rows, which
+       is what lets a shard be a contiguous send with no holes;
     3. the extend gather still restores position order.
 
-(3) is the one that would fail silently. The gather's index is precomputed on
-the host and fed to ``index_select``; a wrong index produces a full-size,
-correctly-typed tensor of the wrong rows, and attention on scrambled KV comes
-back as slightly worse output rather than as a crash. So this simulates the
-whole gather -- pad, all-gather, splice, index -- and checks the result is the
-prefix in position order followed by this chunk's own tokens.
+(3) fails silently if it fails: a wrong index gives a correctly-shaped tensor
+of the wrong rows, and attention on scrambled KV degrades output rather than
+crashing. So the whole gather is simulated -- pad, all-gather, splice, index.
 
 Usage:
     python -m pytest test_dcp_interleave.py -v
@@ -61,12 +53,8 @@ def _local_row(pos, dcp_size, interleave):
 
 class TestDcpInterleaveArithmetic(CustomTestCase):
     def test_interleave_one_is_the_historical_rule(self):
-        """The flag's off position must change nothing at all.
-
-        Stated against the literal old expressions rather than against a
-        property, because "off is a no-op" is the claim that lets this land
-        before the box can check it.
-        """
+        # Against the literal old expressions, not a property: "off is a
+        # no-op" is what lets this land before the box can check it.
         for dcp_size in DCP_SIZES:
             for length in range(0, 400):
                 self.assertEqual(
@@ -83,10 +71,8 @@ class TestDcpInterleaveArithmetic(CustomTestCase):
                 self.assertEqual(_local_row(pos, dcp_size, 1), pos // dcp_size)
 
     def test_every_position_lands_on_exactly_one_dense_row(self):
-        """A bijection with no holes. Holes would matter: the send buffer is
-        sized by dcp_owner_count and written by position order, so a gap would
-        shift every later row of that rank by one and the corruption would
-        start partway through the context."""
+        # No holes: the send is sized by dcp_owner_count and filled in
+        # position order, so a gap shifts every later row of that rank.
         for dcp_size in (2, 4, 16):
             for interleave in INTERLEAVES:
                 for length in (0, 1, 127, 128, 1000, 2048, 4097):
@@ -110,8 +96,8 @@ class TestDcpInterleaveArithmetic(CustomTestCase):
                             )
 
     def test_localize_agrees_with_the_plan_arithmetic(self):
-        """The device-side owner test and the host-side plan must agree, or the
-        write lands on a row the gather never reads back."""
+        # Device-side owner test vs host-side plan: disagree and the write
+        # lands on a row the gather never reads back.
         for dcp_size in (2, 4, 16):
             for interleave in INTERLEAVES:
                 pos = torch.arange(3000, dtype=torch.int64)
@@ -149,8 +135,7 @@ class TestDcpExtendGatherRestoresPositionOrder(CustomTestCase):
             )
             for rank in range(dcp_size)
         ]
-        # Every rank must plan the same collectives in the same order, or the
-        # group deadlocks. Only local_lens may differ.
+        # Same collectives in the same order on every rank, or it deadlocks.
         for plan in plans[1:]:
             self.assertEqual(len(plan.pieces), len(plans[0].pieces))
             self.assertEqual(plan.padded_lens, plans[0].padded_lens)
@@ -162,8 +147,7 @@ class TestDcpExtendGatherRestoresPositionOrder(CustomTestCase):
         plan = plans[0]
         padded = plan.padded_lens
 
-        # Each rank's send buffer: its owned prefix rows per request, in order,
-        # padded out to padded_lens -- what _pad_dcp_extend_send builds.
+        # What _pad_dcp_extend_send builds: owned rows per request, padded.
         sends = []
         for rank in range(dcp_size):
             buf = torch.full((sum(padded),), PAD_VALUE, dtype=torch.int64)
@@ -195,9 +179,7 @@ class TestDcpExtendGatherRestoresPositionOrder(CustomTestCase):
             scratch[gathered:] = own[piece.extend_start : piece.extend_end]
             out[piece.out_start : piece.out_end] = scratch.index_select(0, piece.index)
 
-        # One contiguous run per request: its prefix in position order, then
-        # its own tokens -- which is what the sparse operator needs under a
-        # non-paged layout.
+        # One contiguous run per request, which is what the operator needs.
         expected = []
         for req, (plen, elen) in enumerate(zip(prefix_lens, extend_lens)):
             expected += [prefix_val(req, p) for p in range(plen)]
@@ -217,8 +199,8 @@ class TestDcpExtendGatherRestoresPositionOrder(CustomTestCase):
                         self.assertTrue(torch.equal(out, expected))
 
     def test_many_requests_share_a_piece(self):
-        # Small requests ride in one piece together, which is where the
-        # per-request send offset in the index expression earns its keep.
+        # Small requests share a piece -- where the per-request send offset
+        # in the index expression earns its keep.
         for interleave in INTERLEAVES:
             with self.subTest(interleave=interleave):
                 out, expected = self._run(
@@ -227,8 +209,8 @@ class TestDcpExtendGatherRestoresPositionOrder(CustomTestCase):
                 self.assertTrue(torch.equal(out, expected))
 
     def test_a_prefix_that_spans_several_pieces(self):
-        # The piece budget is deliberately small so one request is cut several
-        # times; cuts must fall on whole blocks or a rank's run splits.
+        # Small budget so one request is cut several times; cuts must fall on
+        # whole blocks or a rank's run splits.
         for interleave in INTERLEAVES:
             with self.subTest(interleave=interleave):
                 out, expected = self._run(
@@ -237,8 +219,8 @@ class TestDcpExtendGatherRestoresPositionOrder(CustomTestCase):
                 self.assertTrue(torch.equal(out, expected))
 
     def test_an_unaligned_prefix_still_restores(self):
-        # Served prefixes are cycle-aligned, but the plan pads rather than
-        # assuming it, and the padding rows must never reach the output.
+        # Served prefixes are cycle-aligned; the plan pads rather than
+        # assuming it, and pad rows must never reach the output.
         for interleave in (1, 8):
             for prefix in (1, 7, 129, 1023):
                 with self.subTest(interleave=interleave, prefix=prefix):
