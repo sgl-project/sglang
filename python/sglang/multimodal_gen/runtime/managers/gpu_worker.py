@@ -51,6 +51,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     materialize_output_sample,
     post_process_sample,
     save_outputs,
+    warm_image_writer,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
     WarmupMemoryRecord,
@@ -452,6 +453,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     or self.server_args.is_arg_explicitly_set("dit_layerwise_offload")
                 ),
             )
+
+        if (
+            self.is_output_rank
+            and self.server_args.pipeline_config.task_type.is_image_gen()
+        ):
+            warm_image_writer()
 
         logger.info(
             f"Worker {self.rank}: Initialized device, model, and distributed environment."

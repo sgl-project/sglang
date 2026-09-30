@@ -73,6 +73,24 @@ def test_png_output_saving_uses_fast_pillow_path(
     assert save_calls == [("PNG", expected_compress_level)]
 
 
+def test_warm_image_writer_takes_the_default_jpeg_path(tmp_path, monkeypatch):
+    written = []
+    imwrite = output_utils.imageio.imwrite
+
+    def imwrite_spy(path, frame, **kwargs):
+        written.append((path, kwargs))
+        return imwrite(path, frame, **kwargs)
+
+    monkeypatch.setattr(output_utils.imageio, "imwrite", imwrite_spy)
+    monkeypatch.setattr(output_utils.tempfile, "tempdir", str(tmp_path))
+
+    output_utils.warm_image_writer()
+
+    assert len(written) == 1
+    assert written[0][0].endswith(".jpg") and written[0][1] == {"quality": 75}
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_video_with_audio_uses_single_pass_encoder(tmp_path, monkeypatch):
     output_path = tmp_path / "sample.mp4"
     calls = []
