@@ -260,11 +260,28 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
     return backend
 
 
+def _decode_cache_owns_store(
+    *,
+    disable_radix_cache: bool,
+    enable_hierarchical_cache: bool,
+    retraction_backup: str,
+    hicache_storage_backend: Optional[str],
+    external_linker: bool,
+) -> bool:
+    # Must match default_radix_cache_factory and create_unified_radix_cache:
+    # a chunk cache ignores store flags, and HiCache takes precedence over a linker.
+    if disable_radix_cache and retraction_backup != "host_pool":
+        return False
+    if enable_hierarchical_cache or retraction_backup == "host_pool":
+        return hicache_storage_backend is not None
+    return external_linker
+
+
 def _decode_store_contribution_bytes(
-    *, disaggregation_mode: str, external_linker: bool
+    *, disaggregation_mode: str, cache_owns_store: bool
 ) -> int:
-    if disaggregation_mode != "decode" or external_linker:
-        # Other roles, and a decode rank with a linker, mount through their cache.
+    if disaggregation_mode != "decode" or cache_owns_store:
+        # Other roles, and a decode cache with its own store, mount through it.
         return 0
     # Decode keeps no store-backed cache; it lends memory only when sized like prefill.
     if not envs.MOONCAKE_GLOBAL_SEGMENT_SIZE.is_set():
@@ -290,11 +307,11 @@ def _decode_store_contribution_bytes(
 
 
 def _maybe_create_decode_storage_contributor(
-    *, server_args: ServerArgs, params
+    *, server_args: ServerArgs, params, cache_owns_store: bool
 ) -> object:
     contribution_bytes = _decode_store_contribution_bytes(
         disaggregation_mode=get_disagg().disaggregation_mode,
-        external_linker=get_memory().enable_unified_cache_external_linker,
+        cache_owns_store=cache_owns_store,
     )
     if contribution_bytes == 0:
         return None
@@ -455,7 +472,15 @@ def build_kv_cache(
     )
 
     storage_contributor = _maybe_create_decode_storage_contributor(
-        server_args=server_args, params=params
+        server_args=server_args,
+        params=params,
+        cache_owns_store=_decode_cache_owns_store(
+            disable_radix_cache=disable_radix_cache,
+            enable_hierarchical_cache=enable_hierarchical_cache,
+            retraction_backup=retraction_backup,
+            hicache_storage_backend=get_memory().hicache_storage_backend,
+            external_linker=get_memory().enable_unified_cache_external_linker,
+        ),
     )
 
     tree_context = TreeCacheBuildContext(
