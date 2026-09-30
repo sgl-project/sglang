@@ -54,8 +54,6 @@ class TestFlashAttentionReturnLse(CustomTestCase):
                 kv_cache_dtype=torch.bfloat16,
                 kv_cache_dtype_str="auto",
                 page_size=1,
-                attn_cp_size=1,
-                tp_size=1,
                 is_draft_worker=False,
                 kv_index_translator=KVIndexTranslator(
                     req_to_token=req_pool.req_to_token,
