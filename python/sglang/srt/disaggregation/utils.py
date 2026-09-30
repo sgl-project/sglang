@@ -22,6 +22,7 @@ import torch.distributed as dist
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_dsa
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.layout.transfer import TransferLayout
 from sglang.srt.runtime_context import (
     get_disagg,
     get_spec,
@@ -912,6 +913,82 @@ def compute_mamba_state_slice_byte_blocks(
     return blocks
 
 
+def validate_unified_state_layouts(
+    src: TransferLayout, dst: TransferLayout, src_tp: int, dst_tp: int
+) -> None:
+    """Validate every tensor before any part of a shared state slot is written."""
+    if min(src_tp, dst_tp) <= 0 or max(src_tp, dst_tp) % min(src_tp, dst_tp):
+        raise ValueError("One attention TP size must divide the other")
+    if src.rows_per_block != 1 or dst.rows_per_block != 1:
+        raise ValueError("Unified recurrent state must use one row per slot")
+    if len(src.tensors) != len(dst.tensors):
+        raise ValueError("Unified state tensor counts differ")
+    for a, b in zip(src.tensors, dst.tensors):
+        if (a.name, a.layer_id, a.itemsize, a.slice_axis, a.shard_groups) != (
+            b.name,
+            b.layer_id,
+            b.itemsize,
+            b.slice_axis,
+            b.shard_groups,
+        ):
+            raise ValueError("Unified state tensor metadata differs")
+        shape_a, shape_b = list(a.shape), list(b.shape)
+        if a.slice_axis is not None:
+            shape_a[a.slice_axis] *= src_tp
+            shape_b[b.slice_axis] *= dst_tp
+        if shape_a != shape_b:
+            raise ValueError("Unified state tensor shapes do not match across TP")
+        if a.shard_groups is not None and (
+            a.slice_axis is None
+            or sum(a.shard_groups) != a.slice_dim * src_tp
+            or any(g <= 0 or g % max(src_tp, dst_tp) for g in a.shard_groups)
+        ):
+            raise ValueError("Unified convolution groups cannot be split across TP")
+
+
+def build_unified_state_transfer_blocks(
+    *,
+    src: TransferLayout,
+    dst: TransferLayout,
+    src_base: int,
+    dst_base: int,
+    src_slot: int,
+    dst_slot: int,
+    src_tp: int,
+    dst_tp: int,
+    src_rank: int,
+    dst_rank: int,
+) -> List[Tuple[int, int, int]]:
+    """Reuse tensor TP slicing with envelope strides and per-tensor offsets."""
+    validate_unified_state_layouts(src, dst, src_tp, dst_tp)
+    if not 0 <= src_rank < src_tp or not 0 <= dst_rank < dst_tp:
+        raise ValueError("Unified state TP rank is out of range")
+    if src_rank // max(1, src_tp // dst_tp) != dst_rank // max(1, dst_tp // src_tp):
+        raise ValueError("Unified state peers belong to different TP groups")
+    blocks = []
+    for i, (a, b) in enumerate(zip(src.tensors, dst.tensors)):
+        for src_offset, dst_offset, length in compute_mamba_state_slice_byte_blocks(
+            src_item_len=a.row_bytes,
+            dst_item_len=b.row_bytes,
+            src_dim=a.slice_dim,
+            dst_dim=b.slice_dim,
+            outer_count=a.outer_count,
+            src_attn_tp_size=src_tp,
+            dst_attn_tp_size=dst_tp,
+            local_tp_rank_in_group=src_rank,
+            dst_tp_rank_in_group=dst_rank,
+            conv_shard_groups=a.shard_groups,
+        ):
+            blocks.append(
+                (
+                    src.address(src_base, src_slot, i) + src_offset,
+                    dst.address(dst_base, dst_slot, i) + dst_offset,
+                    length,
+                )
+            )
+    return blocks
+
+
 def build_transfer_entry_pairs(
     src_layer_ids: List[int],
     dst_layer_ids: List[int],
@@ -1326,6 +1403,8 @@ def setup_state_kv_args(
     from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
     from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
+    kv_args.unified_kv_layout = None
+    kv_args.unified_state_layout = None
     kv_args.state_types = []
     kv_args.state_data_ptrs = []
     kv_args.state_data_lens = []
@@ -1431,6 +1510,22 @@ def setup_state_kv_args(
                         c128_item_lens,
                     )
         elif isinstance(token_to_kv_pool, HybridLinearKVPool):
+            from sglang.srt.mem_cache.unified_memory_pool import (
+                UnifiedMambaPool,
+                UnifiedMLATokenToKVPool,
+            )
+
+            if isinstance(
+                token_to_kv_pool.full_kv_pool, UnifiedMLATokenToKVPool
+            ) and isinstance(token_to_kv_pool.mamba_pool, UnifiedMambaPool):
+                kv_args.unified_kv_layout = (
+                    token_to_kv_pool.full_kv_pool.get_transfer_layout(
+                        list(token_to_kv_pool.full_attention_layer_id_mapping)
+                    )
+                )
+                kv_args.unified_state_layout = (
+                    token_to_kv_pool.mamba_pool.get_transfer_layout()
+                )
             dim = (
                 token_to_kv_pool.get_state_dim_per_tensor()
                 if hasattr(token_to_kv_pool, "get_state_dim_per_tensor")

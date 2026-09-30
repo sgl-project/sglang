@@ -1,3 +1,4 @@
+import json
 import struct
 import threading
 import unittest
@@ -123,6 +124,20 @@ class TestDisaggregationWire(unittest.TestCase):
         self.assertEqual(info.dst_kv_item_lens, [])
         info = KVArgsRegisterInfo.from_zmq(msg + [b"", struct.pack("Q", 128)])
         self.assertEqual(info.dst_kv_item_lens, [128])
+
+        from sglang.srt.mem_cache.layout.transfer import TransferLayout, TransferTensor
+
+        layout = TransferLayout(
+            128, 1, (TransferTensor("temporal", 3, 32, (4, 4), 4, 0),)
+        )
+        wire_layout = json.dumps(
+            {"kv": layout.to_dict(), "state": layout.to_dict()}
+        ).encode()
+        info = KVArgsRegisterInfo.from_zmq(
+            msg + [b"", struct.pack("Q", 128), wire_layout]
+        )
+        self.assertEqual(info.dst_unified_kv_layout, layout)
+        self.assertEqual(info.dst_unified_state_layout, layout)
 
     def test_int_lists_roundtrip(self):
         cases = [

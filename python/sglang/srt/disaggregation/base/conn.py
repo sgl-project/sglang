@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, List, Optional
 import numpy as np
 import numpy.typing as npt
 
+from sglang.srt.mem_cache.layout.transfer import TransferLayout
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
@@ -107,6 +108,8 @@ class KVArgs:
     # Only used of npu, for decode total kv layers
     draft_kv_layers: int
     num_draft_entries: int = 0
+    unified_kv_layout: Optional[TransferLayout] = None
+    unified_state_layout: Optional[TransferLayout] = None
 
 
 class KVPoll:

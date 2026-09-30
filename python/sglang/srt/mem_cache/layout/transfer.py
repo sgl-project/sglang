@@ -5,7 +5,7 @@ not separate registration regions: layer views overlap, and the stride between
 pages/slots is generally larger than an individual tensor's payload.
 """
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from math import prod
 from typing import Optional, Tuple
 
@@ -67,4 +67,28 @@ class TransferLayout:
         entry = self.tensors[tensor]
         return (
             base + block * self.block_bytes + entry.offset_bytes + row * entry.row_bytes
+        )
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, value: dict) -> "TransferLayout":
+        return cls(
+            block_bytes=value["block_bytes"],
+            rows_per_block=value["rows_per_block"],
+            tensors=tuple(
+                TransferTensor(
+                    **{
+                        **tensor,
+                        "shape": tuple(tensor["shape"]),
+                        "shard_groups": (
+                            tuple(tensor["shard_groups"])
+                            if tensor.get("shard_groups") is not None
+                            else None
+                        ),
+                    }
+                )
+                for tensor in value["tensors"]
+            ),
         )

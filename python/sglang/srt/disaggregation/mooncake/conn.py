@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import dataclasses
+import json
 import logging
 import os
 import struct
@@ -50,13 +51,16 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     build_dsa_tail_transfer_blocks,
     build_transfer_entry_pairs,
+    build_unified_state_transfer_blocks,
     compute_mamba_state_slice_byte_blocks,
     resolve_dcp_dst_entry_indices,
     should_send_replicated_state,
     slice_dsa_tail_dst_ptrs_for_pp,
+    validate_unified_state_layouts,
 )
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.layout.transfer import TransferLayout
 from sglang.srt.observability.mooncake_trace import (
     MooncakeRequestStage,
     mooncake_trace_func,
@@ -159,10 +163,19 @@ class KVArgsRegisterInfo:
     staging_base_ptr: int = 0
     staging_total_size: int = 0
     staging: Optional[StagingRegisterInfo] = None
+    dst_unified_kv_layout: Optional[TransferLayout] = None
+    dst_unified_state_layout: Optional[TransferLayout] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
+        unified = json.loads(msg[20]) if len(msg) > 20 and msg[20] else {}
         return cls(
+            dst_unified_kv_layout=(
+                TransferLayout.from_dict(unified["kv"]) if unified else None
+            ),
+            dst_unified_state_layout=(
+                TransferLayout.from_dict(unified["state"]) if unified else None
+            ),
             room=str(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
             dst_port=int(msg[2].decode("ascii")),
@@ -983,6 +996,40 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     return ret
             return 0
 
+    def _validate_unified_peer_layout(self, peer: KVArgsRegisterInfo) -> None:
+        if not get_memory().enable_unified_memory:
+            if peer.dst_unified_kv_layout is not None:
+                raise RuntimeError("Both PD peers must enable unified memory")
+            return
+        src_kv = self.kv_args.unified_kv_layout
+        src_state = self.kv_args.unified_state_layout
+        unequal_tp = self.attn_tp_size != peer.dst_attn_tp_size
+        if unequal_tp:
+            if not (
+                self.is_hybrid_mla_backend
+                and self.pp_size == 1
+                and self.dcp_size == peer.dst_dcp_size == 1
+                and src_kv is not None
+                and src_state is not None
+                and peer.dst_unified_kv_layout is not None
+                and peer.dst_unified_state_layout is not None
+            ):
+                raise RuntimeError(
+                    "Unified unequal-TP PD requires hybrid MLA, PP1/DCP1, and "
+                    "transfer layouts from both peers; upgrade both servers"
+                )
+            validate_unified_state_layouts(
+                src_state,
+                peer.dst_unified_state_layout,
+                self.attn_tp_size,
+                peer.dst_attn_tp_size,
+            )
+        if peer.dst_unified_kv_layout is not None:
+            if src_kv != peer.dst_unified_kv_layout:
+                raise RuntimeError("Unified MLA KV layouts differ between PD peers")
+            if not unequal_tp and src_state != peer.dst_unified_state_layout:
+                raise RuntimeError("Unified state layouts differ between PD peers")
+
     def _validate_envelope_kv_layout(
         self,
         dst_kv_ptrs: list[int],
@@ -1003,17 +1050,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         """
         if not get_memory().enable_unified_memory:
             return
-        if dst_attn_tp_size is not None and self.attn_tp_size != dst_attn_tp_size:
-            # The unified mamba state ships as one whole-slot envelope with no
-            # per-tensor dims, so `_send_mamba_state_slice` cannot reslice it and
-            # silently falls back to an unsliced copy. Reject here, before any KV
-            # is written, rather than in `maybe_send_extra` afterwards.
-            raise RuntimeError(
-                "--enable-unified-memory does not support different prefill / "
-                f"decode attention TP sizes (prefill={self.attn_tp_size}, "
-                f"decode={dst_attn_tp_size}): the whole-envelope state cannot "
-                "be TP-resliced."
-            )
         src_item_lens = self.kv_args.kv_item_lens
         if (
             len(src_item_lens) != 1
@@ -1682,6 +1718,40 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
 
             if st == StateType.MAMBA:
+                if (
+                    self.kv_args.unified_state_layout is not None
+                    and target_rank_registration_info is not None
+                    and self.attn_tp_size
+                    != target_rank_registration_info.dst_attn_tp_size
+                ):
+                    dst_layout = target_rank_registration_info.dst_unified_state_layout
+                    if (
+                        dst_layout is None
+                        or len(src_data_ptrs) != 1
+                        or len(dst_data_ptrs) != 1
+                    ):
+                        raise RuntimeError(
+                            "Unified state transfer requires raw buffers and layouts from both peers"
+                        )
+                    if len(indices) != 1 or len(dst_indices) != 1:
+                        raise RuntimeError(
+                            "Unified recurrent state requires one source and destination slot"
+                        )
+                    blocks = build_unified_state_transfer_blocks(
+                        src=self.kv_args.unified_state_layout,
+                        dst=dst_layout,
+                        src_base=src_data_ptrs[0],
+                        dst_base=dst_data_ptrs[0],
+                        src_slot=int(indices[0]),
+                        dst_slot=int(dst_indices[0]),
+                        src_tp=self.attn_tp_size,
+                        dst_tp=target_rank_registration_info.dst_attn_tp_size,
+                        src_rank=self.kv_args.engine_rank % self.attn_tp_size,
+                        dst_rank=target_rank_registration_info.dst_tp_rank
+                        % target_rank_registration_info.dst_attn_tp_size,
+                    )
+                    rc = self._transfer_data(req.mooncake_session_id, blocks) or rc
+                    continue
                 if (not src_dim_per_tensor or not dst_dim_per_tensor) and list(
                     src_item_lens
                 ) != list(dst_item_lens):
@@ -2172,6 +2242,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
+                        )
+                        self._validate_unified_peer_layout(
+                            target_rank_registration_info
                         )
                         is_dcp_transfer = (
                             target_rank_registration_info.requires_dcp_relayout
@@ -2955,6 +3028,14 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                                 f"{len(self.kv_mgr.kv_args.kv_item_lens)}Q",
                                 *self.kv_mgr.kv_args.kv_item_lens,
                             ),
+                            json.dumps(
+                                {
+                                    "kv": self.kv_mgr.kv_args.unified_kv_layout.to_dict(),
+                                    "state": self.kv_mgr.kv_args.unified_state_layout.to_dict(),
+                                }
+                            ).encode("utf-8")
+                            if self.kv_mgr.kv_args.unified_kv_layout is not None
+                            else b"",
                         ]
                     )
             except zmq.ZMQError:
