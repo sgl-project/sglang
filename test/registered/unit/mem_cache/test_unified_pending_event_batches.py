@@ -61,7 +61,7 @@ def _payload(ids, buffer, tag, generation=0):
 class TestUnifiedPendingEventBatches(CustomTestCase):
     def test_multiple_flushes_preserve_event_sources(self):
         # Events model reader completion only; these CPU checks make no CUDA
-        # stream-ordering claim. The allocator selects the actual move geometry.
+        # stream-ordering claim.
         for (layout, owner), page_size, mode in itertools.product(
             ((2, "full"), (3, "full"), (3, "mamba")),
             (1, 4, 16),

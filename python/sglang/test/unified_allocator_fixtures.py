@@ -1,7 +1,4 @@
-"""Small unified-pool builders and fakes shared by allocator regression tests.
-
-These helpers contain no TestCase classes or test-specific assertions.
-"""
+"""Small unified-pool builders and fakes shared by allocator regression tests."""
 
 from types import SimpleNamespace
 
