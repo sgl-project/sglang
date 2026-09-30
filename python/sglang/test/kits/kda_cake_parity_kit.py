@@ -41,7 +41,8 @@ Every arm is measured on every prompt and a per-prompt table is printed
 before any assertion fires. ``SGLANG_TEST_KDA_PARITY_CONTROL=1`` adds a
 ``triton_control`` arm (a second launch of the reference configuration) whose
 row is the served stack's own noise floor; ``SGLANG_TEST_KDA_PARITY_DUMP=DIR``
-writes the raw observations for offline analysis.
+writes the raw observations for offline analysis;
+``SGLANG_TEST_KDA_PARITY_ARMS=a,b`` runs a subset of the arms.
 
 Multi-node TP (e.g. Kimi-K3 TP8 on two 4-GPU GB300 nodes): set
 ``SGLANG_TEST_KDA_PARITY_NNODES=N``, ``SGLANG_TEST_KDA_PARITY_DIST_INIT_ADDR``
@@ -113,6 +114,10 @@ class CakeArm:
     # The TF32 export serves bounded gates only; a model with an unbounded
     # softplus gate runs the Triton prefill under ``tf32`` and must say so.
     expect_cake_fallback: bool = False
+    # The exported Cake decode is the Kimi-K3 TP8 contract (12 heads x 128,
+    # bounded gate); any other model routes every decode to Triton and must
+    # say so.
+    expect_cake_decode_fallback: bool = False
     # A re-launch of the reference configuration (noise floor); only checked
     # for finiteness and for the absence of Cake launches.
     control: bool = False
@@ -144,7 +149,11 @@ DECODE_ARM = CakeArm(
     cake_prefill=False,
     cake_decode=True,
 )
-# The production configuration: Cake prefill (BF16) and Cake decode, BF16 pool.
+# The production configuration: Cake prefill and Cake decode on the BF16
+# pool, i.e. ``--linear-attn-backend cake --mamba-ssm-dtype bfloat16``. The
+# prepared BF16 prefill export requires the FP32 pool, so this arm keeps the
+# default ``SGLANG_KDA_CAKE_PREFILL_API=auto`` policy (facade prefill on a
+# BF16 pool) instead of forcing ``prepared``.
 BF16_DECODE_ARM = CakeArm(
     name="cake_bf16_decode",
     extra_args=(
@@ -153,6 +162,7 @@ BF16_DECODE_ARM = CakeArm(
         "--linear-attn-decode-backend",
         "cake",
     ),
+    env={},
     state_dtype="bfloat16",
     cake_decode=True,
 )
@@ -643,6 +653,16 @@ class KDACakeParityMixin:
         arms = tuple(self.arms)
         if os.environ.get("SGLANG_TEST_KDA_PARITY_CONTROL") == "1":
             arms = (TRITON_CONTROL_ARM,) + arms
+        # Comma-separated arm names to run a subset (debugging / reruns).
+        selected = os.environ.get("SGLANG_TEST_KDA_PARITY_ARMS")
+        if selected:
+            wanted = set(selected.split(","))
+            arms = tuple(arm for arm in arms if arm.name in wanted)
+            self.assertEqual(
+                {arm.name for arm in arms},
+                wanted,
+                "unknown arm in SGLANG_TEST_KDA_PARITY_ARMS",
+            )
         return arms
 
     def _reference(self, state_dtype: str) -> dict[str, _Observation]:
@@ -700,7 +720,7 @@ class KDACakeParityMixin:
                     "decode",
                     counts["decode"],
                     cake=arm.cake_decode and not arm.control,
-                    fallback=False,
+                    fallback=arm.expect_cake_decode_fallback,
                 )
 
     def _assert_route(
