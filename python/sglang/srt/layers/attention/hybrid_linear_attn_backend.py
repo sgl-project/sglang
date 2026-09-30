@@ -11,7 +11,9 @@ from sglang.kernels.ops.mamba.mamba_state_indices_triton import (
 )
 from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
     fused_conv_window_scatter_with_mask,
+    fused_mamba_state_scatter_multi,
     fused_mamba_state_scatter_with_mask,
+    prepare_mamba_state_scatter_multi,
     scatter_mamba_states_after_mtp_verify,
     track_mamba_states_all_layers,
     track_mamba_states_if_needed,
@@ -1498,6 +1500,19 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
             return
 
+        prepared = self._prepare_verify_state_scatter(mamba_caches)
+        if prepared is not None:
+            state_pairs, metadata = prepared
+            fused_mamba_state_scatter_multi(
+                state_pairs,
+                state_indices_tensor,
+                last_correct_step_indices,
+                mamba_track_indices,
+                mamba_steps_to_track,
+                _metadata=metadata,
+            )
+            return
+
         scatter_mamba_states_after_mtp_verify(
             mamba_caches,
             state_indices_tensor,
@@ -1546,18 +1561,50 @@ class HybridLinearAttnBackend(AttentionBackend):
             :, src_indices[valid_indices], steps[valid_indices]
         ]
 
-    def _update_ple_state_after_mtp_verify(
-        self,
-        state_indices_tensor: torch.Tensor,
-        last_correct_step_indices: torch.Tensor,
-        mamba_track_indices: Optional[torch.Tensor],
-        mamba_steps_to_track: Optional[torch.Tensor],
-    ):
-        """Roll the accepted per-step PLE side states into their main slots."""
-        req_to_token_pool = self.linear_attn_backend.req_to_token_pool
-        if mamba_track_indices is not None:
-            assert mamba_steps_to_track is not None
+    def _prepare_verify_state_scatter(self, mamba_caches):
+        pool = self.linear_attn_backend.req_to_token_pool
+        tensors = (
+            mamba_caches.temporal,
+            mamba_caches.intermediate_ssm,
+            *mamba_caches.conv,
+            *mamba_caches.intermediate_conv_window,
+            pool.short_conv_pool.conv_state,
+            pool.short_conv_pool.intermediate_conv_state,
+            pool.ngram_pool.context,
+            pool.ngram_pool.intermediate_context,
+        )
+        key = tuple(
+            (
+                (id(t), t.data_ptr(), t.shape, t.stride(), t.device, t.dtype)
+                if t is not None
+                else None
+            )
+            for t in tensors
+        )
+        if getattr(self, "_verify_scatter_key", None) == key:
+            return self._verify_scatter_prepared
+        state_pairs = self._ple_state_pairs()
+        prepared = None
+        if state_pairs:
+            state_pairs = (
+                list(zip(mamba_caches.conv, mamba_caches.intermediate_conv_window))
+                + state_pairs
+            )
+            if mamba_caches.temporal.numel() > 0:
+                state_pairs.insert(
+                    0, (mamba_caches.temporal, mamba_caches.intermediate_ssm)
+                )
+            if all(
+                dst.is_cuda and src.is_cuda and (src.is_contiguous() or src.ndim == 5)
+                for dst, src in state_pairs
+            ):
+                prepared = (state_pairs, prepare_mamba_state_scatter_multi(state_pairs))
+        self._verify_scatter_key = key
+        self._verify_scatter_prepared = prepared
+        return prepared
 
+    def _ple_state_pairs(self):
+        req_to_token_pool = self.linear_attn_backend.req_to_token_pool
         state_pairs = []
         short_conv_pool = req_to_token_pool.short_conv_pool
         if (
@@ -1582,6 +1629,34 @@ class HybridLinearAttnBackend(AttentionBackend):
                     ngram_pool.intermediate_context.unsqueeze(0),
                 )
             )
+
+        return state_pairs
+
+    def _update_ple_state_after_mtp_verify(
+        self,
+        state_indices_tensor: torch.Tensor,
+        last_correct_step_indices: torch.Tensor,
+        mamba_track_indices: Optional[torch.Tensor],
+        mamba_steps_to_track: Optional[torch.Tensor],
+    ):
+        """Roll the accepted per-step PLE side states into their main slots."""
+        if mamba_track_indices is not None:
+            assert mamba_steps_to_track is not None
+
+        state_pairs = self._ple_state_pairs()
+
+        if state_pairs and all(
+            state.is_cuda and intermediate.is_cuda
+            for state, intermediate in state_pairs
+        ):
+            fused_mamba_state_scatter_multi(
+                state_pairs, state_indices_tensor, last_correct_step_indices
+            )
+            if mamba_track_indices is not None:
+                fused_mamba_state_scatter_multi(
+                    state_pairs, mamba_track_indices, mamba_steps_to_track
+                )
+            return
 
         for state, intermediate_state in state_pairs:
             self._scatter_speculative_state_with_mask(
