@@ -21,6 +21,12 @@ from openai.types.responses import (
     ResponseOutputText,
     ResponseReasoningItem,
 )
+from openai.types.responses.response_content_part_added_event import (
+    PartReasoningText as ResponseReasoningTextAddedPart,
+)
+from openai.types.responses.response_content_part_done_event import (
+    PartReasoningText as ResponseReasoningTextDonePart,
+)
 from openai.types.responses.response_custom_tool_call import ResponseCustomToolCall
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 from openai.types.responses.response_output_text import Logprob, LogprobTopLogprob
@@ -2134,7 +2140,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                             sequence_number=-1,
                             output_index=reasoning_state["output_index"],
                             content_index=0,
-                            part=completed_item.content[0].model_dump(),
+                            part=ResponseReasoningTextDonePart(
+                                type="reasoning_text", text=text
+                            ),
                         )
                     )
                 )
@@ -2382,7 +2390,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                                     item_id=item_id,
                                     output_index=reasoning_state["output_index"],
                                     content_index=0,
-                                    part={"type": "reasoning_text", "text": ""},
+                                    part=ResponseReasoningTextAddedPart(
+                                        type="reasoning_text", text=""
+                                    ),
                                     sequence_number=-1,
                                 )
                             )
