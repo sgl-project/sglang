@@ -1155,13 +1155,13 @@ def save_intermediate_conv_windows(
     sconv_cache: torch.Tensor,  # [cache_size, W-1, D]
     hidden_states: torch.Tensor,  # [B, T_max, D] or [B*T_max, D]
     cache_indices: torch.Tensor,  # [B], int32 or int64
-    intermediate_out: torch.Tensor,  # [max_bs, T, W-1, D]
+    intermediate_out: torch.Tensor,  # dense [max_bs, T, W-1, D] or strip [max_bs, T, D]
     batch_size: int,
     draft_token_num: int,
 ) -> None:
-    """Fused unfold-and-write into intermediate_out[:batch_size].
+    """Save fresh inputs for strips, or each post-token history for dense layout.
 
-    Equivalent to:
+    The dense layout is equivalent to:
         initial = sconv_cache[cache_indices[:batch_size]]
         padded  = torch.cat([initial, hidden_states[:batch_size, :draft_token_num]], dim=1)
         windows = padded.unfold(1, W-1, 1)[:, 1:draft_token_num+1].transpose(-2,-1).contiguous()
@@ -1175,12 +1175,36 @@ def save_intermediate_conv_windows(
         return
 
     if hidden_states.dim() == 2:
-        hidden_states = hidden_states.view(batch_size, -1, hidden_states.shape[-1])
+        real_rows = batch_size * draft_token_num
+        assert hidden_states.shape[0] >= real_rows, (
+            f"verify hidden rows {hidden_states.shape[0]} < {batch_size=} * {draft_token_num=}"
+        )
+        hidden_states = hidden_states[:real_rows].view(batch_size, draft_token_num, D)
     assert hidden_states.dim() == 3, (
         f"unexpected hidden_states shape {hidden_states.shape}"
     )
     assert hidden_states.shape[0] == batch_size
+    assert hidden_states.shape[1] >= draft_token_num, (
+        f"{hidden_states.shape=} vs {draft_token_num=}"
+    )
+    hidden_states = hidden_states[:, :draft_token_num]
     assert hidden_states.shape[2] == D
+
+    if intermediate_out.dim() == 3:
+        assert intermediate_out.shape[0] >= batch_size, (
+            f"strip rows {intermediate_out.shape[0]} < {batch_size=}"
+        )
+        assert intermediate_out.shape[1] == draft_token_num, (
+            f"strip T {intermediate_out.shape[1]} != {draft_token_num=}"
+        )
+        assert intermediate_out.shape[2] == D
+
+        assert intermediate_out.dtype == hidden_states.dtype, (
+            f"{intermediate_out.dtype=} != {hidden_states.dtype=}"
+        )
+        intermediate_out[:batch_size].copy_(hidden_states)
+        return
+
     assert intermediate_out.shape[1] == draft_token_num
     assert intermediate_out.shape[2] == W_minus_1
     assert intermediate_out.shape[3] == D

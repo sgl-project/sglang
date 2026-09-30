@@ -675,6 +675,184 @@ def fused_conv_window_scatter_multi(
     )
 
 
+@triton.jit
+def _fused_conv_strip_commit_kernel(
+    conv_ptr,
+    strip_ptr,
+    tail_indices_raw_ptr,
+    dst_indices_raw_ptr,
+    step_indices_raw_ptr,
+    conv_layer_stride,
+    conv_slot_stride,
+    conv_w_stride,
+    strip_layer_stride,
+    strip_req_stride,
+    strip_t_stride,
+    D,
+    strip_req_size,
+    strip_t_size,
+    conv_slot_size,
+    W_MINUS_1: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid_req = tl.program_id(0)
+    pid_layer = tl.program_id(1).to(tl.int64)
+    pid_d = tl.program_id(2)
+
+    step = tl.load(step_indices_raw_ptr + pid_req).to(tl.int64)
+    if step < 0:
+        return
+
+    dst_idx = tl.load(dst_indices_raw_ptr + pid_req).to(tl.int64)
+    tail_idx = tl.load(tail_indices_raw_ptr + pid_req).to(tl.int64)
+
+    if not (
+        (dst_idx >= 0)
+        & (dst_idx < conv_slot_size)
+        & (tail_idx >= 0)
+        & (tail_idx < conv_slot_size)
+        & (pid_req < strip_req_size)
+        & (step < strip_t_size)
+    ):
+        return
+
+    d_off = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    d_mask = d_off < D
+
+    conv_layer_base = conv_ptr + pid_layer * conv_layer_stride
+    tail_base = conv_layer_base + tail_idx * conv_slot_stride
+    dst_base = conv_layer_base + dst_idx * conv_slot_stride
+    strip_base = (
+        strip_ptr
+        + pid_layer * strip_layer_stride
+        + pid_req.to(tl.int64) * strip_req_stride
+    )
+
+    # In [old history, fresh inputs], the accepted state starts at step + 1.
+    for w in tl.static_range(W_MINUS_1):
+        p = step + 1 + w
+        in_tail = p < W_MINUS_1
+        in_strip = p >= W_MINUS_1
+
+        tail_p = tl.minimum(p, W_MINUS_1 - 1)
+        strip_t = tl.maximum(p - W_MINUS_1, 0)
+        v_tail = tl.load(
+            tail_base + tail_p * conv_w_stride + d_off,
+            mask=d_mask & in_tail,
+            other=0.0,
+        )
+        v_strip = tl.load(
+            strip_base + strip_t * strip_t_stride + d_off,
+            mask=d_mask & in_strip,
+            other=0.0,
+        )
+        val = tl.where(in_tail, v_tail, v_strip)
+        tl.store(dst_base + w * conv_w_stride + d_off, val, mask=d_mask)
+
+
+def fused_conv_strip_commit(
+    conv_states: torch.Tensor,
+    strip: torch.Tensor,
+    tail_indices_raw: torch.Tensor,
+    dst_indices_raw: torch.Tensor,
+    step_indices_raw: torch.Tensor,
+):
+    """Rebuild the accepted convolution state from overlapping input history.
+
+    K consecutive draft tokens share overlapping width-W convolution windows.
+    Saving the W-1 history rows after every token repeats K*(W-1) rows per
+    channel, though all windows come from just K+W-1 consecutive input rows.
+    The first W-1 rows already live in conv_states, so the strip scratch only
+    needs the K new rows; the combined sequence is logical, not another copy.
+
+    For W=4, old history [10, 20, 30] and K=3 new inputs [40, 50, 60], the
+    dense snapshots are [20, 30, 40], [30, 40, 50], and [40, 50, 60]: nine
+    rows. They are sliding windows of the six-row sequence [10, ..., 60],
+    so the strip stores only [40, 50, 60].
+
+    For accepted_count = step + 1, keep the last W-1 rows of
+    old_history + strip[:accepted_count]. Accepting two tokens in this example
+    gives [30, 40, 50].
+    A negative step leaves the destination unchanged.
+    """
+    total_requests = step_indices_raw.shape[0]
+    if total_requests == 0:
+        return
+
+    if not (
+        conv_states.is_cuda and strip.is_cuda and conv_states.device == strip.device
+    ):
+        raise ValueError(
+            "fused_conv_strip_commit requires conv_states and strip to be CUDA "
+            f"tensors on the same device ({conv_states.device=}, {strip.device=})."
+        )
+    if conv_states.ndim != 4 or strip.ndim != 4:
+        raise ValueError(
+            f"Unexpected ranks: {conv_states.ndim=} (want 4) {strip.ndim=} (want 4)"
+        )
+    if conv_states.shape[0] != strip.shape[0]:
+        raise ValueError(
+            f"Layer dim mismatch: {conv_states.shape[0]=} vs {strip.shape[0]=}"
+        )
+    if conv_states.shape[3] != strip.shape[3]:
+        raise ValueError(
+            f"Channel dim mismatch: {conv_states.shape[3]=} vs {strip.shape[3]=}"
+        )
+    if conv_states.dtype != strip.dtype:
+        raise ValueError(f"dtype mismatch: {conv_states.dtype=} vs {strip.dtype=}")
+    if conv_states.stride(3) != 1:
+        raise ValueError("conv_states must be contiguous along the channel axis")
+    if strip.stride(3) != 1:
+        raise ValueError("strip must be contiguous along the channel axis")
+    for name, idx in (
+        ("tail_indices_raw", tail_indices_raw),
+        ("dst_indices_raw", dst_indices_raw),
+        ("step_indices_raw", step_indices_raw),
+    ):
+        if idx.ndim != 1:
+            raise ValueError(f"{name} must be 1D, got {idx.shape}")
+    if not (
+        tail_indices_raw.shape[0] == total_requests
+        and dst_indices_raw.shape[0] == total_requests
+    ):
+        raise ValueError(
+            f"indices length mismatch: {tail_indices_raw.shape[0]=} "
+            f"{dst_indices_raw.shape[0]=} vs {total_requests=}"
+        )
+
+    num_layers = conv_states.shape[0]
+    conv_slot_size = conv_states.shape[1]
+    w_minus_1 = conv_states.shape[2]
+    D = conv_states.shape[3]
+
+    tail_indices_raw = tail_indices_raw.to(torch.int32).contiguous()
+    dst_indices_raw = dst_indices_raw.to(torch.int32).contiguous()
+    step_indices_raw = step_indices_raw.to(torch.int32).contiguous()
+
+    BLOCK_D = min(triton.next_power_of_2(D), 1024)
+    grid = (total_requests, num_layers, triton.cdiv(D, BLOCK_D))
+
+    _fused_conv_strip_commit_kernel[grid](
+        conv_states,
+        strip,
+        tail_indices_raw,
+        dst_indices_raw,
+        step_indices_raw,
+        conv_states.stride(0),
+        conv_states.stride(1),
+        conv_states.stride(2),
+        strip.stride(0),
+        strip.stride(1),
+        strip.stride(2),
+        D,
+        strip.shape[1],
+        strip.shape[2],
+        conv_slot_size,
+        W_MINUS_1=w_minus_1,
+        BLOCK_D=BLOCK_D,
+    )
+
+
 def scatter_mamba_states_after_mtp_verify(
     mamba_caches,
     state_indices_tensor: torch.Tensor,
@@ -708,6 +886,30 @@ def scatter_mamba_states_after_mtp_verify(
         return
     if mamba_track_indices is not None:
         assert mamba_steps_to_track is not None
+
+    strip_pairs = [p for p in pairs if p[1].dim() == 4]
+    if strip_pairs:
+        pairs = [p for p in pairs if p[1].dim() != 4]
+        for conv_states, strip in strip_pairs:
+            # Both copies need the old history; save tracking before overwriting it.
+            if mamba_track_indices is not None:
+                n_track = mamba_steps_to_track.shape[0]
+                fused_conv_strip_commit(
+                    conv_states,
+                    strip,
+                    state_indices_tensor[:n_track],
+                    mamba_track_indices[:n_track],
+                    mamba_steps_to_track,
+                )
+            fused_conv_strip_commit(
+                conv_states,
+                strip,
+                state_indices_tensor,
+                state_indices_tensor,
+                last_correct_step_indices,
+            )
+        if not pairs:
+            return
     if _conv_multi_eligible(pairs):
         fused_conv_window_scatter_multi(
             pairs,

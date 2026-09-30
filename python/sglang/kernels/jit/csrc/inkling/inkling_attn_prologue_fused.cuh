@@ -294,8 +294,8 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_kernel(const __
   if (valid) {  // save_intermediate_conv_windows (raw copies)
     auto* op = ip + static_cast<int64_t>(seq) * p.inter_stride_b + static_cast<int64_t>(tq) * p.inter_stride_t + ch;
 #pragma unroll
-    for (int w = 0; w < W1; ++w) {
-      const int position = static_cast<int>(tq) + 1 + w;
+    for (int w = 0; w < (p.inter_stride_w == 0 ? 1 : W1); ++w) {
+      const int position = p.inter_stride_w == 0 ? W1 + tq : static_cast<int>(tq) + 1 + w;
       uint4 val;
       if (position < W1) {
         val = pref[position];
@@ -411,9 +411,19 @@ struct AttnPrologueKernel {
         "slice offsets must be 16B aligned");
     RuntimeCheck(k_buf.stride(0) == v_buf.stride(0), "kv buf stride mismatch");
     RuntimeCheck(k_cache.stride(2) == 1 && v_cache.stride(2) == 1, "conv caches must be channel-contiguous");
+    const bool strip = k_inter.ndim() == 3;
+    RuntimeCheck(k_inter.ndim() == v_inter.ndim() && (strip || k_inter.ndim() == 4), "bad inter buffer rank");
+    RuntimeCheck(k_inter.size(0) >= B && v_inter.size(0) >= B, "inter buffer batch too small");
+    RuntimeCheck(k_inter.size(1) == q_num && v_inter.size(1) == q_num, "inter buffer draft size mismatch");
     RuntimeCheck(
-        k_inter.stride(3) == 1 && v_inter.stride(3) == 1 && k_inter.stride(0) == v_inter.stride(0) &&
-            k_inter.stride(1) == v_inter.stride(1) && k_inter.stride(2) == v_inter.stride(2),
+        k_inter.size(strip ? 2 : 3) == dkv && v_inter.size(strip ? 2 : 3) == dkv, "inter buffer channel mismatch");
+    if (!strip) {
+      RuntimeCheck(k_inter.size(2) == W - 1 && v_inter.size(2) == W - 1, "inter buffer window mismatch");
+    }
+    RuntimeCheck(
+        k_inter.stride(strip ? 2 : 3) == 1 && v_inter.stride(strip ? 2 : 3) == 1 &&
+            k_inter.stride(0) == v_inter.stride(0) && k_inter.stride(1) == v_inter.stride(1) &&
+            k_inter.stride(2) == v_inter.stride(2),
         "inter buffers must be channel-contiguous with equal strides");
     const uint32_t lanes = dq / kVecElems + 2 * (dkv / kVecElems);
     RuntimeCheck(lanes <= 1024, "token lanes must fit one block");
@@ -490,7 +500,7 @@ struct AttnPrologueKernel {
         .weight_stride_d = k_weight.stride(0),
         .inter_stride_b = k_inter.stride(0),
         .inter_stride_t = k_inter.stride(1),
-        .inter_stride_w = k_inter.stride(2),
+        .inter_stride_w = strip ? 0 : k_inter.stride(2),
         .kv_buf_stride = k_buf.stride(0),
         .T = T,
         .q = static_cast<uint32_t>(q_num),

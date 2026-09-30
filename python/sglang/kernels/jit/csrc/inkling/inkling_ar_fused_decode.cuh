@@ -516,8 +516,8 @@ __launch_bounds__(1024, 1) void inkling_ar_sconv_norm_verify_kernel(const __grid
         auto* op = static_cast<__nv_bfloat16*>(p.inter_out) + static_cast<int64_t>(seq) * p.inter_stride_b +
                    static_cast<int64_t>(tq) * p.inter_stride_t + c0;
 #pragma unroll
-        for (int w = 0; w < W1; ++w) {
-          const int position = static_cast<int>(tq) + 1 + w;
+        for (int w = 0; w < (p.inter_stride_w == 0 ? 1 : W1); ++w) {
+          const int position = p.inter_stride_w == 0 ? W1 + tq : static_cast<int>(tq) + 1 + w;
           uint4 val;
           if (position < W1) {
             val = pref_raw[position];
@@ -770,9 +770,14 @@ struct ArSconvNormVerifyKernel {
     auto MB = SymbolicSize{"max_bs"};
     auto Qs = SymbolicSize{"q"};
     Qs.set_value(q);
-    TensorMatcher({MB, Qs, W1s, D}).with_dtype<DType>().with_device(dev).verify(inter_out);
+    const bool strip = inter_out.ndim() == 3;
+    if (strip) {
+      TensorMatcher({MB, Qs, D}).with_dtype<DType>().with_device(dev).verify(inter_out);
+    } else {
+      TensorMatcher({MB, Qs, W1s, D}).with_dtype<DType>().with_device(dev).verify(inter_out);
+    }
     RuntimeCheck(MB.unwrap() >= b_num, "inter_out batch dim too small");
-    RuntimeCheck(inter_out.stride(3) == 1, "inter_out must be channel-contiguous");
+    RuntimeCheck(inter_out.stride(strip ? 2 : 3) == 1, "inter_out must be channel-contiguous");
     RuntimeCheck(mc_stage_ptr % 16 == 0, "mc_stage_ptr not 16B aligned");
     RuntimeCheck(local_stage_ptr != 0 && local_stage_ptr % 16 == 0, "bad local_stage_ptr");
     RuntimeCheck(flag_ptrs_dev != 0 && state_ptr != 0, "null barrier resources");
@@ -807,7 +812,7 @@ struct ArSconvNormVerifyKernel {
         .conv_weight_stride_d = conv_weight.stride(0),
         .inter_stride_b = inter_out.stride(0),
         .inter_stride_t = inter_out.stride(1),
-        .inter_stride_w = inter_out.stride(2),
+        .inter_stride_w = strip ? 0 : inter_out.stride(2),
         .rank = static_cast<uint32_t>(rank),
         .T = t_num,
         .D = d_num,
