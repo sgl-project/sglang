@@ -24,10 +24,12 @@ limitations under the License.
 // using fused scatter for eligible shapes and two kernels otherwise. Larger
 // domains keep the old path through the Python dispatcher.
 
+#include <sgl_kernel/bits.h>
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
 #include <sgl_kernel/utils.cuh>
+#include <sgl_kernel/warp.cuh>
 
 #include <tvm/ffi/container/tensor.h>
 
@@ -44,27 +46,7 @@ namespace sglang {
 
 using Vec = int4;
 
-inline uint32_t next_pow2(uint32_t x) noexcept {
-  --x;
-  x |= x >> 1;
-  x |= x >> 2;
-  x |= x >> 4;
-  x |= x >> 8;
-  x |= x >> 16;
-  return x + 1;
-}
-
 namespace moe_lora_merged {
-
-__device__ __forceinline__ int warp_exclusive_scan(int v, unsigned mask = 0xffffffffu) {
-  int original = v;
-#pragma unroll
-  for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
-    int n = __shfl_up_sync(mask, v, offset);
-    if ((threadIdx.x & (WARP_SIZE - 1)) >= offset) v += n;
-  }
-  return v - original;
-}
 
 // Inline mirror of _fused_virtual_topk_ids_kernel (virtual_experts.py). Returns
 // the merged virtual expert id for flat slot `i` (range [-1, virtual_num_experts);
@@ -170,10 +152,14 @@ __global__ void moe_align_block_size_kernel(
     if (pad_sorted_token_ids) {
       Vec fill_vec;
       fill_vec.x = fill_vec.y = fill_vec.z = fill_vec.w = numel;
-      int32_t total_vecs = (max_num_tokens_padded + VEC_SIZE - 1) / VEC_SIZE;
+      // Whole vectors only; a partial last vector would write past the buffer.
+      int32_t total_vecs = max_num_tokens_padded / VEC_SIZE;
       Vec* out_ptr = reinterpret_cast<Vec*>(sorted_token_ids);
       for (int32_t i = threadIdx.x; i < total_vecs; i += blockDim.x) {
         out_ptr[i] = fill_vec;
+      }
+      for (int32_t i = total_vecs * VEC_SIZE + threadIdx.x; i < max_num_tokens_padded; i += blockDim.x) {
+        sorted_token_ids[i] = numel;
       }
     }
     return;
@@ -232,14 +218,14 @@ __global__ void moe_align_block_size_kernel(
   const int warp_id = tid / WARP_SIZE;
   const int lane_id = tid & (WARP_SIZE - 1);
   const int num_warps_for_scan = (scan_size + WARP_SIZE - 1) / WARP_SIZE;
-  const int warp_sum = warp_exclusive_scan(padded_count) + padded_count;
+  const int warp_sum = device::warp::inclusive_sum<32>(padded_count);
   if (lane_id == WARP_SIZE - 1) warp_sums[warp_id] = warp_sum;
   __syncthreads();
 
   // warp0 accumulate all the block's prefix sum
   if (tid < WARP_SIZE) {
     int val = (tid < num_warps_for_scan) ? warp_sums[tid] : 0;
-    int incl = warp_exclusive_scan(val) + val;
+    int incl = device::warp::inclusive_sum<32>(val);
     warp_sums[tid] = incl;
   }
   __syncthreads();
@@ -258,13 +244,13 @@ __global__ void moe_align_block_size_kernel(
 
   // Perform 2 level exclusive-prefix-sum to scan_buf
   int v = (tid < scan_size) ? scan_buf[tid] : 0;
-  int pre = warp_exclusive_scan(v);
+  int pre = device::warp::inclusive_sum<32>(v) - v;
   if (lane_id == WARP_SIZE - 1) warp_sums[warp_id] = pre + v;
   __syncthreads();
 
   if (warp_id == 0) {
     int val = (lane_id < num_warps_for_scan) ? warp_sums[lane_id] : 0;
-    warp_sums[lane_id] = warp_exclusive_scan(val);
+    warp_sums[lane_id] = device::warp::inclusive_sum<32>(val) - val;
   }
   __syncthreads();
 
@@ -344,10 +330,14 @@ __global__ void fused_align_scatter_kernel(
   {
     Vec fill_vec;
     fill_vec.x = fill_vec.y = fill_vec.z = fill_vec.w = numel;
-    int32_t total_vecs = (max_num_tokens_padded + VEC_SIZE - 1) / VEC_SIZE;
+    // Whole vectors only; a partial last vector would write past the buffer.
+    int32_t total_vecs = max_num_tokens_padded / VEC_SIZE;
     Vec* out_ptr = reinterpret_cast<Vec*>(sorted_token_ids);
     for (int32_t i = threadIdx.x; i < total_vecs; i += blockDim.x) {
       out_ptr[i] = fill_vec;
+    }
+    for (int32_t i = total_vecs * VEC_SIZE + threadIdx.x; i < max_num_tokens_padded; i += blockDim.x) {
+      sorted_token_ids[i] = numel;
     }
   }
   if (tid < num_experts) shared_counts[tid] = 0;
@@ -384,12 +374,12 @@ __global__ void fused_align_scatter_kernel(
     padded_count = (count + block_size - 1) / block_size * block_size;
     scan_buf[tid] = padded_count;
   }
-  const int warp_sum = warp_exclusive_scan(padded_count) + padded_count;
+  const int warp_sum = device::warp::inclusive_sum<32>(padded_count);
   if (lane_id == WARP_SIZE - 1) warp_sums[warp_id] = warp_sum;
   __syncthreads();
   if (tid < WARP_SIZE) {
     int val = (tid < num_warps_for_scan) ? warp_sums[tid] : 0;
-    int incl = warp_exclusive_scan(val) + val;
+    int incl = device::warp::inclusive_sum<32>(val);
     warp_sums[tid] = incl;
   }
   __syncthreads();
@@ -402,12 +392,12 @@ __global__ void fused_align_scatter_kernel(
   if (tid >= num_experts && tid < scan_size) scan_buf[tid] = 0;
   __syncthreads();
   int v = (tid < scan_size) ? scan_buf[tid] : 0;
-  int pre = warp_exclusive_scan(v);
+  int pre = device::warp::inclusive_sum<32>(v) - v;
   if (lane_id == WARP_SIZE - 1) warp_sums[warp_id] = pre + v;
   __syncthreads();
   if (warp_id == 0) {
     int val = (lane_id < num_warps_for_scan) ? warp_sums[lane_id] : 0;
-    warp_sums[lane_id] = warp_exclusive_scan(val);
+    warp_sums[lane_id] = device::warp::inclusive_sum<32>(val) - val;
   }
   __syncthreads();
   int off = warp_sums[warp_id];
@@ -500,7 +490,7 @@ struct MoeLoraMergedAlignKernel {
     int32_t* cumsum_buffer_ptr = static_cast<int32_t*>(cumsum_buffer.data_ptr());
     size_t numel = topk_ids.numel();
 
-    const size_t scan_size = next_pow2(num_experts);
+    const size_t scan_size = host::round_up_pow2(static_cast<uint32_t>(num_experts));
 
     if (fuse_scatter) {
       // One block does fill + histogram + scan + expert_ids + scatter. Extra

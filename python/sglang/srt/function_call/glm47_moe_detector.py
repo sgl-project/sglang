@@ -307,6 +307,7 @@ class Glm47MoeDetector(BaseFormatDetector):
 
     def __init__(self):
         super().__init__()
+        self.use_full_assistant_constraint = False
         self.bot_token = "<tool_call>"
         self.eot_token = "</tool_call>"
         self.func_call_regex = r"<tool_call>.*?</tool_call>"
@@ -910,6 +911,9 @@ class Glm47MoeDetector(BaseFormatDetector):
             known_arguments[arg_key] = arguments[arg_key]
 
         return arguments
+
+    def parses_required_natively(self) -> bool:
+        return self.use_full_assistant_constraint
 
     def supports_structural_tag(self) -> bool:
         return _glm47_native_structural_tag_available()

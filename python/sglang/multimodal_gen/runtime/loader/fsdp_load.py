@@ -201,7 +201,20 @@ def _maybe_dequantize_fp8(
     scale_key = target_param_name.rsplit(".", 1)[0] + ".weight_scale"
     scale_tensor = param_sd.get(scale_key)
     if scale_tensor is not None:
-        full_tensor = full_tensor.to(torch.float32) * scale_tensor.float()
+        if (
+            scale_tensor.dtype == torch.uint8
+            and full_tensor.ndim == scale_tensor.ndim
+            and full_tensor.shape[:1] == scale_tensor.shape[:1]
+            and full_tensor.shape[-1] == scale_tensor.shape[-1] * 32
+        ):
+            scale = torch.exp2(scale_tensor.float() - 127.0)
+            blocked_shape = (*full_tensor.shape[:-1], scale_tensor.shape[-1], 32)
+            full_tensor = (
+                full_tensor.float().reshape(blocked_shape) * scale.unsqueeze(-1)
+            ).reshape(full_tensor.shape)
+        else:
+            full_tensor = full_tensor.to(torch.float32) * scale_tensor.float()
+
         logger.debug(
             "Auto-dequantized FP8 weight %s using %s",
             target_param_name,
