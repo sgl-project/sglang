@@ -158,6 +158,9 @@ class MlxTpModelWorker(TpModelWorker):
 
     def _cleanup_stale_rids(self, forward_mode, current_rids: set[str]) -> None:
         """Release finished requests before launching a new non-idle batch."""
+        # Fresh launches follow finalization of any pending chained decode.
+        # Reclaim here, not in the finish hook, where that decode may still
+        # hold references to this request's state.
         finished_rids = self._mlx_finished_rids & self._mlx_active_rids
         for rid in finished_rids:
             self._mlx_runner.remove_request(rid)
