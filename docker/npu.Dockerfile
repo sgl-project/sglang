@@ -26,11 +26,8 @@ ARG DEVICE_TYPE
 ARG MODELSCOPE_VERSION=""
 ARG EVALSCOPE_VERSION=""
 
+# memfabric-hybrid / memcache-hybrid version, installed from the pip index (no OBS bucket download)
 ARG MF_VERSION="1.2.1"
-ARG MF_WHEEL_URL_AARCH64="https://obs-memfabric-hybrid.obs.cn-north-4.myhuaweicloud.com/mf/v1.2.1/20260923.4/memfabric_hybrid-1.2.1-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl"
-ARG MF_WHEEL_URL_X86_64="https://obs-memfabric-hybrid.obs.cn-north-4.myhuaweicloud.com/mf/v1.2.1/20260923.4/memfabric_hybrid-1.2.1-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl"
-ARG MC_WHEEL_URL_AARCH64="https://obs-memfabric-hybrid.obs.cn-north-4.myhuaweicloud.com/memcache/v1.2.1/20260923.4/memcache_hybrid-1.2.1-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl"
-ARG MC_WHEEL_URL_X86_64="https://obs-memfabric-hybrid.obs.cn-north-4.myhuaweicloud.com/memcache/v1.2.1/20260923.4/memcache_hybrid-1.2.1-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl"
 
 # memfabric-zbal: 950 与 a3 使用不同版本
 ARG ZBAL_VERSION_950="1.2.21004.post1"
@@ -77,25 +74,22 @@ ENV LANG=en_US.UTF-8
 ENV LANGUAGE=en_US:en
 ENV LC_ALL=en_US.UTF-8
 
-### Install MemFabric and MemCache (按 TARGETARCH 直接取对应架构的 OBS wheel)
+### Install MemFabric and MemCache
+# 直接从 pip 源安装，不再从 OBS 桶下载 wheel（pip 会按 TARGETARCH 自动选 aarch64/x86_64 的包）。
+# 构建机不在 NPU 环境里，mfcli 无法自行识别芯片型号，所以必须显式传 --soc-version：
+#   DEVICE_TYPE=950 -> A5
+#   DEVICE_TYPE=a3  -> A3
+# 其他取值直接失败，避免装成不匹配的内核模块。
 RUN set -eux; \
-    case "$TARGETARCH" in \
-      arm64) \
-        MF_URL="$MF_WHEEL_URL_AARCH64"; \
-        MC_URL="$MC_WHEEL_URL_AARCH64"; \
-        ;; \
-      amd64) \
-        MF_URL="$MF_WHEEL_URL_X86_64"; \
-        MC_URL="$MC_WHEEL_URL_X86_64"; \
-        ;; \
-      *) \
-        echo "Unsupported architecture: $TARGETARCH" >&2; \
-        exit 1; \
-        ;; \
+    case "$DEVICE_TYPE" in \
+      950) MF_SOC_VERSION="A5" ;; \
+      a3)  MF_SOC_VERSION="A3" ;; \
+      *)   echo "Unsupported DEVICE_TYPE for mfcli kernel install: $DEVICE_TYPE" >&2; \
+           exit 1 ;; \
     esac; \
-    ${PIP_INSTALL} "$MF_URL" --force-reinstall; \
-    mfcli kernel install; \
-    ${PIP_INSTALL} "$MC_URL" --force-reinstall --no-deps
+    ${PIP_INSTALL} memfabric-hybrid==${MF_VERSION}; \
+    mfcli kernel install --soc-version "$MF_SOC_VERSION"; \
+    ${PIP_INSTALL} memcache-hybrid==${MF_VERSION} --no-deps
 
 ### Install memfabric-zbal
 RUN if [ "$DEVICE_TYPE" = "950" ]; then ZBAL_PKG="memfabric-zbal==${ZBAL_VERSION_950}"; \
