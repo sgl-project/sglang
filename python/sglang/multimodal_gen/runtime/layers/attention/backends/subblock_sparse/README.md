@@ -4,8 +4,8 @@ Routes a SubBlock plan to SGLang's CuTe-DSL block-sparse FlashAttention kernel
 on SM90 or FlashInfer's architecture-specific blk64 kernels on SM100 and SM120.
 The architecture-neutral `"compute_mode": "sage_fp8"` selects online Sage-style
 FP8 compute; its current SM90 implementation uses the native SageAttention2
-INT8-QK/FP8-PV Hopper kernel. Future SM100 and SM120 Sage FP8 implementations
-can register under the same configuration value.
+INT8-QK/FP8-PV Hopper kernel. SM120 uses FlashInfer's CuTe-DSL Sage kernel
+with Q64 x K64 blocks. SM100 supports BF16 only.
 Nothing is trained and no weights change: a cheap estimator runs before
 attention and hands the selected kernel a `q2k_block_index`.
 
@@ -46,7 +46,7 @@ are listed below.
 
 | | |
 | --- | --- |
-| GPU | **compute capability 9.0, 10.0, or 12.0** — H100 / H200 use SGLang's CuTe-DSL SM90 block-sparse FlashAttention kernel or the current `sage_fp8` implementation; B200 / GB200 use FlashInfer's architecture-specific `sm_100a` BF16 kernel; SM120 devices use FlashInfer's `bsa_attn_sm120_blk64_fwd` CuTe-DSL BF16 kernel. Other capabilities, including 10.3 (B300 / GB300), are rejected. |
+| GPU | **compute capability 9.0, 10.0, or 12.0** — H100 / H200 use SGLang's CuTe-DSL SM90 block-sparse FlashAttention kernel or the current `sage_fp8` implementation; B200 / GB200 use FlashInfer's architecture-specific `sm_100a` BF16 kernel; SM120 devices use FlashInfer's CuTe-DSL BF16 or Sage FP8 kernel. Other capabilities, including 10.3 (B300 / GB300), are rejected. |
 | dtype | bfloat16 |
 | head_dim | 128 |
 | attention | non-causal, one contiguous sequence per call |
@@ -106,7 +106,17 @@ the normal router's 16-token key pooling cells. Install the optional dependency:
 pip install git+https://github.com/thu-ml/SpargeAttn.git --no-build-isolation
 ```
 
-Enable it on SM90 with:
+SM120 requires FlashInfer's CuTe-DSL SM120 Sage backend and
+`quantize_sage_qkv_sm120`, added in
+[FlashInfer #4691](https://github.com/flashinfer-ai/flashinfer/pull/4691).
+The default FlashInfer `0.6.18` pin does not include these APIs. After installing
+SGLang, install the FlashInfer source revision used for SM120 validation:
+
+```bash
+pip install "git+https://github.com/flashinfer-ai/flashinfer.git@6a84331eb6013e5e61018dc2be532ae90520d30f"
+```
+
+Enable it on SM90 or SM120 with:
 
 ```bash
 --attention-backend-config '{"compute_mode":"sage_fp8"}'
@@ -195,3 +205,9 @@ Tests: `test/unit/test_subblock_sparse_attention.py` and
 test covers the native production dispatch. Running at a full block budget must
 reproduce dense attention up to the expected quantization error, pinning routing
 indices, ragged tails, scale domains and the softmax scale in one check.
+
+Run the SM120 Sage numerical test with:
+
+```bash
+python test/manual/attention/test_subblock_sage_fp8_sm120.py
+```

@@ -109,27 +109,30 @@ class MambaPoolHost(HostKVCache):
         self.dtype = self.conv_dtype
         self.size_per_token = self.get_size_per_token()
 
+        device_capacity = getattr(device_pool, "host_capacity_tokens", None)
+        if device_capacity is None:
+            device_capacity = device_pool.size
         if host_size > 0:
             self.size = sync_fixed_hicache_size(
                 int(host_size * 1e9 // self.size_per_token), host_size
             )
         else:
-            self.size = int(device_pool.size * host_to_device_ratio)
+            self.size = int(device_capacity * host_to_device_ratio)
 
         self.page_num = self.size // self.page_size + 1
         self.size = self.page_num * self.page_size
 
-        if self.size <= device_pool.size:
+        if self.size <= device_capacity:
             logger.warning(
                 "HiCache host KV pool (%d tokens) is smaller than the device pool (%d tokens);"
                 "L2 cache effectiveness is reduced."
                 "Consider increasing --hicache-ratio (or --hicache-size) for higher L2 cache hit rate.",
                 self.size,
-                device_pool.size,
+                device_capacity,
             )
 
         requested_bytes = self.size * self.size_per_token
-        available_bytes = host_memory_budget_bytes()
+        available_bytes = host_memory_budget_bytes(requested_bytes)
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
@@ -352,6 +355,15 @@ class MambaPoolHost(HostKVCache):
         return int(tensor[0].numel() * tensor.element_size())
 
     @staticmethod
+    def _slots_are_strided(tensor: torch.Tensor) -> bool:
+        """Whether slot stride differs from the slot size transfer kernels expect."""
+        return (
+            tensor.dim() >= 1
+            and tensor.shape[0] > 0
+            and tensor.stride(0) != tensor[0].numel()
+        )
+
+    @staticmethod
     def _copy_tensor(
         src: torch.Tensor,
         dst: torch.Tensor,
@@ -360,6 +372,34 @@ class MambaPoolHost(HostKVCache):
         io_backend: str,
     ) -> None:
         if src_indices.numel() == 0:
+            return
+        # Unified conv/SSM views span a whole state envelope per slot. Stage
+        # contiguously for transfer kernels; torch indexing respects the strides
+        # and runs on the caller's transfer stream.
+        if MambaPoolHost._slots_are_strided(src):
+            staged = src.index_select(0, src_indices.to(src.device))
+            MambaPoolHost._copy_tensor(
+                staged,
+                dst,
+                torch.arange(staged.shape[0], device=staged.device),
+                dst_indices,
+                io_backend,
+            )
+            return
+        if MambaPoolHost._slots_are_strided(dst):
+            staged = torch.empty(
+                (dst_indices.numel(), *dst.shape[1:]),
+                dtype=dst.dtype,
+                device=dst.device,
+            )
+            MambaPoolHost._copy_tensor(
+                src,
+                staged,
+                src_indices,
+                torch.arange(staged.shape[0], device=staged.device),
+                io_backend,
+            )
+            dst.index_copy_(0, dst_indices.to(dst.device), staged)
             return
         if io_backend == "kernel":
             # TODO: Rename the interface for clarity.
@@ -401,6 +441,24 @@ class MambaPoolHost(HostKVCache):
         io_backend: str,
     ) -> None:
         if src_indices.numel() == 0:
+            return
+        if MambaPoolHost._slots_are_strided(dst):
+            # Transfer into contiguous staging, then scatter into the strided view.
+            staged = torch.empty(
+                (dst_indices.numel(), *dst.shape[1:]),
+                dtype=dst.dtype,
+                device=dst.device,
+            )
+            MambaPoolHost._copy_tensor_pf_lf(
+                src,
+                staged,
+                src_indices,
+                torch.arange(staged.shape[0], device=staged.device),
+                layer_id,
+                num_layers,
+                io_backend,
+            )
+            dst.index_copy_(0, dst_indices.to(dst.device), staged)
             return
         if io_backend == "kernel":
             item_size = MambaPoolHost._item_size_per_index(dst)
@@ -459,6 +517,31 @@ class MambaPoolHost(HostKVCache):
         can_use_jit: bool = False,
     ) -> None:
         if src_indices.numel() == 0:
+            return
+        if MambaPoolHost._slots_are_strided(src_layers[0]):
+            # Stage contiguous slots per layer and pass the staging buffer's pointers.
+            staged = torch.stack(
+                [
+                    src_layers[i].index_select(0, src_indices.to(src_layers.device))
+                    for i in range(num_layers)
+                ]
+            )
+            staged_ptrs = torch.tensor(
+                [staged[i].data_ptr() for i in range(num_layers)],
+                dtype=torch.uint64,
+                device=staged.device,
+            )
+            MambaPoolHost._copy_tensor_all_layers_lf_pf(
+                staged,
+                dst,
+                torch.arange(staged.shape[1], device=staged.device),
+                dst_indices,
+                num_layers,
+                io_backend,
+                staged_ptrs,
+                staging=staging,
+                can_use_jit=can_use_jit,
+            )
             return
         if io_backend == "kernel":
             item_size = MambaPoolHost._item_size_per_index(src_layers[0])

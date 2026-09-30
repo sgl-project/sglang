@@ -5,7 +5,7 @@ import torch
 import triton
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import DpPaddingMode
+from sglang.srt.layers.dp_attention import DpPaddingMode, dp_slot_in
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
 )
@@ -43,7 +43,6 @@ def aiter_can_use_preshuffle_paged_mqa() -> bool:
 
     Set ``SGLANG_DSA_HIP_DISABLE_PRESHUFFLE=1`` to force the legacy path even when
     the gluon kernel would otherwise be available (useful for CI bisection).
-    ``SGLANG_NSA_HIP_DISABLE_PRESHUFFLE`` is a deprecated alias.
     """
     if not is_hip():
         return False
@@ -185,10 +184,8 @@ def cal_padded_tokens(forward_batch: "ForwardBatch"):
         )
     if dp_padding_mode.is_max_len():
         tokens = max(global_num_tokens)
-    elif len(global_num_tokens) > 1:
-        tokens = global_num_tokens[get_parallel().attn_dp_rank]
     else:
-        tokens = global_num_tokens[0]
+        tokens = global_num_tokens[dp_slot_in(global_num_tokens)]
     if can_dsa_prefill_cp_interleave(forward_batch):
         tokens = ceil_div(tokens, attn_cp_size)
     return tokens
