@@ -10,6 +10,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
 )
+from sglang.srt.mem_cache.pool_host import base
 from sglang.srt.mem_cache.pool_host import mha as mha_pool_host
 from sglang.srt.mem_cache.pool_host import mla as mla_pool_host
 from sglang.srt.mem_cache.pool_host.common import (
@@ -261,6 +262,7 @@ class TestHiCacheHostRegister(unittest.TestCase):
                 "host_memory_budget_bytes",
                 return_value=2 * 1024**3,
             ),
+            mock.patch.object(base, "device_uses_allocator", return_value=True),
             mock.patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": alloc}),
         ):
             with self.assertRaises(ValueError):
