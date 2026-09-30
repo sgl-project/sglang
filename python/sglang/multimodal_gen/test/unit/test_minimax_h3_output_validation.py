@@ -66,7 +66,13 @@ def _encode(
 ) -> str:
     path = directory / (name + suffix)
     command = ["ffmpeg", "-y", "-v", "error"]
-    command += ["-f", "lavfi", "-i", f"testsrc2=size={size}:rate={rate}"]
+    # end the video input; -frames:v can stop ffmpeg before the audio drains
+    command += [
+        "-f",
+        "lavfi",
+        "-i",
+        f"testsrc2=size={size}:rate={rate},trim=end_frame={frames}",
+    ]
     maps = ["-map", "0:v"]
     if audio:
         command += [
@@ -81,7 +87,7 @@ def _encode(
         srt.write_text("1\n00:00:00,000 --> 00:00:01,000\ncaption\n")
         command += ["-i", str(srt)]
         maps += ["-map", f"{2 if audio else 1}:s", "-c:s", "mov_text"]
-    command += maps + ["-frames:v", str(frames), *video]
+    command += maps + [*video]
     if audio:
         command += ["-c:a", audio_codec, "-ac", str(channels)]
     subprocess.run(command + [str(path)], check=True, capture_output=True)
