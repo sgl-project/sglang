@@ -121,8 +121,8 @@ class TestNemotronAuxCapture(CustomTestCase):
                 moe_dp_size=1,
             ),
             patch_communicator("get_moe_cp_size", return_value=1),
-            patch_communicator("apply_flashinfer_allreduce_fusion", return_value=False),
-            patch_communicator("apply_aiter_all_reduce_fusion", return_value=False),
+            patch_communicator("flashinfer_ar_fusion_applies", return_value=False),
+            patch_communicator("aiter_ar_fusion_applies", return_value=False),
         ):
             baseline = _build(pattern, tp, False)(
                 batch.input_ids, torch.arange(2), batch, inputs_embeds=inputs.clone()
