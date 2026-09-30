@@ -3,6 +3,13 @@ import triton.language as tl
 
 
 @triton.jit
+def _draft_probability(value, row_max, inv_sum, temperature, FROM_LOGITS: tl.constexpr):
+    if FROM_LOGITS:
+        value = tl.exp(value.to(tl.float32) / temperature - row_max) * inv_sum
+    return value
+
+
+@triton.jit
 def speculative_sampling_classic_kernel(
     # Pointers
     Predicts,
@@ -13,7 +20,9 @@ def speculative_sampling_classic_kernel(
     UniformSamples,
     UniformSamplesFinal,
     TargetProbs,
-    DraftProbs,
+    DraftProbs,  # Probabilities, or pre-temperature logits when DRAFT_FROM_LOGITS.
+    DraftSoftmaxStats,
+    DraftTemperatures,
     # Strides
     stride_cand_b,
     stride_cand_s,
@@ -29,11 +38,18 @@ def speculative_sampling_classic_kernel(
     stride_dp_v,
     # Constants
     NUM_SLOTS: tl.constexpr,
+    NUM_DRAFT_STEPS: tl.constexpr,
     VOCAB_SIZE: tl.constexpr,
     BLOCK_V: tl.constexpr,
+    DRAFT_FROM_LOGITS: tl.constexpr,
 ):
     pid = tl.program_id(0)
     cur_prob_row = 0
+    temperature = 1.0
+    draft_max = 0.0
+    draft_inv_sum = 1.0
+    if DRAFT_FROM_LOGITS:
+        temperature = tl.load(DraftTemperatures + pid).to(tl.float32)
 
     cand_ptr_base = Candidates + pid * stride_cand_b
     idx_ptr_base = RetriveIndex + pid * stride_idx_b
@@ -65,6 +81,13 @@ def speculative_sampling_classic_kernel(
 
         p = tl.load(TargetProbs + offset_prob)
         q = tl.load(DraftProbs + offset_draft)
+        if DRAFT_FROM_LOGITS:
+            stats_offset = (pid.to(tl.int64) * NUM_DRAFT_STEPS + cur_prob_row) * 2
+            draft_max = tl.load(DraftSoftmaxStats + stats_offset)
+            draft_inv_sum = tl.load(DraftSoftmaxStats + stats_offset + 1)
+        q = _draft_probability(
+            q, draft_max, draft_inv_sum, temperature, DRAFT_FROM_LOGITS
+        )
 
         coin = tl.load(uni_ptr_base + (step - 1) * stride_uni_s)
 
@@ -118,7 +141,12 @@ def speculative_sampling_classic_kernel(
             val = p_val
         else:
             q_ptr = dp_base_ptr_safe + v_offsets * stride_dp_v
-            q_val = tl.load(q_ptr, mask=mask, other=0.0)
+            q_val = tl.load(
+                q_ptr, mask=mask, other=float("-inf") if DRAFT_FROM_LOGITS else 0.0
+            )
+            q_val = _draft_probability(
+                q_val, draft_max, draft_inv_sum, temperature, DRAFT_FROM_LOGITS
+            )
             # Treat any non-probability q (NaN, +-inf, negative) as 0: the
             # residual falls back to p. A comparison against NaN is false, so
             # the range test rejects it along with the infinities.
@@ -148,7 +176,12 @@ def speculative_sampling_classic_kernel(
                 val = p_val
             else:
                 q_ptr = dp_base_ptr_safe + v_offsets * stride_dp_v
-                q_val = tl.load(q_ptr, mask=mask, other=0.0)
+                q_val = tl.load(
+                    q_ptr, mask=mask, other=float("-inf") if DRAFT_FROM_LOGITS else 0.0
+                )
+                q_val = _draft_probability(
+                    q_val, draft_max, draft_inv_sum, temperature, DRAFT_FROM_LOGITS
+                )
                 # Same guard as pass 1.
                 q_val = tl.where((q_val >= 0.0) & (q_val <= 1.0), q_val, 0.0)
                 diff = p_val - q_val
@@ -185,9 +218,26 @@ def chain_speculative_sampling_triton(
     threshold_single,
     threshold_acc,
     deterministic,  # not used
+    *,
+    draft_logits=None,
+    draft_softmax_stats=None,
+    draft_temperatures=None,
 ):
+    """Verify using dense q or logits with per-row (scaled max, inverse sum)."""
     batch_size, num_slots = candidates.shape
     vocab_size = target_probs.shape[-1]
+    from_logits = draft_logits is not None
+    draft_values = draft_logits if from_logits else draft_probs
+    if from_logits:
+        assert draft_probs is None
+        assert draft_softmax_stats is not None and draft_temperatures is not None
+        assert draft_softmax_stats.shape == (*draft_logits.shape[:2], 2)
+        assert draft_softmax_stats.is_contiguous()
+        assert draft_temperatures.numel() == batch_size
+        assert draft_temperatures.is_contiguous()
+    else:
+        assert draft_probs is not None
+        assert draft_softmax_stats is None and draft_temperatures is None
 
     grid = (batch_size,)
     speculative_sampling_classic_kernel[grid](
@@ -199,7 +249,9 @@ def chain_speculative_sampling_triton(
         uniform_samples,
         uniform_samples_for_final_sampling,
         target_probs,
-        draft_probs,
+        draft_values,
+        draft_softmax_stats,
+        draft_temperatures,
         candidates.stride(0),
         candidates.stride(1),
         retrive_index.stride(0),
@@ -209,10 +261,14 @@ def chain_speculative_sampling_triton(
         target_probs.stride(0),
         target_probs.stride(1),
         target_probs.stride(2),
-        draft_probs.stride(0),
-        draft_probs.stride(1),
-        draft_probs.stride(2),
+        draft_values.stride(0),
+        draft_values.stride(1),
+        draft_values.stride(2),
         NUM_SLOTS=num_slots,
+        NUM_DRAFT_STEPS=draft_values.shape[1],
         VOCAB_SIZE=vocab_size,
         BLOCK_V=4096,
+        DRAFT_FROM_LOGITS=from_logits,
+        # Match the separately rounded scaling in the normalization kernel.
+        enable_fp_fusion=not from_logits,
     )

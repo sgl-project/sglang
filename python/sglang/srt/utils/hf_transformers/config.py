@@ -128,6 +128,20 @@ class HfModelConfigParser(ModelConfigParserBase):
         revision: Optional[str] = None,
         **kwargs,
     ):
+        config_dict, _ = PretrainedConfig.get_config_dict(
+            model, revision=revision, **kwargs
+        )
+        if config_dict.get("speculators_model_type") == "dspark":
+            from sglang.srt.configs.dspark import normalize_speculators_dspark_config
+
+            # Use the built-in Qwen3 config and existing JSON/HF loader. Never
+            # enable remote code merely to read the Speculators wrapper.
+            native_config = normalize_speculators_dspark_config(config_dict)
+            model_type = native_config.pop("model_type")
+            config = AutoConfig.for_model(model_type, **native_config)
+            config._name_or_path = model
+            return config
+
         config = _try_load_longcat_config(model, revision, **kwargs)
         if config is None:
             config = _try_load_raw_mamba_config(model, revision, **kwargs)

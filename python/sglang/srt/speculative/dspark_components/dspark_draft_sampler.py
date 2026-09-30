@@ -10,6 +10,9 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
 )
 from sglang.srt.environ import DsparkFoldedSampling, envs
 from sglang.srt.models.dspark import VanillaMarkov
+from sglang.srt.speculative.dspark_components.dspark_config import (
+    resolve_markov_candidate_config,
+)
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     select_draft_hidden_without_anchor,
 )
@@ -19,6 +22,106 @@ logger = logging.getLogger(__name__)
 
 # Same free-memory floor init_cuda_graphs requires before draft capture.
 _CAPTURE_HEADROOM_GB = 1.0
+
+
+def _target_vocab_size(model) -> int:
+    return int(getattr(model, "target_vocab_size", model.lm_head.org_vocab_size))
+
+
+def initialize_markov_candidate_sampler(
+    *,
+    model,
+    draft_hf_config,
+    gamma: int,
+    capacity: Optional[int],
+    tp_size: int,
+    markov_topk: Optional[int] = None,
+    markov_bias_topk: Optional[int] = None,
+):
+    """Resolve the path once after loading weights, before sizing the KV pool.
+
+    The proposal cache is owned by physical sampler slots and shared by eager
+    and all graph tiers. A verifier consumes it on the same stream before the
+    next proposal can clear it. Weight reloads rebuild the table in place;
+    configuration/layout changes require worker restart and graph recapture.
+    """
+    vocab = int(getattr(model, "draft_vocab_size", model.lm_head.org_vocab_size))
+    config = resolve_markov_candidate_config(
+        draft_hf_config,
+        markov_topk=markov_topk,
+        markov_bias_topk=markov_bias_topk,
+        draft_vocab_size=vocab,
+    )
+    model.markov_candidate_sampler = None
+    head = model.markov_head
+    reason = None
+    if config.effective_topk == 0:
+        reason = "K=0 selects the existing full-vocabulary path"
+    elif type(head) is not VanillaMarkov:
+        reason = "candidate walk requires an ordinary vanilla Markov head"
+    else:
+        from sglang.kernels.ops.speculative.dspark.dspark_markov_topk import (
+            MAX_STEPS,
+            CandidateCapacityError,
+            MarkovCandidateSampler,
+            candidate_support_reason,
+        )
+
+        w1 = getattr(head.markov_w1, "weight", None)
+        w2 = getattr(head.markov_w2, "weight", None)
+        if w1 is None or w2 is None:
+            reason = "Markov weights are not directly readable"
+        else:
+            reason = candidate_support_reason(
+                w1,
+                w2,
+                topk=config.effective_topk,
+                bias_topk=config.effective_bias_topk,
+                tp_size=tp_size,
+            )
+        if reason is None and not 0 < gamma <= MAX_STEPS:
+            reason = f"candidate gamma exceeds the bounded range 1..{MAX_STEPS}"
+        if reason is None and (capacity is None or capacity <= 0):
+            reason = (
+                "set --max-running-requests to bound FP32 proposal storage "
+                "before KV capacity planning"
+            )
+        if reason is None:
+            try:
+                model.markov_candidate_sampler = MarkovCandidateSampler(
+                    w1,
+                    w2,
+                    alpha=float(getattr(model, "logit_scale", 1.0)),
+                    topk=config.effective_topk,
+                    bias_topk=config.effective_bias_topk,
+                    target_vocab_size=_target_vocab_size(model),
+                    gamma=gamma,
+                    capacity=capacity,
+                    d2t_offset=getattr(model, "draft_id_to_target_id", None),
+                    logits_dtype=_base_logits_dtype(model),
+                )
+            except CandidateCapacityError as exc:
+                # Only a pre-allocation capability check may choose a memory
+                # fallback. Loading, mapping, OOM and compile errors propagate.
+                reason = str(exc)
+    enabled = model.markov_candidate_sampler is not None
+    logger.info(
+        "DSpark Markov requested K/M=%d/%d effective K/M=%d/%d "
+        "head=%s Vt=%d Vd=%d R=%s gamma=%d TP=%d path=%s reason=%s",
+        config.requested_topk,
+        config.requested_bias_topk,
+        config.effective_topk if enabled else 0,
+        config.effective_bias_topk if enabled else 0,
+        type(head).__name__,
+        _target_vocab_size(model),
+        vocab,
+        getattr(head, "markov_rank", "unknown"),
+        gamma,
+        tp_size,
+        "candidate-triton" if enabled else "full-vocabulary",
+        reason or "supported",
+    )
+    return model.markov_candidate_sampler
 
 
 def _base_logits_dtype(model) -> torch.dtype:
@@ -71,13 +174,28 @@ class DsparkDraftSampler:
             else None
         )
         self.folded_sampling = folded_sampling
+        self.candidate_sampler = getattr(model, "markov_candidate_sampler", None)
         self._tp_sync = tp_sync
         self.temperatures = None
         self.greedy_mask = None
         self.exp_noise = None
         self.corrected_out = None
-        if folded_sampling:
-            vocab = int(model.lm_head.org_vocab_size)
+        self.num_valid = None
+        self.anchors = None
+        if self.candidate_sampler is not None:
+            if max_bs > self.candidate_sampler.capacity:
+                raise ValueError("DSpark graph exceeds the candidate cache capacity")
+            self.temperatures = torch.ones(max_bs, dtype=torch.float32, device=device)
+            self.greedy_mask = torch.ones(max_bs, dtype=torch.bool, device=device)
+            self.num_valid = torch.full((), max_bs, dtype=torch.int32, device=device)
+            self.anchors = torch.empty(max_bs, dtype=torch.int64, device=device)
+            # This is a view of the sampler's authoritative FP32 cache. No
+            # legacy full-vocabulary logits or exponential-noise buffer exists.
+            self.corrected_out = self.candidate_sampler.corrected_logits.view(
+                -1, _target_vocab_size(model)
+            )
+        elif folded_sampling:
+            vocab = _target_vocab_size(model)
             self.temperatures = torch.ones(
                 (max_bs,), dtype=torch.float32, device=device
             )
@@ -94,7 +212,14 @@ class DsparkDraftSampler:
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
         """Host-side refresh of the static sampling params; must run before
         the draft graph replay that consumes them."""
+        if self.num_valid is not None:
+            self.num_valid.fill_(bs)
         if not self.folded_sampling:
+            if self.candidate_sampler is not None:
+                # The proposer consumes this graph tail only for all-greedy
+                # batches. Sampling batches run the candidate sampler eagerly.
+                self.temperatures[:bs].fill_(1.0)
+                self.greedy_mask[:bs].fill_(True)
             return
         if sampling_info is None:
             self.temperatures[:bs].fill_(1.0)
@@ -121,6 +246,26 @@ class DsparkDraftSampler:
         base_logits, confidence_tap = self.model.compute_base_logits(model_hidden)
         base_logits = base_logits.view(bs, self.gamma, -1)
         anchor = input_ids.view(bs, self.query_token_num)[:, 0]
+
+        if self.candidate_sampler is not None:
+            self.anchors[:bs].copy_(anchor)
+            result = self.candidate_sampler.sample(
+                base_logits,
+                self.anchors[:bs],
+                self.temperatures[:bs],
+                self.greedy_mask[:bs],
+                num_valid=self.num_valid,
+            )
+            self.out[: bs * self.gamma].copy_(result.tokens.reshape(-1))
+            if self.confidence_out is not None:
+                confidence = self.confidence_fn(
+                    draft_hidden=sample_hidden,
+                    anchor_tokens=result.prev_tokens[:, 0],
+                    draft_tokens=result.tokens,
+                    confidence_tap=confidence_tap,
+                )
+                self.confidence_out[:bs].copy_(confidence)
+            return
 
         # Fused greedy fast path: only valid for the greedy (non-sampling) fold.
         # Gated/RNN subclasses return None (hidden-state-dependent bias); fall
@@ -195,12 +340,24 @@ def _resolve_folded_sampling(
         return False
     if mode == DsparkFoldedSampling.FORCE:
         return True
+
     # The V4.1 TP head reduces compact argmax summaries in the greedy graph.
     if getattr(model.markov_head, "supports_sharded_greedy", False):
         return False
-    vocab = int(model.lm_head.org_vocab_size)
-    noise_bytes = max_bs * vocab * 4
-    logits_bytes = max_bs * gamma * vocab * _base_logits_dtype(model).itemsize
+    vocab = _target_vocab_size(model)
+    candidate = getattr(model, "markov_candidate_sampler", None)
+    if candidate is not None:
+        # Table, FP32 proposal cache, candidate IDs and RNG storage were
+        # allocated before KV planning; the free-memory probe already excludes
+        # them. Account here only for graph staging and Top-K outputs/scratch.
+        noise_bytes = max_bs * (4 + 1 + 8) + 4
+        logits_bytes = (
+            max_bs * gamma * candidate.topk * (_base_logits_dtype(model).itemsize + 8)
+        )
+    else:
+        noise_bytes = max_bs * vocab * 4
+        logits_bytes = max_bs * gamma * vocab * _base_logits_dtype(model).itemsize
+
     need_gb = (noise_bytes + logits_bytes) / (1 << 30)
     if available_memory_gb - need_gb >= _CAPTURE_HEADROOM_GB:
         return True
