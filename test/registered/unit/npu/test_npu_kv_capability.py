@@ -1,8 +1,8 @@
 """CPU-only tests for the Ascend DSA KV cache capability and its consumers.
 
 Covers the capability accept/reject matrix, the MLA KV cache dim selector, the
-NPU MLA pool's indexer dtypes and the indexer sizer. NPU extension modules are
-stubbed; no operator runs.
+NPU MLA pool's PD layer ids and indexer dtypes, and the indexer sizer. NPU
+extension modules are stubbed; no operator runs.
 """
 
 import sys
@@ -248,6 +248,41 @@ def _build_pool(
 
 
 class TestNpuMlaPoolLayout(unittest.TestCase):
+    def assertLayerIdsAlign(self, pool, expected):
+        ptrs, lens, item_lens = pool.get_contiguous_buf_infos()
+        layer_ids = pool.get_kv_layer_ids()
+        self.assertEqual(layer_ids, expected)
+        self.assertEqual(len(layer_ids), len(ptrs))
+        self.assertEqual(len(layer_ids), len(item_lens))
+        self.assertEqual(len(layer_ids), len(pool.get_dcp_remote_decode_layout()))
+
+    def test_packed_pool_entries_are_k_index_scale(self):
+        pool = _build_pool(FP8)
+        self.assertTrue(pool.dsa_kv_cache_store_fp8)
+        self.assertEqual(pool.v_buffer.shape[-1], 0)
+        self.assertLayerIdsAlign(pool, [0, 1] * 3)
+
+    def test_unpacked_pool_entries_are_k_v_index(self):
+        pool = _build_pool(torch.bfloat16, start_layer=4)
+        self.assertFalse(pool.dsa_kv_cache_store_fp8)
+        self.assertIsNone(pool.index_k_scale_buffer)
+        self.assertLayerIdsAlign(pool, [4, 5] * 3)
+
+    def test_compact_indexer_uses_indexer_layer_ids(self):
+        packed = _build_pool(FP8, start_layer=4, indexer_layer_ids=(5,))
+        self.assertLayerIdsAlign(packed, [4, 5, 5, 5])
+        unpacked = _build_pool(torch.bfloat16, start_layer=4, indexer_layer_ids=(5,))
+        self.assertLayerIdsAlign(unpacked, [4, 5, 4, 5, 5])
+
+    def test_dcp_scales_only_indexer_item_lens(self):
+        pool = _build_pool(FP8, dcp_size=2)
+        self.assertLayerIdsAlign(pool, [0, 1] * 3)
+        _, _, item_lens = pool.get_contiguous_buf_infos()
+        local = pool.k_buffer[0][0].nbytes
+        index = pool.index_k_buffer[0][0].nbytes * 2
+        scale = pool.index_k_scale_buffer[0][0].nbytes * 2
+        self.assertEqual(item_lens, [local] * 2 + [index] * 2 + [scale] * 2)
+
     def test_indexer_dtypes_live_on_the_pool(self):
         packed = _build_pool(FP8)
         self.assertEqual(packed.indexer_kv_dtype, FP8)
