@@ -41,6 +41,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+from sglang.srt.layers.moe.expert_executor import MoeExpertExecutorContext
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -224,7 +225,8 @@ class Gemma4MoE(nn.Module):
         self.layer_id = layer_id
         self.hidden_size = hidden_size
         self.num_experts = config.num_experts
-        self.tp_size = get_parallel().tp_size
+        parallel = get_parallel()
+        self.tp_size = parallel.tp_size
 
         # Per-expert output scale folded into routing weights so that
         # MoE's fused kernel computes: Σ_e (expert_e * w_e * scale_e)
@@ -267,16 +269,36 @@ class Gemma4MoE(nn.Module):
             custom_routing_function=routing_function,
         )
 
-        experts_type = get_moe_impl_class(quant_config)
+        num_redundant_experts = get_exec().moe.ep_num_redundant_experts
+        experts_prefix = add_prefix("experts", prefix)
+        experts_type = get_moe_impl_class(
+            quant_config,
+            context=MoeExpertExecutorContext(
+                model_family="gemma4",
+                layer_id=layer_id,
+                num_experts=config.num_experts,
+                num_redundant_experts=num_redundant_experts,
+                hidden_size=config.hidden_size,
+                intermediate_size=config.moe_intermediate_size,
+                top_k=config.top_k_experts,
+                activation=activation,
+                reduce_results=True,
+                quant_config=quant_config,
+                prefix=experts_prefix,
+                tp_size=parallel.tp_size,
+                moe_tp_size=parallel.moe_tp_size,
+                moe_ep_size=parallel.moe_ep_size,
+            ),
+        )
 
         self.experts = experts_type(
-            num_experts=config.num_experts + get_exec().moe.ep_num_redundant_experts,
+            num_experts=config.num_experts + num_redundant_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             layer_id=layer_id,
             top_k=config.top_k_experts,
             quant_config=quant_config,
-            prefix=add_prefix("experts", prefix),
+            prefix=experts_prefix,
             activation=activation,
             reduce_results=True,
         )

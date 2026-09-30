@@ -19,6 +19,7 @@ from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
 if TYPE_CHECKING:
     import torch
 
+    from sglang.srt.layers.moe.expert_executor import MoeExpertExecutorContext
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 # Re-export for convenience
@@ -68,6 +69,18 @@ class SRTPlatform(DeviceMixin):
 
     def get_full_graph_backend_cls(self) -> type[Any]:
         """Return the full device-graph backend class for this platform."""
+        return None
+
+    def get_moe_expert_executor_cls(
+        self, context: MoeExpertExecutorContext
+    ) -> Optional[type[torch.nn.Module]]:
+        """Return a platform-specific MoE expert executor class.
+
+        Returning ``None`` keeps SGLang's built-in MoE implementation. The
+        returned class must accept the model's standard expert constructor
+        arguments and ``forward(hidden_states, topk_output)`` call. The model
+        remains responsible for producing ``topk_output``.
+        """
         return None
 
     def get_mha_kv_pool_cls(self) -> type:
