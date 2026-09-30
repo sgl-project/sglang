@@ -1,5 +1,7 @@
+import sys
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from sglang.srt.eplb import expert_location as location
@@ -48,3 +50,7 @@ def test_recovery_preserves_graph_visible_tensors():
     assert all(torch.all(getattr(metadata, field) == 7) for field in fields)
     assert torch.equal(metadata.physical_to_logical_map_cpu, tensors[0])
     assert torch.equal(metadata.logical_to_all_physical_map_cpu, tensors[1])
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
