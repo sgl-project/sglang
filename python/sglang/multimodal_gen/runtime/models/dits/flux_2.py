@@ -392,6 +392,24 @@ def _flux2_swiglu(x: torch.Tensor) -> torch.Tensor:
     return F.silu(x[..., :half]) * x[..., half:]
 
 
+def _flux2_cat_swiglu(x: torch.Tensor, gate_up: torch.Tensor) -> torch.Tensor | None:
+    """Bit-exact ``cat([x, _flux2_swiglu(gate_up)], -1)``, the mul writing into the cat.
+    XPU only (the one backend timed); None where the fused kernel or Inductor runs."""
+    if (
+        x.device.type != "xpu"
+        or torch.compiler.is_compiling()
+        or (not _FLUX2_SWIGLU.disabled and can_use_fused_packed_silu_mul(gate_up))
+        or x.dtype != gate_up.dtype
+        or x.shape[:-1] != gate_up.shape[:-1]
+    ):
+        return None
+    d, half = x.shape[-1], gate_up.shape[-1] // 2
+    out = x.new_empty(*x.shape[:-1], d + half)
+    out[..., :d].copy_(x)
+    torch.mul(F.silu(gate_up[..., :half]), gate_up[..., half:], out=out[..., d:])
+    return out
+
+
 class Flux2SwiGLU(nn.Module):
     """
     Flux 2 uses a SwiGLU-style activation in the transformer feedforward sub-blocks, but with the linear projection
@@ -968,7 +986,13 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
 
-        # Handle the feedforward (FF) logic
+        # Handle the feedforward (FF) logic. An eager SwiGLU's mul writes into the
+        # to_out input, so its output and the cat's copy of it go away.
+        if not (self._enable_fp8_token_cat or self._enable_nvfp4_token_cat):
+            cat_input = _flux2_cat_swiglu(hidden_states, mlp_hidden_states)
+            if cat_input is not None:
+                hidden_states, _ = self.to_out(cat_input)
+                return hidden_states
         mlp_hidden_states = self.mlp_act_fn(mlp_hidden_states)
 
         # Concatenate and parallel output projection. FP8 writes a packed
