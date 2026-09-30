@@ -330,6 +330,7 @@ async def preprocess_video(
 
 # Compatible with Qwen-VL & Qwen-Omni Series
 class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
+    gpu_image_decode = False
     supports_transformers_backend = True
     generates_input_ids_from_raw_prompt = True
     artifact_modality = Modality.IMAGE

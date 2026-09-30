@@ -69,6 +69,22 @@ def _is_decoded(img: Image.Image) -> bool:
 
 
 class TestLoadSingleItemImageDecode(CustomTestCase):
+    def test_qwen_jpeg_pixels_match_pil_on_cuda_hosts(self):
+        """Qwen JPEG inputs must retain PIL chroma reconstruction on GPU servers."""
+        from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
+
+        data = _jpeg_bytes()
+        expected = np.asarray(Image.open(io.BytesIO(data)).convert("RGB"))
+        with (
+            patch.object(common, "is_cuda", return_value=True),
+            patch(
+                "torchvision.io.decode_jpeg",
+                return_value=torch.zeros((3, 8, 8), dtype=torch.uint8),
+            ),
+        ):
+            actual = QwenVLImageProcessor._load_single_item(data, Modality.IMAGE)
+        np.testing.assert_array_equal(np.asarray(actual), expected)
+
     def test_load_single_item_forces_decode(self):
         img = _StubProcessor._load_single_item(_png_bytes("RGB"), Modality.IMAGE)
         self.assertIsInstance(img, Image.Image)
