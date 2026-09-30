@@ -8,7 +8,7 @@ import torch
 
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList, AuxHiddenStatePacker
 from sglang.srt.layers.layer_boundary import StageKind
-from sglang.srt.layers.layer_boundary.residual.access import norm_output
+from sglang.srt.layers.layer_boundary.residual.access import final_norm_pair
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.test.boundary_fixtures import prepare_attention, stub_plan, stub_stage
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -35,22 +35,22 @@ class TestAuxStorage(CustomTestCase):
             backend._copy_output_to_buffer(source, tuple(buffers), 2)
 
     def test_capture_move_owns_gather_but_not_slice(self):
-        from sglang.srt.layers.layer_boundary.boundary import Boundary
+        from sglang.srt.layers.layer_boundary.boundary import _capture_move
         from sglang.srt.layers.layer_boundary.layout import Layout, TokenAxis
         from sglang.test.communicator_patch import patch_communicator
 
         full = Layout(frozenset())
-        sharded = Layout(frozenset({TokenAxis.ATTN_TP_SCATTER}))
+        sharded = Layout(frozenset({TokenAxis.ATTN_TP}))
         source = torch.ones(2, 3)
         for rows, target, owns in ((sharded, full, True), (full, sharded, False)):
             edge = SimpleNamespace(
                 residual_to=rows, produced=SimpleNamespace(layout=target)
             )
-            boundary = Boundary(edge=edge, prepare=None)
-            self.assertEqual(boundary.capture_move_allocates, owns)
+            capture_move, allocates = _capture_move(edge)
+            self.assertEqual(allocates, owns)
             with (
                 patch_communicator(
-                    "_redistribute_from_attn_tp_shards",
+                    "attn_tp_gather",
                     side_effect=lambda x: torch.cat((x, x)),
                 ),
                 patch_communicator(
@@ -58,16 +58,16 @@ class TestAuxStorage(CustomTestCase):
                     return_value=SimpleNamespace(attn_tp_size=2, attn_tp_rank=0),
                 ),
             ):
-                value = boundary.capture_move(source, forward_batch=None)
+                value = capture_move(source, forward_batch=None)
             outputs = AuxHiddenStateList()
             if owns:
                 with patch.object(
                     torch.Tensor, "clone", side_effect=AssertionError("extra clone")
                 ):
-                    outputs.capture(value, owned=boundary.capture_move_allocates)
+                    outputs.capture(value, owned=allocates)
                 self.assertIs(outputs[0], value)
             else:
-                outputs.capture(value, owned=boundary.capture_move_allocates)
+                outputs.capture(value, owned=allocates)
                 self.assertIsNot(outputs[0], value)
 
     def test_list_snapshots_borrowed_views_and_reused_buffers(self):
@@ -111,9 +111,9 @@ class TestAuxStorage(CustomTestCase):
                 stage = self.boundary(stream)
                 outputs = AuxHiddenStatePacker(1)
                 kwargs = (
-                    {"capture_output": outputs.capture}
+                    {"capture": outputs.capture}
                     if callback
-                    else {"captured_last_layer_outputs": outputs}
+                    else {"capture_gathered": outputs}
                 )
                 with patch.object(
                     torch.Tensor, "clone", side_effect=AssertionError("extra clone")
@@ -147,7 +147,7 @@ class TestAuxStorage(CustomTestCase):
                 with patch.object(
                     torch.Tensor, "clone", side_effect=AssertionError("extra clone")
                 ):
-                    norm_output(hidden, residual, norm, outputs.capture)
+                    final_norm_pair(hidden, residual, norm, outputs.capture)
                 hidden.zero_()
                 updated.zero_()
                 torch.testing.assert_close(
@@ -170,9 +170,7 @@ class TestAuxStorage(CustomTestCase):
         with patch.object(
             torch.Tensor, "clone", side_effect=AssertionError("extra clone")
         ):
-            prepare_attention(
-                stage, hidden, stream, None, capture_output=outputs.capture
-            )
+            prepare_attention(stage, hidden, stream, None, capture=outputs.capture)
         torch.testing.assert_close(outputs.finalize(), torch.full((2, 3), 4.0))
 
 
@@ -182,8 +180,8 @@ class TestBoundCaptureOwnership(CustomTestCase):
 
         from sglang.srt.layers import layernorm
         from sglang.srt.layers.layer_boundary import (
-            ADD,
-            FusedMlpInput,
+            PLAIN_ADD,
+            FfnInputFusion,
             SumGroup,
             declare_attn,
             declare_ffn,
@@ -212,10 +210,10 @@ class TestBoundCaptureOwnership(CustomTestCase):
 
         custom_fusions = (
             SimpleNamespace(
-                ffn_input=lambda plan: (
-                    FusedMlpInput(completes=SumGroup.ATTN_TP, run=custom_fused),
+                ffn_input_fusions=lambda plan: (
+                    FfnInputFusion(completes=SumGroup.ATTN_TP, run=custom_fused),
                 ),
-                attention_input=lambda plan: (),
+                attn_input_fusions=lambda plan: (),
             )
             if custom
             else None
@@ -224,15 +222,13 @@ class TestBoundCaptureOwnership(CustomTestCase):
             forward_mode=ForwardMode.DECODE,
             residual_stream=ResidualStream(torch.full((2, 4), 2.0)),
         )
-        hidden = fb.residual_stream.leave(torch.full((2, 4), 3.0), ADD)
+        hidden = fb.residual_stream.record(torch.full((2, 4), 3.0), PLAIN_ADD)
         outputs = AuxHiddenStateList()
         with (
             fixture.planning(parallel),
             patch_communicator("_use_aiter", False),
-            patch_communicator("apply_aiter_all_reduce_fusion", return_value=False),
-            patch_communicator(
-                "apply_flashinfer_allreduce_fusion", return_value=enabled
-            ),
+            patch_communicator("aiter_ar_fusion_applies", return_value=False),
+            patch_communicator("flashinfer_ar_fusion_applies", return_value=enabled),
             patch_communicator(
                 "attention_tensor_model_parallel_all_reduce",
                 side_effect=lambda x: x * 2,
@@ -258,9 +254,9 @@ class TestBoundCaptureOwnership(CustomTestCase):
                 predicate is not None and predicate(hidden, fb), enabled and not custom
             )
             kwargs = (
-                {"capture_output": outputs.capture}
+                {"capture": outputs.capture}
                 if callback
-                else {"captured_last_layer_outputs": outputs}
+                else {"capture_gathered": outputs}
             )
             if enabled and not custom:
                 # Only capture is forbidden from cloning. The real FlashInfer

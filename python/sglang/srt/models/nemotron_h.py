@@ -216,6 +216,7 @@ class NemotronHMoE(nn.Module):
         )
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
+            layer_id=layer_idx,
             use_grouped_topk=True,
             topk_group=config.topk_group,
             num_expert_group=config.n_group,
@@ -758,7 +759,9 @@ class NemotronHModel(nn.Module):
             aux_hidden_states.append(
                 residual_batch.snapshot(hidden_states, forward_batch)
             )
-        hidden_states = residual_batch.norm(hidden_states, forward_batch, self.norm_f)
+        hidden_states = residual_batch.final_norm(
+            hidden_states, forward_batch, self.norm_f
+        )
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
