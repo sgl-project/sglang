@@ -425,15 +425,20 @@ _wo_a_aiter_batched_gemm_disabled = False
 _wo_a_fp8_mxscale = None
 _wo_a_fp8_mxscale_fused_invrope = None
 _wo_a_weight_scale_to_e8m0 = None
+_wo_a_fp8_bpreshuffle = None
+_wo_a_weight_to_bpreshuffle = None
 _hip = None
 if _is_hip:
     from sglang.srt.models.deepseek_common.amd import deepseek_v4_hip as _hip
     from sglang.srt.models.deepseek_common.amd.deepseek_v4_wo_a_fp8 import (
+        apply_wo_a_fp8_bpreshuffle,
         apply_wo_a_fp8_mxscale,
         apply_wo_a_fp8_mxscale_fused_invrope,
+        is_wo_a_fp8_bpreshuffle_supported,
         is_wo_a_fp8_fused_invrope_supported,
         is_wo_a_fp8_mxscale_supported,
         wo_a_weight_scale_to_e8m0,
+        wo_a_weight_to_bpreshuffle,
     )
 
     if is_wo_a_fp8_mxscale_supported():
@@ -446,6 +451,10 @@ if _is_hip:
             and is_wo_a_fp8_fused_invrope_supported()
         ):
             _wo_a_fp8_mxscale_fused_invrope = apply_wo_a_fp8_mxscale_fused_invrope
+    elif is_wo_a_fp8_bpreshuffle_supported():
+        # gfx1250: FlyDSL WMMA a8w8 bpreshuffle path (no scaled-MFMA on RDNA4).
+        _wo_a_fp8_bpreshuffle = apply_wo_a_fp8_bpreshuffle
+        _wo_a_weight_to_bpreshuffle = wo_a_weight_to_bpreshuffle
 
 
 @functools.lru_cache(maxsize=1)
@@ -2517,6 +2526,16 @@ class MQALayer(MqaAttentionBase):
                 # activation is quantized per token-group inside the helper.
                 T, G, D = o.shape
                 o = _wo_a_fp8_mxscale(
+                    o,
+                    self.wo_a.weight.view(G, self.o_lora_rank, D),
+                    self.wo_a.weight_scale_inv.data,
+                )
+            elif self.wo_a_fp8 and _wo_a_fp8_bpreshuffle is not None:
+                # ROCm gfx1250: FlyDSL WMMA a8w8 mxfp8 bpreshuffle GEMM.
+                # Weight was preshuffled at load time; activation is quantized
+                # per token-group inside the helper (same Triton kernel).
+                T, G, D = o.shape
+                o = _wo_a_fp8_bpreshuffle(
                     o,
                     self.wo_a.weight.view(G, self.o_lora_rank, D),
                     self.wo_a.weight_scale_inv.data,
@@ -5269,17 +5288,31 @@ class DeepseekV4ForCausalLM(nn.Module):
             D = attn.wo_a.weight.shape[1]
 
             if _wo_a_weight_scale_to_e8m0 is not None:
-                # ROCm: aiter's mxscale GEMM reads uint8 e8m0 block scales, and
-                # requantizes the weight when the checkpoint's scales are not
-                # already powers of two. It also needs the weight row-major, so
-                # check the linear method honoured keep_plain_weight_layout: a
-                # preshuffled weight has the same shape, dtype and strides and
-                # would only show up as garbage output.
+                # ROCm gfx950: aiter's mxscale GEMM reads uint8 e8m0 block
+                # scales, and requantizes the weight when the checkpoint's scales
+                # are not already powers of two. It also needs the weight
+                # row-major, so check the linear method honoured
+                # keep_plain_weight_layout: a preshuffled weight has the same
+                # shape, dtype and strides and would only show up as garbage.
                 assert not getattr(attn.wo_a, "aiter_bpreshuffled", False), (
                     "DSV4 wo_a was B-preshuffled by the fp8 linear method; the "
                     "aiter mxscale absorb GEMM needs the row-major weight"
                 )
                 weight, scale = _wo_a_weight_scale_to_e8m0(
+                    attn.wo_a.weight.data,
+                    attn.wo_a.weight_scale_inv.data,
+                    G,
+                    R,
+                )
+                attn.wo_a.weight.data = weight.view(G * R, D)
+                attn.wo_a.weight_scale_inv.data = scale
+                attn.wo_a.weight_scale_inv.format_ue8m0 = True
+                continue
+            elif _wo_a_weight_to_bpreshuffle is not None:
+                # ROCm gfx1250: convert fp32 scales → e8m0 (same as gfx950) then
+                # apply the WMMA 16×16 tile shuffle so the weight is ready for
+                # batched_gemm_a8w8_mxscale_bpreshuffle at runtime.
+                weight, scale = _wo_a_weight_to_bpreshuffle(
                     attn.wo_a.weight.data,
                     attn.wo_a.weight_scale_inv.data,
                     G,
