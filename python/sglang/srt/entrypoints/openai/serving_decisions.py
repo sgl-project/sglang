@@ -12,6 +12,7 @@ from fastapi import Request
 from fastapi.responses import ORJSONResponse
 from transformers import PreTrainedTokenizerBase
 
+from sglang.srt.entrypoints.decision.protocol import JevRequest
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageContentImageURL,
     DecisionAnswer,
@@ -124,6 +125,18 @@ class OpenAIServingDecisions(OpenAIServingBase):
                         detector.think_end_token,
                     )
                     self.answers_open_reasoning = detector.reasoning_default == "always"
+        # A checkpoint trained on its own decision prompt is a second prompt source,
+        # used for the Jev request shape. Imported here, as it builds on this module.
+        from sglang.srt.entrypoints.decision.serving import TrainedDecisions
+
+        self.trained_decisions = TrainedDecisions(
+            self.tokenizer_manager, validate_server=self._validate_server
+        )
+
+    async def handle_request(self, request, raw_request: Request):
+        if isinstance(request, JevRequest):
+            return await self.trained_decisions.handle_request(request, raw_request)
+        return await super().handle_request(request, raw_request)
 
     def _request_id_prefix(self) -> str:
         return "decision-"

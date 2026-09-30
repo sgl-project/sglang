@@ -8,7 +8,6 @@ from types import SimpleNamespace
 
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import ORJSONResponse
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -18,8 +17,12 @@ from sglang.srt.entrypoints.decision.families.intern import (
     ANSWER_SYMBOLS,
     compile_decision,
 )
-from sglang.srt.entrypoints.decision.serving import DecisionModelServing
+from sglang.srt.entrypoints.decision.request_id import TypesafeRequestIdMiddleware
+from sglang.srt.entrypoints.openai.serving_decisions import OpenAIServingDecisions
+from sglang.srt.entrypoints.systemone.serving import SystemOneServing
 from sglang.srt.managers.tokenizer_manager import resolve_readout_anchor
+from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
+from sglang.srt.parser.template_detection import detect_reasoning_pattern
 from sglang.srt.runtime_context import (
     get_schedule,
     publish,
@@ -32,6 +35,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 TOKENIZER = "internlm/Intern-Decision-0.8B"
+# A chat model outside every decision model family.
+GENERIC_TOKENIZER = "Qwen/Qwen3.5-35B-A3B"
 ROUTES = ("/v1/decisions", "/v1/jev", "/v1/systemone")
 NOUL = {"u": {"type": "noul"}}
 # Image tokens one image expands to in the stand-in for the Qwen-VL processor.
@@ -70,46 +75,79 @@ OFFICIAL_MESSAGES = [
 OFFICIAL_SYMBOLS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 
 
-def _manager(tokenizer, rows, **server_args):
-    """A tokenizer manager whose model returns fixed logprobs per readout position."""
-    server_args = ServerArgs(model_path="dummy", **server_args)
-    publish(server_args, role="test")
-    requests = []
+class ReadoutManager(TokenizerManagerScoreMixin):
+    """Replace only model execution with fixed logprobs per readout position."""
 
-    async def generate_request(request, raw_request):
+    def __init__(self, tokenizer, rows, **server_args):
+        self.server_args = ServerArgs(model_path="dummy", **server_args)
+        publish(self.server_args, role="test")
+        self.tokenizer = tokenizer
+        self.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["Qwen3_5ForConditionalGeneration"],
+                model_type="qwen3_5",
+            )
+        )
+        self.is_generation = True
+        self.context_len = 8192
+        self.num_reserved_tokens = 0
+        self.request_logger = SimpleNamespace(log_requests=False)
+        self.served_model_name = "served-model"
+        self.rows = rows
+        self.requests = []
+
+    def config_value(self, name):
+        return None
+
+    async def generate_request(self, request, raw_request):
+        if request.readout_anchor is None:
+            self.requests.append((request, None))
+            yield list(self._generic_results(request))
+            return
         ids = request.input_ids
         if request.image_data:
             # Expand each image placeholder as the Qwen-VL processor does.
-            pad = tokenizer.convert_tokens_to_ids("<|image_pad|>")
+            pad = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
             ids = []
-            for token in tokenizer.encode(request.text, add_special_tokens=False):
+            for token in self.tokenizer.encode(request.text, add_special_tokens=False):
                 ids += [token] * (IMAGE_TOKENS if token == pad else 1)
         request.token_indices_to_pool = resolve_readout_anchor(
             input_ids=ids,
             anchor=request.readout_anchor,
             chunked_prefill_size=get_schedule().chunked_prefill_size,
         )
-        requests.append((request, ids))
+        self.requests.append((request, ids))
         labels = request.token_ids_logprob
-        readouts = [[(lp, i, None) for lp, i in zip(row, labels)] for row in rows]
+        readouts = [[(lp, i, None) for lp, i in zip(row, labels)] for row in self.rows]
         meta = {"input_token_ids_logprobs": readouts, "prompt_tokens": len(ids)}
         yield {"meta_info": meta}
 
-    return SimpleNamespace(
-        server_args=server_args,
-        tokenizer=tokenizer,
-        is_generation=True,
-        context_len=8192,
-        num_reserved_tokens=0,
-        request_logger=SimpleNamespace(log_requests=False),
-        served_model_name="served-model",
-        generate_request=generate_request,
-        requests=requests,
+    @staticmethod
+    def _generic_results(request):
+        request.normalize_batch_and_arguments()
+        for ids, labels in zip(request.input_ids, request.token_ids_logprob):
+            logprobs = [(math.log(0.1), token, None) for token in labels]
+            meta = {"prompt_tokens": len(ids), "output_token_ids_logprobs": [logprobs]}
+            yield {"meta_info": meta}
+
+
+def _serving(manager, serving_class):
+    """The decision route handler over the chat serving state of a Jinja-template server."""
+    _, reasoning_config = detect_reasoning_pattern(manager.tokenizer.chat_template)
+    template_manager = SimpleNamespace(
+        chat_template_name=None,
+        reasoning_config=reasoning_config,
+        suggested_reasoning_parser=None,
     )
-
-
-async def _handled_by(request, raw_request):
-    return ORJSONResponse({"handled_by": type(request).__name__})
+    chat_serving = SimpleNamespace(
+        tokenizer_manager=manager,
+        template_manager=template_manager,
+        default_chat_template_kwargs={},
+        chat_encoding_spec=None,
+        _prompt_text_round_trip_is_lossy=False,
+        reasoning_parser=None,
+    )
+    return serving_class(chat_serving)
 
 
 def _logs(*ps):
@@ -138,13 +176,17 @@ class TestDecisionModels(unittest.TestCase):
         app.router.routes.extend(
             r for r in routes if isinstance(r, APIRoute) and r.path in ROUTES
         )
+        app.user_middleware = [
+            m
+            for m in server.app.user_middleware
+            if m.cls is TypesafeRequestIdMiddleware
+        ]
         app.add_exception_handler(
             RequestValidationError, server.validation_exception_handler
         )
-        manager = _manager(tokenizer or self.tokenizer, rows, **server_args)
-        app.state.decision_model_serving = DecisionModelServing(manager)
-        recorder = SimpleNamespace(handle_request=_handled_by)
-        app.state.systemone_serving = app.state.openai_serving_decisions = recorder
+        manager = ReadoutManager(tokenizer or self.tokenizer, rows, **server_args)
+        app.state.openai_serving_decisions = _serving(manager, OpenAIServingDecisions)
+        app.state.systemone_serving = _serving(manager, SystemOneServing)
         return TestClient(app), manager
 
     def test_prompt_matches_the_official_compiler(self):
@@ -193,14 +235,21 @@ class TestDecisionModels(unittest.TestCase):
             self.assertEqual(response.status_code, status)
         question = {"id": "a", "type": "yes_no", "question": "q"}
         generic = {"input": "x", "questions": [question]}
+        client, manager = self._client()
         response = client.post("/v1/decisions", json=generic)
-        self.assertEqual(response.json(), {"handled_by": "DecisionRequest"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["object"], "decisions")
+        self.assertAlmostEqual(response.json()["answers"]["a"]["label_mass"], 0.2)
+        self.assertEqual([ids for _, ids in manager.requests], [None])
 
-        client, _ = self._client(tokenizer=SimpleNamespace(get_added_vocab=dict))
+        client, _ = self._client(
+            tokenizer=AutoTokenizer.from_pretrained(GENERIC_TOKENIZER)
+        )
         noul = {"u": {"type": "noul", "instructions": "q"}}
-        systemone = {"state": "s", "model": "m", "questions": noul}
+        systemone = {"state": "s", "model": "served-model", "questions": noul}
         response = client.post("/v1/systemone", json=systemone)
-        self.assertEqual(response.json(), {"handled_by": "SystemOneRequest"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertAlmostEqual(response.json()["answers"]["u"]["x_label_mass"], 0.2)
         refused = client.post("/v1/jev", json=body)
         self.assertEqual(refused.status_code, 400)
         self.assertIn("Intern-Decision", refused.json()["message"])
@@ -304,6 +353,7 @@ class TestDecisionModels(unittest.TestCase):
         long_state = {"state": {"text": "word " * 400}}
         cases = [
             ({}, {"chat_template": "chatml"}, 400),
+            ({}, {"enable_mis": True}, 400),
             (long_state, {"chunked_prefill_size": 256}, 400),
             ({"thinking": {"enabled": True}}, {}, 422),
         ]
