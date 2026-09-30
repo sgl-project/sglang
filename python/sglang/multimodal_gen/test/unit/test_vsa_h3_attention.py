@@ -21,6 +21,9 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h
     _topk_tile_lists,
     vsa_h3_fold_gate,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.vsa_h3_kernels import (
+    vsa_h3_topk_lists,
+)
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="VSA-H3 kernels need CUDA"
@@ -172,15 +175,12 @@ def test_topk_tile_list_semantics() -> None:
 def test_topk_list_kernel_matches_sorted_topk(num_prefix, num_video, sparsity) -> None:
     """The unsorted-top-k list kernel must emit the sorted lists and leave its
     scratch mask zeroed for the next layer."""
-    from sglang.multimodal_gen.runtime.layers.attention.backends.vsa_h3_kernels import (
-        vsa_h3_topk_lists,
-    )
-
     n_tiles = num_prefix + num_video
     scores = torch.randn(HEADS, n_tiles, n_tiles, device="cuda")
     reference = _topk_tile_lists(scores, num_prefix, num_video, sparsity, True)
     keep = reference.shape[-1] - num_prefix
     out = torch.full((HEADS, num_video, n_tiles), -1, dtype=torch.int32, device="cuda")
+    out[..., :num_prefix] = torch.arange(num_prefix, dtype=torch.int32, device="cuda")
     mask = torch.zeros(HEADS, num_video, num_video, dtype=torch.int8, device="cuda")
     for _ in range(2):  # the scratch mask must come back zeroed
         picked = scores[:, num_prefix:, num_prefix:].topk(keep, sorted=False).indices
