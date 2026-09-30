@@ -327,6 +327,9 @@ class AiterRunnerCore(MoeRunnerCore):
             extra["swiglu_limit"] = quant_info.swiglu_limit
         if self.config.no_combine:
             extra["no_combine"] = True
+        extra["moe_sorting_dispatch_policy"] = (
+            envs.SGLANG_AITER_MOE_SORTING_DISPATCH_POLICY.get()
+        )
 
         # gfx950 small-M MXFP4 kernel (on by default, SGLANG_ROCM_SMALLM_MOE=0 disables): same layouts as aiter, bf16 activations.
         if _SMALLM_MOE_ON and quant_info.w13_weight.element_size() == 1:
