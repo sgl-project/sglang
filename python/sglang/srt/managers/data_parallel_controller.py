@@ -768,10 +768,16 @@ class DataParallelController:
         if self.maybe_external_dp_rank_routing(req):
             return
 
-        assert req.bootstrap_room is not None, (
-            "req.bootstrap_room should not be None. Do not send requests directly to "
-            "prefill or decode instances; send to the router instead."
-        )
+        if req.bootstrap_room is None:
+            # An exception here SIGQUITs the whole server. Any scheduler
+            # rejects a room-less PD request with a 400, as with --dp 1.
+            logger.warning(
+                "Request %s has no bootstrap_room; dispatching it round-robin "
+                "so the scheduler can reject it. Send requests through the router.",
+                req.rid,
+            )
+            self.round_robin_scheduler(req)
+            return
         target_rank = req.bootstrap_room % len(self.workers)
         sock_send(self.workers[target_rank], req)
 
@@ -784,7 +790,10 @@ class DataParallelController:
     def total_tokens_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
-        estimated_tokens = len(req.input_ids)
+        # input_embeds requests carry input_ids=None.
+        estimated_tokens = (
+            len(req.input_ids) if req.input_ids is not None else len(req.input_embeds)
+        )
         target_worker = self.dp_budget.dispatch(
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
         )

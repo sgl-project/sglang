@@ -55,12 +55,17 @@ def _make_controller(dp_size: int) -> DataParallelController:
     return ctl
 
 
-def _req(routed_dp_rank=None, bootstrap_room=None, input_ids=None):
-    """Req stand-in; SimpleNamespace avoids pinning to the Req dataclass schema."""
+def _req(routed_dp_rank=None, bootstrap_room=None, input_ids=None, input_embeds=None):
+    """Req stand-in; SimpleNamespace avoids pinning to the Req dataclass schema.
+
+    As with a real input_embeds request, passing input_embeds leaves input_ids None.
+    """
     return SimpleNamespace(
+        rid="req-0",
         routed_dp_rank=routed_dp_rank,
         bootstrap_room=bootstrap_room,
-        input_ids=input_ids or [],
+        input_ids=None if input_embeds is not None else (input_ids or []),
+        input_embeds=input_embeds,
     )
 
 
@@ -224,10 +229,15 @@ class TestFollowBootstrapRoomScheduler(CustomTestCase):
             ctl.follow_bootstrap_room_scheduler(_req(bootstrap_room=room))
             ctl.workers[expected_rank].send_pyobj.assert_called()
 
-    def test_requires_bootstrap_room(self):
+    def test_missing_bootstrap_room_is_handed_to_a_scheduler(self):
+        # An exception in the controller SIGQUITs the server; the scheduler 400s it.
         ctl = _make_controller(dp_size=4)
-        with self.assertRaises(AssertionError):
-            ctl.follow_bootstrap_room_scheduler(_req(bootstrap_room=None))
+        ctl.follow_bootstrap_room_scheduler(_req(bootstrap_room=None))
+        sent = [w for w in ctl.workers if w.send_pyobj.called]
+        self.assertEqual(len(sent), 1)
+        ctl.follow_bootstrap_room_scheduler(_req(bootstrap_room=None))
+        sent = [w for w in ctl.workers if w.send_pyobj.called]
+        self.assertEqual(len(sent), 2)
 
     def test_routed_dp_rank_bypasses_bootstrap_room(self):
         ctl = _make_controller(dp_size=4)
@@ -261,6 +271,17 @@ class TestTotalRequestsScheduler(CustomTestCase):
             [5, 3, 1, 4],
             "external routing must not mutate DPBudget state",
         )
+
+
+class TestTotalTokensScheduler(CustomTestCase):
+    def test_input_embeds_request_is_counted_by_embedding_rows(self):
+        # input_embeds requests carry input_ids=None.
+        ctl = _make_controller(dp_size=2)
+        ctl.dp_budget.total_tokens = [10, 0]
+        ctl.total_tokens_scheduler(_req(input_embeds=[[0.0] * 4] * 3))
+        ctl.workers[1].send_pyobj.assert_called_once()
+        ctl.workers[0].send_pyobj.assert_not_called()
+        self.assertEqual(ctl.dp_budget.total_tokens, [10, 3])
 
 
 class TestStatusAwarenessInconsistency(CustomTestCase):
