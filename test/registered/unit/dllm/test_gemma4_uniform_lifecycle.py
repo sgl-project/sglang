@@ -189,7 +189,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         adder.dllm_block_size = 256
         adder.rem_dllm_tokens = 1024
         adder.can_run_list = []
-        adder._mamba_gap_budget_for_req = lambda req: 0
+        adder._mamba_slots_for_req = lambda req: 0
         adder._update_prefill_budget = Mock()
         adder._account_prefill_cache_admission = Mock()
 
@@ -222,7 +222,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         adder.dllm_config = SimpleNamespace(requires_separate_context_encoding=True)
         adder.can_run_list = []
         adder._get_dllm_remain_tokens = lambda req=None: 64
-        adder._mamba_gap_budget_for_req = lambda req: 0
+        adder._mamba_slots_for_req = lambda req: 0
         adder._update_prefill_budget = Mock()
 
         req = _Req(context_len=10, block_size=4, prefill=True)

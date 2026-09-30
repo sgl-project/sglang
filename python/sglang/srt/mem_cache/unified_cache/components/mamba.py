@@ -684,12 +684,8 @@ class MambaComponent(TreeComponent):
             )
         ):
             return PrepareLoadBackResult()
-        dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
-        if dst is None:
-            self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
-            dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
-            assert dst is not None, "Cannot alloc mamba for load_back"
-        req.kv.mamba_pool_idx = dst[0]
+        dst = self._alloc_request_state_slot(req)
+        assert dst is not None, "Cannot alloc mamba for load_back"
         return PrepareLoadBackResult(allocated_mamba_slot=dst)
 
     def finalize_load_back(
@@ -699,6 +695,15 @@ class MambaComponent(TreeComponent):
         if not success and prep.allocated_mamba_slot is not None:
             self.cache.req_to_token_pool.mamba_allocator.free(prep.allocated_mamba_slot)
             req.kv.mamba_pool_idx = None
+
+    def _alloc_request_state_slot(self, req: Req) -> Optional[torch.Tensor]:
+        dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
+        if dst is None:
+            self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
+            dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
+        if dst is not None:
+            req.kv.mamba_pool_idx = dst[0]
+        return dst
 
     def prepare_prefetch(
         self,

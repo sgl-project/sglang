@@ -948,13 +948,23 @@ class BufferModePipeline:
         return True
 
     def _resolve_device_covered(self, req: Req, f: _StagedPrefetch) -> None:
-        req.host_hit_length = 0
-        req.swa_host_hit_length = 0
-        self._clear_storage_hit(req)
+        self._clear_staged_hit(req)
         self._cache._resolve_storage_prefetch_tokens(
             req.cache_request_handle, f.num_tokens, reason="device_covered"
         )
         self.release_staged_hold(req.cache_request_handle, reason=None)
+
+    def _drop_staged_hit(self, req: Req, reason: str) -> None:
+        self.release_staged_hold(req.cache_request_handle, reason=reason)
+        self._clear_staged_hit(req)
+
+    @classmethod
+    def _clear_staged_hit(cls, req: Req) -> None:
+        req.staged_prefetch_plan = None
+        req.host_hit_length = 0
+        req.swa_host_hit_length = 0
+        req.mamba_host_hit_length = 0
+        cls._clear_storage_hit(req)
 
     @staticmethod
     def _clear_storage_hit(req: Req) -> None:
@@ -1049,6 +1059,42 @@ class BufferModePipeline:
         cache.prefetch_loaded_storage_start_by_reqid[request] = operation.storage_start
         return True
 
+    def defer_staged_admission(self, req: Req, *, pool: str) -> None:
+        """Bound capacity retries before releasing a staged hit for recomputation.
+
+        The caller must end this admission attempt, including after a drop:
+        the next round's joint match must rebuild the FULL-only splice prefix.
+        """
+        request = req.cache_request_handle
+        f = self.staged_prefetches.get(request)
+        if f is None:
+            return
+        cache = self._cache
+        defers = self._staged_admission_defers.get(request, 0) + 1
+        self._staged_admission_defers[request] = defers
+        cache._log_storage_prefetch_deferred(f.num_tokens, "device_capacity")
+        if defers < self.max_staged_admission_defers:
+            logger.warning(
+                "HiCache staged prefetch deferred at admission req=%s "
+                "reason=device_capacity pool=%s tokens=%d defers=%d",
+                req.rid,
+                pool,
+                f.num_tokens,
+                defers,
+            )
+            return
+        # Still unmaterializable: drop the hold so the admission loop stops
+        # breaking on this request, which recomputes on its next pass.
+        logger.warning(
+            "HiCache staged prefetch dropped after %d device_capacity "
+            "deferrals req=%s pool=%s tokens=%d",
+            defers,
+            req.rid,
+            pool,
+            f.num_tokens,
+        )
+        self._drop_staged_hit(req, reason="device_capacity")
+
     def init_load_back(
         self, params: InitLoadBackParams
     ) -> Optional[tuple[torch.Tensor, NodeId]]:
@@ -1056,8 +1102,8 @@ class BufferModePipeline:
 
         The caller has finished selecting its prefill shape and must acquire
         the request lock after success, without further admission gates. The
-        prefix lock protects allocation-time eviction. None retains staging
-        and its anchor for the next admission attempt.
+        prefix lock protects allocation-time eviction. None ends the attempt;
+        staging is retained until the bounded admission deferral drops it.
 
         Ownership contract: cc.load queues the H2D before insert adjudicates
         ownership, so the prepared boundary must ensure the insert can only
@@ -1082,33 +1128,6 @@ class BufferModePipeline:
             plan.full_tokens,
             plan.swa_tokens,
         ), f"staged load-back budget changed for {req.rid}"
-
-        def _defer_for_capacity(pool: str) -> None:
-            defers = self._staged_admission_defers.get(request, 0) + 1
-            self._staged_admission_defers[request] = defers
-            cache._log_storage_prefetch_deferred(f.num_tokens, "device_capacity")
-            if defers < self.max_staged_admission_defers:
-                logger.warning(
-                    "HiCache staged prefetch deferred at admission req=%s "
-                    "reason=device_capacity pool=%s tokens=%d defers=%d",
-                    req.rid,
-                    pool,
-                    f.num_tokens,
-                    defers,
-                )
-                return
-            # Still unmaterializable: drop the hold so the admission loop stops
-            # breaking on this request, which recomputes on its next pass.
-            logger.warning(
-                "HiCache staged prefetch dropped after %d device_capacity "
-                "deferrals req=%s pool=%s tokens=%d",
-                defers,
-                req.rid,
-                pool,
-                f.num_tokens,
-            )
-            self.release_staged_hold(request, reason="device_capacity")
-            req.staged_prefetch_plan = None
 
         splice_base = plan.device_prefix_len
         assert len(req.prefix_indices) == splice_base
@@ -1136,7 +1155,7 @@ class BufferModePipeline:
             else:
                 avail = cache.token_to_kv_pool_allocator.available_size()
             if avail < load_tokens:
-                return _defer_for_capacity("full")
+                return self.defer_staged_admission(req, pool="full")
 
         load_back_id = -(f.operation_id) - 1
         # The full trailing-window aux transfer is independent of the shorter
@@ -1158,7 +1177,7 @@ class BufferModePipeline:
         if device_indices is None:
             # load() allocates all pools atomically before queueing H2D, so the
             # staged host buffers remain reusable after either pool is short.
-            return _defer_for_capacity("full_or_aux")
+            return self.defer_staged_admission(req, pool="full_or_aux")
         del self.staged_prefetches[request]
         self._staged_admission_defers.pop(request, None)
         req.staged_prefetch_plan = None

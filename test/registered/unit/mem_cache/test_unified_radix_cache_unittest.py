@@ -3335,6 +3335,41 @@ class UnifiedRadixCacheSuite:
             time.sleep(0.01)
         self.fail(f"prefetch {req_id} did not complete in time")
 
+    def _load_back_req(
+        self,
+        cache,
+        req_id,
+        prefix_len,
+        prefix_indices=None,
+        *,
+        extra_key=None,
+        cache_salt=None,
+        last_node=None,
+    ):
+        """Use a real Req so mock auto-attributes cannot masquerade as slots."""
+        req = Req(
+            rid=req_id.rid,
+            origin_input_text="",
+            origin_input_ids=array("q"),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+            extra_key=extra_key,
+            cache_salt=cache_salt,
+        )
+        # The staged hold is keyed by the handle the prefetch was issued under,
+        # not by a fresh attempt-0 handle.
+        req.cache_request_handle = req_id
+        req.last_node = cache.root_node_handle() if last_node is None else last_node
+        req.prefix_indices = (
+            prefix_indices
+            if prefix_indices is not None
+            else torch.zeros(
+                prefix_len,
+                dtype=torch.int64,
+                device=cache.tree_core.empty_match_result.device_indices.device,
+            )
+        )
+        return req
+
     def _consume_staged_prefetch(
         self,
         cache,
@@ -3359,24 +3394,20 @@ class UnifiedRadixCacheSuite:
         f = cache.buffer_pipeline.staged_prefetches[req_id]
         if prefix_len is None:
             prefix_len = f.matched_len
-        req = mock.Mock()
-        req.rid = req_id.rid
-        req.cache_request_handle = req_id
-        req.extra_key = extra_key
-        req.cache_salt = cache_salt
         if prefix_indices is not None:
             # Spliceable mid-anchor consumption publishes value=cat(prefix,
             # fill) — the real device prefix is required (zeros would insert
             # bogus slots into the tree).
             assert len(prefix_indices) == prefix_len
-            req.prefix_indices = prefix_indices
-        else:
-            req.prefix_indices = torch.zeros(
-                prefix_len,
-                dtype=torch.int64,
-                device=cache.tree_core.empty_match_result.device_indices.device,
-            )
-        req.last_node = cache.root_node_handle() if last_node is None else last_node
+        req = self._load_back_req(
+            cache,
+            req_id,
+            prefix_len,
+            prefix_indices,
+            extra_key=extra_key,
+            cache_salt=cache_salt,
+            last_node=last_node,
+        )
         joint = cache.match_prefix(
             MatchPrefixParams(
                 key=RadixKey(
@@ -4134,17 +4165,7 @@ class UnifiedRadixCacheSuite:
         from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams
 
         held = cons.buffer_pipeline.staged_prefetches[req_id]
-        req = mock.Mock()
-        req.rid = req_id.rid
-        req.cache_request_handle = req_id
-        req.extra_key = None
-        req.cache_salt = None
-        req.last_node = cons.root_node_handle()
-        req.prefix_indices = torch.zeros(
-            held.matched_len,
-            dtype=torch.int64,
-            device=cons.tree_core.empty_match_result.device_indices.device,
-        )
+        req = self._load_back_req(cons, req_id, held.matched_len)
         self.assertTrue(cons.buffer_pipeline.prepare_staged_prefetch(req))
         spliced, _last = cons.init_load_back(
             InitLoadBackParams(
@@ -4518,17 +4539,7 @@ class UnifiedRadixCacheSuite:
 
         # Consume at admission (init_load_back + request lock).
         held = cons.buffer_pipeline.staged_prefetches[req_id]
-        req = mock.Mock()
-        req.rid = req_id.rid
-        req.cache_request_handle = req_id
-        req.extra_key = None
-        req.cache_salt = None
-        req.last_node = cons.root_node_handle()
-        req.prefix_indices = torch.zeros(
-            held.matched_len,
-            dtype=torch.int64,
-            device=cons.tree_core.empty_match_result.device_indices.device,
-        )
+        req = self._load_back_req(cons, req_id, held.matched_len)
         self.assertTrue(cons.buffer_pipeline.prepare_staged_prefetch(req))
         spliced, last_node = cons.init_load_back(
             InitLoadBackParams(
@@ -4958,17 +4969,7 @@ class UnifiedRadixCacheSuite:
             return real_load(*args, **kwargs)
 
         f = cons.buffer_pipeline.staged_prefetches[req_id]
-        req = mock.Mock()
-        req.rid = req_id.rid
-        req.cache_request_handle = req_id
-        req.extra_key = None
-        req.cache_salt = None
-        req.prefix_indices = torch.zeros(
-            0,
-            dtype=torch.int64,
-            device=cons.tree_core.empty_match_result.device_indices.device,
-        )
-        req.last_node = cons.root_node_handle()
+        req = self._load_back_req(cons, req_id, 0)
         self.assertTrue(cons.buffer_pipeline.prepare_staged_prefetch(req))
         with mock.patch.object(cons.cache_controller, "load", adversarial_load):
             with self.assertRaisesRegex(RuntimeError, "ownership violation"):
