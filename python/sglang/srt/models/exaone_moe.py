@@ -534,7 +534,7 @@ class ExaoneMoEDecoderLayer(nn.Module):
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         # Fully Connected
         with self.ffn_boundary.exit(forward_batch) as ffn_exit:
-            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.mlp(hidden_states, forward_batch)
         return ffn_exit.finish(hidden_states)
 
 
