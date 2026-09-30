@@ -146,7 +146,9 @@ def host_memory_budget_bytes(
                 )
             free = allocator.free_hugetlb_bytes()
         elif mode == HUGEPAGE_MODE_PREFER:
-            free = max(free, allocator.free_hugetlb_bytes())
+            hugetlb_free = allocator.free_hugetlb_bytes()
+            if hugetlb_free > 0:
+                free = max(free, hugetlb_free)
     return free // ranks_per_host()
 
 
