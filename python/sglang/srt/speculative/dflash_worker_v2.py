@@ -55,7 +55,6 @@ from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
     apply_dflash_simulated_acceptance,
     apply_dflash_verify_logits_adjustments,
-    build_speculative_verify_target_probs,
     can_dflash_use_fused_qkv_proj,
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
@@ -2133,11 +2132,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_input,
         prefix_lens: torch.Tensor,
         bs: int,
-        return_target_probs: bool,
     ):
         new_seq_lens = None
         target_predict = None
-        target_probs = None
         if self._selector_sample is not None:
             selector_candidate_ids, selector_q_rows = self._selector_sample
             accept_len, bonus = self._selector_sampling_accept(
@@ -2151,27 +2148,15 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, accept_len)
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, bonus)
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
-            if return_target_probs:
-                target_probs = build_speculative_verify_target_probs(
-                    next_token_logits=next_token_logits,
-                    sampling_info=sampling_info,
-                    draft_token_num=int(self.block_size),
-                    bs=bs,
-                    max_top_k=draft_input.max_top_k,
-                    uniform_top_k_value=draft_input.uniform_top_k_value,
-                )
         elif (
             not _is_all_greedy(sampling_info) and is_dflash_sampling_verify_available()
         ):
-            accept_len, bonus, target_probs = (
-                compute_dflash_sampling_correct_drafts_and_bonus(
-                    candidates=candidates,
-                    next_token_logits=next_token_logits,
-                    sampling_info=sampling_info,
-                    max_top_k=draft_input.max_top_k,
-                    uniform_top_k_value=draft_input.uniform_top_k_value,
-                    return_target_probs=return_target_probs,
-                )
+            accept_len, bonus = compute_dflash_sampling_correct_drafts_and_bonus(
+                candidates=candidates,
+                next_token_logits=next_token_logits,
+                sampling_info=sampling_info,
+                max_top_k=draft_input.max_top_k,
+                uniform_top_k_value=draft_input.uniform_top_k_value,
             )
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, accept_len)
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, bonus)
@@ -2219,15 +2204,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     target_predict=target_predict,
                 )
                 out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
-        return (
-            accept_len,
-            commit_lens,
-            bonus,
-            out_tokens,
-            new_seq_lens,
-            target_predict,
-            target_probs,
-        )
+        return accept_len, commit_lens, bonus, out_tokens, new_seq_lens, target_predict
 
     def _validate_phase1_sampling_support(self, batch: ScheduleBatch) -> None:
         sampling_info = batch.sampling_info
@@ -2818,10 +2795,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             grammar_mask.apply(logits_output.next_token_logits)
 
         candidates = draft_tokens
-        needs_sampling_masks = (
-            sampling_info is not None
-            and sampling_info.sampling_mask_batch_indices is not None
-        )
         (
             accept_len,
             commit_lens,
@@ -2829,7 +2802,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             out_tokens,
             new_seq_lens,
             target_predict,
-            target_probs,
         ) = self._accept_block(
             candidates=candidates,
             next_token_logits=logits_output.next_token_logits,
@@ -2837,7 +2809,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_input=draft_input,
             prefix_lens=prefix_lens,
             bs=bs,
-            return_target_probs=needs_sampling_masks,
         )
 
         if SIMULATE_ACC_LEN > 0:
@@ -2868,10 +2839,14 @@ class DFlashWorkerV2(BaseSpecWorker):
             # accept_len; recompute it from the forced commit_lens.
             new_seq_lens = None
 
-        if needs_sampling_masks:
-            sampling_mask_capture = SpeculativeSamplingMaskCapture.from_sampling_info(
-                sampling_info, target_probs=target_probs
-            )
+        sampling_mask_capture = SpeculativeSamplingMaskCapture.from_logits(
+            sampling_info,
+            next_token_logits=logits_output.next_token_logits,
+            draft_input=draft_input,
+            draft_token_num=int(self.block_size),
+            bs=bs,
+        )
+        if sampling_mask_capture is not None:
             logits_output.sampling_mask_output = sampling_mask_capture.build_output(
                 out_tokens=out_tokens,
                 commit_lens=commit_lens,

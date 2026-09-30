@@ -8,7 +8,10 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import SamplingMaskOutput, SamplingMaskStatus
 from sglang.srt.runtime_context import get_spec
-from sglang.srt.speculative.dflash_utils import is_dflash_sampling_verify_available
+from sglang.srt.speculative.dflash_utils import (
+    build_speculative_verify_target_probs,
+    is_dflash_sampling_verify_available,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -60,13 +63,30 @@ class SpeculativeSamplingMaskCapture(msgspec.Struct):
     support_capture_indices: torch.Tensor | None = None
 
     @classmethod
-    def from_sampling_info(
+    def from_logits(
         cls,
         sampling_info,
         *,
-        target_probs: torch.Tensor | None,
+        next_token_logits: torch.Tensor,
+        draft_input,
+        draft_token_num: int,
+        bs: int,
         greedy_mask: torch.Tensor | None = None,
-    ) -> SpeculativeSamplingMaskCapture:
+    ) -> SpeculativeSamplingMaskCapture | None:
+        """Rebuild the verified target policy after acceptance; returns None
+        when no request in the batch asked for sampling masks."""
+        if sampling_info is None or sampling_info.sampling_mask_batch_indices is None:
+            return None
+        target_probs = None
+        if not sampling_info.is_all_greedy:
+            target_probs = build_speculative_verify_target_probs(
+                next_token_logits=next_token_logits,
+                sampling_info=sampling_info,
+                draft_token_num=draft_token_num,
+                bs=bs,
+                max_top_k=draft_input.max_top_k,
+                uniform_top_k_value=draft_input.uniform_top_k_value,
+            )
         return cls(
             target_probs=target_probs,
             batch_indices=sampling_info.sampling_mask_batch_indices,
