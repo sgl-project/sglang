@@ -330,7 +330,8 @@ class DecodingStage(PipelineStage):
         if (
             type(self).forward is not DecodingStage.forward
             or type(self).decode is not DecodingStage.decode
-            or not getattr(self.vae, "supports_decode_on_frames", False)
+            or not isinstance(self.vae, ParallelTiledVAE)
+            or not self.vae.supports_decode_on_frames
             or batch.return_trajectory_decoded
             or not isinstance(batch.latents, torch.Tensor)
         ):

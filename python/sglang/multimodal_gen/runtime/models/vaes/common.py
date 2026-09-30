@@ -82,6 +82,8 @@ def should_run_spatial_shard_parallel_decode(
 
 class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
     layerwise_offload_dit_group_enabled = False
+    # decode(z, on_frames=...) hands out finished frames while it decodes
+    supports_decode_on_frames = False
     layer_names = [
         "encoder.down_blocks",
         "decoder.up_blocks",
