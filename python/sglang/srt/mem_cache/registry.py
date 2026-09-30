@@ -20,7 +20,6 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.runtime_context import (
     get_disagg,
     get_memory,
-    get_parallel,
     get_serving,
 )
 
@@ -104,10 +103,6 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 
         return SWAChunkCache(params)
-
-    if get_parallel().enable_kv_cache_sharding:
-        logger.info("Using UnifiedRadixCache for logical-page KV sharding.")
-        return create_unified_radix_cache(ctx)
 
     if get_memory().enable_lmcache:
         from sglang.srt.mem_cache.storage.lmcache.lmcache_unified_radix_cache import (

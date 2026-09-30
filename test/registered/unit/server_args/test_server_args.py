@@ -115,6 +115,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
     CustomTestCase,
+    enter_scope,
 )
 
 register_cpu_ci(est_time=14, suite="base-a-test-cpu")
@@ -3704,6 +3705,13 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
 
 
 class TestKvCacheShardingCompatibility(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        # Sharding currently requires Python, independent of the default backend.
+        enter_scope(
+            self, envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("python")
+        )
+
     def _args(self, **overrides):
         model_config = overrides.pop("model_config", None)
         args = ServerArgs(
