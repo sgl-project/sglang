@@ -35,13 +35,14 @@ import importlib.util
 import platform
 import unittest
 from array import array
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo, ScheduleBatch
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -422,22 +423,22 @@ class TestMlxFinishedRequestRelease(CustomTestCase):
             vocab_size=128,
         )
 
-    def _process_prefill(self, worker, reqs):
+    def _processor(self, worker, *, overlap=False, tree_cache=None):
         logprob_processor = Mock()
         logprob_processor.calculate_num_input_logprobs.return_value = 0
-        processor = SchedulerBatchResultProcessor(
+        return SchedulerBatchResultProcessor(
             is_generation=True,
             disaggregation_mode=None,
             enable_overlap=False,
-            enable_overlap_mlx=False,
+            enable_overlap_mlx=overlap,
             model_config=SimpleNamespace(think_end_ids=None),
             token_to_kv_pool_allocator=Mock(),
-            tree_cache=None,
+            tree_cache=tree_cache,
             hisparse_coordinator=None,
             req_to_token_pool=None,
             decode_offload_manager=None,
             metrics_collector=None,
-            metrics_reporter=Mock(),
+            metrics_reporter=Mock(num_generated_tokens=0, forward_ct_decode=0),
             draft_worker=None,
             model_worker=worker,
             logprob_result_processor=logprob_processor,
@@ -445,6 +446,9 @@ class TestMlxFinishedRequestRelease(CustomTestCase):
             beam_coordinator=Mock(),
             abort_request=Mock(),
         )
+
+    def _process_prefill(self, worker, reqs):
+        processor = self._processor(worker)
         batch = SimpleNamespace(
             reqs=reqs,
             forward_mode=ForwardMode.EXTEND,
@@ -499,6 +503,202 @@ class TestMlxFinishedRequestRelease(CustomTestCase):
             self.assertEqual(worker._mlx_finished_rids, {rid})
             # Reclamation remains deferred, preserving overlap safety.
             self.assertEqual(worker._mlx_runner._known, {rid})
+
+    def test_finished_rid_reuse_starts_a_new_prefill(self):
+        worker = self._worker({"same"})
+        runner = worker._mlx_runner
+        old_cache = [runner._fake_cache_layer()]
+        runner._req_caches["same"] = old_cache
+        self._process_prefill(worker, [self._req("same")])
+
+        new_req = _FakeReq("same")
+        batch = _FakeBatch(ForwardMode.EXTEND, [new_req], [2])
+        launch = worker.async_forward_batch_generation_mlx(batch)
+
+        self.assertEqual(runner.ops_for("same"), ["remove_request", "prefill_start"])
+        self.assertEqual(worker._mlx_active_rids, {"same"})
+        self.assertFalse(worker._mlx_finished_rids)
+        self.assertEqual(len(launch.prefills), 1)
+        self.assertFalse(launch.extends)
+        self.assertIsNot(launch.prefills[0].cache, old_cache)
+        worker.finalize_mlx_result(launch, [new_req])
+
+    def test_overlap_drains_chained_decode_before_mixed_launch_cleanup(self):
+        import mlx.core as mx
+
+        from sglang.srt.hardware_backend.mlx.model_runner import MlxModelRunner
+        from sglang.srt.hardware_backend.mlx.scheduler_mixin import (
+            SchedulerMlxOverlapMixin,
+        )
+
+        events = []
+        worker = self._worker({"finished", "live"})
+        runner = worker._mlx_runner
+        # Exercise remove_request's radix-enabled pool flush, with synthetic
+        # cache tensors / scheduler rows and a mocked pool-write destination.
+        runner.disable_radix_cache = False
+        runner._cache_layout = SimpleNamespace(
+            has_auxiliary_state=False,
+            first_attention_layer_index=0,
+            full_attention_layer_indices=[0],
+        )
+        runner._cache_pool = []
+        runner._req_token_ids = {rid: [1, 2] for rid in runner._known}
+        runner._req_sampling = {}
+        runner._req_pool_idx = {"finished": 0, "live": 1}
+        runner._req_synced_offset = {rid: 1 for rid in runner._known}
+        runner._req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.arange(8).reshape(2, 4)
+        )
+        runner._attention_kv_pool = Mock()
+        for rid in runner._known:
+            state = mx.zeros((1, 1, 2, 1))
+            runner._req_caches[rid] = [
+                SimpleNamespace(keys=state, values=state, offset=2, state=[state])
+            ]
+        for name in (
+            "_sync_decode_kv_to_pool",
+            "_sync_new_kv_to_pool",
+            "_first_attention_cache",
+            "_release_cache",
+            "flush_all_decode_kv",
+        ):
+            setattr(runner, name, getattr(MlxModelRunner, name).__get__(runner))
+
+        def remove(rid):
+            events.append(("remove", rid))
+            MlxModelRunner.remove_request(runner, rid)
+            runner._known.discard(rid)
+
+        runner.remove_request = remove
+        original_decode_start = runner.decode_batch_start
+        original_prefill_start = runner.prefill_start
+
+        def chain(previous):
+            events.append(("chain", None))
+            pending = original_decode_start(previous.req_ids)
+            pending.lazy_tokens = previous.lazy_tokens + 1
+            pending.chained = True
+            return pending
+
+        def finalize(pending):
+            pending.lazy_tokens.tolist()
+            if getattr(pending, "chained", False):
+                # Both requests' state must survive the first result's finish
+                # notification until the already-launched decode has drained.
+                self.assertTrue(runner.has_request("finished"))
+                self.assertTrue(runner.has_request("live"))
+                events.append(("finalize_chain", None))
+            return [3] * len(pending.req_ids)
+
+        def prefill(**kwargs):
+            events.append(("prefill", kwargs["req_id"]))
+            return original_prefill_start(**kwargs)
+
+        runner.decode_batch_start_chained = chain
+        runner.decode_batch_finalize = finalize
+        runner.prefill_start = prefill
+
+        # Fake computation still needs to publish the new request's state at
+        # the same boundary as MlxModelRunner.prefill_finalize.
+        def prefill_finalize(pending):
+            runner._known.add(pending.req_id)
+            runner._req_caches[pending.req_id] = pending.cache
+            return 3
+
+        runner.prefill_finalize = prefill_finalize
+        finished = self._req("finished", max_new_tokens=1)
+        live = self._req("live", max_new_tokens=8)
+        fresh = self._req("fresh")
+        for req in (finished, live, fresh):
+            req.return_logprob = False
+            req.full_untruncated_fill_ids = array("q", [1, 2])
+            req.extend_range = SimpleNamespace(end=2, length=2)
+            req.prefix_indices = torch.empty(0, dtype=torch.long)
+
+        def batch(mode, reqs, lengths, decoding_reqs=None):
+            out = ScheduleBatch(reqs=reqs)
+            out.forward_mode = mode
+            out.extend_lens = lengths
+            out.decoding_reqs = decoding_reqs
+            out.input_ids = torch.arange(sum(lengths))
+            out.out_cache_loc = torch.arange(sum(lengths))
+            out.return_logprob = False
+            out.enable_overlap = True
+            out.spec_algorithm = SimpleNamespace(is_none=lambda: True)
+            return out
+
+        decode = batch(ForwardMode.DECODE, [finished, live], [1, 1])
+        mixed = batch(ForwardMode.MIXED, [fresh, live], [2, 1], [live])
+        processor = self._processor(worker, overlap=True, tree_cache=Mock())
+        scheduler = SchedulerMlxOverlapMixin()
+        scheduler.tp_worker = worker
+        scheduler.forward_ct = 0
+        scheduler._sched_idled = False
+        scheduler.gracefully_exit = False
+        scheduler._engine_paused = False
+        scheduler.waiting_queue = []
+        scheduler.result_queue = deque()
+        scheduler.running_batch = decode
+        scheduler.last_batch = None
+        scheduler.profiler_manager = Mock()
+        scheduler.future_map = Mock()
+        scheduler.ingest_requests = Mock()
+        scheduler.invariant_checker = Mock()
+        scheduler.get_next_batch_to_run = Mock(
+            side_effect=[
+                SimpleNamespace(running_batch=decode, batch_to_run=decode),
+                SimpleNamespace(running_batch=mixed, batch_to_run=mixed),
+                StopIteration,
+            ]
+        )
+
+        def process(batch, result):
+            if batch.forward_mode.is_decode():
+                processor.process_batch_result_decode(batch, result)
+            else:
+                processor.process_batch_result_prefill(batch, result)
+
+        scheduler.process_batch_result = process
+
+        def release(req, *_args, **_kwargs):
+            self.assertIn(req.rid, worker._mlx_finished_rids)
+            self.assertTrue(runner.has_request(req.rid))
+            events.append(("finish", req.rid))
+
+        module = "sglang.srt.managers.scheduler_components.batch_result_processor"
+        with (
+            get_context().override_server_args(
+                disable_radix_cache=False, disable_overlap_schedule=False
+            ),
+            patch(f"{module}.release_kv_cache", side_effect=release),
+            patch(f"{module}.maybe_cache_unfinished_req"),
+            patch(
+                "sglang.srt.hardware_backend.mlx.scheduler_mixin.resolve_forward_inputs"
+            ),
+            self.assertRaises(StopIteration),
+        ):
+            scheduler.event_loop_overlap_mlx()
+
+        self.assertLess(
+            events.index(("chain", None)), events.index(("finish", "finished"))
+        )
+        self.assertLess(
+            events.index(("finish", "finished")), events.index(("finalize_chain", None))
+        )
+        self.assertLess(
+            events.index(("finalize_chain", None)), events.index(("remove", "finished"))
+        )
+        self.assertLess(
+            events.index(("remove", "finished")), events.index(("prefill", "fresh"))
+        )
+        self.assertNotIn(("remove", "live"), events)
+        self.assertEqual(worker._mlx_active_rids, {"live", "fresh"})
+        self.assertEqual(worker._mlx_finished_rids, {"fresh"})
+        self.assertFalse(live.finished())
+        pool_writes = runner._attention_kv_pool.set_kv_all_layers.call_args_list
+        self.assertEqual([call.args[0].tolist() for call in pool_writes], [[1], [5]])
+        self.assertEqual(len(scheduler.result_queue), 0)
 
     def test_generation_finished_during_prefill_is_marked(self):
         worker = self._worker({"a"})
