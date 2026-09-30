@@ -3154,6 +3154,39 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator, *, owns_attention: b
         _TP = old_tp_group
 
 
+@contextmanager
+def patch_decode_context_parallel_group(dcp_group: Optional[GroupCoordinator]):
+    """Patch the DCP group temporarily until this function ends.
+
+    This method is for draft workers of speculative decoding, whose KV cache is
+    replicated rather than striped by token position; ``None`` is the state of a
+    process booted without decode context parallelism. The widths derive from
+    configuration at publish rather than from the group, so they are restated.
+
+    Unlike the tp and pp patches this one nests: draft chain decode runs inside
+    a draft forward, so an inner scope cannot know whether an outer one is open.
+    """
+    global _DCP
+    old_dcp_group = _DCP
+    _DCP = dcp_group
+    size = dcp_group.world_size if dcp_group is not None else 1
+    rank = dcp_group.rank_in_group if dcp_group is not None else 0
+    try:
+        # Every name together: a scope that narrowed the widths but left the
+        # group pointing at the target's would let an ungated read reach it.
+        with get_parallel().override(
+            dcp_enabled=size > 1,
+            dcp_size=size,
+            dcp_rank=rank,
+            attn_dcp_size=size,
+            attn_dcp_rank=rank,
+            dcp_group=dcp_group,
+        ):
+            yield
+    finally:
+        _DCP = old_dcp_group
+
+
 def get_world_size():
     """Return world size for the world group."""
     return get_world_group().world_size

@@ -894,6 +894,61 @@ class TestEagleConfigurator(CustomTestCase):
         self.assertGreater(used, available * 0.99)
 
 
+class TestReplicatedDraftPoolScale(CustomTestCase):
+    """One symbol sizes a replicated draft pool's span and its byte budget."""
+
+    def _kvc(self, *, draft_layers=2, is_draft_worker=False):
+        algo = MagicMock()
+        algo.is_eagle.return_value = True
+        algo.is_standalone.return_value = False
+        return SimpleNamespace(
+            spec_algorithm=algo,
+            is_draft_worker=is_draft_worker,
+            spec_aux_config=SimpleNamespace(eagle_draft_num_layers=draft_layers),
+        )
+
+    def _scale(self, *, dcp_size, speculative_dcp_size=1):
+        from sglang.srt.mem_cache.allocation_sizing import replicated_draft_pool_scale
+        from sglang.srt.runtime_context import get_context
+
+        with get_parallel().override(attn_dcp_size=dcp_size):
+            with get_context().override_server_args(
+                speculative_dcp_size=speculative_dcp_size
+            ):
+                return replicated_draft_pool_scale()
+
+    def test_the_scale_is_the_stripe_the_draft_does_not_take(self):
+        """A draft at the target's width would need no replication at all."""
+        for dcp in (1, 2, 4, 8):
+            with self.subTest(dcp=dcp):
+                self.assertEqual(self._scale(dcp_size=dcp), dcp)
+                self.assertEqual(self._scale(dcp_size=dcp, speculative_dcp_size=dcp), 1)
+
+    def test_the_draft_term_carries_the_scale(self):
+        from sglang.srt.model_executor.pool_configurator import _eagle_draft_layers
+
+        _publish_config(self)
+        for dcp in (1, 2, 8):
+            with self.subTest(dcp=dcp):
+                with get_parallel().override(attn_dcp_size=dcp):
+                    self.assertEqual(_eagle_draft_layers(self._kvc()), 2 * dcp)
+
+    def test_a_draft_worker_does_not_budget_a_draft_pool(self):
+        from sglang.srt.model_executor.pool_configurator import _eagle_draft_layers
+
+        _publish_config(self)
+        with get_parallel().override(attn_dcp_size=8):
+            self.assertEqual(_eagle_draft_layers(self._kvc(is_draft_worker=True)), 0)
+
+    def test_an_unknown_draft_depth_budgets_nothing(self):
+        """Absent geometry must skip the term, not stand in a guessed floor."""
+        from sglang.srt.model_executor.pool_configurator import _eagle_draft_layers
+
+        _publish_config(self)
+        with get_parallel().override(attn_dcp_size=8):
+            self.assertEqual(_eagle_draft_layers(self._kvc(draft_layers=None)), 0)
+
+
 class TestDSAIndexerAllocationPolicy(CustomTestCase):
     @patch(
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",

@@ -204,7 +204,10 @@ from sglang.srt.speculative.adaptive_spec_params import (
     resolve_candidate_steps_from_config,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
+from sglang.srt.speculative.spec_utils import (
+    draft_dcp_context,
+    resolve_num_tokens_per_req,
+)
 from sglang.srt.state_capturer.base import TopkCaptureOutput
 from sglang.srt.state_capturer.indexer_topk import (
     create_indexer_capturer,
@@ -219,6 +222,7 @@ from sglang.srt.state_capturer.routed_experts import (
 )
 from sglang.srt.utils import (
     cpu_has_amx_support,
+    empty_context,
     enable_show_time_cost,
     get_available_gpu_memory,
     is_host_cpu_arm64,
@@ -345,6 +349,7 @@ class ModelRunner:
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
+        self.draft_dcp_context = draft_dcp_context if is_draft_worker else empty_context
         # The process entry published; a draft runner is not one (it must not
         # clobber the target's config), so only the target checks.
         if not is_draft_worker:
@@ -1752,6 +1757,7 @@ class ModelRunner:
         with (
             canary_ctx,
             step_span_ctx,
+            self.draft_dcp_context(),
             get_global_expert_distribution_recorder().with_forward_pass(
                 self.forward_pass_id,
                 forward_batch,

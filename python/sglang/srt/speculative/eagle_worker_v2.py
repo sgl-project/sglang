@@ -104,6 +104,7 @@ from sglang.srt.speculative.eagle_worker_common import (
 from sglang.srt.speculative.pp_draft_embedding import resolve_draft_embed_and_head
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
+    draft_dcp_context,
     draft_pp_context,
     draft_tp_context,
     fast_sample,
@@ -197,6 +198,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         with (
             ctx,
             draft_pp_context(),
+            draft_dcp_context(),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
             draft_model_build_scope(),
@@ -259,6 +261,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def init_attention_backends(self):
         with (
             draft_pp_context(),
+            draft_dcp_context(),
             self.draft_tp_context(
                 self.draft_runner.tp_group,
                 owns_attention=self.draft_owns_attention,
@@ -272,6 +275,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def init_cuda_graphs(self):
         with (
             draft_pp_context(),
+            draft_dcp_context(),
             self.draft_tp_context(
                 self.draft_runner.tp_group,
                 owns_attention=self.draft_owns_attention,
@@ -482,9 +486,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"num_tokens_per_req={self.topk}, bs={capture_bs}, "
                 f"avail mem={before_mem:.2f} GB",
             )
-            self.cuda_graph_runner = Device2DraftCudaGraphRunner[
-                self.target_worker.device
-            ](self)
+            # Capture at the draft's own width, which is what replay runs at.
+            with draft_dcp_context():
+                self.cuda_graph_runner = Device2DraftCudaGraphRunner[
+                    self.target_worker.device
+                ](self)
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
             capture_time = time.perf_counter() - tic
             self._specialized_graph_memory_usage["draft_decode"] = (
@@ -586,9 +592,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"num_tokens_per_req={self.speculative_num_draft_tokens}, "
                 f"bs={capture_bs}, avail mem={before_mem:.2f} GB",
             )
-            self.cuda_graph_runner_for_draft_extend = Device2ExtendCudaGraphRunner[
-                self.target_worker.device
-            ](self)
+            # Capture must match replay: same rule as the draft-decode graph.
+            with draft_dcp_context():
+                self.cuda_graph_runner_for_draft_extend = Device2ExtendCudaGraphRunner[
+                    self.target_worker.device
+                ](self)
             # draft_extend is the step's last shared-buffer-reading phase; its
             # read-done event is what the scheduler's WAR barrier waits on.
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
@@ -639,7 +647,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             else contextlib.nullcontext()
         )
 
-        with canary_outside_ctx:
+        # This draft path runs outside ModelRunner.forward, which opens the scope.
+        with canary_outside_ctx, draft_dcp_context():
             # Run draft
             if can_run_decode_cuda_graph:
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
@@ -1106,7 +1115,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             if (c := self.draft_runner.canary_manager) is not None
             else contextlib.nullcontext()
         )
-        with canary_ctx:
+        with canary_ctx, draft_dcp_context():
             if can_run_decode_cuda_graph:
                 draft_logits_output = self.cuda_graph_runner_for_draft_extend.execute(
                     forward_batch, select_index

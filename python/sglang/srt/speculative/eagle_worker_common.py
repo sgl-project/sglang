@@ -27,6 +27,7 @@ from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     build_grammar_vocab_mask,
     commit_mamba_states_after_verify,
+    draft_dcp_context,
     move_accept_tokens_to_target_kvcache,
     record_stream_each,
     record_stream_for_v2_verify,
@@ -196,7 +197,9 @@ def prepare_for_draft_extend(
         forward_batch
     )
     if not batch.forward_mode.is_idle() and not can_run_decode_cuda_graph:
-        draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
+        # Must match the DCP state of the forward that consumes this metadata.
+        with draft_dcp_context():
+            draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
         # Planned pre-pad; do NOT opt into post-pad re-plan. DSA's indexer
         # cannot rebuild its deep_gemm schedule_meta on a DP-padded batch
         # (the `_batch_size == batch_size` assertion, see #27091); the

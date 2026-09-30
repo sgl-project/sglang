@@ -15,7 +15,7 @@
 """Per-forward metadata for decode context parallel (DCP)."""
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Callable, Optional, Protocol, runtime_checkable
 
 import torch
 
@@ -35,3 +35,21 @@ class DecodeContextParallelMetadata:
     dcp_kv_indices: Optional[torch.Tensor] = None
     dcp_local_prefix_kv_indices: Optional[torch.Tensor] = None
     dcp_extend_prefix_lens_sum: Optional[int] = None
+
+
+@runtime_checkable
+class SupportsDecodeContextParallelMetadata(Protocol):
+    def prepare_context_parallel_metadata_for_dcp(
+        self,
+        seq_lens: torch.Tensor,
+        extend_prefix_lens: torch.Tensor,
+        extend_prefix_lens_cpu: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        req_to_token: torch.Tensor,
+        seq_lens_sum: int,
+        kv_buffer_shape: torch.Size,
+        kv_cache_dtype: Any,
+        kv_cache_device: Any,
+        create_chunked_prefix_cache_kv_indices_fn: Callable[..., Any],
+    ) -> Optional[DecodeContextParallelMetadata]: ...

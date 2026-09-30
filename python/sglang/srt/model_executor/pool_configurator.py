@@ -29,7 +29,10 @@ from sglang.srt.configs.model_config import (
     is_minimax_sparse,
 )
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
+from sglang.srt.mem_cache.allocation_sizing import (
+    get_alloc_len_per_decode,
+    replicated_draft_pool_scale,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     collect_sources_by_ratio,
     get_compress_state_write_pad,
@@ -100,15 +103,26 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _eagle_draft_layers(kvc: KVCacheConfigurator) -> int:
+    """Draft layers to budget for, in the target's per-layer terms."""
+    if kvc.is_draft_worker or not (
+        kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
+    ):
+        return 0
+    draft_layers = kvc.spec_aux_config.eagle_draft_num_layers
+    if draft_layers is None or int(draft_layers) <= 0:
+        return 0
+    return int(draft_layers) * replicated_draft_pool_scale()
+
+
 def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
-    """Bytes/token the DFLASH draft KV pool adds, 0 if none; replicated across DCP
-    ranks because the draft pool spans the widened virtual location space."""
+    """Bytes/token the DFLASH draft KV pool adds, 0 if none."""
     if kvc.is_draft_worker or not kvc.spec_algorithm.is_dflash_family():
         return 0
     cell_size = kvc.spec_aux_config.dflash_draft_cell_size_per_token
     if cell_size is None or int(cell_size) <= 0:
         return 0
-    return int(cell_size) * get_parallel().attn_dcp_size
+    return int(cell_size) * replicated_draft_pool_scale()
 
 
 def _get_dsa_cache_layer_ids(kvc: KVCacheConfigurator, num_layers: int) -> list[int]:
@@ -221,14 +235,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         if (
             kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
         ) and not kvc.is_draft_worker:
-            eagle_draft_num_layers = kvc.spec_aux_config.eagle_draft_num_layers
-            if (
-                eagle_draft_num_layers is not None
-                and int(eagle_draft_num_layers) > 0
-                and int(num_layers) > 0
-            ):
-                draft_num_layers = int(eagle_draft_num_layers)
+            eagle_draft_layers = _eagle_draft_layers(kvc)
+            if eagle_draft_layers > 0 and int(num_layers) > 0:
                 if is_deepseek_dsa(kvc.model_config.hf_config):
+                    draft_num_layers = int(kvc.spec_aux_config.eagle_draft_num_layers)
                     target_indexer_size = self._compute_dsa_indexer_cell_size(
                         kvc=kvc,
                         num_layers=num_layers,
@@ -249,10 +259,12 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         num_layers=draft_num_layers,
                         allocate_all_layers=True,
                     )
-                    self._cell_size += draft_kv_size + draft_indexer_size
+                    self._cell_size += (
+                        draft_kv_size + draft_indexer_size
+                    ) * replicated_draft_pool_scale()
                 else:
                     self._cell_size = int(
-                        self._cell_size * (1 + draft_num_layers / int(num_layers))
+                        self._cell_size * (1 + eagle_draft_layers / int(num_layers))
                     )
 
         # DFLASH/DSPARK: the draft's per-token KV cost can differ from the target's
@@ -272,7 +284,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     target_cell_size_per_token=self._cell_size,
                     target_num_layers=int(num_layers),
                     draft_num_layers=int(draft_num_layers)
-                    * get_parallel().attn_dcp_size,
+                    * replicated_draft_pool_scale(),
                     draft_cell_size_per_token=_dflash_draft_cell_size(kvc) or None,
                 )
 
@@ -674,6 +686,10 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                     - self._draft_swa_layers_num
                     - self._draft_swa_full_layers_num
                 )
+                scale = replicated_draft_pool_scale()
+                self._draft_full_layers_num *= scale
+                self._draft_swa_layers_num *= scale
+                self._draft_swa_full_layers_num *= scale
 
         self._draft_cell_size = _dflash_draft_cell_size(kvc)
 
