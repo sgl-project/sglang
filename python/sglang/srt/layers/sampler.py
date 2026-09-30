@@ -36,12 +36,12 @@ from sglang.srt.utils.common import (
 if is_cuda():
     from flashinfer.sampling import (
         min_p_sampling_from_probs,
+    )
+    from flashinfer.sampling import top_k_renorm_probs as top_k_renorm_prob
+    from flashinfer.sampling import (
         top_k_top_p_sampling_from_probs,
     )
-    from sgl_kernel import (
-        top_k_renorm_prob,
-        top_p_renorm_prob,
-    )
+    from flashinfer.sampling import top_p_renorm_probs as top_p_renorm_prob
 
 if is_musa() or is_xpu():
     from sgl_kernel import (
@@ -398,13 +398,10 @@ class Sampler(nn.Module):
                         probs.contiguous(),
                         sampling_info.top_ks,
                         sampling_info.top_ps,
-                        filter_apply_order="joint",
+                        filter_apply_order="top_k_first",
                     )
                     if return_sampling_mask:
-                        # Correctness invariant: the fused joint sampler and these
-                        # separate renormalization primitives must share cutoff,
-                        # tie, and joint-support semantics so captured positive
-                        # support exactly describes the sampler's action space.
+                        # Match the sampler's top-k-first order and cutoff ties.
                         capture_probs = select_capture_rows(probs)
                         capture_top_ks = select_capture_rows(sampling_info.top_ks)
                         capture_top_ps = select_capture_rows(sampling_info.top_ps)
@@ -415,13 +412,9 @@ class Sampler(nn.Module):
                                 capture_probs, capture_top_ks
                             )
                         if sampling_info.need_top_p_sampling:
-                            top_p_probs = top_p_renorm_prob(
-                                capture_probs, capture_top_ps
+                            filtered_probs = top_p_renorm_prob(
+                                filtered_probs, capture_top_ps
                             )
-                            if filtered_probs is capture_probs:
-                                filtered_probs = top_p_probs
-                            else:
-                                filtered_probs.masked_fill_(top_p_probs <= 0, 0)
                         selected_weight = torch.gather(
                             filtered_probs,
                             1,
@@ -764,11 +757,12 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     the selected weights.
     """
     probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
-    probs_sum = torch.cumsum(probs_sort, dim=-1)
     probs_sort[
         torch.arange(0, probs.shape[-1], device=probs.device).view(1, -1)
         >= top_ks.view(-1, 1)
     ] = 0.0
+    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+    probs_sum = torch.cumsum(probs_sort, dim=-1)
     probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
 
     if need_min_p_sampling:
@@ -849,6 +843,7 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
             1, -1
         ) >= top_ks.view(-1, 1)
         probs_sort.masked_fill_(top_k_mask, 0.0)
+        probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
 
         probs_sum = torch.cumsum(probs_sort, dim=-1)
         top_p_mask = probs_sum - probs_sort > top_ps.view(-1, 1)

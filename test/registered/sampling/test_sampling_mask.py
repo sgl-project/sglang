@@ -216,19 +216,20 @@ class TestSamplingMaskCapture(CustomTestCase):
                 self.assertIn(2, output.next_token_sampling_mask_idx[1])
 
     @unittest.skipIf(is_hip(), "FlashInfer is not available on ROCm")
-    def test_flashinfer_joint_cutoff_ties_match_capture(self):
+    def test_flashinfer_top_k_first_cutoff_ties_match_capture(self):
         batch_size = 256
         top_k = 2
-        top_p = 0.45
+        top_p = 0.55
         base_probs = torch.tensor([[0.4, 0.2, 0.2, 0.1, 0.1]], device="cuda")
         probs = base_probs.repeat(batch_size, 1)
 
-        # Derive the threshold-based joint support independently. Both filters
-        # cut at 0.2, so the tied entries must survive even though this yields
-        # more support entries than top_k.
+        # Top-k retains both entries tied at 0.2. After renormalization,
+        # top-p=0.55 also keeps that tie, yielding more entries than top_k.
         sorted_probs = base_probs[0].sort(descending=True).values
         top_k_cutoff = sorted_probs[top_k - 1]
-        mass_before = sorted_probs.cumsum(dim=-1) - sorted_probs
+        top_k_probs = sorted_probs.masked_fill(sorted_probs < top_k_cutoff, 0.0)
+        top_k_probs /= top_k_probs.sum()
+        mass_before = top_k_probs.cumsum(dim=-1) - top_k_probs
         top_p_cutoff = sorted_probs[mass_before <= top_p][-1]
         expected_support = (base_probs[0] >= top_k_cutoff) & (
             base_probs[0] >= top_p_cutoff
@@ -280,13 +281,9 @@ class TestSamplingMaskCapture(CustomTestCase):
 
         output = self._materialize(sampled, capture, requested_rows)
         self.assertIsNone(output.next_token_sampling_mask_idx[0])
-        self.assertEqual(
-            set(output.next_token_sampling_mask_idx[1].tolist()), {0, 1, 2}
-        )
+        self.assertEqual(set(output.next_token_sampling_mask_idx[1].tolist()), {0})
         self.assertIsNone(output.next_token_sampling_mask_idx[2])
-        self.assertEqual(
-            set(output.next_token_sampling_mask_idx[3].tolist()), {0, 1, 2}
-        )
+        self.assertEqual(set(output.next_token_sampling_mask_idx[3].tolist()), {0})
         self.assertIsNone(output.next_token_sampling_logprobs[0])
         self.assertIsNotNone(output.next_token_sampling_logprobs[1])
         self.assertIsNone(output.next_token_sampling_logprobs[2])
