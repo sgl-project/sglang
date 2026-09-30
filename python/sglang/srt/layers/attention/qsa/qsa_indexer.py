@@ -200,6 +200,7 @@ class QSAIndexer(MultiPlatformOp):
                 self.q_layernorm.variance_epsilon,
                 self.rotary_emb.is_neox_style,
                 q_heads_padded=q_heads_padded,
+                out_dtype=pool.qsa_compressed_dtype,
             )
             return q, token_k, True
         q_raw = qk[:, : self.index_n_heads * self.index_head_dim]
@@ -207,6 +208,8 @@ class QSAIndexer(MultiPlatformOp):
             -1, self.index_n_heads, self.index_head_dim
         )
         q = self.apply_rope(positions, q)
+        if pool is not None:
+            q = q.to(pool.qsa_compressed_dtype)
         return q, token_k, False
 
     def normalize_compressed_keys(
@@ -494,6 +497,7 @@ class QSAIndexer(MultiPlatformOp):
         max_model_len: int,
         query_positions: torch.Tensor,
         sequence_lengths: torch.Tensor,
+        defer_expansion: bool = False,
     ) -> torch.Tensor:
         logits = qsa_mqa_decode(
             q,
@@ -518,6 +522,8 @@ class QSAIndexer(MultiPlatformOp):
             block_indices = qsa_fast_topk(
                 logits, row_starts, compressed_lengths, topk=self.block_topk
             )
+        if defer_expansion:
+            return block_indices
         return expand_qsa_block_indices(
             block_indices,
             query_positions,
@@ -567,8 +573,11 @@ class QSAIndexer(MultiPlatformOp):
         positions = (
             positions[:, :num_local] if positions.ndim == 2 else positions[:num_local]
         )
-        # Local q (normed + roped) and raw local k; no ring store here.
-        q, token_k, _ = self.project_qk(hidden_states, positions)
+        # Use the compressed-cache dtype for Q. Leaving cache_loc unset defers
+        # the ring store until raw local K has been gathered into global order.
+        q, token_k, _ = self.project_qk(
+            hidden_states, positions, pool=indexer_metadata.token_to_kv_pool
+        )
         # Raw keys of all new tokens in global packed order: the ring store
         # and compression use the global write plan unchanged. Cached prefix
         # groups already reside in the compressed-K pool on every rank.
@@ -711,6 +720,7 @@ class QSAIndexer(MultiPlatformOp):
                 max_model_len,
                 logical_positions,
                 indexer_metadata.get_seqlens_int32(),
+                defer_expansion=q.is_cuda and indexer_metadata.defer_block_expansion,
             )
 
         compressed_keys, row_starts, row_ends, sequence_lengths = (

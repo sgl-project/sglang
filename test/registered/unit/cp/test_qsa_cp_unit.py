@@ -9,6 +9,7 @@ import torch
 
 from sglang.srt.layers.attention import qwen_sparse_attn_backend
 from sglang.srt.layers.attention.qsa import qsa_indexer
+from sglang.srt.layers.attention.qsa.mqa import _scoring_dtype, torch_qsa_mqa_prefill
 from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import QwenSparseAttnBackend
 from sglang.srt.layers.cp import base as cp_base
@@ -68,6 +69,87 @@ def test_cuda_indexer_forwards_global_rope_to_cp_path():
     indexer.forward_cuda_cp.assert_called_once_with(
         hidden, local_rope, batch, metadata, global_rope
     )
+
+
+@pytest.mark.parametrize("compressed_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_cp_indexer_matches_compressed_dtype_without_storing_local_keys(
+    monkeypatch, compressed_dtype
+):
+    local_rows = torch.tensor([0, 1, 6, 7])
+    hidden = (torch.arange(32).reshape(8, 4) / 13).to(torch.bfloat16)
+    positions = torch.arange(8)
+    compressed_keys = hidden.reshape(4, 2, 4).mean(1).unsqueeze(1).to(compressed_dtype)
+    row_starts = torch.zeros(4, dtype=torch.int32)
+    row_ends = (positions[local_rows] + 1).to(torch.int32) // 2
+    pool = SimpleNamespace(qsa_compressed_dtype=compressed_dtype)
+    metadata = SimpleNamespace(
+        token_to_kv_pool=pool,
+        pending_ring_slots=torch.arange(8),
+        get_token_to_batch_idx=lambda: torch.zeros(8, dtype=torch.int32),
+        get_prefill_mqa_inputs=lambda *args, **kwargs: (
+            compressed_keys,
+            row_starts,
+            row_ends,
+            torch.tensor([8], dtype=torch.int32),
+        ),
+    )
+    batch = SimpleNamespace(
+        positions=positions,
+        attn_cp_metadata=SimpleNamespace(total_q_prev_tokens=2, total_q_next_tokens=2),
+    )
+    monkeypatch.setattr(
+        qsa_indexer,
+        "get_cp_strategy",
+        lambda: SimpleNamespace(kind=ContextParallelStrategyKind.ZIGZAG),
+    )
+    for name in ("cp_shard_position_ids", "cp_shard_hidden_states"):
+        monkeypatch.setattr(qsa_indexer, name, lambda value, batch: value[local_rows])
+
+    def gather_raw_keys(local, batch):
+        torch.testing.assert_close(local, hidden[local_rows])
+        return hidden
+
+    monkeypatch.setattr(
+        qsa_indexer, "cp_materialize_global_token_order", gather_raw_keys
+    )
+
+    def score_queries(q, k, starts, ends, query_positions, sequence_lengths):
+        # Use the same operand check as GPU scoring; the CPU reference otherwise
+        # accepts mixed dtypes and would conceal the FP8 compatibility failure.
+        assert _scoring_dtype(q, k) == compressed_dtype
+        return torch_qsa_mqa_prefill(q, k, starts, ends)
+
+    indexer = SimpleNamespace(
+        layer_id=0,
+        index_n_heads=1,
+        index_kv_heads=1,
+        index_head_dim=4,
+        index_qk_proj=lambda value: (torch.cat([value, value], dim=-1), None),
+        q_layernorm=lambda value: value,
+        apply_rope=lambda positions, value: value,
+        _use_fused_prep=Mock(
+            side_effect=AssertionError("local keys must not be stored")
+        ),
+        update_key_state_and_compress=Mock(),
+        select_prefill_tokens=score_queries,
+    )
+    indexer.project_qk = lambda *args, **kwargs: QSAIndexer.project_qk(
+        indexer, *args, **kwargs
+    )
+    actual = QSAIndexer.forward_cuda_cp(
+        indexer, hidden[local_rows], positions[local_rows], batch, metadata, positions
+    )
+    expected = torch_qsa_mqa_prefill(
+        hidden[local_rows].unsqueeze(1).to(compressed_dtype),
+        compressed_keys,
+        row_starts,
+        row_ends,
+    )
+    torch.testing.assert_close(actual, expected)
+    indexer._use_fused_prep.assert_not_called()
+    update = indexer.update_key_state_and_compress.call_args
+    torch.testing.assert_close(update.args[0], hidden.unsqueeze(1))
+    assert update.kwargs["state_stored"] is False
 
 
 def _cpu_sparse_chunk_attention(q, k, v, indices, cu_q, cu_k, kv_lens, scale):

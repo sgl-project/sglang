@@ -1267,14 +1267,13 @@ class Qwen3LLMModel(Qwen3Model):
 
         if not self.pp_group.is_last_rank:
             return residual_batch.to_pp(hidden_states, forward_batch)
-        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
-        if hidden_states.shape[0] != 0:
-            hidden_states = residual_batch.norm(
-                hidden_states,
-                forward_batch,
-                self.norm,
-                post_residual_addition=last_deepstack,
-            )
+        hidden_states = residual_batch.final_norm(
+            hidden_states,
+            forward_batch,
+            self.norm,
+            post_residual_addition=last_deepstack,
+            skip_empty=True,
+        )
 
         if len(aux_hidden_states) == 0:
             return hidden_states
