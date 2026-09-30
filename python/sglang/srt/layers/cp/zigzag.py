@@ -39,7 +39,6 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    is_symmetric_memory_enabled,
     use_symmetric_memory,
 )
 from sglang.srt.layers.cp.base import (
@@ -469,25 +468,17 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         assert x.shape[0] >= local_len
         x = x[:local_len]
         pad_size = max_len - x.shape[0]
+        if pad_size > 0:
+            padding = [0, 0] * (x.ndim - 1) + [0, pad_size]
+            x = F.pad(x, padding, mode="constant", value=0)
+
         group = get_parallel().attn_cp_group
-        symmetric = (
-            x.is_cuda and is_symmetric_memory_enabled() and is_allocation_symmetric()
+        ctx = (
+            use_symmetric_memory(group, disabled=not is_allocation_symmetric())
+            if x.is_cuda
+            else nullcontext()
         )
-        ctx = use_symmetric_memory(group) if symmetric else nullcontext()
         with ctx:
-            if symmetric:
-                # Allocate the same send/receive shapes on every rank, including
-                # ranks without padding. Both buffers must belong to the pool;
-                # contiguous() can return a producer's existing allocation.
-                local = x.new_empty((max_len, *x.shape[1:]))
-                local[:local_len].copy_(x)
-                local[local_len:].zero_()
-                x = local
-            elif pad_size > 0:
-                padding = [0, 0] * (x.ndim - 1) + [0, pad_size]
-                x = F.pad(x, padding, mode="constant", value=0)
-            else:
-                x = x.contiguous()
             gathered = torch.empty(
                 max_len * self.cp_size,
                 *x.shape[1:],
