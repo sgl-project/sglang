@@ -1,18 +1,3 @@
-"""MXFP8 quantization written as an epilogue of the kernel that produces the row.
-
-At the speculative BS=1 shapes (<=8 rows) the standalone FlashInfer
-``mxfp8_quantize`` launch costs about as much as the norm it follows, even
-though it only re-reads what that norm just wrote.  These kernels do the norm
-and the quantization in one pass; the quantized values come from the same BF16
-rounding the standalone pair produces, so both outputs are bitwise identical to
-``rmsnorm`` followed by ``mxfp8_quantize(..., is_sf_swizzled_layout=True)``.
-
-The scale factors use FlashInfer's 128x4 swizzle:
-``off = (g // 4) * 512 + ((r % 32) * 4 + ((r // 32) % 4)) * 4 + (g % 4)``
-over a row count padded to a multiple of 128, with the UE8M0 conversion
-(positive rounding, subnormals included) that ``mxfp8_quantize`` uses.
-"""
-
 from __future__ import annotations
 
 import torch
@@ -40,6 +25,7 @@ def mxfp8_epilogue(
 ):
     # Stores only groups in [g_lo, g_hi) so a row can be split across CTAs.
     GP: tl.constexpr = BLOCK // 32
+    SCALE_TILE_SIZE: tl.constexpr = tl.cdiv(GROUPS, 4) * 512
     g = tl.arange(0, GP)
     gmask = (g < GROUPS) & (g >= g_lo) & (g < g_hi)
     e = tl.arange(0, 32)
@@ -49,7 +35,12 @@ def mxfp8_epilogue(
     sf, scale = ue8m0_scale(amax)
     q = tl.minimum(tl.maximum(v * scale[:, None], -448.0), 448.0).to(tl.float8e4nv)
     tl.store(Q + row * K + idx, q, gmask[:, None])
-    off = (g // 4) * 512 + ((row % 32) * 4 + ((row // 32) % 4)) * 4 + (g % 4)
+    off = (
+        (row // 128) * SCALE_TILE_SIZE
+        + (g // 4) * 512
+        + ((row % 32) * 4 + ((row // 32) % 4)) * 4
+        + (g % 4)
+    )
     tl.store(S + off, sf.to(tl.uint8), gmask)
 
 
@@ -77,10 +68,11 @@ def _rmsnorm_mxfp8_kernel(
         tl.store(Y + row * K + h, y, h < K)
         mxfp8_epilogue(y, row, Q, S, K, BLOCK, GROUPS, 0, GROUPS)
     else:
-        # Padding scale entries are disjoint from the live rows above.
-        off = (row - M) * 512 + tl.arange(0, 512)
-        pad_row = ((off // 4) % 4) * 32 + ((off // 16) % 32)
-        tl.store(S + off, 0, (off < GROUPS * 128) & (pad_row >= M))
+        block = row - M
+        i = tl.arange(0, 512)
+        scale_row = (block // tl.cdiv(GROUPS, 4)) * 128 + (i // 4 % 4) * 32 + i // 16
+        scale_group = (block % tl.cdiv(GROUPS, 4)) * 4 + i % 4
+        tl.store(S + block * 512 + i, 0, (scale_row >= M) | (scale_group >= GROUPS))
 
 
 def rmsnorm_mxfp8(
@@ -88,12 +80,16 @@ def rmsnorm_mxfp8(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """RMSNorm returning ``(y_bf16, y_q, y_sf)`` with the same MXFP8 epilogue."""
     m, k = x.shape
-    assert 0 < m <= 8 and k % 32 == 0
+    assert 0 < m <= 512 and k % 32 == 0
     assert x.dtype == weight.dtype == torch.bfloat16 and x.stride(1) == 1
     y = torch.empty_like(x, memory_format=torch.contiguous_format)
     q = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=x.device)
-    s = torch.empty((k // 32) * 128, dtype=torch.uint8, device=x.device)
-    _rmsnorm_mxfp8_kernel[(m + triton.cdiv(s.numel(), 512),)](
+    s = torch.empty(
+        triton.cdiv(k // 32, 4) * 512 * triton.cdiv(m, 128),
+        dtype=torch.uint8,
+        device=x.device,
+    )
+    _rmsnorm_mxfp8_kernel[(m + s.numel() // 512,)](
         x,
         weight,
         y,

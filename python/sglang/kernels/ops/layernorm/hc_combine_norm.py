@@ -57,7 +57,7 @@ def hc_combine_norm(
 ) -> torch.Tensor:
     """Fuse four-stream combine and RMSNorm for BF16 batches of width 5120."""
     m = x.shape[0]
-    assert (0 < m <= 96 or 4096 <= m <= 65536) and x.shape == (m, 20480)
+    assert (0 < m <= 512 or 4096 <= m <= 65536) and x.shape == (m, 20480)
     assert pre.shape == (m, 4) and pre.stride(1) == 1
     assert weight.shape == (5120,) and weight.is_contiguous()
     assert x.dtype == weight.dtype == torch.bfloat16 and x.stride(1) == 1
@@ -112,32 +112,22 @@ def _hc_combine_norm_mxfp8_kernel(
     )
 
 
-def _parts_for(k: int) -> int:
-    # Row splits: recomputing the statistic beats running 6 CTAs on 148 SMs.
-    parts = 4
-    while parts > 1 and (k % (parts * 32)):
-        parts //= 2
-    return parts
-
-
-def _alloc(m, k, device):
-    q = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=device)
-    s = torch.zeros(
-        (k // 32) * (triton.cdiv(m, 128) * 128), dtype=torch.uint8, device=device
-    )
-    return q, s
-
-
 def hc_combine_norm_mxfp8(
     x: torch.Tensor, pre: torch.Tensor, weight: torch.Tensor, eps: float
-):
-    """Four-stream combine + RMSNorm returning ``(y_bf16, y_q, y_sf)``."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     m = x.shape[0]
-    assert 0 < m <= 8, "the fused MXFP8 epilogue only supports small decode/verify"
+    assert 0 < m <= 512
     k = x.shape[1] // 4
     y = torch.empty((m, k), dtype=x.dtype, device=x.device)
-    q, s = _alloc(m, k, x.device)
-    parts = _parts_for(k)
+    q = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=x.device)
+    s = torch.zeros(
+        triton.cdiv(k // 32, 4) * 512 * triton.cdiv(m, 128),
+        dtype=torch.uint8,
+        device=x.device,
+    )
+    parts = 4 if m <= 8 else (2 if m <= 48 else 1)
+    while parts > 1 and k % (parts * 32):
+        parts //= 2
     _hc_combine_norm_mxfp8_kernel[(m, parts)](
         x,
         pre,
