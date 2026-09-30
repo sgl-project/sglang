@@ -1,8 +1,8 @@
-import os
 import unittest
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -57,11 +57,8 @@ class TestSmallMRouterGfx950(CustomTestCase):
             x[:, :2048],
         ):
             self.assertFalse(R.smallm_router_supported(bad))
-        os.environ["SGLANG_ROCM_SMALLM_ROUTER"] = "0"
-        try:
+        with envs.SGLANG_ROCM_SMALLM_ROUTER.override(False):
             self.assertFalse(R.smallm_router_supported(x))
-        finally:
-            del os.environ["SGLANG_ROCM_SMALLM_ROUTER"]
 
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):

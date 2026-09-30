@@ -10,7 +10,8 @@ import tempfile
 import torch
 
 from sglang.kernels.ops.moe.smallm_moe_gfx950 import _check, _hip_lib, _hipcc, _Kernel
-from sglang.srt.utils import get_bool_env_var, is_gfx95_supported
+from sglang.srt.environ import envs
+from sglang.srt.utils import is_gfx95_supported
 
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "smallm_router.hip")
 MAX_TOK = 8  # MAX_TOK in smallm_router.hip; from 9 tokens the unfused path is faster
@@ -34,7 +35,7 @@ class Args(ctypes.Structure):
 def smallm_router_supported(x: torch.Tensor) -> bool:
     return (
         not _disabled
-        and get_bool_env_var("SGLANG_ROCM_SMALLM_ROUTER", "true")
+        and envs.SGLANG_ROCM_SMALLM_ROUTER.get()
         and is_gfx95_supported()
         and 1 <= x.shape[0] <= MAX_TOK
         and x.dtype == torch.bfloat16
@@ -82,7 +83,6 @@ def smallm_router(x, gate_weight, shared_gate_weight, scale=1.0):
 
 def qwen_moe_topk_output(block, hidden_states):
     """StandardTopKOutput for Qwen2MoeSparseMoeBlock with fused shared expert, or None (unfused path)."""
-    from sglang.srt.environ import envs
     from sglang.srt.eplb.expert_distribution import (
         get_global_expert_distribution_recorder,
     )
@@ -97,10 +97,10 @@ def qwen_moe_topk_output(block, hidden_states):
     )
     from sglang.srt.runtime_context import get_parallel
 
+    gw, sw = block.gate.weight, block.shared_expert_gate.weight
     ok = getattr(block, "_smallm_router_ok", None)
     if ok is None:
-        cfg, gw = block.topk.topk_config, block.gate.weight
-        sw, backend = block.shared_expert_gate.weight, get_moe_runner_backend()
+        cfg, backend = block.topk.topk_config, get_moe_runner_backend()
         ok = block._smallm_router_ok = (
             block.num_fused_shared_experts == 1
             and get_parallel().moe_ep_size == 1
@@ -123,7 +123,6 @@ def qwen_moe_topk_output(block, hidden_states):
         or is_in_tc_piecewise_cuda_graph()
     ):
         return None
-    gw, sw = block.gate.weight, block.shared_expert_gate.weight
     out = smallm_router(hidden_states, gw, sw, block._shared_expert_scale())
     if out is None:
         return None
