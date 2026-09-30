@@ -35,10 +35,7 @@ def maybe_publish_prefill_shared_read_done(
     declared = model_runner.attn_backend.shared_read_ends(forward_batch.forward_mode)
     if declared is not SharedReadEnds.PRE_REPLAY:
         return
-    if (
-        not model_runner.spec_algorithm.is_none()
-        and not model_runner.spec_algorithm.is_dflash_family()
-    ):
+    if not model_runner.spec_algorithm.supports_prefill_shared_read_done():
         # Stage the draft's shared reads before publishing the read-done event.
         stage = getattr(model_runner, "prefill_shared_read_stager", None)
         if stage is None or not stage(forward_batch):

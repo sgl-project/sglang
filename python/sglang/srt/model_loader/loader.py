@@ -83,7 +83,10 @@ from sglang.srt.connector.utils import parse_model_name
 from sglang.srt.distributed import model_parallel_is_initialized
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.moe.utils import install_shared_experts_fusion_decision
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.base_config import (
+    QuantizationConfig,
+    QuantizeMethodBase,
+)
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     trigger_transferring_weights_request,
 )
@@ -301,13 +304,25 @@ def _initialize_model(
     return model_class(**kwargs)
 
 
-def _post_load_weights(model: nn.Module) -> None:
+def post_load_weights(model: nn.Module) -> None:
     # Loaders that bypass `model.load_weights()` (dummy / sharded state / remote instance /
     # remote fs) must trigger the model's post-load fixup explicitly; `model.load_weights()`
     # would normally do it internally. NextN subclasses override the method to fill in
     # `is_nextn=True`, so the loader doesn't need to know.
     if hasattr(model, "post_load_weights"):
         model.post_load_weights()
+
+
+def _modules_with_quant_method(model: nn.Module):
+    from sglang.srt.lora.layers import BaseLayerWithLoRA
+
+    for _, module in model.named_modules():
+        # LoRA wrappers forward quant_method but do not own the packed params
+        if isinstance(module, BaseLayerWithLoRA):
+            continue
+        quant_method = getattr(module, "quant_method", None)
+        if quant_method is not None:
+            yield module, quant_method
 
 
 class BaseModelLoader(ABC):
@@ -819,7 +834,7 @@ class DefaultModelLoader(BaseModelLoader):
             self._startup_optional_parameter_values = initialize_capture_safe_weights(
                 model
             )
-            _post_load_weights(model)
+            post_load_weights(model)
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
                 if quant_method is None:
@@ -1076,16 +1091,23 @@ class DefaultModelLoader(BaseModelLoader):
 
     @staticmethod
     def postprocess_weights(model, target_device):
-        for _, module in model.named_modules():
-            quant_method = getattr(module, "quant_method", None)
-            if quant_method is not None:
-                # When quant methods need to process weights after loading
-                # (for repacking, quantizing, etc), they expect parameters
-                # to be on the global target device. This scope is for the
-                # case where cpu offloading is used, where we will move the
-                # parameters onto device for processing and back off after.
+        for module, quant_method in _modules_with_quant_method(model):
+            # When quant methods need to process weights after loading
+            # (for repacking, quantizing, etc), they expect parameters
+            # to be on the global target device. This scope is for the
+            # case where cpu offloading is used, where we will move the
+            # parameters onto device for processing and back off after.
+            with device_loading_context(module, target_device):
+                quant_method.process_weights_after_loading(module)
+
+    @staticmethod
+    def restore_weights_before_loading(model, target_device):
+        """Undo in-place quant packing so fresh weights can be loaded."""
+        for module, quant_method in _modules_with_quant_method(model):
+            # AMX packing and the MXFP4 backend wrappers are duck-typed and cannot restore
+            if isinstance(quant_method, QuantizeMethodBase):
                 with device_loading_context(module, target_device):
-                    quant_method.process_weights_after_loading(module)
+                    quant_method.restore_weights_before_loading(module)
 
 
 class LayeredModelLoader(DefaultModelLoader):
@@ -1663,7 +1685,7 @@ class DummyModelLoader(BaseModelLoader):
             # random values to the weights.
             initialize_dummy_weights(model)
 
-            _post_load_weights(model)
+            post_load_weights(model)
 
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
@@ -1824,7 +1846,7 @@ class ShardedStateLoader(BaseModelLoader):
             if state_dict:
                 raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
 
-            _post_load_weights(model)
+            post_load_weights(model)
 
         return model.eval()
 
@@ -2066,9 +2088,9 @@ class PreshardedModelLoader(DefaultModelLoader):
         cls, local_sig: Optional[str]
     ) -> Optional[str]:
         try:
-            from sglang.srt.distributed import get_world_group
+            from sglang.srt.runtime_context import get_parallel
 
-            group = get_world_group()
+            group = get_parallel().world_group
             if group.world_size <= 1:
                 return local_sig
             all_sigs = group.all_gather_object(local_sig)
@@ -2088,21 +2110,21 @@ class PreshardedModelLoader(DefaultModelLoader):
 
     @staticmethod
     def _world_rank_and_size() -> Tuple[int, int]:
-        from sglang.srt.distributed import get_world_group
+        from sglang.srt.runtime_context import get_parallel
 
         try:
-            g = get_world_group()
+            g = get_parallel().world_group
             return g.rank_in_group, g.world_size
-        except (AssertionError, AttributeError):
+        except (AssertionError, AttributeError, RuntimeError):
             return 0, 1
 
     @staticmethod
     def _world_barrier() -> None:
-        from sglang.srt.distributed import get_world_group
+        from sglang.srt.runtime_context import get_parallel
 
         try:
-            get_world_group().barrier()
-        except (AssertionError, AttributeError):
+            get_parallel().world_group.barrier()
+        except (AssertionError, AttributeError, RuntimeError):
             pass
 
     @staticmethod
@@ -3446,7 +3468,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 )
             current_platform.synchronize()
 
-            _post_load_weights(model)
+            post_load_weights(model)
         end_get_weights_tic = time.time()
         logger.debug(
             f"finish getting all weights from remote instance, time used: {(end_get_weights_tic - start_get_weights_tic):.4f}s"
@@ -3509,7 +3531,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             logger.error(f"batch transfer failed, error: {ret}")
             return False
 
-        _post_load_weights(model)
+        post_load_weights(model)
 
         return True
 
@@ -3599,7 +3621,7 @@ class RemoteModelLoader(BaseModelLoader):
         if state_dict:
             raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
 
-        _post_load_weights(model)
+        post_load_weights(model)
 
     def _load_model_from_remote_fs(
         self, model, client, model_config: ModelConfig, device_config: DeviceConfig

@@ -16,7 +16,6 @@ from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
@@ -63,12 +62,12 @@ def build_draft_tp_worker(
     *,
     server_args: ServerArgs,
     gpu_id: int,
-    ps: ParallelState,
     nccl_port: int,
     target_model_config: ModelConfig,
     algo_label: str,
     attention_backend_override: Optional[str] = None,
     draft_worker_cls: type[TpModelWorker] = TpModelWorker,
+    random_seed: Optional[int] = None,
 ) -> DraftWorkerBundle:
     # An override names a draft-specific backend the caller has already
     # validated (e.g. a self-drafting architecture); it skips the generic
@@ -87,9 +86,9 @@ def build_draft_tp_worker(
         draft_worker = draft_worker_cls(
             server_args=server_args,
             gpu_id=gpu_id,
-            ps=ps,
             nccl_port=nccl_port,
             is_draft_worker=True,
+            random_seed=random_seed,
             # The draft runs at absolute target positions.
             context_length=target_model_config.context_len,
             draft_attention_backend=draft_backend,

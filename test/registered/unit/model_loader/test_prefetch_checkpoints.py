@@ -27,6 +27,7 @@ from sglang.srt.model_loader.weight_utils import (
     fastsafetensors_weights_iterator,
     safetensors_weights_iterator,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -326,10 +327,7 @@ class TestPrefetchCheckpoints(CustomTestCase):
             patch("threading.Thread", _InlineThread),
             patch("concurrent.futures.ThreadPoolExecutor", _InlineExecutor),
             patch("concurrent.futures.wait", side_effect=_wait_all),
-            patch(
-                "sglang.srt.model_loader.weight_utils.get_world_group",
-                return_value=FakeWorldGroup(),
-            ),
+            get_parallel().override(world_group=FakeWorldGroup()),
             patch(
                 "sglang.srt.model_loader.weight_utils._prefetch_checkpoint_file",
                 side_effect=lambda path, cancel_event: (
