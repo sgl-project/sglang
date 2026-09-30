@@ -3,7 +3,8 @@
 
 //! Peer-snapshot bootstrap for the KV-event tree: the wire shape
 //! ([`PeerSnapshot`]) and its producer constants, the fetch client
-//! ([`fetch_snapshot`], [`fetch_cursors`]), the per-rank
+//! ([`fetch_snapshot`], [`fetch_cursors`]), the [`VettedSnapshot`] pass that
+//! turns wire input into something graftable, the per-rank
 //! [`BootstrapTracker`], and the [`PeerRegistry`] of peers a snapshot may be
 //! pulled from.
 //!
@@ -37,10 +38,12 @@ use super::tree::{KvWorkerId, SnapshotNode};
 mod fetch;
 mod peers;
 mod tracker;
+mod vet;
 
 pub use fetch::{fetch_cursors, fetch_snapshot, FetchAnswer};
 pub use peers::PeerRegistry;
 pub use tracker::BootstrapTracker;
+pub use vet::{VetError, VettedSnapshot};
 
 /// Wire-format version. Bump on any incompatible change to [`PeerSnapshot`].
 pub const SNAPSHOT_FORMAT: u32 = 1;
@@ -124,7 +127,8 @@ pub enum SnapshotOutcome {
     Unreachable,
     /// Answered, but holds no state to graft.
     ColdPeer,
-    /// Answered with an untrustworthy body (format, parents, block size).
+    /// Answered with an untrustworthy body: any [`VetError`] whose
+    /// [`VetError::outcome`] is `Rejected`.
     Rejected,
 }
 
@@ -176,12 +180,16 @@ pub enum RankOutcome {
     Uncovered,
     /// No peer supplied a usable snapshot.
     Abandoned,
-    /// The held batches overflowed before a snapshot arrived.
+    /// Held batches hit their cap before a snapshot arrived; bootstrap was
+    /// abandoned and they were replayed as live deltas.
     Overflow,
     /// The publisher restarted mid-bootstrap.
     PublisherReset,
     /// The tree refused the snapshot's structure.
     TreeRejected,
+    /// The rank's first held batch was its publisher's first batch ever, so its
+    /// history is complete without a snapshot and none was grafted.
+    FromOrigin,
 }
 
 impl RankOutcome {
@@ -195,6 +203,7 @@ impl RankOutcome {
             Self::Overflow => "overflow",
             Self::PublisherReset => "publisher_reset",
             Self::TreeRejected => "tree_rejected",
+            Self::FromOrigin => "from_origin",
         }
     }
 }
@@ -229,8 +238,9 @@ pub struct PeerSnapshot {
     pub block_size: u32,
     /// Producer's hashing mode (EAGLE-family workers hash token bigrams).
     pub is_bigram: bool,
-    /// True when the producer's hash config is established and its tree holds
-    /// nodes, so a cold or half-configured replica is never copied.
+    /// True when the producer's own bootstrap has settled, its hash config is
+    /// established, and its tree holds nodes, so a cold, still-bootstrapping
+    /// or half-configured replica is never copied.
     pub producer_ready: bool,
     /// Worker table; node carrier lists index into this.
     pub workers: Vec<WireWorker>,
@@ -272,6 +282,13 @@ impl PeerSnapshot {
 mod test_support {
     use super::*;
 
+    pub(super) fn wire_worker(url: &str, dp_rank: u32) -> WireWorker {
+        WireWorker {
+            url: url.into(),
+            dp_rank,
+        }
+    }
+
     pub(super) fn sample_snapshot() -> PeerSnapshot {
         PeerSnapshot {
             format: SNAPSHOT_FORMAT,
@@ -309,8 +326,37 @@ mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::sample_snapshot;
+    use super::test_support::{sample_snapshot, wire_worker};
     use super::*;
+
+    /// A wire cursor is read by worker identity, without vetting. A worker the
+    /// snapshot does not mention yields `None` rather than a misaddressed
+    /// cursor from another rank's table slot.
+    #[test]
+    fn wire_cursor_is_addressed_by_identity_not_table_position() {
+        let snap = PeerSnapshot {
+            format: SNAPSHOT_FORMAT,
+            block_size: 4,
+            is_bigram: false,
+            producer_ready: true,
+            workers: vec![wire_worker("http://w1", 0), wire_worker("http://w2", 1)],
+            // Out of table order, and with no entry for index 0.
+            cursors: vec![(1, 77)],
+            nodes: vec![],
+        };
+        assert_eq!(snap.wire_cursor_for("http://w2", 1), Some(77));
+        assert_eq!(
+            snap.wire_cursor_for("http://w1", 0),
+            None,
+            "a worker in the table without a cursor must not borrow another's",
+        );
+        assert_eq!(
+            snap.wire_cursor_for("http://w2", 0),
+            None,
+            "dp_rank matters"
+        );
+        assert_eq!(snap.wire_cursor_for("http://nope", 0), None);
+    }
 
     /// A body with every field populated survives a JSON round trip.
     #[test]
