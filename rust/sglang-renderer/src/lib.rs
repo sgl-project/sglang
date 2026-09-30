@@ -42,9 +42,15 @@ pub use preprocessing::{
     ChatRequest, DynamoTokenizer, PreparedChat, ReasoningEffort, RendererService, SamplingParams,
     TextTokenizer, load_tokenizer,
 };
+// Legacy template stack: the canonical home for conversation-template
+// rendering. `sglang-server` delegates here instead of carrying its own copy.
 pub use preprocessing::{
     GenerateRequest, GenerateRequestMetadata, GenerateSamplingParams, GenerationOptions,
     TextRequest, TokenIdsRequest,
+};
+pub use preprocessing::{
+    LegacyFormatter, LegacySpec, TemplateError, builtin_template,
+    infer_legacy_template_from_model_path, parse_legacy_template,
 };
 #[cfg(feature = "http")]
 pub use runtime::{RendererRuntimeConfig, serve};
