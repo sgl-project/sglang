@@ -1,9 +1,8 @@
 use futures::StreamExt;
-use sglang_processor::{RendererConfig, RendererLimits, SamplingDefaults};
+use sglang_processor::{RendererConfig, RendererLimits, ResponseError, SamplingDefaults};
 use tokio::sync::mpsc;
 
 use crate::{GenerationFinishReason, GenerationOutput, GenerationStream, MatchedStop};
-use sglang_processor::ResponseError;
 
 use super::completions::SubmittedChoice;
 

@@ -7,9 +7,11 @@ use sglang_processor::{
     DynamoTokenizer, RendererConfig, RendererService, TextTokenizer, load_tokenizer,
 };
 
-use crate::api::OpenAIService;
-use crate::engine::{GenerationService, HttpGenerateClient, TokenDecoder};
-use crate::http::{hosted_routes, render_only_routes, standalone_routes};
+use crate::{
+    api::OpenAIService,
+    engine::{GenerationService, HttpGenerateClient, TokenDecoder},
+    http::{hosted_routes, render_only_routes, standalone_routes},
+};
 
 #[derive(Clone, Debug)]
 pub struct RendererRuntimeConfig {

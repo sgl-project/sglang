@@ -12,10 +12,10 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use sglang_processor::{
-    ChatRequest, GenerateRequestMetadata, GenerationOptions, OneOrMany, ReasoningEffort,
-    RendererConfig, RendererError, SamplingDefaults, SamplingParams, TokenIds, TokenIdsRequest,
+    ChatRequest, GenerateRequestIdentity, GenerateRequestMetadata, GenerationOptions, OneOrMany,
+    ReasoningEffort, RendererConfig, RendererError, SamplingDefaults, SamplingParams,
+    TextRequestGroup, TokenIds, TokenIdsRequest,
 };
-use sglang_processor::{GenerateRequestIdentity, TextRequestGroup};
 
 const MAX_OPENAI_CHOICES: usize = 4096;
 

@@ -21,14 +21,16 @@ mod suite {
     use tokio::sync::Barrier;
     use tower::ServiceExt;
 
-    use crate::engine::test_utils::tiny_tokenizer;
-    use crate::engine::{GenerationService, TokenDecoder};
+    use crate::{
+        api::test_utils::renderer_config,
+        engine::test_utils::tiny_tokenizer,
+        engine::{GenerationService, TokenDecoder},
+    };
 
     use super::super::{
         DEFAULT_REQUEST_BODY_LIMIT_BYTES, HttpGenerateClient, OpenAIService, hosted_routes,
         render_only_routes, standalone_routes,
     };
-    use crate::api::test_utils::renderer_config;
     use sglang_processor::{RendererError, RendererService, TextTokenizer};
 
     struct WordTokenizer;

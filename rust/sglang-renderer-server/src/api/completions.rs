@@ -1,6 +1,11 @@
 //! OpenAI completion preparation, response aggregation, and typed chunks.
 
-use crate::engine::response::{collect_output, merge_indexed};
+use crate::{
+    GenerationFinishReason, GenerationOutput, GenerationOutputExtras, GenerationStream,
+    MatchedStop, PositionLogprobs,
+    engine::TokenDecoder,
+    engine::response::{collect_output, merge_indexed},
+};
 use std::collections::BTreeMap;
 
 use super::{
@@ -11,14 +16,10 @@ use super::{
     },
     unix_seconds_u32,
 };
-use crate::{
-    GenerationFinishReason, GenerationOutput, GenerationOutputExtras, GenerationStream,
-    MatchedStop, engine::TokenDecoder,
-};
 use dynamo_protocols::types::{CompletionUsage, Prompt};
 use futures::StreamExt;
 use serde::Serialize;
-use sglang_processor::{GenerateRequest, RendererService, ResponseError};
+use sglang_processor::{GenerateRequest, RendererError, RendererService, ResponseError};
 
 pub(crate) struct SubmittedChoice {
     pub(crate) index: usize,
@@ -120,10 +121,10 @@ fn prepare_response(
     let prompt_echoes = if !echo {
         vec![String::new(); choice_count / n]
     } else if matches!(&request.prompt, Prompt::String(_) | Prompt::StringArray(_)) {
-        text_completion_prompts(&request.prompt).map_err(sglang_processor::RendererError::from)?
+        text_completion_prompts(&request.prompt).map_err(RendererError::from)?
     } else {
         token_ids_completion_prompts(&request.prompt)
-            .map_err(sglang_processor::RendererError::from)?
+            .map_err(RendererError::from)?
             .into_iter()
             .map(|ids| tokenizer.detokenize_prompt(ids))
             .collect::<Result<Vec<_>, _>>()?
@@ -362,7 +363,7 @@ fn completion_logprobs(
     result
 }
 
-fn append_logprobs(result: &mut CompletionLogprobsWire, positions: &[crate::PositionLogprobs]) {
+fn append_logprobs(result: &mut CompletionLogprobsWire, positions: &[PositionLogprobs]) {
     for position in positions {
         let selected = &position.token;
         result.tokens.push(
@@ -458,12 +459,13 @@ mod tests {
         completion_event_stream, completion_logprobs, prepare_request, prepare_response,
         unary_completion,
     };
-    use crate::GenerationOutputExtras;
-    use crate::api::test_utils::{chunk, renderer_config, submitted};
-    use crate::engine::{TokenDecoder, test_utils::tiny_tokenizer};
-    use crate::{PositionLogprobs, TokenLogprob};
+    use crate::{
+        GenerationOutputExtras, PositionLogprobs, TokenLogprob,
+        api::test_utils::{chunk, renderer_config, submitted},
+        engine::{TokenDecoder, test_utils::tiny_tokenizer},
+    };
     use futures::StreamExt;
-    use sglang_processor::{DynamoTokenizer, RendererService, ResponseError};
+    use sglang_processor::{DynamoTokenizer, RendererService, ResponseError, ResponseErrorKind};
     use std::sync::Arc;
 
     #[tokio::test]
@@ -675,13 +677,13 @@ mod tests {
         futures::pin_mut!(stream);
 
         tx0.send(Err(ResponseError {
-            kind: sglang_processor::ResponseErrorKind::Unavailable,
+            kind: ResponseErrorKind::Unavailable,
             message: "out of memory".into(),
         }))
         .await
         .unwrap();
         let error = stream.next().await.unwrap().unwrap_err();
-        assert_eq!(error.kind, sglang_processor::ResponseErrorKind::Unavailable);
+        assert_eq!(error.kind, ResponseErrorKind::Unavailable);
 
         tx1.send(chunk("late", true)).await.unwrap();
         let remaining = stream.collect::<Vec<_>>().await;

@@ -2,7 +2,10 @@
 
 use std::collections::BTreeMap;
 
-use crate::{GenerationFinishReason, GenerationOutput, GenerationOutputExtras, GenerationStream};
+use crate::{
+    GenerationFinishReason, GenerationOutput, GenerationOutputExtras, GenerationStream,
+    engine::response::merge_indexed,
+};
 use dynamo_protocols::types::{
     ChatChoice, ChatChoiceLogprobs, ChatChoiceStream, ChatCompletionMessageContent,
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
@@ -16,12 +19,11 @@ use futures::StreamExt;
 use serde::Serialize;
 use sglang_processor::{
     ChatEvent, ChatFinishReason, ChatResponseProcessor, ChatToolCallDelta, DecodedChatEvent,
-    ResponseError,
+    PreparedChat, RendererService, ResponseError, ResponseErrorKind,
 };
 
 use super::protocol::{ChatCompletionRequest, lower_chat_request};
 use super::{completion_usage, unix_seconds_u32};
-use crate::engine::response::merge_indexed;
 
 pub(crate) struct ChatResponseContext {
     pub(crate) response_id: String,
@@ -33,9 +35,9 @@ pub(crate) struct ChatResponseContext {
 }
 
 pub(crate) async fn prepare_request(
-    renderer: &sglang_processor::RendererService,
+    renderer: &RendererService,
     request: ChatCompletionRequest,
-) -> Result<(String, sglang_processor::PreparedChat), ResponseError> {
+) -> Result<(String, PreparedChat), ResponseError> {
     let (response_id, request) = lower_chat_request(renderer.config(), request)?;
     let chat = renderer.prepare_chat(request).await?;
     Ok((response_id, chat))
@@ -72,7 +74,7 @@ pub(crate) async fn unary_chat(
             }) => {
                 let Some(choice) = accumulated.get_mut(choice) else {
                     return Err(ResponseError {
-                        kind: sglang_processor::ResponseErrorKind::Internal,
+                        kind: ResponseErrorKind::Internal,
                         message: "chat response choice is out of range".into(),
                     });
                 };
@@ -580,13 +582,16 @@ impl super::OpenAIService {
 #[cfg(test)]
 mod tests {
     use super::{ChatResponseContext, chat_event_stream, chat_logprobs, unary_chat};
-    use crate::api::protocol::ChatCompletionRequest;
-    use crate::api::protocol::{chat_sampling_params, lower_chat_request};
-    use crate::api::test_utils::{chat_submitted, chunk};
-    use crate::{GenerationOutputExtras, PositionLogprobs, TokenLogprob};
+    use crate::{
+        GenerationOutputExtras, PositionLogprobs, TokenLogprob,
+        api::protocol::ChatCompletionRequest,
+        api::protocol::{chat_sampling_params, lower_chat_request},
+        api::test_utils::{chat_submitted, chunk},
+    };
     use futures::{FutureExt, StreamExt};
     use sglang_processor::{
-        ChatPreprocessor, RendererConfig, RendererLimits, ResponseError, SamplingDefaults,
+        ChatPreprocessor, ChatResponseProcessor, RendererConfig, RendererLimits, ResponseError,
+        ResponseErrorKind, SamplingDefaults, UpstreamErrorCode,
     };
 
     fn request() -> ChatCompletionRequest {
@@ -597,10 +602,7 @@ mod tests {
         .unwrap()
     }
 
-    fn response_processor(
-        reasoning_parser: Option<&str>,
-        choices: usize,
-    ) -> sglang_processor::ChatResponseProcessor {
+    fn response_processor(reasoning_parser: Option<&str>, choices: usize) -> ChatResponseProcessor {
         let config = RendererConfig {
             model_path: String::new(),
             served_model_name: "model".into(),
@@ -888,9 +890,7 @@ mod tests {
         futures::pin_mut!(stream);
 
         tx0.send(Err(ResponseError {
-            kind: sglang_processor::ResponseErrorKind::Upstream(
-                sglang_processor::UpstreamErrorCode::Http(429),
-            ),
+            kind: ResponseErrorKind::Upstream(UpstreamErrorCode::Http(429)),
             message: "out of memory".into(),
         }))
         .await
@@ -898,9 +898,7 @@ mod tests {
         let error = stream.next().await.unwrap().unwrap_err();
         assert_eq!(
             error.kind,
-            sglang_processor::ResponseErrorKind::Upstream(
-                sglang_processor::UpstreamErrorCode::Http(429)
-            )
+            ResponseErrorKind::Upstream(UpstreamErrorCode::Http(429))
         );
         assert_eq!(error.message, "out of memory");
 

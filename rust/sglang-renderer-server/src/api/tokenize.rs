@@ -7,7 +7,10 @@ use futures::future::try_join_all;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use sglang_processor::{ChatRequest, OneOrMany, ReasoningEffort, RendererService, ResponseError};
+use sglang_processor::{
+    ChatRequest, GenerateRequestMetadata, OneOrMany, ReasoningEffort, RendererError,
+    RendererService, ResponseError, ResponseErrorKind,
+};
 
 use super::protocol::normalize_reasoning_inputs;
 
@@ -19,7 +22,7 @@ pub(crate) async fn tokenize(
     let has_messages = request.messages.is_some();
     if has_prompt == has_messages {
         return Err(ResponseError {
-            kind: sglang_processor::ResponseErrorKind::InvalidRequest,
+            kind: ResponseErrorKind::InvalidRequest,
             message: "Exactly one of 'prompt' or 'messages' must be provided.".into(),
         });
     }
@@ -81,10 +84,7 @@ pub(crate) struct TokenizeRequest {
 }
 
 impl TokenizeRequest {
-    fn into_chat(
-        mut self,
-        served_model: &str,
-    ) -> Result<ChatRequest, sglang_processor::RendererError> {
+    fn into_chat(mut self, served_model: &str) -> Result<ChatRequest, RendererError> {
         normalize_reasoning_inputs(
             &mut self.reasoning_effort,
             self.reasoning.take(),
@@ -113,7 +113,7 @@ impl TokenizeRequest {
             return_logprob: false,
             top_logprobs_num: 0,
             parallel_tool_calls: true,
-            metadata: sglang_processor::GenerateRequestMetadata::default(),
+            metadata: GenerateRequestMetadata::default(),
         })
     }
 }

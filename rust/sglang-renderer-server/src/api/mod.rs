@@ -1,7 +1,7 @@
 //! OpenAI request preparation and typed response construction.
 
 use dynamo_protocols::types::CompletionUsage;
-use sglang_processor::ResponseError;
+use sglang_processor::{RendererService, ResponseError};
 
 pub(crate) mod chat;
 pub(crate) mod completions;
@@ -37,13 +37,13 @@ pub(crate) enum OperationResponse<U, C> {
 }
 
 pub(crate) struct OpenAIService {
-    pub(crate) renderer: std::sync::Arc<sglang_processor::RendererService>,
+    pub(crate) renderer: std::sync::Arc<RendererService>,
     generation: crate::engine::GenerationService,
 }
 
 impl OpenAIService {
     pub(crate) fn new(
-        renderer: std::sync::Arc<sglang_processor::RendererService>,
+        renderer: std::sync::Arc<RendererService>,
         generation: crate::engine::GenerationService,
     ) -> Self {
         Self {

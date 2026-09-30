@@ -5,8 +5,10 @@ use super::{
     error::{json_rejection_response, response_error},
     response::sse_response,
 };
-use crate::api::chat::serialize_chat_stream_response;
-use crate::api::{OpenAIService, OperationResponse};
+use crate::{
+    api::chat::serialize_chat_stream_response,
+    api::{OpenAIService, OperationResponse},
+};
 use axum::{
     Json, Router,
     extract::{State, rejection::JsonRejection},

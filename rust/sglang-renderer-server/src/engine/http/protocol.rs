@@ -1,12 +1,12 @@
 //! SGLang engine frame parsing and normalization into generation deltas.
 
 use super::internal;
-use crate::engine::TokenDelta;
 use crate::{
     GenerationFinishReason, GenerationOutputExtras, MatchedStop, PositionLogprobs, TokenLogprob,
+    engine::TokenDelta,
 };
 use serde::Deserialize;
-use sglang_processor::{ResponseError, TokenIds};
+use sglang_processor::{ResponseError, ResponseErrorKind, TokenIds, UpstreamErrorCode};
 
 type WireLogprob = (Option<f32>, i32, Option<String>);
 type WireTopLogprobs = Vec<Option<Vec<WireLogprob>>>;
@@ -75,9 +75,7 @@ fn default_error_code() -> u16 {
 pub(super) fn parse_engine_frame(payload: &str) -> Result<TokenDelta, ResponseError> {
     if let Ok(error) = serde_json::from_str::<EngineErrorEnvelope>(payload) {
         return Err(ResponseError {
-            kind: sglang_processor::ResponseErrorKind::Upstream(
-                sglang_processor::UpstreamErrorCode::Http(error.error.code),
-            ),
+            kind: ResponseErrorKind::Upstream(UpstreamErrorCode::Http(error.error.code)),
             message: error.error.message,
         });
     }
@@ -88,9 +86,7 @@ pub(super) fn parse_engine_frame(payload: &str) -> Result<TokenDelta, ResponseEr
         && let Some(status_code) = reason.status_code
     {
         return Err(ResponseError {
-            kind: sglang_processor::ResponseErrorKind::Upstream(
-                sglang_processor::UpstreamErrorCode::Http(status_code),
-            ),
+            kind: ResponseErrorKind::Upstream(UpstreamErrorCode::Http(status_code)),
             message: reason
                 .message
                 .clone()
@@ -278,6 +274,7 @@ pub(super) fn engine_error_message(body: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::engine::test_utils::position;
+    use sglang_processor::{ResponseErrorKind, UpstreamErrorCode};
 
     #[test]
     fn engine_frame_maps_tokens_usage_finish_and_logprobs() {
@@ -349,7 +346,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_eq!(error.kind, sglang_processor::ResponseErrorKind::Internal);
+        assert_eq!(error.kind, ResponseErrorKind::Internal);
         assert_eq!(
             error.message,
             "engine returned 1 output top-logprob positions for 2 selected-token positions"
@@ -364,9 +361,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             error.kind,
-            sglang_processor::ResponseErrorKind::Upstream(
-                sglang_processor::UpstreamErrorCode::Http(400)
-            )
+            ResponseErrorKind::Upstream(UpstreamErrorCode::Http(400))
         );
         assert_eq!(error.message, "too long");
     }
@@ -380,9 +375,7 @@ mod tests {
 
         assert_eq!(
             error.kind,
-            sglang_processor::ResponseErrorKind::Upstream(
-                sglang_processor::UpstreamErrorCode::Http(503)
-            )
+            ResponseErrorKind::Upstream(UpstreamErrorCode::Http(503))
         );
         assert_eq!(error.message, "out of memory");
     }
@@ -454,7 +447,7 @@ mod tests {
 
         let error = normalize_engine_output(&mut output, &mut emitted_tokens).unwrap_err();
 
-        assert_eq!(error.kind, sglang_processor::ResponseErrorKind::Internal);
+        assert_eq!(error.kind, ResponseErrorKind::Internal);
         assert!(error.message.contains("2 output token IDs"));
         assert_eq!(emitted_tokens, 2);
     }

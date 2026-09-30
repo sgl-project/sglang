@@ -7,7 +7,7 @@ use futures::{StreamExt, future::BoxFuture};
 
 use super::{GenerateTransport, TokenStream, internal};
 use protocol::{engine_error_message, normalize_engine_output, parse_engine_frame};
-use sglang_processor::{GenerateRequest, ResponseError};
+use sglang_processor::{GenerateRequest, ResponseError, ResponseErrorKind, UpstreamErrorCode};
 
 mod protocol;
 
@@ -17,7 +17,7 @@ const ENGINE_HEALTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn unavailable(message: impl Into<String>) -> ResponseError {
     ResponseError {
-        kind: sglang_processor::ResponseErrorKind::Unavailable,
+        kind: ResponseErrorKind::Unavailable,
         message: message.into(),
     }
 }
@@ -104,9 +104,7 @@ impl GenerateTransport for HttpGenerateClient {
             if !status.is_success() {
                 let body = response.text().await.unwrap_or_default();
                 return Err(ResponseError {
-                    kind: sglang_processor::ResponseErrorKind::Upstream(
-                        sglang_processor::UpstreamErrorCode::Http(status.as_u16()),
-                    ),
+                    kind: ResponseErrorKind::Upstream(UpstreamErrorCode::Http(status.as_u16())),
                     message: engine_error_message(&body)
                         .unwrap_or_else(|| format!("engine returned HTTP {status}")),
                 });
@@ -211,7 +209,7 @@ mod tests {
         response::sse::{Event, Sse},
         routing::post,
     };
-    use sglang_processor::{GenerationOptions, TokenIds, TokenIdsRequest};
+    use sglang_processor::{GenerationOptions, ResponseErrorKind, TokenIds, TokenIdsRequest};
     use std::convert::Infallible;
     use std::sync::{Arc, Mutex};
 
@@ -431,7 +429,7 @@ mod tests {
                 .await;
             if let Some(message) = error_message {
                 let error = events.last().unwrap().as_ref().unwrap_err();
-                assert_eq!(error.kind, sglang_processor::ResponseErrorKind::Internal);
+                assert_eq!(error.kind, ResponseErrorKind::Internal);
                 assert!(
                     error.message.starts_with(message),
                     "{case}: {}",

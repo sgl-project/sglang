@@ -2,7 +2,7 @@
 
 use futures::{StreamExt, TryStreamExt, future::BoxFuture};
 
-use sglang_processor::{GenerateRequest, ResponseError};
+use sglang_processor::{GenerateRequest, ResponseError, ResponseErrorKind};
 
 mod decode;
 mod http;
@@ -71,14 +71,14 @@ impl GenerationService {
 
 fn invalid(message: impl Into<String>) -> ResponseError {
     ResponseError {
-        kind: sglang_processor::ResponseErrorKind::InvalidRequest,
+        kind: ResponseErrorKind::InvalidRequest,
         message: message.into(),
     }
 }
 
 fn internal(message: impl Into<String>) -> ResponseError {
     ResponseError {
-        kind: sglang_processor::ResponseErrorKind::Internal,
+        kind: ResponseErrorKind::Internal,
         message: message.into(),
     }
 }
