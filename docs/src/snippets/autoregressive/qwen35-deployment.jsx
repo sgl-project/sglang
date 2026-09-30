@@ -118,8 +118,8 @@ export const Qwen35Deployment = () => {
       name: 'kvOffload',
       title: 'KV Cache Offloading',
       // HiCache adds a host-DRAM tier below the device KV cache. Wired up for
-      // the two MI355X arms it is tuned on: the MXFP4 recipe, and 397B FP8 for
-      // long-context agentic serving.
+      // the MI355X MXFP4 recipe, which is the arm it is tuned on, and
+      // separately for the 397B FP8 long-context agentic recipe.
       condition: (values) => values.hardware === 'mi355x' &&
         (values.quantization === 'fp4' ||
           (values.quantization === 'fp8' && values.model === '397b')),
