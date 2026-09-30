@@ -58,23 +58,20 @@ _FULL_CONFIG = {
 }
 
 
-def test_config_resolution_matrix(tmp_path, caplog):
+def test_config_file_and_inline_json_resolve_all_fields(tmp_path):
     config_path = tmp_path / "watermark.json"
     _write_config(config_path, **_FULL_CONFIG)
-    server_args = ServerArgs(
-        model_path="dummy",
-        device="cuda",
-        enable_watermark=True,
-        watermark_config=str(config_path),
-    )
-    with caplog.at_level(logging.WARNING):
+    for source in (str(config_path), json.dumps(_FULL_CONFIG)):
+        server_args = ServerArgs(
+            model_path="dummy",
+            device="cuda",
+            enable_watermark=True,
+            watermark_config=source,
+        )
         server_args.resolve_once()
-    check_watermark_server_args(server_args)
-    assert "deprecated" not in caplog.text
-    for field, value in _FULL_CONFIG.items():
-        assert resolution_result(server_args, f"watermark_{field}") == value
-    assert server_args.watermark_key is None
-    assert server_args.watermark_context_window == 4
+        check_watermark_server_args(server_args)
+        for field, value in _FULL_CONFIG.items():
+            assert resolution_result(server_args, f"watermark_{field}") == value
 
     manager = object.__new__(TokenizerManager)
     manager.server_args = server_args
@@ -86,85 +83,35 @@ def test_config_resolution_matrix(tmp_path, caplog):
     finally:
         reset_context()
 
-    caplog.clear()
-    server_args = ServerArgs(
-        model_path="dummy",
-        device="cuda",
-        enable_watermark=True,
-        watermark_key="0123456789abcdef",
-        watermark_enforce_all=True,
-    )
-    with caplog.at_level(logging.WARNING):
-        server_args.resolve_once()
-    check_watermark_server_args(server_args)
-    assert "--watermark-key is deprecated" in caplog.text
-    assert "--watermark-enforce-all is deprecated" in caplog.text
-
-    _write_config(config_path)
-    server_args = ServerArgs(
-        model_path="dummy",
-        enable_watermark=True,
-        watermark_config=str(config_path),
-        watermark_key_b="1111222233334444",
-    )
-    server_args.resolve_once()
-    assert resolution_result(server_args, "watermark_key") == "0123456789abcdef"
-    assert resolution_result(server_args, "watermark_key_b") == "1111222233334444"
-
-
-@pytest.mark.parametrize(
-    ("field", "flag_value"),
-    [
-        ("key", "1111222233334444"),
-        ("key_b", "1111222233334444"),
-        ("context_window", 3),
-        ("mixing_probability", 0.3),
-        ("max_probability", 0.8),
-        ("default_enabled", True),
-        ("enforce_all", True),
-    ],
-)
-def test_config_field_conflicts_with_deprecated_flag(tmp_path, field, flag_value):
-    config_path = tmp_path / "watermark.json"
-    _write_config(config_path, **{field: _FULL_CONFIG[field]})
-    with pytest.raises(ValueError, match=f"config {field} and .* mutually exclusive"):
-        ServerArgs(
-            model_path="dummy",
-            enable_watermark=True,
-            watermark_config=str(config_path),
-            **{f"watermark_{field}": flag_value},
-        ).resolve_once()
-
 
 _KEY = "0123456789abcdef"
 _KEY_B = "fedcba9876543210"
 
 
 @pytest.mark.parametrize(
-    ("overrides", "match"),
+    ("overrides", "config", "match"),
     [
         pytest.param(
-            {"enable_watermark": False, "watermark_key": _KEY},
-            "require --enable-watermark",
-            id="key-without-capability",
-        ),
-        pytest.param(
-            {"enable_watermark": False, "watermark_enforce_all": True},
-            "require --enable-watermark",
-            id="mode-without-capability",
+            {"enable_watermark": False},
+            {},
+            "requires --enable-watermark",
+            id="config-without-capability",
         ),
         pytest.param(
             {"disaggregation_mode": "decode"},
+            {},
             "not supported with PD disaggregation",
             id="pd-disaggregation",
         ),
         pytest.param(
             {"dllm_algorithm": "LowConfidence"},
+            {},
             "not supported with diffusion LLM",
             id="diffusion-llm",
         ),
         pytest.param(
             {"speculative_algorithm": "DFLASH"},
+            {},
             "supports speculative algorithms",
             id="unsupported-spec",
         ),
@@ -173,62 +120,75 @@ _KEY_B = "fedcba9876543210"
                 "speculative_algorithm": "EAGLE",
                 "speculative_use_rejection_sampling": True,
             },
+            {},
             "speculative-use-rejection-sampling",
             id="rejection-sampling",
         ),
         pytest.param(
             {"pp_size": 2, "speculative_algorithm": "EAGLE"},
+            {},
             "pipeline-parallel speculative decoding",
             id="pp-spec",
         ),
         pytest.param(
-            {"watermark_key_b": _KEY_B, "watermark_mixing_probability": 0.0},
+            {},
+            {"key_b": _KEY_B, "mixing_probability": 0.0},
             "strictly between 0 and 1",
             id="mixing-lower",
         ),
         pytest.param(
-            {"watermark_key_b": _KEY_B, "watermark_mixing_probability": 1.0},
+            {},
+            {"key_b": _KEY_B, "mixing_probability": 1.0},
             "strictly between 0 and 1",
             id="mixing-upper",
         ),
         pytest.param(
-            {"watermark_mixing_probability": 0.25},
+            {},
+            {"mixing_probability": 0.25},
             "requires key_b",
             id="mixing-without-key-b",
         ),
         pytest.param(
-            {"watermark_max_probability": 0.0},
+            {},
+            {"max_probability": 0.0},
             "greater than 0 and at most 1",
             id="max-probability-lower",
         ),
         pytest.param(
-            {"watermark_max_probability": 1.01},
+            {},
+            {"max_probability": 1.01},
             "greater than 0 and at most 1",
             id="max-probability-upper",
         ),
         pytest.param(
-            {"watermark_key": None, "watermark_key_b": _KEY_B},
+            {},
+            {"key": None, "key_b": _KEY_B},
             "key_b requires a server key",
             id="key-b-without-key",
         ),
         pytest.param(
-            {"watermark_key": None, "watermark_default_enabled": True},
+            {},
+            {"key": None, "default_enabled": True},
             "require a server key",
             id="default-enabled-without-key",
         ),
         pytest.param(
-            {"watermark_key": None, "watermark_enforce_all": True},
+            {},
+            {"key": None, "enforce_all": True},
             "require a server key",
             id="enforce-all-without-key",
         ),
     ],
 )
-def test_startup_validation_fails_closed(overrides, match):
+def test_startup_validation_fails_closed(overrides, config, match):
+    config = {"key": _KEY, **config}
     kwargs = {
         "model_path": "dummy",
         "device": "cuda",
         "enable_watermark": True,
-        "watermark_key": _KEY,
+        "watermark_config": json.dumps(
+            {name: value for name, value in config.items() if value is not None}
+        ),
         **overrides,
     }
     server_args = ServerArgs(**kwargs)
@@ -239,7 +199,10 @@ def test_startup_validation_fails_closed(overrides, match):
 
 def test_rust_server_is_rejected(monkeypatch):
     server_args = ServerArgs(
-        model_path="dummy", device="cuda", enable_watermark=True, watermark_key=_KEY
+        model_path="dummy",
+        device="cuda",
+        enable_watermark=True,
+        watermark_config=json.dumps({"key": _KEY}),
     )
     server_args.resolve_once()
     monkeypatch.setenv("SGLANG_RUST_SERVER", "1")
@@ -349,15 +312,14 @@ def test_config_errors_and_logs_do_not_expose_secrets(tmp_path, caplog):
     assert dump_request.sampling_params.watermark.key == "<redacted>"
     assert tokenized_request.sampling_params.watermark.key == secret
 
+    inline_config = json.dumps({"key": secret, "key_b": secret_b})
     command = redact_watermark_command_line(
         [
             "python",
             "-m",
             "sglang.launch_server",
-            "--watermark-key",
-            secret,
-            "--watermark-key-b",
-            secret_b,
+            "--watermark-config",
+            inline_config,
             "--watermark-config=/run/secrets/watermark.json",
         ]
     )
@@ -369,15 +331,13 @@ def test_config_errors_and_logs_do_not_expose_secrets(tmp_path, caplog):
         [
             "--model-path",
             "dummy",
-            "--watermark-key",
-            secret,
-            f"--watermark-key-b={secret_b}",
-            "--watermark-config=/run/secrets/watermark.json",
+            "--enable-watermark",
+            "--watermark-config",
+            inline_config,
         ]
     )
     assert secret not in server_args.launch_command
     assert secret_b not in server_args.launch_command
-    assert "/run/secrets/watermark.json" not in server_args.launch_command
 
 
 def test_config_file_security_guards(tmp_path, caplog):

@@ -53,7 +53,7 @@ def parse_watermark_key(value: Any) -> int:
     return key if key < (1 << 63) else key - (1 << 64)
 
 
-def load_watermark_config(path: str) -> WatermarkServerConfig:
+def _read_config_file(path: str) -> str:
     config_path = Path(path).expanduser()
     try:
         flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
@@ -69,9 +69,16 @@ def load_watermark_config(path: str) -> WatermarkServerConfig:
                     "watermark config is readable by group or other users; "
                     "restrict it to the server account"
                 )
-            payload = config_file.read(_MAX_CONFIG_BYTES + 1)
+            return config_file.read(_MAX_CONFIG_BYTES + 1)
     except (OSError, UnicodeError):
         raise WatermarkConfigError("failed to read watermark config JSON") from None
+
+
+def load_watermark_config(source: str) -> WatermarkServerConfig:
+    if source.lstrip().startswith("{"):
+        payload = source
+    else:
+        payload = _read_config_file(source)
     if len(payload.encode("utf-8")) > _MAX_CONFIG_BYTES:
         raise WatermarkConfigError("watermark config exceeds 4096 bytes")
     try:

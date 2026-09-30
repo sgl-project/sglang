@@ -110,13 +110,9 @@ def redact_watermark_command_line(argv: Sequence[str]) -> str:
         if redact_next:
             result.append("<redacted>")
             redact_next = False
-        elif argument in {"--watermark-key", "--watermark-key-b", "--watermark-config"}:
+        elif argument == "--watermark-config":
             result.append(argument)
             redact_next = True
-        elif argument.startswith("--watermark-key="):
-            result.append("--watermark-key=<redacted>")
-        elif argument.startswith("--watermark-key-b="):
-            result.append("--watermark-key-b=<redacted>")
         elif argument.startswith("--watermark-config="):
             result.append("--watermark-config=<redacted>")
         else:

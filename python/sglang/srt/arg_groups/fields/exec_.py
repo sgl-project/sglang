@@ -72,58 +72,39 @@ class ExecFeatures(msgspec.Struct):
         bool,
         "Enable Aaronson-Gumbel text watermarking.",
     ] = False
+    watermark_config: A[
+        Optional[str],
+        "Watermark settings as a JSON file path or an inline JSON object with "
+        "optional key, key_b, context_window, mixing_probability, max_probability, "
+        "default_enabled, and enforce_all fields.",
+    ] = None
     watermark_key: A[
         Optional[str],
-        Arg(
-            help="Deprecated; set 'key' in --watermark-config. Visible in the "
-            "process command line.",
-            resolvable=True,
-        ),
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
     ] = None
     watermark_key_b: A[
         Optional[str],
-        Arg(help="Deprecated; set 'key_b' in --watermark-config.", resolvable=True),
-    ] = None
-    watermark_mixing_probability: A[
-        float,
-        Arg(
-            help="Deprecated; set 'mixing_probability' in --watermark-config.",
-            resolvable=True,
-        ),
-    ] = 0.5
-    watermark_max_probability: A[
-        float,
-        Arg(
-            help="Deprecated; set 'max_probability' in --watermark-config.",
-            resolvable=True,
-        ),
-    ] = 1.0
-    watermark_config: A[
-        Optional[str],
-        "Path to a watermark JSON config file with optional key, key_b, "
-        "context_window, mixing_probability, max_probability, default_enabled, "
-        "and enforce_all fields.",
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
     ] = None
     watermark_context_window: A[
         int,
-        Arg(
-            help="Deprecated; set 'context_window' in --watermark-config.",
-            resolvable=True,
-        ),
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
     ] = 4
+    watermark_mixing_probability: A[
+        float,
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = 0.5
+    watermark_max_probability: A[
+        float,
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = 1.0
     watermark_default_enabled: A[
         bool,
-        Arg(
-            help="Deprecated; set 'default_enabled' in --watermark-config.",
-            resolvable=True,
-        ),
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
     ] = False
     watermark_enforce_all: A[
         bool,
-        Arg(
-            help="Deprecated; set 'enforce_all' in --watermark-config.",
-            resolvable=True,
-        ),
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
     ] = False
     enable_return_hidden_states: A[
         bool,

@@ -30,43 +30,16 @@ from sglang.utils import is_in_ci
 logger = logging.getLogger(__name__)
 
 
-_WATERMARK_CONFIG_FIELDS = {
-    "key": ("watermark_key", None),
-    "key_b": ("watermark_key_b", None),
-    "context_window": ("watermark_context_window", 4),
-    "mixing_probability": ("watermark_mixing_probability", 0.5),
-    "max_probability": ("watermark_max_probability", 1.0),
-    "default_enabled": ("watermark_default_enabled", False),
-    "enforce_all": ("watermark_enforce_all", False),
-}
-
-
 def handle_watermark_config(server_args: Any) -> None:
     cfg = resolving_view(server_args)
-    flags_set = {
-        field
-        for field, (name, default) in _WATERMARK_CONFIG_FIELDS.items()
-        if getattr(cfg, name) != default
-    }
-    for field in sorted(flags_set):
-        flag = "--" + _WATERMARK_CONFIG_FIELDS[field][0].replace("_", "-")
-        logger.warning(
-            f"{flag} is deprecated; set {field!r} in --watermark-config instead"
-        )
     if cfg.watermark_config is None:
         return
     config = load_watermark_config(cfg.watermark_config)
-    resolved = {}
-    for field, (name, _) in _WATERMARK_CONFIG_FIELDS.items():
-        value = getattr(config, field)
-        if value is None:
-            continue
-        if field in flags_set:
-            raise ValueError(
-                f"watermark config {field} and --{name.replace('_', '-')} are "
-                "mutually exclusive"
-            )
-        resolved[name] = value
+    resolved = {
+        f"watermark_{field}": getattr(config, field)
+        for field in config.__struct_fields__
+        if getattr(config, field) is not None
+    }
     if resolved:
         declare_resolution(server_args, "handle_watermark_config", **resolved)
 

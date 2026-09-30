@@ -20,10 +20,6 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
 )
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.sampling.watermarking.config import (
-    MAX_WATERMARK_CONTEXT_WINDOW,
-    parse_watermark_key,
-)
 from sglang.srt.utils.common import torch_release
 from sglang.srt.utils.runai_utils import is_runai_obj_uri
 
@@ -47,21 +43,8 @@ _PP_EAGLE_SUPPORTED_ARCHITECTURES = frozenset(
 
 def check_watermark_server_args(server_args: Any) -> None:
     cfg = resolving_view(server_args)
-    has_watermark_setting = any(
-        (
-            cfg.watermark_key is not None,
-            cfg.watermark_key_b is not None,
-            cfg.watermark_config is not None,
-            cfg.watermark_mixing_probability != 0.5,
-            cfg.watermark_max_probability != 1.0,
-            cfg.watermark_default_enabled,
-            cfg.watermark_enforce_all,
-        )
-    )
-    if has_watermark_setting and not cfg.enable_watermark:
-        raise ValueError(
-            "--watermark-config and watermark settings require --enable-watermark"
-        )
+    if cfg.watermark_config is not None and not cfg.enable_watermark:
+        raise ValueError("--watermark-config requires --enable-watermark")
 
     if not cfg.enable_watermark:
         return
@@ -70,12 +53,8 @@ def check_watermark_server_args(server_args: Any) -> None:
         raise ValueError(
             f"--enable-watermark requires --device cuda, got {cfg.device!r}"
         )
-    if cfg.watermark_key is not None:
-        parse_watermark_key(cfg.watermark_key)
-    if cfg.watermark_key_b is not None:
-        parse_watermark_key(cfg.watermark_key_b)
-        if cfg.watermark_key is None:
-            raise ValueError("watermark key_b requires a server key")
+    if cfg.watermark_key_b is not None and cfg.watermark_key is None:
+        raise ValueError("watermark key_b requires a server key")
     if not 0 < cfg.watermark_mixing_probability < 1:
         raise ValueError(
             "watermark mixing_probability must be strictly between 0 and 1"
@@ -91,11 +70,6 @@ def check_watermark_server_args(server_args: Any) -> None:
     ) and cfg.watermark_key is None:
         raise ValueError(
             "watermark default_enabled and enforce_all require a server key"
-        )
-    if not 1 <= cfg.watermark_context_window <= MAX_WATERMARK_CONTEXT_WINDOW:
-        raise ValueError(
-            "watermark context_window must be from 1 to 64, "
-            f"got {cfg.watermark_context_window!r}"
         )
     if cfg.enable_custom_logit_processor:
         raise ValueError(

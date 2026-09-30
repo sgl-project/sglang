@@ -92,7 +92,7 @@ The Triton selector and state kernels live in `sglang/kernels/ops/sampling/texts
 
 ## Server configuration
 
-`--enable-watermark` allocates CUDA watermark state and accepts request configuration. All other settings come from one JSON file passed with `--watermark-config PATH`; every field is optional and unknown fields are rejected.
+`--enable-watermark` allocates CUDA watermark state and accepts request configuration. All other settings come from one JSON object passed with `--watermark-config`, as a file path or inline JSON (a value starting with `{`); every field is optional and unknown fields are rejected.
 
 | Field | Default | Behavior |
 | --- | --- | --- |
@@ -104,9 +104,9 @@ The Triton selector and state kernels live in `sglang/kernels/ops/sampling/texts
 | `default_enabled` | `false` | Uses the server key when a request omits `watermark`; explicit opt-out remains allowed. |
 | `enforce_all` | `false` | Uses the server key by default and rejects explicit opt-out. |
 
-Default-on and enforce-all modes require a server key. A server key without either mode remains available only to requests that opt in. The per-field flags (`--watermark-key`, `--watermark-key-b`, `--watermark-context-window`, `--watermark-mixing-probability`, `--watermark-max-probability`, `--watermark-default-enabled`, `--watermark-enforce-all`) are deprecated: each logs a warning, applies only when the file leaves its field unset, and conflicts with a file that sets it.
+Default-on and enforce-all modes require a server key. A server key without either mode remains available only to requests that opt in.
 
-Use a regular config file readable only by the server account. Launch-command, request-log, server-info, and crash-payload rendering redacts key fields and the config path. Process command lines, client request bodies, and process or GPU core dumps remain separate secret-bearing surfaces.
+Use a regular config file readable only by the server account for keys; inline JSON is visible in the process command line. Launch-command, request-log, server-info, and crash-payload rendering redacts key fields and the `--watermark-config` value. Process command lines, client request bodies, and process or GPU core dumps remain separate secret-bearing surfaces.
 
 ## Per-request control
 
