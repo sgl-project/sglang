@@ -54,6 +54,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.parser.template_detection import detect_inline_system_support
+from sglang.srt.runtime_context import get_context, get_memory, get_serving
 
 if TYPE_CHECKING:
     from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
@@ -85,26 +86,25 @@ ERROR_TYPE_MAP = {
 }
 
 
+def _prompt_tokens(usage) -> int:
+    return getattr(usage, "prompt_tokens", 0) or 0
+
+
 def _cached_prompt_tokens(usage) -> int:
     prompt_tokens_details = getattr(usage, "prompt_tokens_details", None)
     return getattr(prompt_tokens_details, "cached_tokens", 0) or 0
 
 
-def _anthropic_input_tokens(usage) -> int:
-    prompt = getattr(usage, "prompt_tokens", 0) or 0
-    cached = _cached_prompt_tokens(usage)
-    if cached > prompt:
-        # Upstream telemetry bug: cached cannot exceed the prompt it caches.
-        # Clamping silently here would hide the discrepancy from billing
-        # dashboards, so make it visible at WARNING level.
-        logger.warning(
-            "Cached tokens (%d) exceed prompt tokens (%d); clamping "
-            "input_tokens to 0. This usually indicates an upstream "
-            "telemetry bug.",
-            cached,
-            prompt,
-        )
-    return max(prompt - cached, 0)
+def _prefix_cache_usage_enabled() -> bool:
+    """True when OpenAI usage is expected to carry radix/prefix-cache stats."""
+    ctx = get_context()
+    if not ctx.is_config_namespace_published("serving"):
+        return False
+    if not get_serving().enable_cache_report:
+        return False
+    if ctx.is_config_namespace_published("memory") and get_memory().disable_radix_cache:
+        return False
+    return True
 
 
 def _anthropic_usage_from_openai(
@@ -113,19 +113,54 @@ def _anthropic_usage_from_openai(
     include_input: bool,
     include_output: bool,
     force_zero_output: bool = False,
+    enable_cache_report: Optional[bool] = None,
 ) -> AnthropicUsage:
+    """Map OpenAI ``UsageInfo`` onto Anthropic's disjoint usage fields.
+
+    OpenAI's ``prompt_tokens`` is the full prompt; ``cached_tokens`` is the
+    radix/prefix-cache hit. Anthropic's three input fields are mutually
+    exclusive and must sum to the prompt:
+
+    * ``cache_read_input_tokens`` — tokens retrieved from the prefix cache
+    * ``cache_creation_input_tokens`` — uncached prompt tokens, which the
+      radix tree inserts (cold write, or the warm miss suffix)
+    * ``input_tokens`` — tokens that were neither read nor written; 0 when
+      prefix-cache stats are available because the whole prompt is
+      cache-eligible
+
+    Without cache stats the whole prompt stays in ``input_tokens``.
+    """
     if usage is None:
         return AnthropicUsage(
             input_tokens=0 if include_input else None,
             output_tokens=0 if include_output else None,
         )
 
+    if enable_cache_report is None:
+        enable_cache_report = _prefix_cache_usage_enabled()
+
     usage_fields: dict[str, int] = {}
-    cached_tokens = _cached_prompt_tokens(usage)
+    prompt = _prompt_tokens(usage)
+    cache_read = _cached_prompt_tokens(usage)
+    if cache_read > prompt:
+        # Upstream telemetry bug: cached cannot exceed the prompt it caches.
+        logger.warning(
+            "Cached tokens (%d) exceed prompt tokens (%d); clamping "
+            "cache_creation_input_tokens to 0. This usually indicates an "
+            "upstream telemetry bug.",
+            cache_read,
+            prompt,
+        )
     if include_input:
-        usage_fields["input_tokens"] = _anthropic_input_tokens(usage)
-        if cached_tokens:
-            usage_fields["cache_read_input_tokens"] = cached_tokens
+        if enable_cache_report or cache_read:
+            cache_creation = max(prompt - cache_read, 0)
+            usage_fields["input_tokens"] = 0
+            if cache_creation:
+                usage_fields["cache_creation_input_tokens"] = cache_creation
+            if cache_read:
+                usage_fields["cache_read_input_tokens"] = cache_read
+        else:
+            usage_fields["input_tokens"] = prompt
     if include_output:
         usage_fields["output_tokens"] = (
             0 if force_zero_output else (getattr(usage, "completion_tokens", 0) or 0)
