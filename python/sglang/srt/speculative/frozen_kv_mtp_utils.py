@@ -21,6 +21,7 @@ import torch
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.speculative.frozen_kv_mtp_info import FrozenKVMTPContext
+from sglang.srt.utils.common import async_h2d
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -152,6 +153,6 @@ def select_last_extend_hidden(
 ) -> torch.Tensor:
     if hidden_states.shape[0] == batch.batch_size():
         return hidden_states
-    lens = torch.tensor(batch.extend_lens, device=hidden_states.device)
+    lens = async_h2d(batch.extend_lens, dtype=torch.int64, device=hidden_states.device)
     last_indices = torch.cumsum(lens, dim=0) - 1
     return hidden_states[last_indices.to(torch.long)]

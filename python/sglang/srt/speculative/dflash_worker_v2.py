@@ -2289,11 +2289,13 @@ class DFlashWorkerV2(BaseSpecWorker):
 
             # Materialize prompt tokens into the draft KV cache immediately. This is required
             # for radix cache safety (the scheduler may update radix after prefill returns).
-            # Pinned, non-blocking copies: a pageable copy here would wait for the
-            # in-flight decode under the overlap schedule.
+            # Pinned, non-blocking copies (as in DSpark): a pageable copy here would
+            # block the host until the forward stream drains.
             device = next_token_ids.device
-            ctx_lens = async_h2d(batch.extend_lens, torch.int32, device)
-            draft_seq_lens = async_h2d(batch.prefix_lens, torch.int32, device)
+            ctx_lens = async_h2d(batch.extend_lens, dtype=torch.int32, device=device)
+            draft_seq_lens = async_h2d(
+                batch.prefix_lens, dtype=torch.int32, device=device
+            )
 
             if batch.out_cache_loc is None:
                 raise RuntimeError(

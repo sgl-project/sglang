@@ -1489,8 +1489,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
         # pageable memory and wait for the in-flight forward.
         select_index_device = async_h2d(
             select_index,
-            torch.int64,
-            self.req_index_to_mamba_index_mapping.device,
+            dtype=torch.int64,
+            device=self.req_index_to_mamba_index_mapping.device,
         )
         self.req_index_to_mamba_index_mapping[select_index_device] = mamba_index_tensor
         if self.enable_mamba_extra_buffer:

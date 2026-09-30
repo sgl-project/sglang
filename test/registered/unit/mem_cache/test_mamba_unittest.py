@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils import get_device
+from sglang.srt.utils.common import async_h2d
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cuda_ci,
@@ -175,8 +176,9 @@ class TestMamba(unittest.TestCase):
         """Under the overlap schedule the scheduler clears and maps mamba slots for
         a new prefill while the previous forward is still running; a host sync
         there drains that forward."""
-        _, req_to_token_pool, _ = self._setup_pools()
+        _, req_to_token_pool, _ = self._setup_pools(enable_mamba_extra_buffer=True)
         mamba_pool = req_to_token_pool.mamba_pool
+        self.assertTrue(mamba_pool._should_fuse_slot_ops())
         temporal = mamba_pool.mamba_cache.temporal
         temporal.fill_(1)
         slots = req_to_token_pool.mamba_allocator.alloc(3)
@@ -198,12 +200,7 @@ class TestMamba(unittest.TestCase):
         try:
             mamba_pool.clear_slots(slots)
             select_index = req_to_token_pool.alloc(reqs)
-            # The check itself catches the synchronizing forms both calls used.
-            with self.assertRaises(RuntimeError):
-                temporal[:, slots] = 0
-            probe = req_to_token_pool.req_index_to_mamba_index_mapping.clone()
-            with self.assertRaises(RuntimeError):
-                probe[select_index] = probe[: len(select_index)]
+            lens = async_h2d([3, 0, 7], dtype=torch.int32, device=temporal.device)
         finally:
             torch.cuda.set_sync_debug_mode("default")
 
@@ -220,22 +217,19 @@ class TestMamba(unittest.TestCase):
                 expected,
             )
         )
-
-    @unittest.skipUnless(torch.cuda.is_available(), "host-sync checks need CUDA")
-    def test_async_h2d_does_not_sync_host(self):
-        from sglang.srt.utils.common import async_h2d
-
-        values = [3, 0, 7, 1]
-        torch.cuda.synchronize()
-        torch.cuda.set_sync_debug_mode("error")
-        try:
-            copied = async_h2d(values, torch.int32, "cuda")
-            with self.assertRaises(RuntimeError):
-                torch.tensor(values, dtype=torch.int32, device="cuda")
-        finally:
-            torch.cuda.set_sync_debug_mode("default")
-        self.assertEqual(copied.dtype, torch.int32)
-        self.assertEqual(copied.tolist(), values)
+        ping_pong = torch.stack([req.kv.mamba_ping_pong_track_buffer for req in reqs])
+        self.assertTrue(
+            torch.equal(
+                req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
+                    select_index
+                ],
+                ping_pong.to(
+                    req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping.dtype
+                ),
+            )
+        )
+        self.assertEqual(lens.dtype, torch.int32)
+        self.assertEqual(lens.tolist(), [3, 0, 7])
 
     def test_mamba_pool_deduplicated_conv_window_axis(self):
         class WindowFirstMambaPool(MambaPool):
@@ -294,7 +288,7 @@ class TestMamba(unittest.TestCase):
         view[0, 0, 0, 1, 0] = -1
         self.assertEqual(view[0, 0, 1, 0, 0].item(), -1)
 
-    def _setup_pools(self):
+    def _setup_pools(self, enable_mamba_extra_buffer: bool = False):
         """Build the hybrid req/KV pools and an allocator for pool-level tests."""
         server_args = ServerArgs(model_path="dummy", page_size=1)
         # The mamba pool reads mamba_cache_chunk_size, whose property otherwise
@@ -339,7 +333,7 @@ class TestMamba(unittest.TestCase):
             enable_memory_saver=False,
             cache_params=mamba2_cache_params,
             mamba_layer_ids=mamba_layers,
-            enable_mamba_extra_buffer=False,
+            enable_mamba_extra_buffer=enable_mamba_extra_buffer,
             speculative_num_draft_tokens=3,
         )
         pool = HybridLinearKVPool(

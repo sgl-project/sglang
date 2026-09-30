@@ -561,12 +561,13 @@ def is_pin_memory_available(device=None) -> bool:
     return current_platform.is_pin_memory_available(device)
 
 
-def async_h2d(values, dtype: torch.dtype, device) -> torch.Tensor:
+def async_h2d(values: Sequence[int], *, dtype: torch.dtype, device) -> torch.Tensor:
     """Copy a host list of numbers to ``device`` without blocking the host.
 
     ``torch.tensor(values, device=cuda)`` (and indexing a CUDA tensor with a
-    Python list) copies from pageable memory, which waits for the stream to
-    drain. Staging through pinned memory keeps the copy stream-ordered.
+    Python list) copies from pageable memory, which blocks the host until the
+    stream drains; a pinned staging copy does not. Not for use under CUDA graph
+    capture: the temporary pinned source would be baked into the graph.
     """
     pin = is_pin_memory_available(device)
     return torch.tensor(values, dtype=dtype, pin_memory=pin).to(
