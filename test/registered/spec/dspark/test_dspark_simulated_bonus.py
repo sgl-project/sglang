@@ -6,6 +6,9 @@ import torch
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     sample_simulated_bonus,
 )
+from sglang.test.ci.ci_register import register_amd_ci
+
+register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 
 def _info(temps):
@@ -27,7 +30,9 @@ class TestSimulatedBonus(unittest.TestCase):
             bs=bs,
             verify_num_draft_tokens=rows,
         )
-        ref = logits.view(bs, rows, vocab).argmax(-1)[torch.arange(bs), correct_len.long()]
+        ref = logits.view(bs, rows, vocab).argmax(-1)[
+            torch.arange(bs), correct_len.long()
+        ]
         self.assertEqual(out.dtype, torch.int64)
         self.assertTrue(torch.equal(out, ref))
 
@@ -44,7 +49,11 @@ class TestSimulatedBonus(unittest.TestCase):
             bs=bs,
             verify_num_draft_tokens=rows,
         )
-        ref = logits.float().view(bs, rows, vocab).argmax(-1)[torch.arange(bs), correct_len]
+        ref = (
+            logits.float()
+            .view(bs, rows, vocab)
+            .argmax(-1)[torch.arange(bs), correct_len]
+        )
         self.assertTrue(torch.equal(out, ref))
 
     def test_matches_softmax_distribution(self):
