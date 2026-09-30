@@ -8,8 +8,8 @@ mod service;
 mod template;
 mod tokenizer;
 
-pub(crate) use chat::dynamo_parser_name;
-pub use chat::{ChatPreprocessor, ChatRequest, LoweredChat, ReasoningEffort};
+pub(crate) use chat::{ChatPreprocessor, LoweredChat, dynamo_parser_name};
+pub use chat::{ChatRequest, ReasoningEffort};
 pub use request::{
     GenerateRequest, GenerateRequestMetadata, GenerateSamplingParams, GenerationOptions,
     TextRequest, TokenIdsRequest,

@@ -590,9 +590,18 @@ mod tests {
     };
     use futures::{FutureExt, StreamExt};
     use sglang_processor::{
-        ChatPreprocessor, ChatResponseProcessor, RendererConfig, RendererLimits, ResponseError,
-        ResponseErrorKind, SamplingDefaults, UpstreamErrorCode,
+        ChatResponseProcessor, RendererConfig, RendererError, RendererLimits, RendererService,
+        ResponseError, ResponseErrorKind, SamplingDefaults, TextTokenizer, UpstreamErrorCode,
     };
+    use std::sync::Arc;
+
+    struct WordTokenizer;
+
+    impl TextTokenizer for WordTokenizer {
+        fn encode(&self, text: &str, _add_special_tokens: bool) -> Result<Vec<i32>, RendererError> {
+            Ok(text.split_whitespace().map(|_| 7).collect())
+        }
+    }
 
     fn request() -> ChatCompletionRequest {
         serde_json::from_value(serde_json::json!({
@@ -602,7 +611,10 @@ mod tests {
         .unwrap()
     }
 
-    fn response_processor(reasoning_parser: Option<&str>, choices: usize) -> ChatResponseProcessor {
+    async fn response_processor(
+        reasoning_parser: Option<&str>,
+        choices: usize,
+    ) -> ChatResponseProcessor {
         let config = RendererConfig {
             model_path: String::new(),
             served_model_name: "model".into(),
@@ -629,8 +641,9 @@ mod tests {
         }))
         .unwrap();
         let (_, chat) = lower_chat_request(&config, request).unwrap();
-        ChatPreprocessor::from_config(&config)
-            .preprocess(chat)
+        RendererService::with_tokenizer(config, Arc::new(WordTokenizer), 1, 1)
+            .prepare_chat(chat)
+            .await
             .unwrap()
             .response_processor
     }
@@ -745,7 +758,7 @@ mod tests {
 
         let response = unary_chat(
             vec![choice0, choice1],
-            response_processor(None, 2),
+            response_processor(None, 2).await,
             "chatcmpl-test".into(),
             "model".into(),
             1,
@@ -770,7 +783,7 @@ mod tests {
 
         let response = unary_chat(
             vec![choice],
-            response_processor(Some("deepseek-r1"), 1),
+            response_processor(Some("deepseek-r1"), 1).await,
             "chatcmpl-test".into(),
             "model".into(),
             1,
@@ -798,7 +811,7 @@ mod tests {
 
         let stream = chat_event_stream(
             vec![choice],
-            response_processor(Some("deepseek-r1"), 1),
+            response_processor(Some("deepseek-r1"), 1).await,
             wire_context(true),
         );
         futures::pin_mut!(stream);
@@ -836,7 +849,7 @@ mod tests {
 
         let stream = chat_event_stream(
             vec![choice],
-            response_processor(None, 1),
+            response_processor(None, 1).await,
             wire_context(true),
         );
         futures::pin_mut!(stream);
@@ -864,7 +877,7 @@ mod tests {
         let (choice, tx) = chat_submitted(0);
         let stream = chat_event_stream(
             vec![choice],
-            response_processor(None, 1),
+            response_processor(None, 1).await,
             wire_context(false),
         );
         futures::pin_mut!(stream);
@@ -884,7 +897,7 @@ mod tests {
         let (choice1, tx1) = chat_submitted(1);
         let stream = chat_event_stream(
             vec![choice0, choice1],
-            response_processor(None, 2),
+            response_processor(None, 2).await,
             wire_context(true),
         );
         futures::pin_mut!(stream);

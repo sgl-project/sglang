@@ -189,7 +189,7 @@ impl OAIChatLikeRequest for ChatRequest {
 }
 
 /// Chat-to-text result plus the state needed to interpret generated output.
-pub struct LoweredChat {
+pub(crate) struct LoweredChat {
     pub text_requests: Vec<TextRequestGroup>,
     pub response_processor: ChatResponseProcessor,
 }
@@ -210,13 +210,6 @@ pub struct ChatPreprocessor {
 }
 
 impl ChatPreprocessor {
-    /// Load chat preprocessing support without creating a tokenizer or worker pool.
-    /// Template-loading errors are reported when a chat request is processed.
-    pub fn from_config(config: &RendererConfig) -> Self {
-        let (formatter, formatter_error) = super::service::load_chat_support(config);
-        Self::new(config, formatter).with_formatter_error(formatter_error)
-    }
-
     pub(crate) fn new(config: &RendererConfig, formatter: Option<ChatFormatter>) -> Self {
         Self {
             formatter,
