@@ -10,12 +10,13 @@ from sglang.srt.disaggregation.ascend.transfer_engine import AscendTransferEngin
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
 from sglang.srt.disaggregation.mooncake.conn import (
+    KVArgsRegisterInfo,
     MooncakeKVBootstrapServer,
     MooncakeKVManager,
     MooncakeKVReceiver,
     MooncakeKVSender,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_memory, get_parallel
 from sglang.srt.utils.network import get_local_ip_auto
 
 logger = logging.getLogger(__name__)
@@ -140,6 +141,56 @@ class AscendKVManager(MooncakeKVManager):
             lens.extend(component_lens)
         if ptrs:
             self.engine.batch_register(ptrs, lens)
+
+    def check_decode_kv_layout(self, info: KVArgsRegisterInfo) -> Optional[str]:
+        if info.dst_kv_buf_groups is None or info.dst_kv_cache_dtype is None:
+            logger.warning(
+                "Decode session %s did not advertise its KV layout "
+                "(kv_buf_groups, kv_cache_dtype); it likely runs an older build. "
+                "Skipping the PD KV layout check for it.",
+                info.mooncake_session_id,
+            )
+            return None
+
+        src_groups = getattr(self.kv_args, "kv_buf_groups", None) or 0
+        src_item_lens = list(self.kv_args.kv_item_lens)
+        dst_item_lens = list(info.dst_kv_item_lens)
+        mismatched = []
+        if info.dst_kv_cache_dtype != self.kv_cache_dtype_str:
+            mismatched.append("kv_cache_dtype")
+        if info.dst_kv_buf_groups != src_groups:
+            mismatched.append("kv_buf_groups")
+        # Item lengths legitimately differ under DCP relayout (decode index
+        # entries span dcp_size pages) and PP (a prefill stage registers a
+        # subset of the decode entries); the envelope path checks its own.
+        if (
+            self._is_npu_dsa_layout()
+            and not info.requires_dcp_relayout
+            and not get_memory().enable_unified_memory
+            and src_item_lens
+            and dst_item_lens
+        ):
+            if len(src_item_lens) == len(dst_item_lens):
+                item_lens_match = src_item_lens == dst_item_lens
+            else:
+                item_lens_match = set(src_item_lens) <= set(dst_item_lens)
+            if not item_lens_match:
+                mismatched.append("kv_item_lens")
+        if not mismatched:
+            return None
+
+        reason = (
+            f"PD KV layout mismatch ({', '.join(mismatched)}) with decode "
+            f"session {info.mooncake_session_id}: prefill has "
+            f"kv_cache_dtype={self.kv_cache_dtype_str}, kv_buf_groups={src_groups}, "
+            f"kv_item_lens={src_item_lens}; decode has "
+            f"kv_cache_dtype={info.dst_kv_cache_dtype}, "
+            f"kv_buf_groups={info.dst_kv_buf_groups}, "
+            f"kv_item_lens={dst_item_lens}. Both sides must use the same "
+            "--kv-cache-dtype and a KV layout their NPUs support."
+        )
+        logger.error(reason)
+        return reason
 
     def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
         if self._is_npu_dsa_layout() and self.dcp_size != dst_dcp_size:
