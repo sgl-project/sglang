@@ -1125,12 +1125,14 @@ class DeepseekV4AttnBackend(
         self.has_c128: bool = 128 in self.present_ratios
         cfg = model_runner.model_config.hf_text_config
         self.is_dsv41: bool = getattr(cfg, "model_type", None) == "deepseek_v41"
+        self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
         self.prefill_candidates, self.decode_candidates = make_candidate_indexer(
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
             page_size=self.page_size,
             candidate_topk_blocks=getattr(cfg, "candidate_topk_blocks", 0),
             candidate_block_size=getattr(cfg, "candidate_block_size", 0),
+            use_flashinfer_topk=self.dsa_topk_backend.is_flashinfer(),
         )
         self.full_topk_indexer = make_full_topk_indexer(
             token_to_kv_pool=self.token_to_kv_pool, req_to_token=self.req_to_token
@@ -1149,7 +1151,6 @@ class DeepseekV4AttnBackend(
         )
         # The model switches onto this metadata in enter_late_layer_tail.
         self.tail_forward_metadata: Optional[DSV4Metadata] = None
-        self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
         self.dsv4_prefill_backend = getattr(kernel, "dsv4_prefill_backend", "auto")
         if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
             if not get_platform().is_sm90:

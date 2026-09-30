@@ -24,6 +24,7 @@ from sglang.kernels.ops.attention.dsv4.index_logits import (
     sparse_logits,
 )
 from sglang.kernels.ops.attention.dsv4.topk import (
+    resolve_flashinfer_sparse_topk,
     topk_transform_paged_v2,
     topk_transform_ragged_v2,
     topk_transform_sparse,
@@ -107,12 +108,18 @@ class SparseTableBackend:
         page_size: int,
         candidate_topk_blocks: int,
         candidate_block_size: int,
+        use_flashinfer_topk: bool = False,
     ) -> None:
         assert candidate_block_size == CANDIDATE_BLOCK_SIZE
         self.token_to_kv_pool = token_to_kv_pool
         self.req_to_token = req_to_token
         self.page_size = page_size
         self.topk_blocks = candidate_topk_blocks
+        self._sparse_topk_op = (
+            resolve_flashinfer_sparse_topk(req_to_token.device)
+            if use_flashinfer_topk
+            else None
+        )
         self.alt_stream = torch.cuda.Stream()
         self._cached_row_ids: Optional[torch.Tensor] = None
         # captured graphs keep reading the buffers they saw
@@ -319,7 +326,11 @@ class SparseTableBackend:
         )
         assert out.raw_indices is None
         topk_transform_sparse(
-            logits, published.valid_lens, published.phys_blocks, out.page_indices
+            logits,
+            published.valid_lens,
+            published.phys_blocks,
+            out.page_indices,
+            topk_op=self._sparse_topk_op,
         )
 
     def _get_request_ids(self, inputs: DecodeInputs, rows: int, device: torch.device):

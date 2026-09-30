@@ -92,6 +92,7 @@ def make_candidate_indexer(
     page_size: int,
     candidate_topk_blocks: int,
     candidate_block_size: int,
+    use_flashinfer_topk: bool = False,
 ) -> Tuple[PrefillCandidates, DecodeCandidates]:
     from sglang.srt.runtime_context import get_parallel
 
@@ -126,6 +127,7 @@ def make_candidate_indexer(
         page_size=page_size,
         candidate_topk_blocks=candidate_topk_blocks,
         candidate_block_size=candidate_block_size,
+        use_flashinfer_topk=use_flashinfer_topk,
     )
     # A CP rank's rows are an interleaved subset of the batch; the torch prefill
     # env keeps the sparse table on decode only.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Optional
+import inspect
+from typing import Callable, Optional
 
 import torch
 
@@ -94,7 +95,8 @@ def topk_transform_bf16_small(
     in no particular order, and ``-1`` fills the slots past
     ``min(k, seq_lens[b])``. Selection is exact (two radix passes over the raw
     bf16 bytes locate the k-th largest value); which of the elements equal to
-    it fill the last slots is arbitrary. NaN scores are not supported.
+    it fill the last slots is arbitrary. NaNs inside a valid prefix are not
+    supported; values outside that prefix are ignored.
     """
     _jit_topk_bf16_small_module().topk_transform(
         scores, seq_lens, page_table, out_page_indices, page_size
@@ -333,11 +335,82 @@ def topk_transform_sparse(
     valid_lens: torch.Tensor,
     blocks: torch.Tensor,
     out_indices: torch.Tensor,
+    *,
+    topk_op: Optional[Callable] = None,
 ) -> None:
     """Top-``k`` (``k = out_indices.shape[1]``) of each row of the bf16 sparse
     ``logits`` within its first ``valid_lens[b]`` columns, ``-1`` padded, unordered;
     column ``j`` is written as ``blocks[b, j // 8] * 8 + j % 8``: pool slots for the
-    published blocks as pool slots / 8, compressed positions for logical ids."""
+    published blocks as pool slots / 8, compressed positions for logical ids.
+
+    ``topk_op`` is the optional FlashInfer varlen API resolved by the decode
+    backend. Its automatic dispatch owns backend selection; the temporary raw
+    indices and the physical remap are part of this utility's execution.
+    NaNs inside a valid prefix are unsupported; padding outside it is ignored.
+    """
+    if topk_op is not None:
+        from .topk_flashinfer import topk_transform_sparse_flashinfer
+
+        if topk_transform_sparse_flashinfer(
+            logits, valid_lens, blocks, out_indices, topk_op
+        ):
+            return
     topk_transform_bf16_small(
         logits, valid_lens, blocks, out_indices, CANDIDATE_BLOCK_SIZE
     )
+
+
+def resolve_flashinfer_sparse_topk(device: torch.device) -> Optional[Callable]:
+    """Resolve the optional decode API once, keeping older installs on stock.
+
+    The registered cuDNN backend identifies the varlen API contract needed by
+    this route. The API may still select a legacy backend for a particular
+    shape or when experimental automatic selection is disabled. Its
+    ``suitable_auto_backends`` attribute is populated only by an actual call,
+    so it cannot be used as an import-time capability check.
+    """
+    if device.type != "cuda":
+        return None
+    try:
+        import flashinfer
+    except ImportError:
+        return None
+    op = getattr(flashinfer, "top_k_varlen", None)
+    if not callable(op):
+        return None
+    has_backend = getattr(op, "has_backend", None)
+    is_supported = getattr(op, "is_backend_supported", None)
+    if not callable(has_backend) or not callable(is_supported):
+        return None
+    try:
+        signature = inspect.signature(op)
+        required = {
+            "logits",
+            "seq_lens",
+            "top_k",
+            "compress_ratio",
+            "next_n",
+            "return_values",
+            "out_indices",
+            "backend",
+        }
+        if not required.issubset(signature.parameters):
+            return None
+        signature.bind(
+            None,
+            None,
+            512,
+            compress_ratio=1,
+            next_n=1,
+            return_values=False,
+            out_indices=None,
+            backend="auto",
+        )
+        if not has_backend("cudnn"):
+            return None
+        major, minor = torch.cuda.get_device_capability(device)
+        if not is_supported("cudnn", major * 10 + minor):
+            return None
+    except (TypeError, ValueError):
+        return None
+    return op
