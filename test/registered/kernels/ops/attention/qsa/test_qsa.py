@@ -1245,7 +1245,8 @@ def test_qsa_mtp_step_out_cache_loc_matches_draft_forward_layout():
     assert torch.equal(backend._step_out_cache_loc(fb, 0), flat)
 
 
-def test_qsa_graph_metadata_kernels_match_legacy_host_path():
+@pytest.mark.parametrize("max_pages", [32, 129, 2048, 8193])
+def test_qsa_graph_metadata_kernels_match_legacy_host_path(max_pages):
     """For decode rows and target-verify fan-out (boundary and non-boundary),
     replay kernels and the host refresh must build identical graph buffers."""
     from sglang.srt.layers.attention.qsa.graph_metadata import launch_graph_metadata
@@ -1263,11 +1264,13 @@ def test_qsa_graph_metadata_kernels_match_legacy_host_path():
         pool = _Pool()
         backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
         # A page-aligned token table: request r's token i lives in full page
-        # (r * 32 + i // 64) at offset i % 64, mirroring the paged allocator.
+        # (r * max_pages + i // 64) at offset i % 64, mirroring the paged allocator.
         rows = torch.arange(8, dtype=torch.int32, device=device)[:, None]
-        cols = torch.arange(2048, dtype=torch.int32, device=device)[None, :]
+        cols = torch.arange(max_pages * full_page, dtype=torch.int32, device=device)[
+            None, :
+        ]
         backend.req_to_token = (
-            (rows * 32 + cols // full_page) * full_page + cols % full_page
+            (rows * max_pages + cols // full_page) * full_page + cols % full_page
         ).contiguous()
         seq_lens = torch.tensor(seq_lens_list, dtype=torch.int32, device=device)
         req_pool_indices = torch.arange(bs, dtype=torch.int32, device=device)
@@ -1295,7 +1298,7 @@ def test_qsa_graph_metadata_kernels_match_legacy_host_path():
                     num_rows, dtype=torch.int32, device=device
                 ),
                 graph_compressed_page_table=torch.zeros(
-                    (num_rows, 32), dtype=torch.int32, device=device
+                    (num_rows, max_pages), dtype=torch.int32, device=device
                 ),
                 graph_compressed_lengths=torch.zeros(
                     num_rows, dtype=torch.int32, device=device
@@ -1386,9 +1389,10 @@ def _qsa_expected_graph_layout(
     for pid in range(bs):
         base = seq_lens[pid]
         if mode == 0:
+            base = base if pid < real_reqs else 1
             row_lens.append(base)
             row_prefix.append(max(base - 1, 0))
-            row_reqs.append(req_pool[pid])
+            row_reqs.append(req_pool[pid] if pid < real_reqs else 0)
             continue
         eff = (
             (extend_len if pid < real_reqs else 0)
@@ -1409,7 +1413,8 @@ def _qsa_expected_graph_layout(
     return row_lens, row_prefix, row_reqs
 
 
-def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail():
+@pytest.mark.parametrize("seq_offset", [0, 1, 3])
+def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail(seq_offset):
     """The layout kernel must rebuild speculative row fan-out and the padded dummy tail;
     the row-metadata kernel must derive compressed slots from those rows."""
     from sglang.srt.layers.attention.qsa.graph_metadata import launch_graph_metadata
@@ -1488,6 +1493,7 @@ def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail():
             metadata=metadata,
             req_to_token=backend.req_to_token,
             pool=pool,
+            seq_offset=seq_offset if mode == 0 else 0,
         )
         torch.cuda.synchronize()
 
@@ -1495,7 +1501,7 @@ def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail():
             mode=mode,
             bs=bs,
             num_rows=num_rows,
-            seq_lens=seq_lens,
+            seq_lens=[x + seq_offset for x in seq_lens] if mode == 0 else seq_lens,
             req_pool=req_pool,
             extend_lens=extend_lens,
             extend_len=extend_len,
@@ -1534,16 +1540,104 @@ def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail():
         extend_len=0,
         num_padding=2,
     )
+    run_case(
+        mode=0,
+        bs=4,
+        num_rows=4,
+        seq_lens=[255, 1024, 4096, 4096],
+        extend_lens=None,
+        extend_len=0,
+        num_padding=2,
+    )
     # Decode with a padded tail (dummy rows alias request slot 0).
     run_case(
         mode=0,
         bs=4,
         num_rows=4,
-        seq_lens=[256, 1024, 1025, 4096],
+        seq_lens=[256, 1024, 1025, 4080],
         extend_lens=None,
         extend_len=0,
         num_padding=0,
     )
+
+
+@pytest.mark.parametrize("bs", [1, 3, 128])
+@pytest.mark.parametrize("padding", [0, 1])
+def test_qsa_draft_metadata_multi_step_graph(bs, padding):
+    from types import SimpleNamespace
+
+    from sglang.srt.layers.attention.qsa.graph_metadata import (
+        launch_draft_graph_metadata,
+        launch_graph_metadata,
+        prepare_draft_graph_metadata,
+    )
+
+    pages, ratio, full_page = 129, 4, 64
+    pool = SimpleNamespace(qsa_compress_ratio=ratio, qsa_compressed_page_size=16)
+    table = torch.arange(
+        (bs + 2) * pages * full_page, dtype=torch.int32, device="cuda"
+    ).reshape(bs + 2, -1)
+    seq = torch.full((bs,), 8190, dtype=torch.int64, device="cuda")
+    reqs = torch.arange(1, bs + 1, dtype=torch.int32, device="cuda")
+
+    def metadata():
+        indexer = SimpleNamespace(
+            graph_compressed_lengths=torch.empty(bs, dtype=torch.int32, device="cuda"),
+            graph_write_locs=torch.empty(bs, dtype=torch.int32, device="cuda"),
+            graph_compressed_page_table=torch.empty(
+                (bs, pages), dtype=torch.int32, device="cuda"
+            ),
+            decode_logical_positions=torch.empty(bs, dtype=torch.int32, device="cuda"),
+            pending_ring_slots=torch.empty(bs, dtype=torch.int64, device="cuda"),
+            graph_ring_group_locs=torch.empty(
+                (bs, ratio), dtype=torch.int32, device="cuda"
+            ),
+            graph_prefix_lengths=torch.empty(bs, dtype=torch.int32, device="cuda"),
+            compress_ratio=ratio,
+        )
+        return SimpleNamespace(
+            sequence_lengths=torch.empty(bs, dtype=torch.int32, device="cuda"),
+            row_req_pool_indices=torch.empty(bs, dtype=torch.int32, device="cuda"),
+            indexer_metadata=indexer,
+        )
+
+    outputs = [metadata() for _ in range(3)]
+    references = [metadata() for _ in range(3)]
+    args = prepare_draft_graph_metadata(outputs, table, pool)
+    launch_draft_graph_metadata(args, seq, reqs, bs, padding)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch_draft_graph_metadata(args, seq, reqs, bs, padding)
+    for replay in range(3):
+        seq.add_(replay)
+        reqs.copy_(reqs.roll(1))
+        graph.replay()
+        for step, (out, ref) in enumerate(zip(outputs, references)):
+            launch_graph_metadata(
+                mode=0,
+                bs=bs,
+                num_rows=bs,
+                seq_lens=seq,
+                req_pool_indices=reqs,
+                extend_lens=None,
+                extend_len=0,
+                num_padding=padding,
+                metadata=ref,
+                req_to_token=table,
+                pool=pool,
+                seq_offset=step + 1,
+            )
+            torch.testing.assert_close(
+                out.sequence_lengths, ref.sequence_lengths, rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                out.row_req_pool_indices, ref.row_req_pool_indices, rtol=0, atol=0
+            )
+            for key, value in vars(out.indexer_metadata).items():
+                if isinstance(value, torch.Tensor):
+                    torch.testing.assert_close(
+                        value, getattr(ref.indexer_metadata, key), rtol=0, atol=0
+                    )
 
 
 if __name__ == "__main__":
