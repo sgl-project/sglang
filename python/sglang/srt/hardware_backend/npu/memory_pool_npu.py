@@ -856,27 +856,44 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         )
 
     def _get_disagg_buffer_entries(self):
-        """Return (buffer, uses_global_slots) entries in PD transfer order."""
+        """Return (buffer, uses_global_slots, layer_id) entries in PD transfer order."""
         self._raise_if_native_kv_cache_disabled()
         global_kv = self.is_draft_worker
-        entries = [(buffer, global_kv) for buffer in self.k_buffer]
+        kv_layer_ids = range(self.start_layer, self.start_layer + self.layer_num)
+        entries = [
+            (buffer, global_kv, layer_id)
+            for buffer, layer_id in zip(self.k_buffer, kv_layer_ids, strict=True)
+        ]
         if not getattr(self, "dsa_kv_cache_store_fp8", False):
-            entries += [(buffer, global_kv) for buffer in self.v_buffer]
+            entries += [
+                (buffer, global_kv, layer_id)
+                for buffer, layer_id in zip(self.v_buffer, kv_layer_ids, strict=True)
+            ]
         if self.index_head_dim is not None:
-            entries += [(buffer, True) for buffer in self.index_k_buffer]
+            entries += [
+                (buffer, True, layer_id)
+                for buffer, layer_id in zip(
+                    self.index_k_buffer, self.indexer_layer_ids, strict=True
+                )
+            ]
             if self.index_k_scale_buffer is not None:
-                entries += [(buffer, True) for buffer in self.index_k_scale_buffer]
+                entries += [
+                    (buffer, True, layer_id)
+                    for buffer, layer_id in zip(
+                        self.index_k_scale_buffer, self.indexer_layer_ids, strict=True
+                    )
+                ]
         return entries
 
     # for disagg
     def get_contiguous_buf_infos(self):
         entries = self._get_disagg_buffer_entries()
         return (
-            [buffer.data_ptr() for buffer, _ in entries],
-            [buffer.nbytes for buffer, _ in entries],
+            [buffer.data_ptr() for buffer, _, _ in entries],
+            [buffer.nbytes for buffer, _, _ in entries],
             [
                 buffer[0].nbytes * (self.dcp_size if uses_global_slots else 1)
-                for buffer, uses_global_slots in entries
+                for buffer, uses_global_slots, _ in entries
             ],
         )
 
@@ -884,14 +901,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         """Whether each PD entry uses allocator-global slots on decode."""
         return [
             uses_global_slots
-            for _, uses_global_slots in self._get_disagg_buffer_entries()
+            for _, uses_global_slots, _ in self._get_disagg_buffer_entries()
         ]
 
     def get_kv_layer_ids(self):
-        return (
-            list(range(self.start_layer, self.start_layer + self.layer_num)) * 2
-            + self.get_state_layer_ids()
-        )
+        """Global layer id per PD entry, aligned with get_contiguous_buf_infos()."""
+        return [layer_id for _, _, layer_id in self._get_disagg_buffer_entries()]
 
     def get_state_layer_ids(self):
         return list(self.indexer_layer_ids) * (
