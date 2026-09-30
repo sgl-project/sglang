@@ -1642,9 +1642,14 @@ class DeepseekV4HipRadixBackend(
         save_kv_cache: bool = True,
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
+        inv_rope_positions: Optional[torch.Tensor] = None,
+        inv_rope_freqs: Optional[torch.Tensor] = None,
+        out_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """q_rope present: packed fp8 q over the two-pool fp8 layout (asm decode;
-        prefill also needs k_rope). Absent: plain bf16 q and pool (Triton)."""
+        prefill also needs k_rope). Absent: plain bf16 q and pool (Triton).
+        inv_rope_*: return o inverse-RoPE'd (env_gate.unified_decode_fuses_inv_rope).
+        out_scale: return fp8 o and fill its wo_a e8m0 scales (see paged_decode)."""
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
 
         pool = self.token_to_kv_pool
@@ -1668,6 +1673,11 @@ class DeepseekV4HipRadixBackend(
         # decode; its per-token decode streams were built in metadata.
         verify_as_decode = forward_batch.forward_mode.is_target_verify()
         is_decode = forward_batch.forward_mode.is_decode_or_idle() or verify_as_decode
+        # The model skips its own inverse RoPE when passing these; only the bf16
+        # Triton decode below applies them.
+        assert (inv_rope_positions is None and out_scale is None) or (
+            is_decode and q_rope is None
+        )
         if is_decode:
             if verify_as_decode:
                 # Writing every draft token's K into the ring is safe: spec_extra
@@ -1762,6 +1772,9 @@ class DeepseekV4HipRadixBackend(
                 # Only this call site knows compress_ratio, and it is the one
                 # thing that separates the ragged stream from the clamped ones.
                 kv_splits=_kv_splits_for_stream(compress_ratio),
+                inv_rope_positions=inv_rope_positions,
+                inv_rope_freqs=inv_rope_freqs,
+                out_scale=out_scale,
             )
 
         # prefill / extend
@@ -1941,10 +1954,18 @@ class DeepseekV4HipRadixBackend(
         attn_sink: Optional[torch.Tensor] = None,
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
+        inv_rope_positions: Optional[torch.Tensor] = None,
+        inv_rope_freqs: Optional[torch.Tensor] = None,
+        out_scale: Optional[torch.Tensor] = None,
         **_,
     ) -> torch.Tensor:
         if self.mtp_enabled and forward_batch.forward_mode.is_idle():
-            return q.new_empty(q.shape[0], q.shape[1], layer.v_head_dim)
+            return q.new_empty(
+                q.shape[0],
+                q.shape[1],
+                layer.v_head_dim,
+                dtype=q.dtype if out_scale is None else torch.float8_e4m3fn,
+            )
 
         assert k is v, "DeepseekV4 shares k and v"
         swa_k = k
@@ -1971,6 +1992,9 @@ class DeepseekV4HipRadixBackend(
                 save_kv_cache=save_kv_cache,
                 q_rope=q_rope,
                 k_rope=k_rope,
+                inv_rope_positions=inv_rope_positions,
+                inv_rope_freqs=inv_rope_freqs,
+                out_scale=out_scale,
             )
 
         if isinstance(core_attn_metadata, DSV4AttnMetadata):

@@ -89,6 +89,10 @@ _FP8_GROUP_SIZE = 64
 # gfx950 store e4m3fn. See quant_k_cache.py / indexer.py FP8_DTYPE.
 _FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
+# QUANT_OUT emits the wo_a mxfp8 activation (aiter batched_gemm_a8w8_mxscale):
+# e4m3fn codes + one e8m0 exponent per 128 lanes of a head.
+_OUT_QUANT_GROUP = 128
+
 
 # --- layer-aware split-K (SGLANG_MLA_HCA_KV_SPLITS, 0 = keep the heuristic) --
 # `_kv_splits_heuristic` is an OCCUPANCY rule: it splits only when the base grid
@@ -257,6 +261,60 @@ def _kv_splits_heuristic(
 
 
 @triton.jit
+def _inv_rope(
+    out,  # fp32 [M, 2 * N_PAIRS] tile of head rows, lane pairs from `pair_start`
+    pos_ptr,
+    t,
+    fr_ptr,  # fp32 view_as_real(freqs_cis) [max_pos, ROPE_DIM]: cos 2k, sin 2k+1
+    fr_stride,
+    pair_start,
+    M: tl.constexpr,
+    N_PAIRS: tl.constexpr,
+    NOPE: tl.constexpr,
+    ROPE_HALF: tl.constexpr,
+):
+    # Inverse GPT-J RoPE, same as apply_rotary_emb_flat_kernel(IS_INVERSE).
+    # NoPE pairs get (cos, sin) = (1, 0) and stay bit-exact.
+    k = pair_start + tl.arange(0, N_PAIRS) - NOPE // 2
+    is_rope = (k >= 0) & (k < ROPE_HALF)
+    pos = tl.load(pos_ptr + t).to(tl.int64)
+    row = fr_ptr + pos * fr_stride + 2 * tl.where(is_rope, k, 0)
+    cos = tl.load(row, mask=is_rope, other=1.0)[None, :]
+    sin = tl.load(row + 1, mask=is_rope, other=0.0)[None, :]
+    even, odd = tl.split(tl.reshape(out, (M, N_PAIRS, 2)))
+    return tl.reshape(
+        tl.join(even * cos + odd * sin, odd * cos - even * sin), (M, 2 * N_PAIRS)
+    )
+
+
+@triton.jit
+def _store_out(
+    out,  # fp32 [M, N]
+    o_ptrs,  # [M, N]
+    o_mask,
+    s_ptrs,  # [M, 1] or scalar: e8m0 slot of each row, used when QUANT_OUT
+    s_mask,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    QUANT_OUT: tl.constexpr,
+):
+    if QUANT_OUT:
+        # Same codes/scales as _wo_a_quant_mxfp8_kernel (deepseek_v4_wo_a_fp8.py),
+        # but quantized from fp32 rather than the bf16-rounded output.
+        x = tl.reshape(out, (M, N // 128, 128))
+        raw = tl.maximum(tl.max(tl.abs(x), axis=2) / 448.0, 1e-10)
+        bits = raw.to(tl.int32, bitcast=True)
+        exp = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+        exp = tl.minimum(tl.maximum(exp, 1), 254)
+        scale = (exp << 23).to(tl.float32, bitcast=True)
+        x = tl.minimum(tl.maximum(x / scale[:, :, None], -448.0), 448.0)
+        out = tl.reshape(x, (M, N))
+        s_offs = tl.arange(0, N // 128)[None, :]
+        tl.store(s_ptrs + s_offs, exp.to(tl.uint8), mask=s_mask)
+    tl.store(o_ptrs, out.to(o_ptrs.dtype.element_ty), mask=o_mask)
+
+
+@triton.jit
 def _paged_decode_fused_kernel(
     q_ptr,  # [N, H, D]
     unified_kv_ptr,  # [total_pages, D] bf16/fp16, or fp8 when QUANT_KV
@@ -264,7 +322,10 @@ def _paged_decode_fused_kernel(
     kv_indices_ptr,  # [total_indices] int32
     kv_indptr_ptr,  # [N+1] int32
     attn_sink_ptr,  # [H]
-    out_ptr,  # [N, H, D]
+    out_ptr,  # [N, H, D], fp8 e4m3fn when QUANT_OUT
+    out_scale_ptr,  # [N, H * D // 128] uint8 e8m0 (dummy unless QUANT_OUT)
+    inv_rope_pos_ptr,  # [>=N] int positions (dummy unless FUSE_INV_ROPE)
+    inv_rope_fr_ptr,  # [max_pos, ROPE_DIM] fp32 (dummy unless FUSE_INV_ROPE)
     q_stride_t,
     q_stride_h,
     q_stride_d,
@@ -274,6 +335,7 @@ def _paged_decode_fused_kernel(
     out_stride_t,
     out_stride_h,
     out_stride_d,
+    fr_stride_pos,
     qk_scale,  # = softmax_scale * LOG2E
     log2e,  # = LOG2E, to lift natural-log sink into log2 domain
     H: tl.constexpr,
@@ -284,6 +346,10 @@ def _paged_decode_fused_kernel(
     QUANT_KV: tl.constexpr,  # True → dequant fp8 KV via kv_scales
     GROUP_SIZE: tl.constexpr,  # scale block width along D (e.g. 64)
     NUM_GROUPS: tl.constexpr,  # D // GROUP_SIZE (constexpr; D % GROUP_SIZE == 0)
+    FUSE_INV_ROPE: tl.constexpr,
+    NOPE: tl.constexpr,
+    ROPE_HALF: tl.constexpr,
+    QUANT_OUT: tl.constexpr,
 ):
     """Single-pass online-softmax with sink folded inline — fast path for
     cases where ``kv_splits = 1`` (base grid already saturates the GPU). Skips
@@ -398,13 +464,31 @@ def _paged_decode_fused_kernel(
     out = tl.where(
         l_final[:, None] > 0.0, (acc * alpha_kv[:, None]) / denom[:, None], 0.0
     )
-    tl.store(
+    if FUSE_INV_ROPE:
+        out = _inv_rope(
+            out,
+            inv_rope_pos_ptr,
+            t,
+            inv_rope_fr_ptr,
+            fr_stride_pos,
+            0,
+            BLOCK_H,
+            BLOCK_D // 2,
+            NOPE,
+            ROPE_HALF,
+        )
+    _store_out(
+        out,
         out_ptr
         + t * out_stride_t
         + h_offs[:, None] * out_stride_h
         + d_offs[None, :] * out_stride_d,
-        out.to(out_ptr.dtype.element_ty),
-        mask=h_mask[:, None] & d_mask[None, :],
+        h_mask[:, None] & d_mask[None, :],
+        out_scale_ptr + (t * H + h_offs[:, None]) * (D // 128),
+        h_mask[:, None],
+        BLOCK_H,
+        BLOCK_D,
+        QUANT_OUT,
     )
 
 
@@ -559,7 +643,10 @@ def _paged_decode_reduce_kernel(
     acc_partial_ptr,  # [N, KV_SPLITS, H_padded, D] fp32
     attn_sink_ptr,  # [H]
     kv_indptr_ptr,  # [N+1] int32
-    out_ptr,  # [N, H, D]
+    out_ptr,  # [N, H, D], fp8 e4m3fn when QUANT_OUT
+    out_scale_ptr,  # [N, H * D // 128] uint8 e8m0 (dummy unless QUANT_OUT)
+    inv_rope_pos_ptr,  # [>=N] int positions (dummy unless FUSE_INV_ROPE)
+    inv_rope_fr_ptr,  # [max_pos, ROPE_DIM] fp32 (dummy unless FUSE_INV_ROPE)
     mp_stride_t,
     mp_stride_k,
     mp_stride_h,
@@ -573,6 +660,7 @@ def _paged_decode_reduce_kernel(
     out_stride_t,
     out_stride_h,
     out_stride_d,
+    fr_stride_pos,
     log2e,  # = LOG2E, used to convert natural-log sink → log2 domain
     H: tl.constexpr,
     D: tl.constexpr,
@@ -580,6 +668,10 @@ def _paged_decode_reduce_kernel(
     BLOCK_D: tl.constexpr,
     D_CHUNK: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    FUSE_INV_ROPE: tl.constexpr,
+    NOPE: tl.constexpr,
+    ROPE_HALF: tl.constexpr,
+    QUANT_OUT: tl.constexpr,  # needs D_CHUNK % 128 == 0
 ):
     """2D-tile reduce: combine KV_SPLITS partials, fold attn_sink, write
     final output. Grid: ``(T, H, ceil(D / D_CHUNK))`` — one CTA owns one
@@ -621,6 +713,10 @@ def _paged_decode_reduce_kernel(
     kv_start = tl.load(kv_indptr_ptr + t)
     kv_end = tl.load(kv_indptr_ptr + t + 1)
     kv_len = kv_end - kv_start
+    o_ptrs = (out_ptr + t * out_stride_t + h * out_stride_h + d_offs * out_stride_d)[
+        None, :
+    ]
+    s_ptrs = out_scale_ptr + (t * H + h) * (D // 128) + dc * (D_CHUNK // 128)
     # CTA-level early return for empty tokens (CUDAGraph padding, or any
     # caller-supplied zero-length slice). Split kernel skipped these without
     # writing partials → partial buffers hold garbage; the segm_mask path
@@ -628,11 +724,15 @@ def _paged_decode_reduce_kernel(
     # and the sink-fold arithmetic. Skipping the whole CTA also halves the
     # reduce-kernel cost on mixed-kv batches with many padded tokens.
     if kv_len == 0:
-        out_off = t * out_stride_t + h * out_stride_h + d_offs * out_stride_d
-        tl.store(
-            out_ptr + out_off,
-            tl.zeros([D_CHUNK], dtype=out_ptr.dtype.element_ty),
-            mask=d_mask,
+        _store_out(
+            tl.zeros((1, D_CHUNK), dtype=tl.float32),
+            o_ptrs,
+            d_mask[None, :],
+            s_ptrs,
+            None,
+            1,
+            D_CHUNK,
+            QUANT_OUT,
         )
         return
     tiles_per_segment = tl.cdiv(kv_len, KV_SPLITS * BLOCK_K)
@@ -685,12 +785,22 @@ def _paged_decode_reduce_kernel(
     # (perf) is untouched; only the final normalize arithmetic changes.
     acc_final = acc_combined * alpha_kv
     out = tl.where(l_final > 0.0, acc_final / denom, 0.0)
-
-    tl.store(
-        out_ptr + t * out_stride_t + h * out_stride_h + d_offs * out_stride_d,
-        out.to(out_ptr.dtype.element_ty),
-        mask=d_mask,
-    )
+    out = tl.reshape(out, (1, D_CHUNK))
+    if FUSE_INV_ROPE:
+        # D_CHUNK is even, so a lane pair never straddles two chunks.
+        out = _inv_rope(
+            out,
+            inv_rope_pos_ptr,
+            t,
+            inv_rope_fr_ptr,
+            fr_stride_pos,
+            dc * D_CHUNK // 2,
+            1,
+            D_CHUNK // 2,
+            NOPE,
+            ROPE_HALF,
+        )
+    _store_out(out, o_ptrs, d_mask[None, :], s_ptrs, None, 1, D_CHUNK, QUANT_OUT)
 
 
 # ---------------------------------------------------------------------------
@@ -709,6 +819,9 @@ def _sparse_attn_v4_paged_decode_triton(
     block_h: int | None = None,
     kv_splits: int | None = None,
     block_k: int | None = None,
+    inv_rope_positions: torch.Tensor | None = None,
+    inv_rope_freqs: torch.Tensor | None = None,
+    out_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """V4 sparse decode Triton implementation: split-K with FUSED fast path,
     exp2 softmax, CG-safe heuristic. ``block_h`` and ``kv_splits`` are
@@ -718,6 +831,13 @@ def _sparse_attn_v4_paged_decode_triton(
     ``kv_scales`` must be ``[total_pages, D // GROUP_SIZE]`` fp32 — 1xGROUP_SIZE
     block-scale quantization. Dequant happens in-kernel; the dot still runs
     in q.dtype.
+
+    ``inv_rope_positions`` / ``inv_rope_freqs`` (fp32 view_as_real(freqs_cis)
+    .flatten(-2)) apply the output inverse RoPE on the trailing rope lanes.
+
+    ``out_scale`` (uint8, T * H * D // 128 contiguous elements) makes the kernel
+    return fp8 e4m3fn o and fill ``out_scale`` with its e8m0 per-128-lane scales,
+    i.e. ``quant_wo_a_act_mxfp8(o.view(T, G, -1))`` for any head grouping G.
     """
     if not q.is_cuda:
         raise RuntimeError(
@@ -757,7 +877,28 @@ def _sparse_attn_v4_paged_decode_triton(
             )
 
     T, H, D = q.shape
-    out = torch.empty_like(q)
+    quant_out = out_scale is not None
+    if quant_out:
+        assert D == triton.next_power_of_2(D) and D % _OUT_QUANT_GROUP == 0, D
+        assert out_scale.dtype == torch.uint8 and out_scale.is_contiguous()
+        assert out_scale.numel() == T * H * D // _OUT_QUANT_GROUP
+        out = torch.empty(q.shape, dtype=torch.float8_e4m3fn, device=q.device)
+    else:
+        out = torch.empty_like(q)
+        out_scale = out  # never read: QUANT_OUT=False compiles the store out
+
+    fuse_inv_rope = inv_rope_positions is not None
+    if fuse_inv_rope:
+        assert inv_rope_freqs.dtype == torch.float32 and inv_rope_freqs.stride(-1) == 1
+        pos_arg, fr_arg = inv_rope_positions, inv_rope_freqs
+        fr_stride_pos, rope_half = (
+            inv_rope_freqs.stride(0),
+            inv_rope_freqs.shape[-1] // 2,
+        )
+        nope = D - 2 * rope_half
+    else:  # never read: FUSE_INV_ROPE=False compiles the epilogue out
+        pos_arg = fr_arg = q
+        fr_stride_pos, nope, rope_half = 0, 0, 1
 
     if block_h is None:
         block_h = triton.next_power_of_2(min(H, 64))
@@ -808,6 +949,9 @@ def _sparse_attn_v4_paged_decode_triton(
             kv_indptr,
             attn_sink,
             out,
+            out_scale,
+            pos_arg,
+            fr_arg,
             q.stride(0),
             q.stride(1),
             q.stride(2),
@@ -817,6 +961,7 @@ def _sparse_attn_v4_paged_decode_triton(
             out.stride(0),
             out.stride(1),
             out.stride(2),
+            fr_stride_pos,
             qk_scale,
             LOG2E,
             H,
@@ -827,6 +972,10 @@ def _sparse_attn_v4_paged_decode_triton(
             QUANT_KV=quant_kv,
             GROUP_SIZE=_FP8_GROUP_SIZE,
             NUM_GROUPS=num_groups_arg,
+            FUSE_INV_ROPE=fuse_inv_rope,
+            NOPE=nope,
+            ROPE_HALF=rope_half,
+            QUANT_OUT=quant_out,
             num_warps=num_warps,
             num_stages=num_stages,
         )
@@ -902,6 +1051,8 @@ def _sparse_attn_v4_paged_decode_triton(
         d_chunks_needed = max(1, target_reduce_wg // base_grid_t_h)
         d_chunks_needed = min(d_chunks_needed, block_d // 32)
         d_chunk = max(32, triton.next_power_of_2(block_d // d_chunks_needed))
+    if quant_out:  # a quant group must not straddle two CTAs
+        d_chunk = max(d_chunk, _OUT_QUANT_GROUP)
     grid_reduce = (T, H, (D + d_chunk - 1) // d_chunk)
     _paged_decode_reduce_kernel[grid_reduce](
         m_partial,
@@ -910,6 +1061,9 @@ def _sparse_attn_v4_paged_decode_triton(
         attn_sink,
         kv_indptr,
         out,
+        out_scale,
+        pos_arg,
+        fr_arg,
         m_partial.stride(0),
         m_partial.stride(1),
         m_partial.stride(2),
@@ -923,6 +1077,7 @@ def _sparse_attn_v4_paged_decode_triton(
         out.stride(0),
         out.stride(1),
         out.stride(2),
+        fr_stride_pos,
         LOG2E,
         H,
         D,
@@ -930,7 +1085,13 @@ def _sparse_attn_v4_paged_decode_triton(
         BLOCK_D=block_d,
         D_CHUNK=d_chunk,
         BLOCK_K=block_k,
-        num_warps=4,
+        FUSE_INV_ROPE=fuse_inv_rope,
+        NOPE=nope,
+        ROPE_HALF=rope_half,
+        QUANT_OUT=quant_out,
+        # MI355X: with the quant epilogue 2 warps is never slower (4: up to +25 us
+        # per layer at H=128, T=256).
+        num_warps=2 if quant_out else 4,
     )
     return out
 
@@ -944,6 +1105,9 @@ def sparse_attn_v4_paged_decode(
     softmax_scale: float,
     kv_scales: torch.Tensor | None = None,
     kv_splits: int | None = None,
+    inv_rope_positions: torch.Tensor | None = None,
+    inv_rope_freqs: torch.Tensor | None = None,
+    out_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """V4 decode sparse attention over a unified KV pool with paged indices.
 
@@ -952,8 +1116,14 @@ def sparse_attn_v4_paged_decode(
 
     ``kv_splits`` overrides `_kv_splits_heuristic`. The caller knows the layer's
     ``compress_ratio`` and the heuristic does not; see `_kv_splits_for_stream`.
+
+    ``inv_rope_*`` / ``out_scale``: see `_sparse_attn_v4_paged_decode_triton`
+    (Triton path only).
     """
     if _is_gfx1250_supported:
+        assert inv_rope_positions is None and out_scale is None, (
+            "pa_decode_sparse has no epilogue"
+        )
         # aiter ships only on ROCm, and this module is imported by a CPU-registered
         # test, so the import has to sit behind the same gate as the call.
         from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
@@ -978,4 +1148,7 @@ def sparse_attn_v4_paged_decode(
             softmax_scale,
             kv_scales=kv_scales,
             kv_splits=kv_splits,
+            inv_rope_positions=inv_rope_positions,
+            inv_rope_freqs=inv_rope_freqs,
+            out_scale=out_scale,
         )
