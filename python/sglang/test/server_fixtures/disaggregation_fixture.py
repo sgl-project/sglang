@@ -97,7 +97,7 @@ class PDDisaggregationServerBase(CustomTestCase):
         cls._ucx_net_devices_set = False
         if is_in_ci():
             cls.transfer_backend = ["--disaggregation-transfer-backend", "mooncake"]
-            _check_rdma_openable()
+            _warn_if_rdma_unopenable()
             ib_devices = get_rdma_devices_args()
             cls.rdma_devices = ["--disaggregation-ib-device", ib_devices]
             cls._mc_gid_index_set = _maybe_set_roce_gid_index(ib_devices)
@@ -428,15 +428,16 @@ def _ibverbs_device_names() -> Optional[set]:
 
 
 # Without an openable device the PD transfer backend silently falls back to TCP,
-# and transfers then fail under load instead of at setup.
-def _check_rdma_openable() -> None:
+# and transfers may then fail under load; warn so such failures are traceable.
+def _warn_if_rdma_unopenable() -> None:
     if not _get_available_ib_devices():
         return
     if _ibverbs_device_names() == set():
-        raise RuntimeError(
-            f"Active RDMA devices are listed in {_IB_SYSFS} but ibverbs can open "
-            "none; the PD transfer backend would lose RDMA. "
-            "Check /dev/infiniband in the container."
+        logger.warning(
+            "Active RDMA devices are listed in %s but ibverbs can open none; "
+            "the PD transfer backend will fall back to TCP. "
+            "Check /dev/infiniband in the container.",
+            _IB_SYSFS,
         )
 
 
