@@ -1197,13 +1197,14 @@ struct TopKKernel {
 #elif defined(USE_ROCM)
       // Split dispatch. One block per row leaves a long row latency bound on one
       // CU however idle the rest is; split_plan decides where a second launch pays.
+      // PDL stays off: the hist -> select kernel boundary is the barrier.
       if (const auto [split, split_ws] = split_plan(batch_size, max_seq_len, device); split >= kSplitMin) {
         LaunchKernel({batch_size, split}, kBlockSize, device)
-            .config({.use_pdl = kUsePDL})
-            .launch(topk_split_hist<kUsePDL>, params, split_ws);
+            .config({.use_pdl = false})
+            .launch(topk_split_hist<false>, params, split_ws);
         LaunchKernel({batch_size, split}, kBlockSize, device)
-            .config({.use_pdl = kUsePDL})
-            .launch(topk_split_select<kUsePDL, kMode>, params, split_ws);
+            .config({.use_pdl = false})
+            .launch(topk_split_select<false, kMode>, params, split_ws);
         return;
       }
 #endif
