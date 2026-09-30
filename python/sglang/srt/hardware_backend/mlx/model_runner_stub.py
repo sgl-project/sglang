@@ -108,6 +108,13 @@ class MlxModelRunnerStub(ModelRunner):
     prefill_aware_swa = False
 
     @property
+    def logical_max_total_num_tokens(self) -> int:
+        """MLX pool slots already count logical tokens; no DCP expansion applies."""
+        return self.req_to_token_pool.schedulable_token_capacity(
+            self.max_total_num_tokens
+        )
+
+    @property
     def preloaded_weights_bytes(self) -> int:
         """Return zero for the base Torch loader accounting hook.
 
