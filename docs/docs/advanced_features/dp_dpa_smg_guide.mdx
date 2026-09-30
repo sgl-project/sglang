@@ -122,6 +122,12 @@ python -m sglang.launch_server \
 
 > **Deprecated**: `--enable-dp-attention` still works: `--dp-size N --enable-dp-attention` resolves to `--attn-dp-size N --dp-size 1` and prints a deprecation warning. Use `--attn-dp-size N` instead.
 
+**Elastic EP scale joiners.** A rank that joins an existing DPA deployment through elastic EP scale-up runs DPA even when it is launched with `--attn-dp-size 1`: its own attention DP group is one rank wide.
+
+**DP rank count.** The number of DP ranks (one scheduler each) is `dp_size × attn_dp_size`; one of the two is always 1.
+- `/server_info` reports `dp_size` (replicas) and `attn_dp_size` separately, so under DPA its `dp_size` is 1. Its deprecated `enable_dp_attention` field is always `false`; read `attn_dp_size` instead.
+- Wire formats that predate `--attn-dp-size` keep the key `dp_size` for the DP rank count: KV-event descriptors, the PD prefill server info, and load snapshots.
+
 ### TP LMHead with all-to-all
 
 `dp-lm-head` keeps full weight and computes the local batch, making the gemm inefficient when batchsize per-rank is small. The existing `tp-lm-head` improves the gemm efficiency but introduce heavy allgather communication on full vocabulary.
