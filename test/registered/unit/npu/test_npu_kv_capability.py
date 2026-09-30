@@ -1,10 +1,11 @@
 """CPU-only tests for the Ascend DSA KV cache capability and its consumers.
 
 Covers the capability accept/reject matrix, the MLA KV cache dim selector, the
-NPU MLA pool's PD layer ids and indexer dtypes, and the indexer sizer. NPU
-extension modules are stubbed; no operator runs.
+NPU MLA pool's PD layer ids and indexer dtypes, the indexer sizer, and the PD
+KV layout handshake. NPU extension modules are stubbed; no operator runs.
 """
 
+import struct
 import sys
 import types
 import unittest
@@ -27,6 +28,9 @@ _real_utils_is_npu = _utils.is_npu
 _common_utils.is_npu = lambda: False
 _utils.is_npu = _common_utils.is_npu
 try:
+    from sglang.srt.disaggregation.ascend import conn as ascend_conn
+    from sglang.srt.disaggregation.ascend.conn import AscendKVManager
+    from sglang.srt.disaggregation.mooncake.conn import KVArgsRegisterInfo
     from sglang.srt.hardware_backend.npu import kv_capability, memory_pool_npu
     from sglang.srt.hardware_backend.npu.kv_capability import resolve_kv_capability
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
@@ -339,6 +343,147 @@ class TestNpuIndexerSizing(_NpuPatchedTestCase):
         self.assertEqual(
             self._pool_indexer_bytes_per_token(_build_pool(torch.bfloat16)), 256
         )
+
+
+def _registration_msg(extra=()):
+    return [
+        b"room",
+        b"127.0.0.1",
+        b"1234",
+        b"session",
+        struct.pack("Q", 0x1000),
+        struct.pack("Q", 0x2000),
+        b"",
+        b"0",
+        b"1",
+        b"128",
+        b"",
+        b"",
+        b"",
+        b"",
+        struct.pack("Q", 0x3000),
+        b"4096",
+        b"1",
+        b"0",
+        b"",
+        struct.pack("2Q", 656, 132),
+        *extra,
+    ]
+
+
+class TestPdKvLayoutHandshake(unittest.TestCase):
+    SRC_ITEM_LENS = [656 * 128] * 2 + [128 * 128] * 2 + [4 * 128] * 2
+
+    def setUp(self):
+        p = patch.object(
+            ascend_conn,
+            "get_memory",
+            return_value=SimpleNamespace(enable_unified_memory=False),
+        )
+        p.start()
+        self.addCleanup(p.stop)
+        self.mgr = object.__new__(AscendKVManager)
+        self.mgr.kv_args = SimpleNamespace(
+            kv_buf_groups=3, kv_item_lens=list(self.SRC_ITEM_LENS)
+        )
+        self.mgr.kv_cache_dtype_str = "fp8_e4m3"
+
+    def _info(self, **overrides):
+        fields = dict(
+            dst_kv_buf_groups=3,
+            dst_kv_cache_dtype="fp8_e4m3",
+            dst_kv_item_lens=list(self.SRC_ITEM_LENS),
+        )
+        fields.update(overrides)
+        return KVArgsRegisterInfo(
+            room="None",
+            endpoint="127.0.0.1",
+            dst_port=1234,
+            mooncake_session_id="decode-0",
+            dst_kv_ptrs=[],
+            dst_aux_ptrs=[],
+            dst_state_data_ptrs=[],
+            dst_tp_rank=0,
+            dst_attn_tp_size=1,
+            dst_kv_item_len=0,
+            dst_state_item_lens=[],
+            dst_state_dim_per_tensor=[],
+            dst_kv_layer_ids=[],
+            dst_state_layer_ids=[],
+            **fields,
+        )
+
+    def test_from_zmq_reads_layout_frames(self):
+        info = KVArgsRegisterInfo.from_zmq(_registration_msg((b"3", b"fp8_e4m3")))
+        self.assertEqual(info.dst_kv_buf_groups, 3)
+        self.assertEqual(info.dst_kv_cache_dtype, "fp8_e4m3")
+        self.assertEqual(info.dst_kv_item_lens, [656, 132])
+        self.assertEqual(info.staging_base_ptr, 0x3000)
+        self.assertEqual(info.staging_total_size, 4096)
+
+    def test_from_zmq_zero_groups_is_not_an_old_peer(self):
+        info = KVArgsRegisterInfo.from_zmq(_registration_msg((b"0", b"bf16")))
+        self.assertEqual(info.dst_kv_buf_groups, 0)
+        self.assertEqual(info.dst_kv_cache_dtype, "bf16")
+
+    def test_from_zmq_tolerates_old_peer(self):
+        info = KVArgsRegisterInfo.from_zmq(_registration_msg())
+        self.assertIsNone(info.dst_kv_buf_groups)
+        self.assertIsNone(info.dst_kv_cache_dtype)
+        self.assertIsNone(info.kv_layout_error)
+
+    def test_matching_layout_is_accepted(self):
+        self.assertIsNone(self.mgr.check_decode_kv_layout(self._info()))
+
+    def test_dtype_mismatch_is_rejected_with_both_sides(self):
+        with self.assertLogs(ascend_conn.logger, level="ERROR"):
+            reason = self.mgr.check_decode_kv_layout(
+                self._info(dst_kv_cache_dtype="bf16")
+            )
+        self.assertIn("kv_cache_dtype", reason)
+        self.assertIn("prefill has kv_cache_dtype=fp8_e4m3", reason)
+        self.assertIn("decode has kv_cache_dtype=bf16", reason)
+
+    def test_group_mismatch_is_rejected(self):
+        with self.assertLogs(ascend_conn.logger, level="ERROR"):
+            reason = self.mgr.check_decode_kv_layout(self._info(dst_kv_buf_groups=0))
+        self.assertIn("(kv_buf_groups)", reason)
+        self.assertIn("kv_buf_groups=3", reason)
+        self.assertIn("kv_buf_groups=0", reason)
+
+    def test_item_len_mismatch_is_rejected(self):
+        dst = [576 * 128] * 2 + self.SRC_ITEM_LENS[2:]
+        with self.assertLogs(ascend_conn.logger, level="ERROR"):
+            reason = self.mgr.check_decode_kv_layout(self._info(dst_kv_item_lens=dst))
+        self.assertIn("(kv_item_lens)", reason)
+        self.assertIn(str(dst), reason)
+        self.assertIn(str(self.SRC_ITEM_LENS), reason)
+
+    def test_pp_stage_subset_is_accepted(self):
+        self.mgr.kv_args.kv_item_lens = self.SRC_ITEM_LENS[::2]
+        self.assertIsNone(self.mgr.check_decode_kv_layout(self._info()))
+
+    def test_pp_stage_foreign_item_len_is_rejected(self):
+        self.mgr.kv_args.kv_item_lens = [576 * 128, 128 * 128]
+        with self.assertLogs(ascend_conn.logger, level="ERROR"):
+            reason = self.mgr.check_decode_kv_layout(self._info())
+        self.assertIn("(kv_item_lens)", reason)
+
+    def test_dcp_relayout_skips_item_lens(self):
+        dst = self.SRC_ITEM_LENS[:2] + [n * 2 for n in self.SRC_ITEM_LENS[2:]]
+        info = self._info(dst_kv_item_lens=dst, requires_dcp_relayout=True)
+        self.assertIsNone(self.mgr.check_decode_kv_layout(info))
+
+    def test_non_dsa_layout_skips_item_lens(self):
+        self.mgr.kv_args.kv_buf_groups = None
+        info = self._info(dst_kv_buf_groups=0, dst_kv_item_lens=[1, 2])
+        self.assertIsNone(self.mgr.check_decode_kv_layout(info))
+
+    def test_old_peer_is_tolerated_with_a_warning(self):
+        info = self._info(dst_kv_buf_groups=None, dst_kv_cache_dtype=None)
+        with self.assertLogs(ascend_conn.logger, level="WARNING") as logs:
+            self.assertIsNone(self.mgr.check_decode_kv_layout(info))
+        self.assertIn("older build", "\n".join(logs.output))
 
 
 if __name__ == "__main__":

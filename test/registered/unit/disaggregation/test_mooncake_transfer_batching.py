@@ -472,6 +472,7 @@ class TestMooncakeEarlySend(unittest.TestCase):
         )
         registration = SimpleNamespace(
             requires_dcp_relayout=False,
+            kv_layout_error=None,
             dst_kv_ptrs=[1000],
             dst_kv_layer_ids=[0],
             dst_kv_item_len=16,
