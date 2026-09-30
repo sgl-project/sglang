@@ -272,11 +272,10 @@ def test_return_compress_fold_on_row_shards_is_bit_identical() -> None:
 
 
 @requires_cuda
-@pytest.mark.parametrize("sparsity", [0.0, 0.9])
+@pytest.mark.parametrize("sparsity", [0.0, 0.8])
 def test_odd_tile_count_matches_reference(sparsity: float) -> None:
-    """The native kernel pairs query tiles, so an odd tile count runs with one
-    padded empty tile; the pooled means, the top-k lists and the gate fold must
-    stay on the real tiles (dense with the gate, and the shipped sparsity)."""
+    """An odd tile count (padded to even for the SM100 kernel) must keep the
+    pooled means, the top-k lists and the gate fold on the real tiles."""
     device = torch.device("cuda")
     prefix = (70, 0, 40)
     meta = VideoSparseAttentionH3MetadataBuilder().build(

@@ -93,13 +93,18 @@ def test_fasth3_dmd_schedule_matches_trained_rungs() -> None:
         }
     )
     assert metadata.dmd_denoising_steps == DMD_STEPS
-    base = torch.tensor([s / 1000.0 for s in DMD_STEPS] + [0.0])
-    for shift in (10.0, 3.0):
+    # FastVideo's _set_dmd_schedule output for the video / audio shifts 10 / 3
+    served = {
+        10.0: [0.9999, 0.985788, 0.967575, 0.943168, 0.909091]
+        + [0.857143, 0.769231, 0.588235, 0.0],
+        3.0: [0.999666, 0.954148, 0.89952, 0.83274, 0.75]
+        + [0.642857, 0.5, 0.3, 0.0],
+    }
+    for shift, expected in served.items():
         sigmas = minimax_h3_time_shift_sigmas(
             num_steps=9, shift_scale=shift, dmd_steps=DMD_STEPS
         )
-        # FastVideo's _set_dmd_schedule: shift the unshifted rungs once.
-        assert sigmas == (shift * base / (1 + (shift - 1) * base)).tolist()
+        assert sigmas == pytest.approx(expected, abs=1e-6)
     with pytest.raises(ValueError, match="8 DiT forwards"):
         minimax_h3_time_shift_sigmas(num_steps=5, shift_scale=10.0, dmd_steps=DMD_STEPS)
     with pytest.raises(ValueError, match="strictly decreasing"):
