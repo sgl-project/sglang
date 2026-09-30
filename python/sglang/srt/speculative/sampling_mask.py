@@ -23,7 +23,7 @@ class SpeculativeSamplingMaskCapture(msgspec.Struct):
             dtype=torch.long,
         )
         output_tokens = out_tokens.index_select(0, batch_indices).clone()
-        output_lens = commit_lens.index_select(0, batch_indices).clone()
+        num_accept_tokens = commit_lens.index_select(0, batch_indices).clone()
         greedy_mask = (
             None
             if self.greedy_mask is None
@@ -95,5 +95,5 @@ class SpeculativeSamplingMaskCapture(msgspec.Struct):
             selected_logprobs=selected_logprobs,
             support_logprobs=support_logprobs,
             statuses=statuses,
-            output_lens=output_lens,
+            num_accept_tokens=num_accept_tokens,
         )

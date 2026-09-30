@@ -312,8 +312,10 @@ def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
         "sampling_mask_statuses": (
             None if sampling_mask_output is None else sampling_mask_output.statuses
         ),
-        "sampling_mask_output_lens": (
-            None if sampling_mask_output is None else sampling_mask_output.output_lens
+        "sampling_mask_num_accept_tokens": (
+            None
+            if sampling_mask_output is None
+            else sampling_mask_output.num_accept_tokens
         ),
         "input_token_logprobs": result.logits_output.input_token_logprobs,
         "input_top_logprobs_val": result.logits_output.input_top_logprobs_val,
@@ -335,7 +337,9 @@ def get_logprob_from_pp_outputs(
             selected_logprobs=next_pp_outputs["sampling_mask_selected_logprobs"],
             support_logprobs=next_pp_outputs["sampling_mask_support_logprobs"],
             statuses=next_pp_outputs["sampling_mask_statuses"],
-            output_lens=next_pp_outputs.tensors.get("sampling_mask_output_lens"),
+            num_accept_tokens=next_pp_outputs.tensors.get(
+                "sampling_mask_num_accept_tokens"
+            ),
         )
     logits_output = LogitsProcessorOutput(
         # Do not send logits and hidden states because they are large

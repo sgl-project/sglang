@@ -106,7 +106,7 @@ class SamplingMaskOutput:
     selected_logprobs: torch.Tensor
     support_logprobs: Optional[torch.Tensor]
     statuses: torch.Tensor
-    output_lens: Optional[torch.Tensor] = None
+    num_accept_tokens: Optional[torch.Tensor] = None
 
     def map_device_tensors(self, fn) -> None:
         self.token_ids = fn(self.token_ids)
@@ -115,8 +115,8 @@ class SamplingMaskOutput:
         if self.support_logprobs is not None:
             self.support_logprobs = fn(self.support_logprobs)
         self.statuses = fn(self.statuses)
-        if self.output_lens is not None:
-            self.output_lens = fn(self.output_lens)
+        if self.num_accept_tokens is not None:
+            self.num_accept_tokens = fn(self.num_accept_tokens)
 
 
 def _trace_e2e_logits(stage: str, **fields) -> None:

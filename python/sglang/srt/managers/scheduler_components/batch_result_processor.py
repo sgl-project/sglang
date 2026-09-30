@@ -1213,34 +1213,34 @@ class SchedulerBatchResultProcessor:
             if sampling_output.support_logprobs is None
             else sampling_output.support_logprobs.cpu().numpy()
         )
-        output_lens = (
+        num_accept_tokens = (
             None
-            if getattr(sampling_output, "output_lens", None) is None
-            else sampling_output.output_lens.tolist()
+            if getattr(sampling_output, "num_accept_tokens", None) is None
+            else sampling_output.num_accept_tokens.tolist()
         )
-        assert output_lens is None or len(batch_indices) == len(output_lens)
+        assert num_accept_tokens is None or len(batch_indices) == len(num_accept_tokens)
         packed_width = token_ids.shape[-1]
         support_row = 0
         for row, batch_index in enumerate(batch_indices):
             returns_support_logprobs = (
                 reqs[batch_index].sampling_logprobs_mode == "support"
             )
-            if output_lens is None:
-                row_output_len = None
+            if num_accept_tokens is None:
+                row_num_accept_tokens = None
                 row_lengths = [int(lengths[row])]
                 row_statuses = [int(statuses[row])]
             else:
-                row_output_len = int(output_lens[row])
-                if not 0 <= row_output_len <= token_ids.shape[1]:
-                    row_output_len = 0
+                row_num_accept_tokens = int(num_accept_tokens[row])
+                if not 0 <= row_num_accept_tokens <= token_ids.shape[1]:
+                    row_num_accept_tokens = 0
                     row_statuses = [int(SamplingMaskStatus.INVALID)]
                     row_lengths = []
                 else:
                     row_statuses = [
-                        int(value) for value in statuses[row][:row_output_len]
+                        int(value) for value in statuses[row][:row_num_accept_tokens]
                     ]
                     row_lengths = [
-                        int(value) for value in lengths[row][:row_output_len]
+                        int(value) for value in lengths[row][:row_num_accept_tokens]
                     ]
 
             status = max(row_statuses, default=int(SamplingMaskStatus.OK))
@@ -1250,7 +1250,7 @@ class SchedulerBatchResultProcessor:
                 status = SamplingMaskStatus.INVALID
             status_by_batch[batch_index] = status
             if status == SamplingMaskStatus.OK:
-                if row_output_len is None:
+                if row_num_accept_tokens is None:
                     masks[batch_index] = token_ids[row, : row_lengths[0]]
                     logprobs[batch_index] = (
                         support_logprobs[support_row, : row_lengths[0]]
@@ -1270,7 +1270,7 @@ class SchedulerBatchResultProcessor:
                         if returns_support_logprobs
                         else [
                             selected_logprobs[row, token : token + 1]
-                            for token in range(row_output_len)
+                            for token in range(row_num_accept_tokens)
                         ]
                     )
             if returns_support_logprobs:
