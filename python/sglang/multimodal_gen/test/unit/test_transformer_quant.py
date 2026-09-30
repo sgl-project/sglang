@@ -869,6 +869,19 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertTrue(config.supports_input_partition("blocks.0.mlp.fc1", 6400))
         self.assertFalse(config.supports_input_partition("blocks.0.mlp.fc1", 3200))
 
+    @patch(_CONVROT_SGL_AVAILABLE, return_value=False)
+    def test_online_convrot_int8_loads_on_the_host_under_offload(self, _sgl):
+        """Online convrot_int8 quantizes each layer through its own CUDA round
+        trip, so the loader must not require the whole BF16 DiT on the GPU
+        (an offloaded 62 GB H3 DiT has to stay on the host during load)."""
+        config = ConvRotInt8Config()
+
+        self.assertFalse(config.is_checkpoint_int8_serialized)
+        self.assertFalse(_needs_device_weight_postprocess(config))
+        spec = TransformerQuantLoadSpec([], config, None, None)
+        self.assertTrue(spec.is_convrot_int8)
+        self.assertFalse(spec.is_serialized_convrot_int8)
+
     def test_minimax_h3_w4a8_metadata_resolves_serialized_kitchen(self):
         metadata = {
             "_quantization_metadata": json.dumps(

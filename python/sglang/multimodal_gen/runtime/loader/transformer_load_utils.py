@@ -175,6 +175,10 @@ class TransformerQuantLoadSpec:
         return _get_quant_config_name(self.quant_config) == "comfy_fp8"
 
     @property
+    def is_convrot_int8(self) -> bool:
+        return isinstance(self.quant_config, ConvRotInt8Config)
+
+    @property
     def is_serialized_convrot_int8(self) -> bool:
         return (
             isinstance(self.quant_config, ConvRotInt8Config)
@@ -816,10 +820,8 @@ def _needs_device_weight_postprocess(
     quant_name = _get_quant_config_name(quant_config)
     if quant_name in ("modelopt_fp8", "comfy_fp8", "auto-round", "mxfp8"):
         return True
-    if quant_name == "convrot_int8":
-        assert isinstance(quant_config, ConvRotInt8Config)
-        return not quant_config.is_checkpoint_int8_serialized
-
+    # convrot_int8 is deliberately absent: both backends quantize each layer
+    # through their own CUDA round trip, so an offloaded DiT stays on the host.
     serialized_flag_by_quant_name = {
         "fp8": "is_checkpoint_fp8_serialized",
         "mxfp4": "is_checkpoint_mxfp4_serialized",
