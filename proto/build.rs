@@ -1,9 +1,6 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Prefer an explicitly configured protoc; otherwise use the vendored
-    // binary so builds (including `cargo clippy` and the pre-commit hook on
-    // machines/CI runners without protobuf installed) are self-contained.
-    // protoc_bin_path() errs on platforms the vendored crate doesn't cover;
-    // those fall back to prost-build's own lookup of `protoc` on PATH.
+    // binary so builds remain self-contained on machines without protobuf.
     if std::env::var_os("PROTOC").is_none()
         && let Ok(vendored) = protoc_bin_vendored::protoc_bin_path()
     {
@@ -11,21 +8,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         unsafe { std::env::set_var("PROTOC", vendored) };
     }
 
-    let proto_path = "../../proto/sglang/runtime/v1/sglang.proto";
+    let proto_path = "sglang/runtime/v1/sglang.proto";
 
     tonic_build::configure()
         .build_server(true)
-        .build_client(false)
+        .build_client(true)
         // The follower implements only GetServerInfo; all other RPCs return
         // UNIMPLEMENTED without constructing the inference bridge.
         .generate_default_stubs(true)
         .protoc_arg("--experimental_allow_proto3_optional")
-        .file_descriptor_set_path(
-            std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap())
-                .join("sglang_descriptor.bin"),
-        )
-        .compile_protos(&[proto_path], &["../../proto"])?;
+        .compile_protos(&[proto_path], &["."])?;
 
-    println!("cargo:rerun-if-changed={}", proto_path);
+    println!("cargo:rerun-if-changed={proto_path}");
     Ok(())
 }

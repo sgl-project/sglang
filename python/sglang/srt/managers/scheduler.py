@@ -329,6 +329,9 @@ from sglang.srt.speculative.eagle_utils import (
     get_draft_recurrent_hidden_state_spec_from_config,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_sampling_mask import (
+    validate_spec_sampling_mask_request,
+)
 from sglang.srt.speculative.uno_validation import validate_uno_request
 from sglang.srt.state_capturer.indexer_topk import destroy_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import destroy_global_experts_capturer
@@ -513,7 +516,7 @@ class Scheduler(
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
         self.enable_hisparse = get_memory().enable_hisparse
-        self.enable_dp_attention = get_parallel().enable_dp_attention
+        self.attn_dp_enabled = get_parallel().attn_dp_enabled
         self.enable_unified_memory = get_memory().enable_unified_memory
 
         # Init model configs
@@ -626,7 +629,7 @@ class Scheduler(
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 tp_group=(
                     self.attn_tp_cpu_group
-                    if self.enable_dp_attention
+                    if self.attn_dp_enabled
                     else self.tp_cpu_group
                 ),
                 tree_cache=self.tree_cache,
@@ -820,7 +823,7 @@ class Scheduler(
         try:
             self.load_snapshot_writer = create_load_snapshot_writer(
                 port_args,
-                get_parallel().dp_size,
+                get_parallel().num_dp_ranks,
                 dp_rank,
                 publish_interval=get_observability().load_snapshot_publish_interval,
             )
@@ -1213,9 +1216,7 @@ class Scheduler(
         # the base TP group. Entry rank is the local rank 0 in that group.
         # Use the CPU (gloo) group to broadcast VLM Python objects and avoid CUDA
         # stream/device coupling (#11910).
-        self.dp_tp_group = (
-            self.attn_tp_group if self.enable_dp_attention else self.tp_group
-        )
+        self.dp_tp_group = self.attn_tp_group if self.attn_dp_enabled else self.tp_group
         self.dp_tp_cpu_group = self.dp_tp_group.cpu_group
 
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
@@ -1576,7 +1577,6 @@ class Scheduler(
                 metadata_buffers=self.disagg_metadata_buffers,
                 gpu_id=get_device().gpu_id,
                 bootstrap_port=get_disagg().disaggregation_bootstrap_port,
-                gloo_group=self.attn_tp_cpu_group,
                 max_total_num_tokens=self.max_total_num_tokens,
                 scheduler=self,
                 scheduler_stage_metrics=self.scheduler_stage_metrics,
@@ -2316,9 +2316,7 @@ class Scheduler(
             mm_receiver=self.mm_receiver,
             tp_group=self.tp_group,
             tp_cpu_group=self.tp_cpu_group,
-            attn_tp_group=self.attn_tp_group,
             attn_tp_cpu_group=self.attn_tp_cpu_group,
-            attn_cp_group=self.attn_cp_group,
             attn_cp_cpu_group=self.attn_cp_cpu_group,
             world_group=self.world_group,
             server_args=self.server_args,
@@ -2975,14 +2973,10 @@ class Scheduler(
                 return
 
         if req.return_sampling_mask and not self.spec_algorithm.is_none():
-            # Spec workers do not emit one sampling support per accepted token, so
-            # the returned mask would not align 1:1 with generated tokens. Reject
-            # the combination instead of silently returning a misaligned mask.
-            error_msg = (
-                "return_sampling_mask is not supported with speculative decoding."
-            )
-            self._reject_sampling_mask_request(req, error_msg)
-            return
+            error_msg = validate_spec_sampling_mask_request(req, self.spec_algorithm)
+            if error_msg is not None:
+                self._reject_sampling_mask_request(req, error_msg)
+                return
 
         if req.return_sampling_mask and get_exec().kernel.sampling_backend == "ascend":
             # The ascend backend samples from logits directly and never builds the
@@ -4658,9 +4652,7 @@ class Scheduler(
         return ret
 
     def _maybe_report_active_ranks(self) -> None:
-        if not (
-            self.enable_dp_attention and get_exec().moe.elastic_ep_backend is not None
-        ):
+        if not (self.attn_dp_enabled and get_exec().moe.elastic_ep_backend is not None):
             return
         from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 
@@ -5230,7 +5222,6 @@ class Scheduler(
         # readback reflects values changed via /set_internal_state, not startup.
         ret = get_context().resolved_server_args_dict()
         ret["world_size"] = compute_world_size(
-            enable_dp_attention=get_parallel().enable_dp_attention,
             dp_size=get_parallel().dp_size,
             tp_size=get_parallel().tp_size,
             pp_size=get_parallel().pp_size,
@@ -5310,6 +5301,52 @@ class Scheduler(
 
         return GetInternalStateReqOutput(internal_state=msgspec_to_builtins(ret))
 
+    def _has_active_sampling_mask_request(self) -> bool:
+        """Whether any unfinished request holding a sampling mask is queued or
+        running, including PP micro-batches and PD decode queues."""
+        active_batches = [self.running_batch, self.last_batch]
+        active_batches.extend(getattr(self, "running_mbs", ()))
+        active_batches.extend(getattr(self, "mbs", ()))
+        active_batches.extend(getattr(self, "last_mbs", ()))
+        has_active_mask_request = any(
+            req.return_sampling_mask and not req.finished()
+            for batch in active_batches
+            if batch is not None
+            for req in batch.reqs
+        )
+        has_active_mask_request |= any(
+            req.return_sampling_mask and not req.finished()
+            for req in self.waiting_queue
+        )
+        has_active_mask_request |= any(
+            req.return_sampling_mask and not req.finished()
+            for req in self.grammar_manager.grammar_queue
+        )
+        has_active_mask_request |= (
+            self.chunked_req is not None
+            and self.chunked_req.return_sampling_mask
+            and not self.chunked_req.finished()
+        )
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            prealloc_queue = self.disagg_decode_prealloc_queue
+            decode_reqs = [
+                *prealloc_queue.queue,
+                *prealloc_queue.pending_reqs,
+                *self.disagg_decode_transfer_queue.queue,
+            ]
+            has_active_mask_request |= any(
+                decode_req.req.return_sampling_mask and not decode_req.req.finished()
+                for decode_req in decode_reqs
+            )
+            has_active_mask_request |= any(
+                req.return_sampling_mask and not req.finished()
+                for req in (
+                    *prealloc_queue.retracted_queue,
+                    *prealloc_queue.held_rebootstrap_reqs,
+                )
+            )
+        return has_active_mask_request
+
     def set_internal_state(self, recv_req: SetInternalStateReq):
         server_args_dict = recv_req.server_args
         args_allow_update = set(
@@ -5336,6 +5373,22 @@ class Scheduler(
                 )
                 if_success = False
                 break
+            elif (
+                k
+                in (
+                    "speculative_accept_threshold_single",
+                    "speculative_accept_threshold_acc",
+                )
+                and self.spec_algorithm.is_dflash()
+                and float(v) != 1.0
+            ):
+                if self._has_active_sampling_mask_request():
+                    logging.warning(
+                        f"Updating {k} is rejected while DFlash sampling-mask "
+                        "requests are active."
+                    )
+                    if_success = False
+                    break
             elif k == "dspark_force_budget_frac":
                 if not self.spec_algorithm.is_dspark() or not hasattr(
                     self.draft_worker, "set_dspark_forced_budget_frac"

@@ -2243,7 +2243,7 @@ async def _send_disaggregation_warmup_requests(
         return await asyncio.gather(
             *(
                 send_request(session, dp_rank)
-                for dp_rank in range(get_parallel().dp_size)
+                for dp_rank in range(get_parallel().num_dp_ranks)
             )
         )
 
@@ -2307,9 +2307,11 @@ def _execute_server_warmup(server_args: ServerArgs):
         },
     }
     if get_serving().skip_tokenizer_init:
-        json_data["input_ids"] = [[10, 11, 12] for _ in range(get_parallel().dp_size)]
+        json_data["input_ids"] = [
+            [10, 11, 12] for _ in range(get_parallel().num_dp_ranks)
+        ]
         # TODO Workaround the bug that embedding errors for list of size 1
-        if get_parallel().dp_size == 1:
+        if get_parallel().num_dp_ranks == 1:
             json_data["input_ids"] = json_data["input_ids"][0]
     elif (
         is_vlm
@@ -2353,9 +2355,11 @@ def _execute_server_warmup(server_args: ServerArgs):
             "temperature": 0.0,
         }
     else:
-        json_data["text"] = ["The capital city of France is"] * get_parallel().dp_size
+        json_data["text"] = [
+            "The capital city of France is"
+        ] * get_parallel().num_dp_ranks
         # TODO Workaround the bug that embedding errors for list of size 1
-        if get_parallel().dp_size == 1:
+        if get_parallel().num_dp_ranks == 1:
             json_data["text"] = json_data["text"][0]
 
     # Config debug dumping
@@ -2396,7 +2400,7 @@ def _execute_server_warmup(server_args: ServerArgs):
             if not failed_status_codes:
                 logger.info(
                     "Disaggregation warmup requests completed for all %s DP ranks",
-                    get_parallel().dp_size,
+                    get_parallel().num_dp_ranks,
                 )
                 logger.info("End of disaggregation warmup")
             else:

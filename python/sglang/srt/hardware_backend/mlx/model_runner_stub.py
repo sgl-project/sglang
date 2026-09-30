@@ -19,7 +19,13 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     ModelLayerInfo,
 )
-from sglang.srt.runtime_context import get_exec, get_memory, get_model, get_schedule
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_memory,
+    get_model,
+    get_parallel,
+    get_schedule,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -179,7 +185,7 @@ class MlxModelRunnerStub(ModelRunner):
         aux_state_size = get_schedule().max_mamba_cache_size
         if aux_state_size is None:
             return None
-        return aux_state_size // self.attn_dp_size
+        return aux_state_size // get_parallel().attn_dp_size
 
     def _resolve_max_running_requests(self) -> int:
         """Concurrency cap handed to the scheduler.
@@ -204,7 +210,7 @@ class MlxModelRunnerStub(ModelRunner):
             requested_per_worker = None
             resolved = min(capacity_cap, 4096)
         else:
-            requested_per_worker = requested // self.attn_dp_size
+            requested_per_worker = requested // get_parallel().attn_dp_size
             resolved = min(requested_per_worker, capacity_cap)
 
         aux_state_size = self._explicit_aux_state_size_per_worker()
@@ -216,7 +222,7 @@ class MlxModelRunnerStub(ModelRunner):
             resolved = min(resolved, aux_state_size // ratio)
             if resolved <= 0:
                 global_aux_state_size = get_schedule().max_mamba_cache_size
-                min_global_aux_state_size = ratio * self.attn_dp_size
+                min_global_aux_state_size = ratio * get_parallel().attn_dp_size
                 raise RuntimeError(
                     f"MLX auxiliary-state cache is too small to serve any "
                     f"requests: max_mamba_cache_size={global_aux_state_size} "

@@ -81,7 +81,7 @@ fn resolve_max_message_size_honors_env_var() {
 
 #[tokio::test]
 async fn follower_metadata_server_exposes_only_server_info_and_shuts_down() {
-    use crate::proto::{GetServerInfoRequest, GetServerInfoResponse};
+    use sglang_grpc_types::sglang::runtime::v1::{GetServerInfoRequest, GetServerInfoResponse};
     use tonic::codec::ProstCodec;
 
     let _guard = PAYLOAD_ENV_LOCK.lock().await;
