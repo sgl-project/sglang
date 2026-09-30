@@ -101,6 +101,10 @@ class Disagg(msgspec.Struct):
         int,
         "Number of decode tokens that will have memory reserved when adding new request to the running batch.",
     ] = 512
+    disaggregation_decode_workload_balancing: A[
+        bool,
+        "Let the total_tokens scheduler override decode rank hints while preserving explicit prefill DP routing. Requires decode mode, DP attention, and --load-balance-method total_tokens. Does not balance multiple decode replicas.",
+    ] = False
     disaggregation_decode_extra_slots: A[
         Optional[int],
         "Number of extra decode req_to_token slots pre-allocated for in-transfer requests (PD mode). If unset, defaults to 0 (or 2x the per-worker running batch for small batches).",

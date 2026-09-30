@@ -21,6 +21,12 @@ logger = logging.getLogger(__name__)
 
 def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     """Validate and normalize PD-disaggregation server args."""
+    from sglang.srt.managers.decode_workload_routing import (
+        validate_decode_workload_config,
+    )
+
+    validate_decode_workload_config(resolving_view(server_args))
+
     cfg = resolving_view(server_args)
 
     # "mooncake_tcp" is mooncake with the TCP transport forced: set MC_FORCE_TCP
@@ -196,6 +202,12 @@ def _alias_bootstrap_port_to_api_port(server_args: ServerArgs) -> None:
     field and agrees automatically. Decode is untouched: there the field names
     the PREFILL side's bootstrap port and must stay as the operator set it.
     """
+    from sglang.srt.managers.decode_workload_routing import (
+        validate_decode_workload_config,
+    )
+
+    validate_decode_workload_config(resolving_view(server_args))
+
     cfg = resolving_view(server_args)
     default_port = next(
         f.default
@@ -230,7 +242,12 @@ def _alias_bootstrap_port_to_api_port(server_args: ServerArgs) -> None:
 def handle_encoder_disaggregation(server_args: Any):
     from sglang.srt.arg_groups.model_hook import handle_language_model_only
     from sglang.srt.arg_groups.validation_hook import validate_ib_devices
+    from sglang.srt.managers.decode_workload_routing import (
+        validate_decode_workload_config,
+    )
     from sglang.srt.server_args import resolve_encoder_transfer_backend
+
+    validate_decode_workload_config(resolving_view(server_args))
 
     cfg = resolving_view(server_args)
     handle_language_model_only(server_args)
