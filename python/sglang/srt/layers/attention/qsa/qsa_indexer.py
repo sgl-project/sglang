@@ -193,6 +193,7 @@ class QSAIndexer(MultiPlatformOp):
                 self.q_layernorm.variance_epsilon,
                 self.rotary_emb.is_neox_style,
                 q_heads_padded=q_heads_padded,
+                out_dtype=pool.qsa_compressed_dtype,
             )
             return q, token_k, True
         q_raw = qk[:, : self.index_n_heads * self.index_head_dim]
@@ -200,6 +201,8 @@ class QSAIndexer(MultiPlatformOp):
             -1, self.index_n_heads, self.index_head_dim
         )
         q = self.apply_rope(positions, q)
+        if pool is not None:
+            q = q.to(pool.qsa_compressed_dtype)
         return q, token_k, False
 
     def normalize_compressed_keys(
