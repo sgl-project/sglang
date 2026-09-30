@@ -43,9 +43,11 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
 
 
 if is_cuda():
+    from flashinfer import top_k as flashinfer_top_k
     from flashinfer.sampling import top_k_renorm_probs as top_k_renorm_prob
     from flashinfer.sampling import top_p_renorm_probs as top_p_renorm_prob
 
+    from sglang.kernels.ops.sampling.topk_probs import scatter_top_k_top_p_probs
     from sglang.kernels.ops.speculative.sampling import (
         tree_speculative_sampling_target_only,
     )
@@ -1146,7 +1148,6 @@ def build_speculative_verify_target_probs(
     expanded_temperature = torch.repeat_interleave(
         sampling_info.temperatures, draft_token_num, dim=0
     )
-    scaled_logits = next_token_logits / expanded_temperature
     sparse_topk_applied = False
 
     # Joint top-p needs full-vocabulary mass; use the dense path for it.
@@ -1158,7 +1159,7 @@ def build_speculative_verify_target_probs(
         repeated_top_ks = torch.repeat_interleave(
             sampling_info.top_ks, draft_token_num, dim=0
         ).to(dtype=torch.int64)
-        vocab_size = int(scaled_logits.shape[-1])
+        vocab_size = int(next_token_logits.shape[-1])
         repeated_top_ks.clamp_(min=1, max=vocab_size)
         if max_top_k is None:
             max_top_k = int(repeated_top_ks.max().item())
@@ -1171,6 +1172,40 @@ def build_speculative_verify_target_probs(
 
         # Sparse exact path for top-k/top-p (top-k-first semantics), then scatter to dense.
         if 0 < max_top_k < vocab_size:
+            if (
+                is_cuda()
+                and next_token_logits.is_cuda
+                and next_token_logits.dtype == torch.float32
+                and expanded_temperature.dtype == torch.float32
+                and max_top_k <= 128
+                # FlashInfer's cluster top-k vector loads require aligned rows.
+                and vocab_size % 4 == 0
+                and next_token_logits.storage_offset() % 4 == 0
+            ):
+                topk_logits, topk_indices = flashinfer_top_k(
+                    next_token_logits.contiguous(),
+                    max_top_k,
+                    sorted=True,
+                    deterministic=False,
+                )
+                repeated_top_ps = (
+                    torch.repeat_interleave(
+                        sampling_info.top_ps, draft_token_num, dim=0
+                    )
+                    if need_top_p
+                    else None
+                )
+                target_probs = scatter_top_k_top_p_probs(
+                    topk_logits,
+                    topk_indices,
+                    expanded_temperature,
+                    repeated_top_ks,
+                    repeated_top_ps,
+                    vocab_size,
+                )
+                return target_probs.view(bs, draft_token_num, -1)
+
+            scaled_logits = next_token_logits / expanded_temperature
             topk_logits, topk_indices = torch.topk(scaled_logits, k=max_top_k, dim=-1)
             if uniform_top_k_value is None or int(uniform_top_k_value) != max_top_k:
                 ranks = torch.arange(max_top_k, device=device, dtype=torch.int64)[
@@ -1191,6 +1226,7 @@ def build_speculative_verify_target_probs(
             sparse_topk_applied = True
 
     if not sparse_topk_applied:
+        scaled_logits = next_token_logits / expanded_temperature
         target_probs = F.softmax(scaled_logits, dim=-1)
         target_probs = renorm_top_k_top_p(
             target_probs,

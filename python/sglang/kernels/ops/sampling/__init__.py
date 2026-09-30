@@ -6,10 +6,28 @@ from typing import TYPE_CHECKING, Union
 
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
-from sglang.kernels.spec import FormatSignature, KernelBackend, KernelSpec
+from sglang.kernels.spec import (
+    CapabilityRequirement,
+    FormatSignature,
+    KernelBackend,
+    KernelSpec,
+)
 
 if TYPE_CHECKING:
     import torch
+
+register_kernel(
+    KernelSpec(
+        op="sampling.scatter_top_k_top_p_probs",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.sampling.topk_probs:scatter_top_k_top_p_probs",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+        format_signature=FormatSignature(
+            description="sorted compact fp32 logits to dense top-k-first probabilities"
+        ),
+        description="Fuse temperature, normalization, top-p filtering and scatter on compact top-k support.",
+    )
+)
 
 register_kernel(
     KernelSpec(
