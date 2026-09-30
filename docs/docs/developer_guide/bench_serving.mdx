@@ -208,7 +208,7 @@ python3 -m sglang.bench_serving \
 ### Other key options
 
 - `--output-file FILE.jsonl`: append JSONL results to file; auto-named if unspecified
-- `--output-details`: include per-request arrays (generated texts, errors, ttfts, itls, input/output lens)
+- `--output-details`: include per-request arrays (generated texts, errors, ttfts, E2E latencies, itls, input/output lens)
 - `--extra-request-body '&#123;"top_p":0.9,"temperature":0.6&#125;'`: merged into payload (sampling params, etc.)
 - `--disable-ignore-eos`: pass through EOS behavior (varies by backend)
 - `--warmup-requests N`: run warmup requests with short output first (default 1)
@@ -258,7 +258,14 @@ With `--output-details`, an extended object also includes arrays:
 
 - `input_lens`, `output_lens`
 - `ttfts`, `itls` (per request: ITL arrays)
+- `e2e_latencies`: recorded end-to-end latency for each request, in seconds
 - `generated_texts`, `errors`
+
+Use `e2e_latencies` to calculate custom latency percentiles or the fraction of requests that meet a latency target without rerunning the benchmark. The arrays share the same request order, so you can also relate slow requests to their input and output lengths. For multi-turn workloads, each entry corresponds to one round.
+
+Failed requests retain their positions and recorded values, which may be zero if no latency was recorded. Check the corresponding `errors` entries before analyzing successful-request latency. Unlike the aggregate `*_e2e_latency_ms` metrics, these raw values are in seconds.
+
+This field adds one number per request to the detailed output. Without `--output-details`, the JSONL file contains only the existing summary fields.
 
 ### End-to-end examples
 
