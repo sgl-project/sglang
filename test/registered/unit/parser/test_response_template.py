@@ -4,6 +4,7 @@ import copy
 import json
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
@@ -770,6 +771,36 @@ class TestResponseTemplateAdapters(CustomTestCase):
 
         self.assertEqual(result.normal_text, "hello")
         self.assertEqual([call.name for call in result.calls], ["get_weather"])
+
+    def test_call_cut_off_after_its_opener_is_detected(self):
+        """A response ending right after a tool-call opener is a cut-off call,
+        dropped instead of returned as content."""
+        detector = ResponseTemplateToolDetector(
+            response_template=GEMMA4_RESPONSE_TEMPLATE,
+        )
+        opener = TOOL_CALL.split("{", 1)[0]
+
+        self.assertTrue(detector.has_tool_call(opener))
+        result = detector.detect_and_parse(opener, [_tool()])
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(result.calls, [])
+
+    def test_cut_off_call_too_deep_to_decode_is_dropped(self):
+        """A cut-off call whose arguments nest too deeply to decode is dropped,
+        keeping the text before it, instead of failing the response."""
+        detector = ResponseTemplateToolDetector(
+            response_template=GEMMA4_RESPONSE_TEMPLATE,
+        )
+        text = "hello" + TOOL_CALL.split("{", 1)[0] + "{hours:[[1"
+
+        # How deeply JSON must nest to exhaust the decoder depends on the Python version.
+        with patch("json.loads", side_effect=RecursionError) as decode:
+            self.assertTrue(detector.has_tool_call(text))
+            result = detector.detect_and_parse(text, [_tool()])
+
+        decode.assert_called_with('{"hours":[[1')
+        self.assertEqual(result.normal_text, "hello")
+        self.assertEqual(result.calls, [])
 
     def test_streaming_malformed_call_is_dropped_before_emission(self):
         detector = ResponseTemplateToolDetector(
