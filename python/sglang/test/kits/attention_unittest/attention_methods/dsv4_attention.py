@@ -345,9 +345,6 @@ class MockDSV4ModelRunner:
         self.canary_manager = None
         self.page_size = case.page_size
         self.model_config = model_config
-        self.tp_size = 1
-        self.dp_size = 1
-        self.pp_size = 1
         self._server_args_override = get_context().override_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
@@ -423,7 +420,6 @@ class MockDSV4ModelRunner:
         identity = torch.arange(swa_size, dtype=torch.int64, device=device)
         self.token_to_kv_pool.register_mapping(identity)
         self.token_to_kv_pool_allocator = SimpleNamespace(page_size=case.page_size)
-        self.attn_cp_size = 1
         self.attention_chunk_size = None
         self.hisparse_coordinator = None
         self.init_new_workspace = False

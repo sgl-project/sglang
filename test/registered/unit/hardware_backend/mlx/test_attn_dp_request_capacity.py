@@ -48,8 +48,12 @@ def _stub_for_initialize(
     pool_size: int = 64,
 ):
     # ``initialize`` reads the config namespaces, so the config has to be
-    # published rather than stubbed onto the runner.
+    # published rather than stubbed onto the runner. One attention replica
+    # per TP rank gives the requested attention-DP width.
     override = get_context().override_server_args(
+        tp_size=attn_dp_size,
+        dp_size=dp_size,
+        enable_dp_attention=attn_dp_size > 1,
         enable_memory_saver=False,
         max_running_requests=max_running_requests,
         max_mamba_cache_size=max_mamba_cache_size,
@@ -61,7 +65,6 @@ def _stub_for_initialize(
     stub = MlxModelRunnerStub.__new__(MlxModelRunnerStub)
     stub._mlx_pool_size = pool_size
     stub.device = "cpu"
-    stub.attn_dp_size = attn_dp_size
     stub.server_args = server_args
     stub.model_config = SimpleNamespace(
         is_hybrid_swa=False,
