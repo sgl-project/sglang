@@ -65,9 +65,7 @@ class SchedulerRequestReceiver:
     mm_receiver: Any
     tp_group: Any
     tp_cpu_group: Any
-    attn_tp_group: Any
     attn_tp_cpu_group: Any
-    attn_cp_group: Any
     attn_cp_cpu_group: Any
     world_group: Any
     server_args: ServerArgs
