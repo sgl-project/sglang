@@ -54,6 +54,7 @@ from sglang.srt.eplb.expert_distribution import (
     ExpertDistributionRecorder,
     get_global_expert_distribution_recorder,
     set_global_expert_distribution_recorder,
+    should_advance_eplb_counter,
 )
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
@@ -780,6 +781,13 @@ class ModelRunner:
             pp_rank=self.pp_rank,
         )
 
+    def get_aux_hidden_states_width(self) -> int:
+        return misc_utils.resolve_aux_hidden_states_width(
+            model=self.model,
+            spec_algorithm=self.spec_algorithm,
+            is_draft_worker=self.is_draft_worker,
+        )
+
     def get_pp_proxy_topk_size(self) -> Optional[int]:
         return misc_utils.resolve_pp_proxy_topk_size(
             model_config=self.model_config,
@@ -1391,6 +1399,22 @@ class ModelRunner:
         return self.lora_manager.unload_lora_adapter(lora_ref)
 
     @property
+    def logical_max_total_num_tokens(self):
+        """Request-token capacity in logical tokens, not per-rank DCP rows."""
+        return self.req_to_token_pool.schedulable_token_capacity(
+            self.kv_cache_configurator.logical_token_capacity(
+                max_total_num_tokens=self.max_total_num_tokens
+            )
+        )
+
+    @property
+    def effective_logical_max_total_num_tokens(self):
+        """Logical request limit, preserving hybrid SWA's separate pool bounds."""
+        if self.is_hybrid_swa:
+            return self.effective_max_total_num_tokens
+        return self.logical_max_total_num_tokens
+
+    @property
     def effective_max_total_num_tokens(self):
         """Return the max token pool size considering hybrid swa settings."""
         if self.is_hybrid_swa:
@@ -1609,9 +1633,11 @@ class ModelRunner:
             forward_batch.prepare_mlp_sync_batch(self)
         else:
             forward_batch.prepare_attn_tp_scatter_input(self)
+        if self.lora_manager is not None and self.lora_manager.enable_dp_attention:
+            self.lora_manager.prepare_lora_batch(forward_batch)
 
         # Derive the LOCAL num_token_non_padded from the GLOBAL scalar. sharded is
-        # cleared for DSACPLayerCommunicator-style CP (DSA, MLA): those flavors
+        # cleared for DSA and MLA prefill CP: those flavors
         # already feed a zigzag-split rank-local layout whose token count should
         # not be further divided by attn_tp_size, so they keep the full count.
         # MHA-arch prefill CP (Qwen3/Qwen2 MoE) keeps the attn_tp-replicated
@@ -1767,7 +1793,8 @@ class ModelRunner:
                 no_copy_to_cpu=no_copy_to_cpu,
             )
 
-        if self.eplb_manager is not None:
+        # should_advance_eplb_counter is always True on non-hip platform
+        if self.eplb_manager is not None and should_advance_eplb_counter(forward_batch):
             self.eplb_manager.on_forward_pass_end()
 
         if dumper.may_enable:
@@ -1900,6 +1927,7 @@ class ModelRunner:
                 and not isinstance(self.prefill_cuda_graph_runner, EagerRunner)
                 and self.prefill_cuda_graph_runner is not None
                 and self.prefill_cuda_graph_runner.can_run_graph(forward_batch)
+                and forward_batch.token_indices_to_pool is None
                 and _prefill_cuda_graph_allows_context_parallel(
                     self.prefill_cuda_graph_runner, forward_batch
                 )

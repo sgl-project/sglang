@@ -25,8 +25,8 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import get_rdma_devices_args
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -389,12 +389,11 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
         self.fail("Timed out waiting for scaling to complete (300s)")
 
     def _run_post_scale_gsm8k(self) -> None:
-        metrics = run_eval(
+        metrics = run_sgl_eval(
             SimpleNamespace(
                 base_url=self.base_url,
                 model=self.model,
                 eval_name="gsm8k",
-                api="completion",
                 max_tokens=512,
                 num_examples=256,
                 num_threads=50,

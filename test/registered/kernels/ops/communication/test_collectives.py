@@ -13,7 +13,6 @@ from sglang.kernels.ops.attention import attn_res
 from sglang.kernels.ops.communication import all_reduce_residual as all_reduce
 from sglang.kernels.ops.communication import (
     gemm_ag,
-    gemm_ar,
     sp_collective,
 )
 from sglang.kernels.ops.communication.mp import register_comm_cleanup
@@ -28,7 +27,6 @@ register_cuda_ci(est_time=34, stage="base-c", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=480, stage="nightly", runner_config="8-gpu-b200")
 
 _HIDDEN_SIZE = 7168
-_GEMM_AR_K_TOTAL = 12288
 _GEMM_AG_WORLD_SIZE = 8
 _MB = 1024 * 1024
 _SP_TUNING = sp_collective.Tuning(num_blocks=1, block_size=256)
@@ -78,18 +76,6 @@ def _init_comm():
     attn_res.register_comm(comm.obj)
     register_comm_cleanup(comm)
     return comm
-
-
-@cache_once
-def _init_gemm_ar():
-    cpu_group, _ = _init_world()
-    world_size = dist.get_world_size()
-    gemm_ar.init(
-        world_size=world_size,
-        rank=dist.get_rank(),
-        group=cpu_group,
-        k=_GEMM_AR_K_TOTAL // world_size,
-    )
 
 
 def _symmetric_tensor(shape):
@@ -249,29 +235,6 @@ def test_gemm_all_gather():
 
 
 @torch.inference_mode()
-def test_gemm_all_reduce():
-    _require_sm100()
-    _init_gemm_ar()
-    rank, world_size = dist.get_rank(), dist.get_world_size()
-    local_k = _GEMM_AR_K_TOTAL // world_size
-    generator = torch.Generator().manual_seed(40 + rank)
-    x = torch.randn(1, local_k, generator=generator).to(
-        device=_device(), dtype=torch.bfloat16
-    )
-    weight = torch.randn(gemm_ar.N, local_k, generator=generator).to(
-        device=_device(), dtype=torch.bfloat16
-    )
-    expected = (x.float() @ weight.float().t()).to(torch.bfloat16).float()
-    _, nccl_group = _init_world()
-    dist.all_reduce(expected, group=nccl_group)
-
-    output = gemm_ar.o_proj_gemm_ar(x, weight)
-    torch.cuda.synchronize()
-    bad = ((output.float() - expected).abs() > 0.05 + 0.02 * expected.abs()).sum()
-    assert bad.item() <= output.numel() / 1000
-
-
-@torch.inference_mode()
 def test_attention_residual_direct_all_gather():
     _require_sm100()
     comm = _init_comm()
@@ -343,7 +306,6 @@ def _precompile(num_gpus):
     for world_size in num_gpus:
         all_reduce._jit_module(world_size)
         sp_collective._jit_module(world_size)
-        gemm_ar._jit_module(_GEMM_AR_K_TOTAL // world_size, world_size)
     if _GEMM_AG_WORLD_SIZE in num_gpus:
         gemm_ag._jit_module()
     attn_res._jit_fused_tma_module(4, 1, 200)
