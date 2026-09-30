@@ -315,6 +315,15 @@ curl -sS -X POST "http://localhost:30010/v1/videos" \
       }'
 ```
 
+#### MP4 encoding
+
+`x264_preset` picks the libx264 preset for the returned MP4: `ultrafast`,
+`superfast`, `veryfast`, `faster`, `fast` (the default), `medium`, `slow`,
+`slower`, `veryslow` or `placebo`. Faster presets finish encoding sooner and
+trade file size and fidelity at the same `output_compression`/`output_quality`.
+Send it at the top level of a JSON body or as a multipart form field;
+`sglang generate` takes `--x264-preset`.
+
 **List videos**
 
 **Endpoint:** `GET /v1/videos`

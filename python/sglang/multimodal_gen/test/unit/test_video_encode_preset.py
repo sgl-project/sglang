@@ -14,7 +14,10 @@ import numpy as np
 import pytest
 import torch
 
-from sglang.multimodal_gen.configs.sample.sampling_params import DataType
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    DataType,
+    SamplingParams,
+)
 from sglang.multimodal_gen.runtime.entrypoints.utils import X264_PRESET, save_outputs
 
 FPS = 8
@@ -88,6 +91,49 @@ def test_saved_video_carries_the_configured_preset(tmp_path):
         assert any(got.get(k) != default.get(k) for k in PRESET_DERIVED_KEYS), (
             "encode is indistinguishable from ffmpeg's default preset"
         )
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
+@pytest.mark.parametrize(
+    "device",
+    [
+        # a host tensor saves through imageio, a CUDA one through the ffmpeg pipe
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="direct save needs CUDA"
+            ),
+        ),
+    ],
+)
+@pytest.mark.parametrize("preset", ["ultrafast", "slow"])
+def test_request_preset_reaches_the_encoder(tmp_path, device, preset):
+    rng = np.random.default_rng(2)
+    frames = rng.integers(0, 256, (FRAMES, SIZE, SIZE, 3), dtype=np.uint8)
+    sample = torch.from_numpy(frames).permute(3, 0, 1, 2).float() / 255.0
+
+    saved = tmp_path / "clip.mp4"
+    save_outputs(
+        [sample.to(device)],
+        DataType.VIDEO,
+        FPS,
+        True,
+        lambda _idx: str(saved),
+        x264_preset=preset,
+    )
+
+    got = _x264_options(saved)
+    expected = _x264_options(_reference_encode(tmp_path, frames, preset))
+    for key in PRESET_DERIVED_KEYS:
+        assert got.get(key) == expected.get(key), f"{key} does not match {preset}"
+
+
+def test_unknown_preset_is_rejected():
+    assert SamplingParams(x264_preset="ultrafast").x264_preset == "ultrafast"
+    assert SamplingParams().x264_preset is None
+    with pytest.raises(ValueError, match="x264_preset must be one of"):
+        SamplingParams(x264_preset="lightspeed")
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")

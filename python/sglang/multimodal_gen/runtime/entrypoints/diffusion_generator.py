@@ -407,6 +407,7 @@ class DiffGenerator:
                             audios_out=audios_out,
                             frames_out=frames_out,
                             output_compression=requests[0].output_compression,
+                            x264_preset=requests[0].x264_preset,
                             enable_frame_interpolation=requests[
                                 0
                             ].enable_frame_interpolation,
