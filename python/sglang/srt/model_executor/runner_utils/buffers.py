@@ -47,6 +47,12 @@ def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -
             for dst, src in zip(dsts, srcs):
                 dst.copy_(src)
 
+    if dsts and dsts[0].is_cuda:
+        from sglang.kernels.ops.memory.small_copy import try_small_copy
+
+        if try_small_copy(dsts, srcs):
+            return
+
     groups: Dict[Tuple[torch.dtype, torch.dtype], Tuple[List, List]] = {}
     for dst, src in zip(dsts, srcs):
         key = (dst.dtype, src.dtype)
@@ -108,6 +114,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
     num_token_non_padded: Optional[torch.Tensor]
     custom_mask: torch.Tensor
     next_token_logits_buffer: torch.Tensor
+    # Packed aux hidden-state output shared by every captured graph size.
+    aux_hidden_states: Optional[torch.Tensor]
     mamba_track_indices: Optional[torch.Tensor]
     mamba_track_mask: Optional[torch.Tensor]
     global_num_tokens_gpu: torch.Tensor
@@ -142,6 +150,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         pp_proxy_topk_size: Optional[int] = None,
         pp_proxy_residual_num_blocks: Optional[int] = None,
         pp_proxy_dspark_hidden_size: int = 0,
+        aux_hidden_states_width: int = 0,
     ) -> DecodeInputBuffers:
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
@@ -168,6 +177,11 @@ class DecodeInputBuffers(ForwardInputBuffers):
             )
             mamba_track_mask = (
                 torch.zeros((max_bs,), dtype=torch.bool) if enable_mamba_track else None
+            )
+            aux_hidden_states = (
+                torch.zeros((max_num_token, aux_hidden_states_width), dtype=dtype)
+                if aux_hidden_states_width
+                else None
             )
 
             pp_proxy_tensors = (
@@ -240,6 +254,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             num_token_non_padded=num_token_non_padded,
             custom_mask=custom_mask,
             next_token_logits_buffer=next_token_logits_buffer,
+            aux_hidden_states=aux_hidden_states,
             mamba_track_indices=mamba_track_indices,
             mamba_track_mask=mamba_track_mask,
             encoder_lens=encoder_lens,
