@@ -50,13 +50,14 @@ on:
         type: boolean
         default: false
       skip_pr_test_health_check:
-        description: "Skip PR test health check fast-fail (e.g. for release branch cuts)"
+        description: "Skip PR test health check fail-fast (e.g. for release branch cuts)"
         required: false
         type: boolean
         default: false
 
 concurrency:
-  group: pr-test-extra-${{ github.event_name }}-${{ github.head_ref || github.ref_name || 'default' }}-${{ inputs.git_ref || 'all' }}
+  # Keys on the PR number: two forks can share a head_ref and would cancel each other.
+  group: pr-test-extra-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref_name || 'default' }}-${{ inputs.git_ref || 'all' }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 env:
@@ -202,7 +203,14 @@ jobs:
         simulator-test-cpu,
         extra-test,
       ]
-    if: always()
+    # Without this guard an unrelated label starts a run that finishes green with
+    # nothing executed, over the real failure; `skipped` is what pr-states.yml reads.
+    if: |
+      always() &&
+      (github.event_name != 'pull_request' ||
+       github.event.action != 'labeled' ||
+       github.event.label.name == 'run-ci' ||
+       github.event.label.name == 'run-ci-extra')
     runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses
@@ -232,10 +240,14 @@ jobs:
   # there (initial completion) and pull_request_target (push / label).
   notify-pr-states:
     needs: [pr-test-extra-finish]
+    # Same guard; pr-states.yml subscribes to labeled/unlabeled itself, so nothing is lost.
     if: |
       always() &&
       github.event_name == 'pull_request' &&
-      github.event.pull_request.head.repo.full_name == github.repository
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      (github.event.action != 'labeled' ||
+       github.event.label.name == 'run-ci' ||
+       github.event.label.name == 'run-ci-extra')
     runs-on: ubuntu-latest
     steps:
       - name: Dispatch pr-states refresh

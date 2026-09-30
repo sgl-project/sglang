@@ -14,38 +14,22 @@ from sglang.test.test_utils import (
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState  # noqa: E402
 from sglang.srt.managers.scheduler_components.request_receiver import (  # noqa: E402
     SchedulerRequestReceiver,
 )
-from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
+from sglang.srt.managers.scheduler_pp_mixin import (  # noqa: E402
+    SchedulerPPMixin,
+    _pp_exchange_outputs_before_forward,
+)
+from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
-def _make_ps(**overrides) -> ParallelState:
-    defaults = dict(
-        tp_size=8,
-        pp_rank=1,
-        pp_size=2,
-        dp_rank=None,
-        attn_tp_size=2,
-        attn_cp_size=2,
-        attn_dp_rank=1,
-        attn_dp_size=2,
-        moe_dp_rank=None,
-    )
-    defaults.update(overrides)
-    return ParallelState.trivial(**defaults)
-
-
 def _published_topology():
-    """The topology `_make_ps` describes, published instead of stood in.
+    """Publish WORLD rank 12 with TP=8 and PP=2.
 
-    World rank 12 of a `tp=8, pp=2` world is `tp_rank=4` on the second stage,
-    which puts this process at `attn_dp_rank=1` with `attn_tp_rank=0`: the
-    context derives all of them from that one number and the widths, where the
-    record above had to be handed each.
+    This gives TP rank 4, PP rank 1, attention-DP rank 1, and attention-TP rank 0.
     """
     return published_topology(
         role="scheduler",
@@ -62,7 +46,7 @@ def _fake_group() -> SimpleNamespace:
     return SimpleNamespace(rank=0, ranks=[0], cpu_group=object())
 
 
-def _make_receiver(ps: ParallelState) -> SchedulerRequestReceiver:
+def _make_receiver() -> SchedulerRequestReceiver:
     tp_group = _fake_group()
     attn_tp_group = _fake_group()
     attn_cp_group = _fake_group()
@@ -73,7 +57,6 @@ def _make_receiver(ps: ParallelState) -> SchedulerRequestReceiver:
         recv_skipper=None,
         input_blocker=None,
         mm_receiver=None,
-        ps=ps,
         tp_group=tp_group,
         tp_cpu_group=tp_group,
         attn_tp_group=attn_tp_group,
@@ -97,18 +80,16 @@ class TestRequestReceiverBroadcast(unittest.TestCase):
         # Decode uses pure DP attention (attn_tp=attn_cp=1). The DP controller
         # sends control requests to every local leader, so no per-tick Gloo
         # broadcast should remain in SchedulerRequestReceiver.
-        ps = SimpleNamespace(
+        receiver = _make_receiver()
+        control_req = SimpleNamespace(kind="control")
+        parallel = SimpleNamespace(
+            enable_dp_attention=True,
+            enable_dp_attention_local_control_broadcast=True,
             attn_tp_rank=0,
             attn_cp_rank=0,
             attn_tp_size=1,
             attn_cp_size=1,
             tp_size=32,
-        )
-        receiver = _make_receiver(ps)
-        control_req = SimpleNamespace(kind="control")
-        parallel = SimpleNamespace(
-            enable_dp_attention=True,
-            enable_dp_attention_local_control_broadcast=True,
         )
 
         with (
@@ -133,18 +114,16 @@ class TestRequestReceiverBroadcast(unittest.TestCase):
         broadcast.assert_not_called()
 
     def test_default_control_uses_full_tp_broadcast(self):
-        ps = SimpleNamespace(
+        receiver = _make_receiver()
+        control_req = SimpleNamespace(kind="control")
+        parallel = SimpleNamespace(
+            enable_dp_attention=True,
+            enable_dp_attention_local_control_broadcast=False,
             attn_tp_rank=0,
             attn_cp_rank=0,
             attn_tp_size=1,
             attn_cp_size=1,
             tp_size=32,
-        )
-        receiver = _make_receiver(ps)
-        control_req = SimpleNamespace(kind="control")
-        parallel = SimpleNamespace(
-            enable_dp_attention=True,
-            enable_dp_attention_local_control_broadcast=False,
         )
 
         with (
@@ -183,7 +162,6 @@ class TestRequestReceiverBroadcast(unittest.TestCase):
 
 class TestPPCPRankOffsets(unittest.TestCase):
     def test_request_receiver_uses_cp_size_for_pp_recv_rank(self):
-        ps = _make_ps()
         enter_scope(self, _published_topology())
         calls = []
 
@@ -191,7 +169,7 @@ class TestPPCPRankOffsets(unittest.TestCase):
             calls.append((rank, src, dst))
             return ["req"]
 
-        receiver = _make_receiver(ps)
+        receiver = _make_receiver()
         with patch(
             "sglang.srt.managers.scheduler_components.request_receiver."
             "point_to_point_pyobj",
@@ -202,10 +180,8 @@ class TestPPCPRankOffsets(unittest.TestCase):
         self.assertEqual(calls, [(12, 4, 12)])
 
     def test_pp_mixin_uses_cp_size_for_pyobj_send_and_recv_rank(self):
-        ps = _make_ps()
         enter_scope(self, _published_topology())
         scheduler = SchedulerPPMixin()
-        scheduler.ps = ps
         scheduler.world_group = _fake_group()
         scheduler.attn_tp_group = _fake_group()
         scheduler.attn_tp_cpu_group = _fake_group()
@@ -291,6 +267,21 @@ class TestDSparkPPOutput(CustomTestCase):
         torch.testing.assert_close(batch.spec_info.new_seq_lens, batch.seq_lens)
         torch.testing.assert_close(payloads[0].bonus_tokens, tokens)
         self.assertEqual(payloads[0].hidden_states.numel(), 0)
+
+
+class TestPPSpecExchangeOrder(unittest.TestCase):
+    def test_extend_launches_before_the_relay_exchange(self):
+        kwargs = dict(spec_relay=True, is_last_rank=False, async_batch_depth=0)
+        extend = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND, is_extend_in_batch=False
+        )
+        decode = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE, is_extend_in_batch=False
+        )
+        self.assertFalse(
+            _pp_exchange_outputs_before_forward(cur_batch=extend, **kwargs)
+        )
+        self.assertTrue(_pp_exchange_outputs_before_forward(cur_batch=decode, **kwargs))
 
 
 if __name__ == "__main__":

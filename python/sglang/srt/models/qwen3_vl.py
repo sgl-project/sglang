@@ -16,6 +16,7 @@
 
 import logging
 import re
+from array import array
 from collections import defaultdict
 from functools import lru_cache, partial
 from typing import Callable, Iterable, List, Optional, Tuple, Union
@@ -36,10 +37,12 @@ from sglang.srt.layers.attention.vision import (
     VisionAttentionMetadata,
     prepare_vision_attention_metadata,
 )
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.conv import Conv3dLayer
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
@@ -1203,21 +1206,23 @@ class Qwen3LLMModel(Qwen3Model):
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
-            residual = None
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
 
-        aux_hidden_states = []
+        aux_hidden_states = AuxHiddenStateList()
         for layer_idx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer]
         ):
             layer_idx = layer_idx + self.start_layer
-            if layer_idx in self.layers_to_capture:
-                aux_hidden_states.append(
-                    hidden_states + residual if residual is not None else hidden_states
-                )
+            capture_output = (
+                aux_hidden_states.capture
+                if layer_idx in self.layers_to_capture
+                else None
+            )
 
             if self.use_hf_deepstack_order:
                 # HF-order path (RL on-policy / FSDP). SGLang applies residual at the START of the
@@ -1226,29 +1231,31 @@ class Qwen3LLMModel(Qwen3Model):
                 deepstack_embeds = self.get_deepstack_embeds(
                     layer_idx - 1, input_deepstack_embeds
                 )
-                hidden_states, residual = layer(
+                hidden_states = layer(
                     positions,
                     hidden_states,
                     forward_batch,
-                    residual,
                     post_residual_addition=deepstack_embeds,
+                    capture_output=capture_output,
                 )
             else:
                 # Inference path: add deepstack directly to hidden_states at the end of the layer
                 # (original, grounding-correct order).
-                hidden_states, residual = layer(
+                hidden_states = layer(
                     positions,
                     hidden_states,
                     forward_batch,
-                    residual,
+                    capture_output=capture_output,
                 )
                 if (
                     input_deepstack_embeds is not None
                     and layer_idx in self.deepstack_embed_to_decoder_layer
                 ):
                     sep = self.hidden_size * layer_idx
-                    hidden_states.add_(
-                        input_deepstack_embeds[:, sep : sep + self.hidden_size]
+                    hidden_states = residual_batch.add_to_output(
+                        hidden_states,
+                        forward_batch,
+                        input_deepstack_embeds[:, sep : sep + self.hidden_size],
                     )
 
         # Handle deepstack for the last processed layer (HF-order path only).
@@ -1259,20 +1266,14 @@ class Qwen3LLMModel(Qwen3Model):
         )
 
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
-        else:
-            if hidden_states.shape[0] != 0:
-                if residual is None:
-                    hidden_states = self.norm(hidden_states)
-                else:
-                    hidden_states, _ = self.norm(
-                        hidden_states, residual, post_residual_addition=last_deepstack
-                    )
+            return residual_batch.to_pp(hidden_states, forward_batch)
+        hidden_states = residual_batch.final_norm(
+            hidden_states,
+            forward_batch,
+            self.norm,
+            post_residual_addition=last_deepstack,
+            skip_empty=True,
+        )
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -1420,7 +1421,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         cfg = getattr(model, "config", None)
         return int(getattr(cfg, "num_hidden_layers", 0))
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         if mm_inputs and mm_inputs.mm_items:
             _require_vision(self)
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()

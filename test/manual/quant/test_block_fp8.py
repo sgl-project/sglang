@@ -4,12 +4,12 @@ from functools import lru_cache
 
 import torch
 
+from sglang.kernels.ops.gemm.fp8_kernel import w8a8_block_fp8_matmul
 from sglang.kernels.ops.quantization.fp8_kernel import (
     per_tensor_quant_mla_fp8,
     per_token_group_quant_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
     static_quant_fp8,
-    w8a8_block_fp8_matmul,
 )
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
@@ -747,7 +747,6 @@ class TestW8A8BlockFP8BatchedDeepGemm(CustomTestCase):
         )
 
     def test_w8a8_block_fp8_batched_deep_gemm(self):
-
         for params in itertools.product(
             self.M,
             self.N,

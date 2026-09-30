@@ -38,12 +38,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_is_shuffle_moe_mxfp4 = is_gfx95_supported()
-
 __all__ = ["QuarkW4A4MXFp4MoE"]
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_is_gfx95 = is_gfx95_supported()
+_is_shuffle_moe_mxfp4 = _use_aiter and _is_gfx95
 if _use_aiter:
     from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight, shuffle_weight
     from aiter.utility.fp4_utils import e8m0_shuffle
@@ -202,6 +202,8 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             is_concat=True,
             is_packed=True,
         )
+        layer.hidden_pad = 0
+        layer.intermediate_pad = w13_up_dim // 2 - intermediate_size_per_partition
 
         # Add the quantization method used (per tensor/grouped/channel)
         # to ensure the weight scales are loaded in properly
@@ -819,6 +821,11 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         layer.w2_weight = torch.nn.Parameter(qw2_weight, requires_grad=False)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if not getattr(self, "_owns_moe_runner", False):
+            raise RuntimeError(
+                "Quark MXFP4 weight preshuffling requires an owned AITER runner."
+            )
+
         if (
             not self.is_checkpoint_mxfp4_serialized
             or self.dequantization_config is not None
@@ -889,15 +896,19 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         )
 
         self.moe_runner_config = moe_runner_config
+        self._owns_moe_runner = False
         moe_runner_backend = get_moe_runner_backend()
         if moe_runner_backend.is_auto() and get_moe_a2a_backend().supports_aiter():
             moe_runner_backend = MoeRunnerBackend.AITER
 
         if moe_runner_backend.is_aiter():
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+            self._owns_moe_runner = True
         else:
-            # TODO(cwan): refactor other backends
-            pass
+            raise NotImplementedError(
+                "Quark MXFP4 MoE currently requires the AITER runner; "
+                f"got {moe_runner_backend.value!r}."
+            )
 
     def apply_weights(
         self,
@@ -924,6 +935,12 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             from aiter.ops.flydsl.moe_common import GateMode
 
             _fused_moe_kwargs = {"gate_mode": GateMode.INTERLEAVE.value}
+        elif _is_gfx95:
+            from aiter.ops.flydsl.moe_common import GateMode
+
+            # Quark checkpoints store gate and up projections as separate
+            # contiguous row ranges. Keep that ordering for correctness.
+            _fused_moe_kwargs = {"gate_mode": GateMode.SEPARATED.value}
         else:
             _fused_moe_kwargs = None
 
@@ -934,6 +951,9 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             w13_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
             expert_mask=layer.dispatcher.expert_mask_gpu,
+            hidden_pad=getattr(layer, "hidden_pad", 0),
+            intermediate_pad=getattr(layer, "intermediate_pad", 0),
+            swiglu_limit=self.moe_runner_config.swiglu_limit or 0.0,
             fused_moe_kwargs=_fused_moe_kwargs,
         )
         return self.runner.run(dispatch_output, quant_info)
