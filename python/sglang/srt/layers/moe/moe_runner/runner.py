@@ -61,6 +61,12 @@ class MoeRunner:
         self.config = config
         self.lora_enabled = lora_enabled
 
+        if config.silu_mul_keep_fp32 and not runner_backend.is_deep_gemm():
+            raise ValueError(
+                "silu_mul_keep_fp32 is currently supported only by deep_gemm, "
+                f"got {runner_backend.value}"
+            )
+
         # --moe-runner-backend hpc_ops makes the standard dispatcher keep
         # global expert ids (skip_local_expert_mapping), so every MoE layer
         # must actually run the hpc_ops runner. A quant method that falls
@@ -80,9 +86,11 @@ class MoeRunner:
             raise ValueError(
                 "--moe-a2a-backend deepep_v2 requires the deep_gemm MoE runner, "
                 f"but this MoE layer's quantization method selected the "
-                f"'{runner_backend.value}' runner. deepep_v2 dispatches FP8 "
-                "activations plus scales, which only deep_gemm consumes; use an "
-                "FP8 blockwise-quantized checkpoint, or --moe-a2a-backend deepep."
+                f"'{runner_backend.value}' runner. deepep_v2 dispatches into "
+                "the deep_gemm grouped-GEMM layout (FP8 activations plus "
+                "scales, or BF16 activations for unquantized experts); use an "
+                "FP8 blockwise-quantized or BF16 checkpoint, or "
+                "--moe-a2a-backend deepep."
             )
 
         self.fused_func = None

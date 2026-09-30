@@ -232,7 +232,7 @@ class HashTopK(nn.Module):
         if _is_xpu:
             topk_weights, topk_ids = self._forward_xpu(router_logits, input_ids)
         elif envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get():
-            from sglang.kernels.ops.attention.dsv4 import hash_topk
+            from sglang.kernels.ops.moe.dsv4 import hash_topk
 
             topk_weights, topk_ids = hash_topk(
                 router_logits=router_logits,
@@ -254,8 +254,7 @@ class HashTopK(nn.Module):
         log2phy_prob = None
         if (
             expert_location_dispatch_info is not None
-            and getattr(expert_location_dispatch_info, "ep_dispatch_algorithm", None)
-            == "lp"
+            and expert_location_dispatch_info.ep_dispatch_algorithm == "lp"
         ):
             if self.layer_id is None:
                 raise RuntimeError("HashTopK LP dispatch requires layer_id.")
