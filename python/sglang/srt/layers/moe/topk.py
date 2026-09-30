@@ -836,6 +836,7 @@ class TopK(BaseFusedOp):
         *,
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+        dynamic_expert_bias: Optional[torch.Tensor] = None,
     ) -> TopKOutput:
         self.topk_config.torch_native = True
         # [NOTE] XPU device support for topk kernels
@@ -852,6 +853,7 @@ class TopK(BaseFusedOp):
             topk_config=self.topk_config,
             num_token_non_padded=num_token_non_padded,
             expert_location_dispatch_info=expert_location_dispatch_info,
+            dynamic_expert_bias=dynamic_expert_bias,
         )
 
 
