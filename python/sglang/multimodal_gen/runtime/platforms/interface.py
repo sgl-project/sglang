@@ -211,9 +211,8 @@ class Platform:
 
     @classmethod
     def is_gfx1151(cls) -> bool:
-        """True on the gfx1151 (Strix Halo) ROCm arch. Base default is False;
-        overridden on RocmPlatform, which is the only platform that can be
-        gfx1151."""
+        """True on the gfx1151 (Strix Halo) ROCm arch. Overridden on
+        RocmPlatform; every other platform is False."""
         return False
 
     @classmethod

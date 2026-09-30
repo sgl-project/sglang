@@ -57,8 +57,6 @@ class RocmPlatform(Platform):
     @classmethod
     @lru_cache(maxsize=1)
     def is_gfx1151(cls) -> bool:
-        """True on gfx1151 (Strix Halo APU), which hangs decoding full-frame
-        VAE tiles at >=896px; see the Qwen-Image 2.1 default-tiling fix."""
         return cls.get_gcn_arch_name().startswith("gfx1151")
 
     @classmethod

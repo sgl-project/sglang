@@ -19,12 +19,8 @@ class QwenImage21PipelineConfig(ImagePipelineConfig):
     task_type: ModelTaskType = ModelTaskType.TI2I
     should_use_guidance: bool = False
     enable_autocast: bool = False
-    # Keep the fast (non-tiled) default everywhere except gfx1151, where
-    # should_enable_vae_tiling() below forces tiling on regardless of this
-    # value. Measured on CUDA, tiling costs ~2.6x-3.8x decode wall time (see
-    # PR #41655 discussion), so platforms without the gfx1151 hang should not
-    # pay that cost by default. --vae-tiling still applies on every other
-    # platform.
+    # User-controlled default; see should_enable_vae_tiling() for the
+    # gfx1151-specific override.
     vae_tiling: bool = False
     vae_sp: bool = False
     vae_precision: str = "bf16"
@@ -36,12 +32,11 @@ class QwenImage21PipelineConfig(ImagePipelineConfig):
 
     def should_enable_vae_tiling(self, latents: torch.Tensor) -> bool:
         del latents
+        # gfx1151 hangs decoding a full (non-tiled) frame at >=896px, so force
+        # tiling on there regardless of --vae-tiling. Untiled decode on CUDA
+        # measures 2.6x-3.8x faster than tiled, so other platforms keep the
+        # user-controlled default instead of paying that cost unconditionally.
         if current_platform.is_gfx1151():
-            # gfx1151 hangs decoding a full (non-tiled) frame at >=896px;
-            # tiling avoids the hang with no correctness issue (hash-verified
-            # reproducible per mode on gfx1151), so force it on there
-            # regardless of --vae-tiling. Other platforms keep the
-            # user-controlled default (see vae_tiling above).
             return True
         return self.vae_tiling
 

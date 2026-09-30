@@ -359,11 +359,8 @@ def test_latent_pack_decode_contract():
 
 
 def test_vae_tiling_defaults_off_but_forced_on_for_gfx1151(monkeypatch):
-    # Full-frame decode hangs on gfx1151 from 896px upward, so Qwen-Image 2.1
-    # forces tiling on there regardless of --vae-tiling. Measured on CUDA,
-    # tiling costs ~2.6x-3.8x decode wall time, so platforms without the
-    # gfx1151 hang keep the fast (untiled) default instead of paying that
-    # cost unconditionally.
+    # See QwenImage21PipelineConfig.should_enable_vae_tiling for why this is
+    # gfx1151-only rather than a global default.
     latents = torch.zeros(1, 4, 1, 56, 56)
     module = "sglang.multimodal_gen.configs.pipeline_configs.qwen_image21"
 
