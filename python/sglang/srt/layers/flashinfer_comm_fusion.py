@@ -941,7 +941,7 @@ def can_use_flashinfer_allreduce(
 
     # Size checks stay last: they read the token dim, which is symbolic under
     # Dynamo, so statically-off configs must short-circuit before reaching them
-    # (same ordering rule as apply_flashinfer_allreduce_fusion).
+    # (same ordering rule as flashinfer_ar_fusion_applies).
     token_num, hidden_dim = input_.shape
 
     # MNNVL hard-fails instead of falling back when the width is not float4-aligned

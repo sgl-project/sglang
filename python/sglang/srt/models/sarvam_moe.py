@@ -25,7 +25,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.layer_boundary import (
     declare_attn,
     declare_ffn,
-    enable_moe_dense_fully_dp,
+    is_dense_ffn_fully_dp,
     make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
@@ -300,7 +300,7 @@ class SarvamMoESparseMoeBlock(nn.Module):
             and config.num_shared_experts > 0
         ):
             intermediate_size = config.moe_intermediate_size * config.num_shared_experts
-            if enable_moe_dense_fully_dp():
+            if is_dense_ffn_fully_dp():
                 shared_tp_rank, shared_tp_size = 0, 1
             else:
                 shared_tp_rank, shared_tp_size = None, None
@@ -1028,7 +1028,7 @@ class SarvamMoEMLADecoderLayer(nn.Module):
                 alt_stream=alt_stream,
             )
         else:
-            if enable_moe_dense_fully_dp():
+            if is_dense_ffn_fully_dp():
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
@@ -1059,12 +1059,12 @@ class SarvamMoEMLADecoderLayer(nn.Module):
             (
                 declare_ffn(
                     sparse=self.is_layer_sparse,
-                    next_sparse=is_next_layer_sparse,
+                    next_layer_sparse=is_next_layer_sparse,
                 ),
                 self.post_attention_layernorm,
             ),
             previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_sparse=self.is_layer_sparse
+                sparse=is_previous_layer_sparse, next_layer_sparse=self.is_layer_sparse
             )
             if layer_id != 0
             else None,
@@ -1172,7 +1172,9 @@ class SarvamMLAModel(nn.Module):
         hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
 
         if hidden_states.shape[0] != 0:
-            hidden_states = residual_batch.norm(hidden_states, forward_batch, self.norm)
+            hidden_states = residual_batch.final_norm(
+                hidden_states, forward_batch, self.norm
+            )
 
         return hidden_states
 
@@ -1275,7 +1277,7 @@ class SarvamMLAForCausalLM(nn.Module):
             forward_batch.hidden_states = residual_batch.complete_output(
                 forward_batch.hidden_states, forward_batch
             )
-            forward_batch.hidden_states = residual_batch.norm(
+            forward_batch.hidden_states = residual_batch.final_norm(
                 forward_batch.hidden_states, forward_batch, self.model.norm
             )
             return self.logits_processor(
@@ -1454,7 +1456,7 @@ class SarvamMoEForCausalLM(BailingMoEForCausalLM):
             forward_batch.hidden_states = residual_batch.complete_output(
                 forward_batch.hidden_states, forward_batch
             )
-            forward_batch.hidden_states = residual_batch.norm(
+            forward_batch.hidden_states = residual_batch.final_norm(
                 forward_batch.hidden_states, forward_batch, self.model.norm
             )
 

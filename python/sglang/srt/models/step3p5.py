@@ -571,12 +571,13 @@ class Step3p5DecoderLayer(nn.Module):
             (
                 declare_ffn(
                     sparse=self.is_moe_layer,
-                    next_sparse=self.is_next_layer_sparse,
+                    next_layer_sparse=self.is_next_layer_sparse,
                 ),
                 self.post_attention_layernorm,
             ),
             previous=declare_ffn(
-                sparse=self.is_previous_layer_sparse, next_sparse=self.is_moe_layer
+                sparse=self.is_previous_layer_sparse,
+                next_layer_sparse=self.is_moe_layer,
             )
             if not (0 if is_nextn else layer_id) == 0
             else None,
@@ -721,7 +722,7 @@ class Step3p5Model(nn.Module):
                     hidden_states_before_norm = residual_batch.snapshot(
                         hidden_states, forward_batch
                     )
-                    hidden_states = residual_batch.norm(
+                    hidden_states = residual_batch.final_norm(
                         hidden_states, forward_batch, self.norm
                     )
             return hidden_states, hidden_states_before_norm
