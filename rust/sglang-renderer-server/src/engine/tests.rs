@@ -9,8 +9,10 @@ use super::{
     GenerateTransport, GenerationService, TokenDecoder, TokenDelta, TokenStream,
     test_utils::{position, tiny_tokenizer},
 };
-use crate::{GenerationFinishReason, GenerationOutputExtras, MatchedStop};
-use sglang_processor::{GenerateRequest, GenerationOptions, ResponseError, TokenIdsRequest};
+use crate::{
+    GenerateRequest, GenerationFinishReason, GenerationOptions, GenerationOutputExtras,
+    MatchedStop, ResponseError, TokenIdsRequest,
+};
 
 struct DropNotice(Arc<AtomicUsize>);
 

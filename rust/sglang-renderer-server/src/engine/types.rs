@@ -2,7 +2,7 @@
 
 use futures::stream::BoxStream;
 
-use sglang_processor::{ResponseError, TokenIds};
+use crate::{ResponseError, TokenIds};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum MatchedStop {

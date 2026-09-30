@@ -20,10 +20,12 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+flume = "0.12.0"
 
 axum = { version = "0.8.9", features = ["json"] }
 clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+regex-syntax = "=0.8.11"
 hf-hub = { version = "0.4", default-features = false, features = ["rustls-tls", "tokio"] }
 
 [dev-dependencies]

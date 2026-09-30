@@ -2,11 +2,10 @@
 
 use super::internal;
 use crate::{
-    GenerationFinishReason, GenerationOutputExtras, MatchedStop, PositionLogprobs, TokenLogprob,
-    engine::TokenDelta,
+    GenerationFinishReason, GenerationOutputExtras, MatchedStop, PositionLogprobs, ResponseError,
+    ResponseErrorKind, TokenIds, TokenLogprob, UpstreamErrorCode, engine::TokenDelta,
 };
 use serde::Deserialize;
-use sglang_processor::{ResponseError, ResponseErrorKind, TokenIds, UpstreamErrorCode};
 
 type WireLogprob = (Option<f32>, i32, Option<String>);
 type WireTopLogprobs = Vec<Option<Vec<WireLogprob>>>;
@@ -273,8 +272,7 @@ pub(super) fn engine_error_message(body: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::test_utils::position;
-    use sglang_processor::{ResponseErrorKind, UpstreamErrorCode};
+    use crate::{ResponseErrorKind, UpstreamErrorCode, engine::test_utils::position};
 
     #[test]
     fn engine_frame_maps_tokens_usage_finish_and_logprobs() {

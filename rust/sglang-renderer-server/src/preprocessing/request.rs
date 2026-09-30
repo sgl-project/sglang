@@ -2,8 +2,8 @@
 
 use std::collections::BTreeMap;
 
-use dynamo_renderer::RenderedPrompt;
 use serde::{Deserialize, Serialize};
+use sglang_processor::dynamo_renderer::RenderedPrompt;
 
 use crate::{SamplingParams, TokenIds};
 
@@ -121,11 +121,6 @@ impl TextRequest {
             options,
             metadata: GenerateRequestMetadata::default(),
         }
-    }
-
-    pub fn with_metadata(mut self, metadata: GenerateRequestMetadata) -> Self {
-        self.metadata = metadata;
-        self
     }
 }
 

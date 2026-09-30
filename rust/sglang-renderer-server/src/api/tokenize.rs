@@ -6,11 +6,9 @@ use serde_json::{Value, json};
 use sglang_processor::dynamo_protocols::types::{
     ChatCompletionRequestMessage, ChatCompletionTool, ChatCompletionToolChoiceOption,
 };
+use sglang_processor::{ChatRequest, ReasoningEffort};
 
-use sglang_processor::{
-    ChatRequest, GenerateRequestMetadata, OneOrMany, ReasoningEffort, RendererError,
-    RendererService, ResponseError, ResponseErrorKind,
-};
+use crate::{OneOrMany, RendererError, RendererService, ResponseError, ResponseErrorKind};
 
 use super::protocol::normalize_reasoning_inputs;
 
@@ -95,7 +93,6 @@ impl TokenizeRequest {
             return Err(format!("The model `{model}` does not exist").into());
         }
         Ok(ChatRequest {
-            rid: "tokenize".into(),
             model,
             messages: self
                 .messages
@@ -107,13 +104,7 @@ impl TokenizeRequest {
             reasoning_effort: self.reasoning_effort,
             continue_final_message: self.continue_final_message,
             chat_template_args: self.chat_template_kwargs,
-            sampling_params: Default::default(),
-            choice_count: 1,
-            stream: false,
-            return_logprob: false,
-            top_logprobs_num: 0,
             parallel_tool_calls: true,
-            metadata: GenerateRequestMetadata::default(),
         })
     }
 }

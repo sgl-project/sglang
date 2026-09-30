@@ -1,8 +1,9 @@
 //! Generation stream merging and aggregation.
 
-use crate::{GenerationOutput, GenerationOutputExtras, GenerationStream};
+use crate::{
+    GenerationOutput, GenerationOutputExtras, GenerationStream, ResponseError, ResponseErrorKind,
+};
 use futures::{StreamExt, stream::BoxStream};
-use sglang_processor::{ResponseError, ResponseErrorKind};
 
 pub(crate) fn merge_indexed(
     streams: Vec<GenerationStream>,

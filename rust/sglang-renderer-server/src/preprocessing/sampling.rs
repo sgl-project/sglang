@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::{error::RendererError as Error, types::OneOrMany};
+use crate::{OneOrMany, RendererError as Error};
 
 use super::regex::RegexPattern;
 

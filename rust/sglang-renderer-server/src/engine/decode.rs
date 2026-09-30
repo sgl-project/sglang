@@ -1,8 +1,11 @@
 //! Prompt and generated-token decoding, including local text stops.
 
 use super::{internal, invalid};
-use crate::{GenerationOutput, GenerationOutputExtras, TokenLogprob};
-use sglang_processor::{GenerateRequest, ResponseError, TokenIds, dynamo_tokenizers};
+use crate::{
+    GenerateRequest, GenerationOutput, GenerationOutputExtras, ResponseError, TokenIds,
+    TokenLogprob,
+};
+use sglang_processor::dynamo_tokenizers;
 
 use super::{GenerationFinishReason, GenerationStream, MatchedStop, TokenStream};
 use futures::StreamExt;
@@ -268,7 +271,7 @@ fn fill_text(tokenizer: &dynamo_tokenizers::Tokenizer, token: &mut TokenLogprob)
 mod tests {
     use super::super::test_utils::{position, tiny_tokenizer};
     use super::*;
-    use sglang_processor::{GenerationOptions, SamplingParams, TokenIdsRequest};
+    use crate::{GenerationOptions, SamplingParams, TokenIdsRequest};
 
     fn request(stop: Vec<&str>) -> GenerateRequest {
         TokenIdsRequest {

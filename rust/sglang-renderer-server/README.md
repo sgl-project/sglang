@@ -14,9 +14,11 @@ request fields or server behavior changes are deferred to separate PRs.
 This service is a stopgap for integrations that need a standalone
 OpenAI-to-token-IDs frontend today, such as llm-d. It will be removed once
 sgl-router serves OpenAI requests as preprocessed `GenerateRequest`s.
-Preprocessing lives in the [`sglang-processor`](../sglang-processor) library,
-which sgl-router and the Rust server share. This package only adds the OpenAI
-routes, generation decoding, the HTTP engine client, and the process runtime.
+Chat templates, tokenization, and output parsing come from the
+[`sglang-processor`](../sglang-processor) library, which sgl-router and the
+Rust server share. This package adds the OpenAI routes, request preparation
+and validation, generation decoding, the HTTP engine client, and the process
+runtime.
 
 ## Build and run
 

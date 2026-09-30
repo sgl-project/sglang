@@ -6,8 +6,8 @@ use async_stream::stream;
 use futures::{StreamExt, future::BoxFuture};
 
 use super::{GenerateTransport, TokenStream, internal};
+use crate::{GenerateRequest, ResponseError, ResponseErrorKind, UpstreamErrorCode};
 use protocol::{engine_error_message, normalize_engine_output, parse_engine_frame};
-use sglang_processor::{GenerateRequest, ResponseError, ResponseErrorKind, UpstreamErrorCode};
 
 mod protocol;
 
@@ -202,14 +202,16 @@ fn event_end(bytes: &[u8]) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::test_utils::tiny_tokenizer;
+    use crate::{
+        GenerationOptions, ResponseErrorKind, TokenIds, TokenIdsRequest,
+        engine::test_utils::tiny_tokenizer,
+    };
     use axum::{
         Json, Router,
         extract::State,
         response::sse::{Event, Sse},
         routing::post,
     };
-    use sglang_processor::{GenerationOptions, ResponseErrorKind, TokenIds, TokenIdsRequest};
     use std::convert::Infallible;
     use std::sync::{Arc, Mutex};
 

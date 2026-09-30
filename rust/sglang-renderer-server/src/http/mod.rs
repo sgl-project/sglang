@@ -5,6 +5,7 @@ use std::sync::Arc;
 use axum::Router;
 
 use crate::{
+    RendererService,
     api::OpenAIService,
     api::protocol::{ChatCompletionRequest, CompletionRequest},
     engine::HttpGenerateClient,
@@ -20,8 +21,6 @@ mod tokenize;
 
 #[cfg(test)]
 mod tests;
-
-use sglang_processor::RendererService;
 
 const DEFAULT_REQUEST_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 

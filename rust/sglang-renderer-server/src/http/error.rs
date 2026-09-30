@@ -5,7 +5,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use sglang_processor::{ResponseError, ResponseErrorKind, UpstreamErrorCode};
+use crate::{ResponseError, ResponseErrorKind, UpstreamErrorCode};
 
 fn openai_error(code: StatusCode, message: impl Into<String>) -> Response {
     (code, Json(error_payload(code, message))).into_response()

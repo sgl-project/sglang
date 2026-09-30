@@ -1,10 +1,7 @@
 use std::sync::{Arc, Mutex};
 
-use dynamo_protocols::types::ChatCompletionRequestMessage;
-use sglang_processor::{
-    ChatRequest, GenerateRequestMetadata, GenerationOptions, RendererConfig, RendererError,
-    RendererLimits, RendererService, SamplingDefaults, SamplingParams, TextRequest, TextTokenizer,
-};
+use sglang_processor::dynamo_protocols::types::ChatCompletionRequestMessage;
+use sglang_processor::{ChatConfig, ChatPreprocessor, ChatRequest, ProcessorError, TextTokenizer};
 
 #[derive(Clone, Default)]
 struct RecordingTokenizer {
@@ -12,7 +9,7 @@ struct RecordingTokenizer {
 }
 
 impl TextTokenizer for RecordingTokenizer {
-    fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<i32>, RendererError> {
+    fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<i32>, ProcessorError> {
         self.prompts
             .lock()
             .unwrap()
@@ -21,54 +18,12 @@ impl TextTokenizer for RecordingTokenizer {
     }
 }
 
-fn config() -> RendererConfig {
-    RendererConfig {
-        served_model_name: "model".into(),
-        tokenizer_path: ".".into(),
-        revision: None,
-        model_path: String::new(),
-        chat_template: Some("chatml".into()),
-        tool_call_parser: None,
-        reasoning_parser: None,
-        default_chat_template_kwargs: Default::default(),
-        stream_response_default_include_usage: false,
-        default_sampling_params: SamplingDefaults::default(),
-        limits: RendererLimits {
-            vocab_size: 128,
-            context_len: 128,
-            num_reserved_tokens: 0,
-            allow_auto_truncate: false,
-            enable_return_hidden_states: false,
-        },
-    }
-}
-
-#[test]
-fn completion_and_chat_share_the_public_text_preparation_boundary() {
-    let tokenizer = RecordingTokenizer::default();
-    let prompts = tokenizer.prompts.clone();
-    let renderer = RendererService::with_tokenizer(config(), Arc::new(tokenizer), 1, 8);
-
-    let completion = TextRequest::text(
-        "completion-0",
-        "plain completion",
-        true,
-        GenerationOptions {
-            sampling_params: SamplingParams {
-                max_new_tokens: Some(1),
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-    );
-    futures::executor::block_on(renderer.prepare_text_requests(vec![completion])).unwrap();
-
+fn chat_request() -> ChatRequest {
     let messages: Vec<ChatCompletionRequestMessage> = serde_json::from_value(serde_json::json!([
         {"role": "user", "content": "hello"}
     ]))
     .unwrap();
-    let chat = ChatRequest {
-        rid: "chat".into(),
+    ChatRequest {
         model: "model".into(),
         messages,
         tools: None,
@@ -77,28 +32,32 @@ fn completion_and_chat_share_the_public_text_preparation_boundary() {
         reasoning_effort: None,
         continue_final_message: false,
         chat_template_args: None,
-        sampling_params: SamplingParams {
-            max_new_tokens: Some(1),
-            ..Default::default()
-        },
-        choice_count: 1,
-        stream: false,
-        return_logprob: false,
-        top_logprobs_num: 0,
         parallel_tool_calls: true,
-        metadata: GenerateRequestMetadata::default(),
-    };
-    futures::executor::block_on(renderer.prepare_chat(chat)).unwrap();
+    }
+}
 
-    let prompts = prompts.lock().unwrap();
-    assert!(
-        prompts
-            .iter()
-            .any(|(text, add_special_tokens)| text == "plain completion" && *add_special_tokens)
+#[test]
+fn rendered_chat_is_tokenized_through_the_public_tokenizer_boundary() {
+    let preprocessor = ChatPreprocessor::load(&ChatConfig {
+        tokenizer_path: ".".into(),
+        chat_template: Some("chatml".into()),
+        ..Default::default()
+    });
+    let chat = preprocessor.preprocess(chat_request()).unwrap();
+    assert_eq!(
+        chat.template_stops.as_deref(),
+        Some(["<|endoftext|>".to_owned(), "<|im_end|>".to_owned()].as_slice())
     );
-    assert!(
-        prompts
-            .iter()
-            .any(|(text, add_special_tokens)| text.contains("hello") && !add_special_tokens)
-    );
+    assert!(chat.tool_constraint.is_none());
+    assert!(!chat.tool_calls_enabled);
+
+    let tokenizer = RecordingTokenizer::default();
+    let input_ids = tokenizer.encode(chat.prompt.as_str(), false).unwrap();
+
+    assert_eq!(input_ids, [7]);
+    let prompts = tokenizer.prompts.lock().unwrap();
+    assert!(prompts.iter().any(
+        |(text, add_special_tokens)| text.contains("<|im_start|>user\nhello")
+            && !add_special_tokens
+    ));
 }

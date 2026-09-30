@@ -1,8 +1,8 @@
 //! OpenAI completion preparation, response aggregation, and typed chunks.
 
 use crate::{
-    GenerationFinishReason, GenerationOutput, GenerationOutputExtras, GenerationStream,
-    MatchedStop, PositionLogprobs,
+    GenerateRequest, GenerationFinishReason, GenerationOutput, GenerationOutputExtras,
+    GenerationStream, MatchedStop, PositionLogprobs, RendererError, RendererService, ResponseError,
     engine::TokenDecoder,
     engine::response::{collect_output, merge_indexed},
 };
@@ -19,7 +19,6 @@ use super::{
 use futures::StreamExt;
 use serde::Serialize;
 use sglang_processor::dynamo_protocols::types::{CompletionUsage, Prompt};
-use sglang_processor::{GenerateRequest, RendererError, RendererService, ResponseError};
 
 pub(crate) struct SubmittedChoice {
     pub(crate) index: usize,
@@ -460,12 +459,13 @@ mod tests {
         unary_completion,
     };
     use crate::{
-        GenerationOutputExtras, PositionLogprobs, TokenLogprob,
+        GenerationOutputExtras, PositionLogprobs, RendererService, ResponseError,
+        ResponseErrorKind, TokenLogprob,
         api::test_utils::{chunk, renderer_config, submitted},
         engine::{TokenDecoder, test_utils::tiny_tokenizer},
     };
     use futures::StreamExt;
-    use sglang_processor::{DynamoTokenizer, RendererService, ResponseError, ResponseErrorKind};
+    use sglang_processor::DynamoTokenizer;
     use std::sync::Arc;
 
     #[tokio::test]

@@ -1,12 +1,12 @@
 //! HTTP SSE framing for typed OpenAI response streams.
 
 use super::error::error_payload;
+use crate::ResponseError;
 use axum::response::{
     IntoResponse, Response,
     sse::{Event, Sse},
 };
 use futures::{Stream, StreamExt};
-use sglang_processor::ResponseError;
 use std::convert::Infallible;
 
 pub(super) fn sse_response<T, S, F>(chunks: S, serialize: F) -> Response

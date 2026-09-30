@@ -2,7 +2,7 @@
 
 use futures::{StreamExt, TryStreamExt, future::BoxFuture};
 
-use sglang_processor::{GenerateRequest, ResponseError, ResponseErrorKind};
+use crate::{GenerateRequest, ResponseError, ResponseErrorKind};
 
 mod decode;
 mod http;

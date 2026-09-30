@@ -1,37 +1,26 @@
-//! Reusable request preprocessing for SGLang over the Dynamo frontend crates.
+//! Shared SGLang wrappers over Dynamo's frontend crates.
 //!
-//! The library renders normalized chat requests, lowers textual completions,
-//! tokenizes prompts, and produces the token-in contract consumed by SGLang.
-//! It also parses generated output into chat events. Hosts own their protocol
-//! handling, transport, and runtime.
+//! The library loads and applies model chat templates, tokenizes rendered
+//! prompts, derives tool-call constraints, and parses generated output into
+//! chat events, using `dynamo-renderer`, `dynamo-tokenizers`, and
+//! `dynamo-parsers`. Hosts own request types, sampling, validation,
+//! transport, and runtime.
 
-mod config;
 mod error;
 mod postprocessing;
 mod preprocessing;
-mod types;
 
-pub use config::{RendererConfig, RendererLimits, SamplingDefaults};
-pub use error::{
-    RendererError, RendererErrorKind, ResponseError, ResponseErrorKind, UpstreamErrorCode,
-};
+pub use error::ProcessorError;
 pub use postprocessing::{
     ChatEvent, ChatFinishReason, ChatResponseProcessor, ChatToolCallDelta, DecodedChatEvent,
 };
-pub(crate) use preprocessing::ChatFormatter;
-pub(crate) use preprocessing::{ChatPreprocessor, LoweredChat};
 pub use preprocessing::{
-    ChatRequest, DynamoTokenizer, PreparedChat, ReasoningEffort, RendererService, SamplingParams,
-    TextTokenizer, load_tokenizer,
+    ChatConfig, ChatPreprocessor, ChatRequest, ReasoningEffort, RenderedChat, ToolConstraint,
 };
 pub use preprocessing::{
-    GenerateRequest, GenerateRequestMetadata, GenerateSamplingParams, GenerationOptions,
-    TextRequest, TokenIdsRequest,
+    DynamoTokenizer, TextTokenizer, load_tokenizer, resolve_chat_template_file, resolve_model_file,
+    resolve_tokenizer_file,
 };
-pub use preprocessing::{
-    GenerateRequestIdentity, TextRequestGroup, resolve_model_file, resolve_tokenizer_file,
-};
-pub use types::{OneOrMany, TokenIds};
 
 // Dynamo crates whose types appear in this crate's public API. Hosts use these
 // re-exports so their Dynamo versions always match the processor's.

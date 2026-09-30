@@ -22,6 +22,7 @@ mod suite {
     use tower::ServiceExt;
 
     use crate::{
+        RendererService,
         api::test_utils::renderer_config,
         engine::test_utils::tiny_tokenizer,
         engine::{GenerationService, TokenDecoder},
@@ -31,12 +32,16 @@ mod suite {
         DEFAULT_REQUEST_BODY_LIMIT_BYTES, HttpGenerateClient, OpenAIService, hosted_routes,
         render_only_routes, standalone_routes,
     };
-    use sglang_processor::{RendererError, RendererService, TextTokenizer};
+    use sglang_processor::{ProcessorError, TextTokenizer};
 
     struct WordTokenizer;
 
     impl TextTokenizer for WordTokenizer {
-        fn encode(&self, text: &str, _add_special_tokens: bool) -> Result<Vec<i32>, RendererError> {
+        fn encode(
+            &self,
+            text: &str,
+            _add_special_tokens: bool,
+        ) -> Result<Vec<i32>, ProcessorError> {
             Ok(text.split_whitespace().map(|_| 7).collect())
         }
     }

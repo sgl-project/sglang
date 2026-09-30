@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use crate::{
     GenerationFinishReason, GenerationOutput, GenerationOutputExtras, GenerationStream,
+    PreparedChat, RendererService, ResponseError, ResponseErrorKind,
     engine::response::merge_indexed,
 };
 use futures::StreamExt;
@@ -19,7 +20,6 @@ use sglang_processor::dynamo_protocols::types::{
 };
 use sglang_processor::{
     ChatEvent, ChatFinishReason, ChatResponseProcessor, ChatToolCallDelta, DecodedChatEvent,
-    PreparedChat, RendererService, ResponseError, ResponseErrorKind,
 };
 
 use super::protocol::{ChatCompletionRequest, lower_chat_request};
@@ -583,22 +583,24 @@ impl super::OpenAIService {
 mod tests {
     use super::{ChatResponseContext, chat_event_stream, chat_logprobs, unary_chat};
     use crate::{
-        GenerationOutputExtras, PositionLogprobs, TokenLogprob,
+        GenerationOutputExtras, PositionLogprobs, RendererConfig, RendererLimits, RendererService,
+        ResponseError, ResponseErrorKind, SamplingDefaults, TokenLogprob, UpstreamErrorCode,
         api::protocol::ChatCompletionRequest,
         api::protocol::{chat_sampling_params, lower_chat_request},
         api::test_utils::{chat_submitted, chunk},
     };
     use futures::{FutureExt, StreamExt};
-    use sglang_processor::{
-        ChatResponseProcessor, RendererConfig, RendererError, RendererLimits, RendererService,
-        ResponseError, ResponseErrorKind, SamplingDefaults, TextTokenizer, UpstreamErrorCode,
-    };
+    use sglang_processor::{ChatResponseProcessor, ProcessorError, TextTokenizer};
     use std::sync::Arc;
 
     struct WordTokenizer;
 
     impl TextTokenizer for WordTokenizer {
-        fn encode(&self, text: &str, _add_special_tokens: bool) -> Result<Vec<i32>, RendererError> {
+        fn encode(
+            &self,
+            text: &str,
+            _add_special_tokens: bool,
+        ) -> Result<Vec<i32>, ProcessorError> {
             Ok(text.split_whitespace().map(|_| 7).collect())
         }
     }

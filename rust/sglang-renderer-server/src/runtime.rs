@@ -3,15 +3,13 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use sglang_processor::{
-    DynamoTokenizer, RendererConfig, RendererService, TextTokenizer, load_tokenizer,
-};
-
 use crate::{
+    RendererConfig, RendererService,
     api::OpenAIService,
     engine::{GenerationService, HttpGenerateClient, TokenDecoder},
     http::{hosted_routes, render_only_routes, standalone_routes},
 };
+use sglang_processor::{DynamoTokenizer, TextTokenizer, load_tokenizer};
 
 #[derive(Clone, Debug)]
 pub struct RendererRuntimeConfig {

@@ -4,7 +4,7 @@ use super::{
     ChatCompletionRequest, CompletionRequest,
     error::{json_rejection_response, response_error},
 };
-use crate::engine::HttpGenerateClient;
+use crate::{RendererService, engine::HttpGenerateClient};
 use axum::{
     Json, Router,
     extract::{State, rejection::JsonRejection},
@@ -12,7 +12,6 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use sglang_processor::RendererService;
 use std::sync::Arc;
 
 pub(super) fn routes(renderer: Arc<RendererService>) -> Router<()> {
@@ -91,14 +90,17 @@ mod tests {
     };
     use tower::ServiceExt;
 
-    use sglang_processor::{
-        RendererConfig, RendererError, RendererLimits, SamplingDefaults, TextTokenizer,
-    };
+    use crate::{RendererConfig, RendererLimits, SamplingDefaults};
+    use sglang_processor::{ProcessorError, TextTokenizer};
 
     struct WordTokenizer;
 
     impl TextTokenizer for WordTokenizer {
-        fn encode(&self, text: &str, _add_special_tokens: bool) -> Result<Vec<i32>, RendererError> {
+        fn encode(
+            &self,
+            text: &str,
+            _add_special_tokens: bool,
+        ) -> Result<Vec<i32>, ProcessorError> {
             Ok(text.split_whitespace().map(|_| 7).collect())
         }
     }

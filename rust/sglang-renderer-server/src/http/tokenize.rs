@@ -1,7 +1,10 @@
 //! HTTP tokenization adapter.
 
 use super::error::{json_rejection_response, response_error};
-use crate::api::tokenize::{TokenizeRequest, tokenize as tokenize_request};
+use crate::{
+    RendererService,
+    api::tokenize::{TokenizeRequest, tokenize as tokenize_request},
+};
 use axum::{
     Json, Router,
     extract::{State, rejection::JsonRejection},
@@ -9,7 +12,6 @@ use axum::{
     routing::post,
 };
 use serde_json::Value;
-use sglang_processor::RendererService;
 use std::sync::Arc;
 
 pub(super) fn routes(renderer: Arc<RendererService>) -> Router<()> {
@@ -40,14 +42,13 @@ mod tests {
     use serde_json::json;
     use tower::ServiceExt;
 
-    use sglang_processor::{
-        RendererConfig, RendererError, RendererLimits, SamplingDefaults, TextTokenizer,
-    };
+    use crate::{RendererConfig, RendererLimits, SamplingDefaults};
+    use sglang_processor::{ProcessorError, TextTokenizer};
 
     struct PrefixTokenizer;
 
     impl TextTokenizer for PrefixTokenizer {
-        fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<i32>, RendererError> {
+        fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<i32>, ProcessorError> {
             Ok(add_special_tokens
                 .then_some(1)
                 .into_iter()

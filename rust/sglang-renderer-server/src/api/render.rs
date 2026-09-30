@@ -1,7 +1,7 @@
 //! OpenAI render-only operations, without model execution or HTTP framing.
 
 use super::protocol::{ChatCompletionRequest, CompletionRequest};
-use sglang_processor::{GenerateRequest, RendererService, ResponseError, ResponseErrorKind};
+use crate::{GenerateRequest, RendererService, ResponseError, ResponseErrorKind};
 
 pub(crate) async fn render_chat(
     renderer: &RendererService,

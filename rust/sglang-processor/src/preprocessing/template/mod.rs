@@ -23,7 +23,12 @@ use minijinja::machinery::{Token, tokenize};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::OneOrMany;
+/// Legacy stop strings: a single separator-style stop or a list of stops.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum OneOrMany<T> {
+    One(T),
+    Many(Vec<T>),
+}
 
 pub(crate) use self::deepseek_v4::DeepSeekV4Profile;
 use self::{
@@ -33,6 +38,9 @@ use self::{
 
 mod deepseek_v4;
 mod kimi_k25;
+mod select;
+
+pub(crate) use self::select::load_chat_support;
 
 const SUPPORTED_STYLES: &[&str] = &[
     "ADD_COLON_SINGLE",
