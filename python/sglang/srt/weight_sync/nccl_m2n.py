@@ -6,6 +6,7 @@ import hashlib
 import json
 from collections import deque
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -13,15 +14,9 @@ import torch
 import torch.distributed as dist
 
 _ROUTED_EXPERT_WEIGHT_RECIPES = frozenset(("expert_gate", "expert_up", "expert_down"))
-_FP8_WEIGHT_RECIPES = {
-    "expert_gate": "expert_fc1_0",
-    "expert_up": "expert_fc1_1",
-    "expert_down": "expert_fc2",
-}
-_FP8_SCALE_RECIPES = {
-    f"{recipe}_scale": f"{source}_scale"
-    for recipe, source in _FP8_WEIGHT_RECIPES.items()
-}
+_FP8_SCALE_RECIPES = frozenset(
+    f"{recipe}_scale" for recipe in _ROUTED_EXPERT_WEIGHT_RECIPES
+)
 _FP8_BLOCK_SIZE = 128
 _FP8_QUANTIZATION = {
     "quant_method": "fp8",
@@ -29,7 +24,6 @@ _FP8_QUANTIZATION = {
     "weight_block_size": [_FP8_BLOCK_SIZE, _FP8_BLOCK_SIZE],
     "weight_dtype": "float8_e4m3fn",
     "scale_dtype": "float32",
-    "scale_format": "ue8m0_unpacked",
 }
 
 
@@ -186,7 +180,8 @@ class NcclM2NReceiver:
             ).hexdigest()
             if expected_hash != actual_hash:
                 raise ValueError("Miles NCCL M2N manifest hash mismatch")
-        self.manifest = manifest
+        # Own the metadata so caller mutations cannot invalidate the cached plan.
+        self.manifest = deepcopy(manifest)
         self._pg = pg
         self.model = model
         self.device = (
@@ -200,17 +195,14 @@ class NcclM2NReceiver:
         self.comm_ptr = _warm_and_borrow_nccl_comm(pg, self.device)
         try:
             world_size = dist.get_world_size(pg)
-            if world_size != manifest["communicator_world_size"]:
+            if world_size != self.manifest["communicator_world_size"]:
                 raise ValueError("Process-group and manifest world sizes differ")
-            self._world_size = world_size
             self._validate_topology(topology, static_expert_placement)
             self._topology = dict(topology)
             self._comm_rank = pg.rank()
             self._params = dict(model.named_parameters())
-            self._entries = self._validate_manifest(
-                world_size,
-                allow_packed_expert_weights=True,
-            )
+            self._entries = self._validate_manifest(world_size)
+            self._validate_live_parameters(allow_packed_expert_weights=True)
             self.stream = torch.cuda.Stream(device=self.device)
         except Exception:
             self.destroy()
@@ -374,18 +366,7 @@ class NcclM2NReceiver:
             weight, weight_src, weight_dst = roles["weight"]
             scale, scale_src, scale_dst = roles["scale"]
             recipe = weight["destination"]["recipe"]
-            source_recipe = _FP8_WEIGHT_RECIPES[recipe]
-            component = recipe.removeprefix("expert_")
-            scale_name = f"{pair_id.removesuffix('.weight')}.weight_scale_inv"
-            if (
-                weight["name"] != pair_id
-                or not pair_id.endswith(f".{component}_proj.weight")
-                or scale["name"] != scale_name
-                or scale["destination"]["recipe"] != f"{recipe}_scale"
-                or weight["source"]["recipe"] != source_recipe
-                or scale["source"]["recipe"] != f"{source_recipe}_scale"
-                or weight["source"]["names_by_rank"] != scale["source"]["names_by_rank"]
-            ):
+            if scale["destination"]["recipe"] != f"{recipe}_scale":
                 raise ValueError(f"FP8 pair {pair_id!r} has mismatched recipes")
             if (
                 weight["family"] != scale["family"]
@@ -423,7 +404,7 @@ class NcclM2NReceiver:
                 )
             components.add(recipe)
 
-        expected_components = set(_FP8_WEIGHT_RECIPES)
+        expected_components = _ROUTED_EXPERT_WEIGHT_RECIPES
         for module_name, components in components_by_module.items():
             if components != expected_components:
                 raise ValueError(
@@ -434,9 +415,8 @@ class NcclM2NReceiver:
     def _validate_manifest(
         self,
         world_size: int,
-        *,
-        allow_packed_expert_weights: bool = False,
     ) -> list[tuple[Mapping[str, Any], _Layout, _Layout]]:
+        """Parse and validate the connection's static transfer plan once."""
         entries: list[tuple[Mapping[str, Any], _Layout, _Layout]] = []
         names: set[str] = set()
         pairs: dict[
@@ -499,19 +479,6 @@ class NcclM2NReceiver:
                     f"SGLang {parallelism} rank {expected_rank}"
                 )
 
-            source_ranks = {str(rank) for rank in src_ranks}
-            if (
-                set(source["names_by_rank"]) != source_ranks
-                or any(not names for names in source["names_by_rank"].values())
-                or not source.get("recipe")
-                or not destination.get("recipe")
-            ):
-                raise ValueError(f"{name} has an incomplete source/destination recipe")
-            parameter = destination["parameter"]
-            if parameter not in self._params:
-                raise ValueError(
-                    f"Missing NCCL M2N destination parameter {parameter!r}"
-                )
             recipe = destination["recipe"]
             if (family == "routed_expert") != recipe.startswith("expert_"):
                 raise ValueError(
@@ -546,7 +513,7 @@ class NcclM2NReceiver:
                 )
             if pair_id is not None:
                 expected_recipes = (
-                    _FP8_WEIGHT_RECIPES
+                    _ROUTED_EXPERT_WEIGHT_RECIPES
                     if tensor_role == "weight"
                     else _FP8_SCALE_RECIPES
                     if tensor_role == "scale"
@@ -571,32 +538,23 @@ class NcclM2NReceiver:
                     raise ValueError(
                         f"FP8 pair {pair_id!r} has duplicate {tensor_role} entries"
                     )
-                self._validate_fp8_target(entry)
             elif recipe in _FP8_SCALE_RECIPES or dtype_name.startswith("float8"):
                 raise ValueError(f"{name} FP8 weights and scales require pair metadata")
 
-            param = self._params[parameter]
-            live_scale = tensor_role == "scale" and bool(
-                getattr(param, "format_ue8m0", False)
-            )
-            if param.dtype != _dtype(dtype_name) and not live_scale:
-                raise ValueError(
-                    f"{parameter} has dtype {param.dtype}, expected {entry['dtype']}"
-                )
-            self._validate_parameter(
-                entry,
-                dst_layout.local_shape,
-                param,
-                allow_packed_expert_weights=allow_packed_expert_weights,
-            )
             record = (entry, src_layout, dst_layout)
             entries.append(record)
             if pair_id is not None:
                 pairs[pair_id][tensor_role] = record
         if pairs:
-            if self.manifest.get("quantization") not in (
-                _FP8_QUANTIZATION,
-                {**_FP8_QUANTIZATION, "scale_format": "canonical"},
+            quantization = self.manifest.get("quantization")
+            if (
+                not isinstance(quantization, Mapping)
+                or quantization.get("scale_format")
+                not in ("canonical", "ue8m0_unpacked")
+                or any(
+                    quantization.get(key) != value
+                    for key, value in _FP8_QUANTIZATION.items()
+                )
             ):
                 raise ValueError(
                     "Paired FP8 entries require canonical or ue8m0_unpacked "
@@ -608,6 +566,42 @@ class NcclM2NReceiver:
                 "Unquantized NCCL M2N manifests must not include quantization metadata"
             )
         return entries
+
+    def _validate_live_parameters(
+        self, *, allow_packed_expert_weights: bool = False
+    ) -> None:
+        """Recheck live storage after offload or model post-load processing."""
+        fp8_targets: set[str] = set()
+        for entry, _, dst_layout in self._entries:
+            parameter = entry["destination"]["parameter"]
+            if parameter not in self._params:
+                raise ValueError(
+                    f"Missing NCCL M2N destination parameter {parameter!r}"
+                )
+            tensor_role = entry.get("tensor_role")
+            if tensor_role is not None:
+                weight_name = (
+                    parameter.removesuffix("_scale_inv")
+                    if tensor_role == "scale"
+                    else parameter
+                )
+                if weight_name not in fp8_targets:
+                    self._validate_fp8_target(entry)
+                    fp8_targets.add(weight_name)
+            param = self._params[parameter]
+            live_scale = tensor_role == "scale" and bool(
+                getattr(param, "format_ue8m0", False)
+            )
+            if param.dtype != _dtype(entry["dtype"]) and not live_scale:
+                raise ValueError(
+                    f"{parameter} has dtype {param.dtype}, expected {entry['dtype']}"
+                )
+            self._validate_parameter(
+                entry,
+                dst_layout.local_shape,
+                param,
+                allow_packed_expert_weights=allow_packed_expert_weights,
+            )
 
     def _validate_parameter(
         self,
@@ -847,7 +841,7 @@ class NcclM2NReceiver:
         # updates must keep the existing inference storage and scale format.
         self._params = dict(self.model.named_parameters())
         self._prepare_unquantized_expert_destinations()
-        self._entries = self._validate_manifest(self._world_size)
+        self._validate_live_parameters()
         self.stream.wait_stream(torch.cuda.current_stream(self.device))
 
     def _receive_entries(self, in_flight: list):

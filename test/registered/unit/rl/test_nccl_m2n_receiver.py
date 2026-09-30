@@ -103,13 +103,17 @@ def _model(*, fp8=True, moe_tp=False, device="cpu", scale_format="ue8m0_unpacked
 def _manifest(*, fp8=True, moe_tp=False, scale_format="ue8m0_unpacked"):
     manifest = {"schema_version": 1, "communicator_world_size": 4, "entries": []}
     if fp8:
-        manifest["quantization"] = {**_QUANTIZATION, "scale_format": scale_format}
-    for component, recipe, parameter in (
-        ("gate", "expert_fc1_0", "w13_weight"),
-        ("up", "expert_fc1_1", "w13_weight"),
-        ("down", "expert_fc2", "w2_weight"),
+        manifest["quantization"] = {
+            **_QUANTIZATION,
+            "scale_format": scale_format,
+            "producer": "test",
+        }
+    for component, parameter in (
+        ("gate", "w13_weight"),
+        ("up", "w13_weight"),
+        ("down", "w2_weight"),
     ):
-        pair = f"model.layers.0.mlp.experts.{component}_proj.weight"
+        pair = f"layers.0.{component}"
         for scale in (False, True) if fp8 else (False,):
             size = 2 if scale else 256
             suffix = "_scale" if scale else ""
@@ -118,7 +122,7 @@ def _manifest(*, fp8=True, moe_tp=False, scale_format="ue8m0_unpacked"):
             local = shape.copy()
             local[dim] //= 2
             entry = {
-                "name": pair + ("_scale_inv" if scale else ""),
+                "name": pair + ("_scale" if scale else ""),
                 "family": "routed_expert",
                 "pp_rank": 0,
                 "dtype": (
@@ -129,11 +133,6 @@ def _manifest(*, fp8=True, moe_tp=False, scale_format="ue8m0_unpacked"):
                     "mesh": [[0, 1]],
                     "placements": [{"type": "replicate"}, {"type": "shard", "dim": 0}],
                     "local_shape": [1, size, size],
-                    "recipe": recipe + suffix,
-                    "names_by_rank": {
-                        str(rank): [f"trainer.{recipe}.weight{rank}"]
-                        for rank in range(2)
-                    },
                 },
                 "destination": {
                     "mesh": [[2, 3]],
@@ -148,7 +147,9 @@ def _manifest(*, fp8=True, moe_tp=False, scale_format="ue8m0_unpacked"):
                 },
             }
             if fp8:
-                entry.update(pair_id=pair, tensor_role="scale" if scale else "weight")
+                entry.update(
+                    pair_id=f"pair:{pair}", tensor_role="scale" if scale else "weight"
+                )
             manifest["entries"].append(entry)
     manifest["entries"].sort(key=lambda entry: entry["name"])
     return manifest
@@ -215,7 +216,6 @@ def _concurrent_pp_receivers(*, fp8=True, layers_per_stage=(1, 1)):
         receiver.comm_ptr = 101 + stage
         receiver._pg = object()
         receiver.stream = Mock()
-        receiver._entries = receiver._validate_manifest(4)
         receivers.append(receiver)
     return model, receivers
 
@@ -230,9 +230,6 @@ def test_concurrent_pp_receives_interleave_streams_and_keep_buffers_alive(fp8):
             source = entry["source"]
             source["mesh"] = [[0]]
             source["local_shape"][0] *= 2
-            source["names_by_rank"] = {
-                "0": [n for names in source["names_by_rank"].values() for n in names]
-            }
         receiver._entries = receiver._validate_manifest(4)
     events = []
     pending = {receiver.comm_ptr: [] for receiver in receivers}
@@ -452,7 +449,6 @@ def test_bf16_refits_preserve_expert_layout_and_values(
             [2, hidden, intermediate] if is_down else [2, intermediate, hidden]
         )
     receiver = _receiver(manifest, model=model, topology=_MOE_TP_TOPOLOGY)
-    receiver._entries = receiver._validate_manifest(4, allow_packed_expert_weights=True)
     receiver._pg = object()
     receiver.comm_ptr = 123
     receiver.stream = Mock()
@@ -642,9 +638,18 @@ def test_fp8_refits_never_replace_inference_storage(
             ) as pack,
             patch("torch.cuda.current_stream"),
             patch("torch.cuda.stream", side_effect=lambda stream: nullcontext()),
+            patch.object(
+                receiver,
+                "_validate_manifest",
+                side_effect=AssertionError("Static plan must not be reparsed"),
+            ),
+            patch.object(
+                receiver, "_validate_fp8_target", wraps=receiver._validate_fp8_target
+            ) as validate_target,
         ):
             receiver.receive()
         assert pack.call_count == (3 if packed else 0)
+        assert validate_target.call_count == 2  # W13 and W2, once per physical pair.
         order = (
             ("expert_up", "expert_gate") if up_first else ("expert_gate", "expert_up")
         )
@@ -720,6 +725,11 @@ def test_fp8_rejects_incompatible_formats_without_replacing_storage(
     model = _model(scale_format=scale_format)
     experts = model.model.layers[0].mlp.experts
     manifest = _manifest(scale_format=scale_format)
+    receiver = (
+        _receiver(manifest, model=model)
+        if incompatible not in ("wire_format", "other_format")
+        else None
+    )
     if incompatible == "wire_format":
         manifest["quantization"]["scale_format"] = "unknown"
     elif incompatible == "other_format":
@@ -739,6 +749,9 @@ def test_fp8_rejects_incompatible_formats_without_replacing_storage(
     buffers = {name: param.detach() for name, param in model.named_parameters()}
     with pytest.raises(ValueError):
         _receiver(manifest, model=model)
+    if receiver is not None:
+        with pytest.raises(ValueError):
+            receiver._prepare_receive()
     for name, parameter in model.named_parameters():
         assert parameter.data_ptr() == buffers[name].data_ptr()
         assert parameter.stride() == buffers[name].stride()
