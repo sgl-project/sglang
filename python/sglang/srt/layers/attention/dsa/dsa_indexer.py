@@ -310,13 +310,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # Fusion folds wk and weights_proj into a single wk_weights_proj GEMM and
         # drops the Hadamard rotation (indexer scores are invariant to it). CUDA
         # then runs its own fused q/k kernels; ROCm feeds the merged GEMM into the
-        # AITER fused writer, so it is enabled wherever that writer is.
+        # AITER fused writer, so it is enabled wherever that writer survives the
+        # gfx950 fused indexer's gate below.
         # is_neox_style changes the RoPE layout the CUDA fused kernels assume.
-        self.use_dsa_indexer_fusion = (
-            not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
-            and not is_neox_style
-            and (_is_cuda or self.use_aiter_fused_fp8_writer)
+        indexer_fusion_allowed = (
+            not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get() and not is_neox_style
         )
+        self.use_dsa_indexer_fusion = _is_cuda and indexer_fusion_allowed
         self.alt_stream = alt_stream
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         if self.dsa_enable_prefill_cp:
@@ -342,13 +342,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         )
 
         if self.use_dsa_indexer_fusion:
-            self.wk_weights_proj = ReplicatedLinear(
-                self.hidden_size,
-                self.head_dim + self.n_heads,
-                bias=False,
-                params_dtype=torch.bfloat16,
-                prefix=add_prefix("wk_weights_proj", prefix),
-            )
+            self._init_wk_weights_proj(prefix)
         else:
             self.wk = ReplicatedLinear(
                 self.hidden_size,
@@ -515,11 +509,28 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     fp8_dtype=fp8_dtype,
                 )
 
+        # The gfx950 fused indexer reads wk and weights_proj separately and needs
+        # the Hadamard kept, so ROCm merges them only once that gate has declined
+        # this layer, which leaves the AITER fused writer on.
+        if _is_hip and indexer_fusion_allowed and self.use_aiter_fused_fp8_writer:
+            self.use_dsa_indexer_fusion = True
+            del self.wk, self.weights_proj
+            self._init_wk_weights_proj(prefix)
+
         # After the gfx950 fused indexer's gate, which may turn the writer off.
         global _FUSED_FP8_WRITER_LOGGED
         if self.use_aiter_fused_fp8_writer and not _FUSED_FP8_WRITER_LOGGED:
             logger.info("Enabled AITER fused FP8 DSA indexer writer")
             _FUSED_FP8_WRITER_LOGGED = True
+
+    def _init_wk_weights_proj(self, prefix: str) -> None:
+        self.wk_weights_proj = ReplicatedLinear(
+            self.hidden_size,
+            self.head_dim + self.n_heads,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            prefix=add_prefix("wk_weights_proj", prefix),
+        )
 
     @contextlib.contextmanager
     def _with_real_sm_count(self):
