@@ -2163,18 +2163,16 @@ class DFlashWorkerV2(BaseSpecWorker):
         elif (
             not _is_all_greedy(sampling_info) and is_dflash_sampling_verify_available()
         ):
-            sampling_result = compute_dflash_sampling_correct_drafts_and_bonus(
-                candidates=candidates,
-                next_token_logits=next_token_logits,
-                sampling_info=sampling_info,
-                max_top_k=draft_input.max_top_k,
-                uniform_top_k_value=draft_input.uniform_top_k_value,
-                return_target_probs=return_target_probs,
+            accept_len, bonus, target_probs = (
+                compute_dflash_sampling_correct_drafts_and_bonus(
+                    candidates=candidates,
+                    next_token_logits=next_token_logits,
+                    sampling_info=sampling_info,
+                    max_top_k=draft_input.max_top_k,
+                    uniform_top_k_value=draft_input.uniform_top_k_value,
+                    return_target_probs=return_target_probs,
+                )
             )
-            if return_target_probs:
-                accept_len, bonus, target_probs = sampling_result
-            else:
-                accept_len, bonus = sampling_result
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, accept_len)
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, bonus)
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)

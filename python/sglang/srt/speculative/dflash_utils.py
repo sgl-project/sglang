@@ -995,9 +995,7 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     uniform_samples_for_final_sampling: Optional[torch.Tensor] = None,
     use_sparse_topk: bool = True,
     return_target_probs: bool = False,
-) -> (
-    Tuple[torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-):
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Compute DFlash accept lengths and bonus tokens for non-greedy sampling.
 
     This is a chain-specialized variant of speculative target-only verification:
@@ -1134,7 +1132,7 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
             deterministic=True,
         )
         if not return_target_probs:
-            del target_probs
+            target_probs = None
         del draft_probs, candidates_i64
         del coins, coins_for_final_sampling
 
@@ -1142,9 +1140,7 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     row_ids = torch.arange(bs, dtype=torch.long, device=device)
     accept_pos = accept_index[row_ids, correct_len.to(torch.long)].to(torch.long)
     bonus = predicts[accept_pos].to(torch.int64)
-    if return_target_probs:
-        return correct_len, bonus, target_probs
-    return correct_len, bonus
+    return correct_len, bonus, target_probs
 
 
 def build_speculative_verify_target_probs(

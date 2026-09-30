@@ -1211,7 +1211,6 @@ class SchedulerBatchResultProcessor:
             else sampling_output.num_accept_tokens.tolist()
         )
         assert num_accept_tokens is None or len(batch_indices) == len(num_accept_tokens)
-        packed_width = token_ids.shape[-1]
         support_row = 0
         for row, batch_index in enumerate(batch_indices):
             returns_support_logprobs = (
@@ -1223,23 +1222,14 @@ class SchedulerBatchResultProcessor:
                 row_statuses = [int(statuses[row])]
             else:
                 row_num_accept_tokens = int(num_accept_tokens[row])
-                if not 0 <= row_num_accept_tokens <= token_ids.shape[1]:
-                    row_num_accept_tokens = 0
-                    row_statuses = [int(SamplingMaskStatus.INVALID)]
-                    row_lengths = []
-                else:
-                    row_statuses = [
-                        int(value) for value in statuses[row][:row_num_accept_tokens]
-                    ]
-                    row_lengths = [
-                        int(value) for value in lengths[row][:row_num_accept_tokens]
-                    ]
+                row_statuses = [
+                    int(value) for value in statuses[row][:row_num_accept_tokens]
+                ]
+                row_lengths = [
+                    int(value) for value in lengths[row][:row_num_accept_tokens]
+                ]
 
-            status = max(row_statuses, default=int(SamplingMaskStatus.OK))
-            if status == SamplingMaskStatus.OK and any(
-                not 0 <= length <= packed_width for length in row_lengths
-            ):
-                status = SamplingMaskStatus.INVALID
+            status = max(row_statuses)
             status_by_batch[batch_index] = status
             if status == SamplingMaskStatus.OK:
                 if row_num_accept_tokens is None:

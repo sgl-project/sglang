@@ -819,7 +819,7 @@ class TestGraphPoolBorrow(CustomTestCase):
                 fake_sampling,
             ),
         ):
-            correct_len, bonus = (
+            correct_len, bonus, _ = (
                 dflash_utils.compute_dflash_sampling_correct_drafts_and_bonus(
                     candidates=torch.zeros((1, 2), dtype=torch.int64),
                     next_token_logits=torch.randn((2, 8)),
