@@ -1,8 +1,10 @@
 """CPU contract tests for the FlashInfer CAKE KDA adapter."""
 
+import gc
 import os
 import sys
 import unittest
+import weakref
 from contextlib import ExitStack
 from dataclasses import FrozenInstanceError
 from types import ModuleType, SimpleNamespace
@@ -480,8 +482,12 @@ class TestCakeKDAFacadeRoute(CustomTestCase):
                 "_cake_prefill_admission",
                 return_value=CakePrefillAdmission(True, CakePrefillReason.ELIGIBLE),
             ),
-            patch.object(kernel, "_cake_prefill_uses_prepared_export", return_value=False),
-            patch.object(kernel, "_extend_triton", return_value=triton_result) as triton,
+            patch.object(
+                kernel, "_cake_prefill_uses_prepared_export", return_value=False
+            ),
+            patch.object(
+                kernel, "_extend_triton", return_value=triton_result
+            ) as triton,
             patch.object(
                 kda_flashinfer,
                 "_get_flashinfer_kda_prefill_kernel",
@@ -626,6 +632,81 @@ class TestCakeKDAPlainDecodeTelemetry(CustomTestCase):
         self.assertTrue(event["triton_fallback"])
         self.assertFalse(event["fatal"])
         self.assertEqual(event["reason"], CakePackedDecodeReason.GQA_HEADS)
+
+
+class TestCakeKDAIdentityValidatedCaches(CustomTestCase):
+    """id()-keyed caches must re-validate the keyed tensors' identity.
+
+    CPython reuses the id of a collected tensor, so a caller handing fresh
+    A_log/dt_bias (or state pool) tensors per call could otherwise be served
+    another layer's cached entry.
+    """
+
+    @staticmethod
+    def _kernel():
+        kernel = object.__new__(CakeKDAKernel)
+        kernel._backend = "cake"
+        kernel._gate_cache = {}
+        kernel._state_contract_ok = {}
+        return kernel
+
+    def test_gate_params_hit_only_for_the_same_live_tensors(self):
+        kernel = self._kernel()
+        A_log = torch.randn(1, 1, 12, 1)
+        dt_bias = torch.randn(12 * 128)
+        first = kernel._prep_gate_params(A_log, dt_bias)
+        self.assertIs(kernel._prep_gate_params(A_log, dt_bias), first)
+        torch.testing.assert_close(first[0], A_log.reshape(-1))
+        torch.testing.assert_close(first[1], dt_bias)
+
+    def test_gate_params_reject_a_stale_entry_from_other_tensors(self):
+        kernel = self._kernel()
+        other_A_log, other_dt_bias = torch.randn(1, 1, 12, 1), torch.randn(12 * 128)
+        A_log, dt_bias = torch.randn(1, 1, 12, 1), torch.randn(12 * 128)
+        stale = (torch.full((12,), 7.0), torch.full((12 * 128,), 7.0))
+        # Simulate id() reuse: the entry keyed by this call's ids was built
+        # from different (still alive) tensors.
+        kernel._gate_cache[(id(A_log), id(dt_bias))] = (
+            weakref.ref(other_A_log),
+            weakref.ref(other_dt_bias),
+            stale,
+        )
+        prepared = kernel._prep_gate_params(A_log, dt_bias)
+        self.assertIsNot(prepared, stale)
+        torch.testing.assert_close(prepared[0], A_log.reshape(-1))
+        torch.testing.assert_close(prepared[1], dt_bias)
+        # The entry is replaced and now hits.
+        self.assertIs(kernel._prep_gate_params(A_log, dt_bias), prepared)
+
+    def test_gate_params_reject_an_entry_whose_tensors_died(self):
+        kernel = self._kernel()
+        A_log, dt_bias = torch.randn(1, 1, 12, 1), torch.randn(12 * 128)
+        dead = torch.randn(1, 1, 12, 1)
+        dead_ref = weakref.ref(dead)
+        del dead
+        gc.collect()
+        self.assertIsNone(dead_ref())
+        stale = (torch.full((12,), 7.0), torch.full((12 * 128,), 7.0))
+        kernel._gate_cache[(id(A_log), id(dt_bias))] = (
+            dead_ref,
+            weakref.ref(dt_bias),
+            stale,
+        )
+        prepared = kernel._prep_gate_params(A_log, dt_bias)
+        self.assertIsNot(prepared, stale)
+        torch.testing.assert_close(prepared[0], A_log.reshape(-1))
+
+    def test_state_contract_revalidates_a_reused_pool_id(self):
+        kernel = self._kernel()
+        good = torch.zeros(4, 12, 128, 128, dtype=torch.bfloat16)
+        kernel._check_state_stride_contract(good)
+        self.assertIs(kernel._state_contract_ok[id(good)](), good)
+        # A pool with non-compact inner strides fails the contract; a stale
+        # OK entry under its id (built from the good pool) must not skip it.
+        bad = torch.zeros(4, 12, 128, 256, dtype=torch.bfloat16)[..., :128]
+        kernel._state_contract_ok[id(bad)] = weakref.ref(good)
+        with self.assertRaisesRegex(ValueError, "inner strides"):
+            kernel._check_state_stride_contract(bad)
 
 
 class TestCakeKDAIndexedStateAdapter(CustomTestCase):
@@ -1002,9 +1083,12 @@ class TestCakeKDAPackedDecodeAdapter(CustomTestCase):
             (CakePackedDecodeReason.REPLAYSSM_REQUESTED, "", "replayssm"),
             *((reason, f"case:{reason}", "selector") for reason in selector_reasons),
         )
+        # GQA_HEADS is a plain-``decode`` fallback (the packed selector never
+        # sees grouped value heads); TestCakeKDAPlainDecodeTelemetry covers it.
         self.assertEqual(
             {reason for reason, _, _ in cases},
-            set(kda_route_telemetry._DECODE_FALLBACK_REASONS),
+            set(kda_route_telemetry._DECODE_FALLBACK_REASONS)
+            - {CakePackedDecodeReason.GQA_HEADS},
         )
         inputs = self._inputs()
         sentinel = torch.empty(1, 2, 12, 128, dtype=torch.bfloat16)

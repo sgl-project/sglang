@@ -25,6 +25,7 @@ import inspect
 import logging
 import math
 import os
+import weakref
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -124,9 +125,14 @@ def maybe_build_cake_checkpoint_plan(
     checkpoint_cu_starts = torch.zeros(checkpoint_counts.numel() + 1, dtype=torch.int64)
     checkpoint_cu_starts[1:] = torch.cumsum(checkpoint_counts, dim=0)
 
-    forward_metadata.state_checkpoint_cu_starts = checkpoint_cu_starts.pin_memory().to(
-        device, non_blocking=True
-    )
+    if torch.cuda.is_available():
+        checkpoint_cu_starts = checkpoint_cu_starts.pin_memory().to(
+            device, non_blocking=True
+        )
+    else:
+        # pin_memory() needs a CUDA runtime; CPU-only hosts (unit tests) skip it.
+        checkpoint_cu_starts = checkpoint_cu_starts.to(device)
+    forward_metadata.state_checkpoint_cu_starts = checkpoint_cu_starts
     forward_metadata.num_state_checkpoints = int(checkpoint_cu_starts[-1])
     forward_metadata.state_checkpoint_every_n_tokens = checkpoint_every_n_tokens
 
@@ -499,17 +505,22 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         self._cake_prefill_precision = (
             _cake_prefill_precision() if backend == "cake" else "bf16"
         )
-        # Cache the per-layer constant gate-param prep (A_log/dt_bias reshape+cast),
-        # keyed by tensor identity. Layer params are persistent weights so id() is
-        # stable; this removes the per-call reshape/float/contiguous work.
+        # Cache the per-layer constant gate-param prep (A_log/dt_bias reshape+cast)
+        # keyed by tensor identity. Layer params are persistent weights, but
+        # ``id()`` alone is not a safe key: CPython reuses the id of a collected
+        # tensor for a new one, so a caller that hands fresh A_log/dt_bias
+        # tensors per call (tests, replays, reloaded weights) would silently get
+        # another layer's gate parameters. Every entry therefore carries weak
+        # references to the keyed tensors and is only used while they are alive
+        # and identical (see ``_prep_gate_params``).
         self._gate_cache: dict = {}
         # Cache the constant per-(row-map, batch, T) verify scatter indices
         # (ssm_state_indices), which never change across verify calls.
         self._verify_idx_cache: dict = {}
         # State pools whose stride layout has been validated against the
-        # recurrent_kda contract (per-layer views are pool-stable, so id() is
-        # a stable key — same lifetime argument as _gate_cache).
-        self._state_contract_ok: set = set()
+        # recurrent_kda contract, keyed by id() and guarded by a weak reference
+        # like ``_gate_cache`` (a reused id must re-validate, never skip).
+        self._state_contract_ok: dict = {}
         logger.info("Using FlashInfer KDA kernel backend=%s", backend)
 
     @property
@@ -532,7 +543,8 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         state in-kernel without any error; fail loudly here instead.
         """
         key = id(ssm_states)
-        if key in self._state_contract_ok:
+        validated = self._state_contract_ok.get(key)
+        if validated is not None and validated() is ssm_states:
             return
         if ssm_states.dim() != 4:
             raise ValueError(
@@ -554,7 +566,7 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
                 f"of 16 and the base byte offset {base_bytes} a multiple of 32 "
                 "(sym_int64(divisibility=16) / assumed_align=32)"
             )
-        self._state_contract_ok.add(key)
+        self._state_contract_ok[key] = weakref.ref(ssm_states)
 
     @staticmethod
     def _check_cake_state_contract(
@@ -623,7 +635,11 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         key = (id(A_log), id(dt_bias))
         cached = self._gate_cache.get(key)
         if cached is not None:
-            return cached
+            a_ref, d_ref, prepared = cached
+            # The ids match; use the entry only if it was built from these very
+            # tensors (a reused id after garbage collection must not hit).
+            if a_ref() is A_log and (d_ref is None or d_ref() is dt_bias):
+                return prepared
         # Model weights arrive as nn.Parameters (requires_grad=True); the
         # exported prepared prefill refuses autograd-tracked inputs, so detach.
         A_log_fi = A_log.detach().reshape(-1).float().contiguous()
@@ -632,8 +648,13 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
             if dt_bias is not None
             else None
         )
-        self._gate_cache[key] = (A_log_fi, dt_bias_fi)
-        return A_log_fi, dt_bias_fi
+        prepared = (A_log_fi, dt_bias_fi)
+        self._gate_cache[key] = (
+            weakref.ref(A_log),
+            weakref.ref(dt_bias) if dt_bias is not None else None,
+            prepared,
+        )
+        return prepared
 
     @staticmethod
     def _beta_logit_to_prob(b: torch.Tensor) -> torch.Tensor:
@@ -1842,7 +1863,13 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
                 draft_token_num,
                 scratch_steps,
             )
-            ssm_state_indices = self._verify_idx_cache.get(cache_key)
+            cached_indices = self._verify_idx_cache.get(cache_key)
+            ssm_state_indices = None
+            if cached_indices is not None:
+                row_map_ref, cached_tensor = cached_indices
+                # id() reuse guard: only trust the entry built from this row map.
+                if row_map_ref() is intermediate_state_indices:
+                    ssm_state_indices = cached_tensor
             if ssm_state_indices is None:
                 # The fast seed copy below assumes row n in scratch belongs to
                 # request n.
@@ -1858,7 +1885,10 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
                 ssm_state_indices = (
                     base_rows.to(torch.int32)[:, None] * scratch_steps + step[None, :]
                 ).contiguous()  # [N, T]
-                self._verify_idx_cache[cache_key] = ssm_state_indices
+                self._verify_idx_cache[cache_key] = (
+                    weakref.ref(intermediate_state_indices),
+                    ssm_state_indices,
+                )
 
             # Seed step 0 from committed state, then recurrent_kda overwrites it
             # with token-0 post-state. Padded graph rows clamp to slot 0; their
