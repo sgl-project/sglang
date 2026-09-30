@@ -44,6 +44,7 @@ from sglang.srt.mem_cache.pool_host import HostKVCache
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     host_memory_budget_bytes,
+    host_memory_requested_bytes,
     synchronized,
 )
 from sglang.srt.mem_cache.pool_host.common import (
@@ -244,7 +245,13 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         self.device_buffers = device_buffers
         self.gpu_device = device_buffers[0].device if device_buffers else device
 
-        requested_bytes = self.layer_num * num_host_pages * self.item_bytes
+        if layout == "layer_first":
+            mapping_bytes = [num_host_pages * self.item_bytes] * self.layer_num
+        else:
+            mapping_bytes = [num_host_pages * self.layer_num * self.item_bytes]
+        requested_bytes = host_memory_requested_bytes(
+            mapping_bytes, allocator=self.allocator, device=self.gpu_device
+        )
         available_bytes = host_memory_budget_bytes(
             allocator=self.allocator, device=self.gpu_device
         )
@@ -753,7 +760,13 @@ class DeepSeekV4StateHostPool(HostKVCache):
         self._init_device_page_views()
         self.size_per_token = self.state_page_bytes
 
-        requested_bytes = self.layer_num * num_host_pages * self.state_page_bytes
+        if layout == "layer_first":
+            mapping_bytes = [num_host_pages * self.state_page_bytes] * self.layer_num
+        else:
+            mapping_bytes = [num_host_pages * self.layer_num * self.state_page_bytes]
+        requested_bytes = host_memory_requested_bytes(
+            mapping_bytes, allocator=self.allocator, device=self.gpu_device
+        )
         available_bytes = host_memory_budget_bytes(
             allocator=self.allocator, device=self.gpu_device
         )
