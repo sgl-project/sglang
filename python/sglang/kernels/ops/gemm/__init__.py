@@ -21,6 +21,7 @@ _CUDA = frozenset({CapabilityRequirement.CUDA})
 _SM90 = frozenset({CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))})
 _SM120 = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 0))})
 _SM12X = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))})
+_SM10X = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))})
 _KDA_PACKAGE = "sglang.kernels.kda_kernels"
 
 
@@ -166,6 +167,22 @@ _FP8_SCALED_MM = register_fused_op(Fp8ScaledMMOp(), __name__, "_FP8_SCALED_MM")
 
 register_kernel(
     KernelSpec(
+        op="gemm.dual_gemm_swiglu_fp8",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.gemm.cutedsl_dual_gemm:dual_gemm_swiglu_fp8",
+        capabilities=_SM10X,
+        format_signature=FormatSignature(
+            supported_dtypes=("float8_e4m3fn",),
+            description=(
+                "FP8 gate/up dual GEMM, SwiGLU, and static or dynamic "
+                "per-token FP8 activation quantization"
+            ),
+        ),
+        description="Blackwell TMA/tcgen05 fused dual GEMM and quantization.",
+    )
+)
+register_kernel(
+    KernelSpec(
         op="gemm.bmm_fp8",
         backend=KernelBackend.FLASHINFER,
         target="sglang.srt.layers.quantization.fp8_utils:bmm_fp8",
@@ -286,6 +303,23 @@ def fp8_scaled_mm(
     return _FP8_SCALED_MM(mat_a, mat_b, scales_a, scales_b, out_dtype, bias)
 
 
+def dual_gemm_swiglu_fp8(
+    x: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    gate_up_weight_scale: torch.Tensor,
+    output_scale: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse FP8 gate/up projections, SwiGLU, and activation quantization."""
+    return get_kernel("gemm.dual_gemm_swiglu_fp8", KernelBackend.CUTE_DSL)(
+        x,
+        gate_up_weight,
+        x_scale,
+        gate_up_weight_scale,
+        output_scale,
+    )
+
+
 def bmm_fp8(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -384,11 +418,12 @@ def kimi_k3_tiny_gemm(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
 
 
 __all__ = [
-    "kimi_k3_tiny_gemm",
     "Fp8ScaledMMOp",
     "bmm_fp8",
     "dsv3_fused_a_gemm",
+    "dual_gemm_swiglu_fp8",
     "fp8_scaled_mm",
+    "kimi_k3_tiny_gemm",
     "n128k512_gemm_bf16",
     "n32k5120_gemm_bf16",
     "tiny_gemm_bf16",
