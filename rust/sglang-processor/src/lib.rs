@@ -1,19 +1,19 @@
 //! Shared SGLang wrappers over Dynamo's frontend crates.
 //!
 //! The library loads and applies model chat templates, tokenizes rendered
-//! prompts, derives tool-call constraints, and parses generated output into
-//! chat events, using `dynamo-renderer`, `dynamo-tokenizers`, and
-//! `dynamo-parsers`. Hosts own request types, sampling, validation,
-//! transport, and runtime.
+//! prompts, and parses generated output into chat events, using
+//! `dynamo-renderer`, `dynamo-tokenizers`, and `dynamo-parsers`. Hosts own
+//! request types, sampling, validation, transport, and runtime.
 
 mod error;
+mod parsers;
 mod postprocessing;
 mod preprocessing;
 
 pub use error::ProcessorError;
+pub use parsers::dynamo_parser_name;
 pub use postprocessing::{
     ChatEvent, ChatFinishReason, ChatResponseProcessor, ChatToolCallDelta, DecodedChatEvent,
-    dynamo_parser_name,
 };
 pub use preprocessing::{
     ChatFormatter, ChatTemplateConfig, DeepSeekV4Profile, OneOrMany, TemplateError,

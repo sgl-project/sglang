@@ -6,6 +6,7 @@
 //! responsibilities. HTTP and future gRPC adapters consume these semantic
 //! events without reimplementing parser behavior.
 
+use crate::parsers::dynamo_parser_name;
 use std::pin::Pin;
 
 use dynamo_parsers::ToolDefinition;
@@ -500,16 +501,6 @@ impl ReasoningStreamSplitter {
         };
         let tail = parser.finish_reasoning_stream();
         (tail.reasoning_text, tail.normal_text)
-    }
-}
-
-/// Map SGLang parser aliases onto Dynamo's parser names.
-pub fn dynamo_parser_name(parser: &str) -> &str {
-    match parser {
-        "llama3" => "llama3_json",
-        "qwen" => "qwen25",
-        "glm" | "glm45" => "glm47",
-        other => other,
     }
 }
 

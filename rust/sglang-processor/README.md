@@ -9,8 +9,7 @@ It renders chat requests, derives tool-call constraints, tokenizes rendered
 prompts, and parses generated output into chat events, including tool calls
 and reasoning.
 
-It has no SGLang request, sampling, or validation types, and no protocol
-handlers, transport, or runtime. Hosts such as sgl-router, the Rust server,
+Hosts such as sgl-router, the Rust server,
 and the standalone renderer own those and build their own generate requests
 from the rendered output.
 
