@@ -12,6 +12,13 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels.ops.diffusion import (
+    BitExactFusionGate,
+    can_use_modulate_scale_shift_cuda,
+    modulate_scale_shift,
+    try_fused_fp32_layernorm_bf16,
+    try_fused_scaled_residual_bf16,
+)
 from sglang.multimodal_gen.configs.models.dits import LingBotWorldVideoConfig
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
@@ -78,18 +85,18 @@ from sglang.multimodal_gen.runtime.models.dits.wanvideo import (
     WanTimeTextImageEmbedding,
     WanTransformer3DModel,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world.constants import (
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
+from sglang.multimodal_gen.runtime.platforms.aiter import USE_AITER
+from sglang.multimodal_gen.runtime.realtime.lingbot_world import (
     LINGBOT_C2WS_PLUCKER_EMB_CACHE,
     LINGBOT_CAM_CONDITIONER_CACHE,
     LINGBOT_ROPE_CACHE,
     LINGBOT_SEQUENCE_SHARD_ROPE_CACHE,
     LINGBOT_TIME_EMBEDDINGS_CACHE,
 )
-from sglang.multimodal_gen.runtime.platforms import (
-    AttentionBackendEnum,
-    current_platform,
-)
-from sglang.multimodal_gen.runtime.platforms.aiter import USE_AITER
 from sglang.multimodal_gen.runtime.realtime.states import (
     get_realtime_causal_dit_state,
 )
@@ -196,6 +203,24 @@ class LingBotWorldCamConditioner(nn.Module):
         if scale_shift is None:
             scale_shift = self.compute_scale_shift(c2ws_plucker_emb)
         cam_scale, cam_shift = scale_shift
+        if (
+            hidden_states.is_cuda
+            and torch.version.hip is None
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+            and hidden_states.is_contiguous()
+            and cam_scale.is_contiguous()
+            and cam_shift.is_contiguous()
+            and cam_scale.shape == cam_shift.shape == hidden_states.shape
+        ):
+            channels = hidden_states.shape[-1]
+            x = hidden_states.view(-1, 1, channels)
+            scale = cam_scale.view(-1, channels)
+            shift = cam_shift.view(-1, channels)
+            if can_use_modulate_scale_shift_cuda(x, scale, shift):
+                # This existing CUDA kernel preserves every storage-dtype
+                # rounding boundary and already owns its runtime fallback.
+                return modulate_scale_shift(x, scale, shift).view_as(hidden_states)
         return (1.0 + cam_scale) * hidden_states + cam_shift
 
 
@@ -909,6 +934,165 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         self.cam_conditioner = LingBotWorldCamConditioner(self.hidden_dim)
         self._fused_qkv_weight = None
         self._fused_qkv_bias = None
+        self._norm1_modulation_gate = BitExactFusionGate(
+            "LingBot norm1 modulation", per_signature=True
+        )
+        self._cross_norm_gate = BitExactFusionGate(
+            "LingBot cross-attention FP32 norm", per_signature=True
+        )
+        self._self_residual_gate = BitExactFusionGate(
+            "LingBot self-attention residual", per_signature=True
+        )
+
+    def _fp32_norm(
+        self,
+        hidden_states: torch.Tensor,
+        scale: torch.Tensor | None = None,
+        shift: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        modulate = scale is not None
+        norm = self.norm1 if modulate else self.self_attn_residual_norm.norm
+        gate = self._norm1_modulation_gate if modulate else self._cross_norm_gate
+        batch, tokens, channels = hidden_states.shape
+        frames = scale.shape[1] if modulate else 1
+
+        def reference():
+            if not modulate:
+                return norm(hidden_states)
+            return (
+                (
+                    norm(hidden_states.float()).unflatten(1, (frames, tokens // frames))
+                    * (1 + scale)
+                    + shift
+                )
+                .flatten(1, 2)
+                .to(hidden_states.dtype)
+            )
+
+        if (
+            hidden_states.is_cuda
+            and torch.version.hip is None
+            # The FP32 Welford order is validated against Hopper's native
+            # LayerNorm. A matching first input on B200 does not establish
+            # equivalence for later inputs or graph replays.
+            and current_platform.is_hopper()
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.is_contiguous()
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+            and not gate.disabled
+            and frames > 0
+            and tokens % frames == 0
+            and (
+                norm.weight is None and norm.bias is None
+                if modulate
+                else norm.weight is not None and norm.bias is not None
+            )
+        ):
+            sig = (hidden_states.device, hidden_states.shape, frames, norm.eps)
+            verified = gate.is_verified(sig)
+            if verified or not torch.cuda.is_current_stream_capturing():
+                try:
+                    if modulate:
+                        affine_scale = scale.reshape(
+                            batch * frames, channels
+                        ).contiguous()
+                        affine_shift = shift.reshape(
+                            batch * frames, channels
+                        ).contiguous()
+                    else:
+                        affine_scale = (
+                            norm._cached_fp32_param(
+                                "_weight_fp32_cache", norm.weight, hidden_states.device
+                            )
+                            .view(1, channels)
+                            .expand(batch, -1)
+                        )
+                        affine_shift = (
+                            norm._cached_fp32_param(
+                                "_bias_fp32_cache", norm.bias, hidden_states.device
+                            )
+                            .view(1, channels)
+                            .expand(batch, -1)
+                        )
+                    out = try_fused_fp32_layernorm_bf16(
+                        hidden_states.view(batch * frames, tokens // frames, channels),
+                        affine_scale,
+                        affine_shift,
+                        norm.eps,
+                        affine=not modulate,
+                    )
+                    if out is not None:
+                        out = out.view_as(hidden_states)
+                        if verified:
+                            return out
+                        return gate.accept_or_fallback(
+                            out,
+                            reference(),
+                            sig=sig,
+                            equal=lambda a, b: torch.equal(
+                                a.view(torch.int16), b.view(torch.int16)
+                            ),
+                            logger=logger,
+                        )
+                except Exception as exc:
+                    gate.on_exception(exc, logger=logger)
+        return reference()
+
+    def _self_attn_residual(
+        self,
+        hidden_states: torch.Tensor,
+        attn_output: torch.Tensor,
+        gate_msa: torch.Tensor,
+    ) -> torch.Tensor:
+        def reference():
+            zero = hidden_states.new_zeros((1,))
+            return self.self_attn_residual_norm(
+                hidden_states, attn_output, gate_msa, zero, zero
+            )[1]
+
+        gate = self._self_residual_gate
+        if (
+            hidden_states.is_cuda
+            and torch.version.hip is None
+            and hidden_states.dtype == attn_output.dtype == torch.bfloat16
+            and gate_msa.dtype == torch.float32
+            and hidden_states.shape[-1] % 256 == 0
+            and hidden_states.shape[-1] <= 8192
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+            and not gate.disabled
+        ):
+            sig = (
+                hidden_states.device,
+                hidden_states.shape,
+                hidden_states.stride(),
+                attn_output.stride(),
+                gate_msa.shape,
+                gate_msa.stride(),
+            )
+            verified = gate.is_verified(sig)
+            if verified or not torch.cuda.is_current_stream_capturing():
+                try:
+                    out = try_fused_scaled_residual_bf16(
+                        hidden_states, attn_output.contiguous(), gate_msa
+                    )
+                    if out is None:
+                        return reference()
+                    if verified:
+                        return out
+                    return gate.accept_or_fallback(
+                        out,
+                        reference(),
+                        sig=sig,
+                        equal=lambda a, b: torch.equal(
+                            a.view(torch.int16), b.view(torch.int16)
+                        ),
+                        logger=logger,
+                    )
+                except Exception as exc:
+                    gate.on_exception(exc, logger=logger)
+        return reference()
 
     def _can_fuse_qkv_projection(self) -> bool:
         if self._fused_qkv_weight is not None:
@@ -1057,24 +1241,12 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
     ) -> torch.Tensor:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
-        num_frames = temb.shape[1]
-        seqlen_per_frame = hidden_states.shape[1] // num_frames
         orig_dtype = hidden_states.dtype
         e = self.scale_shift_table + temb.float()
         shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = e.chunk(
             6, dim=2
         )
-        norm_hidden_states = (
-            (
-                self.norm1(hidden_states.float()).unflatten(
-                    dim=1, sizes=(num_frames, seqlen_per_frame)
-                )
-                * (1 + scale_msa)
-                + shift_msa
-            )
-            .flatten(1, 2)
-            .to(orig_dtype)
-        )
+        norm_hidden_states = self._fp32_norm(hidden_states, scale_msa, shift_msa)
         query, key, value = self._project_qkv(norm_hidden_states)
         if self.tp_rmsnorm:
             query = tensor_parallel_rms_norm(query, self.norm_q)
@@ -1103,12 +1275,9 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
 
-        residual_zero = torch.zeros(
-            (1,), device=hidden_states.device, dtype=hidden_states.dtype
-        )
-        norm_hidden_states, hidden_states = self.self_attn_residual_norm(
-            hidden_states, attn_output, gate_msa, residual_zero, residual_zero
-        )
+        # Camera conditioning changes the residual before cross-attention LN;
+        # the normalized output of the earlier fused residual+LN was discarded.
+        hidden_states = self._self_attn_residual(hidden_states, attn_output, gate_msa)
         hidden_states = self.cam_conditioner(
             hidden_states.to(orig_dtype),
             c2ws_plucker_emb,
@@ -1118,9 +1287,7 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
                 else self._cam_conditioner_scale_shift(c2ws_plucker_emb)
             ),
         )
-        norm_hidden_states = self.self_attn_residual_norm.norm(hidden_states).to(
-            orig_dtype
-        )
+        norm_hidden_states = self._fp32_norm(hidden_states).to(orig_dtype)
 
         attn_output = self._cross_attn_with_cache(
             norm_hidden_states, encoder_hidden_states, crossattn_cache

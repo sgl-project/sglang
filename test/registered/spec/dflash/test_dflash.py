@@ -23,7 +23,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=500, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=1078, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=420, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
@@ -68,7 +68,7 @@ class TestDFlashServerBase(
             # private pools on 32GB CI cards.
             "--mem-fraction-static",
             "0.7",
-            "--cuda-graph-bs",
+            "--cuda-graph-bs-decode",
             *[str(i) for i in range(1, cls.max_running_requests + 1)],
         ]
         if cls.disable_overlap:

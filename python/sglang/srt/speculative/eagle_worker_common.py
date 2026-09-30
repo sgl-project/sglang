@@ -14,6 +14,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    PPProxyTensors,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import (
@@ -471,6 +472,7 @@ def run_eagle_verify(
     device: str,
     metadata_ready_pre_pad: bool,
     finalize_tree_path: bool,
+    pp_proxy_tensors: Optional[PPProxyTensors] = None,
     grammar_barrier=None,
     uno_target_max_top_k: Optional[int] = None,
 ) -> GenerationBatchResult:
@@ -495,6 +497,10 @@ def run_eagle_verify(
     # Batch 1: Target verify
     # Prepare for target verify in a separate stream
     with plan_stream_ctx:
+        if plan_stream is not None:
+            # Verify prep copies draft-produced tree metadata on the plan stream,
+            # so it must not start before the draft frontier.
+            plan_stream.wait_stream(fwd_stream)
         verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
             verify_input,
             req_to_token_pool,
@@ -564,6 +570,7 @@ def run_eagle_verify(
         batch=None,
         forward_batch=verify_forward_batch,
         is_verify=True,
+        pp_proxy_tensors=pp_proxy_tensors,
     )
     logits_output = forward_batch_output.logits_output
 
@@ -660,6 +667,7 @@ def run_eagle_verify(
         speculative_num_draft_tokens=num_draft_tokens,
         next_draft_input=next_draft_input,
         accept_lens=accept_lens,
+        accept_index=accept_index,
         new_seq_lens=new_seq_lens,
         routed_experts_output=forward_batch_output.routed_experts_output,
         indexer_topk_output=forward_batch_output.indexer_topk_output,

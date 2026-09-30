@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING
 import torch
 from compressed_tensors import CompressionFormat
 
-from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -310,11 +309,7 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
 
         router_logits = topk_output.router_logits
         topk_config = topk_output.topk_config
-        correction_bias = (
-            None
-            if topk_config.correction_bias is None
-            else topk_config.correction_bias.to(x.dtype)
-        )
+        correction_bias = topk_config.correction_bias
 
         local_num_experts = self.moe_runner_config.num_local_experts
         routing_method_type = layer.routing_method_type
@@ -329,7 +324,7 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
         )
 
         with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
+            get_parallel().tp_group, disabled=not is_allocation_symmetric()
         ):
             num_tokens = x.shape[0]
             hidden_size = x.shape[-1]

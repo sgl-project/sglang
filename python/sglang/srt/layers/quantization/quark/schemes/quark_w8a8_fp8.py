@@ -15,6 +15,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     cutlass_fp8_supported,
     normalize_e4m3fn_to_e4m3fnuz,
+    use_aiter_bpreshuffle_gemm,
 )
 from sglang.srt.layers.quantization.quark.schemes import QuarkLinearScheme
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
@@ -95,7 +96,7 @@ class QuarkW8A8Fp8(QuarkLinearScheme):
                 weight_scale = layer.weight_scale.data
             if self.per_token:
                 weight_scale = weight_scale.view(-1, 1)
-            if _use_aiter:
+            if use_aiter_bpreshuffle_gemm(weight.shape[0]):
                 layer.weight = Parameter(
                     shuffle_weight(weight, (16, 16)).t(), requires_grad=False
                 )
@@ -173,7 +174,14 @@ class QuarkW8A8Fp8(QuarkLinearScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
+        # Activations must be a plain bf16 tensor: per-channel FP8 (weight_scale
+        # [N, 1]) is gated off the aiter fused RMSNorm+quant kernel upstream by
+        # _is_block_scale_fp8, so the per-token quant happens in apply_fp8_linear.
+        assert not isinstance(x, tuple), (
+            "quark W8A8 FP8 linear received a pre-quantized tuple; a fused "
+            "RMSNorm+quant producer was not gated off by _is_block_scale_fp8 "
+            "(per-channel FP8 must fall through to the plain bf16 path)."
+        )
         return apply_fp8_linear(
             x,
             layer.weight,

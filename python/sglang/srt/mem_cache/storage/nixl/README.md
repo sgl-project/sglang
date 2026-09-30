@@ -206,7 +206,7 @@ Important details from this validation:
 
 - Use a real `.toml` file path with `--hicache-storage-backend-extra-config`.
 - For this validated path, the storage directory was provided through `SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR`.
-- Use `--mamba-scheduler-strategy extra_buffer` to support page sizes larger than 1.
+- Use `--mamba-radix-cache-strategy extra_buffer` to support page sizes larger than 1.
 
 Example TOML file:
 
@@ -237,7 +237,7 @@ export SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR=/tmp/sglang_nixl_e2e_storage
   --disable-cuda-graph \
   --hicache-storage-backend nixl \
   --hicache-storage-backend-extra-config @/tmp/nixl.config.toml \
-  --mamba-scheduler-strategy extra_buffer
+  --mamba-radix-cache-strategy extra_buffer
 ```
 
 Expected behavior for this validated setup:

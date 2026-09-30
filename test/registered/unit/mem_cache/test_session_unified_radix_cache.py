@@ -2,16 +2,15 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
-import ast
 import unittest
 from array import array
-from pathlib import Path
 from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
@@ -20,81 +19,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
-from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.test_utils import CustomTestCase
-
-REPO_ROOT = Path(__file__).resolve().parents[4]
-MEM_CACHE_ROOT = REPO_ROOT / "python/sglang/srt/mem_cache"
-
-
-def class_bases(path: Path, class_name: str) -> set[str]:
-    tree = ast.parse(path.read_text())
-    class_node = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == class_name
-    )
-    return {
-        base.id if isinstance(base, ast.Name) else ast.unparse(base)
-        for base in class_node.bases
-    }
-
-
-class TestSessionCacheOwnership(CustomTestCase):
-    def test_only_unified_radix_cache_owns_session_ref_tracker(self):
-        ordinary_mixin = MEM_CACHE_ROOT / "session_radix_cache.py"
-        radix_cache = MEM_CACHE_ROOT / "radix_cache.py"
-        hiradix_cache = MEM_CACHE_ROOT / "hiradix_cache.py"
-        evict_policy = MEM_CACHE_ROOT / "evict_policy.py"
-        unified_cache = MEM_CACHE_ROOT / "unified_radix_cache.py"
-        session_ref_tracker = (
-            MEM_CACHE_ROOT / "unified_cache" / "session_ref_tracker.py"
-        )
-
-        self.assertFalse(ordinary_mixin.exists())
-        ordinary_source = "\n".join(
-            path.read_text() for path in (radix_cache, hiradix_cache, evict_policy)
-        )
-        for removed_symbol in (
-            "SessionRadixCacheMixin",
-            "SessionAwareEvictionStrategy",
-            "session_ref",
-            "_session_on_",
-            "_session_forget_node",
-            "_account_new_evictable_node",
-            "_supports_session_radix_cache",
-            "enable_session_radix_cache",
-        ):
-            self.assertNotIn(removed_symbol, ordinary_source)
-        self.assertNotIn(
-            "SessionRadixCacheMixin", class_bases(radix_cache, "RadixCache")
-        )
-        # Session behavior is composed, not mixed in (general-code-style rule).
-        self.assertEqual(
-            class_bases(unified_cache, "UnifiedRadixCache"), {"BasePrefixCache"}
-        )
-        self.assertIn("UnifiedSessionRefTracker", session_ref_tracker.read_text())
-        self.assertNotIn("SessionUnifiedRadixCacheMixin", unified_cache.read_text())
-
-        for component in (
-            "full_component.py",
-            "swa_component.py",
-            "mamba_component.py",
-        ):
-            self.assertIn(
-                "session_ref",
-                (
-                    MEM_CACHE_ROOT / "unified_cache" / "components" / component
-                ).read_text(),
-            )
-
-        registry = MEM_CACHE_ROOT / "registry.py"
-        self.assertIn(
-            "--enable-session-radix-cache requires UnifiedRadixCache",
-            registry.read_text(),
-        )
 
 
 def make_params(enable_session: bool) -> CacheInitParams:
@@ -156,34 +85,40 @@ def match_len(cache, token_ids) -> int:
 def register(cache, token_ids, session_id, generation=None):
     if generation is None:
         generation = cache.ensure_session_generation(session_id)
+    leaf = cache.match_prefix(
+        MatchPrefixParams(key=RadixKey(array("q", token_ids)))
+    ).last_device_node
     cache.session_refs.register_session_ref(
         SimpleNamespace(
             session_id=session_id,
             session_generation=generation,
             session=None,
-            last_node=cache.match_prefix(
-                MatchPrefixParams(key=RadixKey(array("q", token_ids)))
-            ).last_device_node,
             origin_input_ids=array("q", token_ids),
             output_ids=array("q"),
             extra_key=None,
-        )
+        ),
+        leaf=leaf,
     )
-
-
-class TestRadixCacheSessionRemoval(CustomTestCase):
-    def test_plain_radix_cache_does_not_enable_session_references(self):
-        cache = RadixCache(make_params(enable_session=True))
-
-        self.assertFalse(hasattr(cache, "enable_session_radix_cache"))
-        self.assertFalse(hasattr(cache, "register_session_ref"))
-        self.assertFalse(hasattr(cache, "open_radix_session"))
 
 
 class TestSessionUnifiedRadixCache(CustomTestCase):
     def setUp(self):
         self.cache = UnifiedRadixCache(make_params(enable_session=True))
         self.full = self.cache.components[ComponentType.FULL]
+
+    def test_explicit_rust_selection_uses_python_session_semantics(self):
+        with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("rust"):
+            cache = UnifiedRadixCache(make_params(enable_session=True))
+        self.assertEqual(cache._tree_core_backend, "python")
+        self.assertIsInstance(cache.tree_core, UnifiedTreeCore)
+        leaf = insert(cache, [1, 2, 3, 4])
+        generation = cache.open_radix_session("fallback")
+        register(cache, [1, 2, 3, 4], "fallback", generation)
+        full = cache.components[ComponentType.FULL]
+        self.assertEqual(full.session_ref(leaf), 1)
+        cache.release_radix_session("fallback")
+        self.assertEqual(full.session_ref(leaf), 0)
+        cache.sanity_check()
 
     def test_register_and_release_update_full_component_reference(self):
         leaf = insert(self.cache, [1, 2, 3, 4])

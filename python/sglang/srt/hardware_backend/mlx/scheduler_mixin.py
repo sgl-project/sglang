@@ -98,6 +98,8 @@ class SchedulerMlxOverlapMixin:
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
         batch.launch_ts = time.monotonic()
+        batch.after_idle_gap = self._sched_idled
+        self._sched_idled = False
         self.profiler_manager._profile_batch_predicate(batch)
 
     def _finalize_mlx_pending_job(self: Scheduler, pending: MlxPendingJob):
@@ -210,9 +212,9 @@ class SchedulerMlxOverlapMixin:
                 mx.synchronize()
                 break
 
-            recv_reqs = self.request_receiver.recv_requests()
-            self.process_input_requests(recv_reqs)
+            self.ingest_requests()
             if self._engine_paused:
+                self._record_scheduler_state_for_paused_engine()
                 continue
 
             # 1. If pending_curr is a pure decode AND no new prefill is waiting,
@@ -273,6 +275,7 @@ class SchedulerMlxOverlapMixin:
                 pending_curr = _launch_fresh(next_batch)
                 self.result_queue.append(pending_curr)
             else:
+                self._sched_idled = True
                 self.on_idle()
 
             self.last_batch = next_batch

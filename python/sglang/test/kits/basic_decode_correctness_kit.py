@@ -58,8 +58,11 @@ class BasicDecodeCorrectnessMixin:
         # Language-agnostic gibberish detector. Healthy English output is
         # >90% printable ASCII; multilingual token salad / Unicode noise
         # from broken weight load drops well below 50%.
+        # Q/A framing, as in the probes above: a base model continues a bare
+        # instruction with arbitrary text whose language is not pinned down,
+        # so the ratio would measure the continuation, not output health.
         out = self._decode_generate(
-            "Write a single sentence about a sunny day in the park.",
+            "Q: Write a single sentence about a sunny day in the park.\nA:",
             self.sanity_max_new_tokens_long,
         )
         printable = sum(1 for c in out if 32 <= ord(c) < 127 or c in "\n\t")

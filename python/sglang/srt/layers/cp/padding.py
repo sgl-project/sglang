@@ -23,11 +23,10 @@ from sglang.srt.runtime_context import get_parallel
 
 def get_cp_padding_align_size() -> int:
     """Return the token-count alignment required by the active CP strategy."""
-    from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
-    from sglang.srt.layers.utils.cp_utils import is_prefill_cp_in_seq_split
+    from sglang.srt.layers.cp.base import is_zigzag
 
     attn_cp_size = get_parallel().attn_cp_size
-    if is_prefill_cp_in_seq_split() or is_dsa_prefill_cp_in_seq_split():
+    if is_zigzag():
         return attn_cp_size * 2
     return attn_cp_size
 

@@ -27,6 +27,8 @@ on:
         value: ${{ jobs.run.outputs.jit_kernel }}
       multimodal_gen:
         value: ${{ jobs.run.outputs.multimodal_gen }}
+      renderer:
+        value: ${{ jobs.run.outputs.renderer }}
       rust_workspace:
         value: ${{ jobs.run.outputs.rust_workspace }}
       partitions:
@@ -50,6 +52,7 @@ jobs:
       sgl_kernel: ${{ steps.filter.outputs.sgl_kernel }}
       jit_kernel: ${{ steps.filter.outputs.jit_kernel || steps.run-mode.outputs.run_all_tests }}
       multimodal_gen: ${{ steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }}
+      renderer: ${{ steps.filter.outputs.renderer || steps.run-mode.outputs.run_all_tests }}
       rust_workspace: ${{ steps.filter.outputs.rust_workspace || steps.run-mode.outputs.run_all_tests }}
       partitions: ${{ steps.partitions.outputs.partitions }}
       partition_model_sha: ${{ steps.partition-model-sha.outputs.sha }}
@@ -89,14 +92,18 @@ jobs:
               - ".github/workflows/pr-gate.yml"
               - ".github/actions/**"
               - "python/pyproject.toml"
+              - "python/setup.py"
               - "python/sglang/!(multimodal_gen|kernels)/**/!(*.md)"
               - "python/sglang/kernels/!(*.md)"
               - "python/sglang/kernels/!(aot)/**/!(*.md)"
               - "scripts/ci/cuda/*"
               - "scripts/ci/utils/*"
               - "test/**/!(*.md)"
-              - "rust/**"
+              - "rust/*"
+              - "rust/!(sglang-renderer)/**"
               - "proto/sglang/runtime/v1/sglang.proto"
+            renderer:
+              - "rust/sglang-renderer/**"
             simulator:
               - ".github/workflows/pr-test-extra.yml"
               - ".github/workflows/_pr-test-simulator-cpu.yml"
@@ -112,6 +119,7 @@ jobs:
               - "python/sglang/kernels/ops/diffusion/**"
               - "test/registered/kernels/ops/diffusion/**"
               - "test/registered/kernels/benchmark/diffusion/**"
+              - "test/registered/unit/diffusion/**"
               - "python/sglang/cli/**"
             jit_kernel:
               - ".github/workflows/pr-test.yml"
@@ -134,15 +142,24 @@ jobs:
               - "test/registered/rust/**"
               - ".github/workflows/_pr-test-*.yml"
 
+      - name: Resolve CI labels
+        id: ci-labels
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { resolveCiLabels } = require(
+              `${process.env.GITHUB_WORKSPACE}/.github/scripts/ci-labels.cjs`
+            );
+            const axes = await resolveCiLabels(github, context);
+            core.info(`CI labels: [${axes.labels.join(', ')}]`);
+            core.setOutput('max_concurrency', String(axes.maxConcurrency));
+
       - name: Determine full-parallel mode
         id: parallel-mode
         run: |
           # `full=true` lifts the matrix-fanout throttle so each suite's
-          # max_parallel = size. Conditions:
-          #   1. Scheduled cron run.
-          #   2. run_all_tests run (manual full dispatch / release) -- a full
-          #      run should mirror the cron's parallelism, not just its test set.
-          #   3. pull_request event with the `high priority` label.
+          # max_parallel = size.
           FULL=false
           if [[ "${{ github.event_name }}" == "schedule" ]]; then
             FULL=true
@@ -150,9 +167,9 @@ jobs:
           elif [[ "${{ inputs.run_all_tests }}" == "true" ]]; then
             FULL=true
             echo "run_all_tests -> full parallelism"
-          elif [[ "${{ github.event_name }}" == "pull_request" && "${{ contains(github.event.pull_request.labels.*.name, 'high priority') }}" == "true" ]]; then
+          elif [[ "${{ steps.ci-labels.outputs.max_concurrency }}" == "true" ]]; then
             FULL=true
-            echo "high priority PR -> full parallelism"
+            echo "max-concurrency PR -> full parallelism"
           fi
           echo "full=$FULL" >> "$GITHUB_OUTPUT"
 
@@ -187,10 +204,7 @@ jobs:
         id: partitions
         run: |
           # Emit a single JSON output `partitions` keyed by suite name with
-          # {size, arr, max_parallel} fields per suite. Replaces the prior
-          # full/low max-parallel presets; `--full-parallel` keeps the
-          # `high priority` PR / scheduled cron escape hatch.
-          # See scripts/ci/utils/compute_partitions.py.
+          # {size, arr, max_parallel} fields per suite.
           python3 scripts/ci/utils/compute_partitions.py \
             --full-parallel ${{ steps.parallel-mode.outputs.full }} \
             --partition-model-file /tmp/partition-model.json \

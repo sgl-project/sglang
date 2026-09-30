@@ -19,7 +19,7 @@
 //! whatever fixture is checked in.
 
 use serde::Deserialize;
-use sgl_router::policies::kv_events::compute_block_hashes;
+use sgl_router::state::kv_events::compute_block_hashes;
 use std::path::PathBuf;
 
 #[derive(Debug, Deserialize)]

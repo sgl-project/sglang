@@ -23,7 +23,7 @@ impl Overloaded {
 impl EligibilityFilter for Overloaded {
     fn keep(&self, workers: &[Arc<Worker>], _ctx: &SelectionContext<'_>) -> Vec<bool> {
         (workers.iter())
-            .map(|w| w.active_load() < self.max_in_flight)
+            .map(|w| w.router_inflight_load() < self.max_in_flight)
             .collect()
     }
 
@@ -42,7 +42,7 @@ impl Policy for Overloaded {
             .collect();
         eligible
             .iter()
-            .min_by_key(|w| w.active_load())
+            .min_by_key(|w| w.router_inflight_load())
             .map(Arc::clone)
     }
 
@@ -69,6 +69,7 @@ mod tests {
 
     #[test]
     fn the_cap_is_a_strict_ceiling() {
+        assert!(!Overloaded::new(3).needs_load_snapshot());
         let ws = vec![worker("idle"), worker("under"), worker("at")];
         let _under: Vec<_> = (0..2).map(|_| ws[1].load_guard()).collect();
         let _at: Vec<_> = (0..3).map(|_| ws[2].load_guard()).collect();

@@ -9,7 +9,7 @@
 //!   * To_scheduler   — 1 thread driving the FSM
 //!   * From_scheduler — 1 thread draining the scheduler → detok shards
 //!   * MM workers     — K unpinned OS threads, spawned late via
-//!     [`Runtime::spawn_mm_pool`] (multimodal models only)
+//!     [`Runtime::start_mm_workers`] (multimodal models only)
 //!
 //! Keeping CPU-bound tokenize/detokenize off the async executor avoids stalling
 //! axum's worker threads.
@@ -41,18 +41,8 @@ pub trait Runnable: Send + 'static {
 pub struct Runtime {
     pub to_scheduler_rx: ToSchedulerRx,
     pub from_scheduler_tx: FromSchedulerTx,
-    /// Requests parked in `Encoding`, drained by the MM worker pool
-    /// (`Server.start_mm_workers`). Stays empty for non-multimodal models —
-    /// request never routes to it.
-    pub to_mm_worker_rx: flume::Receiver<crate::message::request::MmRequest>,
-    /// Back-channel for the MM workers' `MmEncoded` / `MmFailed` into to_scheduler.
-    pub from_mm_worker_tx: flume::Sender<TmEvent>,
-    /// The loaded tokenizer, shared with the MM worker path (`None` under
-    /// `skip_tokenizer_init`).
-    pub tokenizer: Option<Arc<dyn tokenizer::TextTokenizer>>,
-    /// MM results parked between a worker's `MmEncoded` and the scheduler drain
-    /// (`Server.take_mm_result`).
-    pub mm_sidecar: crate::multi_modality::sidecar::Sidecar,
+    /// Wiring for the late-spawned MM pool ([`Runtime::start_mm_workers`]).
+    mm_wiring: crate::multi_modality::worker::MmWiring,
     /// Worker join handles, joined by `request_shutdown` / `Drop`.
     threads: Mutex<Vec<JoinHandle<()>>>,
     /// The single shutdown sender.
@@ -64,20 +54,47 @@ pub struct Runtime {
 const SHUTDOWN_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl Runtime {
-    /// Spawn `workers` `mm-worker-{i}` threads into the shutdown join set —
-    /// late, once Python has built the mm spec (`Server::start_mm_workers`).
+    /// Build the family context from `spec` and spawn `workers`
+    /// `mm-worker-{i}` threads into the shutdown join set — late, once Python
+    /// has built the mm spec (`Server.start_mm_workers`).
     ///
     /// Deliberately unpinned: the threads inherit the launch thread's affinity,
     /// already narrowed by `RustServer.launch` to the server cores, so bursty
     /// MM preprocessing floats over that whole set (rather than owning cores
     /// that idle between bursts) and never preempts the scheduler's reserved
     /// cores.
-    pub fn spawn_mm_pool(&self, workers: usize, ctx: Arc<crate::multi_modality::worker::Context>) {
+    pub fn start_mm_workers(
+        &self,
+        spec: crate::message::config::MmSpec,
+        workers: usize,
+    ) -> Result<(), String> {
+        let ctx = Arc::new(crate::multi_modality::worker::MmContext::new(spec)?);
+        self.spawn_mm_pool(workers, ctx);
+        Ok(())
+    }
+
+    /// Start the shared worker pool with a processor supplied by an external
+    /// model package. `feature_shm` is that package's `_use_feature_shm`
+    /// answer: place feature tensors in POSIX shm for the TP broadcast.
+    pub fn start_mm_workers_with_processor(
+        &self,
+        processor: Arc<dyn crate::multi_modality::worker::MmProcessor>,
+        workers: usize,
+        feature_shm: bool,
+    ) {
+        let ctx = Arc::new(crate::multi_modality::worker::MmContext::with_processor(
+            processor,
+            feature_shm,
+        ));
+        self.spawn_mm_pool(workers, ctx);
+    }
+
+    fn spawn_mm_pool(&self, workers: usize, ctx: Arc<crate::multi_modality::worker::MmContext>) {
         let mut threads = self.threads.lock().unwrap();
         spawn_pool("mm-worker", None, workers.max(1), &mut threads, |_| {
             crate::multi_modality::worker::MmWorker::new(
-                self.to_mm_worker_rx.clone(),
-                self.from_mm_worker_tx.clone(),
+                self.mm_wiring.mm_rx.clone(),
+                self.mm_wiring.tm_tx.clone(),
                 ctx.clone(),
             )
         });
@@ -122,9 +139,8 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         flume::bounded::<crate::message::request::Request>(cfg.rust_server_args.stage_channel_cap);
     // Encoding → MM worker pool. Bounded like the other stage edges so a slow
     // pool back-pressures instead of buffering unboundedly.
-    let (mm_worker_tx, mm_worker_rx) = flume::bounded::<crate::message::request::MmRequest>(
-        cfg.rust_server_args.stage_channel_cap,
-    );
+    let (mm_worker_tx, mm_worker_rx) =
+        flume::bounded::<crate::message::request::Request>(cfg.rust_server_args.stage_channel_cap);
     let detokenizer_worker_num = cfg.server_args.detokenizer_worker_num;
     let mut detokenizer_tx = Vec::with_capacity(detokenizer_worker_num);
     let mut detokenizer_rx = Vec::with_capacity(detokenizer_worker_num);
@@ -158,14 +174,11 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         cfg.server_args.revision.as_deref(),
         skip_tokenizer_init,
     )?;
-    // The `TextTokenizer` view of it, shared by the tokenizer pool and the MM
-    // worker path (which encodes the placeholder-expanded prompt itself).
+    // The `TextTokenizer` view of it, for the tokenizer pool. The MM workers
+    // never tokenize: a multimodal text prompt passes through the pool first.
     let text_tokenizer: Option<Arc<dyn tokenizer::TextTokenizer>> = dyn_tokenizer
         .as_ref()
         .map(|t| Arc::new(tokenizer::DynamoTokenizer::new(t.clone())) as _);
-
-    // Shared: MM workers park, the Python drain pops.
-    let mm_sidecar: crate::multi_modality::sidecar::Sidecar = Default::default();
 
     // --- Detokenizer shards (pinned, CPU bound) ---
     {
@@ -250,10 +263,9 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
             .and_then(|p| p.tm.get(1).or_else(|| p.tm.first()).copied())
             .map(|c| vec![c]);
         let limits = tokenizer_manager::to_scheduler::Limits::from(&*cfg.server_args);
-        let mm = tokenizer_manager::to_scheduler::Mm {
+        let mm = tokenizer_manager::to_scheduler::MmDispatch {
             enabled: cfg.server_args.model_is_multimodal(),
             tx: mm_worker_tx,
-            sidecar: mm_sidecar.clone(),
         };
         let mut parts = Some((tok_manager_rx, to_scheduler_tx)); // moved into the single worker
         let shutdown_rx = shutdown_rx.clone();
@@ -271,12 +283,26 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         });
     }
 
-    // --- API server (tokio, I/O bound) ---
+    // One transport-neutral entrance to the runtime. Each configured listener
+    // receives a clone; no listener owns or reconstructs scheduler wiring.
+    let frontend = crate::frontend::FrontendHandle::new(
+        senders.tok_manager_tx.clone(),
+        senders.abort_tx.clone(),
+        crate::frontend::FrontendConfig {
+            response_capacity: cfg.rust_server_args.stage_channel_cap,
+            response_activity: response_activity.clone(),
+            startup_ready: cfg.server_args.skip_server_warmup,
+            is_disaggregation: cfg.server_args.is_disaggregation(),
+            mm_limits: cfg.server_args.limit_mm_data_per_request.clone(),
+            metadata: crate::frontend::FrontendMetadata::from(cfg.server_args.as_ref()),
+        },
+    );
+
+    // --- HTTP adapter (tokio, I/O bound) ---
     {
         let cfg = cfg.clone();
         let api_cores = plan.as_ref().map(|p| p.api.clone());
-        let senders = senders.clone();
-        let response_activity = response_activity.clone();
+        let frontend = frontend.clone();
         let shutdown_rx = shutdown_rx.clone();
         // Bind synchronously so an unavailable port (EADDRINUSE) is a hard
         // startup error. The `?` drops `shutdown_tx`/`senders`, which stops the
@@ -303,11 +329,8 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                 let rt = builder.build().expect("build api runtime");
                 rt.block_on(api_server::app::serve(
                     listener,
-                    senders,
-                    cfg.rust_server_args.stage_channel_cap,
+                    frontend,
                     cfg.server_args.clone(),
-                    // Response heartbeat watched by `/health_generate`.
-                    response_activity,
                     shutdown_rx,
                 ))
             })
@@ -318,10 +341,10 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     Ok(Runtime {
         to_scheduler_rx,
         from_scheduler_tx,
-        to_mm_worker_rx: mm_worker_rx,
-        from_mm_worker_tx: tok_manager_tx,
-        tokenizer: text_tokenizer,
-        mm_sidecar,
+        mm_wiring: crate::multi_modality::worker::MmWiring {
+            mm_rx: mm_worker_rx,
+            tm_tx: tok_manager_tx,
+        },
         threads: Mutex::new(threads),
         shutdown_tx: Mutex::new(Some(shutdown_tx)),
     })
