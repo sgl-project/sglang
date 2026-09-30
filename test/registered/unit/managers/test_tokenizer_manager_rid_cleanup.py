@@ -1123,9 +1123,7 @@ class TestDelayedAbortOwnership(CustomTestCase):
             self._run_cleanup(
                 tm,
                 obj,
-                during_sleep=lambda: tm.rid_to_state.__setitem__(
-                    rids[1], replacement
-                ),
+                during_sleep=lambda: tm.rid_to_state.__setitem__(rids[1], replacement),
             )
         )
         tm.abort_request.assert_called_once_with(rids[0])
@@ -1167,7 +1165,6 @@ class TestDelayedAbortOwnership(CustomTestCase):
 
                 asyncio.run(self._run_cleanup(tm, obj, finish_or_remove))
                 tm.abort_request.assert_not_called()
-
 
 
 if __name__ == "__main__":
