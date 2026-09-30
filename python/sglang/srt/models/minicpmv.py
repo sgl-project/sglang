@@ -22,6 +22,7 @@
 """Inference-only MiniCPM-V model compatible with HuggingFace weights."""
 
 import types
+from array import array
 from functools import partial
 from itertools import chain
 from typing import (
@@ -983,7 +984,7 @@ class MiniCPMV2_6(MiniCPMBaseModel):
         )
         return self.resampler(vision_embedding, tgt_sizes)
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, image_inputs: MultimodalInputs) -> array:
         # Get all special token IDs
         im_start_id: int = image_inputs.im_start_id
         im_end_id: int = image_inputs.im_end_id
@@ -1149,7 +1150,7 @@ class MiniCPMV4_0(MiniCPMBaseModel):
         )
         return self.resampler(vision_embedding, tgt_sizes)
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, image_inputs: MultimodalInputs) -> array:
         # Get all special token IDs
         im_start_id: int = image_inputs.im_start_id
         im_end_id: int = image_inputs.im_end_id
@@ -1319,7 +1320,7 @@ class MiniCPMV4_5(MiniCPMBaseModel):
         )
         return self.resampler(vision_embedding, tgt_sizes)
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, image_inputs: MultimodalInputs) -> array:
         # Get all special token IDs
         im_start_id: int = image_inputs.im_start_id
         im_end_id: int = image_inputs.im_end_id
@@ -1544,7 +1545,7 @@ class MiniCPMV4_6(MiniCPMBaseModel):
     # source. sglang's dispatcher routes by ``get_{modality}_feature``.
     get_video_feature = get_image_feature
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, image_inputs: MultimodalInputs) -> array:
         im_start_id: int = image_inputs.im_start_id
         im_end_id: int = image_inputs.im_end_id
         slice_start_id: int = image_inputs.slice_start_id

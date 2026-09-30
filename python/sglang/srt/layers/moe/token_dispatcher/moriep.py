@@ -319,6 +319,15 @@ def init_mori_op(
                 block_num = 256
                 warp_num_per_block = 16
 
+    if kernel_type == mori.ops.EpDispatchCombineKernelType.IntraNode:
+        # mori's intranode combine ends in a grid-wide barrier every block spins
+        # on. A 256-block grid deadlocks on a 192-CU device; clamping to the CU
+        # count is a conservative bound, not the measured residency limit.
+        cu_count = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count
+        block_num = min(block_num, cu_count)
+
     # Fp8 blockwise combine uses its own internal scale_dim driven which can be
     # overridden by env ``MORI_FP8_COMBINE_SCALE_DIM`` (default 56)
     # See https://github.com/ROCm/mori/blob/96ffa169710f214e76e07abe5008d686fe54522b/python/mori/ops/dispatch_combine.py#L81-L84
@@ -493,19 +502,6 @@ class _MoriEPDispatcherImplBase:
                             "MoE would read them as e8m0 bytes. Falling back to "
                             "bf16 dispatch."
                         )
-        elif (
-            "SGLANG_MORI_FP8_DISP" in os.environ or "SGLANG_MORI_FP4_DISP" in os.environ
-        ):
-            # Deprecated: will be removed in a future release
-            logger.warning_once(
-                "SGLANG_MORI_FP8_DISP and SGLANG_MORI_FP4_DISP are deprecated "
-                "and will be removed in a future release. "
-                "Use SGLANG_MORI_DISPATCH_DTYPE=auto|bf16|fp8|fp4 instead."
-            )
-            if get_bool_env_var("SGLANG_MORI_FP8_DISP", "False"):
-                self.dispatch_dtype = DispatchDtype.fp8
-            if get_bool_env_var("SGLANG_MORI_FP4_DISP", "False"):
-                self.dispatch_dtype = DispatchDtype.fp4
 
         if "SGLANG_MORI_COMBINE_DTYPE" in os.environ:
             combine_dtype = os.environ["SGLANG_MORI_COMBINE_DTYPE"].lower()
@@ -518,15 +514,6 @@ class _MoriEPDispatcherImplBase:
                     self.combine_dtype = CombineDtype.fp8_direct_cast
                 elif combine_dtype == "fp4":
                     self.combine_dtype = CombineDtype.fp4
-        elif "SGLANG_MORI_FP8_COMB" in os.environ:
-            # Deprecated: will be removed in a future release
-            logger.warning_once(
-                "SGLANG_MORI_FP8_COMB is deprecated "
-                "and will be removed in a future release. "
-                "Use SGLANG_MORI_COMBINE_DTYPE=auto|bf16|fp8|fp4|fp8_direct_cast instead."
-            )
-            if get_bool_env_var("SGLANG_MORI_FP8_COMB", "False"):
-                self.combine_dtype = CombineDtype.fp8
 
     def dispatch_a(
         self,

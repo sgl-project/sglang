@@ -12,12 +12,11 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.distributed import get_moe_ep_group
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
 from sglang.srt.layers.moe.utils import DeepEPMode
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -30,7 +29,7 @@ _PARAMS_BYTES = 2  # bf16 — Ascend's Dispatch & Combine does not support fp16
 def _get_fuseep_buffer(layer: FusedMoE):
     DeepEPBuffer.set_dispatch_mode_as_low_latency()
     return DeepEPBuffer.get_deepep_buffer(
-        get_moe_ep_group().device_group,
+        get_parallel().moe_ep_group.device_group,
         layer.hidden_size,
         _PARAMS_BYTES,
         DeepEPMode.LOW_LATENCY,

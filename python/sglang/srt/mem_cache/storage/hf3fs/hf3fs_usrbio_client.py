@@ -8,12 +8,14 @@ from pathlib import Path
 from typing import List
 
 import torch
-from torch.utils.cpp_extension import load
 
 from sglang.srt.mem_cache.storage.hf3fs.hf3fs_client import Hf3fsClient
+from sglang.srt.utils.cpp_extension_loader import load_extension_with_recovery
 
 root = Path(__file__).parent.resolve()
-hf3fs_utils = load(name="hf3fs_utils", sources=[f"{root}/hf3fs_utils.cpp"])
+hf3fs_utils = load_extension_with_recovery(
+    name="hf3fs_utils", sources=[f"{root}/hf3fs_utils.cpp"]
+)
 
 logger = logging.getLogger(__name__)
 

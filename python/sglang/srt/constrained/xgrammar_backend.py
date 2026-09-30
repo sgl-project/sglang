@@ -36,6 +36,10 @@ from sglang.srt.constrained.base_grammar_backend import (
     GrammarStats,
     InvalidGrammarObject,
 )
+from sglang.srt.constrained.json_schema_validation import (
+    UnsupportedJSONSchemaFeature,
+    validate_xgrammar_json_schema,
+)
 from sglang.srt.constrained.utils import is_legacy_structural_tag
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.common import is_pin_memory_available
@@ -211,6 +215,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         vocab_size: int,
         model_eos_token_ids: Optional[List[int]] = None,
         any_whitespace: bool = True,
+        max_whitespace_cnt: Optional[int] = None,
     ):
         super().__init__()
 
@@ -240,6 +245,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         self.vocab_size = vocab_size
         self.override_stop_tokens = override_stop_tokens
         self.any_whitespace = any_whitespace
+        self.max_whitespace_cnt = max_whitespace_cnt
 
     @property
     def is_support_token_filter(self):
@@ -255,11 +261,15 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
 
     @staticmethod
     def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
-        if logits.device.type in {"cuda", "npu", "xpu", "musa"}:
+        if logits.device.type in {"cuda", "xpu", "musa"}:
             if _is_hip:
                 apply_token_bitmask_inplace_cuda(logits, vocab_mask)
             else:
                 apply_token_bitmask_inplace_triton(logits, vocab_mask)
+        elif logits.device.type == "npu":
+            import sgl_kernel_npu  # noqa: F401
+
+            torch.ops.npu.apply_token_bitmask(logits, vocab_mask)
         else:
             raise RuntimeError(f"Unsupported device: {logits.device.type}")
 
@@ -339,11 +349,22 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 # Note: This builtin JSON grammar includes *all* valid JSON (including, for example, arrays at the root)
                 ctx = self.grammar_compiler.compile_builtin_json_grammar()
             else:
+                # Inspect the decoded schema for semantic loss, then give the
+                # original string to XGrammar to preserve its parser behavior.
+                schema = json.loads(key_string)
+                validate_xgrammar_json_schema(schema)
                 ctx = self.grammar_compiler.compile_json_schema(
-                    schema=key_string, any_whitespace=self.any_whitespace
+                    schema=key_string,
+                    any_whitespace=self.any_whitespace,
+                    max_whitespace_cnt=self.max_whitespace_cnt,
                 )
 
-        except (RuntimeError, json.decoder.JSONDecodeError, UnicodeDecodeError) as e:
+        except (
+            RuntimeError,
+            UnsupportedJSONSchemaFeature,
+            json.decoder.JSONDecodeError,
+            UnicodeDecodeError,
+        ) as e:
             logger.error(f"Hit invalid json_schema: {key_string=}, {e=}")
             return InvalidGrammarObject(str(e))
         return self._from_context(ctx, key_string, GrammarStats(dispatch_type="json"))

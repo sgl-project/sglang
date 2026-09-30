@@ -13,7 +13,7 @@ from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.layers.quantization.quark.schemes import QuarkMoEScheme
 from sglang.srt.layers.quantization.utils import all_close_1d, per_tensor_dequantize
-from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
+from sglang.srt.utils import get_bool_env_var, is_hip, print_info_once, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -30,8 +30,6 @@ _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
-
-    from sglang.kernels.ops.moe.rocm_moe_utils import rocm_fused_experts_tkw1
 
 
 class QuarkW8A8FP8MoE(QuarkMoEScheme):
@@ -238,74 +236,84 @@ class QuarkW8A8FP8MoE(QuarkMoEScheme):
                 f"Unsupported weight quantization strategy: {self.weight_qscheme}."
             )
 
-        if (
-            _use_aiter
-            and self.is_weight_per_channel
-            and self.moe_runner_config.apply_router_weight_on_input
-        ):
+        # Triton reads the canonical layout; only AITER wants the shuffled one,
+        # which aiter.fused_moe selects on via the is_shuffled tag.
+        if _use_aiter and self.runner.runner_backend.is_aiter():
             with torch.no_grad():
-                # Pre-shuffle weights
                 layer.w13_weight = torch.nn.Parameter(
                     shuffle_weight(layer.w13_weight.data, (16, 16)),
                     requires_grad=False,
                 )
+                layer.w13_weight.is_shuffled = True
                 torch.cuda.empty_cache()
                 layer.w2_weight = torch.nn.Parameter(
                     shuffle_weight(layer.w2_weight.data, (16, 16)),
                     requires_grad=False,
                 )
+                layer.w2_weight.is_shuffled = True
                 torch.cuda.empty_cache()
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
+        from sglang.srt.layers.moe.utils import (
+            get_moe_a2a_backend,
+            get_moe_runner_backend,
+        )
+
         self.moe_runner_config = moe_runner_config
-        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        moe_runner_backend = get_moe_runner_backend()
+        a2a_supports_aiter = get_moe_a2a_backend().supports_aiter()
+        # AITER's per_Token fused MoE needs per-channel weight scales; the
+        # per-tensor scheme has no equivalent there.
+        use_aiter_runner = (
+            _use_aiter
+            and self.is_weight_per_channel
+            and a2a_supports_aiter
+            and (moe_runner_backend.is_auto() or moe_runner_backend.is_aiter())
+        )
+        self.runner = MoeRunner(
+            MoeRunnerBackend.AITER if use_aiter_runner else MoeRunnerBackend.TRITON,
+            moe_runner_config,
+        )
+        print_info_once(
+            f"QuarkW8A8FP8MoE runner={self.runner.runner_backend.value} "
+            f"(use_aiter={_use_aiter} per_channel={self.is_weight_per_channel} "
+            f"a2a_supports_aiter={a2a_supports_aiter} "
+            f"requested={moe_runner_backend.value})"
+        )
 
     def apply_weights(
         self,
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-
-        x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
-
-        moe_runner_config = self.moe_runner_config
-
-        if (
-            _use_aiter
-            and self.is_weight_per_channel
-            and moe_runner_config.apply_router_weight_on_input
-        ):
-            topk_weights, topk_ids, _ = topk_output
-            output = rocm_fused_experts_tkw1(
-                hidden_states=x,
-                w1=layer.w13_weight,
-                w2=layer.w2_weight,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                activation=moe_runner_config.activation,
-                apply_router_weight_on_input=moe_runner_config.apply_router_weight_on_input,
-                use_fp8_w8a8=True,
-                per_channel_quant=self.is_weight_per_channel,
-                w1_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-                a1_scale=layer.w13_input_scale,
-                a2_scale=layer.w2_input_scale,
+        if self.runner.runner_backend.is_aiter():
+            from sglang.srt.layers.moe.moe_runner.aiter import (
+                AiterMoeQuantInfo,
+                AiterQuantType,
             )
-            return StandardCombineInput(hidden_states=output)
-        else:
-            quant_info = TritonMoeQuantInfo(
+
+            quant_info = AiterMoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
-                use_fp8_w8a8=True,
-                per_channel_quant=self.is_weight_per_channel,
+                quant_type=AiterQuantType.PER_TOKEN,
                 w13_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
                 a13_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
+                expert_mask=layer.dispatcher.expert_mask_gpu,
             )
             return self.runner.run(dispatch_output, quant_info)
+
+        quant_info = TritonMoeQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            use_fp8_w8a8=True,
+            per_channel_quant=self.is_weight_per_channel,
+            w13_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            a13_scale=layer.w13_input_scale,
+            a2_scale=layer.w2_input_scale,
+        )
+        return self.runner.run(dispatch_output, quant_info)

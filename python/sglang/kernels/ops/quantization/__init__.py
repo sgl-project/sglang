@@ -172,15 +172,12 @@ _TRITON_KERNELS = [
     ("fp8_kernel", "sglang_per_token_group_quant_8bit"),
     ("fp8_kernel", "sglang_per_token_quant_fp8"),
     ("fp8_kernel", "static_quant_fp8"),
-    ("fp8_kernel", "w8a8_block_fp8_matmul"),
     ("fp8_kernel", "per_tensor_quant_mla_fp8"),
     ("fp8_kernel", "per_token_group_quant_mla_deep_gemm_masked_fp8"),
     ("fp8_kernel", "per_token_group_quant_fp8_hopper_moe_mn_major"),
     ("fp8_kernel", "per_group_transpose"),
-    ("fp8_kernel", "triton_scaled_mm"),
     ("int8_kernel", "per_token_quant_int8"),
     ("int8_kernel", "per_token_group_quant_int8"),
-    ("int8_kernel", "w8a8_block_int8_matmul"),
     ("awq_triton", "awq_dequantize_triton"),
     ("awq_triton", "awq_gemm_triton"),
     ("mxfp8_amd_gfx95", "mxfp8_e4m3_quantize"),
@@ -205,5 +202,16 @@ register_kernel(
         ),
         capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))}),
         description="Fused NVFP4 GEMM + SwiGLU + NVFP4 quant (CuTe DSL, SM100).",
+    )
+)
+
+
+# Public entry points inventoried by logical operator group (RFC #29630).
+register_kernel(
+    KernelSpec(
+        op="quantization.cvt_fp8_e4m3",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.quantization.fp8_cvt:cvt_fp8_e4m3",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
     )
 )

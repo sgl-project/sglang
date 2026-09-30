@@ -1,0 +1,166 @@
+---
+title: FLUX 3 Action
+metatags:
+    description: "Deploy Black Forest Labs FLUX 3 Action robot policies (joint video + action flow matching) with SGLang's native multimodal_gen runtime."
+tag: dVLA
+---
+
+## 1. Model Introduction
+
+FLUX 3 Action is a robot policy from Black Forest Labs built on a FLUX 3 video diffusion transformer. From the current camera frames, the robot state and a language instruction, it denoises a chunk of future video latents **jointly** with a chunk of continuous actions; only the actions are returned.
+
+The model has three parts:
+
+- **DiT** (`JointSingleSeq`, about 6.6B parameters). Each stream (text, `video`, `video_cond`, the action and state streams) runs through its own 5 mode blocks. The text and all streams then share 28 joint single-stream blocks with per-stream modulation and a 4-axis `(t, h, w, l)` RoPE.
+- **Text encoder**: Qwen3-VL-4B. Eight hidden layers are stacked into a 20480-dim context.
+- **Video VAE**: a Swin3D neighborhood-attention VAE (NATTEN), 96 latent channels, 32x spatial compression.
+
+The sampler is Cosmos UniPC (order 2). Classifier-free guidance is applied per stream (DROID: `4.0` on video, `1.0` on actions).
+
+SGLang runs it in the native `multimodal_gen` runtime. Work that does not depend on the noised streams is computed once:
+
+- The text context, once per caption, across requests.
+- The observation and state streams, once per request.
+- The mode blocks of the noised streams, once per step, shared by the conditional and unconditional passes.
+
+Supported checkpoints (`black-forest-labs/flux-3-action-droid`; three 360x640 cameras `wrist`, `left`, `right`; state and action dim 8; 32-action chunks):
+
+| `--model-variant` | Recipe | Weights | Latency on 1x RTX 5090 | Latency on 1x H200 |
+| --- | --- | --- | ---: | ---: |
+| (default) / `base` | 4 steps, guidance 4.0 (video) / 1.0 (action) | BF16 | 1.14 s | 0.41 s |
+| `fp8r` | same | FP8 rowwise | 0.93 s | 0.47 s |
+| `gd` | guidance-distilled: 4 steps, no CFG | BF16 | 0.63 s | 0.24 s |
+| `gd-fp8r` | same | FP8 rowwise | 0.52 s | 0.27 s |
+| `sd` | step-distilled: 1 step | BF16 | 0.18 s | 0.09 s |
+| `sd-fp8r` | same | FP8 rowwise | 0.16 s | 0.11 s |
+
+Latency is the median server-side time per request (`server_timing.infer_ms`) over 50 sequential requests after 10 warmup requests, on one GPU with the default serve command, eager mode (no `torch.compile`). Requests go through the OpenPI WebSocket with msgpack numpy images, and the caption is cached. Measure it with `python -m sglang.multimodal_gen.benchmarks.bench_flux3_action --url ws://127.0.0.1:30000` against a running server. On H200 the FP8r packages are slower than BF16; they save memory. LayerNorm + modulation, SwiGLU and the gated residual run on bit-exact fused kernels; QK RMSNorm + RoPE runs on a fused kernel at bf16 rounding level (set `SGLANG_ENABLE_FUSED_QKNORM_ROPE=0` to use the eager path). FP8r packages load their native E4M3 weights (one scale per output row) and run `torch._scaled_mm` with per-token activation scales. This needs an SM89+ GPU.
+
+The frozen text encoder and video VAE are downloaded from the pinned revision of [`black-forest-labs/flux-3-action-base`](https://huggingface.co/black-forest-labs/flux-3-action-base) that the policy config references.
+
+References:
+
+- [FLUX Action](https://github.com/black-forest-labs/flux-action)
+- [FLUX 3 Action collection](https://huggingface.co/collections/black-forest-labs/flux-3-action)
+
+## 2. Installation
+
+```bash Command
+git clone https://github.com/sgl-project/sglang.git
+cd sglang
+pip install -e "python[diffusion]"
+```
+
+The video VAE runs its neighborhood attention on [NATTEN](https://natten.org) when it is installed. NATTEN is not a dependency of `sglang[diffusion]`; without it the VAE uses a compiled FlexAttention fallback with the same windows (actions stay at the bf16 rounding level). The fallback compiles on the first request (about 3 s on H200) and is then no slower than NATTEN for this single-frame encode (24 ms vs. 36 ms per request on H200). To use NATTEN, pick the wheel that matches your torch and CUDA versions from [whl.natten.org](https://whl.natten.org/).
+
+## 3. Model Deployment
+
+Serve the DROID policy:
+
+```bash Command
+sglang serve black-forest-labs/flux-3-action-droid \
+  --model-type diffusion \
+  --host 127.0.0.1 \
+  --port 30000
+```
+
+Serve a distilled variant:
+
+```bash Command
+sglang serve black-forest-labs/flux-3-action-droid \
+  --model-type diffusion \
+  --model-variant gd \
+  --port 30000
+```
+
+A local policy export (a directory containing `manifest.json`, `config.native.json` and `model.safetensors`) is detected automatically when passed as the model path. Pass `--revision` to pin a Hub revision. At startup the policy config and weights are checked against the SHA-256 hashes in `manifest.json`.
+
+Peak GPU memory and per-request latency on one RTX 5090. The resident rows use the same median protocol as the table above. The layerwise-offload rows are from the earlier single-run measurement.
+
+| Flags | Peak memory | Latency |
+| --- | ---: | ---: |
+| (none) | 23.3 GiB | 1.14 s |
+| `--dit-layerwise-offload` | 14.5 GB | 2.51 s |
+| `--layerwise-offload-components all` | 9.8 GB | 2.56 s |
+| `--model-variant fp8r` | 17.9 GiB | 0.93 s |
+| `--model-variant fp8r --dit-layerwise-offload` | 13.2 GB | 1.29 s |
+
+Layerwise offload streams the DiT blocks (and, with `all`, the text encoder and VAE blocks) from host memory, so use it only when the resident configuration does not fit.
+
+### 3.1 Multi-GPU
+
+Three layouts split the DiT across GPUs. They compose as `--num-gpus` = TP size x SP degree x (2 with CFG parallel):
+
+| Flags | What is split | Actions vs 1 GPU |
+| --- | --- | --- |
+| `--num-gpus 2 --enable-cfg-parallel` | The conditional and unconditional passes | Bit-identical |
+| `--num-gpus 2 --tp-size 2` | DiT weights (heads and MLP channels), one all-reduce per block | bf16 rounding level |
+| `--num-gpus 2 --sp-degree 2` | The joint sequence and the video mode blocks (K/V gather; add `--ulysses-degree 2` for Ulysses) | bf16 rounding level |
+
+CFG parallel only helps recipes that use guidance (`base`, `fp8r`). The distilled `gd` and `sd` variants run one pass per step, so both GPUs compute the same pass. TP and SP accept the FP8r packages too. Ring attention is not supported.
+
+```bash Command
+sglang serve black-forest-labs/flux-3-action-droid \
+  --model-type diffusion \
+  --num-gpus 2 \
+  --enable-cfg-parallel \
+  --port 30000
+```
+
+### 3.2 Action Request Schema
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `input.task` | string | Language instruction. |
+| `input.observation.images` | object | Camera name -> HWC RGB image, uint8 or float in `[0, 1]`. DROID: `wrist`, `left`, `right` (or the LeRobot names `wrist_image_left`, `exterior_image_1_left`, `exterior_image_2_left`). Alternatively send `composite`: the 540x640 image with the wrist camera on top and the two exterior cameras at half resolution below. |
+| `input.observation.state` | array | Robot state in dataset units. DROID: 7 joint positions (rad) followed by the gripper position. |
+| `parameters.num_inference_steps` | integer, optional | Defaults to the checkpoint recipe. |
+| `parameters.guidance_scale` / `guidance_scale_action` | number, optional | Guidance scale on the video / action stream. Defaults to the checkpoint recipe. |
+| `parameters.seed` | integer, optional | Noise seed. Defaults to the package's `inference_seed` (`0` for DROID), so a repeated observation returns the same actions. |
+| `runtime.prefix_cache` | boolean, optional | `false` bypasses the per-caption text context cache for this request. Defaults to `true`. |
+| `runtime.output_format` | `"list"` or `"numpy"`, optional | Use `"numpy"` with msgpack clients. |
+
+The response returns absolute commands of shape `[32, 8]` in the dataset's conventions.
+
+## 4. API Usage
+
+### 4.1 Generic Action HTTP API
+
+```python Example
+import numpy as np
+import requests
+
+image = np.zeros((360, 640, 3), dtype=np.uint8)
+payload = {
+    "input": {
+        "task": "put the marker in the cup",
+        "observation": {
+            "images": {"wrist": image.tolist(), "left": image.tolist(), "right": image.tolist()},
+            "state": np.zeros(8, dtype=np.float32).tolist(),
+        },
+    },
+}
+response = requests.post("http://127.0.0.1:30000/v1/actions/generations", json=payload)
+action = response.json()["data"][0]["action"]
+print(action["shape"])  # [32, 8]
+```
+
+`GET /v1/actions/metadata` reports the camera keys, action shape and sampler defaults of the served policy.
+
+### 4.2 OpenPI-Compatible WebSocket
+
+`/openpi/policy` takes one observation per message, with camera images as
+`observation.images.<camera>` (`wrist`, `left`, `right`, or the LeRobot names
+`wrist_image_left`, `exterior_image_1_left`, `exterior_image_2_left`), the state
+as `observation.state` and the instruction as `task` or `prompt`. The response
+carries the `[32, 8]` chunk as `actions`. Use the msgpack helpers from the
+[Pi0.5 page](/cookbook/vla/OpenPI/Pi0.5) to pack numpy arrays.
+
+## 5. Accuracy
+
+With the same observation and seed, SGLang matches the FLUX Action reference implementation to the bf16 rounding level:
+
+- The DiT agrees to 1e-6 (relative) in fp32.
+- The VAE latents and text contexts are bit-identical.
+- Across the full 4-step, CFG 4.0 sampling loop, actions differ by at most 0.015 rad (mean 0.003 rad). The reference's own eager and prepared paths differ from each other by 0.015 rad.
+- FP8r packages differ from the reference FP8r path by at most 0.025 rad. The reference FP8r path itself differs from BF16 by 0.055 rad.

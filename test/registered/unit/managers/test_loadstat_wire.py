@@ -23,13 +23,12 @@ from unittest.mock import MagicMock, patch
 
 import msgspec.msgpack
 
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.scheduler_components.load_publisher import (
     LoadStat,
     SchedulerLoadPublisher,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, published_topology
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -97,19 +96,19 @@ class TestLoadPublisherGating(CustomTestCase):
     connect-style one.
     """
 
-    def _build(
-        self, *, config=ZMQ_ENDPOINT, dp_size=1, explicit="auto", **ps_overrides
-    ):
-        """Construct a publisher with the socket bind stubbed out, returning
-        (publisher, captured _open_pub_socket mock). Opts in via explicit="auto"
-        by default (the feature is off without it). dp_size lives on the ps,
-        which the publisher reads (no separate param to disagree with it)."""
-        with patch(
-            "sglang.srt.managers.scheduler_components.load_publisher._open_pub_socket"
-        ) as open_sock:
+    def _build(self, *, config=ZMQ_ENDPOINT, explicit="auto", ranks=None, **topology):
+        """Return a publisher and its mocked socket factory under a published topology.
+
+        ``explicit="auto"`` enables load publication by default.
+        """
+        with (
+            published_topology(ranks=ranks, **topology),
+            patch(
+                "sglang.srt.managers.scheduler_components.load_publisher._open_pub_socket"
+            ) as open_sock,
+        ):
             pub = SchedulerLoadPublisher(
                 kv_events_config=config,
-                ps=ParallelState.trivial(dp_size=dp_size, **ps_overrides),
                 load_publish_endpoint=explicit,
             )
         return pub, open_sock
@@ -130,14 +129,17 @@ class TestLoadPublisherGating(CustomTestCase):
     def test_disabled_off_pp_rank_zero(self):
         # Every PP stage shares attn_tp_rank/attn_cp_rank 0, so without the
         # pp_rank gate they all bind the same load port.
-        pub, open_sock = self._build(pp_rank=1, pp_size=2)
+        pub, open_sock = self._build(pp_size=2, ranks={"world_rank": 1})
         self.assertFalse(pub.enable)
         open_sock.assert_not_called()
 
     def test_disabled_off_attn_tp_and_cp_rank_zero(self):
-        for override in ({"attn_tp_rank": 1}, {"attn_cp_rank": 1}):
-            with self.subTest(**override):
-                pub, open_sock = self._build(**override)
+        for layout in (
+            {"tp_size": 2},
+            {"tp_size": 2, "attn_cp_size": 2},
+        ):
+            with self.subTest(**layout):
+                pub, open_sock = self._build(ranks={"world_rank": 1}, **layout)
                 self.assertFalse(pub.enable)
                 open_sock.assert_not_called()
 
@@ -145,11 +147,16 @@ class TestLoadPublisherGating(CustomTestCase):
         # Pure DP: attn_dp_size == 1 and every worker has attn_dp_rank == 0, so
         # the publisher must key off dp_rank or all replicas collide on one
         # port. kv 5557 + dp_size 4 => base 5561; rank 2 binds 5563.
-        _, open_sock = self._build(attn_dp_size=1, attn_dp_rank=0, dp_rank=2, dp_size=4)
+        _, open_sock = self._build(dp_size=4, ranks={"world_rank": 0, "dp_rank": 2})
         open_sock.assert_called_once_with("tcp://*:5563")
 
     def test_dp_attention_keys_the_load_port_by_attn_dp_rank(self):
-        _, open_sock = self._build(attn_dp_size=4, attn_dp_rank=3, dp_rank=0, dp_size=4)
+        _, open_sock = self._build(
+            tp_size=4,
+            dp_size=4,
+            enable_dp_attention=True,
+            ranks={"world_rank": 3, "dp_rank": 0},
+        )
         open_sock.assert_called_once_with("tcp://*:5564")
 
     def test_load_port_is_packed_after_the_kv_range(self):
@@ -259,10 +266,8 @@ class TestLoadPublisherGating(CustomTestCase):
 
         _, open_sock = self._build(
             explicit="tcp://*:7000",
-            attn_dp_size=1,
-            attn_dp_rank=0,
-            dp_rank=2,
             dp_size=4,
+            ranks={"world_rank": 0, "dp_rank": 2},
         )
         open_sock.assert_called_once_with("tcp://*:7002")
 
@@ -289,11 +294,11 @@ class TestLoadPublisherGating(CustomTestCase):
             "sglang.srt.managers.scheduler_components.load_publisher._open_pub_socket",
             side_effect=zmq.ZMQError,
         ) as open_sock:
-            pub = SchedulerLoadPublisher(
-                kv_events_config=ZMQ_ENDPOINT,
-                ps=ParallelState.trivial(),
-                load_publish_endpoint="auto",
-            )
+            with published_topology():
+                pub = SchedulerLoadPublisher(
+                    kv_events_config=ZMQ_ENDPOINT,
+                    load_publish_endpoint="auto",
+                )
         open_sock.assert_called_once()  # the bind was attempted and failed
         self.assertFalse(pub.enable)
         pub.publish_load_stat(MagicMock(), force=True)  # still a no-op
@@ -468,11 +473,11 @@ class TestLoadStatIntegration(CustomTestCase):
             with _socket.socket() as probe:
                 probe.bind(("", 0))
                 port = probe.getsockname()[1]
-            pub = SchedulerLoadPublisher(
-                kv_events_config='{"publisher": "zmq", "endpoint": "tcp://*:5557"}',
-                ps=ParallelState.trivial(),
-                load_publish_endpoint=f"tcp://*:{port}",
-            )
+            with published_topology():
+                pub = SchedulerLoadPublisher(
+                    kv_events_config='{"publisher": "zmq", "endpoint": "tcp://*:5557"}',
+                    load_publish_endpoint=f"tcp://*:{port}",
+                )
             if pub.enable:
                 break
         self.assertTrue(pub.enable, "load socket never bound a free port")

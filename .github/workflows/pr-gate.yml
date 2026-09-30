@@ -9,6 +9,10 @@ on:
         description: "Whether the PR must also have the run-ci-extra label (in addition to run-ci)"
         type: boolean
         default: false
+      require-label:
+        description: "Additional label the PR must carry besides run-ci (empty = disabled)"
+        type: string
+        default: ''
       cool-down-minutes:
         description: "Cooldown period in minutes for low-permission users; 0 disables rate limiting"
         type: number
@@ -18,10 +22,15 @@ jobs:
   pr-gate:
     # 1. for commits on main: no gating needed
     # 2. for workflow_dispatch: this can only be triggered by users with write access
+    # 3. for pull_request and pull_request_target: apply the checks below.
+    #    This job only reads PR metadata through the API and never checks out
+    #    or executes PR code, so it is safe for pull_request_target callers.
     runs-on: ubuntu-latest
+    env:
+      IS_PR_EVENT: ${{ github.event_name == 'pull_request' || github.event_name == 'pull_request_target' }}
     steps:
       - name: Fetch latest PR info
-        if: github.event_name == 'pull_request'
+        if: env.IS_PR_EVENT == 'true'
         id: pr
         uses: actions/github-script@v8
         with:
@@ -37,7 +46,7 @@ jobs:
             core.setOutput("user", pr.data.user.login);
 
       - name: Log PR info
-        if: github.event_name == 'pull_request'
+        if: env.IS_PR_EVENT == 'true'
         run: |
           echo "===== PR Info ====="
           echo "PR Event: ${{ github.event_name }}"
@@ -46,17 +55,18 @@ jobs:
           echo "PR User: ${{ steps.pr.outputs.user }}"
           echo "Require run-ci: ${{ inputs.require-run-ci }}"
           echo "Require run-ci-extra: ${{ inputs.require-run-ci-extra }}"
+          echo "Require label: ${{ inputs.require-label }}"
           echo "Cool down minutes: ${{ inputs.cool-down-minutes }}"
           echo "==================="
 
       - name: Block draft PR
-        if: github.event_name == 'pull_request' && fromJson(steps.pr.outputs.draft)
+        if: env.IS_PR_EVENT == 'true' && fromJson(steps.pr.outputs.draft)
         run: |
           echo "PR is draft. Blocking CI."
           exit 1
 
       - name: Require run-ci label (optional)
-        if:  github.event_name == 'pull_request' && inputs.require-run-ci == true
+        if: env.IS_PR_EVENT == 'true' && inputs.require-run-ci == true
         run: |
           labels='${{ steps.pr.outputs.labels }}'
           if [[ "${{ contains(fromJson(steps.pr.outputs.labels), 'run-ci') }}" == "false" ]]; then
@@ -70,15 +80,28 @@ jobs:
       # then reruns) could never un-skip. A runtime step using gh-api-fetched
       # labels lets reruns pick up the new label set.
       - name: Require run-ci-extra label (optional)
-        if: github.event_name == 'pull_request' && inputs.require-run-ci-extra == true
+        if: env.IS_PR_EVENT == 'true' && inputs.require-run-ci-extra == true
         run: |
           if [[ "${{ contains(fromJson(steps.pr.outputs.labels), 'run-ci-extra') }}" == "false" ]]; then
             echo "Missing required label 'run-ci-extra'. Add the label (e.g. via /tag-and-rerun-ci extra) to opt this PR into the extra test workflow."
             exit 1
           fi
 
+      # Generic opt-in label gate (same live-fetch semantics as run-ci-extra).
+      # Lets a workflow require its own label on top of run-ci without adding
+      # a dedicated input per label.
+      - name: Require additional label (optional)
+        if: env.IS_PR_EVENT == 'true' && inputs.require-label != ''
+        env:
+          REQUIRED_LABEL: ${{ inputs.require-label }}
+        run: |
+          if [[ "${{ contains(fromJson(steps.pr.outputs.labels), inputs.require-label) }}" == "false" ]]; then
+            echo "Missing required label '${REQUIRED_LABEL}' (in addition to 'run-ci'). Add the label to opt this PR into this workflow."
+            exit 1
+          fi
+
       - name: Enforce rate limit for low-permission actors (optional)
-        if: github.event_name == 'pull_request' && inputs.cool-down-minutes > 0
+        if: env.IS_PR_EVENT == 'true' && inputs.cool-down-minutes > 0
         uses: actions/github-script@v8
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -87,6 +110,11 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const eventName = context.eventName;
+            // pr-test.yml runs on pull_request, so pull_request_target callers must
+            // query that event to share the same rate-limit history.
+            const rateLimitEventName = eventName === "pull_request_target"
+              ? "pull_request"
+              : eventName;
             const curRun = await github.rest.actions.getWorkflowRun({
               owner, repo, run_id: context.runId
             });
@@ -161,14 +189,14 @@ jobs:
 
             const cutoff = new Date(Date.now() - effectiveCooldownMinutes * 60 * 1000);
             core.info(
-              `Checking for workflow runs since ${cutoff.toISOString()} (last ${effectiveCooldownMinutes} minutes) for event '${eventName}'.`
+              `Checking for workflow runs since ${cutoff.toISOString()} (last ${effectiveCooldownMinutes} minutes) for event '${rateLimitEventName}'.`
             );
 
             const { data } = await github.rest.actions.listWorkflowRuns({
               owner,
               repo,
               workflow_id: 'pr-test.yml',
-              event: eventName,
+              event: rateLimitEventName,
               per_page: 100,
             });
 

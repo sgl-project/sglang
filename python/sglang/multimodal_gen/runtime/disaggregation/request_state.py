@@ -7,6 +7,8 @@ import threading
 import time
 from dataclasses import dataclass, field
 
+from sglang.multimodal_gen.runtime.observability.metrics import DiffusionMetrics
+
 logger = logging.getLogger(__name__)
 
 
@@ -80,16 +82,21 @@ class RequestRecord:
 class RequestTracker:
     """Thread-safe tracker for request state machines."""
 
-    def __init__(self):
+    def __init__(self, metrics: DiffusionMetrics | None = None):
+        self._metrics = metrics
         self._lock = threading.Lock()
         self._requests: dict[str, RequestRecord] = {}
 
-    def submit(self, request_id: str) -> RequestRecord:
+    def submit(self, request_id: str, *, is_warmup: bool = False) -> RequestRecord:
         with self._lock:
             if request_id in self._requests:
                 raise ValueError(f"Duplicate request_id: {request_id}")
             record = RequestRecord(request_id=request_id)
             self._requests[request_id] = record
+            if self._metrics is not None:
+                self._metrics.enqueue(
+                    request_id, is_warmup=is_warmup, now=record.submit_time
+                )
             return record
 
     def transition(
@@ -124,6 +131,13 @@ class RequestTracker:
 
             record.state = new_state
             record.last_transition_time = time.monotonic()
+            if self._metrics is not None:
+                if new_state == RequestState.ENCODER_RUNNING:
+                    self._metrics.dispatch(request_id)
+                elif new_state in _TERMINAL_STATES:
+                    self._metrics.finish(
+                        request_id, error=new_state != RequestState.DONE
+                    )
             if error is not None:
                 record.error = error
             if encoder_instance is not None:
@@ -144,6 +158,8 @@ class RequestTracker:
 
     def remove(self, request_id: str) -> RequestRecord | None:
         with self._lock:
+            if self._metrics is not None:
+                self._metrics.finish(request_id, error=True)
             return self._requests.pop(request_id, None)
 
     def find_timed_out(self, timeout_s: float) -> list[str]:

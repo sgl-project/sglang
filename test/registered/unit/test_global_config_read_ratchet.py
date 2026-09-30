@@ -1,28 +1,8 @@
-"""Ratchet guard: process-global config reads may only decrease.
+"""Runtime config reads use namespace accessors instead of the raw startup record.
 
-``get_server_args()`` returns the published ``ServerArgs`` — one process's
-startup record. Config decisions read the namespace accessors instead
-(``get_exec()`` / ``get_memory()`` / …), which carry the resolved value
-including post-publish overrides, and per-runner values come from the runner
-that owns them.
-
-Business code no longer reads the published record for a config value at all:
-both baselines are zero, over the whole package minus the modules that own the
-slot.
-
-The reads that remain live in ``runtime_context.py`` (exempt by module): the
-``@property`` / method members computed from several fields plus the HF config,
-which are not namespace leaves and have no home but ``ServerArgs``.
-
-What the scan sees: ``get_server_args().field``, an alias (``sa =
-get_server_args()`` then ``sa.field`` -- function-local, module-level, or parked
-on an instance attribute), a local copy of an alias (``cfg = sa``), and the
-``getattr(<either>, "field")`` spelling of each. It matches the accessors by
-their literal names, which is why import-renaming them is banned below. A name
-computed at runtime, or indirection deeper than a local name copy, is invisible
-here -- the census tool in the context repo audits that shape. A whole-object
-pass (``def f(server_args)``) is not a global read and is not counted: there the
-caller decided which instance to hand over.
+Scan direct field reads and local, module, or instance aliases of
+``get_server_args()`` outside the modules that own configuration resolution.
+Dynamic indirection is outside this check; whole-object handoffs are allowed.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -44,9 +24,6 @@ _PACKAGE_ROOT = Path(next(iter(sglang.__path__)))
 # named accessors for the derived members, server_args/arg_groups ARE the
 # resolution pipeline.
 _SLOT_OWNERS = ("srt/runtime_context.py", "srt/server_args.py", "srt/arg_groups/")
-
-_DIRECT_BASELINE = 0
-_ALIAS_BASELINE = 0
 
 
 def _is_global_call(node) -> bool:
@@ -112,7 +89,7 @@ def _collect(rel: str, tree: ast.AST):
         # A copy of an alias reaches the same record (``cfg = sa`` after
         # ``sa = get_server_args()``), so follow Name-to-Name assignments to a
         # fixpoint. Deeper indirection (through containers, attributes of
-        # other objects, cross-scope copies) stays census-tool territory.
+        # other objects, cross-scope copies) is outside this check.
         changed = True
         while changed:
             changed = False
@@ -325,35 +302,18 @@ def _field_reads():
     return direct, alias
 
 
-class TestGlobalConfigReadRatchet(CustomTestCase):
-    def _check(self, kind, reads, baseline):
-        if len(reads) > baseline:
-            self.fail(
-                f"{kind} process-global config field reads grew: {len(reads)} > "
-                f"baseline {baseline}. Read the namespace accessor for the "
-                "field's namespace, or the owning runner for a per-runner "
-                "field:\n" + "\n".join(reads)
-            )
-        if len(reads) < baseline:
-            self.fail(
-                f"{kind} process-global config field reads shrank: {len(reads)} < "
-                f"baseline {baseline}. Lower the baseline in this file to lock "
-                "in the progress."
-            )
-
-    def test_global_field_reads_match_the_baseline(self):
+class TestGlobalConfigReads(CustomTestCase):
+    def test_no_global_config_field_reads(self):
         direct, alias = _field_reads()
-        self._check("direct", direct, _DIRECT_BASELINE)
-        self._check("alias-form", alias, _ALIAS_BASELINE)
+        self.assertFalse(
+            direct + alias,
+            "read resolved config through namespace accessors, or use the owning "
+            "runner for per-runner values:\n" + "\n".join(direct + alias),
+        )
 
 
 class TestNoRenamedAccessorImports(CustomTestCase):
-    """The baseline scanner matches ``get_server_args`` by its literal name, so
-    an ``import ... as`` rename would walk a read straight past the zero
-    baseline. Renaming the accessor buys nothing (the name is already short and
-    unambiguous), so it is banned outright — which is exactly what makes
-    literal-name matching sound. (The configured-size registry resolves
-    ``get_parallel`` aliases itself, so it needs no such ban.)"""
+    """Import aliases must not bypass the raw-config read scanner."""
 
     def test_the_scanned_accessors_are_never_import_renamed(self):
         offenders = []
@@ -380,8 +340,8 @@ class TestNoRenamedAccessorImports(CustomTestCase):
         self.assertFalse(
             offenders,
             "get_server_args imported under another name; the read ratchet "
-            "matches it by its literal name, so a rename silently escapes the "
-            "baseline:\n" + "\n".join(offenders),
+            "matches it by its literal name, so a rename escapes detection:\n"
+            + "\n".join(offenders),
         )
 
 

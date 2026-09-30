@@ -19,7 +19,8 @@ register_cpu_ci(est_time=80, suite="base-a-test-cpu")
 
 @unittest.skipIf(
     envs.SGLANG_SKIP_RUST_TESTS.get(),
-    "SGLANG_SKIP_RUST_TESTS is set (no rust/ workspace changes per CI check-changes)",
+    "SGLANG_SKIP_RUST_TESTS is set "
+    "(no Rust workspace input changes per CI check-changes)",
 )
 class TestSGLangRadixTreeCargo(CustomTestCase):
     def test_sglang_radix_tree_native_tests(self):

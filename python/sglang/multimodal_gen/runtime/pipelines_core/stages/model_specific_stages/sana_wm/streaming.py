@@ -27,6 +27,7 @@ from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_c
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
+from sglang.multimodal_gen.runtime.models.dits import sana_wm_parity as parity_probe
 from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
     _NUM_STREAM_CACHE_SLOTS,
 )
@@ -47,9 +48,8 @@ from sglang.multimodal_gen.runtime.realtime.states import (
     get_realtime_causal_dit_state,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
 
-from . import parity_probe
 from .base import (
     _align_sana_wm_cfg_text_conditions,
     _cat_optional_tensors,

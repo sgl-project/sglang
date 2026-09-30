@@ -3,6 +3,7 @@
 """MiniMax H3-specific pipeline stages."""
 
 from .stages.audio_encoding import MiniMaxH3AudioEncodingStage
+from .stages.comfyui_step import MiniMaxH3ComfyUIStepStage
 from .stages.decoding import MiniMaxH3DecodingStage
 from .stages.denoising import MiniMaxH3DenoisingStage
 from .stages.latent_preparation import MiniMaxH3LatentPreparationStage
@@ -12,6 +13,7 @@ from .stages.visual_encoding import MiniMaxH3VisualEncodingStage
 
 __all__ = [
     "MiniMaxH3AudioEncodingStage",
+    "MiniMaxH3ComfyUIStepStage",
     "MiniMaxH3DecodingStage",
     "MiniMaxH3DenoisingStage",
     "MiniMaxH3LatentPreparationStage",

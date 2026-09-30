@@ -4,18 +4,45 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _evict_mamba_for_device_alloc,
     _evict_swa_for_device_alloc,
+    _MambaStrategy,
+    _MambaSwaStrategy,
+    _require_single_row_dsv4_swa_pages,
     _split_hicache_size,
+    _SwaStrategy,
     build_full_draft_pools,
+    build_hybrid_swa_group,
 )
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
+from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+
+class TestDeepSeekV4SWAPageLayout(CustomTestCase):
+    def test_split_physical_rows_are_rejected_for_hicache_consumers(self):
+        with self.assertRaisesRegex(ValueError, "direct SWA KV layout"):
+            _require_single_row_dsv4_swa_pages(
+                logical_page_size=256,
+                physical_page_size=64,
+                consumer="test consumer",
+            )
+
+    def test_matching_page_geometry_is_supported(self):
+        _require_single_row_dsv4_swa_pages(
+            logical_page_size=256,
+            physical_page_size=256,
+            consumer="test consumer",
+        )
 
 
 class _Pool:
@@ -76,6 +103,88 @@ class TestSplitHicacheSize(CustomTestCase):
         self.assertEqual(sum(shares), 100)  # total budget preserved, not doubled
 
 
+class TestHybridStageLayerMappings(CustomTestCase):
+    def test_strategies_pass_stage_local_maps_without_changing_device_maps(self):
+        """Later pipeline stages must transfer every layer before signaling completion."""
+        cases = [
+            (
+                _MambaStrategy,
+                "build_hybrid_mamba_stack",
+                {"full": {3: 0}, "mamba": {0: 2, 1: 0, 2: 1}},
+            ),
+            (
+                _SwaStrategy,
+                "build_hybrid_swa_stack",
+                {"full": {3: 0}, "swa": {0: 2, 1: 0, 2: 1}},
+            ),
+            (
+                _MambaSwaStrategy,
+                "build_hybrid_mamba_swa_stack",
+                {"full": {3: 0}, "swa": {0: 2, 1: 0, 2: 1}, "mamba": {0: 1, 3: 0}},
+            ),
+        ]
+        for strategy_cls, builder_name, local_maps in cases:
+            for start_layer in (0, 4):
+                with self.subTest(strategy=strategy_cls.__name__, start=start_layer):
+                    global_maps = {
+                        name: {
+                            layer + start_layer: index
+                            for layer, index in mapping.items()
+                        }
+                        for name, mapping in local_maps.items()
+                    }
+                    layers_mapping = {
+                        layer: (index, name == "swa")
+                        for name in ("full", "swa")
+                        for layer, index in global_maps.get(name, {}).items()
+                    }
+                    kvcache = SimpleNamespace(
+                        start_layer=start_layer,
+                        full_attention_layer_id_mapping=global_maps["full"].copy(),
+                        layers_mapping=layers_mapping.copy(),
+                        full_kv_pool=object(),
+                        swa_kv_pool=object(),
+                        use_mla=False,
+                    )
+                    req_pool = SimpleNamespace(
+                        mamba_map=global_maps.get("mamba", {}).copy(),
+                        mamba_pool=object(),
+                    )
+                    params = SimpleNamespace(
+                        req_to_token_pool=req_pool,
+                        tp_cache_group=None,
+                        pp_cache_group=None,
+                    )
+                    with patch.object(
+                        hybrid_pool_assembler,
+                        builder_name,
+                        return_value=(
+                            MagicMock(),
+                            SimpleNamespace(transfer_layer_id_max=4),
+                        ),
+                    ) as build_stack:
+                        result = strategy_cls().build(
+                            cache=SimpleNamespace(page_size=1),
+                            kvcache=kvcache,
+                            params=params,
+                            server_args=None,
+                            load_cache_event=None,
+                        )
+
+                    build_stack.assert_called_once()
+                    for name, mapping in local_maps.items():
+                        self.assertEqual(
+                            build_stack.call_args.kwargs[f"{name}_layer_mapping"],
+                            mapping,
+                        )
+                    self.assertEqual(result.cache_controller.transfer_layer_id_max, 4)
+                    self.assertEqual(
+                        kvcache.full_attention_layer_id_mapping, global_maps["full"]
+                    )
+                    self.assertEqual(kvcache.layers_mapping, layers_mapping)
+                    self.assertEqual(req_pool.mamba_map, global_maps.get("mamba", {}))
+
+
 class TestDraftSidecarPoolDispatch(CustomTestCase):
     def test_full_builder_unwraps_empty_hybrid_linear_pool(self):
         draft_kv_pool = object.__new__(HybridLinearKVPool)
@@ -126,6 +235,98 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
         self.assertEqual(build_host_pool.call_args.kwargs["host_to_device_ratio"], 1.0)
         self.assertEqual(len(specs), 1)
         self.assertIs(entries[0].host_pool, draft_host_pool)
+
+
+_ASSEMBLER = "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler."
+
+
+class TestTransferLayerSpan(CustomTestCase):
+    """``transfer_layer_id_max`` must span global layer ids, not count the mapped ones.
+
+    A hybrid model with an uncached layer type keys its mappings non-contiguously,
+    and the per-layer transfer loop then never reaches the high layer ids.
+    """
+
+    def test_pool_entries_span_the_highest_global_layer_id(self):
+        # Global ids 0/2/4/6 with holes between them, the shape NemotronH's
+        # cache-ineligible MLP layers produce: 4 mapped layers spanning 7 ids.
+        full_layer_mapping = {0: 0, 6: 1}
+        swa_layer_mapping = {2: 0, 4: 1}
+
+        with (
+            patch(_ASSEMBLER + "build_kv_host_pool"),
+            patch(_ASSEMBLER + "HostPoolGroup"),
+            patch(_ASSEMBLER + "build_pool_entry") as build_pool_entry,
+        ):
+            build_hybrid_swa_group(
+                page_size=64,
+                full_kv_pool=MagicMock(),
+                swa_kv_pool=MagicMock(),
+                full_layer_mapping=full_layer_mapping,
+                swa_layer_mapping=swa_layer_mapping,
+                use_mla=False,
+            )
+
+        self.assertEqual(
+            [
+                c.kwargs["transfer_layer_id_max"]
+                for c in build_pool_entry.call_args_list
+            ],
+            [7, 7],
+        )
+
+
+def _build_unified_swa_pool(page_size: int = 4):
+    return init_unified_swa_pools(
+        device="cpu",
+        kv_cache_dtype=torch.float16,
+        head_num=2,
+        head_dim=4,
+        v_head_dim=4,
+        swa_head_num=2,
+        swa_head_dim=4,
+        swa_v_head_dim=4,
+        page_size=page_size,
+        start_layer=0,
+        end_layer=4,
+        swa_attention_layer_ids=[3],
+        full_attention_layer_ids=[0, 1, 2],
+        total_bytes=4096,
+        enable_memory_saver=False,
+        need_sort=False,
+        lazy_compaction=True,
+    )
+
+
+def _build_unified_host_pair(bundle):
+    pool = bundle.token_to_kv_pool
+    return UnifiedPageEnvelopeHostPool.build_hybrid_swa_pool_pair(
+        device_pools=(pool.full_kv_pool, pool.swa_kv_pool),
+        host_to_device_ratio=1.0,
+        host_size=0,
+        page_size=pool.page_size,
+        layout="layer_first",
+        pin_memory=False,
+        allocator_type="default",
+    )
+
+
+class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
+    def test_shared_arena_can_reuse_bytes_across_sides(self):
+        page_size = 4
+        full_pool, swa_pool = _build_unified_host_pair(
+            _build_unified_swa_pool(page_size)
+        )
+        self.addCleanup(full_pool.destroy)
+        self.addCleanup(swa_pool.destroy)
+
+        full_indices = full_pool.alloc(full_pool.available_size())
+        self.assertIsNotNone(full_indices)
+        self.assertIsNotNone(swa_pool.alloc(swa_pool.available_size()))
+        self.assertIsNone(swa_pool.alloc(page_size))
+
+        full_pool.free(full_indices[page_size:])
+        self.assertIsNotNone(swa_pool.alloc(page_size))
 
 
 if __name__ == "__main__":

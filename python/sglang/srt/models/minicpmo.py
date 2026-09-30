@@ -16,6 +16,7 @@
 """Inference-only MiniCPM-o model compatible with HuggingFace weights."""
 
 import math
+from array import array
 from dataclasses import dataclass
 from typing import Any, Iterable, List, Literal, Optional, Tuple, Union
 
@@ -1518,7 +1519,7 @@ class MiniCPMO(MiniCPMBaseModel):
 
         return resampler.to(device=get_device(), dtype=torch.get_default_dtype())
 
-    def pad_input_ids(self, input_ids: List[int], mm_input: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_input: MultimodalInputs) -> array:
         # Get all special token IDs
         im_start_id: int = mm_input.im_start_id
         im_end_id: int = mm_input.im_end_id

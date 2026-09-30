@@ -1,6 +1,5 @@
 import sys
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -13,6 +12,7 @@ from sglang.srt.multimodal.internvl_vit_cuda_graph_runner import (
     InternViTCudaGraphRunner,
 )
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
+from sglang.srt.runtime_context import get_parallel
 
 
 class _Block:
@@ -32,12 +32,10 @@ def _runner(*, use_data_parallel: bool) -> ViTCudaGraphRunner:
 
 def test_dp_vit_graph_capture_does_not_enter_tp_communication_capture():
     runner = _runner(use_data_parallel=True)
-    with patch(
-        "sglang.srt.multimodal.vit_cuda_graph_runner.get_tp_group",
-        side_effect=AssertionError("DP capture must be rank-local"),
-    ):
-        with runner._capture_context():
-            pass
+    # No tp_group is stated, so reading one would raise: the DP path must not
+    # ask for the TP group at all.
+    with runner._capture_context():
+        pass
 
 
 def test_non_dp_vit_graph_capture_uses_tp_communication_capture():
@@ -52,9 +50,7 @@ def test_non_dp_vit_graph_capture_uses_tp_communication_capture():
 
     group = SimpleNamespace(ca_comm=SimpleNamespace(capture=lambda: Capture()))
     runner = _runner(use_data_parallel=False)
-    with patch(
-        "sglang.srt.multimodal.vit_cuda_graph_runner.get_tp_group", return_value=group
-    ):
+    with get_parallel().override(tp_group=group):
         with runner._capture_context():
             pass
     assert entered == [True]

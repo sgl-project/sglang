@@ -13,9 +13,9 @@ from sglang.multimodal_gen.configs.sensenova_u1 import (
     DEFAULT_T_EPS,
     DEFAULT_THINK_MODE,
     DEFAULT_TIMESTEP_SHIFT,
+    RESOLUTION_ALIGNMENT,
     SENSENOVA_U1_CFG_NORM_CHOICES,
     SENSENOVA_U1_REQUEST_EXTRA_KEY,
-    SENSENOVA_U1_RESOLUTION_ALIGNMENT,
 )
 
 _PUBLIC_OVERRIDE_FIELDS = {
@@ -33,6 +33,10 @@ _PUBLIC_OVERRIDE_FIELDS = {
     "output_quality",
     "output_compression",
     "quality",
+    "profile",
+    "profile_all_stages",
+    "num_profiled_timesteps",
+    "perf_dump_path",
 }
 
 
@@ -74,12 +78,12 @@ class SenseNovaU1SamplingParams(SamplingParams):
     def _validate(self) -> None:
         super()._validate()
         if (
-            self.width % SENSENOVA_U1_RESOLUTION_ALIGNMENT != 0
-            or self.height % SENSENOVA_U1_RESOLUTION_ALIGNMENT != 0
+            self.width % RESOLUTION_ALIGNMENT != 0
+            or self.height % RESOLUTION_ALIGNMENT != 0
         ):
             raise ValueError(
                 "SenseNova-U1 requires width and height to be divisible by "
-                f"{SENSENOVA_U1_RESOLUTION_ALIGNMENT}, got "
+                f"{RESOLUTION_ALIGNMENT}, got "
                 f"{self.width}x{self.height}."
             )
         if self.num_frames != 1:

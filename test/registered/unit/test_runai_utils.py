@@ -45,10 +45,6 @@ class TestRunaiUtils(CustomTestCase):
         path2 = ObjectStorageModel.get_path("s3://bucket/model-b/")
         self.assertNotEqual(path1, path2)
 
-    def test_get_path_contains_model_streamer(self):
-        path = ObjectStorageModel.get_path("s3://bucket/model/")
-        self.assertIn("model_streamer", path)
-
 
 if __name__ == "__main__":
     unittest.main()

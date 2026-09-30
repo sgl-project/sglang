@@ -20,7 +20,6 @@ from torch import nn
 
 from sglang.srt.configs.beam import BeamConfig
 from sglang.srt.distributed import (
-    get_pp_group,
     moe_expert_parallel_all_reduce,
     moe_tensor_model_parallel_all_reduce,
 )
@@ -390,7 +389,7 @@ class BeamModel(nn.Module):
     ):
         super().__init__()
         self.config = config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.embed_tokens = (
             VocabParallelEmbedding(
                 config.vocab_size,

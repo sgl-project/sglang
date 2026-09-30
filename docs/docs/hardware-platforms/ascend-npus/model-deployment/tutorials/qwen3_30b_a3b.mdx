@@ -64,13 +64,13 @@ For multi-node deployment, download the weights to a shared directory accessible
 - [Qwen3-a3B_eagle3](https://www.modelscope.cn/models/vllm-ascend/Qwen3-a3B_eagle3) (EAGLE3 draft model for speculative decoding)
 
 <Info>
-Both variants fit within a single 64GB die. For single-node deployment, `--tp-size 1` is sufficient on either A2 or A3.
+Both variants fit within a single 64GB die. For single-node deployment, `--tp-size 1` is sufficient on either A2 Series or A3 Series.
 </Info>
 
 This is the minimum recommended configuration. For optimized configurations,
 see [Best practices](#best-practices), which may require additional cards or nodes.
 
-For the hardware specifications (memory per die, dies per card, and the difference between A2 and A3),
+For the hardware specifications (memory per die, dies per card, and the difference between A2 Series and A3 Series),
 see [Ascend NPU Reference — Hardware](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware).
 
 ## Installation
@@ -86,7 +86,7 @@ Both **stable releases** and **daily builds** are available. The following comma
 For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/faq#8-docker-image-versions-stable-release-vs-daily-build).
 
 <Tabs>
-  <Tab title="Atlas 800I A3">
+  <Tab title="Ascend A3 Series">
 
 ```bash Command
 docker pull quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16
@@ -121,7 +121,7 @@ quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16
 ```
 
   </Tab>
-  <Tab title="Atlas 800I A2">
+  <Tab title="Ascend A2 Series">
 
 ```bash Command
 docker pull quay.io/ascend/sglang:cann9.0.0-910b-v0.5.16
@@ -163,7 +163,7 @@ quay.io/ascend/sglang:cann9.0.0-910b-v0.5.16
 Single-node deployment completes both prefill and decode within the same node (PD mixed mode), suitable for scenarios
 with limited hardware resources. This scenario is already covered in the best practice. For the complete, optimized
 deployment commands and benchmark data, see
-[Qwen3-30B-A3B Best Practice — PD Mixed On A3](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_30b_a3b#single-node-pd-mixed).
+[Qwen3-30B-A3B Best Practice — PD Mixed On A3 Series](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_30b_a3b#single-node-pd-mixed).
 
 ## Functional verification
 

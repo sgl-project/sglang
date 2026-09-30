@@ -20,7 +20,7 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
 from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import get_compute_dtype
+from sglang.multimodal_gen.runtime.utils.precision import get_compute_dtype
 
 logger = init_logger(__name__)
 

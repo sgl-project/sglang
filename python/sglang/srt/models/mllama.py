@@ -20,7 +20,6 @@ from transformers.models.mllama.modeling_mllama import (
     _prepare_aspect_ratio_attention_mask,
 )
 
-import sglang.srt.distributed.parallel_state as ps
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.layernorm import RMSNorm
@@ -392,7 +391,7 @@ class MllamaVisionModel(nn.Module):
             pixel_values.to(self.layernorm_pre.weight.dtype)
         )
         hidden_state = patch_embeds
-        hidden_state = ps.get_tp_group().all_gather(hidden_state)
+        hidden_state = get_parallel().tp_group.all_gather(hidden_state)
 
         # tile embeddings
         _, num_patches, dim = hidden_state.shape

@@ -17,7 +17,17 @@ from typing import Any, Deque, Dict, Optional, Sequence, Tuple
 import torch
 from torch.distributed import TCPStore
 
+try:
+    from torch.distributed import all_gather_single as _all_gather_single
+    from torch.distributed import reduce_scatter_single as _reduce_scatter_single
+except ImportError:  # older torch builds only have the *_tensor names
+    from torch.distributed import all_gather_into_tensor as _all_gather_single
+    from torch.distributed import reduce_scatter_tensor as _reduce_scatter_single
+
 from sglang.srt.runtime_context import get_resources
+
+all_gather_single = _all_gather_single
+reduce_scatter_single = _reduce_scatter_single
 
 logger = logging.getLogger(__name__)
 

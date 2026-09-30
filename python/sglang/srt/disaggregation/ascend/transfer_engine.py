@@ -57,10 +57,7 @@ class AscendTransferEngine(MooncakeTransferEngine):
             self.session_id = NetworkAddress(self.hostname, rpc_port).to_host_port_str()
 
     def initialize(self) -> None:
-        from sglang.srt.distributed.parallel_state import (
-            get_world_group,
-            get_world_size,
-        )
+        from sglang.srt.runtime_context import get_parallel
 
         transfer_protocol = self._get_transfer_protocol()
         if transfer_protocol == "device_rdma":
@@ -68,10 +65,13 @@ class AscendTransferEngine(MooncakeTransferEngine):
             # through all_gather to avoid conflicts with rdma initialization.
             tmp_tensor = torch.zeros(1, device="npu")
             output_tensor_list = [
-                torch.empty_like(tmp_tensor) for _ in range(get_world_size())
+                torch.empty_like(tmp_tensor)
+                for _ in range(get_parallel().launch_world_size)
             ]
             torch.distributed.all_gather(
-                output_tensor_list, tmp_tensor, group=get_world_group().device_group
+                output_tensor_list,
+                tmp_tensor,
+                group=get_parallel().world_group.device_group,
             )
 
         trans_op_type = self._resolve_trans_op_type(transfer_protocol)

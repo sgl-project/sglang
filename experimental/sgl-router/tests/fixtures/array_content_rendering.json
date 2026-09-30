@@ -1,0 +1,4 @@
+{"chat_template": "{% for message in messages %}{{ message.role }}:{% for part in message.content %}{% if part.type == 'text' %}{{ part.text }}{% elif part.type == 'image' %}<image>{% endif %}{% endfor %};{% endfor %}{% if add_generation_prompt %}assistant:{% endif %}", "cases": [
+{"content": "hello", "engine_token_ids": [117, 115, 101, 114, 58, 59, 97, 115, 115, 105, 115, 116, 97, 110, 116, 58]},
+{"content": [{"type": "text", "text": "hello"}], "engine_token_ids": [117, 115, 101, 114, 58, 104, 101, 108, 108, 111, 59, 97, 115, 115, 105, 115, 116, 97, 110, 116, 58]}
+]}

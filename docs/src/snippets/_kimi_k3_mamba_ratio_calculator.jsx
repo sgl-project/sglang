@@ -135,10 +135,18 @@ export const KimiK3MambaRatioCalculator = () => {
   const eff = derive(cfg.flags, cfg.env);
   const bs = derive(cfg.baseFlags.length ? cfg.baseFlags : cfg.flags,
                     cfg.baseFlags.length ? cfg.baseEnv : cfg.env);
-  // A --max-mamba-cache-size cell sizes the pool explicitly — no ratio to
-  // compute or broadcast.
-  const explicitSizing = (cfg.baseFlags.length ? cfg.baseFlags : cfg.flags)
-    .some((f) => f.startsWith("--max-mamba-cache-size"));
+  // Recipes that size the dual pool without the ratio neither render one nor
+  // broadcast one:
+  //   - a --max-mamba-cache-size cell pins the KDA slot count explicitly;
+  //   - the Ascend NPU recipes size both pools internally and never set
+  //     --mamba-full-memory-ratio (every NPU recipe carries --device npu).
+  const baseFlagList = cfg.baseFlags.length ? cfg.baseFlags : cfg.flags;
+  const explicitSizing = baseFlagList.some((f) => f.startsWith("--max-mamba-cache-size"));
+  const npuRecipe = baseFlagList.some((f) => {
+    const [head, ...rest] = f.trim().split(/[\s=]+/);
+    return head === "--device" && rest[0] === "npu";
+  });
+  const ratioNotApplicable = explicitSizing || npuRecipe;
   const { ratio, tp, dp, attnTp, dcp, kvDtype, ssmDtype, radixOff, strategy, skipLock, slots, specOn, replaySpec, block, pdRole } = eff;
   const valid = Number.isFinite(ratio) && ratio > 0 && length > 0 && 96 % attnTp === 0;
   const baseValid = Number.isFinite(bs.ratio) && bs.ratio > 0 && length > 0;
@@ -155,18 +163,22 @@ export const KimiK3MambaRatioCalculator = () => {
   const cliFlag = valid ? `--mamba-full-memory-ratio ${result}` : "";
 
   // Broadcast both results: the Deploy command takes the base-config value,
-  // the Playground's composed command takes the effective one.
+  // the Playground's composed command takes the effective one. On a recipe
+  // that does not use the ratio, broadcast nulls instead of skipping the
+  // dispatch — the panels must drop a ratio pinned for a recipe the reader
+  // has since left rather than keep injecting it.
   useEffect(() => {
-    if (explicitSizing) return;
     window.dispatchEvent(
       new CustomEvent("sglang-k3-mamba-ratio", {
-        detail: {
-          ratio: valid ? result : null,
-          baseRatio: baseValid ? baseResult : null,
-        },
+        detail: ratioNotApplicable
+          ? { ratio: null, baseRatio: null }
+          : {
+              ratio: valid ? result : null,
+              baseRatio: baseValid ? baseResult : null,
+            },
       })
     );
-  }, [result, valid, baseResult, baseValid, explicitSizing]);
+  }, [result, valid, baseResult, baseValid, ratioNotApplicable]);
 
   const copyFlag = () => {
     if (!cliFlag || typeof navigator === "undefined" || !navigator.clipboard) return;
@@ -235,10 +247,12 @@ export const KimiK3MambaRatioCalculator = () => {
     specLabel,
   ].filter(Boolean);
 
-  if (explicitSizing) {
+  if (ratioNotApplicable) {
     return (
       <div className="not-prose" style={{ padding: "14px", border: `1px solid ${colors.border}`, borderRadius: "8px", background: colors.panel, color: colors.muted, fontSize: "13px" }}>
-        This recipe sizes the KDA state pool explicitly with <code style={{ color: colors.text }}>--max-mamba-cache-size</code>, so the ratio calculator does not apply.
+        {explicitSizing
+          ? <>This recipe sizes the KDA state pool explicitly with <code style={{ color: colors.text }}>--max-mamba-cache-size</code>, so the ratio calculator does not apply.</>
+          : <>This recipe runs on Ascend NPUs, which size the KDA state pool and the MLA KV pool internally and never set <code style={{ color: colors.text }}>--mamba-full-memory-ratio</code>, so the ratio calculator does not apply.</>}
       </div>
     );
   }

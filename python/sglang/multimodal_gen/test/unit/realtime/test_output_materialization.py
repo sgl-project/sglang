@@ -10,9 +10,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
-from sglang.multimodal_gen.runtime.utils.realtime_video import (
-    build_raw_rgb_frame_batches,
-)
+from sglang.multimodal_gen.runtime.realtime.video import build_raw_rgb_frame_batches
 
 
 def test_materialize_output_sample_converts_tensor_to_uint8_frames():

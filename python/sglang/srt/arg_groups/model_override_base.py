@@ -1,11 +1,7 @@
-"""What the per-model override declarations are written against.
+"""Registry and read views shared by model override providers.
 
-The declarations themselves live one directory down, in
-``arg_groups/model_overrides/``: one module per model family, mirroring the
-``models/`` naming. This module is what they all import -- the registry they
-register into, the read-only views they are handed, and the few accessors that
-answer questions about the model. It deliberately depends on nothing in
-``overrides.py``, so a family module never has to import its way back up.
+Model-family modules in ``model_overrides/`` import this module without
+creating a dependency back to ``overrides.py``.
 """
 
 import logging
@@ -18,10 +14,9 @@ from sglang.srt.utils.common import is_mps, is_no_spec_infer_or_topk_one
 logger = logging.getLogger(__name__)
 
 
-# Constant per-architecture overrides (populated by the migration sweeps).
+# Constant per-architecture overrides.
 MODEL_OVERRIDES: Dict[str, Dict[str, Any]] = {
-    # These models run in bfloat16 regardless of the requested dtype
-    # (faithful port of the legacy unconditional arch branch).
+    # These models require bfloat16 regardless of the requested dtype.
     "MistralLarge3ForCausalLM": {"dtype": "bfloat16"},
     "PixtralForConditionalGeneration": {"dtype": "bfloat16"},
 }
@@ -31,9 +26,7 @@ MODEL_OVERRIDES: Dict[str, Dict[str, Any]] = {
 _MODEL_OVERRIDE_FNS: Dict[str, List[Callable[..., dict]]] = {}
 
 
-# Predicate-keyed providers, in registration order — for legacy branches
-# matched by substring/predicate on the architecture string rather than an
-# exact name (e.g. '"Step3p5ForCausalLM" in model_arch').
+# Predicate-keyed providers, in registration order.
 _PREDICATE_OVERRIDE_FNS: List[Tuple[Callable[[str], bool], Callable[..., dict]]] = []
 
 
@@ -78,12 +71,7 @@ def _invoke_provider(
 
 
 class ResolvedView:
-    """Read-only view of the resolving configuration handed to post-process
-    passes: the accumulated declarations overlaid on the pristine
-    ``server_args`` (residual imperative writes of non-resolved fields show
-    through the fallthrough) — exactly the state the legacy handler at the
-    same slot observed. Writes are rejected: passes return declarations.
-    """
+    """Read-only snapshot of declarations over raw inputs, used by post-process passes."""
 
     __slots__ = ("_server_args", "_overlay")
 
@@ -104,14 +92,9 @@ class ResolvedView:
 
 
 class ResolvingConfig:
-    """Live read view of the resolution result: the declaration stash over the
-    record's fields, looked up per read.
+    """Live view of declarations over raw inputs.
 
-    ``ResolvedView`` snapshots the overlay when it is built, which is what a
-    post-process pass wants -- it reads the state at its slot. A resolver that
-    reads *after* declaring, or after calling something that declares, needs the
-    current answer instead, so this one walks the stash on every read. It falls
-    through to the field, which is where the raw input lives.
+    Unlike ``ResolvedView``, each read observes declarations made since construction.
     """
 
     __slots__ = ("_server_args",)
@@ -140,10 +123,7 @@ def resolving_view(server_args: Any) -> ResolvingConfig:
 
 
 def _declaration_overlay(server_args: Any) -> Dict[str, Any]:
-    """What the declarations say so far, last writer wins.
-
-    Nothing writes the fields, so a mid-resolution reader needs this to see a
-    decision at all; the fields keep what the caller supplied."""
+    """Merge declarations in order, with the last writer winning."""
     overlay: Dict[str, Any] = {}
     for _source, declared in getattr(server_args, "_resolved_overrides", None) or ():
         overlay.update(declared)
@@ -151,13 +131,7 @@ def _declaration_overlay(server_args: Any) -> Dict[str, Any]:
 
 
 def resolved_view(server_args: Any) -> ResolvedView:
-    """Read-only view of the resolving configuration: the declarations
-    overlaid on the fields, snapshotted per call.
-
-    For mid-resolution code that is not a pass (``__post_init__`` handlers and
-    hooks) that must answer with what resolution decided -- a declaration-only resolver (a model-specific
-    override, a registry entry) never writes the field, so a field read there
-    answers with the raw input."""
+    """Snapshot current declarations over the record fields in a read-only view."""
     return ResolvedView(server_args, overlay=_declaration_overlay(server_args))
 
 
@@ -200,12 +174,7 @@ def record_of(view: Any) -> Any:
 
 
 def is_attention_backend_not_set(cfg: Any):
-    """None of the three attention backends has been decided yet.
-
-    Takes the view rather than the record: every read is a view read, and the
-    callers that hold a view (the override providers) would otherwise have to
-    reach back through it for a record.
-    """
+    """Return whether all three attention backends are unset in the resolving view."""
     return (
         cfg.attention_backend is None
         and cfg.prefill_attention_backend is None
@@ -221,12 +190,7 @@ def use_mla_backend(server_args: Any):
 
 
 def model_config_of(server_args: Any):
-    """The model configuration this record describes, built once and memoised.
-
-    Takes a view as readily as the record: a view is a read overlay of one
-    record, the memo has to live on that record either way, and the callers
-    that hold a view would otherwise all have to unwrap it themselves.
-    """
+    """Build and memoize ModelConfig on the underlying record, accepting records or views."""
     if isinstance(server_args, (ResolvedView, ResolvingConfig)):
         server_args = record_of(server_args)
     # Lazy init to avoid circular import
@@ -258,13 +222,7 @@ def model_config_of(server_args: Any):
 
 
 def ep_joiner_of(cfg: Any) -> bool:
-    """Whether this process was launched as an elastic-EP joiner.
-
-    The one definition. After publish the answer is a bag leaf --
-    `get_exec().moe.is_ep_joiner` -- computed from this function by the
-    declaration in `arg_groups/fields/exec_.py`; resolution needs it before
-    there is a bag to read, which is why it is still a function.
-    """
+    """Return whether this process was launched as an elastic-EP joiner."""
     return cfg.ep_join_mode in ("scale", "recover")
 
 
@@ -279,13 +237,7 @@ def startup_weight_load_overlap_of(cfg: Any) -> bool:
 
 
 def mamba_extra_buffer_of(cfg: Any) -> bool:
-    """The predicate, read off a config-shaped object mid-resolution.
-
-    This is the one definition. After publish the answer is a bag leaf --
-    ``get_exec().mamba.enable_mamba_extra_buffer`` -- computed from this same
-    function by the declaration in ``arg_groups/fields/exec_.py``. Resolution
-    needs it before there is a bag to read, which is why it is still a
-    function."""
+    """Return whether the resolved Mamba cache strategy requires an extra buffer."""
     return cfg.disable_radix_cache is False and cfg.mamba_radix_cache_strategy in (
         "extra_buffer",
         "extra_buffer_lazy",

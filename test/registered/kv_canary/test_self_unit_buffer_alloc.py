@@ -8,7 +8,6 @@ import torch
 from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
 from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
 from sglang.srt.kv_canary.pool_patcher.buffer_alloc import (
-    make_packed_source,
     make_row_source,
     resolve_real_kv_read_bytes,
 )
@@ -74,70 +73,6 @@ class TestMakeRowSource(CustomTestCase):
             with self.subTest(label=label):
                 with self.assertRaisesRegex(ValueError, "num_bytes_per_token"):
                     make_row_source(layer_buffer=layer_buf, read_bytes=read_bytes)
-
-
-class TestMakePackedSource(CustomTestCase):
-    def test_make_packed_source_large_stride(self) -> None:
-        """Verify packed sources with 128-byte stride return the requested clip / full stride."""
-        bytes_per_token = 128
-        page_size = 2
-        page_buffer = torch.zeros(4, bytes_per_token * page_size, dtype=torch.uint8)
-        cases = [
-            ("partial", 32, 32),
-            ("all", sys.maxsize, bytes_per_token),
-        ]
-        for label, read_bytes, expected_read in cases:
-            with self.subTest(label=label):
-                sources = make_packed_source(
-                    page_buffer=page_buffer,
-                    page_size=page_size,
-                    bytes_per_token=bytes_per_token,
-                    read_bytes=read_bytes,
-                )
-                self.assertEqual(len(sources), 1)
-                self.assertEqual(sources[0].read_bytes, expected_read)
-                self.assertEqual(sources[0].num_bytes_per_token, bytes_per_token)
-
-    def test_make_packed_source_small_stride_raises(self) -> None:
-        """Verify packed sources reject 8-byte strides (cannot satisfy 16-byte aligned loads)."""
-        bytes_per_token = 8
-        page_size = 1
-        page_buffer = torch.zeros(4, bytes_per_token, dtype=torch.uint8)
-        for label, read_bytes in [("partial", 32), ("all", sys.maxsize)]:
-            with self.subTest(label=label):
-                with self.assertRaisesRegex(ValueError, "num_bytes_per_token"):
-                    make_packed_source(
-                        page_buffer=page_buffer,
-                        page_size=page_size,
-                        bytes_per_token=bytes_per_token,
-                        read_bytes=read_bytes,
-                    )
-
-    def test_make_packed_source_unaligned_read_bytes_raises(self) -> None:
-        """Verify packed sources reject unaligned explicit reads."""
-        bytes_per_token = 128
-        page_size = 1
-        page_buffer = torch.zeros(4, bytes_per_token, dtype=torch.uint8)
-        with self.assertRaisesRegex(ValueError, "multiple of 16"):
-            make_packed_source(
-                page_buffer=page_buffer,
-                page_size=page_size,
-                bytes_per_token=bytes_per_token,
-                read_bytes=24,
-            )
-
-    def test_make_packed_source_oversized_read_bytes_raises(self) -> None:
-        """Verify packed sources reject oversized explicit reads."""
-        bytes_per_token = 128
-        page_size = 1
-        page_buffer = torch.zeros(4, bytes_per_token, dtype=torch.uint8)
-        with self.assertRaisesRegex(ValueError, "<= num_bytes_per_token"):
-            make_packed_source(
-                page_buffer=page_buffer,
-                page_size=page_size,
-                bytes_per_token=bytes_per_token,
-                read_bytes=256,
-            )
 
 
 if __name__ == "__main__":

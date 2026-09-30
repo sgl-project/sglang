@@ -8,6 +8,12 @@ on:
       - ".github/workflows/pr-test-rust.yml"
       - "scripts/ci/cuda/ci_install_dependency.sh"
       - "scripts/ci/cuda/ci_install_gateway_dependencies.sh"
+      # gateway-e2e resolves the SMG runtime deps (the smg-grpc-servicer
+      # floor) from here, via ci_install_dependency.sh's
+      # `pip install -e python[...]` — a bump there must re-run this workflow.
+      - "python/pyproject.toml"
+      # The SMG gRPC entrypoint; only this workflow exercises it.
+      - "python/sglang/srt/entrypoints/grpc_server.py"
   pull_request:
     branches: [ main ]
     types: [opened, synchronize, reopened, labeled]
@@ -16,6 +22,12 @@ on:
       - ".github/workflows/pr-test-rust.yml"
       - "scripts/ci/cuda/ci_install_dependency.sh"
       - "scripts/ci/cuda/ci_install_gateway_dependencies.sh"
+      # gateway-e2e resolves the SMG runtime deps (the smg-grpc-servicer
+      # floor) from here, via ci_install_dependency.sh's
+      # `pip install -e python[...]` — a bump there must re-run this workflow.
+      - "python/pyproject.toml"
+      # The SMG gRPC entrypoint; only this workflow exercises it.
+      - "python/sglang/srt/entrypoints/grpc_server.py"
   workflow_dispatch:
 
 concurrency:

@@ -274,6 +274,7 @@ class TestHttpServerAdminAuth(unittest.TestCase):
         paths_allowed = [
             "/health",
             "/health_generate",
+            "/ready",
             "/metrics",
             "/metrics/",
             "/metrics/prometheus",

@@ -2,7 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -59,7 +59,6 @@ class TestGQACP2TP2EP2(CustomTestCase):
         args = SimpleNamespace(
             model=self.model,
             eval_name="gsm8k",
-            num_shots=5,
             num_examples=200,
             max_tokens=16000,
             num_threads=128,
@@ -68,10 +67,10 @@ class TestGQACP2TP2EP2(CustomTestCase):
             top_p=0.95,
             top_k=20,
             base_url=self.base_url,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreaterEqual(metrics["score"], GSM8K_BASELINE_ACCURACY)
 
@@ -117,7 +116,6 @@ class TestGQACPTP2CP2EP4(CustomTestCase):
         args = SimpleNamespace(
             model=self.model,
             eval_name="gsm8k",
-            num_shots=5,
             num_examples=200,
             max_tokens=16000,
             num_threads=128,
@@ -126,10 +124,10 @@ class TestGQACPTP2CP2EP4(CustomTestCase):
             top_p=0.95,
             top_k=20,
             base_url=self.base_url,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreaterEqual(metrics["score"], GSM8K_BASELINE_ACCURACY)
 
@@ -177,7 +175,6 @@ class TestGQACPCP4EP4(CustomTestCase):
         args = SimpleNamespace(
             model=self.model,
             eval_name="gsm8k",
-            num_shots=5,
             num_examples=200,
             max_tokens=16000,
             num_threads=128,
@@ -186,10 +183,10 @@ class TestGQACPCP4EP4(CustomTestCase):
             top_p=0.95,
             top_k=20,
             base_url=self.base_url,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreaterEqual(metrics["score"], GSM8K_BASELINE_ACCURACY)
 

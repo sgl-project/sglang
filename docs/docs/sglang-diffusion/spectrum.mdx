@@ -20,15 +20,19 @@ sglang generate \
 
 ## Scope and constraints
 
-- Available only on native FLUX.1, Wan, HunyuanVideo, and SD3 implementation
-  paths. It is not a `--backend diffusers` feature and does not currently
-  cover FLUX.2.
+- Available on native FLUX.1, Wan, HunyuanVideo, SD3, and MiniMax-H3
+  implementation paths. It is not a `--backend diffusers` feature and does
+  not currently cover FLUX.2.
 - The request control is available through `sglang generate` and Python
   sampling parameters. It is not a `sglang serve` or OpenAI-server request
   option yet.
-- Spectrum and `--enable-teacache` are mutually exclusive.
-- Start with the defaults. `--debug` adds shadow-prediction validation work, so
-  its latency is not representative of normal Spectrum execution.
+- Spectrum and `--enable-teacache` are mutually exclusive. On MiniMax-H3
+  it also cannot run with Cache-DiT / `quality="high"`, or with SP &gt; 1.
+- MiniMax-H3 50-step recipe: `--spectrum-warmup-steps 11
+  --spectrum-window-size 5 --spectrum-flex-window 1.0`. Defaults are the
+  20-step schedule. See the [MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3).
+- Start with the defaults. `--debug` adds shadow-prediction validation work,
+  so its latency is not representative of normal Spectrum execution.
 
 ## Advanced controls
 

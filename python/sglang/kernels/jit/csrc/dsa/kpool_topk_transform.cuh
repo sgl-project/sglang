@@ -11,7 +11,11 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#ifndef USE_ROCM
 #include <cuda_fp16.h>
+#else
+#include <hip/hip_fp16.h>
+#endif
 
 namespace sglang {
 namespace {

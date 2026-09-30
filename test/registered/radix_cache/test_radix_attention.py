@@ -40,6 +40,7 @@ class TestRadixCacheFCFS(CustomTestCase):
                 "--schedule-policy",
                 "fcfs",
             ],
+            env={"SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1"},
         )
 
     @classmethod
@@ -68,6 +69,7 @@ class TestRadixCacheLPM(TestRadixCacheFCFS):
                 "--schedule-policy",
                 "lpm",
             ],
+            env={"SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1"},
         )
 
 
@@ -89,6 +91,7 @@ class TestRadixCacheNonOverlapLPM(TestRadixCacheFCFS):
                 "--schedule-policy",
                 "lpm",
             ],
+            env={"SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1"},
         )
 
 

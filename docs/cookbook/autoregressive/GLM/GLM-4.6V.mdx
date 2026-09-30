@@ -76,8 +76,7 @@ import { GLM46VDeployment } from "/src/snippets/autoregressive/glm-46v-deploymen
   - **H200 / B200:** Runs out of the box, supporting full context length plus concurrent image + video processing.
 - **Additional Multimodal Parameters:**
   - `--mm-attention-backend fa3`: Specify multimodal attention backend (Flash Attention 3).
-  - `--keep-mm-feature-on-device`: Retain multimodal feature tensors on GPU after processing to avoid D2H memory copies.
-  - `SGLANG_USE_CUDA_IPC_TRANSPORT=1`: Use CUDA IPC shared memory for multimodal data transport to significantly improve E2E latency.
+  - `--mm-feature-transport=cuda_ipc`: Use CUDA IPC shared memory for multimodal data transport to avoid D2H memory copies and significantly improve E2E latency.
 
 **Example with full multimodal optimizations:**
 ```bash Command
@@ -389,8 +388,13 @@ print(response)
 
 #### Command
 ```shell Command
-python3 ./benchmark/gsm8k/bench_sglang.py
+sgl-eval run gsm8k \
+  --base-url http://127.0.0.1:30000/v1 \
+  --num-examples 200 \
+  --num-threads 64
 ```
+
+Historical results below use the removed harness and are not measurements of the sgl-eval command above.
 #### Result Output
 ```text Output
 Accuracy: 0.925

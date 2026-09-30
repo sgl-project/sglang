@@ -34,7 +34,10 @@ class TestHiCacheSpecFileStorage(HiCacheSpecStorageMixin, CustomTestCase):
 
     @classmethod
     def _get_spec_server_env(cls):
-        return {"SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir}
+        return {
+            "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
+            "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir,
+        }
 
     @classmethod
     def _count_file_storage_pages(cls):

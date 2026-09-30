@@ -1,6 +1,6 @@
 import abc
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Optional
 
 import torch
@@ -65,7 +65,7 @@ class MultimodalCache(abc.ABC):
 
 
 def _get_tensor_size(embedding: torch.Tensor):
-    return embedding.element_size() * embedding.numel()
+    return embedding.untyped_storage().nbytes()
 
 
 @dataclass(kw_only=True)
@@ -109,13 +109,19 @@ class MultiModalStaticCache(MultimodalCache):
         if mm_hash in self.mm_cache:
             self.mm_cache.move_to_end(mm_hash)
             return True
-        data_size = _get_tensor_size(embedding.embedding)
+        tensor = embedding.embedding
+        storage_size = _get_tensor_size(tensor)
+        data_size = min(storage_size, tensor.element_size() * tensor.numel())
         while self.current_size + data_size > self.max_size:
             if not self.mm_cache:
                 return False
             lru_hash, lru_embedding = self.mm_cache.popitem(last=False)
             self.current_size -= _get_tensor_size(lru_embedding.embedding)
 
+        if storage_size > data_size:
+            # Clone admitted slices so one cached item cannot retain a whole batch.
+            embedding = replace(embedding, embedding=tensor.clone())
+        data_size = _get_tensor_size(embedding.embedding)
         self.mm_cache[mm_hash] = embedding
         self.current_size += data_size
         return True

@@ -68,10 +68,7 @@ else:
                 awq_dequantize_triton as awq_dequantize,
             )
         except ImportError:
-            try:
-                from sgl_kernel import awq_dequantize
-            except ImportError:
-                pass
+            pass
 
 _, scalar_types = get_scalar_types()
 

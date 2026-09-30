@@ -19,6 +19,7 @@ import torch
 from torch import nn
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.models.dits import sana_wm_parity as parity_probe
 from sglang.multimodal_gen.runtime.models.dits.sana_wm_refiner_transformer import (
     pack_latents,
     unpack_latents,
@@ -26,7 +27,6 @@ from sglang.multimodal_gen.runtime.models.dits.sana_wm_refiner_transformer impor
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
-from . import parity_probe
 from .refiner import (
     STAGE_2_DISTILLED_SIGMA_VALUES,
     SanaWMLTX2RefinerStage,

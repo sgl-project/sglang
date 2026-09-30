@@ -69,8 +69,8 @@ def make_processor(case, config, image_processor_cls=None):
     server_args = SimpleNamespace(
         # Non-auto: get_resolved_model_impl would choke on a SimpleNamespace.
         model_impl="sglang",
-        keep_mm_feature_on_device=False,
         mm_feature_transport="cpu",
+        mm_enable_dp_encoder=False,
         image_processor_backend="auto",
         disable_fast_image_processor=True,
         skip_tokenizer_init=False,

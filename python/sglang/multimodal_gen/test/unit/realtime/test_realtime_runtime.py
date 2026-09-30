@@ -58,9 +58,7 @@ from sglang.multimodal_gen.runtime.realtime.session import (
 from sglang.multimodal_gen.runtime.realtime.states import (
     RealtimeCausalDecodeState,
 )
-from sglang.multimodal_gen.runtime.utils.realtime_video import (
-    RAW_RGB_CONTENT_TYPE,
-)
+from sglang.multimodal_gen.runtime.realtime.video import RAW_RGB_CONTENT_TYPE
 
 
 class _Req(SimpleNamespace):

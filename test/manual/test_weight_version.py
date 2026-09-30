@@ -1,13 +1,4 @@
-"""
-Test weight version functionality.
-
-This test suite verifies the weight_version feature implementation including:
-1. Default weight_version setting
-2. /get_weight_version endpoint
-3. /update_weight_version endpoint
-4. /generate request meta_info contains weight_version
-5. OpenAI API response metadata contains weight_version
-"""
+"""weight_version: /model_info, /update_weight_version, and generate/OpenAI metadata."""
 
 import unittest
 
@@ -49,12 +40,6 @@ class TestWeightVersion(CustomTestCase):
         """Comprehensive test for all weight_version functionality."""
 
         response = requests.get(f"{self.base_url}/get_model_info")
-        self.assertEqual(response.status_code, 200)
-        data = response.json()
-        self.assertIn("weight_version", data)
-        self.assertEqual(data["weight_version"], "test_version_1.0")
-
-        response = requests.get(f"{self.base_url}/get_weight_version")
         self.assertEqual(response.status_code, 200)
         data = response.json()
         self.assertIn("weight_version", data)
@@ -114,7 +99,7 @@ class TestWeightVersion(CustomTestCase):
         self.assertTrue(data["success"])
         self.assertEqual(data["new_version"], "updated_version_2.0")
 
-        response = requests.get(f"{self.base_url}/get_weight_version")
+        response = requests.get(f"{self.base_url}/model_info")
         self.assertEqual(response.status_code, 200)
         data = response.json()
         self.assertEqual(data["weight_version"], "updated_version_2.0")
@@ -147,11 +132,6 @@ class TestWeightVersion(CustomTestCase):
         data = response.json()
         self.assertTrue(data["success"])
         self.assertEqual(data["new_version"], "final_version_3.0")
-
-        # Check /get_weight_version
-        response = requests.get(f"{self.base_url}/get_weight_version")
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["weight_version"], "final_version_3.0")
 
         # Check /get_model_info
         response = requests.get(f"{self.base_url}/get_model_info")
@@ -214,7 +194,7 @@ class TestWeightVersion(CustomTestCase):
         )
 
         # Verify version was updated
-        version_response = requests.get(f"{self.base_url}/get_weight_version")
+        version_response = requests.get(f"{self.base_url}/model_info")
         self.assertEqual(version_response.status_code, 200)
         self.assertEqual(
             version_response.json()["weight_version"], "disk_update_v2.0.0"

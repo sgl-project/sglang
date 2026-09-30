@@ -15,7 +15,7 @@ def handle_layernorm_sp(server_args: ServerArgs) -> None:
     """Validate --enable-layernorm-sp against the resolved parallelism config.
 
     Runs in the resolution pipeline rather than in the layers so a model that
-    never builds a LayerCommunicator rejects the flag instead of ignoring it.
+    does not use layer boundaries rejects the flag instead of ignoring it.
     """
     cfg = resolving_view(server_args)
     if not cfg.enable_layernorm_sp:

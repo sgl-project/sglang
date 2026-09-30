@@ -63,13 +63,13 @@ For multi-node deployment, download the weights to a shared directory accessible
 
 <Info>
 We recommend deploying the W8A8 variant for reduced resource usage and higher throughput.
-It (774.08GB) can be deployed on 16 × 64GB of device memory (`--tp-size 16`), which corresponds to one full A3 node (8 cards, 16 dies) or two A2 nodes.
+It (774.08GB) can be deployed on 16 × 64GB of device memory (`--tp-size 16`), which corresponds to one full A3 Series node (8 cards, 16 dies) or two A2 Series nodes.
 </Info>
 
 This is the minimum recommended configuration. For optimized configurations,
 see [Best practices](#best-practices), which may require additional cards or nodes.
 
-For the hardware specifications (memory per die, dies per card, and the difference between A2 and A3),
+For the hardware specifications (memory per die, dies per card, and the difference between A2 Series and A3 Series),
 see [Ascend NPU Reference — Hardware](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware).
 
 ## Installation
@@ -82,7 +82,7 @@ The dependencies required for the NPU runtime environment have been integrated i
 online platform. You can directly pull it.
 
 <Tabs>
-  <Tab title="Atlas 800I A3">
+  <Tab title="Ascend A3 Series">
 
 ```bash Command
 docker pull quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16
@@ -117,7 +117,7 @@ quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16
 ```
 
   </Tab>
-  <Tab title="Atlas 800I A2">
+  <Tab title="Ascend A2 Series">
 
 ```bash Command
 docker pull quay.io/ascend/sglang:cann9.0.0-910b-v0.5.16
@@ -164,7 +164,7 @@ quay.io/ascend/sglang:cann9.0.0-910b-v0.5.16
 
 ### Single-node deployment
 
-Quantized model `GLM-5.2-w8a8` can be deployed on one Atlas 800I A3 node.
+Quantized model `GLM-5.2-w8a8` can be deployed on one Ascend A3 Series node.
 
 Run the following script to execute online inference.
 
@@ -229,7 +229,7 @@ python3 -m sglang.launch_server \
 
 ### Multi-node deployment
 
-Quantized model `GLM-5.2-w8a8` can be deployed on two Atlas 800I A3 nodes.
+Quantized model `GLM-5.2-w8a8` can be deployed on two Ascend A3 Series nodes.
 
 Modify the IP addresses of the two nodes, then run the same script on both nodes.
 

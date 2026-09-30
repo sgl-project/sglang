@@ -16,6 +16,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+import msgspec
 import numpy as np
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -82,18 +83,35 @@ class TestQwenE2eParity(CustomTestCase):
         ids, features, grids, hashes, offsets, mrope, delta = DRIVER(
             PROMPT_PER_IMAGE * len(sources), sources, spec.rust_json()
         )
-        # The shape of Rust's MmEncodedResult, inline transport
-        # (test_wrap_encoded pins the shm shape).
-        encoded = SimpleNamespace(
-            features=features,
-            shm_names=None,
-            grids=grids,
-            hashes=hashes,
-            offsets=offsets,
-            mrope=mrope,
-            mrope_delta=delta,
-        )
-        return snapshot(ids, RustMmProcessor.wrap_encoded(spec, encoded))
+        # The `mm.*` buffers of one `IngressRequest`, inline transport
+        # (test_wrap_encoded pins the shm shape): the binding concatenates the
+        # per-item features, so slice them back out per grid, and the sidecar
+        # is built as the Rust worker encodes it.
+        meta = {
+            "items": [
+                {
+                    "modality": "image",
+                    "hash": item_hash,
+                    "offsets": [list(offset)],
+                    "model_specific_data": {"image_grid_thw": list(grid)},
+                }
+                for grid, item_hash, offset in zip(grids, hashes, offsets)
+            ],
+            "token_ids": None,
+            "mrope_delta": delta,
+        }
+        buffers = {
+            "mm.mrope": mrope.reshape(3, -1),
+            "mm.meta": np.frombuffer(msgspec.msgpack.encode(meta), dtype=np.uint8),
+        }
+        row = 0
+        for index, (t, h, w) in enumerate(grids):
+            n = t * h * w
+            buffers[f"mm.feature.{index}"] = features[
+                row * spec.feature_dim : (row + n) * spec.feature_dim
+            ].reshape(n, spec.feature_dim)
+            row += n
+        return snapshot(ids, RustMmProcessor.wrap_encoded(spec, buffers))
 
     def run_python(self, sources):
         """The reference path: the Python `mm_processor` the scheduler would use."""

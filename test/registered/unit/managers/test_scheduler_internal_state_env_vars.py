@@ -42,6 +42,8 @@ class TestSchedulerInternalStateEnvVars(unittest.TestCase):
             is_dspark=lambda: False,
         )
         scheduler.draft_worker = None
+        # Set by maybe_init_rust_server in a real boot; None = no embedded Rust server.
+        scheduler.rust_server = None
 
         with get_context().override_server_args():
             output = scheduler.get_internal_state(recv_req=GetInternalStateReq())

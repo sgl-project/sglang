@@ -42,10 +42,10 @@ from sglang.srt.disaggregation.kv_events import (
     resolve_load_pub_range,
     select_kv_publisher_dp_rank,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.network import NetworkAddress, is_zmq_endpoint_ipv6
 
 if TYPE_CHECKING:
-    from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.managers.load_snapshot import LoadSnapshot
 
 logger = logging.getLogger(__name__)
@@ -132,7 +132,6 @@ class SchedulerLoadPublisher:
         self,
         *,
         kv_events_config: Optional[str],
-        ps: ParallelState,
         load_publish_endpoint: Optional[str] = None,
         publish_interval: int = LOAD_PUBLISH_INTERVAL,
     ) -> None:
@@ -147,7 +146,7 @@ class SchedulerLoadPublisher:
         self._last_counts: Optional[tuple] = None
         self._last_publish_ts = 0.0
         self._publish_failed = False
-        if not is_kv_publisher_rank(kv_events_config, ps):
+        if not is_kv_publisher_rank(kv_events_config):
             return
         try:
             cfg = KVEventsConfig.from_cli(kv_events_config)
@@ -165,7 +164,7 @@ class SchedulerLoadPublisher:
         resolved, reason = resolve_load_pub_range(
             kv_endpoint=cfg.endpoint,
             replay_endpoint=cfg.replay_endpoint,
-            dp_size=ps.dp_size,
+            dp_size=get_parallel().dp_size,
             load_publish_endpoint=load_publish_endpoint,
         )
         if resolved is None:
@@ -173,8 +172,9 @@ class SchedulerLoadPublisher:
                 logger.warning("load-publisher disabled: %s", reason)
             return
         host, base = resolved
+        parallel = get_parallel()
         self._rank = select_kv_publisher_dp_rank(
-            ps.attn_dp_size, ps.attn_dp_rank, ps.dp_rank
+            parallel.attn_dp_size, parallel.attn_dp_rank, parallel.dp_rank
         )
         endpoint = NetworkAddress(host, base + self._rank).to_tcp()
         try:

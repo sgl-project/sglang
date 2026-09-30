@@ -243,9 +243,13 @@ class TestBeamNumerics(CustomTestCase):
         with (
             get_context().override_server_args(),
             get_parallel().override(
-                tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0, attn_dp_size=1
+                tp_size=1,
+                tp_rank=0,
+                attn_tp_size=1,
+                attn_tp_rank=0,
+                attn_dp_size=1,
+                pp_group=pp_group,
             ),
-            patch("sglang.srt.models.beam.get_pp_group", return_value=pp_group),
             patch(
                 "sglang.srt.models.beam.BeamRotaryEmbedding",
                 side_effect=lambda config: torch.nn.Identity(),
@@ -544,8 +548,10 @@ class TestBeamLoading(CustomTestCase):
             with (
                 self.subTest(tp_size=tp_size),
                 get_parallel().override(
+                    tp_size=tp_size,
                     attn_tp_rank=rank,
                     attn_tp_size=tp_size,
+                    moe_tp_size=tp_size,
                 ),
                 patch(
                     # This is a loading test; constructing the unused CPU rotary

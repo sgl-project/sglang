@@ -1,15 +1,7 @@
-"""Config fields of the ``mm`` namespace.
-
-One class per namespace. The class *is* the namespace: a field declared here
-lands in the ``mm`` bag, which is what ``get_mm()`` returns, so a reader
-spells it exactly as before. ``ServerArgs`` composes these classes, so the
-record stays one flat object -- the split moves where declarations live, not
-how config is shaped at runtime.
-"""
+"""Config fields of the ``mm`` namespace."""
 
 from __future__ import annotations
 
-import dataclasses
 import json
 from typing import (
     Any,
@@ -20,14 +12,15 @@ from typing import (
     Union,
 )
 
+import msgspec
+
 from sglang.srt.arg_groups.arg_utils import (
     A,
     Arg,
 )
 
 
-@dataclasses.dataclass
-class Mm:
+class Mm(msgspec.Struct):
     """Namespace ``mm``."""
 
     _NS_PATH = "mm"
@@ -91,7 +84,7 @@ class Mm:
         "Restrict client-supplied HTTP(S) image, video, and audio URLs to these "
         "exact hostnames. Redirect destinations are checked against the same "
         "allowlist. When unset, remote media from any domain is allowed.",
-    ] = dataclasses.field(default_factory=list)
+    ] = msgspec.field(default_factory=list)
     media_url_max_file_size_mb: A[
         int,
         "Maximum size in MiB for one client-supplied remote media download. "
@@ -99,10 +92,15 @@ class Mm:
     ] = 64
     mm_preprocess_cache_size_mb: A[
         Optional[int],
-        "CPU memory budget for content-addressed multimodal preprocessing "
-        "artifacts. Unset selects a model-specific default (256 MiB for "
-        "Kimi-K3); 0 disables the cache. The budget is divided across "
-        "tokenizer workers and does not reserve GPU memory.",
+        Arg(
+            help=(
+                "CPU memory budget for content-addressed multimodal preprocessing "
+                "artifacts. Unset selects a model-specific default (256 MiB for "
+                "Kimi-K3); 0 disables the cache. The budget is divided across "
+                "tokenizer workers and does not reserve GPU memory."
+            ),
+            resolvable=True,
+        ),
     ] = None
     trust_mm_content_hashes: A[
         bool,
@@ -139,16 +137,16 @@ class Mm:
     ] = False
     mm_feature_transport: A[
         Optional[Literal["cpu", "cuda_ipc", "cuda_vmm"]],
-        "Transport multimodal features through CPU memory, a bounded CUDA IPC "
-        "pool, or a bounded CUDA VMM pool. "
-        "Unset uses cpu except for validated multi-node GB200/GB300 MNNVL models, "
-        "which use cuda_vmm when an IMEX channel is available. Select cuda_ipc "
-        "explicitly for single-node GPU transport. GPU transports reserve "
-        "SGLANG_MM_FEATURE_CACHE_MB (default 1024 MiB) on the base GPU and fall "
-        "back to CPU transport when the pool is full.",
+        Arg(
+            help=(
+                "Transport multimodal features through CPU memory, a bounded CUDA IPC "
+                "pool, or a bounded CUDA VMM pool. "
+                "Unset uses cpu except for validated multi-node GB200/GB300 MNNVL models, "
+                "which use cuda_vmm when an IMEX channel is available. Select cuda_ipc "
+                "explicitly for single-node GPU transport. GPU transports reserve "
+                "SGLANG_MM_FEATURE_CACHE_MB (default 1024 MiB) on the base GPU and fall "
+                "back to CPU transport when the pool is full."
+            ),
+            resolvable=True,
+        ),
     ] = None
-    keep_mm_feature_on_device: A[
-        bool,
-        "Deprecated. Use --mm-feature-transport=cuda_ipc for bounded GPU-resident "
-        "multimodal feature transport.",
-    ] = False

@@ -15,6 +15,7 @@
 
 import logging
 import re
+from array import array
 from functools import lru_cache
 from typing import Iterable, List, Optional, Set, Tuple, TypedDict, Union
 
@@ -28,7 +29,6 @@ from transformers import (
     PreTrainedModel,
 )
 
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.layernorm import Gemma4RMSNorm
@@ -65,6 +65,7 @@ from sglang.srt.models.gemma4_causal import (
     pp_filter_load_weight,
 )
 from sglang.srt.models.gemma4_vision import Gemma4VisionEncoder
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
@@ -187,7 +188,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         prefix: str = "",
     ) -> None:
         super().__init__(config=config)
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
 
@@ -296,9 +297,9 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
     def pad_input_ids(
         self,
-        input_ids: List[int],
+        input_ids: array,
         mm_inputs: MultimodalInputs,
-    ) -> List[int]:
+    ) -> array:
         """Pad input IDs with image and audio tokens."""
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)

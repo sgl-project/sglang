@@ -20,7 +20,6 @@ PR #25090 vs #14194):
   - cp_lse_ag_out_rs_mla: Triton (log2/exp2) correction / reduce-scatter
 """
 
-import warnings
 from typing import Optional
 
 import torch
@@ -36,38 +35,11 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.distributed.parallel_state import GroupCoordinator
-from sglang.srt.runtime_context import get_parallel, get_platform
-from sglang.srt.utils.common import is_mnnvl_fabric_device
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import is_hip
+from sglang.srt.utils.common import is_fi_a2a_supported
 
-
-def _warn_deprecated_dcp_accessor(name: str, replacement: str) -> None:
-    warnings.warn(
-        f"{name} is deprecated; use {replacement} instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-
-
-def dcp_enabled() -> bool:
-    """Deprecated: use ``get_parallel().dcp_enabled``."""
-    _warn_deprecated_dcp_accessor("dcp_enabled()", "get_parallel().dcp_enabled")
-    return get_parallel().dcp_enabled
-
-
-def get_attention_dcp_world_size() -> int:
-    """Deprecated: use ``get_parallel().attn_dcp_size``."""
-    _warn_deprecated_dcp_accessor(
-        "get_attention_dcp_world_size()", "get_parallel().attn_dcp_size"
-    )
-    return get_parallel().attn_dcp_size
-
-
-def get_attention_dcp_rank() -> int:
-    """Deprecated: use ``get_parallel().attn_dcp_rank``."""
-    _warn_deprecated_dcp_accessor(
-        "get_attention_dcp_rank()", "get_parallel().attn_dcp_rank"
-    )
-    return get_parallel().attn_dcp_rank
+_is_hip = is_hip()
 
 
 def _ag_lse(cp_attn_lse: torch.Tensor, cp_group: GroupCoordinator) -> torch.Tensor:
@@ -149,6 +121,41 @@ def cp_lse_ag_out_rs_mla(
     )
     out = cp_group.reduce_scatter_along_dim(out, dim=0)
     return out.to(cp_attn_out.dtype)
+
+
+def cp_lse_ag_out_rs_mla_npu(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: GroupCoordinator,
+) -> torch.Tensor:
+    """Merge NPU DCP partial outputs and return the local head slice."""
+    if cp_group.world_size == 1:
+        return cp_attn_out
+
+    import torch_npu
+
+    batch_size, total_heads, head_dim = cp_attn_out.shape
+    world_size = cp_group.world_size
+    local_heads = total_heads // world_size
+    packed = torch.cat([cp_attn_out.float(), cp_attn_lse.float().unsqueeze(-1)], dim=-1)
+    packed = packed.permute(1, 2, 0).contiguous()
+    gathered = torch.empty_like(packed)
+    cp_group.all_to_all_single(gathered, packed)
+    # all_to_all_single splits the leading head dimension. After the exchange,
+    # the heads are grouped by source rank inside every token. Move that source
+    # rank in front before flattening tokens and local heads for the update op.
+    gathered = gathered.permute(2, 0, 1).contiguous()
+    gathered = (
+        gathered.view(batch_size, world_size, local_heads, head_dim + 1)
+        .permute(1, 0, 2, 3)
+        .contiguous()
+        .view(world_size, batch_size * local_heads, head_dim + 1)
+    )
+    out_flat, lse_flat = torch.split(gathered, [head_dim, 1], dim=-1)
+    merged, _ = torch_npu.npu_attention_update(
+        lse_flat.squeeze(-1).unbind(0), out_flat.unbind(0), 0
+    )
+    return merged.view(batch_size, local_heads, head_dim).to(cp_attn_out.dtype)
 
 
 def _all_gather_dcp_kv_cache(kv_a: torch.Tensor):
@@ -276,19 +283,21 @@ def all_gather_kv_cache_for_mla_extend(
     k_nope,
     k_pe,
 ):
-    cache_k_nope, cache_k_rope = token_to_kv_pool.get_mla_kv_buffer(
-        attn_mqa,
-        dcp_local_prefix_kv_indices,
-    )
-    extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
-    # all gather kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
-    gathered_kv = all_gather_kv_cache_for_dcp(
-        cache_k_nope,
-        cache_k_rope,
-        extend_prefix_lens_cpu,
-        prefix_starts_cpu=torch.zeros_like(extend_prefix_lens_cpu),
-    )
-    dcp_kv_buffer[:dcp_extend_prefix_lens_sum] = gathered_kv
+    # On hip, skip the all-gather when there is no cached prefix to avoid crash
+    if not _is_hip or dcp_extend_prefix_lens_sum > 0:
+        cache_k_nope, cache_k_rope = token_to_kv_pool.get_mla_kv_buffer(
+            attn_mqa,
+            dcp_local_prefix_kv_indices,
+        )
+        extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
+        # all gather kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
+        gathered_kv = all_gather_kv_cache_for_dcp(
+            cache_k_nope,
+            cache_k_rope,
+            extend_prefix_lens_cpu,
+            prefix_starts_cpu=torch.zeros_like(extend_prefix_lens_cpu),
+        )
+        dcp_kv_buffer[:dcp_extend_prefix_lens_sum] = gathered_kv
 
     # copy local kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
     dcp_kv_buffer[
@@ -383,17 +392,6 @@ def all_gather_kv_cache_for_dcp(
 # Per-process singleton: MNNVL workspace + this rank's cp position. Populated
 # once, pre-CUDA-graph-capture, by init_fi_a2a_workspace().
 _FI_A2A_STATE: Optional[dict] = None
-
-
-def is_fi_a2a_supported(
-    *, dcp_size: int, tp_size: int, pp_size: int, nnodes: int
-) -> bool:
-    if not get_platform().is_sm100:
-        return False
-    if is_mnnvl_fabric_device():
-        return True
-    tp_size_per_node = tp_size // max(nnodes // pp_size, 1)
-    return tp_size_per_node % dcp_size == 0
 
 
 def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:

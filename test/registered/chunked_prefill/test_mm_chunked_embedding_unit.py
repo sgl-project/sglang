@@ -17,6 +17,11 @@ import torch
 
 from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.multimodal.transport.cuda_ipc import (
+    BORROW_CUDA_IPC_FEATURE_KEY,
+    DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
+    CudaIpcTensorTransportProxy,
+)
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -172,20 +177,15 @@ def test_list_cache_entries_own_storage():
         assert emb.untyped_storage().nbytes() == own_bytes
 
 
-def test_tensor_cache_entries_share_storage():
-    # Documents the motivation for the per-item form: split views of the
-    # combined tensor keep the whole concatenated buffer alive.
+def test_tensor_cache_entries_own_storage():
     mm_schedule.init_mm_embedding_cache(1 << 30)
     items = _make_items()
     mm_schedule._get_chunked_embedding_by_item(
         _encoder_tensor, items, ITEM_OFFSETS, 0, TOTAL_LEN, _CPU
     )
-    total_tokens = sum(_num_tokens(item) for item in items)
     for item in items:
         emb = mm_schedule.embedding_cache.get_single(item.hash).embedding
-        assert (
-            emb.untyped_storage().nbytes() == total_tokens * HIDDEN * emb.element_size()
-        )
+        assert emb.untyped_storage().nbytes() == emb.numel() * emb.element_size()
 
 
 def test_by_item_mismatched_cache_entry_is_reencoded():
@@ -233,6 +233,30 @@ def test_batched_mismatched_cache_entry_is_reencoded():
         HIDDEN,
     )
     encoder.assert_called_once()
+
+
+def test_full_deferred_ipc_item_is_marked_for_borrow():
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    proxy = object.__new__(CudaIpcTensorTransportProxy)
+    item = MultimodalDataItem(
+        modality=Modality.IMAGE,
+        hash=1000,
+        pad_value=1000,
+        feature=proxy,
+        offsets=[ITEM_OFFSETS[0]],
+        model_specific_data={DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY: True},
+    )
+    request = mm_schedule.PerImageRequestInfo(
+        req_idx=0,
+        items=[item],
+        items_offset=[ITEM_OFFSETS[0]],
+        extend_prefix_len=0,
+        extend_seq_len=TOTAL_LEN,
+    )
+
+    mm_schedule._batch_encode_per_image_misses(_encoder_list, [request], _CPU)
+
+    assert item.model_specific_data[BORROW_CUDA_IPC_FEATURE_KEY]
 
 
 def test_batched_colliding_hashes_with_different_lengths_are_not_deduplicated():
