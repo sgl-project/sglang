@@ -118,6 +118,35 @@ def _make_valued_batch(bs: int) -> ForwardBatch:
     )
 
 
+class TestTboMixedBoundary(CustomTestCase):
+    def test_filter_batch_counts_decode_requests_in_each_child(self):
+        # Every request has one query token, so lengths cannot identify the
+        # original prefill/decode boundary.
+        parent = _make_valued_batch(6)
+        parent.forward_mode = ForwardMode.MIXED
+        parent.extend_seq_lens = torch.ones(6, dtype=torch.int32)
+        parent.extend_seq_lens_cpu = [1] * 6
+        parent.extend_num_tokens = 6
+        parent.lora_ids = [None] * 6
+        parent.rids = [str(i) for i in range(6)]
+
+        for count, split, expected in (
+            (None, 3, [None, None]),
+            (0, 3, [0, 0]),
+            (3, 2, [0, 3]),
+            (3, 4, [1, 2]),
+            (3, 5, [2, 1]),
+        ):
+            with self.subTest(count=count, split=split):
+                parent.mix_decode_bs = count
+                children = (
+                    _filter(parent, lo=0, hi=split),
+                    _filter(parent, lo=split, hi=6),
+                )
+                self.assertEqual([c.mix_decode_bs for c in children], expected)
+                self.assertEqual(parent.mix_decode_bs, count)
+
+
 class TestTboFilterBatchOnRegistryView(CustomTestCase):
     """TBO runs one forward on the parent and splits via filter_batch, so an
     eager registry-backed view must filter into children identically to the raw

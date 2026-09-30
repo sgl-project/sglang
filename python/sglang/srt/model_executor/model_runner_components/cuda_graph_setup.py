@@ -17,6 +17,9 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.mlu.graph_runner.mlu_graph_runner import (
+    MLUGraphRunner,
+)
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.hardware_backend.xpu.graph_runner.xpu_graph_runner import XPUGraphRunner
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
@@ -408,7 +411,7 @@ def capture_cuda_graphs(
         capture_time=0,
     )
     if capture_decode_cuda_graph:
-        if model_runner.device in ("cuda", "musa", "cpu", "npu", "xpu"):
+        if model_runner.device in ("cuda", "musa", "cpu", "npu", "xpu", "mlu"):
             decode = capture_decode_graph(model_runner=model_runner)
         elif (
             current_platform.is_out_of_tree() and current_platform.support_cuda_graph()
@@ -705,6 +708,7 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
             "cpu": "CPU graph",
             "npu": "NPU graph",
             "xpu": "XPU graph",
+            "mlu": "MLU graph",
         },
     )
     role = "draft" if model_runner.is_draft_worker else "target"
@@ -732,6 +736,7 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
                 "cpu": CPUGraphRunner,
                 "npu": NPUGraphRunner,
                 "xpu": XPUGraphRunner,
+                "mlu": MLUGraphRunner,
             },
         )
         runner = graph_runners[model_runner.device](model_runner)
