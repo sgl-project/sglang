@@ -158,9 +158,7 @@ class BaseLayerWithLoRA(nn.Module):
         lora_B_sliced = self.slice_lora_b_weights(
             lora_B.to(device=input_parallel.device, non_blocking=True)
         )
-        delta_parallel = _compute_lora_delta(
-            input_lora, lora_A_sliced, lora_B_sliced
-        )
+        delta_parallel = _compute_lora_delta(input_lora, lora_A_sliced, lora_B_sliced)
         if self.lora_alpha != self.lora_rank:
             delta_parallel *= self.lora_alpha / self.lora_rank  # type: ignore
         delta_parallel *= self.strength
