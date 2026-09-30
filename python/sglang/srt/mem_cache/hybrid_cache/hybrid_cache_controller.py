@@ -240,7 +240,13 @@ class HybridCacheController(BaseHiCacheController):
             and transfer_layer_id_max != self.transfer_layer_id_max
         ):
             self.transfer_layer_id_max = transfer_layer_id_max
-            self.layer_done_counter = LayerDoneCounter(self.transfer_layer_id_max)
+            # async_enqueue has to be carried over: the replacement counter is
+            # the one the load path uses, and without the flag its per-layer
+            # handshake is absent, so a forward would sail past copies the
+            # loader thread has not submitted yet.
+            self.layer_done_counter = LayerDoneCounter(
+                self.transfer_layer_id_max, async_enqueue=self.async_load_enqueue
+            )
 
         self.storage_host_pool = mem_pool_host.anchor_entry.host_pool
         if startup_storage_backend is not None:
