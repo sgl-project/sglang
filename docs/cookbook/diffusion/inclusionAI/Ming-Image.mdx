@@ -1,0 +1,115 @@
+---
+title: Ming-Image
+tag: NEW
+description: "Deploy Ming-Image Design and Design-Layer with SGLang Diffusion for text-to-image, RGBA image editing, and ordered transparent layer decomposition."
+---
+
+import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config } from '/src/snippets/configs/inclusionAI/ming-image.jsx';
+
+<DiffusionModelTags tags={["RGBA images", "text-to-image", "image editing", "layer decomposition", "12 steps"]} />
+
+## 1. Quick start
+
+Install the dependencies, then this integration from its source checkout:
+
+```bash Installation
+uv pip install "sglang[diffusion]" --prerelease=allow
+uv pip install -e "python[diffusion]" --no-deps
+```
+
+Choose **Design** for generation or editing and **Design-Layer** for decomposition.
+The two checkpoints require separate servers. Start with one H200 on Linux/CUDA;
+the picker marks unverified hardware and feature combinations explicitly.
+
+<Deployment config={config} />
+
+Requests return base64 PNGs, preserving all four RGBA channels. For decomposition,
+each returned image is one ordered layer, not an independent generation. The
+internal composite frame is omitted from the response. Save all entries in
+`data`, rather than only the first image.
+`n` selects independent generations (or sets of layers), processed sequentially.
+
+## 2. Model capabilities
+
+[Ming-Image Design](https://huggingface.co/inclusionAI/Ming-Image-0.1-Design)
+generates images from text and edits a single reference image. It targets design
+assets, layouts, and transparent RGBA output. Use the prompt prefix
+`RGBA, 4-channel, transparent background` to request transparency; RGBA output
+alone does not guarantee a transparent background.
+
+[Design-Layer](https://huggingface.co/inclusionAI/Ming-Image-0.1-Design-Layer)
+decomposes one reference into ordered transparent layers. Supply `num_layers`,
+or specify a count with `into N layers` or `Number of layers: N` in the prompt;
+the prompt count takes precedence. Defaults are 12 steps with guidance 1 for
+Design and guidance 2 for Design-Layer. The model uses zero unconditional
+embeddings and does not support custom negative prompts.
+
+Both checkpoints use the native Bailing multimodal MoE encoder, query connector,
+joint DiT, and four-channel Qwen-style VAE. No remote modeling code is executed.
+The original checkpoint directory layout is accepted without conversion.
+
+## 3. Offline generation
+
+```bash Design
+sglang generate --model-path inclusionAI/Ming-Image-0.1-Design \
+  --prompt "A minimalist exhibition poster with a red geometric sculpture" \
+  --height 1024 --width 1024 --save-output
+```
+
+```bash Layer decomposition
+sglang generate --model-path inclusionAI/Ming-Image-0.1-Design-Layer \
+  --image-path /path/to/input.png --num-layers 4 --save-output
+```
+
+Design defaults to 2048 by 2048; 1024 by 1024 reduces latency and activation
+memory. Decomposition defaults to the official 1024-resolution aspect buckets;
+use `--height 512 --width 512` for the 512 buckets. Reference-image requests
+select the closest official bucket and restore the input aspect ratio in the
+returned PNGs. Multiple reference images are not supported.
+
+For a renamed local checkpoint directory, also provide
+`--model-id inclusionAI/Ming-Image-0.1-Design` or the corresponding Layer ID.
+
+## 4. Runtime features
+
+DiT parallelism reuses the native TP and sequence-parallel attention layers.
+The DiT has 30 attention heads: TP multiplied by Ulysses must divide 30.
+Encoder folding has its own head constraints; two-way folding is compatible
+with the 16-head language tower, 16-head vision tower, and 12-head connector.
+Do not infer encoder compatibility from the DiT's head count.
+
+Use the standard component residency controls for `transformer`, `text_encoder`,
+and `vae`. Layerwise offload trades host memory and transfer time for lower VRAM.
+The default eager path does not use approximate caching or quantized attention.
+Cache-DiT and SageAttention require workload-specific quality validation.
+VAE tiling is disabled by default to match the official inference path. Enable
+`--vae-tiling true` when decode memory is constrained; tiling can change pixels.
+
+Breakable CUDA graphs preserve Ming's checkpoint-specific padding and RoPE
+offsets. They capture exact prompt shapes; an uncaptured shape runs eagerly.
+Requests with different prompts are not merged into a dynamic batch. A fixed
+seed does not imply bit-identical output across attention backends, GPU types,
+or parallel topologies.
+
+Full-checkpoint validation covers generation, editing, and layer decomposition
+on H200, including repeated HTTP requests before and after warmup. Tested
+resolutions include 2048-square generation and four-layer 1024-square
+decomposition. See the [compatibility notes](/docs/sglang-diffusion/compatibility_matrix#ming-image-integration-status)
+for the tested feature scope. Other GPU families and quantized checkpoints
+have not been validated for this model.
+
+See [performance optimization](/docs/sglang-diffusion/performance-optimization)
+for shared runtime controls and the
+[official repository](https://github.com/inclusionAI/Ming-Image) for model examples.
+
+## 5. Run in ComfyUI
+
+import { ComfyUISupport } from '/src/snippets/diffusion/comfyui-support.jsx';
+
+<ComfyUISupport model="image" />
+
+Use the generic image node for Design generation. The ComfyUI integration has
+not been validated for ordered multi-layer output; use the HTTP API above for
+Design-Layer decomposition.
