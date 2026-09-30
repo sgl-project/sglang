@@ -101,7 +101,7 @@ jobs:
               - "test/**/!(*.md)"
               - "rust/*"
               - "rust/!(sglang-processor|sglang-renderer-server)/**"
-              - "proto/sglang/runtime/v1/sglang.proto"
+              - "proto/**"
             renderer:
               - "rust/sglang-processor/**"
               - "rust/sglang-renderer-server/**"
@@ -139,7 +139,7 @@ jobs:
               # Gates the cargo test in test/registered/rust/; exported to the
               # CPU stage as its negation, SGLANG_SKIP_RUST_TESTS.
               - "rust/**"
-              - "proto/sglang/runtime/v1/sglang.proto"
+              - "proto/**"
               - "test/registered/rust/**"
               - ".github/workflows/_pr-test-*.yml"
 

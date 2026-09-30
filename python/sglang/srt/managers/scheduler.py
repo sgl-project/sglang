@@ -3290,7 +3290,9 @@ class Scheduler(
             if not is_retracted:
                 req.time_stats.set_decode_prealloc_queue_entry_time()
             else:
-                req.time_stats.set_retract_time()
+                # Restart the queue wait here;
+                # resume_retracted_reqs() re-queues the request without stamping it.
+                req.time_stats.set_wait_queue_entry_time()
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
 
