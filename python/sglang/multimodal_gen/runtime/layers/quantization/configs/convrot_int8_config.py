@@ -1,15 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Config for convrot_int8: online or serialized ConvRot INT8 on sgl-kernel or comfy_kitchen.
+"""Config for convrot_int8: online or serialized ConvRot INT8 on the JIT ops or comfy_kitchen.
 
 Both backends implement the same quantization (arXiv:2512.03673): group-wise
 regular Hadamard rotation, per-row dynamic INT8 activations and per-output-
 channel INT8 weights, with interchangeable weight and scale tensors. ``auto``
-picks sgl-kernel's fused ``convrot_int8_*`` ops where they run (CC 9.0, 10.0,
-12.0 and 12.1; group size 64, 128, 256 or 512; output width a multiple of 8)
-and ``comfy_kitchen.int8_linear`` otherwise (Turing and later; group size 16,
-64 or 256; the load fails with an install hint when the package is missing).
-Only a layer whose output width the sgl-kernel epilogue cannot store falls to
-comfy_kitchen or, without it, stays BF16.
+picks SGLang's JIT-compiled fused ``convrot_int8`` ops where they build and run
+(CC 9.0, 10.0, 12.0 and 12.1 with a CUDA toolchain; group size 64, 128, 256 or
+512; output width a multiple of 8) and ``comfy_kitchen.int8_linear`` otherwise
+(Turing and later; group size 16, 64 or 256; the load fails with an install hint
+when the package is missing). Only a layer whose output width the JIT epilogue
+cannot store falls to comfy_kitchen or, without it, stays BF16.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from typing import Any
 
 import torch
 
+from sglang.kernels.ops.gemm.convrot_int8 import GROUP_SIZES as JIT_GROUP_SIZES
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
@@ -42,30 +43,32 @@ from sglang.srt.layers.quantization.utils import is_layer_skipped
 logger = init_logger(__name__)
 
 COMFY_KITCHEN = "comfy_kitchen"
-SGL_KERNEL = "sgl_kernel"
-BACKENDS = ("auto", COMFY_KITCHEN, SGL_KERNEL)
+JIT = "jit"
+BACKENDS = ("auto", COMFY_KITCHEN, JIT)
 # Group widths each backend's kernels are instantiated for.
-BACKEND_GROUP_SIZES = {COMFY_KITCHEN: (16, 64, 256), SGL_KERNEL: (64, 128, 256, 512)}
-_SUPPORTED_GROUP_SIZES = (16, 64, 128, 256, 512)
+BACKEND_GROUP_SIZES = {COMFY_KITCHEN: (16, 64, 256), JIT: JIT_GROUP_SIZES}
+_SUPPORTED_GROUP_SIZES = tuple(
+    sorted({*BACKEND_GROUP_SIZES[COMFY_KITCHEN], *JIT_GROUP_SIZES})
+)
 
 
-def _sgl_kernel_available() -> bool:
-    from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_sgl_kernel import (
-        sgl_kernel_convrot_unavailable_reason,
+def _jit_available() -> bool:
+    from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_jit import (
+        jit_convrot_unavailable_reason,
     )
 
-    reason = sgl_kernel_convrot_unavailable_reason()
+    reason = jit_convrot_unavailable_reason()
     if reason is not None:
-        _log_sgl_kernel_fallback(reason)
+        _log_jit_fallback(reason)
     return reason is None
 
 
 @functools.cache
-def _log_sgl_kernel_fallback(reason: str) -> None:
-    # Once per process: the refused-GPU reason (for example CC 10.3) would
-    # otherwise only surface with an explicit sgl_kernel backend.
+def _log_jit_fallback(reason: str) -> None:
+    # Once per process: the refused-GPU reason (for example CC 10.3) or a failed
+    # build would otherwise only surface with an explicit jit backend.
     logger.info(
-        "convrot_int8: sgl-kernel backend unavailable (%s); auto uses comfy_kitchen",
+        "convrot_int8: JIT backend unavailable (%s); auto uses comfy_kitchen",
         reason,
     )
 
@@ -139,8 +142,8 @@ class ConvRotInt8Config(QuantizationConfig):
         elif backend == "auto" and self.resolve_backend() is None:
             raise ValueError(
                 f"convrot_int8: no backend on this machine serves group size "
-                f"{group_size} (sgl-kernel needs CC 9.0/10.0/12.0/12.1 and one of "
-                f"{BACKEND_GROUP_SIZES[SGL_KERNEL]}; comfy_kitchen serves "
+                f"{group_size} (the JIT backend needs CC 9.0/10.0/12.0/12.1, a CUDA "
+                f"toolchain and one of {BACKEND_GROUP_SIZES[JIT]}; comfy_kitchen serves "
                 f"{BACKEND_GROUP_SIZES[COMFY_KITCHEN]})"
             )
         # Logged per backend at the end of loading: a silent fallback to BF16
@@ -151,7 +154,7 @@ class ConvRotInt8Config(QuantizationConfig):
         self.selected_embeddings: list[str] = []
         self.selected_by_backend: dict[str, list[str]] = {
             COMFY_KITCHEN: [],
-            SGL_KERNEL: [],
+            JIT: [],
         }
         self.skipped: list[str] = []
         self._processed = 0
@@ -167,8 +170,8 @@ class ConvRotInt8Config(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        # INT8 tensor cores land on Turing (comfy_kitchen); the sgl-kernel
-        # backend checks its own table when it is selected.
+        # INT8 tensor cores land on Turing (comfy_kitchen); the JIT backend
+        # checks its own table when it is selected.
         return 75
 
     @classmethod
@@ -186,31 +189,28 @@ class ConvRotInt8Config(QuantizationConfig):
     def resolve_backend(self, group_size: int | None = None) -> str | None:
         """Backend serving ``group_size`` (default: the online group size), or
         None when the requested backend has no kernel for it. ``auto`` prefers
-        sgl-kernel where its ops run on this GPU; an explicit backend is never
-        substituted."""
+        the JIT ops where they build and run on this GPU; an explicit backend
+        is never substituted."""
         group_size = self.group_size if group_size is None else group_size
         if self.backend == "auto":
-            if (
-                group_size in BACKEND_GROUP_SIZES[SGL_KERNEL]
-                and _sgl_kernel_available()
-            ):
-                return SGL_KERNEL
+            if group_size in BACKEND_GROUP_SIZES[JIT] and _jit_available():
+                return JIT
             if group_size in BACKEND_GROUP_SIZES[COMFY_KITCHEN]:
                 return COMFY_KITCHEN
             return None
         return self.backend if group_size in BACKEND_GROUP_SIZES[self.backend] else None
 
     def require_comfy_kitchen(self, reason: str) -> None:
-        """Serve every layer with comfy_kitchen; an explicit sgl_kernel request is refused."""
-        if self.backend == SGL_KERNEL:
+        """Serve every layer with comfy_kitchen; an explicit jit request is refused."""
+        if self.backend == JIT:
             raise ValueError(
-                f"convrot_int8 backend sgl_kernel {reason}; use backend "
+                f"convrot_int8 backend jit {reason}; use backend "
                 "comfy_kitchen or TP and/or sequence parallelism instead"
             )
         if self.group_size not in BACKEND_GROUP_SIZES[COMFY_KITCHEN]:
             raise ValueError(
                 f"convrot_int8 backend comfy_kitchen has no kernel for group size "
-                f"{self.group_size}, and the sgl_kernel backend {reason}"
+                f"{self.group_size}, and the jit backend {reason}"
             )
         if self.backend == "auto":
             logger.info(
@@ -220,8 +220,8 @@ class ConvRotInt8Config(QuantizationConfig):
 
     def _backend_for(self, *, group_size: int, out_size: int) -> str | None:
         backend = self.resolve_backend(group_size)
-        if backend == SGL_KERNEL and out_size % 8:
-            # The sgl-kernel GEMM epilogue stores 8 BF16 outputs at a time.
+        if backend == JIT and out_size % 8:
+            # The JIT GEMM epilogue stores 8 BF16 outputs at a time.
             if (
                 self.backend == "auto"
                 and group_size in BACKEND_GROUP_SIZES[COMFY_KITCHEN]
@@ -239,7 +239,7 @@ class ConvRotInt8Config(QuantizationConfig):
         )
         return (
             f"ConvRot group {group_size}, {out_size} outputs; backend {self.backend!r}; "
-            f"sgl_kernel serves group sizes {BACKEND_GROUP_SIZES[SGL_KERNEL]} with an "
+            f"jit serves group sizes {BACKEND_GROUP_SIZES[JIT]} with an "
             f"output width that is a multiple of 8, comfy_kitchen serves group sizes "
             f"{BACKEND_GROUP_SIZES[COMFY_KITCHEN]} and is {comfy}"
         )
@@ -249,12 +249,12 @@ class ConvRotInt8Config(QuantizationConfig):
     ) -> QuantizeMethodBase:
         self.selected.append(prefix)
         self.selected_by_backend[backend].append(prefix)
-        if backend == SGL_KERNEL:
-            from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_sgl_kernel import (
-                ConvRotInt8SglKernelLinearMethod,
+        if backend == JIT:
+            from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_jit import (
+                ConvRotInt8JitLinearMethod,
             )
 
-            return ConvRotInt8SglKernelLinearMethod(
+            return ConvRotInt8JitLinearMethod(
                 self, group_size=group_size, is_checkpoint_serialized=serialized
             )
         from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_comfy_kitchen import (
@@ -335,11 +335,11 @@ class ConvRotInt8Config(QuantizationConfig):
         if self._processed == len(self.selected) - len(self.selected_embeddings):
             logger.info(
                 "convrot_int8: quantized %d linear layers (%.2f GiB of BF16 weights "
-                "-> %.2f GiB INT8; sgl_kernel %d, comfy_kitchen %d), left %d in BF16",
+                "-> %.2f GiB INT8; jit %d, comfy_kitchen %d), left %d in BF16",
                 self._processed,
                 self._quantized_bytes / 1024**3,
                 self._quantized_bytes / 2 / 1024**3,
-                len(self.selected_by_backend[SGL_KERNEL]),
+                len(self.selected_by_backend[JIT]),
                 len(self.selected_by_backend[COMFY_KITCHEN]),
                 len(self.skipped),
             )
@@ -351,9 +351,9 @@ class ConvRotInt8Config(QuantizationConfig):
         if self._processed == len(self.selected) - len(self.selected_embeddings):
             logger.info(
                 "convrot_int8: loaded %d serialized INT8 linear layers "
-                "(sgl_kernel %d, comfy_kitchen %d)",
+                "(jit %d, comfy_kitchen %d)",
                 self._processed,
-                len(self.selected_by_backend[SGL_KERNEL]),
+                len(self.selected_by_backend[JIT]),
                 len(self.selected_by_backend[COMFY_KITCHEN]),
             )
 

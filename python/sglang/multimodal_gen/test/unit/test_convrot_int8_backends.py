@@ -1,4 +1,4 @@
-"""Unit tests for convrot_int8's backend selection and its sgl-kernel backend."""
+"""Unit tests for convrot_int8's backend selection and its JIT backend."""
 
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -7,6 +7,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.ops.gemm.convrot_int8 import convrot_int8_supported_capabilities
 from sglang.multimodal_gen.runtime.layers.linear import (
     LinearBase,
     ReplicatedLinear,
@@ -19,36 +20,40 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_conf
 from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_comfy_kitchen import (
     ConvRotInt8ComfyKitchenLinearMethod,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_sgl_kernel import (
-    ConvRotInt8SglKernelLinearMethod,
+from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_jit import (
+    ConvRotInt8JitLinearMethod,
     apply_convrot_int8_gelu_input,
     apply_convrot_int8_shared_input,
     apply_convrot_int8_shared_input_out,
     convrot_int8_fuses_gelu_input,
     convrot_int8_shares_input,
-    sgl_kernel_convrot_available,
 )
 
 _CONFIG_MODULE = (
     "sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config"
 )
-_LOAD_SGL_KERNEL = (
-    "sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_sgl_kernel."
-    "_load_sgl_kernel"
+_LOAD_JIT_KERNEL = (
+    "sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_jit."
+    "_load_jit_kernel"
 )
 _LOAD_COMFY_KITCHEN = "sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_comfy_kitchen._load_comfy_kitchen"
 
 QWEN_IMAGE_IGNORED_LAYERS = ["img_mod", "txt_mod", "txt_mlp.net.2"]
 
 
+# Capability only: on a supported GPU a missing toolchain or a failed build must
+# fail these tests, not skip them.
 requires_kernel = pytest.mark.skipif(
-    not sgl_kernel_convrot_available(),
-    reason="needs a GPU in sgl-kernel's convrot table and a build with the convrot ops",
+    not (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability() in convrot_int8_supported_capabilities()
+    ),
+    reason="needs a GPU in the convrot_int8 capability table",
 )
 
 
-def _sgl_config(**kwargs) -> ConvRotInt8Config:
-    return ConvRotInt8Config(backend="sgl_kernel", **kwargs)
+def _jit_config(**kwargs) -> ConvRotInt8Config:
+    return ConvRotInt8Config(backend="jit", **kwargs)
 
 
 def _method_for(config, prefix, input_size=3072):
@@ -56,12 +61,12 @@ def _method_for(config, prefix, input_size=3072):
     return config.get_quant_method(layer, prefix)
 
 
-@patch(_LOAD_SGL_KERNEL)
+@patch(_LOAD_JIT_KERNEL)
 def test_ignored_layer_patterns_select_bf16_on_module_path_boundaries(_load):
     """A pattern must match its own module path only: `txt_mlp.net.2` keeps the
     text FFN down-projection in BF16 without also catching `img_mlp.net.2` or
     the text FFN up-projection, and `img_mod` must not catch `img_mlp`."""
-    config = _sgl_config(ignored_layers=QWEN_IMAGE_IGNORED_LAYERS)
+    config = _jit_config(ignored_layers=QWEN_IMAGE_IGNORED_LAYERS)
 
     kept_bf16 = [
         "transformer_blocks.0.img_mod.1",
@@ -77,14 +82,14 @@ def test_ignored_layer_patterns_select_bf16_on_module_path_boundaries(_load):
     for prefix in kept_bf16:
         assert isinstance(_method_for(config, prefix), UnquantizedLinearMethod)
     for prefix in quantized:
-        assert isinstance(_method_for(config, prefix), ConvRotInt8SglKernelLinearMethod)
+        assert isinstance(_method_for(config, prefix), ConvRotInt8JitLinearMethod)
     assert config.skipped == kept_bf16
     assert config.selected == quantized
 
 
-@patch(_LOAD_SGL_KERNEL)
+@patch(_LOAD_JIT_KERNEL)
 def test_input_dim_not_divisible_by_group_stays_bf16(_load):
-    config = _sgl_config()
+    config = _jit_config()
     method = _method_for(config, "blocks.0.mod", input_size=2688)
     assert isinstance(method, UnquantizedLinearMethod)
     assert config.skipped == ["blocks.0.mod(in=2688)"]
@@ -93,13 +98,13 @@ def test_input_dim_not_divisible_by_group_stays_bf16(_load):
     assert config.supports_input_partition("blocks.0.attn.to_out", 1536)
 
 
-@patch(_LOAD_SGL_KERNEL)
+@patch(_LOAD_JIT_KERNEL)
 def test_shared_input_and_gelu_helpers_refuse_deferred_bias_and_lora(_load):
     """The helpers stand in for `layer(x)`; a layer that returns its bias
     separately would silently lose it, and a LoRA-wrapped projection is not a
     `LinearBase` at all, so eligibility must say no to both instead of
     crashing on the wrapper."""
-    config = _sgl_config()
+    config = _jit_config()
     plain = ReplicatedLinear(256, 8, quant_config=config, prefix="q")
     deferred = ReplicatedLinear(
         256, 8, skip_bias_add=True, quant_config=config, prefix="k"
@@ -142,7 +147,7 @@ def _quantized_layer(
 
 @requires_kernel
 def test_quantized_layer_tracks_bf16_reference():
-    config = _sgl_config()
+    config = _jit_config()
     layer, weight = _quantized_layer(config, 3072, 3072, "attn.to_q", seed=0)
     assert layer.weight.dtype == torch.int8
     assert layer.weight_scale.shape == (3072,)
@@ -160,7 +165,7 @@ def test_quantized_layer_tracks_bf16_reference():
 
 @requires_kernel
 def test_shared_input_helper_is_bitwise_three_layer_calls():
-    config = _sgl_config()
+    config = _jit_config()
     layers = [
         _quantized_layer(config, 3072, 3072, f"attn.to_{n}", seed=i)[0]
         for i, n in enumerate("qkv")
@@ -177,7 +182,7 @@ def test_shared_input_helper_is_bitwise_three_layer_calls():
 def test_shared_input_out_helper_is_bitwise_into_joint_buffer_slices():
     """The joint text-image Q/K/V path writes each projection into a row slice
     of one larger buffer; the slice write must equal the allocating helper."""
-    config = _sgl_config()
+    config = _jit_config()
     layers = [
         _quantized_layer(config, 3072, 3072, f"attn.to_{n}", seed=10 + i)[0]
         for i, n in enumerate("qkv")
@@ -204,7 +209,7 @@ def test_shared_input_out_helper_is_bitwise_into_joint_buffer_slices():
 
 @requires_kernel
 def test_gelu_input_helper_is_bitwise_eager_gelu_then_layer():
-    config = _sgl_config()
+    config = _jit_config()
     down, _ = _quantized_layer(config, 12288, 3072, "img_mlp.net.2", seed=3)
     up = torch.randn(1, 2048, 12288, device="cuda", dtype=torch.bfloat16)
 
@@ -226,7 +231,7 @@ def _with_tp(monkeypatch, tp_size):
     monkeypatch.setattr(linear, "get_group_size", lambda group: tp_size)
 
 
-@patch(_LOAD_SGL_KERNEL)
+@patch(_LOAD_JIT_KERNEL)
 @pytest.mark.parametrize("tp_size,input_size", [(4, 13824), (8, 3072)])
 def test_row_parallel_shard_not_divisible_by_group_is_refused(
     _load, monkeypatch, tp_size, input_size
@@ -234,7 +239,7 @@ def test_row_parallel_shard_not_divisible_by_group_is_refused(
     from sglang.multimodal_gen.runtime.layers.linear import RowParallelLinear
 
     _with_tp(monkeypatch, tp_size)
-    config = _sgl_config()
+    config = _jit_config()
     # convrot_int8 semantics: the unsharded input divides, so the layer is
     # selected, and a shard that does not divide is refused at construction.
     with pytest.raises(ValueError, match="divisible by group_size"):
@@ -247,34 +252,34 @@ def test_row_parallel_shard_not_divisible_by_group_is_refused(
         )
 
 
-@patch(_LOAD_SGL_KERNEL)
+@patch(_LOAD_JIT_KERNEL)
 def test_row_parallel_shard_divisible_by_group_is_quantized(_load, monkeypatch):
     from sglang.multimodal_gen.runtime.layers.linear import RowParallelLinear
 
     _with_tp(monkeypatch, 4)
-    config = _sgl_config()
+    config = _jit_config()
     layer = RowParallelLinear(
         12288, 3072, bias=True, quant_config=config, prefix="blocks.0.ffn.net.2"
     )
-    assert isinstance(layer.quant_method, ConvRotInt8SglKernelLinearMethod)
+    assert isinstance(layer.quant_method, ConvRotInt8JitLinearMethod)
     assert config.selected == ["blocks.0.ffn.net.2"]
 
 
-@patch(_LOAD_SGL_KERNEL)
+@patch(_LOAD_JIT_KERNEL)
 def test_output_width_not_multiple_of_8_stays_bf16(_load):
-    config = _sgl_config()
+    config = _jit_config()
     layer = LinearBase(input_size=4096, output_size=4)
     method = config.get_quant_method(layer, "blocks.0.attn.to_gate_logits")
     assert isinstance(method, UnquantizedLinearMethod)
     assert config.skipped == ["blocks.0.attn.to_gate_logits(out=4)"]
 
 
-@patch(_LOAD_SGL_KERNEL)
+@patch(_LOAD_JIT_KERNEL)
 def test_column_parallel_shard_output_not_multiple_of_8_stays_bf16(_load, monkeypatch):
     from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
 
     _with_tp(monkeypatch, 8)
-    config = _sgl_config()
+    config = _jit_config()
     # 32 output rows split eight ways leave 4 per rank; the epilogue stores 8 at
     # a time, so the layer stays in BF16 instead of failing in the first forward.
     layer = ColumnParallelLinear(
@@ -286,7 +291,7 @@ def test_column_parallel_shard_output_not_multiple_of_8_stays_bf16(_load, monkey
 
 @requires_kernel
 def test_fp16_activations_are_cast_and_returned_in_fp16():
-    config = _sgl_config()
+    config = _jit_config()
     layer, weight = _quantized_layer(config, 3072, 3072, "attn.to_q", seed=3)
     x = torch.randn(2, 64, 3072, device="cuda", dtype=torch.float16)
     out, _ = layer(x)
@@ -301,7 +306,7 @@ def test_fp16_activations_are_cast_and_returned_in_fp16():
 def test_fp16_parameters_are_cast_for_the_kernel_in_every_helper():
     """FP16 parameters (--dit-precision fp16) must run through the plain apply
     and every fused helper; the out= helper must refuse an FP16 input."""
-    config = _sgl_config()
+    config = _jit_config()
     layers = []
     weights = []
     for i, n in enumerate("qkv"):
@@ -353,7 +358,7 @@ def test_fp16_parameters_are_cast_for_the_kernel_in_every_helper():
 def test_lora_merge_mode_is_redirected_to_dynamic_on_int8_base():
     from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import LoRAPipeline
 
-    config = _sgl_config()
+    config = _jit_config()
     layer, weight = _quantized_layer(
         config, 3072, 3072, "transformer_blocks.0.attn.to_q", seed=4
     )
@@ -392,26 +397,26 @@ def test_lora_merge_mode_is_redirected_to_dynamic_on_int8_base():
     assert rel_l2 < 2e-2, rel_l2
 
 
-_SGL_AVAILABLE = f"{_CONFIG_MODULE}._sgl_kernel_available"
+_JIT_AVAILABLE = f"{_CONFIG_MODULE}._jit_available"
 _COMFY_AVAILABLE = f"{_CONFIG_MODULE}._comfy_kitchen_available"
 
 
 @patch(_LOAD_COMFY_KITCHEN)
-@patch(_LOAD_SGL_KERNEL)
-def test_auto_backend_prefers_sgl_kernel_and_falls_back_to_comfy(_sgl, _comfy):
-    """``auto`` must pick sgl-kernel where its ops run and comfy_kitchen
+@patch(_LOAD_JIT_KERNEL)
+def test_auto_backend_prefers_jit_and_falls_back_to_comfy(_jit, _comfy):
+    """``auto`` must pick the JIT ops where they run and comfy_kitchen
     otherwise; the choice is per config, not per import."""
     with (
-        patch(_SGL_AVAILABLE, return_value=True),
+        patch(_JIT_AVAILABLE, return_value=True),
         patch(_COMFY_AVAILABLE, return_value=True),
     ):
         config = ConvRotInt8Config()
-        assert config.resolve_backend() == "sgl_kernel"
+        assert config.resolve_backend() == "jit"
         method = config.get_quant_method(LinearBase(3072, 3072), "blocks.0.attn.to_q")
-        assert isinstance(method, ConvRotInt8SglKernelLinearMethod)
-        assert config.selected_by_backend["sgl_kernel"] == ["blocks.0.attn.to_q"]
+        assert isinstance(method, ConvRotInt8JitLinearMethod)
+        assert config.selected_by_backend["jit"] == ["blocks.0.attn.to_q"]
     with (
-        patch(_SGL_AVAILABLE, return_value=False),
+        patch(_JIT_AVAILABLE, return_value=False),
         patch(_COMFY_AVAILABLE, return_value=True),
     ):
         config = ConvRotInt8Config()
@@ -422,11 +427,11 @@ def test_auto_backend_prefers_sgl_kernel_and_falls_back_to_comfy(_sgl, _comfy):
 
 
 @patch(_LOAD_COMFY_KITCHEN)
-@patch(_LOAD_SGL_KERNEL)
-def test_auto_backend_serves_narrow_outputs_with_comfy_or_leaves_bf16(_sgl, _comfy):
-    """The sgl-kernel epilogue stores 8 outputs at a time; a narrower layer goes
+@patch(_LOAD_JIT_KERNEL)
+def test_auto_backend_serves_narrow_outputs_with_comfy_or_leaves_bf16(_jit, _comfy):
+    """The JIT epilogue stores 8 outputs at a time; a narrower layer goes
     to comfy_kitchen when it is installed and stays BF16 otherwise."""
-    with patch(_SGL_AVAILABLE, return_value=True):
+    with patch(_JIT_AVAILABLE, return_value=True):
         with patch(_COMFY_AVAILABLE, return_value=True):
             config = ConvRotInt8Config()
             method = config.get_quant_method(LinearBase(4096, 4), "blocks.0.gate")
@@ -440,10 +445,10 @@ def test_auto_backend_serves_narrow_outputs_with_comfy_or_leaves_bf16(_sgl, _com
 
 
 @patch(_LOAD_COMFY_KITCHEN)
-@patch(_LOAD_SGL_KERNEL)
-def test_serialized_layers_pick_the_backend_per_marker_group_size(_sgl, _comfy):
+@patch(_LOAD_JIT_KERNEL)
+def test_serialized_layers_pick_the_backend_per_marker_group_size(_jit, _comfy):
     """A Comfy checkpoint may mix group sizes; 16 exists only in comfy_kitchen
-    while 256 runs on the sgl ops with the stored [N, 1] scale."""
+    while 256 runs on the JIT ops with the stored [N, 1] scale."""
     markers = {
         "visual.proj": {
             "format": "int8_tensorwise",
@@ -457,7 +462,7 @@ def test_serialized_layers_pick_the_backend_per_marker_group_size(_sgl, _comfy):
         },
     }
     with (
-        patch(_SGL_AVAILABLE, return_value=True),
+        patch(_JIT_AVAILABLE, return_value=True),
         patch(_COMFY_AVAILABLE, return_value=True),
     ):
         config = ConvRotInt8Config(layer_markers=markers)
@@ -468,7 +473,7 @@ def test_serialized_layers_pick_the_backend_per_marker_group_size(_sgl, _comfy):
             256, 16, bias=False, quant_config=config, prefix="blocks.0.fc1"
         )
     assert isinstance(small.quant_method, ConvRotInt8ComfyKitchenLinearMethod)
-    assert isinstance(fc1.quant_method, ConvRotInt8SglKernelLinearMethod)
+    assert isinstance(fc1.quant_method, ConvRotInt8JitLinearMethod)
     assert fc1.quant_method.is_checkpoint_serialized
     assert fc1.weight.dtype == torch.int8 and fc1.weight.shape == (16, 256)
     assert fc1.weight_scale.dtype == torch.float32
@@ -478,32 +483,32 @@ def test_serialized_layers_pick_the_backend_per_marker_group_size(_sgl, _comfy):
 
 def test_explicit_backend_rejects_group_sizes_it_has_no_kernel_for():
     with pytest.raises(ValueError, match="group sizes"):
-        ConvRotInt8Config(group_size=16, backend="sgl_kernel")
+        ConvRotInt8Config(group_size=16, backend="jit")
     with pytest.raises(ValueError, match="group sizes"):
         ConvRotInt8Config(group_size=128, backend="comfy_kitchen")
     with pytest.raises(ValueError, match="backend must be one of"):
         ConvRotInt8Config(backend="triton")
 
 
-def test_require_comfy_kitchen_pins_auto_and_refuses_explicit_sgl_kernel():
+def test_require_comfy_kitchen_pins_auto_and_refuses_explicit_jit():
     with (
-        patch(_SGL_AVAILABLE, return_value=True),
+        patch(_JIT_AVAILABLE, return_value=True),
         patch(_COMFY_AVAILABLE, return_value=True),
     ):
         config = ConvRotInt8Config()
         config.require_comfy_kitchen("is not validated here")
         assert config.resolve_backend() == "comfy_kitchen"
-        with pytest.raises(ValueError, match="sgl_kernel is not validated here"):
-            ConvRotInt8Config(backend="sgl_kernel").require_comfy_kitchen(
+        with pytest.raises(ValueError, match="jit is not validated here"):
+            ConvRotInt8Config(backend="jit").require_comfy_kitchen(
                 "is not validated here"
             )
 
 
 @requires_kernel
-def test_serialized_layer_on_sgl_kernel_matches_online_quantization_bitwise():
+def test_serialized_layer_on_jit_matches_online_quantization_bitwise():
     """Loading the online path's INT8 weight and fp32 [N, 1] row scale through
     the serialized method must reproduce the online layer bit for bit."""
-    online, _ = _quantized_layer(_sgl_config(), 3072, 3072, "attn.to_q", seed=30)
+    online, _ = _quantized_layer(_jit_config(), 3072, 3072, "attn.to_q", seed=30)
     markers = {
         "attn.to_q": {
             "format": "int8_tensorwise",
@@ -511,11 +516,11 @@ def test_serialized_layer_on_sgl_kernel_matches_online_quantization_bitwise():
             "convrot_groupsize": 256,
         }
     }
-    config = ConvRotInt8Config(layer_markers=markers, backend="sgl_kernel")
+    config = ConvRotInt8Config(layer_markers=markers, backend="jit")
     serialized = ReplicatedLinear(
         3072, 3072, params_dtype=torch.bfloat16, quant_config=config, prefix="attn.to_q"
     ).cuda()
-    assert isinstance(serialized.quant_method, ConvRotInt8SglKernelLinearMethod)
+    assert isinstance(serialized.quant_method, ConvRotInt8JitLinearMethod)
     with torch.no_grad():
         serialized.weight.copy_(online.weight)
         serialized.weight_scale.copy_(online.weight_scale.view(-1, 1))
@@ -527,23 +532,23 @@ def test_serialized_layer_on_sgl_kernel_matches_online_quantization_bitwise():
     assert convrot_int8_shares_input([serialized, online])
 
 
-def test_auto_logs_why_the_sgl_kernel_backend_is_unavailable(caplog):
+def test_auto_logs_why_the_jit_backend_is_unavailable(caplog):
     """A refused GPU (CC 10.3) must still say why once the method is convrot_int8
-    with auto backend, not only when sgl_kernel is requested explicitly."""
+    with auto backend, not only when jit is requested explicitly."""
     import logging
 
     from sglang.multimodal_gen.runtime.layers.quantization.configs import (
         convrot_int8_config,
     )
 
-    convrot_int8_config._log_sgl_kernel_fallback.cache_clear()
+    convrot_int8_config._log_jit_fallback.cache_clear()
     reason = (
         "CC 10.3 is not supported: Blackwell Ultra cuts INT8 tensor-core throughput"
     )
     with (
         patch(
-            "sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_sgl_kernel."
-            "sgl_kernel_convrot_unavailable_reason",
+            "sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_jit."
+            "jit_convrot_unavailable_reason",
             return_value=reason,
         ),
         patch(_COMFY_AVAILABLE, return_value=True),
@@ -555,13 +560,13 @@ def test_auto_logs_why_the_sgl_kernel_backend_is_unavailable(caplog):
     messages = [
         r.getMessage()
         for r in caplog.records
-        if "sgl-kernel backend unavailable" in r.getMessage()
+        if "JIT backend unavailable" in r.getMessage()
     ]
     assert len(messages) == 1 and reason in messages[0]
 
 
-@patch(_LOAD_SGL_KERNEL)
-def test_shared_input_requires_one_group_size(_sgl):
+@patch(_LOAD_JIT_KERNEL)
+def test_shared_input_requires_one_group_size(_jit):
     """One rotated activation serves several layers only at one group width; a
     serialized checkpoint may mix 64- and 256-group layers."""
     markers = {
@@ -569,7 +574,7 @@ def test_shared_input_requires_one_group_size(_sgl):
         "b": {"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": 64},
         "c": {"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": 256},
     }
-    config = ConvRotInt8Config(layer_markers=markers, backend="sgl_kernel")
+    config = ConvRotInt8Config(layer_markers=markers, backend="jit")
     a, b, c = (
         ReplicatedLinear(256, 16, bias=False, quant_config=config, prefix=name)
         for name in "abc"
@@ -582,13 +587,13 @@ def test_every_no_kernel_branch_raises_instead_of_falling_back():
     """A serialized INT8 layer that no backend serves must not land in a BF16
     parameter, and an impossible auto config must fail at construction."""
     with (
-        patch(_SGL_AVAILABLE, return_value=False),
+        patch(_JIT_AVAILABLE, return_value=False),
         patch(_COMFY_AVAILABLE, return_value=True),
     ):
         with pytest.raises(ValueError, match="no backend on this machine"):
             ConvRotInt8Config(group_size=128)
     with (
-        patch(_SGL_AVAILABLE, return_value=True),
+        patch(_JIT_AVAILABLE, return_value=True),
         patch(_COMFY_AVAILABLE, return_value=False),
     ):
         with pytest.raises(ValueError, match="no kernel for group size 128"):
@@ -606,8 +611,8 @@ def test_every_no_kernel_branch_raises_instead_of_falling_back():
 
 
 @patch(_LOAD_COMFY_KITCHEN)
-@patch(_LOAD_SGL_KERNEL)
-def test_serialized_layers_log_the_backend_split_once_loaded(_sgl, _comfy, caplog):
+@patch(_LOAD_JIT_KERNEL)
+def test_serialized_layers_log_the_backend_split_once_loaded(_jit, _comfy, caplog):
     """Serialized layers skip online quantization, so the backend split must be
     reported when their weights are in place instead."""
     import logging
@@ -621,7 +626,7 @@ def test_serialized_layers_log_the_backend_split_once_loaded(_sgl, _comfy, caplo
         },
     }
     with (
-        patch(_SGL_AVAILABLE, return_value=True),
+        patch(_JIT_AVAILABLE, return_value=True),
         patch(_COMFY_AVAILABLE, return_value=True),
         caplog.at_level(logging.INFO),
     ):
@@ -637,7 +642,7 @@ def test_serialized_layers_log_the_backend_split_once_loaded(_sgl, _comfy, caplo
         r.getMessage() for r in caplog.records if "serialized INT8" in r.getMessage()
     ]
     assert lines == [
-        "convrot_int8: loaded 2 serialized INT8 linear layers (sgl_kernel 1, comfy_kitchen 1)"
+        "convrot_int8: loaded 2 serialized INT8 linear layers (jit 1, comfy_kitchen 1)"
     ]
 
 

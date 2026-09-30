@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""convrot_int8's sgl-kernel backend: INT8 W8A8 linear on the fused ConvRot ops.
+"""convrot_int8's JIT backend: INT8 W8A8 linear on the fused ConvRot ops.
 
 One op takes a BF16 activation and performs the group-wise Hadamard rotation,
 dynamic per-row INT8 quantization, INT8 GEMM, dequantization and bias add
@@ -7,6 +7,11 @@ without materializing the intermediates. Weights receive the same rotation and
 per-output-channel quantization once, after loading a stock BF16 checkpoint; a
 serialized Comfy ConvRot INT8 checkpoint loads its INT8 weights and row scales
 directly, the same tensors comfy_kitchen consumes.
+
+The ops live in ``sglang.kernels.ops.gemm.convrot_int8`` and are compiled for
+the local GPU on first use (nvcc, about a minute once per machine; cached
+afterwards). A missing toolchain or a failed build makes this backend
+unavailable, and ``auto`` then takes comfy_kitchen.
 
 Two variants of that op are exposed to the model code as helpers below: a
 shared-input form that rotates and quantizes an activation once for several
@@ -18,11 +23,20 @@ bitwise identical to the plain op on the equivalent eager input.
 from __future__ import annotations
 
 import functools
+import time
 from collections.abc import Sequence
 
 import torch
 from torch.nn.parameter import Parameter
 
+from sglang.kernels.ops.gemm.convrot_int8 import (
+    convrot_int8_fused_linear,
+    convrot_int8_linear_prequant,
+    convrot_int8_local_capability,
+    convrot_int8_supported_capabilities,
+    convrot_rotate_quantize_activation,
+    load_convrot_int8_module,
+)
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     LinearBase,
@@ -33,33 +47,26 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config import (
     ConvRotInt8Config,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
+from sglang.srt.environ import envs
+
+logger = init_logger(__name__)
 
 __all__ = [
-    "ConvRotInt8SglKernelLinearMethod",
+    "ConvRotInt8JitLinearMethod",
     "REFUSED_CAPABILITY_REASONS",
     "apply_convrot_int8_gelu_input",
     "apply_convrot_int8_shared_input",
     "apply_convrot_int8_shared_input_out",
-    "check_convrot_int8_capability",
     "convrot_int8_fuses_gelu_input",
     "convrot_int8_shares_input",
-    "convrot_int8_supported_capabilities",
-    "sgl_kernel_convrot_available",
-    "sgl_kernel_convrot_unavailable_reason",
+    "jit_convrot_available",
+    "jit_convrot_unavailable_reason",
 ]
 
-_REQUIRED_OPS = (
-    "convrot_int8_supported_sm_versions",
-    "convrot_rotate_quantize_activation",
-    "convrot_int8_fused_linear",
-    "convrot_int8_fused_linear_gelu_input",
-    "convrot_int8_linear_prequant",
-    "convrot_int8_linear_prequant_out",
-)
-
 # Parts the ops deliberately leave out, with the reason shown at load time. The
-# supported table itself lives in sgl-kernel (convrot_int8_supported_sm_versions);
+# supported table itself lives with the ops (convrot_int8_supported_capabilities);
 # nothing here duplicates it.
 REFUSED_CAPABILITY_REASONS: dict[tuple[int, int], str] = {
     (10, 3): (
@@ -70,69 +77,71 @@ REFUSED_CAPABILITY_REASONS: dict[tuple[int, int], str] = {
 }
 
 
-def _ops_registered() -> bool:
-    try:
-        import sgl_kernel  # noqa: F401 -- registers torch.ops.sgl_kernel.*
-    except ImportError:
-        return False
-    return all(hasattr(torch.ops.sgl_kernel, op) for op in _REQUIRED_OPS)
-
-
-def convrot_int8_supported_capabilities() -> frozenset[tuple[int, int]]:
-    """(major, minor) pairs the installed sgl_kernel carries convrot code for."""
-    import sgl_kernel  # noqa: F401 -- registers torch.ops.sgl_kernel.*
-
-    versions = torch.ops.sgl_kernel.convrot_int8_supported_sm_versions()
-    return frozenset((int(v) // 10, int(v) % 10) for v in versions)
-
-
-def check_convrot_int8_capability(capability: tuple[int, int]) -> None:
-    """Raise with the specific reason when `capability` is not in the kernel's table."""
-    supported = convrot_int8_supported_capabilities()
-    if capability in supported:
-        return
+def _unsupported_capability_reason(capability: tuple[int, int]) -> str:
     major, minor = capability
     reason = REFUSED_CAPABILITY_REASONS.get(
-        capability, "the convrot_int8_* ops carry no code for it"
+        capability, "the convrot_int8 ops carry no code for it"
     )
-    supported_text = ", ".join(f"{a}.{b}" for a, b in sorted(supported))
-    raise RuntimeError(
-        f"convrot_int8 backend sgl_kernel does not support CC {major}.{minor}: "
-        f"{reason}. Supported compute capabilities: {supported_text}"
+    supported = ", ".join(
+        f"{a}.{b}" for a, b in sorted(convrot_int8_supported_capabilities())
     )
+    return f"CC {major}.{minor} is not supported: {reason} (supported: {supported})"
 
 
 @functools.cache
-def sgl_kernel_convrot_unavailable_reason() -> str | None:
-    """Why the sgl-kernel backend cannot run here, or None when it can."""
+def jit_convrot_unavailable_reason() -> str | None:
+    """Why the JIT backend cannot run here, or None when it can.
+
+    Builds the ops on the way (once per machine; cached afterwards), so a
+    missing CUDA toolchain or a failed build shows up here as a reason instead
+    of failing the first quantized layer.
+    """
     if not torch.cuda.is_available():
         return "no CUDA device"
-    if not _ops_registered():
-        return "the installed sgl_kernel does not register the convrot_int8_* ops"
-    capability = torch.cuda.get_device_capability()
-    if capability in convrot_int8_supported_capabilities():
-        return None
-    major, minor = capability
-    reason = REFUSED_CAPABILITY_REASONS.get(
-        capability, "the convrot_int8_* ops carry no code for it"
+    capability = convrot_int8_local_capability()
+    if capability is None:
+        return "not a CUDA device"
+    if capability not in convrot_int8_supported_capabilities():
+        return _unsupported_capability_reason(capability)
+    logger.info(
+        "convrot_int8: loading the JIT ops for CC %d.%d (the first use on a "
+        "machine compiles them, about a minute)",
+        *capability,
     )
-    return f"CC {major}.{minor} is not supported: {reason}"
-
-
-def sgl_kernel_convrot_available() -> bool:
-    """Whether the installed sgl_kernel carries the convrot ops for the current GPU."""
-    return sgl_kernel_convrot_unavailable_reason() is None
-
-
-def _load_sgl_kernel() -> None:
-    # Ops first: the capability table is read from the kernel itself.
-    if not _ops_registered():
-        raise RuntimeError(
-            "convrot_int8 backend sgl_kernel requires an sgl_kernel build that "
-            "registers the torch.ops.sgl_kernel.convrot_int8_* ops; the installed "
-            "sgl_kernel does not"
+    started = time.monotonic()
+    try:
+        load_convrot_int8_module()
+    except Exception as exc:  # nvcc / ninja missing, or the build itself failed
+        if envs.SGLANG_CRASH_ON_JIT_COMPILE.get():
+            raise
+        logger.warning("convrot_int8: the JIT build failed: %s", exc)
+        detail = str(exc).strip().splitlines()
+        return (
+            f"the JIT build of the convrot_int8 ops failed "
+            f"({type(exc).__name__}: {detail[0] if detail else 'no message'}; "
+            "the compiler output is in the log above)"
         )
-    check_convrot_int8_capability(torch.cuda.get_device_capability())
+    elapsed = time.monotonic() - started
+    # A cache hit loads in well under a second; anything longer was a build.
+    if elapsed > 5:
+        logger.info(
+            "convrot_int8: compiled the JIT ops for CC %d.%d in %.0f s "
+            "(cached for later runs)",
+            *capability,
+            elapsed,
+        )
+    return None
+
+
+def jit_convrot_available() -> bool:
+    """Whether the JIT convrot ops run (and built) on the current GPU."""
+    return jit_convrot_unavailable_reason() is None
+
+
+def _load_jit_kernel() -> None:
+    reason = jit_convrot_unavailable_reason()
+    if reason is not None:
+        raise RuntimeError(f"convrot_int8 backend jit is unavailable: {reason}")
 
 
 def _as_rows(x: torch.Tensor) -> torch.Tensor:
@@ -143,7 +152,7 @@ def _as_rows(x: torch.Tensor) -> torch.Tensor:
         x = x.to(torch.bfloat16)
     elif x.dtype != torch.bfloat16:
         raise ValueError(
-            f"convrot_int8 backend sgl_kernel does not support activation dtype {x.dtype}"
+            f"convrot_int8 backend jit does not support activation dtype {x.dtype}"
         )
     return x.reshape(-1, x.shape[-1]).contiguous()
 
@@ -153,8 +162,8 @@ def _like_input(out: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     return out if out.dtype == x.dtype else out.to(x.dtype)
 
 
-class ConvRotInt8SglKernelLinearMethod(LinearMethodBase):
-    """Loads or creates ConvRot INT8 weights and runs sgl-kernel's fused ops."""
+class ConvRotInt8JitLinearMethod(LinearMethodBase):
+    """Loads or creates ConvRot INT8 weights and runs the JIT fused ops."""
 
     def __init__(
         self,
@@ -166,7 +175,7 @@ class ConvRotInt8SglKernelLinearMethod(LinearMethodBase):
         self.quant_config = quant_config
         self.group_size = group_size
         self.is_checkpoint_serialized = is_checkpoint_serialized
-        _load_sgl_kernel()
+        _load_jit_kernel()
 
     def create_weights(
         self,
@@ -190,7 +199,7 @@ class ConvRotInt8SglKernelLinearMethod(LinearMethodBase):
             )
         if sum(output_partition_sizes) % 8:
             raise ValueError(
-                f"convrot_int8 backend sgl_kernel needs the output size per "
+                f"convrot_int8 backend jit needs the output size per "
                 f"partition ({sum(output_partition_sizes)}) to be a multiple of 8"
             )
         # The online path initially matches UnquantizedLinearMethod so the
@@ -224,15 +233,12 @@ class ConvRotInt8SglKernelLinearMethod(LinearMethodBase):
             self.quant_config.note_loaded()
         elif weight.dtype != torch.int8:
             # Quantization runs on CUDA; a layer staged on CPU is round-tripped
-            # on its own. (The transformer loader currently materialises every
-            # online-quantized component on the GPU before this runs, so INT8
-            # saves memory after load, not during it.)
+            # on its own, so an offloaded model never holds more than one BF16
+            # layer on the GPU during load.
             home = weight.device
-            weight_q, weight_scale = (
-                torch.ops.sgl_kernel.convrot_rotate_quantize_activation(
-                    weight.to("cuda", non_blocking=True).to(torch.bfloat16),
-                    self.group_size,
-                )
+            weight_q, weight_scale = convrot_rotate_quantize_activation(
+                weight.to("cuda", non_blocking=True).to(torch.bfloat16),
+                self.group_size,
             )
             layer.weight = Parameter(weight_q.to(home), requires_grad=False)
             layer.register_parameter(
@@ -259,7 +265,7 @@ class ConvRotInt8SglKernelLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        out = torch.ops.sgl_kernel.convrot_int8_fused_linear(
+        out = convrot_int8_fused_linear(
             _as_rows(x),
             layer.weight,
             layer.weight_scale,
@@ -283,10 +289,10 @@ def _forward_is_plain_apply(layer: LinearBase) -> bool:
     return False
 
 
-def _is_sgl_kernel_int8(layer: torch.nn.Module) -> bool:
+def _is_jit_int8(layer: torch.nn.Module) -> bool:
     # LoRA wrappers and other non-LinearBase modules carry no quant_method.
     return isinstance(layer, LinearBase) and isinstance(
-        layer.quant_method, ConvRotInt8SglKernelLinearMethod
+        layer.quant_method, ConvRotInt8JitLinearMethod
     )
 
 
@@ -294,8 +300,7 @@ def convrot_int8_shares_input(layers: Sequence[torch.nn.Module]) -> bool:
     """Whether ``apply_convrot_int8_shared_input`` reproduces ``layer(x)`` for
     every layer in ``layers``."""
     if not layers or not all(
-        _is_sgl_kernel_int8(layer) and _forward_is_plain_apply(layer)
-        for layer in layers
+        _is_jit_int8(layer) and _forward_is_plain_apply(layer) for layer in layers
     ):
         return False
     # One rotated input serves every layer only at one group width.
@@ -308,15 +313,13 @@ def apply_convrot_int8_shared_input(
     """``[layer(x)[0] for layer in layers]`` with ``x`` rotated and quantized once.
 
     Bitwise identical to applying each layer on its own; see
-    ``convrot_int8_linear_prequant`` in sgl-kernel.
+    ``convrot_int8_linear_prequant`` in ``sglang.kernels.ops.gemm.convrot_int8``.
     """
     group_size = layers[0].quant_method.group_size
-    x_q, x_scale = torch.ops.sgl_kernel.convrot_rotate_quantize_activation(
-        _as_rows(x), group_size
-    )
+    x_q, x_scale = convrot_rotate_quantize_activation(_as_rows(x), group_size)
     outs = []
     for layer in layers:
-        out = torch.ops.sgl_kernel.convrot_int8_linear_prequant(
+        out = convrot_int8_linear_prequant(
             x_q,
             x_scale,
             layer.weight,
@@ -336,7 +339,8 @@ def apply_convrot_int8_shared_input_out(
     like ``layer(x)[0]``, so ``x`` must be BF16 as well (an FP16 ``x`` would
     have ``layer(x)`` return FP16; use ``apply_convrot_int8_shared_input`` for
     it). Bitwise identical to ``apply_convrot_int8_shared_input`` and to
-    ``layer(x)``; see ``convrot_int8_linear_prequant_out`` in sgl-kernel.
+    ``layer(x)``; see ``convrot_int8_linear_prequant`` in
+    ``sglang.kernels.ops.gemm.convrot_int8``.
     """
     if x.dtype != torch.bfloat16:
         raise ValueError(
@@ -344,38 +348,37 @@ def apply_convrot_int8_shared_input_out(
             f"input must be BF16, got {x.dtype}"
         )
     group_size = layers[0].quant_method.group_size
-    x_q, x_scale = torch.ops.sgl_kernel.convrot_rotate_quantize_activation(
-        _as_rows(x), group_size
-    )
+    x_q, x_scale = convrot_rotate_quantize_activation(_as_rows(x), group_size)
     for layer, out in zip(layers, outs, strict=True):
         # view() rather than reshape(): a copy here would silently drop the write.
-        torch.ops.sgl_kernel.convrot_int8_linear_prequant_out(
+        convrot_int8_linear_prequant(
             x_q,
             x_scale,
             layer.weight,
             layer.weight_scale,
             layer.bias,
             group_size,
-            out.view(-1, out.shape[-1]),
+            out=out.view(-1, out.shape[-1]),
         )
 
 
 def convrot_int8_fuses_gelu_input(layer: torch.nn.Module) -> bool:
     """Whether ``apply_convrot_int8_gelu_input`` reproduces
     ``layer(F.gelu(x, approximate="tanh"))[0]``."""
-    return _is_sgl_kernel_int8(layer) and _forward_is_plain_apply(layer)
+    return _is_jit_int8(layer) and _forward_is_plain_apply(layer)
 
 
 def apply_convrot_int8_gelu_input(layer: LinearBase, x: torch.Tensor) -> torch.Tensor:
     """``layer(F.gelu(x, approximate="tanh"))[0]`` as one op, bitwise identical
     to the eager GELU followed by the layer for a BF16 ``x`` (an FP16 ``x`` is
-    cast to BF16 before the GELU); see ``convrot_int8_fused_linear_gelu_input``
-    in sgl-kernel."""
-    out = torch.ops.sgl_kernel.convrot_int8_fused_linear_gelu_input(
+    cast to BF16 before the GELU); see ``convrot_int8_fused_linear`` in
+    ``sglang.kernels.ops.gemm.convrot_int8``."""
+    out = convrot_int8_fused_linear(
         _as_rows(x),
         layer.weight,
         layer.weight_scale,
         layer.bias,
         layer.quant_method.group_size,
+        gelu_input=True,
     )
     return _like_input(out=out, x=x)

@@ -331,9 +331,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "SGLANG_DIFFUSION_CFG_GATE_STEP", 1.0
     ),
     # Kernel backend for convrot_int8 (online or serialized ConvRot INT8):
-    # "auto" prefers sgl-kernel's convrot_int8_* ops where they run (CC 9.0,
-    # 10.0, 12.0, 12.1) and falls back to comfy_kitchen; "sgl_kernel" or
-    # "comfy_kitchen" forces one backend.
+    # "auto" prefers SGLang's JIT-compiled convrot_int8 ops where they build
+    # and run (CC 9.0, 10.0, 12.0, 12.1 with nvcc) and falls back to
+    # comfy_kitchen; "jit" or "comfy_kitchen" forces one backend.
     "SGLANG_DIFFUSION_CONVROT_INT8_BACKEND": _lazy_str(
         "SGLANG_DIFFUSION_CONVROT_INT8_BACKEND", "auto"
     ),

@@ -83,7 +83,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
     NunchakuConfig,
     is_nunchaku_available,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_sgl_kernel import (
+from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_jit import (
     apply_convrot_int8_gelu_input,
     apply_convrot_int8_shared_input,
     apply_convrot_int8_shared_input_out,
@@ -756,8 +756,8 @@ def _joint_qkv_operands_match(
     if not all(isinstance(layer, ColumnParallelLinear) for layer in layers):
         return False
     if attn.separate_convrot_qkv_proj:
-        # convrot_int8_linear_prequant_out stores BF16 only; FP16 streams take
-        # the allocating helper, which casts at the op boundary.
+        # apply_convrot_int8_shared_input_out stores BF16 only; FP16 streams
+        # take apply_convrot_int8_shared_input, which casts at the op boundary.
         return dtype == torch.bfloat16
     # The out= GEMMs below take no part in autocast and do no promotion, so
     # every operand must already be in the dtype F.linear would compute in.

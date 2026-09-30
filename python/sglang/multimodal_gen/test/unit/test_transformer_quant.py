@@ -143,9 +143,9 @@ from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod as SRTFp8LinearMe
 
 # convrot_int8 picks its kernel backend from the GPU; pin comfy_kitchen so these
 # cases do not depend on the runner.
-_CONVROT_SGL_AVAILABLE = (
+_CONVROT_JIT_AVAILABLE = (
     "sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config."
-    "_sgl_kernel_available"
+    "_jit_available"
 )
 
 
@@ -869,8 +869,8 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertTrue(config.supports_input_partition("blocks.0.mlp.fc1", 6400))
         self.assertFalse(config.supports_input_partition("blocks.0.mlp.fc1", 3200))
 
-    @patch(_CONVROT_SGL_AVAILABLE, return_value=False)
-    def test_online_convrot_int8_loads_on_the_host_under_offload(self, _sgl):
+    @patch(_CONVROT_JIT_AVAILABLE, return_value=False)
+    def test_online_convrot_int8_loads_on_the_host_under_offload(self, _jit):
         """Online convrot_int8 quantizes each layer through its own CUDA round
         trip, so the loader must not require the whole BF16 DiT on the GPU
         (an offloaded 62 GB H3 DiT has to stay on the host during load)."""
@@ -1033,7 +1033,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
                 "sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_comfy_kitchen."
                 "_load_comfy_kitchen"
             ),
-            patch(_CONVROT_SGL_AVAILABLE, return_value=False),
+            patch(_CONVROT_JIT_AVAILABLE, return_value=False),
         ):
             config = resolve_minimax_h3_checkpoint_quantization(markers)
             w4a4 = ReplicatedLinear(
@@ -1058,12 +1058,12 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertEqual(int8.weight.shape, (3, 256))
         self.assertEqual(set(config.selected), {"w4a4", "int8"})
 
-    @patch(_CONVROT_SGL_AVAILABLE, return_value=False)
+    @patch(_CONVROT_JIT_AVAILABLE, return_value=False)
     @patch(
         "sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_comfy_kitchen."
         "_load_comfy_kitchen"
     )
-    def test_serialized_kitchen_constructs_int8_weight_and_row_scale(self, _load, _sgl):
+    def test_serialized_kitchen_constructs_int8_weight_and_row_scale(self, _load, _jit):
         config = ConvRotInt8Config(
             layer_markers={
                 "proj": {
@@ -1765,7 +1765,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
                 "sglang.multimodal_gen.runtime.layers.quantization."
                 "convrot_int8_comfy_kitchen._load_comfy_kitchen"
             ),
-            patch(_CONVROT_SGL_AVAILABLE, return_value=False),
+            patch(_CONVROT_JIT_AVAILABLE, return_value=False),
         ):
             self.assertIsInstance(
                 config.get_quant_method(

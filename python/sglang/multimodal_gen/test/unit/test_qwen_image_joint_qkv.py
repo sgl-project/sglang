@@ -7,6 +7,7 @@ from unittest.mock import patch
 import torch
 import torch.nn as nn
 
+from sglang.kernels.ops.gemm.convrot_int8 import convrot_int8_supported_capabilities
 from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import join_seqs
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import (
@@ -16,9 +17,6 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
 from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config import (
     ConvRotInt8Config,
-)
-from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_sgl_kernel import (
-    sgl_kernel_convrot_available,
 )
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
     QwenImageCrossAttention,
@@ -46,9 +44,12 @@ FUSED_INPLACE_QKNORM = (
 _TP_GROUP = SimpleNamespace(world_size=1, rank_in_group=0)
 
 
+# Capability only: on a supported GPU a missing toolchain or a failed build must
+# fail these tests, not skip them.
 requires_convrot_kernel = unittest.skipUnless(
-    sgl_kernel_convrot_available(),
-    "needs a GPU in sgl-kernel's convrot table and a build with the convrot ops",
+    torch.cuda.is_available()
+    and torch.cuda.get_device_capability() in convrot_int8_supported_capabilities(),
+    "needs a GPU in the convrot_int8 capability table",
 )
 
 
@@ -380,12 +381,12 @@ class TestQwenImageJointQkvBuffers(_JointQkvCase):
 
 @requires_convrot_kernel
 class TestQwenImageJointQkvBuffersConvRot(_JointQkvCase):
-    """The same forward with the six projections on convrot_int8's sgl-kernel
+    """The same forward with the six projections on convrot_int8's JIT
     backend, which writes the joint buffers through its out= op."""
 
     def setUp(self) -> None:
         super().setUp()
-        self.config = ConvRotInt8Config(backend="sgl_kernel")
+        self.config = ConvRotInt8Config(backend="jit")
 
     def test_forward_is_bitwise_identical_to_join_seqs_path(self):
         attn = _attention(quant_config=self.config)
