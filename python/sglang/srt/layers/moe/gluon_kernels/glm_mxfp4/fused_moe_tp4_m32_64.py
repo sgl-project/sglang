@@ -115,9 +115,9 @@ def _select_routes(L, Bias, Sorted, Weights, Counts, Jobs, expert_start, M: gl.c
     gl.store(Jobs + job, selected_id | ticket // TM << 9, publish)
 
 @gluon.jit
-def _decode_job(Counts, Jobs, tile, M: gl.constexpr, TM: gl.constexpr, LOCAL_EXPERTS: gl.constexpr):
+def _decode_job(Counts, Jobs, tile, M: gl.constexpr, TM: gl.constexpr, LOCAL_EXPERTS: gl.constexpr, HAS_SHARED: gl.constexpr):
     index_type: gl.constexpr = gl.uint32 if TM == 16 else gl.int32
-    SHARED_BLOCKS: gl.constexpr = triton.cdiv(M, TM) if LOCAL_EXPERTS == 256 else 0
+    SHARED_BLOCKS: gl.constexpr = triton.cdiv(M, TM) if HAS_SHARED else 0
     expert = LOCAL_EXPERTS
     block = tile.to(gl.int32)
     live = gl.minimum(TM, M - tile.to(gl.int32) * TM)
@@ -175,7 +175,7 @@ def _load_packed_weight(W, S, expert, column, base, N: gl.constexpr, K: gl.const
     return (words, scale_byte)
 
 @gluon.jit
-def _project_tile(X, XS, W, WS, Sorted, block, column, expert, live, tile, M: gl.constexpr, N: gl.constexpr, K: gl.constexpr, BN: gl.constexpr, BK: gl.constexpr, UP: gl.constexpr, WARPS: gl.constexpr, WEIGHT_CACHE: gl.constexpr, DIRECT_A: gl.constexpr, TM: gl.constexpr, LOCAL_EXPERTS: gl.constexpr):
+def _project_tile(X, XS, W, WS, Sorted, block, column, expert, live, tile, M: gl.constexpr, N: gl.constexpr, K: gl.constexpr, BN: gl.constexpr, BK: gl.constexpr, UP: gl.constexpr, WARPS: gl.constexpr, WEIGHT_CACHE: gl.constexpr, DIRECT_A: gl.constexpr, TM: gl.constexpr, LOCAL_EXPERTS: gl.constexpr, HAS_SHARED: gl.constexpr):
     index_type: gl.constexpr = gl.uint32 if TM == 16 else gl.int32
     native_32: gl.constexpr = not UP and TM == 32
     mma: gl.constexpr = gl.amd.AMDMFMALayout(version=4, instr_shape=[32, 32, 64] if native_32 else [16, 16, 128], transposed=True, warps_per_cta=[1, WARPS])
@@ -185,7 +185,7 @@ def _project_tile(X, XS, W, WS, Sorted, block, column, expert, live, tile, M: gl
     bsl: gl.constexpr = gl.amd.cdna4.get_mfma_scale_layout(bd, [BN, BK // 32])
     al: gl.constexpr = gl.BlockedLayout([1, 4], [32, 2], [WARPS, 1], [0, 1]) if DIRECT_A else gl.BlockedLayout([1, 4], [8, 8], [WARPS, 1], [1, 0])
     mi = gl.arange(0, TM, gl.SliceLayout(1, al)).to(index_type)
-    shared = (LOCAL_EXPERTS == 256) & (expert == LOCAL_EXPERTS)
+    shared = HAS_SHARED & (expert == LOCAL_EXPERTS)
     arena_row = expert * (triton.cdiv(M, TM) * TM) + block * TM
     if UP:
         if shared:
@@ -277,15 +277,15 @@ def _store_projection(acc, Sorted, Parts, Y, arena_row, block, column, shared, l
         gl.amd.cdna4.buffer_store(acc.to(Parts.dtype.element_ty), part_base, address, rr[:, None] < live)
 
 @gluon.jit
-def _scaled_experts(X, XS, W, WS, Sorted, Counts, Jobs, Q, QS, Parts, Y, M: gl.constexpr, N: gl.constexpr, K: gl.constexpr, GROUP: gl.constexpr, UP: gl.constexpr, BN: gl.constexpr, WARPS: gl.constexpr, BK: gl.constexpr, WEIGHT_CACHE: gl.constexpr, DIRECT_A: gl.constexpr, TM: gl.constexpr, LOCAL_EXPERTS: gl.constexpr):
+def _scaled_experts(X, XS, W, WS, Sorted, Counts, Jobs, Q, QS, Parts, Y, M: gl.constexpr, N: gl.constexpr, K: gl.constexpr, GROUP: gl.constexpr, UP: gl.constexpr, BN: gl.constexpr, WARPS: gl.constexpr, BK: gl.constexpr, WEIGHT_CACHE: gl.constexpr, DIRECT_A: gl.constexpr, TM: gl.constexpr, LOCAL_EXPERTS: gl.constexpr, HAS_SHARED: gl.constexpr):
     index_type: gl.constexpr = gl.uint32 if TM == 16 else gl.int32
     pid = gl.program_id(0).to(index_type)
     COLS: gl.constexpr = N // BN
     tile = pid // (GROUP * COLS) * GROUP + pid % GROUP
     panel = pid // GROUP % COLS
-    expert, block, live = _decode_job(Counts, Jobs, tile, M, TM, LOCAL_EXPERTS)
+    expert, block, live = _decode_job(Counts, Jobs, tile, M, TM, LOCAL_EXPERTS, HAS_SHARED)
     if live > 0:
-        acc, arena_row, shared = _project_tile(X, XS, W, WS, Sorted, block, panel, expert, live, tile, M, N, K, BN, BK, UP, WARPS, WEIGHT_CACHE, DIRECT_A, TM, LOCAL_EXPERTS)
+        acc, arena_row, shared = _project_tile(X, XS, W, WS, Sorted, block, panel, expert, live, tile, M, N, K, BN, BK, UP, WARPS, WEIGHT_CACHE, DIRECT_A, TM, LOCAL_EXPERTS, HAS_SHARED)
         if UP:
             _store_activation(acc, Q, QS, tile * TM if TM == 32 else arena_row, panel, shared, N, BN, WARPS, TM)
         else:
@@ -316,7 +316,7 @@ def _reduce_parts(P, Y, Weights, M: gl.constexpr, H: gl.constexpr, HAS_SHARED: g
         value += gl.load(Y + m * H + h).to(gl.float32)
     gl.store(Y + m * H + h, value)
 
-def fused_moe(x, router, correction_bias, w13, w13_scale, w2, w2_scale, expert_start=0, routed_scaling_factor=2.5):
+def fused_moe(x, router, correction_bias, w13, w13_scale, w2, w2_scale, expert_start=0, routed_scaling_factor=2.5, fuse_shared_expert=False):
     m, h = x.shape
     intermediate = w13.shape[1] // 2
     local_experts = w13.shape[0] - 1
@@ -325,7 +325,8 @@ def fused_moe(x, router, correction_bias, w13, w13_scale, w2, w2_scale, expert_s
     expert_rows = triton.cdiv(m, tile_rows) * tile_rows
     distinct = min(256, routes)
     routed_blocks = distinct + (routes - distinct) // tile_rows
-    scheduled = triton.cdiv(routed_blocks + triton.cdiv(m, tile_rows), 4) * 4
+    shared_blocks = triton.cdiv(m, tile_rows) if fuse_shared_expert else 0
+    scheduled = triton.cdiv(routed_blocks + shared_blocks, 4) * 4
 
     def empty(shape, dtype=torch.bfloat16):
         return torch.empty(shape, device=x.device, dtype=dtype)
@@ -347,9 +348,9 @@ def fused_moe(x, router, correction_bias, w13, w13_scale, w2, w2_scale, expert_s
     router_ctas = triton.cdiv(m, router_rows) * 16 * router_splits
     _router_and_quantize[router_ctas + quant_ctas,](x, router, logits, xq, xs, counts, m, h, x.stride(0), BM=router_rows, BN=16, BK=128, GROUPS=16, SPLITS=router_splits, num_warps=1, enable_fp_fusion=False)
     _select_routes[m,](logits, correction_bias, sorted_routes, weights, counts, jobs, expert_start, m, tile_rows, router_splits, local_experts, routed_scaling_factor, num_warps=1, enable_fp_fusion=False)
-    _scaled_experts[scheduled * (2 * intermediate // 64),](xq, xs, w13, w13_scale, sorted_routes, counts, jobs, aq, aqs, parts, out, m, 2 * intermediate, h, GROUP=1, UP=True, BN=64, WARPS=2, BK=512, WEIGHT_CACHE='.cg', DIRECT_A=False, TM=tile_rows, LOCAL_EXPERTS=local_experts, num_warps=2, enable_fp_fusion=False)
+    _scaled_experts[scheduled * (2 * intermediate // 64),](xq, xs, w13, w13_scale, sorted_routes, counts, jobs, aq, aqs, parts, out, m, 2 * intermediate, h, GROUP=1, UP=True, BN=64, WARPS=2, BK=512, WEIGHT_CACHE='.cg', DIRECT_A=False, TM=tile_rows, LOCAL_EXPERTS=local_experts, HAS_SHARED=fuse_shared_expert, num_warps=2, enable_fp_fusion=False)
     down_n = 64 if m <= 32 else 128
     down_warps = 2 if m <= 32 else 4
-    _scaled_experts[scheduled * (h // down_n),](aq, aqs, w2, w2_scale, sorted_routes, counts, jobs, aq, aqs, parts, out, m, h, intermediate, GROUP=2, UP=False, BN=down_n, WARPS=down_warps, BK=512, WEIGHT_CACHE='', DIRECT_A=m > 32, TM=tile_rows, LOCAL_EXPERTS=local_experts, num_warps=down_warps)
-    _reduce_parts[m, h // 128](parts, out, weights, m, h, local_experts == 256, num_warps=1, enable_fp_fusion=False)
+    _scaled_experts[scheduled * (h // down_n),](aq, aqs, w2, w2_scale, sorted_routes, counts, jobs, aq, aqs, parts, out, m, h, intermediate, GROUP=2, UP=False, BN=down_n, WARPS=down_warps, BK=512, WEIGHT_CACHE='', DIRECT_A=m > 32, TM=tile_rows, LOCAL_EXPERTS=local_experts, HAS_SHARED=fuse_shared_expert, num_warps=down_warps)
+    _reduce_parts[m, h // 128](parts, out, weights, m, h, fuse_shared_expert, num_warps=1, enable_fp_fusion=False)
     return out

@@ -211,7 +211,7 @@ class GlmMxfp4GluonMoeBackend(GluonMoeBackend):
             "supported shared expert layout": layer.num_fused_shared_experts in (0, 1)
             and not (
                 layer.num_fused_shared_experts == 1
-                and (layer.moe_ep_size > 1 or layer.is_nextn)
+                and layer.is_nextn
             ),
             "no replicated shared expert": not layer._shared_expert_tp1,
             "no SBO shared-expert fusion": not layer._fuse_shared_experts_inside_sbo,
@@ -362,6 +362,7 @@ class GlmMxfp4GluonMoeBackend(GluonMoeBackend):
         kwargs = {"routed_scaling_factor": float(self.layer.routed_scaling_factor)}
         if self.total_tp == 4 or self.ep_size > 1:
             kwargs["expert_start"] = self.expert_start
+            kwargs["fuse_shared_expert"] = self.fuse_shared_expert
         output = fused_moe(hidden_states, *self.parameters, **kwargs)
 
         if self.native_shared:

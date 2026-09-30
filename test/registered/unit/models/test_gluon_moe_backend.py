@@ -411,6 +411,17 @@ def test_glm_backend_fuses_shared_expert_by_default(monkeypatch):
     assert backend.fuse_shared_expert
 
 
+def test_glm_backend_fuses_shared_expert_with_ep(monkeypatch):
+    backend, layer, experts = _glm_backend_shell(
+        monkeypatch, total_tp=4, ep_size=4, ep_rank=3
+    )
+    layer.num_fused_shared_experts = 1
+
+    backend.bind(layer, experts)
+
+    assert backend.fuse_shared_expert
+
+
 def test_glm_backend_honors_disable_shared_experts_fusion(monkeypatch):
     backend, layer, experts = _glm_backend_shell(monkeypatch)
     layer.num_fused_shared_experts = 0
