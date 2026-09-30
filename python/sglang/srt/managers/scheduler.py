@@ -329,6 +329,9 @@ from sglang.srt.speculative.eagle_utils import (
     get_draft_recurrent_hidden_state_spec_from_config,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_sampling_mask import (
+    validate_spec_sampling_mask_request,
+)
 from sglang.srt.speculative.uno_validation import validate_uno_request
 from sglang.srt.state_capturer.indexer_topk import destroy_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import destroy_global_experts_capturer
@@ -2964,14 +2967,10 @@ class Scheduler(
                 return
 
         if req.return_sampling_mask and not self.spec_algorithm.is_none():
-            # Spec workers do not emit one sampling support per accepted token, so
-            # the returned mask would not align 1:1 with generated tokens. Reject
-            # the combination instead of silently returning a misaligned mask.
-            error_msg = (
-                "return_sampling_mask is not supported with speculative decoding."
-            )
-            self._reject_sampling_mask_request(req, error_msg)
-            return
+            error_msg = validate_spec_sampling_mask_request(req, self.spec_algorithm)
+            if error_msg is not None:
+                self._reject_sampling_mask_request(req, error_msg)
+                return
 
         if req.return_sampling_mask and get_exec().kernel.sampling_backend == "ascend":
             # The ascend backend samples from logits directly and never builds the
@@ -5299,6 +5298,52 @@ class Scheduler(
 
         return GetInternalStateReqOutput(internal_state=msgspec_to_builtins(ret))
 
+    def _has_active_sampling_mask_request(self) -> bool:
+        """Whether any unfinished request holding a sampling mask is queued or
+        running, including PP micro-batches and PD decode queues."""
+        active_batches = [self.running_batch, self.last_batch]
+        active_batches.extend(getattr(self, "running_mbs", ()))
+        active_batches.extend(getattr(self, "mbs", ()))
+        active_batches.extend(getattr(self, "last_mbs", ()))
+        has_active_mask_request = any(
+            req.return_sampling_mask and not req.finished()
+            for batch in active_batches
+            if batch is not None
+            for req in batch.reqs
+        )
+        has_active_mask_request |= any(
+            req.return_sampling_mask and not req.finished()
+            for req in self.waiting_queue
+        )
+        has_active_mask_request |= any(
+            req.return_sampling_mask and not req.finished()
+            for req in self.grammar_manager.grammar_queue
+        )
+        has_active_mask_request |= (
+            self.chunked_req is not None
+            and self.chunked_req.return_sampling_mask
+            and not self.chunked_req.finished()
+        )
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            prealloc_queue = self.disagg_decode_prealloc_queue
+            decode_reqs = [
+                *prealloc_queue.queue,
+                *prealloc_queue.pending_reqs,
+                *self.disagg_decode_transfer_queue.queue,
+            ]
+            has_active_mask_request |= any(
+                decode_req.req.return_sampling_mask and not decode_req.req.finished()
+                for decode_req in decode_reqs
+            )
+            has_active_mask_request |= any(
+                req.return_sampling_mask and not req.finished()
+                for req in (
+                    *prealloc_queue.retracted_queue,
+                    *prealloc_queue.held_rebootstrap_reqs,
+                )
+            )
+        return has_active_mask_request
+
     def set_internal_state(self, recv_req: SetInternalStateReq):
         server_args_dict = recv_req.server_args
         args_allow_update = set(
@@ -5325,6 +5370,22 @@ class Scheduler(
                 )
                 if_success = False
                 break
+            elif (
+                k
+                in (
+                    "speculative_accept_threshold_single",
+                    "speculative_accept_threshold_acc",
+                )
+                and self.spec_algorithm.is_dflash()
+                and float(v) != 1.0
+            ):
+                if self._has_active_sampling_mask_request():
+                    logging.warning(
+                        f"Updating {k} is rejected while DFlash sampling-mask "
+                        "requests are active."
+                    )
+                    if_success = False
+                    break
             elif k == "dspark_force_budget_frac":
                 if not self.spec_algorithm.is_dspark() or not hasattr(
                     self.draft_worker, "set_dspark_forced_budget_frac"
