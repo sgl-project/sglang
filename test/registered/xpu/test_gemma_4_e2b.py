@@ -133,6 +133,11 @@ register_xpu_ci(
     suite="nightly-xpu-1-gpu",
     nightly=True,
 )
+register_xpu_ci(
+    est_time=240,
+    suite="release-nightly-xpu-1-gpu",
+    nightly=True,
+)
 
 if __name__ == "__main__":
     unittest.main()

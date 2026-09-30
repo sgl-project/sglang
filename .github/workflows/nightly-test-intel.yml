@@ -34,7 +34,8 @@ concurrency:
   cancel-in-progress: ${{ !inputs.ref && github.event_name != 'workflow_call' && github.event_name != 'workflow_dispatch' }}
 
 jobs:
-  nightly-xpu-1-gpu:
+  main-nightly-xpu-1-gpu:
+    # sglang main + sgl-kernel-xpu main.
     if: github.repository == 'sgl-project/sglang'
     runs-on: intel-bmg-nightly
     env:
@@ -52,10 +53,10 @@ jobs:
           fetch-depth: 0
           ref: ${{ inputs.ref || github.sha }}
 
-      - name: Start CI container (pull intel/sglang-dev:latest)
+      - name: Start CI container (pull intel/sglang-dev:latest-kernel-main)
         run: |
           export HF_TOKEN="$(cat ~/huggingface_token.txt)"
-          bash scripts/ci/xpu/xpu_ci_start_container.sh
+          bash scripts/ci/xpu/xpu_ci_start_container.sh --image-tag latest-kernel-main
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -141,7 +142,8 @@ jobs:
             docker rmi -f "${CI_SGLANG_XPU_IMAGE}" || true
           fi
 
-  nightly-xpu-2-gpu:
+  main-nightly-xpu-2-gpu:
+    # sglang main + sgl-kernel-xpu main.
     if: github.repository == 'sgl-project/sglang'
     runs-on: intel-bmg-nightly
     env:
@@ -159,10 +161,10 @@ jobs:
           fetch-depth: 0
           ref: ${{ inputs.ref || github.sha }}
 
-      - name: Start CI container (pull intel/sglang-dev:latest)
+      - name: Start CI container (pull intel/sglang-dev:latest-kernel-main)
         run: |
           export HF_TOKEN="$(cat ~/huggingface_token.txt)"
-          bash scripts/ci/xpu/xpu_ci_start_container.sh
+          bash scripts/ci/xpu/xpu_ci_start_container.sh --image-tag latest-kernel-main
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -237,7 +239,8 @@ jobs:
             docker rmi -f "${CI_SGLANG_XPU_IMAGE}" || true
           fi
 
-  nightly-xpu-4-gpu:
+  main-nightly-xpu-4-gpu:
+    # sglang main + sgl-kernel-xpu main.
     if: github.repository == 'sgl-project/sglang'
     runs-on: intel-bmg-nightly
     env:
@@ -255,10 +258,10 @@ jobs:
           fetch-depth: 0
           ref: ${{ inputs.ref || github.sha }}
 
-      - name: Start CI container (pull intel/sglang-dev:latest)
+      - name: Start CI container (pull intel/sglang-dev:latest-kernel-main)
         run: |
           export HF_TOKEN="$(cat ~/huggingface_token.txt)"
-          bash scripts/ci/xpu/xpu_ci_start_container.sh
+          bash scripts/ci/xpu/xpu_ci_start_container.sh --image-tag latest-kernel-main
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -333,7 +336,8 @@ jobs:
             docker rmi -f "${CI_SGLANG_XPU_IMAGE}" || true
           fi
 
-  nightly-xpu-8-gpu:
+  main-nightly-xpu-8-gpu:
+    # sglang main + sgl-kernel-xpu main.
     if: github.repository == 'sgl-project/sglang'
     runs-on: intel-bmg-nightly
     env:
@@ -351,10 +355,10 @@ jobs:
           fetch-depth: 0
           ref: ${{ inputs.ref || github.sha }}
 
-      - name: Start CI container (pull intel/sglang-dev:latest)
+      - name: Start CI container (pull intel/sglang-dev:latest-kernel-main)
         run: |
           export HF_TOKEN="$(cat ~/huggingface_token.txt)"
-          bash scripts/ci/xpu/xpu_ci_start_container.sh
+          bash scripts/ci/xpu/xpu_ci_start_container.sh --image-tag latest-kernel-main
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -429,13 +433,142 @@ jobs:
             docker rmi -f "${CI_SGLANG_XPU_IMAGE}" || true
           fi
 
+  release-nightly-xpu-1-gpu:
+    # sglang main + prebuilt sgl-kernel-xpu wheel: PR CI suites plus release-nightly-xpu-1-gpu.
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: intel-bmg-nightly
+    # Two suites back to back (~5h est. incl. setup) exceed the 360-min default.
+    timeout-minutes: 600
+    env:
+      DOCKERHUB_INTEL_USERNAME: ${{ secrets.DOCKERHUB_INTEL_USERNAME }}
+      DOCKERHUB_INTEL_TOKEN: ${{ secrets.DOCKERHUB_INTEL_TOKEN }}
+    steps:
+      - name: Reset workspace ownership
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/w" busybox:latest \
+            chown -R "$(id -u):$(id -g)" /w || true
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Start CI container (pull intel/sglang-dev:latest)
+        run: |
+          export HF_TOKEN="$(cat ~/huggingface_token.txt)"
+          bash scripts/ci/xpu/xpu_ci_start_container.sh --image-tag latest
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Overlay in-tree sglang test helpers onto image site-packages
+        run: |
+          # Bridges the up-to-24h window between merge and nightly image rebuild.
+          dest=$(docker exec ci_sglang_xpu /opt/venv/bin/python3 -c \
+                 "import sglang, os; print(os.path.dirname(sglang.__file__))")
+          docker exec ci_sglang_xpu cp \
+            /sglang-checkout/python/sglang/test/ci/ci_utils.py \
+            "$dest/test/ci/ci_utils.py"
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -c \
+            "import sglang.test.ci.ci_utils; print('overlay ok')"
+
+      - name: HF login + install run_suite extras
+        timeout-minutes: 10
+        run: |
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir tabulate
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir --no-deps xgrammar==0.1.33
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir "lm-eval==0.4.9"
+          # Test deps of the PR CI suites (mirrors pr-test-xpu.yml, minus the sglang reinstall).
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir pytest expecttest ray huggingface_hub "lmcache>=0.3.9" accelerate
+          # Diffusion extras (needed by test_xpu_zimage_turbo).
+          # Pins mirror python/pyproject_xpu.toml [project.optional-dependencies.diffusion].
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir "sglang[diffusion]"
+          # HF /whoami-v2 is aggressively rate-limited and the scheduled
+          # jobs all hit it at the same second. Retry with linear backoff +
+          # jitter to desynchronize them.
+          docker exec ci_sglang_xpu /bin/bash -c '
+            for i in 1 2 3 4 5; do
+              /opt/venv/bin/hf auth login --token "${HF_TOKEN}" && exit 0
+              sleep_secs=$((i * 15 + RANDOM % 15))
+              echo "hf auth login failed (attempt $i), retrying in ${sleep_secs}s..."
+              sleep "${sleep_secs}"
+            done
+            exit 1
+          '
+
+      - name: Download olmOCR-bench dataset (for test_deepseek_ocr_2_olmbench)
+        timeout-minutes: 30
+        run: |
+          # PyMuPDF renders the bench PDFs to images; bench_sglang.py errors
+          # every sample without it.
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir pymupdf
+          docker exec ci_sglang_xpu /bin/bash -c '
+            /opt/venv/bin/hf download --repo-type dataset allenai/olmOCR-bench \
+              --local-dir /sglang-checkout/olmOCR-bench'
+
+      - name: PR CI suites (stage-a + stage-b, 1-GPU XPU)
+        # Same suites and budget as pr-test-xpu.yml.
+        timeout-minutes: 180
+        run: |
+          touch github_summary_ci.md
+          docker exec ci_sglang_xpu bash -c "
+            source /opt/venv/bin/activate &&
+            cd /sglang-checkout/test &&
+            GITHUB_STEP_SUMMARY=/sglang-checkout/github_summary_ci.md \
+            SGLANG_IS_IN_CI=true \
+            python3 run_suite.py --hw xpu --suite stage-a-test-1-gpu-xpu,stage-b-test-1-gpu-xpu --enable-retry ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
+          " || TEST_EXIT_CODE=$?
+          echo "$(<github_summary_ci.md)" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+      - name: Release Nightly Test (1-GPU XPU)
+        # Run even if the PR CI suites failed; skip only on cancel.
+        if: success() || failure()
+        timeout-minutes: 240
+        run: |
+          touch github_summary.md release-nightly-xpu-1-gpu-metrics.jsonl
+          docker exec ci_sglang_xpu bash -c "
+            source /opt/venv/bin/activate &&
+            cd /sglang-checkout/test &&
+            OLMOCR_BENCH_DIR=/sglang-checkout/olmOCR-bench/bench_data \
+            GITHUB_STEP_SUMMARY=/sglang-checkout/github_summary.md \
+            SGLANG_IS_IN_CI=true \
+            SGLANG_TEST_METRICS_FILE=/sglang-checkout/release-nightly-xpu-1-gpu-metrics.jsonl \
+            python3 run_suite.py --hw xpu --suite release-nightly-xpu-1-gpu --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
+          " || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md)" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+      - name: Upload per-model metrics jsonl
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-nightly-xpu-1-gpu-metrics
+          path: release-nightly-xpu-1-gpu-metrics.jsonl
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/w" busybox:latest \
+            chown -R "$(id -u):$(id -g)" /w || true
+          rm -rf test/result.jsonl test/results test/.pytest_cache .pytest_cache || true
+          find . -type d -name "__pycache__" -prune -exec rm -rf {} + || true
+          find . -type f -name "*.pyc" -delete || true
+          docker rm -f ci_sglang_xpu || true
+          if [[ -n "${CI_SGLANG_XPU_IMAGE:-}" ]]; then
+            docker rmi -f "${CI_SGLANG_XPU_IMAGE}" || true
+          fi
+
   check-all-jobs:
     if: always() && (github.repository == 'sgl-project/sglang' || github.event_name == 'workflow_dispatch')
     needs:
-      - nightly-xpu-1-gpu
-      - nightly-xpu-2-gpu
-      - nightly-xpu-4-gpu
-      - nightly-xpu-8-gpu
+      - main-nightly-xpu-1-gpu
+      - main-nightly-xpu-2-gpu
+      - main-nightly-xpu-4-gpu
+      - main-nightly-xpu-8-gpu
+      - release-nightly-xpu-1-gpu
     runs-on: ubuntu-latest
     steps:
       - name: Check if any job failed
