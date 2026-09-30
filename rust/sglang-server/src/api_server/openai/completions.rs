@@ -24,14 +24,15 @@ use super::{
     AppState, MAX_OPENAI_CHOICES, collect_output, error_payload, indexed_decode_stream,
     openai_error, submit_generation, unix_seconds_u32,
 };
-use crate::frontend::{FrontendCall, FrontendError};
+use crate::api_server::frontend_error_status;
+use crate::frontend::{
+    FrontendCall, FrontendError, FrontendEvent, FrontendOutput, FrontendRequest,
+};
 use crate::message::finish_reason::Matched;
 use crate::message::ids::Rid;
-use crate::message::request::GenerateRequest;
-use crate::message::response::{ChunkEvent, ChunkExtras, ResponseItem};
+use crate::message::response::ChunkExtras;
 use crate::message::sampling::SamplingParams;
 use crate::message::types::{OneOrMany, TokenIds};
-use crate::utils::error::Error;
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new().route("/v1/completions", post(completions))
@@ -163,7 +164,7 @@ async fn completions(
                     Err(response) => return response,
                 };
             }
-            let native = GenerateRequest {
+            let native = FrontendRequest {
                 rid: rid.clone(),
                 text: text.clone(),
                 input_ids: input_ids.clone(),
@@ -234,13 +235,7 @@ async fn completions(
 /// or an `Error` (e.g. out-of-range ids → `Validation` → 400).
 async fn decode_prompt_echo(state: &AppState, token_ids: TokenIds) -> Result<String, Response> {
     match state.frontend.detokenize(token_ids).await {
-        Ok(payload) => String::from_utf8(payload.to_vec()).map_err(|_| {
-            openai_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "detokenized prompt is not valid UTF-8",
-                false,
-            )
-        }),
+        Ok(text) => Ok(text),
         // Same rule as `submit_generation`: build the refusal in the OpenAI
         // error shape rather than forwarding the native-shaped response.
         Err(FrontendError::Unavailable) => Err(openai_error(
@@ -248,30 +243,22 @@ async fn decode_prompt_echo(state: &AppState, token_ids: TokenIds) -> Result<Str
             "service unavailable",
             false,
         )),
-        Err(FrontendError::Pipeline(Error::Validation(message))) => {
+        Err(FrontendError::InvalidArgument(message)) => {
             Err(openai_error(StatusCode::BAD_REQUEST, &message, false))
         }
-        Err(FrontendError::Pipeline(error)) => {
-            let status = StatusCode::from_u16(error.http_status())
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        Err(FrontendError::InvalidResponse(message)) => Err(openai_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            message,
+            false,
+        )),
+        Err(error) => {
+            let status = frontend_error_status(&error);
             Err(openai_error(
                 status,
                 format!("failed to decode prompt for echo: {error}"),
                 false,
             ))
         }
-        Err(FrontendError::ResponseClosed | FrontendError::UnexpectedResponse(_)) => {
-            Err(openai_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to decode prompt for echo: reply channel closed",
-                false,
-            ))
-        }
-        Err(error @ FrontendError::InvalidArgument(_)) => Err(openai_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to decode prompt for echo: {error}"),
-            false,
-        )),
     }
 }
 
@@ -419,7 +406,7 @@ pub(super) async fn unary_completion(
 fn completion_choice(
     index: usize,
     text: String,
-    output: &ChunkEvent,
+    output: &FrontendOutput,
     want_logprobs: bool,
     include_input_logprobs: bool,
 ) -> (Choice, ChoiceExtensions) {
@@ -532,29 +519,14 @@ pub(super) fn completion_event_stream(
         }
         let mut events = futures::stream::select_all(streams);
 
-        while let Some((index, item)) = events.next().await {
-            let Some(item) = item else {
-                yield error_payload(StatusCode::INTERNAL_SERVER_ERROR, "response truncated before completion").to_string();
-                continue;
-            };
-            let output = match item {
-                ResponseItem::Frame(output) => output,
-                ResponseItem::Done(output) => output,
-                ResponseItem::Error(error) => {
-                    yield error_payload(StatusCode::from_u16(error.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), error.to_string()).to_string();
+        while let Some((index, event)) = events.next().await {
+            let output = match event {
+                FrontendEvent::Delta(output) | FrontendEvent::Finished(output) => output,
+                FrontendEvent::Failed(error) => {
+                    yield error_payload(frontend_error_status(&error), error.to_string()).to_string();
                     continue;
                 }
-                ResponseItem::Control(_) | ResponseItem::Data(_) => continue,
             };
-
-            if let Some((code, message)) = output
-                .finish_reason
-                .as_ref()
-                .and_then(|reason| reason.abort_status())
-            {
-                yield error_payload(StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), message).to_string();
-                continue;
-            }
 
             prompt_tokens_by_prompt
                 .entry(prompt_indexes[index])
