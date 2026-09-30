@@ -1443,7 +1443,7 @@ class TestForwardFlags(_IsolatedServerArgs):
         self.assertEqual(probe(torch.zeros(())).item(), 0)
 
     def test_parallel_config_leaves_trace_under_torch_compile(self):
-        # Regression: gate helpers such as ``enable_moe_dense_fully_dp()`` read
+        # Regression: gate helpers such as ``is_dense_ffn_fully_dp()`` read
         # parallel config leaves inside compiled model forwards, which must
         # stay dynamo-traceable (``object.__getattribute__`` graph-breaks).
         # fullgraph=True turns any graph break back into a failure.
@@ -1503,7 +1503,7 @@ class TestForwardFlags(_IsolatedServerArgs):
     def test_attn_tp_context_per_forward_slots(self):
         from types import SimpleNamespace
 
-        from sglang.srt.layers.communicator import get_attn_tp_context
+        from sglang.srt.layers.layer_boundary import get_attn_tp_context
         from sglang.srt.runtime_context import get_forward
 
         reset_context()
