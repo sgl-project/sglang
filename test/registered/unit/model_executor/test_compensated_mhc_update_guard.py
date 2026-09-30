@@ -50,7 +50,7 @@ class TestCompensatedMhcUpdateGuard(CustomTestCase):
         model = torch.nn.Sequential(torch.nn.Linear(1, 1))
         model[0]._hc_attn_tf32_parts = model[0]._hc_ffn_tf32_parts = None
         with patch(
-            "sglang.kernels.ops.attention.dsv4.gemm.hpc_bf16xfp32_gemm_enabled",
+            "sglang.kernels.ops.gemm.bf16_fp32.hpc_bf16xfp32_gemm_enabled",
             return_value=False,
         ):
             self.assertIsNone(_unsupported_derived_weight_cache_error(model))

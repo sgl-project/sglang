@@ -131,8 +131,7 @@ do
         --max-prefill-tokens 70000 \
         --chunked-prefill-size -1 \
         --max-running-requests 112 \
-        --dp-size 16 \
-        --enable-dp-attention \
+        --attn-dp-size 16 \
         --moe-a2a-backend deepep \
         --deepep-mode normal \
         --quantization modelslim \
@@ -177,8 +176,7 @@ do
         --chunked-prefill-size 32768 \
         --disaggregation-transfer-backend ascend \
         --max-running-requests 896 \
-        --dp-size 16 \
-        --enable-dp-attention \
+        --attn-dp-size 16 \
         --moe-a2a-backend deepep \
         --deepep-mode auto \
         --quantization modelslim \
@@ -319,8 +317,7 @@ python3 -m sglang.launch_server \
     --mem-fraction-static 0.7 \
     --chunked-prefill-size 131072 \
     --max-running-requests 64 \
-    --dp-size 16 \
-    --enable-dp-attention \
+    --attn-dp-size 16 \
     --moe-a2a-backend deepep \
     --deepep-mode auto \
     --quantization modelslim \
@@ -444,8 +441,7 @@ python3 -m sglang.launch_server \
     --mem-fraction-static 0.7 \
     --chunked-prefill-size 131072 \
     --max-running-requests 160 \
-    --dp-size 16 \
-    --enable-dp-attention \
+    --attn-dp-size 16 \
     --moe-a2a-backend deepep \
     --deepep-mode auto \
     --quantization modelslim \
