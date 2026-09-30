@@ -202,6 +202,15 @@ def _temporal_core_halo(
     return window_start(core_start), window_start(core_end - 1) + kernel
 
 
+def _temporal_offset_key(temporal_offset: int | float | torch.Tensor):
+    """Hash key for one scalar time origin. ``None`` means do not cache."""
+    if isinstance(temporal_offset, torch.Tensor):
+        if temporal_offset.numel() != 1:
+            return None
+        return float(temporal_offset.detach().item())
+    return float(temporal_offset)
+
+
 class RotaryPositionEmbedding3D(nn.Module):
     def __init__(self, head_dim: int, base: float = 256.0):
         super().__init__()
@@ -221,17 +230,27 @@ class RotaryPositionEmbedding3D(nn.Module):
             ]
         )
         self.register_buffer("inv_freq", inv_freq)
+        self._cos_sin_cache: tuple | None = None
 
-    def forward(
+    def cos_sin(
         self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        *,
-        temporal_offset: int | torch.Tensor = 0,
+        t: int,
+        h: int,
+        w: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        temporal_offset: int | float | torch.Tensor = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Rotate ``(B, T, H, W, heads, head_dim)``; ``temporal_offset`` is the time of frame 0."""
-        _, t, h, w, _, _ = q.shape
-        device, dtype = q.device, q.dtype
+        """``(1, T, H, W, 1, head_dim)`` rotate-half tables, memoized per grid."""
+        offset_key = _temporal_offset_key(temporal_offset)
+        key = (
+            None
+            if offset_key is None
+            else (t, h, w, dtype, device, offset_key, self.inv_freq.data_ptr())
+        )
+        cached = self._cos_sin_cache
+        if key is not None and cached is not None and cached[0] == key:
+            return cached[1], cached[2]
         grids = torch.meshgrid(
             torch.arange(t, device=device, dtype=torch.float32) + temporal_offset,
             torch.arange(h, device=device, dtype=torch.float32),
@@ -242,8 +261,24 @@ class RotaryPositionEmbedding3D(nn.Module):
         freqs = torch.einsum("...a,af->...af", pos, self.inv_freq.float())
         freqs = freqs.reshape(1, t, h, w, 1, -1)
         freqs = torch.cat([freqs, freqs], dim=-1)
-        cos = freqs.cos().to(dtype)
-        sin = freqs.sin().to(dtype)
+        cos = freqs.cos().to(dtype).contiguous()
+        sin = freqs.sin().to(dtype).contiguous()
+        if key is not None:
+            self._cos_sin_cache = (key, cos, sin)
+        return cos, sin
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        *,
+        temporal_offset: int | torch.Tensor = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Rotate ``(B, T, H, W, heads, head_dim)``; ``temporal_offset`` is the time of frame 0."""
+        _, t, h, w, _, _ = q.shape
+        cos, sin = self.cos_sin(
+            t, h, w, q.dtype, q.device, temporal_offset=temporal_offset
+        )
         q = q * cos + self._rotate_half(q) * sin
         k = k * cos + self._rotate_half(k) * sin
         return q, k
