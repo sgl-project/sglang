@@ -7,17 +7,23 @@ gets its hooks applied. A hook on ``ModelConfig.__init__`` is only installed by
 ``HookRegistry.apply_hooks()``; if ``load_plugins()`` has not run by the time
 the constructor is called, the hook is silently skipped.
 
-Worker entry points also load plugins before model and tokenizer reads. The
-loader is idempotent if construction or unpickling already loaded them.
+Pickle and deepcopy rebuild through ServerArgs construction, so spawned workers
+load their own plugins before model and tokenizer reads.
 
 Run:  python -m pytest test/registered/unit/plugins/test_model_config_loads_plugins.py -v
 """
 
-from unittest.mock import MagicMock, patch
+import os
+import pickle
+import subprocess
+import sys
+import tempfile
+import textwrap
+from pathlib import Path
+from unittest.mock import patch
 
 import sglang.srt.plugins as plugins_mod
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.managers import detokenizer_manager
 from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -91,41 +97,76 @@ class TestServerArgsLoadsPlugins(CustomTestCase):
                 ModelConfig.from_server_args(server_args)
             self.assertEqual(self.seen_model_paths, [_MODEL_PATH, _MODEL_PATH])
 
+    def test_unpickling_server_args_loads_plugins(self):
+        with patch.object(plugins_mod, "load_plugins_by_group", return_value={}):
+            payload = pickle.dumps(ServerArgs(model_path=_MODEL_PATH))
 
-class TestDetokenizerProcessLoadsPlugins(CustomTestCase):
-    def test_run_detokenizer_process_loads_plugins_before_manager(self):
-        """run_detokenizer_process loads plugins before the manager (and its
-        tokenizer) is constructed, without touching the parent process."""
-        calls = []
-
-        def fake_load_plugins():
-            calls.append("load_plugins")
-
-        def fake_manager_class(server_args, port_args):
-            calls.append("manager")
-            manager = MagicMock()
-            manager.event_loop.side_effect = lambda: calls.append("event_loop")
-            return manager
-
-        serving = MagicMock()
-        serving.tokenizer_worker_num = 1
-
-        with (
-            patch.object(detokenizer_manager, "load_plugins", fake_load_plugins),
-            patch.object(detokenizer_manager, "kill_itself_when_parent_died"),
-            patch.object(detokenizer_manager, "setproctitle"),
-            patch.object(detokenizer_manager, "configure_logger"),
-            patch.object(detokenizer_manager, "publish"),
-            patch.object(detokenizer_manager, "psutil"),
-            patch.object(detokenizer_manager, "get_serving", return_value=serving),
-        ):
-            detokenizer_manager.run_detokenizer_process(
-                server_args=MagicMock(),
-                port_args=MagicMock(),
-                detokenizer_manager_class=fake_manager_class,
+        with tempfile.TemporaryDirectory() as directory:
+            plugin_dir = Path(directory)
+            (plugin_dir / "fake_server_args_plugin.py").write_text(
+                "import os\n"
+                "from pathlib import Path\n\n"
+                "def register():\n"
+                "    Path(__file__).with_suffix('.loaded').write_text(str(os.getpid()))\n"
             )
+            dist_info = plugin_dir / "fake_plugin-0.0.0.dist-info"
+            dist_info.mkdir()
+            (dist_info / "METADATA").write_text(
+                "Metadata-Version: 2.1\nName: fake-plugin\nVersion: 0.0.0\n"
+            )
+            (dist_info / "entry_points.txt").write_text(
+                "[sglang.srt.plugins]\n"
+                "server_args_pickle_fixture = fake_server_args_plugin:register\n"
+            )
+            marker = plugin_dir / "fake_server_args_plugin.loaded"
+            source_root = Path(__file__).resolve().parents[4] / "python"
+            script = textwrap.dedent(
+                """\
+                import os
+                import pickle
+                import sys
+                from pathlib import Path
 
-        self.assertEqual(calls, ["load_plugins", "manager", "event_loop"])
+                import sglang.srt.plugins as plugins_mod
+                import sglang.srt.server_args as server_args_mod
+
+                marker = Path(sys.argv[1])
+                assert Path(server_args_mod.__file__).resolve() == Path(sys.argv[2])
+                assert not plugins_mod._plugins_loaded
+                assert not marker.exists(), "General plugin loaded before unpickling"
+                server_args = pickle.loads(sys.stdin.buffer.read())
+                assert marker.exists(), "General plugin was not loaded during ServerArgs unpickling"
+                assert marker.read_text() == str(os.getpid())
+                assert plugins_mod._plugins_loaded
+                assert isinstance(server_args, server_args_mod.ServerArgs)
+                assert server_args.model_path == sys.argv[3]
+                """
+            )
+            env = os.environ.copy()
+            env.pop("SGLANG_PLATFORM", None)
+            env["SGLANG_PLUGINS"] = "server_args_pickle_fixture"
+            env["PYTHONPATH"] = os.pathsep.join(
+                (str(plugin_dir), str(source_root), env.get("PYTHONPATH", ""))
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    script,
+                    str(marker),
+                    str(source_root / "sglang/srt/server_args.py"),
+                    _MODEL_PATH,
+                ],
+                input=payload,
+                capture_output=True,
+                env=env,
+                timeout=60,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                result.stdout.decode() + result.stderr.decode(),
+            )
 
 
 if __name__ == "__main__":

@@ -228,8 +228,9 @@ class ServerArgs:
 
     def __post_init__(self):
         """Leave construction unresolved; launchers and publishers call ``resolve_once``."""
-        # Embedders may read model metadata before constructing an Engine.
-        # Install process-wide hooks before that first read.
+        # Enable resolution plugins before model/config/tokenizer reads.
+        # Pickle (including spawn) and deepcopy reconstruct through this method,
+        # so child processes load their own plugins too.
         from sglang.srt.plugins import load_plugins
 
         load_plugins()
