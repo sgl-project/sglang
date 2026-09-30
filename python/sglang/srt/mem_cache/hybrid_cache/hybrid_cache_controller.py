@@ -567,15 +567,10 @@ class HybridCacheController(BaseHiCacheController):
             for entry, (_, need_size) in zip(entries, requests, strict=True)
         ]
 
-        def try_allocate():
-            allocated = domain.alloc_many(domain_requests)
-            if self._shared_host_alloc_succeeded_on_all_ranks(allocated, requests):
-                return allocated
-            if allocated is not None:
-                self._free_shared_host_allocations(entries, allocated)
-            return None
-
-        allocated = try_allocate()
+        # Scheduler drains commit the same logical host allocations and frees
+        # across attention ranks. Layout compaction waits for local I/O before
+        # allocating; transfer readiness does not change the capacity decision.
+        allocated = domain.alloc_many(domain_requests)
         if allocated is not None:
             return allocated
 
@@ -608,9 +603,6 @@ class HybridCacheController(BaseHiCacheController):
                     pool.page_size * pool.size_per_token,
                     requested_bytes - domain.free_bytes(),
                 )
-                shortfall_bytes = self._sync_shared_host_value(
-                    shortfall_bytes, torch.distributed.ReduceOp.MAX
-                )
                 tokens = (
                     (
                         (shortfall_bytes + pool.size_per_token - 1)
@@ -622,97 +614,14 @@ class HybridCacheController(BaseHiCacheController):
                     * pool.page_size
                 )
                 evicted = entry.host_evict_fn(tokens)
-                self._assert_shared_host_value_equal(evicted, "evicted tokens")
                 if evicted <= 0:
                     continue
                 made_progress = True
-                allocated = try_allocate()
+                allocated = domain.alloc_many(domain_requests)
                 if allocated is not None:
                     return allocated
             if not made_progress:
                 return None
-
-    def _sync_shared_host_value(self, value: int, op) -> int:
-        if not self._shared_host_consensus_groups():
-            return value
-        synced = torch.tensor(value, dtype=torch.int64, device="cpu")
-        self._all_reduce_shared_host_groups(synced, op)
-        return int(synced.item())
-
-    def _assert_shared_host_value_equal(self, value: int, label: str) -> None:
-        if not self._shared_host_consensus_groups():
-            return
-        synced = torch.tensor([value, -value], dtype=torch.int64, device="cpu")
-        self._all_reduce_shared_host_groups(synced, torch.distributed.ReduceOp.MIN)
-        if synced[0].item() != -synced[1].item():
-            raise RuntimeError(
-                f"Shared host {label} diverged across attention ranks: "
-                f"min={synced[0].item()}, max={-synced[1].item()}"
-            )
-
-    def _shared_host_alloc_succeeded_on_all_ranks(
-        self,
-        allocated: Optional[list[torch.Tensor]],
-        requests: list[tuple[PoolName, int]],
-    ) -> bool:
-        if not self._shared_host_consensus_groups():
-            return allocated is not None
-
-        pool_names = list(PoolName)
-        ordered_pool_ids = [0] * len(pool_names)
-        ordered_sizes = [0] * len(pool_names)
-        for index, (name, size) in enumerate(requests):
-            ordered_pool_ids[index] = pool_names.index(name) + 1
-            ordered_sizes[index] = size
-        values = [
-            int(allocated is not None),
-            len(requests),
-            sum(
-                size * self.mem_pool_host.entry_map[name].host_pool.size_per_token
-                for name, size in requests
-            ),
-            *ordered_pool_ids,
-            *ordered_sizes,
-        ]
-        synced = torch.tensor(
-            [*values, *(-value for value in values)],
-            dtype=torch.int64,
-            device="cpu",
-        )
-        self._all_reduce_shared_host_groups(synced, torch.distributed.ReduceOp.MIN)
-        mins = synced[: len(values)].tolist()
-        maxs = (-synced[len(values) :]).tolist()
-        if mins[1:] != maxs[1:]:
-            raise RuntimeError(
-                "Shared host allocation request diverged across attention ranks: "
-                f"min={mins[1:]}, max={maxs[1:]}"
-            )
-        return bool(mins[0])
-
-    def _shared_host_consensus_groups(self) -> list:
-        groups = [
-            group
-            for group in (self.attn_cp_group, self.attn_tp_group)
-            if group is not None and torch.distributed.get_world_size(group=group) > 1
-        ]
-        if (
-            not groups
-            and self.tp_group is not None
-            and torch.distributed.get_world_size(group=self.tp_group) > 1
-        ):
-            groups.append(self.tp_group)
-        return groups
-
-    def _all_reduce_shared_host_groups(self, tensor: torch.Tensor, op) -> None:
-        for group in self._shared_host_consensus_groups():
-            torch.distributed.all_reduce(tensor, op=op, group=group)
-
-    @staticmethod
-    def _free_shared_host_allocations(
-        entries: list[PoolEntry], allocated: list[torch.Tensor]
-    ) -> None:
-        for entry, indices in zip(entries, allocated, strict=True):
-            entry.host_pool.free(indices)
 
     def allocate_shared_host_transfers(
         self,
@@ -796,12 +705,7 @@ class HybridCacheController(BaseHiCacheController):
             (self.mem_pool_host.entry_map[name].host_pool.pool_label, size)
             for name, size in requests
         ]
-        fits = domain.can_fit_many_then(domain_requests, (), empty=empty)
-        if not empty:
-            fits = self._sync_shared_host_value(
-                int(fits), torch.distributed.ReduceOp.MIN
-            )
-        return bool(fits)
+        return domain.can_fit_many_then(domain_requests, (), empty=empty)
 
     def prefetch_rate_limited(self) -> bool:
         if self.host_memory_mode == "buffer_only" and uses_shared_host_layout(

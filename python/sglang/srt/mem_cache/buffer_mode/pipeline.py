@@ -399,14 +399,9 @@ class BufferModePipeline:
         return (num_bytes + anchor.size_per_token - 1) // anchor.size_per_token
 
     def _shared_backup_fits(self, requests, *, empty: bool = False) -> bool:
-        can_fit = self._shared_host_domain().can_fit_many_then(
+        return self._shared_host_domain().can_fit_many_then(
             requests, self._shared_load_reserve_requests(), empty=empty
         )
-        if not empty:
-            can_fit = self._cache.cache_controller._sync_shared_host_value(
-                int(can_fit), torch.distributed.ReduceOp.MIN
-            )
-        return bool(can_fit)
 
     def _shared_load_reserve_requests(self) -> list[tuple[str, int]]:
         cc = self._cache.cache_controller
