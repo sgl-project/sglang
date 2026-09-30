@@ -86,7 +86,6 @@ def test_matches_masked_reference(batch, heads, num_blocks, max_kv):
 
     out = torch.empty_like(q)
     vsa_block_sparse_sm100(q, k, v, q2k_idx, q2k_num, block_sizes, out, sm_scale)
-    torch.cuda.synchronize()
     reference = _reference(q, k, v, q2k_idx, q2k_num, block_sizes, sm_scale)
     torch.testing.assert_close(out.float(), reference, atol=2e-2, rtol=2e-2)
     assert torch.all(out[0, 0, :BLOCK] == 0)

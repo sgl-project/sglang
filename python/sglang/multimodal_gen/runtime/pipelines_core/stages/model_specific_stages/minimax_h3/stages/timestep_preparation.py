@@ -26,16 +26,18 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
     deduplicated_tensor_tree_output_fields = ("timesteps", "sigmas")
     deduplicated_extra_tensor_tree_output_keys = (MINIMAX_H3_SIGMAS_EXTRA_KEY,)
 
-    def __init__(self, sigma_shift_scales=None, dmd_denoising_steps=None) -> None:
+    def __init__(
+        self,
+        sigma_shift_scales=None,
+        dmd_denoising_steps: tuple[int, ...] | None = None,
+    ) -> None:
         super().__init__()
         # Per-model sigma shift override (model_index.json "_minimax_h3" release
         # block, sigma_shift_scales): the schedule constants are a MODEL
         # serving contract — fl2va and ref2va use video 12 / audio 3 by default.
         self.sigma_shift_scales = sigma_shift_scales
         # Trained DMD rungs of a distilled release; None keeps the uniform grid.
-        self.dmd_denoising_steps = (
-            None if dmd_denoising_steps is None else tuple(dmd_denoising_steps)
-        )
+        self.dmd_denoising_steps = dmd_denoising_steps
         self._pdd_config = None
         pdd_heads = envs.SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS
         if pdd_heads:
