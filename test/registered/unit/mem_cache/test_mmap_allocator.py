@@ -108,6 +108,38 @@ class TestMmapAllocator(unittest.TestCase):
         ):
             mmap_allocator.alloc_mmap((4,), torch.float32)
 
+    def test_alloc_mmap_tracks_mem_backend(self):
+        from sglang.srt.mem_cache.storage.mmap.mmap_allocator import (
+            MEM_BACKEND_HUGEPAGE,
+            MEM_BACKEND_MMAP,
+            tensor_mem_backend,
+        )
+
+        with envs.SGLANG_HUGEPAGE_MODE.override("off"):
+            with envs.SGLANG_HUGEPAGE_SIZE.override(""):
+                buf = mmap_allocator.alloc_mmap((4,), torch.float32)
+                self.assertEqual(tensor_mem_backend(buf), MEM_BACKEND_MMAP)
+
+        with envs.SGLANG_HUGEPAGE_MODE.override("prefer"):
+            with envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
+                with unittest.mock.patch.object(
+                    mmap_allocator, "_alloc_hugepage"
+                ) as mock_hp:
+                    mock_hp.return_value = (ctypes.c_uint8 * 16)()
+                    buf = mmap_allocator.alloc_mmap((4,), torch.float32)
+                self.assertEqual(tensor_mem_backend(buf), MEM_BACKEND_HUGEPAGE)
+
+        with envs.SGLANG_HUGEPAGE_MODE.override("prefer"):
+            with envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
+                with unittest.mock.patch.object(
+                    mmap_allocator,
+                    "_alloc_hugepage",
+                    side_effect=OSError("no hugepages"),
+                ):
+                    with unittest.mock.patch.object(mmap_allocator, "_libc", object()):
+                        buf = mmap_allocator.alloc_mmap((4,), torch.float32)
+                self.assertEqual(tensor_mem_backend(buf), MEM_BACKEND_MMAP)
+
     def test_alloc_shm(self):
         dims = (10, 1024)
         dtype = torch.float32
