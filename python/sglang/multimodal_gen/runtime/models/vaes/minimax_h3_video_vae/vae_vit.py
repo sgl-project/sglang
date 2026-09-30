@@ -326,9 +326,11 @@ class ViT3DDecoder(ViTBase):
         if cache_hit:
             rotary_pos_emb = cache_record[2]
         else:
+            # every sample shares the expanded token ids, so one row serves the batch
             rotary_pos_emb = prepare_rotary_pos_emb(
-                self.pos_embed(img_ids),
+                self.pos_embed(img_ids[:1]),
                 dtype=rotary_dtype,
+                batch=B,
             )
             if cache_enabled:
                 self._rotary_pos_emb_cache = (

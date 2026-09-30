@@ -144,6 +144,39 @@ def test_vit_fast_path_is_gated_and_matches_reference():
     torch.testing.assert_close(fused, reference, atol=2e-2, rtol=1e-2)
 
 
+@requires_cuda
+def test_vit_fused_qknorm_rope_batched_tiles_match_per_tile():
+    """Stacked decoder tiles share one RoPE row and run the fused kernel over
+    the flattened batch, bit-identical to one tile at a time."""
+    from types import SimpleNamespace
+
+    from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_vae_cuda_opt import (
+        _fused_qknorm_rope,
+    )
+
+    device, dtype = torch.device("cuda"), torch.float16
+    tiles, heads, dim_head, rope_dim = 3, 4, 64, 48
+    pos_embed = RotaryEmbeddingND(rope_dim, 100.0, n_dim=3, use_angle=True).to(device)
+    ids = create_token_ids((2, 4, 4), device, dtype)
+    rotary = prepare_rotary_pos_emb(pos_embed(ids), dtype=dtype)
+    batched_rotary = prepare_rotary_pos_emb(pos_embed(ids), dtype=dtype, batch=tiles)
+    generator = torch.Generator(device="cpu").manual_seed(0)
+    qkv = torch.randn(
+        (tiles, ids.shape[1], heads, 3 * dim_head), generator=generator
+    ).to(device=device, dtype=dtype)
+    attn = SimpleNamespace(
+        dim_head=dim_head, _sgl_unit_weight=None, norm_q=SimpleNamespace(eps=1e-5)
+    )
+
+    per_tile = qkv.clone()
+    for tile in range(tiles):
+        query, key, _ = per_tile[tile : tile + 1].chunk(3, dim=-1)
+        assert _fused_qknorm_rope(attn, query, key, rotary)
+    query, key, _ = qkv.chunk(3, dim=-1)
+    assert _fused_qknorm_rope(attn, query, key, batched_rotary)
+    assert torch.equal(qkv, per_tile)
+
+
 def test_audio_vae_attention_defaults_to_local_sdpa_and_allows_fa():
     class RecordingFA(nn.Module):
         backend = AttentionBackendEnum.FA

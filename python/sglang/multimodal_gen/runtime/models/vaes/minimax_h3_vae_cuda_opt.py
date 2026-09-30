@@ -53,9 +53,10 @@ def _fused_qknorm_rope(self, query, key, rotary_pos_emb) -> bool:
     if weight is None or weight.dtype != query.dtype or weight.device != query.device:
         weight = torch.ones(self.dim_head, dtype=query.dtype, device=query.device)
         self._sgl_unit_weight = weight
+    # Batched decoder tiles flatten into rows; a view, so the update is in place.
     fused_inplace_qknorm_rope(
-        query[0],
-        key[0],
+        query.flatten(0, 1),
+        key.flatten(0, 1),
         weight,
         weight,
         cache,
@@ -166,10 +167,13 @@ def maybe_optimize_minimax_h3_vae(vae: nn.Module) -> nn.Module:
 
     gate = VaeFastPathGate()
     install_fast_attention(eligible, gate)
+    # Decode each rank's spatial tiles as one batch: the tiles are independent
+    # samples of one shape, but a larger GEMM M may select different kernels.
+    vae._sgl_stack_tiles_gate = gate
     register_vae_fast_path_gate(vae, gate)
     logger.info(
         "MiniMax-H3 VAE: installed quality-gated fast path (%d QK RMSNorm+RoPE "
-        "fusions, cuDNN SDPA).",
+        "fusions, cuDNN SDPA, batched decoder tiles).",
         len(eligible),
     )
     return vae

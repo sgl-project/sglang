@@ -115,8 +115,10 @@ def prepare_rotary_pos_emb(
     rotary_pos_emb: Tuple[torch.Tensor, torch.Tensor],
     *,
     dtype: torch.dtype,
+    batch: int = 1,
 ) -> tuple[torch.Tensor, ...]:
-    """Prebuild the native Q/K rotary cache once per ViT decoder forward."""
+    """Prebuild the native Q/K rotary cache once per ViT decoder forward; its
+    positions cover ``batch`` samples sharing one token grid."""
     cos, sin = rotary_pos_emb
     if (
         not cos.is_cuda
@@ -143,7 +145,7 @@ def prepare_rotary_pos_emb(
         cos.shape[1],
         dtype=torch.long,
         device=cos.device,
-    )
+    ).repeat(batch)
     return cos, sin, cache, positions
 
 
@@ -215,7 +217,8 @@ def native_rope_cache(
     rotary_pos_emb: Sequence[torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """``(cache, positions)`` from ``prepare_rotary_pos_emb`` when the native
-    kernels can consume it for this Q/K, else None."""
+    kernels can consume it for this Q/K, else None. ``positions`` covers the
+    batch-major rows of ``query.flatten(0, 1)``."""
     if not (
         len(rotary_pos_emb) == 4
         and query.is_cuda
@@ -223,7 +226,6 @@ def native_rope_cache(
         and query.dtype == key.dtype
         and query.dtype in (torch.float16, torch.bfloat16)
         and query.dim() == 4
-        and query.shape[0] == 1
         and not torch.compiler.is_compiling()
     ):
         return None
@@ -235,7 +237,7 @@ def native_rope_cache(
         and cache.shape[0] == query.shape[1]
         and cache.shape[1] <= query.shape[-1]
         and positions.is_cuda
-        and positions.shape == (query.shape[1],)
+        and positions.shape == (query.shape[0] * query.shape[1],)
     ):
         return None
     return cache, positions
@@ -256,8 +258,8 @@ def apply_rotary_pos_emb_qk(
         key = key.contiguous()
         rotary_embedding(
             positions,
-            query.view(query.shape[1], -1),
-            key.view(key.shape[1], -1),
+            query.view(positions.shape[0], -1),
+            key.view(positions.shape[0], -1),
             query.shape[-1],
             cache,
             True,
