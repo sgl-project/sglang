@@ -27,6 +27,7 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
         batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,
             batch_size=lambda: 4,
+            spec_info=None,
         )
         tbo_preparer = Mock()
         tbo_preparer.prepare_all_gather.return_value = (
@@ -39,6 +40,18 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
             envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(False),
             patch.object(dp_attn, "TboDPAttentionPreparer", return_value=tbo_preparer),
             patch.object(dp_attn, "world_dp_gather_enabled", return_value=False),
+            patch.object(
+                dp_attn,
+                "get_parallel",
+                return_value=SimpleNamespace(
+                    dp_size=1,
+                    attn_tp_size=4,
+                    attn_cp_size=1,
+                    tp_group=SimpleNamespace(
+                        device_group=object(), device="cpu", cpu_group=object()
+                    ),
+                ),
+            ),
             patch.object(dp_attn, "check_cuda_graph_backend", return_value=False),
             patch.object(dp_attn.MLPSyncBatchInfo, "all_gather") as all_gather,
         ):
@@ -48,12 +61,6 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
                     prefill_cuda_graph_runner=None,
                     spec_algorithm=SpeculativeAlgorithm.NONE,
                     model_config=object(),
-                ),
-                dp_size=1,
-                attn_tp_size=4,
-                attn_cp_size=1,
-                tp_group=SimpleNamespace(
-                    device_group=object(), device="cpu", cpu_group=object()
                 ),
                 get_idle_batch=Mock(
                     side_effect=AssertionError("DP1 must not emit idle batch")

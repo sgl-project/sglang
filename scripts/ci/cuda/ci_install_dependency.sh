@@ -468,8 +468,21 @@ install_pytorch_stack() {
         fi
     done
 
+    # A cancelled install can leave dist-info without files, which uv then skips.
+    REINSTALL_ARGS=$(python3 -c '
+import importlib.metadata as md
+for name in ("torch", "torchaudio", "torchvision", "torchcodec", "triton"):
+    try:
+        dist = md.distribution(name)
+    except md.PackageNotFoundError:
+        continue
+    if not all(dist.locate_file(f).exists() for f in dist.files or []):
+        print("--reinstall-package", name)
+')
+
     $PIP_CMD install \
         "${PYTORCH_SPECS[@]}" \
+        $REINSTALL_ARGS \
         --index-url "https://download.pytorch.org/whl/${CU_VERSION}"
 
     mark_step_done "${FUNCNAME[0]}"
@@ -719,7 +732,7 @@ stabilize_flashinfer_jit_paths() {
 }
 
 install_extra_deps() {
-    MOONCAKE_VERSION="0.3.13"
+    MOONCAKE_VERSION="0.3.13.post1"
     NIXL_VERSION="1.3.0"
     MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
     MOONCAKE_STALE_PKG="mooncake-transfer-engine"
