@@ -57,11 +57,9 @@ class MSCCLPPExpertMajorLLDispatchOutput(MSCCLPPLLDispatchOutput):
 
     * ``hidden_states``      -> ``[num_local_experts, slots_per_expert, hidden]``
     * ``masked_m``           -> valid counts per local expert
-    * ``expected_m``         -> average tokens per expert (GEMM size hint)
     """
 
     masked_m: torch.Tensor
-    expected_m: int
 
     @property
     def format(self) -> DispatchOutputFormat:

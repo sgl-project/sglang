@@ -25,21 +25,26 @@ import os
 import statistics
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass
-from typing import Callable
+from typing import Callable, Optional
 
 import torch
 import torch.distributed as dist
+from torch.profiler import ProfilerActivity, profile
 
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
 from sglang.srt.distributed.parallel_state import (
     destroy_model_parallel,
     init_distributed_environment,
     initialize_model_parallel,
 )
+from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.token_dispatcher.mscclpp import MSCCLPPDispatcher
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
-from sglang.srt.runtime_context import get_flags
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.test.test_utils import publish_build_topology
 
 DTYPE = torch.bfloat16
@@ -89,7 +94,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def initialize_distributed() -> tuple[int, int, int]:
+def initialize_distributed(tokens_per_rank: int) -> tuple[int, int, int]:
     if not torch.cuda.is_available():
         raise RuntimeError("MSCCL++ LL benchmark requires CUDA GPUs")
 
@@ -117,6 +122,8 @@ def initialize_distributed() -> tuple[int, int, int]:
         ep_size=world_size,
         moe_a2a_backend="none",
         moe_runner_backend="triton",
+        # Inputs below are already per-rank after attention-TP scatter.
+        chunked_prefill_size=tokens_per_rank * world_size,
     )
     initialize_model_parallel(backend="nccl")
     return rank, world_size, int(os.environ.get("LOCAL_WORLD_SIZE", world_size))
@@ -229,6 +236,182 @@ def synchronize() -> None:
     dist.barrier()
 
 
+@dataclass(frozen=True)
+class PhaseLatencies:
+    """Wall-clock graph latency and profiled CUDA kernel time per phase."""
+
+    total_us: float
+    dispatch_us: float
+    compute_us: float
+    combine_us: float
+    unclassified_us: float
+
+    def __str__(self) -> str:
+        return (
+            f"total={self.total_us:.2f} us "
+            f"(median rank-0 CUDA kernels: dispatch={self.dispatch_us:.2f} us, "
+            f"compute={self.compute_us:.2f} us, "
+            f"combine={self.combine_us:.2f} us, "
+            f"unclassified={self.unclassified_us:.2f} us)"
+        )
+
+
+def _profiled_kernel_names(prof: profile) -> set[str]:
+    return {
+        evt.key
+        for evt in prof.key_averages()
+        if evt.device_type == torch.autograd.DeviceType.CUDA
+        and evt.self_device_time_total > 0
+    }
+
+
+def calibrate_phase_kernel_names(
+    layer: FusedMoE, inputs: Inputs
+) -> tuple[set[str], set[str], set[str]]:
+    """Learn phase kernel names without using eager timings as results."""
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        dispatch_output = layer.dispatcher.dispatch(
+            hidden_states=inputs.hidden_states, topk_output=inputs.topk_output
+        )
+        torch.cuda.synchronize()
+    dispatch_names = _profiled_kernel_names(prof)
+
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        combine_input = layer.run_moe_core(dispatch_output=dispatch_output)
+        torch.cuda.synchronize()
+    compute_names = _profiled_kernel_names(prof)
+
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        with use_symmetric_memory(
+            get_parallel().tp_group, disabled=not is_allocation_symmetric()
+        ):
+            final_hidden_states = layer.dispatcher.combine(combine_input=combine_input)
+            final_hidden_states[..., : inputs.hidden_states.shape[-1]].contiguous()
+        torch.cuda.synchronize()
+    combine_names = _profiled_kernel_names(prof)
+
+    overlaps = {
+        "dispatch/compute": dispatch_names & compute_names,
+        "dispatch/combine": dispatch_names & combine_names,
+        "compute/combine": compute_names & combine_names,
+    }
+    ambiguous = {pair: names for pair, names in overlaps.items() if names}
+    if ambiguous:
+        raise RuntimeError(
+            "Cannot classify graph kernels unambiguously because phase kernel "
+            f"names overlap: {ambiguous}"
+        )
+    synchronize()
+    return dispatch_names, compute_names, combine_names
+
+
+def profile_graph_phase_latencies_us(
+    graph: torch.cuda.CUDAGraph,
+    phase_kernel_names: tuple[set[str], set[str], set[str]],
+    total_us: float,
+    warmup_iters: int,
+    benchmark_iters: int,
+    graph_iters: int,
+) -> PhaseLatencies:
+    """Profile CUDA kernels launched by actual graph replays.
+
+    Rank 0 profiles ``benchmark_iters`` replays of a graph containing
+    ``graph_iters`` full pipeline iterations while every other rank replays
+    without CUPTI instrumentation. For each CUDA kernel, its median invocation
+    duration is multiplied by its occurrences per pipeline iteration, then
+    summed into its phase. These are rank-0 graph kernel measurements, not
+    rescaled eager estimates; their sum can differ from wall-clock ``total_us``
+    when kernels overlap.
+    """
+    dispatch_names, compute_names, combine_names = phase_kernel_names
+    for _ in range(warmup_iters):
+        graph.replay()
+    synchronize()
+
+    prof = None
+    if dist.get_rank() == 0:
+        with profile(activities=[ProfilerActivity.CUDA]) as rank_zero_prof:
+            dist.barrier()
+            for _ in range(benchmark_iters):
+                graph.replay()
+            torch.cuda.synchronize()
+        prof = rank_zero_prof
+    else:
+        dist.barrier()
+        for _ in range(benchmark_iters):
+            graph.replay()
+        torch.cuda.synchronize()
+    dist.barrier()
+
+    denominator = benchmark_iters * graph_iters
+    phase_totals = {
+        "dispatch": 0.0,
+        "compute": 0.0,
+        "combine": 0.0,
+        "unclassified": 0.0,
+    }
+    debug_events = []
+    if prof is not None:
+        durations_by_kernel: dict[str, list[float]] = {}
+        for evt in prof.events():
+            if (
+                evt.device_type != torch.autograd.DeviceType.CUDA
+                or evt.self_device_time_total <= 0
+            ):
+                continue
+            durations_by_kernel.setdefault(evt.key, []).append(
+                evt.self_device_time_total
+            )
+
+        for name, durations in durations_by_kernel.items():
+            if name in dispatch_names:
+                phase = "dispatch"
+            elif name in compute_names:
+                phase = "compute"
+            elif name in combine_names:
+                phase = "combine"
+            else:
+                phase = "unclassified"
+            median_duration_us = statistics.median(durations)
+            contribution_us = median_duration_us * len(durations) / denominator
+            phase_totals[phase] += contribution_us
+            debug_events.append(
+                (phase, name, len(durations), median_duration_us, contribution_us)
+            )
+
+    if os.environ.get("SGLANG_BENCH_PHASE_DEBUG") == "1" and prof is not None:
+        for phase, name, count, median_duration_us, contribution_us in sorted(
+            debug_events
+        ):
+            print(
+                f"PHASE_DEBUG phase={phase} count={count} "
+                f"median_invocation_us={median_duration_us:.4f} "
+                f"per_iteration_us={contribution_us:.4f} kernel={name}",
+                flush=True,
+            )
+
+    phase_times = torch.tensor(
+        [
+            phase_totals["dispatch"],
+            phase_totals["compute"],
+            phase_totals["combine"],
+            phase_totals["unclassified"],
+        ],
+        dtype=torch.float64,
+        device="cuda",
+    )
+    dist.broadcast(phase_times, src=0)
+    dispatch_us, compute_us, combine_us, unclassified_us = phase_times.tolist()
+
+    return PhaseLatencies(
+        total_us=total_us,
+        dispatch_us=dispatch_us,
+        compute_us=compute_us,
+        combine_us=combine_us,
+        unclassified_us=unclassified_us,
+    )
+
+
 def assert_close(
     reference: torch.Tensor,
     candidate: torch.Tensor,
@@ -258,38 +441,56 @@ def assert_close(
 
 
 def capture_graph(
-    pipeline: FusedMoEPipeline, inputs: Inputs, warmup_iters: int
-) -> tuple[torch.cuda.CUDAGraph, torch.Tensor]:
+    pipeline: FusedMoEPipeline,
+    inputs: Inputs,
+    warmup_iters: int,
+    graph_iters: int = 10,
+) -> tuple[torch.cuda.CUDAGraph, torch.Tensor, int]:
+    """Capture ``graph_iters`` back-to-back pipeline calls inside a single
+    CUDA Graph. A single ``graph.replay()`` then runs ``graph_iters``
+    iterations, amortizing per-replay CPU/event-timing overhead over more
+    GPU work, giving a more accurate/efficient per-iteration measurement
+    than capturing (and replaying) just one iteration at a time."""
     for _ in range(warmup_iters):
         output = pipeline(inputs)
     synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        output = pipeline(inputs)
+        for _ in range(graph_iters):
+            output = pipeline(inputs)
     synchronize()
-    return graph, output
+    return graph, output, graph_iters
 
 
 def median_graph_latency_us(
-    graph: torch.cuda.CUDAGraph, warmup_iters: int, benchmark_iters: int
+    graph: torch.cuda.CUDAGraph,
+    warmup_iters: int,
+    benchmark_iters: int,
+    graph_iters: int = 1,
 ) -> float:
+    """Time ``benchmark_iters`` graph replays as a single elapsed-time
+    window (start/end events outside the loop, per ``bench_time`` in
+    mscclpp's ``python/test/executor_test.py``), rather than timing each
+    replay individually -- this avoids per-replay CPU/event-recording
+    overhead from skewing small-workload measurements. The result is
+    per-iteration average latency (elapsed time divided by
+    ``benchmark_iters * graph_iters``, since each graph replay itself runs
+    ``graph_iters`` captured iterations)."""
     for _ in range(warmup_iters):
         graph.replay()
     synchronize()
 
-    samples = []
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
     for _ in range(benchmark_iters):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
         graph.replay()
-        end.record()
-        end.synchronize()
-        samples.append(start.elapsed_time(end) * 1000.0)
-    latency = torch.tensor(
-        statistics.median(samples), dtype=torch.float64, device="cuda"
-    )
+    end.record()
+    end.synchronize()
+    elapsed_us = start.elapsed_time(end) * 1000.0 / benchmark_iters / graph_iters
+
+    latency = torch.tensor(elapsed_us, dtype=torch.float64, device="cuda")
     dist.all_reduce(latency, op=dist.ReduceOp.MAX)
     return latency.item()
 
@@ -343,14 +544,29 @@ def run_rank_major(
                 print(f"Running {name} eager warmup...", flush=True)
             eager = pipeline(inputs).clone()
             if rank == 0:
+                print(f"Calibrating {name} phase kernel names...", flush=True)
+            phase_kernel_names = calibrate_phase_kernel_names(pipeline.layer, inputs)
+            if rank == 0:
                 print(f"Capturing {name} CUDA Graph...", flush=True)
-            graph, graph_output = capture_graph(pipeline, inputs, config.warmup_iters)
+            graph, graph_output, graph_iters = capture_graph(
+                pipeline, inputs, config.warmup_iters
+            )
             graph.replay()
             synchronize()
             assert_close(eager, graph_output, config, f"{name} eager vs graph")
             outputs[name] = graph_output.clone()
-            results[name] = median_graph_latency_us(
-                graph, config.warmup_iters, config.benchmark_iters
+            total_us = median_graph_latency_us(
+                graph, config.warmup_iters, config.benchmark_iters, graph_iters
+            )
+            if rank == 0:
+                print(f"Profiling {name} CUDA Graph kernels...", flush=True)
+            results[name] = profile_graph_phase_latencies_us(
+                graph,
+                phase_kernel_names,
+                total_us,
+                config.warmup_iters,
+                config.benchmark_iters,
+                graph_iters,
             )
             if rank == 0:
                 print(f"Finished {name}.", flush=True)
@@ -367,17 +583,19 @@ def run_rank_major(
     )
     if rank == 0:
         print(f"Correctness: PASS max_abs={max_abs:.6g} max_rel={max_rel:.6g}")
-        for name, latency in results.items():
-            print(f"{name}: median latency={latency:.2f} us")
+        for name, latencies in results.items():
+            print(f"{name}: {latencies}")
 
 
-def triton_all_to_all_reference(
-    layer: FusedMoEPipeline,
-    inputs: Inputs,
-    config: BenchmarkConfig,
-    rank: int,
-) -> torch.Tensor:
-    """Variable-split token all-to-all around a rank-local Triton FusedMoE."""
+def _reference_dispatch(
+    inputs: Inputs, config: BenchmarkConfig
+) -> tuple[Inputs, list[torch.Tensor], list[int], list[int]]:
+    """Pack tokens per-destination and all-to-all them to their target rank.
+
+    Returns the local (post all-to-all) ``Inputs`` for the compute step,
+    plus the bookkeeping (``send_token_indices``, ``send_counts``,
+    ``recv_counts``) needed by ``_reference_combine`` to route results back.
+    """
     world_size = config.world_size
     device = inputs.hidden_states.device
     num_local_experts = config.num_experts // world_size
@@ -437,8 +655,24 @@ def triton_all_to_all_reference(
         recv_ids,
         torch.empty(0, dtype=torch.float32, device=device),
     )
-    recv_output = layer(Inputs(recv_hidden, recv_topk))
+    return (
+        Inputs(recv_hidden, recv_topk),
+        send_token_indices,
+        send_counts,
+        recv_counts,
+    )
 
+
+def _reference_combine(
+    recv_output: torch.Tensor,
+    inputs: Inputs,
+    config: BenchmarkConfig,
+    send_token_indices: list[torch.Tensor],
+    send_counts: list[int],
+    recv_counts: list[int],
+) -> torch.Tensor:
+    """All-to-all expert outputs back to their originating rank and scatter."""
+    device = inputs.hidden_states.device
     returned = torch.empty(
         (sum(send_counts), config.hidden_size), dtype=DTYPE, device=device
     )
@@ -452,6 +686,22 @@ def triton_all_to_all_reference(
     output = torch.zeros_like(inputs.hidden_states)
     output.index_add_(0, returned_indices, returned)
     return output
+
+
+def triton_all_to_all_reference(
+    layer: FusedMoEPipeline,
+    inputs: Inputs,
+    config: BenchmarkConfig,
+    rank: int,
+) -> torch.Tensor:
+    """Variable-split token all-to-all around a rank-local Triton FusedMoE."""
+    local_inputs, send_token_indices, send_counts, recv_counts = _reference_dispatch(
+        inputs, config
+    )
+    recv_output = layer(local_inputs)
+    return _reference_combine(
+        recv_output, inputs, config, send_token_indices, send_counts, recv_counts
+    )
 
 
 def run_expert_major(
@@ -508,9 +758,17 @@ def run_expert_major(
     )
     if rank == 0:
         print(f"Correctness: PASS max_abs={max_abs:.6g} max_rel={max_rel:.6g}")
-        print(f"mscclpp-ll-expert-major-triton: median latency={mscclpp_us:.2f} us")
-        print(f"triton-all-to-all-reference: median latency={reference_us:.2f} us")
         print(
+            "mscclpp-ll-expert-major-triton: "
+            f"eager median latency={mscclpp_us:.2f} us"
+        )
+        print(
+            "triton-all-to-all-reference: "
+            f"eager median latency={reference_us:.2f} us"
+        )
+        print(
+            "Phase timing is omitted for expert-major because this path is "
+            "not CUDA-graph captured. "
             "Performance note: the Triton reference uses explicit PyTorch "
             "variable-split all-to-all calls and is not an apples-to-apples "
             "performance comparison with MSCCL++."
@@ -520,7 +778,7 @@ def run_expert_major(
 @torch.inference_mode()
 def main() -> None:
     args = parse_args()
-    rank, world_size, local_world_size = initialize_distributed()
+    rank, world_size, local_world_size = initialize_distributed(args.tokens_per_rank)
     validate_args(args, world_size)
     config = BenchmarkConfig(
         **vars(args),
@@ -535,8 +793,9 @@ def main() -> None:
         print(json.dumps(asdict(config), indent=2, sort_keys=True))
         print(f"nodes={world_size // local_world_size}, dtype={DTYPE}")
         print(
-            "Timing unit: microseconds; aggregation: median on each rank, "
-            "then maximum across ranks"
+            "Timing unit: microseconds; total is the graph-window average "
+            "maximized across ranks; phase values sum rank-0 median CUDA "
+            "kernel invocation durations"
         )
 
     try:

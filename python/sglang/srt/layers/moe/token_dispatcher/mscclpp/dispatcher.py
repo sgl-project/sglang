@@ -25,16 +25,6 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKOutput
 
 
-def _resolve_ll_num_blocks(
-    output_layout: MSCCLPPOutputLayout, overlap_enabled: bool
-) -> Optional[tuple[int, int]]:
-    if output_layout == MSCCLPPOutputLayout.RANK_MAJOR and overlap_enabled:
-        # The shared-expert MLP runs concurrently on another stream. Keep the
-        # full dispatch grid, but leave SM headroom during combine for that work.
-        return 130, 32
-    return None
-
-
 class _MSCCLPPDispatcherImplBase(ABC):
     @abstractmethod
     def dispatch(
@@ -84,66 +74,30 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
     ] = {}
 
     @staticmethod
-    def _resolve_cuda_graph_caps(
-        cuda_graph_bs: Sequence[int] | None,
-        cuda_graph_max_bs: int | None,
-        *,
-        num_tokens_per_bs: int = 1,
-        attn_tp_size: int = 1,
-    ) -> tuple[int, ...]:
-        """Convert request buckets to token rows per rank after attention TP."""
-        if num_tokens_per_bs <= 0 or attn_tp_size <= 0:
-            raise ValueError("num_tokens_per_bs and attn_tp_size must be positive")
-        batch_sizes = {int(value) for value in cuda_graph_bs or () if int(value) > 0}
-        if cuda_graph_max_bs is not None and cuda_graph_max_bs > 0:
-            batch_sizes.add(int(cuda_graph_max_bs))
-        return tuple(
-            sorted(
-                {
-                    (batch_size * num_tokens_per_bs + attn_tp_size - 1) // attn_tp_size
-                    for batch_size in batch_sizes
-                }
-            )
-        )
-
-    @staticmethod
-    def _resolve_prefill_capacity(
-        chunked_prefill_size: int,
-        ep_size: int,
-        configured_capacity: int,
-        *,
-        dp_size: int = 1,
-        dp_attention_enabled: bool = False,
+    def _resolve_capacity_per_attention_tp(
+        num_tokens: int,
+        attn_tp_size: int,
     ) -> int:
-        """Resolve the per-rank prefill capacity from the global chunk bound."""
-        if ep_size <= 0 or configured_capacity <= 0 or dp_size <= 0:
+        if num_tokens < 0 or attn_tp_size <= 0:
             raise ValueError(
-                "ep_size, dp_size, and configured_capacity must be positive"
+                "num_tokens must be non-negative and attn_tp_size positive"
             )
-        global_chunked_prefill_size = (
-            chunked_prefill_size * dp_size
-            if dp_attention_enabled and chunked_prefill_size > 0
-            else chunked_prefill_size
-        )
-        chunked_capacity = (
-            (global_chunked_prefill_size + ep_size - 1) // ep_size
-            if global_chunked_prefill_size > 0
-            else 0
-        )
-        return max(configured_capacity, chunked_capacity)
-
-    @staticmethod
-    def _resolve_shared_runtime_capacity(
-        prefill_capacity: int,
-        decode_capacities: Sequence[int],
-    ) -> int:
-        """Return the allocation capacity shared by prefill and graph buckets."""
-        if prefill_capacity <= 0:
-            raise ValueError("prefill_capacity must be positive")
-        return max((prefill_capacity, *(int(value) for value in decode_capacities)))
+        return (num_tokens + attn_tp_size - 1) // attn_tp_size
 
     @classmethod
-    def _resolve_runtime_cuda_graph_caps(cls, attn_tp_size: int) -> tuple[int, ...]:
+    def _resolve_prefill_capacity(
+        cls,
+        chunked_prefill_size: int,
+        attn_tp_size: int,
+    ) -> int:
+        """Resolve the per-rank prefill capacity from the chunk size."""
+        return cls._resolve_capacity_per_attention_tp(
+            chunked_prefill_size,
+            attn_tp_size,
+        )
+
+    @classmethod
+    def _resolve_runtime_decode_capacity(cls, attn_tp_size: int) -> int:
         from sglang.srt.runtime_context import (
             get_exec,
             get_spec,
@@ -152,7 +106,7 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
 
         cuda_graph_config = get_exec().graph.cuda_graph_config
         if cuda_graph_config is None:
-            return ()
+            return 0
 
         spec = get_spec()
         num_tokens_per_bs = 1
@@ -166,11 +120,9 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
                     "before allocating the communicator"
                 )
 
-        return cls._resolve_cuda_graph_caps(
-            cuda_graph_config.decode.bs,
-            cuda_graph_config.decode.max_bs,
-            num_tokens_per_bs=num_tokens_per_bs,
-            attn_tp_size=attn_tp_size,
+        return cls._resolve_capacity_per_attention_tp(
+            num_tokens_per_bs * cuda_graph_config.decode.max_bs,
+            attn_tp_size,
         )
 
     @classmethod
@@ -274,41 +226,28 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
             raise TypeError("output_layout must be an MSCCLPPOutputLayout")
         from sglang.srt.runtime_context import get_parallel, get_schedule
 
-        num_max_dispatch_tokens_per_rank = (
-            envs.SGLANG_MSCCLPP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
-        )
-
         parallel = get_parallel()
         self._attn_tp_size = int(parallel.attn_tp_size)
         self._prefill_capacity = self._resolve_prefill_capacity(
-            int(get_schedule().chunked_prefill_size or 0),
-            group.size(),
-            num_max_dispatch_tokens_per_rank,
-            dp_size=int(parallel.dp_size),
-            dp_attention_enabled=bool(parallel.enable_dp_attention),
+            int(get_schedule().chunked_prefill_size),
+            self._attn_tp_size,
         )
-        self._decode_caps = (
-            self._resolve_runtime_cuda_graph_caps(self._attn_tp_size)
-            if output_layout == MSCCLPPOutputLayout.RANK_MAJOR
-            else ()
+        self._decode_capacity = self._resolve_runtime_decode_capacity(
+            self._attn_tp_size
         )
-        self._allocation_capacity = self._resolve_shared_runtime_capacity(
-            self._prefill_capacity,
-            self._decode_caps,
-        )
+        self._allocation_capacity = max(self._prefill_capacity, self._decode_capacity)
 
         self.router_topk = router_topk
         self.num_experts = num_experts
         self.num_local_experts = num_local_experts
         self.hidden_size = hidden_size
         self.params_dtype = params_dtype
-        self.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         self.output_layout = output_layout
         self.overlap_enabled = (
             output_layout == MSCCLPPOutputLayout.RANK_MAJOR
             and envs.SGLANG_MSCCLPP_LL_OVERLAP.get()
         )
-        num_blocks = _resolve_ll_num_blocks(output_layout, self.overlap_enabled)
+        num_blocks = (130, 32) if self.overlap_enabled else None
 
         # Allocating these capacity-scaled resources per layer would OOM large
         # MoE models, so LL implementations with identical geometry share them.
@@ -336,39 +275,20 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
         self._combine_handle = None
 
     def _select_active_capacity(self, num_tokens: int) -> int:
-        if num_tokens > self._allocation_capacity:
-            raise RuntimeError(
-                "MSCCL++ local token count exceeds the shared allocation: "
-                f"local={num_tokens}, allocated={self._allocation_capacity}"
-            )
-        if self.output_layout != MSCCLPPOutputLayout.RANK_MAJOR:
-            return self._allocation_capacity
-
-        if torch.cuda.is_current_stream_capturing():
-            for capacity in self._decode_caps:
-                if num_tokens <= capacity:
-                    return capacity
-            return self._allocation_capacity
-
         from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
 
         global_num_tokens = get_dp_global_num_tokens()
-        if global_num_tokens is None:
-            return self._allocation_capacity
-
-        global_max = max((int(value) for value in global_num_tokens), default=0)
-        active_capacity = max(
-            1, (global_max + self._attn_tp_size - 1) // self._attn_tp_size
-        )
-        if num_tokens > active_capacity:
-            raise RuntimeError(
-                "MSCCL++ rank-major local token count exceeds the scheduler-global "
-                "maximum after attention-TP scatter: "
-                f"local={num_tokens}, per_rank_max={active_capacity}"
+        if global_num_tokens is not None and len(global_num_tokens) > 1:
+            active_capacity = self._resolve_capacity_per_attention_tp(
+                max((int(value) for value in global_num_tokens), default=0),
+                self._attn_tp_size,
             )
+        else:
+            active_capacity = num_tokens
+
         if active_capacity > self._allocation_capacity:
             raise RuntimeError(
-                "MSCCL++ rank-major eager capacity exceeds the shared allocation: "
+                "MSCCL++ active capacity exceeds the shared allocation: "
                 f"active={active_capacity}, allocated={self._allocation_capacity}"
             )
         return active_capacity
@@ -404,13 +324,12 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
             assert dispatch_out.weights is not None
             assert dispatch_out.layout.num_tokens_per_rank is not None
             assert dispatch_out.combine_input_buffer is not None
-            active_rows = self.num_ranks * active_capacity
             return MSCCLPPRankMajorLLDispatchOutput(
-                hidden_states=dispatch_out.tokens[:active_rows],
+                hidden_states=dispatch_out.tokens,
                 hidden_states_scale=hidden_states_scale,
                 topk_output=StandardTopKOutput(
-                    dispatch_out.weights[:active_rows],
-                    dispatch_out.topk_ids[:active_rows],
+                    dispatch_out.weights,
+                    dispatch_out.topk_ids,
                     topk_output.router_logits,
                 ),
                 expert_output_buffer=dispatch_out.combine_input_buffer,
@@ -419,27 +338,16 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
         masked_m = dispatch_out.layout.num_tokens_per_expert
         assert isinstance(masked_m, torch.Tensor)
 
-        # Average tokens per expert (same hint DeepEP-LL passes to the masked
-        # GEMM); ``world_size`` copies of each token are scattered across the
-        # ``num_experts`` experts. Unused by the Triton runner but kept for
-        # parity with the DeepEP-LL contract.
-        expected_m = (
-            hidden_states.shape[0] * self.num_ranks * self.router_topk
-            + self.num_experts
-            - 1
-        ) // self.num_experts
-
         return MSCCLPPExpertMajorLLDispatchOutput(
             hidden_states=dispatch_out.tokens,
             hidden_states_scale=hidden_states_scale,
             masked_m=masked_m,
-            expected_m=expected_m,
         )
 
     def combine(self, combine_input: MSCCLPPCombineInputBase) -> torch.Tensor:
-        assert self._combine_handle is not None, (
-            "MSCCL++ low-latency combine called before dispatch"
-        )
+        assert (
+            self._combine_handle is not None
+        ), "MSCCL++ low-latency combine called before dispatch"
 
         # The handle carries the layout-specific routing and scatter metadata.
         combined_x = self._moe_comm.combine(

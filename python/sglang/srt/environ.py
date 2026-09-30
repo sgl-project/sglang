@@ -1253,7 +1253,6 @@ class Envs:
     SGLANG_NPU_DSV4_DEEPEP_LL_DISPATCH_QUANT_MODE = EnvStr("mxfp8")
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
     # MSCCL++ EP
-    SGLANG_MSCCLPP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     # Launch shared experts after LL rank-major dispatch on the model's
     # alternate stream so their GEMMs can overlap routed compute and combine.
     SGLANG_MSCCLPP_LL_OVERLAP = EnvBool(False)
