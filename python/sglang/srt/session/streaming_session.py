@@ -326,23 +326,14 @@ class StreamingSession(BasePrefixCache):
         return True
 
     def try_checkpoint_req(self, req: Req, *, up_to: int, **kwargs) -> bool:
-        """Handles a streaming-session mid-flight cache op:
-          - extend not finished (chunked prefill): snapshot current KV as
-            prefix, skip radix
-          - subsequent turn: skip radix (slot already holds KV)
-        Returns False for a first turn whose extend is done (caller must run
-        raw radix insert to set up the initial tree lock)."""
-        if not _is_streaming(req):
+        """A first turn checkpoints into the tree like any request (its
+        prompt prefix is tree-owned and the slot inherits that lock); later
+        turns run on the slot's KV, so only the chunk cursor is kept."""
+        if not _is_streaming(req) or req.session.session_id not in self.slots:
             return False
-        if up_to < len(req.full_untruncated_fill_ids):
-            kv_indices = self.req_to_token_pool.req_to_token[
-                req.kv.req_pool_idx, :up_to
-            ]
-            req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
-            return True
-        if req.session.session_id in self.slots:
-            return True
-        return False
+        kv_indices = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :up_to]
+        req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+        return True
 
     # -- BasePrefixCache abstract methods: thin adapters over try_handle_* --
 
