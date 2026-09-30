@@ -317,8 +317,7 @@ def _path_ffmpeg_with_libx264() -> Optional[str]:
 
 
 def _resolve_ffmpeg_exe() -> str:
-    # Prefer a system ffmpeg with libx264: imageio's bundled static build is
-    # old (4.2.2 on aarch64) and encodes 1344x768 H.264 about 3x slower.
+    # imageio's bundled static ffmpeg is old and encodes H.264 much slower
     ffmpeg_exe = _path_ffmpeg_with_libx264()
     if ffmpeg_exe is not None:
         return ffmpeg_exe

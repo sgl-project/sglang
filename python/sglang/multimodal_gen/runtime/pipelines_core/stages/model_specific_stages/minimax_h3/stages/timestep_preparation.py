@@ -205,8 +205,7 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
         dmd_steps = self.dmd_denoising_steps
         num_steps = requested_num_steps
         if dmd_steps is not None and batch.is_warmup:
-            # Warmup may run fewer forwards, but on the trained rungs rather
-            # than a rescaled shorter grid.
+            # warmup truncates the trained rungs instead of rescaling a shorter grid
             num_steps = len(dmd_steps) + 1
         sigmas: dict[str, list[float]] = {}
         for modality in ("video", "audio"):

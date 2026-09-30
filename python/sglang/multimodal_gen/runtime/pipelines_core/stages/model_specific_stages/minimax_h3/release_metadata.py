@@ -51,8 +51,7 @@ class MiniMaxH3ReleaseMetadata:
     task_aliases: Mapping[str, str]
     video_sigma_shift: float
     audio_sigma_shift: float
-    # DMD-distilled releases (FastH3 8-step) fix their denoising rungs as
-    # unshifted integer timesteps in (0, 1000]; None keeps the uniform grid.
+    # trained DMD rungs of a distilled release, unshifted; None keeps the uniform grid
     dmd_denoising_steps: tuple[int, ...] | None = None
 
     @classmethod

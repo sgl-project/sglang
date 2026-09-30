@@ -43,8 +43,7 @@ def minimax_h3_time_shift_sigmas(
     import torch
 
     if dmd_steps is not None:
-        # A DMD-distilled release runs its trained rungs: unshifted integer
-        # timesteps over 1000, then the final solver update to sigma 0.
+        # trained rungs are unshifted timesteps over 1000; append the final step to sigma 0
         if int(num_steps) != len(dmd_steps) + 1:
             raise ValueError(
                 f"this checkpoint is distilled for {len(dmd_steps)} DiT forwards "

@@ -167,8 +167,7 @@ def maybe_optimize_minimax_h3_vae(vae: nn.Module) -> nn.Module:
 
     gate = VaeFastPathGate()
     install_fast_attention(eligible, gate)
-    # Decode each rank's spatial tiles as one batch: the tiles are independent
-    # samples of one shape, but a larger GEMM M may select different kernels.
+    # batched tiles are gated: a larger GEMM M may select different kernels than per-tile decode
     vae._sgl_stack_tiles_gate = gate
     register_vae_fast_path_gate(vae, gate)
     logger.info(
