@@ -142,9 +142,7 @@ def _sync_draft_sampling_across_tp(*tensors):
     from sglang.srt.distributed import get_tp_group
     from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 
-    grp = (
-        get_parallel().attn_tp_group if is_dp_attention_enabled() else get_tp_group()
-    )
+    grp = get_parallel().attn_tp_group if is_dp_attention_enabled() else get_tp_group()
     if grp is None or grp.world_size <= 1:
         return
     if get_is_capture_mode():
@@ -867,9 +865,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             topk_p, topk_index = fast_sample(probs, num_samples=1)
         else:
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
-        _sync_draft_sampling_across_tp(
-            topk_index, topk_p, logits_output.hidden_states
-        )
+        _sync_draft_sampling_across_tp(topk_index, topk_p, logits_output.hidden_states)
         return EagleDraftInput(
             topk_p=topk_p,
             topk_index=topk_index,
@@ -1028,9 +1024,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
             ret_draft_probs = None
         ret_hidden_states = draft_logits_output.hidden_states
-        _sync_draft_sampling_across_tp(
-            ret_topk_index, ret_topk_p, ret_hidden_states
-        )
+        _sync_draft_sampling_across_tp(ret_topk_index, ret_topk_p, ret_hidden_states)
 
         # Construct the return values
         next_draft_input = batch_result.next_draft_input
