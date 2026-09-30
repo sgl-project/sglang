@@ -112,6 +112,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import (
     get_exec,
+    get_forward,
     get_parallel,
     get_stream,
 )
@@ -845,8 +846,18 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         ~0.1 ms of host time per layer, which is visible on launch-bound
         forwards."""
         cfg = self.topk.topk_config
-        assert cfg.correction_bias is None and not cfg.use_grouped_topk
-        assert precomputed_topk_postprocess_is_noop(cfg)
+        if (
+            cfg.correction_bias is not None
+            or cfg.use_grouped_topk
+            or cfg.scoring_func != "softmax"
+            or cfg.custom_routing_function is not None
+            or cfg.routed_scaling_factor is not None
+            or self.topk.enable_waterfill
+            or not precomputed_topk_postprocess_is_noop(cfg)
+        ):
+            raise NotImplementedError(
+                "CP local routing requires unmodified CUDA softmax top-k"
+            )
         num_tokens = router_logits.shape[0]
         # Both buffers feed the rows all-gather: allocate them where the
         # collective wants them (symmetric memory when enabled).
@@ -857,7 +868,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             topk_ids = torch.empty(
                 num_tokens, cfg.top_k, dtype=torch.int32, device=router_logits.device
             )
-        topk_softmax(topk_weights, topk_ids, router_logits, cfg.renormalize)
+        if num_tokens:
+            topk_softmax(topk_weights, topk_ids, router_logits, cfg.renormalize)
         return build_precomputed_topk_output(topk_weights, topk_ids, cfg, self.layer_id)
 
     def forward_cp(
@@ -865,30 +877,57 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         *,
         all_gather_rows: Callable[..., list[torch.Tensor]],
-        reduce_scatter_rows: Callable[[torch.Tensor], torch.Tensor],
         symmetric_memory: Callable[[], ContextManager],
     ) -> torch.Tensor:
-        """Collocated prefill CP: router on this rank's rows, experts on all rows.
+        """Route local CP rows, then compute experts on full rank-major rows.
 
-        gate + top-k run on the local rows only (routing is per token, so this
-        is exact); the rows, the fp32 top-k weights and the int32 top-k ids are
-        all-gathered rank-major in one call (one NCCL group launch on the
-        torch.distributed path), the TP-sharded routed and shared experts run
-        on all N rows, and the TP-partial sum is reduce-scattered back to the
-        local rows. Same bytes as the all-reduce of the TP path plus 80 B per
-        row of top-k, without replicating the router on every rank."""
-        num_tokens, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_dim)
-        router_logits, _ = self.gate(hidden_states)
+        The FFN input contract leaves the CP gather to compute so gate and
+        top-k only see local rows. ``all_gather_rows`` must concatenate equal
+        padded rank blocks matching ``attn_cp_metadata.per_rank_actual_token``
+        for the hidden states, fp32 weights and int32 IDs in the same order.
+        Return the full expert output: the FFN exit owns the reduce-scatter
+        back to local rows, or takes back an output reduced here under its AR
+        policy. Call this inside ``ffn_boundary.exit(forward_batch)``.
+        """
+        parallel = get_parallel()
+        moe = get_exec().moe
+        if (
+            not get_moe_a2a_backend().is_none()
+            or parallel.moe_ep_size != 1
+            or parallel.moe_dp_size != 1
+            or parallel.dwdp_size > 1
+        ):
+            raise NotImplementedError("CP local routing requires TP-only MoE experts")
+        if (
+            moe.enable_eplb
+            or moe.init_expert_location != "trivial"
+            or moe.ep_num_redundant_experts > 0
+        ):
+            raise NotImplementedError(
+                "CP local routing does not support expert remapping"
+            )
+        if get_forward().defer_moe_finalize:
+            raise NotImplementedError("CP local routing cannot defer MoE finalization")
+
+        if hidden_states.shape[0]:
+            router_logits, _ = self.gate(hidden_states)
+        else:
+            # Empty ranks still join the row gather, without launching GEMMs
+            # or the CUDA top-k kernel on M=0.
+            router_logits = hidden_states.new_empty((0, self.num_experts))
         topk_local = self._cp_router(router_logits, symmetric_memory)
         gathered, topk_weights, topk_ids = all_gather_rows(
             hidden_states, topk_local.topk_weights, topk_local.topk_ids
         )
+        if gathered.shape[0] == 0:
+            return gathered
         # The gathered tensors are already contiguous: no pack / unpack copies
         # (each extra launch costs ~40 us of host time on a launch-bound forward).
         topk_output = StandardTopKOutput(
             topk_weights=topk_weights, topk_ids=topk_ids, router_logits=None
         )
+        if self.enable_shared_expert_fusion:
+            topk_output = self._append_shared_to_topk_output(topk_output, gathered)
         use_fused_gate = self._use_fused_shared_gate()
         shared_output = self._forward_shared_experts(
             gathered, apply_gate=not use_fused_gate
@@ -904,7 +943,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 )
             else:
                 final_hidden_states += shared_output
-        return reduce_scatter_rows(final_hidden_states).view(num_tokens, hidden_dim)
+        return reduce_moe_output(final_hidden_states)
 
     def forward(
         self,
