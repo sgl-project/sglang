@@ -462,12 +462,12 @@ class LagunaDecoderLayer(nn.Module):
             (
                 declare_ffn(
                     sparse=self.is_layer_sparse,
-                    next_sparse=is_next_layer_sparse,
+                    next_layer_sparse=is_next_layer_sparse,
                 ),
                 self.post_attention_layernorm,
             ),
             previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_sparse=self.is_layer_sparse
+                sparse=is_previous_layer_sparse, next_layer_sparse=self.is_layer_sparse
             )
             if layer_id != 0
             else None,
@@ -482,7 +482,7 @@ class LagunaDecoderLayer(nn.Module):
         capture_output=None,
     ) -> torch.Tensor:
         hidden_states = self.attn_boundary.prepare(
-            hidden_states, forward_batch, capture_output=capture_output
+            hidden_states, forward_batch, capture=capture_output
         )
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
@@ -607,17 +607,15 @@ class LagunaModel(nn.Module):
 
         if not self.pp_group.is_last_rank:
             return residual_batch.to_pp(hidden_states, forward_batch)
-        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
-
-        if hidden_states.shape[0] != 0:
-            hidden_states = residual_batch.norm(
-                hidden_states,
-                forward_batch,
-                self.norm,
-                capture_output=aux_hidden_states.append
-                if self.end_layer in self.layers_to_capture
-                else None,
-            )
+        hidden_states = residual_batch.final_norm(
+            hidden_states,
+            forward_batch,
+            self.norm,
+            capture=aux_hidden_states.append
+            if self.end_layer in self.layers_to_capture
+            else None,
+            skip_empty=True,
+        )
         if len(aux_hidden_states) == 0:
             return hidden_states
         return hidden_states, aux_hidden_states
