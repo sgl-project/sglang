@@ -65,6 +65,8 @@ def test_scheduler_counts_original_requests_and_cleans_up(
 ):
     collector, registry = metrics
     scheduler = Scheduler.__new__(Scheduler)
+    scheduler._async_output_save = False
+    scheduler._inflight_finalizes = deque()
     scheduler.metrics = collector if enabled else None
     scheduler._disagg_role = RoleType.MONOLITHIC
     scheduler._disagg_metrics = None
