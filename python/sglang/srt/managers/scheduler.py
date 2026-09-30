@@ -109,6 +109,7 @@ from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
@@ -569,7 +570,6 @@ class Scheduler(
             page_size=self.page_size,
             spec_algorithm=self.spec_algorithm,
             attn_tp_cpu_group=self.attn_tp_cpu_group,
-            tp_cpu_group=self.tp_cpu_group,
             attn_cp_cpu_group=self.attn_cp_cpu_group,
             enable_metrics=get_observability().enable_metrics,
             enable_kv_cache_events=bool(
@@ -626,11 +626,7 @@ class Scheduler(
             self.decode_offload_manager = DecodeKVCacheOffloadManager(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                tp_group=(
-                    self.attn_tp_cpu_group
-                    if self.attn_dp_enabled
-                    else self.tp_cpu_group
-                ),
+                tp_group=self.dp_tp_cpu_group,
                 tree_cache=self.tree_cache,
             )
         else:
@@ -1213,11 +1209,9 @@ class Scheduler(
         self.world_group = get_parallel().world_group
 
         # NOTE: dp_tp_* are request/data-plane coordination groups (not tensor collectives).
-        # When DP attention is enabled, scope to the attention-TP group; otherwise use
-        # the base TP group. Entry rank is the local rank 0 in that group.
-        # Use the CPU (gloo) group to broadcast VLM Python objects and avoid CUDA
-        # stream/device coupling (#11910).
-        self.dp_tp_group = self.attn_tp_group if self.attn_dp_enabled else self.tp_group
+        # Entry rank is the local rank 0 in that group. Use the CPU (gloo) group to
+        # broadcast VLM Python objects and avoid CUDA stream/device coupling (#11910).
+        self.dp_tp_group = get_dp_tp_group()
         self.dp_tp_cpu_group = self.dp_tp_group.cpu_group
 
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()

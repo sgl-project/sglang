@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 
+from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.runtime_context import get_exec
 
 logger = logging.getLogger(__name__)
@@ -267,7 +268,6 @@ def build_kv_cache(
     page_size: int,
     spec_algorithm: SpeculativeAlgorithm,
     attn_tp_cpu_group: ProcessGroup,
-    tp_cpu_group: ProcessGroup,
     attn_cp_cpu_group: ProcessGroup,
     enable_metrics: bool,
     enable_kv_cache_events: bool,
@@ -358,9 +358,7 @@ def build_kv_cache(
             else token_to_kv_pool_allocator.page_size
         ),
         is_eagle=spec_algorithm.is_eagle(),
-        tp_cache_group=(
-            attn_tp_cpu_group if get_parallel().attn_dp_enabled else tp_cpu_group
-        ),
+        tp_cache_group=get_dp_tp_group().cpu_group,
         attn_cp_cache_group=attn_cp_cpu_group,
         attn_tp_cache_group=attn_tp_cpu_group,
         pp_cache_group=pp_group.cpu_group,
