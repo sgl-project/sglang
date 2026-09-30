@@ -620,6 +620,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         bs = len(batch.seq_lens)
         device = self.device
         prefix_lens = batch.seq_lens
+        if self.target_worker.training_capture is not None:
+            self.target_worker.training_capture.before_forward(batch.reqs)
 
         self._observers.begin_step()
 
@@ -759,6 +761,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
         )
+        training_capture = None
+        if self.target_worker.training_capture is not None:
+            training_capture = self.target_worker.training_capture.after_verify_accept(
+                target_verify.training_capture,
+                commit_lens=accept.commit_lens,
+                out_tokens=accept.out_tokens,
+            )
         if on_publish is not None:
             if confidence is not None:
                 on_publish(accept.new_seq_lens, confidence=confidence)
@@ -815,6 +824,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         return GenerationBatchResult(
             logits_output=logits_output,
+            training_capture=training_capture,
             next_token_ids=accept.out_tokens.reshape(-1),
             accept_lens=accept.commit_lens,
             block_accept_lens=accept.commit_lens + accept.cap_trim_lens,

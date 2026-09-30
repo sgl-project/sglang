@@ -1,20 +1,135 @@
 """Synthetic snapshot fixtures shared by unit and Store integration tests."""
 
 import ctypes
+from types import SimpleNamespace
 
 import torch
 
 from sglang.srt.training_capture.protocol import (
+    DTYPES,
     KVSpec,
     LayerGeometry,
     Provenance,
     SequenceInfo,
     TeacherIdentity,
     canonical_bytes,
+    decode_manifest,
     digest_bytes,
+    tensor_bytes,
+    validate_tensors,
 )
 from sglang.srt.training_capture.snapshot import SnapshotMetadata, build_snapshot
 from sglang.srt.training_capture.teacher import capture_teacher
+
+
+class CaptureTestRequest(SimpleNamespace):
+    def __init__(self, rid, max_new_tokens=3):
+        from sglang.srt.sampling.sampling_params import SamplingParams
+
+        super().__init__(
+            rid=rid,
+            is_retracted=False,
+            output_ids=[],
+            finished_reason=None,
+            finished_len=None,
+            eos_token_ids=set(),
+            lora_id=None,
+            multimodal_inputs=None,
+            input_embeds=None,
+            positional_embed_overrides=None,
+            session=None,
+            custom_logit_processor=None,
+            sampling_params=SamplingParams(max_new_tokens=max_new_tokens),
+            origin_input_ids=[3, 4],
+            training_capture_attempted=False,
+            training_capture_context=None,
+            training_capture_finalize=None,
+        )
+
+    def finished(self):
+        return self.finished_reason is not None
+
+    @property
+    def output_ids_through_stop(self):
+        return self.output_ids[: self.finished_len]
+
+
+def read_snapshot(store, publication):
+    data = store.get_tensor(
+        publication["manifest_key"],
+        [publication["manifest_nbytes"]],
+        torch.uint8,
+        publication["manifest_sha256"],
+    )
+    manifest = decode_manifest(bytes(tensor_bytes(data)))
+    tensors = {
+        obj.key: store.get_tensor(obj.key, obj.shape, DTYPES[obj.dtype], obj.sha256)
+        for obj in manifest.objects
+    }
+    validate_tensors(manifest, tensors)
+    packed = {
+        name: torch.cat(
+            [
+                tensors[obj.key]
+                for obj in sorted(
+                    (obj for obj in manifest.objects if obj.name == name),
+                    key=lambda obj: obj.token_range[0] if obj.kind == "kv" else 0,
+                )
+            ]
+        )
+        for name in {obj.name for obj in manifest.objects}
+    }
+    return manifest, packed
+
+
+class VerifyCaptureFixture:
+    def __init__(self, coordinator, request):
+        self.coordinator, self.request = coordinator, request
+        coordinator.capture_mode = "speculative_accepted_target_path"
+        coordinator.before_forward([request])
+        self.record = request.training_capture_context
+        for index, buffer in enumerate(coordinator.exporter.buffers.values()):
+            buffer.copy_(torch.arange(buffer.numel()).view_as(buffer) + index * 256)
+        self.sources = {k: v.clone() for k, v in coordinator.exporter.buffers.items()}
+        context = self.record.context
+        context.export_kv(coordinator.exporter, torch.tensor([7, 3]), end=2)
+        self.prefill_logits = torch.arange(256).float()[None]
+        context.record_teacher(
+            capture_teacher(self.prefill_logits, 256), row=0, position=2
+        )
+        context.commit_token(position=2, token_id=10)
+        request.output_ids.append(10)
+
+    def forward(self, *, inputs=(10, 20, 30, 40), prefix=2, selected_row=0):
+        requests = [CaptureTestRequest("not-selected")] * selected_row + [self.request]
+        width = len(inputs)
+        self.forward_batch = SimpleNamespace(
+            input_ids=torch.tensor(list(inputs) * len(requests)),
+            positions=torch.arange(prefix, prefix + width).repeat(len(requests)),
+            out_cache_loc=torch.tensor([6, 1, 9, 5]).repeat(len(requests)),
+        )
+        generator = torch.Generator().manual_seed(prefix)
+        self.logits = torch.randn(len(requests) * width, 256, generator=generator)
+        return self.coordinator.after_verify_forward(
+            SimpleNamespace(reqs=requests, seq_lens_cpu=[prefix] * len(requests)),
+            self.forward_batch,
+            SimpleNamespace(next_token_logits=self.logits),
+            width=width,
+            can_run_cuda_graph=False,
+        )
+
+    def accept(self, ticket, outputs, count):
+        return self.coordinator.after_verify_accept(
+            ticket, commit_lens=torch.tensor(count), out_tokens=torch.tensor(outputs)
+        )
+
+    def finish(self, outputs, length, reason=None):
+        from sglang.srt.managers.schedule_batch import FINISH_LENGTH
+
+        self.request.output_ids = outputs
+        self.request.finished_len = length
+        self.request.finished_reason = reason or FINISH_LENGTH(length)
+        self.coordinator.on_release(self.request)
 
 
 def make_kv_spec():

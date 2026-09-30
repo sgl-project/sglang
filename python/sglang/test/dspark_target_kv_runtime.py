@@ -23,6 +23,7 @@ from sglang.srt.speculative.dspark_components.dspark_target_kv_contract import (
 from sglang.srt.training_capture.protocol import digest_bytes
 from sglang.srt.utils import kill_process_tree
 from sglang.test import test_utils
+from sglang.test.dspark_capture_observer import check_speculative_snapshot
 
 
 def export_synthetic_kv_draft(model_path, destination, manifest, tensors):
@@ -104,6 +105,8 @@ def exercise_target_kv_draft(
 ):
     destination = Path(directory) / f"synthetic-kv-draft-{cuda_graph}"
     export_synthetic_kv_draft(model_path, destination, *samples[1])
+    first_publication = len(test.catalog.publications)
+    results = []
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         url = f"http://127.0.0.1:{sock.getsockname()[1]}"
@@ -124,13 +127,14 @@ def exercise_target_kv_draft(
             url,
             timeout=240,
             other_args=[
+                "--training-capture-config",
+                str(test.capture_path),
                 "--speculative-algorithm",
                 "DSPARK",
                 "--speculative-draft-model-path",
                 str(destination),
                 "--disable-overlap-schedule",
                 "--skip-server-warmup",
-                "--skip-tokenizer-init",
                 "--attention-backend",
                 "triton",
                 "--speculative-draft-attention-backend",
@@ -184,6 +188,7 @@ def exercise_target_kv_draft(
             )
             test.assertEqual(response.status_code, 200, response.text)
             actual = response.json()
+            results.append(actual)
             test.assertEqual(actual["output_ids"], baseline["output_ids"])
             if index:
                 test.assertGreater(actual["meta_info"]["cached_tokens"], 0)
@@ -208,7 +213,123 @@ def exercise_target_kv_draft(
         )
         test.assertEqual(batched.status_code, 200, batched.text)
         for actual, baseline in zip(batched.json(), responses[1:], strict=True):
+            results.append(actual)
             test.assertEqual(actual["output_ids"], baseline["output_ids"])
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
+        extra_cases = (
+            (
+                "sampling_penalty",
+                {
+                    "temperature": 0.8,
+                    "top_k": 16,
+                    "top_p": 0.9,
+                    "repetition_penalty": 1.1,
+                    "frequency_penalty": 0.15,
+                    "max_new_tokens": 4,
+                    "ignore_eos": True,
+                },
+            ),
+            (
+                "stop_token",
+                {
+                    "temperature": 0,
+                    "min_new_tokens": 1,
+                    "max_new_tokens": 8,
+                    "stop_token_ids": [100],
+                    "logit_bias": {"100": 100.0},
+                },
+            ),
+            (
+                "eos",
+                {
+                    "temperature": 0,
+                    "min_new_tokens": 1,
+                    "max_new_tokens": 8,
+                    "logit_bias": {str(tokenizer.eos_token_id): 100.0},
+                },
+            ),
+            (
+                "grammar",
+                {"temperature": 0.8, "max_new_tokens": 16, "regex": "[0-9]{12}"},
+            ),
+        )
+        for name, params in extra_cases:
+            response = requests.post(
+                url + "/generate",
+                json={
+                    "input_ids": samples[0][1]["token_ids"][
+                        : samples[0][0].sequence.prompt_length
+                    ].tolist(),
+                    "sampling_params": params,
+                },
+                timeout=120,
+            )
+            test.assertEqual(response.status_code, 200, response.text)
+            actual = response.json()
+            results.append(actual)
+            if name in ("stop_token", "eos"):
+                test.assertEqual(len(actual["output_ids"]), 2, actual)
+                test.assertEqual(
+                    actual["output_ids"][-1],
+                    100 if name == "stop_token" else tokenizer.eos_token_id,
+                )
+                test.assertEqual(actual["meta_info"]["finish_reason"]["type"], "stop")
+            elif name == "grammar":
+                test.assertRegex(actual["text"], r"^[0-9]{12}$")
+        publications = test.catalog.wait_publications(
+            first_publication + len(results), timeout=30
+        )[first_publication:]
+        references = [
+            torch.load(path, weights_only=True)
+            for path in sorted((destination / "capture-reference").glob("*.pt"))
+        ]
+        captured = [test.read_sample(publication) for publication in publications]
+        test.assertCountEqual(
+            [
+                tensors["token_ids"][manifest.sequence.prompt_length :].tolist()
+                for manifest, tensors in captured
+            ],
+            [result["output_ids"] for result in results],
+        )
+        for manifest, tensors in captured:
+            check_speculative_snapshot(test, manifest, tensors, references)
+        test.assertIn(
+            "eos", [manifest.sequence.stop_reason for manifest, _ in captured]
+        )
+        test.assertIn(
+            "stop_token", [manifest.sequence.stop_reason for manifest, _ in captured]
+        )
+        capture_state = requests.get(url + "/server_info", timeout=10).json()[
+            "internal_states"
+        ][0]["training_capture"]
+        test.assertGreater(
+            capture_state["counters"].get("speculative_verify_forwards", 0),
+            0,
+            capture_state,
+        )
+        test.assertGreater(
+            capture_state["counters"].get("speculative_commits_copied", 0),
+            0,
+            capture_state,
+        )
+        if cuda_graph:
+            test.assertGreater(
+                capture_state["counters"].get("cuda_graph_forwards", 0),
+                0,
+                capture_state,
+            )
+        print(
+            json.dumps(
+                {
+                    "speculative_capture": capture_state,
+                    "samples": len(captured),
+                    "cuda_graph_enabled": cuda_graph,
+                }
+            ),
+            flush=True,
+        )
         observations = [
             json.loads(line)
             for line in (destination / "observations.jsonl").read_text().splitlines()

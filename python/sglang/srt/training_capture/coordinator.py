@@ -36,7 +36,7 @@ from sglang.srt.training_capture.snapshot_writer import (
     PublicationJournal,
     SnapshotWriter,
 )
-from sglang.srt.training_capture.teacher import capture_teacher
+from sglang.srt.training_capture.teacher import TeacherRows, capture_teacher
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +63,22 @@ class CaptureBatch(msgspec.Struct, frozen=True):
     steps: tuple[CaptureStep, ...]
 
 
+class VerifyCaptureStep(msgspec.Struct, frozen=True):
+    request: Any
+    reservation: CaptureReservation
+    batch_row: int
+    prefix_end: int
+
+
+class VerifyCaptureBatch(msgspec.Struct, frozen=True):
+    steps: tuple[VerifyCaptureStep, ...]
+    teacher: TeacherRows
+    input_tokens: torch.Tensor
+    positions: torch.Tensor
+    cache_locs: torch.Tensor
+    width: int
+
+
 class CaptureCoordinator:
     @classmethod
     def create(
@@ -71,6 +87,7 @@ class CaptureCoordinator:
         if config_path is None:
             return None
         from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+        from sglang.srt.runtime_context import get_spec
 
         if not isinstance(pool, MHATokenToKVPool):
             raise ContractError("training capture requires a dense MHA/GQA KV pool")
@@ -108,6 +125,11 @@ class CaptureCoordinator:
                 req_to_token=req_to_token,
                 store=store,
                 catalog=catalog,
+                capture_mode=(
+                    "speculative_accepted_target_path"
+                    if get_spec().speculative_algorithm == "DSPARK"
+                    else "autoregressive"
+                ),
             )
         except Exception:
             store.close()
@@ -126,8 +148,10 @@ class CaptureCoordinator:
         store,
         catalog,
         pin_memory=True,
+        capture_mode="autoregressive",
     ):
         self.config, self.teacher, self.kv = config, teacher, kv
+        self.capture_mode = capture_mode
         self.exporter, self.req_to_token = exporter, req_to_token
         self.store, self.catalog = store, catalog
         self.pool = HostBufferPool(
@@ -363,7 +387,7 @@ class CaptureCoordinator:
                 },
             }
             record.provenance = Provenance(
-                capture_mode="autoregressive",
+                capture_mode=self.capture_mode,
                 producer_revision=self.config.producer_revision,
                 capture_config_sha256=self.config.fingerprint,
                 sampling_config=sampling,
@@ -451,13 +475,129 @@ class CaptureCoordinator:
             )
         return CaptureBatch(tuple(steps))
 
+    def after_verify_forward(
+        self, batch, forward_batch, logits_output, *, width, can_run_cuda_graph
+    ):
+        """Own compact raw rows before grammar, penalties or rejection sampling."""
+        steps = tuple(
+            VerifyCaptureStep(
+                req, req.training_capture_context, row, int(batch.seq_lens_cpu[row])
+            )
+            for row, req in enumerate(batch.reqs)
+            if req.training_capture_context is not None
+        )
+        if not steps:
+            return None
+        try:
+            if (
+                width < 1
+                or forward_batch.input_ids.numel() != len(batch.reqs) * width
+                or logits_output.next_token_logits.shape[0] != len(batch.reqs) * width
+            ):
+                raise ContractError("capture requires a dense linear verify layout")
+            indices = torch.tensor(
+                [
+                    step.batch_row * width + column
+                    for step in steps
+                    for column in range(width)
+                ],
+                dtype=torch.long,
+                device=forward_batch.input_ids.device,
+            )
+            ticket = VerifyCaptureBatch(
+                steps=steps,
+                teacher=capture_teacher(
+                    logits_output.next_token_logits, self.teacher.vocab_size, indices
+                ),
+                input_tokens=forward_batch.input_ids.index_select(0, indices).view(
+                    -1, width
+                ),
+                positions=forward_batch.positions.index_select(0, indices).view(
+                    -1, width
+                ),
+                cache_locs=forward_batch.out_cache_loc.index_select(0, indices).view(
+                    -1, width
+                ),
+                width=width,
+            )
+            self._count("speculative_verify_forwards")
+            self._count(
+                "cuda_graph_forwards" if can_run_cuda_graph else "eager_forwards"
+            )
+            return ticket
+        except Exception:  # noqa: BLE001 - Capture failure must not stop serving.
+            for step in steps:
+                self._fail_request(
+                    step.request, step.reservation, "verify_capture_failed"
+                )
+            return None
+
+    def after_verify_accept(self, ticket, *, commit_lens, out_tokens):
+        if ticket is None:
+            return None
+        steps = []
+        try:
+            counts = commit_lens.cpu().tolist()
+            outputs = out_tokens.cpu().tolist()
+            inputs = ticket.input_tokens.cpu().tolist()
+            positions = ticket.positions.cpu().tolist()
+        except Exception:  # noqa: BLE001 - Capture failure must not stop serving.
+            for step in ticket.steps:
+                self._fail_request(
+                    step.request, step.reservation, "verify_commit_failed"
+                )
+            return None
+        for selected_row, step in enumerate(ticket.steps):
+            req, record, start = step.request, step.reservation, step.prefix_end
+            if req.training_capture_context is not record:
+                continue
+            context = record.context
+            try:
+                count = counts[step.batch_row]
+                if (
+                    record.invalid_reason
+                    or not 1 <= count <= ticket.width
+                    or start != context.kv_end
+                    or len(context.token_ids) != start + 1
+                    or inputs[selected_row][0] != context.token_ids[-1]
+                    or positions[selected_row]
+                    != list(range(start, start + ticket.width))
+                    or outputs[step.batch_row][: count - 1]
+                    != inputs[selected_row][1:count]
+                ):
+                    raise ContractError(
+                        "verify commit does not extend the recorded token path"
+                    )
+                kv_count = min(count, context.max_tokens - start)
+                teacher_count = min(count, context.max_tokens - start - 1)
+                context.export_kv(
+                    self.exporter,
+                    ticket.cache_locs[selected_row, :kv_count],
+                    end=start + kv_count,
+                )
+                context.record_positions(
+                    ticket.positions[selected_row, :kv_count], start=start
+                )
+                context.record_teacher_range(
+                    ticket.teacher,
+                    row=selected_row * ticket.width,
+                    position=start + 1,
+                    count=teacher_count,
+                )
+                steps.append(CaptureStep(req, record, None))
+                self._count("speculative_commits_copied")
+            except Exception:  # noqa: BLE001 - Capture failure must not stop serving.
+                self._fail_request(req, record, "verify_commit_failed")
+        return CaptureBatch(tuple(steps))
+
     def _commit(self, req, record):
         context = record.context
         committed = len(context.token_ids) - context.prompt_length
-        for index in range(committed, len(req.output_ids)):
+        outputs = req.output_ids_through_stop
+        for index in range(committed, len(outputs)):
             context.commit_token(
                 position=context.prompt_length + index,
-                token_id=int(req.output_ids[index]),
+                token_id=int(outputs[index]),
             )
 
     def after_result(self, ticket: CaptureBatch | None):
@@ -501,12 +641,14 @@ class CaptureCoordinator:
             return
         try:
             self._commit(req, record)
+            if record.provenance.capture_mode == "speculative_accepted_target_path":
+                record.context.trim_terminal_prefix()
             if isinstance(req.finished_reason, FINISH_LENGTH):
                 reason = "length"
             elif isinstance(req.finished_reason, FINISH_MATCHED_TOKEN):
                 reason = (
                     "eos"
-                    if req.output_ids[-1] in (req.eos_token_ids or set())
+                    if record.context.token_ids[-1] in (req.eos_token_ids or set())
                     else "stop_token"
                 )
             else:

@@ -12,6 +12,7 @@ from sglang.srt.speculative.dspark_components.dspark_target_kv_inject import (
     TargetKVInjector,
 )
 from sglang.srt.speculative.dspark_components.dspark_verify import TargetVerifyExecutor
+from sglang.test.dspark_capture_observer import install_capture_observer
 
 
 def record(model, event):
@@ -149,6 +150,7 @@ def observed_target_verify(self, **kwargs):
 DSparkTargetKVDraftModel.write_target_kv = observed_write
 TargetKVInjector.inject_verify = observed_verify
 TargetVerifyExecutor.run_non_compact = observed_target_verify
+install_capture_observer()
 
 
 if __name__ == "__main__":

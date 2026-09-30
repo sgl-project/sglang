@@ -6,8 +6,10 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import msgspec
+from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.training_capture.config import (
     CaptureConfig,
@@ -88,8 +90,33 @@ class TestCaptureConfiguration(CustomTestCase):
                 finally:
                     setattr(self.args, name, previous)
 
+    def test_static_dspark_capture_rejects_compact_or_simulated_paths(self):
+        self.args.speculative_algorithm = "DSPARK"
+        with (
+            patch.object(envs.SGLANG_RAGGED_VERIFY_MODE, "get", return_value="static"),
+            patch.object(envs.SGLANG_SIMULATE_ACC_LEN, "get", return_value=0),
+        ):
+            validate_capture_server_args(self.args)
+            for mode in ("compact", "cap-accept"):
+                with (
+                    self.subTest(mode=mode),
+                    patch.object(
+                        envs.SGLANG_RAGGED_VERIFY_MODE, "get", return_value=mode
+                    ),
+                    self.assertRaisesRegex(ValueError, "non-static speculative verify"),
+                ):
+                    validate_capture_server_args(self.args)
+            with (
+                patch.object(envs.SGLANG_SIMULATE_ACC_LEN, "get", return_value=2),
+                self.assertRaisesRegex(ValueError, "simulated speculative acceptance"),
+            ):
+                validate_capture_server_args(self.args)
+            self.args.speculative_algorithm = "EAGLE"
+            with self.assertRaisesRegex(ValueError, "speculative algorithm"):
+                validate_capture_server_args(self.args)
+
     def test_invalid_contract_and_budgets_are_rejected(self):
-        for patch in (
+        for override in (
             {"selected_layer_ids": []},
             {"selected_layer_ids": [0, 0]},
             {"max_host_bytes": 0},
@@ -98,8 +125,8 @@ class TestCaptureConfiguration(CustomTestCase):
             {"journal_directory": "relative/journal"},
             {"unknown_option": True},
         ):
-            with self.subTest(patch=patch):
-                self.path.write_text(json.dumps(self.config | patch))
+            with self.subTest(override=override):
+                self.path.write_text(json.dumps(self.config | override))
                 with self.assertRaises((ContractError, msgspec.ValidationError)):
                     CaptureConfig.load(str(self.path))
 

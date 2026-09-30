@@ -74,6 +74,7 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
 class TargetVerifyResult(msgspec.Struct, frozen=True):
     logits_output: object
     can_run_cuda_graph: bool
+    training_capture: object = None
 
 
 class TargetVerifyExecutor:
@@ -298,9 +299,19 @@ class TargetVerifyExecutor:
             is_verify=True,
             skip_attn_backend_init=True,
         )
+        training_capture = None
+        if self.target_worker.training_capture is not None:
+            training_capture = self.target_worker.training_capture.after_verify_forward(
+                batch,
+                verify_forward_batch,
+                target_out.logits_output,
+                width=self.verify_num_draft_tokens,
+                can_run_cuda_graph=target_out.can_run_cuda_graph,
+            )
         return TargetVerifyResult(
             logits_output=target_out.logits_output,
             can_run_cuda_graph=target_out.can_run_cuda_graph,
+            training_capture=training_capture,
         )
 
     def commit_target_context(

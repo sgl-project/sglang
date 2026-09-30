@@ -91,6 +91,12 @@ def validate_capture_server_args(args) -> None:
     if args.training_capture_config is None:
         return
     CaptureConfig.load(args.training_capture_config)
+    from sglang.srt.environ import envs
+    from sglang.srt.speculative.ragged_verify import (
+        RaggedVerifyMode,
+        read_ragged_verify_mode,
+    )
+
     unsupported = {
         "TP/PP/DP or context parallelism": args.tp_size != 1
         or args.pp_size != 1
@@ -99,7 +105,11 @@ def validate_capture_server_args(args) -> None:
         or args.dcp_size != 1
         or args.enable_dp_attention,
         "overlap scheduling": not args.disable_overlap_schedule,
-        "speculative decoding": args.speculative_algorithm is not None,
+        "speculative algorithm": args.speculative_algorithm not in (None, "DSPARK"),
+        "non-static speculative verify": args.speculative_algorithm == "DSPARK"
+        and read_ragged_verify_mode() is not RaggedVerifyMode.STATIC,
+        "simulated speculative acceptance": args.speculative_algorithm is not None
+        and envs.SGLANG_SIMULATE_ACC_LEN.get() > 0,
         "PD disaggregation": args.disaggregation_mode != "null",
         "mixed-chunk scheduling": args.enable_mixed_chunk,
         "PDMux": args.enable_pdmux,

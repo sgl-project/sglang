@@ -93,16 +93,25 @@ class RequestCaptureContext:
             self._record_completion(positions.device)
 
     def record_teacher(self, rows: TeacherRows, *, row: int, position: int):
-        self._collecting()
-        if (
-            position != self.prompt_length + self.teacher_rows
-            or not position < self.max_tokens
-        ):
-            raise ContractError("teacher row is missing, duplicated, or shifted")
         if position != self.kv_end:
             raise ContractError(
                 "teacher prediction is not aligned with the computed KV prefix"
             )
+        self.record_teacher_range(rows, row=row, position=position, count=1)
+
+    def record_teacher_range(
+        self, rows: TeacherRows, *, row: int, position: int, count: int
+    ):
+        self._collecting()
+        if (
+            count < 1
+            or position != self.prompt_length + self.teacher_rows
+            or position + count > self.max_tokens
+            or position + count - 1 > self.kv_end
+            or row < 0
+            or row + count > rows.logits.shape[0]
+        ):
+            raise ContractError("teacher range is missing, duplicated, or shifted")
         index = self.teacher_rows
         try:
             for name, source in (
@@ -110,15 +119,31 @@ class RequestCaptureContext:
                 ("teacher_topk_logits", rows.logits),
                 ("teacher_logsumexp", rows.logsumexp),
             ):
-                self.slot.tensors[name][index].copy_(
-                    source[row], non_blocking=source.is_cuda
+                self.slot.tensors[name][index : index + count].copy_(
+                    source[row : row + count], non_blocking=source.is_cuda
                 )
                 if source.is_cuda:
                     source.record_stream(torch.cuda.current_stream(source.device))
         finally:
             self._record_completion(rows.logits.device)
-        self.slot.tensors["logits_positions"][index] = position
-        self.teacher_rows += 1
+        self.slot.tensors["logits_positions"][index : index + count].copy_(
+            torch.arange(position, position + count)
+        )
+        self.teacher_rows += count
+
+    def trim_terminal_prefix(self):
+        """Discard verify suffixes past the scheduler's final output boundary."""
+        self._collecting()
+        n = len(self.token_ids)
+        response_length = n - self.prompt_length
+        if (
+            response_length < 1
+            or response_length > self.teacher_rows
+            or self.kv_end < n - 1
+        ):
+            raise ContractError("terminal output has incomplete teacher or KV coverage")
+        self.teacher_rows = response_length
+        self.kv_end = min(self.kv_end, n)
 
     def commit_token(self, *, position: int, token_id: int):
         self._collecting()

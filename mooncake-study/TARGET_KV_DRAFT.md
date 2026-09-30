@@ -137,12 +137,40 @@ SGLANG_RAGGED_VERIFY_MODE=static python -m sglang.launch_server \
   --speculative-draft-attention-backend triton
 ```
 
-The producer's `--training-capture-config` still rejects speculative execution.
-Collecting accepted-token teacher/KV data while serving this draft is P9 work.
 The checkpoint's golden-fixture/acceptance metadata is recorded and validated
 structurally; startup does not execute or certify a SpecForge validation report.
 Full training/serving backbone and logits parity, quality/throughput gates,
 parallel topology, overlap, PD, RDMA and production rollout remain open.
+
+## Online Capture
+
+Add `--training-capture-config /path/to/capture.json` to collect training samples
+while serving a static DSpark draft. The existing registered Host arena,
+Mooncake writer and Catalog producer protocol are reused. The manifest records
+`capture_mode=speculative_accepted_target_path`; its tensor contract is unchanged.
+Compact/cap-accept verification, simulated acceptance and other speculative
+algorithms are rejected by the capture capability gate.
+
+`TargetVerifyExecutor` calls `CaptureCoordinator.after_verify_forward` immediately
+after the target forward, before grammar, penalties, bias or rejection sampling.
+An owned ticket preserves compact raw top-128 IDs/scores, full-vocabulary LSE,
+the selected requests' original batch rows, input tokens, positions and KV slots.
+It does not retain mutable graph-output views.
+
+`DSparkWorkerV2` passes the result to `after_verify_accept` before KV slot reuse.
+For a prefix ending at `s` and a commit length `L`, the forwarded inputs are the
+anchor plus `L-1` correct drafts. Their KV occupies `[s, s+L)`, while raw teacher
+rows predict positions `[s+1, s+L+1)`, including the bonus/correction token.
+The collector validates the anchor, consecutive positions and correct-draft
+tokens against the actual emitted prefix. Rejected suffixes do not enter the
+sample, and temporary copies are clipped to the reserved Host capacity.
+
+Scheduler stop/length/grammar processing can shorten that result further.
+Finalization commits `Req.output_ids_through_stop` and truncates the owned teacher
+and KV ranges before sealing. A final response token already computed by verify
+has valid KV; an unforwarded bonus has `kv_valid=0`. No target forward is added
+to fill missing KV or regenerate teacher scores. Capture failures invalidate the
+sample through the existing writer cleanup path.
 
 ## Verification
 
@@ -158,5 +186,11 @@ prefill, prefix reuse, batches with different verify commit lengths, ordinary
 and graph execution, raw projected-KV values, lossless greedy output, and
 continued serving after rejected management calls. Observers and forced proposal
 weights exist only in `sglang.test`; they do not modify normal serving behavior.
+The DSpark servers also publish training snapshots. A test observer saves raw
+vocabulary scores and target-pool rows before reuse; final output tokens select
+the reference path independently of the collector's acceptance ticket. Readback
+checks raw scores, top-128 membership, LSE, masks, positions and KV validity.
+The live cases include stochastic sampling, repetition/frequency penalties,
+minimum output length, stop tokens, EOS and constrained regex generation.
 See [implementation evidence](IMPLEMENTATION_STATUS.md) for exact completed runs
 and limits. The runtime Catalog remains a test double, and transport is TCP.

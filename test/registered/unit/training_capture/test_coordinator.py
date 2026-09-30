@@ -3,7 +3,6 @@
 import tempfile
 import time
 import unittest
-from types import SimpleNamespace
 
 import msgspec
 import torch
@@ -18,8 +17,11 @@ from sglang.test.test_utils import CustomTestCase
 from sglang.test.training_capture_catalog import TestCaptureCatalog
 from sglang.test.training_capture_utils import (
     BufferStore,
+    CaptureTestRequest,
     FakeReplicateConfig,
+    VerifyCaptureFixture,
     make_snapshot,
+    read_snapshot,
 )
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -76,25 +78,135 @@ class TestCaptureCoordinator(CustomTestCase):
             time.sleep(0.01)
 
     def request(self, rid):
-        from sglang.srt.sampling.sampling_params import SamplingParams
+        return CaptureTestRequest(rid)
 
-        return SimpleNamespace(
-            rid=rid,
-            finished=lambda: False,
-            is_retracted=False,
-            output_ids=[],
-            lora_id=None,
-            multimodal_inputs=None,
-            input_embeds=None,
-            positional_embed_overrides=None,
-            session=None,
-            custom_logit_processor=None,
-            sampling_params=SamplingParams(max_new_tokens=3),
-            origin_input_ids=[3, 4],
-            training_capture_attempted=False,
-            training_capture_context=None,
-            training_capture_finalize=None,
+    def test_verify_reject_owns_raw_teacher_and_only_committed_kv(self):
+        self.wait_until(lambda: len(self.coordinator.available) == 1)
+        fixture = VerifyCaptureFixture(self.coordinator, self.request("reject"))
+        ticket = fixture.forward()
+        raw = fixture.logits.clone()
+        fixture.logits.fill_(-1000)
+        fixture.forward_batch.input_ids.zero_()
+        fixture.forward_batch.positions.zero_()
+        fixture.forward_batch.out_cache_loc.zero_()
+        result = fixture.accept(ticket, [[55, 0, 0, 0]], [1])
+        for source in self.coordinator.exporter.buffers.values():
+            source.zero_()
+        fixture.finish([10, 55], 2)
+        self.coordinator.after_result(result)
+        publication = self.catalog.wait_publications(1)[0]
+        manifest, tensors = read_snapshot(self.store, publication)
+        self.assertEqual(
+            manifest.provenance.capture_mode, "speculative_accepted_target_path"
         )
+        self.assertEqual(tensors["token_ids"].tolist(), [3, 4, 10, 55])
+        self.assertEqual(tensors["kv_valid"].tolist(), [1, 1, 1, 0])
+        self.assertEqual(tensors["logits_positions"].tolist(), [2, 3])
+        values, indices = raw[0].topk(128)
+        torch.testing.assert_close(
+            tensors["teacher_topk_logits"][1], values, rtol=0, atol=0
+        )
+        torch.testing.assert_close(tensors["teacher_topk_ids"][1], indices.int())
+        torch.testing.assert_close(tensors["teacher_logsumexp"][1], raw[0].logsumexp(0))
+        for name, source in fixture.sources.items():
+            torch.testing.assert_close(tensors[name], source[[7, 3, 6]], rtol=0, atol=0)
+
+    def test_verify_length_truncation_keeps_final_computed_kv(self):
+        self.wait_until(lambda: len(self.coordinator.available) == 1)
+        fixture = VerifyCaptureFixture(self.coordinator, self.request("length"))
+        ticket = fixture.forward()
+        fixture.accept(ticket, [[20, 30, 55, 0]], [3])
+        fixture.finish([10, 20, 30, 55], 3)
+        manifest, tensors = read_snapshot(
+            self.store, self.catalog.wait_publications(1)[0]
+        )
+        self.assertEqual(manifest.sequence.response_length, 3)
+        self.assertEqual(tensors["token_ids"].tolist(), [3, 4, 10, 20, 30])
+        self.assertEqual(tensors["loss_mask"].tolist(), [0, 0, 1, 1, 1])
+        self.assertEqual(tensors["kv_valid"].tolist(), [1] * 5)
+        self.assertEqual(tensors["logits_positions"].tolist(), [2, 3, 4])
+        torch.testing.assert_close(
+            tensors["teacher_topk_logits"][1:], fixture.logits[:2].topk(128).values
+        )
+        for name, source in fixture.sources.items():
+            torch.testing.assert_close(
+                tensors[name], source[[7, 3, 6, 1, 9]], rtol=0, atol=0
+            )
+
+    def test_verify_eos_truncates_later_correct_drafts_and_bonus(self):
+        from sglang.srt.managers.schedule_batch import FINISH_MATCHED_TOKEN
+
+        self.wait_until(lambda: len(self.coordinator.available) == 1)
+        fixture = VerifyCaptureFixture(self.coordinator, self.request("eos"))
+        fixture.request.eos_token_ids = {20}
+        ticket = fixture.forward()
+        fixture.accept(ticket, [[20, 30, 55, 0]], [3])
+        fixture.finish([10, 20, 30, 55], 2, FINISH_MATCHED_TOKEN(20))
+        manifest, tensors = read_snapshot(
+            self.store, self.catalog.wait_publications(1)[0]
+        )
+        self.assertEqual(manifest.sequence.stop_reason, "eos")
+        self.assertEqual(tensors["token_ids"].tolist(), [3, 4, 10, 20])
+        self.assertEqual(tensors["kv_valid"].tolist(), [1] * 4)
+        self.assertEqual(tensors["teacher_topk_logits"].shape[0], 2)
+
+    def test_verify_crossing_host_capacity_trims_to_real_output(self):
+        self.wait_until(lambda: len(self.coordinator.available) == 1)
+        fixture = VerifyCaptureFixture(
+            self.coordinator, CaptureTestRequest("capacity", 6)
+        )
+        ticket = fixture.forward()
+        result = fixture.accept(ticket, [[20, 30, 40, 50]], [4])
+        fixture.request.output_ids = [10, 20, 30, 40, 50]
+        self.coordinator.after_result(result)
+        ticket = fixture.forward(inputs=(50, 60, 70, 80), prefix=6)
+        fixture.accept(ticket, [[60, 70, 80, 90]], [4])
+        fixture.finish([10, 20, 30, 40, 50, 60, 70, 80, 90], 6)
+        manifest, tensors = read_snapshot(
+            self.store, self.catalog.wait_publications(1)[0]
+        )
+        self.assertEqual(manifest.sequence.total_length, 8)
+        self.assertEqual(tensors["token_ids"].tolist(), [3, 4, 10, 20, 30, 40, 50, 60])
+        self.assertEqual(tensors["kv_valid"].tolist(), [1] * 8)
+        self.assertEqual(tensors["logits_positions"].tolist(), list(range(2, 8)))
+        torch.testing.assert_close(
+            tensors["teacher_topk_logits"][-1], fixture.logits[0].topk(128).values
+        )
+
+    def test_verify_selected_batch_row_maps_back_to_original_accept_counts(self):
+        self.wait_until(lambda: len(self.coordinator.available) == 1)
+        fixture = VerifyCaptureFixture(
+            self.coordinator, self.request("selected-second")
+        )
+        ticket = fixture.forward(selected_row=1)
+        self.assertEqual(ticket.steps[0].batch_row, 1)
+        fixture.accept(ticket, [[20, 30, 40, 50], [55, 0, 0, 0]], [4, 1])
+        fixture.finish([10, 55], 2)
+        _, tensors = read_snapshot(self.store, self.catalog.wait_publications(1)[0])
+        torch.testing.assert_close(
+            tensors["teacher_topk_logits"][1], fixture.logits[4].topk(128).values
+        )
+        self.assertEqual(tensors["kv_valid"].tolist(), [1, 1, 1, 0])
+
+    def test_verify_wrong_anchor_position_or_correct_prefix_never_publishes(self):
+        for failure in ("anchor", "position", "correct_prefix"):
+            with self.subTest(failure=failure):
+                self.wait_until(lambda: len(self.coordinator.available) == 1)
+                fixture = VerifyCaptureFixture(self.coordinator, self.request(failure))
+                ticket = fixture.forward()
+                if failure == "anchor":
+                    ticket.input_tokens[0, 0] = 99
+                elif failure == "position":
+                    ticket.positions[0, 1] = 99
+                outputs = [[99 if failure == "correct_prefix" else 20, 55, 0, 0]]
+                fixture.accept(ticket, outputs, [2])
+                self.wait_until(lambda fixture=fixture: fixture.record.state == "done")
+                self.assertIsNone(fixture.request.training_capture_context)
+                self.assertEqual(
+                    self.catalog.captures[fixture.record.lease.capture_id]["reason"],
+                    "verify_commit_failed",
+                )
+                self.assertFalse(self.catalog.publications)
 
     def test_admission_is_bounded_and_publication_runs_off_request_thread(self):
         self.wait_until(lambda: len(self.coordinator.available) == 1)

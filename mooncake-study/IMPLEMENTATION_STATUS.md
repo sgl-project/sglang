@@ -34,7 +34,8 @@ it does not redefine the goal as the modules already implemented.
 | Runtime collection | Opt-in CLI config, capability gates, request ledger, prefill/decode hooks, invalidation and counters | Six real Qwen3-0.6B requests published through Mooncake; ordinary and CUDA graph replay executions pass |
 | Real model identity/parity | Weight/tokenizer artifact digests, actual selected-layer geometry, K norm and RoPE | Captured KV and teacher scores match online tensors exactly; full-vocabulary LSE matches within 1e-5; HF teacher logits pass numerical comparison, but cross-engine KV equivalence is not certified |
 | Draft serving | Explicit KV-input architecture, contract, encoder, incremental injector and invalidation | Real Qwen3 target plus synthetic KV draft passes ordinary/batched/graph generation and per-layer projected-KV checks; full SpecForge backbone/logit parity remains open |
-| Deployment coverage | Not yet implemented | TP/PP, overlap, speculative/PD, RDMA and workload SLO gates remain open |
+| Speculative collection | Static DSpark raw verify ticket, commit mapping and terminal truncation | Actual KV-input draft requests publish and read back through Mooncake in ordinary and graph modes; see evidence below |
+| Deployment coverage | Partial | TP/PP, overlap, non-static speculative verify, PD, RDMA and workload SLO gates remain open |
 
 Initial test evidence (shared lab state under
 `/gpfs/users/fuxuanwei-1/dspark-maas-lab/state`):
@@ -162,8 +163,54 @@ branches; it is not trained or evidence of useful acceptance/throughput. The
 golden-fixture digest is contract metadata, not a certified SpecForge export.
 Full backbone/logit parity, training quality, fresh-instance rollback and
 production artifact validation remain open. Runtime gates still require static
-verify, one GPU, no overlap/PD/LoRA and dense unquantized pools. Speculative
-teacher/KV collection is separate P9 work and is still gated off.
+verify, one GPU, no overlap/PD/LoRA and dense unquantized pools. Static speculative
+teacher/KV collection is now implemented as described below.
+
+## Static Speculative Collection
+
+The target verify hook captures compact raw teacher tensors before serving-side
+mutation. The commit hook validates the anchor, positions and correct-draft
+prefix, then copies only the forwarded commit range into owned Host storage.
+The request finalizer applies the scheduler's actual terminal token boundary,
+including EOS/stop/length truncation, before sealing. This supports both a final
+computed token and an unforwarded bonus without an extra target forward.
+
+Evidence:
+
+- `01790806925908285704-3d00701591aa`: 37 capture tests and 48 subtests passed in
+  16.89s. New cases cover source mutation, rejected suffix exclusion, mixed
+  selected/unselected batch rows, EOS and length truncation, verify windows
+  crossing Host capacity, and invalid anchor/position/token-path rejection.
+- `01790807115212349474-201ec59ce104`: complete runtime test passed in 134.655s.
+  The six AR samples still pass, and ten static DSpark samples now publish and
+  read back through the real Store. Each speculative mode records seven verify
+  forwards and eight per-request commit copies; graph mode uses seven actual
+  replays. Both modes exercise full rejection, full acceptance, length truncation
+  and batch commit lengths `[1, 4]`. Selected KV and raw top-128 values match
+  online reference snapshots exactly, and CPU full-vocabulary LSE agrees within
+  `rtol=1e-6, atol=1e-6`. All ten greedy responses match the target AR baseline.
+- `01790807394929085326-c7467397a17d`: extended runtime test passed in 228.638s.
+  With tokenizer initialization enabled, both speculative modes additionally
+  exercise temperature/top-k/top-p, repetition/frequency penalties, minimum
+  output length, stop tokens, EOS and constrained regex generation. Each mode
+  publishes nine samples and records 24 verify forwards / 25 commit copies;
+  graph mode confirms 24 actual replays. All 18 speculative snapshots pass
+  raw teacher, token-path and KV readback checks alongside the six AR samples.
+  EOS/stop requests end at two output tokens despite a larger verify window.
+- `01790807395062603809-0299f4562e39`: focused regression passed with 110 tests
+  and 79 subtests in 19.03s, covering capture, target-KV serving, legacy draft
+  selection/projection, graph-runner helpers and request IPC normalization.
+  Added modules/helpers pass full Ruff; capture modules and tests pass Ruff
+  F/I checks. The original worktree's staged changes remain untouched.
+
+The speculative observer independently reads the target pool and full vocabulary
+outputs before their reuse, then reconstructs the final path from returned token
+IDs. It does not use acceptance tickets, the KV exporter or captured top-k
+tensors. Unlike the earlier AR attention-input observer, this speculative KV
+reference reads the pool, so it verifies selection/copy/lifetime, not the
+attention backend's pool-write correctness. Test observers add synchronous work;
+these runs are correctness evidence, not SLO measurements. Catalog is still a
+test double and transport is TCP.
 
 ## Next Implementation
 
@@ -172,8 +219,8 @@ teacher/KV collection is separate P9 work and is still gated off.
 2. Complete P8's fixed-input backbone/logit parity against the training side,
    exporter compatibility and artifact/quality validation. Broaden the runtime
    lifecycle tests to cache eviction, cancellation and real request retraction.
-3. Complete P9's topology work: TP/PP, overlap, speculative accepted-token
-   collection, PD transfer and cross-node RDMA. Existing capability gates do
+3. Complete P9's topology work: TP/PP, overlap, non-static speculative layouts,
+   PD transfer and cross-node RDMA. Existing capability gates do
    not constitute implementation of these paths.
 4. Complete P10's adaptive capture limits, metrics, capture-on/off SLO benchmarks
    and rollout/rollback checks. Per-model numerical/runtime validation and
