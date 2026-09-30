@@ -814,13 +814,9 @@ def _causal_conv1d_update_kernel(
     mask_x_1d = idx_feats < dim
 
     if SAVE_INTERMEDIATE and DEDUP_WINDOW:
-        # Deduplicated sliding-window layout (see MambaPool): the step and window
-        # strides coincide, so step t's window is buf[:, t : t + K - 1] of one
-        # [dim, seqlen + K - 2] buffer per slot. After the per-token window stores
-        # that buffer holds [s_1, ..., s_{K-2}, x_0, ..., x_{seqlen-1}] per channel
-        # (s = conv state before this call). Store those values once as a
-        # [BLOCK_N, seqlen + K - 2] tile instead of K - 1 overlapping strided
-        # stores per token; the bytes written are the same.
+        # Dedup layout (MambaPool): the per-slot buffer ends as
+        # [s_1..s_{K-2}, x_0..x_{seqlen-1}] per channel (s = conv state before this
+        # call), so store it once as a [BLOCK_N, seqlen + K - 2] tile.
         idx_span = tl.arange(0, NP2_WINDOW_SPAN)
         idx_span_x = idx_span - (KERNEL_WIDTH - 2)
         window_vals = tl.load(
@@ -1027,32 +1023,33 @@ def _causal_conv1d_update_kernel(
             )
 
 
+# Largest tile span (seqlen + width - 2) measured for the tile store; longer
+# spans keep the per-token stores.
+_DEDUP_WINDOW_MAX_SPAN = 32
+
+
+# Linear-chain verify into MambaPool's deduplicated window layout (step stride ==
+# window stride) stores the per-slot buffer as one tile; tree verify, fused accept
+# and dense layouts keep the per-token stores.
 def _use_dedup_window_store(
     intermediate_conv_window: Optional[torch.Tensor],
     *,
-    conv_state_indices: Optional[torch.Tensor],
     num_accept_tokens: Optional[torch.Tensor],
     retrieve_next_token: Optional[torch.Tensor],
     width: int,
     seqlen: int,
 ) -> bool:
-    """Whether causal_conv1d_update can store the intermediate windows as one tile.
-
-    True for linear-chain verify into the deduplicated sliding-window layout
-    (MambaPool): consecutive steps' windows share K - 2 columns, so the step
-    stride equals the window stride and the per-slot buffer can be written once
-    per program instead of per token. Tree verify stores per-path windows and
-    dense layouts have independent windows; both keep the per-token stores.
-    """
     if (
         intermediate_conv_window is None
         or intermediate_conv_window.dim() != 4
-        or conv_state_indices is None
         or num_accept_tokens is not None
         or retrieve_next_token is not None
         or not 2 <= width <= 4
+        or seqlen + width - 2 > _DEDUP_WINDOW_MAX_SPAN
     ):
         return False
+    # The layout is inferred from strides because MambaPool passes no flag; a future
+    # overlapping layout with these strides would also take the tile store.
     _, _, stride_dim, stride_win = intermediate_conv_window.stride()
     return (
         intermediate_conv_window.stride(1) == stride_win
@@ -1209,7 +1206,6 @@ def causal_conv1d_update(
 
     dedup_window = _use_dedup_window_store(
         intermediate_conv_window,
-        conv_state_indices=conv_state_indices,
         num_accept_tokens=num_accept_tokens,
         retrieve_next_token=retrieve_next_token,
         width=width,
