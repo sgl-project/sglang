@@ -122,7 +122,7 @@ from sglang.srt.utils.common import (
     LazyValue,
     add_prefix,
     log_info_on_rank0,
-    make_layers,
+    make_pp_layers,
     set_weight_attrs,
 )
 
@@ -1008,7 +1008,7 @@ class Glm5NextModel(nn.Module):
             else None
         )
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Glm5NextDecoderLayer(
                 config=config,
@@ -1017,8 +1017,6 @@ class Glm5NextModel(nn.Module):
                 prefix=prefix,
                 alt_stream=self.alt_stream,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:

@@ -107,7 +107,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
-    make_layers,
+    make_pp_layers,
     use_intel_amx_backend,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
@@ -1130,7 +1130,7 @@ class Qwen2MoeModel(nn.Module):
             self.pp_group.rank_in_group,
             self.pp_group.world_size,
         )
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: decoder_layer_type(
                 layer_id=idx,
@@ -1140,8 +1140,6 @@ class Qwen2MoeModel(nn.Module):
                 prefix=prefix,
                 alt_stream=alt_stream,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:

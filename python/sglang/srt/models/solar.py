@@ -54,7 +54,7 @@ from sglang.srt.model_loader.weight_utils import (
 # limitations under the License.
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/solar.py
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, make_pp_layers
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 
@@ -302,7 +302,7 @@ class SolarModel(nn.Module):
             )
         else:
             self.embed_tokens = PPMissingLayer()
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: SolarDecoderLayer(
                 config=config,
@@ -310,8 +310,6 @@ class SolarModel(nn.Module):
                 layer_id=idx,
                 prefix=prefix,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=f"{prefix}.layers",
         )
         _check_skips_stay_in_stage(config, self.start_layer, self.end_layer)

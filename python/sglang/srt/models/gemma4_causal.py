@@ -58,7 +58,7 @@ from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, make_pp_layers
 
 logger = logging.getLogger(__name__)
 
@@ -862,7 +862,7 @@ class Gemma4TextModel(PreTrainedModel):
             self.per_layer_input_scale = None
             self.per_layer_projection_scale = None
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Gemma4DecoderLayer(
                 layer_id=idx,
@@ -870,8 +870,6 @@ class Gemma4TextModel(PreTrainedModel):
                 quant_config=quant_config,
                 prefix=prefix,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
 
