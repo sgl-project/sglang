@@ -408,3 +408,16 @@ class Step3Detector(BaseFormatDetector):
 
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError()
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Flush buffered text when the stream ends.
+
+        The base implementation returns an empty result, so text held back
+        while waiting for a tool-call marker that can no longer arrive would
+        be silently dropped. Release it here as normal text instead.
+        """
+        text = self._buffer
+        self._buffer = ""
+        if text:
+            return StreamingParseResult(normal_text=text)
+        return StreamingParseResult()
