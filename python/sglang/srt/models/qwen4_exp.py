@@ -2,7 +2,6 @@
 
 import math
 from contextlib import nullcontext
-from dataclasses import dataclass
 from typing import Any, Iterable, Optional, Set, Tuple, Union
 
 import msgspec
@@ -170,10 +169,10 @@ class _PLEBatch(msgspec.Struct, frozen=True):
     ngram_eos_token_id: Optional[int]
 
 
-@dataclass
 class _BreakablePLEBatch:
-    # eager_on_graph updates this reference; dynamic layouts stay outside graphs.
-    batch: Optional[_PLEBatch]
+    # _copy_output needs __dict__ to replace batch on replay; Struct uses slots.
+    def __init__(self, batch: Optional[_PLEBatch]):
+        self.batch = batch
 
 
 @eager_on_graph(True)
