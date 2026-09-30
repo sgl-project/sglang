@@ -26,7 +26,7 @@ from transformers.models.ernie4_5_moe.configuration_ernie4_5_moe import (
 from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.layers.layer_boundary import enable_moe_dense_fully_dp
+from sglang.srt.layers.layer_boundary import is_dense_ffn_fully_dp
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
@@ -198,7 +198,7 @@ class Ernie4DecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
             )
         else:
-            if enable_moe_dense_fully_dp():
+            if is_dense_ffn_fully_dp():
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
