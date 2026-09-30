@@ -26,12 +26,12 @@ if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
 ):
     pytest.skip("CAKE KDA export requires SM100/SM103", allow_module_level=True)
 
+from sglang.srt.layers.attention.linear.kernels import (  # noqa: E402
+    kda_flashinfer as kda_flashinfer_module,
+)
 from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (  # noqa: E402
     CakeKDAKernel,
     _get_flashinfer_prepared_bf16_prefill,
-)
-from sglang.srt.layers.attention.linear.kernels import (  # noqa: E402
-    kda_flashinfer as kda_flashinfer_module,
 )
 from sglang.srt.layers.attention.linear.kernels.kda_triton import (  # noqa: E402
     TritonKDAKernel,
@@ -310,9 +310,7 @@ def test_kda_prefill_prepared_export_native_checkpoints():
     "num_heads,seq_lens",
     [(16, [64, 160]), (8, [17, 64, 65, 127, 128, 255]), (16, [8192])],
 )
-def test_kda_prefill_prepared_export_unbounded_gate_matches_triton(
-    num_heads, seq_lens
-):
+def test_kda_prefill_prepared_export_unbounded_gate_matches_triton(num_heads, seq_lens):
     """Kimi-Linear has no gate lower bound; the export serves the unbounded softplus
     gate by default (tile-anchored floored-prefix decay in the fused BF16 schedule)."""
     torch.manual_seed(99 + num_heads + sum(seq_lens))
@@ -460,7 +458,9 @@ def test_kda_prefill_fp32_checkpoints_track_fp32_reference_per_chunk():
     cp_kwargs = dict(
         return_intermediate_states=True,
         track_ssm_h_src=torch.zeros(1, device="cuda", dtype=torch.int64),
-        state_checkpoint_cu_starts=torch.tensor([0, n_cp], device="cuda", dtype=torch.int64),
+        state_checkpoint_cu_starts=torch.tensor(
+            [0, n_cp], device="cuda", dtype=torch.int64
+        ),
         num_state_checkpoints=n_cp,
         state_checkpoint_every_n_tokens=64,
     )

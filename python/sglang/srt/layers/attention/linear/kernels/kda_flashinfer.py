@@ -223,6 +223,8 @@ def _cake_prefill_precision() -> str:
             f"kda_cake_prefill_precision must be bf16 or tf32, got {value!r}"
         )
     return value
+
+
 _flashinfer_kda_prefill_plan_cache_cls = None
 
 
@@ -255,6 +257,8 @@ def _prepared_qkv_layout_supported(
         if t.shape[0] > 1 and t.stride(0) != t.shape[1] * token_stride:
             return False
     return True
+
+
 # FP32 intermediate-state rows are exported per gate kind: index 0 = unbounded
 # softplus gate (lower_bound=None), index 1 = bounded gate.
 _flashinfer_kda_prefill_fp32_checkpoints = (False, False)
@@ -275,8 +279,8 @@ def _get_flashinfer_prepared_bf16_prefill():
     global _flashinfer_kda_prefill_fp32_checkpoints
     if _flashinfer_prepared_bf16_available is None:
         try:
-            from flashinfer import prepare_bf16_kda_prefill
             from flashinfer import kda_prefill as _kda_prefill_module
+            from flashinfer import prepare_bf16_kda_prefill
 
             _flashinfer_prepare_bf16_kda_prefill = prepare_bf16_kda_prefill
             # Same prepared-call ABI on the TF32 export (BF16 q/k/v/out, FP32
@@ -335,7 +339,11 @@ def _maybe_dump_kda_prefill_call(layer_id: int, **tensors) -> None:
     torch.cuda.synchronize()
     os.makedirs(_KDA_PREFILL_DUMP_DIR, exist_ok=True)
     rank = int(os.environ.get("RANK", "-1") or -1)
-    if rank < 0 and torch.distributed.is_available() and torch.distributed.is_initialized():
+    if (
+        rank < 0
+        and torch.distributed.is_available()
+        and torch.distributed.is_initialized()
+    ):
         rank = torch.distributed.get_rank()
     record = {"layer_id": int(layer_id), "rank": max(rank, 0)}
     for name, value in tensors.items():
@@ -889,7 +897,9 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         checkpoint_dtype = (
             torch.float32
             if precision == "bf16"
-            and _flashinfer_kda_prefill_fp32_checkpoints[0 if lower_bound is None else 1]
+            and _flashinfer_kda_prefill_fp32_checkpoints[
+                0 if lower_bound is None else 1
+            ]
             else torch.bfloat16
         )
         state_checkpoints = (
@@ -987,23 +997,35 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         qsl = query_start_loc_fi.detach().to("cpu", dtype=torch.int64)
         problems = []
         if ci.numel() != num_seqs:
-            problems.append(f"cache_indices has {ci.numel()} rows for {num_seqs} sequences")
+            problems.append(
+                f"cache_indices has {ci.numel()} rows for {num_seqs} sequences"
+            )
         if ci.numel():
             lo, hi = int(ci.min()), int(ci.max())
             if lo < 0 or hi >= pool_rows:
-                problems.append(f"cache_indices outside [0, {pool_rows}): min={lo} max={hi}")
+                problems.append(
+                    f"cache_indices outside [0, {pool_rows}): min={lo} max={hi}"
+                )
             if int(torch.unique(ci).numel()) != ci.numel():
                 problems.append("duplicate cache_indices in one batch")
         if qsl.numel() != num_seqs + 1 or int(qsl[0]) != 0:
-            problems.append(f"query_start_loc shape/origin mismatch: {qsl.tolist()[:8]}")
+            problems.append(
+                f"query_start_loc shape/origin mismatch: {qsl.tolist()[:8]}"
+            )
         else:
             diffs = (qsl[1:] - qsl[:-1]).tolist()
             if diffs != [int(n) for n in sequence_lengths]:
-                problems.append(f"query_start_loc diffs {diffs[:8]} != extend_seq_lens_cpu {list(sequence_lengths)[:8]}")
+                problems.append(
+                    f"query_start_loc diffs {diffs[:8]} != extend_seq_lens_cpu {list(sequence_lengths)[:8]}"
+                )
             if int(qsl[-1]) != total_tokens:
-                problems.append(f"query_start_loc[-1]={int(qsl[-1])} != q tokens {total_tokens}")
+                problems.append(
+                    f"query_start_loc[-1]={int(qsl[-1])} != q tokens {total_tokens}"
+                )
         if any(int(n) <= 0 for n in sequence_lengths):
-            problems.append(f"non-positive sequence length in {list(sequence_lengths)[:8]}")
+            problems.append(
+                f"non-positive sequence length in {list(sequence_lengths)[:8]}"
+            )
         ckpt_summary = "ckpt=off"
         if needs_checkpoints:
             every = int(state_checkpoint_every_n_tokens)
@@ -1016,9 +1038,13 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
                 for c in counts:
                     expected.append(expected[-1] + c)
                 if cs.tolist() != expected:
-                    problems.append(f"checkpoint_cu_starts {cs.tolist()[:8]} != expected {expected[:8]}")
+                    problems.append(
+                        f"checkpoint_cu_starts {cs.tolist()[:8]} != expected {expected[:8]}"
+                    )
                 if int(cs[-1]) != int(num_state_checkpoints):
-                    problems.append(f"num_state_checkpoints={num_state_checkpoints} != cu_starts[-1]={int(cs[-1])}")
+                    problems.append(
+                        f"num_state_checkpoints={num_state_checkpoints} != cu_starts[-1]={int(cs[-1])}"
+                    )
                 ckpt_summary = f"ckpt=every{every} rows={int(num_state_checkpoints)}"
         summary = (
             f"cake prepared prefill inputs: T={total_tokens} N={num_seqs} "
