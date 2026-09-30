@@ -17,7 +17,7 @@ use crate::config::{
     InflightLoadConfig, K8sDiscoveryConfig, KvIndexerEndpointConfig, LogFormat, ModelConfig,
     ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
     StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, TokenizerBackend, TokenizerConfig,
-    DEFAULT_FUSE, DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
+    DEFAULT_FUSE, DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS, DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
 };
 
 const DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS: u64 = 100;
@@ -264,6 +264,12 @@ pub struct CacheArgs {
     #[arg(long)]
     pub kv_bootstrap_timeout_ms: Option<u64>,
 
+    /// Cap on one peer-snapshot fetch in milliseconds; raise it when one
+    /// snapshot transfer + decode outgrows it. Requires --kv-peer-selector.
+    /// Defaults to 300000; at least 30000.
+    #[arg(long)]
+    pub kv_bootstrap_fetch_timeout_cap_ms: Option<u64>,
+
     /// Minimum cache-hit tokens for a candidate. Defaults to 1024.
     #[arg(long)]
     pub cache_affinity_min_matched_tokens: Option<u64>,
@@ -398,14 +404,17 @@ impl Cli {
             .transpose()?;
         let circuit_breaker = self.routing.build_circuit_breaker()?;
         let kv_bootstrap_timeout_ms = self.cache.kv_bootstrap_timeout_ms;
+        let kv_bootstrap_fetch_timeout_cap_ms = self.cache.kv_bootstrap_fetch_timeout_cap_ms;
         let cache_aware = self.cache.into_config(self.routing.policy)?;
         // Peer bootstrap grafts into this router's own radix tree, so it needs
         // cache-aware over a local tree; checked here because it spans groups.
         let has_peer_selector = discovery.peer_selector().is_some();
         ensure!(
-            has_peer_selector || kv_bootstrap_timeout_ms.is_none(),
-            "--kv-bootstrap-timeout-ms requires --kv-peer-selector, which is what \
-             enables peer bootstrap"
+            has_peer_selector
+                || (kv_bootstrap_timeout_ms.is_none()
+                    && kv_bootstrap_fetch_timeout_cap_ms.is_none()),
+            "--kv-bootstrap-timeout-ms / --kv-bootstrap-fetch-timeout-cap-ms \
+             require --kv-peer-selector, which is what enables peer bootstrap"
         );
         if has_peer_selector {
             match cache_aware.as_ref().map(|c| c.prefix_provider) {
@@ -701,6 +710,9 @@ impl CacheArgs {
             bootstrap_timeout_ms: self
                 .kv_bootstrap_timeout_ms
                 .unwrap_or(DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS),
+            bootstrap_fetch_timeout_cap_ms: self
+                .kv_bootstrap_fetch_timeout_cap_ms
+                .unwrap_or(DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS),
         }))
     }
 }
@@ -933,6 +945,7 @@ mod tests {
     use super::*;
     use crate::config::{
         DiscoveryBackend, K8sDiscoveryMode, ScoreTermKind, MAX_KV_BOOTSTRAP_TIMEOUT_MS,
+        MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS,
     };
 
     #[test]
@@ -1358,15 +1371,6 @@ mod tests {
         assert!(err.contains("greater than zero"), "got: {err}");
     }
 
-    /// Without a selector the timeout tunes a bootstrap that never runs.
-    #[test]
-    fn rejects_bootstrap_timeout_without_a_peer_selector() {
-        let err = peer_cfg(&["--kv-bootstrap-timeout-ms", "20000"])
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("requires --kv-peer-selector"), "got: {err}");
-    }
-
     /// An empty selector matches every EndpointSlice in the namespace.
     #[test]
     fn rejects_an_empty_peer_selector() {
@@ -1375,6 +1379,42 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("must not be empty"), "{selector:?} got: {err}");
+        }
+    }
+
+    /// Without a selector these tune a bootstrap that never runs.
+    #[test]
+    fn rejects_bootstrap_tuning_without_a_peer_selector() {
+        for flag in [
+            ["--kv-bootstrap-timeout-ms", "20000"],
+            ["--kv-bootstrap-fetch-timeout-cap-ms", "60000"],
+        ] {
+            let err = peer_cfg(&flag).unwrap_err().to_string();
+            assert!(
+                err.contains("require --kv-peer-selector"),
+                "{flag:?} got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn kv_bootstrap_fetch_timeout_cap_bounds() {
+        let parse = |ms: u64| {
+            peer_cfg(&[
+                "--kv-peer-selector",
+                "app=sgl-router",
+                "--kv-bootstrap-fetch-timeout-cap-ms",
+                &ms.to_string(),
+            ])
+        };
+        assert!(parse(MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS).is_ok());
+        assert!(parse(MAX_KV_BOOTSTRAP_TIMEOUT_MS).is_ok());
+        for ms in [
+            MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS - 1,
+            MAX_KV_BOOTSTRAP_TIMEOUT_MS + 1,
+        ] {
+            let err = parse(ms).unwrap_err().to_string();
+            assert!(err.contains("out of range"), "{ms} got: {err}");
         }
     }
 
