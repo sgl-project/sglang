@@ -499,7 +499,7 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
 
         pos_ids = torch.cat(pos_ids, dim=0)
         max_grid_size = int(grid_thw[:, 1:].max())
-        # transformers 5.12's rotary forward takes 1-D position_ids on the input device (grid_thw is CPU).
+        # The vision rotary forward takes 1-D position_ids on the input device (grid_thw is CPU).
         rotary_pos_emb_full = self.rotary_pos_emb(
             torch.arange(max_grid_size, device=self.device)
         )

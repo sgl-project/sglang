@@ -110,6 +110,7 @@ class TestGLM53FlashB200HighThroughput(
         "4",
         "--cuda-graph-backend-prefill",
         "breakable",
+        "--mm-enable-dp-encoder",
     ]
 
 
