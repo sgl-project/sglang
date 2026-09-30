@@ -75,42 +75,55 @@ class ExecFeatures(msgspec.Struct):
     watermark_key: A[
         Optional[str],
         Arg(
-            help="Default hex-encoded 64-bit watermark key. This value is visible "
-            "in the process command line; prefer --watermark-config.",
+            help="Deprecated; set 'key' in --watermark-config. Visible in the "
+            "process command line.",
             resolvable=True,
         ),
     ] = None
     watermark_key_b: A[
         Optional[str],
-        Arg(
-            help="Optional second hex-encoded 64-bit watermark key.",
-            resolvable=True,
-        ),
+        Arg(help="Deprecated; set 'key_b' in --watermark-config.", resolvable=True),
     ] = None
     watermark_mixing_probability: A[
         float,
-        "Probability of selecting watermark key A at each eligible position.",
+        Arg(
+            help="Deprecated; set 'mixing_probability' in --watermark-config.",
+            resolvable=True,
+        ),
     ] = 0.5
     watermark_max_probability: A[
         float,
-        "Skip watermark forcing when the truncated distribution's maximum "
-        "probability exceeds this value.",
+        Arg(
+            help="Deprecated; set 'max_probability' in --watermark-config.",
+            resolvable=True,
+        ),
     ] = 1.0
     watermark_config: A[
         Optional[str],
-        "Path to a JSON file containing key, optional key_b, and context_window.",
+        "Path to a watermark JSON config file with optional key, key_b, "
+        "context_window, mixing_probability, max_probability, default_enabled, "
+        "and enforce_all fields.",
     ] = None
     watermark_context_window: A[
         int,
-        Arg(help="Default and maximum watermark context window.", resolvable=True),
+        Arg(
+            help="Deprecated; set 'context_window' in --watermark-config.",
+            resolvable=True,
+        ),
     ] = 4
     watermark_default_enabled: A[
         bool,
-        "Watermark requests that omit the watermark field using the server key.",
+        Arg(
+            help="Deprecated; set 'default_enabled' in --watermark-config.",
+            resolvable=True,
+        ),
     ] = False
     watermark_enforce_all: A[
         bool,
-        "Require watermarking for every request and reject per-request opt-out.",
+        Arg(
+            help="Deprecated; set 'enforce_all' in --watermark-config.",
+            resolvable=True,
+        ),
     ] = False
     enable_return_hidden_states: A[
         bool,

@@ -54,10 +54,10 @@ def redact_watermark_secrets(value: Any, *, in_watermark_config: bool = False) -
             context_window=value.context_window,
         )
     if isinstance(value, WatermarkServerConfig):
-        return WatermarkServerConfig(
-            key="<redacted>",
+        return msgspec.structs.replace(
+            value,
+            key="<redacted>" if value.key is not None else None,
             key_b="<redacted>" if value.key_b is not None else None,
-            context_window=value.context_window,
         )
     if isinstance(value, msgspec.Struct):
         result = copy.copy(value)
@@ -200,8 +200,8 @@ def resolve_watermark_request(
     if config is not None and config.context_window is not None:
         if config.context_window > default_context_window:
             raise ValueError(
-                "request watermark context_window cannot exceed the server "
-                "--watermark-context-window"
+                "request watermark context_window cannot exceed the server's "
+                "watermark context_window"
             )
 
     if config is None:
@@ -215,8 +215,8 @@ def resolve_watermark_request(
                 )
             if enforce_all:
                 raise ValueError(
-                    "request watermark enabled=false is not allowed when "
-                    "--watermark-enforce-all is set"
+                    "request watermark enabled=false is not allowed when the "
+                    "server sets watermark enforce_all"
                 )
             return None, context_window, False
         enabled = config.enabled is True or config.key is not None

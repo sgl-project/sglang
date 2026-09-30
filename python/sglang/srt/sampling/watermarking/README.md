@@ -64,7 +64,7 @@ The [operator guide's detector specification](../../../../../docs/docs/advanced_
 - **Ring buffer.** Each `req_pool_idx` owns the committed prompt/output tail used to reconstruct contexts. GPU state avoids stale CPU output IDs under overlap scheduling and supplies current contexts for every speculative tree row.
 - **Repeated-context masking.** A context hash is forced at most once per request. Repeated contexts use ordinary sampling, preventing a deterministic short cycle from repeatedly excluding EOS. Only forced contexts enter the history.
 - **Greedy bypass.** Rows normalized to `top_k <= 1`, including `temperature=0`, use ordinary greedy selection and are not recorded.
-- **Entropy gate.** A row uses ordinary sampling when its largest truncated probability exceeds `--watermark-max-probability`. Skipped contexts remain eligible for a later higher-entropy occurrence.
+- **Entropy gate.** A row uses ordinary sampling when its largest truncated probability exceeds the server's `max_probability`. Skipped contexts remain eligible for a later higher-entropy occurrence.
 - **Speculative decoding.** NGRAM, EAGLE, EAGLE3, and NEXTN reconstruct verify-row contexts from the committed ring tail, tree mask, draft tokens, and positions. Forcing clones logits only when speculative logprobs are requested, so logprob computation sees the pre-watermark target distribution. Fused kernels admit contexts and append only accepted tokens.
 - **Selector paths.** Finite `top_k <= 8,192` uses `torch.topk`, canonicalizes boundary ties, and performs small-k truncation. Unlimited top-k retains full-vocabulary sorting. Both paths use the same hash and selection contract.
 - **Disabled-batch exit.** A host-side candidate bit follows filtering and merging. Fully disabled or greedy-only batches skip prompt initialization, verify cloning, selector work, and append kernels.
@@ -92,19 +92,19 @@ The Triton selector and state kernels live in `sglang/kernels/ops/sampling/texts
 
 ## Server configuration
 
-| Argument | Default | Behavior |
-| --- | --- | --- |
-| `--enable-watermark` | disabled | Allocates CUDA watermark state and accepts request configuration. |
-| `--watermark-config PATH` | unset | Loads `key`, optional `key_b`, and `context_window` from JSON. |
-| `--watermark-key HEX` | unset | Server key A. Prefer the file option because command-line values are process-visible. |
-| `--watermark-key-b HEX` | unset | Enables dual-key mode with server key B. Requires key A. |
-| `--watermark-mixing-probability P` | `0.5` | Probability of selecting key A for an eligible context. |
-| `--watermark-max-probability P` | `1.0` | Uses ordinary sampling when the largest truncated probability exceeds `P`. |
-| `--watermark-context-window N` | `4` | Default context window and per-request maximum, from 1 to 64. |
-| `--watermark-default-enabled` | disabled | Uses the server key when a request omits `watermark`; explicit opt-out remains allowed. |
-| `--watermark-enforce-all` | disabled | Uses the server key by default and rejects explicit opt-out. |
+`--enable-watermark` allocates CUDA watermark state and accepts request configuration. All other settings come from one JSON file passed with `--watermark-config PATH`; every field is optional and unknown fields are rejected.
 
-`--watermark-config` and `--watermark-key` are mutually exclusive. A config-file `key_b` is mutually exclusive with `--watermark-key-b`; the CLI option may supplement a file that omits `key_b`. Default-on and enforce-all modes require a server key. A server key without either mode remains available only to requests that opt in.
+| Field | Default | Behavior |
+| --- | --- | --- |
+| `key` | unset | Server key A. |
+| `key_b` | unset | Enables dual-key mode with server key B. Requires key A. |
+| `context_window` | `4` | Default context window and per-request maximum, from 1 to 64. |
+| `mixing_probability` | `0.5` | Probability of selecting key A for an eligible context; a non-default value requires `key_b`. |
+| `max_probability` | `1.0` | Uses ordinary sampling when the largest truncated probability exceeds this value. |
+| `default_enabled` | `false` | Uses the server key when a request omits `watermark`; explicit opt-out remains allowed. |
+| `enforce_all` | `false` | Uses the server key by default and rejects explicit opt-out. |
+
+Default-on and enforce-all modes require a server key. A server key without either mode remains available only to requests that opt in. The per-field flags (`--watermark-key`, `--watermark-key-b`, `--watermark-context-window`, `--watermark-mixing-probability`, `--watermark-max-probability`, `--watermark-default-enabled`, `--watermark-enforce-all`) are deprecated: each logs a warning, applies only when the file leaves its field unset, and conflicts with a file that sets it.
 
 Use a regular config file readable only by the server account. Launch-command, request-log, server-info, and crash-payload rendering redacts key fields and the config path. Process command lines, client request bodies, and process or GPU core dumps remain separate secret-bearing surfaces.
 

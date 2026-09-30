@@ -36,66 +36,69 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
-def _write_config(path, *, key="0123456789abcdef", key_b=None, context_window=4):
-    config = {"key": key, "context_window": context_window}
-    if key_b is not None:
-        config["key_b"] = key_b
-    path.write_text(json.dumps(config), encoding="utf-8")
+def _write_config(path, **fields):
+    config = {"key": "0123456789abcdef", "context_window": 4, **fields}
+    path.write_text(
+        json.dumps(
+            {name: value for name, value in config.items() if value is not None}
+        ),
+        encoding="utf-8",
+    )
     os.chmod(path, 0o600)
 
 
-def test_file_config_resolution_contract(tmp_path):
+_FULL_CONFIG = {
+    "key": "0123456789abcdef",
+    "key_b": "fedcba9876543210",
+    "context_window": 2,
+    "mixing_probability": 0.25,
+    "max_probability": 0.9,
+    "default_enabled": True,
+    "enforce_all": True,
+}
+
+
+def test_config_resolution_matrix(tmp_path, caplog):
     config_path = tmp_path / "watermark.json"
-    _write_config(config_path, key_b="fedcba9876543210", context_window=2)
+    _write_config(config_path, **_FULL_CONFIG)
     server_args = ServerArgs(
         model_path="dummy",
         device="cuda",
         enable_watermark=True,
         watermark_config=str(config_path),
-        watermark_context_window=9,
-        watermark_default_enabled=True,
     )
-
-    server_args.resolve_once()
+    with caplog.at_level(logging.WARNING):
+        server_args.resolve_once()
     check_watermark_server_args(server_args)
-
-    assert resolution_result(server_args, "watermark_key") == "0123456789abcdef"
-    assert resolution_result(server_args, "watermark_key_b") == "fedcba9876543210"
-    assert resolution_result(server_args, "watermark_context_window") == 2
+    assert "deprecated" not in caplog.text
+    for field, value in _FULL_CONFIG.items():
+        assert resolution_result(server_args, f"watermark_{field}") == value
     assert server_args.watermark_key is None
-    assert server_args.watermark_key_b is None
-    assert server_args.watermark_context_window == 9
+    assert server_args.watermark_context_window == 4
 
     manager = object.__new__(TokenizerManager)
     manager.server_args = server_args
     publish(server_args, role="test")
     try:
-        assert b"0123456789abcdef" not in pickle.dumps(manager._server_args_for_dump())
-        assert b"fedcba9876543210" not in pickle.dumps(manager._server_args_for_dump())
+        dumped = pickle.dumps(manager._server_args_for_dump())
+        assert b"0123456789abcdef" not in dumped
+        assert b"fedcba9876543210" not in dumped
     finally:
         reset_context()
 
-
-def test_default_key_source_validation(tmp_path, monkeypatch):
-    config_path = tmp_path / "watermark.json"
-    _write_config(config_path)
-
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        ServerArgs(
-            model_path="dummy",
-            enable_watermark=True,
-            watermark_key="0123456789abcdef",
-            watermark_config=str(config_path),
-        ).resolve_once()
-
-    _write_config(config_path, key_b="fedcba9876543210")
-    with pytest.raises(ValueError, match="key_b.*mutually exclusive"):
-        ServerArgs(
-            model_path="dummy",
-            enable_watermark=True,
-            watermark_config=str(config_path),
-            watermark_key_b="1111222233334444",
-        ).resolve_once()
+    caplog.clear()
+    server_args = ServerArgs(
+        model_path="dummy",
+        device="cuda",
+        enable_watermark=True,
+        watermark_key="0123456789abcdef",
+        watermark_enforce_all=True,
+    )
+    with caplog.at_level(logging.WARNING):
+        server_args.resolve_once()
+    check_watermark_server_args(server_args)
+    assert "--watermark-key is deprecated" in caplog.text
+    assert "--watermark-enforce-all is deprecated" in caplog.text
 
     _write_config(config_path)
     server_args = ServerArgs(
@@ -105,7 +108,37 @@ def test_default_key_source_validation(tmp_path, monkeypatch):
         watermark_key_b="1111222233334444",
     )
     server_args.resolve_once()
+    assert resolution_result(server_args, "watermark_key") == "0123456789abcdef"
     assert resolution_result(server_args, "watermark_key_b") == "1111222233334444"
+
+
+@pytest.mark.parametrize(
+    ("field", "flag_value"),
+    [
+        ("key", "1111222233334444"),
+        ("key_b", "1111222233334444"),
+        ("context_window", 3),
+        ("mixing_probability", 0.3),
+        ("max_probability", 0.8),
+        ("default_enabled", True),
+        ("enforce_all", True),
+    ],
+)
+def test_config_field_conflicts_with_deprecated_flag(tmp_path, field, flag_value):
+    config_path = tmp_path / "watermark.json"
+    _write_config(config_path, **{field: _FULL_CONFIG[field]})
+    with pytest.raises(ValueError, match=f"config {field} and .* mutually exclusive"):
+        ServerArgs(
+            model_path="dummy",
+            enable_watermark=True,
+            watermark_config=str(config_path),
+            **{f"watermark_{field}": flag_value},
+        ).resolve_once()
+
+
+def test_default_key_source_validation(tmp_path, monkeypatch):
+    config_path = tmp_path / "watermark.json"
+    _write_config(config_path)
 
     server_args = ServerArgs(
         model_path="dummy",
@@ -224,7 +257,7 @@ def test_dual_key_requires_complete_server_config():
         watermark_key_b="fedcba9876543210",
     )
     server_args.resolve_once()
-    with pytest.raises(ValueError, match="requires --watermark-key"):
+    with pytest.raises(ValueError, match="key_b requires a server key"):
         check_watermark_server_args(server_args)
 
     server_args = ServerArgs(
@@ -235,7 +268,7 @@ def test_dual_key_requires_complete_server_config():
         watermark_mixing_probability=0.25,
     )
     server_args.resolve_once()
-    with pytest.raises(ValueError, match="requires --watermark-key-b"):
+    with pytest.raises(ValueError, match="requires key_b"):
         check_watermark_server_args(server_args)
 
 
@@ -251,7 +284,7 @@ def test_default_modes_require_server_key(mode_flag):
         **{mode_flag: True},
     )
     server_args.resolve_once()
-    with pytest.raises(ValueError, match="require --watermark-key"):
+    with pytest.raises(ValueError, match="require a server key"):
         check_watermark_server_args(server_args)
 
 
@@ -418,6 +451,14 @@ def test_config_file_security_guards(tmp_path, caplog):
 
     _write_config(config_path, key_b="not-hex")
     with pytest.raises(WatermarkConfigError, match="only hex digits"):
+        load_watermark_config(str(config_path))
+
+    _write_config(config_path, enforce_all="true")
+    with pytest.raises(WatermarkConfigError, match="must be a boolean"):
+        load_watermark_config(str(config_path))
+
+    _write_config(config_path, mixing_probability=True)
+    with pytest.raises(WatermarkConfigError, match="must be a number"):
         load_watermark_config(str(config_path))
 
     fifo_path = tmp_path / "watermark.fifo"

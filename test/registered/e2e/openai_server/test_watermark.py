@@ -70,7 +70,7 @@ def _assert_detected(response, key, *, other_key=None):
 
 
 class WatermarkServerTest(CustomTestCase):
-    mode_args = []
+    config_fields = {}
     process = None
     config_file = None
 
@@ -79,7 +79,9 @@ class WatermarkServerTest(CustomTestCase):
         cls.config_file = tempfile.NamedTemporaryFile(
             mode="w", suffix=".json", delete=False
         )
-        json.dump({"key": _KEY_A, "context_window": 4}, cls.config_file)
+        json.dump(
+            {"key": _KEY_A, "context_window": 4, **cls.config_fields}, cls.config_file
+        )
         cls.config_file.close()
         os.chmod(cls.config_file.name, 0o600)
         cls.process = popen_launch_server(
@@ -90,7 +92,6 @@ class WatermarkServerTest(CustomTestCase):
                 "--enable-watermark",
                 "--watermark-config",
                 cls.config_file.name,
-                *cls.mode_args,
             ],
         )
 
@@ -131,7 +132,7 @@ class TestWatermarkRequestEndpoint(WatermarkServerTest):
 
 
 class TestWatermarkDefaultEnabledEndpoint(WatermarkServerTest):
-    mode_args = ["--watermark-default-enabled"]
+    config_fields = {"default_enabled": True}
 
     def test_omitted_request_uses_server_key_and_opt_out_is_allowed(self):
         response = requests.post(
@@ -217,7 +218,7 @@ class TestWatermarkDefaultEnabledEndpoint(WatermarkServerTest):
 
 
 class TestWatermarkEnforceAllEndpoint(WatermarkServerTest):
-    mode_args = ["--watermark-enforce-all"]
+    config_fields = {"enforce_all": True}
 
     def test_omitted_request_uses_server_key_and_opt_out_is_rejected(self):
         response = requests.post(

@@ -130,7 +130,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--watermark-config", required=True)
     parser.add_argument("--tokenizer")
     parser.add_argument("--max-contexts", type=int, default=4096)
-    parser.add_argument("--mixing-probability", type=probability, default=0.5)
     parser.add_argument("--p-value-threshold", type=probability, default=0.01)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -139,11 +138,17 @@ def parse_args() -> argparse.Namespace:
 
 def main(args: argparse.Namespace) -> None:
     config = load_watermark_config(args.watermark_config)
+    if config.key is None:
+        raise ValueError("watermark config must set key")
     detector = WatermarkDetector(
         config.key,
         key_b=config.key_b,
-        mixing_probability=args.mixing_probability,
-        context_window=config.context_window,
+        mixing_probability=(
+            config.mixing_probability if config.mixing_probability is not None else 0.5
+        ),
+        context_window=(
+            config.context_window if config.context_window is not None else 4
+        ),
         max_contexts=args.max_contexts,
     )
     uvicorn.run(

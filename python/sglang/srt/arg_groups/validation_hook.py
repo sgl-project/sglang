@@ -60,7 +60,7 @@ def check_watermark_server_args(server_args: Any) -> None:
     )
     if has_watermark_setting and not cfg.enable_watermark:
         raise ValueError(
-            "watermark key, config, and mode arguments require --enable-watermark"
+            "--watermark-config and watermark settings require --enable-watermark"
         )
 
     if not cfg.enable_watermark:
@@ -75,29 +75,26 @@ def check_watermark_server_args(server_args: Any) -> None:
     if cfg.watermark_key_b is not None:
         parse_watermark_key(cfg.watermark_key_b)
         if cfg.watermark_key is None:
-            raise ValueError(
-                "--watermark-key-b requires --watermark-key or --watermark-config"
-            )
+            raise ValueError("watermark key_b requires a server key")
     if not 0 < cfg.watermark_mixing_probability < 1:
         raise ValueError(
-            "--watermark-mixing-probability must be strictly between 0 and 1"
+            "watermark mixing_probability must be strictly between 0 and 1"
         )
     if cfg.watermark_key_b is None and cfg.watermark_mixing_probability != 0.5:
-        raise ValueError("--watermark-mixing-probability requires --watermark-key-b")
+        raise ValueError("watermark mixing_probability requires key_b")
     if not 0 < cfg.watermark_max_probability <= 1:
         raise ValueError(
-            "--watermark-max-probability must be greater than 0 and at most 1"
+            "watermark max_probability must be greater than 0 and at most 1"
         )
     if (
         cfg.watermark_default_enabled or cfg.watermark_enforce_all
     ) and cfg.watermark_key is None:
         raise ValueError(
-            "--watermark-default-enabled and --watermark-enforce-all require "
-            "--watermark-key or --watermark-config"
+            "watermark default_enabled and enforce_all require a server key"
         )
     if not 1 <= cfg.watermark_context_window <= MAX_WATERMARK_CONTEXT_WINDOW:
         raise ValueError(
-            "--watermark-context-window must be from 1 to 64, "
+            "watermark context_window must be from 1 to 64, "
             f"got {cfg.watermark_context_window!r}"
         )
     if cfg.enable_custom_logit_processor:

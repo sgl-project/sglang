@@ -21,14 +21,23 @@ class WatermarkConfigError(ValueError):
 
 
 class WatermarkServerConfig(msgspec.Struct, frozen=True, kw_only=True):
-    key: str
-    context_window: int
+    # None marks a field the file leaves unset, so server defaults still apply.
+    key: str | None = None
     key_b: str | None = None
+    context_window: int | None = None
+    mixing_probability: float | None = None
+    max_probability: float | None = None
+    default_enabled: bool | None = None
+    enforce_all: bool | None = None
 
     def __repr__(self) -> str:
         return (
             "WatermarkServerConfig(key=<redacted>, key_b=<redacted>, "
-            f"context_window={self.context_window!r})"
+            f"context_window={self.context_window!r}, "
+            f"mixing_probability={self.mixing_probability!r}, "
+            f"max_probability={self.max_probability!r}, "
+            f"default_enabled={self.default_enabled!r}, "
+            f"enforce_all={self.enforce_all!r})"
         )
 
 
@@ -71,21 +80,17 @@ def load_watermark_config(path: str) -> WatermarkServerConfig:
         raise WatermarkConfigError("failed to read watermark config JSON") from error
     if not isinstance(raw, dict):
         raise WatermarkConfigError("watermark config must be a JSON object")
-    if set(raw) - {"key", "key_b", "context_window"}:
+    if set(raw) - set(WatermarkServerConfig.__struct_fields__):
         raise WatermarkConfigError("watermark config contains unknown fields")
-    if not {"key", "context_window"}.issubset(raw):
-        raise WatermarkConfigError("watermark config requires key and context_window")
 
-    key = raw["key"]
-    key_b = raw.get("key_b")
     try:
-        parse_watermark_key(key)
-        if key_b is not None:
-            parse_watermark_key(key_b)
+        for name in ("key", "key_b"):
+            if raw.get(name) is not None:
+                parse_watermark_key(raw[name])
     except ValueError as error:
         raise WatermarkConfigError(str(error)) from error
-    context_window = raw["context_window"]
-    if (
+    context_window = raw.get("context_window")
+    if context_window is not None and (
         isinstance(context_window, bool)
         or not isinstance(context_window, int)
         or not 1 <= context_window <= MAX_WATERMARK_CONTEXT_WINDOW
@@ -93,4 +98,13 @@ def load_watermark_config(path: str) -> WatermarkServerConfig:
         raise WatermarkConfigError(
             "watermark config context_window must be an integer from 1 to 64"
         )
-    return WatermarkServerConfig(key=key, key_b=key_b, context_window=context_window)
+    for name in ("mixing_probability", "max_probability"):
+        value = raw.get(name)
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, (int, float))
+        ):
+            raise WatermarkConfigError(f"watermark config {name} must be a number")
+    for name in ("default_enabled", "enforce_all"):
+        if raw.get(name) is not None and not isinstance(raw[name], bool):
+            raise WatermarkConfigError(f"watermark config {name} must be a boolean")
+    return WatermarkServerConfig(**raw)

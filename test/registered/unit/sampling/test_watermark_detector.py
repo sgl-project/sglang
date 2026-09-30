@@ -175,7 +175,14 @@ class TestWatermarkDetectionServer(CustomTestCase):
         self.addCleanup(config_dir.cleanup)
         config_path = Path(config_dir.name) / "watermark.json"
         config_path.write_text(
-            json.dumps({"key": _KEY_A, "key_b": _KEY_B, "context_window": 4})
+            json.dumps(
+                {
+                    "key": _KEY_A,
+                    "key_b": _KEY_B,
+                    "context_window": 4,
+                    "mixing_probability": 0.3,
+                }
+            )
         )
         config_path.chmod(0o600)
         repository_root = Path(__file__).resolve().parents[4]
@@ -188,8 +195,6 @@ class TestWatermarkDetectionServer(CustomTestCase):
             "127.0.0.1",
             "--port",
             str(port),
-            "--mixing-probability",
-            "0.3",
             "--p-value-threshold",
             "0.0001",
         ]
