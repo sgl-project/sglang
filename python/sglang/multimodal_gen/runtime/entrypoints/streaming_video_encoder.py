@@ -2,7 +2,7 @@
 """H.264-encode decoded video chunks while later chunks are still decoding.
 
 A decoding stage pushes each finished temporal chunk and hands the encoder to
-the worker's direct MP4 save through ``OutputBatch.streamed_video``; the save
+the worker's direct MP4 save through ``OutputBatch.streaming_encoder``; the save
 then only muxes the audio track. The pushed frames must equal the final output
 tensor, or the save falls back to encoding that tensor."""
 
@@ -36,7 +36,7 @@ class StreamingVideoEncoder:
         crf: int,
     ) -> None:
         self.save_file_path = save_file_path
-        self.shape = (height, width)
+        self.frame_hw = (height, width)
         self.num_frames = 0
         self.video_path = f"{save_file_path}.video.mp4"
         self._error: Optional[BaseException] = None
@@ -86,7 +86,7 @@ class StreamingVideoEncoder:
         """Queue float frames [3, T, H, W] in [0, 1] from the current CUDA stream."""
         if self._error is not None:
             return
-        if frames.shape[0] != 3 or tuple(frames.shape[-2:]) != self.shape:
+        if frames.shape[0] != 3 or tuple(frames.shape[-2:]) != self.frame_hw:
             self._error = ValueError(f"unexpected chunk shape {tuple(frames.shape)}")
             return
         # the direct CUDA save converts the final tensor the same way
@@ -131,7 +131,7 @@ class StreamingVideoEncoder:
         self._error = RuntimeError("aborted")
         self._process.kill()
         self._close_video()
-        _remove(self.video_path)
+        _remove_if_exists(self.video_path)
 
     def finish(
         self,
@@ -152,7 +152,7 @@ class StreamingVideoEncoder:
             logger.warning(
                 "Streaming video encode failed (%s); encoding the output.", self._error
             )
-            _remove(self.video_path)
+            _remove_if_exists(self.video_path)
             return False
         audio_np = _utils._normalize_audio_to_numpy(audio)
         if audio_np is None:
@@ -197,15 +197,15 @@ class StreamingVideoEncoder:
             )
         except (OSError, subprocess.CalledProcessError) as exc:
             logger.warning("Streaming video mux failed (%s); encoding the output.", exc)
-            _remove(save_file_path)
+            _remove_if_exists(save_file_path)
             return False
         finally:
-            _remove(self.video_path)
-            _remove(wav_path)
+            _remove_if_exists(self.video_path)
+            _remove_if_exists(wav_path)
         return True
 
 
-def _remove(path: str) -> None:
+def _remove_if_exists(path: str) -> None:
     try:
         os.remove(path)
     except FileNotFoundError:

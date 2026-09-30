@@ -295,9 +295,9 @@ class _Workspace:
     ) -> None:
         n_tiles = meta.num_tiles
         self.n_tiles = n_tiles
-        self.native = can_use_vsa_block_sparse_sm100(device.index, dtype, head_dim)
-        n_alloc = n_tiles + (n_tiles % 2 if self.native else 0)
-        seq_pad = n_alloc * VSA_H3_TILE_ELEMS
+        self.use_sm100_kernel = can_use_vsa_block_sparse_sm100(device.index, dtype, head_dim)
+        n_tiles_padded = n_tiles + (n_tiles % 2 if self.use_sm100_kernel else 0)
+        seq_pad = n_tiles_padded * VSA_H3_TILE_ELEMS
         self.key = _workspace_key(meta, heads, head_dim, has_gate, dtype, device)
         self.tiled = torch.zeros(
             (3 + int(has_gate), heads, seq_pad, head_dim), dtype=dtype, device=device
@@ -308,14 +308,14 @@ class _Workspace:
         self.out_tiled = torch.empty(
             (heads, seq_pad, head_dim), dtype=dtype, device=device
         )
-        self.block_sizes = torch.zeros(n_alloc, dtype=torch.int32, device=device)
+        self.block_sizes = torch.zeros(n_tiles_padded, dtype=torch.int32, device=device)
         self.block_sizes[:n_tiles] = meta.variable_block_sizes
         all_tiles = torch.arange(n_tiles, dtype=torch.int32, device=device)
         self.dense_index = torch.zeros(
-            (heads, n_alloc, n_tiles), dtype=torch.int32, device=device
+            (heads, n_tiles_padded, n_tiles), dtype=torch.int32, device=device
         )
         self.dense_index[:, :n_tiles] = all_tiles
-        self.dense_num = torch.zeros((heads, n_alloc), dtype=torch.int32, device=device)
+        self.dense_num = torch.zeros((heads, n_tiles_padded), dtype=torch.int32, device=device)
         self.dense_num[:, :n_tiles] = n_tiles
         self.q2k_index = self.dense_index.clone()
         self.q2k_num = self.dense_num.clone()
@@ -334,7 +334,7 @@ class _Workspace:
         return self.q2k_index, self.q2k_num
 
 
-def vsa_h3_gate_tile_index(
+def _gate_tile_index(
     meta: VideoSparseAttentionH3Metadata, row_start: int, num_rows: int
 ) -> torch.Tensor:
     """Tile of each packed row in the shard, -1 for pad rows."""
@@ -363,7 +363,7 @@ def vsa_h3_fold_gate(
         out,
         gate_compress,
         out_compress,
-        vsa_h3_gate_tile_index(meta, row_start, out.shape[0]),
+        _gate_tile_index(meta, row_start, out.shape[0]),
     )
 
 
@@ -510,7 +510,7 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
 
         sparsity = 0.0 if self.layer_idx in meta.dense_layers else meta.VSA_sparsity
         has_gate = gate_compress is not None
-        want_compress = has_gate or return_compress
+        needs_compress = has_gate or return_compress
         ws = _get_workspace(meta, query, has_gate)
 
         vsa_h3_pack_tiles(
@@ -526,7 +526,7 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
         q_pooled, k_pooled, v_pooled = ws.pooled
 
         scores = None
-        if sparsity > 0.0 or want_compress:
+        if sparsity > 0.0 or needs_compress:
             scores = torch.matmul(q_pooled, k_pooled.transpose(-2, -1)) * (
                 self.head_size**-0.5
             )
@@ -540,11 +540,11 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
             q2k_num[None],
             ws.block_sizes,
             out=ws.out_tiled[None],
-            native=ws.native,
+            use_sm100_kernel=ws.use_sm100_kernel,
         )
 
         out_compress = None
-        if want_compress:
+        if needs_compress:
             out_compress = torch.matmul(torch.softmax(scores, dim=-1), v_pooled)
 
         result = torch.empty(query.shape, dtype=query.dtype, device=query.device)

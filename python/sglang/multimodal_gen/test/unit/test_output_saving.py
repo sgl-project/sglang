@@ -256,20 +256,20 @@ def test_streamed_video_matches_direct_save(tmp_path):
         start_streaming_video_encoder,
     )
 
-    if output_utils._path_ffmpeg_with_libx264() is None:
+    if output_utils._system_ffmpeg_with_libx264() is None:
         pytest.skip("requires ffmpeg with libx264")
     generator = torch.Generator(device="cpu").manual_seed(0)
     video = torch.rand((3, 20, 64, 96), generator=generator).half().cuda()
     audio = torch.rand((2, 20 * 32000 // 24), generator=generator) * 0.2 - 0.1
 
-    def save(path, streamed_video=None):
+    def save(path, streaming_encoder=None):
         return output_utils._try_save_cuda_video_direct(
             save_file_path=str(path),
             sample=(video.float(), audio),
             fps=24,
             audio_sample_rate=32000,
             output_compression=None,
-            streamed_video=streamed_video,
+            streaming_encoder=streaming_encoder,
         )
 
     def decoded_stream(path, stream):
@@ -297,7 +297,7 @@ def test_streamed_video_matches_direct_save(tmp_path):
         assert encoder is not None
         for start, end in zip(chunk_starts, chunk_starts[1:]):
             encoder.push(video[:, start:end])
-        assert save(tmp_path / name, streamed_video=encoder)
+        assert save(tmp_path / name, streaming_encoder=encoder)
         for stream in ("0:v:0", "0:a:0"):
             assert decoded_stream(tmp_path / name, stream) == decoded_stream(
                 tmp_path / "direct.mp4", stream

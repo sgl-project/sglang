@@ -438,7 +438,7 @@ class MiniMaxH3DecodingStage(DecodingStage):
                 frame_sink.encoder.abort()
             raise
         if frame_sink is not None:
-            output.streamed_video = frame_sink.encoder
+            output.streaming_encoder = frame_sink.encoder
         return output
 
     def _decode_outputs(

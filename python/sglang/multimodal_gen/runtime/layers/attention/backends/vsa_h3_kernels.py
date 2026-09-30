@@ -109,11 +109,11 @@ def vsa_h3_block_sparse_attn_forward(
     q2k_num: torch.Tensor,
     variable_block_sizes: torch.Tensor,
     out: torch.Tensor | None = None,
-    native: bool = False,
+    use_sm100_kernel: bool = False,
 ) -> torch.Tensor:
     """q/k/v: contiguous [B, H, S_pad, D] bf16 with S_pad = n_tiles * 64; pad
     rows zero. q2k_index/q2k_num: contiguous [B, H, n_tiles, max_kv] /
-    [B, H, n_tiles] int32. ``native`` runs FastVideo's tcgen05 kernel (sm_100a /
+    [B, H, n_tiles] int32. ``use_sm100_kernel`` runs FastVideo's tcgen05 kernel (sm_100a /
     sm_103a, even n_tiles) instead of the Triton kernel."""
     batch, heads, seq_q, head_dim = q.shape
     seq_kv = k.shape[2]
@@ -129,7 +129,7 @@ def vsa_h3_block_sparse_attn_forward(
         )
     if out is None:
         out = torch.empty_like(q)
-    if native:
+    if use_sm100_kernel:
         vsa_block_sparse_sm100(
             q,
             k,

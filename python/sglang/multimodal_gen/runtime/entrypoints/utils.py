@@ -300,7 +300,7 @@ def _pick_audio_sample_rate(
 
 
 @functools.lru_cache(maxsize=1)
-def _path_ffmpeg_with_libx264() -> Optional[str]:
+def _system_ffmpeg_with_libx264() -> Optional[str]:
     ffmpeg_on_path = shutil.which("ffmpeg")
     if not ffmpeg_on_path:
         return None
@@ -318,7 +318,7 @@ def _path_ffmpeg_with_libx264() -> Optional[str]:
 
 def _resolve_ffmpeg_exe() -> str:
     # imageio's bundled static ffmpeg is old and encodes H.264 much slower
-    ffmpeg_exe = _path_ffmpeg_with_libx264()
+    ffmpeg_exe = _system_ffmpeg_with_libx264()
     if ffmpeg_exe is not None:
         return ffmpeg_exe
     ffmpeg_exe = "ffmpeg"
@@ -389,11 +389,11 @@ def _try_save_cuda_video_direct(
     fps: int,
     audio_sample_rate: Optional[int],
     output_compression: Optional[int],
-    streamed_video: Any = None,
+    streaming_encoder: Any = None,
 ) -> bool:
     """Stream CUDA RGB chunks to ffmpeg through a registered memfd.
 
-    ``streamed_video`` is a ``StreamingVideoEncoder`` that already encoded
+    ``streaming_encoder`` is a ``StreamingVideoEncoder`` that already encoded
     these frames during decode; only its audio mux remains."""
     if not hasattr(os, "memfd_create") or not hasattr(os, "sendfile"):
         return False
@@ -415,7 +415,7 @@ def _try_save_cuda_video_direct(
         return False
 
     _, num_frames, height, width = video.shape
-    if streamed_video is not None and streamed_video.finish(
+    if streaming_encoder is not None and streaming_encoder.finish(
         save_file_path=save_file_path,
         num_frames=num_frames,
         audio=audio,
@@ -1075,7 +1075,7 @@ def save_outputs(
     enable_upscaling: bool = False,
     upscaling_model_path: Optional[str] = None,
     upscaling_scale: int = 4,
-    streamed_video: Any = None,
+    streaming_encoder: Any = None,
 ) -> list[str]:
     output_paths: list[str] = []
     samples = (
@@ -1139,7 +1139,7 @@ def save_outputs(
                         fps=fps,
                         audio_sample_rate=audio_sample_rate,
                         output_compression=output_compression,
-                        streamed_video=streamed_video if len(outputs) == 1 else None,
+                        streaming_encoder=streaming_encoder if len(outputs) == 1 else None,
                     )
                 if direct_saved:
                     if samples_out is not None:

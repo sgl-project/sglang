@@ -497,7 +497,7 @@ class OutputBatch:
     error: str | None = None
     output_file_paths: list[str] | None = None
     # StreamingVideoEncoder the worker's MP4 save adopts; never leaves the worker.
-    streamed_video: Any = None
+    streaming_encoder: Any = None
 
     # logged metrics info, directly from Req.timings
     metrics: Optional[RequestMetrics] = None
