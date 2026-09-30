@@ -294,6 +294,79 @@ def _moe_sorting_small_kernel_distributed(
             tl.store(qscale_ptr + sw, exp.to(tl.uint8))
 
 
+# no-quant path: histogram + bitonic sort keep every pair in registers of one CTA
+@triton.jit(do_not_specialize=["M", "moe_buf_numel", "num_buf"])
+def _moe_sorting_small_kernel_sorted(
+    topk_ids_ptr,  # [M, topk] i32
+    topk_weights_ptr,  # [M, topk] fp32
+    sorted_ids_ptr,  # [max_padded] i32
+    sorted_weights_ptr,  # [max_padded] fp32
+    sorted_expert_ids_ptr,  # [max_blocks] i32
+    num_valid_ids_ptr,  # [2] i32
+    moe_buf_ptr,
+    moe_buf_numel,
+    M,
+    TOPK: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    P_POW2: tl.constexpr,  # >= M * topk
+    E_POW2: tl.constexpr,  # > num_experts; bin E_POW2 - 1 holds the inactive lanes
+    PAD_POW2: tl.constexpr,  # >= (M * topk) * BLOCK_SIZE (worst-case padded len)
+    BUF_BLOCK: tl.constexpr,
+    num_buf,  # buf-zero CTAs occupy pids [1, num_buf]
+):
+    pid = tl.program_id(0)
+    if pid > 0:
+        offs = (pid - 1) * BUF_BLOCK + tl.arange(0, BUF_BLOCK)
+        tl.store(
+            moe_buf_ptr + offs,
+            tl.zeros((BUF_BLOCK,), moe_buf_ptr.dtype.element_ty),
+            mask=offs < moe_buf_numel,
+        )
+        return
+
+    P = M * TOPK
+    offs_p = tl.arange(0, P_POW2)
+    e = tl.load(topk_ids_ptr + offs_p, mask=offs_p < P, other=E_POW2 - 1)
+    offs_e = tl.arange(0, E_POW2)
+    cnt = tl.where(offs_e < E_POW2 - 1, tl.histogram(e, E_POW2), 0)
+    blocks = (cnt + BLOCK_SIZE - 1) // BLOCK_SIZE
+    # sorted position of a pair -> padded dest: add the block-tail padding of smaller experts
+    shift = (tl.cumsum(blocks, 0) - blocks) * BLOCK_SIZE - (tl.cumsum(cnt, 0) - cnt)
+    num_valid = tl.sum(blocks, 0) * BLOCK_SIZE
+
+    # pad the whole used region first, then scatter the real pairs over it
+    offs_pad = tl.arange(0, PAD_POW2)
+    pad_mask = offs_pad < num_valid
+    tl.store(
+        sorted_ids_ptr + offs_pad,
+        tl.full((PAD_POW2,), (TOPK << 24) | M, tl.int32),
+        mask=pad_mask,
+    )
+    tl.store(
+        sorted_weights_ptr + offs_pad, tl.zeros((PAD_POW2,), tl.float32), mask=pad_mask
+    )
+    tl.debug_barrier()
+
+    # stable (expert, pair) order; inactive lanes sort last
+    key = tl.sort(e * P_POW2 + offs_p)
+    es = key // P_POW2
+    ps = key % P_POW2
+    valid = offs_p < P
+    dest = offs_p + tl.gather(shift, tl.where(valid, es, 0), 0)
+    tl.store(sorted_ids_ptr + dest, ((ps % TOPK) << 24) | (ps // TOPK), mask=valid)
+    tl.store(
+        sorted_weights_ptr + dest,
+        tl.load(topk_weights_ptr + ps, mask=valid, other=0.0),
+        mask=valid,
+    )
+    # every block holds a real pair; its pairs all write the same expert id
+    tl.store(sorted_expert_ids_ptr + dest // BLOCK_SIZE, es, mask=valid)
+    tl.store(
+        num_valid_ids_ptr + tl.arange(0, 2),
+        tl.where(tl.arange(0, 2) == 0, num_valid, M),
+    )
+
+
 def _small_sort_supported(
     topk_ids, block_size, expert_mask, num_local_tokens, num_experts
 ):
@@ -343,6 +416,28 @@ def _run_small_sort(
         n_cols, scalen_pad = 32, 8
         qout = qscale = moe_buf  # unused placeholder pointers
     num_buf = triton.cdiv(max(moe_buf.numel(), 1), buf_block)
+    if not emit_mx and p > 32:
+        # beyond one 32-lane tile the sort variant beats both P x P compare kernels
+        _moe_sorting_small_kernel_sorted[(1 + num_buf,)](
+            topk_ids,
+            topk_weights,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+            moe_buf.numel(),
+            m,
+            TOPK=topk,
+            BLOCK_SIZE=block_size,
+            P_POW2=triton.next_power_of_2(p),
+            E_POW2=triton.next_power_of_2(num_experts + 1),
+            PAD_POW2=triton.next_power_of_2(p * block_size),
+            BUF_BLOCK=buf_block,
+            num_buf=num_buf,
+            num_warps=4,
+        )
+        return None
     if p <= 64 and p <= 2 * block_size:
         # compact variant: one sort CTA does the P x P rank compare
         num_quant = (p * (n_cols // min(2048, n_cols))) if emit_mx else 0
