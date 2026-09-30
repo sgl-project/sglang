@@ -647,7 +647,14 @@ class DeepseekV2MoE(nn.Module):
             0 if config.n_shared_experts is None else int(config.n_shared_experts)
         )
         _fusion_disabled = is_shared_experts_fusion_disabled() or (
-            get_moe_runner_backend().is_gluon() and (self.moe_ep_size > 1 or is_nextn)
+            get_moe_runner_backend().is_gluon()
+            and (
+                is_nextn
+                or (
+                    self.moe_ep_size > 1
+                    and getattr(config, "model_type", None) != "glm_moe_dsa"
+                )
+            )
         )
 
         # num_fused_shared_experts drives weight remapping in deepseek_weight_loader:
