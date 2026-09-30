@@ -799,6 +799,44 @@ class BaseMultimodalProcessor(ABC):
             ):
                 npu_apply_minimax_m3_video_preprocess_patch(processor.video_processor)
             return "npu"
+
+        # GLM5-Next may come from the built-in Transformers namespace or from
+        # trust_remote_code under transformers_modules.*. Detect the processor
+        # by its concrete inner module/class, then patch those actual classes.
+        inner_processors = (
+            getattr(processor, "image_processor", None),
+            getattr(processor, "video_processor", None),
+        )
+        if processor.__class__.__name__ == "Glm5NextProcessor" or any(
+            "glm5_next" in type(inner).__module__.lower()
+            or type(inner).__name__
+            in {
+                "Glm5NextImageProcessor",
+                "Glm5NextVideoProcessor",
+            }
+            for inner in inner_processors
+            if inner is not None
+        ):
+            from sglang.srt.hardware_backend.npu.modules.glm5_next_processor import (
+                npu_apply_glm5_next_preprocess_patch,
+            )
+
+            npu_apply_glm5_next_preprocess_patch(processor)
+            return "npu"
+
+        # Compatibility with older GLM5-Next processor builds whose concrete
+        # image/video classes still lived in the GLMGA namespace.
+        if any(
+            ".models.glmga." in type(inner).__module__
+            for inner in inner_processors
+            if inner is not None
+        ):
+            from sglang.srt.hardware_backend.npu.modules.glmga_processor import (
+                npu_apply_glmga_preprocess_patch,
+            )
+
+            npu_apply_glmga_preprocess_patch()
+            return "npu"
         if processor.__class__.__name__ not in {"Glm4vProcessor", "Glm46VProcessor"}:
             # For qwen-vl, the processor hits a reshape issue from the Ascend
             # dims restriction.

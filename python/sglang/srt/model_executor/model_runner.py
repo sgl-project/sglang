@@ -800,6 +800,47 @@ class ModelRunner:
             start_layer=self.layer_info.start_layer,
         )
 
+    def is_pp_proxy_input_scattered(self) -> bool:
+        """Whether the PP-boundary hidden states entering this rank's first local
+        layer are attn-TP-scattered (num_tokens // attn_tp_size rows per rank).
+
+        A2A-MoE backends (e.g. deepep) leave the boundary in ScatterMode.SCATTERED,
+        so pp_proxy buffers used for graph capture and warmup must be sliced to the
+        scattered row count; full-length slicing trips the ``world_size * size``
+        check in the first local layer's scattered->TP_ATTN_FULL all-gather. Models
+        without per-layer scatter modes always transfer full-length tensors.
+        """
+        if get_parallel().pp_size <= 1 or get_parallel().pp_rank == 0:
+            return False
+        from sglang.srt.layers.communicator import ScatterMode
+
+        modes = self._local_layer_scatter_modes(first=True)
+        return modes is not None and modes.layer_input_mode == ScatterMode.SCATTERED
+
+    def is_pp_proxy_output_scattered(self) -> bool:
+        """Whether the hidden states sent across the next PP boundary (this
+        rank's last local layer output) are attn-TP-scattered; gates the PP
+        transport, whose send-slice + recv-all-gather assumes replicated tensors."""
+        if get_parallel().pp_size <= 1 or get_parallel().pp_rank == get_parallel().pp_size - 1:
+            return False
+        from sglang.srt.layers.communicator import ScatterMode
+
+        modes = self._local_layer_scatter_modes(first=False)
+        return modes is not None and modes.layer_output_mode == ScatterMode.SCATTERED
+
+    def _local_layer_scatter_modes(self, *, first: bool):
+        """Scatter modes of this rank's first (or last) local decoder layer; its
+        input (output) mode is the mode of the tensor crossing the adjacent PP
+        boundary. None for models that manage the boundary at the model level."""
+        modes = None
+        for module in self.model.modules():
+            found = getattr(module, "layer_scatter_modes", None)
+            if found is not None:
+                modes = found
+                if first:
+                    break
+        return modes
+
     def decode_num_tokens_per_req(
         self, *, num_draft_tokens: Optional[int] = None
     ) -> int:

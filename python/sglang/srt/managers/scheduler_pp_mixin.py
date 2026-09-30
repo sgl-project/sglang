@@ -582,6 +582,15 @@ class SchedulerPPMixin:
         self.pp_loop_size: int = (
             get_parallel().pp_size + get_parallel().pp_async_batch_depth
         )
+        # In CP mode, attention weights are duplicated, eliminating the need for the attention TP all-gather operation.
+        # A2A-MoE models (e.g. deepep) leave the PP-boundary hidden states scattered across the
+        # attn-TP group; the send-slice + recv-all-gather transport assumes replicated tensors
+        # and would scramble them, so those ranks must transfer per-rank tensors as-is.
+        self.require_attn_tp_allgather = (
+            not get_parallel().enable_dsa_prefill_context_parallel
+            and not self.tp_worker.model_runner.is_pp_proxy_input_scattered()
+            and not self.tp_worker.model_runner.is_pp_proxy_output_scattered()
+        )
         self.mbs = [None] * self.pp_loop_size
         self.last_mbs = [None] * self.pp_loop_size
         self.running_mbs = [
@@ -1538,14 +1547,17 @@ class SchedulerPPMixin:
         # same time.
 
         # CUDA: send first
-        # XPU: even ranks send first, odd ranks recv first.
+        # XPU/NPU: even ranks send first, odd ranks recv first.
         # PP+spec also pairs by parity: its relay carries several extra GPU
         # tensors (accept_lens, new_seq_lens, bonus tokens, next chain), and
         # device-side P2P stays ordered on the stream, so enqueueing that many
         # sends before any recv can form the same ring wait on CUDA. Parity
         # makes rank 1 post its recv first, which breaks the cycle for any
         # pp_size > 1.
-        needs_pairing = is_xpu() or self._pp_spec_relay
+        # NPU: HCCL P2P can mutually deadlock when both sides of a pair post
+        # isend+irecv concurrently (2 active mb slots); parity ordering keeps
+        # one side receiving while the other sends.
+        needs_pairing = is_xpu() or is_npu() or self._pp_spec_relay
         send_first = (not needs_pairing) or ((get_parallel().pp_rank % 2) == 0)
 
         def _do_send():

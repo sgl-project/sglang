@@ -1058,6 +1058,94 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
 
 
 # ---------------------------------------------------------------------------
+#  NPUFp8MoEMethod
+# ---------------------------------------------------------------------------
+class NPUFp8MoEMethod(_NPUMoEMethodBase):
+    """A5 block FP8 GMM with FP8 activations and 3D FP32 weight scales.
+
+    Keep weights in contiguous ND format. NZ weights route to WeightNz,
+    while antiquant_scale selects a weight-only path without block scales.
+    """
+
+    def __init__(self):
+        super().__init__(quant_config=None)
+        self.matmul = GroupedMatmul()
+        # Set after validating the checkpoint's block scale layout.
+        self._block_k = None
+
+    def process_weights_after_loading(
+        self, layer: torch.nn.Module, weight_prefix: str
+    ) -> None:
+        self._validate_weight_prefix(layer, weight_prefix)
+
+        weight: torch.Tensor = getattr(layer, f"{weight_prefix}_weight")
+        scale = getattr(layer, f"{weight_prefix}_weight_scale_inv", None)
+        if weight.dtype != torch.float8_e4m3fn or scale is None or scale.ndim != 3:
+            raise ValueError("A5 FP8 MoE requires FP8 weights and 3D block scales")
+        if tuple(scale.shape) != (
+            weight.shape[0],
+            (weight.shape[1] + 127) // 128,
+            (weight.shape[2] + 127) // 128,
+        ):
+            raise ValueError("A5 FP8 MoE requires [128, 128] block scales")
+        # Keep ND (no npu_format_cast) so FP8 does not hit the WeightNz kernel.
+        # Transpose [E, N, K] -> [E, K, N] and materialize a contiguous ND
+        # weight for the V4 quant path.
+        weight.data = weight.data.transpose(1, 2).contiguous()
+        setattr(layer, f"{weight_prefix}_weight", weight)
+
+        # Keep the checkpoint's FP32 scales and the attribute consumed by
+        # Fp8MoEMethod, transposing [E, N_b, K_b] to [E, K_b, N_b].
+        scale.data = scale.data.transpose(1, 2).contiguous()
+        self._block_k = 128
+
+        if weight_prefix == "w13":
+            self._set_dispatcher_output_dtype(layer, "bf16")
+
+    def apply(
+        self,
+        quant_info: "AscendQuantInfo",
+        hidden_states: torch.Tensor,
+        expert_tokens: torch.Tensor,
+        pertoken_scale: torch.Tensor,
+        output_dtype: torch.dtype,
+        weight_prefix: str,
+        group_list_type,
+    ) -> torch.Tensor:
+        scale = getattr(quant_info, f"{weight_prefix}_weight_scale", None)
+        if pertoken_scale is not None and hidden_states.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                "A5 block FP8 MoE requires BF16 dispatch or FP8 block activations"
+            )
+        # w8a8 quant path: the activation must be FP8. If the dispatcher did not
+        # already hand us a quantized input (pertoken_scale is None), quantize
+        # here with the weight's K block size (V4: ``scale`` + ``per_token_scale``).
+        if pertoken_scale is None:
+            hidden_states, pertoken_scale = torch.ops.npu.npu_dynamic_block_quant(
+                hidden_states,
+                dst_type=torch.float8_e4m3fn,
+                row_block_size=1,
+                col_block_size=self._block_k,
+            )
+        scale_args: Dict[str, Any] = {
+            "scale": [scale],
+            "per_token_scale": [pertoken_scale],
+        }
+        scale_args.update(self._get_bias_args(quant_info, weight_prefix))
+        result = self.matmul.forward(
+            quant_info,
+            weight_prefix,
+            hidden_states,
+            expert_tokens,
+            output_dtype,
+            group_list_type=group_list_type,
+            transposed=True,
+            **scale_args,
+        )
+        return result
+
+
+# ---------------------------------------------------------------------------
 #  NPUMXFP8MoEMethod
 # ---------------------------------------------------------------------------
 class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
