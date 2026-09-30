@@ -310,15 +310,14 @@ class UMBPStore(HiCacheStorage):
         if dp_rank_hint is None:
             try:
                 from sglang.srt.layers.dp_attention import (
-                    get_attention_dp_rank,
-                    get_attention_dp_size,
                     is_dp_attention_enabled,
                 )
+                from sglang.srt.runtime_context import get_parallel
 
                 if is_dp_attention_enabled():
-                    dp_rank_hint = get_attention_dp_rank()
-                    dp_size_hint = get_attention_dp_size()
-            except (ImportError, AssertionError):
+                    dp_rank_hint = get_parallel().attn_dp_rank
+                    dp_size_hint = get_parallel().attn_dp_size
+            except (ImportError, AssertionError, RuntimeError):
                 pass
 
         if local_rank_hint is not None:
@@ -649,25 +648,16 @@ class UMBPStore(HiCacheStorage):
             if "dram_page_size" in extra:
                 page_byte_size = int(extra["dram_page_size"])
             elif mem_pool_host is not None:
-                # Probe element_size from the same buffer-meta helper that
-                # batch_preprocess will actually use; this matches per-call
-                # Put/Get size byte-for-byte for MHA / MHA-split / MLA / NSA
-                # without per-case formulas (NSA in particular: get_ksize_per_token
-                # would over-count by the indexer buffer that is never put to UMBP).
-                dummy = torch.zeros(mem_pool_host.page_size, dtype=torch.int64)
-                if self.is_mla_backend:
-                    meta = mem_pool_host.get_page_buffer_meta(dummy)
-                elif storage_config is not None and getattr(
-                    storage_config, "should_split_heads", False
+                split_factor = 1
+                if (
+                    not self.is_mla_backend
+                    and storage_config is not None
+                    and storage_config.should_split_heads
                 ):
-                    sf = storage_config.tp_lcm_size // storage_config.tp_size
-                    meta = mem_pool_host.get_split_heads_page_buffer_meta(dummy, sf)
-                else:
-                    meta = mem_pool_host.get_page_buffer_meta(dummy)
-                # A hybrid logical anchor returns None here by design; leave
-                # dram_page_size at 0 and let the per-pool v2 sizes handle it.
-                esz = meta[1] if meta else None
-                page_byte_size = int(esz[0]) if esz else 0
+                    split_factor = storage_config.tp_lcm_size // storage_config.tp_size
+                page_byte_size = mem_pool_host.get_page_buffer_element_size(
+                    split_factor
+                )
 
             if (
                 page_byte_size is not None
@@ -690,7 +680,7 @@ class UMBPStore(HiCacheStorage):
                         if (
                             mem_pool_host is not None
                             and storage_config is not None
-                            and getattr(storage_config, "should_split_heads", False)
+                            and storage_config.should_split_heads
                         )
                         else ""
                     ),
@@ -807,14 +797,13 @@ class UMBPStore(HiCacheStorage):
 
         try:
             from sglang.srt.layers.dp_attention import (
-                get_attention_dp_rank,
-                get_attention_dp_size,
                 is_dp_attention_enabled,
             )
+            from sglang.srt.runtime_context import get_parallel
 
             if is_dp_attention_enabled():
-                dp_rank = get_attention_dp_rank()
-                dp_size = get_attention_dp_size()
+                dp_rank = get_parallel().attn_dp_rank
+                dp_size = get_parallel().attn_dp_size
                 dp_rank_hint = dp_rank
                 dp_size_hint = dp_size
                 if cfg.ssd.enabled:
@@ -883,7 +872,7 @@ class UMBPStore(HiCacheStorage):
                             dp_size,
                             cfg.ssd.storage_dir,
                         )
-        except (ImportError, AssertionError):
+        except (ImportError, AssertionError, RuntimeError):
             pass
 
         if (

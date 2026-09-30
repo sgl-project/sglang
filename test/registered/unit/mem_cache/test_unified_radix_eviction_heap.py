@@ -24,7 +24,6 @@ from numpy import float64
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
-    DecLockRefParams,
     EvictParams,
     InsertParams,
     MatchPrefixParams,
@@ -253,15 +252,12 @@ class Replay:
                 )
                 node_id = res.last_device_node
                 if node_id != self.cache.root_node_handle():
-                    lr = self.cache.inc_lock_ref(node_id)
+                    lr = self.cache.inc_lock_ref(node_id).to_dec_params()
                     self._locked.append((node_id, lr))
             elif kind == "unlock":
                 if self._locked:
                     node_id, lr = self._locked.pop(op[1] % len(self._locked))
-                    self.cache.dec_lock_ref(
-                        node_id,
-                        DecLockRefParams(swa_uuid_for_lock=lr.swa_uuid_for_lock),
-                    )
+                    self.cache.dec_lock_ref(node_id, lr)
             elif kind == "register":
                 seq, sid = op[1], op[2]
                 res = self.cache.match_prefix(
@@ -279,7 +275,8 @@ class Replay:
                             origin_input_ids=array("q", seq),
                             output_ids=array("q"),
                             extra_key=None,
-                        )
+                        ),
+                        leaf=res.last_device_node,
                     )
             elif kind == "release":
                 self.cache.release_radix_session(op[1])
@@ -294,9 +291,7 @@ class Replay:
         # release everything so the final state is comparable
         while self._locked:
             node_id, lr = self._locked.pop()
-            self.cache.dec_lock_ref(
-                node_id, DecLockRefParams(swa_uuid_for_lock=lr.swa_uuid_for_lock)
-            )
+            self.cache.dec_lock_ref(node_id, lr)
         self.cache.sanity_check()
 
     def leaf_paths(self) -> set:
@@ -560,7 +555,8 @@ class TestHeapOnRealCache(CustomTestCase):
                 origin_input_ids=array("q", [1, 2, 3, 4]),
                 output_ids=array("q"),
                 extra_key=None,
-            )
+            ),
+            leaf=res.last_device_node,
         )
         cache.evict(EvictParams(num_tokens=3))
         self.assertEqual(_match_len(cache, [7, 8, 9]), 0)  # unreferenced goes first

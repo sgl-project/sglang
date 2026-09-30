@@ -64,7 +64,7 @@ def _device_pool_stub(*, layer_num: int, **fields) -> SimpleNamespace:
 
 
 def _host_group_stub(captured, *, can_use_write_back_jit: bool) -> SimpleNamespace:
-    class FakeHostPool:
+    class FakeHostPool(MHATokenToKVPoolHost):
         size_per_token = 2
 
         def backup_from_device_all_layer(
@@ -75,7 +75,7 @@ def _host_group_stub(captured, *, can_use_write_back_jit: bool) -> SimpleNamespa
     entries = [
         PoolEntry(
             name=name,
-            host_pool=FakeHostPool(),
+            host_pool=FakeHostPool.__new__(FakeHostPool),
             device_pool=None,
             layer_mapper=lambda layer_id: layer_id,
             is_primary_index_anchor=name == PoolName.KV,
@@ -85,6 +85,7 @@ def _host_group_stub(captured, *, can_use_write_back_jit: bool) -> SimpleNamespa
     return SimpleNamespace(
         layout="page_first",
         can_use_write_back_jit=can_use_write_back_jit,
+        supports_per_pool_backup_indices=False,
         anchor_entry=entries[0],
         entry_map={entry.name: entry for entry in entries},
     )
@@ -238,7 +239,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             start_event=object(), finish_event=object(), timing_enabled=False
         )
         controller.l2_transfer_engine.submit_host_to_device.return_value = completion
-        controller.layer_num = 2
+        controller.transfer_layer_id_max = 2
         controller.ack_load_queue = []
 
         self.assertEqual(HybridCacheController.start_loading(controller), 0)
@@ -335,7 +336,8 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         pipeline.release_staged_hold.assert_not_called()
 
     def test_l2_transfer_maps_global_layers(self):
-        host_pool = mock.Mock()
+        host_pool = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
+        host_pool.load_to_device_per_layer = mock.Mock()
         transfer = L2Transfer(
             host_pool=host_pool,
             device_pool=mock.sentinel.device_pool,
@@ -344,7 +346,9 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             layer_mapper={1: 0, 3: 1}.get,
         )
         with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
-            L2TransferEngine("kernel").submit_host_to_device([transfer], layer_num=4)
+            L2TransferEngine("kernel").submit_host_to_device(
+                [transfer], transfer_layer_id_max=4
+            )
 
         self.assertEqual(
             [
@@ -355,7 +359,8 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         )
 
     def test_packed_draft_load_is_flattened_into_l2_transfers(self):
-        host_pool = mock.Mock()
+        host_pool = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
+        host_pool.load_to_device_per_layer = mock.Mock()
         controller = HybridCacheController.__new__(HybridCacheController)
         entry = PoolEntry(
             name=PoolName.KV,
@@ -369,7 +374,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             anchor_entry=entry,
             entry_map={entry.name: entry},
         )
-        controller.layer_num = 2
+        controller.transfer_layer_id_max = 2
 
         self.assertEqual(
             len(controller._l2_transfers(_indices(0, 2), _indices(2, 4))), 1
@@ -380,7 +385,9 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         self.assertFalse(transfers[0].is_draft)
         self.assertTrue(transfers[1].is_draft)
         with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
-            L2TransferEngine("kernel").submit_host_to_device(transfers, layer_num=2)
+            L2TransferEngine("kernel").submit_host_to_device(
+                transfers, transfer_layer_id_max=2
+            )
         self.assertEqual(
             [
                 call.args[3]
@@ -1174,10 +1181,99 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller.move_hybrid_indices.assert_called_once()
         self.assertEqual([indices.device.type for indices in captured], ["cpu", "cpu"])
 
+    def _chain_write_controller(self, captured):
+        """A hybrid controller over a real HostPoolGroup whose KV pool records
+        every backup it receives."""
+
+        class ChainHostPool:
+            def prepare_transfer_indices(self, host, device, backend):
+                return host, device
+
+            def backup_from_device_all_layer_physical(self, *args):
+                self.backup_from_device_all_layer(*args)
+
+            layout = "page_first"
+            page_size = 4
+            device = "cpu"
+            size = 64
+            logical_size = 64
+            size_per_token = 2
+            can_use_write_back_jit = True
+
+            def __init__(self):
+                self.next_free = 0
+
+            def alloc(self, need_size):
+                start = self.next_free
+                self.next_free += need_size
+                return _indices(start, start + need_size)
+
+            def backup_from_device_all_layer(
+                self, device_pool, host_indices, device_indices, io_backend
+            ):
+                captured.append((host_indices, device_indices))
+
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.write_queue = []
+        controller.io_backend = "kernel"
+        controller.mem_pool_host = HostPoolGroup(
+            [
+                PoolEntry(
+                    name=PoolName.KV,
+                    host_pool=ChainHostPool(),
+                    device_pool=None,
+                    layer_mapper=lambda layer_id: layer_id,
+                    is_primary_index_anchor=True,
+                )
+            ]
+        )
+        controller.mem_pool_device = None
+        controller.ack_write_queue = []
+        with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
+            controller.l2_transfer_engine = L2TransferEngine("kernel")
+        return controller
+
+    def test_hybrid_write_without_flush_merges_chain_into_one_submit(self):
+        captured = []
+        controller = self._chain_write_controller(captured)
+
+        with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
+            first = controller.write(_indices(4, 8), node_id=1, flush=False)
+            second = controller.write(_indices(12, 16), node_id=2, flush=False)
+            self.assertEqual(len(controller.write_queue), 2)
+            self.assertEqual(captured, [])
+            self.assertEqual(controller.ack_write_queue, [])
+
+            controller.start_writing()
+            # Flushing a drained queue must not submit another copy or ack.
+            controller.start_writing()
+
+        self.assertEqual(controller.write_queue, [])
+        self.assertEqual(len(captured), 1)
+        host_indices, device_indices = captured[0]
+        self.assertEqual(host_indices.tolist(), torch.cat([first, second]).tolist())
+        self.assertEqual(
+            device_indices.tolist(), list(range(4, 8)) + list(range(12, 16))
+        )
+        self.assertEqual(len(controller.ack_write_queue), 1)
+        self.assertEqual(controller.ack_write_queue[0].node_ids, [1, 2])
+        self.assertEqual(controller.ack_write_queue[0].num_tokens, 8)
+
+    def test_hybrid_write_flushes_by_default(self):
+        captured = []
+        controller = self._chain_write_controller(captured)
+
+        with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
+            controller.write(_indices(4, 8), node_id=1)
+
+        self.assertEqual(controller.write_queue, [])
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(controller.ack_write_queue[0].node_ids, [1])
+
     def test_write_back_jit_cache_controller_keeps_host_indices_on_cpu(self):
         captured = {}
 
-        class FakeHostPool:
+        class FakeHostPool(MHATokenToKVPoolHost):
             layout = "page_first"
             can_use_write_back_jit = True
             size_per_token = 2
@@ -1196,7 +1292,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             )
         ]
         controller.io_backend = "kernel"
-        controller.mem_pool_host = FakeHostPool()
+        controller.mem_pool_host = FakeHostPool.__new__(FakeHostPool)
         controller.mem_pool_device = None
         controller.device = "cuda"
         controller.ack_write_queue = []
@@ -1214,7 +1310,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
     def test_cache_controller_moves_indices_without_write_back_jit(self):
         captured = {}
 
-        class FakeHostPool:
+        class FakeHostPool(MHATokenToKVPoolHost):
             layout = "page_first"
             can_use_write_back_jit = False
             size_per_token = 2
@@ -1232,7 +1328,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller = HiCacheController.__new__(HiCacheController)
         controller.write_queue = [op]
         controller.io_backend = "kernel"
-        controller.mem_pool_host = FakeHostPool()
+        controller.mem_pool_host = FakeHostPool.__new__(FakeHostPool)
         controller.mem_pool_device = None
         controller.device = "cuda"
         controller.ack_write_queue = []

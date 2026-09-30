@@ -16,6 +16,11 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
     SchedulerDisaggMixin,
 )
+from sglang.multimodal_gen.runtime.distributed.ipc_cuda import (
+    materialize_cuda_refs,
+    release_retained_producer_tensors,
+    spill_cuda_tensors,
+)
 from sglang.multimodal_gen.runtime.distributed.utils import broadcast_pyobj
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     GetDisaggStatsReq,
@@ -43,6 +48,7 @@ from sglang.multimodal_gen.runtime.managers.dynamic_batch_admission import (
     BatchAdmissionController,
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
+from sglang.multimodal_gen.runtime.observability.metrics import DiffusionMetrics
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
     normalize_output_seeds,
@@ -87,6 +93,8 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
     It listens for external requests via ZMQ and coordinates with other workers.
     This class does NOT manage worker processes.
     """
+
+    metrics: DiffusionMetrics | None = None
 
     def __init__(
         self,
@@ -135,6 +143,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             server_args=server_args,
         )
         self.worker = worker
+        self.metrics = worker.metrics
         self.gpu_id = gpu_id
         self._show_warmup_progress = gpu_id == 0
         self._running = True
@@ -658,6 +667,8 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         reject_reasons: list[str] | None = None,
         stop_reason: str | None = None,
     ) -> None:
+        if self.metrics is not None:
+            self.metrics.observe_batch(request_count, stop_reason)
         if not self._batch_metrics_enabled:
             return
 
@@ -766,6 +777,13 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                         )
 
                 with self._record_return_stage(
+                    output_batch, "Scheduler.return_result.spill_cuda"
+                ):
+                    # The previous reply has already been mapped: the client
+                    # only sends the next hop after materializing the last one.
+                    release_retained_producer_tensors()
+                    spill_cuda_tensors(output_batch, in_place=True)
+                with self._record_return_stage(
                     output_batch, "Scheduler.return_result.pickle"
                 ):
                     payload = pickle.dumps(output_batch)
@@ -793,6 +811,8 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         output_batch: OutputBatch,
     ) -> None:
         identity, processed_req = item
+        if self.metrics is not None:
+            self.metrics.finish(id(processed_req), error=output_batch.error is not None)
         is_warmup = is_warmup_req(processed_req)
         self._log_warmup_result(output_batch, processed_req, is_warmup)
 
@@ -1175,7 +1195,9 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
     def recv_reqs(self) -> List[tuple[bytes, Any]]:
         """
-        For non-main schedulers, reqs are broadcasted from main using broadcast_pyobj
+        For non-main schedulers, reqs are broadcasted from main using
+        broadcast_pyobj. ``--comfyui-mode`` multi-rank instead keeps CUDA
+        tensors on NCCL so per-step latents do not pickle onto the gloo group.
         """
         if self.receiver is not None:
             try:
@@ -1200,30 +1222,37 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         else:
             recv_reqs = None
 
-        # TODO: fix this condition
-        if self.server_args.sp_degree != 1:
-            recv_reqs = broadcast_pyobj(
-                recv_reqs,
-                self.worker.sp_group.rank,
-                self.worker.sp_cpu_group,
-                src=self.worker.sp_group.ranks[0],
-            )
+        # Rebuild CUDA IPC handles on rank 0 (no-op when the payload has none).
+        if recv_reqs is not None:
+            recv_reqs = materialize_cuda_refs(recv_reqs)
 
-        if self.server_args.enable_cfg_parallel:
-            recv_reqs = broadcast_pyobj(
-                recv_reqs,
-                self.worker.cfg_group.rank,
-                self.worker.cfg_cpu_group,
-                src=self.worker.cfg_group.ranks[0],
-            )
+        if self.server_args.comfyui_mode and self._is_multi_rank():
+            recv_reqs = self._broadcast_recv_reqs(recv_reqs)
+        else:
+            # TODO: fix this condition
+            if self.server_args.sp_degree != 1:
+                recv_reqs = broadcast_pyobj(
+                    recv_reqs,
+                    self.worker.sp_group.rank,
+                    self.worker.sp_cpu_group,
+                    src=self.worker.sp_group.ranks[0],
+                )
 
-        if self.server_args.tp_size > 1:
-            recv_reqs = broadcast_pyobj(
-                recv_reqs,
-                self.worker.tp_group.rank,
-                self.worker.tp_cpu_group,
-                src=self.worker.tp_group.ranks[0],
-            )
+            if self.server_args.enable_cfg_parallel:
+                recv_reqs = broadcast_pyobj(
+                    recv_reqs,
+                    self.worker.cfg_group.rank,
+                    self.worker.cfg_cpu_group,
+                    src=self.worker.cfg_group.ranks[0],
+                )
+
+            if self.server_args.tp_size > 1:
+                recv_reqs = broadcast_pyobj(
+                    recv_reqs,
+                    self.worker.tp_group.rank,
+                    self.worker.tp_cpu_group,
+                    src=self.worker.tp_group.ranks[0],
+                )
 
         assert recv_reqs is not None
 
@@ -1255,6 +1284,13 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 self.waiting_queue.extend(
                     [(identity, req, now) for identity, req in new_reqs]
                 )
+                if self.metrics is not None:
+                    for _, req_or_group in new_reqs:
+                        req = get_first_generation_req(req_or_group)
+                        if req is not None:
+                            self.metrics.enqueue(
+                                id(req_or_group), is_warmup=req.is_warmup, now=now
+                            )
                 # Reset error count on success
                 self._consecutive_error_count = 0
             except Exception as e:
@@ -1288,6 +1324,14 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                         time.sleep(remaining_ms / 1000.0)
                 continue
 
+            if self.metrics is not None:
+                for _, req in items:
+                    self.metrics.dispatch(id(req))
+                    if (
+                        isinstance(req, list)
+                        and get_first_generation_req(req) is not None
+                    ):
+                        self.metrics.observe_batch(1, "request_group")
             try:
                 with maybe_record_function(
                     f"REQ {self._req_label(items)} dispatch+forward"
@@ -1305,6 +1349,10 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     self._return_results_sequentially(items, handler_result.outputs)
                 except zmq.ZMQError as e:
                     logger.error(f"ZMQ error sending replies sequentially: {e}")
+                finally:
+                    if self.metrics is not None:
+                        for _, req in items:
+                            self.metrics.finish(id(req), error=True)
                 continue
 
             if isinstance(handler_result, list):
@@ -1336,6 +1384,10 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 # Reply failed; log and keep loop alive to accept future requests
                 logger.error(f"ZMQ error sending reply: {e}")
                 continue
+            finally:
+                if self.metrics is not None:
+                    for _, req in items:
+                        self.metrics.finish(id(req), error=True)
 
         self._log_batch_metrics_summary()
 

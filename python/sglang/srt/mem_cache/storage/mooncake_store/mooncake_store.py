@@ -814,10 +814,18 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         elif pool_name in (
             PoolName.INDEXER,
             PoolName.DRAFT_INDEXER,
+            PoolName.DEEPSEEK_V4_C1,
+            PoolName.DEEPSEEK_V4_C1_INDEXER,
+            PoolName.DEEPSEEK_V4_C1_INDEXER_SCALE,
+            PoolName.DEEPSEEK_V4_C2,
+            PoolName.DEEPSEEK_V4_C2_INDEXER,
+            PoolName.DEEPSEEK_V4_C2_INDEXER_SCALE,
             PoolName.DEEPSEEK_V4_C4,
+            PoolName.DEEPSEEK_V4_C4_ROPE,
             PoolName.DEEPSEEK_V4_C4_INDEXER,
             PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE,
             PoolName.DEEPSEEK_V4_C128,
+            PoolName.DEEPSEEK_V4_C128_ROPE,
             PoolName.DEEPSEEK_V4_C4_STATE,
             PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
             PoolName.DEEPSEEK_V4_C128_STATE,
@@ -873,7 +881,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 keys, transfer
             )
             component_keys = self._tag_keys(component_keys)
-            ex = self._batch_exist(component_keys)
+            ex = self._batch_exist(component_keys, extra_info)
             if key_multiplier > 0:
                 page_exists = [
                     all(
@@ -1314,7 +1322,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     query_keys.append(f"{key}_{self.mha_suffix}_v")
                 key_multiplier = 2
 
-        exist_result = self._batch_exist(query_keys)
+        exist_result = self._batch_exist(query_keys, extra_info)
         for i in range(len(query_keys)):
             if exist_result[i] != 1:
                 return i // key_multiplier
@@ -1366,7 +1374,21 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             )
         return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
 
-    def _batch_exist(self, key_strs: List[str]) -> List[int]:
+    def _batch_exist(
+        self, key_strs: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
+    ) -> List[int]:
+        pp_rank = (
+            (extra_info.extra_info or {}).get("pp_rank")
+            if extra_info is not None
+            else None
+        )
+        if pp_rank is not None:
+            # PP is the last rank field before the pool suffix. Replace from
+            # the right so an identical TP rank or backend tag stays unchanged.
+            key_strs = [
+                f"_{pp_rank}_".join(key.rsplit(f"_{self.pp_rank}_", 1))
+                for key in key_strs
+            ]
         return self.store.batch_is_exist(key_strs)
 
     def get_stats(self):
