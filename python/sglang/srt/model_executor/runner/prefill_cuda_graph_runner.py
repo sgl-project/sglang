@@ -70,6 +70,7 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    dp_slot_in,
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
@@ -310,7 +311,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.prefill_backend_name = prefill_config.backend
         self.prefer_eager_mixed_prefill = (
             self.prefill_backend_name == Backend.BREAKABLE
-            and get_parallel().enable_dp_attention
+            and get_parallel().attn_dp_enabled
             and getattr(
                 model_runner.attn_backend,
                 "prefer_eager_mixed_prefill_under_dp_attention",
@@ -426,7 +427,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.moe_fusions = self.model_runner.moe_fusions
         self.dsa_indexers = getattr(self.model_runner, "dsa_indexers", None)
 
-        self.dp_size = get_parallel().dp_size
         self.require_mlp_tp_gather = require_mlp_tp_gather()
         self.require_attn_tp_gather = require_attn_tp_gather()
 
@@ -616,7 +616,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         # --- capture --------------------------------------------------
         self.device_module.synchronize()
-        self.model_runner.tp_group.barrier()
+        get_parallel().tp_group.barrier()
         self.capture()
 
         self.raw_num_tokens = 0
@@ -672,8 +672,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         global_num_tokens = forward_batch.global_num_tokens_for_logprob_cpu
         if global_num_tokens is not None:
-            dp_rank = get_parallel().attn_dp_rank
-            return int(global_num_tokens[dp_rank if len(global_num_tokens) > 1 else 0])
+            return int(global_num_tokens[dp_slot_in(global_num_tokens)])
 
         return sum(
             max(int(seq_len) - int(start_len), 1)
@@ -1433,7 +1432,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return registry.get_slot(name).slice_for(bs, num_tokens)
 
         if self.require_mlp_tp_gather:
-            global_num_tokens_cpu = [num_tokens] * self.dp_size
+            global_num_tokens_cpu = [num_tokens] * self.num_dp_ranks
         elif self.require_attn_tp_gather:
             global_num_tokens_cpu = [num_tokens]
         else:

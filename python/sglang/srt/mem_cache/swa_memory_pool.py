@@ -42,6 +42,7 @@ class SWAKVPool(BaseSWAKVPool):
         swa_kv_pool_class: Optional[type] = None,
         full_kv_pool_kwargs: Optional[dict] = None,
         swa_kv_pool_kwargs: Optional[dict] = None,
+        enable_memory_saver: bool = False,
         **kwargs,
     ):
         self.size = size
@@ -66,7 +67,7 @@ class SWAKVPool(BaseSWAKVPool):
         swa_kv_pool_class = swa_kv_pool_class or token_to_kv_pool_class
         common_kwargs = {
             "page_size": page_size,
-            "enable_memory_saver": False,
+            "enable_memory_saver": enable_memory_saver,
             "device": device,
         }
         if full_kv_pool_kwargs is None:
@@ -305,18 +306,6 @@ class SWAKVPool(BaseSWAKVPool):
         assert not is_swa_layer
         return self.full_kv_pool.get_index_k_with_scale_buffer(layer_id_pool)
 
-    def get_index_k_continuous(self, layer_id: int, *args, **kwargs):
-        layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
-        assert not is_swa_layer
-        return self.full_kv_pool.get_index_k_continuous(layer_id_pool, *args, **kwargs)
-
-    def get_index_k_scale_continuous(self, layer_id: int, *args, **kwargs):
-        layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
-        assert not is_swa_layer
-        return self.full_kv_pool.get_index_k_scale_continuous(
-            layer_id_pool, *args, **kwargs
-        )
-
     def get_index_k_scale_buffer(self, layer_id: int, *args, **kwargs):
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
         assert not is_swa_layer
@@ -337,7 +326,7 @@ class SWAKVPool(BaseSWAKVPool):
         src_loc_swa = self.translate_loc_from_full_to_swa(src_loc)
         self.swa_kv_pool.move_kv_cache(tgt_loc_swa, src_loc_swa)
 
-    def _filter_swa_cpu_copy(self, swa_kv_cpu, row_mask: torch.Tensor):
+    def _filter_swa_cpu_copy(self, *, swa_kv_cpu, row_mask: torch.Tensor):
         if swa_kv_cpu is None:
             return None
         if row_mask is None or bool(torch.all(row_mask).item()):
@@ -419,5 +408,7 @@ class SWAKVPool(BaseSWAKVPool):
             if swa_indices.numel() == 0:
                 return
 
-            swa_kv_cpu = self._filter_swa_cpu_copy(swa_kv_cpu, row_mask)
+            swa_kv_cpu = self._filter_swa_cpu_copy(
+                swa_kv_cpu=swa_kv_cpu, row_mask=row_mask
+            )
             self.swa_kv_pool.load_cpu_copy(swa_kv_cpu, swa_indices)

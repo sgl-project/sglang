@@ -21,6 +21,7 @@ from sglang.kernels.ops.diffusion import (
 )
 from sglang.multimodal_gen.configs.models.dits.cosmos3video import Cosmos3VideoConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_module_list_entry_in
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_conditioning
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
     get_sp_world_size,
@@ -88,12 +89,11 @@ def _can_enable_t1_fused_qk_norm_rope(
         return False
     if is_blackwell:
         return True
-    return (
-        is_hopper
-        and (hidden_act != "relu2" or hidden_size == 2048)
-        and tp_size == 1
-        and sp_size == 1
-    )
+    if not is_hopper or sp_size != 1:
+        return False
+    if tp_size == 1:
+        return hidden_act != "relu2" or hidden_size == 2048
+    return tp_size == 2 and hidden_act == "silu" and hidden_size == 5120
 
 
 # -----------------------------------------------------------------------------
@@ -1100,6 +1100,7 @@ class Cosmos3LanguageModel(nn.Module):
             ]
         )
 
+    @cached_conditioning
     def forward(
         self,
         text_ids: torch.Tensor,
@@ -1728,8 +1729,8 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         # The T=1 fused path is faster on Blackwell. It also benefits the
         # single-GPU Hopper Nano (SwiGLU) and Edge (2048-wide dense) workloads,
-        # while the Hopper Cosmos3-Super (dense MLP) multi-GPU workload remains on the split
-        # path because that shape regresses with the fusion.
+        # as well as TP2 Super-Text2Image (SwiGLU). The older dense-MLP Super
+        # workload remains on the split path because that shape regresses.
         enable_t1_fused_qk_norm_rope = T == 1 and _can_enable_t1_fused_qk_norm_rope(
             is_blackwell=current_platform.is_blackwell(),
             is_hopper=current_platform.is_hopper(),

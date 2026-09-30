@@ -11,8 +11,8 @@ from sglang.srt.arg_groups.overrides import (
     run_post_process_pass,
 )
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import is_npu
+from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform, num_dp_ranks_of
+from sglang.srt.utils.common import is_gfx95_supported, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -21,16 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None:
-    """Residual imperative arm of the DeepSeek V4 defaults.
-
-    The attention/page/window/MoE-runner declarations moved to the override
-    registry (arg_groups/overrides.py: _deepseek_v4_overrides) and the
-    kv-cache dtype default to the resolution pipeline
-    (_deepseek_v4_kv_cache_dtype, invoked below at its legacy slot). This
-    keeps, at the legacy slot: the ROCm env fill (env-write policy), the
-    max_running_requests fill (the speculative hook is a later writer of
-    that field) and the validations.
-    """
+    """Apply DeepSeek V4 environment defaults, request limits, and validation."""
     cfg = resolving_view(server_args)
 
     # FlashMLA sparse prefill (SGLANG_OPT_FLASHMLA_SPARSE_PREFILL, default on)
@@ -132,10 +123,18 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
             "reindexes with interleave order."
         )
 
+    # DeepSeek-V4 CP runs data-parallel groups as attention DP.
+    assert not (cfg.attn_dp_size > 1 and cfg.dp_size > 1), (
+        f"--dp-size {cfg.dp_size} with --attn-dp-size {cfg.attn_dp_size}: "
+        "data-parallel replicas combined with attention data parallelism "
+        "are not supported."
+    )
+    attn_dp_size = cfg.attn_dp_size * cfg.dp_size
     declare_resolution(
         server_args,
         "validate_deepseek_v4_cp",
-        enable_dp_attention=True,
+        attn_dp_size=attn_dp_size,
+        dp_size=1,
     )
     declare_resolution(
         server_args,
@@ -145,10 +144,10 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     declare_resolution(
         server_args,
         "validate_deepseek_v4_cp",
-        attn_cp_size=cfg.tp_size // cfg.dp_size,
+        attn_cp_size=cfg.tp_size // attn_dp_size,
     )
     if not is_npu():
-        assert cfg.dp_size == 1, (
+        assert attn_dp_size == 1, (
             "For round-robin split mode, dp attention is not supported."
         )
         assert cfg.tp_size <= 8, (
@@ -170,7 +169,7 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     logger.warning(
         f"Enable Context Parallel for DeepSeekV4, "
         f"strategy={cfg.cp_strategy}, "
-        f"dp_size={cfg.dp_size}, moe_dense_tp_size={cfg.moe_dense_tp_size}, "
+        f"attn_dp_size={attn_dp_size}, moe_dense_tp_size={cfg.moe_dense_tp_size}, "
         f"attn_cp_size={cfg.attn_cp_size}, ep_size={cfg.ep_size}, tp_size={cfg.tp_size}"
     )
 
@@ -191,12 +190,18 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         from sglang.srt.model_executor.cuda_graph_config import Backend
 
         incompatible = (
-            ("non-CUDA hardware", not get_platform().is_cuda),
+            (
+                "hardware other than CUDA or gfx950",
+                not (
+                    get_platform().is_cuda
+                    or (get_platform().is_hip and is_gfx95_supported())
+                ),
+            ),
             (
                 "prefill CUDA graphs",
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
             ),
-            ("DP attention", cfg.enable_dp_attention),
+            ("DP attention", attn_dp_enabled_of(cfg)),
             ("context parallelism", cfg.attn_cp_size > 1),
             ("external cache linker", cfg.enable_unified_cache_external_linker),
             ("unified memory", cfg.enable_unified_memory),
@@ -249,8 +254,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         if (
             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
             or cfg.disaggregation_transfer_backend != "mooncake"
-            or cfg.dp_size != 1
-            or cfg.enable_dp_attention
+            or num_dp_ranks_of(cfg) != 1
+            or attn_dp_enabled_of(cfg)
             or cfg.attn_cp_size != 1
             or cfg.dcp_size != 1
         ):
@@ -288,7 +293,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
             ),
             # input_ids_global is a DP-wide gather, so the tail slice cannot apply.
-            ("DP attention", cfg.enable_dp_attention),
+            ("DP attention", attn_dp_enabled_of(cfg)),
         )
         for feature, enabled in incompatible:
             if enabled:

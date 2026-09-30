@@ -11,7 +11,7 @@ from sglang.srt.models.llama import (
     LlamaForCausalLM,
     LlamaModel,
 )
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, make_pp_layers
 
 
 def _get_llama_4_attn_scale(
@@ -141,7 +141,7 @@ class Ministral3Model(LlamaModel):
         # Override layer creation to use Ministral3Attention
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Ministral3DecoderLayer(
                 config=config,
@@ -150,8 +150,6 @@ class Ministral3Model(LlamaModel):
                 start_layer=self.start_layer,
                 prefix=prefix,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix="model.layers",
         )
 
