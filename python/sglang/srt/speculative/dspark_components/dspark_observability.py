@@ -109,6 +109,9 @@ class DecodeStepRecord(msgspec.Struct, omit_defaults=True):
     draft_gpu_ms: Optional[float] = None
     target_verify_gpu_ms: Optional[float] = None
     reqs: Optional[list[ReqDetail]] = None
+    # num_verify_tokens is the target input size, before runner padding.
+    verify_tokens_actual: int = -1
+    verify_used_cuda_graph: Optional[bool] = None
 
 
 class DecodeStepObservation(msgspec.Struct):
@@ -133,6 +136,38 @@ class DecodeStepObservation(msgspec.Struct):
     cap_trim_lens: torch.Tensor
     commit_lens: torch.Tensor
     rids: Optional[list[str]]
+    verify_tokens_actual: int = -1
+    verify_used_cuda_graph: Optional[bool] = None
+
+
+def resolve_target_verify_num_tokens(
+    *,
+    is_compact: bool,
+    layout,
+    verify_ids_2d: torch.Tensor,
+) -> int:
+    # Cap-accept uses the ragged layout only to trim acceptance; its target
+    # forward still evaluates the complete dense verify window.
+    if is_compact and layout is not None:
+        return int(layout.graph_num_tokens)
+    return int(verify_ids_2d.numel())
+
+
+def resolve_target_verify_graph_num_tokens(*, runner, used_cuda_graph: bool) -> int:
+    """Return executed graph capacity in token rows, or -1 if unavailable.
+
+    Dense replay keys count requests; ragged replay keys count token rows.
+    Read the completed replay instead of predicting a tier from the batch.
+    """
+    if not used_cuda_graph or runner is None:
+        return -1
+    key = getattr(runner, "_replay_graph_key", None)
+    if key is None:
+        return -1
+    if getattr(runner, "ragged_verify_mode", False):
+        return int(key.size)
+    width = getattr(runner, "captured_req_width", None)
+    return -1 if width is None else int(key.size * width)
 
 
 class _PendingStep(msgspec.Struct):
@@ -151,6 +186,8 @@ class _PendingStep(msgspec.Struct):
     rids: Optional[list[str]]
     future: Optional[FutureTensors]
     segment_events: dict[InfoSegment, tuple[torch.cuda.Event, torch.cuda.Event]]
+    verify_tokens_actual: int = -1
+    verify_used_cuda_graph: Optional[bool] = None
 
 
 class DsparkInfoDumper:
@@ -255,6 +292,8 @@ class DsparkInfoDumper:
             rids=obs.rids,
             future=future,
             segment_events=self._current_segments,
+            verify_tokens_actual=obs.verify_tokens_actual,
+            verify_used_cuda_graph=obs.verify_used_cuda_graph,
         )
         self._current_segments = {}
         self._prev_stamp = now
@@ -348,6 +387,8 @@ class DsparkInfoDumper:
             record.verify_tokens_local = pending.verify_tokens_local
             record.verify_tokens_dp_synced = pending.verify_tokens_dp_synced
             record.verify_tokens_graph_key = pending.verify_tokens_graph_key
+            record.verify_tokens_actual = pending.verify_tokens_actual
+            record.verify_used_cuda_graph = pending.verify_used_cuda_graph
             record.predicted_step_ms = pending.predicted_step_ms
             record.predicted_theta = pending.predicted_theta
         if InfoComponent.STEP_CPU_TIME in self._components:
@@ -836,6 +877,8 @@ class DsparkStepObservers:
         req_pool_indices: torch.Tensor,
         verify_tier_num_tokens: int,
         dp_tier_num_tokens: Optional[int],
+        target_graph_runner,
+        used_cuda_graph: bool,
     ) -> None:
         planner = self._planner
         if not proposal_folded:
@@ -893,10 +936,13 @@ class DsparkStepObservers:
             predicted_theta = (
                 None if budget_decision is None else budget_decision.predicted_theta
             )
-            num_verify_tokens = (
-                layout.graph_num_tokens
-                if layout is not None
-                else int(verify_ids_2d.numel())
+            num_verify_tokens = resolve_target_verify_num_tokens(
+                is_compact=planner.should_run_compact(layout=layout),
+                layout=layout,
+                verify_ids_2d=verify_ids_2d,
+            )
+            graph_num_tokens = resolve_target_verify_graph_num_tokens(
+                runner=target_graph_runner, used_cuda_graph=used_cuda_graph
             )
             self._info_dumper.observe_decode_step(
                 DecodeStepObservation(
@@ -910,7 +956,11 @@ class DsparkStepObservers:
                     verify_tokens_dp_synced=(
                         -1 if dp_tier_num_tokens is None else int(dp_tier_num_tokens)
                     ),
-                    verify_tokens_graph_key=num_verify_tokens,
+                    verify_tokens_graph_key=graph_num_tokens,
+                    verify_tokens_actual=(
+                        graph_num_tokens if used_cuda_graph else num_verify_tokens
+                    ),
+                    verify_used_cuda_graph=used_cuda_graph,
                     predicted_step_ms=predicted_step_ms,
                     predicted_theta=predicted_theta,
                     verify_lens=layout.verify_lens if layout is not None else None,

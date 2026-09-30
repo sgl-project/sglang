@@ -1,6 +1,7 @@
 import functools
 import types
 import unittest
+from unittest import mock
 
 import torch
 
@@ -9,6 +10,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
 )
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkScheduleConfig,
+    DSparkVerifyPlanner,
     HostConfidenceBudgetPlanner,
     VerifyBudgetDecision,
     compute_verify_token_budget,
@@ -19,6 +21,7 @@ from sglang.srt.speculative.dspark_components.dspark_sps import (
     SpsCostTable,
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -223,6 +226,82 @@ class TestBudgetDecisionLifecycle(CustomTestCase):
         planner.last_decision = VerifyBudgetDecision(budget=1)
         planner.note_non_decode_step()
         self.assertIsNone(planner.take_last_decision())
+
+
+class TestVerifyBudgetTpSync(CustomTestCase):
+    class _FakeTpSync:
+        def __init__(self, rank0_budget):
+            self.rank0_budget = rank0_budget
+            self.site = None
+
+        def sync_cpu(self, site, values):
+            self.site = site
+            values.fill_(-1 if self.rank0_budget is None else self.rank0_budget)
+            return values
+
+    def test_uses_rank0_budget_for_graph_tier_selection(self):
+        planner = DSparkVerifyPlanner.__new__(DSparkVerifyPlanner)
+        planner._tp_sync = self._FakeTpSync(rank0_budget=7)
+
+        self.assertEqual(planner._sync_verify_token_budget(3), 7)
+        self.assertEqual(planner._tp_sync.site, SpecTpSyncSite.DSPARK_PLAN)
+
+    def test_preserves_none_with_wire_sentinel(self):
+        planner = DSparkVerifyPlanner.__new__(DSparkVerifyPlanner)
+        planner._tp_sync = self._FakeTpSync(rank0_budget=None)
+
+        self.assertIsNone(planner._sync_verify_token_budget(3))
+
+    def test_resolve_synchronizes_overlap_and_non_overlap_budgets(self):
+        for disable_overlap in (False, True):
+            for rank0_budget in (None, 0, 7):
+                with self.subTest(overlap=not disable_overlap, budget=rank0_budget):
+                    planner = DSparkVerifyPlanner.__new__(DSparkVerifyPlanner)
+                    planner._budget_planner = object()
+                    planner._tp_sync = self._FakeTpSync(rank0_budget)
+                    draft = types.SimpleNamespace(verify_token_budget=3)
+                    with (
+                        mock.patch(
+                            "sglang.srt.speculative.dspark_components.dspark_planner.get_schedule",
+                            return_value=types.SimpleNamespace(
+                                disable_overlap_schedule=disable_overlap
+                            ),
+                        ),
+                        mock.patch.object(
+                            planner, "compute_budget_sync", return_value=5
+                        ),
+                    ):
+                        budget = planner.resolve_verify_token_budget(
+                            draft_input=draft,
+                            confidence=torch.ones((2, 5)),
+                            prefix_lens=torch.tensor([3, 4]),
+                            req_pool_indices=torch.tensor([0, 1]),
+                        )
+                    self.assertEqual(budget, rank0_budget)
+                    self.assertEqual(draft.verify_token_budget, rank0_budget)
+
+    def test_cpu_sync_uses_the_tp_subgroup_global_source_rank(self):
+        sync = SpecTpSync.__new__(SpecTpSync)
+        sync._sites = {SpecTpSyncSite.DSPARK_PLAN}
+        sync._tp_group = types.SimpleNamespace(ranks=[4, 5], cpu_group=object())
+        values = torch.tensor([3], dtype=torch.int64)
+        with mock.patch(
+            "torch.distributed.broadcast",
+            side_effect=lambda values, **kw: values.fill_(7),
+        ) as broadcast:
+            result = sync.sync_cpu(SpecTpSyncSite.DSPARK_PLAN, values)
+        self.assertIs(result, values)
+        self.assertEqual(values.item(), 7)
+        broadcast.assert_called_once_with(values, src=4, group=sync._tp_group.cpu_group)
+
+    def test_disabled_cpu_sync_preserves_the_local_budget(self):
+        sync = SpecTpSync.__new__(SpecTpSync)
+        sync._sites = frozenset()
+        values = torch.tensor([3], dtype=torch.int64)
+        with mock.patch("torch.distributed.broadcast") as broadcast:
+            self.assertIs(sync.sync_cpu(SpecTpSyncSite.DSPARK_PLAN, values), values)
+        self.assertEqual(values.item(), 3)
+        broadcast.assert_not_called()
 
 
 class TestScheduleVerifyLensTopk(CustomTestCase):

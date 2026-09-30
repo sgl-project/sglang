@@ -660,6 +660,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
         cap_layout.verify_lens.copy_(live.verify_lens)
         cap_layout.qo_indptr_device.copy_(live.qo_indptr_device)
+        cap_layout.extend_start_loc.copy_(live.extend_start_loc)
 
     @staticmethod
     def _max_dp_batch_size(forward_batch: ForwardBatch) -> int:

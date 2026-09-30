@@ -27,6 +27,7 @@ from sglang.kernels.ops.embeddings.engram_gather import engram_gather
 from sglang.kernels.ops.embeddings.engram_hash import (
     MODE_DECODE,
     MODE_EXTEND,
+    MODE_RAGGED_VERIFY,
     MODE_VERIFY,
     engram_commit_history,
     engram_hash_ids,
@@ -291,17 +292,23 @@ class EngramHasher(nn.Module):
         # Tokens at or past num_real are graph padding. History comes from
         # self.history via req_slots unless the scheduler supplied this extend's rows.
         num_real, block, row, starts = num_tokens, 1, None, None
+        qo_indptr = None
         history, hist_via_slots = self.history, True
         if mode.is_decode():
             kmode = MODE_DECODE
             commit_rows, commit_last = req_slots, None
         elif mode.is_target_verify():
-            block = int(forward_batch.spec_info.draft_token_num)
-            assert num_tokens == bs * block, (
-                "engram target-verify expects one equal block per request, got "
-                f"{num_tokens} tokens for {bs} requests of {block}"
-            )
-            kmode = MODE_VERIFY
+            layout = forward_batch.spec_info.ragged_verify_layout
+            if layout is not None:
+                kmode = MODE_RAGGED_VERIFY
+                qo_indptr = layout.qo_indptr_device
+            else:
+                block = int(forward_batch.spec_info.draft_token_num)
+                assert num_tokens == bs * block, (
+                    "engram target-verify expects one equal block per request, got "
+                    f"{num_tokens} tokens for {bs} requests of {block}"
+                )
+                kmode = MODE_VERIFY
             commit_rows = commit_last = None
         else:
             assert mode.is_extend(), (
@@ -350,6 +357,7 @@ class EngramHasher(nn.Module):
                 block=block,
                 row=row,
                 starts=starts,
+                qo_indptr=qo_indptr,
                 image_token_id=self.image_token_id,
                 mm_pad_shift=MM_PAD_SHIFT_VALUE,
             )
@@ -363,6 +371,7 @@ class EngramHasher(nn.Module):
                 block,
                 row,
                 starts,
+                qo_indptr,
             )
         if commit_rows is not None:
             # Padded rows must not overwrite a live request's history.
@@ -387,6 +396,7 @@ class EngramHasher(nn.Module):
         block: int,
         row: Optional[torch.Tensor],
         starts: Optional[torch.Tensor],
+        qo_indptr: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Non-CUDA fallback of the hash kernel: predecessor table [T, n] and hash ids.
         ``history`` is already the per-request [bs, n - 1] rows of this batch."""
@@ -404,6 +414,10 @@ class EngramHasher(nn.Module):
             if kmode == MODE_VERIFY:
                 row = t // block
                 offset = t - row * block
+            elif kmode == MODE_RAGGED_VERIFY:
+                row = torch.searchsorted(qo_indptr[1:], t, right=True)
+                row = row.clamp_max(history.shape[0] - 1)
+                offset = t - qo_indptr[row]
             else:
                 offset = t - starts[row]
             # Predecessor at shift s of token t: an earlier token of the same run
@@ -421,6 +435,10 @@ class EngramHasher(nn.Module):
         blocked = positions.unsqueeze(-1) < shifts
         if num_real < num_tokens:
             blocked[num_real:] = True
+        if kmode == MODE_RAGGED_VERIFY:
+            padding = torch.arange(num_tokens, device=device) >= qo_indptr[-1]
+            tokens = tokens.masked_fill(padding.unsqueeze(-1), 0)
+            blocked = blocked | padding.unsqueeze(-1)
         if self.image_token_id is not None:
             # Scheduler-provided history still carries the multimodal pad ids.
             tokens = tokens.masked_fill(

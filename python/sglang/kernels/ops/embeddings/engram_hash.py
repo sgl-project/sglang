@@ -20,6 +20,7 @@ import triton.language as tl
 MODE_DECODE = 0
 MODE_VERIFY = 1
 MODE_EXTEND = 2
+MODE_RAGGED_VERIFY = 3
 
 
 @triton.jit
@@ -87,6 +88,7 @@ def _engram_hash_kernel(
     pos_ptr,
     row_ptr,
     starts_ptr,
+    qo_indptr_ptr,
     slots_ptr,
     hist_ptr,
     token_map_ptr,
@@ -103,6 +105,8 @@ def _engram_hash_kernel(
     mm_pad_shift,
     MODE: tl.constexpr,
     BLOCK: tl.constexpr,
+    NUM_REQS: tl.constexpr,
+    SEARCH_STEPS: tl.constexpr,
     HIST_VIA_SLOTS: tl.constexpr,
     HAS_IMAGE: tl.constexpr,
     COMMIT: tl.constexpr,
@@ -123,6 +127,20 @@ def _engram_hash_kernel(
     elif MODE == 1:
         r = (t // BLOCK).to(tl.int64)
         off = t - (t // BLOCK) * BLOCK
+    elif MODE == 3:
+        # Upper bound over row ends handles empty rows and does not materialize
+        # a variable-sized row map (which would break CUDA graph capture).
+        real = real & (t < tl.load(qo_indptr_ptr + NUM_REQS))
+        lo = tl.full((BLOCK_T,), 0, tl.int32)
+        hi = tl.full((BLOCK_T,), NUM_REQS, tl.int32)
+        for _ in tl.static_range(SEARCH_STEPS):
+            mid = (lo + hi) // 2
+            end = tl.load(qo_indptr_ptr + mid + 1, mask=mid < NUM_REQS, other=0)
+            advance = (mid < NUM_REQS) & (end <= t)
+            lo = tl.where(advance, mid + 1, lo)
+            hi = tl.where(advance, hi, mid)
+        r = tl.minimum(lo, NUM_REQS - 1).to(tl.int64)
+        off = t - tl.load(qo_indptr_ptr + r).to(tl.int32)
     else:
         r = tl.load(row_ptr + t, mask=real, other=0).to(tl.int64)
         off = t - tl.load(starts_ptr + r, mask=real, other=0).to(tl.int32)
@@ -202,6 +220,7 @@ def _launch_hash_kernel(
     block: int,
     row: Optional[torch.Tensor],
     starts: Optional[torch.Tensor],
+    qo_indptr: Optional[torch.Tensor],
     image_token_id: Optional[int],
     mm_pad_shift: int,
     out_cache_loc: Optional[torch.Tensor],
@@ -216,6 +235,9 @@ def _launch_hash_kernel(
     assert history.dim() == 2 and history.shape[1] == N - 1, history.shape
     if mode == MODE_EXTEND:
         assert row is not None and starts is not None
+    if mode == MODE_RAGGED_VERIFY:
+        assert req_slots is not None and req_slots.numel() > 0
+        assert qo_indptr is not None and qo_indptr.numel() == req_slots.numel() + 1
     if out_cache_loc is not None:
         assert mode == MODE_DECODE and req_slots is not None, "commit is decode-only"
         assert out_cache_loc.shape[0] == num_tokens, out_cache_loc.shape
@@ -236,6 +258,7 @@ def _launch_hash_kernel(
         positions,
         row if row is not None else dummy,
         starts if starts is not None else dummy,
+        qo_indptr if qo_indptr is not None else dummy,
         req_slots if req_slots is not None else dummy,
         history,
         token_map,
@@ -252,6 +275,10 @@ def _launch_hash_kernel(
         mm_pad_shift,
         MODE=mode,
         BLOCK=block,
+        NUM_REQS=req_slots.numel() if mode == MODE_RAGGED_VERIFY else 0,
+        SEARCH_STEPS=(
+            req_slots.numel().bit_length() if mode == MODE_RAGGED_VERIFY else 0
+        ),
         HIST_VIA_SLOTS=req_slots is not None,
         HAS_IMAGE=image_token_id is not None,
         COMMIT=out_cache_loc is not None,
@@ -281,6 +308,7 @@ def engram_hash_ids(
     block: int = 1,
     row: Optional[torch.Tensor] = None,
     starts: Optional[torch.Tensor] = None,
+    qo_indptr: Optional[torch.Tensor] = None,
     image_token_id: Optional[int] = None,
     mm_pad_shift: int = 0,
     block_t: int = 32,
@@ -290,7 +318,9 @@ def engram_hash_ids(
 
     ``mode``: MODE_DECODE (row = t, offset 0), MODE_VERIFY (row = t // block),
     MODE_EXTEND (``row`` [num_real] and ``starts`` [bs] give each token's request and
-    the run's first token). ``history`` is [rows, n - 1] oldest first; with
+    the run's first token), or MODE_RAGGED_VERIFY (``qo_indptr`` [bs + 1]
+    describes the packed runs, including empty rows and a padding tail).
+    ``history`` is [rows, n - 1] oldest first; with
     ``req_slots`` given it is indexed by ``req_slots[row]``, else by ``row``.
     Tokens at or past ``num_real`` are padding: PAD ids, zero predecessors.
     """
@@ -309,6 +339,7 @@ def engram_hash_ids(
         block=block,
         row=row,
         starts=starts,
+        qo_indptr=qo_indptr,
         image_token_id=image_token_id,
         mm_pad_shift=mm_pad_shift,
         out_cache_loc=None,
@@ -354,6 +385,7 @@ def engram_hash_ids_and_commit(
         block=1,
         row=None,
         starts=None,
+        qo_indptr=None,
         image_token_id=image_token_id,
         mm_pad_shift=mm_pad_shift,
         out_cache_loc=out_cache_loc,
