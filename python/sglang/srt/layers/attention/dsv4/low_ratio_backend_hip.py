@@ -1,5 +1,5 @@
 """DeepSeek V4.1 low-ratio (1 / 2) indexer on ROCm: FlyDSL fp4 paged MQA logits over the split
-payload / scale index-K pools, then the AOT top-k transform -- the DeepGEMM path's contract."""
+payload / scale index-K pools, then the top-k v2 transform -- the DeepGEMM path's contract."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from sglang.kernels.ops.attention.dsv4.candidate_blocks_hip import (
     cat_candidate_blocks,
     select_candidate_blocks_hip,
     slice_candidate_blocks,
-    topk_transform_paged_sorted,
+    topk_transform_paged_hip,
     topk_within_candidate_blocks_hip,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
@@ -292,7 +292,6 @@ def low_ratio_index_topk_hip_decode(
             page_size=indexer_metadata.compressed_page_size,
             page_indices=core.sparse_page_indices(ratio),
             raw_indices=core.sparse_raw_indices(ratio),
-            sort_output=True,
         )
         return
     if two_level and indexer.is_candidate_source:
@@ -302,7 +301,7 @@ def low_ratio_index_topk_hip_decode(
             topk_blocks=indexer.candidate_topk_blocks,
             block_size=indexer.candidate_block_size,
         )
-    topk_transform_paged_sorted(
+    topk_transform_paged_hip(
         logits,
         indexer_metadata.compressed_seq_lens,
         indexer_metadata.page_table,
@@ -547,7 +546,7 @@ def _select_topk_extend_hip(
             rows_page = page_indices[rows]
             rows_raw = raw_indices[rows] if raw_indices is not None else None
             if consume[b] is None:
-                topk_transform_paged_sorted(
+                topk_transform_paged_hip(
                     logits[rows],
                     compress_lens[rows].contiguous(),
                     page_table[rows],
@@ -564,10 +563,9 @@ def _select_topk_extend_hip(
                     page_size=page_size,
                     page_indices=rows_page,
                     raw_indices=rows_raw,
-                    sort_output=True,
                 )
         return
-    topk_transform_paged_sorted(
+    topk_transform_paged_hip(
         logits,
         compress_lens.contiguous(),
         page_table,
