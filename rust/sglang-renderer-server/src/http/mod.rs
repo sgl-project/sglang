@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use axum::Router;
 
+use crate::api::OpenAIService;
 use crate::engine::HttpGenerateClient;
-use crate::openai::OpenAIService;
 
 mod chat;
 mod completions;
@@ -18,7 +18,7 @@ mod tokenize;
 #[cfg(test)]
 mod tests;
 
-use crate::openai::protocol::{ChatCompletionRequest, CompletionRequest};
+use crate::api::protocol::{ChatCompletionRequest, CompletionRequest};
 
 const DEFAULT_REQUEST_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 

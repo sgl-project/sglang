@@ -1,7 +1,7 @@
 //! HTTP tokenization adapter.
 
 use super::error::{json_rejection_response, response_error};
-use crate::openai::tokenize::{TokenizeRequest, tokenize as tokenize_request};
+use crate::api::tokenize::{TokenizeRequest, tokenize as tokenize_request};
 use axum::{
     Json, Router,
     extract::{State, rejection::JsonRejection},

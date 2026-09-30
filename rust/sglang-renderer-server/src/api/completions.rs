@@ -459,8 +459,8 @@ mod tests {
         unary_completion,
     };
     use crate::GenerationOutputExtras;
+    use crate::api::test_utils::{chunk, renderer_config, submitted};
     use crate::engine::{TokenDecoder, test_utils::tiny_tokenizer};
-    use crate::openai::test_utils::{chunk, renderer_config, submitted};
     use crate::{PositionLogprobs, TokenLogprob};
     use futures::StreamExt;
     use sglang_processor::{DynamoTokenizer, RendererService, ResponseError};

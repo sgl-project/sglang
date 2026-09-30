@@ -4,10 +4,10 @@
 //! Temporary: see README.md. Protocol adapters own middleware and framing;
 //! shared services own submission policy and decoding.
 
+mod api;
 mod engine;
 mod http;
 mod launcher;
-mod openai;
 mod runtime;
 
 pub(crate) use engine::{
