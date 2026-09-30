@@ -49,6 +49,7 @@ fn build_sticky_ctx(header_name: &str, worker_urls: &[String]) -> Arc<AppContext
             circuit_breaker: None,
             cache_aware: None,
             decode_policy: None,
+            dp_aware: Default::default(),
             sticky: Some(StickyConfig {
                 header_name: header_name.to_string(),
                 fallback_policy: PolicyKind::RoundRobin,

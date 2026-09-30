@@ -49,6 +49,7 @@ fn config(policy: PolicyKind, decode_policy: Option<PolicyKind>) -> Config {
             circuit_breaker: None,
             cache_aware: None,
             decode_policy,
+            dp_aware: Default::default(),
             sticky: None,
             max_output_tokens: None,
             sampling_overrides: Default::default(),

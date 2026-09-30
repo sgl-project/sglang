@@ -59,6 +59,10 @@ pub struct ServerInfo {
     /// field) ⇒ stay on HTTP/1.1. Consumed by `manager::register_one` to set
     /// [`crate::workers::WireProtocol`].
     pub enable_http2: Option<bool>,
+    /// Attention-DP size (`ServerArgs.dp_size`, falling back to the
+    /// `kv_events` block's). `None` when the worker reports neither. Consumed
+    /// by `--dp-aware` routing, which picks a rank in `0..dp_size`.
+    pub dp_size: Option<u32>,
 }
 
 /// PD classification derived from a worker's `/server_info` response.
@@ -143,6 +147,13 @@ impl WorkerIntrospector {
         let event_config = parsed
             .kv_events
             .map(|block| resolve_event_config(block, worker_url, is_bigram));
+        // Top-level `dp_size` is authoritative (present whether or not KV
+        // events are enabled); the events block's copy covers engines that
+        // somehow expose only that one.
+        let dp_size = parsed
+            .dp_size
+            .or_else(|| event_config.as_ref().map(|c| c.dp_size))
+            .filter(|&n| n > 0);
 
         let disaggregation_role = resolve_disaggregation_role(
             parsed.disaggregation_mode.as_deref(),
@@ -155,6 +166,7 @@ impl WorkerIntrospector {
             event_config,
             disaggregation_role,
             enable_http2: parsed.enable_http2,
+            dp_size,
         }
     }
 
@@ -367,6 +379,10 @@ struct ServerInfoBody {
     /// versions that predate the flag.
     #[serde(default)]
     enable_http2: Option<bool>,
+    /// `ServerArgs.dp_size` — the attention-DP size with
+    /// `--enable-dp-attention`, which is what `routed_dp_rank` indexes.
+    #[serde(default)]
+    dp_size: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -588,6 +604,27 @@ mod tests {
         assert_eq!(cfg.topic, "kv");
         assert_eq!(cfg.block_size, 64);
         assert_eq!(cfg.dp_size, 2);
+    }
+
+    /// `--dp-aware` reads the top-level `dp_size` (present with or without KV
+    /// events), falling back to the events block's copy.
+    #[tokio::test]
+    async fn fetch_reports_dp_size_top_level_then_kv_events() {
+        let (url, _s1) = spawn_fake_worker(json!({"served_model_name": "m", "dp_size": 8})).await;
+        assert_eq!(fast_introspector().fetch(&url).await.dp_size, Some(8));
+
+        let (url, _s2) = spawn_fake_worker(json!({
+            "served_model_name": "m",
+            "kv_events": {
+                "publisher": "zmq", "endpoint_host": "h", "endpoint_port_base": 6000,
+                "topic": "kv", "block_size": 64, "dp_size": 4,
+            }
+        }))
+        .await;
+        assert_eq!(fast_introspector().fetch(&url).await.dp_size, Some(4));
+
+        let (url, _s3) = spawn_fake_worker(json!({"served_model_name": "m"})).await;
+        assert_eq!(fast_introspector().fetch(&url).await.dp_size, None);
     }
 
     #[tokio::test]

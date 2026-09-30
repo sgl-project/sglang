@@ -382,6 +382,16 @@ pub struct MatchResult {
     pub tiers: HashMap<KvWorkerId, Tiers>,
 }
 
+/// What one `dp_rank` of a worker holds of a block chain — see
+/// [`HashTree::match_prefix_by_rank`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RankHold {
+    /// Deepest block of the chain this rank holds (1-based count of blocks).
+    pub depth: usize,
+    /// Tiers the rank holds that deepest block on.
+    pub tiers: Tiers,
+}
+
 impl MatchResult {
     /// The subset of `workers` holding the deepest matched node on device.
     pub fn device_workers(&self) -> HashSet<KvWorkerId> {
@@ -1032,6 +1042,53 @@ impl TreeState {
         owned_depth
     }
 
+    /// Read-only per-rank match path within this shard. See
+    /// [`HashTree::match_prefix_by_rank`] for the semantics. Like
+    /// [`Self::match_prefix_for_url`], it does not touch `last_used`.
+    fn match_prefix_by_rank(
+        &self,
+        parent_hash: Option<i64>,
+        block_hashes: &[i64],
+        url: &str,
+    ) -> HashMap<u32, RankHold> {
+        let start = match parent_hash {
+            None => ROOT_ID,
+            Some(p) => match self.by_hash.get(&p) {
+                Some(set) if set.len() == 1 => *set.iter().next().unwrap(),
+                _ => ROOT_ID,
+            },
+        };
+
+        let mut current = start;
+        let mut holds: HashMap<u32, RankHold> = HashMap::new();
+        for (i, &h) in block_hashes.iter().enumerate() {
+            let Some(child_id) = self
+                .nodes
+                .get(&current)
+                .and_then(|n| n.children.get(&h).copied())
+            else {
+                break;
+            };
+            current = child_id;
+            let depth = i + 1;
+            if let Some(node) = self.nodes.get(&child_id) {
+                for (w, tiers) in node.workers.iter().filter(|(w, _)| w.url == url) {
+                    // Deeper wins; the walk is monotone in depth, so the last
+                    // write for a rank is its deepest holding and the tiers it
+                    // holds THAT node on.
+                    holds.insert(
+                        w.dp_rank,
+                        RankHold {
+                            depth,
+                            tiers: *tiers,
+                        },
+                    );
+                }
+            }
+        }
+        holds
+    }
+
     /// Count of *non-root* nodes in this shard.
     fn node_count(&self) -> usize {
         // Subtract one for the root sentinel.
@@ -1388,6 +1445,33 @@ impl HashTree {
         self.shards[idx]
             .read()
             .match_prefix_for_url(effective_parent, block_hashes, url)
+    }
+
+    /// Per `dp_rank` of the worker at `url`: the deepest block of
+    /// `block_hashes` that rank holds, and the tiers it holds that block on.
+    ///
+    /// The DP-aware counterpart of [`Self::match_prefix_for_url`]: that one
+    /// collapses a URL's ranks into one destination, which is right when the
+    /// engine picks the rank. When the router picks it (`--dp-aware`), a
+    /// prefix on rank 3 is only a hit if the request is sent to rank 3, so the
+    /// ranks must stay apart. One walk answers every rank.
+    ///
+    /// Ranks holding nothing on the chain are absent from the map. Like
+    /// [`Self::match_prefix_for_url`] it does NOT touch `last_used`, and an
+    /// ambiguous `parent_hash` falls back to matching from the root.
+    pub fn match_prefix_by_rank(
+        &self,
+        parent_hash: Option<i64>,
+        block_hashes: &[i64],
+        url: &str,
+    ) -> HashMap<u32, RankHold> {
+        if block_hashes.is_empty() {
+            return HashMap::new();
+        }
+        let (idx, effective_parent) = self.route_match(parent_hash, block_hashes);
+        self.shards[idx]
+            .read()
+            .match_prefix_by_rank(effective_parent, block_hashes, url)
     }
 
     /// Number of non-root nodes across all shards (root sentinels are not
@@ -2119,6 +2203,32 @@ mod tests {
             tree.match_prefix_for_url(None, &[1, 2, 3, 4], "http://a"),
             4,
         );
+    }
+
+    /// `--dp-aware` needs the ranks kept apart: rank 1 holding four blocks
+    /// must not make rank 0 look like it holds four.
+    #[test]
+    fn match_prefix_by_rank_keeps_ranks_apart() {
+        let tree = HashTree::new();
+        tree.insert(&worker("http://a", 0), None, &[1, 2]);
+        tree.insert(&worker("http://a", 1), None, &[1, 2, 3, 4]);
+        tree.insert(&worker("http://b", 2), None, &[1, 2, 3, 4]);
+
+        let holds = tree.match_prefix_by_rank(None, &[1, 2, 3, 4], "http://a");
+        assert_eq!(holds.len(), 2, "only http://a's ranks: {holds:?}");
+        assert_eq!(holds[&0].depth, 2);
+        assert_eq!(holds[&1].depth, 4);
+        assert!(holds[&1].tiers.contains(Tiers::DEVICE));
+        assert!(
+            !holds.contains_key(&2),
+            "another URL's rank must not leak in"
+        );
+
+        assert!(tree
+            .match_prefix_by_rank(None, &[1, 2, 3, 4], "http://absent")
+            .is_empty());
+        assert!(tree.match_prefix_by_rank(None, &[], "http://a").is_empty());
+        assert!(tree.match_prefix_by_rank(None, &[9], "http://a").is_empty());
     }
 
     /// A node kept alive by a descendant after its owner was removed is not

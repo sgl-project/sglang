@@ -111,6 +111,7 @@ fn build_ctx(worker_url: &str, cache_sim_url: &str) -> Arc<AppContext> {
             circuit_breaker: None,
             cache_aware: None,
             decode_policy: None,
+            dp_aware: Default::default(),
             sticky: None,
             max_output_tokens: None,
             sampling_overrides: Default::default(),

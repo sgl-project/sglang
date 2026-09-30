@@ -13,6 +13,7 @@ mod common;
 mod cache_aware_input_ids;
 mod cache_sim_extend_tee;
 mod chat_routing;
+mod dp_aware_routing;
 mod failover;
 mod graceful_shutdown;
 mod h2c_forward;

@@ -38,7 +38,9 @@ pub use hash::{compute_block_hashes, compute_block_hashes_bigram, sha256_to_i64}
 pub use index::KvEventIndex;
 pub use subscriber::{KvEventSubscriberRegistry, SubKind, WorkerEvent};
 pub use tally::{EventKind, EventTally, TallyRow};
-pub use tree::{HashTree, KvWorkerId, MatchResult, RestoreError, SnapshotNode, TierCounts, Tiers};
+pub use tree::{
+    HashTree, KvWorkerId, MatchResult, RankHold, RestoreError, SnapshotNode, TierCounts, Tiers,
+};
 pub use wire::{
     decode_event_batch, BlockRemoved, BlockStored, DecodeError, KvCacheEvent, KvEventBatch,
 };

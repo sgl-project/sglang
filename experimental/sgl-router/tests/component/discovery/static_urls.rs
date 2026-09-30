@@ -137,6 +137,7 @@ async fn static_urls_pd_role_resolved_end_to_end() {
             circuit_breaker: None,
             cache_aware: None,
             decode_policy: None,
+            dp_aware: Default::default(),
             sticky: None,
             max_output_tokens: None,
             sampling_overrides: Default::default(),

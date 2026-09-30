@@ -65,6 +65,7 @@ fn config() -> Config {
             // Push eviction far out so the background sweeper never fires
             // mid-test; round-robin fallback for the initial pin of a key.
             decode_policy: None,
+            dp_aware: Default::default(),
             sticky: Some(StickyConfig {
                 header_name: HEADER.to_string(),
                 fallback_policy: PolicyKind::RoundRobin,

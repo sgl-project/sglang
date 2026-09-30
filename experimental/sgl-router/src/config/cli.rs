@@ -17,9 +17,9 @@ use crate::config::{
     default_stream_send_stall_secs, default_stream_total_timeout_secs, default_tokenizer_shards,
     default_transfer_group_label, resolve_mode, ActiveLoadConfig, AdmissionConfig,
     CacheAwareConfig, CircuitBreakerConfig, Config, ConflictPolicy, DiscoveryBackend,
-    K8sDiscoveryConfig, LoadGate, LoadMonitorConfig, LogFormat, ModelConfig, ObservabilityConfig,
-    ParamSpec, PolicyKind, ProxyConfig, RetryConfig, SamplingField, SamplingOverrides,
-    ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig,
+    DpAwareConfig, K8sDiscoveryConfig, LoadGate, LoadMonitorConfig, LogFormat, ModelConfig,
+    ObservabilityConfig, ParamSpec, PolicyKind, ProxyConfig, RetryConfig, SamplingField,
+    SamplingOverrides, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig,
 };
 
 /// `sgl-router` — slim KV-aware OpenAI-compatible router for SGLang workers.
@@ -159,6 +159,26 @@ pub struct Cli {
         value_parser = clap::builder::BoolishValueParser::new()
     )]
     pub disable_input_ids_offload: bool,
+
+    // ---- attention-DP-aware routing ----
+    /// Route to a specific attention-DP rank of the selected worker instead of
+    /// letting the engine's DP controller pick one — the router sends the rank
+    /// as `X-Data-Parallel-Rank` (`routed_dp_rank`). Same flag as
+    /// sgl-model-gateway's `--dp-aware`. With `--policy cache_aware_zmq` the
+    /// rank is the one holding the request's prefix (per-rank KV events), so
+    /// the prefix hit the router routed for is the one the engine serves;
+    /// otherwise, and when no rank holds it, the least-loaded rank. The rank
+    /// count comes from each worker's `/server_info` `dp_size`; workers with
+    /// `dp_size <= 1` are unaffected. Plain (non-PD) mode only.
+    #[arg(long)]
+    pub dp_aware: bool,
+    /// Per-rank queue limit for `--dp-aware`: a rank with at least this many
+    /// waiting requests stops winning on cache affinity, and the request goes
+    /// to another rank holding the prefix or the least-loaded rank. Defaults
+    /// to `--worker-queue-limit / dp_size` (rounded up) when that is set;
+    /// otherwise no per-rank gate. Requires `--dp-aware`.
+    #[arg(long)]
+    pub dp_rank_queue_limit: Option<NonZeroUsize>,
     /// Routing policy (plain-mode workers, or the PREFILL pool in PD mode).
     #[arg(long, value_enum, default_value = "round_robin")]
     pub policy: PolicyKind,
@@ -492,6 +512,9 @@ impl Cli {
         // than silently dropping them — mirrors the discovery mutual-exclusion
         // checks. Otherwise an operator believes they tuned something that has
         // no effect.
+        if self.dp_rank_queue_limit.is_some() && !self.dp_aware {
+            return Err(anyhow!("--dp-rank-queue-limit requires --dp-aware"));
+        }
         if self.cb_cool_down_secs.is_some() && self.cb_threshold.is_none() {
             return Err(anyhow!(
                 "--cb-cool-down-secs requires --cb-threshold (the circuit breaker is \
@@ -765,6 +788,10 @@ impl Cli {
                 sampling_overrides,
                 forward_input_ids: !self.disable_input_ids_offload,
                 decode_policy: self.decode_policy,
+                dp_aware: DpAwareConfig {
+                    enabled: self.dp_aware,
+                    rank_queue_limit: self.dp_rank_queue_limit,
+                },
             },
             discovery,
             proxy: ProxyConfig {
@@ -2261,6 +2288,36 @@ mod tests {
         // The gate REPLACES the spread strategy — the spread knobs must not
         // survive alongside it in the built config.
         assert!(matches!(ca.load_gate, LoadGate::PerWorkerQueue(_)));
+    }
+
+    #[test]
+    fn dp_aware_flags_reach_the_model_config() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--dp-aware",
+            "--dp-rank-queue-limit",
+            "2",
+        ]))
+        .unwrap();
+        assert!(c.model.dp_aware.enabled);
+        assert_eq!(c.model.dp_aware.rank_queue_limit.map(|n| n.get()), Some(2));
+
+        let off = into_config_owned(with_model(&["--worker-urls", "http://x:30000"])).unwrap();
+        assert_eq!(off.model.dp_aware, DpAwareConfig::default());
+    }
+
+    #[test]
+    fn rejects_dp_rank_queue_limit_without_dp_aware() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--dp-rank-queue-limit",
+            "2",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--dp-aware"), "got: {err}");
     }
 
     /// A limit of 0 would make every worker ineligible, silently degrading the

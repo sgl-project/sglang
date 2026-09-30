@@ -5,7 +5,8 @@ use crate::discovery::{ModelId, WorkerId, WorkerMode};
 use crate::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -292,7 +293,24 @@ pub struct Worker {
     bootstrap_port: Option<u16>,
     /// PD transfer group (see [`crate::discovery::WorkerSpec::transfer_group`]).
     transfer_group: Option<String>,
+    /// Attention-DP size from `/server_info` (`dp_size`); 0 = not known yet.
+    /// Interior-mutable for the same reason as `protocol`: the manager stamps
+    /// it from introspection, and a reconcile can correct it in place.
+    dp_size: AtomicU32,
+    /// Router-side dispatch timestamps per attention-DP rank, recorded by
+    /// `--dp-aware` routing. The per-rank analogue of the slot timestamps
+    /// behind [`Self::slots_acquired_since`]: between two engine gauges it is
+    /// the only record of what this router already sent to a rank, and without
+    /// it every request for a hot prefix lands on the same rank until the next
+    /// gauge arrives. Pruned to [`RANK_DISPATCH_HORIZON`] on every write.
+    rank_dispatches: Mutex<Vec<VecDeque<Instant>>>,
 }
+
+/// How long [`Worker::record_rank_dispatch`] keeps a timestamp. Longer than
+/// any engine-load freshness window (the gauge a count is added on top of is
+/// at most that old) with slack for a slow publisher; beyond it a stale gauge
+/// is not trusted anyway.
+pub const RANK_DISPATCH_HORIZON: Duration = Duration::from_secs(60);
 
 impl Worker {
     pub fn new(spec: crate::discovery::WorkerSpec) -> Self {
@@ -327,7 +345,47 @@ impl Worker {
             bootstrap_host,
             bootstrap_port: spec.bootstrap_port,
             transfer_group: spec.transfer_group,
+            dp_size: AtomicU32::new(0),
+            rank_dispatches: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Attention-DP size, or 0 when introspection has not reported one.
+    pub fn dp_size(&self) -> u32 {
+        self.dp_size.load(Ordering::Relaxed)
+    }
+
+    /// Stamp the attention-DP size from `/server_info`.
+    pub fn set_dp_size(&self, dp_size: u32) {
+        self.dp_size.store(dp_size, Ordering::Relaxed);
+    }
+
+    /// Record that this router just sent a request to `rank`.
+    pub fn record_rank_dispatch(&self, rank: u32, now: Instant) {
+        let mut log = self.rank_dispatches.lock();
+        let idx = rank as usize;
+        if log.len() <= idx {
+            log.resize_with(idx + 1, VecDeque::new);
+        }
+        for q in log.iter_mut() {
+            while q
+                .front()
+                .is_some_and(|&t| now.saturating_duration_since(t) > RANK_DISPATCH_HORIZON)
+            {
+                q.pop_front();
+            }
+        }
+        log[idx].push_back(now);
+    }
+
+    /// Requests this router sent to `rank` at or after `since` (within
+    /// [`RANK_DISPATCH_HORIZON`]).
+    pub fn rank_dispatches_since(&self, rank: u32, since: Instant) -> usize {
+        let log = self.rank_dispatches.lock();
+        log.get(rank as usize)
+            // Timestamps are appended in order, so count from the back.
+            .map(|q| q.iter().rev().take_while(|&&t| t >= since).count())
+            .unwrap_or(0)
     }
 
     /// PD transfer group, or `None` for ungrouped workers. Prefill and

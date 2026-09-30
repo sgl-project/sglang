@@ -10,14 +10,14 @@ use crate::policies::registry::{
     prefill_with_compatible_group, same_transfer_group, select_decode_with_affinity_outcome,
     PdPoolResolver, PdResolveError,
 };
-use crate::policies::{request_tokens_for, RequestTokens, SelectionContext};
+use crate::policies::{dp_rank, request_tokens_for, Policy, RequestTokens, SelectionContext};
 use crate::proxy::sse::{StreamCapture, StreamEnd};
 use crate::proxy::AbortReason;
 use crate::server::app::{RequestPhase, RequestPhaseCell};
 use crate::server::app_context::AppContext;
 use crate::server::cache_sim_extend::{self, ReplySource};
 use crate::server::error::ApiError;
-use crate::server::header_utils::SERVER_TIMING;
+use crate::server::header_utils::{SERVER_TIMING, X_DATA_PARALLEL_RANK};
 use crate::server::metrics::{
     MetricsRegistry, RequestLogContext, RequestOutcome, StaleRequestOutcome, StreamOutcome,
     WorkerModeLabel,
@@ -587,6 +587,10 @@ async fn chat_completions_inner(
     // since the engine's last report on top of the reported depth.
     let decode_hint_url: Option<String> = decode_peer.as_ref().map(|d| d.url.clone());
     let mut request_headers = headers;
+    // The rank override is the router's to set (`--dp-aware`, per attempt
+    // below). A client-sent one would otherwise ride the forwarding whitelist
+    // and steer the engine's DP controller around every policy.
+    request_headers.remove(X_DATA_PARALLEL_RANK);
     if let Some(url) = &decode_hint_url {
         match HeaderValue::from_str(url) {
             Ok(v) => {
@@ -1143,6 +1147,12 @@ async fn chat_completions_inner(
             // interrupts a running attempt; the attempt completes or fails on its
             // own, bounded only by `request_timeout` / the stale budget.
             let attempt_start = std::time::Instant::now();
+            // `--dp-aware`: pin this attempt to one attention-DP rank of
+            // `worker`. Per attempt, not per request: a retry lands on a
+            // different worker, whose ranks and prefix holdings differ.
+            let rank_headers =
+                dp_rank_headers(&ctx, policy.as_ref(), &worker, &selection_ctx, &headers);
+            let attempt_headers: &HeaderMap = rank_headers.as_ref().unwrap_or(&headers);
             let attempt_result = if streaming {
                 // Plain mode, streaming. Both guards ride the SSE pump until
                 // the body completes — see the matching comment in the
@@ -1171,7 +1181,7 @@ async fn chat_completions_inner(
                     worker.protocol(),
                     &worker.breaker,
                     "/v1/chat/completions",
-                    &headers,
+                    attempt_headers,
                     // Cloned so the body survives for a possible re-dispatch;
                     // `Bytes` clone is a cheap refcount bump.
                     outgoing_body.clone(),
@@ -1241,7 +1251,7 @@ async fn chat_completions_inner(
                     worker.protocol(),
                     &worker.breaker,
                     "/v1/chat/completions",
-                    &headers,
+                    attempt_headers,
                     outgoing_body.clone(),
                 );
                 // Same `biased` order as the streaming arm.
@@ -1802,6 +1812,66 @@ fn build_outgoing_body(
         ApiError::Internal(anyhow::Error::new(e).context("re-serialize injected request body"))
     })?;
     Ok(Bytes::from(bytes))
+}
+
+/// `--dp-aware`: pick the attention-DP rank of `worker` for one dispatch
+/// attempt and return that attempt's headers carrying it as
+/// `X-Data-Parallel-Rank`, or `None` to send `headers` unchanged (flag off,
+/// or a worker with `dp_size <= 1`). Records the dispatch against the rank so
+/// the next pick sees it before the engine's next load report does.
+fn dp_rank_headers(
+    ctx: &AppContext,
+    policy: &dyn Policy,
+    worker: &Worker,
+    selection_ctx: &SelectionContext<'_>,
+    headers: &HeaderMap,
+) -> Option<HeaderMap> {
+    let cfg = &ctx.config.model.dp_aware;
+    if !cfg.enabled {
+        return None;
+    }
+    let dp_size = worker.dp_size();
+    if dp_size <= 1 {
+        return None;
+    }
+    let now = std::time::Instant::now();
+    // One table backs both the push (ZMQ LoadStat) and pull (Load Monitor)
+    // paths; either handle reaches it.
+    let gauges = ctx
+        .kv_index()
+        .map(|idx| idx.engine_load().rank_state(&worker.url, now))
+        .or_else(|| {
+            ctx.load_monitor
+                .as_ref()
+                .map(|lm| lm.table().rank_state(&worker.url, now))
+        })
+        .unwrap_or_default();
+    let worker_queue_limit = ctx
+        .config
+        .model
+        .cache_aware
+        .as_ref()
+        .and_then(|c| c.load_gate.queue_limit());
+    let rank_queue_limit = dp_rank::effective_rank_queue_limit(
+        cfg.rank_queue_limit.map(std::num::NonZeroUsize::get),
+        worker_queue_limit,
+        dp_size,
+    );
+    let prefix = policy.rank_prefix(worker, selection_ctx);
+    let pick = dp_rank::pick_rank(worker, prefix.as_ref(), &gauges, rank_queue_limit, now)?;
+    worker.record_rank_dispatch(pick.rank, now);
+    ctx.metrics.record_dp_rank_selection(pick.decision);
+    tracing::debug!(
+        worker = %worker.url,
+        dp_size,
+        rank = pick.rank,
+        decision = pick.decision.as_str(),
+        prefix_ranks = prefix.as_ref().map_or(0, |p| p.holds.len()),
+        "dp-aware: pinned dispatch to attention-DP rank",
+    );
+    let mut out = headers.clone();
+    out.insert(X_DATA_PARALLEL_RANK, HeaderValue::from(pick.rank));
+    Some(out)
 }
 
 /// Select the ids to forward to the engine as `input_ids`, if any.
@@ -2656,6 +2726,7 @@ mod tests {
                 circuit_breaker: None,
                 cache_aware: None,
                 decode_policy: None,
+                dp_aware: Default::default(),
                 sticky: None,
                 max_output_tokens: None,
                 sampling_overrides: Default::default(),

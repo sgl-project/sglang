@@ -666,6 +666,17 @@ async fn register_one(
     // protocol on the post-insert entry.
     if let Some(w) = registry.get(&worker_id) {
         w.set_protocol(protocol);
+        // Same post-insert stamping as the protocol, for `--dp-aware`.
+        if let Some(dp_size) = info.dp_size {
+            w.set_dp_size(dp_size);
+            if dp_size > 1 {
+                tracing::info!(
+                    worker_url = %worker_url,
+                    dp_size,
+                    "/server_info reports attention-DP; --dp-aware routes across its ranks",
+                );
+            }
+        }
     }
     if let Some(lm) = &load_monitor {
         // Start polling `/v1/loads` right away so the worker becomes
@@ -714,6 +725,7 @@ mod tests {
                 }),
                 cache_aware: None,
                 decode_policy: None,
+                dp_aware: Default::default(),
                 sticky: None,
                 max_output_tokens: None,
                 sampling_overrides: Default::default(),

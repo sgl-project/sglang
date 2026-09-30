@@ -49,6 +49,7 @@
 //! | `sgl_router_engine_aborts_total` | Counter | `reason` |
 //! | `sgl_router_retries_total` | Counter | `model_id` |
 //! | `sgl_router_retries_exhausted_total` | Counter | `model_id` |
+//! | `sgl_router_dp_rank_selections_total` | Counter | `decision` |
 //! | `sgl_router_worker_itl_ms` | Gauge | `worker_url` |
 //! | `sgl_router_queued_requests` | Gauge | (none) |
 //! | `sgl_router_admission_wait_seconds` | Histogram | `model_id` |
@@ -679,6 +680,8 @@ pub struct MetricsRegistry {
     /// where zero retries were performed; `retries_total` says how many actual
     /// re-dispatches happened.
     retries_exhausted_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
+    /// `--dp-aware` rank picks, by [`crate::policies::dp_rank::RankDecision`].
+    dp_rank_selections_total: [AtomicU64; 3],
     /// Current admission wait-queue depth (parked requests). A single
     /// router-wide gauge — the queue is shared across the router, so this is a
     /// global count, not per-model.
@@ -729,6 +732,7 @@ impl Default for MetricsRegistry {
             engine_aborts_total: std::array::from_fn(|_| AtomicU64::new(0)),
             retries_total: Default::default(),
             retries_exhausted_total: Default::default(),
+            dp_rank_selections_total: std::array::from_fn(|_| AtomicU64::new(0)),
             queued_requests: Default::default(),
             admission_wait_seconds: Default::default(),
         }
@@ -1413,6 +1417,13 @@ impl MetricsRegistry {
             .clone();
         drop(guard);
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_dp_rank_selections_total{decision}` — one `--dp-aware`
+    /// dispatch was pinned to an attention-DP rank for this reason. The
+    /// `prefix_owner` share is the rank-level locality the flag exists to buy.
+    pub fn record_dp_rank_selection(&self, decision: crate::policies::dp_rank::RankDecision) {
+        self.dp_rank_selections_total[decision.index()].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Bump `sgl_router_retries_exhausted_total{model_id}` — a request the
@@ -2284,6 +2295,19 @@ impl MetricsRegistry {
             ));
         }
         drop(guard);
+
+        // dp_rank_selections_total
+        out.push_str(
+            "# HELP sgl_router_dp_rank_selections_total --dp-aware dispatches pinned to an attention-DP rank, by why that rank was picked.\n",
+        );
+        out.push_str("# TYPE sgl_router_dp_rank_selections_total counter\n");
+        for decision in crate::policies::dp_rank::RankDecision::ALL {
+            out.push_str(&format!(
+                "sgl_router_dp_rank_selections_total{{decision=\"{}\"}} {}\n",
+                decision.as_str(),
+                self.dp_rank_selections_total[decision.index()].load(Ordering::Relaxed),
+            ));
+        }
 
         // queued_requests (router-wide gauge, no labels)
         out.push_str(

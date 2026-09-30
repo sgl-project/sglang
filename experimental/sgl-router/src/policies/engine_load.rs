@@ -159,6 +159,16 @@ impl WorkerDepth {
     }
 }
 
+/// One rank's latest gauge, as [`EngineLoadTable::rank_state`] returns it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RankLoad {
+    pub depth: WorkerDepth,
+    /// When this gauge was recorded.
+    pub at: Instant,
+    /// Inside the freshness window and not behind a failed pull.
+    pub fresh: bool,
+}
+
 /// Per-`(worker_url, dp_rank)` engine-reported load. Written by the load
 /// subscriber pump, read by the cache-aware-zmq policy. Shared out of
 /// [`super::kv_events::index::KvEventIndex`] the same way the hash tree is.
@@ -331,6 +341,34 @@ impl EngineLoadTable {
             oldest = Some(oldest.map_or(entry.value().at, |o| o.min(entry.value().at)));
         }
         oldest.map(|at| (agg, at))
+    }
+
+    /// The latest gauge of every rank one worker has reported, unsummed.
+    ///
+    /// The per-rank view `--dp-aware` routes on: the router picks the rank, so
+    /// the rank's own queue is what a request sent there waits behind — the
+    /// worker-level sum ([`Self::fresh_worker_state`]) reads `dp_size` times
+    /// that. A rank whose gauge is older than the freshness window is returned
+    /// with `fresh == false` rather than dropped, so the caller can tell
+    /// "reported long ago" from "never reported". A failed pull marks every
+    /// rank stale, matching [`Self::worker_freshness`].
+    pub fn rank_state(&self, url: &str, now: Instant) -> HashMap<u32, RankLoad> {
+        let pull_failed = self.pull_status.contains_key(url);
+        let window = self.freshness();
+        self.by_rank
+            .iter()
+            .filter(|entry| entry.key().0 == url)
+            .map(|entry| {
+                let at = entry.value().at;
+                let l = &entry.value().load;
+                let depth = WorkerDepth::new(
+                    usize::try_from(l.num_running_reqs).unwrap_or(usize::MAX),
+                    usize::try_from(l.num_waiting_reqs).unwrap_or(usize::MAX),
+                );
+                let fresh = !pull_failed && now.saturating_duration_since(at) <= window;
+                (entry.key().1, RankLoad { depth, at, fresh })
+            })
+            .collect()
     }
 
     /// Record the latest load for one `(worker_url, dp_rank)`.
@@ -536,6 +574,33 @@ mod tests {
             num_tokens: 0,
             max_total_num_tokens: 0,
         }
+    }
+
+    #[test]
+    fn rank_state_keeps_ranks_apart_and_flags_stale_ones() {
+        let t = EngineLoadTable::with_freshness(Duration::from_secs(1));
+        let now = Instant::now();
+        let stat = |running, waiting| LoadStat {
+            num_running_reqs: running,
+            num_waiting_reqs: waiting,
+            num_tokens: 0,
+            max_total_num_tokens: 100,
+        };
+        t.set("http://a", 0, stat(3, 1), now);
+        t.set("http://a", 1, stat(5, 0), now - Duration::from_secs(5));
+        t.set("http://b", 0, stat(9, 9), now);
+
+        let ranks = t.rank_state("http://a", now);
+        assert_eq!(ranks.len(), 2, "only http://a's ranks");
+        assert_eq!(ranks[&0].depth, WorkerDepth::new(3, 1));
+        assert!(ranks[&0].fresh);
+        assert!(!ranks[&1].fresh, "older than the window");
+
+        t.set_pull_status("http://a", Some(PullStatus::Unreachable("x".into())));
+        assert!(
+            t.rank_state("http://a", now).values().all(|r| !r.fresh),
+            "a failed pull makes every rank stale",
+        );
     }
 
     #[test]

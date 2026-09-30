@@ -90,9 +90,10 @@
 
 use crate::config::{CacheAwareConfig, LoadGate};
 
+use crate::policies::dp_rank::RankPrefix;
 use crate::policies::engine_load::EngineLoadTable;
 use crate::policies::kv_events::{
-    compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, HashTree, Tiers,
+    compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, HashTree, RankHold, Tiers,
 };
 use crate::policies::mm_affinity::{self, MultimodalAffinity, PinLookup};
 use crate::policies::{request_tokens_for, Policy, SelectionContext};
@@ -429,13 +430,7 @@ impl CacheAwareZmqPolicy {
         primary_bigram: bool,
         bimodal: bool,
     ) -> MatchOutcome {
-        // Primary mode first; append the opposite only when the fleet is mixed.
-        let modes: &[bool] = match (bimodal, primary_bigram) {
-            (false, true) => &[true],
-            (false, false) => &[false],
-            (true, true) => &[true, false],
-            (true, false) => &[false, true],
-        };
+        let modes = hashing_modes(bimodal, primary_bigram);
 
         let mut owner_urls: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut owner_tiers: HashMap<String, Tiers> = HashMap::new();
@@ -661,6 +656,17 @@ impl CacheAwareZmqPolicy {
     }
 }
 
+/// Hashing modes (`true` = bigram) to match a request under: the fleet's
+/// primary mode first, plus the opposite one only when the fleet is mixed.
+fn hashing_modes(bimodal: bool, primary_bigram: bool) -> &'static [bool] {
+    match (bimodal, primary_bigram) {
+        (false, true) => &[true],
+        (false, false) => &[false],
+        (true, true) => &[true, false],
+        (true, false) => &[false, true],
+    }
+}
+
 impl Policy for CacheAwareZmqPolicy {
     fn select(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Option<Arc<Worker>> {
         let model_id = ctx.model().0.as_str();
@@ -830,6 +836,45 @@ impl Policy for CacheAwareZmqPolicy {
     /// reaches the forwarding decision, so `input_ids` offload silently stops.
     fn needs_request_tokens(&self) -> bool {
         true
+    }
+
+    /// Per-rank prefix holdings of `worker` for `--dp-aware`.
+    ///
+    /// Re-hashes the ingress tokens rather than threading the selection's
+    /// hashes through admission: `select` may run several times (claim races,
+    /// retries) and the worker admission settles on is not necessarily the one
+    /// a given `select` returned, so the holdings are computed for the worker
+    /// actually dispatched to. Uses the same threshold and hashing modes as
+    /// [`Self::match_request`], per mode, keeping each rank's deepest holding.
+    fn rank_prefix(&self, worker: &Worker, ctx: &SelectionContext<'_>) -> Option<RankPrefix> {
+        let tokens = ctx.request_tokens().filter(|t| !t.is_empty())?;
+        let (block_size, is_bigram, bimodal) = self.block_size_oracle.fleet_config()?;
+        let mut holds: HashMap<u32, RankHold> = HashMap::new();
+        for &mode_bigram in hashing_modes(bimodal, is_bigram) {
+            let hashes = if mode_bigram {
+                compute_block_hashes_bigram(tokens, block_size as usize)
+            } else {
+                compute_block_hashes(tokens, block_size as usize)
+            };
+            if hashes.is_empty() {
+                continue;
+            }
+            for (rank, hold) in self.tree.match_prefix_by_rank(None, &hashes, &worker.url) {
+                let rate = hold.depth as f32 / hashes.len() as f32;
+                if rate <= self.config.cache_threshold {
+                    continue;
+                }
+                holds
+                    .entry(rank)
+                    .and_modify(|h| {
+                        if hold.depth > h.depth {
+                            *h = hold;
+                        }
+                    })
+                    .or_insert(hold);
+            }
+        }
+        Some(RankPrefix { holds })
     }
 
     fn attach_metrics(&self, metrics: Arc<MetricsRegistry>) {
@@ -1312,6 +1357,7 @@ mod tests {
                 circuit_breaker: None,
                 cache_aware: None,
                 decode_policy: None,
+                dp_aware: Default::default(),
                 sticky: None,
                 max_output_tokens: None,
                 sampling_overrides: Default::default(),
@@ -1408,6 +1454,55 @@ mod tests {
         let ctx = SelectionContext::new(&model, Some(&body));
         let chosen = policy.select(&workers, &ctx).expect("must pick");
         assert_eq!(chosen.url, "http://w0:30000");
+    }
+
+    /// `--dp-aware`: the chosen worker's ranks come back apart — a full hold
+    /// on rank 2, a partial one on rank 0 filtered by `cache_threshold`, and
+    /// nothing from another worker's ranks.
+    #[test]
+    fn rank_prefix_reports_the_chosen_workers_ranks_above_threshold() {
+        let tree = Arc::new(HashTree::new());
+        let registry = tokenizer_registry_with_tiny();
+        let text = "hello world hello world hello world hello world";
+        let tok = registry.get("tiny").unwrap();
+        let ids = adapter::encode(&tok, text).unwrap();
+        let hashes = compute_block_hashes(&ids, 4);
+        assert!(
+            hashes.len() >= 4,
+            "need several blocks, got {}",
+            hashes.len()
+        );
+        let url = "http://w0:30000";
+        tree.insert(&KvWorkerId::new(url.into(), 2), None, &hashes);
+        tree.insert(&KvWorkerId::new(url.into(), 0), None, &hashes[..1]);
+        tree.insert(&KvWorkerId::new("http://w1:30000".into(), 1), None, &hashes);
+
+        let policy = new_policy(
+            CacheAwareConfig {
+                cache_threshold: 0.5,
+                ..Default::default()
+            },
+            tree,
+            registry,
+            oracle_for_tests(4),
+        );
+        let w0 = worker(url, "tiny");
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
+        let prefix = policy
+            .rank_prefix(&w0, &ctx)
+            .expect("tokens + block size known");
+        assert_eq!(
+            prefix.holds.keys().copied().collect::<Vec<_>>(),
+            vec![2],
+            "rank 0 holds 1 block (below 0.5) and rank 1 is w1's: {:?}",
+            prefix.holds,
+        );
+        assert_eq!(prefix.holds[&2].depth, hashes.len());
+
+        // Without ingress tokens there is nothing to match: load decides.
+        let bare = SelectionContext::new(&model, None);
+        assert!(policy.rank_prefix(&w0, &bare).is_none());
     }
 
     /// Helper: an oracle for a **bimodal** fleet whose majority-derived

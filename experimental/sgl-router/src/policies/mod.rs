@@ -3,6 +3,7 @@
 
 pub mod active_load;
 pub mod cache_aware_zmq;
+pub mod dp_rank;
 pub mod engine_load;
 pub mod factory;
 pub mod itl;
@@ -340,6 +341,20 @@ pub trait Policy: Send + Sync + std::fmt::Debug {
     /// without prefix tokens); only the cache-aware policy overrides it.
     fn needs_request_tokens(&self) -> bool {
         false
+    }
+
+    /// `--dp-aware`: which attention-DP ranks of the already-selected `worker`
+    /// hold this request's prefix. Called once per dispatch attempt, after
+    /// admission settled on `worker`; [`dp_rank::pick_rank`] then prefers
+    /// those ranks. `None` (the default: load-only and sticky policies) means
+    /// the policy has no per-rank locality signal, and the rank is picked by
+    /// load alone.
+    fn rank_prefix(
+        &self,
+        _worker: &Worker,
+        _ctx: &SelectionContext<'_>,
+    ) -> Option<dp_rank::RankPrefix> {
+        None
     }
 
     /// Attach the process metrics registry after construction. Default is a

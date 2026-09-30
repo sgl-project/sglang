@@ -11,13 +11,24 @@ use axum::http::HeaderName;
 /// the header name itself can't drift between call sites.
 pub const SERVER_TIMING: HeaderName = HeaderName::from_static("server-timing");
 
+/// The engine's attention-DP rank override (`routed_dp_rank`; header wins over
+/// the body field). Set only by the router under `--dp-aware`: the chat
+/// handler strips any client-sent copy at ingress, so the whitelist entry
+/// below forwards the router's value and never a client's.
+pub const X_DATA_PARALLEL_RANK: HeaderName = HeaderName::from_static("x-data-parallel-rank");
+
 /// True if a request header from the inbound client should be forwarded
 /// to the upstream worker. Mirrors SMG's whitelist semantics.
 pub fn should_forward_request_header(name: &HeaderName) -> bool {
     let n = name.as_str();
     matches!(
         n,
-        "authorization" | "x-request-id" | "x-correlation-id" | "traceparent" | "tracestate"
+        "authorization"
+            | "x-request-id"
+            | "x-correlation-id"
+            | "traceparent"
+            | "tracestate"
+            | "x-data-parallel-rank"
     ) || n.starts_with("x-request-id-")
         || n.starts_with("x-sgl-")
 }

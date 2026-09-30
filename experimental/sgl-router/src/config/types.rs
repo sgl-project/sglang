@@ -436,6 +436,26 @@ pub struct ModelConfig {
     /// selects decode workers with a real policy over the (freshness-gated)
     /// decode pool. Ignored for plain-mode models.
     pub decode_policy: Option<PolicyKind>,
+    /// Attention-DP-aware routing (`--dp-aware`). See [`DpAwareConfig`].
+    pub dp_aware: DpAwareConfig,
+}
+
+/// `--dp-aware`: the router, not the engine's DP controller, picks the
+/// attention-DP rank of the selected worker and sends it as
+/// `X-Data-Parallel-Rank` (the engine's `routed_dp_rank`). Plain mode only.
+///
+/// Same flag and intent as sgl-model-gateway's `--dp-aware`, but the worker
+/// stays one routing destination: the rank is chosen after the worker, inside
+/// it (see [`crate::policies::dp_rank`]), so admission, breakers, health and
+/// every per-URL table are untouched.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct DpAwareConfig {
+    pub enabled: bool,
+    /// Queued-request count at or above which a rank stops winning on cache
+    /// affinity (the per-rank analogue of `--worker-queue-limit`). `None` ⇒
+    /// derived from `--worker-queue-limit / dp_size` when that is set, else no
+    /// per-rank gate.
+    pub rank_queue_limit: Option<NonZeroUsize>,
 }
 
 /// Sampling parameters an operator fixes for the whole fleet, and what to do
