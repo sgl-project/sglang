@@ -1604,6 +1604,7 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
+            kv_int8_layout=(self.kv_cache_dtype == torch.int8),
         )
         return token_to_kv_pool
 

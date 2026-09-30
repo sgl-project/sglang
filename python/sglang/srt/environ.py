@@ -998,6 +998,13 @@ class Envs:
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)
     SGLANG_ZBAL_LOCAL_MEM_SIZE = EnvInt(0)
     SGLANG_ZBAL_BOOTSTRAP_URL = EnvStr("")
+    # DSA (GLM-5.3) int8 KV cache on Ascend NPU. When enabled, the
+    # NPU MLA pool stores per-128-tile int8-quantized latent KV in the
+    # single-pool COMBINE layout consumed by
+    # npu_kv_quant_sparse_flash_attention (656B row = int8 nope 512 +
+    # bf16 rope 128 (NoPE zero-fill) + fp32 scales 16). Off =>
+    # bit-identical bf16 path.
+    SGLANG_DSA_KV_INT8 = EnvBool(False)
 
     # ===================================================================
     # MUSA

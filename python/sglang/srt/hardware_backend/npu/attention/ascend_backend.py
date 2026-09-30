@@ -1342,6 +1342,305 @@ class AscendAttnBackend(AttentionBackend):
         attn_out = torch.cat([attn_out_prev, attn_out_next], dim=0)
         return attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+    def _int8kv_forward_sparse_read(
+        self, q_nope, q_pe, topk_indices, layer, forward_batch,
+        actual_seq_qlen, actual_seq_lengths_kv, is_prefill,
+    ):
+        """int8kv: int8 KV read path for DSA sparse attention.
+
+        Prefill/extend: bf16 sparse op over a ragged gather-dequantized
+        shadow of the int8 pool. Decode/target-verify: the quantized-sparse
+        operator directly on the COMBINE pool. Fail-loud guards included.
+        """
+        # Read path splits by forward mode: npu_kv_quant_sparse_flash_
+        # attention (the quantized-sparse operator) loses 0.42-0.95x at
+        # prefill Q_S>=512, so prefill/extend keeps the bf16 operator
+        # fed by a gather-dequantized shadow of the int8 pool
+        # (measured relerr 0.0073-0.0079, ratio 0.94-1.0x at chunked
+        # prefill size 4096); decode/verify (small Q_S) go quantized
+        # (decode Q_S=1 median 1.33x).
+        if k_nope.dtype != torch.int8 or k_nope.dim() != 4:
+            # fail loud, no silent bf16 fallback
+            raise RuntimeError(
+                "int8 KV cache: expected a 4-D int8 paged K pool view, "
+                f"got dtype={k_nope.dtype} dim={k_nope.dim()}"
+            )
+        if topk_indices is None:
+            raise RuntimeError(
+                "int8 KV cache: int8 sparse read path requires "
+                "topk_indices (DSA layers always provide them)."
+            )
+        block_tables = self.forward_metadata.block_tables
+        num_tokens = q_nope.shape[0]
+        batch_size = block_tables.shape[0]
+        asl_kv_i32 = actual_seq_lengths_kv.to(
+            device=q_nope.device, dtype=torch.int32
+        )
+        if is_prefill:
+            # Prefill/extend: bf16 operator over a dequantized shadow
+            # of the pages referenced by the block table. Chunk-local
+            # rows are also read back dequantized (they were written
+            # quantized this same step by set_kv_buffer), so no
+            # chunk-local/prefix split is needed.
+            # Rope models: feed the operator the same q_pe the bf16
+            # path feeds query_rope, and a bf16 k_rope shadow
+            # reinterpreted from the COMBINE rows' [512:640) byte
+            # segment (the form the bf16 pool serves from v_buffer).
+            # NoPE models keep the zero-rope convention (this CANN
+            # build's tiling rejects absent rope inputs, so zero
+            # buffers are materialized -- semantically inert).
+            k_shadow, k_rope_shadow, bt_remapped = (
+                self._int8kv_dequant_visible_pages(
+                    k_nope, block_tables, kv_lens=asl_kv_i32
+                )
+            )
+            if self.qk_rope_head_dim > 0:
+                if q_pe is None:
+                    raise RuntimeError(
+                        "int8 KV cache: rope model but "
+                        "forward_sparse got no q_rope (prefill)."
+                    )
+                query_rope_arg = q_pe
+            else:
+                query_rope_arg = torch.zeros(
+                    num_tokens,
+                    layer.tp_q_head_num,
+                    64,
+                    dtype=q_nope.dtype,
+                    device=q_nope.device,
+                )
+            attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
+                query=q_nope,
+                key=k_shadow,
+                value=k_shadow,
+                query_rope=query_rope_arg,
+                key_rope=k_rope_shadow,
+                sparse_indices=topk_indices,
+                scale_value=layer.scaling,
+                actual_seq_lengths_query=actual_seq_qlen.to(
+                    device=q_nope.device, dtype=torch.int32
+                ),
+                actual_seq_lengths_kv=asl_kv_i32,
+                block_table=bt_remapped,
+                sparse_block_size=1,
+                layout_query="TND",
+                layout_kv="PA_BSND",
+                sparse_mode=3,
+                attention_mode=2,
+                return_softmax_lse=False,
+            )
+        elif num_tokens == batch_size:
+            # Decode Q_S=1: TND form (the decode asl_q is the [1+i]
+            # cumsum form, which is TND-correct for all B).
+            # Fuse the real q_pe (post-rotary, the same tensor the
+            # bf16 path feeds query_rope) into the TND query tail;
+            # the K rows carry their rope bytes in the 656-byte row's
+            # [512:640) segment, read by the kernel itself (COMBINE
+            # layout's job). NoPE models keep the zero segment.
+            if self.qk_rope_head_dim > 0:
+                if q_pe is None:
+                    raise RuntimeError(
+                        "int8 KV cache: rope model but "
+                        "forward_sparse got no q_rope (decode TND)."
+                    )
+                q_ding = torch.cat([q_nope, q_pe], dim=-1)
+            else:
+                q_ding = torch.cat(
+                    [
+                        q_nope,
+                        torch.zeros(
+                            num_tokens,
+                            layer.tp_q_head_num,
+                            64,
+                            dtype=q_nope.dtype,
+                            device=q_nope.device,
+                        ),
+                    ],
+                    dim=-1,
+                )
+            attn_out = torch.ops.npu.npu_kv_quant_sparse_flash_attention(
+                query=q_ding,
+                key=k_nope,
+                value=k_nope,
+                sparse_indices=topk_indices,
+                scale_value=layer.scaling,
+                key_quant_mode=2,
+                value_quant_mode=2,
+                block_table=block_tables,
+                actual_seq_lengths_query=actual_seq_qlen.to(
+                    device=q_nope.device, dtype=torch.int32
+                ),
+                actual_seq_lengths_kv=asl_kv_i32,
+                sparse_block_size=1,
+                layout_query="TND",
+                layout_kv="PA_BSND",
+                sparse_mode=3,
+                attention_mode=2,
+                quant_scale_repo_mode=1,
+                tile_size=128,
+                rope_head_dim=64,
+            )
+        elif num_tokens % batch_size == 0:
+            # Q_S > 1 (target-verify / draft-extend): BSND 4-D. The
+            # TND [T,1,K] form with B>1 AND Q_S>1 has non-equivalent
+            # batch semantics (relerr 0.4+); BSND 4-D matches the
+            # bf16 form (measured relerr 0.0072-0.0080 vs the TND
+            # reference, GQA q heads over kv_head_num=1 latent).
+            q_len = num_tokens // batch_size
+            # Real q_pe reshaped onto the BSND query grid (NoPE:
+            # zero segment as before).
+            q_nope_bsnd = q_nope.reshape(
+                batch_size, q_len, layer.tp_q_head_num, -1
+            )
+            if self.qk_rope_head_dim > 0:
+                if q_pe is None:
+                    raise RuntimeError(
+                        "int8 KV cache: rope model but "
+                        "forward_sparse got no q_rope (BSND)."
+                    )
+                q_rope_bsnd = q_pe.reshape(
+                    batch_size, q_len, layer.tp_q_head_num, -1
+                )
+            else:
+                q_rope_bsnd = torch.zeros(
+                    batch_size,
+                    q_len,
+                    layer.tp_q_head_num,
+                    64,
+                    dtype=q_nope.dtype,
+                    device=q_nope.device,
+                )
+            query_ding = torch.cat([q_nope_bsnd, q_rope_bsnd], dim=-1)
+            attn_out = torch.ops.npu.npu_kv_quant_sparse_flash_attention(
+                query=query_ding,
+                key=k_nope,
+                value=k_nope,
+                # Single-pool convention: the operator's `value`
+                # parameter is dead, so key=value=same k_buffer view.
+                sparse_indices=topk_indices.reshape(
+                    batch_size, q_len, 1, topk_indices.shape[-1]
+                ),
+                scale_value=layer.scaling,
+                key_quant_mode=2,
+                value_quant_mode=2,
+                block_table=block_tables,
+                actual_seq_lengths_query=torch.full(
+                    (batch_size,),
+                    q_len,
+                    dtype=torch.int32,
+                    device=q_nope.device,
+                ),
+                actual_seq_lengths_kv=asl_kv_i32,
+                sparse_block_size=1,
+                layout_query="BSND",
+                layout_kv="PA_BSND",
+                sparse_mode=3,
+                attention_mode=2,
+                quant_scale_repo_mode=1,
+                tile_size=128,
+                rope_head_dim=64,
+            )
+            # [B, QS, H, D] -> [T, H, D] to match the TND convention
+            attn_out = attn_out.reshape(
+                num_tokens, layer.tp_q_head_num, layer.v_head_dim
+            )
+        else:
+            raise RuntimeError(
+                "int8 KV cache: unsupported q/batch layout for the "
+                f"int8 read path: tokens={num_tokens} "
+                f"batch={batch_size}"
+            )
+
+    def _int8kv_dequant_visible_pages(self, k_nope, block_tables, kv_lens=None):
+        """Gather-dequantize the int8 pool pages referenced by block_tables
+        into a bf16 shadow pool and remap the block table onto the shadow's
+        page ids. COMBINE 656-byte row = int8 nope[0:Dn] + bf16 rope bytes
+        [512:640) (zero bytes under NoPE) + per-128-dim-tile fp32 scales.
+        Also returns a bf16 k_rope shadow reinterpreted from the rope byte
+        segment. bf16 arithmetic: measured 0.58ms/100K rows, relerr 0.0028
+        vs the fp32 dequant."""
+        # Flatten-gather + arange remap, no torch.unique / searchsorted:
+        # those two ops cost ~0.85ms/call of overhead and sync at the
+        # chunk shape, dropping the prefill ratio to 0.92x;
+        # flatten-gather reaches 0.99x. Duplicate entries -- bt pad
+        # columns (page 0) and, with radix cache on, shared prefix
+        # pages -- are simply dequantized once per reference, which
+        # stays correct.
+        lora_rank = self.kv_lora_rank
+        num_tiles = lora_rank // 128
+        scale_off = k_nope.shape[-1] - num_tiles * 4
+        # Ragged gather. The padded 2-D block table materializes
+        # bs*max_width page refs -- one long prefill in a mixed batch
+        # makes every short request's pad columns real gathers
+        # (measured: a 269K-token prefill mixed with 32 decodes
+        # allocated 5.08 GiB at the gather line). Gathering only each
+        # request's real pages (ceil(kv_len/page_size)) cuts the temp
+        # to sum(real_pages): the mixed-run worst case drops ~30x.
+        # Pad columns of the remapped shadow bt stay 0 (shadow page
+        # 0), which the sparse attention never reads -- indices are
+        # built from seq lens, same unread-page-0 convention the
+        # padded gather had. Eager prefill only (never captured), so
+        # the int(counts.sum()) host sync (~0.1ms x78 layers vs 1-2s
+        # per prefill chunk) is acceptable.
+        row_idx = None
+        if kv_lens is not None and kv_lens.numel() >= block_tables.shape[0]:
+            ps = k_nope.shape[1]  # tokens per page (pool view dim 1)
+            bs = block_tables.shape[0]
+            lens = kv_lens[:bs].to(torch.int64)
+            counts = (lens + ps - 1) // ps
+            num_rows_h = int(counts.sum())
+            dev = block_tables.device
+            row_idx = torch.repeat_interleave(
+                torch.arange(bs, device=dev), counts
+            )
+            offs = torch.cumsum(counts, 0) - counts
+            col_idx = torch.arange(num_rows_h, device=dev) - offs[row_idx]
+            flat_bt = block_tables[row_idx, col_idx].reshape(-1)
+        else:
+            # no kv lens in scope / shape mismatch: fall back to the
+            # padded gather (correct, only wasteful)
+            flat_bt = block_tables.reshape(-1)
+        rows = k_nope[flat_bt]
+        num_rows = rows.shape[0]
+        nope = rows[..., :lora_rank].reshape(
+            num_rows, -1, num_tiles, 128
+        ).to(torch.bfloat16)
+        scale = (
+            rows[..., scale_off:]
+            .contiguous()
+            .view(torch.float32)
+            .to(torch.bfloat16)
+            .reshape(num_rows, -1, num_tiles, 1)
+        )
+        shadow = (nope * scale).reshape(
+            num_rows, k_nope.shape[1], 1, lora_rank
+        )
+        # Reinterpret the rows' bf16 k_rope bytes ([512:640), written by
+        # the int8 write path; zero bytes under NoPE) so prefill can feed
+        # the operator's key_rope from the single pool -- same form the
+        # bf16 pool serves from v_buffer.
+        rope_bytes = 2 * 64  # tiling pins rope_head_dim=64
+        rope_shadow = (
+            rows[..., lora_rank : lora_rank + rope_bytes]
+            .contiguous()
+            .view(torch.bfloat16)
+            .reshape(num_rows, k_nope.shape[1], 1, rope_bytes // 2)
+        )
+        if row_idx is not None:
+            # Ragged remap: shadow page ids are sequential over the
+            # real (row, col) refs; pad cells stay 0.
+            remapped = torch.zeros(
+                block_tables.shape, dtype=torch.int32, device=flat_bt.device
+            )
+            remapped[row_idx, col_idx] = torch.arange(
+                num_rows, dtype=torch.int32, device=flat_bt.device
+            )
+        else:
+            remapped = torch.arange(
+                num_rows, dtype=torch.int32, device=flat_bt.device
+            ).reshape(block_tables.shape)
+        return shadow, rope_shadow, remapped
+
     def forward_sparse(
         self,
         q: torch.Tensor,
@@ -1406,11 +1705,25 @@ class AscendAttnBackend(AttentionBackend):
         else:
             actual_seq_lengths_kv = self.forward_metadata.seq_lens
 
+        # Read-path switch flag. Host-side attribute probe only — the
+        # pool layout is fixed at init time, so this branch is stable
+        # across NPUGraph capture/replay (no data-value branch).
+        kv_int8_layout = getattr(self.token_to_kv_pool, "kv_int8_layout", False)
+
         if (
             is_prefill
             and is_dsa_enable_prefill_cp()
             and forward_batch.attn_cp_metadata is not None
         ):
+            # The CP balanced path (do_cp_balance_attn) still calls
+            # the bf16 op; raw int8 COMBINE pool views must not
+            # silently flow into it.
+            if kv_int8_layout:
+                raise RuntimeError(
+                    "int8 KV cache: CP balanced attention (prefill context "
+                    "parallel) is not supported with SGLANG_DSA_KV_INT8=1; "
+                    "disable CP or unset the int8 KV env."
+                )
             attn_out = self.do_cp_balance_attn(
                 q_nope,
                 k_nope,
@@ -1422,74 +1735,89 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_lengths_kv,
             )
         else:
-            if topk_indices is not None:
-                topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
-            topk_indices = _expand_dsa_sparse_indices(topk_indices)
-            if get_parallel().dcp_enabled and not self.is_draft_worker:
-                return forward_dcp_sparse_attention(
-                    q_nope=q_nope,
-                    q_rope=q_pe,
-                    k_nope=k_nope,
-                    k_rope=k_pe,
-                    topk_indices=topk_indices,
-                    actual_seq_lengths_query=actual_seq_qlen,
-                    forward_metadata=self.forward_metadata,
-                    forward_batch=forward_batch,
-                    speculative_num_draft_tokens=self.speculative_num_draft_tokens,
-                    scaling=layer.scaling,
-                )
-            if self.kv_cache_dtype == torch.float8_e4m3fn:
-                assert q_nope.dtype == q_pe.dtype == torch.bfloat16
-                packed = k_nope.view(torch.float8_e4m3fn)
-                attn_out = torch_npu.npu_kv_quant_sparse_flash_attention(
-                    query=torch.cat((q_nope, q_pe), dim=-1).contiguous(),
-                    key=packed,
-                    value=packed,
-                    sparse_indices=topk_indices,
-                    scale_value=layer.scaling,
-                    key_quant_mode=2,
-                    value_quant_mode=2,
-                    key_dequant_scale=None,
-                    value_dequant_scale=None,
-                    actual_seq_lengths_query=actual_seq_qlen.to(
-                        device=q_nope.device, dtype=torch.int32
-                    ),
-                    actual_seq_lengths_kv=actual_seq_lengths_kv.to(
-                        device=q_nope.device, dtype=torch.int32
-                    ),
-                    block_table=self.forward_metadata.block_tables,
-                    sparse_block_size=1,
-                    layout_query="TND",
-                    layout_kv="PA_BSND",
-                    sparse_mode=3,
-                    attention_mode=2,
-                    quant_scale_repo_mode=1,
-                    tile_size=128,
-                    rope_head_dim=self.qk_rope_head_dim,
+            if kv_int8_layout:
+                # DCP (decode context parallel) feeds raw pool views into
+                # forward_dcp_sparse_attention, which still expects bf16
+                # latents; the int8 COMBINE rows must not silently flow in.
+                if get_parallel().dcp_enabled and not self.is_draft_worker:
+                    raise RuntimeError(
+                        "int8 KV cache: DCP sparse attention (decode context "
+                        "parallel) is not supported with SGLANG_DSA_KV_INT8=1; "
+                        "disable DCP or unset the int8 KV env."
+                    )
+                attn_out = self._int8kv_forward_sparse_read(
+                    q_nope, q_pe, topk_indices, layer, forward_batch,
+                    actual_seq_qlen, actual_seq_lengths_kv, is_prefill,
                 )
             else:
-                attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
-                    query=q_nope,
-                    key=k_nope,
-                    value=k_nope,
-                    query_rope=q_pe,
-                    key_rope=k_pe,
-                    sparse_indices=topk_indices,
-                    scale_value=layer.scaling,
-                    actual_seq_lengths_query=actual_seq_qlen.to(
-                        device=q_nope.device, dtype=torch.int32
-                    ),
-                    actual_seq_lengths_kv=actual_seq_lengths_kv.to(
-                        device=q_nope.device, dtype=torch.int32
-                    ),
-                    block_table=self.forward_metadata.block_tables,
-                    sparse_block_size=1,
-                    layout_query="TND",
-                    layout_kv="PA_BSND",
-                    sparse_mode=3,
-                    attention_mode=2,
-                    return_softmax_lse=False,
-                )
+                if topk_indices is not None:
+                    topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
+                topk_indices = _expand_dsa_sparse_indices(topk_indices)
+                if get_parallel().dcp_enabled and not self.is_draft_worker:
+                    return forward_dcp_sparse_attention(
+                        q_nope=q_nope,
+                        q_rope=q_pe,
+                        k_nope=k_nope,
+                        k_rope=k_pe,
+                        topk_indices=topk_indices,
+                        actual_seq_lengths_query=actual_seq_qlen,
+                        forward_metadata=self.forward_metadata,
+                        forward_batch=forward_batch,
+                        speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+                        scaling=layer.scaling,
+                    )
+                if self.kv_cache_dtype == torch.float8_e4m3fn:
+                    assert q_nope.dtype == q_pe.dtype == torch.bfloat16
+                    packed = k_nope.view(torch.float8_e4m3fn)
+                    attn_out = torch_npu.npu_kv_quant_sparse_flash_attention(
+                        query=torch.cat((q_nope, q_pe), dim=-1).contiguous(),
+                        key=packed,
+                        value=packed,
+                        sparse_indices=topk_indices,
+                        scale_value=layer.scaling,
+                        key_quant_mode=2,
+                        value_quant_mode=2,
+                        key_dequant_scale=None,
+                        value_dequant_scale=None,
+                        actual_seq_lengths_query=actual_seq_qlen.to(
+                            device=q_nope.device, dtype=torch.int32
+                        ),
+                        actual_seq_lengths_kv=actual_seq_lengths_kv.to(
+                            device=q_nope.device, dtype=torch.int32
+                        ),
+                        block_table=self.forward_metadata.block_tables,
+                        sparse_block_size=1,
+                        layout_query="TND",
+                        layout_kv="PA_BSND",
+                        sparse_mode=3,
+                        attention_mode=2,
+                        quant_scale_repo_mode=1,
+                        tile_size=128,
+                        rope_head_dim=self.qk_rope_head_dim,
+                    )
+                else:
+                    attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
+                        query=q_nope,
+                        key=k_nope,
+                        value=k_nope,
+                        query_rope=q_pe,
+                        key_rope=k_pe,
+                        sparse_indices=topk_indices,
+                        scale_value=layer.scaling,
+                        actual_seq_lengths_query=actual_seq_qlen.to(
+                            device=q_nope.device, dtype=torch.int32
+                        ),
+                        actual_seq_lengths_kv=actual_seq_lengths_kv.to(
+                            device=q_nope.device, dtype=torch.int32
+                        ),
+                        block_table=self.forward_metadata.block_tables,
+                        sparse_block_size=1,
+                        layout_query="TND",
+                        layout_kv="PA_BSND",
+                        sparse_mode=3,
+                        attention_mode=2,
+                        return_softmax_lse=False,
+                    )
 
         return attn_out
 
@@ -2344,6 +2672,18 @@ class AscendAttnBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ):
+        # Fail loud: the MLA branch of the decode graph views the
+        # latent pool as bf16 (c_kv at ~:2671). DSA decode always
+        # carries topk_indices and never enters this function;
+        # reaching it under int8 means the layout assumptions broke.
+        if self.use_mla and getattr(
+            self.token_to_kv_pool, "kv_int8_layout", False
+        ):
+            raise RuntimeError(
+                "int8 KV cache: forward_decode_graph MLA branch is "
+                "unsupported with SGLANG_DSA_KV_INT8=1 (bf16 pool "
+                "reader); DSA decode must go through forward_sparse."
+            )
         if save_kv_cache:
             if self.use_mla:
                 k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
@@ -2704,6 +3044,18 @@ class AscendAttnBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ):
+        # Fail loud: the MLA branch of this path consumes the latent
+        # pool as bf16 (c_kv at ~:2343). Normally unreachable for DSA
+        # layers (they route through forward_sparse), so reaching it
+        # under int8 means the layout assumptions broke.
+        if self.use_mla and getattr(
+            self.token_to_kv_pool, "kv_int8_layout", False
+        ):
+            raise RuntimeError(
+                "int8 KV cache: forward_mtp MLA branch is unsupported "
+                "with SGLANG_DSA_KV_INT8=1 (bf16 pool reader); DSA "
+                "layers must go through forward_sparse."
+            )
         if save_kv_cache:
             if self.use_mla:
                 k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
