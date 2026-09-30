@@ -60,6 +60,9 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
             DeepseekV4HipRadixBackend.use_captured_forward_metadata_for_breakable_cuda_graph
         )
         self.assertTrue(
+            DeepseekV4HipRadixBackend.supports_prefill_cuda_graph_max_context_size
+        )
+        self.assertTrue(
             DeepseekV4HipRadixBackend.prefer_eager_mixed_prefill_under_dp_attention
         )
 
@@ -226,7 +229,7 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
         backend._build_forward_metadata = mock.Mock(return_value=capture_metadata)
         backend.init_forward_metadata_in_graph = mock.Mock()
         backend._refresh_fp4_prefill_workspace = mock.Mock()
-        forward_batch = SimpleNamespace(name="capture")
+        forward_batch = SimpleNamespace(name="capture", max_seq_len_override=1024)
 
         result = backend.init_forward_metadata_for_breakable_cuda_graph_capture(
             forward_batch
@@ -234,13 +237,31 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
 
         backend._build_forward_metadata.assert_called_once_with(
             forward_batch,
-            max_seq_len_override=backend.MAX_SEQ_LEN_FOR_CAPTURE,
+            max_seq_len_override=1024,
             use_prefill_cuda_graph=True,
         )
         backend.init_forward_metadata_in_graph.assert_called_once_with(forward_batch)
         backend._refresh_fp4_prefill_workspace.assert_called_once_with(forward_batch)
         self.assertIs(result, capture_metadata)
         self.assertIs(backend.forward_metadata, capture_metadata)
+
+    def test_build_rejects_live_context_above_graph_bound(self):
+        backend = object.__new__(DeepseekV4HipRadixBackend)
+        backend.swa_page_size = 128
+        backend.page_size = 256
+        backend.req_to_token = torch.zeros((2, 8), dtype=torch.int32)
+        backend.req_to_token_pool = SimpleNamespace(req_to_token=backend.req_to_token)
+        forward_batch = SimpleNamespace(
+            req_pool_indices=torch.tensor([0], dtype=torch.int32),
+            seq_lens=torch.tensor([5], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([5], dtype=torch.int64),
+            max_seq_len_override=4,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "max context size is smaller than the live context"
+        ):
+            backend._build_forward_metadata(forward_batch)
 
     def test_refresh_preserves_captured_hip_tensor_storage(self):
         capture_workspace = object()
@@ -353,8 +374,8 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
         backend.init_forward_metadata_in_graph = mock.Mock()
         backend._refresh_fp4_prefill_workspace = mock.Mock()
 
-        forward_batch = SimpleNamespace(name="live")
-        static_forward_batch = SimpleNamespace(name="static")
+        forward_batch = SimpleNamespace(name="live", max_seq_len_override=None)
+        static_forward_batch = SimpleNamespace(name="static", max_seq_len_override=2048)
         backend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
             capture_metadata,
             forward_batch,
@@ -363,7 +384,7 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
 
         backend._build_forward_metadata.assert_called_once_with(
             static_forward_batch,
-            max_seq_len_override=backend.MAX_SEQ_LEN_FOR_CAPTURE,
+            max_seq_len_override=2048,
             use_prefill_cuda_graph=True,
         )
         backend.init_forward_metadata_in_graph.assert_called_once_with(
