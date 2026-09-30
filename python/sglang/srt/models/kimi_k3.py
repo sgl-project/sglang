@@ -33,6 +33,10 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.layers import zero_copy_context
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
 from sglang.srt.layers.attn_residual import AttnResidual, aggregate_stream, get_cw
+from sglang.srt.layers.aux_hidden_states import (
+    AuxHiddenStateAccumulator,
+    AuxHiddenStatePacker,
+)
 from sglang.srt.layers.communication import k3_ar_fusion, k3_sp_collective
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
@@ -243,15 +247,14 @@ def _merge_weights_as_views(
     return merged, sizes
 
 
-# K3 cannot use LayerCommunicator: the attn-res aggregation kernels replace
-# input_layernorm / post_attention_layernorm, which the communicator expects
-# to own. Instead the MLP/MoE modules gather/scatter around their own body:
+# K3 manages its own boundaries: the attn-res aggregation kernels replace
+# input_layernorm / post_attention_layernorm, and the MLP/MoE modules
+# gather/scatter around their own body:
 # attention and the attn-res buffers stay in local (per-DP-rank) token space,
 # the MLP/MoE runs on the DP-gathered global batch, and the delayed prefix_sum
 # add stays local, applied after the scatter back.
 def _dp_local_buffer_group():
-    """Symmetric-memory group for the local DP buffer (mirrors
-    CommunicateSummableTensorPairFn._scatter_hidden_states)."""
+    """Symmetric-memory group holding this DP rank's local token buffer."""
     parallel = get_parallel()
     if parallel.tp_size == parallel.attn_dp_size:
         return get_parallel().tp_group
@@ -490,6 +493,7 @@ class KimiK3MoE(nn.Module):
 
         self.topk = TopK(
             top_k=config.num_experts_per_token,
+            layer_id=self.layer_idx,
             renormalize=moe_renormalize,
             use_grouped_topk=True,
             num_expert_group=config.num_expert_group,
@@ -2252,7 +2256,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
 
             self.o_proj.forward = _symm_o_proj_forward
         else:
-            # K3 has no LayerCommunicator, so o_proj must reduce within the
+            # K3 owns its output reduction, so o_proj must reduce within the
             # attn-TP group itself: the default full-TP collective is the wrong
             # group at attn_tp>1 and deadlocks idle DP ranks.
             self.o_proj.use_dp_attention_reduce = True
@@ -2516,7 +2520,9 @@ class KimiK3DecoderLayer(nn.Module):
 
                 def _sp_o_proj_forward(x, *args, **kwargs):
                     output_rows = k3_sp_collective.get_o_proj_output_rows(x.shape[0])
-                    if k3_sp_collective.requires_symmetric_rs(output_rows, x.device):
+                    if k3_sp_collective.requires_symmetric_rs(
+                        output_rows, x.device, x.element_size()
+                    ):
                         output = k3_sp_collective.get_o_proj_output_buffer(
                             output_rows, x.dtype, o_proj.output_size
                         )
@@ -2571,7 +2577,7 @@ class KimiK3DecoderLayer(nn.Module):
     ) -> torch.Tensor:
         # DP attention: idle ranks (padded to the global shape) have no
         # attention metadata; pass hidden_states through shape-preserving
-        # (same as the LayerCommunicator models' is_idle skip).
+        # (matching the idle skip in other DP-attention models).
         if forward_batch.forward_mode.is_idle():
             return hidden_states
 
@@ -2614,9 +2620,9 @@ class KimiK3DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
-        # For MLA layers with q_lora_rank, set up communicator attn_inputs
-        # before the forward call (normally done by LayerCommunicator).
-        from sglang.srt.layers.communicator import (
+        # For MLA layers with q_lora_rank, set up attn_inputs before the
+        # forward call (normally done by the attention boundary).
+        from sglang.srt.layers.layer_boundary import (
             AttentionInputs,
             get_attn_tp_context,
         )
@@ -2957,7 +2963,14 @@ class KimiK3LinearModel(nn.Module):
             and k3_sp_collective.enabled()
         )
         sp_sharded = False
-        aux_hidden_states = []
+        packs_aux = self.packs_aux_hidden_states
+        aux_hidden_states: AuxHiddenStateAccumulator = (
+            AuxHiddenStatePacker.for_batch(
+                forward_batch, len(self.dspark_layers_to_capture)
+            )
+            if packs_aux
+            else []
+        )
         if (
             self.dspark_layers_to_capture is not None
             and not self.pp_group.is_first_rank
@@ -3048,9 +3061,18 @@ class KimiK3LinearModel(nn.Module):
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
+        if packs_aux:
+            return hidden_states, aux_hidden_states.finalize()
         if self.dspark_layers_to_capture is not None:
             return hidden_states, aux_hidden_states
         return hidden_states
+
+    @property
+    def packs_aux_hidden_states(self) -> bool:
+        # PP stages keep the list: inherited captures arrive pre-concatenated.
+        return (
+            self.dspark_layers_to_capture is not None and self.pp_group.world_size == 1
+        )
 
     def _dspark_capture_stream(
         self,
@@ -3109,7 +3131,14 @@ class KimiK3LinearForCausalLM(nn.Module):
                 }
                 quant_config.update_packed_modules_mapping({"model": model_mapping})
             else:
-                quant_config.update_packed_modules_mapping(self.packed_modules_mapping)
+                # The loader seeded this mapping from the outer model class;
+                # replacing it would drop those entries.
+                quant_config.update_packed_modules_mapping(
+                    {
+                        **(quant_config.packed_modules_mapping or {}),
+                        **self.packed_modules_mapping,
+                    }
+                )
         self.model = KimiK3LinearModel(
             config, quant_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -3136,6 +3165,11 @@ class KimiK3LinearForCausalLM(nn.Module):
         return self.config.hidden_size * sum(
             layer < self.model.start_layer - 1 for layer in layers
         )
+
+    def get_aux_hidden_states_width(self) -> int:
+        if not self.model.packs_aux_hidden_states:
+            return 0
+        return len(self.model.dspark_layers_to_capture) * self.config.hidden_size
 
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
         if layer_ids is None:
@@ -3619,6 +3653,11 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 "DSPARK layer capture is not available in encoder-only mode"
             )
         self.language_model.set_dspark_layers_to_capture(layer_ids)
+
+    def get_aux_hidden_states_width(self) -> int:
+        if self.language_model is None:
+            return 0
+        return self.language_model.get_aux_hidden_states_width()
 
     def preprocess_mm_for_encoder(
         self,
