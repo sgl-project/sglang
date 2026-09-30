@@ -454,12 +454,14 @@ def test_glm_nextn_low_m_reuses_three_kernel_target_schedule():
         assert _kernel_name(8, 1, True, m) == "fused_moe_tp8_m1_16_mtp"
 
 
-@pytest.mark.parametrize("ep_size", (2, 4, 8))
-@pytest.mark.parametrize("m", (32, 64))
-def test_glm_ep_uses_rank_local_exact_m_kernel(ep_size, m):
+@pytest.mark.parametrize(
+    "total_tp,ep_size", ((4, 1), (4, 4), (8, 2), (8, 4), (8, 8))
+)
+@pytest.mark.parametrize("m", (17, 31, 32, 48, 63, 64))
+def test_glm_low_m_uses_exact_kernel(total_tp, ep_size, m):
     from sglang.srt.layers.moe.glm_mxfp4_gluon import _kernel_name
 
-    assert _kernel_name(8, ep_size, False, m) == "fused_moe_tp4_m32_64"
+    assert _kernel_name(total_tp, ep_size, False, m) == "fused_moe_tp4_m32_64"
 
 
 @pytest.mark.parametrize(
