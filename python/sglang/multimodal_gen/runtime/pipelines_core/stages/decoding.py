@@ -379,13 +379,18 @@ class DecodingStage(PipelineStage):
                 quality_allows_kernel_fusions(batch.sampling_params.quality),
             ):
                 try:
-                    frames = self.decode(
-                        batch.latents,
-                        server_args,
-                        vae_dtype=vae_dtype,
-                        on_frames=stream,
-                    )
-                    if stream is not None:
+                    if stream is None:
+                        # Model-specific decode overrides need not support streaming.
+                        frames = self.decode(
+                            batch.latents, server_args, vae_dtype=vae_dtype
+                        )
+                    else:
+                        frames = self.decode(
+                            batch.latents,
+                            server_args,
+                            vae_dtype=vae_dtype,
+                            on_frames=stream,
+                        )
                         output_file_paths = stream.finish()
                 except BaseException:
                     if stream is not None:
