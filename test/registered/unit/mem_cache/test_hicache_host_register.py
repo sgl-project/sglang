@@ -251,6 +251,37 @@ class TestHiCacheHostRegister(unittest.TestCase):
                     2 * 2 * 3,
                 )
 
+    def test_layer_first_v4_pool_checks_per_mapping_hugetlb_rounding(self):
+        alloc = mock.Mock(return_value=torch.empty(1, dtype=torch.uint8))
+        device_buffers = [torch.empty(1, dtype=torch.uint8) for _ in range(3)]
+        with (
+            envs.SGLANG_HUGEPAGE_MODE.override("prefer"),
+            envs.SGLANG_HUGEPAGE_SIZE.override("1GB"),
+            mock.patch.object(
+                memory_pool_host,
+                "host_memory_budget_bytes",
+                return_value=2 * 1024**3,
+            ),
+            mock.patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": alloc}),
+        ):
+            with self.assertRaises(ValueError):
+                DeepSeekV4PagedHostPool(
+                    pool_name="test",
+                    device_buffers=device_buffers,
+                    item_bytes=11,
+                    num_host_pages=4,
+                    slot_page_size=2,
+                    layout="layer_first",
+                )
+            DeepSeekV4PagedHostPool(
+                pool_name="test",
+                device_buffers=device_buffers,
+                item_bytes=11,
+                num_host_pages=4,
+                slot_page_size=2,
+                layout="page_first",
+            )
+
     def test_k_only_mha_page_layouts_use_page_registration_granularity(self):
         for layout in ("page_first", "page_first_direct"):
             with self.subTest(layout=layout):

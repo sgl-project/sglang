@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.pool_host.common import (
     get_allocator_from_storage,
 )
 from sglang.srt.mem_cache.storage.mmap.mmap_allocator import (
+    HUGEPAGE_MODE_OFF,
     HUGEPAGE_MODE_PREFER,
     HUGEPAGE_MODE_REQUIRED,
     hugepage_mode,
@@ -90,6 +91,35 @@ def ranks_per_host() -> int:
     return max(launch_world_size // get_parallel().nnodes, 1)
 
 
+def _hugetlb_supported(
+    allocator: Optional[HostTensorAllocator],
+    device: Optional[Union[str, torch.device]],
+) -> bool:
+    return (
+        allocator is not None
+        and device is not None
+        and device_uses_allocator(device)
+        and allocator.supports_hugetlb()
+    )
+
+
+def host_memory_requested_bytes(
+    mapping_bytes: Iterable[int],
+    allocator: Optional[HostTensorAllocator] = None,
+    device: Optional[Union[str, torch.device]] = None,
+) -> int:
+    """Return the host memory the given mappings request.
+
+    With normal pages this is the plain sum. With hugepages each mapping
+    rounds up to a whole page on its own (alloc_mmap).
+    """
+    if _hugetlb_supported(allocator, device):
+        page_size = hugepage_size_requested()
+        if page_size and hugepage_mode(page_size) != HUGEPAGE_MODE_OFF:
+            return sum(-(-b // page_size) * page_size for b in mapping_bytes)
+    return sum(mapping_bytes)
+
+
 def host_memory_budget_bytes(
     requested_bytes: int = 0,
     allocator: Optional[HostTensorAllocator] = None,
@@ -128,14 +158,7 @@ def host_memory_budget_bytes(
         available_host_memory_bytes(allow_cgroup_fallback=not auto_size)
         - HICACHE_HOST_MEMORY_RESERVE_BYTES
     )
-    hugetlb_supported = (
-        allocator is not None
-        and device is not None
-        and device_uses_allocator(device)
-        and allocator.supports_hugetlb()
-    )
-
-    if hugetlb_supported:
+    if _hugetlb_supported(allocator, device):
         size = hugepage_size_requested()
         mode = hugepage_mode(size)
         if mode == HUGEPAGE_MODE_REQUIRED:
@@ -274,7 +297,9 @@ class HostKVCache(abc.ABC):
             )
 
         # Verify there is enough available host memory.
-        requested_bytes = self.size * self.size_per_token
+        requested_bytes = host_memory_requested_bytes(
+            self.get_mapping_bytes(), self.allocator, self.device_pool.device
+        )
         available_bytes = host_memory_budget_bytes(
             requested_bytes, self.allocator, self.device_pool.device
         )
@@ -313,6 +338,16 @@ class HostKVCache(abc.ABC):
         # A lock for synchronized operations on memory allocation and state transitions.
         self.lock = threading.RLock()
         self.clear()
+
+    def get_mapping_bytes(self) -> list[int]:
+        """Return the bytes each host mapping reserves, one entry per mapping.
+
+        One fused buffer by default. Pools that map K/V or scale blocks
+        separately override this so the budget check rounds each mapping to
+        whole hugepages the way alloc_mmap does. Called after the pool size is
+        finalized in __init__.
+        """
+        return [self.size * self.size_per_token]
 
     def destroy(self):
         """Unregister pinned host buffers in userspace before process exit.
