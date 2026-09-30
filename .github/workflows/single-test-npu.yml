@@ -34,6 +34,7 @@ jobs:
           SGLANG_USE_MODELSCOPE: true
           HF_ENDPOINT: https://hf-mirror.com
           SGLANG_IS_IN_CI: true
+          ASCEND_USE_FIA: "1"
         shell: bash
         run: |
           sglang_source_path=$(pwd)
