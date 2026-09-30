@@ -1,8 +1,8 @@
 # SGLang、Mooncake 与 SpecForge 协同训练 DSpark 的完整设计
 
-状态: RFC / 待实现。日期: 2026-09-30。
+状态: RFC / 实现进行中。日期: 2026-09-30。当前进度与验收证据见 [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md)。
 
-本文定义在线 MaaS 请求采集、Mooncake 数据交换、SpecForge 训练及 SGLang 部署的完整协议。本文中的新增类、配置、HTTP 路由和 schema 均是拟实现接口，不代表上游已有这些能力。本次交付为设计与协议示例，未修改三个组件的生产代码，未执行 GPU/RDMA 联调。
+本文定义在线 MaaS 请求采集、Mooncake 数据交换、SpecForge 训练及 SGLang 部署的完整协议。本文中的新增类、配置、HTTP 路由和 schema 描述完整实现目标，不代表上游已有这些能力。初始交付为设计与协议示例；后续实现和实际验证范围以进度文档为准，未通过对应验收的部分仍为待实现目标。
 
 ## 0. 目标与阅读顺序
 
