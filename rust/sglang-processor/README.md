@@ -17,8 +17,6 @@ and runtime. They build their own generate requests from the rendered output.
 `select_chat_formatter` takes `ChatFormatterOptions` and returns an optional
 `ChatFormatter` and an optional loading error. `ChatFormatter::render_prompt`
 renders a Dynamo chat request; `stop_strs` exposes the template's stop strings.
-See [`tests/template_selection.rs`](tests/template_selection.rs) for a public
-API example.
 
 `load_tokenizer` loads a Dynamo tokenizer. `DynamoTokenizer` implements
 `TextTokenizer` for encoding rendered prompts with or without special tokens.

@@ -225,3 +225,23 @@ fn load_model_identity(config_file: &str) -> Result<ModelIdentity, String> {
         dsv4_reasoning_effort_profile,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{ChatFormatterOptions, select_chat_formatter};
+    use crate::OneOrMany;
+
+    #[test]
+    fn built_in_chatml_preserves_stop_strings() {
+        let (formatter, error) = select_chat_formatter(&ChatFormatterOptions {
+            tokenizer_path: ".".into(),
+            chat_template: Some("chatml".into()),
+            ..Default::default()
+        });
+        assert!(error.is_none());
+        let Some(OneOrMany::Many(stops)) = formatter.unwrap().stop_strs() else {
+            panic!("chatml declares multiple stop strings");
+        };
+        assert_eq!(stops, ["<|endoftext|>", "<|im_end|>"]);
+    }
+}
