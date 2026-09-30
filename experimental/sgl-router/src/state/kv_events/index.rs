@@ -39,6 +39,7 @@ use tracing::{debug, info, warn};
 use super::block_size_oracle::BlockSizeOracle;
 use super::bootstrap::{
     BootstrapState, BootstrapTracker, PeerRegistry, RankOutcome, VettedSnapshot,
+    SNAPSHOT_FETCH_CONNECT_TIMEOUT, SNAPSHOT_FETCH_READ_TIMEOUT,
 };
 use super::discovery::{fetch_event_config, EventConfig};
 use super::subscriber::{KvEventSubscriberRegistry, SubKind, WorkerEvent};
@@ -46,13 +47,19 @@ use super::tally::{EventKind, EventTally};
 use super::tree::{HashTree, KvWorkerId, Tiers};
 use super::wire::{KvCacheEvent, KvEventBatch};
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
-use fallback::{discard_graft, fail_rank, resolve_from_origin};
+use coordinator::bootstrap_coordinator;
+use fallback::{fail_rank, resolve_from_origin, resolve_gap};
 use graft::{apply_snapshot, leaves_gap, still_owed};
 use producer::CachedSnapshot;
+use sweep::{
+    snapshot_fetch_timeout, SNAPSHOT_FETCH_ATTEMPTS_PER_DEADLINE, SNAPSHOT_FETCH_TIMEOUT_FLOOR,
+};
 
+mod coordinator;
 mod fallback;
 mod graft;
 mod producer;
+mod sweep;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
@@ -76,6 +83,11 @@ const EVENT_CHANNEL_BUFFER: usize = 1024;
 /// snapshot is not arriving in time anyway.
 const PENDING_BATCH_LIMIT: usize = 1024;
 
+/// Depth of the obligation queue feeding the coordinator, sized well past a
+/// fleet's worker count. Overflow falls back as [`KvEventIndex::enqueue_bootstrap`]
+/// describes.
+const BOOTSTRAP_QUEUE_DEPTH: usize = 1024;
+
 /// Sequence number of the FIRST batch a publisher ever emits.
 ///
 /// SGLang's `ZmqEventPublisher` numbers batches from `itertools.count()`, and it
@@ -94,8 +106,6 @@ const PENDING_BATCH_LIMIT: usize = 1024;
 /// `pump_loop`.
 const STREAM_ORIGIN_SEQ: i64 = 0;
 
-// Constructed by the peer sweep, which lands next.
-#[allow(dead_code)]
 /// Control-plane messages for the pump task.
 ///
 /// Tree mutation MUST stay on the single writer (see the single-writer property
@@ -171,6 +181,41 @@ impl KvIndexMetrics {
     }
 }
 
+/// Obligations handed to the coordinator and the instant their ranks began
+/// holding; a peer's export must be newer to splice.
+struct ObligationBatch {
+    obligations: Vec<(KvWorkerId, u64)>,
+    /// Folded into [`PendingSweep::freshness_floor`], which the sweep asks with.
+    ///
+    /// [`PendingSweep::freshness_floor`]: coordinator::PendingSweep::freshness_floor
+    holding_since: Instant,
+    /// Whether this batch may ride a sweep already in flight.
+    late_join: LateJoin,
+}
+
+/// What a batch accepts when it arrives while a sweep is already in flight.
+///
+/// The sweep asked for freshness on behalf of the ranks it started with, so a
+/// batch that arrives afterwards may be delivered against an export predating
+/// its own `holding_since` — which the pump then resolves [`RankOutcome::Gap`].
+/// Whether that is acceptable depends on what the batch has left to spend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LateJoin {
+    /// Ride the in-flight sweep's snapshot regardless.
+    ///
+    /// Used by discovery, whose workers land during the first fetch; a rank
+    /// that gaps this way still has its one retry.
+    Permitted,
+    /// Wait for a sweep that asks on this batch's behalf.
+    ///
+    /// Used by a gap retry, for which riding along is equivalent to dropping
+    /// it: `gap_retried` caps it at one, and a snapshot taken before the rank
+    /// resumed holding re-gaps by construction. Deferring costs one loop
+    /// iteration, since the coordinator re-enters `take_pending` as soon as it
+    /// has delivered.
+    Refused,
+}
+
 /// Bundle of `HashTree` + `KvEventSubscriberRegistry` + pump task.
 ///
 /// Construct one instance per router process and hand it to the worker
@@ -214,6 +259,13 @@ pub struct KvEventIndex {
     /// Control channel into the pump, so snapshot grafting happens on the
     /// single writer rather than in the bootstrap task.
     ctrl_tx: mpsc::Sender<PumpControl>,
+    /// Client for snapshot fetches. Not `http`: its 2s total timeout suits
+    /// `/server_info` but cannot fit a multi-megabyte body, and every large
+    /// snapshot would be booked `unreachable`.
+    snapshot_http: reqwest::Client,
+    /// Obligations waiting for the coordinator to fold them into the sweep that
+    /// is in flight, or to start one. See [`bootstrap_coordinator`].
+    bootstrap_tx: mpsc::Sender<ObligationBatch>,
     /// Last built snapshot; see [`KvEventIndex::peer_snapshot_body`].
     snapshot_cache: Arc<AsyncMutex<Option<CachedSnapshot>>>,
     /// Worker-sourced `page_size` shared with prefix providers.
@@ -287,6 +339,47 @@ impl KvEventIndex {
         bootstrap: Arc<BootstrapTracker>,
         maintain_tree: bool,
     ) -> Arc<Self> {
+        // Connect and read timeouts cut a gone or stalled peer; the total
+        // bounds a progressing transfer to a fraction of the deadline so the
+        // sweep can reach another candidate (see `snapshot_fetch_timeout`).
+        let per_fetch = snapshot_fetch_timeout(bootstrap.timeout(), bootstrap.fetch_cap());
+        // A short `--kv-bootstrap-timeout-ms` can derive a per-fetch bound
+        // below the floor that the cap cannot lift; warn once so the operator
+        // raises the deadline.
+        if bootstrap.enabled() && per_fetch < SNAPSHOT_FETCH_TIMEOUT_FLOOR {
+            warn!(
+                per_fetch_ms = per_fetch.as_millis(),
+                bootstrap_timeout_ms = bootstrap.timeout().as_millis(),
+                fetch_cap_ms = bootstrap.fetch_cap().as_millis(),
+                floor_ms = SNAPSHOT_FETCH_TIMEOUT_FLOOR.as_millis(),
+                suggested_bootstrap_timeout_ms = (SNAPSHOT_FETCH_TIMEOUT_FLOOR
+                    * SNAPSHOT_FETCH_ATTEMPTS_PER_DEADLINE)
+                    .as_millis(),
+                "kv-bootstrap: the per-fetch timeout derived from --kv-bootstrap-timeout-ms \
+                 is below the floor a multi-megabyte snapshot needs, so peers will be \
+                 booked unreachable and every rank will boot cold; raise \
+                 --kv-bootstrap-timeout-ms (the fetch cap cannot lift this on its own)",
+            );
+        }
+        let snapshot_http = match reqwest::Client::builder()
+            .connect_timeout(SNAPSHOT_FETCH_CONNECT_TIMEOUT)
+            .read_timeout(SNAPSHOT_FETCH_READ_TIMEOUT)
+            .timeout(per_fetch)
+            .build()
+        {
+            Ok(client) => client,
+            Err(e) => {
+                // Not silent: the fallback's total timeout is sized for
+                // `/server_info`, so every large snapshot would then time out
+                // and be booked `unreachable` with nothing pointing here.
+                warn!(
+                    error = %e,
+                    "kv-bootstrap: snapshot client failed to build; falling back to the \
+                     introspection client, whose timeout cannot fit a large snapshot",
+                );
+                http.clone()
+            }
+        };
         let tree = Arc::new(HashTree::new());
         let (tx, rx) = mpsc::channel::<WorkerEvent>(EVENT_CHANNEL_BUFFER);
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<PumpControl>(16);
@@ -297,6 +390,7 @@ impl KvEventIndex {
         let live_workers: Arc<Mutex<HashSet<KvWorkerId>>> = Arc::new(Mutex::new(HashSet::new()));
         let pump_cancel = CancellationToken::new();
         let peers = Arc::new(PeerRegistry::new());
+        let (bootstrap_tx, bootstrap_rx) = mpsc::channel(BOOTSTRAP_QUEUE_DEPTH);
         let tally = Arc::new(EventTally::new());
         let pump = tokio::spawn(pump_loop(
             PumpDeps {
@@ -306,12 +400,13 @@ impl KvEventIndex {
                 cursors: cursors.clone(),
                 live_workers: live_workers.clone(),
                 bootstrap: Arc::clone(&bootstrap),
+                bootstrap_tx: bootstrap_tx.clone(),
             },
             pump_cancel.clone(),
             rx,
             ctrl_rx,
         ));
-        Arc::new(Self {
+        let index = Arc::new(Self {
             tree,
             maintain_tree,
             subscribers,
@@ -327,9 +422,21 @@ impl KvEventIndex {
             bootstrap,
             peers,
             ctrl_tx,
+            snapshot_http,
+            bootstrap_tx,
             snapshot_cache: Arc::new(AsyncMutex::new(None)),
             block_size_oracle,
-        })
+        });
+        // Same gate as registration, so a coordinator exists exactly when
+        // obligations can be produced.
+        if index.peer_bootstrap_enabled() {
+            tokio::spawn(bootstrap_coordinator(
+                bootstrap_rx,
+                Arc::downgrade(&index),
+                pump_cancel,
+            ));
+        }
+        index
     }
 
     /// Shared handle to the bootstrap tracker. `/readyz` reads it to decide
@@ -509,12 +616,7 @@ impl KvEventIndex {
             .iter()
             .map(|&rank| KvWorkerId::new(worker_url.to_string(), rank))
             .collect();
-        let bootstrap_obligations: Vec<(KvWorkerId, u64)> =
-            if self.peer_bootstrap_enabled() && !bootstrap_ranks.is_empty() {
-                self.bootstrap.register(&bootstrap_ranks)
-            } else {
-                Vec::new()
-            };
+        let bootstrap_obligations = self.register_for_bootstrap(&bootstrap_ranks);
         self.workers.lock().insert(
             worker_url.to_string(),
             WorkerEntry {
@@ -524,10 +626,24 @@ impl KvEventIndex {
         if self.maintain_tree && !kv_dp_ranks.is_empty() {
             self.subscribers.add_worker(worker_url, &cfg).await;
         }
-        // Registered ranks hold their batches until an `ApplySnapshot` or
-        // `AbandonBootstrap` names them. Every production constructor passes a
-        // disabled tracker, which registers nothing.
-        drop(bootstrap_obligations);
+        if !bootstrap_obligations.is_empty() {
+            // Stamped HERE, after `subscribers.add_worker` — not at `register`.
+            // A peer's export has to beat the subscription, and anything earlier
+            // would let the sweep accept a snapshot taken during the subscribe
+            // window, which is precisely the hole the watermark check would then
+            // reject as `Gap`. `subscribers.add_worker` only spawns the SUB
+            // tasks, though: the connect completes asynchronously, so an export
+            // taken between this stamp and the connect can still gap, and the
+            // splice check is what catches it.
+            let batch = ObligationBatch {
+                obligations: bootstrap_obligations,
+                holding_since: Instant::now(),
+                late_join: LateJoin::Permitted,
+            };
+            // The stamp travels with the batch, so whichever sweep picks it up
+            // asks for an export newer than it.
+            self.enqueue_bootstrap(batch);
+        }
         // Mark only the ranks that have an actual SUB socket. `EngineReportedLoadTable`
         // then rejects missing or stale advertised ranks as a whole worker.
         if !load_dp_ranks.is_empty() {
@@ -544,6 +660,20 @@ impl KvEventIndex {
     /// independent of visible peers, because registering arms the deadline.
     fn peer_bootstrap_enabled(&self) -> bool {
         self.bootstrap.enabled()
+    }
+
+    /// Register the ranks a sweep should run for, returning their obligations.
+    ///
+    /// Only ranks the tracker does not already hold yield one:
+    /// `reconcile_unresolved_workers` re-calls `add_worker` for a worker it
+    /// already knows, and a rank that is `Pending` already has a sweep while a
+    /// terminal one has nothing left to fetch. A rank `remove_worker` forgot
+    /// registers as a new incarnation.
+    fn register_for_bootstrap(&self, ranks: &[KvWorkerId]) -> Vec<(KvWorkerId, u64)> {
+        if !self.peer_bootstrap_enabled() {
+            return Vec::new();
+        }
+        self.bootstrap.register(ranks)
     }
 
     /// Tear down a worker's subscribers and clear it from the tree.
@@ -651,6 +781,9 @@ struct PumpDeps {
     cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>>,
     live_workers: Arc<Mutex<HashSet<KvWorkerId>>>,
     bootstrap: Arc<BootstrapTracker>,
+    /// Obligation queue, so a gap-discarded rank can be handed back for another
+    /// sweep instead of staying cold with budget unspent.
+    bootstrap_tx: mpsc::Sender<ObligationBatch>,
 }
 
 /// Drain `WorkerEvent`s: apply KV `Batch`es to the tree and `Load` snapshots
@@ -678,12 +811,14 @@ async fn pump_loop(
         cursors,
         live_workers,
         bootstrap,
+        bootstrap_tx,
     } = deps;
     let pump_state = PumpState {
         tree: &tree,
         cursors: &cursors,
         tally: &tally,
         bootstrap: &bootstrap,
+        bootstrap_tx: &bootstrap_tx,
         live_workers: &live_workers,
     };
 
@@ -966,7 +1101,13 @@ async fn pump_loop(
                             "kv-bootstrap: sequence gap between snapshot and live stream; \
                              discarding snapshot state for this rank to avoid stale cache entries",
                         );
-                        discard_graft(&pump_state, &worker, RankOutcome::Gap);
+                        // Held, not applied: `resolve_gap` either replays it after
+                        // clearing, or keeps it for the retry's graft.
+                        held.entry(worker.clone())
+                            .or_default()
+                            .push_back((seq, batch));
+                        resolve_gap(&pump_state, &mut held, &worker);
+                        continue;
                     } else {
                         // The deferred check passed: this rank's grafted state is
                         // now proven continuous with its live stream, which is the
@@ -987,6 +1128,9 @@ struct PumpState<'a> {
     tally: &'a EventTally,
     bootstrap: &'a BootstrapTracker,
     live_workers: &'a Mutex<HashSet<KvWorkerId>>,
+    /// Obligation queue, so the graft path can hand a gapped rank back for
+    /// another sweep. See [`resolve_gap`].
+    bootstrap_tx: &'a mpsc::Sender<ObligationBatch>,
 }
 
 /// Apply one batch, honouring the cursor's out-of-order filter.
