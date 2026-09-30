@@ -1136,7 +1136,7 @@ class TestLoadBalanceMethod(unittest.TestCase):
             dcp_size=4,
         )
         with self.assertRaisesRegex(
-            ValueError, "mooncake, nixl, or fake for synthetic benchmarking"
+            ValueError, "mooncake, nixl, ascend, or fake for synthetic benchmarking"
         ):
             handle_pd_disaggregation(server_args)
 
@@ -1465,6 +1465,7 @@ class TestContextParallelServerArgs(CustomTestCase):
         )
         server_args._model_config = SimpleNamespace(
             hf_config=SimpleNamespace(architectures=["DeepseekV32ForCausalLM"]),
+            hf_text_config=SimpleNamespace(model_type="deepseek_v32"),
             is_multimodal=False,
         )
 
@@ -2522,8 +2523,6 @@ class TestCudaGraphConfigDataclassAccess(CustomTestCase):
 class TestPipelineParallelCompat(CustomTestCase):
     """Features supported with `pipeline-parallel-size > 1`."""
 
-    _SUPPORTED_ARCH = "GlmMoeDsaForCausalLM"
-
     @staticmethod
     def _cfg(**overrides):
         cfg = dict(
@@ -2566,10 +2565,7 @@ class TestPipelineParallelCompat(CustomTestCase):
                 )
 
     def test_eagle_is_allowed_on_prefill(self):
-        check_pipeline_parallel_compat(
-            self._cfg(speculative_algorithm="EAGLE"),
-            model_architecture=self._SUPPORTED_ARCH,
-        )
+        check_pipeline_parallel_compat(self._cfg(speculative_algorithm="EAGLE"))
 
     def test_eagle_is_rejected_outside_prefill(self):
         for mode in ("decode", "null"):
@@ -2578,34 +2574,8 @@ class TestPipelineParallelCompat(CustomTestCase):
                     check_pipeline_parallel_compat(
                         self._cfg(
                             speculative_algorithm="EAGLE", disaggregation_mode=mode
-                        ),
-                        model_architecture=self._SUPPORTED_ARCH,
+                        )
                     )
-
-    def test_eagle_is_rejected_for_unsupported_model(self):
-        with self.assertRaisesRegex(AssertionError, "DeepSeek/GLM/Qwen3.5 models"):
-            check_pipeline_parallel_compat(
-                self._cfg(speculative_algorithm="EAGLE"),
-                model_architecture="LlamaForCausalLM",
-            )
-
-    def test_supported_architectures(self):
-        for architecture in (
-            "DeepseekV2ForCausalLM",
-            "DeepseekV3ForCausalLM",
-            "DeepseekV32ForCausalLM",
-            "GlmMoeDsaForCausalLM",
-            "Qwen3_5ForCausalLM",
-            "Qwen3_5MoeForCausalLM",
-            "Qwen3_5ForConditionalGeneration",
-            "Qwen3_5MoeForConditionalGeneration",
-            "Qwen4ExpForConditionalGeneration",
-        ):
-            with self.subTest(architecture=architecture):
-                check_pipeline_parallel_compat(
-                    self._cfg(speculative_algorithm="EAGLE"),
-                    model_architecture=architecture,
-                )
 
     def test_pp_spec_env_gate_allows_aggregate_and_rejects_pd(self):
         cfg = self._cfg(
@@ -2617,33 +2587,23 @@ class TestPipelineParallelCompat(CustomTestCase):
         with patch.object(
             validation_hook.envs.SGLANG_ENABLE_PP_SPEC, "get", return_value=True
         ):
-            check_pipeline_parallel_compat(cfg, model_architecture="LlamaForCausalLM")
+            check_pipeline_parallel_compat(cfg)
             with self.assertRaisesRegex(AssertionError, "SGLANG_ENABLE_PP_SPEC"):
-                check_pipeline_parallel_compat(
-                    self._cfg(speculative_algorithm="EAGLE"),
-                    model_architecture=self._SUPPORTED_ARCH,
-                )
+                check_pipeline_parallel_compat(self._cfg(speculative_algorithm="EAGLE"))
 
     def test_nextn_resolves_to_eagle_and_is_allowed(self):
         """`--speculative-algorithm NEXTN` has collapsed to EAGLE by the time the
         validation hook runs, so the check only ever sees the resolved name."""
-        check_pipeline_parallel_compat(
-            self._cfg(speculative_algorithm="eagle"),
-            model_architecture=self._SUPPORTED_ARCH,
-        )
+        check_pipeline_parallel_compat(self._cfg(speculative_algorithm="eagle"))
 
     def test_non_eagle_speculative_algorithms_are_rejected(self):
         with self.assertRaisesRegex(AssertionError, "only supports EAGLE"):
-            check_pipeline_parallel_compat(
-                self._cfg(speculative_algorithm="EAGLE3"),
-                model_architecture=self._SUPPORTED_ARCH,
-            )
+            check_pipeline_parallel_compat(self._cfg(speculative_algorithm="EAGLE3"))
 
     def test_multi_layer_eagle_is_rejected(self):
         with self.assertRaisesRegex(AssertionError, "only supports EAGLE"):
             check_pipeline_parallel_compat(
-                self._cfg(speculative_algorithm="EAGLE", enable_multi_layer_eagle=True),
-                model_architecture=self._SUPPORTED_ARCH,
+                self._cfg(speculative_algorithm="EAGLE", enable_multi_layer_eagle=True)
             )
 
     def test_min_free_slots_delay_is_rejected(self):
@@ -4043,6 +4003,10 @@ class TestDcpCommBackendDefault(CustomTestCase):
 
     def test_no_dcp_is_ag_rs(self):
         self.assertEqual(self._resolved(dcp_size=1), "ag_rs")
+
+    @override_platform(is_npu=True, is_cuda=False, is_hip=False)
+    def test_a5_npu_supports_dcp(self):
+        self.assertEqual(self._resolved(dcp_size=2), "ag_rs")
 
     @override_platform(is_cuda=True, is_hip=False)
     def test_fi_a2a_where_supported(self):
