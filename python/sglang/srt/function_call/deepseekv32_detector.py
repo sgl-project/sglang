@@ -75,7 +75,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
     tool_calls_block_name = "function_calls"
     invoke_tag_name = "invoke"
     parameter_tag_name = "parameter"
-    strip_string_param_value: bool = True
+    strip_string_param_value: bool = False
 
     def __init__(self):
         super().__init__()
