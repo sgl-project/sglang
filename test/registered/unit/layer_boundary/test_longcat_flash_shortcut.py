@@ -23,7 +23,7 @@ class TestLongcatShortcut(CustomTestCase):
         tp, rows = 2, 4
         # The MoE runs on each attention-TP rank's slice; the last layer hands on
         # the attention's rows, where the dense branch ends.
-        local = comm.Layout(frozenset({comm.TokenAxis.ATTN_TP_SCATTER}))
+        local = comm.Layout(frozenset({comm.TokenAxis.ATTN_TP}))
         attention = comm.Layout(frozenset())
 
         class Communicator(SimpleNamespace):
@@ -35,10 +35,10 @@ class TestLongcatShortcut(CustomTestCase):
         moe_communicator = Communicator(
             prepare_attn=lambda h, r, batch: (h, r),
             prepare_mlp=lambda h, r, batch: (fork_hidden, fork_residual),
-            _branch_rows=lambda batch: (local, local, attention),
+            branch_rows=lambda batch: (local, local, attention),
         )
         dense_communicator = Communicator(
-            _branch_rows=lambda batch: (attention, attention, attention)
+            branch_rows=lambda batch: (attention, attention, attention)
         )
         layer = LongcatFlashDecoderLayer.__new__(LongcatFlashDecoderLayer)
         nn.Module.__init__(layer)
@@ -60,7 +60,7 @@ class TestLongcatShortcut(CustomTestCase):
 
         def dense_branch(*args):
             stream = ResidualStream(torch.full((rows, 3), 11.0))
-            hidden = stream.leave(torch.full((rows, 3), 3.0), comm.ADD)
+            hidden = stream.record(torch.full((rows, 3), 3.0), comm.PLAIN_ADD)
             batch.residual_stream = stream
             return hidden, None
 
@@ -82,7 +82,7 @@ class TestLongcatShortcut(CustomTestCase):
             hidden, _ = layer(
                 torch.arange(rows), torch.zeros(rows, 3), batch, None, None
             )
-        hidden, residual = batch.residual_stream.finish(hidden)
+        hidden, residual = batch.residual_stream.export(hidden)
         torch.testing.assert_close(hidden, torch.full((rows, 3), 5.0))
         torch.testing.assert_close(hidden + residual, torch.full((rows, 3), 16.0))
         torch.testing.assert_close(fork_residual, torch.full_like(fork_residual, 5.0))

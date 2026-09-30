@@ -105,7 +105,7 @@ class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
                 )
 
         if self.has_start_projections:
-            hidden_states = residual_batch.written(hidden_states, forward_batch)
+            hidden_states = residual_batch.set_written(hidden_states, forward_batch)
 
         hidden_states = super().forward(
             hidden_states=hidden_states,
@@ -115,7 +115,7 @@ class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
         if self.has_end_norm:
             hidden_states = residual_batch.fold(hidden_states, forward_batch)
 
-            hidden_states = residual_batch.written(
+            hidden_states = residual_batch.set_written(
                 self.final_layernorm(hidden_states), forward_batch
             )
 
@@ -187,7 +187,7 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
                 )
 
         if self.has_start_projections:
-            hidden_states = residual_batch.written(hidden_states, forward_batch)
+            hidden_states = residual_batch.set_written(hidden_states, forward_batch)
 
         hidden_states = super().forward(
             hidden_states=hidden_states,
@@ -197,7 +197,7 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
         if self.has_end_norm:
             hidden_states = residual_batch.fold(hidden_states, forward_batch)
 
-            hidden_states = residual_batch.written(
+            hidden_states = residual_batch.set_written(
                 self.final_layernorm(hidden_states), forward_batch
             )
 
