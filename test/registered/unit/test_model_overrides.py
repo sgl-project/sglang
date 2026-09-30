@@ -2269,8 +2269,14 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             _dsa_split_backend_resolution,
         )
 
-        def _view(arch="DeepseekV32ForCausalLM", learnable_sink=False, **kw):
-            hf = SimpleNamespace(architectures=[arch], learnable_sink=learnable_sink)
+        def _view(
+            arch="DeepseekV32ForCausalLM", learnable_sink=False, index_kpool=1, **kw
+        ):
+            hf = SimpleNamespace(
+                architectures=[arch],
+                learnable_sink=learnable_sink,
+                index_kpool=index_kpool,
+            )
             defaults = dict(
                 kv_cache_dtype="fp8_e4m3",
                 dsa_prefill_backend=None,
@@ -2340,6 +2346,33 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                             _dsa_split_backend_resolution(
                                 _view(arch=arch, learnable_sink=True, **{field: value})
                             )
+            # index_kpool > 1: Hopper FP8 defaults (flashmla_kv) cannot take the
+            # pooled tail tokens, so reject at resolution time instead of failing
+            # in CUDA graph capture after the weights load.
+            kpool_arch = "Glm5NextForConditionalGeneration"
+            with self.assertRaisesRegex(ValueError, "index_kpool=4.*flashmla_kv"):
+                _dsa_split_backend_resolution(_view(arch=kpool_arch, index_kpool=4))
+            # explicit unsupported decode backend is rejected too
+            with self.assertRaisesRegex(ValueError, "flashmla_kv"):
+                _dsa_split_backend_resolution(
+                    _view(
+                        arch=kpool_arch,
+                        index_kpool=4,
+                        kv_cache_dtype="bfloat16",
+                        dsa_decode_backend="flashmla_kv",
+                    )
+                )
+            # Hopper bf16 defaults stay valid: flashmla_sparse is remapped to
+            # fa3 for the kpool tail at run time.
+            self.assertEqual(
+                _dsa_split_backend_resolution(
+                    _view(arch=kpool_arch, index_kpool=4, kv_cache_dtype="bfloat16")
+                ),
+                {
+                    "dsa_prefill_backend": "flashmla_sparse",
+                    "dsa_decode_backend": "fa3",
+                },
+            )
             # non-family arch declares nothing
             self.assertEqual(
                 _dsa_split_backend_resolution(_view(arch="LlamaForCausalLM")), {}
