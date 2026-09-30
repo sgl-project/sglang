@@ -247,6 +247,7 @@ fn pick_decode_worker(
         ttft_slo_ms: routing.ttft_slo_ms,
         tps_slo: routing.tps_slo,
         load_snapshot: routing.load_snapshot.as_ref(),
+        metrics: Some(ctx.metrics.as_ref()),
     })
     .ok_or_else(|| ApiError::NoDecodeWorkersAvailable {
         model: request.model.0.clone(),

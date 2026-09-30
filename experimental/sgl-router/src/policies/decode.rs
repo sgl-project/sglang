@@ -151,7 +151,9 @@ impl DecodePolicy for LegacyHostAffinityDecodePolicy {
         ctx: &DecodeSelectionContext<'_>,
     ) -> Option<SelectionProposal> {
         let prefill_url = ctx.prefill_url()?;
-        select_decode_with_affinity(prefill_url, &domain.workers).map(SelectionProposal::primary)
+        select_decode_with_affinity(prefill_url, &domain.workers).map(|(worker, outcome)| {
+            SelectionProposal::primary(worker).with_decode_affinity_outcome(outcome)
+        })
     }
 }
 
