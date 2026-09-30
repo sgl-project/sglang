@@ -18,7 +18,6 @@ from __future__ import annotations
 from functools import partial
 from typing import Callable, Optional, Tuple
 
-import msgspec
 import torch
 
 from sglang.srt.distributed import GroupCoordinator
@@ -376,7 +375,9 @@ def _batch_allows_deferred_sum(forward_batch: ForwardBatch, boundary=None) -> bo
     return residual is not None and aiter_ar_fusion_applies(residual, forward_batch)
 
 
-class ExitDecision(msgspec.Struct, frozen=True):
+# A plain class, not msgspec.Struct;
+# Dynamo cannot build a Struct inside a compiled layer.
+class ExitDecision:
     """One decision shared by compute flags and the matching output completion.
 
     Fields:
@@ -390,10 +391,24 @@ class ExitDecision(msgspec.Struct, frozen=True):
     Do not independently reselect completion after compute has used these flags.
     """
 
-    defer_moe_finalize: bool
-    fuse_mlp_allreduce: bool
-    mlp_reduce_scatter: bool
-    complete: Callable[[torch.Tensor, torch.Tensor], Tuple]
+    __slots__ = (
+        "defer_moe_finalize",
+        "fuse_mlp_allreduce",
+        "mlp_reduce_scatter",
+        "complete",
+    )
+
+    def __init__(
+        self,
+        defer_moe_finalize: bool,
+        fuse_mlp_allreduce: bool,
+        mlp_reduce_scatter: bool,
+        complete: Callable[[torch.Tensor, torch.Tensor], Tuple],
+    ):
+        self.defer_moe_finalize = defer_moe_finalize
+        self.fuse_mlp_allreduce = fuse_mlp_allreduce
+        self.mlp_reduce_scatter = mlp_reduce_scatter
+        self.complete = complete
 
 
 def _defer(

@@ -37,7 +37,9 @@ class OutputTransform(msgspec.Struct, frozen=True):
     before_reduce_scatter: bool = False
 
 
-class UnreducedOutput(msgspec.Struct, frozen=True):
+# Per-forward values are plain classes, not msgspec.Struct;
+# Dynamo cannot build a Struct inside a compiled layer.
+class UnreducedOutput:
     """Internal adapter value describing an unfinished reduction.
 
     Fields:
@@ -52,11 +54,19 @@ class UnreducedOutput(msgspec.Struct, frozen=True):
     required when reduce_to_dp_local is absent.
     """
 
-    partial: torch.Tensor
-    group: Optional[GroupCoordinator] = None
-    # Under attention DP: the reduction that also brings ``partial`` back to this
-    # rank's tokens (a reduce-scatter, or an all-reduce then a scatter).
-    reduce_to_dp_local: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
+    __slots__ = ("partial", "group", "reduce_to_dp_local")
+
+    def __init__(
+        self,
+        partial: torch.Tensor,
+        group: Optional[GroupCoordinator] = None,
+        # Under attention DP: reduces ``partial`` and moves it to this rank's tokens,
+        # by a reduce-scatter or by an all-reduce then a scatter.
+        reduce_to_dp_local: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    ):
+        self.partial = partial
+        self.group = group
+        self.reduce_to_dp_local = reduce_to_dp_local
 
     def complete(self) -> torch.Tensor:
         """Complete the sum, on the destination rows when it moves them."""

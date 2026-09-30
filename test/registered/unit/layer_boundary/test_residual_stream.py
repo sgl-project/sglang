@@ -423,6 +423,33 @@ class TestResidualStream(CustomTestCase):
         with self.assertRaises(RuntimeError):
             stream.input(hidden)
 
+    def test_layers_trace_under_fullgraph(self):
+        """A stream's record, complete, snapshot and write trace under fullgraph."""
+        group = SimpleNamespace(all_reduce=lambda x: x * 2)
+
+        def layers(hidden, residual):
+            stream = ResidualStream(residual)
+            for _ in range(2):
+                owed = stream.record(hidden, PLAIN_ADD, declared_sum=SumGroup.TP)
+                residual = stream.write(stream.complete(owed) + stream.residual)
+                owed = stream.record(
+                    UnreducedOutput(residual * 3, group=group), PLAIN_ADD
+                )
+                captured = stream.snapshot(owed)
+                _, residual = stream.input(owed)
+                hidden = stream.write(stream.complete(owed) + residual) + captured
+            return hidden
+
+        with patch(
+            "sglang.srt.layers.layer_boundary.residual.stream._sum_group",
+            lambda sum_group: group,
+        ):
+            expected = layers(torch.ones(2, 4), torch.full((2, 4), 3.0))
+            torch._dynamo.reset()
+            compiled = torch.compile(layers, fullgraph=True, backend="eager")
+            actual = compiled(torch.ones(2, 4), torch.full((2, 4), 3.0))
+        torch.testing.assert_close(actual, expected)
+
 
 class TestBatchStageOwnership(CustomTestCase):
     def test_terminal_norm_releases_layer_buffers(self):
