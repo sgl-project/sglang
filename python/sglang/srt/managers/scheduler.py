@@ -324,13 +324,11 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs, compute_world_size
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
-from sglang.srt.speculative.dflash_utils import (
-    is_dflash_sampling_verify_available,
-    validate_dflash_request,
-)
+from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.eagle_utils import (
     get_draft_recurrent_hidden_state_spec_from_config,
 )
+from sglang.srt.speculative.sampling_mask import validate_spec_sampling_mask_request
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.uno_validation import validate_uno_request
 from sglang.srt.state_capturer.indexer_topk import destroy_global_indexer_capturer
@@ -2969,66 +2967,11 @@ class Scheduler(
                 self._reject_sampling_mask_request(req, error_msg)
                 return
 
-        if req.return_sampling_mask and not (
-            self.spec_algorithm.is_none() or self.spec_algorithm.is_dflash_family()
-        ):
-            error_msg = (
-                "return_sampling_mask is not supported with speculative decoding."
-            )
-            self._reject_sampling_mask_request(req, error_msg)
-            return
-
-        if (
-            req.return_sampling_mask
-            and self.spec_algorithm.is_dflash_family()
-            and req.sampling_params.min_p > 0
-        ):
-            error_msg = (
-                "return_sampling_mask with DFlash-family speculative decoding "
-                "does not support min_p."
-            )
-            self._reject_sampling_mask_request(req, error_msg)
-            return
-
-        if (
-            req.return_sampling_mask
-            and self.spec_algorithm.is_dflash()
-            and req.sampling_params.top_k > 1
-            and not is_dflash_sampling_verify_available()
-        ):
-            error_msg = (
-                "return_sampling_mask with non-greedy DFlash decoding requires "
-                "sampling verification support."
-            )
-            self._reject_sampling_mask_request(req, error_msg)
-            return
-
-        if (
-            req.return_sampling_mask
-            and self.spec_algorithm.is_dflash()
-            and (
-                get_spec().speculative_accept_threshold_single != 1.0
-                or get_spec().speculative_accept_threshold_acc != 1.0
-            )
-        ):
-            error_msg = (
-                "return_sampling_mask with DFlash requires acceptance thresholds "
-                "of 1.0."
-            )
-            self._reject_sampling_mask_request(req, error_msg)
-            return
-
-        if (
-            req.return_sampling_mask
-            and self.spec_algorithm.is_dflash_family()
-            and envs.SGLANG_SIMULATE_ACC_LEN.get() > 0
-        ):
-            error_msg = (
-                "return_sampling_mask is not supported with simulated speculative "
-                "acceptance."
-            )
-            self._reject_sampling_mask_request(req, error_msg)
-            return
+        if req.return_sampling_mask and not self.spec_algorithm.is_none():
+            error_msg = validate_spec_sampling_mask_request(req, self.spec_algorithm)
+            if error_msg is not None:
+                self._reject_sampling_mask_request(req, error_msg)
+                return
 
         if req.return_sampling_mask and get_exec().kernel.sampling_backend == "ascend":
             # The ascend backend samples from logits directly and never builds the

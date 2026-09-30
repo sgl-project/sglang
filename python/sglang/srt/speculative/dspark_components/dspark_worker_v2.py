@@ -145,10 +145,7 @@ def _build_dspark_sampling_mask_capture(
     draft_token_num: int,
     bs: int,
 ) -> SpeculativeSamplingMaskCapture | None:
-    if sampling_info is None:
-        return None
-    return_sampling_masks = sampling_info.return_sampling_masks or []
-    if not any(return_sampling_masks):
+    if sampling_info is None or sampling_info.sampling_mask_batch_indices is None:
         return None
     target_probs = None
     if not sampling_info.is_all_greedy:
@@ -160,12 +157,8 @@ def _build_dspark_sampling_mask_capture(
             max_top_k=draft_input.max_top_k,
             uniform_top_k_value=draft_input.uniform_top_k_value,
         )
-    return SpeculativeSamplingMaskCapture(
-        target_probs=target_probs,
-        return_sampling_masks=list(return_sampling_masks),
-        max_top_k=sampling_info.sampling_mask_max_top_k,
-        greedy_mask=greedy_mask,
-        support_capture_indices=sampling_info.sampling_support_logprobs_capture_indices,
+    return SpeculativeSamplingMaskCapture.from_sampling_info(
+        sampling_info, target_probs=target_probs, greedy_mask=greedy_mask
     )
 
 

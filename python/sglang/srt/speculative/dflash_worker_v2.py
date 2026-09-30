@@ -224,19 +224,6 @@ def _is_all_greedy(sampling_info) -> bool:
     return sampling_info is None or sampling_info.is_all_greedy
 
 
-def _build_dflash_sampling_mask_capture(
-    *,
-    target_probs: Optional[torch.Tensor],
-    sampling_info,
-) -> SpeculativeSamplingMaskCapture:
-    return SpeculativeSamplingMaskCapture(
-        target_probs=target_probs,
-        return_sampling_masks=list(sampling_info.return_sampling_masks or []),
-        max_top_k=sampling_info.sampling_mask_max_top_k,
-        support_capture_indices=sampling_info.sampling_support_logprobs_capture_indices,
-    )
-
-
 def _selector_lattice(draft_model, pred_hidden, anchor_token_ids):
     # Flattened to [N, H] and viewed back because the radix top-k kernel is 2D.
     bs, num_pred = pred_hidden.shape[0], pred_hidden.shape[1]
@@ -2833,10 +2820,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             grammar_mask.apply(logits_output.next_token_logits)
 
         candidates = draft_tokens
-        return_sampling_masks = (
-            sampling_info.return_sampling_masks if sampling_info is not None else []
+        needs_sampling_masks = (
+            sampling_info is not None
+            and sampling_info.sampling_mask_batch_indices is not None
         )
-        needs_sampling_masks = any(return_sampling_masks or [])
         (
             accept_len,
             commit_lens,
@@ -2884,9 +2871,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             new_seq_lens = None
 
         if needs_sampling_masks:
-            sampling_mask_capture = _build_dflash_sampling_mask_capture(
-                target_probs=target_probs,
-                sampling_info=sampling_info,
+            sampling_mask_capture = SpeculativeSamplingMaskCapture.from_sampling_info(
+                sampling_info, target_probs=target_probs
             )
             logits_output.sampling_mask_output = sampling_mask_capture.build_output(
                 out_tokens=out_tokens,
