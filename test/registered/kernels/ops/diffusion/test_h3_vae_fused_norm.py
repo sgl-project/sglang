@@ -1,5 +1,8 @@
 """MiniMax-H3 video VAE fused RMSNorm and Q/K RoPE."""
 
+import sys
+
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -70,3 +73,7 @@ def test_qk_rmsnorm_rope_matches_eager_neox():
     torch.testing.assert_close(actual_q, expected_q, rtol=1e-3, atol=1e-2)
     torch.testing.assert_close(actual_k, expected_k, rtol=1e-3, atol=1e-2)
     assert h3_vae_qk_rmsnorm_rope(query.float(), key.float(), 1e-5, cos, sin) is None
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
