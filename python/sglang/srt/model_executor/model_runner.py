@@ -558,7 +558,7 @@ class ModelRunner:
             custom_weight_loaders=get_model().custom_weight_loader,
             get_model=lambda: self.model,
             update_model_fields=self.update_model_fields,
-            recapture_cuda_graph=self.init_decode_cuda_graph,
+            recapture_cuda_graph=self.recapture_decode_cuda_graph,
             get_model_runner=lambda: self,
         )
 
@@ -1531,6 +1531,17 @@ class ModelRunner:
         self.decode_cuda_graph_capture_bs = list(
             getattr(self.decode_cuda_graph_runner, "capture_bs", []) or []
         )
+
+    def recapture_decode_cuda_graph(self):
+        # A draft whose spec worker captures its graphs inside the draft
+        # placement scopes owns no decode graph here; capturing one now would
+        # build it under the target's placement, and nothing replays it.
+        if (
+            self.is_draft_worker
+            and getattr(self, "decode_cuda_graph_runner", None) is None
+        ):
+            return
+        self.init_decode_cuda_graph()
 
     def ensure_decode_cuda_graphs(self, capture_bs: Optional[list[int]] = None):
         """Idempotently capture decode CUDA graphs after startup.
