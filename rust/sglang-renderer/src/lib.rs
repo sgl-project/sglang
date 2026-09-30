@@ -37,14 +37,16 @@ pub use postprocessing::{
     ChatEvent, ChatFinishReason, ChatResponseProcessor, ChatToolCallDelta, DecodedChatEvent,
 };
 pub(crate) use preprocessing::ChatFormatter;
-pub(crate) use preprocessing::{ChatPreprocessor, LoweredChat};
 pub use preprocessing::{
-    ChatRequest, DynamoTokenizer, PreparedChat, ReasoningEffort, RendererService, SamplingParams,
-    TextTokenizer, load_tokenizer,
+    ChatPreprocessor, ChatRequest, DynamoTokenizer, LoweredChat, PreparedChat, ReasoningEffort,
+    RendererService, SamplingParams, TextTokenizer, load_tokenizer,
 };
 pub use preprocessing::{
     GenerateRequest, GenerateRequestMetadata, GenerateSamplingParams, GenerationOptions,
     TextRequest, TokenIdsRequest,
+};
+pub use preprocessing::{
+    GenerateRequestIdentity, TextRequestGroup, resolve_model_file, resolve_tokenizer_file,
 };
 #[cfg(feature = "http")]
 pub use runtime::{RendererRuntimeConfig, serve};

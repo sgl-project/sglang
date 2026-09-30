@@ -627,13 +627,10 @@ mod tests {
         }))
         .unwrap();
         let (_, chat) = lower_chat_request(&config, request).unwrap();
-        ChatPreprocessor::new(
-            &config,
-            Some(crate::preprocessing::load_test_chat_formatter("chatml")),
-        )
-        .preprocess(chat)
-        .unwrap()
-        .response_processor
+        ChatPreprocessor::from_config(&config)
+            .preprocess(chat)
+            .unwrap()
+            .response_processor
     }
 
     fn wire_context(include_usage: bool) -> ChatResponseContext {

@@ -9,8 +9,8 @@ use hf_hub::api::tokio::{ApiBuilder, ApiRepo};
 use hf_hub::{Cache, Repo, RepoType};
 use serde_json::Value;
 
-use crate::preprocessing::{resolve_model_file, resolve_tokenizer_file};
 use crate::{RendererConfig, RendererLimits, RendererRuntimeConfig, SamplingDefaults, serve};
+use crate::{resolve_model_file, resolve_tokenizer_file};
 
 const DEFAULT_CONTEXT_LEN: u64 = 2048;
 
