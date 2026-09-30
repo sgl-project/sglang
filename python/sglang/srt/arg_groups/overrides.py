@@ -374,7 +374,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
 )
 
 # Architectures that support the extra_buffer mamba radix cache strategy.
-# The single source of truth; `supports_mamba_cache_extra_buffer` reads it.
+# Registry specs opt in through `support_mamba_cache_extra_buffer` instead.
 _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
     {
         "KimiLinearForCausalLM",
@@ -409,11 +409,15 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
 )
 
 
-def supports_mamba_cache_extra_buffer(view: Any, model_arch: str) -> bool:
-    """Whether ``model_arch`` supports the extra_buffer strategy on the
-    configured linear-attention backend (pure read)."""
+def supports_mamba_cache_extra_buffer(view: Any, hf_config: Any) -> bool:
+    """Whether the model of ``hf_config`` supports the extra_buffer strategy on
+    the configured linear-attention backend (pure read)."""
+    from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec
+
     if get_platform().is_xpu:
         return False
+    spec = get_linear_attn_spec(hf_config)
+    model_arch = hf_config.architectures[0]
     if model_arch == "KimiK3ForConditionalGeneration":
         base = view.linear_attn_backend
         decode = getattr(view, "linear_attn_decode_backend", None) or base
@@ -426,7 +430,9 @@ def supports_mamba_cache_extra_buffer(view: Any, model_arch: str) -> bool:
                 "triton",
                 "cake",
             }
-    if model_arch in _MAMBA_EXTRA_BUFFER_ARCHS:
+    if model_arch in _MAMBA_EXTRA_BUFFER_ARCHS or (
+        spec is not None and spec.support_mamba_cache_extra_buffer
+    ):
         return view.linear_attn_backend == "triton"
     return False
 
@@ -434,9 +440,7 @@ def supports_mamba_cache_extra_buffer(view: Any, model_arch: str) -> bool:
 @register_post_process
 def _mamba_radix_cache_resolution(view: Any) -> dict:
     """Resolve hybrid-Mamba cache settings using the current page size and overlap policy."""
-    from sglang.srt.configs.linear_attn_model_registry import (
-        get_linear_attn_spec_by_arch,
-    )
+    from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec
 
     hf_config = model_config_of(view).hf_config
     model_arch = hf_config.architectures[0]
@@ -447,7 +451,9 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
             layer_type == "mamba"
             for layer_type in getattr(hf_config, "layer_types", [])
         )
-    spec = get_linear_attn_spec_by_arch(model_arch)
+    # Specs registered by config predicate (archs=[]) are only reachable
+    # through the HF config, not the architecture name.
+    spec = get_linear_attn_spec(hf_config)
     if not ((spec is not None and spec.uses_mamba_radix_cache) or in_branch):
         return {}
 
@@ -459,7 +465,7 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
         wants_overlap = not view.disable_overlap_schedule
         wants_paging = view.page_size is not None and view.page_size > 1
         if (wants_overlap or wants_paging) and supports_mamba_cache_extra_buffer(
-            view, model_arch
+            view, hf_config
         ):
             declared["mamba_radix_cache_strategy"] = "extra_buffer"
         else:

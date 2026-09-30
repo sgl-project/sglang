@@ -6,6 +6,10 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from sglang.kernels.ops.diffusion import (
+    BitExactFusionGate,
+    fused_packed_silu_mul_bitexact,
+)
 from sglang.multimodal_gen.runtime.distributed import get_sp_world_size
 from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
     gather_seq,
@@ -14,7 +18,18 @@ from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
     tail_attn_meta,
 )
 from sglang.multimodal_gen.runtime.models.dits.zimage import ZImageTransformer2DModel
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.layers.layernorm import RMSNorm
+
+logger = init_logger(__name__)
+_MING_SWIGLU_FUSION = BitExactFusionGate(
+    "Ming-Image packed SiLU-mul", per_signature=True
+)
+
+
+def _eager_silu_and_mul(x: torch.Tensor) -> torch.Tensor:
+    gate, up = x.chunk(2, dim=-1)
+    return F.silu(gate) * up
 
 
 class MingRMSNorm(RMSNorm):
@@ -25,8 +40,47 @@ class MingRMSNorm(RMSNorm):
 
 class MingSiluAndMul(nn.Module):
     def forward(self, x):
-        gate, up = x.chunk(2, dim=-1)
-        return F.silu(gate) * up
+        # Inductor can fuse the reference expression while tracing.
+        if torch.compiler.is_compiling():
+            return _eager_silu_and_mul(x)
+
+        can_fuse = (
+            not _MING_SWIGLU_FUSION.disabled
+            and x.is_cuda
+            and x.dtype is torch.bfloat16
+            and x.dim() == 3
+            and x.stride(-1) == 1
+            and x.stride(-2) >= x.shape[-1]
+            and x.stride(0) == x.shape[1] * x.stride(1)
+            and x.shape[-1] % 2 == 0
+            and x.numel() > 0
+        )
+        if not can_fuse:
+            return _eager_silu_and_mul(x)
+
+        # The first tensor of each layout is compared bit-for-bit against
+        # eager. Avoid a host synchronization inside CUDA graph capture.
+        sig = (x.dtype, x.device, x.shape[0], x.shape[-1], x.stride(-2), x.stride(-1))
+        verified = _MING_SWIGLU_FUSION.is_verified(sig)
+        if not verified and torch.cuda.is_current_stream_capturing():
+            return _eager_silu_and_mul(x)
+        try:
+            out = fused_packed_silu_mul_bitexact(x)
+        except Exception as exc:
+            _MING_SWIGLU_FUSION.on_exception(exc, logger=logger)
+            return _eager_silu_and_mul(x)
+        if verified:
+            return out
+        return _MING_SWIGLU_FUSION.accept_or_fallback(
+            out,
+            _eager_silu_and_mul(x),
+            sig=sig,
+            logger=logger,
+            mismatch_msg=(
+                "Ming-Image packed SiLU-mul is not bit-exact on this platform; "
+                "falling back to eager"
+            ),
+        )
 
 
 class MingImageTransformer2DModel(ZImageTransformer2DModel):
