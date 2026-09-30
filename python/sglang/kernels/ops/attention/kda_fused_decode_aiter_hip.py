@@ -22,14 +22,14 @@ def _ops():
         from sglang.kernels.ops.attention.kda_flydsl.source import load_module
 
         module = load_module(
-            "sglang.kernels.ops.attention.kda_flydsl.kimi_k3_kda_decode",
-            "aiter.ops.flydsl.kimi_k3_kda_decode",
+            "sglang.kernels.ops.attention.kda_flydsl.kda_decode",
+            "aiter.ops.flydsl.kda_decode",
         )
     except (ImportError, ModuleNotFoundError):
         return None, None
     return (
-        module.flydsl_kimi_k3_kda_decode_with_f_b,
-        module.is_flydsl_kimi_k3_kda_decode_supported,
+        module.flydsl_kda_decode_with_f_b,
+        module.is_flydsl_kda_decode_supported,
     )
 
 

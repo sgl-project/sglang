@@ -35,7 +35,7 @@ _WAVES_PER_EU = 3
 
 
 @functools.cache
-def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
+def create_kda_decode_kernel(norm_eps: float, lower_bound: float):
     """Build the fixed gfx950 BF16 Kimi-K3 decode specialization."""
 
     @fx.struct
@@ -47,7 +47,7 @@ def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
         norm_partial: fx.Array[fx.Float32, 2, 16]
 
     @flyc.kernel(
-        name="kimi_k3_kda_decode_bf16_gfx950",
+        name="kda_decode_bf16_gfx950",
         known_block_size=[_BLOCK_THREADS, 1, 1],
     )
     def kernel(
@@ -561,4 +561,4 @@ def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
     return launch
 
 
-__all__ = ["create_kimi_k3_kda_decode_kernel"]
+__all__ = ["create_kda_decode_kernel"]
