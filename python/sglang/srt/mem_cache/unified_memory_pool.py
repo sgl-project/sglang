@@ -41,6 +41,7 @@ from sglang.srt.mem_cache.layout.page_major import (
     build_mla_views,
     build_page_major_mamba_views,
 )
+from sglang.srt.mem_cache.layout.transfer import TransferLayout, TransferTensor
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
@@ -229,6 +230,7 @@ class MambaSubPoolSpec(SubPoolSpec):
     temporal_state_shape: Tuple[int, ...]
     temporal_dtype: torch.dtype
     conv_slice_axis: int = 0
+    conv_shard_groups: Optional[Tuple[int, ...]] = None
 
     def __post_init__(self):
         super().__post_init__()
@@ -758,6 +760,27 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
         raw = self._unified_buffer._raw
         return [raw.data_ptr()], [raw.numel()], [self._page_bytes]
 
+    def get_transfer_layout(self, layer_ids: List[int]) -> TransferLayout:
+        """Describe latent rows without registering overlapping kernel views."""
+        if len(layer_ids) != self.layer_num:
+            raise ValueError("MLA transfer layer IDs must match the local layers")
+        raw = self._unified_buffer._raw
+        return TransferLayout(
+            block_bytes=self._page_bytes,
+            rows_per_block=self.page_size,
+            tensors=tuple(
+                TransferTensor(
+                    name="kv",
+                    layer_id=layer_id,
+                    offset_bytes=view.data_ptr() - raw.data_ptr(),
+                    shape=tuple(view.shape[1:]),
+                    itemsize=view.element_size(),
+                    # MLA latents are replicated across attention TP.
+                )
+                for layer_id, view in zip(layer_ids, self.kv_buffer)
+            ),
+        )
+
     def _physical_to_kernel_indices(self, indices: torch.Tensor) -> torch.Tensor:
         """Physical TOKEN ids -> the kernel-facing ids this class's `kv_buffer`
         views are indexed by; the formula is the one in the class docstring."""
@@ -854,7 +877,7 @@ class UnifiedMambaPool(MambaPool):
         self.replayssm_cache_base = None
         self.replayssm_is_flush = None
         self.debug_memory_pool = False
-        self.conv_shard_groups = None
+        self.conv_shard_groups = spec.conv_shard_groups
         self.conv_slice_axis = spec.conv_slice_axis
 
         assert conv_views[0].shape[0] == self.num_mamba_layers, (
@@ -937,6 +960,38 @@ class UnifiedMambaPool(MambaPool):
         spec = self._unified_buffer.mamba_spec(self._sub_pool_name)
         raw = self._unified_buffer._raw
         return [raw.data_ptr()], [raw.numel()], [spec.entry_bytes()]
+
+    def get_transfer_layout(self) -> TransferLayout:
+        """Describe tensor pieces; the raw allocation stays registered once."""
+        raw = self._unified_buffer._raw
+        tensors = []
+        fields = [
+            (f"conv.{i}", view, self.conv_slice_axis, self.conv_shard_groups)
+            for i, view in enumerate(self.mamba_cache.conv)
+        ]
+        fields.append(("temporal", self.mamba_cache.temporal, 0, None))
+        for name, view, axis, groups in fields:
+            if view.numel() == 0:
+                continue
+            for layer, layer_id in enumerate(self.mamba_layer_ids):
+                tensors.append(
+                    TransferTensor(
+                        name=name,
+                        layer_id=layer_id,
+                        offset_bytes=view[layer].data_ptr() - raw.data_ptr(),
+                        shape=tuple(view.shape[2:]),
+                        itemsize=view.element_size(),
+                        slice_axis=axis,
+                        shard_groups=tuple(groups) if groups is not None else None,
+                    )
+                )
+        return TransferLayout(
+            block_bytes=self._unified_buffer.mamba_spec(
+                self._sub_pool_name
+            ).entry_bytes(),
+            rows_per_block=1,
+            tensors=tuple(tensors),
+        )
 
     def get_state_dim_per_tensor(self):
         return []
@@ -1338,6 +1393,7 @@ def init_unified_mamba_pools(
         temporal_state_shape=tuple(int(x) for x in cp.shape.temporal),
         temporal_dtype=cp.dtype.temporal,
         conv_slice_axis=getattr(cp.shape, "conv_slice_axis", 0),
+        conv_shard_groups=getattr(cp.shape, "conv_shard_groups", None),
         grow_direction="up",
     )
     if unified_total_bytes is not None:
