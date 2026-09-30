@@ -15,6 +15,9 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
     AscendTorchNativeAttnBackend,
 )
+from sglang.srt.hardware_backend.npu.attention.dsa_dcp import (
+    forward_dcp_sparse_attention,
+)
 from sglang.srt.hardware_backend.npu.attention.mla_cache import gather_mla_cache_pages
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
@@ -33,10 +36,8 @@ from sglang.srt.layers.attention.dsa.dsa_cp import (
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dcp.layout import (
     dcp_crop_free_extend,
-    dcp_local_kv_block_table,
     get_dcp_chain_spec_lens,
     get_dcp_lens,
-    remap_dcp_local_topk_indices,
 )
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
@@ -79,31 +80,6 @@ def _expand_dsa_sparse_indices(topk_indices: torch.Tensor) -> torch.Tensor:
     if topk_indices.dim() == 2:
         return topk_indices.unsqueeze(-2)
     return topk_indices
-
-
-def _dcp_lse_from_softmax(
-    softmax_max: torch.Tensor, softmax_sum: torch.Tensor
-) -> torch.Tensor:
-    """The operator's two softmax halves -> the ``[T, H]`` LSE the merge takes.
-
-    ``sgl_sparse_flash_attention`` returns the two halves separately,
-    matching vLLM-Ascend's vendored operator, and the caller reconstructs.
-    Under ``layout_query="TND"`` both come back as ``(N2, T, G)`` while
-    ``cp_lse_ag_out_rs_mla`` wants ``[B, H]``, so the head axes are flattened
-    in the order the query uses.
-
-    The result is a **natural** log, because CANN defines ``softmax_sum`` as
-    ``sum(exp(qk - max))``; that is what puts ``"ascend"`` in
-    ``is_mla_dcp_lse_base_on_e``, and getting it wrong does not fail loudly.
-
-    No epsilon on ``softmax_sum``: a row whose indices are all ``-1`` comes
-    back with the kernel's ``-2e38`` sentinel and a sum equal to the slot
-    count, never zero, so nothing evaluates ``log(0)`` and the combine
-    underflows it to the zero weight an empty shard should contribute.
-    """
-    lse = softmax_max + torch.log(softmax_sum)
-    n2, t, g = lse.shape
-    return lse.permute(1, 0, 2).reshape(t, n2 * g)
 
 
 def _reshape_kv_for_fia_nz(
@@ -153,10 +129,6 @@ class ForwardMetadata:
     # prefix cache
     prefix_lens: Optional[torch.Tensor] = None
     flatten_prefix_block_tables: Optional[torch.Tensor] = None
-
-    # The second page table DCP needs: block_tables above is the indexer's
-    # replicated full-span view, this one addresses this rank's KV shard.
-    dcp_local_block_tables: Optional[torch.Tensor] = None
 
 
 class AscendAttnMaskBuilder:
@@ -528,7 +500,17 @@ class AscendAttnBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         is_spec: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build rank-local paged KV metadata for NPU DSA DCP."""
+        """Build rank-local paged KV metadata for NPU DSA DCP.
+
+        ``interleave_size=1``, not ``page_size``: upstream shards the latent KV
+        in page-sized blocks, this pool shards it per token -- the allocator
+        widens a page to ``page_size * dcp_size`` and rank r owns the slots with
+        ``loc % dcp_size == r`` (``plan_dcp_owner_write``,
+        ``maybe_dcp_kernel_indices``). The block TABLE is the same either way,
+        since both stride by ``page_size * dcp_size``; the lengths and the
+        top-k remap are not. Moving to page-interleave means changing the pool
+        and the extend gather together, which is its own commit.
+        """
         parallel = get_parallel()
         if is_spec:
             local_kv_lens = get_dcp_chain_spec_lens(
@@ -536,14 +518,12 @@ class AscendAttnBackend(AttentionBackend):
                 self.speculative_num_draft_tokens,
                 parallel.attn_dcp_size,
                 parallel.attn_dcp_rank,
-                interleave_size=self.page_size,
             )
         else:
             local_kv_lens = get_dcp_lens(
                 kv_lens_cpu,
                 parallel.attn_dcp_size,
                 parallel.attn_dcp_rank,
-                interleave_size=self.page_size,
             ).int()
         page_stride = self.page_size * parallel.attn_dcp_size
         max_len = int(kv_lens_cpu.max().item()) if kv_lens_cpu.numel() else 0
@@ -627,10 +607,6 @@ class AscendAttnBackend(AttentionBackend):
         self.forward_metadata.block_tables = (
             loc_rows[:, :: self.page_size] // self.page_size
         )
-        if get_parallel().dcp_enabled:
-            self.forward_metadata.dcp_local_block_tables = dcp_local_kv_block_table(
-                loc_rows, self.page_size
-            )
         if self.is_hybrid_swa:
             self.forward_metadata.block_tables_swa = (
                 (
@@ -792,16 +768,6 @@ class AscendAttnBackend(AttentionBackend):
                 device=self.device,
             ),
         }
-        if get_parallel().dcp_enabled:
-            # A captured graph needs persistent storage for the rank-local table
-            # too, or the operator refuses the call at capture time. Strided by
-            # page_size * dcp_size, so 1/dcp_size the width of the table above.
-            stride = self.page_size * get_parallel().attn_dcp_size
-            self.graph_metadata["dcp_local_block_tables"] = torch.empty(
-                (max_bs, (total_context_len + stride - 1) // stride),
-                dtype=torch.int32,
-                device=self.device,
-            )
         # DCP decode needs its own block_table (different stride: dcp_page_size).
         if get_parallel().dcp_enabled and not self.is_draft_worker:
             dcp_page_size = self.page_size * get_parallel().attn_dcp_size
@@ -892,9 +858,6 @@ class AscendAttnBackend(AttentionBackend):
             )
         metadata.block_tables = self.graph_metadata["block_tables"][:bs, :]
         if get_parallel().dcp_enabled:
-            metadata.dcp_local_block_tables = self.graph_metadata[
-                "dcp_local_block_tables"
-            ][:bs, :]
             if "dcp_origin_out_cache_loc" in self.graph_metadata:
                 metadata.dcp_origin_out_cache_loc = self.graph_metadata[
                     "dcp_origin_out_cache_loc"
@@ -1106,17 +1069,6 @@ class AscendAttnBackend(AttentionBackend):
                 metadata.dcp_block_tables[:bs, :dcp_pages].copy_(dcp_block_tables)
                 metadata.dcp_block_tables[:bs, dcp_pages:].fill_(0)
         metadata.block_tables[bs:, :].fill_(0)
-
-        if get_parallel().dcp_enabled:
-            # Same refill at the rank-local stride, using the arithmetic
-            # dcp_local_kv_block_table applies on the eager path.
-            stride = self.page_size * get_parallel().attn_dcp_size
-            max_local_pages = (max_len + stride - 1) // stride
-            metadata.dcp_local_block_tables[:bs, :max_local_pages].copy_(
-                self.req_to_token[req_pool_indices[:bs], 0:max_len:stride] // stride
-            )
-            metadata.dcp_local_block_tables[:bs, max_local_pages:].fill_(0)
-            metadata.dcp_local_block_tables[bs:, :].fill_(0)
 
         if forward_mode.is_target_verify():
             seq_lens = seq_lens + self.speculative_num_draft_tokens
@@ -1549,20 +1501,34 @@ class AscendAttnBackend(AttentionBackend):
             layout_kv = "PA_BSND"
 
             if dcp_decode:
-                # Global positions from the replicated view -> this rank's KV
-                # coordinates, non-owned entries marked -1.
-                topk_indices = remap_dcp_local_topk_indices(topk_indices)
-                block_table = self.forward_metadata.dcp_local_block_tables
-                seq_lengths_kv = get_dcp_lens(
-                    actual_seq_lengths_kv,
-                    get_parallel().attn_dcp_size,
-                    get_parallel().attn_dcp_rank,
+                # Upstream #37787 owns decode (npu/attention/dsa_dcp.py). It
+                # reads its own rank-local metadata off forward_metadata and
+                # ignores the block_table, seq_lengths_kv and sparse_mode the
+                # branches below compute, so it returns before they are set.
+                # Extend stays ours -- gathering the context beats gathering
+                # the query once the tail clears prefix/178, which at a 1M
+                # prefix is 5.6k tokens and we serve 16-32k. See
+                # p20_dcp_extend_cost_model.py.
+                if self.kv_cache_dtype == torch.float8_e4m3fn:
+                    raise NotImplementedError(
+                        "FP8 KV cache with decode context parallelism is not "
+                        "supported: the LSE path is bf16-only."
+                    )
+                if not self.has_sparse_fa_lse:
+                    raise RuntimeError(_MISSING_SPARSE_FA_LSE)
+                return forward_dcp_sparse_attention(
+                    q_nope=q_nope,
+                    q_rope=q_pe,
+                    k_nope=k_nope,
+                    k_rope=k_pe,
+                    topk_indices=_expand_dsa_sparse_indices(topk_indices),
+                    actual_seq_lengths_query=actual_seq_qlen,
+                    forward_metadata=self.forward_metadata,
+                    forward_batch=forward_batch,
+                    speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+                    scaling=layer.scaling,
                 )
-                # 0, not 3: rank-local KV length and global query length share no
-                # coordinate system, so the crop must go. Safe at decode only --
-                # every key in the buffer is already a past token.
-                sparse_mode = 0
-            elif dcp_extend:
+            if dcp_extend:
                 # Indices relative to each request's KV start, cumulative KV
                 # lengths. Three of the four index/length conventions run and
                 # return plausible garbage, so re-probe before changing this.
@@ -1601,22 +1567,12 @@ class AscendAttnBackend(AttentionBackend):
                 sparse_mode = 3
 
             topk_indices = _expand_dsa_sparse_indices(topk_indices)
-            # Upstream #37787 routes EVERY DCP forward through
-            # forward_dcp_sparse_attention, extend included: each rank attends
-            # all heads against its own KV shard and the ranks merge by LSE.
-            # Ours gathers the context at extend instead, so taking their entry
-            # point here would discard the gathered buffer, the crop-free lift
-            # and the DSA-CP interplay -- silently, because that function reads
-            # forward_metadata.dcp_* and ignores the block_table, seq_lengths_kv
-            # and sparse_mode the branches above just computed. The switch is a
-            # deliberate commit, not a merge artefact; see the plan in
-            # DSA_CP_HANDOFF_2026-09-24.md.
             if self.kv_cache_dtype == torch.float8_e4m3fn:
-                # DCP does not compose with an FP8 KV cache: this branch does not
-                # read the gathered buffer and the LSE port has no quant form.
-                assert not (dcp_decode or dcp_extend), (
+                # DCP does not compose with an FP8 KV cache: this branch does
+                # not read the gathered buffer. Decode already returned above.
+                assert not dcp_extend, (
                     "FP8 KV cache with decode context parallelism is not "
-                    "supported: the DCP gathered/LSE paths are bf16-only."
+                    "supported: the DCP gathered path is bf16-only."
                 )
                 assert q_nope.dtype == q_pe.dtype == torch.bfloat16
                 packed = k_nope.view(torch.float8_e4m3fn)
@@ -1671,19 +1627,6 @@ class AscendAttnBackend(AttentionBackend):
                 # are not always the same thing.
                 if block_table is not None:
                     call["block_table"] = block_table
-
-                if dcp_decode:
-                    # CANN refuses return_softmax_lse under PA_BSND, its only
-                    # paged layout, so DCP calls sgl-kernel-npu's operator
-                    # instead. Same kwargs, same three outputs.
-                    if not self.has_sparse_fa_lse:
-                        raise RuntimeError(_MISSING_SPARSE_FA_LSE)
-                    attn_out, softmax_max, softmax_sum = (
-                        torch.ops.npu.sgl_sparse_flash_attention(
-                            **call, return_softmax_lse=True
-                        )
-                    )
-                    return attn_out, _dcp_lse_from_softmax(softmax_max, softmax_sum)
 
                 attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
                     **call, return_softmax_lse=False

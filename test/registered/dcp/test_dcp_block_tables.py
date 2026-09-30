@@ -1,7 +1,8 @@
 """CPU unit test for the two DCP page tables over one allocation.
 
 [Test Category] Correctness
-[Test Target] layers/dcp/layout.py::dcp_local_kv_block_table
+[Test Target] hardware_backend/npu/attention/ascend_backend.py::
+               AscendAttnBackend._get_kv_lens_and_block_tables
 
 Under DCP the NPU attention backend has to hand two different page tables to two
 different consumers reading the same allocation:
@@ -30,8 +31,6 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.dcp.layout import dcp_local_kv_block_table
-from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -59,12 +58,17 @@ def _index_block_table(loc_rows, page_size):
 
 
 def _local(loc_rows, page_size, dcp_size, rank=0):
-    with get_parallel().override(
-        dcp_enabled=dcp_size > 1,
-        attn_dcp_size=dcp_size,
-        attn_dcp_rank=rank,
-    ):
-        return dcp_local_kv_block_table(loc_rows, page_size)
+    """The backend's rank-local expression, verbatim.
+
+    ``_get_kv_lens_and_block_tables`` builds this as
+    ``req_to_token[rows, :max_len:page_stride] // page_stride`` with
+    ``page_stride = page_size * attn_dcp_size``. It is rank-independent by
+    construction -- every rank's shard of an allocator page is the physical
+    page of the same index -- which is why ``rank`` is unused here and why the
+    table survived the move to upstream's decode path unchanged.
+    """
+    stride = page_size * dcp_size
+    return loc_rows[:, ::stride] // stride
 
 
 class TestDcpBlockTables(CustomTestCase):

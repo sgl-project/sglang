@@ -36,6 +36,7 @@ from sglang.srt.layers.dcp.comm import (
     all_gather_q_for_mla_decode,
     cp_lse_ag_out_rs_mha,
     cp_lse_ag_out_rs_mla,
+    cp_lse_ag_out_rs_mla_npu,
     dcp_a2a_lse_reduce,
     init_fi_a2a_workspace,
 )
@@ -65,6 +66,7 @@ __all__ = [
     "all_gather_q_for_mla_decode",
     "cp_lse_ag_out_rs_mha",
     "cp_lse_ag_out_rs_mla",
+    "cp_lse_ag_out_rs_mla_npu",
     "create_triton_kv_indices_for_dcp_triton",
     "filter_dcp_local_kv_indices",
     "get_dcp_lens",

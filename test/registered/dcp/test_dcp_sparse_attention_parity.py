@@ -38,8 +38,7 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.dcp.layout import remap_dcp_local_topk_indices
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.layers.dcp.layout import remap_dcp_sparse_indices
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -114,12 +113,8 @@ def _combine(partial_out, partial_lse, base_e=True):
 
 
 def _remap(topk, dcp_size, rank):
-    with get_parallel().override(
-        dcp_enabled=dcp_size > 1,
-        attn_dcp_size=dcp_size,
-        attn_dcp_rank=rank,
-    ):
-        return remap_dcp_local_topk_indices(topk)
+    # interleave_size 1: this pool shards per token, not per page.
+    return remap_dcp_sparse_indices(topk, dcp_size, rank)
 
 
 def _sharded_attention(q, kv, topk, dcp_size, scale, *, base_e=True):

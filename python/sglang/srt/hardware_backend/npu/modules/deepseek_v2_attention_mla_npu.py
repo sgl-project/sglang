@@ -27,18 +27,17 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.layers.dcp import (
     all_gather_q_for_mla_decode,
-    cp_lse_ag_out_rs_mla,
-    dcp_a2a_lse_reduce,
+    cp_lse_ag_out_rs_mla_npu,
 )
 from sglang.srt.layers.dcp.layout import (
     dcp_extend_gather_buffer,
     plan_dcp_extend_gather,
+    remap_dcp_sparse_indices,
 )
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
     is_dcp_mla_decode_phase,
-    is_mla_dcp_lse_base_on_e,
 )
 from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk
@@ -579,6 +578,18 @@ def forward_dsa_prepare_npu(
         # DSA layers that skip the indexer reuse ``prev_topk_indices``. Remap
         # only when a fresh global top-k is produced so shared-index layers do
         # not repeat the same DCP partitioning work.
+        if is_dcp_mla_decode_phase(forward_batch):
+            # Decode only, unlike upstream's _use_dsa_dcp_partial_attention:
+            # our extend reads the GATHERED context, whose coordinates are
+            # global, so remapping there would point every index at the wrong
+            # row. interleave_size stays 1 -- this pool shards per token, not
+            # per page; see _get_kv_lens_and_block_tables.
+            parallel = get_parallel()
+            topk_indices = remap_dcp_sparse_indices(
+                topk_indices,
+                parallel.attn_dcp_size,
+                parallel.attn_dcp_rank,
+            )
     else:
         topk_indices = prev_topk_indices
 
@@ -799,26 +810,13 @@ def forward_dsa_core_npu(
         attn_output = attn_output.view(
             -1, m.num_local_heads * get_parallel().attn_dcp_size, m.kv_lora_rank
         )
-        comm_backend = get_parallel().dcp_comm_backend
-        # Ascend returns a natural-log LSE; a base mismatch here degrades
-        # acceptance without failing.
-        base_on_e = is_mla_dcp_lse_base_on_e(m.current_attention_backend)
-        if comm_backend in ("a2a", "fi_a2a"):
-            attn_output = dcp_a2a_lse_reduce(
-                attn_output.contiguous(),
-                lse.contiguous(),
-                get_parallel().dcp_group,
-                is_lse_base_on_e=base_on_e,
-                comm_backend=comm_backend,
-            )
-        else:
-            attn_output = cp_lse_ag_out_rs_mla(
-                attn_output,
-                lse,
-                get_parallel().dcp_group,
-                is_lse_base_on_e=base_on_e,
-            )
-            attn_output = attn_output.transpose(0, 1)
+        # One all_to_all_single of the packed [out, lse] then npu_attention_update,
+        # which is what #37787 landed for this. It returns the local head slice
+        # already, so there is no transpose here and no LSE base flag: the
+        # operator and the Ascend kernel both work in natural log.
+        attn_output = cp_lse_ag_out_rs_mla_npu(
+            attn_output, lse, get_parallel().dcp_group
+        )
     else:
         attn_mqa = m.attn_mqa
         dsa_cp_plan = get_dsa_cp_plan(forward_batch)

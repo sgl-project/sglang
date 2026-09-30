@@ -1,6 +1,6 @@
 """CPU unit test for the DCP sparse top-k remap.
 
-Pins ``remap_dcp_local_topk_indices`` (``layers/dcp/layout.py``), which converts
+Pins ``remap_dcp_sparse_indices`` (``layers/dcp/layout.py``), which converts
 the sparse indexer's *global* top-k positions into the *rank-local* coordinates
 sparse attention reads.
 
@@ -24,8 +24,7 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.dcp.layout import remap_dcp_local_topk_indices
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.layers.dcp.layout import remap_dcp_sparse_indices
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -36,12 +35,10 @@ PAD = -1
 
 
 def _remap(topk, dcp_size, dcp_rank):
-    with get_parallel().override(
-        dcp_enabled=dcp_size > 1,
-        attn_dcp_size=dcp_size,
-        attn_dcp_rank=dcp_rank,
-    ):
-        return remap_dcp_local_topk_indices(topk)
+    # interleave_size stays 1: this pool shards the latent KV per token, so the
+    # owner rule is pos % dcp_size == rank. Upstream's default of page_size
+    # belongs to a page-interleaved pool and is a different partition.
+    return remap_dcp_sparse_indices(topk, dcp_size, dcp_rank)
 
 
 def _topk_rows(num_rows: int, k: int, seq_len: int, seed: int) -> torch.Tensor:
@@ -196,17 +193,32 @@ class TestDcpTopkRemap(CustomTestCase):
         flat_out = _remap(topk.reshape(-1, 16), dcp_size, rank)
         self.assertTrue(torch.equal(out.reshape(-1, 16), flat_out))
 
-    def test_a_top_k_too_wide_for_exact_float32_keys_is_refused(self):
-        # The bound is stated so it fails loudly if index_topk ever grows past
-        # it, rather than degrading into a silently non-unique permutation --
-        # colliding keys would make the sort tie-break, and the whole reason
-        # the offset exists is to avoid depending on that.
-        # A stride-0 view, so this costs one element rather than 32 MiB: the
-        # precondition is checked before any elementwise work, which is the
-        # point of checking it up front.
-        topk = torch.zeros(1, dtype=torch.int32).expand(1, (1 << 23) + 1)
-        with self.assertRaises(AssertionError):
-            _remap(topk, 4, 1)
+    def test_the_float32_bound_on_the_position_itself(self):
+        """Where this remap stops being exact, pinned rather than asserted.
+
+        The function does its arithmetic in float32 -- on the POSITIONS, not
+        just on the sort keys -- so a position above 2**24 is not exactly
+        representable and the owner test silently reads the rounded value. That
+        caps usable context at 16,777,216 tokens. We serve 1M, so this is
+        headroom rather than a bug, but it degrades quietly rather than
+        failing, and we are the ones running the longest contexts.
+
+        Below the bound the remap is exact; the test states both halves so a
+        future move to a larger context finds the reason here.
+        """
+        dcp_size, rank = 4, 1
+        exact = (1 << 24) - dcp_size + rank
+        out = _remap(torch.tensor([[exact]], dtype=torch.int64), dcp_size, rank)
+        self.assertEqual(int(out[0, 0]), exact // dcp_size)
+
+        # One rank-cycle past the bound, float32 rounds to an even multiple and
+        # the position is no longer recognised as this rank's.
+        beyond = (1 << 25) + rank
+        self.assertNotEqual(
+            float(beyond), float(torch.tensor(beyond, dtype=torch.float32))
+        )
+        out = _remap(torch.tensor([[beyond]], dtype=torch.int64), dcp_size, rank)
+        self.assertEqual(int(out[0, 0]), PAD)
 
 
 if __name__ == "__main__":
