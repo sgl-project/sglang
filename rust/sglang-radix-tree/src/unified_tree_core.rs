@@ -1357,28 +1357,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         full_kv_hit_length: usize,
         action: Option<CacheAction>,
     ) -> MatchResult {
-        for i in 0..self.components.len() {
-            // Full uses last_access ticks, not LRU.
-            if self.components[i].component_type() == BASE_COMPONENT_TYPE {
-                continue;
-            }
-            let component = Arc::clone(&self.components[i]);
-            component.refresh_lru(self, LRURefreshPhase::MatchEnd, best_match_node_id);
-        }
-
-        // Re-stamp the matched path with fresh ticks, newest leaf-ward.
-        let mut path = Vec::new();
-        let mut cur = Some(best_match_node_id);
-        while let Some(id) = cur {
-            path.push(id);
-            cur = self.arena.node(id).try_parent();
-        }
-        let newest_tick = self
-            .arena
-            .get_and_batch_bump_access_counter(path.len() as i64);
-        for (i, id) in path.iter().enumerate() {
-            self.arena.node_mut(*id).last_access_counter = newest_tick - i as i64;
-        }
+        self.refresh_path_lru_(best_match_node_id);
 
         // last_host_node will be used as the starting node for the subsequent
         // `prefetch_from_storage` flow. We directly use best_match_node here,
@@ -1422,6 +1401,43 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         }
         result.cache_actions = action.into_iter().collect();
         result
+    }
+
+    /// Refresh a path as a match ending on it does: aux components move to MRU,
+    /// and Full is re-stamped with fresh ticks, newest leaf-ward.
+    fn refresh_path_lru_(&mut self, node_id: NodeIdx_) {
+        for i in 0..self.components.len() {
+            // Full uses last_access ticks, not LRU.
+            if self.components[i].component_type() == BASE_COMPONENT_TYPE {
+                continue;
+            }
+            let component = Arc::clone(&self.components[i]);
+            component.refresh_lru(self, LRURefreshPhase::MatchEnd, node_id);
+        }
+
+        let mut path = Vec::new();
+        let mut cur = Some(node_id);
+        while let Some(id) = cur {
+            path.push(id);
+            cur = self.arena.node(id).try_parent();
+        }
+        let newest_tick = self
+            .arena
+            .get_and_batch_bump_access_counter(path.len() as i64);
+        for (i, id) in path.iter().enumerate() {
+            self.arena.node_mut(*id).last_access_counter = newest_tick - i as i64;
+        }
+    }
+
+    /// Re-age a cached path as if it had just been matched. Both the device and
+    /// host eviction heaps order Full by `last_access_counter`, so one walk
+    /// protects the path on both tiers. False when the handle is no longer live.
+    pub fn refresh_lru_to_root(&mut self, node_id: NodeId) -> bool {
+        let Ok(node_idx) = self.arena.resolve(node_id) else {
+            return false;
+        };
+        self.refresh_path_lru_(node_idx);
+        true
     }
 
     /// An empty match: no device indices, every boundary anchored at the root.
@@ -3720,6 +3736,34 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         Ok((kv_xfer, comp_xfers))
     }
 
+    /// One Full transfer per source node, in the chain's root-first order.
+    ///
+    /// A node only counts as a reclaimable host duplicate once its KV is on
+    /// device, so loading a chain one node at a time lets each loaded node fund
+    /// the write-back that the next node's device eviction cascades into.
+    pub fn split_full_load_back_spec(
+        &self,
+        kv_xfer: &PoolTransfer,
+    ) -> Result<Vec<PoolTransfer>, NodeAccessError> {
+        kv_xfer
+            .nodes_to_load
+            .iter()
+            .flatten()
+            .map(|&node_id| {
+                let node = self.arena.node(self.arena.resolve(node_id)?);
+                let host_value = node.try_host_value(FULL).unwrap_or_else(|| {
+                    panic!("split_full_load_back_spec: node {node_id} has no Full host value")
+                });
+                Ok(PoolTransfer {
+                    name: PoolName::Kv,
+                    host_indices: Some(host_value.shallow_clone()),
+                    nodes_to_load: Some(vec![node_id]),
+                    ..Default::default()
+                })
+            })
+            .collect()
+    }
+
     /// Validate that every external node handle names a live node.
     pub(crate) fn validate_node_handles(&self, node_ids: &[NodeId]) -> Result<(), NodeAccessError> {
         for &node_id in node_ids {
@@ -5088,6 +5132,34 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let node_id = self.arena.resolve(node_id)?;
         self.assert_component_enabled_(component_type);
         Ok(self.arena.node(node_id).device_lock_ref(component_type))
+    }
+
+    /// A component's host lock count on a node.
+    pub fn inspect_get_component_host_lock_ref(
+        &self,
+        node_id: NodeId,
+        component_type: ComponentType,
+    ) -> Result<u32, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
+        self.assert_component_enabled_(component_type);
+        Ok(self.arena.node(node_id).host_lock_ref(component_type))
+    }
+
+    /// Whether the node is registered and still settled as a Full host/device
+    /// duplicate; registration is dropped lazily, so membership alone may be stale.
+    pub fn inspect_is_full_host_duplicate(&self, node_id: NodeId) -> Result<bool, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
+        Ok(self.full_coexisting_host_nodes.contains(node_id)
+            && self.is_settled_full_coexisting_host_node_(self.arena.node(node_id)))
+    }
+
+    /// Whether the node's Full host copy may be reclaimed right now.
+    pub fn inspect_can_reclaim_full_host_duplicate(
+        &self,
+        node_id: NodeId,
+    ) -> Result<bool, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
+        Ok(self.can_reclaim_coexisting_host_value_(node_id, FULL))
     }
 
     /// A node's accumulated match count.
