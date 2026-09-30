@@ -288,6 +288,7 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
+from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
     discard_kv_cache_backup,
@@ -442,6 +443,9 @@ class Scheduler(
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
 
+    # Logical-to-physical KV capacity ratio; defaults to 1 before pool init.
+    kv_shard_widening: int = 1
+
     # Class-level default so on_idle's stall gate works even if a fork
     # overrides init_load_publisher (which would otherwise not set it).
     _last_stall_publish_ts: float = float("-inf")
@@ -496,6 +500,7 @@ class Scheduler(
         )
         self.page_size = get_schedule().page_size
         self.enable_hierarchical_cache = get_memory().enable_hierarchical_cache
+        self.enable_lmcache = get_memory().enable_lmcache
         self.enable_session_radix_cache = get_memory().enable_session_radix_cache
         self.enable_hicache_storage = get_memory().hicache_storage_backend is not None
         self.enable_unified_cache_external_linker = (
@@ -587,6 +592,9 @@ class Scheduler(
         self.swa_tokens_per_layer = result.swa_tokens_per_layer
         self.req_to_token_pool = result.req_to_token_pool
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
+        self.kv_shard_widening = page_interleave_shard_size(
+            self.token_to_kv_pool_allocator
+        )
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
         if self.enable_hierarchical_cache:
@@ -1250,7 +1258,8 @@ class Scheduler(
             # TODO: max_running_requests_under_SLO has no setter — dead chain.
             max_running_requests_under_SLO=None,
             page_size=self.page_size,
-            num_pages=self.max_total_num_tokens // self.page_size,
+            num_pages=self.max_total_num_tokens
+            // self.token_to_kv_pool_allocator.page_size,
             context_len=self.model_config.context_len,
             startup_available_gpu_memory_gb=self.startup_available_gpu_memory_gb,
         )
@@ -2345,8 +2354,8 @@ class Scheduler(
             enable_hisparse=self.enable_hisparse,
             full_tokens_per_layer=self.full_tokens_per_layer,
             swa_tokens_per_layer=self.swa_tokens_per_layer,
-            max_total_num_tokens=self.max_total_num_tokens
-            * get_parallel().attn_dcp_size,
+            # Match the allocator and radix counters' logical units.
+            max_total_num_tokens=self.max_total_num_tokens * self.kv_shard_widening,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
         )
@@ -2359,7 +2368,7 @@ class Scheduler(
             page_size=self.page_size,
             full_tokens_per_layer=self.full_tokens_per_layer,
             swa_tokens_per_layer=self.swa_tokens_per_layer,
-            max_total_num_tokens=self.max_total_num_tokens,
+            max_total_num_tokens=self.max_total_num_tokens * self.kv_shard_widening,
             tree_cache=self.tree_cache,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             req_to_token_pool=self.req_to_token_pool,
@@ -2411,7 +2420,8 @@ class Scheduler(
         self.load_inquirer = SchedulerLoadInquirer(
             disaggregation_mode=self.disaggregation_mode,
             server_args=self.server_args,
-            max_total_num_tokens=self.max_total_num_tokens,
+            # The worker reports logical DCP capacity; add KV shard widening.
+            max_total_num_tokens=self.max_total_num_tokens * self.kv_shard_widening,
             max_running_requests=self.max_running_requests,
             pool_stats_observer=self.pool_stats_observer,
             tp_worker=self.tp_worker,
@@ -2456,7 +2466,9 @@ class Scheduler(
             is_generation=self.is_generation,
             spec_algorithm=self.spec_algorithm,
             disaggregation_mode=self.disaggregation_mode,
-            enable_hicache_storage=lambda: self.enable_hicache_storage,
+            enable_hicache_storage=lambda: (
+                self.enable_hicache_storage or self.enable_lmcache
+            ),
             rust_server=self.rust_server,
         )
 
@@ -2524,10 +2536,16 @@ class Scheduler(
                 self.max_req_len - input_len - 1,
             ),
         )
+        # PrefillAdder reserves one page per shard; the allocator reserves one.
+        # Subtract the other N - 1 pages to keep queue admission schedulable.
+        token_capacity = (
+            self.max_total_num_tokens * self.kv_shard_widening
+            - self.page_size * (self.kv_shard_widening - 1)
+        )
         max_new_tokens = self.token_to_kv_pool_allocator.max_new_tokens_for_memory(
             input_len,
             max_new_tokens,
-            token_capacity=self.max_total_num_tokens * get_parallel().attn_dcp_size,
+            token_capacity=token_capacity,
             sliding_window_size=self.sliding_window_size,
             chunk_size=self.chunked_prefill_size,
         )
@@ -2798,6 +2816,7 @@ class Scheduler(
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
+                token_indices_to_pool=recv_req.token_indices_to_pool,
             )
             req.tokenizer = self.tokenizer
 
@@ -3108,7 +3127,7 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req, storage_hit_end: Optional[int] = None):
-        if self.enable_hicache_storage:
+        if self.enable_hicache_storage or self.enable_lmcache:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
             buffer_mode = get_memory().hicache_host_memory_mode == "buffer_only"
@@ -3271,7 +3290,9 @@ class Scheduler(
             if not is_retracted:
                 req.time_stats.set_decode_prealloc_queue_entry_time()
             else:
-                req.time_stats.set_retract_time()
+                # Restart the queue wait here;
+                # resume_retracted_reqs() re-queues the request without stamping it.
+                req.time_stats.set_wait_queue_entry_time()
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
 
@@ -3612,6 +3633,7 @@ class Scheduler(
             self.enable_hierarchical_cache
             or get_memory().enable_flexkv
             or self.enable_unified_cache_external_linker
+            or self.enable_lmcache
         ):
             self.tree_cache.check_hicache_events()
             if self.enable_hicache_storage:
@@ -3966,7 +3988,7 @@ class Scheduler(
                 ):
                     break
 
-            if self.enable_hicache_storage:
+            if self.enable_hicache_storage or self.enable_lmcache:
                 prefetch_done = self.tree_cache.check_prefetch_progress(
                     req.cache_request_handle
                 )
@@ -4009,6 +4031,7 @@ class Scheduler(
                 if res == AddReqResult.NO_TOKEN:
                     if (
                         self.enable_hierarchical_cache
+                        or self.enable_lmcache
                         or self.enable_unified_cache_external_linker
                     ):
                         # Set batch_is_full after making sure there are requests that can be served
@@ -4180,6 +4203,9 @@ class Scheduler(
         if (kv_full_retract_flag := not batch.check_decode_mem()) or (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
+            if self.decode_offload_manager is not None:
+                # Pending offload copies may still read the device KV that retraction frees.
+                self.decode_offload_manager.drain_before_retraction()
             old_available_tokens = self.token_to_kv_pool_allocator.available_size()
             old_ratio = self.new_token_ratio_tracker.current
             mamba_allocator = getattr(
@@ -4879,12 +4905,12 @@ class Scheduler(
         return self.external_corpus_manager.list(recv_req)
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
-        if self.enable_hierarchical_cache:
+        if self.enable_hierarchical_cache or self.enable_lmcache:
             self.tree_cache.clear_storage_backend()
-            logger.info("Hierarchical cache cleared successfully!")
+            logger.info("Hierarchical cache or LMCache cleared successfully!")
             if_success = True
         else:
-            logging.warning("Hierarchical cache is not enabled.")
+            logging.warning("Hierarchical cache or LMCache is not enabled.")
             if_success = False
         return ClearHiCacheReqOutput(success=if_success)
 
@@ -4914,6 +4940,7 @@ class Scheduler(
             if (
                 self.enable_hicache_storage
                 or self.disaggregation_mode != DisaggregationMode.NULL
+                or self.enable_lmcache
             ):
                 # Storage and transfer workers need the GIL between I/O calls.
                 # Singleton PD polls no longer yield through a collective.
@@ -5044,6 +5071,8 @@ class Scheduler(
                         # storage writes still hold host staging
                         # (buffer-mode unified tree only).
                         idle &= tc.buffer_pipeline.is_idle()
+            elif self.enable_lmcache:
+                idle &= not self.tree_cache.has_pending_cache_operations()
 
         return idle
 
@@ -5255,6 +5284,9 @@ class Scheduler(
 
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.metrics_reporter.step_time_dict
+
+        if self.rust_server is not None:
+            ret["rust_mm_transport"] = self.rust_server.mm_transport_stats()
 
         if self.spec_algorithm.is_dspark() and self.draft_worker is not None:
             info_record = self.draft_worker.dump_info_records()
@@ -5514,21 +5546,10 @@ class Scheduler(
                         # Keep the host destination alive until prefill stops writing.
                         prepare_abort(decode_req.req, "Aborted by AbortReq.")
                         continue
-                    receiver = decode_req.kv_receiver
-                    receiver.abort()
-                    # Arm drain-ack accounting once the ABORT is sent, so acks
-                    # arriving before this req is deferred (e.g. during the next
-                    # forward step) are captured. A fresh set also drops stale acks
-                    # from a prior request that reused this bootstrap_room. A
-                    # redundant abort only re-wipes -- holds longer, never releases
-                    # early -- so no transition guard is needed.
-                    if (
-                        receiver.kv_mgr.enable_deferred_decode_kv_release
-                        and receiver.abort_notified
-                    ):
-                        receiver.kv_mgr.register_deferred_abort_room(
-                            decode_req.req.bootstrap_room
-                        )
+                    # The receiver arms drain-ack accounting before sending the
+                    # ABORT (see CommonKVReceiver._send_abort_notification), so
+                    # an ack racing back is never dropped.
+                    decode_req.kv_receiver.abort()
 
             # Abort requests whose KV is already backed up for retraction.
             if self.disagg_decode_prealloc_queue.retracted_queue:
@@ -5609,6 +5630,10 @@ class Scheduler(
         self.last_batch = None
         self.cur_batch_for_debug = None
 
+        if self.decode_offload_manager is not None:
+            # Pending offload copies may still read the device KV that retraction frees,
+            # and the paused decode loop never drains them.
+            self.decode_offload_manager.drain_before_retraction()
         if retract_reqs:
             # Decode-side retract always rebootstraps (recomputes the KV from
             # the prefill), so skip the device->host KV offload that release_req
