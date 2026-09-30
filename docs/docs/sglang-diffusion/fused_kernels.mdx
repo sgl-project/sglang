@@ -174,7 +174,6 @@ this path. This kernel does not enable model-level BCG support for FLUX.2.
 | `sparse_linear_attn_fwd` | Triton | block-map, compression, and forward for sparse linear attention |
 | `bigdn` | Triton | Sana-WM bidirectional gated delta-net; the chunkwise form splits phase A along the KV and Z streams so two blocks stay resident per SM, and stores `(I - P)` so phase B's MMA folds the identity-add in |
 | `vsa_block_sparse_sm100` | JIT CUDA | FastVideo's warp-specialized tcgen05 block-sparse VSA forward for 64-token tiles (sm_100a / sm_103a); a CTA owns two adjacent query tiles with their own key lists. VSA-H3 uses it on Blackwell and keeps the Triton tile-64 kernel elsewhere |
-| `vsa_h3_topk_lists` | Triton | VSA-H3 kv-tile lists from an unsorted top-k: scatter to a byte mask, then one prefix sum per query tile writes the ascending list with the prefix tiles into the kernel index buffer (replaces the value and index sorts); bit-exact |
 
 ### MoE routing
 

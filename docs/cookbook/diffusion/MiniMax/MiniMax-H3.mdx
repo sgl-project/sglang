@@ -887,9 +887,11 @@ VAEs keep their own backends. Ulysses sequence parallelism is supported. See
 `torch_sdpa`, ...) also runs on the FastH3 weights without VSA flags, and
 `sglang generate` takes the same flags as `sglang serve`.
 
-Served MP4s are H.264-encoded while the VAE is still decoding: each finished
-temporal chunk is streamed to libx264, and the save only muxes the audio track.
-The output frames are those of the one-pass encode of the final tensor.
+Every MiniMax-H3 pipeline H.264-encodes a served MP4 while the VAE is still
+decoding: each finished temporal chunk is streamed to libx264, and the save
+only muxes the audio track. The frames are those of the one-pass encode, which
+other outputs (several videos per request, frame interpolation, upscaling,
+`torch.compile`) still use.
 
 Measured latencies for the 4× GB300 recipe are in
 [FastH3 on GB300](#fasth3-on-gb300).
@@ -1008,8 +1010,8 @@ levels:
 - `"extra-high"`: includes the global fusion-only tier but does not enable
   Cache-DiT or another approximate optimization. The denoise path is the same
   as `lossless`; VAE decode fuses the ViT decoder's per-head QK RMSNorm and
-  RoPE into one launch and runs its attention on cuDNN SDPA (decode
-  1.72 → 1.35 s at 10 s on 4× B300; rounding-level differences only).
+  RoPE into one launch, runs its attention on cuDNN SDPA and decodes each
+  GPU's spatial tiles as one batch (rounding-level differences only).
 - `"high"`: the audited accelerated path. Quality is guaranteed (the audited
   Cache-DiT configuration measures SSIM 0.931 / PSNR 28.16 dB against
   `lossless`), but output is no longer bit-identical to the reference.
@@ -1057,8 +1059,9 @@ omitting the field is equivalent.
 <Tab title="extra-high">
 
 The global fusion-only tier. It does not enable MiniMax-H3 Cache-DiT and
-follows the same H3 denoise path as `lossless`; only the VAE decoder's fused
-QK RMSNorm + RoPE and cuDNN SDPA attention differ.
+follows the same H3 denoise path as `lossless`; only the VAE decoder differs:
+fused QK RMSNorm + RoPE, cuDNN SDPA attention, and each GPU's spatial tiles
+decoded as one batch.
 
 ```json Request field
 {
@@ -1088,7 +1091,7 @@ The measured trade-off is:
 | `quality` | Mean <br />inference <br />latency | Speedup | SSIM vs <br />lossless | PSNR vs <br />lossless | Expected <br />trade-off |
 | --- | ---: | ---: | ---: | ---: | --- |
 | `lossless` | 75.10 s | 1.00× | 1.000 | exact | Native reference path |
-| `extra-high` | Not separately measured | — | Same H3 denoise path | Same H3 denoise path | Fusion-only tier; VAE decode fuses QK RMSNorm + RoPE and uses cuDNN SDPA (rounding-level differences) |
+| `extra-high` | Not separately measured | — | Same H3 denoise path | Same H3 denoise path | Fusion-only tier; VAE decode fuses QK RMSNorm + RoPE, uses cuDNN SDPA and batches spatial tiles (rounding-level differences) |
 | `high` | 53.70 s | 1.40× | 0.931 | 28.16 dB | Smallest same-seed visual change |
 
 These numbers use 1344×768, 124-frame, 24 fps T2VA with 50 inference steps,
