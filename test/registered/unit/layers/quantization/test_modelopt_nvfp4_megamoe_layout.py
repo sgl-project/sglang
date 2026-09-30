@@ -2,7 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import PropertyMock, patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -68,22 +68,31 @@ class TestModelOptNvFp4MegaMoeLayout(CustomTestCase):
         layer._num_local_routed = 1
         layer.quant_config = SimpleNamespace(get_name=lambda: "nvfp4")
         layer.moe_runner_config = SimpleNamespace(is_gated=True)
-        layer.__dict__["use_padded_loading"] = False
+        layer.__dict__["use_padded_loading"] = nominal_trtllm_layout
         return layer
 
     @staticmethod
-    def _load_w13_pair(layer, method):
+    def _load_w13_pair(layer, runner_backend):
+        import sglang.srt.layers.moe as moe_mod
+        import sglang.srt.layers.quantization.modelopt_quant as modelopt_mod
+
         weight = torch.nn.Parameter(torch.full((1, 4, 2), -1.0), requires_grad=False)
         block_scale = torch.nn.Parameter(
             torch.full((1, 4, 1), -1.0), requires_grad=False
         )
         tensor_scale = torch.nn.Parameter(torch.full((1, 2), -1.0), requires_grad=False)
 
-        with patch.object(
-            type(method),
-            "load_up_proj_weight_first",
-            new_callable=PropertyMock,
-            return_value=False,
+        with (
+            patch.object(
+                moe_mod,
+                "get_moe_runner_backend",
+                return_value=runner_backend,
+            ),
+            patch.object(
+                modelopt_mod,
+                "is_flashinfer_cutedsl_v1_path",
+                return_value=False,
+            ),
         ):
             for shard_id, value in (("w1", 11.0), ("w3", 33.0)):
                 layer._weight_loader_impl(
@@ -152,36 +161,41 @@ class TestModelOptNvFp4MegaMoeLayout(CustomTestCase):
             with self.subTest(a2a=a2a_backend, runner=runner_backend):
                 method = self._make_method(a2a_backend, runner_backend)
                 self.assertIs(method.enable_flashinfer_trtllm_moe, nominal)
+                self.assertIs(
+                    method.use_megamoe_w13_weight_layout,
+                    a2a_backend.is_megamoe(),
+                )
                 self.assertIs(method.use_flashinfer_trtllm_weight_layout, layout)
                 if not a2a_backend.is_megamoe():
                     self.assertEqual(layout, nominal)
 
     def test_modelopt_loader_keeps_weights_and_scales_in_w13_for_megamoe(self):
-        import sglang.srt.layers.quantization.modelopt_quant as modelopt_mod
-
-        method = self._make_method(
-            MoeA2ABackend.MEGAMOE,
+        runner_backends = (
             MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED,
+            MoeRunnerBackend.FLASHINFER_CUTLASS,
+            MoeRunnerBackend.FLASHINFER_CUTEDSL,
         )
-        method.moe_runner_config = SimpleNamespace(is_gated=True)
-        layer = self._make_loader_layer(method, nominal_trtllm_layout=True)
 
-        with patch.object(
-            modelopt_mod,
-            "get_moe_runner_backend",
-            return_value=MoeRunnerBackend.AUTO,
-        ):
-            weight, block_scale, tensor_scale = self._load_w13_pair(layer, method)
+        for runner_backend in runner_backends:
+            with self.subTest(runner=runner_backend):
+                method = self._make_method(MoeA2ABackend.MEGAMOE, runner_backend)
+                method.moe_runner_config = SimpleNamespace(is_gated=True)
+                layer = self._make_loader_layer(
+                    method,
+                    nominal_trtllm_layout=method.enable_flashinfer_trtllm_moe,
+                )
 
-        torch.testing.assert_close(weight[0, :2], torch.full((2, 2), 11.0))
-        torch.testing.assert_close(weight[0, 2:], torch.full((2, 2), 33.0))
-        torch.testing.assert_close(block_scale[0, :2], torch.full((2, 1), 12.0))
-        torch.testing.assert_close(block_scale[0, 2:], torch.full((2, 1), 34.0))
-        torch.testing.assert_close(tensor_scale[0], torch.tensor([13.0, 35.0]))
+                weight, block_scale, tensor_scale = self._load_w13_pair(
+                    layer, runner_backend
+                )
+
+                torch.testing.assert_close(weight[0, :2], torch.full((2, 2), 11.0))
+                torch.testing.assert_close(weight[0, 2:], torch.full((2, 2), 33.0))
+                torch.testing.assert_close(block_scale[0, :2], torch.full((2, 1), 12.0))
+                torch.testing.assert_close(block_scale[0, 2:], torch.full((2, 1), 34.0))
+                torch.testing.assert_close(tensor_scale[0], torch.tensor([13.0, 35.0]))
 
     def test_modelopt_loader_keeps_w31_for_real_trtllm_consumer(self):
-        import sglang.srt.layers.quantization.modelopt_quant as modelopt_mod
-
         method = self._make_method(
             MoeA2ABackend.NONE,
             MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED,
@@ -189,18 +203,78 @@ class TestModelOptNvFp4MegaMoeLayout(CustomTestCase):
         method.moe_runner_config = SimpleNamespace(is_gated=True)
         layer = self._make_loader_layer(method, nominal_trtllm_layout=True)
 
-        with patch.object(
-            modelopt_mod,
-            "get_moe_runner_backend",
-            return_value=MoeRunnerBackend.AUTO,
-        ):
-            weight, block_scale, tensor_scale = self._load_w13_pair(layer, method)
+        weight, block_scale, tensor_scale = self._load_w13_pair(
+            layer, MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED
+        )
 
         torch.testing.assert_close(weight[0, :2], torch.full((2, 2), 33.0))
         torch.testing.assert_close(weight[0, 2:], torch.full((2, 2), 11.0))
         torch.testing.assert_close(block_scale[0, :2], torch.full((2, 1), 34.0))
         torch.testing.assert_close(block_scale[0, 2:], torch.full((2, 1), 12.0))
         torch.testing.assert_close(tensor_scale[0], torch.tensor([35.0, 13.0]))
+
+    def test_modelopt_loader_keeps_up_first_for_non_megamoe_cutlass(self):
+        runner_backends = (
+            MoeRunnerBackend.FLASHINFER_CUTLASS,
+            MoeRunnerBackend.FLASHINFER_CUTEDSL,
+        )
+
+        for runner_backend in runner_backends:
+            with self.subTest(runner=runner_backend):
+                method = self._make_method(MoeA2ABackend.NONE, runner_backend)
+                method.moe_runner_config = SimpleNamespace(is_gated=True)
+                layer = self._make_loader_layer(
+                    method,
+                    nominal_trtllm_layout=False,
+                )
+
+                weight, block_scale, tensor_scale = self._load_w13_pair(
+                    layer, runner_backend
+                )
+
+                torch.testing.assert_close(weight[0, :2], torch.full((2, 2), 33.0))
+                torch.testing.assert_close(weight[0, 2:], torch.full((2, 2), 11.0))
+                torch.testing.assert_close(block_scale[0, :2], torch.full((2, 1), 34.0))
+                torch.testing.assert_close(block_scale[0, 2:], torch.full((2, 1), 12.0))
+                torch.testing.assert_close(tensor_scale[0], torch.tensor([13.0, 35.0]))
+
+    def test_megamoe_layout_decision_is_stable_after_construction(self):
+        import sglang.srt.layers.quantization.modelopt_quant as modelopt_mod
+
+        method = self._make_method(
+            MoeA2ABackend.MEGAMOE,
+            MoeRunnerBackend.FLASHINFER_CUTLASS,
+        )
+        method.moe_runner_config = SimpleNamespace(is_gated=True)
+        method._build_mega_moe_weights = Mock()
+
+        with patch.object(
+            modelopt_mod,
+            "get_moe_a2a_backend",
+            return_value=MoeA2ABackend.NONE,
+        ):
+            method.process_weights_after_loading(SimpleNamespace())
+
+        method._build_mega_moe_weights.assert_called_once()
+
+        with (
+            patch.object(
+                modelopt_mod,
+                "get_moe_a2a_backend",
+                return_value=MoeA2ABackend.NONE,
+            ),
+            patch.object(
+                modelopt_mod,
+                "get_moe_runner_backend",
+                return_value=MoeRunnerBackend.FLASHINFER_CUTLASS,
+            ),
+        ):
+            method.create_moe_runner(
+                SimpleNamespace(),
+                SimpleNamespace(is_gated=True),
+            )
+
+        self.assertIsNone(method.runner)
 
     def test_non_modelopt_methods_retain_layer_owned_w31_layout(self):
         import sglang.srt.layers.moe.fused_moe_triton.layer as layer_mod
@@ -255,26 +329,22 @@ class TestModelOptNvFp4MegaMoeLayout(CustomTestCase):
         )
         method = object.__new__(modelopt_mod.ModelOptNvFp4FusedMoEMethod)
         method.enable_flashinfer_trtllm_moe = True
+        method.use_megamoe_w13_weight_layout = True
         method.use_flashinfer_trtllm_weight_layout = False
+        method.moe_runner_config = SimpleNamespace(is_gated=True)
         build_inputs = []
         method._build_mega_moe_weights = lambda current: build_inputs.append(
             (current.w13_weight.data.clone(), current.w13_weight_scale.data.clone())
         )
 
-        with patch.object(
-            modelopt_mod,
-            "get_moe_a2a_backend",
-            return_value=MoeA2ABackend.MEGAMOE,
-        ):
-            method.process_weights_after_loading(layer)
-            method.process_weights_after_loading(layer)
+        method.process_weights_after_loading(layer)
 
         expected_weight = _expected_deinterleave(source_weight, up_first=False)
         expected_scale = _expected_deinterleave(source_scale, up_first=False)
         torch.testing.assert_close(layer.w13_weight.data, expected_weight)
         torch.testing.assert_close(layer.w13_weight_scale.data, expected_scale)
         self.assertTrue(layer._w13_deinterleaved)
-        self.assertEqual(len(build_inputs), 2)
+        self.assertEqual(len(build_inputs), 1)
         for built_weight, built_scale in build_inputs:
             torch.testing.assert_close(built_weight, expected_weight)
             torch.testing.assert_close(built_scale, expected_scale)
@@ -283,6 +353,7 @@ class TestModelOptNvFp4MegaMoeLayout(CustomTestCase):
         import sglang.srt.layers.quantization.modelopt_quant as modelopt_mod
 
         method = object.__new__(modelopt_mod.ModelOptNvFp4FusedMoEMethod)
+        method.use_megamoe_w13_weight_layout = True
         method.use_flashinfer_trtllm_weight_layout = True
 
         with self.assertRaisesRegex(AssertionError, "canonical W13"):
