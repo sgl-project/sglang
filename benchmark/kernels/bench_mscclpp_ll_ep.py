@@ -266,7 +266,9 @@ def _profiled_kernel_names(prof: profile) -> set[str]:
 
 
 def calibrate_phase_kernel_names(
-    layer: FusedMoE, inputs: Inputs
+    layer: FusedMoE,
+    inputs: Inputs,
+    allow_ambiguous: bool = False,
 ) -> tuple[set[str], set[str], set[str]]:
     """Learn phase kernel names without using eager timings as results."""
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
@@ -297,10 +299,15 @@ def calibrate_phase_kernel_names(
     }
     ambiguous = {pair: names for pair, names in overlaps.items() if names}
     if ambiguous:
-        raise RuntimeError(
-            "Cannot classify graph kernels unambiguously because phase kernel "
-            f"names overlap: {ambiguous}"
-        )
+        if not allow_ambiguous:
+            raise RuntimeError(
+                "Cannot classify kernels unambiguously because phase kernel "
+                f"names overlap: {ambiguous}"
+            )
+        ambiguous_names = set().union(*ambiguous.values())
+        dispatch_names -= ambiguous_names
+        compute_names -= ambiguous_names
+        combine_names -= ambiguous_names
     synchronize()
     return dispatch_names, compute_names, combine_names
 
@@ -323,7 +330,6 @@ def profile_graph_phase_latencies_us(
     rescaled eager estimates; their sum can differ from wall-clock ``total_us``
     when kernels overlap.
     """
-    dispatch_names, compute_names, combine_names = phase_kernel_names
     for _ in range(warmup_iters):
         graph.replay()
     synchronize()
@@ -343,7 +349,40 @@ def profile_graph_phase_latencies_us(
         torch.cuda.synchronize()
     dist.barrier()
 
-    denominator = benchmark_iters * graph_iters
+    phase_totals = _aggregate_profiled_phase_latencies(
+        prof,
+        phase_kernel_names,
+        benchmark_iters * graph_iters,
+    )
+
+    phase_times = torch.tensor(
+        [
+            phase_totals["dispatch"],
+            phase_totals["compute"],
+            phase_totals["combine"],
+            phase_totals["unclassified"],
+        ],
+        dtype=torch.float64,
+        device="cuda",
+    )
+    dist.broadcast(phase_times, src=0)
+    dispatch_us, compute_us, combine_us, unclassified_us = phase_times.tolist()
+
+    return PhaseLatencies(
+        total_us=total_us,
+        dispatch_us=dispatch_us,
+        compute_us=compute_us,
+        combine_us=combine_us,
+        unclassified_us=unclassified_us,
+    )
+
+
+def _aggregate_profiled_phase_latencies(
+    prof: Optional[profile],
+    phase_kernel_names: tuple[set[str], set[str], set[str]],
+    denominator: int,
+) -> dict[str, float]:
+    dispatch_names, compute_names, combine_names = phase_kernel_names
     phase_totals = {
         "dispatch": 0.0,
         "compute": 0.0,
@@ -390,6 +429,41 @@ def profile_graph_phase_latencies_us(
                 flush=True,
             )
 
+    return phase_totals
+
+
+def profile_eager_phase_latencies_us(
+    pipeline: FusedMoEPipeline,
+    inputs: Inputs,
+    phase_kernel_names: tuple[set[str], set[str], set[str]],
+    warmup_iters: int,
+    benchmark_iters: int,
+) -> tuple[float, float, float, float]:
+    """Profile rank-0 CUDA kernels from complete eager pipeline iterations."""
+    for _ in range(warmup_iters):
+        pipeline(inputs)
+    synchronize()
+
+    prof = None
+    if dist.get_rank() == 0:
+        with profile(activities=[ProfilerActivity.CUDA]) as rank_zero_prof:
+            dist.barrier()
+            for _ in range(benchmark_iters):
+                pipeline(inputs)
+            torch.cuda.synchronize()
+        prof = rank_zero_prof
+    else:
+        dist.barrier()
+        for _ in range(benchmark_iters):
+            pipeline(inputs)
+        torch.cuda.synchronize()
+    dist.barrier()
+
+    phase_totals = _aggregate_profiled_phase_latencies(
+        prof,
+        phase_kernel_names,
+        benchmark_iters,
+    )
     phase_times = torch.tensor(
         [
             phase_totals["dispatch"],
@@ -402,14 +476,7 @@ def profile_graph_phase_latencies_us(
     )
     dist.broadcast(phase_times, src=0)
     dispatch_us, compute_us, combine_us, unclassified_us = phase_times.tolist()
-
-    return PhaseLatencies(
-        total_us=total_us,
-        dispatch_us=dispatch_us,
-        compute_us=compute_us,
-        combine_us=combine_us,
-        unclassified_us=unclassified_us,
-    )
+    return dispatch_us, compute_us, combine_us, unclassified_us
 
 
 def assert_close(
@@ -718,8 +785,20 @@ def run_expert_major(
         if rank == 0:
             print("Running mscclpp-ll-expert-major-triton...", flush=True)
         mscclpp_output = mscclpp(inputs).clone()
+        phase_kernel_names = calibrate_phase_kernel_names(
+            mscclpp.layer,
+            inputs,
+            allow_ambiguous=True,
+        )
         mscclpp_us = median_eager_latency_us(
             lambda: mscclpp(inputs),
+            config.warmup_iters,
+            config.benchmark_iters,
+        )
+        mscclpp_phases = profile_eager_phase_latencies_us(
+            mscclpp,
+            inputs,
+            phase_kernel_names,
             config.warmup_iters,
             config.benchmark_iters,
         )
@@ -758,20 +837,23 @@ def run_expert_major(
     )
     if rank == 0:
         print(f"Correctness: PASS max_abs={max_abs:.6g} max_rel={max_rel:.6g}")
+        dispatch_us, compute_us, combine_us, unclassified_us = mscclpp_phases
         print(
             "mscclpp-ll-expert-major-triton: "
-            f"eager median latency={mscclpp_us:.2f} us"
+            f"eager median latency={mscclpp_us:.2f} us "
+            f"(rank-0 median CUDA kernels: dispatch={dispatch_us:.2f} us, "
+            f"compute={compute_us:.2f} us, combine={combine_us:.2f} us, "
+            f"unclassified={unclassified_us:.2f} us)"
         )
         print(
             "triton-all-to-all-reference: "
             f"eager median latency={reference_us:.2f} us"
         )
         print(
-            "Phase timing is omitted for expert-major because this path is "
-            "not CUDA-graph captured. "
-            "Performance note: the Triton reference uses explicit PyTorch "
-            "variable-split all-to-all calls and is not an apples-to-apples "
-            "performance comparison with MSCCL++."
+            "Reference phase timing is omitted because its explicit PyTorch "
+            "variable-split all-to-all calls cannot be classified reliably by "
+            "CUDA kernel name. Its performance is not an apples-to-apples "
+            "comparison with MSCCL++."
         )
 
 
