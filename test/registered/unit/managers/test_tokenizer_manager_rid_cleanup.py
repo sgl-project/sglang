@@ -998,5 +998,174 @@ class TestDisconnectAfterDispatchAbortsRequest(CustomTestCase):
         self.assertIn(rid, tm.rid_to_state)
 
 
+class TestDelayedAbortOwnership(CustomTestCase):
+    """Delayed HTTP cleanup must never abort a newer request reusing the RID."""
+
+    async def _run_cleanup(self, tm, obj, during_sleep=None):
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def controlled_sleep(_seconds):
+            entered.set()
+            await release.wait()
+
+        with patch(
+            "sglang.srt.managers.tokenizer_manager.asyncio.sleep",
+            side_effect=controlled_sleep,
+        ):
+            task = asyncio.create_task(tm.create_abort_task(obj)())
+            await entered.wait()
+            if during_sleep is not None:
+                during_sleep()
+            release.set()
+            await task
+
+    def test_reused_rid_does_not_abort_replacement(self):
+        tm = _make_tokenizer_manager(self)
+        tm.abort_request = Mock()
+        rid = "reused-rid"
+        obj = Mock(spec=GenerateReqInput)
+        obj.is_single = True
+        obj.rid = rid
+        original = _make_req_state(rid)
+        original.obj = obj
+        replacement = _make_req_state(rid)
+        tm.rid_to_state[rid] = original
+
+        asyncio.run(
+            self._run_cleanup(
+                tm,
+                obj,
+                during_sleep=lambda: tm.rid_to_state.__setitem__(rid, replacement),
+            )
+        )
+        tm.abort_request.assert_not_called()
+        self.assertIs(tm.rid_to_state[rid], replacement)
+
+    def test_replacement_present_before_cleanup_starts_is_not_aborted(self):
+        tm = _make_tokenizer_manager(self)
+        tm.abort_request = Mock()
+        rid = "replacement-before-start"
+        obj = Mock(spec=GenerateReqInput)
+        obj.is_single = True
+        obj.rid = rid
+        replacement = _make_req_state(rid)
+        tm.rid_to_state[rid] = replacement
+
+        asyncio.run(self._run_cleanup(tm, obj))
+        tm.abort_request.assert_not_called()
+        self.assertIs(tm.rid_to_state[rid], replacement)
+
+    def test_same_request_object_new_state_generation_is_not_aborted(self):
+        tm = _make_tokenizer_manager(self)
+        tm.abort_request = Mock()
+        rid = "same-object-new-state"
+        obj = Mock(spec=GenerateReqInput)
+        obj.is_single = True
+        obj.rid = rid
+        original = _make_req_state(rid)
+        original.obj = obj
+        replacement = _make_req_state(rid)
+        replacement.obj = obj
+        tm.rid_to_state[rid] = original
+
+        asyncio.run(
+            self._run_cleanup(
+                tm,
+                obj,
+                during_sleep=lambda: tm.rid_to_state.__setitem__(rid, replacement),
+            )
+        )
+        tm.abort_request.assert_not_called()
+        self.assertIs(tm.rid_to_state[rid], replacement)
+
+    def test_absent_at_start_then_replacement_appears_is_not_aborted(self):
+        tm = _make_tokenizer_manager(self)
+        tm.abort_request = Mock()
+        rid = "late-replacement"
+        obj = Mock(spec=GenerateReqInput)
+        obj.is_single = True
+        obj.rid = rid
+        replacement = _make_req_state(rid)
+
+        asyncio.run(
+            self._run_cleanup(
+                tm,
+                obj,
+                during_sleep=lambda: tm.rid_to_state.__setitem__(rid, replacement),
+            )
+        )
+        tm.abort_request.assert_not_called()
+        self.assertIs(tm.rid_to_state[rid], replacement)
+
+    def test_batch_aborts_only_members_still_owned_by_original_generation(self):
+        tm = _make_tokenizer_manager(self)
+        tm.abort_request = Mock()
+        rids = ["batch-live", "batch-replaced"]
+        children = []
+        for rid in rids:
+            child = Mock(spec=GenerateReqInput)
+            child.rid = rid
+            children.append(child)
+        obj = MagicMock(spec=GenerateReqInput)
+        obj.is_single = False
+        obj.rid = rids
+        obj.__getitem__.side_effect = children
+        original = []
+        for rid, child in zip(rids, children):
+            state = _make_req_state(rid)
+            state.obj = child
+            tm.rid_to_state[rid] = state
+            original.append(state)
+        replacement = _make_req_state(rids[1])
+
+        asyncio.run(
+            self._run_cleanup(
+                tm,
+                obj,
+                during_sleep=lambda: tm.rid_to_state.__setitem__(rids[1], replacement),
+            )
+        )
+        tm.abort_request.assert_called_once_with(rids[0])
+        self.assertIs(tm.rid_to_state[rids[0]], original[0])
+        self.assertIs(tm.rid_to_state[rids[1]], replacement)
+
+    def test_original_live_request_is_still_aborted(self):
+        tm = _make_tokenizer_manager(self)
+        tm.abort_request = Mock()
+        rid = "live-rid"
+        obj = Mock(spec=GenerateReqInput)
+        obj.is_single = True
+        obj.rid = rid
+        state = _make_req_state(rid)
+        state.obj = obj
+        tm.rid_to_state[rid] = state
+
+        asyncio.run(self._run_cleanup(tm, obj))
+        tm.abort_request.assert_called_once_with(rid)
+
+    def test_finished_or_removed_original_is_not_aborted(self):
+        for removed in (False, True):
+            with self.subTest(removed=removed):
+                tm = _make_tokenizer_manager(self)
+                tm.abort_request = Mock()
+                rid = f"done-{removed}"
+                obj = Mock(spec=GenerateReqInput)
+                obj.is_single = True
+                obj.rid = rid
+                state = _make_req_state(rid)
+                state.obj = obj
+                tm.rid_to_state[rid] = state
+
+                def finish_or_remove():
+                    if removed:
+                        del tm.rid_to_state[rid]
+                    else:
+                        state.finished = True
+
+                asyncio.run(self._run_cleanup(tm, obj, finish_or_remove))
+                tm.abort_request.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

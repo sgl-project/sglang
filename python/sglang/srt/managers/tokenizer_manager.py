@@ -2290,12 +2290,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         return None
 
     def create_abort_task(self, obj: GenerateReqInput):
-        # Abort the request if the client is disconnected.
+        # A request ID can be reused after the response finishes. Bind delayed
+        # disconnect cleanup to the exact request/state generation that created
+        # this response, rather than aborting whichever request currently owns
+        # the same textual ID two seconds later.
         async def abort_request():
+            request_objs = (
+                [obj] if obj.is_single else [obj[i] for i in range(len(obj.rid))]
+            )
+            owned_states = []
+            for request_obj in request_objs:
+                state = self.rid_to_state.get(request_obj.rid)
+                if state is not None and state.obj is request_obj:
+                    owned_states.append((request_obj.rid, state))
+
             await asyncio.sleep(2)
-            rids = [obj.rid] if obj.is_single else obj.rid
-            for rid in rids:
-                if rid in self.rid_to_state:
+            for rid, state in owned_states:
+                if self.rid_to_state.get(rid) is state and not state.finished:
                     self.abort_request(rid)
 
         background_tasks = BackgroundTasks()
