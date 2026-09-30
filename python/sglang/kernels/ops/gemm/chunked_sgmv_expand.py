@@ -10,7 +10,16 @@ from sglang.srt.utils import cached_triton_kernel
 
 
 @cached_triton_kernel(
-    lambda _, kwargs: (kwargs["NUM_SLICES"], kwargs["BLOCK_M"], kwargs["OUTPUT_DIM"])
+    lambda _, kwargs: (
+        kwargs["NUM_SLICES"],
+        kwargs["BLOCK_M"],
+        kwargs["OUTPUT_DIM"],
+        kwargs["MAX_RANK"],
+        kwargs["BLOCK_N"],
+        kwargs["BLOCK_K"],
+        kwargs["SLICE_OFFSETS"],
+        kwargs["x"].dtype,
+    )
 )
 @triton.jit(do_not_specialize=["num_segs", "output_stride_0", "output_stride_1"])
 def _chunked_lora_expand_kernel(
@@ -39,6 +48,7 @@ def _chunked_lora_expand_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    SLICE_OFFSETS: tl.constexpr,
 ):
     """
     Computes a chunked SGMV for LoRA expand operations.
@@ -63,7 +73,7 @@ def _chunked_lora_expand_kernel(
     w_stride_1: tl.constexpr = MAX_RANK
     w_stride_2: tl.constexpr = 1
 
-    pid_s = tl.program_id(axis=2)
+    pid_s = tl.program_id(axis=1) if len(SLICE_OFFSETS) > 0 else tl.program_id(axis=2)
     if pid_s >= num_segs:
         return
 
@@ -82,9 +92,30 @@ def _chunked_lora_expand_kernel(
     if cur_rank == 0:
         return
 
-    slice_id = tl.program_id(axis=1)
-    slice_start = tl.load(slice_offsets + slice_id)
-    slice_end = tl.load(slice_offsets + slice_id + 1)
+    if len(SLICE_OFFSETS) > 0:
+        # Flatten the ragged slice grid. SLICE_OFFSETS is model metadata, known on CPU.
+        flat_tile = tl.program_id(0)
+        slice_id = tl.full((), 0, tl.int32)
+        slice_start = tl.full((), 0, tl.int32)
+        slice_end = tl.full((), 0, tl.int32)
+        pid_n = tl.full((), 0, tl.int32)
+        tile_start = tl.full((), 0, tl.int32)
+        for s in tl.static_range(NUM_SLICES):
+            tiles = (SLICE_OFFSETS[s + 1] - SLICE_OFFSETS[s] + BLOCK_N - 1) // BLOCK_N
+            belongs = (flat_tile >= tile_start) & (flat_tile < tile_start + tiles)
+            slice_id = tl.where(belongs, s, slice_id)
+            slice_start = tl.where(belongs, SLICE_OFFSETS[s], slice_start)
+            slice_end = tl.where(belongs, SLICE_OFFSETS[s + 1], slice_end)
+            pid_n = tl.where(belongs, flat_tile - tile_start, pid_n)
+            tile_start += tiles
+
+    else:
+        slice_id = tl.program_id(axis=1)
+        slice_start = tl.load(slice_offsets + slice_id)
+        slice_end = tl.load(slice_offsets + slice_id + 1)
+        pid_n = tl.program_id(axis=0)
+        if pid_n * BLOCK_N >= slice_end - slice_start:
+            return
 
     scaling = tl.load(scalings + w_index)
     # Adjust K (rank) according to the specific LoRA adapter
@@ -99,7 +130,6 @@ def _chunked_lora_expand_kernel(
     # Create pointers for the first block of x and weights[batch_id][n_start: n_end][:]
     # The pointers will be advanced as we move in the K direction
     # and accumulate
-    pid_n = tl.program_id(axis=0)
     n_offset = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N + slice_start
     k_offset = tl.arange(0, BLOCK_K)
 
@@ -153,8 +183,8 @@ def chunked_sgmv_lora_expand_forward(
     slice_offsets: torch.Tensor,
     max_slice_size: int,
     base_output: Optional[torch.Tensor],
+    slice_offsets_cpu: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-
     # x: (s, slice_num * r)
     # weights: (num_lora, output_dim, r)
     # slice_offsets: boundaries for different slices in the output dimension
@@ -192,11 +222,19 @@ def chunked_sgmv_lora_expand_forward(
         else num_segments
     )
 
+    # Layer metadata is already on the CPU; never copy device offsets here.
+    offsets = tuple(slice_offsets_cpu.tolist()) if slice_offsets_cpu is not None else ()
     grid = (
         triton.cdiv(max_slice_size, BLOCK_N),
         num_slices,  # number of slices in the input/output
         segment_grid,
     )
+
+    if offsets:
+        grid = (
+            sum(triton.cdiv(hi - lo, BLOCK_N) for lo, hi in zip(offsets, offsets[1:])),
+            segment_grid,
+        )
 
     if base_output is None:
         output = torch.zeros((M, OUTPUT_DIM), device=x.device, dtype=x.dtype)
@@ -232,6 +270,7 @@ def chunked_sgmv_lora_expand_forward(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
+        SLICE_OFFSETS=offsets,
         **extra_kwargs,
     )
 
