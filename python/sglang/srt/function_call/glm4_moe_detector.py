@@ -665,6 +665,19 @@ class Glm4MoeDetector(BaseFormatDetector):
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError()
 
+    def finish(self, tools: list[Tool]) -> StreamingParseResult:
+        """Release any buffered text at end of stream.
+
+        The closing marker can no longer arrive once the stream is over, so
+        flush whatever is still buffered as normal text instead of silently
+        dropping it.
+        """
+        if self._buffer:
+            text = self._buffer
+            self._buffer = ""
+            return StreamingParseResult(normal_text=text)
+        return StreamingParseResult()
+
 
 class _GlmTrieNode:
     """Trie node with Aho-Corasick failure link."""
