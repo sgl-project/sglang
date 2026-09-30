@@ -186,6 +186,24 @@ class TestSnapshotPublication(CustomTestCase):
         self.assertEqual(self.client.put_keys, puts)
         self.assertEqual(len(list(self.journal.pending())), 1)
 
+    def test_recovery_does_not_publish_missing_or_corrupted_tensor(self):
+        self.catalog.fail_seal = True
+        with self.assertRaises(CatalogUnavailable):
+            self.write()
+        key = self.manifest.objects[0].key
+        original = self.client.data.pop(key)
+        with self.assertRaises(TransportError):
+            self.writer.recover()
+        self.assertFalse(self.store.quarantined)
+        self.client.data[key] = bytes(len(original))
+        with self.assertRaises(ContractError):
+            self.writer.recover()
+        self.assertIsNone(self.catalog.published)
+        self.assertTrue(self.journal.has_pending(self.lease.capture_id))
+        self.client.data[key] = original
+        self.writer.recover()
+        self.assertIsNotNone(self.catalog.published)
+
     def test_journal_ownership_and_namespace(self):
         with self.assertRaises(BlockingIOError):
             PublicationJournal(self.directory.name)

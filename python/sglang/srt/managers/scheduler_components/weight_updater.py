@@ -87,6 +87,8 @@ class SchedulerWeightUpdaterManager:
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
+        if self.tp_worker.training_capture is not None:
+            self.tp_worker.training_capture.disable("target_weights_update")
         # Edge-trigger weight_load_duration_seconds at the end of each
         # update_weights_from_* call. Engine is paused during the update so
         # the periodic log_stats path can't carry this.
@@ -189,6 +191,8 @@ class SchedulerWeightUpdaterManager:
         freeing them would leave the daemon and every peer pointing at released
         memory.
         """
+        if self.tp_worker.training_capture is not None:
+            self.tp_worker.training_capture.disable("model_memory_changed")
         mode = self.tp_worker.model_runner.server_args.weight_cache_mode
         if mode != "off":
             raise RuntimeError(

@@ -494,6 +494,13 @@ class ServerArgs:
         NS("model"),
     ]
     tokenizer_path: A[Optional[str], "The path of the tokenizer.", NS("serving")] = None
+    training_capture_config: A[
+        Optional[str],
+        Arg(
+            help="Path to a JSON configuration for opt-in target KV and raw teacher capture to Mooncake."
+        ),
+        NS("serving"),
+    ] = None
     tokenizer_mode: A[
         str,
         Arg(
@@ -8969,6 +8976,9 @@ class ServerArgs:
             )
 
     def check_server_args(self):
+        from sglang.srt.training_capture.config import validate_capture_server_args
+
+        validate_capture_server_args(self)
         # Check parallel size constraints
         if self.ep_join_mode != "scale":
             assert (

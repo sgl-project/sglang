@@ -12,9 +12,12 @@ it does not redefine the goal as the modules already implemented.
 - Mooncake reference source: `76bd234d7ae072edd3aed6ff595f94c85b635c2f`.
 - Runtime SDK tested: `mooncake-transfer-engine-cuda13==0.3.11.post1`.
 - H100 image: `harbor.local.clusters/bp/lmsysorg/sglang:v0.5.15`.
-- Runtime: Python 3.12.3, PyTorch 2.11.0+cu130, CUDA 13.0,
-  Transformers 5.12.1. Tests select this checkout using `PYTHONPATH=.../python`;
-  the image's installed SGLang 0.5.15 is not the code under test.
+- Foundation tests used the image's PyTorch 2.11.0+cu130. Actual inference uses
+  a dedicated Python 3.12.3 environment with PyTorch 2.13.0, sglang-kernel
+  0.4.6.post1, FlashInfer 0.6.17 and Transformers 5.12.1, matching this source's
+  requirements. See `experiments/h100-runtime-lock.json` for the base image
+  digest and dependency overlay hashes. The system environment remains the
+  idle worker's environment; the image's installed SGLang is not tested here.
 - Resident allocation: `job-fe1ce1dcdea6-20261001023258`, one H100 80GB on
   initial node `node064`. Experiment submissions pause/resume the idle load.
 
@@ -23,13 +26,13 @@ it does not redefine the goal as the modules already implemented.
 | Area | Implemented | Evidence / Remaining Work |
 | --- | --- | --- |
 | Wire contract | Typed manifest, raw tensor descriptors, shape/byte/digest/coverage/content validation | Generated fixtures pass the design's JSON Schema; malformed metadata and contents are rejected |
-| Raw teacher primitive | Unpadded top-128 IDs/values and full-vocabulary LSE, independent output storage | CPU reference and H100 source-mutation checks pass; runtime hook is pending |
-| KV export primitive | Selected layers, arbitrary source slots, NHD BF16/FP16, independent D2H copies | H100 source-reuse check passes; request/prefix/retract integration is pending |
-| Host ownership | Bounded registered arenas, quota rejection, reuse, transfer quarantine | Ownership/backpressure tests pass; runtime admission/renewal is pending |
+| Raw teacher capture | Unpadded top-128 IDs/values and full-vocabulary LSE before serving processors | Independent online logits observer validates every captured row; serving bias does not leak into teacher scores |
+| KV export | Selected layers, arbitrary source slots, NHD BF16/FP16, independent D2H copies | H100 source-reuse test and exact online attention-input comparison pass, including chunked prefill, prefix hits and decode |
+| Host ownership | Bounded registered arenas, quota rejection, reuse, transfer quarantine | Coordinator admission, renewal, expiry, retract, shutdown and publication tests pass; traffic-scale stress remains open |
 | Mooncake adapter | Required hard pin, registered raw buffers, immutable retry verification, exact read length | Real cross-process TCP roundtrip passes; cross-node RDMA is pending |
-| Publication | Catalog producer client, manifest-last writer, durable metadata journal, fenced replay | Lost seal/publish responses, failed tensor puts, stale fence and identical retries tested; actual Catalog service is SpecForge-owned |
-| Runtime collection | Not yet connected | Add config/capability gates, request position ledger, prefill/decode hooks, abort/retract/shutdown handling, metrics |
-| Real model parity | Not yet run | Bind immutable target/tokenizer/codec identity and compare captured KV/logits against a reference |
+| Publication | Catalog producer client, manifest-last writer, durable metadata journal, fenced replay | Lost responses, failed puts, stale fences, missing/corrupt objects and identical retries tested; actual Catalog service is SpecForge-owned |
+| Runtime collection | Opt-in CLI config, capability gates, request ledger, prefill/decode hooks, invalidation and counters | Six real Qwen3-0.6B requests published through Mooncake; ordinary and CUDA graph replay executions pass |
+| Real model identity/parity | Weight/tokenizer artifact digests, actual selected-layer geometry, K norm and RoPE | Captured KV and teacher scores match online tensors exactly; full-vocabulary LSE matches within 1e-5; HF teacher logits pass numerical comparison, but cross-engine KV equivalence is not certified |
 | Draft serving | Not yet implemented | KV input checkpoint contract, injector, invalidation and training/serving parity |
 | Deployment coverage | Not yet implemented | TP/PP, overlap, speculative/PD, RDMA and workload SLO gates remain open |
 
@@ -48,18 +51,72 @@ Initial test evidence (shared lab state under
   calls in this transport test use a test double. The independent reader
   validated all 20 objects / 4532 tensor bytes; the journal was empty after ACK.
 
-These checks do not prove a MaaS request is being captured, full training
-correctness, retention correctness of an external Catalog, or RDMA performance.
+Runtime test evidence:
+
+- `01790801677964242601-39295c40360a`: 30 producer unit tests passed in the
+  matching runtime environment, including the CUDA ownership test.
+- `01790801966846060429-6158123feed6`: 108 existing configuration/runtime-context
+  tests and 37 subtests passed after adding the CLI field and namespace.
+- `01790802247034636938-f2f34259e7a8`: actual prefill/decode capture passed with
+  a test-only independent attention/logits observer. All selected KV and
+  top-128 score values are exact; top-128 membership and full-vocabulary LSE
+  are checked independently. Producer exit does not prevent the separate
+  Store client from reading the three published snapshots.
+- `01790802358606301790-d48f81614828`: extended runtime test passed in 68.757s.
+  Three additional requests used normal serving with decode CUDA graphs;
+  five actual graph replays were counted. Every captured tensor matches the
+  corresponding observed ordinary-execution sample exactly. This checks graph
+  replay at batch size one, not padded/batched graphs or prefill graphs.
+- `01790802703712589471-1d80760ee575`: final producer/configuration and real
+  cross-process Store regression passed: 38 tests and 45 subtests. New capture
+  modules pass Ruff I/F checks; touched upstream files add no diagnostics
+  relative to the baseline (the baseline itself is not lint-clean).
+
+The runtime fixture uses a 160-token prompt, response lengths 1/4/3, layers
+0/14/27, 128-token prefill chunks and 64-token storage chunks. It verifies the
+159-token prefix hit, partial final chunk, final-token `kv_valid=0`, accepted
+token IDs, prompt/response masks, positions and a serving logit bias. The
+resident job has no RDMA allocation; transport evidence is TCP only. All
+Catalog calls still target a test double, not a production SpecForge Catalog.
+
+An idle Python scheduler initially starved the publication thread between CPU
+tensor checks. A conditional idle yield while publication work is pending
+resolved the observed 30-second publication timeouts. This is functional
+evidence; capture-on/off latency and throughput budgets are not yet measured.
+
+## Cross-Engine Numerical Diagnostic
+
+The online observer reads per-layer attention inputs before subsequent model
+work can reuse them; it does not read the KV pool or use the snapshot exporter.
+All 2,979,840 selected KV scalar values across the first three samples match
+Mooncake readback exactly. It also reads raw logits before sampling.
+
+HF BF16 eager KV does **not** pass the experimental `rtol=0.03, atol=0.125`
+cross-engine check. For example, layer 14 V at position 20/head 0/dimension 118
+is -27 in online SGLang and -1.953125 in the HF eager reference. The independent
+reference-only experiment `01790802067633772909-b44e737cfdca` also obtains
+-11.5625 with HF BF16 SDPA and approximately -17.30 with both FP32 backends.
+It reproduces sensitivity without involving the exporter or Mooncake.
+
+`experiments/diagnose_qwen3_kv.py` preserves FP32 RoPE frequency buffers while
+loading each weight dtype separately. The runtime test retains all HF KV error
+statistics; `--assert-hf-kv` re-enables the original failing cross-engine gate
+without increasing its tolerances. The required capture invariant is exact
+preservation of online tensors. This evidence does not establish equivalence
+between arbitrary target implementations or training/serving DSpark parity.
 
 ## Next Implementation
 
-1. Add an immutable request position ledger and a bounded background coordinator
-   that obtains/renews Catalog leases without blocking inference.
-2. Wire raw capture before serving processors and KV gather before source reuse;
-   propagate immutable capture tickets through result processing.
-3. Bind explicit model/tokenizer/layout identities, reject unsupported runtime
-   paths, and invalidate capture across weight updates.
-4. Exercise actual prefill/decode, prefix hits, chunk boundaries, single-token
-   responses, cancellation and backpressure on the resident H100.
-5. Complete the remaining SGLang serving and deployment work packages from the
-   design. Keep unsupported paths explicit until their corresponding gates pass.
+1. Broaden real-request coverage to batching, padded/prefill graphs, cancellation,
+   retraction, cache eviction, weight replacement and saturated backpressure.
+2. Complete P8's SGLang KV-input DSpark checkpoint contract, injector, cache
+   invalidation and parity against the training-side contract.
+3. Complete P9's topology work: TP/PP, overlap, speculative accepted-token
+   collection, PD transfer and cross-node RDMA. Existing capability gates do
+   not constitute implementation of these paths.
+4. Complete P10's adaptive capture limits, metrics, capture-on/off SLO benchmarks
+   and rollout/rollback checks. Per-model numerical/runtime validation and
+   runtime identity coverage also need expansion beyond the tested combination.
+5. Integrate with the SpecForge-owned production Catalog and consumer when
+   available. Test doubles do not prove retention, consumer checkpoint replay,
+   training loss correctness or actual draft-model training quality.

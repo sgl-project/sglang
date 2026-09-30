@@ -1,0 +1,122 @@
+"""Opt-in capture configuration and explicit runtime capability gates."""
+
+from __future__ import annotations
+
+import math
+from pathlib import Path
+from typing import Annotated, Literal
+
+import msgspec
+from sglang.srt.training_capture.protocol import (
+    ContractError,
+    Digest,
+    Identifier,
+    Nonnegative,
+    Positive,
+    StrictStruct,
+    Text,
+    canonical_bytes,
+    digest_bytes,
+)
+
+
+class StoreSetup(StrictStruct):
+    local_hostname: Text
+    master_server_addr: Text
+    protocol: Literal["tcp", "rdma"] = "tcp"
+    metadata_server: Text = "P2PHANDSHAKE"
+    global_segment_size: Nonnegative = 0
+    local_buffer_size: Positive = 16 << 20
+    rdma_devices: str = ""
+
+
+class CaptureConfig(StrictStruct):
+    dataset_id: Identifier
+    model_id: Text
+    producer_revision: Text
+    selected_layer_ids: list[Nonnegative]
+    catalog_endpoint: Text
+    journal_directory: Text
+    store: StoreSetup
+    contract_id: Identifier = "maas-target-kv-top128-v1"
+    expected_weights_revision: Digest | None = None
+    expected_tokenizer_revision: Digest | None = None
+    catalog_token_env: str | None = None
+    sample_ratio: Annotated[float, msgspec.Meta(ge=0, le=1)] = 0.01
+    sample_seed: int = 0
+    max_sample_tokens: Annotated[int, msgspec.Meta(ge=2, le=2147483647)] = 8192
+    max_inflight_samples: Positive = 4
+    max_host_bytes: Positive = 512 << 20
+    manifest_buffer_bytes: Positive = 1 << 20
+    storage_chunk_tokens: Positive = 256
+    replica_num: Positive = 1
+    capture_lease_seconds: Annotated[float, msgspec.Meta(gt=0)] = 120.0
+    max_capture_seconds: Annotated[float, msgspec.Meta(gt=0)] = 1800.0
+    http_timeout_seconds: Annotated[float, msgspec.Meta(gt=0)] = 5.0
+    http_attempts: Annotated[int, msgspec.Meta(ge=1, le=10)] = 3
+
+    @classmethod
+    def load(cls, path: str):
+        source = Path(path)
+        if source.stat().st_size > 1 << 20:
+            raise ContractError("capture configuration is too large")
+        config = msgspec.json.decode(source.read_bytes(), type=cls)
+        if not config.selected_layer_ids or len(config.selected_layer_ids) != len(
+            set(config.selected_layer_ids)
+        ):
+            raise ContractError("selected layers must be nonempty and unique")
+        if not all(
+            math.isfinite(value)
+            for value in (
+                config.sample_ratio,
+                config.capture_lease_seconds,
+                config.max_capture_seconds,
+                config.http_timeout_seconds,
+            )
+        ):
+            raise ContractError("capture limits must be finite")
+        if not config.catalog_endpoint.startswith(("http://", "https://")):
+            raise ContractError("capture requires a Catalog HTTP endpoint")
+        if not Path(config.journal_directory).is_absolute():
+            raise ContractError("capture journal directory must be absolute")
+        return config
+
+    @property
+    def fingerprint(self):
+        return digest_bytes(canonical_bytes(self))
+
+
+def validate_capture_server_args(args) -> None:
+    """Called during ServerArgs validation, before loading target weights."""
+    if args.training_capture_config is None:
+        return
+    CaptureConfig.load(args.training_capture_config)
+    unsupported = {
+        "TP/PP/DP or context parallelism": args.tp_size != 1
+        or args.pp_size != 1
+        or args.dp_size != 1
+        or args.attn_cp_size != 1
+        or args.dcp_size != 1
+        or args.enable_dp_attention,
+        "overlap scheduling": not args.disable_overlap_schedule,
+        "speculative decoding": args.speculative_algorithm is not None,
+        "PD disaggregation": args.disaggregation_mode != "null",
+        "mixed-chunk scheduling": args.enable_mixed_chunk,
+        "PDMux": args.enable_pdmux,
+        "diffusion language models": args.dllm_algorithm is not None,
+        "model overlap": args.enable_two_batch_overlap
+        or args.enable_single_batch_overlap,
+        "unified or sparse KV memory": args.enable_unified_memory
+        or args.enable_hisparse,
+        "LoRA": bool(args.enable_lora) or bool(args.lora_paths),
+        "quantized weights": args.quantization is not None,
+        "unverifiable weight loading": args.load_format not in ("auto", "safetensors"),
+        "custom weight or forward hooks": bool(args.custom_weight_loader)
+        or bool(args.forward_hooks),
+        "embedding/encoder serving": args.is_embedding or args.encoder_only,
+    }
+    rejected = [name for name, enabled in unsupported.items() if enabled]
+    if rejected:
+        raise ValueError(
+            "training capture does not yet support: " + ", ".join(rejected)
+        )

@@ -1008,6 +1008,8 @@ class Scheduler(
         ):
             model_runner.post_capture_elastic_ep_recover()
 
+        self.tp_worker.init_training_capture()
+
         # Dispatch the model worker
         if self.spec_algorithm.is_none():
             self.model_worker = self.tp_worker
@@ -3926,6 +3928,9 @@ class Scheduler(
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
 
+        if self.tp_worker.training_capture is not None:
+            self.tp_worker.training_capture.after_result(result.training_capture)
+
         self._record_step_counters(batch, result)
 
         self.metrics_reporter.log_batch_result_stats(batch, result)
@@ -4061,6 +4066,8 @@ class Scheduler(
         self.publish_load_snapshot(force=True)
 
         # sleep until next event
+        if self.tp_worker.training_capture is not None:
+            self.tp_worker.training_capture.on_idle()
         self.maybe_sleep_on_idle()
 
     def is_fully_idle(self, for_health_check=False) -> bool:
@@ -4280,6 +4287,8 @@ class Scheduler(
         )
         ret["startup_time"] = self.startup_time
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+        if self.tp_worker.training_capture is not None:
+            ret["training_capture"] = self.tp_worker.training_capture.stats()
 
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager

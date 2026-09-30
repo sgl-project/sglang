@@ -13,6 +13,7 @@ import torch
 from sglang.srt.training_capture.catalog import CaptureLease, Catalog, CatalogConflict
 from sglang.srt.training_capture.mooncake_store import MooncakeSnapshotStore
 from sglang.srt.training_capture.protocol import (
+    DTYPES,
     ContractError,
     Manifest,
     canonical_bytes,
@@ -91,6 +92,9 @@ class PublicationJournal:
             data = base64.b64decode(value["manifest_base64"], validate=True)
             decode_manifest(data)
             yield lease, data
+
+    def has_pending(self, capture_id: str) -> bool:
+        return self._path(capture_id).exists()
 
     def complete(self, capture_id):
         self._path(capture_id).unlink()
@@ -242,6 +246,10 @@ class SnapshotWriter:
             manifest = decode_manifest(data)
             self._check_identity(manifest, lease)
             self._seal(manifest, data, lease)
+            # A journal survives producer/data-node loss. Confirm every immutable
+            # object still exists before making the recovered reference visible.
+            for obj in manifest.objects:
+                self.store.get_tensor(obj.key, obj.shape, DTYPES[obj.dtype], obj.sha256)
             buffer = torch.empty(len(data), dtype=torch.uint8)
             self.store.register(buffer)
             try:

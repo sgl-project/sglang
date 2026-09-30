@@ -12,6 +12,9 @@ class SelectedLayerKVExporter:
     def __init__(self, kv: KVSpec, buffers: Mapping[str, torch.Tensor]):
         self.kv = kv
         self.buffers = dict(buffers)
+        if not self.buffers:
+            raise ContractError("KV exporter requires selected source buffers")
+        self.device = next(iter(self.buffers.values())).device
         expected = set()
         for layer in kv.layers:
             for component, dim in (
@@ -21,6 +24,8 @@ class SelectedLayerKVExporter:
                 name = f"target_{component}.{layer.layer_id}"
                 expected.add(name)
                 value = self.buffers[name]
+                if value.device != self.device:
+                    raise ContractError("selected KV buffers must share a device")
                 if (
                     value.ndim != 3
                     or list(value.shape[1:]) != [layer.num_kv_heads, dim]

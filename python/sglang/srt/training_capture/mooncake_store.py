@@ -176,6 +176,8 @@ class MooncakeSnapshotStore:
         )
         if nbytes + retained > self.max_receive_bytes:
             raise ContractError("receive/quarantine budget exceeded")
+        if self.client.is_exist(key) != 1:
+            raise TransportError("Mooncake object is missing or unavailable")
         out = torch.empty(shape, dtype=dtype)
         self.register(out)
         pointer = out.data_ptr()
