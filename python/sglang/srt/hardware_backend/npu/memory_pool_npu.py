@@ -749,11 +749,15 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def _copy_indices_for_buffer(self, indices, uses_global_slots):
         if uses_global_slots or self.dcp_size <= 1:
             return indices
+        # These index buffer ROWS, not pages, and this pool shards rows per
+        # token -- so the interleave is 1, not page_size. #37787 passed
+        # page_size because its own pool shards in page blocks; under this
+        # owner rule that selects the wrong rows for the transfer, silently.
         local_indices = localize_dcp_indices(
             indices,
             self.dcp_size,
             self.dcp_rank,
-            self.page_size,
+            1,
         )
         return local_indices[local_indices >= 0]
 

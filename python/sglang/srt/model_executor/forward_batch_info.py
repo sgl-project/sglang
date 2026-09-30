@@ -43,7 +43,6 @@ from sglang.srt.environ import envs
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     compute_req_all_ids_info,
 )
-from sglang.srt.layers.dcp.layout import localize_dcp_indices
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     dp_slot_in,
@@ -190,21 +189,6 @@ def _elastic_should_preserve_local_token_counts(
 
     uneven_token_count = len(set(global_num_tokens)) > 1
     return uneven_token_count
-
-
-def _localize_npu_dcp_out_cache_loc(
-    out_cache_loc: torch.Tensor,
-    *,
-    interleave_size: int,
-) -> torch.Tensor:
-    """Map allocator-global NPU DCP slots to this target rank."""
-    parallel = get_parallel()
-    return localize_dcp_indices(
-        out_cache_loc,
-        parallel.dcp_size,
-        parallel.dcp_rank,
-        interleave_size,
-    )
 
 
 class ForwardMode(IntEnum):
@@ -1045,15 +1029,26 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             spec_info=batch.spec_info,
         )
 
-        # ScheduleBatch and req_to_token keep allocator-global slot identities.
-        # Preserve that view before exposing rank-local NPU DCP write slots.
+        # ScheduleBatch and req_to_token keep allocator-global slot identities,
+        # and the replicated index-K buffer is written through them, so the
+        # indexer needs this view even where the latent KV does not.
+        #
+        # out_cache_loc is NOT localized here. #37787 localized it once per
+        # forward, page-interleaved, which is the right shape for a pool that
+        # shards in pages -- but this pool localizes per write in
+        # NPUMLAPagedTokenToKVPool._resolve_dcp_write, per token, and applying
+        # both stacks two different partitions on one tensor: the second pass
+        # reads an already-local row as if it were global, and -1 survives
+        # `loc % dcp_size` on the top rank. Keeping ours is what the extend
+        # gather requires (plan_dcp_extend_gather assumes pos % dcp_size ==
+        # rank) and what keeps every rank's share of a top-k balanced.
+        #
+        # Moving to localize-once is worth doing later: it costs one op per
+        # forward instead of 78, and it would retire the capturable row-0
+        # trick _resolve_dcp_write needs at decode. That change has to move the
+        # pool and the extend gather together.
         if _is_npu and get_parallel().dcp_enabled and not model_runner.is_draft_worker:
             ret.origin_out_cache_loc = ret.out_cache_loc
-            if ret.out_cache_loc is not None:
-                ret.out_cache_loc = _localize_npu_dcp_out_cache_loc(
-                    ret.out_cache_loc,
-                    interleave_size=model_runner.page_size,
-                )
         ret._maybe_init_non_generation_fields(batch)
 
         device = model_runner.device
