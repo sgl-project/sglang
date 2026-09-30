@@ -203,6 +203,36 @@ def sample_draft_proposal(
     return probs, topk_p, topk_index
 
 
+def scatter_draft_probs_to_target_vocab(
+    draft_probs: torch.Tensor,
+    hot_token_id: torch.Tensor,
+    target_vocab_size: int,
+) -> torch.Tensor:
+    """Lift a reduced-vocabulary ``q`` into the target vocabulary.
+
+    EAGLE3 draft heads emit ``draft_vocab_size`` logits and ``hot_token_id``
+    maps those columns onto target token ids. This is exact, not an
+    approximation: the draft can only ever propose a hot token, so ``q(x) = 0``
+    on every non-hot ``x`` is the true proposal mass. The accept test therefore
+    never sees ``q = 0`` on a proposed token, and ``relu(p - q)`` keeps the full
+    ``p`` on non-hot tokens.
+
+    fp32 is forced so the eager and CUDA-graph paths hand the kernel the same
+    dtype. No buffer reuse: the returned tensor outlives this call under overlap
+    scheduling, so a cached buffer would alias across iterations.
+    """
+    out = torch.zeros(
+        (*draft_probs.shape[:-1], target_vocab_size),
+        dtype=torch.float32,
+        device=draft_probs.device,
+    )
+    # index_copy_ (not advanced indexing / scatter_): advanced indexing lowers to
+    # a non-deterministic index_put_ on duplicate indices, and scatter_ would
+    # need an index tensor of the full source shape.
+    out.index_copy_(-1, hot_token_id, draft_probs.to(torch.float32))
+    return out
+
+
 # Simulate acceptance length for benchmarking purposes
 SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
