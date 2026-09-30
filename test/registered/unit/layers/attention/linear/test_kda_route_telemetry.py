@@ -819,5 +819,40 @@ class TestKDATerminalRouteTelemetry(unittest.TestCase):
         )
 
 
+class TestPlainDecodeSuccessReason(unittest.TestCase):
+    """``plain_eligible`` is the adapter (non-packed) Cake decode success."""
+
+    def _plain_success(self, **overrides):
+        kwargs = dict(
+            mode="decode",
+            layer_id=2,
+            eligible=True,
+            attempted_cake=True,
+            cake_success=True,
+            triton_fallback=False,
+            fatal=False,
+            reason=CakePackedDecodeReason.PLAIN_ELIGIBLE,
+            telemetry=_recorder(),
+        )
+        kwargs.update(overrides)
+        return record_kda_terminal_route(**kwargs)
+
+    def test_plain_decode_success_carries_no_zero_copy_claim(self):
+        event = self._plain_success()
+        self.assertEqual(event.reason, "plain_eligible")
+        self.assertIsNone(event.copy_count)
+        self.assertEqual(event.copy_count_source, "unknown_requires_cupti")
+
+    def test_plain_decode_success_rejects_the_packed_zero_copy_state(self):
+        with self.assertRaisesRegex(ValueError, "invalid KDA copy-count state"):
+            self._plain_success(
+                copy_count=0, copy_count_source="static_zero_copy_row_view"
+            )
+
+    def test_plain_decode_success_is_decode_only(self):
+        with self.assertRaisesRegex(ValueError, "invalid KDA route reason"):
+            self._plain_success(mode="prefill")
+
+
 if __name__ == "__main__":
     unittest.main()

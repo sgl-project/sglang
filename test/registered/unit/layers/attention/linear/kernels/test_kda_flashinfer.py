@@ -33,6 +33,23 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
+def _validating_route_recorder():
+    """Return (sink, record): a real telemetry sink plus a recorder for it.
+
+    Patching ``record_kda_terminal_route`` with ``record`` keeps the schema
+    validation of ``KDATerminalRouteEvent`` in the loop (a Mock would accept
+    any event shape, including ones the served scheduler rejects).
+    """
+    sink = kda_route_telemetry.KDATerminalRouteTelemetry(
+        raw_event_capacity=16, emit_log=False
+    )
+
+    def record(**kwargs):
+        return kda_route_telemetry.record_kda_terminal_route(**kwargs, telemetry=sink)
+
+    return sink, record
+
+
 class TestFlashInferPackedKDALoader(CustomTestCase):
     def setUp(self):
         self._original_loader_state = (
@@ -476,6 +493,7 @@ class TestCakeKDAFacadeRoute(CustomTestCase):
         kernel = self._kernel()
         inputs = self._served_inputs()
         state = torch.randn(4, 12, 128, 128, dtype=torch.bfloat16)
+        telemetry, record = _validating_route_recorder()
         with (
             patch.object(
                 kernel,
@@ -493,7 +511,9 @@ class TestCakeKDAFacadeRoute(CustomTestCase):
                 "_get_flashinfer_kda_prefill_kernel",
                 return_value=(True, fake_recurrent_kda),
             ),
-            patch.object(kda_flashinfer, "record_kda_terminal_route") as telemetry,
+            patch.object(
+                kda_flashinfer, "record_kda_terminal_route", side_effect=record
+            ),
         ):
             output = kernel.extend(
                 **inputs, ssm_states=state, lower_bound=-5.0, layer_id=9
@@ -515,8 +535,8 @@ class TestCakeKDAFacadeRoute(CustomTestCase):
             self.assertTrue(calls[0][name].is_contiguous())
             self.assertTrue(torch.equal(calls[0][name], inputs[name]))
         triton.assert_not_called()
-        self.assertEqual(telemetry.call_count, 1)
-        event = telemetry.call_args.kwargs
+        self.assertEqual(len(telemetry.raw_events_snapshot()), 1)
+        event = telemetry.raw_events_snapshot()[-1].to_dict()
         self.assertEqual((event["mode"], event["layer_id"]), ("prefill", 9))
         self.assertTrue(event["cake_success"])
         self.assertEqual(event["reason"], CakePrefillReason.ELIGIBLE)
@@ -533,11 +553,13 @@ class TestCakeKDAFacadeRoute(CustomTestCase):
 
         self.assertIs(output, sentinel)
         triton.assert_called_once()
-        self.assertEqual(telemetry.call_count, 1)
-        event = telemetry.call_args.kwargs
+        self.assertEqual(len(telemetry.raw_events_snapshot()), 1)
+        event = telemetry.raw_events_snapshot()[-1].to_dict()
         self.assertEqual(event["mode"], "prefill")
-        self.assertTrue(event["eligible"])
-        self.assertTrue(event["attempted_cake"])
+        # Declared fallback shape: the refusal is FlashInfer's host-side
+        # admission, no Cake kernel was attempted.
+        self.assertFalse(event["eligible"])
+        self.assertFalse(event["attempted_cake"])
         self.assertFalse(event["cake_success"])
         self.assertTrue(event["triton_fallback"])
         self.assertFalse(event["fatal"])
@@ -580,32 +602,41 @@ class TestCakeKDAPlainDecodeTelemetry(CustomTestCase):
 
     def test_cake_decode_records_a_success_event(self):
         kernel = self._kernel()
+        telemetry, record = _validating_route_recorder()
         sentinel = object()
         with (
             patch.object(kernel, "_decode_cake", return_value=sentinel) as cake,
-            patch.object(kda_flashinfer, "record_kda_terminal_route") as telemetry,
+            patch.object(
+                kda_flashinfer, "record_kda_terminal_route", side_effect=record
+            ),
         ):
             output = kernel.decode(**self._decode_inputs(v_heads=12))
 
         self.assertIs(output, sentinel)
         cake.assert_called_once()
-        self.assertEqual(telemetry.call_count, 1)
-        event = telemetry.call_args.kwargs
+        self.assertEqual(len(telemetry.raw_events_snapshot()), 1)
+        event = telemetry.raw_events_snapshot()[-1].to_dict()
         self.assertEqual((event["mode"], event["layer_id"]), ("decode", 4))
         self.assertTrue(event["cake_success"])
         self.assertFalse(event["triton_fallback"])
-        self.assertEqual(event["reason"], CakePackedDecodeReason.ELIGIBLE)
+        self.assertEqual(event["reason"], CakePackedDecodeReason.PLAIN_ELIGIBLE)
+        # The adapter materializes contiguous operands: no zero-copy claim.
+        self.assertIsNone(event["copy_count"])
+        self.assertEqual(event["copy_count_source"], "unknown_requires_cupti")
 
     def test_cake_decode_failure_is_fatal_and_re_raised(self):
         kernel = self._kernel()
+        telemetry, record = _validating_route_recorder()
         with (
             patch.object(kernel, "_decode_cake", side_effect=RuntimeError("boom")),
-            patch.object(kda_flashinfer, "record_kda_terminal_route") as telemetry,
+            patch.object(
+                kda_flashinfer, "record_kda_terminal_route", side_effect=record
+            ),
             self.assertRaisesRegex(RuntimeError, "boom"),
         ):
             kernel.decode(**self._decode_inputs(v_heads=12))
 
-        event = telemetry.call_args.kwargs
+        event = telemetry.raw_events_snapshot()[-1].to_dict()
         self.assertEqual(event["mode"], "decode")
         self.assertTrue(event["fatal"])
         self.assertEqual(event["reason"], kda_route_telemetry.CAKE_DECODE_EXCEPTION)
@@ -616,18 +647,21 @@ class TestCakeKDAPlainDecodeTelemetry(CustomTestCase):
         )
 
         kernel = self._kernel()
+        telemetry, record = _validating_route_recorder()
         sentinel = object()
         with (
             patch.object(TritonKDAKernel, "decode", return_value=sentinel) as triton,
             patch.object(kernel, "_decode_cake") as cake,
-            patch.object(kda_flashinfer, "record_kda_terminal_route") as telemetry,
+            patch.object(
+                kda_flashinfer, "record_kda_terminal_route", side_effect=record
+            ),
         ):
             output = kernel.decode(**self._decode_inputs(v_heads=6))
 
         self.assertIs(output, sentinel)
         triton.assert_called_once()
         cake.assert_not_called()
-        event = telemetry.call_args.kwargs
+        event = telemetry.raw_events_snapshot()[-1].to_dict()
         self.assertEqual(event["mode"], "decode")
         self.assertTrue(event["triton_fallback"])
         self.assertFalse(event["fatal"])

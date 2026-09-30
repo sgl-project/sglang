@@ -1574,11 +1574,14 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
                 # The facade declined the call before touching the state pool:
                 # serve the layer with the Triton prefill kernel and declare it.
                 output = self._extend_triton(q, k, v, g, beta, **fallback_kwargs)
+                # The refusal is FlashInfer's host-side admission (no kernel
+                # was launched), so the schema's declared-fallback shape
+                # (eligible=0, attempted_cake=0) applies.
                 record_kda_terminal_route(
                     mode="prefill",
                     layer_id=layer_id,
-                    eligible=True,
-                    attempted_cake=True,
+                    eligible=False,
+                    attempted_cake=False,
                     cake_success=False,
                     triton_fallback=True,
                     fatal=False,
@@ -1731,8 +1734,8 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
                 cake_success=True,
                 triton_fallback=False,
                 fatal=False,
-                reason=CakePackedDecodeReason.ELIGIBLE,
-                detail="plain_decode",
+                reason=CakePackedDecodeReason.PLAIN_ELIGIBLE,
+                detail=f"H={num_heads},HV={num_v_heads}",
             )
             return output
 

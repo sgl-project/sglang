@@ -20,8 +20,9 @@ fatalizes the transaction instead of leaving a false success receipt.
 
 ``copy_count`` is a host-side, statically audited materialization count, *not* a
 CUPTI activity count.  It is zero only for the packed row-strided CAKE ABI,
-whose admitted inputs are metadata-only views.  Adapter and fallback paths use
-JSON ``null`` with ``copy_count_source=\"unknown_requires_cupti\"``.  The raw
+whose admitted inputs are metadata-only views.  Adapter (``plain_eligible``
+decode) and fallback paths use JSON ``null`` with
+``copy_count_source=\"unknown_requires_cupti\"``.  The raw
 events are deliberately sufficient for an external CUPTI kernel/memcpy name and
 count cross-check; this module never fabricates activity counts.
 
@@ -73,8 +74,11 @@ class CakePackedDecodeReason:
     CACHE_INDEX_UNVERIFIED = "cache_index_unverified"
     CACHE_INDEX_OOB = "cache_index_oob"
     CACHE_INDEX_DUPLICATE = "cache_index_duplicate"
-    # Plain (non-packed) decode: the exported kernel keeps H == HV; grouped
-    # value heads run the Triton decode kernel.
+    # Plain (non-packed) decode through the adapter: a success materializes
+    # contiguous operands, so it never carries the packed zero-copy claim.
+    PLAIN_ELIGIBLE = "plain_eligible"
+    # Plain decode with grouped value heads (H != HV): the exported kernel
+    # keeps H == HV, so the Triton decode kernel runs.
     GQA_HEADS = "gqa_heads"
 
 
@@ -233,6 +237,8 @@ class KDATerminalRouteEvent:
 
         if self.cake_success:
             allowed_reasons = frozenset((CakePackedDecodeReason.ELIGIBLE,))
+            if self.mode == "decode":
+                allowed_reasons |= frozenset((CakePackedDecodeReason.PLAIN_ELIGIBLE,))
         elif self.triton_fallback:
             allowed_reasons = (
                 _DECODE_FALLBACK_REASONS
