@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+import sys
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -97,3 +99,7 @@ def test_fp32_rounding_boundaries():
     rq, rs = reference(x)
     assert torch.equal(s, rs)
     assert torch.equal(q.view(torch.uint8), rq.view(torch.uint8))
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
