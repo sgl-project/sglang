@@ -199,6 +199,20 @@ def test_gluon_ep_keeps_shared_expert_native(monkeypatch):
     assert model.num_fused_shared_experts == 0
 
 
+def test_gluon_glm_target_ep_fuses_shared_expert(monkeypatch):
+    from sglang.srt.models import glm4_moe
+
+    model = glm4_moe.GlmMoeDsaForCausalLM.__new__(
+        glm4_moe.GlmMoeDsaForCausalLM
+    )
+    model.config = SimpleNamespace(n_shared_experts=1)
+    monkeypatch.setattr(glm4_moe, "is_shared_experts_fusion_disabled", lambda: False)
+
+    model.determine_num_fused_shared_experts()
+
+    assert model.num_fused_shared_experts == 1
+
+
 def test_gluon_glm_nextn_pins_shared_expert_native(monkeypatch):
     from sglang.srt.models import glm4_moe
 
