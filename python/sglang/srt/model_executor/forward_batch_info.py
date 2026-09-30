@@ -68,9 +68,6 @@ from sglang.srt.utils import (
     support_triton,
 )
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
-from sglang.srt.utils.npu_pinned_host_diagnostics import (
-    trace_npu_pinned_host_allocation,
-)
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -1731,19 +1728,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self._pad_inputs_to_size(model_runner, num_tokens, bs)
         self.global_num_tokens_cpu = global_num_tokens
         self.use_pin_memory = not _is_cpu
-        if _is_npu:
-            with trace_npu_pinned_host_allocation(
-                "prepare_mlp_sync_batch.global_num_tokens",
-                requested_bytes=len(global_num_tokens) * 8,
-                details={"shape": (len(global_num_tokens),), "dtype": "torch.int64"},
-            ):
-                global_num_tokens_pinned = torch.tensor(
-                    global_num_tokens, pin_memory=self.use_pin_memory
-                )
-        else:
-            global_num_tokens_pinned = torch.tensor(
-                global_num_tokens, pin_memory=self.use_pin_memory
-            )
+        global_num_tokens_pinned = torch.tensor(
+            global_num_tokens, pin_memory=self.use_pin_memory
+        )
         self.global_num_tokens_gpu.copy_(
             global_num_tokens_pinned, non_blocking=self.use_pin_memory
         )

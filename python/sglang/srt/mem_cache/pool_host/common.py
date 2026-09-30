@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import os
 from collections import defaultdict
 from functools import lru_cache
@@ -12,10 +11,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
 from sglang.srt.runtime_context import get_memory
-from sglang.srt.utils import is_hip, is_npu
-from sglang.srt.utils.npu_pinned_host_diagnostics import (
-    trace_npu_pinned_host_allocation,
-)
+from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -266,20 +262,7 @@ def alloc_with_pin_memory(
     """
     Allocate tensor using PyTorch's built-in pin_memory flag.
     """
-    if pin_memory and is_npu():
-        requested_bytes = (
-            math.prod(dims) * torch.empty(0, dtype=dtype, device="cpu").element_size()
-        )
-        with trace_npu_pinned_host_allocation(
-            "hicache_host_pool",
-            requested_bytes=requested_bytes,
-            details={"shape": dims, "dtype": str(dtype)},
-        ):
-            buffer = torch.empty(
-                dims, dtype=dtype, device=device, pin_memory=pin_memory
-            )
-    else:
-        buffer = torch.empty(dims, dtype=dtype, device=device, pin_memory=pin_memory)
+    buffer = torch.empty(dims, dtype=dtype, device=device, pin_memory=pin_memory)
     return buffer
 
 
