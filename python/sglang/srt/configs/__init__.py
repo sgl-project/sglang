@@ -56,6 +56,7 @@ from sglang.srt.configs.mamba import FalconMambaConfig, MambaConfig
 from sglang.srt.configs.mamba2 import Mamba2Config
 from sglang.srt.configs.minicpm import MiniCPMHybridConfig
 from sglang.srt.configs.minicpmv4_6 import MiniCPMV4_6Config, MiniCPMV4_6VisionConfig
+from sglang.srt.configs.minicpmv4_7 import MiniCPMV4_7Config
 from sglang.srt.configs.minimax_vl import MiniMaxM3VLConfig
 from sglang.srt.configs.muse_glimmer import (
     MuseGlimmerAssistantConfig,
@@ -150,6 +151,7 @@ __all__ = [
     "LocateAnythingConfig",
     "MiniCPMV4_6Config",
     "MiniCPMV4_6VisionConfig",
+    "MiniCPMV4_7Config",
     "NemotronHConfig",
     "NemotronHPuzzleConfig",
     "NemotronH_Nano_VL_V2_Config",
