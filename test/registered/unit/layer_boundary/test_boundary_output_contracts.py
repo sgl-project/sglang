@@ -18,11 +18,13 @@ from sglang.srt.layers.layer_boundary import exit as exits
 from sglang.srt.layers.layer_boundary import (
     make_stages,
 )
+from sglang.srt.layers.layer_boundary import stage as stages
 from sglang.srt.layers.layer_boundary.contracts import BatchVariant
 from sglang.srt.layers.layer_boundary.fusions.cutedsl import CuteDSLFusion
 from sglang.srt.layers.layer_boundary.layout import SumGroup
 from sglang.srt.layers.layer_boundary.prepare import _dispatch_by_update
 from sglang.srt.layers.layer_boundary.residual import batch
+from sglang.srt.layers.layer_boundary.residual.add_norm import REPLACE_AT_EXIT
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -203,6 +205,49 @@ class TestBoundaryIntegrations(unittest.TestCase):
             declare_ffn(reduction=ProducerReduction.ALWAYS_PARTIAL)
         with self.assertRaises(ValueError):
             declare_attn(reduction=ProducerReduction.TAIL_AFTER_SUM)
+
+    def test_ffn_writing_the_next_stream_hands_on_a_complete_output(self):
+        # It has each part's sum completed (sum_part) before building the
+        # stream from the parts, so its exit owes no sum and never defers one.
+        for attn_dp in (1, 2):
+            with (
+                self.subTest(attn_dp=attn_dp),
+                fixture.planning(fixture.parallel_of(attn_dp=attn_dp, attn_tp=2)),
+            ):
+                for sparse in (False, True):
+                    _, ffn = make_stages(
+                        (declare_attn(), fixture.Norm()),
+                        (
+                            declare_ffn(sparse=sparse, update=REPLACE_AT_EXIT),
+                            fixture.Norm(),
+                        ),
+                        previous=declare_ffn(sparse=sparse, update=REPLACE_AT_EXIT),
+                    )
+                    for variant, path in ffn.plan.paths.items():
+                        self.assertIsNone(path.output.group, (sparse, variant))
+                        self.assertFalse(path.output.may_defer_to_next)
+
+    def test_only_an_ffn_writing_the_next_stream_sums_its_parts(self):
+        summed = Mock(side_effect=lambda value, *args, **kwargs: value * 2)
+        fb = SimpleNamespace()
+        with (
+            fixture.planning(fixture.parallel_of(attn_dp=1, attn_tp=2)),
+            patch.object(stages, "sum_output", summed),
+        ):
+            for update in (PLAIN_ADD, REPLACE_AT_EXIT):
+                _, ffn = make_stages(
+                    (declare_attn(), fixture.Norm()),
+                    (declare_ffn(update=update), fixture.Norm()),
+                )
+                if update is PLAIN_ADD:
+                    with self.assertRaises(RuntimeError):
+                        ffn.sum_part(torch.ones(2, 4), fb, SumGroup.TP)
+                    continue
+                part = ffn.sum_part(torch.ones(2, 4), fb, SumGroup.MOE_OUTPUT)
+        torch.testing.assert_close(part, torch.full((2, 4), 2.0))
+        summed.assert_called_once()
+        self.assertIs(summed.call_args.args[1], SumGroup.MOE_OUTPUT)
+        self.assertFalse(summed.call_args.kwargs["may_quantize"])
 
     def test_dense_decoder_forwards_capture_callback(self):
         from sglang.srt.models.llama4 import Llama4DecoderLayer
