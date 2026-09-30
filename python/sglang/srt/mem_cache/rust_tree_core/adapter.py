@@ -327,15 +327,6 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             raise ValueError(
                 "--enable-session-radix-cache is not supported by the Rust TreeCore"
             )
-        # TODO: Port the per-node load-back split and the path LRU refresh.
-        if params.hicache_serialize_load_back:
-            raise ValueError(
-                "--hicache-serialize-load-back is not supported by the Rust TreeCore"
-            )
-        if params.allow_subagent_keepalive:
-            raise ValueError(
-                "--allow-subagent-keepalive is not supported by the Rust TreeCore"
-            )
 
         # TODO(Jialin): Port custom component registration from #25754 and
         # C128 support from #33676.
@@ -707,6 +698,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         )
         return _match_result_from_binding(result)
 
+    def refresh_lru_to_root(self, node_id: NodeId) -> bool:
+        return self._binding.refresh_lru_to_root(node_id)
+
     def match_full_device_prefix(self, key: RadixKey) -> tuple[int, NodeId, int]:
         return self._binding.match_full_device_prefix(
             self._bindings.MatchParamsBinding(
@@ -992,6 +986,14 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                     for nid in transfer.nodes_to_load or ()
                 ]
         return kv_xfer, comp_xfers
+
+    def split_full_load_back_spec(self, kv_xfer: PoolTransfer) -> list[PoolTransfer]:
+        return [
+            _transfer_from_binding(transfer)
+            for transfer in self._binding.split_full_load_back_spec(
+                _transfer_to_binding(kv_xfer)
+            )
+        ]
 
     def prefetch_anchor_info(
         self, node_id: NodeId

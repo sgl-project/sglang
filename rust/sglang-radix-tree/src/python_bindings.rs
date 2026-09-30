@@ -2195,6 +2195,27 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             .map_err(node_access_error)
     }
 
+    /// Split a Full load-back transfer into one transfer per node, root-first.
+    fn split_full_load_back_spec(
+        &self,
+        py: Python<'_>,
+        kv_xfer: TransferArgs,
+    ) -> PyResult<Vec<Py<PyAny>>> {
+        let kv_xfer = transfer_from_args(kv_xfer)?;
+        let transfers = py
+            .allow_threads(move || self.core().split_full_load_back_spec(&kv_xfer))
+            .map_err(node_access_error)?;
+        transfers
+            .into_iter()
+            .map(|transfer| transfer_to_py(py, transfer))
+            .collect()
+    }
+
+    /// Re-age a cached path as if just matched; false for a stale handle.
+    fn refresh_lru_to_root(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
+        Ok(py.allow_threads(|| self.core().refresh_lru_to_root(node_id)))
+    }
+
     /// Build transfers for a node with no stored or pending external copy.
     fn build_external_linker_offload_transfers(
         &self,
@@ -2348,6 +2369,20 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                 .inspect_get_component_host_lock_ref(node_id, component_type)
         })
         .map_err(node_access_error)
+    }
+
+    fn inspect_is_full_host_duplicate(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
+        py.allow_threads(|| self.core().inspect_is_full_host_duplicate(node_id))
+            .map_err(node_access_error)
+    }
+
+    fn inspect_can_reclaim_full_host_duplicate(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+    ) -> PyResult<bool> {
+        py.allow_threads(|| self.core().inspect_can_reclaim_full_host_duplicate(node_id))
+            .map_err(node_access_error)
     }
 
     fn inspect_get_node_hit_count(&self, py: Python<'_>, node_id: NodeId) -> PyResult<i64> {
@@ -3451,6 +3486,20 @@ macro_rules! tree_core_binding {
                 catch_native_panic(|| self.inner.finish_load_back(py, anchor_node_id))
             }
 
+            /// Split a Full load-back transfer into one transfer per node, root-first.
+            fn split_full_load_back_spec(
+                &self,
+                py: Python<'_>,
+                kv_xfer: TransferArgs,
+            ) -> PyResult<Vec<Py<PyAny>>> {
+                catch_native_panic(|| self.inner.split_full_load_back_spec(py, kv_xfer))
+            }
+
+            /// Re-age a cached path as if just matched; false for a stale handle.
+            fn refresh_lru_to_root(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
+                catch_native_panic(|| self.inner.refresh_lru_to_root(py, node_id))
+            }
+
             /// Build transfers for a node with no stored or pending external copy.
             fn build_external_linker_offload_transfers(
                 &self,
@@ -3590,6 +3639,22 @@ macro_rules! tree_core_binding {
                 catch_native_panic(|| {
                     self.inner
                         .inspect_get_component_host_lock_ref(py, node_id, component_type)
+                })
+            }
+
+            #[cfg(feature = "inspection")]
+            fn inspect_is_full_host_duplicate(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
+                catch_native_panic(|| self.inner.inspect_is_full_host_duplicate(py, node_id))
+            }
+
+            #[cfg(feature = "inspection")]
+            fn inspect_can_reclaim_full_host_duplicate(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<bool> {
+                catch_native_panic(|| {
+                    self.inner.inspect_can_reclaim_full_host_duplicate(py, node_id)
                 })
             }
 

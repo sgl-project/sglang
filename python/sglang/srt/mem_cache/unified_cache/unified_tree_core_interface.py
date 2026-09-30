@@ -438,6 +438,14 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def refresh_lru_to_root(self, node_id: NodeId) -> bool:
+        """Re-age the node's root path as a match ending on it would.
+
+        Returns False when the node is no longer live.
+        """
+        ...
+
+    @abstractmethod
     def match_full_device_prefix(self, key: RadixKey) -> tuple[int, NodeId, int]:
         """Return (matched tokens, deepest node, FULL tokens pinned by it)."""
         ...
@@ -580,6 +588,11 @@ class UnifiedTreeCoreInterface(ABC):
         self, node_id: NodeId, req: Optional[Req] = None
     ) -> tuple[PoolTransfer, dict[ComponentType, list[PoolTransfer]]]:
         """Build the H->D load-back KV transfer plus per-component aux transfers."""
+        ...
+
+    @abstractmethod
+    def split_full_load_back_spec(self, kv_xfer: PoolTransfer) -> list[PoolTransfer]:
+        """One Full transfer per node of ``kv_xfer``, in its root-first order."""
         ...
 
     @abstractmethod
