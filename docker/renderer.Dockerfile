@@ -17,6 +17,7 @@ RUN apt-get update \
 WORKDIR /build
 COPY rust/Cargo.toml rust/Cargo.lock rust/rust-toolchain.toml rust/
 # Cargo loads every workspace member even when building only the renderer.
+COPY proto/ proto/
 COPY rust/sglang-grpc/Cargo.toml rust/sglang-grpc/
 COPY rust/sglang-grpc/src/ rust/sglang-grpc/src/
 COPY rust/sglang-mm/Cargo.toml rust/sglang-mm/

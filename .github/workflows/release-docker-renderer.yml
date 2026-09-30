@@ -10,6 +10,7 @@ on:
       - "rust/Cargo.toml"
       - "rust/Cargo.lock"
       - "rust/rust-toolchain.toml"
+      - "proto/**"
       - "docker/renderer.Dockerfile"
       - "LICENSE"
       - ".github/workflows/release-docker-renderer.yml"
