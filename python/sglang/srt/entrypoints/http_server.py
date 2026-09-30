@@ -924,7 +924,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                     obj, request
                 ):
                     yield b"data: " + dumps_json(out) + b"\n\n"
-            except ValueError as e:
+            except (ValueError, TypeError) as e:
                 # A client disconnect also surfaces here. It's a client-side
                 # cancellation, not a server error or bad input -- log it and
                 # stop (the request was already aborted upstream) instead of
@@ -955,7 +955,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                 obj, request
             ).__anext__()
             return orjson_response(ret)
-        except ValueError as e:
+        except (ValueError, TypeError) as e:
             logger.error(f"[http_server] Error: {e}")
             return _create_error_response(e)
 
@@ -968,7 +968,7 @@ async def encode_request(obj: EmbeddingReqInput, request: Request):
             obj, request
         ).__anext__()
         return ret
-    except ValueError as e:
+    except (ValueError, TypeError) as e:
         return _create_error_response(e)
 
 
@@ -980,7 +980,7 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
             obj, request
         ).__anext__()
         return ret
-    except ValueError as e:
+    except (ValueError, TypeError) as e:
         return _create_error_response(e)
 
 

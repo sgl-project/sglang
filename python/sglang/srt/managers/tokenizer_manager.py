@@ -1475,15 +1475,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             custom_params = dict(sampling_kwargs.get("custom_params") or {})
             custom_params["thinking_budget"] = obj.max_thinking_tokens
             sampling_kwargs["custom_params"] = custom_params
-        sampling_params = self.sampling_params_class(**sampling_kwargs)
-        sampling_params.normalize(self.tokenizer)
-        sampling_params.verify(self.model_config.vocab_size)
+        try:
+            sampling_params = self.sampling_params_class(**sampling_kwargs)
+            sampling_params.normalize(self.tokenizer)
+            sampling_params.verify(self.model_config.vocab_size)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"Invalid sampling_params: {e}") from e
 
         # Build return object
         if isinstance(obj, GenerateReqInput):
-            session_params = (
-                SessionParams(**obj.session_params) if obj.session_params else None
-            )
+            if obj.session_params:
+                try:
+                    session_params = SessionParams(**obj.session_params)
+                    session_params.verify()
+                except (TypeError, ValueError) as e:
+                    raise ValueError(f"Invalid session_params: {e}") from e
+            else:
+                session_params = None
 
             bootstrap_room = obj.bootstrap_room
             if (
