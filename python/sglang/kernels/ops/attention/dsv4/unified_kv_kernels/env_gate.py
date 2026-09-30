@@ -5,6 +5,7 @@ import logging
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_gfx95_supported, is_hip
+from sglang.srt.utils.common import is_gfx1250_supported
 
 logger = logging.getLogger(__name__)
 
@@ -33,3 +34,23 @@ def is_unified_kv_fp8() -> bool:
         )
         return False
     return True
+
+
+@functools.lru_cache(maxsize=1)
+def _decode_inv_rope_fusion_enabled() -> bool:
+    # bf16 Triton paged decode only: the fp8 asm reader and gfx1250's aiter
+    # pa_decode_sparse have no epilogue hook.
+    return (
+        envs.SGLANG_OPT_DSV4_DECODE_FUSED_INVROPE.get()
+        and is_unified_kv_triton()
+        and not is_unified_kv_fp8()
+        and not is_gfx1250_supported()
+    )
+
+
+def unified_decode_fuses_inv_rope(forward_mode) -> bool:
+    """Whether the attention output comes back inverse-RoPE'd. Static config +
+    forward_mode only, so the decision is fixed per captured graph."""
+    return _decode_inv_rope_fusion_enabled() and (
+        forward_mode.is_decode_or_idle() or forward_mode.is_target_verify()
+    )
