@@ -446,7 +446,7 @@ def _down_reduce_tiny(X, XS, W, WS, Ids, Weights, Y, N: gl.constexpr, K: gl.cons
     n = column * BN + gl.arange(0, BN, gl.SliceLayout(0, ep))
     gl.store(Y + token * N + n[None, :], value)
 
-def fused_moe(x, router, correction_bias, w13, w13_scale, w2, w2_scale, expert_start=0, routed_scaling_factor=2.5):
+def fused_moe(x, router, correction_bias, w13, w13_scale, w2, w2_scale, expert_start=0, routed_scaling_factor=2.5, fuse_shared_expert=False):
     m, h = x.shape
     intermediate = w13.shape[1] // 2
     local_experts = w13.shape[0] - 1

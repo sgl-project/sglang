@@ -610,7 +610,7 @@ def _shared_finish(X, XS, W, WS, Sorted, Parts, Records, Y, M: gl.constexpr, H: 
     nn = gl.arange(0, BN, gl.SliceLayout(0, output_layout))
     gl.amd.cdna4.buffer_store(total.to(Y.dtype.element_ty), Y + column * BN, mm[:, None] * H + nn[None, :], mm[:, None] < M)
 
-def fused_moe(x, router, correction_bias, w13, w13_scale, w2, w2_scale, expert_start=0, routed_scaling_factor=2.5):
+def fused_moe(x, router, correction_bias, w13, w13_scale, w2, w2_scale, expert_start=0, routed_scaling_factor=2.5, fuse_shared_expert=False):
     m, h = x.shape
     intermediate = w13.shape[1] // 2
     local_experts = w13.shape[0] - 1
