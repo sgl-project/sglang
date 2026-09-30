@@ -1243,9 +1243,11 @@ class XPUAttentionBackend(AttentionBackend):
         past ``seq_lens`` for each spec mode.
         """
         if is_verify:
-            # Packs speculative_num_draft_tokens rows, attending past seq_lens
-            # over those draft positions.
-            return self.speculative_num_draft_tokens, self.speculative_num_draft_tokens
+            # DSpark's draft block reuses TARGET_VERIFY but packs
+            # spec_info.num_tokens_per_req rows/req (gamma), not the gamma+1 the
+            # real target verify packs; segment by the width spec_info carries so
+            # the graph path matches the eager verify branch (mirrors triton).
+            return spec_info.num_tokens_per_req, spec_info.num_tokens_per_req
         if is_draft_extend:
             # seq_lens already includes the extend tokens (standard extend
             # convention), so no KV offset is needed.
