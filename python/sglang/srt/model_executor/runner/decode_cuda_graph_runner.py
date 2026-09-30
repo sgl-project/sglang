@@ -198,6 +198,7 @@ def build_replay_fb_view(
         encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         out_cache_loc_virtual=forward_batch.out_cache_loc_virtual,
+        origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
         max_seq_len_override=forward_batch.max_seq_len_override,
         # The mamba-track registry slot (VIRTUAL ids) is the v2p translate SOURCE
@@ -439,6 +440,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             pp_proxy_dspark_hidden_size=(
                 self.model_runner.get_pp_proxy_dspark_hidden_size()
             ),
+            aux_hidden_states_width=self.model_runner.get_aux_hidden_states_width(),
         )
         self.buffers.share_buffers()
         # FB-shared slot registry adopting DecodeInputBuffers storage (same
@@ -906,6 +908,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         mrope_positions = _slot("mrope_positions")
         next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
+        aux_hidden_states_buffer = (
+            buffers.aux_hidden_states[:num_tokens]
+            if buffers.aux_hidden_states is not None
+            else None
+        )
         rids_int = buffers.rids_int[:bs] if buffers.rids_int is not None else None
         bootstrap_room_ids_int = (
             buffers.bootstrap_room_ids_int[:bs]
@@ -981,6 +988,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
             next_token_logits_buffer=next_token_logits_buffer,
+            aux_hidden_states_buffer=aux_hidden_states_buffer,
             orig_seq_lens=seq_lens,
             out_cache_loc=out_cache_loc,
             seq_lens_sum=seq_lens.sum().item(),
