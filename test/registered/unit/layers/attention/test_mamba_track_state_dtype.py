@@ -1,11 +1,20 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     MambaAttnBackendBase,
 )
+from sglang.srt.layers.attention.linear import gdn_backend, kda_backend
+from sglang.srt.layers.attention.linear.gdn_backend import (
+    GDNAttnBackend,
+    GDNKernelDispatcher,
+)
+from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -88,6 +97,148 @@ class TestTrackMambaStateDtype(CustomTestCase):
             torch.float16, h_track_buf, dst_slots=[], batch_rows=[]
         )
         self.assertTrue(torch.all(ssm_states == 0))
+
+    def test_default_prefill_convolution_hooks_preserve_arguments(self):
+        layer = SimpleNamespace(conv_weights=object(), bias=None, activation="silu")
+        batch = SimpleNamespace(
+            extend_prefix_lens=torch.tensor([0, 64]), extend_seq_lens_cpu=[2, 2]
+        )
+        qkv = torch.arange(24).view(4, 6)
+        states = torch.zeros(8, 6, 2)
+        indices = torch.tensor([6, 2])
+        for backend_type, module in (
+            (GDNAttnBackend, gdn_backend),
+            (KDAAttnBackend, kda_backend),
+        ):
+            with self.subTest(backend=backend_type.__name__):
+                backend = object.__new__(backend_type)
+                starts = torch.tensor([0, 2, 4])
+                backend.forward_metadata = SimpleNamespace(query_start_loc=starts)
+                with patch.object(
+                    module, "causal_conv1d_fn", return_value=qkv.T
+                ) as conv:
+                    output = backend._convolve_prefill(
+                        layer, batch, qkv, states, indices
+                    )
+                torch.testing.assert_close(output, qkv)
+                args, kwargs = conv.call_args
+                torch.testing.assert_close(args[0], qkv.T)
+                self.assertIs(args[1], layer.conv_weights)
+                self.assertIsNone(args[2])
+                self.assertEqual(kwargs["activation"], "silu")
+                self.assertIs(kwargs["conv_states"], states)
+                self.assertIs(kwargs["cache_indices"], indices)
+                self.assertIs(kwargs["query_start_loc"], starts)
+                self.assertEqual(kwargs["seq_lens_cpu"], [2, 2])
+                torch.testing.assert_close(
+                    kwargs["has_initial_state"], torch.tensor([False, True])
+                )
+
+    def test_gdn_prefill_hooks_and_checkpoint_routing(self):
+        layer = SimpleNamespace(
+            layer_id=3,
+            q_dim=2,
+            k_dim=2,
+            v_dim=2,
+            num_q_heads=1,
+            num_k_heads=1,
+            num_v_heads=1,
+            head_q_dim=2,
+            head_k_dim=2,
+            head_v_dim=2,
+        )
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            extend_prefix_lens=torch.tensor([0, 64]),
+        )
+        qkv = torch.arange(24, dtype=torch.float32).view(4, 6)
+        indices = torch.tensor([6, 2])
+        metadata = ForwardMetadata(
+            query_start_loc=torch.tensor([0, 2, 4]),
+            mamba_cache_indices=indices,
+            has_mamba_track_mask=True,
+            conv_states_mask_indices=torch.tensor([4, 5]),
+            track_conv_indices=torch.tensor([[0, 1], [2, 3]]),
+            track_ssm_h_src=torch.tensor([0]),
+            track_ssm_h_dst=torch.tensor([4]),
+            track_ssm_h_batch_src=torch.tensor([1]),
+            track_chunk_idx=torch.tensor([-1, 0]),
+            track_ssm_final_src=torch.tensor([6]),
+            track_ssm_final_dst=torch.tensor([5]),
+        )
+        for snapshot in (False, True):
+            for contiguous in (True, False):
+                with self.subTest(snapshot=snapshot, contiguous=contiguous):
+                    backend = object.__new__(GDNAttnBackend)
+                    backend.forward_metadata = metadata
+                    backend.mis_metadata = None
+                    backend.requires_contiguous_prefill_state = contiguous
+                    conv_states = torch.zeros(16, 6, 2)[::2]
+                    ssm_states = torch.zeros(16, 1, 2, 2)[::2]
+                    cache = SimpleNamespace(conv=[conv_states], temporal=ssm_states)
+                    backend.req_to_token_pool = SimpleNamespace(
+                        mamba2_layer_cache=lambda _: cache
+                    )
+                    expected_indices = torch.arange(2) if contiguous else indices
+
+                    def convolve(_layer, _batch, x, states, slots):
+                        torch.testing.assert_close(slots, expected_indices)
+                        self.assertEqual(states.is_contiguous(), contiguous)
+                        states[slots] = 7
+                        return x + 10
+
+                    def extend(q, k, v, g, beta, **kwargs):
+                        self.assertEqual(kwargs["layer_id"], layer.layer_id)
+                        self.assertIs(
+                            kwargs["extend_prefix_lens"], batch.extend_prefix_lens
+                        )
+                        torch.testing.assert_close(
+                            kwargs["cache_indices"], expected_indices
+                        )
+                        self.assertEqual(
+                            kwargs["ssm_states"].is_contiguous(), contiguous
+                        )
+                        kwargs["ssm_states"][kwargs["cache_indices"]] = 5
+                        if snapshot:
+                            self.assertIs(
+                                kwargs["track_chunk_idx"], metadata.track_chunk_idx
+                            )
+                            track = kwargs["track_state"]
+                            self.assertEqual(track.dtype, torch.float32)
+                            self.assertEqual(track.shape, (2, 1, 2, 2))
+                            track[0] = 42
+                            track[1] = DOUBLE_ROUND_PROBE
+                            h = None
+                        else:
+                            self.assertIsNone(kwargs["track_state"])
+                            self.assertIsNone(kwargs["track_chunk_idx"])
+                            h = torch.full((1, 1, 1, 2, 2), 2.0)
+                        return v, None, h
+
+                    backend._convolve_prefill = Mock(side_effect=convolve)
+                    backend._prefill_gates = Mock(return_value=(None, None))
+                    backend.kernel_dispatcher = object.__new__(GDNKernelDispatcher)
+                    backend.kernel_dispatcher.extend_kernel = SimpleNamespace(
+                        supports_track_state_snapshot=snapshot, extend=extend
+                    )
+                    # Exercise the GPU gather policy with CPU tensors and fake kernels.
+                    with (
+                        patch.object(gdn_backend, "is_cpu", return_value=False),
+                        patch.object(gdn_backend, "is_cuda", return_value=False),
+                        patch.object(gdn_backend, "is_hip", return_value=False),
+                        patch.object(gdn_backend, "is_xpu", return_value=False),
+                        patch.object(gdn_backend, "is_npu", return_value=False),
+                    ):
+                        output = backend.forward_extend(layer, batch, qkv, None, None)
+                    backend._prefill_gates.assert_called_once_with(layer, None, None)
+                    torch.testing.assert_close(output.flatten(0, 2), qkv[:, 4:] + 10)
+                    torch.testing.assert_close(
+                        conv_states[[4, 5]], qkv.view(2, 2, 6).transpose(1, 2)
+                    )
+                    self.assertTrue(torch.all(conv_states[indices] == 7))
+                    self.assertTrue(torch.all(ssm_states[[6, 2, 5]] == 5))
+                    expected = DOUBLE_ROUND_PROBE if snapshot else 2.0
+                    self.assertTrue(torch.all(ssm_states[4] == expected))
 
 
 if __name__ == "__main__":
