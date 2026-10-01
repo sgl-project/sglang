@@ -283,11 +283,6 @@ def handle_data_parallelism(server_args: Any):
             "torch_memory_saver replaces the graph pool's physical memory on "
             "release/resume and registered buffers keep the released pages"
         )
-    if _dp_attention_replays_decode_graphs(server_args):
-        _disable_nccl_graph_buffer_registration(
-            "the graph-captured DP-attention gather/scatter collectives hang "
-            "the TP group with registered buffers"
-        )
 
 
 def _graph_pool_is_pausable(server_args: Any) -> bool:
@@ -296,17 +291,6 @@ def _graph_pool_is_pausable(server_args: Any) -> bool:
     return bool(
         resolving_view(server_args).enable_memory_saver
         and envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
-    )
-
-
-def _dp_attention_replays_decode_graphs(server_args: Any) -> bool:
-    """Whether decode graphs capture the DP-attention gather/scatter collectives
-    (attention-DP ranks exchanging their tokens over the TP group)."""
-    view = resolving_view(server_args)
-    return bool(
-        view.enable_dp_attention
-        and view.dp_size > 1
-        and view.cuda_graph_config.decode.backend != Backend.DISABLED
     )
 
 
@@ -325,10 +309,9 @@ def _disable_nccl_graph_buffer_registration(reason: str) -> None:
     deployment; disabling the registration removes the hang while dedicated
     all-to-all buffers alone do not.
 
-    Registered buffers also hang the TP group when the graph pool is pausable
-    (torch_memory_saver resume maps new physical pages under the capture-time
-    registrations) and when DP attention replays its `dp_gather` /
-    `dp_scatter` inside the decode graphs.
+    Registered buffers also hang the TP group when the graph pool is pausable:
+    torch_memory_saver resume maps new physical pages under the capture-time
+    registrations.
 
     Must run before the schedulers create their NCCL communicators, which
     inherit this environment. An explicit setting wins.
