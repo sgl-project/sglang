@@ -1456,10 +1456,42 @@ class OpenAIServingResponses(OpenAIServingChat):
                 }
             )
 
+        pending_reasoning: list[dict] = []
+        assistant_phase = None
+
+        def flush_reasoning():
+            for reasoning in pending_reasoning:
+                if assistant_phase is not None:
+                    reasoning["phase"] = assistant_phase
+            messages.extend(pending_reasoning)
+            pending_reasoning.clear()
+
         for input_item in self._response_input_history(request):
+            if hasattr(input_item, "model_dump"):
+                input_item = input_item.model_dump(exclude_none=True)
             normalized = self._normalize_response_message_for_chat(input_item)
-            if normalized is not None:
-                messages.append(normalized)
+            if normalized is None:
+                continue
+            item_type = input_item.get("type") if isinstance(input_item, dict) else None
+            if item_type == "reasoning":
+                # Reasoning takes the following message or tool-call group's phase,
+                # not necessarily the preceding assistant message's phase.
+                pending_reasoning.append(normalized)
+                continue
+            if isinstance(normalized, dict) and normalized.get("role") == "assistant":
+                if item_type in ("function_call", "custom_tool_call"):
+                    # Tool-call items have no phase on the wire. Keep them with
+                    # the preceding assistant message instead of splitting it.
+                    if assistant_phase is not None:
+                        normalized["phase"] = assistant_phase
+                else:
+                    assistant_phase = normalized.get("phase")
+                flush_reasoning()
+            else:
+                flush_reasoning()
+                assistant_phase = None
+            messages.append(normalized)
+        flush_reasoning()
 
         # One Responses-API assistant turn maps to multiple input items
         # (message + function_call(s)); collapse them into one chat message
