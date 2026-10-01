@@ -6,6 +6,7 @@
 
 use axum::{Router, http::StatusCode, response::Response};
 use futures::StreamExt;
+use sglang_processor::resolve_model_file;
 use std::sync::Arc;
 
 mod chat;
@@ -27,7 +28,6 @@ use crate::frontend::{
     FrontendCall, FrontendError, FrontendEvent, FrontendOutput, FrontendRequest,
 };
 use crate::message::config::ServerArgs;
-use crate::tokenizer_manager::tokenizer;
 use crate::utils::response::error_response;
 
 const MAX_OPENAI_CHOICES: usize = 4096;
@@ -51,7 +51,7 @@ pub(super) fn load_chat_support(server_args: &ServerArgs) -> Option<ChatFormatte
     if server_args.skip_tokenizer_init || server_args.tokenizer_path.is_empty() {
         return None;
     }
-    let config_file = tokenizer::resolve_model_file(
+    let config_file = resolve_model_file(
         &server_args.tokenizer_path,
         server_args.revision.as_deref(),
         "tokenizer_config.json",
