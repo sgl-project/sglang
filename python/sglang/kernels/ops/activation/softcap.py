@@ -103,6 +103,8 @@ def softcap_inplace_logits_kernel(
 
 
 def _softcap_logits(full_logits, final_logit_softcapping, output=None):
+    if output is not None:
+        assert output.shape == full_logits.shape and output.dtype == torch.float32
     if full_logits.is_contiguous() and (output is None or output.is_contiguous()):
         nrows, ncols = 1, full_logits.numel()
         row_stride = ncols
@@ -113,6 +115,10 @@ def _softcap_logits(full_logits, final_logit_softcapping, output=None):
         )
         nrows, ncols = full_logits.shape
         row_stride = full_logits.stride(0)
+        if output is not None:
+            assert output.stride(1) == 1 and (
+                nrows <= 1 or output.stride(0) >= ncols
+            ), "softcap output requires contiguous, non-overlapping rows"
 
     BLOCK_SIZE = 1024
     grid = ((ncols + BLOCK_SIZE - 1) // BLOCK_SIZE, nrows)
@@ -137,4 +143,5 @@ def softcap_inplace_logits(full_logits, final_logit_softcapping):
 
 
 def softcap_to_float32_logits(logits, final_logit_softcapping, output):
+    """Write softcapped FP32 logits to an equally shaped, row-contiguous output."""
     return _softcap_logits(logits, final_logit_softcapping, output)

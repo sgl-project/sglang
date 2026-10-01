@@ -17,11 +17,14 @@ DLLM_FULL_WINDOW = "dllm_full_window"
 
 
 class AttentionGraphVariants(Protocol):
-    # Capture order is significant when variants share a graph memory pool.
-    capture_labels: ClassVar[tuple[str, ...]]
+    def get_capture_labels(self, batch_size: int) -> tuple[str, ...]:
+        """Ordered variants to capture in the batch's shared graph memory pool."""
+        ...
 
-    def select(self, forward_batch: ForwardBatch) -> str:
-        """Select one of capture_labels for the batch."""
+    def select(
+        self, forward_batch: ForwardBatch, capture_batch_size: Optional[int] = None
+    ) -> str:
+        """Select a variant for the actual batch and its padded capture size."""
         ...
 
 
@@ -31,10 +34,16 @@ class DllmWindowGraphVariants:
     block_size: int
     capture_labels: ClassVar[tuple[str, ...]] = (DLLM_VARLEN, DLLM_FULL_WINDOW)
 
-    def select(self, forward_batch: ForwardBatch) -> str:
+    def get_capture_labels(self, batch_size: int) -> tuple[str, ...]:
+        return self.capture_labels if batch_size == 1 else (DLLM_VARLEN,)
+
+    def select(
+        self, forward_batch: ForwardBatch, capture_batch_size: Optional[int] = None
+    ) -> str:
         lengths = forward_batch.seq_lens_cpu
         if (
             forward_batch.batch_size == 1
+            and capture_batch_size in (None, 1)
             and forward_batch.forward_mode.is_dllm_extend()
             and forward_batch.input_ids.numel() == self.block_size
             and lengths is not None
@@ -45,31 +54,18 @@ class DllmWindowGraphVariants:
         return DLLM_VARLEN
 
 
-def capture_attention_graph_labels(variants: AttentionGraphVariants, batch_size: int):
-    if isinstance(variants, DllmWindowGraphVariants) and batch_size != 1:
-        return (DLLM_VARLEN,)
-    return variants.capture_labels
-
-
-def create_dllm_window_graph_variants(attn_backend, forward_mode, block_size):
-    if not forward_mode.is_dllm_extend() or block_size != 256:
-        return None
-    from sglang.srt.layers.attention.flashattention_dense_backend import (
-        FlashAttentionDenseBackend,
-    )
-
-    if isinstance(attn_backend, FlashAttentionDenseBackend):
-        return DllmWindowGraphVariants(attn_backend.sliding_window_size, block_size)
-    return None
-
-
 @dataclass(frozen=True)
 class DsaGraphVariants:
     index_topk: int
     # Dense comes first: the sparse capture peak subsumes its shared-pool storage.
     capture_labels: ClassVar[tuple[str, ...]] = (DSA_DENSE, DSA_SPARSE)
 
-    def select(self, forward_batch: ForwardBatch) -> str:
+    def get_capture_labels(self, batch_size: int) -> tuple[str, ...]:
+        return self.capture_labels
+
+    def select(
+        self, forward_batch: ForwardBatch, capture_batch_size: Optional[int] = None
+    ) -> str:
         seq_lens_cpu = forward_batch.seq_lens_cpu
         if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0:
             # Plain decode maintains this host mirror without a D2H sync.
@@ -121,7 +117,12 @@ class Dsv41CandidateGraphVariants:
     capture_labels: tuple[str, ...]
     verify_extra_tokens: int = 0
 
-    def select(self, forward_batch: ForwardBatch) -> str:
+    def get_capture_labels(self, batch_size: int) -> tuple[str, ...]:
+        return self.capture_labels
+
+    def select(
+        self, forward_batch: ForwardBatch, capture_batch_size: Optional[int] = None
+    ) -> str:
         lengths = getattr(forward_batch, "seq_lens_cpu", None)
         max_seq_len = None
         if lengths is not None and lengths.device.type == "cpu" and lengths.numel() > 0:

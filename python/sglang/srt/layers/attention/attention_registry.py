@@ -253,14 +253,11 @@ def create_flashattention_v3_backend(runner):
 
 @register_attention_backend("fa4")
 def create_flashattention_v4_backend(runner):
-    if "DiffusionGemmaForBlockDiffusion" in runner.model_config.hf_config.architectures:
-        assert get_device_capability()[0] == 10, (
-            "DiffusionGemma FA4 D256/D512 requires an SM100-family GPU."
-        )
-        from sglang.srt.layers.attention.flashattention_dense_backend import (
-            FlashAttentionDenseBackend,
-        )
+    from sglang.srt.layers.attention.flashattention_dense_backend import (
+        FlashAttentionDenseBackend,
+    )
 
+    if FlashAttentionDenseBackend.supports_model(runner.model_config):
         return FlashAttentionDenseBackend(runner)
     from sglang.srt.layers.attention.flashattention_backend import (
         FlashAttentionBackend,

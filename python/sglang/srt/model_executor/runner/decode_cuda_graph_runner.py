@@ -49,10 +49,6 @@ from sglang.srt.layers.attention.base_attn_backend import (
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.attention.graph_variants import (
     AttentionGraphVariants,
-    capture_attention_graph_labels,
-    create_attention_graph_variants,
-    create_dllm_window_graph_variants,
-    create_dsv41_candidate_graph_variants,
 )
 from sglang.srt.layers.cp.utils import is_mla_cp_enabled
 from sglang.srt.layers.dp_attention import (
@@ -312,12 +308,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
 
         self.attention_graph_variants: Optional[AttentionGraphVariants] = (
-            create_attention_graph_variants(model_runner.model_config.hf_config)
-            or create_dsv41_candidate_graph_variants(
+            self.attn_backend.get_cuda_graph_variants(
                 model_runner, self.capture_forward_mode, self.captured_req_width
-            )
-            or create_dllm_window_graph_variants(
-                self.attn_backend, self.capture_forward_mode, self.captured_req_width
             )
         )
 
@@ -605,9 +597,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return [num_tokens]
         return None
 
-    def _resolve_attention_variant(self, forward_batch: ForwardBatch) -> Optional[str]:
+    def _resolve_attention_variant(
+        self, forward_batch: ForwardBatch, capture_batch_size: int
+    ) -> Optional[str]:
         variants = self.attention_graph_variants
-        return variants.select(forward_batch) if variants is not None else None
+        return (
+            variants.select(forward_batch, capture_batch_size)
+            if variants is not None
+            else None
+        )
 
     def _resolve_lora_variant(self, forward_batch: ForwardBatch):
         if not self.record_nolora_graph:
@@ -721,7 +719,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             stream_idx=get_current_stream_idx() if self.enable_pdmux else None,
             variant_label=self._resolve_lora_variant(forward_batch),
             attention_variant=(
-                self._resolve_attention_variant(forward_batch)
+                self._resolve_attention_variant(forward_batch, cuda_graph_bs)
                 if self.disable_padding
                 else None
             ),
@@ -1132,9 +1130,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         variants = self.attention_graph_variants
         for bs in capture_range:
             attention_variants = (
-                capture_attention_graph_labels(variants, bs)
-                if variants is not None
-                else (None,)
+                variants.get_capture_labels(bs) if variants is not None else (None,)
             )
             if get_parallel().tp_rank == 0:
                 avail_mem = get_available_gpu_memory(
@@ -1375,7 +1371,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     forward_batch.input_embeds
                 )
             variant_label = self._resolve_lora_variant(forward_batch)
-            attention_variant = self._resolve_attention_variant(forward_batch)
+            attention_variant = self._resolve_attention_variant(forward_batch, self.bs)
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
             self._replay_graph_key = self._make_graph_key(
                 graph_size_key, stream_idx, variant_label, attention_variant
@@ -1508,7 +1504,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.model_runner.hisparse_coordinator.num_real_reqs.fill_(raw_bs)
 
         variant_label = self._resolve_lora_variant(forward_batch)
-        attention_variant = self._resolve_attention_variant(forward_batch)
+        attention_variant = self._resolve_attention_variant(forward_batch, bs)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         self._replay_graph_key = self._make_graph_key(
             graph_size_key, stream_idx, variant_label, attention_variant

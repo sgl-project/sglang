@@ -353,6 +353,28 @@ class FlashAttentionMLAForwardSm100:
 
         return SharedStorage
 
+    @cute.jit
+    def forward_gqa(
+        self,
+        mQ: cute.Tensor,
+        mK: cute.Tensor,
+        mValue: cute.Tensor,
+        mO: cute.Tensor,
+        mLSE: Optional[cute.Tensor],
+        softmax_scale: Float32,
+        mCuSeqlensQ: Optional[cute.Tensor] = None,
+        mCuSeqlensK: Optional[cute.Tensor] = None,
+        mSeqUsedK: Optional[cute.Tensor] = None,
+        mPageTable: Optional[cute.Tensor] = None,
+        stream: cuda.CUstream = None,
+    ):
+        self(
+            None, mQ, None, mK, mO, mLSE, softmax_scale,
+            mCuSeqlensQ=mCuSeqlensQ, mCuSeqlensK=mCuSeqlensK,
+            mSeqUsedK=mSeqUsedK, mPageTable=mPageTable,
+            stream=stream, mValue=mValue,
+        )
+
     # fmt: off
     @cute.jit
     def __call__(
@@ -374,9 +396,9 @@ class FlashAttentionMLAForwardSm100:
         mPageTable: Optional[cute.Tensor] = None,
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
-        mValue: Optional[cute.Tensor] = None,
-        # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
+        *,
+        mValue: Optional[cute.Tensor] = None,
     ):
         # fmt: on
         self.store_P = mP is not None

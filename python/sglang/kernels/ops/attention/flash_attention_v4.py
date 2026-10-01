@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from functools import lru_cache
 from typing import Callable, Optional, Tuple, Union
 
 import torch
@@ -28,7 +29,11 @@ def is_flash_attention_v4_available() -> bool:
     return _flash_attn_varlen_func is not None
 
 
-_gqa_512_compile_cache = {}
+@lru_cache(maxsize=1)
+def _get_gqa_512_jit_cache():
+    from sglang.kernels.ops.attention.flash_attn.cute.interface import _get_jit_cache
+
+    return _get_jit_cache("fwd_gqa_512")
 
 
 def flash_attn_gqa_512(
@@ -59,24 +64,16 @@ def flash_attn_gqa_512(
     if cu_seqlens_q is not None:
         cu_seqlens_q = cu_seqlens_q.to(dtype=torch.int32)
     args = (
-        None,
         q,
-        None,
         k,
+        v,
         out,
         lse,
         softmax_scale,
-        None,
-        None,
         cu_seqlens_q,
         cu_seqlens_k,
-        None,
         seqused_k,
-        None,
         page_table,
-        None,
-        None,
-        v,
     )
     key = (
         pack_gqa,
@@ -87,7 +84,8 @@ def flash_attn_gqa_512(
             for t in args
         ),
     )
-    if key not in _gqa_512_compile_cache:
+    cache = _get_gqa_512_jit_cache()
+    if key not in cache:
         compile_args = [
             to_cute_tensor(
                 t,
@@ -109,13 +107,13 @@ def flash_attn_gqa_512(
             is_varlen_q=cu_seqlens_q is not None,
             has_qk=False,
         )
-        _gqa_512_compile_cache[key] = cute.compile(
-            kernel,
+        cache[key] = cute.compile(
+            kernel.forward_gqa,
             *compile_args,
             stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options="--enable-tvm-ffi",
         )
-    _gqa_512_compile_cache[key](*args)
+    cache[key](*args)
     return out
 
 

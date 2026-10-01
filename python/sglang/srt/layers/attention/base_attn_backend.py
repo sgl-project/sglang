@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import (
         BaseIndexerMetadata,
     )
+    from sglang.srt.layers.attention.graph_variants import AttentionGraphVariants
     from sglang.srt.layers.attention.verify_mask import VerifyMask
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -159,6 +160,24 @@ class AttentionBackend(ABC):
 
     # True when prefill graph metadata can use ForwardBatch.max_seq_len_override.
     supports_prefill_cuda_graph_max_context_size: bool = False
+
+    def can_run_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
+        """Apply backend-specific limits after the runner's graph eligibility checks."""
+        return True
+
+    def get_cuda_graph_variants(
+        self, model_runner, forward_mode: ForwardMode, captured_req_width: int
+    ) -> Optional[AttentionGraphVariants]:
+        from sglang.srt.layers.attention.graph_variants import (
+            create_attention_graph_variants,
+            create_dsv41_candidate_graph_variants,
+        )
+
+        return create_attention_graph_variants(
+            model_runner.model_config.hf_config
+        ) or create_dsv41_candidate_graph_variants(
+            model_runner, forward_mode, captured_req_width
+        )
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         """Declare where this backend's scheduler-shared reads end per mode.

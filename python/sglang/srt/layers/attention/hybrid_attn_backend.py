@@ -94,8 +94,20 @@ class HybridAttnBackend(AttentionBackend):
         return self.prefill_backend.supports_full_cuda_graph_chunked_prefix
 
     @property
+    def full_cuda_graph_uses_chunked_prefix(self) -> bool:
+        return self.prefill_backend.full_cuda_graph_uses_chunked_prefix
+
+    @property
     def supports_prefill_cuda_graph_max_context_size(self) -> bool:
         return self.prefill_backend.supports_prefill_cuda_graph_max_context_size
+
+    def get_cuda_graph_variants(self, model_runner, forward_mode, captured_req_width):
+        return self._select_backend(forward_mode).get_cuda_graph_variants(
+            model_runner, forward_mode, captured_req_width
+        )
+
+    def can_run_prefill_cuda_graph(self, forward_batch):
+        return self.prefill_backend.can_run_prefill_cuda_graph(forward_batch)
 
     def prepare_full_cuda_graph_chunked_prefix(
         self,
@@ -125,12 +137,15 @@ class HybridAttnBackend(AttentionBackend):
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.decode_backend.init_cuda_graph_state(max_bs, max_num_tokens)
-        if get_spec().speculative_algorithm is not None and self.spec_attn_is_prefill:
-            # When speculative decoding is enabled, we need to initialize the backend
-            # that will be used for target_verify.
+        if self.model_runner.dllm_config is not None or (
+            get_spec().speculative_algorithm is not None and self.spec_attn_is_prefill
+        ):
+            # DLLM and prefill-backed verification capture the prefill backend.
             self.prefill_backend.init_cuda_graph_state(max_bs, max_num_tokens)
 
     def get_cuda_graph_seq_len_fill_value(self):
+        if self.model_runner.dllm_config is not None:
+            return self.prefill_backend.get_cuda_graph_seq_len_fill_value()
         return self.decode_backend.get_cuda_graph_seq_len_fill_value()
 
     def init_mha_chunk_metadata(
@@ -159,7 +174,12 @@ class HybridAttnBackend(AttentionBackend):
         ).update_verify_buffers_to_fill_after_draft(spec_info, cuda_graph_bs)
 
     def validate_elastic_cuda_graph_recapture(self) -> None:
-        self.decode_backend.validate_elastic_cuda_graph_recapture()
+        backend = (
+            self.prefill_backend
+            if self.model_runner.dllm_config is not None
+            else self.decode_backend
+        )
+        backend.validate_elastic_cuda_graph_recapture()
 
     def forward(
         self,
