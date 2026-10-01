@@ -46,6 +46,7 @@ def _accepts(
     *,
     use_mla: bool,
     unified: bool = True,
+    linear_backend: str = "triton",
     linear_decode: str | None = None,
     linear_prefill: str | None = None,
     has_asymmetric_kv: bool = False,
@@ -61,7 +62,7 @@ def _accepts(
         "attention_backend": backend,
         "prefill_attention_backend": None,
         "decode_attention_backend": None,
-        "linear_attn_backend": "triton",
+        "linear_attn_backend": linear_backend,
         "linear_attn_decode_backend": linear_decode,
         "linear_attn_prefill_backend": linear_prefill,
         "mamba_backend": "triton",
@@ -111,6 +112,10 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
         # The uniform-row screen is a property of the model, not of the
         # backend, so it rejects even Triton.
         self.assertFalse(_accepts("triton", use_mla=False, has_asymmetric_kv=True))
+
+    def test_cake_linear_attention_is_stride_safe(self):
+        for use_mla in (True, False):
+            self.assertTrue(_accepts("triton", use_mla=use_mla, linear_backend="cake"))
 
     def test_per_layer_view_mla_backends_allowed_under_unified_mla(self):
         for backend in self.PER_LAYER_VIEW_MLA_BACKENDS:

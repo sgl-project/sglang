@@ -419,7 +419,20 @@ def supports_mamba_cache_extra_buffer(view: Any, hf_config: Any) -> bool:
     if get_platform().is_xpu:
         return False
     spec = get_linear_attn_spec(hf_config)
-    if hf_config.architectures[0] in _MAMBA_EXTRA_BUFFER_ARCHS or (
+    model_arch = hf_config.architectures[0]
+    if model_arch == "KimiK3ForConditionalGeneration":
+        base = view.linear_attn_backend
+        decode = getattr(view, "linear_attn_decode_backend", None) or base
+        prefill = getattr(view, "linear_attn_prefill_backend", None) or base
+        if "cake" in {base, decode, prefill}:
+            # CAKE decode commits active rows before the common KDA tracking
+            # hook snapshots them. Tracked CAKE prefill explicitly falls back
+            # to Triton so the required intermediate states are materialized.
+            return decode in {"triton", "cake"} and prefill in {
+                "triton",
+                "cake",
+            }
+    if model_arch in _MAMBA_EXTRA_BUFFER_ARCHS or (
         spec is not None and spec.support_mamba_cache_extra_buffer
     ):
         return view.linear_attn_backend == "triton"

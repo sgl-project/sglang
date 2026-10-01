@@ -46,6 +46,7 @@ __all__ = [
     "BreakableCUDAGraph",
     "BreakableCUDAGraphCapture",
     "break_graph",
+    "is_in_breakable_cuda_graph_capture",
 ]
 
 
@@ -270,6 +271,11 @@ def eager_on_graph(enable: bool, capture_stub: Optional[Callable] = None):
         return wrapper
 
     return decorator
+
+
+def is_in_breakable_cuda_graph_capture() -> bool:
+    """True for the actual BCG recording body, including eager seams."""
+    return _current_capture_var.get() is not None
 
 
 class BreakableCUDAGraph:

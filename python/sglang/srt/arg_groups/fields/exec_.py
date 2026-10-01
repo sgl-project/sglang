@@ -453,6 +453,13 @@ class ExecMamba(msgspec.Struct):
             choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES + ["nv_cutedsl"],
         ),
     ] = None
+    kda_cake_prefill_precision: A[
+        str,
+        Arg(
+            help="Compute precision of the exported Cake KDA prefill (--linear-attn-prefill-backend cake): 'bf16' (default) runs the BF16 tensor-core export; 'tf32' runs the TF32 export (FP32 state pool required, BF16 checkpoints, bounded gates only; layers with an unbounded softplus gate such as Kimi-Linear fall back to the Triton prefill) for higher accuracy at lower throughput.",
+            choices=["bf16", "tf32"],
+        ),
+    ] = "bf16"
     # ReplaySSM buffered output-only linear-attn decode (GDN + KDA): per-slot
     # ring + periodic flush to cut per-step HBM state traffic.
     enable_linear_replayssm: A[

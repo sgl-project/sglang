@@ -64,6 +64,7 @@ def apply_kimi_k3_linear_attn_defaults(server_args: ServerArgs) -> None:
     # recurrent_kda across bs 1-256, and ReplaySSM requires triton.
     if (
         cfg.linear_attn_decode_backend is None
+        and cfg.linear_attn_backend != "cake"
         and cfg.mamba_ssm_dtype == "bfloat16"
         and get_platform().is_sm100
     ):

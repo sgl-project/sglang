@@ -22,6 +22,7 @@ from sglang.srt.arg_groups import (
 from sglang.srt.arg_groups.attention_hook import (
     handle_attention_backend_compatibility,
     handle_deterministic_inference,
+    handle_linear_attn_backend,
 )
 from sglang.srt.arg_groups.cuda_graph_hook import (
     apply_cuda_graph_compatibility,
@@ -36,6 +37,9 @@ from sglang.srt.arg_groups.hicache_hook import (
 from sglang.srt.arg_groups.hisparse_hook import (
     validate_hisparse_dsa_backend,
     validate_hisparse_kv_cache_dtype,
+)
+from sglang.srt.arg_groups.kimi_k3_hook import (
+    apply_kimi_k3_linear_attn_defaults,
 )
 from sglang.srt.arg_groups.kv_cache_hook import (
     handle_cache_compatibility,
@@ -381,6 +385,23 @@ class TestPrepareServerArgs(CustomTestCase):
 
         with self.assertRaises(SystemExit):
             parser.parse_args(base_args + ["--dsv4-prefill-backend", "flashmla_kv"])
+
+    def test_kda_cake_prefill_precision_cli_choices(self):
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+
+        base_args = ["--model-path", "dummy-model"]
+
+        default_args = parser.parse_args(base_args)
+        self.assertEqual(default_args.kda_cake_prefill_precision, "bf16")
+
+        tf32_args = parser.parse_args(
+            base_args + ["--kda-cake-prefill-precision", "tf32"]
+        )
+        self.assertEqual(tf32_args.kda_cake_prefill_precision, "tf32")
+
+        with self.assertRaises(SystemExit):
+            parser.parse_args(base_args + ["--kda-cake-prefill-precision", "fp8"])
 
     def test_return_hidden_states_mode_configuration(self):
         def _resolved(**kwargs):
@@ -1082,6 +1103,83 @@ class TestKV4Compatibility(unittest.TestCase):
         args = self._make_nvfp4_args(enable_unified_memory=True)
         with self.assertRaisesRegex(ValueError, "enable-unified-memory"):
             handle_kv4_compatibility(args)
+
+
+class TestCakeLinearAttnBackend(unittest.TestCase):
+    @override_platform(is_cuda=False, is_sm100=False)
+    def test_shared_backend_selects_cake_for_prefill_and_decode(self):
+        server_args = ServerArgs(model_path="dummy", linear_attn_backend="cake")
+
+        handle_linear_attn_backend(server_args)
+
+        self.assertEqual(
+            resolution_result(server_args, "linear_attn_decode_backend"), "cake"
+        )
+        self.assertEqual(
+            resolution_result(server_args, "linear_attn_prefill_backend"), "cake"
+        )
+
+    @override_platform(is_cuda=False, is_sm100=False)
+    def test_per_phase_override_wins_over_shared_cake_backend(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            linear_attn_backend="cake",
+            linear_attn_decode_backend="triton",
+        )
+
+        handle_linear_attn_backend(server_args)
+
+        self.assertEqual(
+            resolution_result(server_args, "linear_attn_decode_backend"), "triton"
+        )
+        self.assertEqual(
+            resolution_result(server_args, "linear_attn_prefill_backend"), "cake"
+        )
+
+    @override_platform(is_cuda=False, is_sm100=True)
+    def test_kimi_k3_default_respects_shared_cake_backend(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            linear_attn_backend="cake",
+            mamba_ssm_dtype="bfloat16",
+        )
+
+        apply_kimi_k3_linear_attn_defaults(server_args)
+        handle_linear_attn_backend(server_args)
+
+        self.assertEqual(
+            resolution_result(server_args, "linear_attn_decode_backend"), "cake"
+        )
+        self.assertEqual(
+            resolution_result(server_args, "linear_attn_prefill_backend"), "cake"
+        )
+
+    @override_platform(is_sm100=True)
+    def test_kimi_k3_default_keeps_default_triton_decode(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            mamba_ssm_dtype="bfloat16",
+        )
+
+        apply_kimi_k3_linear_attn_defaults(server_args)
+
+        self.assertEqual(
+            resolution_result(server_args, "linear_attn_decode_backend"), "triton"
+        )
+
+    @override_platform(is_sm100=True)
+    def test_kimi_k3_default_keeps_triton_decode_for_other_shared_backend(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            linear_attn_backend="cutedsl",
+            mamba_ssm_dtype="bfloat16",
+        )
+
+        apply_kimi_k3_linear_attn_defaults(server_args)
+
+        self.assertEqual(
+            resolution_result(server_args, "linear_attn_decode_backend"), "triton"
+        )
 
 
 class TestLoadBalanceMethod(unittest.TestCase):

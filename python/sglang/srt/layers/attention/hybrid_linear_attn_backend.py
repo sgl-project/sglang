@@ -34,6 +34,11 @@ from sglang.srt.layers.attention.mamba.replay_state_indices_validator import (
     validate_replay_state_indices_cpu,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.mem_cache.allocator.mamba import (
+    MAMBA_STATE_INDEX_INVARIANT,
+    MAMBA_STATE_INDEX_REPLAY_PROVENANCE,
+    _issue_state_index_contract,
+)
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -123,6 +128,39 @@ class MambaAttnBackendBase(AttentionBackend):
         state ops, incl. the cuda-graph replay-prep copy into ``state_indices_list``."""
         return self.req_to_token_pool.translate_mamba_indices(mamba_indices)
 
+    def _mamba_cache_index_contract(
+        self,
+        index_tensor: torch.Tensor,
+        *,
+        active_prefix: int,
+        active_request_ids,
+        replay_provenance=None,
+    ):
+        """Attest the post-gather/post-v2p tensor and its active envelope."""
+        allocator = self.req_to_token_pool.mamba_allocator
+        if (
+            getattr(allocator, "state_index_invariant", None)
+            is not MAMBA_STATE_INDEX_INVARIANT
+        ):
+            return None
+        if active_request_ids is None:
+            return None
+        try:
+            return _issue_state_index_contract(
+                allocator,
+                index_tensor,
+                active_prefix=active_prefix,
+                state_slots=self.req_to_token_pool.mamba_pool.size + 1,
+                active_request_ids=active_request_ids,
+                replay_provenance=replay_provenance,
+            )
+        except ValueError:
+            # Expanded/top-k batches repeat request rows, and ad-hoc callers may
+            # not carry the host request identities at all.  Neither path can
+            # honestly prove unique kernel-facing state slots, so Cake fails
+            # closed without synchronizing the CUDA index tensor to the host.
+            return None
+
     @staticmethod
     def _has_cpu_prefill_track_metadata(forward_batch: ForwardBatch) -> bool:
         return (
@@ -164,6 +202,9 @@ class MambaAttnBackendBase(AttentionBackend):
             forward_batch.req_pool_indices
         )
         mamba_cache_indices = self._translate_mamba_indices(mamba_cache_indices)
+        # DP-padded rows (beyond the original batch) are not real requests; the
+        # Cake state-index contract attests only the real-request prefix.
+        _real_bs = forward_batch._original_batch_size
         if forward_batch.mamba_track_indices is not None:
             forward_batch.mamba_track_indices = self._translate_mamba_indices(
                 forward_batch.mamba_track_indices
@@ -318,6 +359,11 @@ class MambaAttnBackendBase(AttentionBackend):
             logical_num_tokens=logical_num_tokens,
             mamba_track_mask_indices=track_mask_indices,
             mamba_cache_indices=mamba_cache_indices,
+            mamba_cache_index_contract=self._mamba_cache_index_contract(
+                mamba_cache_indices,
+                active_prefix=_real_bs if _real_bs is not None else bs,
+                active_request_ids=getattr(forward_batch, "rids", None),
+            ),
             # Physical track destinations (None when tracking off); cuda-graph
             # supplies this via the static backend buffer in _replay_metadata.
             mamba_track_indices=getattr(forward_batch, "mamba_track_indices", None),
@@ -355,6 +401,10 @@ class MambaAttnBackendBase(AttentionBackend):
             ),
             in_capture=in_capture,
             mamba_track_indices=getattr(forward_batch, "mamba_track_indices", None),
+            active_request_ids=getattr(forward_batch, "rids", None),
+            replay_provenance=getattr(
+                forward_batch, "mamba_state_index_replay_provenance", None
+            ),
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -727,6 +777,8 @@ class MambaAttnBackendBase(AttentionBackend):
         num_padding: Optional[int] = None,
         in_capture: bool = False,
         mamba_track_indices: Optional[torch.Tensor] = None,
+        active_request_ids=None,
+        replay_provenance=None,
     ):
         if num_padding is None:
             if seq_lens_cpu is None:
@@ -736,7 +788,24 @@ class MambaAttnBackendBase(AttentionBackend):
                     seq_lens_cpu == self._graph_seq_len_fill_value
                 )
         num_padding = int(num_padding)
-        if self._fused_state_indices_ok and self.replayssm_write_pos_list is None:
+        valid_bs = 0 if in_capture else bs - num_padding
+        trusted_replay_producer = (
+            replay_provenance is MAMBA_STATE_INDEX_REPLAY_PROVENANCE
+            and getattr(
+                self.req_to_token_pool.mamba_allocator,
+                "state_index_invariant",
+                None,
+            )
+            is MAMBA_STATE_INDEX_INVARIANT
+        )
+        if in_capture:
+            # DecodeInputBuffers starts with every req row equal to 0.  Gathering
+            # that mapping would produce duplicate padding slot 0 and cannot be
+            # attested.  Capture Cake with an honestly empty active envelope;
+            # replay refreshes this same stable buffer before graph launch.
+            mamba_indices = self.state_indices_list[bs - 1]
+            mamba_indices.fill_(-1)
+        elif self._fused_state_indices_ok and self.replayssm_write_pos_list is None:
             # Single-launch fast path: mapping gather + padding sentinel + store
             # into the static buffer, plus zeroing padded req_pool_indices rows —
             # bit-identical to the reference chain below.
@@ -744,7 +813,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 req_pool_indices=req_pool_indices,
                 mamba_index_mapping=self.req_to_token_pool.req_index_to_mamba_index_mapping,
                 out_state_indices=self.state_indices_list[bs - 1],
-                valid_bs=bs - int(num_padding),
+                valid_bs=valid_bs,
                 total_bs=bs,
                 v2p=self.req_to_token_pool.mamba_v2p_table,
             )
@@ -884,6 +953,23 @@ class MambaAttnBackendBase(AttentionBackend):
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
         qsl_buf = self.query_start_loc_list[bs - 1]
 
+        contract_request_ids = active_request_ids
+        if in_capture:
+            contract_request_ids = () if trusted_replay_producer else None
+        mamba_cache_index_contract = self._mamba_cache_index_contract(
+            self.state_indices_list[bs - 1],
+            active_prefix=valid_bs,
+            active_request_ids=contract_request_ids,
+            replay_provenance=replay_provenance,
+        )
+        if trusted_replay_producer and mamba_cache_index_contract is None:
+            # A supported runner may have captured Cake against this stable
+            # buffer.  It must never launch that graph after refreshing the
+            # buffer from an unproved/duplicate request set.
+            raise RuntimeError(
+                "CUDA graph Mamba replay lost its unique active-request provenance"
+            )
+
         if is_target_verify and self.topk > 1:
             if (
                 spec_info is not None
@@ -899,6 +985,7 @@ class MambaAttnBackendBase(AttentionBackend):
             return ForwardMetadata(
                 query_start_loc=qsl_buf,
                 mamba_cache_indices=self.state_indices_list[bs - 1],
+                mamba_cache_index_contract=mamba_cache_index_contract,
                 mamba_track_indices=track_buf,
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
@@ -910,6 +997,7 @@ class MambaAttnBackendBase(AttentionBackend):
             return ForwardMetadata(
                 query_start_loc=qsl_buf,
                 mamba_cache_indices=self.state_indices_list[bs - 1],
+                mamba_cache_index_contract=mamba_cache_index_contract,
                 mamba_track_indices=track_buf,
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
@@ -1070,6 +1158,10 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             ),
             in_capture=in_capture,
             mamba_track_indices=getattr(forward_batch, "mamba_track_indices", None),
+            active_request_ids=getattr(forward_batch, "rids", None),
+            replay_provenance=getattr(
+                forward_batch, "mamba_state_index_replay_provenance", None
+            ),
         )
         spec_info = forward_batch.spec_info
         draft_token_num = spec_info.draft_token_num if spec_info is not None else 1

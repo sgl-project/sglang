@@ -20,7 +20,7 @@ from sglang.srt.layers.attention.linear.utils import (
     select_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.utils import is_cpu, is_cuda, is_npu
+from sglang.srt.utils import get_bool_env_var, is_cpu, is_cuda, is_npu
 from sglang.srt.utils.common import is_gfx95_supported, rank0_log
 
 # KDA always uses the triton causal_conv1d_fn (no CUDA override).
@@ -43,6 +43,12 @@ from sglang.srt.runtime_context import (
     get_platform,
     get_spec,
 )
+
+
+def _k3_fused_decode_enabled(decode_kernel) -> bool:
+    return getattr(decode_kernel, "supports_k3_fused_decode", True) and not (
+        get_bool_env_var("SGLANG_DISABLE_K3_FUSED_DECODE")
+    )
 
 
 class KDAKernelDispatcher:
@@ -94,10 +100,22 @@ class KDAKernelDispatcher:
             )
 
             self.decode_kernel = FlashInferKDAKernel()
+        elif decode_backend.is_cake():
+            # Exported CAKE recurrent_kda T=1 backend. Its strict public
+            # contract differs from the default FlashInfer CuTe-DSL path, so
+            # the wrapper performs the gate/state adaptation explicitly.
+            if not is_cuda():
+                raise ValueError("KDA CAKE backend requires CUDA")
+            from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (
+                CakeKDAKernel,
+            )
+
+            self.decode_kernel = CakeKDAKernel()
         else:
             raise ValueError(
                 f"Unsupported KDA decode backend: {decode_backend}. "
-                "KDA supports 'triton', 'helion', 'cutedsl', or 'flashinfer'."
+                "KDA supports 'triton', 'helion', 'cutedsl', 'flashinfer', "
+                "or 'cake'."
             )
 
         # target_verify kernel, selected via --linear-attn-verify-backend (defaults
@@ -139,6 +157,17 @@ class KDAKernelDispatcher:
         elif prefill_backend.is_helion():
             assert helion_kernel is not None
             self.extend_kernel = helion_kernel
+        elif prefill_backend.is_cake():
+            if not is_cuda():
+                raise ValueError("KDA CAKE prefill backend requires CUDA")
+            if decode_backend.is_cake():
+                self.extend_kernel = self.decode_kernel
+            else:
+                from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (
+                    CakeKDAKernel,
+                )
+
+                self.extend_kernel = CakeKDAKernel()
         elif prefill_backend.is_flashkda():
             from sglang.srt.layers.attention.linear.kernels.kda_flashkda import (
                 FlashKDAKernel,
@@ -195,9 +224,9 @@ class KDAKernelDispatcher:
         else:
             raise ValueError(
                 f"Unsupported KDA prefill backend: {prefill_backend}. "
-                "KDA supports 'triton', 'helion', 'flashkda', 'cutedsl', "
-                "'nvidia_kda', or 'ptx_kda' (cutedsl/nvidia_kda prefill need "
-                "SM100, ptx_kda SM100 or SM103)."
+                "KDA supports 'triton', 'helion', 'cake', 'flashkda', "
+                "'cutedsl', 'nvidia_kda', or 'ptx_kda' "
+                "(cake/cutedsl/nvidia_kda prefill need SM100, ptx_kda SM100 or SM103)."
             )
 
         self.supports_packed_decode = getattr(
@@ -210,6 +239,14 @@ class KDAKernelDispatcher:
             f"extend={self.extend_kernel.__class__.__name__} "
             f"packed_decode={self.supports_packed_decode}"
         )
+
+    @property
+    def extend_uses_state_checkpoints(self) -> bool:
+        return self.extend_kernel.uses_state_checkpoints
+
+    @property
+    def extend_uses_cake_prefill(self) -> bool:
+        return getattr(self.extend_kernel, "uses_cake_prefill", False)
 
     def packed_decode(
         self,
@@ -224,6 +261,8 @@ class KDAKernelDispatcher:
         cache_indices: torch.Tensor,
         num_v_heads: int,
         head_v_dim: int,
+        cache_index_contract=None,
+        layer_id: int,
         **kwargs,
     ) -> Optional[torch.Tensor]:
         """Attempt packed decode. Returns output tensor or None if the decode
@@ -241,6 +280,8 @@ class KDAKernelDispatcher:
             cache_indices=cache_indices,
             num_v_heads=num_v_heads,
             head_v_dim=head_v_dim,
+            cache_index_contract=cache_index_contract,
+            layer_id=layer_id,
             **kwargs,
         )
 
@@ -260,12 +301,13 @@ class KDAKernelDispatcher:
         lower_bound: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
-        if lower_bound is not None and not isinstance(
-            self.decode_kernel, TritonKDAKernel
+        if lower_bound is not None and not getattr(
+            self.decode_kernel, "supports_bounded_gate_decode", False
         ):
             raise NotImplementedError(
-                f"lower_bound (safe gate) is only supported by TritonKDAKernel; "
-                f"got {self.decode_kernel.__class__.__name__}."
+                "lower_bound (safe gate) decode is not implemented by "
+                f"{self.decode_kernel.__class__.__name__}; use "
+                "--linear-attn-decode-backend triton or cake."
             )
         return self.decode_kernel.decode(
             q,
@@ -351,9 +393,12 @@ class KDAKernelDispatcher:
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
+        layer_id: int,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         kernel = self.effective_extend_kernel(kwargs.get("lower_bound"))
+        if getattr(kernel, "supports_cake_route_telemetry", False):
+            kwargs["layer_id"] = layer_id
         return kernel.extend(
             q,
             k,
@@ -429,6 +474,17 @@ class KDAAttnBackend(MambaAttnBackendBase):
         self.kernel_dispatcher = KDAKernelDispatcher(
             decode_backend, prefill_backend, verify_backend
         )
+        fused_decode_supported = getattr(
+            self.kernel_dispatcher.decode_kernel, "supports_k3_fused_decode", True
+        )
+        self._allow_fused_decode = _k3_fused_decode_enabled(
+            self.kernel_dispatcher.decode_kernel
+        )
+        if fused_decode_supported and not self._allow_fused_decode:
+            rank0_log(
+                "K3 fused KDA decode disabled by "
+                "SGLANG_DISABLE_K3_FUSED_DECODE; using the selected decode backend."
+            )
         # One-shot; emitted at the first fused-decode interception below.
         self._fused_override_notice = (
             "K3 fused KDA decode engaged: --linear-attn-decode-backend "
@@ -533,6 +589,15 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
+        if (
+            self.kernel_dispatcher.extend_uses_cake_prefill
+            and forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_target_verify()
+            and not forward_batch.forward_mode.is_draft_extend_v2()
+        ):
+            self.forward_metadata.kda_cake_query_start_loc = (
+                self.forward_metadata.query_start_loc.to(torch.int64)
+            )
         if self.forward_metadata.has_mamba_track_mask:
             if self.forward_metadata.mamba_track_mask_indices is None:
                 self.forward_metadata.mamba_track_mask_indices = (
@@ -543,6 +608,14 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     self.forward_metadata.mamba_track_mask_indices
                 ]
             )
+            if self.kernel_dispatcher.extend_uses_state_checkpoints:
+                from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (
+                    maybe_build_cake_checkpoint_plan,
+                )
+
+                maybe_build_cake_checkpoint_plan(
+                    forward_batch, self.forward_metadata, self.device
+                )
 
     def forward_decode(
         self,
@@ -662,7 +735,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # the output-norm gate for this forward (attempt-and-verify stash,
         # see kimi_k3.py) and the shapes are covered; the model applies the
         # norm itself whenever the stash is left unconsumed.
-        if replayssm_d is None:
+        if self._allow_fused_decode and replayssm_d is None:
             fused_static = getattr(layer, "_k3_fused_decode_args", None)
             onorm_gate = getattr(layer, "_k3_onorm_gate", None)
             if (
@@ -757,6 +830,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 cache_indices=cache_indices,
                 num_v_heads=layer.num_v_heads,
                 head_v_dim=layer.head_v_dim,
+                cache_index_contract=(self.forward_metadata.mamba_cache_index_contract),
+                layer_id=layer.layer_id,
                 lower_bound=layer.lower_bound,
                 replayssm_d=replayssm_d,
                 replayssm_k=replayssm_k,
@@ -786,6 +861,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
             lower_bound=layer.lower_bound,
+            layer_id=layer.layer_id,
         )
 
         self._track_mamba_state_decode(
@@ -894,17 +970,24 @@ class KDAAttnBackend(MambaAttnBackendBase):
             extend_kernel = self.kernel_dispatcher.effective_extend_kernel(
                 layer.lower_bound
             )
-            assert extend_kernel.supports_track_state_snapshot, (
-                f"{type(extend_kernel).__name__} cannot write the fp32 track "
-                f"snapshot required by the mamba track path; use "
-                f"--linear-attn-prefill-backend triton or "
-                f"--mamba-radix-cache-strategy no_buffer"
-            )
-            h_track_buf = torch.empty(
-                (track_chunk_idx.shape[0], *ssm_states.shape[1:]),
-                dtype=torch.float32,
-                device=ssm_states.device,
-            )
+            if extend_kernel.supports_track_state_snapshot:
+                h_track_buf = torch.empty(
+                    (track_chunk_idx.shape[0], *ssm_states.shape[1:]),
+                    dtype=torch.float32,
+                    device=ssm_states.device,
+                )
+            else:
+                # CAKE materializes the tracked chunk-boundary states itself
+                # (native state checkpoints from maybe_build_cake_checkpoint_plan,
+                # or the Triton fallback's per-chunk ``h``) and returns them as
+                # ``h``; _track_mamba_state_extend reads that path whenever no
+                # fp32 snapshot buffer is handed in.
+                assert getattr(extend_kernel, "uses_cake_prefill", False), (
+                    f"{type(extend_kernel).__name__} cannot write the fp32 track "
+                    f"snapshot required by the mamba track path; use "
+                    f"--linear-attn-prefill-backend triton or "
+                    f"--mamba-radix-cache-strategy no_buffer"
+                )
         core_attn_out = self.kernel_dispatcher.extend(
             q=q,
             k=k,
@@ -914,13 +997,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
+            layer_id=layer.layer_id,
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
             lower_bound=layer.lower_bound,
             beta_is_raw=gate_was_flat,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             extend_prefix_lens=forward_batch.extend_prefix_lens,
-            layer_id=layer.layer_id,
             # draft_extend_v2 must stay rollback-able, so kernels that commit state
             # in place (e.g. FlashKDA) must not run for it.
             is_spec_decode=forward_batch.forward_mode.is_draft_extend_v2(),
@@ -933,6 +1016,14 @@ class KDAAttnBackend(MambaAttnBackendBase):
             ),
             track_state=h_track_buf,
             track_chunk_idx=(track_chunk_idx if h_track_buf is not None else None),
+            cake_query_start_loc=self.forward_metadata.kda_cake_query_start_loc,
+            state_checkpoint_cu_starts=(
+                self.forward_metadata.state_checkpoint_cu_starts
+            ),
+            num_state_checkpoints=self.forward_metadata.num_state_checkpoints,
+            state_checkpoint_every_n_tokens=(
+                self.forward_metadata.state_checkpoint_every_n_tokens
+            ),
         )
         if track_ssm:
             # Snapshot the SSM state at the last track-aligned chunk boundary

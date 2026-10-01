@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, patch
@@ -6,7 +7,10 @@ import torch
 
 from sglang.srt.arg_groups.attention_hook import handle_linear_attn_backend
 from sglang.srt.arg_groups.overrides import resolution_result
-from sglang.srt.layers.attention.linear.kda_backend import KDAKernelDispatcher
+from sglang.srt.layers.attention.linear.kda_backend import (
+    KDAKernelDispatcher,
+    _k3_fused_decode_enabled,
+)
 from sglang.srt.layers.attention.linear.kernels.kda_helion import HelionKDAKernel
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
@@ -18,6 +22,17 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestHelionKDADispatcher(unittest.TestCase):
+    def test_fused_decode_environment_opt_out(self):
+        supported_kernel = MagicMock(supports_k3_fused_decode=True)
+        unsupported_kernel = MagicMock(supports_k3_fused_decode=False)
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(_k3_fused_decode_enabled(supported_kernel))
+            self.assertFalse(_k3_fused_decode_enabled(unsupported_kernel))
+        with patch.dict(
+            os.environ, {"SGLANG_DISABLE_K3_FUSED_DECODE": "1"}, clear=True
+        ):
+            self.assertFalse(_k3_fused_decode_enabled(supported_kernel))
+
     def _make_dispatcher(self, decode_backend, prefill_backend):
         helion_kernel = MagicMock(supports_packed_decode=True)
         with (

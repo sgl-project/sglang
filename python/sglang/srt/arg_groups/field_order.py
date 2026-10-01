@@ -352,6 +352,7 @@ POSITIONAL_FIELD_ORDER = (
     "linear_attn_decode_backend",
     "linear_attn_prefill_backend",
     "linear_attn_verify_backend",
+    "kda_cake_prefill_precision",
     "enable_linear_replayssm",
     "linear_replayssm_cache_len",
     "enable_linear_replayssm_spec",

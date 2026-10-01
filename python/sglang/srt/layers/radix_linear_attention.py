@@ -215,6 +215,15 @@ def _unified_linear_attention_with_output_impl(
     return
 
 
+def _trim_linear_attention_gate_tokens(
+    a: torch.Tensor, b: torch.Tensor, num_tokens: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Trim KDA singleton-batch or GDN token-leading gate tensors."""
+    if a.ndim >= 3 and a.shape[0] == 1:
+        return a[:, :num_tokens], b[:, :num_tokens]
+    return a[:num_tokens], b[:num_tokens]
+
+
 @register_custom_op(mutates_args=["output"])
 @register_split_op()
 def unified_linear_attention_with_output(
