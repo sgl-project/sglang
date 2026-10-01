@@ -294,6 +294,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
             startup_ready: cfg.server_args.skip_server_warmup,
             is_disaggregation: cfg.server_args.is_disaggregation(),
             mm_limits: cfg.server_args.limit_mm_data_per_request.clone(),
+            metadata: crate::frontend::FrontendMetadata::from(cfg.server_args.as_ref()),
         },
     );
 

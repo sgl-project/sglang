@@ -17,8 +17,8 @@ from sglang.srt.layers import layer_boundary as comm
 from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.layer_boundary import (
     Layout,
+    OutputContract,
     StageKind,
-    StageOutput,
     SumGroup,
 )
 from sglang.srt.layers.layer_boundary import prepare as comm_ops
@@ -103,7 +103,7 @@ class TestLayerNormSPValidation(CustomTestCase):
     VALID = dict(
         architecture="Qwen3ForCausalLM",
         tp_size=2,
-        enable_dp_attention=False,
+        attn_dp_enabled=False,
         speculative_algorithm=None,
     )
 
@@ -119,8 +119,8 @@ class TestLayerNormSPValidation(CustomTestCase):
             validate_layernorm_sp(**{**self.VALID, "tp_size": 1})
 
     def test_rejects_dp_attention(self):
-        with self.assertRaisesRegex(ValueError, "dp-attention"):
-            validate_layernorm_sp(**{**self.VALID, "enable_dp_attention": True})
+        with self.assertRaisesRegex(ValueError, "attention DP"):
+            validate_layernorm_sp(**{**self.VALID, "attn_dp_enabled": True})
 
     def test_rejects_speculative(self):
         with self.assertRaisesRegex(ValueError, "speculative"):
@@ -151,40 +151,40 @@ class TestSpRegionSteps(CustomTestCase):
 
     def communicator(self, *, first_layer):
         c = stub_plan()
-        c._paths[BatchVariant.SEQUENCE_PARALLEL] = sp_region_steps()
-        c._paths[BatchVariant.INPUT_SCATTERED] = None
-        c._paths[BatchVariant.CONTEXT_PARALLEL] = None
+        c.paths[BatchVariant.SEQUENCE_PARALLEL] = sp_region_steps()
+        c.paths[BatchVariant.INPUT_SCATTERED] = None
+        c.paths[BatchVariant.CONTEXT_PARALLEL] = None
         c.enters_stack = first_layer
         c.is_sparse = False
         c._attn_input_fusions = ()
         c.norm = _Norm()
         c.qkv_latent_func = None
-        c._paths[BatchVariant.ORDINARY] = self.ordinary_steps(
+        c.paths[BatchVariant.ORDINARY] = self.ordinary_steps(
             MagicMock(side_effect=AssertionError("moved"))
         )
         return c
 
     def ordinary_steps(self, attention_input):
         """The layer's steps outside the region, which must not run inside it."""
-        return comm.StageSteps(
-            entry=comm.StageEntry(
+        return comm.StagePath(
+            entry=comm.EntryPath(
                 prepare=partial(
-                    comm_ops._consumer_step,
+                    comm_ops._run_entry,
                     step=partial(
-                        comm_ops._read_input,
-                        layer_input=None,
+                        comm_ops._update_read,
+                        pre_move=None,
                         enters_stack=False,
-                        read=comm.NORM_QUANT_READ,
-                        update=comm.ADD,
+                        read=comm.NORM_QUANT_READOUT,
+                        update=comm.PLAIN_ADD,
                     ),
                     carried_fusions=(),
-                    adds_plainly=True,
+                    is_plain_add=True,
                 ),
                 input_rows=comm.Layout(frozenset()),
                 input_move=attention_input,
-                handoff=comm_ops._hand_qkv_hook_its_input,
+                attn_input_adapter=comm_ops._attn_input_default,
             ),
-            output=StageOutput(Layout(frozenset()), group=SumGroup.TP),
+            output=OutputContract(Layout(frozenset()), group=SumGroup.TP),
             output_move=MagicMock(side_effect=AssertionError("postprocess ran")),
         )
 
@@ -220,7 +220,7 @@ class TestSpRegionSteps(CustomTestCase):
     def test_decode_leaves_the_region_closed(self):
         communicator = self.communicator(first_layer=True)
         move = MagicMock(side_effect=lambda **k: k["hidden_states"])
-        communicator._paths[BatchVariant.ORDINARY] = self.ordinary_steps(move)
+        communicator.paths[BatchVariant.ORDINARY] = self.ordinary_steps(move)
         (h, _), active, scatter = self.run_prepare_attn(
             communicator, ForwardMode.DECODE, torch.ones(2, 4), None
         )
@@ -230,7 +230,7 @@ class TestSpRegionSteps(CustomTestCase):
 
     def test_a_later_layer_does_not_reopen_the_region(self):
         communicator = self.communicator(first_layer=False)
-        communicator._paths[BatchVariant.ORDINARY] = self.ordinary_steps(
+        communicator.paths[BatchVariant.ORDINARY] = self.ordinary_steps(
             MagicMock(side_effect=lambda **k: k["hidden_states"])
         )
         _, active, scatter = self.run_prepare_attn(

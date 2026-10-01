@@ -36,11 +36,11 @@ use super::{
     AppState, ChatFormatter, ChatTemplateKwargs, collect_output, contains_media, error_payload,
     indexed_decode_stream, openai_error, submit_generation, unix_seconds_u32,
 };
-use crate::frontend::FrontendCall;
+use crate::api_server::frontend_error_status;
+use crate::frontend::{FrontendCall, FrontendEvent, FrontendRequest};
 use crate::message::config::{DefaultSamplingParams, ServerArgs};
 use crate::message::ids::Rid;
-use crate::message::request::GenerateRequest;
-use crate::message::response::{ChunkExtras, ResponseItem};
+use crate::message::response::ChunkExtras;
 use crate::message::sampling::SamplingParams;
 use crate::message::types::OneOrMany;
 
@@ -204,7 +204,7 @@ async fn chat_completions(
                 .expect("chat prompt exists until the last choice")
                 .clone()
         };
-        let native = GenerateRequest {
+        let native = FrontendRequest {
             rid: rid.clone(),
             text: Some(choice_prompt),
             // Rendered templates own their special tokens — the pool must not
@@ -580,47 +580,20 @@ pub(super) fn chat_event_stream(
         }
 
         let mut events = futures::stream::select_all(streams);
-        while let Some((index, item)) = events.next().await {
-            let Some(item) = item else {
-                yield Annotated {
-                    data: None,
-                    id: None,
-                    event: None,
-                    comment: None,
-                    error: Some(error_payload(StatusCode::INTERNAL_SERVER_ERROR, "response truncated before completion").to_string()),
-                };
-                continue;
-            };
-            let output = match item {
-                ResponseItem::Frame(output) => output,
-                ResponseItem::Done(output) => output,
-                ResponseItem::Error(error) => {
+        while let Some((index, event)) = events.next().await {
+            let output = match event {
+                FrontendEvent::Delta(output) | FrontendEvent::Finished(output) => output,
+                FrontendEvent::Failed(error) => {
                     yield Annotated {
                         data: None,
                         id: None,
                         event: None,
                         comment: None,
-                        error: Some(error_payload(StatusCode::from_u16(error.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), error.to_string()).to_string()),
+                        error: Some(error_payload(frontend_error_status(&error), error.to_string()).to_string()),
                     };
                     continue;
                 }
-                ResponseItem::Control(_) | ResponseItem::Data(_) => continue,
             };
-            if let Some((code, message)) = output
-                .finish_reason
-                .as_ref()
-                .and_then(|reason| reason.abort_status())
-            {
-                yield Annotated {
-                    data: None,
-                    id: None,
-                    event: None,
-                    comment: None,
-                    error: Some(error_payload(StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), message).to_string()),
-                };
-                continue;
-            }
-
             if prompt_tokens == 0 {
                 prompt_tokens = output.prompt_tokens;
             }
