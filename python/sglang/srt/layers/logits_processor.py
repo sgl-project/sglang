@@ -24,6 +24,9 @@ import torch
 from torch import nn
 
 from sglang.kernels.ops.activation.softcap import (
+    softcap_copy_logits,
+)
+from sglang.kernels.ops.activation.softcap import (
     softcap_inplace_logits as fused_softcap,
 )
 from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
@@ -945,11 +948,25 @@ class LogitsProcessor(nn.Module):
                 "dp_logits_scatter_returned", logits_shape=tuple(logits.shape)
             )
 
+        fuse_copy_softcap = (
+            bool(self.final_logit_softcapping)
+            and logits_metadata.forward_mode.is_dllm_extend()
+            and logits.is_cuda
+            and logits.dtype == torch.bfloat16
+            and logits.ndim == 2
+            and logits.shape[0] >= 32
+            and logits.shape[1] >= 65536
+            and logits.stride(1) == 1
+            and torch.cuda.get_device_capability(logits.device)[0] == 10
+        )
         logits = self._copy_logits_to_buffer(
-            logits, logits_metadata, use_buffer=use_logits_buffer
+            logits,
+            logits_metadata,
+            use_buffer=use_logits_buffer,
+            softcap=self.final_logit_softcapping if fuse_copy_softcap else None,
         )
 
-        if self.final_logit_softcapping:
+        if self.final_logit_softcapping and not fuse_copy_softcap:
             if not (_is_npu or _is_cpu):
                 fused_softcap(logits, self.final_logit_softcapping)
             else:
@@ -1148,6 +1165,7 @@ class LogitsProcessor(nn.Module):
         logits: torch.Tensor,
         logits_metadata: LogitsMetadata,
         use_buffer: bool = True,
+        softcap: Optional[float] = None,
     ) -> torch.Tensor:
         logits_buffer = logits_metadata.next_token_logits_buffer if use_buffer else None
         if logits.shape[-1] > self.vocab_size:
@@ -1159,9 +1177,16 @@ class LogitsProcessor(nn.Module):
             logits.shape
         ):
             assert logits_buffer.dtype == torch.float
+            if softcap is not None:
+                return softcap_copy_logits(logits, logits_buffer, softcap)
             logits_buffer.copy_(logits)
             logits = logits_buffer
         else:
+            if softcap is not None:
+                output = torch.empty_like(
+                    logits, dtype=torch.float32, memory_format=torch.contiguous_format
+                )
+                return softcap_copy_logits(logits, output, softcap)
             logits = logits.float()
         return logits
 

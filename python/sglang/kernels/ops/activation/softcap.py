@@ -118,3 +118,36 @@ def softcap_inplace_logits(full_logits, final_logit_softcapping):
         BLOCK_SIZE=BLOCK_SIZE,
     )
     return full_logits
+
+
+@triton.jit
+def _softcap_copy_logits_kernel(
+    INPUT, OUTPUT, cap, ncols, input_stride, output_stride, BLOCK: tl.constexpr
+):
+    row = tl.program_id(1).to(tl.int64)
+    col = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(INPUT + row * input_stride + col, col < ncols, other=0).to(tl.float32)
+    # Match copy-to-FP32 followed by softcap_inplace_logits exactly.
+    x = x / cap
+    x = libdevice.tanh(x)
+    x = x * cap
+    tl.store(OUTPUT + row * output_stride + col, x, col < ncols)
+
+
+def softcap_copy_logits(logits, output, cap):
+    """Copy and softcap into an existing FP32 buffer, preserving its identity."""
+    assert logits.shape == output.shape and logits.ndim == 2
+    assert logits.stride(1) == output.stride(1) == 1
+    assert output.dtype == torch.float32 and logits.device == output.device
+    if logits.numel() == 0:
+        return output
+    if logits.is_contiguous() and output.is_contiguous():
+        rows, cols = 1, logits.numel()
+        input_stride = output_stride = cols
+    else:
+        rows, cols = logits.shape
+        input_stride, output_stride = logits.stride(0), output.stride(0)
+    _softcap_copy_logits_kernel[(triton.cdiv(cols, 2048), rows)](
+        logits, output, cap, cols, input_stride, output_stride, 2048, num_warps=4
+    )
+    return output
