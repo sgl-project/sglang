@@ -1089,10 +1089,19 @@ class Fp8LinearMethod(LinearMethodBase):
                         # Otherwise, by default, aiter only uses per-tensor quantization
                         self.use_per_token_if_dynamic = True
                         if _is_fp8_fnuz:
-                            weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
-                                weight=weight,
-                                weight_scale=weight_scale,
+                            # Double the static input_scale too: apply_fp8_linear still
+                            # consumes it, so it must match the fnuz reinterpretation.
+                            weight, weight_scale, input_scale = (
+                                normalize_e4m3fn_to_e4m3fnuz(
+                                    weight=weight,
+                                    weight_scale=weight_scale,
+                                    input_scale=layer.input_scale,
+                                )
                             )
+                            if input_scale is not None:
+                                layer.input_scale = Parameter(
+                                    input_scale, requires_grad=False
+                                )
                         if use_aiter_bpreshuffle_gemm(weight.shape[0]):
                             weight = shuffle_weight(weight.contiguous(), (16, 16))
                 else:
