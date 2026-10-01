@@ -198,9 +198,7 @@ class TestPPSpecGate(CustomTestCase):
             # DP attention partitions the batch per DP rank, so the stages
             # would no longer rebuild the same verify tree.
             with self.assertRaises(AssertionError):
-                self._server_args(
-                    tp_size=2, dp_size=2, enable_dp_attention=True
-                ).check_server_args()
+                self._server_args(tp_size=2, attn_dp_size=2).check_server_args()
             # Adaptive spec changes num_draft_tokens at runtime, which the
             # relay slices results with.
             with self.assertRaises(AssertionError):

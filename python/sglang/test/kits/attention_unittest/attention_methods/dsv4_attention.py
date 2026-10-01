@@ -364,7 +364,6 @@ class MockDSV4ModelRunner:
             disaggregation_mode=None,
             dp_size=1,
             enable_deterministic_inference=False,
-            enable_dp_attention=False,
             enable_mis=False,
             is_embedding=False,
             kv_cache_dtype="auto",

@@ -186,8 +186,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Use the same attention topology during draft construction and execution.
         self.draft_owns_attention = (
-            get_parallel().enable_dp_attention
-            and self.speculative_algorithm.is_eagle3()
+            get_parallel().attn_dp_enabled and self.speculative_algorithm.is_eagle3()
         )
         with (
             draft_tp_context(self.draft_owns_attention),
@@ -1052,6 +1051,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         next_token_ids = batch_result.next_token_ids.to(torch.int64)
 
         # Prepare for draft extend in a separate stream
+        if self.plan_stream:
+            self.plan_stream.wait_stream(
+                torch.get_device_module(self.device).current_stream()
+            )
         with self.plan_stream_ctx:
             forward_batch = prepare_for_draft_extend(
                 draft_extend_input,

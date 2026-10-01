@@ -85,7 +85,7 @@ class TestEnableMetrics(CustomTestCase):
             self.assertIn("1", num_prefill_ranks_values)
 
         self._execute_core(
-            other_args=["--tp", "2", "--dp", "2", "--enable-dp-attention"],
+            other_args=["--tp", "2", "--attn-dp-size", "2"],
             verify_metrics_extra=_verify_metrics_extra,
             expect_mfu_metrics=True,
             enable_mfu_metrics=True,

@@ -176,7 +176,7 @@ export const GLM47Deployment = () => {
         cmd += ` \\\n  --max-context-length 8192 \\\n  --mem-fraction-static 0.9`;
       }
       if (strategyArray.includes('dp')) {
-        cmd += ` \\\n  --dp 8 \\\n  --enable-dp-attention`;
+        cmd += ` \\\n  --attn-dp-size 8`;
       }
       if (strategyArray.includes('ep')) {
         cmd += ` \\\n  --ep 8`;

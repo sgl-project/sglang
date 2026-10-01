@@ -162,9 +162,11 @@ def _allocate_decode_buffers(
             encoder_lens = None
 
         if require_mlp_tp_gather:
-            global_num_tokens_gpu = torch.zeros((parallel.dp_size,), dtype=torch.int32)
+            global_num_tokens_gpu = torch.zeros(
+                (parallel.num_dp_ranks,), dtype=torch.int32
+            )
             global_num_tokens_for_logprob_gpu = torch.zeros(
-                (parallel.dp_size,), dtype=torch.int32
+                (parallel.num_dp_ranks,), dtype=torch.int32
             )
         else:
             global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
@@ -226,8 +228,8 @@ class BaseRunner(ABC):
         self.model_runner = model_runner
         self.device = model_runner.device
         self.device_module = torch.get_device_module(self.device)
-        # elastic-EP scale-up rewrites dp_size on the published config
-        self.dp_size = get_parallel().dp_size
+        # elastic-EP scale-up widens num_dp_ranks on the published config
+        self.num_dp_ranks = get_parallel().num_dp_ranks
         self.pp_size = get_parallel().pp_size
         self.enable_pdmux = get_disagg().enable_pdmux
         self.return_hidden_states_mode = (
@@ -613,7 +615,7 @@ class BaseRunner(ABC):
             assert require_mlp_tp_gather_ or require_attn_tp_gather_
 
         if require_mlp_tp_gather_:
-            global_num_tokens_cpu = [num_tokens] * get_parallel().dp_size
+            global_num_tokens_cpu = [num_tokens] * get_parallel().num_dp_ranks
         elif require_attn_tp_gather_:
             global_num_tokens_cpu = [num_tokens]
         else:
