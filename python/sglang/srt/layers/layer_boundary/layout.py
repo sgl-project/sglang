@@ -73,6 +73,7 @@ class SumGroup(Enum):
     from get_parallel() when the sum runs."""
 
     ATTN_TP = auto()
+    ATTN_CP = auto()
     TP = auto()
     # The group one all-reduce of a MoE output runs over.
     MOE_OUTPUT = auto()
@@ -145,6 +146,8 @@ def _sum_group(group: SumGroup) -> GroupCoordinator:
     parallel = get_parallel()
     if group is SumGroup.ATTN_TP:
         return parallel.attn_tp_group
+    if group is SumGroup.ATTN_CP:
+        return parallel.attn_cp_group
     if group is SumGroup.TP:
         return parallel.tp_group
     if group is SumGroup.MOE_OUTPUT:

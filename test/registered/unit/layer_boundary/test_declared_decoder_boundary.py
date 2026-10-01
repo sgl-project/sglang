@@ -572,15 +572,14 @@ class TestMhcOnTheDeclarations(CustomTestCase):
                 # The write-back consumes this layer's coefficients.
                 self.assertIsNone(communicator.mhc.h_res)
 
-    def test_a_gather_over_attention_cp_is_rejected(self):
+    def test_mhc_can_keep_its_residual_on_attention_cp_shards(self):
         # A MoE on the TP group under DSA prefill CP gathers its input over
-        # attention CP, which MHC has not been run with.
+        # attention CP while MHC retains its residual and coefficients locally.
         parallel = parallel_of(
             attn_dp=1, attn_tp=1, attn_cp=2, enable_prefill_cp=True, moe_dense_tp_size=1
         )
         facts = layer_case(1, 3, sparse=True, previous_sparse=False)
-        with self.assertRaises(NotImplementedError):
-            build_mhc(facts, parallel, dsa_cp=True)
+        build_mhc(facts, parallel, dsa_cp=True)
         # A dense layer on every rank computes on its own shard: nothing moves.
         facts = layer_case(1, 3, sparse=False, previous_sparse=False)
         build_mhc(facts, parallel, dsa_cp=True)
