@@ -30,7 +30,7 @@ async fn forwards_whitelisted_headers_strips_others() {
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
             id: "tiny".into(),
-            tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+            tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),
             disable_input_ids_forwarding: false,
             tokenizer: Default::default(),
             policy: PolicyKind::RoundRobin,
