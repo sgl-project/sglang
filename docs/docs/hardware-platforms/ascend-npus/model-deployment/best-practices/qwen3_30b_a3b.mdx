@@ -105,8 +105,7 @@ python3 -m sglang.launch_server \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 8 \
     --tp-size 2 \
-    --enable-dp-attention \
-    --dp-size 2 \
+    --attn-dp-size 2 \
     --mem-fraction-static 0.85 \
     --cuda-graph-bs-decode 1 2 4 8 16 20 24 28 32 36 40 44 48 52 56 60 64 68 72 76 80 84 \
     --dtype bfloat16 \
