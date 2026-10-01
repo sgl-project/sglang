@@ -2,6 +2,7 @@ import time
 import unittest
 import unittest.mock
 from array import array
+from dataclasses import replace
 
 import torch
 
@@ -18,6 +19,8 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from sglang.srt.mem_cache.unified_cache.components import ComponentType
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
@@ -33,6 +36,9 @@ NEWER_PREFIX = [5, 6, 7, 8]
 class TestFcfsWaitingPrefixRefresh(CustomTestCase):
     """Under FCFS an LRU eviction must not take the cached prefix of a request that
     is waiting in the queue while a prefix no pending request needs is available."""
+
+    def _make_cache(self, params):
+        return RadixCache(params)
 
     def setUp(self):
         reset_context()
@@ -59,7 +65,7 @@ class TestFcfsWaitingPrefixRefresh(CustomTestCase):
         req_to_token_pool = ReqToTokenPool(
             size=8, max_context_len=64, device="cpu", enable_memory_saver=False
         )
-        self.cache = RadixCache(
+        self.cache = self._make_cache(
             CacheInitParams(
                 disable=False,
                 req_to_token_pool=req_to_token_pool,
@@ -159,6 +165,13 @@ class TestFcfsWaitingPrefixRefresh(CustomTestCase):
             policy.calc_priority([self.waiting])
         match_prefix.assert_not_called()
         refresh.assert_not_called()
+
+
+class TestFcfsWaitingPrefixRefreshUnified(TestFcfsWaitingPrefixRefresh):
+    """The same contract on UnifiedRadixCache, the default prefix cache."""
+
+    def _make_cache(self, params):
+        return UnifiedRadixCache(replace(params, tree_components=(ComponentType.FULL,)))
 
 
 if __name__ == "__main__":
