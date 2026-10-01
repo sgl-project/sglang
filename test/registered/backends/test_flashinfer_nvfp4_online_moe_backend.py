@@ -174,9 +174,8 @@ class TestFlashinferMegaMoeBackendNvFp4OnlineW4A16(
     extra_args = [
         "--dtype",
         "bfloat16",
-        "--dp-size",
+        "--attn-dp-size",
         "4",
-        "--enable-dp-attention",
         "--enable-dp-lm-head",
         "--moe-a2a-backend",
         "flashinfer_megamoe",

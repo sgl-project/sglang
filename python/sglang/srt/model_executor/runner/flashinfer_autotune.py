@@ -189,7 +189,6 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
     return cache_dir / f"{rank_key}.json"
 
 
-
 def _autotune_tactic_sync_group(
     tp_group: GroupCoordinator,
 ) -> Optional[torch.distributed.ProcessGroup]:
