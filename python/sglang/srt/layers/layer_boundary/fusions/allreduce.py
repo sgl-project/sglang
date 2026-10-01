@@ -130,14 +130,12 @@ def attn_input_fusions(plan, read=NORM_QUANT_READOUT) -> Tuple[Callable, ...]:
         return given
     declares_quant = isinstance(read, NormQuantReadout)
     fuses_quant = (
-        isinstance(read, NormQuantReadout)
+        declares_quant
         and read.fp8_input is not None
         and _use_aiter
         and not get_bool_env_var("SGLANG_DISABLE_FUSED_AR_QUANT", default="false")
         and get_exec().comm.enable_aiter_allreduce_fusion
-    )
-    fuses_quant = declares_quant and hasattr(
-        plan.norm, "forward_with_allreduce_fusion_quant_per_group"
+        and hasattr(plan.norm, "forward_with_allreduce_fusion_quant_per_group")
     )
     return (
         *given,
