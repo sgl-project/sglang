@@ -275,6 +275,51 @@ class TestSafePipelineIdsAreIdentical(_EncodeCase):
         )
         self.assertIn(ppe._parallel_ok, (True, False))
 
+    def _run_probe(self, process_cpu, thread_cpu):
+        ppe._parallel_ok = None
+        text = "hello world, this is a test\n" * 4000
+        with (
+            unittest.mock.patch.object(
+                ppe.time, "perf_counter", side_effect=(1.0, 1.01)
+            ),
+            unittest.mock.patch.object(
+                ppe.time, "thread_time", side_effect=(1.0, 1.0 + thread_cpu)
+            ),
+            unittest.mock.patch.object(
+                ppe.time,
+                "process_time",
+                side_effect=(1.0, 1.0 + process_cpu),
+                create=True,
+            ),
+        ):
+            ppe.parallel_prompt_encode(self.tokenizer, text, {})
+        return ppe._parallel_ok
+
+    def test_the_probe_counts_rayon_worker_cpu(self):
+        self.assertTrue(self._run_probe(process_cpu=0.04, thread_cpu=0.006))
+
+    def test_the_probe_rejects_one_cpu(self):
+        self.assertFalse(self._run_probe(process_cpu=0.01, thread_cpu=0.0))
+
+    def test_a_forked_process_rechecks_parallelism(self):
+        old_pid = getattr(ppe, "_parallel_pid", None)
+        self.addCleanup(setattr, ppe, "_parallel_pid", old_pid)
+        ppe._parallel_ok = False
+        ppe._parallel_pid = 100
+        text = "hello world, this is a test\n" * 4000
+        with (
+            unittest.mock.patch.object(ppe.os, "getpid", return_value=101),
+            unittest.mock.patch.object(
+                ppe.time, "perf_counter", side_effect=(1.0, 1.01)
+            ),
+            unittest.mock.patch.object(
+                ppe.time, "process_time", side_effect=(1.0, 1.04)
+            ),
+        ):
+            ppe.parallel_prompt_encode(self.tokenizer, text, {})
+        self.assertEqual(ppe._parallel_pid, 101)
+        self.assertTrue(ppe._parallel_ok)
+
 
 def _metaspace(backend):
     backend.pre_tokenizer = pre_tokenizers.Metaspace()

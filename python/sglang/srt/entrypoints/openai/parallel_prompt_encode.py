@@ -30,6 +30,7 @@ Gated by SGLANG_PARALLEL_PROMPT_ENCODE and SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHA
 
 import json
 import logging
+import os
 import re
 import time
 import weakref
@@ -73,8 +74,9 @@ _INTRA_SPLIT_REGEX = (
 _INTRA_CUT = re.compile(r"(?<=[A-Za-z])(?= [A-Za-z])|(?<=\n)(?=[A-Za-z])")
 
 _plans = weakref.WeakKeyDictionary()
-# None: not yet checked; False: encode_batch ran on the calling thread (rayon
-# disabled, e.g. in a process forked after tokenizers used its pool).
+# None: not yet checked; False: encode_batch consumed only one CPU (rayon
+# disabled, e.g. after a fork). The PID prevents inheriting the parent's result.
+_parallel_pid = os.getpid()
 _parallel_ok = None
 
 
@@ -243,7 +245,11 @@ def split_prompt(text, pattern, npattern, intra=None, max_chunks=_MAX_CHUNKS):
 
 def parallel_prompt_encode(tokenizer, text, encode_kwargs=None):
     """Drop-in for ``tokenizer.encode(text, **encode_kwargs)``."""
-    global _parallel_ok
+    global _parallel_ok, _parallel_pid
+    pid = os.getpid()
+    if pid != _parallel_pid:
+        _parallel_pid = pid
+        _parallel_ok = None
     encode_kwargs = encode_kwargs or {}
     if (
         _parallel_ok is False
@@ -271,13 +277,13 @@ def parallel_prompt_encode(tokenizer, text, encode_kwargs=None):
 
     check = _parallel_ok is None
     if check:
-        w0, c0 = time.perf_counter(), time.thread_time()
+        w0, c0 = time.perf_counter(), time.process_time()
     encodings = backend.encode_batch(chunks, add_special_tokens=False)
     if check:
-        wall, cpu = time.perf_counter() - w0, time.thread_time() - c0
-        # With the rayon pool the calling thread only waits; serial encode_batch
-        # burns its whole wall time on this thread.
-        _parallel_ok = not (wall > 0.005 and cpu > 0.5 * wall)
+        wall, cpu = time.perf_counter() - w0, time.process_time() - c0
+        # Rayon worker CPU adds up well beyond wall time. Serial stays near 1.0;
+        # 1.5 leaves headroom for scheduler and measurement noise.
+        _parallel_ok = not (wall > 0.005 and cpu < 1.5 * wall)
         if not _parallel_ok:
             logger.warning(
                 "parallel_prompt_encode: tokenizers encode_batch runs serially in "
