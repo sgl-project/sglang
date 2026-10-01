@@ -512,3 +512,96 @@ fn page_value_swa_window_validates_and_attaches_loaded_indices() {
     );
     tree.try_sanity_check(&[], &[]).unwrap();
 }
+
+#[test]
+fn native_snapshot_isolates_splits_locks_values_and_eviction() {
+    let mut tree = core("lru");
+    let key = vec![10, 20, 30, 40];
+    insert(&mut tree, &key, &[1, 2, 3, 4]);
+    let prefix = tree.match_prefix(&MatchPrefixParams {
+        key: &vec![10, 20],
+        namespace: KeyNamespaceRef::default(),
+    });
+    let lock = tree
+        .inc_lock_ref(prefix.last_device_node_id, ComponentSet::EMPTY)
+        .unwrap();
+    let mut saved = tree.snapshot_full_device();
+    let candidate = tree
+        .full_device_eviction_candidates()
+        .next()
+        .unwrap()
+        .node_id;
+    let (parent, evicted) = tree.evict_full_device_suffix(candidate, 1).unwrap();
+    assert_eq!(evicted.device_frees[&FULL][0].as_slice(), &[4]);
+    assert_eq!(
+        tree.full_device_eviction_candidate(parent.unwrap())
+            .unwrap()
+            .value
+            .as_slice(),
+        &[3]
+    );
+    assert_eq!(tree.full_kv_prefix_len(&key, Default::default()), 3);
+    assert_eq!(saved.full_kv_prefix_len(&key, Default::default()), 4);
+    assert_eq!(saved.protected_size(), 2);
+    tree.dec_lock_ref(prefix.last_device_node_id, &lock.to_dec_params(), false)
+        .unwrap();
+    assert_eq!(tree.protected_size(), 0);
+    assert_eq!(saved.protected_size(), 2);
+    saved
+        .dec_lock_ref(prefix.last_device_node_id, &lock.to_dec_params(), false)
+        .unwrap();
+    assert_eq!(saved.all_values_flatten().as_slice(), &[1, 2, 3, 4]);
+    tree.try_sanity_check(&[], &[]).unwrap();
+    saved.try_sanity_check(&[], &[]).unwrap();
+}
+
+#[test]
+fn native_suffix_eviction_rejects_locked_or_unaligned_pages_before_mutation() {
+    let mut tree = TestCore::new(
+        CacheInitParams {
+            page_size: 2,
+            ..Default::default()
+        },
+        vec![FULL],
+    );
+    let leaf = insert(&mut tree, &[10, 20, 30, 40], &[1, 2, 3, 4])
+        .last_device_node_id
+        .unwrap();
+    let receipt = tree.inc_lock_ref(leaf, ComponentSet::EMPTY).unwrap();
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || tree.evict_full_device_suffix(leaf, 2)
+        ))
+        .is_err()
+    );
+    assert_eq!(tree.protected_size(), 4);
+    tree.dec_lock_ref(leaf, &receipt.to_dec_params(), false)
+        .unwrap();
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || tree.evict_full_device_suffix(leaf, 1)
+        ))
+        .is_err()
+    );
+    assert_eq!(tree.evictable_size(), 4);
+    let (_, evicted) = tree.evict_full_device_suffix(leaf, 2).unwrap();
+    assert_eq!(evicted.device_frees[&FULL][0].as_slice(), &[3, 4]);
+    assert_eq!(tree.evictable_size(), 2);
+    tree.try_sanity_check(&[], &[]).unwrap();
+}
+
+#[test]
+fn native_snapshot_rejects_an_active_eviction_walk() {
+    let mut tree = core("lru");
+    insert(&mut tree, &[10, 20], &[1, 2]);
+    tree.evict_device_start(FULL, 1);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tree.snapshot_full_device()))
+            .is_err()
+    );
+    tree.evict_device_end(FULL);
+    assert_eq!(
+        tree.snapshot_full_device().all_values_flatten().as_slice(),
+        &[1, 2]
+    );
+}

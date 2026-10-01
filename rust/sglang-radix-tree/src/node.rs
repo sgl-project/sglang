@@ -150,6 +150,7 @@ impl<K: ChildKeyType> Equivalent<(KeyNamespace, K)> for ChildEdgeRef<'_, K> {
 }
 
 /// A radix-tree node, generic over the child-key type `K` (single-token or bigram).
+#[derive(Clone)]
 pub struct Node<K: ChildKeyType, V: RadixValue> {
     /// Parent handle; `None` for the root or a not-yet-attached child.
     pub(crate) parent: Option<NodeIdx_>,
@@ -697,6 +698,7 @@ impl ValueSlotIdx {
 
 /// Per-(component × tier) node state: the KV-index `value` (held opaquely)
 /// and the in-flight `lock_ref`.
+#[derive(Clone)]
 pub struct ValueState<V> {
     /// KV pool indices; `None` = value-less (root) or tombstone (evicted / out-of-window).
     pub value: Option<V>,
@@ -1102,6 +1104,7 @@ pub fn split_node_hash_value(
 
 /// Owns every `Node`; parent/children/LRU hold `NodeIdx_`s into it, with a freelist
 /// and a single root; child edges are keyed by (namespace, page key).
+#[derive(Clone)]
 pub struct NodeArena<K: ChildKeyType, V: RadixValue> {
     /// Node store indexed by `NodeIdx_`; `None` marks a freed slot.
     nodes: Vec<Option<Node<K, V>>>,
@@ -1619,6 +1622,7 @@ impl<K: ChildKeyType, V: RadixValue> NodeArena<K, V> {
 /// consumes this order directly; leaf eviction ranks members in a policy heap.
 /// Links are indexed by arena slot: membership/removal are O(1), insertion is
 /// amortized O(1), and iteration visits only current members.
+#[derive(Clone)]
 pub struct NodeSet {
     /// Per arena slot: `Some((previous, next))` in insertion order, or `None` if absent.
     /// `END` marks a missing neighbor at either end.

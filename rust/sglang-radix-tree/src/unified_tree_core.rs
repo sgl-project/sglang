@@ -516,7 +516,7 @@ pub enum CacheTransferPhase {
 }
 
 /// Per-component tree-wide bookkeeping (device-tier accounting and walk state).
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ComponentState {
     /// Evictable device token count.
     pub(crate) evictable_size: usize,
@@ -647,7 +647,7 @@ pub struct UnifiedTreeCore<K: ChildKeyType, V: RadixValue> {
     /// Device-eviction candidates; the lowest priority is popped first.
     pub(crate) full_evict_device_heap: BinaryHeap<Reverse<(PriorityKey, NodeIdx_)>>,
     /// Eviction-priority strategy; lower priority evicts first.
-    pub(crate) eviction_strategy: Box<dyn EvictionStrategy<K, V> + Send>,
+    pub(crate) eviction_strategy: Arc<dyn EvictionStrategy<K, V> + Send + Sync>,
     /// Keep path depths and branch high-water marks only for T-LRU.
     pub(crate) tlru_bookkeeping: bool,
     /// Atoms per radix page; children are keyed by their key's first page.
@@ -680,6 +680,148 @@ pub struct UnifiedTreeCore<K: ChildKeyType, V: RadixValue> {
     pub(crate) empty_device_indices: V,
     /// The single in-flight resumable insert, if suspended at a barrier.
     ongoing_insert_walk_state: Option<InsertWalkState<K, V>>,
+}
+
+/// Read-only view of an unlocked Full device leaf available to a native policy.
+pub struct FullDeviceEvictionCandidate<'a, V: RadixValue> {
+    pub node_id: NodeId,
+    pub value: &'a V,
+    pub last_access_counter: i64,
+}
+
+impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
+    /// Fork idle, Full-only device-cache metadata for a native transaction.
+    /// The allocator and request leases remain caller-owned: commit only one
+    /// branch. Keys and values use their Clone semantics; immutable backends
+    /// can share their buffers without copying every cached page.
+    pub fn snapshot_full_device(&self) -> Self
+    where
+        V: Clone,
+    {
+        self.assert_full_device_only_();
+        assert!(
+            self.ongoing_insert_walk_state.is_none(),
+            "finish the insert before taking a snapshot"
+        );
+        assert!(
+            !self.component_state(FULL).is_evict_device_ongoing,
+            "finish eviction before taking a snapshot"
+        );
+        Self {
+            arena: self.arena.clone(),
+            components: self.components.clone(),
+            components_by_type: self.components_by_type.clone(),
+            component_states: self.component_states.clone(),
+            evictable_device_leaves: self.evictable_device_leaves.clone(),
+            evictable_host_leaves: self.evictable_host_leaves.clone(),
+            full_coexisting_host_nodes: self.full_coexisting_host_nodes.clone(),
+            write_back_coexist_reclaim_digest: self.write_back_coexist_reclaim_digest,
+            tracked_unbacked_tokens: None,
+            lru_lists: self.lru_lists.clone(),
+            full_evict_device_heap: self.full_evict_device_heap.clone(),
+            eviction_strategy: Arc::clone(&self.eviction_strategy),
+            tlru_bookkeeping: self.tlru_bookkeeping,
+            page_size: self.page_size,
+            is_write_back: self.is_write_back,
+            enable_hicache: self.enable_hicache,
+            is_host_memory_buffer_only: self.is_host_memory_buffer_only,
+            enable_storage: self.enable_storage,
+            enable_external_cache_linker: self.enable_external_cache_linker,
+            has_swa_host_pool: self.has_swa_host_pool,
+            enable_kv_cache_events: self.enable_kv_cache_events,
+            kv_event_queue: self.kv_event_queue.clone(),
+            namespaced_event_hashes: self.namespaced_event_hashes.clone(),
+            write_through_threshold: self.write_through_threshold,
+            swa_uuid_counter: self.swa_uuid_counter,
+            empty_device_indices: self.empty_device_indices.clone(),
+            ongoing_insert_walk_state: None,
+        }
+    }
+
+    fn assert_full_device_only_(&self) {
+        assert!(
+            self.components.len() == 1
+                && self.components[0].component_type() == FULL
+                && !self.enable_hicache
+                && !self.is_write_back,
+            "native cache operation requires a Full-only device tree"
+        );
+    }
+
+    /// Enumerate native policy candidates without mutating access order.
+    pub fn full_device_eviction_candidates(
+        &self,
+    ) -> impl Iterator<Item = FullDeviceEvictionCandidate<'_, V>> {
+        self.evictable_device_leaves.iter().map(|idx| {
+            let node = self.arena.node(idx);
+            FullDeviceEvictionCandidate {
+                node_id: node.id,
+                value: node.device_value(FULL),
+                last_access_counter: node.last_access_counter,
+            }
+        })
+    }
+
+    /// Reconsider a parent after a native policy evicts its last child.
+    pub fn full_device_eviction_candidate(
+        &self,
+        node_id: NodeId,
+    ) -> Option<FullDeviceEvictionCandidate<'_, V>> {
+        let idx = self.arena.resolve(node_id).ok()?;
+        if !self.evictable_device_leaves.contains(idx) {
+            return None;
+        }
+        let node = self.arena.node(idx);
+        Some(FullDeviceEvictionCandidate {
+            node_id,
+            value: node.device_value(FULL),
+            last_access_counter: node.last_access_counter,
+        })
+    }
+
+    /// Evict an aligned suffix selected by a native policy, retaining the prefix.
+    /// Restricted to unlocked Full-only device leaves, outside an eviction walk.
+    /// Returns the remaining parent so the caller can recompute its priority.
+    pub fn evict_full_device_suffix(
+        &mut self,
+        node_id: NodeId,
+        num_atoms: usize,
+    ) -> Result<(Option<NodeId>, EvictionStepResult<V>), NodeAccessError> {
+        self.assert_full_device_only_();
+        assert!(
+            self.ongoing_insert_walk_state.is_none(),
+            "finish the insert before selecting a suffix"
+        );
+        assert!(
+            !self.component_state(FULL).is_evict_device_ongoing,
+            "finish eviction before selecting a suffix"
+        );
+        let idx = self.arena.resolve(node_id)?;
+        assert!(
+            self.evictable_device_leaves.contains(idx),
+            "suffix eviction requires an unlocked device leaf"
+        );
+        let len = self.arena.node(idx).key.atom_len();
+        assert!(
+            num_atoms > 0 && num_atoms <= len && num_atoms.is_multiple_of(self.page_size),
+            "eviction suffix must contain complete radix pages"
+        );
+        if num_atoms < len {
+            let (_, action) = self.split_node_(idx, len - num_atoms);
+            assert!(
+                action.is_none(),
+                "device-only split cannot require a transfer"
+            );
+        }
+        let parent = self
+            .arena
+            .node(idx)
+            .try_parent()
+            .map(|parent| self.arena.node(parent).id);
+        let (backup, result) = self.evict_device_leaf(node_id, false)?;
+        assert!(backup.is_none());
+        Ok((parent, result))
+    }
 }
 
 impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
@@ -1616,8 +1758,9 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
     /// A non-chunked insert replays what a root walk does to the retained prefix,
     /// root first: access tick and LRU refresh, priority floor, hit count, and the
     /// write-through backup trigger, at O(depth) cost. A chunked insert never bumps
-    /// hit counts, so it touches only the anchor and stays O(1): use it for
-    /// per-step growth and finish the request with a non-chunked insert. The
+    /// hit counts, so it touches only the anchor. Anchor validation still walks
+    /// the retained path. Use chunked inserts for per-step growth and finish
+    /// the request with a non-chunked insert. The
     /// component overlap hooks (SWA tombstone recovery, duplicate-slot release)
     /// are never replayed because they need the prefix KV, which this API does
     /// not receive.
@@ -5348,6 +5491,14 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         let node_id = self.arena.resolve(node_id)?;
         self.assert_component_enabled_(component_type);
         Ok(self.arena.node(node_id).device_lock_ref(component_type))
+    }
+
+    /// A node's logical access timestamp, used to compare LRU order.
+    pub fn inspect_get_node_access_counter(&self, node_id: NodeId) -> Result<i64, NodeAccessError> {
+        Ok(self
+            .arena
+            .node(self.arena.resolve(node_id)?)
+            .last_access_counter)
     }
 
     /// A node's accumulated match count.

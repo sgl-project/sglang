@@ -3,6 +3,7 @@
 //! walks read parent links from the arena.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use crate::node::ChildKeyType;
 use crate::node::Node;
@@ -33,6 +34,7 @@ struct Cell {
 /// LRU list over `NodeIdx_`s, with head/tail sentinel cells keeping the link
 /// operations branchless. External APIs take `NodeIdx_`s; internal (`_`-suffixed)
 /// interfaces work on `CellId`s.
+#[derive(Clone)]
 pub struct UnifiedLRUList {
     /// The (component × tier) value slot whose lock gates this list's walkers.
     slot: ValueSlotIdx,
@@ -545,18 +547,18 @@ pub fn get_eviction_strategy<K: ChildKeyType, V: RadixValue>(
     slru_protected_threshold: i64,
     tlru_tail_budget: usize,
     tlru_float_config: Option<TlruFloatConfig>,
-) -> Box<dyn EvictionStrategy<K, V> + Send> {
+) -> Arc<dyn EvictionStrategy<K, V> + Send + Sync> {
     match policy.to_lowercase().as_str() {
-        "lru" => Box::new(LruStrategy),
-        "lfu" => Box::new(LfuStrategy),
-        "fifo" => Box::new(FifoStrategy),
-        "mru" => Box::new(MruStrategy),
-        "filo" => Box::new(FiloStrategy),
-        "priority" => Box::new(PriorityStrategy),
-        "slru" => Box::new(SlruStrategy {
+        "lru" => Arc::new(LruStrategy),
+        "lfu" => Arc::new(LfuStrategy),
+        "fifo" => Arc::new(FifoStrategy),
+        "mru" => Arc::new(MruStrategy),
+        "filo" => Arc::new(FiloStrategy),
+        "priority" => Arc::new(PriorityStrategy),
+        "slru" => Arc::new(SlruStrategy {
             protected_threshold: slru_protected_threshold,
         }),
-        "tlru" => Box::new(TlruStrategy {
+        "tlru" => Arc::new(TlruStrategy {
             tail_budget: tlru_tail_budget,
             float_config: tlru_float_config,
         }),
