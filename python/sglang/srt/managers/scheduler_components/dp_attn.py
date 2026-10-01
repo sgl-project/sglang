@@ -340,6 +340,8 @@ def _local_prefill_cuda_graph_vote(
 
     if prefill_graph_runner is None:
         return True
+    if not isinstance(prefill_graph_runner, PrefillCudaGraphRunner):
+        return False
     return prefill_graph_runner.can_replay_locally(
         batch_size=local_batch.batch_size(),
         num_tokens=num_tokens,

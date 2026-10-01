@@ -217,6 +217,7 @@ class TestUnloadRefCacheCleanup(CustomTestCase):
             return_value=[SimpleNamespace(success=True)]
         )
         tm.lora_ref_cache = {"a": LoRARef(lora_name="a", lora_path="/x")}
+        tm.pending_lora_unloads = {}
 
         async def run():
             async with tm.lora_update_lock:
