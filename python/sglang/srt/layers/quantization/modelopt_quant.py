@@ -2358,9 +2358,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         # MegaMoE consumes canonical W13 directly, regardless of the nominal
         # runner.
-        self.use_megamoe_w13_weight_layout = get_moe_a2a_backend().is_megamoe()
         self.use_flashinfer_trtllm_weight_layout = (
-            self.enable_flashinfer_trtllm_moe and not self.use_megamoe_w13_weight_layout
+            self.enable_flashinfer_trtllm_moe and not get_moe_a2a_backend().is_megamoe()
         )
         self._cache_permute_indices = {}
 
@@ -2582,10 +2581,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def _build_mega_moe_weights(self, layer: torch.nn.Module) -> None:
-        assert (
-            self.use_megamoe_w13_weight_layout
-            and not self.use_up_first_w13_weight_layout
-        ), "MegaMoE NVFP4 weights must use canonical W13 layout"
+        assert not self.use_flashinfer_trtllm_weight_layout, (
+            "MegaMoE NVFP4 weights must use canonical W13 layout"
+        )
         # Activations are quantized per token at dispatch, so w13_input_scale
         # is not used.
         import deep_gemm
@@ -2643,7 +2641,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if getattr(layer, "inference_moe_w13_interleaved", False) and not getattr(
             layer, "_w13_deinterleaved", False
         ):
-            up_first = self.use_up_first_w13_weight_layout
+            up_first = self.use_flashinfer_trtllm_weight_layout
             layer.w13_weight.data = deinterleave_w13(
                 layer.w13_weight.data, up_first=up_first
             )
@@ -2652,7 +2650,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
             layer._w13_deinterleaved = True
 
-        if self.use_megamoe_w13_weight_layout:
+        if get_moe_a2a_backend().is_megamoe():
             self._build_mega_moe_weights(layer)
             return
 
@@ -3015,19 +3013,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     @property
     def load_up_proj_weight_first(self) -> bool:
         # Load W13 as [Up, Gate] for FlashInfer CUTLASS and CuteDSL v2 kernels.
-        # MegaMoE and the CuteDSL v1 (deepep) path use [Gate, Up] -- do NOT
-        # flip. Keep this aligned with use_flashinfer_trtllm_weight_layout.
-        return (
-            self.moe_runner_config.is_gated
-            and not self.use_megamoe_w13_weight_layout
-            and (self.enable_flashinfer_cutlass_moe or self._is_cutedsl_v2_standard)
-        )
-
-    @property
-    def use_up_first_w13_weight_layout(self) -> bool:
-        """Whether the selected consumer expects the final W13 buffer as W31."""
-        return (
-            self.use_flashinfer_trtllm_weight_layout or self.load_up_proj_weight_first
+        # The CuteDSL v1 (deepep) path uses [Gate, Up] -- do NOT flip.
+        return self.moe_runner_config.is_gated and (
+            self.enable_flashinfer_cutlass_moe or self._is_cutedsl_v2_standard
         )
 
     def create_moe_runner(
@@ -3046,7 +3034,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         self._moe_runner_backend = moe_runner_backend
 
-        if self.use_megamoe_w13_weight_layout:
+        if get_moe_a2a_backend().is_megamoe():
             # FusedMoE.forward is never reached under megamoe.
             self.runner = None
             return
