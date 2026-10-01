@@ -55,7 +55,9 @@ def _simulated_bonus_select_kernel(
     val = tl.load(part_val_ptr + row * NSPLIT + s)
     idx = tl.load(part_idx_ptr + row * NSPLIT + s)
     top = tl.max(val, axis=0)
-    tl.store(out_ptr + req, tl.min(tl.where(val == top, idx, vocab), axis=0).to(tl.int64))
+    tl.store(
+        out_ptr + req, tl.min(tl.where(val == top, idx, vocab), axis=0).to(tl.int64)
+    )
 
 
 def simulated_bonus_sample(

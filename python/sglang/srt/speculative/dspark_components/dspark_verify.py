@@ -17,9 +17,6 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     accept_greedy_triton,
     finalize_accept_lens_triton,
 )
-from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
-    simulated_bonus_sample,
-)
 from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     BuildCommitInjectLayout,
     BuildOutTokens,
@@ -28,6 +25,9 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     ScatterCompactToStrided,
     build_unified_commit_inject_layout,
     scatter_compact_to_strided_into,
+)
+from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
+    simulated_bonus_sample,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
