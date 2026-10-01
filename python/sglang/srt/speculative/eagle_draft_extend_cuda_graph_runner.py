@@ -43,6 +43,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
 )
+from sglang.srt.speculative.draft_checkpoint import refresh_track_indices, track_indices
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
@@ -427,11 +428,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             batch_size=bs,
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
-            mamba_track_indices=(
-                None
-                if buffers.mamba_track_indices is None
-                else buffers.mamba_track_indices[:bs]
-            ),
+            mamba_track_indices=track_indices(buffers.mamba_track_indices, bs),
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
             next_token_logits_buffer=next_token_logits_buffer,
@@ -544,13 +541,6 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             buffers.num_accept_tokens.fill_(self.captured_req_width)
             buffers.extend_seq_lens.fill_(self.captured_req_width)
 
-        if buffers.mamba_track_indices is not None:
-            buffers.mamba_track_indices[:bs].zero_()
-            if forward_batch.mamba_track_indices is not None:
-                buffers.mamba_track_indices[:raw_bs].copy_(
-                    forward_batch.mamba_track_indices
-                )
-
         # Batch the small per-field device copies into a grouped foreach copy
         # (one foreach call per dtype pair) to cut launch overhead. hidden_states
         # is handled separately below (see note), and seq_lens_cpu is handled
@@ -590,6 +580,14 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             copy_srcs.append(forward_batch.spec_info.num_accept_tokens)
         copy_dsts.append(buffers.select_index[:raw_bs])
         copy_srcs.append(select_index)
+        refresh_track_indices(
+            buffers.mamba_track_indices,
+            forward_batch.mamba_track_indices,
+            raw_bs=raw_bs,
+            bs=bs,
+            copy_dsts=copy_dsts,
+            copy_srcs=copy_srcs,
+        )
         _grouped_foreach_copy_(copy_dsts, copy_srcs)
 
         # hidden_states is large + contiguous: copy_() uses the cudaMemcpyAsync
@@ -641,8 +639,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             batch_size=bs,
             forward_mode=self.forward_mode,
             input_ids=getattr(forward_batch, "input_ids", None),
-            req_pool_indices=buffers.req_pool_indices[:bs],
-            seq_lens=buffers.seq_lens[:bs],
+            req_pool_indices=buffers.req_pool_indices,
+            seq_lens=buffers.seq_lens,
             seq_lens_sum=seq_lens_sum,
             # Mirror absence must survive replay (stale buffer defeats None-guards).
             seq_lens_cpu=(
@@ -652,11 +650,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             out_cache_loc=buffers.out_cache_loc[:num_tokens],
             out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
             # Virtual input stays separate from the backend's physical buffer.
-            mamba_track_indices=(
-                None
-                if buffers.mamba_track_indices is None
-                else buffers.mamba_track_indices[:bs]
-            ),
+            mamba_track_indices=track_indices(buffers.mamba_track_indices, bs),
             spec_info=forward_batch.spec_info,
         )
         self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)

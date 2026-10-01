@@ -66,6 +66,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
 )
+from sglang.srt.speculative.draft_checkpoint import refresh_track_indices, track_indices
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.speculative.multi_layer_eagle_utils import (
@@ -336,11 +337,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             batch_size=bs,
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
-            mamba_track_indices=(
-                None
-                if buffers.mamba_track_indices is None
-                else buffers.mamba_track_indices[:bs]
-            ),
+            mamba_track_indices=track_indices(buffers.mamba_track_indices, bs),
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
             next_token_logits_buffer=next_token_logits_buffer,
@@ -492,19 +489,15 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             batch_size=bs,
             forward_mode=self.forward_mode,
             input_ids=buffers.input_ids[:num_tokens],
-            req_pool_indices=buffers.req_pool_indices[:bs],
-            seq_lens=buffers.seq_lens[:bs],
+            req_pool_indices=buffers.req_pool_indices,
+            seq_lens=buffers.seq_lens,
             seq_lens_sum=seq_lens_sum,
             seq_lens_cpu=seq_lens_cpu,
             encoder_lens=None,
             # per-step write target; out_cache_loc is frozen at prepare() time.
             out_cache_loc=buffers.out_cache_loc[:num_tokens],
             # Virtual input stays separate from the backend's physical buffer.
-            mamba_track_indices=(
-                None
-                if buffers.mamba_track_indices is None
-                else buffers.mamba_track_indices[:bs]
-            ),
+            mamba_track_indices=track_indices(buffers.mamba_track_indices, bs),
             spec_info=spec_info,
         )
         if (
@@ -772,11 +765,7 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             seq_lens=buffers.seq_lens[:bs],
             extend_seq_lens=buffers.extend_seq_lens[:bs],
             out_cache_loc=buffers.out_cache_loc[: bs * self.captured_req_width],
-            mamba_track_indices=(
-                None
-                if buffers.mamba_track_indices is None
-                else buffers.mamba_track_indices[:bs]
-            ),
+            mamba_track_indices=track_indices(buffers.mamba_track_indices, bs),
         )
         for backend in backends:
             backend.init_forward_metadata_out_graph(batch)
@@ -795,12 +784,12 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         else:
             bs = self.get_runner(0)._pad_to_bucket(raw_bs, self.capture_bs)
 
-        if buffers.mamba_track_indices is not None:
-            buffers.mamba_track_indices[:bs].zero_()
-            if forward_batch.mamba_track_indices is not None:
-                buffers.mamba_track_indices[:raw_bs].copy_(
-                    forward_batch.mamba_track_indices
-                )
+        refresh_track_indices(
+            buffers.mamba_track_indices,
+            forward_batch.mamba_track_indices,
+            raw_bs=raw_bs,
+            bs=bs,
+        )
 
         fill_draft_extend_prepare_buffers(
             buffers.input_ids,
