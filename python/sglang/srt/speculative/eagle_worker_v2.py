@@ -9,6 +9,7 @@ from sglang.kernels.ops.speculative.topk1 import (
     draft_topk1_argmax_only,
     draft_topk1_postprocess,
 )
+from sglang.srt.configs.load_config import _DEFAULT_LOAD_GROUP
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
@@ -188,6 +189,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.draft_owns_attention = (
             get_parallel().attn_dp_enabled and self.speculative_algorithm.is_eagle3()
         )
+        # Only the last target PP stage loads the draft. Capture its TP group
+        # before draft_pp_context hides the target's pipeline topology.
+        load_group = (
+            get_parallel().tp_group
+            if get_parallel().pp_size > 1
+            else _DEFAULT_LOAD_GROUP
+        )
         with (
             draft_tp_context(self.draft_owns_attention),
             draft_pp_context(),
@@ -203,6 +211,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 # The draft runs at absolute target positions.
                 context_length=target_worker.model_runner.model_config.context_len,
                 random_seed=target_worker.random_seed,
+                load_group=load_group,
             )
 
         # Alias for better readability

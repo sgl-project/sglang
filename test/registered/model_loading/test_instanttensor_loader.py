@@ -9,9 +9,9 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.runners import SRTRunner, check_close_model_outputs
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=120, stage="weekly", runner_config="1-gpu-large")
+register_cuda_ci(est_time=120, stage="weekly", runner_config="2-gpu-large")
 
-MODEL = os.getenv("SGLANG_INSTANTTENSOR_TEST_MODEL", "Qwen/Qwen2-0.5B")
+MODEL = "Qwen/Qwen2-0.5B"
 
 
 class TestInstantTensorLoader(CustomTestCase):
@@ -24,6 +24,7 @@ class TestInstantTensorLoader(CustomTestCase):
         runner_args = dict(
             torch_dtype=torch.float16,
             model_type="generation",
+            tp_size=2,
             disable_cuda_graph=True,
             disable_radix_cache=True,
             max_total_tokens=256,

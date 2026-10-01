@@ -641,7 +641,9 @@ class DefaultModelLoader(BaseModelLoader):
             )
         elif self.load_config.load_format == LoadFormat.INSTANTTENSOR:
             weights_iterator = instanttensor_weights_iterator(
-                hf_weights_files, extra_config=extra_config
+                hf_weights_files,
+                extra_config=extra_config,
+                load_group=self.load_config.load_group,
             )
         elif use_safetensors:
             weight_loader_disable_mmap = get_model().weight_loader_disable_mmap

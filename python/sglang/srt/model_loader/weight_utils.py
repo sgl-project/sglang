@@ -38,7 +38,11 @@ from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
 from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
 from tqdm.auto import tqdm
 
-from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.configs.load_config import (
+    _DEFAULT_LOAD_GROUP,
+    LoadConfig,
+    LoadGroup,
+)
 from sglang.srt.configs.model_config import (
     REQUANTIZATION_METHODS,
     ModelConfig,
@@ -1170,6 +1174,7 @@ def safetensors_weights_iterator(
 def instanttensor_weights_iterator(
     hf_weights_files: List[str],
     extra_config: Optional[dict] = None,
+    load_group: LoadGroup = _DEFAULT_LOAD_GROUP,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over Safetensors weights with InstantTensor."""
     if current_platform.device_type != "cuda":
@@ -1211,11 +1216,13 @@ def instanttensor_weights_iterator(
         kwargs["backend"] = [available[name] for name in names]
 
     distributed = torch.distributed.is_initialized()
-    if distributed:
-        world_group = get_parallel().world_group
-        process_group = world_group.device_group if world_group.world_size > 1 else None
-    else:
-        process_group = None
+    if load_group is _DEFAULT_LOAD_GROUP:
+        load_group = get_parallel().world_group if distributed else None
+    process_group = (
+        load_group.device_group
+        if load_group is not None and load_group.world_size > 1
+        else None
+    )
 
     device = current_platform.get_device(torch.cuda.current_device())
     enable_tqdm = not distributed or torch.distributed.get_rank() == 0
