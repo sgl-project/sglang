@@ -189,7 +189,7 @@ def _ffn_norm_emits_mxfp8(layer, num_tokens: int) -> bool:
     consumer = getattr(layer, "_ffn_shared_mxfp8_consumer", None)
     if consumer is None:
         shared = getattr(getattr(layer, "mlp", None), "shared_experts", None)
-        consumer = layer._ffn_shared_mxfp8_consumer = mxfp8_consumes_fp8(
+        consumer = layer._ffn_shared_mxfp8_consumer = _mxfp8_consumer(
             getattr(shared, "gate_up_proj", None)
         )
     return consumer
@@ -230,7 +230,7 @@ def wo_b_emits_mxfp8(attn, num_tokens: int) -> bool:
         return False
     consumer = getattr(attn, "_wo_b_mxfp8_consumer", None)
     if consumer is None:
-        consumer = attn._wo_b_mxfp8_consumer = mxfp8_consumes_fp8(attn.wo_b)
+        consumer = attn._wo_b_mxfp8_consumer = _mxfp8_consumer(attn.wo_b)
     return consumer
 
 
