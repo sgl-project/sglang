@@ -10,14 +10,21 @@ from sglang.kernels.ops.attention.flash_attention_v4 import flash_attn_gqa_512
 from sglang.kernels.ops.attention.flash_attn.cute.interface import (
     flash_attn_varlen_func,
 )
+from sglang.srt.layers.attention.graph_variants import DLLM_FULL_WINDOW
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+from sglang.srt.model_executor.runner_utils.capture_mode import (
+    get_capture_attention_variant,
+)
 
 
 class FlashAttentionDenseBackend(TritonAttnBackend):
     """Dense D256 window and D512 full attention over a paged cache."""
 
+    requires_contiguous_current_kv = False
+
     def __init__(self, model_runner):
         super().__init__(model_runner)
+        self.qo_indptr = self.qo_indptr.to(torch.int32)
         self._native_extend = self.extend_attention_fwd
         self.extend_attention_fwd = self._dense_extend
         self._dense_workspaces = {}
@@ -54,8 +61,8 @@ class FlashAttentionDenseBackend(TritonAttnBackend):
         ):
             return self._native_extend(
                 q,
-                k,
-                v,
+                k.contiguous(),
+                v.contiguous(),
                 out,
                 kb,
                 vb,
@@ -82,7 +89,6 @@ class FlashAttentionDenseBackend(TritonAttnBackend):
                 capacity, heads, dim, bs, q.device, q.dtype
             )
         workspace = self._dense_workspaces[key]
-        qo = qo.to(torch.int32)
         pack_prefix_current(
             k,
             v,
@@ -128,8 +134,17 @@ class FlashAttentionDenseBackend(TritonAttnBackend):
                 softmax_scale=sm_scale,
                 causal=causal,
             )
+        if get_capture_attention_variant() == DLLM_FULL_WINDOW and not causal:
+            return flash_attn_varlen_func(
+                q.unsqueeze(0),
+                workspace.key.unsqueeze(0),
+                workspace.value.unsqueeze(0),
+                out=out.unsqueeze(0),
+                softmax_scale=sm_scale,
+                causal=False,
+            )
         return flash_attn_varlen_func(
-            q.contiguous(),
+            q,
             workspace.key,
             workspace.value,
             out=out,

@@ -12,6 +12,8 @@ logger = logging.getLogger(__name__)
 
 DSA_DENSE = "dense"
 DSA_SPARSE = "sparse"
+DLLM_VARLEN = "dllm_varlen"
+DLLM_FULL_WINDOW = "dllm_full_window"
 
 
 class AttentionGraphVariants(Protocol):
@@ -21,6 +23,44 @@ class AttentionGraphVariants(Protocol):
     def select(self, forward_batch: ForwardBatch) -> str:
         """Select one of capture_labels for the batch."""
         ...
+
+
+@dataclass(frozen=True)
+class DllmWindowGraphVariants:
+    window_size: int
+    block_size: int
+    capture_labels: ClassVar[tuple[str, ...]] = (DLLM_VARLEN, DLLM_FULL_WINDOW)
+
+    def select(self, forward_batch: ForwardBatch) -> str:
+        lengths = forward_batch.seq_lens_cpu
+        if (
+            forward_batch.batch_size == 1
+            and forward_batch.forward_mode.is_dllm_extend()
+            and forward_batch.input_ids.numel() == self.block_size
+            and lengths is not None
+            and lengths.device.type == "cpu"
+            and int(lengths[0]) - self.block_size >= self.window_size
+        ):
+            return DLLM_FULL_WINDOW
+        return DLLM_VARLEN
+
+
+def capture_attention_graph_labels(variants: AttentionGraphVariants, batch_size: int):
+    if isinstance(variants, DllmWindowGraphVariants) and batch_size != 1:
+        return (DLLM_VARLEN,)
+    return variants.capture_labels
+
+
+def create_dllm_window_graph_variants(attn_backend, forward_mode, block_size):
+    if not forward_mode.is_dllm_extend() or block_size != 256:
+        return None
+    from sglang.srt.layers.attention.flashattention_dense_backend import (
+        FlashAttentionDenseBackend,
+    )
+
+    if isinstance(attn_backend, FlashAttentionDenseBackend):
+        return DllmWindowGraphVariants(attn_backend.sliding_window_size, block_size)
+    return None
 
 
 @dataclass(frozen=True)

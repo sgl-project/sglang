@@ -142,6 +142,7 @@ class ForwardMetadata:
 
 class TritonAttnBackend(AttentionBackend):
     full_cuda_graph_uses_chunked_prefix = False
+    requires_contiguous_current_kv = True
     # CUDA-graph replay rebuilds metadata from preallocated kv_indptr/kv_indices
     # buffers; it never reads seq_lens_cpu / seq_lens_sum.
     needs_cpu_seq_lens: bool = False
@@ -1894,8 +1895,8 @@ class TritonAttnBackend(AttentionBackend):
 
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            k.contiguous(),
-            v.contiguous(),
+            k.contiguous() if self.requires_contiguous_current_kv else k,
+            v.contiguous() if self.requires_contiguous_current_kv else v,
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
             self.token_to_kv_pool.get_key_buffer(layer.layer_id),
             self.token_to_kv_pool.get_value_buffer(layer.layer_id),
