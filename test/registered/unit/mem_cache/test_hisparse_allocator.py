@@ -63,6 +63,7 @@ class TestHiSparseDecodeRemap(CustomTestCase):
         coordinator.is_dsv4_hisparse = False
         coordinator.mem_pool_device = pool.main_pool
         coordinator.token_to_kv_pool_allocator = allocator
+        coordinator.compress_ratio = allocator.compress_ratio
         coordinator.device_buffer_size = 2
         coordinator.req_to_device_buffer = allocator.hisparse_attn_allocator.alloc(
             3
