@@ -43,6 +43,7 @@ class Gemma4Renoise(DllmAlgorithm):
     supported_architectures = ("DiffusionGemmaForBlockDiffusion",)
     requires_separate_context_encoding = True
     required_attention_backend = "triton"
+    reuse_forward_metadata = True
 
     @classmethod
     def configure_server_args(cls, server_args: ServerArgs) -> None:

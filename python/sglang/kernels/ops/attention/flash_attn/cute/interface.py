@@ -1589,6 +1589,7 @@ def _flash_attn_fwd(
                 page_table_tensor,
                 window_size_left,
                 window_size_right,
+                None,  # mValue: MLA shares its score latent and values.
                 current_stream,
                 options="--enable-tvm-ffi",
             )
@@ -1687,6 +1688,7 @@ def _flash_attn_fwd(
                 page_table,
                 window_size_left,
                 window_size_right,
+                None,
             )
         else:
             call_args = [

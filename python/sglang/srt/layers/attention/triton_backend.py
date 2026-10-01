@@ -2589,6 +2589,11 @@ def update_sliding_window_buffer(
             window_kv_indptr[-1], dtype=torch.int64, device=device
         )
     window_kv_start_idx = seq_lens - window_kv_lens
+    token_mapping = (
+        token_to_kv_pool.full_to_swa_index_mapping
+        if isinstance(token_to_kv_pool, SWAKVPool)
+        else None
+    )
     translated = translator.fill_packed_read_stream(
         req_pool_indices=req_pool_indices[:bs],
         seq_lens=window_kv_lens,
@@ -2597,6 +2602,7 @@ def update_sliding_window_buffer(
         out=window_kv_indices,
         kv_start_idx=window_kv_start_idx,
         sliding_window=translator.reads_are_translated,
+        token_mapping=token_mapping,
     )
     if not translated and isinstance(token_to_kv_pool, BaseSWAKVPool):
         kv_last_index = window_kv_indptr[-1]

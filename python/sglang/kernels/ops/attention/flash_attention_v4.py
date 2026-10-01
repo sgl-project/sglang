@@ -28,6 +28,94 @@ def is_flash_attention_v4_available() -> bool:
     return _flash_attn_varlen_func is not None
 
 
+_gqa_512_compile_cache = {}
+
+
+def flash_attn_gqa_512(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    page_table: Optional[torch.Tensor] = None,
+    softmax_scale: float = 1.0,
+    lse: Optional[torch.Tensor] = None,
+    pack_gqa: bool = True,
+) -> torch.Tensor:
+    """Noncausal BF16 GQA with 512-dimensional keys and separate values."""
+    import cutlass.cute as cute
+
+    from sglang.kernels.ops.attention.flash_attn.cute.cute_dsl_utils import (
+        to_cute_tensor,
+    )
+    from sglang.kernels.ops.attention.flash_attn.cute.flash_fwd_mla_sm100 import (
+        FlashAttentionMLAForwardSm100,
+    )
+
+    if cu_seqlens_q is not None:
+        cu_seqlens_q = cu_seqlens_q.to(dtype=torch.int32)
+    args = (
+        None,
+        q,
+        None,
+        k,
+        out,
+        lse,
+        softmax_scale,
+        None,
+        None,
+        cu_seqlens_q,
+        None,
+        None,
+        seqused_k,
+        None,
+        page_table,
+        None,
+        None,
+        v,
+    )
+    key = (
+        pack_gqa,
+        q.device,
+        tuple(
+            (tuple(t.shape), t.stride(), t.dtype) if isinstance(t, torch.Tensor) else t
+            for t in args
+        ),
+    )
+    if key not in _gqa_512_compile_cache:
+        compile_args = [
+            to_cute_tensor(
+                t,
+                assumed_align=4
+                if t.dtype in (torch.int32, torch.int64, torch.float32)
+                else 16,
+            )
+            if isinstance(t, torch.Tensor)
+            else t
+            for t in args
+        ]
+        kernel = FlashAttentionMLAForwardSm100(
+            is_causal=False,
+            use_cpasync_load_KV=page_table is not None and k.shape[1] != 128,
+            is_topk_gather=False,
+            pack_gqa=pack_gqa,
+            qhead_per_kvhead=q.shape[-2] // k.shape[-2],
+            nheads_kv=k.shape[-2],
+            is_varlen_q=cu_seqlens_q is not None,
+            has_qk=False,
+        )
+        _gqa_512_compile_cache[key] = cute.compile(
+            kernel,
+            *compile_args,
+            stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        )
+    _gqa_512_compile_cache[key](*args)
+    return out
+
+
 def _maybe_contiguous(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 

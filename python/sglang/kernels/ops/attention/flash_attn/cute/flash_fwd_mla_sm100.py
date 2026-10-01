@@ -374,12 +374,14 @@ class FlashAttentionMLAForwardSm100:
         mPageTable: Optional[cute.Tensor] = None,
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
+        mValue: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
         # fmt: on
         self.store_P = mP is not None
         self.store_row_max = mRowMax is not None
+        self.separate_value = mValue is not None
 
         if const_expr(self.has_qk):
             assert mQ is not None and mK is not None, "has_qk requires mQ and mK"
@@ -402,11 +404,11 @@ class FlashAttentionMLAForwardSm100:
             *(cute.assume(s, divby=128 // mX.element_type.width) for s in mX.stride[:-1]),
             mX.stride[-1],
         )
-        mQ, mQv, mK, mV, mO, mP = [
+        mQ, mQv, mK, mV, mO, mP, mValue = [
             cute.make_tensor(mX.iterator, cute.make_layout(mX.shape, stride=new_stride(mX)))
             if mX is not None
             else None
-            for mX in (mQ, mQv, mK, mV, mO, mP)
+            for mX in (mQ, mQv, mK, mV, mO, mP, mValue)
         ]
 
         # (b, s, h, d)  -> (s, d, h, b)  or
@@ -420,16 +422,18 @@ class FlashAttentionMLAForwardSm100:
             else None
             for mX in (mQ, mQv, mO, mP)
         ]
-        mK, mV = [
+        mK, mV, mValue = [
             cute.make_tensor(mX.iterator, cute.select(mX.layout, mode=KV_layout_transpose))
             if mX is not None
             else None
-            for mX in (mK, mV)
+            for mX in (mK, mV, mValue)
         ]
         # (s_k, dv, h_k, b)  -> (dv, s_k, h_k, b) or
         # (total_k, dv, h_k) -> (dv, total_k, h_k)
         V_layout_transpose = [1, 0, 2, 3] if const_expr(mCuSeqlensK is None) else [1, 0, 2]
-        mVt = cute.make_tensor(mV.iterator, cute.select(mV.layout, mode=V_layout_transpose))
+        # MLA uses the same latent for scores and values; GQA supplies separate values.
+        value = mV if const_expr(mValue is None) else mValue
+        mVt = cute.make_tensor(value.iterator, cute.select(value.layout, mode=V_layout_transpose))
         # (b, s_q, topk) -> (topk, s_q, b) or (total_q, topk) -> (topk, total_q)
         topk_layout_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
         mIndexTopk = (
@@ -2605,7 +2609,9 @@ class FlashAttentionMLAForwardSm100:
 
             softmax = SoftmaxSm100.create(
                 softmax_scale_log2,
-                rescale_threshold=8.0 if const_expr(self.dtype_Q.width == 16) else 0.0,
+                rescale_threshold=8.0
+                if const_expr(self.dtype_Q.width == 16 and not self.separate_value)
+                else 0.0,
                 softmax_scale=softmax_scale,
             )
             softmax.reset()
