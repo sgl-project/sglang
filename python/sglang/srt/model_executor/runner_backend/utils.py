@@ -34,9 +34,6 @@ from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend impor
 from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
     FullCudaGraphBackend,
 )
-from sglang.srt.model_executor.runner_backend.tc_piecewise_cuda_graph_backend import (
-    TcPiecewiseCudaGraphBackend,
-)
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec
 
@@ -46,9 +43,6 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
-
-# Track first occurrence of each fallback warning to avoid log spam.
-_TC_PIECEWISE_DECODE_FALLBACK_LOGGED = False
 
 
 def resolve_decode_backend(
@@ -90,14 +84,9 @@ def resolve_decode_backend(
             enable_memory_saver=enable_memory_saver,
             debug_eager=get_exec().graph.debug_cuda_graph,
         )
-    if backend_name == Backend.TC_PIECEWISE:
-        global _TC_PIECEWISE_DECODE_FALLBACK_LOGGED
-        if not _TC_PIECEWISE_DECODE_FALLBACK_LOGGED:
-            logger.warning(
-                "cuda_graph_config decode='tc_piecewise' is not yet implemented; "
-                "falling back to 'full'."
-            )
-            _TC_PIECEWISE_DECODE_FALLBACK_LOGGED = True
+
+    if backend_name != Backend.FULL:
+        raise ValueError(f"Unsupported decode graph backend: {backend_name}")
 
     full_backend_cls = None
     if current_platform.is_out_of_tree():
@@ -116,9 +105,8 @@ def resolve_prefill_backend(
     cuda_graph_runner: BaseCudaGraphRunner,
 ) -> BaseCudaGraphBackend:
     """Pick a backend instance from cuda_graph_config['prefill']['backend']."""
-    model_runner = cuda_graph_runner.model_runner
     cfg = get_exec().graph.cuda_graph_config
-    backend_name = cfg.prefill.backend if cfg is not None else Backend.TC_PIECEWISE
+    backend_name = cfg.prefill.backend if cfg is not None else Backend.BREAKABLE
 
     if backend_name == Backend.BREAKABLE:
         return BreakableCudaGraphBackend(
@@ -132,5 +120,4 @@ def resolve_prefill_backend(
             enable_memory_saver=get_exec().features.enable_memory_saver,
             reuse_output_buffer=True,
         )
-    # Default: tc_piecewise.
-    return TcPiecewiseCudaGraphBackend(cuda_graph_runner)
+    raise ValueError(f"Unsupported prefill graph backend: {backend_name}")
