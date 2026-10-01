@@ -571,11 +571,7 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.tree_core.supports_fast_match_prefix()
 
     def refresh_device_prefix(self, key: RadixKey) -> int:
-        # The tree walk alone: it refreshes last_access_time along the matched path
-        # and may split a node at the boundary, whose bookkeeping action is applied
-        # here. Skips what match_prefix adds on top -- the streaming-session
-        # shortcut, the component finalizers and the external linker -- so no
-        # request slot is written and no storage lookup is issued.
+        # The walk and its actions only; no session shortcut, finalizers or linker.
         if self.disable:
             return 0
         result = self.tree_core.match_prefix(MatchPrefixParams(key=key))

@@ -427,11 +427,11 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def refresh_device_prefix(self, key: RadixKey) -> int:
         """Touch the device-resident prefix of ``key`` so LRU eviction sees it as recent.
 
-        Returns the number of device tokens matched. Must never reach a host tier,
-        storage backend or external connector: the scheduler calls this for every
-        waiting request on every round, and ``match_prefix`` on those caches can
-        allocate, load or enqueue lookups as a side effect. Caches without a
-        device tree (or whose device match has side effects) leave this a no-op.
+        Returns the number of device tokens matched. The scheduler calls this for
+        every waiting request on every round, so it must stay on the device tree:
+        no host tier, storage backend or external connector, which ``match_prefix``
+        may allocate, load or enqueue lookups on. Caches without a side-effect-free
+        device match leave this a no-op.
         """
         return 0
 

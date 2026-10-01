@@ -8,7 +8,10 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.schedule_policy import SchedulePolicy
+from sglang.srt.managers.schedule_policy import (
+    WAITING_PREFIX_REFRESH_MAX_QUEUE,
+    SchedulePolicy,
+)
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
@@ -24,6 +27,7 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.session.streaming_session import StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -75,18 +79,24 @@ class TestFcfsWaitingPrefixRefresh(CustomTestCase):
                 enable_kv_cache_events=False,
             )
         )
-        self.policy = SchedulePolicy(
-            policy="fcfs",
-            tree_cache=self.cache,
-            enable_hierarchical_cache=False,
-            enable_priority_scheduling=False,
-            schedule_low_priority_values_first=False,
-        )
+        self.policy = self._make_policy(self.cache)
         self._insert(OLDER_PREFIX, [10, 11, 12, 13])
         time.sleep(0.005)
         self._insert(NEWER_PREFIX, [20, 21, 22, 23])
         time.sleep(0.005)
-        self.waiting = Req(1, "", array("q", OLDER_PREFIX + [9]), SamplingParams())
+        self.waiting = self._make_req(1, OLDER_PREFIX + [9])
+
+    def _make_policy(self, cache):
+        return SchedulePolicy(
+            policy="fcfs",
+            tree_cache=cache,
+            enable_hierarchical_cache=False,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+        )
+
+    def _make_req(self, rid, tokens):
+        return Req(rid, "", array("q", tokens), SamplingParams())
 
     def _insert(self, tokens, slots):
         self.cache.insert(
@@ -102,26 +112,43 @@ class TestFcfsWaitingPrefixRefresh(CustomTestCase):
         )
         return len(result.device_indices)
 
-    def test_refresh_keeps_the_waiting_request_prefix_resident(self):
-        with envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH.override(True):
-            self.policy.calc_priority([self.waiting])
-        self.assertEqual(self.waiting.num_matched_prefix_tokens, len(OLDER_PREFIX))
+    def _assert_older_prefix_survives_one_eviction(self):
         self.cache.evict(EvictParams(num_tokens=len(NEWER_PREFIX)))
         self.assertEqual(self._matched_len(OLDER_PREFIX), len(OLDER_PREFIX))
         self.assertEqual(self._matched_len(NEWER_PREFIX), 0)
 
+    def test_refresh_keeps_the_waiting_request_prefix_resident(self):
+        with envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH.override(True):
+            self.policy.calc_priority([self.waiting])
+        self._assert_older_prefix_survives_one_eviction()
+
     def test_refresh_disabled_restores_plain_lru(self):
         with envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH.override(False):
             self.policy.calc_priority([self.waiting])
-        self.assertEqual(self.waiting.num_matched_prefix_tokens, 0)
         self.cache.evict(EvictParams(num_tokens=len(OLDER_PREFIX)))
         self.assertEqual(self._matched_len(OLDER_PREFIX), 0)
         self.assertEqual(self._matched_len(NEWER_PREFIX), len(NEWER_PREFIX))
 
+    def test_head_of_queue_is_refreshed_last(self):
+        # FCFS admits the head next, so when eviction must take a waiting prefix
+        # it has to be the one furthest from admission.
+        second = self._make_req(2, NEWER_PREFIX + [9])
+        with envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH.override(True):
+            self.policy.calc_priority([self.waiting, second])
+        self._assert_older_prefix_survives_one_eviction()
+
+    def test_deep_queue_still_refreshes_the_head(self):
+        fillers = [
+            self._make_req(2 + i, [1000 + i])
+            for i in range(WAITING_PREFIX_REFRESH_MAX_QUEUE)
+        ]
+        with envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH.override(True):
+            self.policy.calc_priority([self.waiting] + fillers)
+        self._assert_older_prefix_survives_one_eviction()
+
     def test_refresh_never_calls_the_general_matcher(self):
         # External-cache implementations (FlexKV, LMCache, hierarchical tiers) give
         # match_prefix side effects: lookups enqueued, KV allocated or loaded per call.
-        # The per-round refresh must stay on the device tree.
         calls = []
         original = type(self.cache).match_prefix
 
@@ -135,7 +162,15 @@ class TestFcfsWaitingPrefixRefresh(CustomTestCase):
         ):
             self.policy.calc_priority([self.waiting])
         self.assertEqual(calls, [])
-        self.assertEqual(self.waiting.num_matched_prefix_tokens, len(OLDER_PREFIX))
+        self._assert_older_prefix_survives_one_eviction()
+
+    def test_streaming_session_wrapper_forwards_the_refresh(self):
+        # --enable-streaming-session wraps caches without native session support;
+        # the wrapper inherits the base no-op unless it forwards explicitly.
+        policy = self._make_policy(StreamingSession(self.cache))
+        with envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH.override(True):
+            policy.calc_priority([self.waiting])
+        self._assert_older_prefix_survives_one_eviction()
 
     def test_chunk_cache_skips_the_refresh(self):
         # --disable-radix-cache deployments have no tree or LRU state to refresh; the
@@ -150,13 +185,7 @@ class TestFcfsWaitingPrefixRefresh(CustomTestCase):
                 enable_kv_cache_events=False,
             )
         )
-        policy = SchedulePolicy(
-            policy="fcfs",
-            tree_cache=chunk_cache,
-            enable_hierarchical_cache=False,
-            enable_priority_scheduling=False,
-            schedule_low_priority_values_first=False,
-        )
+        policy = self._make_policy(chunk_cache)
         with (
             unittest.mock.patch.object(ChunkCache, "match_prefix") as match_prefix,
             unittest.mock.patch.object(ChunkCache, "refresh_device_prefix") as refresh,

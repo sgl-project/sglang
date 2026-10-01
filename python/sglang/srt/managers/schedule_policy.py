@@ -123,10 +123,8 @@ if PREFILL_TILE_BUDGET_MODE not in {"legacy", "compact"}:
     )
     PREFILL_TILE_BUDGET_MODE = "compact"
 
-# Bounds the per-round cost of the cache-agnostic prefix refresh to what LPM
-# already pays: _determine_active_policy drops LPM/HRRN to FCFS above this same
-# queue length (#1896). Inherited precedent, not a measured optimum; above it a
-# waiting request is again unprotected from eviction.
+# Inherited from the LPM/HRRN fallback bound in _determine_active_policy;
+# not a measured optimum.
 WAITING_PREFIX_REFRESH_MAX_QUEUE = 128
 
 
@@ -161,25 +159,16 @@ def estimate_prefill_extend_tile_metrics(
 
 
 def refresh_waiting_prefix(tree_cache: BasePrefixCache, req: Req) -> None:
-    """Touch ``req``'s device-resident prefix and record its length on the request.
-
-    Device-tree-only counterpart of :func:`match_prefix_for_req` for the per-round
-    waiting-queue refresh: it never calls ``match_prefix``, whose external-cache
-    implementations can allocate, load or enqueue lookups per call.
-    """
     token_ids = req.origin_input_ids + req.output_ids
     reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
     key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
-    matched = tree_cache.refresh_device_prefix(
+    tree_cache.refresh_device_prefix(
         RadixKey(
             token_ids=token_ids,
             extra_key=req.extra_key,
             limit=key_limit,
             cache_salt=req.cache_salt,
         )
-    )
-    req.num_matched_prefix_tokens = min(
-        matched, req._compute_max_prefix_len(len(token_ids))
     )
 
 
@@ -306,16 +295,13 @@ class SchedulePolicy:
             if self.tree_cache.supports_fast_match_prefix():
                 for r in waiting_queue:
                     match_prefix_for_req(self.tree_cache, r, include_req=True)
-            # Otherwise keep the waiting requests' cached prefixes resident: without a
-            # touch the LRU evicts a prefix while its request waits behind prompts that
-            # exhaust the budget. Device tree only, so no host-tier or storage lookup
-            # runs as a side effect; nothing to touch under a chunk cache.
+            # Otherwise keep waiting requests' prefixes resident, or the LRU evicts
+            # them while they wait. Head last, so it carries the newest timestamp.
             elif (
                 envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH.get()
                 and not self.tree_cache.is_chunk_cache()
-                and len(waiting_queue) <= WAITING_PREFIX_REFRESH_MAX_QUEUE
             ):
-                for r in waiting_queue:
+                for r in reversed(waiting_queue[:WAITING_PREFIX_REFRESH_MAX_QUEUE]):
                     refresh_waiting_prefix(self.tree_cache, r)
 
         if self.policy == CacheAgnosticPolicy.FCFS:

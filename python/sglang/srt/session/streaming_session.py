@@ -26,6 +26,7 @@ from sglang.srt.utils.common import ceil_align, is_npu
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
+    from sglang.srt.mem_cache.radix_cache import RadixKey
     from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 
 
@@ -625,6 +626,9 @@ class StreamingSession(BasePrefixCache):
 
     def is_chunk_cache(self):
         return self.inner.is_chunk_cache()
+
+    def refresh_device_prefix(self, key: RadixKey) -> int:
+        return self.inner.refresh_device_prefix(key)
 
     def is_tree_cache(self):
         return self.inner.is_tree_cache()

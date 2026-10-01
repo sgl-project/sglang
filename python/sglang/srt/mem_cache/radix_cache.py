@@ -412,9 +412,6 @@ class RadixCache(BasePrefixCache):
         )
 
     def refresh_device_prefix(self, key: RadixKey) -> int:
-        # The device-tree walk only: refreshes last_access_time along the matched
-        # path (and may split a node at the boundary, as match_prefix does) without
-        # the host-tier or storage lookups subclasses add to match_prefix.
         key, _ = key.maybe_to_bigram_view(self.is_eagle)
         if self.disable or len(key) == 0:
             return 0
