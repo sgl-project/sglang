@@ -24,6 +24,7 @@ use axum::http::{HeaderMap, HeaderName, Response};
 use bytes::Bytes;
 use forward::{forward_chat_request, SelectedWorkers};
 use preparation::{parse_routing_fields, PreparedChatRequest};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -115,13 +116,49 @@ async fn select_workers(
         ..RoutingContext::from_headers(ctx, headers)?
     };
 
-    let prefill = pick_prefill_worker(ctx, request, policy, candidates, &routing_context)?;
-    let decode = pick_decode_worker(ctx, request, &prefill, resolver, &routing_context)?;
+    let candidates = prefills_with_decode(ctx, request, candidates, resolver, &routing_context);
+    let prefill = pick_prefill_worker(ctx, request, policy, &candidates, &routing_context)?;
+    let decode = pick_decode_worker(ctx, request, &prefill, resolver, &routing_context, true)?;
     Ok(SelectedWorkers {
         prefill,
         decode,
         track_dispatch_timestamps: policy.needs_dispatch_timestamps(),
     })
+}
+
+/// Keep prefills whose version group has a decode that fits this request, so a
+/// full group falls back to another. Decode selection has no side effects, while
+/// a discarded prefill pick would already have bound affinity.
+fn prefills_with_decode(
+    ctx: &AppContext,
+    request: &PreparedChatRequest,
+    candidates: &[Arc<Worker>],
+    resolver: &PdPoolResolver,
+    routing: &RoutingContext<'_>,
+) -> Vec<Arc<Worker>> {
+    let first = candidates.first().map(|p| p.version_group());
+    if candidates.iter().all(|p| Some(p.version_group()) == first) {
+        return candidates.to_vec();
+    }
+    // Try strict admission across groups before relaxing capacity in any group.
+    for allow_capacity_fallback in [false, true] {
+        let mut fits = HashMap::new();
+        let kept: Vec<_> = candidates
+            .iter()
+            .filter(|p| {
+                *fits.entry(p.version_group()).or_insert_with(|| {
+                    pick_decode_worker(ctx, request, p, resolver, routing, allow_capacity_fallback)
+                        .is_ok()
+                })
+            })
+            .cloned()
+            .collect();
+        if !kept.is_empty() {
+            return kept;
+        }
+    }
+    // With no group fitting, keep them all so the pick reports the real error.
+    candidates.to_vec()
 }
 
 fn capture_load_snapshot(
@@ -229,15 +266,18 @@ fn pick_decode_worker(
     prefill: &Worker,
     resolver: &PdPoolResolver,
     routing: &RoutingContext<'_>,
+    allow_capacity_fallback: bool,
 ) -> Result<Option<Arc<Worker>>, ApiError> {
     if prefill.mode() != WorkerMode::Prefill {
         return Ok(None);
     }
+    // Only a decode worker in the prefill's version group can receive its KV.
     let candidates = resolver
-        .decode_candidates(&request.model)
+        .decode_peers(&request.model, prefill)
         .map_err(|error| pool_error(error, &request.model))?;
     let decode = select_decode_peer(&DecodeSelectionInputs {
         decode_policy_kind: ctx.config.model.decode_policy,
+        allow_capacity_fallback,
         bucket_selector: ctx.bucket_selector.as_ref(),
         model_id: &request.model,
         prefill_url: &prefill.url,
