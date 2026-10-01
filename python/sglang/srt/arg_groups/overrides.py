@@ -1323,9 +1323,7 @@ def _dcp_comm_backend_default(view: Any) -> dict:
         nnodes=view.nnodes,
     ):
         backend = "fi_a2a"
-    # NPU joins the a2a branch: ``ag_rs`` costs three collectives per layer
-    # where ``a2a`` packs output and LSE into one, as vLLM-Ascend does.
-    elif platform.is_cuda or platform.is_hip or platform.is_npu:
+    elif platform.is_cuda or platform.is_hip:
         backend = "a2a"
     else:
         backend = "ag_rs"
