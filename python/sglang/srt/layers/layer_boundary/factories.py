@@ -209,6 +209,9 @@ class StageDeclaration:
         reduction: Whether the next stage's input always completes the sum
             (an attention's), or the exit decides (an FFN's or a mixer's).
         gathers_attn_tp_input: Whether attention gathers TP-sharded input itself.
+        tensor_parallel_over_cp: The mixer partitions its heads over the CP
+            group instead of partitioning tokens. Its input gathers CP rows;
+            its output owes a sum over that group, including on decode batches.
         dense_tp_size: Dense FFN compute width: None uses the configured width,
             1 means local compute, and the full TP size means TP compute.
         exit_rows: Required FFN output rows at the layer or branch exit.
@@ -228,6 +231,7 @@ class StageDeclaration:
     output_transform: Optional[OutputTransform] = None
     reduction: ProducerReduction = ProducerReduction.EXIT_SCOPED
     gathers_attn_tp_input: bool = False
+    tensor_parallel_over_cp: bool = False
     dense_tp_size: Optional[int] = None
     exit_rows: Optional[ExitRows] = None
     # Only declarations participate in construction, never executable stages.
@@ -273,6 +277,7 @@ def declare_attn(
     reduction=ProducerReduction.ALWAYS_PARTIAL,
     gathers_attn_tp_input=True,
     output_transform=None,
+    tensor_parallel_over_cp=False,
 ):
     """Declare attention or a mixer; construct its executable boundary later.
 
@@ -286,6 +291,7 @@ def declare_attn(
             complete, before the residual update (a sandwich norm). The next
             stage's input runs it, so no fused add + norm takes that input.
             Requires ALWAYS_PARTIAL.
+        tensor_parallel_over_cp: Gather context shards for a head-parallel mixer.
 
     Returns:
         A StageDeclaration with no norm, tensors or execution plan.
@@ -302,6 +308,7 @@ def declare_attn(
         output_transform=output_transform,
         reduction=reduction,
         gathers_attn_tp_input=gathers_attn_tp_input,
+        tensor_parallel_over_cp=tensor_parallel_over_cp,
     )
 
 
@@ -375,11 +382,21 @@ def _resolve_stage(stage, variant, following=None):
         else frozenset()
     )
     owes = not sp and axes[TokenAxis.ATTN_TP] > 1
+    group = SumGroup.ATTN_TP
+    compute_rows = attention
+    if stage.tensor_parallel_over_cp:
+        if get_parallel().attn_tp_size != 1 or sp or scattered:
+            raise NotImplementedError(
+                "head parallelism over CP requires attention TP 1"
+            )
+        compute_rows = Layout(attention.sharded - {TokenAxis.ATTN_CP})
+        owes = get_parallel().attn_cp_size > 1
+        group = SumGroup.ATTN_CP
     declaration = StageContract(
-        InputContract(attention, gathered_by_compute=gathers, read=stage.read),
+        InputContract(compute_rows, gathered_by_compute=gathers, read=stage.read),
         OutputContract(
-            local if sp else attention,
-            group=SumGroup.ATTN_TP if owes else None,
+            local if sp else compute_rows,
+            group=group if owes else None,
             always_partial=owes
             and (
                 stage.reduction is ProducerReduction.ALWAYS_PARTIAL

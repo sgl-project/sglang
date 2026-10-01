@@ -64,6 +64,9 @@ class TestBoundaryParallelismResolution(CustomTestCase):
                     dp_size=1,
                     attn_dp_size=1,
                     enable_aiter_allreduce_fusion=False,
+                    disaggregation_mode="null",
+                    language_only=False,
+                    language_model_only=False,
                 ),
                 **options,
             )
@@ -142,6 +145,65 @@ class TestBoundaryParallelismResolution(CustomTestCase):
                             cp_size=cp_size,
                             cp_strategy=cfg.cp_strategy,
                         )
+
+    def test_glm5_next_cp_rejects_disaggregated_kda_state(self):
+        from sglang.srt.arg_groups.parallel_hook import _boundary_parallelism_overrides
+
+        for mode in ("null", "prefill", "decode"):
+            for prefill_cp in (False, True):
+                for cp_size in (1, 4):
+                    with self.subTest(mode=mode, cp=prefill_cp, cp_size=cp_size):
+                        cfg = self.config(
+                            enable_prefill_cp=prefill_cp,
+                            attn_cp_size=cp_size,
+                            disaggregation_mode=mode,
+                            language_only=True,
+                        )
+                        if prefill_cp and cp_size > 1 and mode != "null":
+                            with self.assertRaisesRegex(
+                                ValueError, "GLM-5.3-Flash.*PD"
+                            ):
+                                _boundary_parallelism_overrides(cfg, "glm5_next_text")
+                        else:
+                            self.assertEqual(
+                                _boundary_parallelism_overrides(cfg, "glm5_next_text"),
+                                {},
+                            )
+
+    def test_glm5_next_cp_requires_text_only_serving(self):
+        from sglang.srt.arg_groups.parallel_hook import _boundary_parallelism_overrides
+
+        for prefill_cp in (False, True):
+            for cp_size in (1, 4):
+                for language_only, language_model_only in (
+                    (False, False),
+                    (True, False),
+                    (False, True),
+                ):
+                    with self.subTest(
+                        cp=prefill_cp,
+                        size=cp_size,
+                        language_only=language_only,
+                        language_model_only=language_model_only,
+                    ):
+                        cfg = self.config(
+                            enable_prefill_cp=prefill_cp,
+                            attn_cp_size=cp_size,
+                            language_only=language_only,
+                            language_model_only=language_model_only,
+                        )
+                        if (
+                            prefill_cp
+                            and cp_size > 1
+                            and not (language_only or language_model_only)
+                        ):
+                            with self.assertRaisesRegex(ValueError, "--language-only"):
+                                _boundary_parallelism_overrides(cfg, "glm5_next_text")
+                        else:
+                            self.assertEqual(
+                                _boundary_parallelism_overrides(cfg, "glm5_next_text"),
+                                {},
+                            )
 
 
 class TestModelOverridableWhitelist(CustomTestCase):
