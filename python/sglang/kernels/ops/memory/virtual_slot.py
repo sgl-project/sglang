@@ -200,7 +200,7 @@ TRANSLATE_TOKEN_IDS_BLOCK = 512
 def translate_token_ids_kernel(
     loc_ptr,  # in:  [N] or strided (rows, cols), int32/int64 — virtual token ids, widened under DCP
     v2p_ptr,  # in:  [num_pages + 1] int64 — virtual->physical page table
-    out_ptr,  # out: shaped like loc, int64 — physical token ids
+    out_ptr,  # out: shaped like loc, or packed [W] when W > N; int64 — physical token ids
     N,  # runtime: live element count
     W,  # runtime: lanes to write; [N, W) get 0
     num_v_pages,  # runtime: rows of v2p; a page at or past it is unmapped
