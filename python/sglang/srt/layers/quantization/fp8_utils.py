@@ -16,7 +16,6 @@ from sglang.kernels.ops.gemm.fp8_kernel import (
 from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
     fp8_max,
-    fp8_min,
     is_fp8_fnuz,
     per_token_group_quant_fp8,
     scaled_fp8_quant,
@@ -2135,33 +2134,12 @@ def apply_fp8_linear(
             # On XPU, sgl-kernel-xpu's native quant kernels require output_q
             # to exactly match input's shape; padded output isn't supported.
             num_token_padding = None
-        # For static per-tensor activation scales when using inductor compiler,
-        # use pure PyTorch ops instead of the opaque sgl_kernel quant kernel.
-        # Inductor fuses these with surrounding ops (RMSNorm, residual add),
-        # eliminating a separate kernel launch per linear layer.
-        # weight_scale shape does not matter here -- it is only used in the
-        # GEMM epilogue, not in the activation quant fusion. Only activates when
-        # cuda_graph_config[prefill].tc_compiler=inductor; eager PCG and
-        # decode both use the faster custom kernel.
-
-        if (
-            input_scale is not None
-            and input_scale.numel() == 1
-            and get_exec().graph.cuda_graph_config.prefill.tc_compiler == "inductor"
-        ):
-            qinput = (
-                (input_2d * input_scale.reciprocal())
-                .clamp(min=fp8_min, max=fp8_max)
-                .to(fp8_dtype)
-            )
-            x_scale = input_scale
-        else:
-            qinput, x_scale = scaled_fp8_quant(
-                input_2d,
-                input_scale,
-                num_token_padding=num_token_padding,
-                use_per_token_if_dynamic=use_per_token_if_dynamic,
-            )
+        qinput, x_scale = scaled_fp8_quant(
+            input_2d,
+            input_scale,
+            num_token_padding=num_token_padding,
+            use_per_token_if_dynamic=use_per_token_if_dynamic,
+        )
         if (
             input_scale is not None
             and channelwise_cutlass

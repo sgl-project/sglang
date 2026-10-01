@@ -37,7 +37,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import get_current_device_stream_fast, is_cpu, is_cuda, is_hip
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -428,25 +427,7 @@ class RotaryPosMixin:
 
 
 def _reshape_for_qk_norm(x: torch.Tensor, head_dim: int) -> torch.Tensor:
-    """Reshape a (..., H*D) tensor into (..., H, D) ahead of QK RMSNorm.
-
-    On CUDA with the inductor piecewise-cuda-graph compiler, return a
-    stride-preserving view so inductor can fuse this reshape with the
-    subsequent RMSNorm (and any upstream/downstream FP8 quant) into a
-    single triton kernel -- the original motivation of #21734.
-
-    Everywhere else (ROCm, or CUDA with the eager PCG fallback), use the
-    flat 2D reshape that forces a copy when the input is a non-contiguous
-    QKV-split stride-trick view. ROCm's RMSNorm kernels assume contiguous
-    inputs and fault on strided tensors (root cause of the #21734 revert
-    in #23159).
-    """
-
-    if (
-        _is_cuda
-        and get_exec().graph.cuda_graph_config.prefill.tc_compiler == "inductor"
-    ):
-        return x.view(*x.shape[:-1], -1, head_dim)
+    """Flatten head rows, making non-contiguous QKV views safe for RMSNorm."""
     return x.reshape(-1, head_dim)
 
 
@@ -515,8 +496,6 @@ def apply_qk_norm(
         and allow_inplace  # TODO(dark): this can be relaxed if needed
         and (q_eps == k_eps)  # TODO(dark): this can also be relaxed
         and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
-        and get_exec().graph.cuda_graph_config.prefill.tc_compiler
-        != "inductor"  # let inductor fuse QK norm
         and can_use_fused_inplace_qknorm(head_dim, q.dtype)
     ):
         fused_inplace_qknorm(

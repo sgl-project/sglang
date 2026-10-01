@@ -195,7 +195,7 @@ class TestApplyFp8LinearScaleDispatch(CustomTestCase):
         exec_config = SimpleNamespace(
             graph=SimpleNamespace(
                 cuda_graph_config=SimpleNamespace(
-                    prefill=SimpleNamespace(tc_compiler="none")
+                    prefill=SimpleNamespace(backend="disabled")
                 )
             )
         )
