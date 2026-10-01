@@ -127,7 +127,7 @@ def _breakable_qsa_indexer(layer, hidden_states, positions):
         bridge = topk.new_empty((hidden_states.shape[0], topk.shape[1]))
         layer._qsa_prefill_topk_bridge = bridge
     output = bridge[: hidden_states.shape[0]]
-    output.fill_(-1)
+    output.fill_(0)
     output[: topk.shape[0]].copy_(topk)
     return output
 
@@ -197,10 +197,15 @@ def _breakable_ple_prefetch(ple, batch):
 
 @eager_on_graph(True)
 def _breakable_ple_forward(ple, hidden_states, batch):
+    forward_batch = get_tc_piecewise_forward_context().forward_batch
+    if batch.batch is None:
+        # Idle batch replayed as a dummy extend: join the collective, add nothing.
+        ple.forward_idle(forward_batch)
+        return torch.zeros_like(hidden_states)
     # PLE pads its output to the token bucket after applying the live layout.
     return ple(
         hidden_states=hidden_states,
-        forward_batch=get_tc_piecewise_forward_context().forward_batch,
+        forward_batch=forward_batch,
         batch=batch.batch,
     )
 

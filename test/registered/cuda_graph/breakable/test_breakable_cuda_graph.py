@@ -69,7 +69,7 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
                 context.forward_batch = SimpleNamespace(rows=n)
                 x.fill_(2)
                 graph.replay()
-                self.assertEqual(result.tolist(), [[3, 3]] * n + [[-1, -1]] * (8 - n))
+                self.assertEqual(result.tolist(), [[3, 3]] * n + [[0, 0]] * (8 - n))
 
     def test_no_break_capture_replay(self):
         """Capture and replay without any graph breaks should work like normal CUDA graph."""

@@ -191,7 +191,7 @@ class TestPrefillCudaGraphVote(CustomTestCase):
     def test_multimodal_ranks_vote_eager(self, gather, parallel):
         infos = [
             dp_attn.MLPSyncBatchInfo(
-                dp_size=2,
+                num_dp_ranks=2,
                 tp_size=1,
                 cp_size=1,
                 num_tokens=4,
