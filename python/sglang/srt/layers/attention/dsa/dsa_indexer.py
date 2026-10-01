@@ -1192,11 +1192,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         token_to_batch_idx = metadata.get_token_to_batch_idx()
         q_offset = ks.shape[0]
         k_offset = k_fp8.shape[0]
+        # Opt-in TP row split: this rank computes rows [row_lo, row_hi) only.
+        tp_split = self._indexer_tp_split(
+            forward_batch=forward_batch, q_offset=q_offset
+        )
+        row_lo, row_hi = (0, q_offset) if tp_split is None else tp_split[1:3]
         need_chunk, logits_budget_bytes = self._should_chunk_mqa_logits(
-            q_offset, k_offset, device_index
+            row_hi - row_lo, k_offset, device_index
         )
 
-        if not need_chunk:
+        if not need_chunk and tp_split is None:
             assert q_fp8[:q_offset].shape[0] != 0
             with self._with_real_sm_count():
                 if _is_hip:
@@ -1265,9 +1270,19 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 f"topk_indices_offset too short: {global_topk_offset.shape[0]} < {q_offset}"
             )
 
-        start = 0
-        while start < q_offset:
-            end = min(start + max_rows, q_offset)
+        dst, dst_base = topk_result, 0
+        if tp_split is not None:
+            if not need_chunk:
+                max_rows = row_hi - row_lo
+            # Per-row outputs, so the local rows go to a buffer gathered below.
+            dst = torch.empty(
+                (row_hi - row_lo, self.index_topk), device=device, dtype=torch.int32
+            )
+            dst_base = row_lo
+
+        start = row_lo
+        while start < row_hi:
+            end = min(start + max_rows, row_hi)
 
             with self._with_real_sm_count():
                 if _is_hip:
@@ -1340,10 +1355,82 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 batch_idx_list=batch_idx_chunk,
                 topk_indices_offset_override=topk_offset_chunk,
             )
-            topk_result[start:end] = raw_topk_chunk
+            dst[start - dst_base : end - dst_base] = raw_topk_chunk
             start = end
 
+        if tp_split is not None:
+            # Rank order == row order, so the gather rebuilds rows [0, q_offset).
+            group, _, _, sizes = tp_split
+            group.all_gatherv(dst, sizes=sizes, output=topk_result[:q_offset])
         return topk_result
+
+    _tp_split_logged = False
+
+    def _indexer_tp_split(
+        self, forward_batch: ForwardBatch, q_offset: int
+    ) -> Optional[Tuple[Any, int, int, list[int]]]:
+        # (attn-TP group, lo, hi, rows per rank), or None for the replicated path.
+        # Every input here is identical on all ranks of the group (same batch, env,
+        # mode), so all ranks take the same branch and the all-gather cannot diverge.
+        if not envs.SGLANG_DSA_INDEXER_TP_SPLIT.get() or not _is_cuda:
+            return None
+        if self.dsa_enable_prefill_cp or is_cp_active(forward_batch):
+            return None
+        if get_is_capture_mode() or torch.cuda.is_current_stream_capturing():
+            return None
+        group = get_attn_tp_group()
+        tp = group.world_size
+        min_rows = max(tp, envs.SGLANG_DSA_INDEXER_TP_SPLIT_MIN_ROWS.get())
+        if (
+            tp <= 1
+            or q_offset < min_rows
+            or group.pynccl_comm is None
+            or not group.pynccl_comm.available
+        ):
+            return None
+        bounds = self._indexer_tp_split_bounds(
+            seq_lens_cpu=forward_batch.seq_lens_cpu,
+            extend_lens=forward_batch.extend_seq_lens_cpu,
+            q_offset=q_offset,
+            tp=tp,
+        )
+        rank = group.rank_in_group
+        if not Indexer._tp_split_logged:
+            Indexer._tp_split_logged = True
+            logger.info(
+                "DSA indexer: prefill logits/top-k rows split across attn-TP "
+                f"(SGLANG_DSA_INDEXER_TP_SPLIT=1, tp={tp}): {q_offset} rows, "
+                f"this rank [{bounds[rank]}, {bounds[rank + 1]})"
+            )
+        sizes = [hi - lo for lo, hi in zip(bounds[:-1], bounds[1:])]
+        return group, bounds[rank], bounds[rank + 1], sizes
+
+    @staticmethod
+    def _indexer_tp_split_bounds(
+        seq_lens_cpu: torch.Tensor, extend_lens: list[int], q_offset: int, tp: int
+    ) -> list[int]:
+        # Contiguous row bounds 0 = b_0 < ... < b_tp = q_offset, balanced by each
+        # row's KV length (what logits and top-k cost scales with); host-only math.
+        seq = seq_lens_cpu.to(torch.int64)
+        if (
+            len(extend_lens) == seq.numel()
+            and sum(extend_lens) == q_offset
+            and min(extend_lens) >= 0
+        ):
+            ext = torch.tensor(extend_lens, dtype=torch.int64)
+            row_req_start = torch.repeat_interleave(torch.cumsum(ext, 0) - ext, ext)
+            row_pos = torch.arange(q_offset, dtype=torch.int64) - row_req_start
+            row_kv = torch.repeat_interleave(seq - ext, ext) + row_pos + 1
+            cum = torch.cumsum(row_kv.clamp_(min=1), 0)
+            targets = cum[-1] * torch.arange(1, tp, dtype=torch.int64) // tp
+            cuts = torch.searchsorted(cum, targets, right=True).tolist()
+        else:
+            cuts = [q_offset * r // tp for r in range(1, tp)]
+        bounds = [0]
+        for r, cut in enumerate(cuts, start=1):
+            bounds.append(min(max(cut, bounds[-1] + 1), q_offset - (tp - r)))
+        bounds.append(q_offset)
+        return bounds
 
     def _forward_cuda_k_only(
         self,
