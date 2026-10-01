@@ -15,13 +15,15 @@ Scope, enforced by :func:`is_supported`:
   * TP world size exactly 4 -- the reduction is hand-unrolled over 4 peers and
     the epoch protocol counts in units of 3 remote peers.
   * hidden size exactly 2048, eps 1e-6, and M in {1,2,4,8,16,32,64}.
-  * ``_use_aiter_bpreshuffle_gfx95`` must be False. On ROCm >= 7.2 SGLang
-    physically preshuffles FP8 weights into the gfx95 bpreshuffle layout, which
-    this kernel's consumers do not expect. Returning False here makes the caller
-    fall back rather than produce wrong numbers.
+ROCm >= 7.2 is supported: there SGLang preshuffles FP8 weights and the gfx95
+bpreshuffle GEMM reads the activation scale column-major, so the scale this
+kernel writes row-major is relayed out through upstream's
+``materialize_bpreshuffle_fp8_scale`` before it is returned. The weights
+themselves are never touched by this path.
 
 Anything outside that envelope returns False and the caller keeps the stock
-path. Opt out entirely with ``SGLANG_DISABLE_GLUON_TP_AR_NORM_QUANT=1``.
+path. The existing ``SGLANG_DISABLE_FUSED_AR_QUANT`` opts out of the whole
+fused AR+quant path, this backend included; no separate flag is introduced.
 
 The kernel body lives in ``gluon_tp_ar_norm_quant_kernel.py``. It is tuned per
 token count M; see ``SUPPORTED_M``.
@@ -41,7 +43,7 @@ from sglang.srt.distributed.device_communicators.hip_ipc import (
     create_shared_tensor,
     register_peer_pointers,
 )
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -98,14 +100,6 @@ def is_available(world_size: int, device: torch.device) -> bool:
     """
     if not _is_hip or world_size != TP_SIZE:
         return False
-    if get_bool_env_var("SGLANG_DISABLE_GLUON_TP_AR_NORM_QUANT", default="false"):
-        return False
-    from sglang.srt.layers.quantization.fp8_utils import (
-        _use_aiter_bpreshuffle_gfx95,
-    )
-
-    if _use_aiter_bpreshuffle_gfx95:
-        return False
     return _arch_is_gfx950(device) and _gluon_available()
 
 
@@ -119,8 +113,6 @@ def is_supported(
 ) -> bool:
     """Support predicate. False means "caller should use the stock path"."""
     if not _is_hip or residual is None:
-        return False
-    if get_bool_env_var("SGLANG_DISABLE_GLUON_TP_AR_NORM_QUANT", default="false"):
         return False
     if world_size != TP_SIZE:
         return False
@@ -138,14 +130,6 @@ def is_supported(
         return False
     # The kernel bakes eps into the launch; only the Qwen3-Next value is tuned.
     if abs(eps - EPS) > 1e-12:
-        return False
-    # On ROCm >= 7.2 SGLang preshuffles FP8 weights; this path is not validated
-    # against that layout and would silently produce wrong results.
-    from sglang.srt.layers.quantization.fp8_utils import (
-        _use_aiter_bpreshuffle_gfx95,
-    )
-
-    if _use_aiter_bpreshuffle_gfx95:
         return False
     if not _arch_is_gfx950(hidden_states.device):
         return False
@@ -344,4 +328,16 @@ def fused_tp_ar_add_gemma_rmsnorm_group_fp8_quant(
             eps=EPS,
         )
     )
+    from sglang.srt.layers.quantization.fp8_utils import (
+        _use_aiter_bpreshuffle_gfx95,
+        materialize_bpreshuffle_fp8_scale,
+    )
+
+    if _use_aiter_bpreshuffle_gfx95:
+        # On ROCm >= 7.2 the gfx95 bpreshuffle GEMM reads the activation scale
+        # column-major; the kernel writes it row-major. Relayout with
+        # upstream's own helper so both the CK and the Triton branch of
+        # w8a8_block_fp8_linear interpret it correctly. G == 16 at hidden
+        # 2048, so this copy is negligible.
+        scales = materialize_bpreshuffle_fp8_scale(scales)
     return quantized, scales, residual_out, normalized
