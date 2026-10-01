@@ -10,12 +10,13 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4_moe import (
+    OCP_MX_BLOCK_SIZE as MX_BLOCK_SIZE,
+)
 from sglang.test.test_utils import CustomTestCase
 
-# Mirrors OCP_MX_BLOCK_SIZE, kept local so this test does not import the ROCm
-# scheme module. Both K dimensions and every per-rank intermediate below are
-# multiples of it, which is what create_weights enforces at startup.
-MX_BLOCK_SIZE = 32
+# Both K dimensions and every per-rank intermediate below are multiples of the
+# MX block size, which is what create_weights enforces at startup.
 
 HIDDEN = 64
 # Divisible by the widest TP size times the block size, so every rank's
@@ -376,9 +377,25 @@ class TestSharedExpertOnlineMxfp4Loader(CustomTestCase):
             )
 
     def test_padding_and_tensor_parallelism_together(self):
-        # The shape the model of interest actually serves in: TP8 with aiter's
-        # padding on top. Each rank's slice goes in the leading part of its own
-        # padded band, and the pad after it stays zero.
+        # Padding and sharding combined: each rank's slice goes in the leading
+        # part of its own padded band, and the pad after it stays zero.
+        #
+        # Not the shape amd/Qwen3.8-2.4T-A95B-Quark-MXFP4 serves in. Its
+        # moe_intermediate_size is 2048, so TP8 gives 256 per rank and a
+        # w2_down_dim of 128, which is exactly AITER_PADDING_SIZE; aiter reports
+        # is_padded=False and the measured configuration carries no padding at
+        # all. Padding only appears at a TP size that leaves w2_down_dim short
+        # of 128, e.g. TP16.
+        #
+        # The padded buffer is driven through the plain leading-slice copy here,
+        # not through use_padded_loading. That combination is deliberate: when
+        # aiter really does pad it sets weight_padded on w2_weight, which makes
+        # FusedMoE.use_padded_loading true, and on that branch the checkpoint
+        # offset is shard_size * tp_rank with shard_size already padded. That
+        # mis-slices for tp_rank > 0 for the routed experts too, so it is
+        # pre-existing and out of scope here; it is also why a padded path at
+        # TP > 1 has no test. test_padded_loading_agrees_with_the_plain_path
+        # covers use_padded_loading at TP1, where the offset is zero.
         pad = MX_BLOCK_SIZE
         full_gate = _fake_packed(INTERMEDIATE, HIDDEN // 2, offset=0)
         full_down = _fake_packed(HIDDEN, INTERMEDIATE // 2, offset=0)
