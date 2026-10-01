@@ -231,3 +231,9 @@ def test_packed_mtp_indexer_roundtrip(pools):
             )
     finally:
         host.destroy()
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))
