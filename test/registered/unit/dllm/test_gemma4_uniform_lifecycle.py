@@ -39,7 +39,6 @@ class _Req:
             req_pool_idx=1,
             kv_allocated_len=context_len + block_size,
             kv_committed_len=context_len + block_size,
-            swa_evicted_seqlen=0,
         )
         self.finished_reason = None
         self.finish_on_update = False
