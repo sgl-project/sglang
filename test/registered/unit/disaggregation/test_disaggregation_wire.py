@@ -70,6 +70,61 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
+class TestMixedSWAKVBlockScales(CustomTestCase):
+    def test_swa_block_scales_follow_each_subpools_dtype(self):
+        from sglang.srt.mem_cache.memory_pool import (
+            MHATokenToKVPool,
+            MHATokenToKVPoolMXFP8,
+        )
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+        swa_infos = ([0x1000, 0x2000], [1024, 1024], [64, 64])
+        full_scale_infos = ([0x3000, 0x4000], [128, 128], [8, 8])
+        swa_scale_infos = ([0x5000, 0x6000], [128, 128], [8, 8])
+
+        for full_quantized, swa_quantized in (
+            (False, False),
+            (True, False),
+            (False, True),
+            (True, True),
+        ):
+            with self.subTest(full=full_quantized, swa=swa_quantized):
+                target = object.__new__(SWAKVPool)
+                for name, quantized, scale_infos in (
+                    ("full_kv_pool", full_quantized, full_scale_infos),
+                    ("swa_kv_pool", swa_quantized, swa_scale_infos),
+                ):
+                    pool = object.__new__(
+                        MHATokenToKVPoolMXFP8 if quantized else MHATokenToKVPool
+                    )
+                    pool.get_contiguous_buf_infos = Mock(return_value=swa_infos)
+                    if quantized:
+                        pool.get_kv_scale_buf_infos = Mock(return_value=scale_infos)
+                    setattr(target, name, pool)
+
+                kv_args = KVArgs()
+                setup_state_kv_args(kv_args, target)
+
+                expected_types = [StateType.SWA]
+                expected_infos = [swa_infos]
+                if full_quantized:
+                    expected_types.append(StateType.BLOCK_SCALE)
+                    expected_infos.append(full_scale_infos)
+                if swa_quantized:
+                    expected_types.append(StateType.BLOCK_SCALE_SWA)
+                    expected_infos.append(swa_scale_infos)
+                self.assertEqual(kv_args.state_types, expected_types)
+                self.assertEqual(
+                    kv_args.state_data_ptrs, [infos[0] for infos in expected_infos]
+                )
+                self.assertEqual(
+                    kv_args.state_data_lens, [infos[1] for infos in expected_infos]
+                )
+                self.assertEqual(
+                    kv_args.state_item_lens, [infos[2] for infos in expected_infos]
+                )
+
+
 class TestDisaggregationWire(unittest.TestCase):
     def test_sender_clear_keeps_abort_ack_until_writes_drain(self):
         manager = object.__new__(MooncakeKVManager)
