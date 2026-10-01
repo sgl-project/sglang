@@ -18,6 +18,7 @@ use axum::body::Body;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use axum::response::IntoResponse;
 use bytes::Bytes;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -142,8 +143,7 @@ pub(super) async fn forward_chat_request(
             (Err(ApiError::StaleRequestExpired { model }), None)
         }
     };
-    let log_context =
-        metrics.record_dispatch_result(&result, engine_rid, blamed_prefill.as_deref());
+    let log_context = metrics.record_dispatch_result(&result, engine_rid, blamed_prefill.as_ref());
     // Materialize dispatch errors here so the access log retains the selected worker.
     let mut response = match result {
         Ok(mut response) => {
@@ -251,20 +251,44 @@ async fn prefill_failure(result: Result<Response<Body>, ApiError>) -> PrefillFai
     }))
 }
 
+/// Prefill's failure ended the request, so the client-visible outcome belongs to
+/// `prefill` rather than to the decode worker the dispatch had selected.
+struct Blame {
+    prefill: Arc<Worker>,
+    /// Whether decode had already reached the wire when it was dropped. False
+    /// only if prefill failed before decode's future was ever polled, which is
+    /// a pre-dispatch drop and must stay uncounted.
+    decode_dispatched: bool,
+}
+
 /// Returns decode's response as soon as decode answers, unless prefill fails
 /// first; then prefill's failure is returned along with the blamed prefill.
 async fn forward_pd(
     task: tokio::task::JoinHandle<PrefillFailure>,
     prefill: Arc<Worker>,
     decode: impl std::future::Future<Output = Result<Response<Body>, ApiError>>,
-) -> (Result<Response<Body>, ApiError>, Option<Arc<Worker>>) {
+) -> (Result<Response<Body>, ApiError>, Option<Blame>) {
+    // Set on decode's first poll, which is where `forward_to_response_worker`
+    // begins and the request reaches the worker. Read from the same task, so
+    // `Relaxed` needs no ordering beyond what the select already gives.
+    let dispatched = AtomicBool::new(false);
+    let decode = async {
+        dispatched.store(true, Ordering::Relaxed);
+        decode.await
+    };
     let mut decode = std::pin::pin!(decode);
+    let blame = |prefill| {
+        Some(Blame {
+            prefill,
+            decode_dispatched: dispatched.load(Ordering::Relaxed),
+        })
+    };
     tokio::select! {
         biased;
         failure = task => match failure {
             Ok(None) => (decode.await, None),
-            Ok(Some(failure)) => (failure, Some(prefill)),
-            Err(_) => (Err(ApiError::PrefillFailed { status: None }), Some(prefill)),
+            Ok(Some(failure)) => (failure, blame(prefill)),
+            Err(_) => (Err(ApiError::PrefillFailed { status: None }), blame(prefill)),
         },
         // Dropping the handle leaves prefill running.
         response = &mut decode => (response, None),
@@ -385,15 +409,31 @@ impl DispatchMetrics {
         &self,
         result: &Result<Response<Body>, ApiError>,
         engine_rid: Option<String>,
-        blamed_prefill: Option<&Worker>,
+        blame: Option<&Blame>,
     ) -> RequestLogContext {
         if let Err(ApiError::StaleRequestExpired { .. }) = result {
             self.registry
                 .record_stale_request(StaleRequestOutcome::Expired);
         }
         let outcome = dispatch_outcome(result);
-        let worker_url = match blamed_prefill {
-            Some(prefill) => &prefill.url,
+        let worker_url = match blame {
+            // The prefill task books its own outcome, so recording `outcome`
+            // here would double-count it against prefill. Decode still has to
+            // be accounted for: its dispatch reached the worker and was then
+            // abandoned, and leaving it out would silently shrink decode's
+            // dispatch counts during exactly the prefill incident an operator
+            // is reading them to understand.
+            Some(blame) => {
+                if blame.decode_dispatched {
+                    self.registry.record_worker_request(
+                        &self.worker_url,
+                        &self.model,
+                        self.mode,
+                        RequestOutcome::Cancelled,
+                    );
+                }
+                &blame.prefill.url
+            }
             None => {
                 self.registry.record_worker_request(
                     &self.worker_url,
