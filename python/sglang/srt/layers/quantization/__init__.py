@@ -51,8 +51,10 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_gfx95_supported,
+    is_hip,
     is_mps,
     is_npu,
+    is_triton_kernels_available,
     is_xpu,
 )
 
@@ -94,7 +96,13 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
 # GEMM, which consumes the packed e2m1 + ue8m0 g32 checkpoint layout directly.
 # Other backends without that kernel keep the existing "unknown quantization
 # method" error rather than falling through to a bf16 upcast.
-if is_cpu() or is_cuda() or _is_gfx95_supported or is_xpu():
+if (
+    is_cpu()
+    or is_cuda()
+    or _is_gfx95_supported
+    or is_xpu()
+    or (is_hip() and is_triton_kernels_available())
+):
     BASE_QUANTIZATION_METHODS.update(
         {
             "mxfp4": Mxfp4Config,
