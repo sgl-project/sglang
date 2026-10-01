@@ -3735,6 +3735,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "sglang-processor"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "dynamo-parsers",
+ "dynamo-protocols",
+ "dynamo-renderer",
+ "dynamo-tokenizers",
+ "futures",
+ "hf-hub",
+ "minijinja",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "sglang-renderer"
 version = "0.1.0"
 dependencies = [
@@ -3755,6 +3773,7 @@ dependencies = [
  "rmpv",
  "serde",
  "serde_json",
+ "sglang-processor",
  "thiserror",
  "tokio",
  "tower 0.5.3",
@@ -3790,10 +3809,12 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "sglang-grpc-types",
  "sglang-mm",
  "socket2 0.6.5",
  "thiserror",
  "tokio",
+ "tonic",
  "tower 0.5.3",
  "tracing",
  "tracing-appender",

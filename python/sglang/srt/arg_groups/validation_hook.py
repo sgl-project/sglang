@@ -18,7 +18,7 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
     parse_ib_device_config,
 )
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform, num_dp_ranks_of
 from sglang.srt.utils.common import torch_release
 from sglang.srt.utils.runai_utils import is_runai_obj_uri
 
@@ -72,8 +72,9 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
             # Every stage rebuilds the same verify input from the relayed
             # per-request state, so all stages must see the same batch.
             # DP attention partitions it per DP rank.
-            assert not cfg.enable_dp_attention, (
-                "SGLANG_ENABLE_PP_SPEC is not compatible with --enable-dp-attention"
+            assert not attn_dp_enabled_of(cfg), (
+                "SGLANG_ENABLE_PP_SPEC is not compatible with attention DP "
+                "(--attn-dp-size)"
             )
         else:
             assert cfg.disaggregation_mode == "prefill", (
@@ -114,8 +115,9 @@ def check_server_args(server_args: Any):
     if cfg.pp_size > 1:
         check_pipeline_parallel_compat(cfg)
 
-    assert not (cfg.dp_size > 1 and cfg.nnodes != 1 and not cfg.enable_dp_attention), (
-        "multi-node data parallel is not supported unless dp attention!"
+    assert not (cfg.dp_size > 1 and cfg.nnodes != 1), (
+        "multi-node data-parallel replicas are not supported; use attention DP "
+        "(--attn-dp-size) across nodes"
     )
 
     assert cfg.base_gpu_id >= 0, "base_gpu_id must be non-negative"
@@ -375,7 +377,7 @@ def check_load_publish_args(server_args: Any):
     _, reason = resolve_load_pub_range(
         kv_endpoint=cfg.endpoint,
         replay_endpoint=cfg.replay_endpoint,
-        dp_size=server_cfg.dp_size,
+        dp_size=num_dp_ranks_of(server_cfg),
         load_publish_endpoint=mode,
     )
     if reason:
@@ -528,10 +530,10 @@ def check_two_batch_overlap(server_args: Any):
     if (
         cfg.enable_two_batch_overlap
         and cfg.moe_a2a_backend == "none"
-        and not cfg.enable_dp_attention
+        and not attn_dp_enabled_of(cfg)
     ):
         raise ValueError(
             "When enabling two batch overlap without an EP a2a backend "
-            "(moe_a2a_backend='none'), --enable-dp-attention is required "
+            "(moe_a2a_backend='none'), attention DP (--attn-dp-size) is required "
             "(DeepSeek-V4 non-EP DP TBO path)."
         )
