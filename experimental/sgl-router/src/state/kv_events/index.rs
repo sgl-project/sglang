@@ -384,6 +384,12 @@ impl KvEventIndex {
             .connect_timeout(SNAPSHOT_FETCH_CONNECT_TIMEOUT)
             .read_timeout(SNAPSHOT_FETCH_READ_TIMEOUT)
             .timeout(per_fetch)
+            // A sibling router never redirects this route, so a redirect is
+            // either a misconfigured peer or a hostile one steering the fetch
+            // — and its multi-gigabyte buffering budget — at an arbitrary
+            // in-cluster URL. Refuse to follow: the 3xx lands as
+            // `FetchAnswer::NoBody` and the peer is just not a source.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
         {
             Ok(client) => client,
