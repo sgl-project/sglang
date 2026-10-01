@@ -23,7 +23,7 @@ register_xpu_ci(
 )
 register_xpu_ci(
     est_time=360,
-    suite="release-nightly-xpu-1-gpu",
+    suite="nightly-B-xpu-1-gpu",
     nightly=True,
 )
 

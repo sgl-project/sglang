@@ -16,7 +16,7 @@ from sglang.test.runners import HFRunner, SRTRunner
 from sglang.test.test_utils import CustomTestCase, empty_gpu_cache
 
 register_xpu_ci(est_time=60, suite="nightly-xpu-1-gpu", nightly=True)
-register_xpu_ci(est_time=60, suite="release-nightly-xpu-1-gpu", nightly=True)
+register_xpu_ci(est_time=60, suite="nightly-B-xpu-1-gpu", nightly=True)
 
 MODEL_PATH = "Skywork/Skywork-Reward-V2-Qwen3-0.6B"
 TP_SIZE = 1

@@ -2,9 +2,9 @@ name: Nightly Test (Intel)
 
 on:
   schedule:
-    # 22:30 IST (UTC+5:30) → 17:00 UTC daily: release-nightly-xpu-1-gpu.
+    # 22:30 IST (UTC+5:30) → 17:00 UTC daily: nightly-B-xpu-1-gpu.
     - cron: '0 17 * * *'
-    # 01:00 IST (UTC+5:30) → 19:30 UTC daily: main-nightly-xpu-*.
+    # 01:00 IST (UTC+5:30) → 19:30 UTC daily: nightly-A-xpu-*.
     - cron: '30 19 * * *'
   push:
     branches:
@@ -36,7 +36,7 @@ concurrency:
   cancel-in-progress: ${{ !inputs.ref && github.event_name != 'workflow_call' && github.event_name != 'workflow_dispatch' }}
 
 jobs:
-  main-nightly-xpu-1-gpu:
+  nightly-A-xpu-1-gpu:
     # sglang main + sgl-kernel-xpu main.
     if: github.repository == 'sgl-project/sglang' && github.event.schedule != '0 17 * * *'
     runs-on: intel-bmg-nightly
@@ -144,7 +144,7 @@ jobs:
             docker rmi -f "${CI_SGLANG_XPU_IMAGE}" || true
           fi
 
-  main-nightly-xpu-2-gpu:
+  nightly-A-xpu-2-gpu:
     # sglang main + sgl-kernel-xpu main.
     if: github.repository == 'sgl-project/sglang' && github.event.schedule != '0 17 * * *'
     runs-on: intel-bmg-nightly
@@ -241,7 +241,7 @@ jobs:
             docker rmi -f "${CI_SGLANG_XPU_IMAGE}" || true
           fi
 
-  main-nightly-xpu-4-gpu:
+  nightly-A-xpu-4-gpu:
     # sglang main + sgl-kernel-xpu main.
     if: github.repository == 'sgl-project/sglang' && github.event.schedule != '0 17 * * *'
     runs-on: intel-bmg-nightly
@@ -338,7 +338,7 @@ jobs:
             docker rmi -f "${CI_SGLANG_XPU_IMAGE}" || true
           fi
 
-  main-nightly-xpu-8-gpu:
+  nightly-A-xpu-8-gpu:
     # sglang main + sgl-kernel-xpu main.
     if: github.repository == 'sgl-project/sglang' && github.event.schedule != '0 17 * * *'
     runs-on: intel-bmg-nightly
@@ -435,8 +435,8 @@ jobs:
             docker rmi -f "${CI_SGLANG_XPU_IMAGE}" || true
           fi
 
-  release-nightly-xpu-1-gpu:
-    # sglang main + prebuilt sgl-kernel-xpu wheel: PR CI suites plus release-nightly-xpu-1-gpu.
+  nightly-B-xpu-1-gpu:
+    # sglang main + prebuilt sgl-kernel-xpu wheel: PR CI suites plus nightly-B-xpu-1-gpu.
     if: github.repository == 'sgl-project/sglang' && github.event.schedule != '30 19 * * *'
     runs-on: intel-bmg-nightly
     # Two suites back to back (~5h est. incl. setup) exceed the 360-min default.
@@ -528,15 +528,15 @@ jobs:
         if: success() || failure()
         timeout-minutes: 240
         run: |
-          touch github_summary.md release-nightly-xpu-1-gpu-metrics.jsonl
+          touch github_summary.md nightly-B-xpu-1-gpu-metrics.jsonl
           docker exec ci_sglang_xpu bash -c "
             source /opt/venv/bin/activate &&
             cd /sglang-checkout/test &&
             OLMOCR_BENCH_DIR=/sglang-checkout/olmOCR-bench/bench_data \
             GITHUB_STEP_SUMMARY=/sglang-checkout/github_summary.md \
             SGLANG_IS_IN_CI=true \
-            SGLANG_TEST_METRICS_FILE=/sglang-checkout/release-nightly-xpu-1-gpu-metrics.jsonl \
-            python3 run_suite.py --hw xpu --suite release-nightly-xpu-1-gpu --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
+            SGLANG_TEST_METRICS_FILE=/sglang-checkout/nightly-B-xpu-1-gpu-metrics.jsonl \
+            python3 run_suite.py --hw xpu --suite nightly-B-xpu-1-gpu --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
           " || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md)" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
@@ -545,8 +545,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: release-nightly-xpu-1-gpu-metrics
-          path: release-nightly-xpu-1-gpu-metrics.jsonl
+          name: nightly-B-xpu-1-gpu-metrics
+          path: nightly-B-xpu-1-gpu-metrics.jsonl
           if-no-files-found: warn
           retention-days: 30
 
@@ -566,11 +566,11 @@ jobs:
   check-all-jobs:
     if: always() && (github.repository == 'sgl-project/sglang' || github.event_name == 'workflow_dispatch')
     needs:
-      - main-nightly-xpu-1-gpu
-      - main-nightly-xpu-2-gpu
-      - main-nightly-xpu-4-gpu
-      - main-nightly-xpu-8-gpu
-      - release-nightly-xpu-1-gpu
+      - nightly-A-xpu-1-gpu
+      - nightly-A-xpu-2-gpu
+      - nightly-A-xpu-4-gpu
+      - nightly-A-xpu-8-gpu
+      - nightly-B-xpu-1-gpu
     runs-on: ubuntu-latest
     steps:
       - name: Check if any job failed

@@ -33,7 +33,7 @@ from sglang.test.ci.ci_register import register_xpu_ci
 logger = logging.getLogger(__name__)
 
 register_xpu_ci(est_time=1800, suite="nightly-xpu-1-gpu", nightly=True)
-register_xpu_ci(est_time=1800, suite="release-nightly-xpu-1-gpu", nightly=True)
+register_xpu_ci(est_time=1800, suite="nightly-B-xpu-1-gpu", nightly=True)
 
 XPU_ZIMAGE_CASES = [
     DiffusionTestCase(

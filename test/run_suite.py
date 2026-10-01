@@ -209,7 +209,7 @@ NIGHTLY_SUITES = {
         "nightly-xpu-2-gpu",
         "nightly-xpu-4-gpu",
         "nightly-xpu-8-gpu",
-        "release-nightly-xpu-1-gpu",
+        "nightly-B-xpu-1-gpu",
     ],
 }
 
