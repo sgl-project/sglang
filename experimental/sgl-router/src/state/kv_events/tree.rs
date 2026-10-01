@@ -118,6 +118,7 @@ use tracing::{debug, error};
 
 mod snapshot;
 
+pub(super) use snapshot::ShapeViolation;
 pub use snapshot::{RestoreError, SnapshotNode};
 
 /// Number of independent tree shards. A power of two so `shard_of` selects

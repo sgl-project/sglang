@@ -597,7 +597,7 @@ crate-type = ["cdylib"]
                 "sglang-server",
                 "sglang_server",
                 (),
-                (),
+                (grpc_proto,),
             ),
             (
                 "sglang.srt.rust_extensions._grpc",

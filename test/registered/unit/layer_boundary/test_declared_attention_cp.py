@@ -84,7 +84,7 @@ class TestAttentionCpBoundary(CustomTestCase):
             tp_rank=cp,
             attn_dp_size=1,
             attn_dp_rank=0,
-            enable_dp_attention=False,
+            attn_dp_enabled=False,
             attn_tp_size=1,
             attn_tp_rank=0,
             attn_cp_size=CP_SIZE,
@@ -177,7 +177,7 @@ class TestAttentionCpBoundary(CustomTestCase):
                 last=False,
                 sparse=True,
                 previous_sparse=False,
-                next_sparse=False,
+                next_layer_sparse=False,
                 attention_norm=layernorm,
                 ffn_norm=layernorm,
             )

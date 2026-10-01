@@ -11,10 +11,14 @@ use crate::config::{K8sDiscoveryConfig, K8sDiscoveryMode};
 use crate::discovery::{DiscoveryEvent, WorkerId, WorkerMode, WorkerSpec};
 use anyhow::{Context, Result};
 use futures::{Stream, StreamExt};
-use k8s_openapi::api::discovery::v1::EndpointSlice;
+use k8s_openapi::api::discovery::v1::{Endpoint, EndpointSlice};
 use kube::{api::Api, runtime::watcher, Client};
 use std::collections::{BTreeMap, HashMap};
 use tokio::sync::mpsc;
+
+mod peers;
+
+pub use peers::{peer_address_family, spawn_peer_watch, AddressFamily};
 
 /// Decide which [`WorkerMode`] an `EndpointSlice` should be assigned, based
 /// on the configured discovery mode.
@@ -112,8 +116,7 @@ fn extract_workers(es: &EndpointSlice, mode: WorkerMode) -> Vec<WorkerSpec> {
 
     let mut out = Vec::new();
     for ep in es.endpoints.iter() {
-        let is_ready = ep.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true);
-        if !is_ready {
+        if !endpoint_ready(ep) {
             continue;
         }
         let pod_uid: Option<&str> = ep.target_ref.as_ref().and_then(|r| r.uid.as_deref());
@@ -147,6 +150,11 @@ fn extract_workers(es: &EndpointSlice, mode: WorkerMode) -> Vec<WorkerSpec> {
         }
     }
     out
+}
+
+/// Per the EndpointSlice API, an absent `conditions.ready` means ready.
+fn endpoint_ready(ep: &Endpoint) -> bool {
+    ep.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true)
 }
 
 /// Spawn the k8s discovery task.
@@ -315,10 +323,29 @@ where
     tracing::warn!("k8s watcher stream ended; discovery task exiting");
 }
 
-/// Empty `cfg.namespace` triggers a cluster-wide watch via `Api::all(client)`.
+/// An `EndpointSlice` API handle from the default client config.
+///
+/// An empty `namespace` means a cluster-wide watch via `Api::all(client)`.
 /// `Api::namespaced(client, "")` is namespace-scoped to the empty-named
 /// namespace, which is almost never what callers intend.
-///
+async fn endpoint_slice_api(namespace: &str) -> Result<Api<EndpointSlice>, kube::Error> {
+    let client = Client::try_default().await?;
+    Ok(if namespace.is_empty() {
+        Api::all(client)
+    } else {
+        Api::namespaced(client, namespace)
+    })
+}
+
+/// How a watched namespace appears in startup logs.
+fn namespace_display(namespace: &str) -> &str {
+    if namespace.is_empty() {
+        "<all namespaces>"
+    } else {
+        namespace
+    }
+}
+
 /// State is tracked per-slice as `HashMap<SliceKey, HashMap<WorkerId,
 /// WorkerSpec>>`.  K8s auto-shards Services with >100 endpoints and CNIs
 /// often shard per AZ, so multiple `EndpointSlice` objects can exist per
@@ -342,15 +369,9 @@ pub async fn spawn(
         peer_selector: _,
     } = cfg;
 
-    let client = Client::try_default()
+    let api = endpoint_slice_api(&namespace)
         .await
         .context("kube client default config")?;
-
-    let api: Api<EndpointSlice> = if namespace.is_empty() {
-        Api::all(client)
-    } else {
-        Api::namespaced(client, &namespace)
-    };
 
     // Plain mode pushes the single selector to the server side so the LIST
     // is already filtered.  PD mode leaves the server-side selector empty
@@ -371,11 +392,7 @@ pub async fn spawn(
     // an empty namespace. Surfacing the watch target here lets an
     // operator spot the typo in the first log lines instead of only
     // discovering it via later `no workers available` request failures.
-    let namespace_display: &str = if namespace.is_empty() {
-        "<all namespaces>"
-    } else {
-        &namespace
-    };
+    let namespace_display = namespace_display(&namespace);
     match &mode {
         K8sDiscoveryMode::Plain { label_selector } => tracing::info!(
             namespace = %namespace_display,
@@ -404,7 +421,8 @@ pub async fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointPort};
+    use k8s_openapi::api::core::v1::ObjectReference;
+    use k8s_openapi::api::discovery::v1::{EndpointConditions, EndpointPort};
     use kube::core::ObjectMeta;
 
     /// Helper: build a minimal EndpointSlice with predictable metadata.
@@ -1007,7 +1025,6 @@ mod tests {
     /// Helper: build a slice where every endpoint carries a synthetic
     /// `target_ref.uid`. The endpoint at position `i` gets `uids[i]`.
     fn make_slice_with_uids(addrs: &[&str], port: i32, uids: &[&str]) -> EndpointSlice {
-        use k8s_openapi::api::core::v1::ObjectReference;
         assert_eq!(addrs.len(), uids.len());
         let endpoints = addrs
             .iter()
