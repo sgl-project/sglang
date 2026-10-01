@@ -75,6 +75,9 @@ class Ngram {
   // should not be affected by cache flushes.
   void reset() {
     std::unique_lock<std::mutex> lock(mutex_);
+    // Finish inserts already admitted by asyncInsert before clearing the trie,
+    // otherwise queued work can repopulate it after this reset returns.
+    sync_cv_.wait(lock, [this] { return pending_count_ == 0; });
     if (trie_) {
       trie_->reset();
     }
