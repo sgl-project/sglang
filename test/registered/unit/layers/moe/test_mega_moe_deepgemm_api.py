@@ -48,15 +48,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         deep_gemm.get_symm_buffer_for_mega_moe = MagicMock(return_value=expected_buffer)
         group = object()
 
-        with (
-            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
-            patch.object(
-                mega_moe,
-                "_mega_moe_mma_type",
-                return_value="mxf4xmxf4",
-                create=True,
-            ),
-        ):
+        with patch.dict(sys.modules, {"deep_gemm": deep_gemm}):
             actual_buffer = mega_moe._get_mega_moe_symm_buffer(
                 group,
                 num_experts=8,
@@ -64,6 +56,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                 num_topk=2,
                 hidden=128,
                 intermediate_hidden=256,
+                mma_type="mxf4xmxf4",
             )
 
         self.assertIs(actual_buffer, expected_buffer)
@@ -77,14 +70,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         deep_gemm.get_symm_buffer_for_mega_moe = MagicMock(side_effect=expected_buffers)
         group = object()
 
-        with (
-            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
-            patch.object(
-                mega_moe,
-                "_mega_moe_mma_type",
-                side_effect=("fp8xfp4", "mxf4xmxf4"),
-            ),
-        ):
+        with patch.dict(sys.modules, {"deep_gemm": deep_gemm}):
             actual_buffers = tuple(
                 mega_moe._get_mega_moe_symm_buffer(
                     group,
@@ -93,8 +79,9 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                     num_topk=2,
                     hidden=128,
                     intermediate_hidden=256,
+                    mma_type=mma_type,
                 )
-                for _ in range(2)
+                for mma_type in ("fp8xfp4", "mxf4xmxf4")
             )
 
         self.assertEqual(actual_buffers, expected_buffers)
@@ -465,10 +452,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             )
 
     def _get_test_buffer(self, group):
-        with (
-            patch.dict(sys.modules, {"deep_gemm": self.deep_gemm}),
-            patch.object(mega_moe, "_mega_moe_mma_type", return_value="fp8xfp4"),
-        ):
+        with patch.dict(sys.modules, {"deep_gemm": self.deep_gemm}):
             return mega_moe._get_mega_moe_symm_buffer(
                 group,
                 num_experts=8,
@@ -476,6 +460,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                 num_topk=2,
                 hidden=128,
                 intermediate_hidden=256,
+                mma_type="fp8xfp4",
             )
 
 

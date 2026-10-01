@@ -199,7 +199,10 @@ class Spec(msgspec.Struct):
             "mxf4xmxf4 MMA type (see --enable-w4a4-mxfp4-megamoe). Pass "
             "--no-speculative-enable-w4a4-mxfp4-megamoe to keep the draft on "
             "fp8xfp4 (W4A8) while the target runs W4A4. Same as "
-            "--enable-w4a4-mxfp4-megamoe if unset.",
+            "--enable-w4a4-mxfp4-megamoe if unset. A value different from "
+            "--enable-w4a4-mxfp4-megamoe allocates a second MegaMoE symmetric "
+            "buffer after the KV pool is sized; lower --mem-fraction-static if "
+            "CUDA-graph capture runs out of memory.",
             action=argparse.BooleanOptionalAction,
         ),
     ] = None

@@ -33,7 +33,6 @@ from sglang.srt.layers.moe.mega_moe_sm90 import (
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
-from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import is_hip, is_sm100_supported
 
 if TYPE_CHECKING:
@@ -53,15 +52,11 @@ def _use_amd_flydsl_mega_moe() -> bool:
     return _is_hip and envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get()
 
 
-def _mega_moe_mma_type(experts=None) -> str:
-    if experts is None:
-        w4a4 = get_exec().moe.enable_w4a4_mxfp4_megamoe
-    elif experts._mega_moe_nvfp4:
+def _mega_moe_mma_type(experts) -> str:
+    if experts._mega_moe_nvfp4:
         return "nvfp4xnvfp4"
-    else:
-        # Per layer: a draft may differ from the target (draft_model_build_scope).
-        w4a4 = experts._mega_moe_w4a4
-    return "mxf4xmxf4" if w4a4 else "fp8xfp4"
+    # Per layer: a draft may differ from the target (draft_model_build_scope).
+    return "mxf4xmxf4" if experts._mega_moe_w4a4 else "fp8xfp4"
 
 
 @functools.lru_cache(maxsize=1)
@@ -123,12 +118,11 @@ def _get_mega_moe_symm_buffer(
     hidden: int,
     intermediate_hidden: int,
     num_shared_experts: int = 0,
-    mma_type: Optional[str] = None,
+    *,
+    mma_type: str,
 ) -> SymmBuffer:
     import deep_gemm
 
-    if mma_type is None:
-        mma_type = _mega_moe_mma_type()
     with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
         key = (
             id(group),
