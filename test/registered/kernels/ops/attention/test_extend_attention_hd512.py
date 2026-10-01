@@ -5,6 +5,7 @@ import unittest
 import torch
 
 from sglang.kernels.ops.attention.extend_attention import extend_attention_fwd
+from sglang.kernels.ops.attention.hd512_bmm_attention import hd512_bmm_attention
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -119,6 +120,100 @@ class TestExtendAttentionHD512(CustomTestCase):
 
     def test_ragged_batch_graph_reuse(self):
         self._check([33, 8000], [17, 256], graph=True)
+
+    def test_packed_bmm_graph_dynamic_prefix(self):
+        torch.manual_seed(7)
+        old_tf32 = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        try:
+            for capacity, canvas, scale in [
+                (0, 32, 1.0),
+                (905, 255, 0.125),
+                (16384, 256, 1.0),
+            ]:
+                with self.subTest(capacity=capacity, canvas=canvas, scale=scale):
+                    packed = (
+                        torch.randn(
+                            canvas, 20 * 512, device="cuda", dtype=torch.bfloat16
+                        )
+                        * 0.15
+                    )
+                    q = packed[:, : 16 * 512].view(canvas, 16, 512)
+                    k = packed[:, 16 * 512 : 18 * 512].contiguous().view(canvas, 2, 512)
+                    v = packed[:, 18 * 512 :].contiguous().view(canvas, 2, 512)
+                    pool_k = (
+                        torch.randn(
+                            capacity + 17, 2, 512, device="cuda", dtype=torch.bfloat16
+                        )
+                        * 0.15
+                    )
+                    pool_v = torch.randn_like(pool_k) * 0.15
+                    # A nonzero indptr start and invalid padding detect stale
+                    # length use and speculative reads outside the valid prefix.
+                    indices = torch.full(
+                        (capacity + 7,), 2**30, device="cuda", dtype=torch.int64
+                    )
+                    indptr = torch.tensor([7, 7], device="cuda", dtype=torch.int32)
+
+                    def run():
+                        return hd512_bmm_attention(
+                            q, k, v, pool_k, pool_v, indices, indptr, capacity, scale
+                        )
+
+                    run()
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        output = run()
+                    for prefix in sorted(
+                        {
+                            0,
+                            min(1, capacity),
+                            min(257, capacity),
+                            min(8000, capacity),
+                            capacity,
+                        },
+                        reverse=True,
+                    ):
+                        indices.fill_(2**30)
+                        indices[7 : prefix + 7] = torch.randint(
+                            pool_k.shape[0], (prefix,), device="cuda"
+                        )
+                        indptr[1] = prefix + 7
+                        q.mul_(1.01)
+                        pool_v.mul_(1.02)
+                        graph.replay()
+                        slots = indices[7 : prefix + 7]
+                        keys = (
+                            torch.cat((pool_k[slots], k))
+                            .repeat_interleave(8, dim=1)
+                            .transpose(0, 1)
+                            .float()
+                        )
+                        values = (
+                            torch.cat((pool_v[slots], v))
+                            .repeat_interleave(8, dim=1)
+                            .transpose(0, 1)
+                            .float()
+                        )
+                        scores = (
+                            q.transpose(0, 1).float() @ keys.transpose(1, 2) * scale
+                        )
+                        expected = (scores.softmax(-1) @ values).transpose(0, 1)
+                        actual = output.float()
+                        torch.testing.assert_close(
+                            actual, expected, atol=0.005, rtol=0.03
+                        )
+                        error = (
+                            (
+                                (actual - expected).square().mean()
+                                / expected.square().mean()
+                            )
+                            .sqrt()
+                            .item()
+                        )
+                        self.assertLessEqual(error, 0.01)
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = old_tf32
 
 
 if __name__ == "__main__":

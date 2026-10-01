@@ -1785,6 +1785,55 @@ class TritonAttnBackend(AttentionBackend):
         ):
             return o
 
+        # Independent-K/V HD512 denoising benefits from packing the GQA
+        # query heads into larger GEMMs. Cap the materialized score workspace;
+        # all dynamic prefix lengths and padding are handled on the GPU.
+        if (
+            _is_cuda
+            and torch.cuda.get_device_capability()[0] == 10
+            and forward_batch.forward_mode.is_dllm_extend()
+            and forward_batch.batch_size == 1
+            and layer.qk_head_dim == layer.v_head_dim == 512
+            and layer.tp_q_head_num == 16
+            and layer.tp_k_head_num == 2
+            and 32 <= q.shape[0] <= 256
+            and self.max_context_len <= 16384
+            and not causal
+            and (layer.sliding_window_size is None or layer.sliding_window_size <= -1)
+            and self.forward_metadata.custom_mask is None
+            and logits_soft_cap <= 0
+            and sinks is None
+            and score_mod is None
+            and (layer.xai_temperature_len is None or layer.xai_temperature_len <= 0)
+            and layer.k_scale is None
+            and layer.v_scale is None
+            and self.page_size == 1
+            and self.dcp_size == 1
+            and q.dtype == k.dtype == v.dtype == o.dtype == torch.bfloat16
+            and self.token_to_kv_pool.get_key_buffer(layer.layer_id).dtype
+            == torch.bfloat16
+            and self.token_to_kv_pool.get_value_buffer(layer.layer_id).dtype
+            == torch.bfloat16
+            and hasattr(torch.ops.aten.bmm, "dtype")
+        ):
+            from sglang.kernels.ops.attention.hd512_bmm_attention import (
+                hd512_bmm_attention,
+            )
+
+            result = hd512_bmm_attention(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                k.contiguous(),
+                v.contiguous(),
+                self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                kv_indices,
+                kv_indptr,
+                min(self.max_context_len, kv_indices.numel()),
+                scale=layer.scaling,
+            )
+            o.copy_(result.view_as(o))
+            return o
+
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k.contiguous(),
