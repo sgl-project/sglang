@@ -61,7 +61,9 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     MROPE: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
-    token = tl.program_id(0)
+    # int64: token * stride passes 2**31 elements in long prefills (about 210k
+    # tokens at Qwen3.5-4B's 10,240-element qkv row).
+    token = tl.program_id(0).to(tl.int64)
     head = tl.program_id(1)
     is_k = head >= NUM_Q_HEADS
     local_head = tl.where(is_k, head - NUM_Q_HEADS, head)
