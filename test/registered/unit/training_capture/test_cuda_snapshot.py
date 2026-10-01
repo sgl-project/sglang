@@ -34,7 +34,7 @@ class TestCudaSnapshot(CustomTestCase):
             for component in ("k", "v")
         }
         exporter = SelectedLayerKVExporter(kv, sources)
-        slots = torch.tensor([7, 3, 6], device="cuda")
+        slots = torch.tensor([7, 0, 3, 0, 6, 0], dtype=torch.int32, device="cuda")[::2]
         expected = {name: buffer[slots].cpu() for name, buffer in sources.items()}
         logits = torch.arange(256, device="cuda").float()[None]
         stream.wait_stream(torch.cuda.current_stream())

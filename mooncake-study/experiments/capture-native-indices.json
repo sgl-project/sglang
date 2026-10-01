@@ -1,0 +1,922 @@
+{
+  "purpose": "Preserve native integer slot indices during selected-layer KV export",
+  "source_baseline": "ad730be27f0b577443c0eb95ab37d0274414abbe",
+  "production_source_sha256": {
+    "python/sglang/srt/training_capture/kv_exporter.py": "fee3df7475b1b877c85979f3234588a6eb5c442c577825e7cc3110e607273ce1"
+  },
+  "change": [
+    "Reuse int32/int64 indices on the source device instead of converting them to int64 for every K/V component.",
+    "Record the index tensor on the producer stream so temporary indices cannot be recycled while a gather is pending.",
+    "Reject noninteger indices before any Host write; preserve existing gather ownership and D2H completion fencing."
+  ],
+  "pre_fix_trace": {
+    "kernel": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#4}::operator()() const::{lambda(long)#1}, std::array<char*, 2ul>, 4, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithCast<1>, at::native::memory::StoreWithCast<1> >(int, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#4}::operator()() const::{lambda(long)#1}, std::array<char*, 2ul>, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithCast<1>, at::native::memory::StoreWithCast<1>)",
+    "correlation": 1380645,
+    "cpu_stack": [
+      {
+        "name": "scheduler.run_batch",
+        "cat": "user_annotation"
+      },
+      {
+        "name": "training_capture.kv",
+        "cat": "user_annotation"
+      },
+      {
+        "name": "aten::to",
+        "cat": "cpu_op"
+      },
+      {
+        "name": "aten::_to_copy",
+        "cat": "cpu_op"
+      },
+      {
+        "name": "aten::copy_",
+        "cat": "cpu_op"
+      }
+    ]
+  },
+  "unit": {
+    "job_id": "01790830007807467624-c9b51ad70713",
+    "returncode": 0,
+    "tests": 34,
+    "subtests": 7,
+    "seconds": 27.22,
+    "files": [
+      "test_cuda_snapshot.py",
+      "test_buffers.py",
+      "test_context.py",
+      "test_coordinator.py"
+    ],
+    "log_sha256": "6236f39e21d8e732c4b091c52f38a1b650298b38c7ef55f795c31fc3c29fd5ab",
+    "tested_source_sha256": {
+      "test/registered/unit/training_capture/test_buffers.py": "866bb0d6756c8c5695fdc45b12abfe5a35a6677ec2afadd8de0cbfbd421e7c47",
+      "test/registered/unit/training_capture/test_cuda_snapshot.py": "d5c29a96e93d2a35cff2e1e1a4c3263f981e3499210f89035ce59e7292fe146c"
+    }
+  },
+  "pre_fix_fractional_index_regression": {
+    "job_id": "01790830132139430947-4386e948395e",
+    "returncode": 1,
+    "failure": "ContractError not raised; the old exporter truncates slot 1.5 to slot 1.",
+    "log_sha256": "8c1db62ffe7b60c9a9c01dccf2388e162bb300e356076195c0edacdc922325d1",
+    "exporter_source_sha256": "1cbe0d79d5e7cc30af1902f40efc023338c65e34d9a48ed60634c6e02434123f"
+  },
+  "runtime_job_id": "01790830132480654368-175a28a57d4b",
+  "profile_job_id": "01790830132909131039-373e5c2bdaac",
+  "benchmark_job_id": "01790830133240918660-801405517ba5",
+  "baseline_evidence": "capture-serving-performance.json",
+  "limits": [
+    "One H100, Qwen3-0.6B BF16, TP=1, local TCP Store and HTTP test Catalog.",
+    "A native index change does not reduce the number of KV or teacher D2H operations.",
+    "Profiler device work is not critical-path latency; its 100% admission probes are separate from normal serving.",
+    "Before/after performance uses separate bracketed synthetic runs; no production SLO or trained-draft quality is certified.",
+    "The test-only source revision label includes +kv-int32; exact producer hashes are retained and match the checkout. Relative to the previous benchmark, only kv_exporter.py changes within training_capture."
+  ],
+  "runtime": {
+    "job_id": "01790830132480654368-175a28a57d4b",
+    "returncode": 0,
+    "seconds": 377.459,
+    "log_sha256": "99144b9e714c01b99b2d051bf3e5459e4465bae1824ba927e257e0f7f945eb78",
+    "snapshots": {
+      "synchronous_ar": 6,
+      "overlap_ar": 18,
+      "synchronous_dspark": 18,
+      "overlap_dspark": 22,
+      "writer_pressure_feedback": 2,
+      "latency_feedback": 2,
+      "total": 68
+    }
+  },
+  "profile": {
+    "job_id": "01790830132909131039-373e5c2bdaac",
+    "returncode": 0,
+    "raw_report_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-profile-int32-20261001/report.json",
+    "raw_report_sha256": "b001e25505384689b8dd9fade555112ef50d4152550026fc7eacc6f20f5ffe7a",
+    "log_sha256": "e5834d0dc34908b04a3ae5ea8d1d55ea31e0ed65b363322a650b7982e4d32a69",
+    "report": {
+      "status": "completed",
+      "config": {
+        "model_path": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "source_revision": "ad730be27+kv-int32",
+        "output_dir": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-profile-int32-20261001",
+        "input_len": 128,
+        "output_len": 32,
+        "concurrency": 8,
+        "warmup_steps": 10,
+        "steps": 5,
+        "layers": [
+          0,
+          14,
+          27
+        ],
+        "capture_slots": 16,
+        "host_mib": 256,
+        "segment_mib": 2048,
+        "seed": 42
+      },
+      "scope": "Profiler-only scopes; probes wait for capture slots. GPU work attribution, not serving latency or throughput.",
+      "modes": [
+        {
+          "enabled": false,
+          "prefill": {
+            "input_len": 128,
+            "output_len": 1,
+            "batches": 5,
+            "requests": 40,
+            "capture_counter_delta": {},
+            "traces": [
+              "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-profile-int32-20261001/off/prefill/prefill-1790830575.2530468-TP-0.trace.json.gz"
+            ],
+            "capture_after": null
+          },
+          "decode": {
+            "input_len": 1,
+            "output_len": 32,
+            "batches": 5,
+            "requests": 40,
+            "capture_counter_delta": {},
+            "traces": [
+              "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-profile-int32-20261001/off/decode/decode-1790830599.3575258-TP-0.trace.json.gz"
+            ],
+            "capture_after": null
+          }
+        },
+        {
+          "enabled": true,
+          "prefill": {
+            "input_len": 128,
+            "output_len": 1,
+            "batches": 5,
+            "requests": 40,
+            "capture_counter_delta": {
+              "considered": 40,
+              "excluded_health_check": 0,
+              "admitted": 40,
+              "overlap_forwards": 45,
+              "eager_forwards": 40,
+              "sealed": 40,
+              "writer_started": 40,
+              "copies_completed": 40,
+              "snapshot_built": 40,
+              "ready": 40,
+              "cuda_graph_forwards": 5
+            },
+            "traces": [
+              "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-profile-int32-20261001/on/prefill/prefill-1790830670.7510862-TP-0.trace.json.gz"
+            ],
+            "capture_after": {
+              "counters": {
+                "considered": 121,
+                "excluded_health_check": 1,
+                "admitted": 120,
+                "overlap_forwards": 135,
+                "eager_forwards": 120,
+                "sealed": 120,
+                "writer_started": 120,
+                "copies_completed": 120,
+                "snapshot_built": 120,
+                "ready": 120,
+                "cuda_graph_forwards": 15
+              },
+              "disabled_reason": null,
+              "enable_overlap": true,
+              "reservations": 6,
+              "states": {
+                "available": 6
+              },
+              "queued": 0,
+              "occupied_fraction": 0,
+              "writer_age_seconds": 0,
+              "host_pool": {
+                "allocated_bytes": 50913280,
+                "free": 10,
+                "filling": 6,
+                "quarantined": 0
+              },
+              "admission": {
+                "adaptive": false,
+                "configured_ratio": 1,
+                "target_ratio": 1,
+                "effective_ratio": 1,
+                "reason": "configured",
+                "cooldown_remaining_seconds": 0,
+                "occupied_fraction": 0,
+                "writer_age_seconds": 0,
+                "decreases": 0,
+                "recoveries": 0,
+                "failures": 0,
+                "pauses": 0,
+                "latency": null
+              }
+            }
+          },
+          "decode": {
+            "input_len": 1,
+            "output_len": 32,
+            "batches": 5,
+            "requests": 40,
+            "capture_counter_delta": {
+              "considered": 40,
+              "excluded_health_check": 0,
+              "admitted": 40,
+              "overlap_forwards": 165,
+              "eager_forwards": 5,
+              "sealed": 40,
+              "writer_started": 40,
+              "copies_completed": 40,
+              "snapshot_built": 40,
+              "ready": 40,
+              "cuda_graph_forwards": 160
+            },
+            "traces": [
+              "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-profile-int32-20261001/on/decode/decode-1790830778.8352146-TP-0.trace.json.gz"
+            ],
+            "capture_after": {
+              "counters": {
+                "considered": 241,
+                "excluded_health_check": 1,
+                "admitted": 240,
+                "overlap_forwards": 630,
+                "eager_forwards": 135,
+                "sealed": 240,
+                "writer_started": 240,
+                "copies_completed": 240,
+                "snapshot_built": 240,
+                "ready": 240,
+                "cuda_graph_forwards": 495
+              },
+              "disabled_reason": null,
+              "enable_overlap": true,
+              "reservations": 8,
+              "states": {
+                "available": 8
+              },
+              "queued": 0,
+              "occupied_fraction": 0,
+              "writer_age_seconds": 0,
+              "host_pool": {
+                "allocated_bytes": 50913280,
+                "free": 8,
+                "filling": 8,
+                "quarantined": 0
+              },
+              "admission": {
+                "adaptive": false,
+                "configured_ratio": 1,
+                "target_ratio": 1,
+                "effective_ratio": 1,
+                "reason": "configured",
+                "cooldown_remaining_seconds": 0,
+                "occupied_fraction": 0,
+                "writer_age_seconds": 0,
+                "decreases": 0,
+                "recoveries": 0,
+                "failures": 0,
+                "pauses": 0,
+                "latency": null
+              }
+            }
+          }
+        }
+      ]
+    },
+    "analysis": [
+      {
+        "trace": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-profile-int32-20261001/off/prefill/prefill-1790830575.2530468-TP-0.trace.json.gz",
+        "sha256": "1c28a817b05a576c9697ef8fbaf64e7aafea445ae19d0fbe8e538556b7f6948f",
+        "attribution": "CUDA correlation -> runtime/driver call contained in disjoint capture CPU scope",
+        "groups": {},
+        "all_kernel_us": 72808.8850000012,
+        "all_d2h_us": 101.66199999999998
+      },
+      {
+        "trace": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-profile-int32-20261001/off/decode/decode-1790830599.3575258-TP-0.trace.json.gz",
+        "sha256": "3c2e990f3f62d3ea86200c56a4e2a81cfbb65e915f8762ddfc89d67e1bdb3e9c",
+        "attribution": "CUDA correlation -> runtime/driver call contained in disjoint capture CPU scope",
+        "groups": {},
+        "all_kernel_us": 206468.4979999909,
+        "all_d2h_us": 377.72299999999973
+      },
+      {
+        "trace": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-profile-int32-20261001/on/prefill/prefill-1790830670.7510862-TP-0.trace.json.gz",
+        "sha256": "87a8d6759de44615cdc9c0ffa29e1aef29f7b7b65afc22a21b9b0e5923f3d5c0",
+        "attribution": "CUDA correlation -> runtime/driver call contained in disjoint capture CPU scope",
+        "groups": {
+          "training_capture.kv": {
+            "cpu_calls": 45,
+            "cpu_scope_us": 25391.162999999997,
+            "gpu_kernel_calls": 270,
+            "gpu_kernel_us": 498.24199999999985,
+            "d2h_calls": 270,
+            "d2h_us": 2028.2620000000009,
+            "d2h_bytes": 62976000,
+            "d2h_events_missing_bytes": 0
+          },
+          "training_capture.positions_d2h": {
+            "cpu_calls": 45,
+            "cpu_scope_us": 4732.184000000001,
+            "gpu_kernel_calls": 0,
+            "gpu_kernel_us": 0,
+            "d2h_calls": 45,
+            "d2h_us": 123.51599999999998,
+            "d2h_bytes": 41000,
+            "d2h_events_missing_bytes": 0
+          },
+          "training_capture.teacher": {
+            "cpu_calls": 45,
+            "cpu_scope_us": 24192.319999999996,
+            "gpu_kernel_calls": 1395,
+            "gpu_kernel_us": 3747.355000000003,
+            "d2h_calls": 0,
+            "d2h_us": 0,
+            "d2h_bytes": 0,
+            "d2h_events_missing_bytes": 0
+          },
+          "training_capture.teacher_d2h": {
+            "cpu_calls": 45,
+            "cpu_scope_us": 11586.809,
+            "gpu_kernel_calls": 0,
+            "gpu_kernel_us": 0,
+            "d2h_calls": 135,
+            "d2h_us": 321.3140000000002,
+            "d2h_bytes": 46260,
+            "d2h_events_missing_bytes": 0
+          }
+        },
+        "all_kernel_us": 77336.53500000134,
+        "all_d2h_us": 2589.538999999996
+      },
+      {
+        "trace": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-profile-int32-20261001/on/decode/decode-1790830778.8352146-TP-0.trace.json.gz",
+        "sha256": "24b64b5cba799f61c40c7c083edb2b0a07cb7de081739b3bdd68104019b571a9",
+        "attribution": "CUDA correlation -> runtime/driver call contained in disjoint capture CPU scope",
+        "groups": {
+          "training_capture.kv": {
+            "cpu_calls": 1320,
+            "cpu_scope_us": 527024.5079999999,
+            "gpu_kernel_calls": 7920,
+            "gpu_kernel_us": 15294.019000000364,
+            "d2h_calls": 7920,
+            "d2h_us": 20694.196000000404,
+            "d2h_bytes": 16220160,
+            "d2h_events_missing_bytes": 0
+          },
+          "training_capture.positions_d2h": {
+            "cpu_calls": 1320,
+            "cpu_scope_us": 120162.56199999992,
+            "gpu_kernel_calls": 0,
+            "gpu_kernel_us": 0,
+            "d2h_calls": 1320,
+            "d2h_us": 3485.536999999984,
+            "d2h_bytes": 10560,
+            "d2h_events_missing_bytes": 0
+          },
+          "training_capture.teacher": {
+            "cpu_calls": 165,
+            "cpu_scope_us": 87387.34300000005,
+            "gpu_kernel_calls": 5115,
+            "gpu_kernel_us": 17172.759999999947,
+            "d2h_calls": 0,
+            "d2h_us": 0,
+            "d2h_bytes": 0,
+            "d2h_events_missing_bytes": 0
+          },
+          "training_capture.teacher_d2h": {
+            "cpu_calls": 1320,
+            "cpu_scope_us": 278838.4479999999,
+            "gpu_kernel_calls": 0,
+            "gpu_kernel_us": 0,
+            "d2h_calls": 3960,
+            "d2h_us": 9999.247999999941,
+            "d2h_bytes": 1356960,
+            "d2h_events_missing_bytes": 0
+          }
+        },
+        "all_kernel_us": 239435.69599998978,
+        "all_d2h_us": 34616.07100000055
+      }
+    ],
+    "kv_before_after": [
+      {
+        "workload": "prefill",
+        "before": {
+          "trace_sha256": "96ec277ab3dc14f79800817d6a11816f384368cff38590fab9b9e7a522e2c263",
+          "cpu_calls": 45,
+          "cpu_scope_us": 34923.543999999994,
+          "gpu_kernel_calls": 540,
+          "gpu_kernel_us": 874.3349999999989,
+          "d2h_calls": 270,
+          "d2h_us": 2020.4759999999999,
+          "d2h_bytes": 62976000,
+          "d2h_events_missing_bytes": 0,
+          "kernels": {
+            "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#4}::operator()() const::{lambda(long)#1}, std::array<char*, 2ul>, 4, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithCast<1>, at::native::memory::StoreWithCast<1> >(int, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#4}::operator()() const::{lambda(long)#1}, std::array<char*, 2ul>, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithCast<1>, at::native::memory::StoreWithCast<1>)": {
+              "calls": 270,
+              "us": 371.0099999999994
+            },
+            "void at::native::vectorized_gather_kernel<16, long>(char*, char*, long*, int, long, long, long, long, bool)": {
+              "calls": 240,
+              "us": 444.15599999999984
+            },
+            "void at::native::(anonymous namespace)::indexSelectSmallIndex<c10::BFloat16, long, unsigned int, 2, 2, -2>(at::cuda::detail::TensorInfo<c10::BFloat16, unsigned int>, at::cuda::detail::TensorInfo<c10::BFloat16 const, unsigned int>, at::cuda::detail::TensorInfo<long const, unsigned int>, int, int, unsigned int, long)": {
+              "calls": 30,
+              "us": 59.169
+            }
+          }
+        },
+        "after": {
+          "trace_sha256": "87a8d6759de44615cdc9c0ffa29e1aef29f7b7b65afc22a21b9b0e5923f3d5c0",
+          "cpu_calls": 45,
+          "cpu_scope_us": 25391.162999999997,
+          "gpu_kernel_calls": 270,
+          "gpu_kernel_us": 498.24199999999985,
+          "d2h_calls": 270,
+          "d2h_us": 2028.2620000000009,
+          "d2h_bytes": 62976000,
+          "d2h_events_missing_bytes": 0,
+          "kernels": {
+            "void at::native::vectorized_gather_kernel<16, int>(char*, char*, int*, int, long, long, long, long, bool)": {
+              "calls": 240,
+              "us": 438.21099999999984
+            },
+            "void at::native::(anonymous namespace)::indexSelectSmallIndex<c10::BFloat16, int, unsigned int, 2, 2, -2>(at::cuda::detail::TensorInfo<c10::BFloat16, unsigned int>, at::cuda::detail::TensorInfo<c10::BFloat16 const, unsigned int>, at::cuda::detail::TensorInfo<int const, unsigned int>, int, int, unsigned int, long)": {
+              "calls": 30,
+              "us": 60.03099999999999
+            }
+          }
+        },
+        "remaining_dma_matches": true
+      },
+      {
+        "workload": "decode",
+        "before": {
+          "trace_sha256": "2c30b851e17f475233e75e6a4037fefd65dcc140d03b89a64cdd880544b71b31",
+          "cpu_calls": 1320,
+          "cpu_scope_us": 779515.755,
+          "gpu_kernel_calls": 15840,
+          "gpu_kernel_us": 25663.096000002046,
+          "d2h_calls": 7920,
+          "d2h_us": 20751.812000000453,
+          "d2h_bytes": 16220160,
+          "d2h_events_missing_bytes": 0,
+          "kernels": {
+            "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#4}::operator()() const::{lambda(long)#1}, std::array<char*, 2ul>, 4, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithCast<1>, at::native::memory::StoreWithCast<1> >(int, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#4}::operator()() const::{lambda(long)#1}, std::array<char*, 2ul>, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithCast<1>, at::native::memory::StoreWithCast<1>)": {
+              "calls": 7920,
+              "us": 10530.154999999508
+            },
+            "void at::native::(anonymous namespace)::indexSelectSmallIndex<c10::BFloat16, long, unsigned int, 2, 2, -2>(at::cuda::detail::TensorInfo<c10::BFloat16, unsigned int>, at::cuda::detail::TensorInfo<c10::BFloat16 const, unsigned int>, at::cuda::detail::TensorInfo<long const, unsigned int>, int, int, unsigned int, long)": {
+              "calls": 7920,
+              "us": 15132.94100000029
+            }
+          }
+        },
+        "after": {
+          "trace_sha256": "24b64b5cba799f61c40c7c083edb2b0a07cb7de081739b3bdd68104019b571a9",
+          "cpu_calls": 1320,
+          "cpu_scope_us": 527024.5079999999,
+          "gpu_kernel_calls": 7920,
+          "gpu_kernel_us": 15294.019000000364,
+          "d2h_calls": 7920,
+          "d2h_us": 20694.196000000404,
+          "d2h_bytes": 16220160,
+          "d2h_events_missing_bytes": 0,
+          "kernels": {
+            "void at::native::(anonymous namespace)::indexSelectSmallIndex<c10::BFloat16, int, unsigned int, 2, 2, -2>(at::cuda::detail::TensorInfo<c10::BFloat16, unsigned int>, at::cuda::detail::TensorInfo<c10::BFloat16 const, unsigned int>, at::cuda::detail::TensorInfo<int const, unsigned int>, int, int, unsigned int, long)": {
+              "calls": 7920,
+              "us": 15294.019000000364
+            }
+          }
+        },
+        "remaining_dma_matches": true
+      }
+    ]
+  },
+  "environment_lock": "h100-runtime-lock.json",
+  "benchmark": {
+    "job_id": "01790830133240918660-801405517ba5",
+    "returncode": 0,
+    "raw_report_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-int32-20261001/report.json",
+    "raw_report_sha256": "d3f397d5c5e3c3db9cd349151740fcce620643ac06fccec50e305b71092419cf",
+    "log_sha256": "e65e80b6f2236a4d30c6f9fb0f34811932a2f496fb6b9ca0babf1ef811153957",
+    "status": "completed",
+    "declared_source_revision": "ad730be27+kv-int32",
+    "producer_source_sha256": {
+      "python/sglang/srt/training_capture/__init__.py": "84877adf938e0700c299e02d8a50d6e95f097b5585ef0841a34041aa95d0272f",
+      "python/sglang/srt/training_capture/admission.py": "b00f2ce37476ff60bc2f1924dc1d2e7ac4093dffbe4eab44dc2bd88afd96b44e",
+      "python/sglang/srt/training_capture/catalog.py": "e38f2c5d84f5c074154d5b484e629696d8428a2ea136d9c5a32801516bc38944",
+      "python/sglang/srt/training_capture/config.py": "395fe440b09e0eb506003be900578aeea29278e7820ba339c719bf77134aacd4",
+      "python/sglang/srt/training_capture/context.py": "8a3b3e5d4a18aa29e97713e497302b02e68475affecae0e2f96dda980fdde75d",
+      "python/sglang/srt/training_capture/coordinator.py": "fd45dc245b2999b6923f104f7d080518621a4bde09446c3f8164eedd89936524",
+      "python/sglang/srt/training_capture/host_pool.py": "51c867a0ce6e747e64ea31b1d12bae549a4c8ecf16852fee4267097126222cb9",
+      "python/sglang/srt/training_capture/identity.py": "f2629937313ce4edeb92f3d1c1e8b01420521d8ebf3f08ce6ea614197f0bfb93",
+      "python/sglang/srt/training_capture/kv_codec.py": "96794e4fd9a141200843451530bf9956e9d678766aa40f608f4bab23db5880f7",
+      "python/sglang/srt/training_capture/kv_exporter.py": "fee3df7475b1b877c85979f3234588a6eb5c442c577825e7cc3110e607273ce1",
+      "python/sglang/srt/training_capture/latency.py": "483942c37807da9156bdf4ef96b994ab2894b8d94602c510d48c938d95c810dc",
+      "python/sglang/srt/training_capture/metrics.py": "58394b6a56012629e1416350e77e211c8387b543b19f81dd60649711b54ce60b",
+      "python/sglang/srt/training_capture/mooncake_store.py": "1c256830525cb30acfdd19a31826f2a006761c068d441bad2a0031a289a71202",
+      "python/sglang/srt/training_capture/protocol.py": "34dda38a141ec2b73abfc9e367e04cbfd043e4f3c725fdaea5028b5ba8362bac",
+      "python/sglang/srt/training_capture/snapshot.py": "cc72e0b308d416315e62c5832530d7fab1b2510c2f609ce8d6a53f2814479e92",
+      "python/sglang/srt/training_capture/snapshot_writer.py": "70aac420dfd7f81683ac57255bc57590dae5e6902172bee72ad72aa9c1684621",
+      "python/sglang/srt/training_capture/teacher.py": "ca48d11bf2eff16bf206aaa9928f820e6ed8d134e1b55622c68c116473a7a708"
+    },
+    "driver_sha256": "a0a9200cde934b0821f9b417b48d2f0720f6c52b4b3dd276073183de130abe21",
+    "config": {
+      "model_path": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+      "source_revision": "ad730be27+kv-int32",
+      "output_dir": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-int32-20261001",
+      "num_prompts": 2048,
+      "input_len": 128,
+      "output_len": 32,
+      "concurrency": 8,
+      "ratios": [
+        0.1
+      ],
+      "repeats": 2,
+      "seed": 42,
+      "layers": [
+        0,
+        14,
+        27
+      ],
+      "capture_slots": 16,
+      "host_mib": 256,
+      "segment_mib": 2048,
+      "phase_timeout": 600
+    },
+    "versions": {
+      "torch": "2.13.0",
+      "transformers": "5.12.1",
+      "sglang-kernel": "0.4.6.post1",
+      "mooncake-transfer-engine-cuda13": "0.3.11.post1"
+    },
+    "scope": {
+      "transport": "local TCP",
+      "catalog": "HTTP test double",
+      "adaptive": false,
+      "overlap": true,
+      "decode_cuda_graphs": true,
+      "prefill_cuda_graphs": false,
+      "client": "existing sglang.benchmark.serving, streaming native /generate",
+      "workload": "seeded fixed-length random-ids, closed-loop concurrency, not production traffic",
+      "timing": "Client timing excludes warmup, server launch, readback and post-response writer drain",
+      "payload_bytes": "Validated manifest tensor sizes; not D2H or wire byte counters",
+      "gpu_capture_kernel_time": null,
+      "d2h_bytes": null,
+      "rdma_bytes": null,
+      "production_slo_pass": null
+    },
+    "rounds": [
+      {
+        "repetition": 0,
+        "comparison": {
+          "baseline_bracket_mean": {
+            "median_ttft_ms": 89.71970900893211,
+            "p95_ttft_ms": 144.2071725614369,
+            "p99_ttft_ms": 158.23427233844993,
+            "median_tpot_ms": 3.3195819104871442,
+            "p95_tpot_ms": 6.150807788775813,
+            "p99_tpot_ms": 6.206702770845544,
+            "output_throughput": 1314.1988974011936
+          },
+          "baseline_after_over_before": {
+            "median_ttft_ms": 1.0009820900563828,
+            "p95_ttft_ms": 0.9957911824352692,
+            "p99_ttft_ms": 0.9895763157553948,
+            "median_tpot_ms": 0.9982785545051768,
+            "p95_tpot_ms": 0.9981345446329912,
+            "p99_tpot_ms": 0.997689937556393,
+            "output_throughput": 1.001546901244702
+          },
+          "capture_over_baseline": [
+            {
+              "sample_ratio": 0.1,
+              "ratios": {
+                "median_ttft_ms": 1.1724390653344212,
+                "p95_ttft_ms": 1.0978432381456953,
+                "p99_ttft_ms": 1.1083152380314356,
+                "median_tpot_ms": 1.2083972001344634,
+                "p95_tpot_ms": 1.1456761594037217,
+                "p99_tpot_ms": 1.3530069946855343,
+                "output_throughput": 0.8314139661268934
+              }
+            }
+          ]
+        },
+        "phases": [
+          {
+            "sample_ratio": null,
+            "capture_counter_delta": {},
+            "selected_requests": 0,
+            "actual_admission_fraction": 0,
+            "ready_fraction_of_admitted": null,
+            "ready_fraction_of_selected": null,
+            "readback": {},
+            "post_client_capture_drain_seconds": 0.007795073091983795,
+            "serving": {
+              "completed": 2048,
+              "duration": 49.90621205791831,
+              "total_input_tokens": 262144,
+              "total_output_tokens": 65536,
+              "output_throughput": 1313.1832150262705,
+              "median_ttft_ms": 89.67567421495914,
+              "p95_ttft_ms": 144.51128337532282,
+              "p99_ttft_ms": 159.06328506767747,
+              "median_tpot_ms": 3.32244161155916,
+              "p95_tpot_ms": 6.156550173557574,
+              "p99_tpot_ms": 6.213879996249752,
+              "cache_report": {
+                "total_prompt_tokens": 262144,
+                "total_cached_tokens": 0,
+                "cache_hit_rate_pct": 0,
+                "device_cached_tokens": null,
+                "host_cached_tokens": null,
+                "storage_cached_tokens": null,
+                "storage_backend": null
+              }
+            },
+            "host_pool": null
+          },
+          {
+            "sample_ratio": 0.1,
+            "capture_counter_delta": {
+              "considered": 2048,
+              "sampled_out": 1858,
+              "admitted": 190,
+              "overlap_forwards": 4830,
+              "eager_forwards": 190,
+              "cuda_graph_forwards": 4640,
+              "sealed": 190,
+              "writer_started": 190,
+              "copies_completed": 190,
+              "snapshot_built": 190,
+              "ready": 190
+            },
+            "selected_requests": 190,
+            "actual_admission_fraction": 0.0927734375,
+            "ready_fraction_of_admitted": 1,
+            "ready_fraction_of_selected": 1,
+            "readback": {
+              "validated_samples": 190,
+              "manifest_bytes": 2687930,
+              "payload_bytes": 380255360,
+              "aux_payload_bytes": 6700160,
+              "payload_objects": 4940,
+              "kv_payload_bytes": 373555200
+            },
+            "post_client_capture_drain_seconds": 0.00868353620171547,
+            "serving": {
+              "completed": 2048,
+              "duration": 59.97931708022952,
+              "total_input_tokens": 262144,
+              "total_output_tokens": 65536,
+              "output_throughput": 1092.6433175679167,
+              "median_ttft_ms": 105.19089177250862,
+              "p95_ttft_ms": 158.31686928868294,
+              "p99_ttft_ms": 175.37345521152014,
+              "median_tpot_ms": 4.011373486249678,
+              "p95_tpot_ms": 7.046833844675172,
+              "p99_tpot_ms": 8.397712262888108,
+              "cache_report": {
+                "total_prompt_tokens": 262144,
+                "total_cached_tokens": 0,
+                "cache_hit_rate_pct": 0,
+                "device_cached_tokens": null,
+                "host_cached_tokens": null,
+                "storage_cached_tokens": null,
+                "storage_backend": null
+              }
+            },
+            "host_pool": {
+              "allocated_bytes": 50913280,
+              "free": 0,
+              "filling": 16,
+              "quarantined": 0
+            }
+          },
+          {
+            "sample_ratio": null,
+            "capture_counter_delta": {},
+            "selected_requests": 0,
+            "actual_admission_fraction": 0,
+            "ready_fraction_of_admitted": null,
+            "ready_fraction_of_selected": null,
+            "readback": {},
+            "post_client_capture_drain_seconds": 0.007703803479671478,
+            "serving": {
+              "completed": 2048,
+              "duration": 49.82913131266832,
+              "total_input_tokens": 262144,
+              "total_output_tokens": 65536,
+              "output_throughput": 1315.2145797761166,
+              "median_ttft_ms": 89.76374380290508,
+              "p95_ttft_ms": 143.90306174755096,
+              "p99_ttft_ms": 157.40525960922238,
+              "median_tpot_ms": 3.3167222094151283,
+              "p95_tpot_ms": 6.145065403994052,
+              "p99_tpot_ms": 6.199525545441335,
+              "cache_report": {
+                "total_prompt_tokens": 262144,
+                "total_cached_tokens": 0,
+                "cache_hit_rate_pct": 0,
+                "device_cached_tokens": null,
+                "host_cached_tokens": null,
+                "storage_cached_tokens": null,
+                "storage_backend": null
+              }
+            },
+            "host_pool": null
+          }
+        ]
+      },
+      {
+        "repetition": 1,
+        "comparison": {
+          "baseline_bracket_mean": {
+            "median_ttft_ms": 90.60242213308811,
+            "p95_ttft_ms": 144.39761638641357,
+            "p99_ttft_ms": 158.87859640642998,
+            "median_tpot_ms": 3.3151776559891237,
+            "p95_tpot_ms": 6.158824634527969,
+            "p99_tpot_ms": 6.230121039815487,
+            "output_throughput": 1311.5964325587565
+          },
+          "baseline_after_over_before": {
+            "median_ttft_ms": 0.9869159658050727,
+            "p95_ttft_ms": 0.9875886800143628,
+            "p99_ttft_ms": 0.9848050574444812,
+            "median_tpot_ms": 0.9970538165042415,
+            "p95_tpot_ms": 0.9933670488106742,
+            "p99_tpot_ms": 0.9886518629660193,
+            "output_throughput": 1.0068659640335305
+          },
+          "capture_over_baseline": [
+            {
+              "sample_ratio": 0.1,
+              "ratios": {
+                "median_ttft_ms": 1.1848341976618673,
+                "p95_ttft_ms": 1.1187006390887437,
+                "p99_ttft_ms": 1.1046614491808937,
+                "median_tpot_ms": 1.2114074589824981,
+                "p95_tpot_ms": 1.1528963199984144,
+                "p99_tpot_ms": 1.3668467675701275,
+                "output_throughput": 0.824419329285258
+              }
+            }
+          ]
+        },
+        "phases": [
+          {
+            "sample_ratio": null,
+            "capture_counter_delta": {},
+            "selected_requests": 0,
+            "actual_admission_fraction": 0,
+            "ready_fraction_of_admitted": null,
+            "ready_fraction_of_selected": null,
+            "readback": {},
+            "post_client_capture_drain_seconds": 0.0077962204813957214,
+            "serving": {
+              "completed": 2048,
+              "duration": 50.138123493641615,
+              "total_input_tokens": 262144,
+              "total_output_tokens": 65536,
+              "output_throughput": 1307.1091503516502,
+              "median_ttft_ms": 91.19904786348343,
+              "p95_ttft_ms": 145.2992944046855,
+              "p99_ttft_ms": 160.09491290897128,
+              "median_tpot_ms": 3.320068421383058,
+              "p95_tpot_ms": 6.179318192505068,
+              "p99_tpot_ms": 6.265672897138903,
+              "cache_report": {
+                "total_prompt_tokens": 262144,
+                "total_cached_tokens": 0,
+                "cache_hit_rate_pct": 0,
+                "device_cached_tokens": null,
+                "host_cached_tokens": null,
+                "storage_cached_tokens": null,
+                "storage_backend": null
+              }
+            },
+            "host_pool": null
+          },
+          {
+            "sample_ratio": 0.1,
+            "capture_counter_delta": {
+              "considered": 2048,
+              "sampled_out": 1858,
+              "admitted": 190,
+              "overlap_forwards": 4830,
+              "eager_forwards": 190,
+              "cuda_graph_forwards": 4640,
+              "sealed": 190,
+              "writer_started": 190,
+              "copies_completed": 190,
+              "snapshot_built": 190,
+              "ready": 190
+            },
+            "selected_requests": 190,
+            "actual_admission_fraction": 0.0927734375,
+            "ready_fraction_of_admitted": 1,
+            "ready_fraction_of_selected": 1,
+            "readback": {
+              "validated_samples": 190,
+              "manifest_bytes": 2687930,
+              "payload_bytes": 380255360,
+              "aux_payload_bytes": 6700160,
+              "payload_objects": 4940,
+              "kv_payload_bytes": 373555200
+            },
+            "post_client_capture_drain_seconds": 0.007984206080436707,
+            "serving": {
+              "completed": 2048,
+              "duration": 60.6082212254405,
+              "total_input_tokens": 262144,
+              "total_output_tokens": 65536,
+              "output_throughput": 1081.3054512230271,
+              "median_ttft_ms": 107.34884813427925,
+              "p95_ttft_ms": 161.5377057343721,
+              "p99_ttft_ms": 175.50706055015326,
+              "median_tpot_ms": 4.016030940317338,
+              "p95_tpot_ms": 7.100486256662875,
+              "p99_tpot_ms": 8.51562080484244,
+              "cache_report": {
+                "total_prompt_tokens": 262144,
+                "total_cached_tokens": 0,
+                "cache_hit_rate_pct": 0,
+                "device_cached_tokens": null,
+                "host_cached_tokens": null,
+                "storage_cached_tokens": null,
+                "storage_backend": null
+              }
+            },
+            "host_pool": {
+              "allocated_bytes": 50913280,
+              "free": 0,
+              "filling": 16,
+              "quarantined": 0
+            }
+          },
+          {
+            "sample_ratio": null,
+            "capture_counter_delta": {},
+            "selected_requests": 0,
+            "actual_admission_fraction": 0,
+            "ready_fraction_of_admitted": null,
+            "ready_fraction_of_selected": null,
+            "readback": {},
+            "post_client_capture_drain_seconds": 0.007864803075790405,
+            "serving": {
+              "completed": 2048,
+              "duration": 49.796224407851696,
+              "total_input_tokens": 262144,
+              "total_output_tokens": 65536,
+              "output_throughput": 1316.083714765863,
+              "median_ttft_ms": 90.0057964026928,
+              "p95_ttft_ms": 143.49593836814165,
+              "p99_ttft_ms": 157.66227990388867,
+              "median_tpot_ms": 3.31028689059519,
+              "p95_tpot_ms": 6.138331076550869,
+              "p99_tpot_ms": 6.194569182492072,
+              "cache_report": {
+                "total_prompt_tokens": 262144,
+                "total_cached_tokens": 0,
+                "cache_hit_rate_pct": 0,
+                "device_cached_tokens": null,
+                "host_cached_tokens": null,
+                "storage_cached_tokens": null,
+                "storage_backend": null
+              }
+            },
+            "host_pool": null
+          }
+        ]
+      }
+    ],
+    "before_after": [
+      {
+        "repetition": 0,
+        "before_output_tokens_per_second": 1092.3974355624166,
+        "after_output_tokens_per_second": 1092.6433175679167,
+        "before_capture_over_bracket_throughput": 0.8437204598229687,
+        "after_capture_over_bracket_throughput": 0.8314139661268934,
+        "before_tpot_p95_over_bracket": 1.1492189140284745,
+        "after_tpot_p95_over_bracket": 1.1456761594037217
+      },
+      {
+        "repetition": 1,
+        "before_output_tokens_per_second": 1079.0112258341546,
+        "after_output_tokens_per_second": 1081.3054512230271,
+        "before_capture_over_bracket_throughput": 0.819971962571117,
+        "after_capture_over_bracket_throughput": 0.824419329285258,
+        "before_tpot_p95_over_bracket": 1.1638883541772342,
+        "after_tpot_p95_over_bracket": 1.1528963199984144
+      }
+    ],
+    "interpretation": "KV conversion work is removed, but these repeated normal-serving runs show no demonstrated end-to-end throughput gain. Ten-percent capture still reduces throughput by 16.9% and 17.6% relative to its own bracket baselines."
+  },
+  "validation_summary": {
+    "timed_requests": 12288,
+    "generated_output_tokens": 393216,
+    "benchmark_snapshots_after_producer_exit": 380,
+    "runtime_snapshots": 68,
+    "profile_ready_requests_excluding_warmup": 80
+  }
+}

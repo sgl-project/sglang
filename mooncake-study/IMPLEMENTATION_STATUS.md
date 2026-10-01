@@ -901,6 +901,67 @@ The benchmark's post-client drain begins after the client process exits; it is
 not response-to-READY latency. These local TCP results do not establish RDMA,
 production Catalog retention, draft quality, rollout thresholds or a service SLO.
 
+## Native KV Slot Indices
+
+The baseline's extra `direct_copy_kernel_cuda` launches in KV export come from
+`slots.to(dtype=torch.long)`, repeated for each selected K/V buffer. The real
+request pool uses int32; PyTorch's native `index_select` accepts both int32 and
+int64. CUDA correlation inspection confirms the launches are nested inside
+`aten::to` / `aten::_to_copy`, rather than additional KV payload transfers.
+
+`SelectedLayerKVExporter` now preserves either integer dtype, moves indices to
+the source device once, and records their use on the producer stream. Independent
+gather storage, pinned destinations and completion fencing remain in place.
+Noninteger indices fail before a Host write; the old implicit cast silently
+changed a fractional slot to a different integer slot. CPU and CUDA ownership
+tests now exercise strided int32 indices while retaining int64 coverage.
+
+Job `01790830007807467624-c9b51ad70713` passes 34 tests and seven subtests in
+27.22s. A separate run of the new fractional-index regression against the old
+exporter fails with `ContractError not raised`, confirming the prior truncation.
+H100 runtime job `01790830132480654368-175a28a57d4b` passes in 377.459s with
+68 snapshots, including AR/DSpark, ordinary/graph/overlap execution, abort,
+prefix remapping, writer pressure and latency recovery. The tests continue to
+compare captured tensors against actual forward observations and read Store
+snapshots after producer exit.
+
+Profiler job `01790830132909131039-373e5c2bdaac` completes both off/on workload
+pairs, with 40 measured READY samples per enabled workload. Relative to the
+retained baseline, the native index path removes every attributed index-conversion
+kernel. The remaining KV kernel is `indexSelectSmallIndex` with int32 indices.
+
+| Profile Workload | KV Kernel Launches, Before / After | KV GPU Work, Before / After | KV D2H Copies / Bytes, Both Runs |
+| --- | ---: | ---: | ---: |
+| 128-to-1 | 540 / 270 | 0.874 / 0.498ms | 270 / 62,976,000 |
+| 1-to-32 | 15,840 / 7,920 | 25.663 / 15.294ms | 7,920 / 16,220,160 |
+
+Decode-workload KV GPU work decreases 40.4%; its instrumented CPU scope time
+decreases from 779.516ms to 527.025ms. These are profiler work measurements,
+not serving latency. Teacher and position copy counts/bytes are also unchanged.
+The 13,200 total capture D2H calls remain an optimization target.
+
+The separate normal-serving rerun, job
+`01790830133240918660-801405517ba5`, completes two off/10%-capture/off rounds:
+12,288 timed requests, 393,216 generated output tokens and 380 validated
+snapshots after producer exit. All selected requests are admitted and READY,
+with no quarantine or cached prompt tokens. Its benchmark driver is unchanged.
+Source-hash comparison finds only `kv_exporter.py` changed in the capture package.
+
+| Round | Baseline Mean Output Tokens/s | 10% Capture Output Tokens/s | Throughput Loss | TPOT p95 Increase |
+| --- | ---: | ---: | ---: | ---: |
+| 0 | 1,314.20 | 1,092.64 | 16.9% | 14.6% |
+| 1 | 1,311.60 | 1,081.31 | 17.6% | 15.3% |
+
+There is no demonstrated end-to-end throughput improvement: the previous
+10%-capture values were 1,092.40 and 1,079.01 tokens/s, with losses of 15.6%
+and 18.0% against their own baselines. This change removes redundant GPU work;
+it does not resolve overall capture overhead or satisfy P10's service SLO.
+The complete evidence, source/trace hashes, before/after kernel counts and
+benchmark metrics are retained in
+[`capture-native-indices.json`](experiments/capture-native-indices.json).
+Formatting and whitespace checks pass. Ruff diagnostics in the modified legacy
+files match HEAD. All jobs have terminated and the H100 resumes its idle workload.
+
 ## Next Implementation
 
 1. Broaden real-request coverage to prefill graphs, real retraction, cache eviction,

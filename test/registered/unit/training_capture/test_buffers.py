@@ -69,7 +69,7 @@ class TestCaptureOwnership(CustomTestCase):
             for c in ("k", "v")
         }
         original = {name: t.clone() for name, t in source.items()}
-        indices = torch.tensor([7, 1, 15, 3, 8])
+        indices = torch.tensor([7, 0, 1, 0, 15, 0, 3, 0, 8, 0], dtype=torch.int32)[::2]
         SelectedLayerKVExporter(kv, source).export(indices, slot.tensors, 0, 5)
         for name in source:
             source[name].zero_()
@@ -83,6 +83,21 @@ class TestCaptureOwnership(CustomTestCase):
             pool.close()
         with self.assertRaises(CaptureError):
             pool.release(slot, transfer_complete=True)
+
+    def test_fractional_slots_are_rejected_before_any_host_write(self):
+        kv = make_kv_spec()
+        source = {
+            f"target_{c}.{g.layer_id}": torch.ones(16, 2, 4, dtype=torch.bfloat16)
+            for g in kv.layers
+            for c in ("k", "v")
+        }
+        destination = {name: torch.zeros_like(value) for name, value in source.items()}
+        with self.assertRaises(ContractError):
+            SelectedLayerKVExporter(kv, source).export(
+                torch.tensor([1.5]), destination, 0, 1
+            )
+        for value in destination.values():
+            self.assertEqual(torch.count_nonzero(value).item(), 0)
 
     def test_quota_rejection_precedes_registration(self):
         registrar = Registrar()

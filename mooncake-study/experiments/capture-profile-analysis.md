@@ -22,6 +22,13 @@ Shares use all kernel time in the corresponding enabled trace: 77.330ms for the
 The teacher row aggregates all top-k, conversion and LSE kernels attributed to
 that scope; it does not attribute unrelated target model kernels.
 
+Subsequent correlation inspection places the KV `direct_copy_kernel_cuda`
+launches inside `aten::to` / `aten::_to_copy`: they convert the request pool's
+int32 slot indices to int64 once per selected K/V buffer. They are not extra
+copies of the KV payload. The native-index optimization and its follow-up
+measurements are recorded in `capture-native-indices.json`; this table preserves
+the original baseline.
+
 | Workload | Kernel / Group | GPU Time | Kernel Share | Launches | Python Source / CPU Op |
 | --- | --- | ---: | ---: | ---: | --- |
 | 128-to-1 | KV gather and copy kernels | 0.874ms | 1.13% | 540 | `training_capture/kv_exporter.py`, `index_select` / `copy_` |

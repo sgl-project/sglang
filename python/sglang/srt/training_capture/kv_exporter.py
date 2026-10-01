@@ -75,8 +75,18 @@ class SelectedLayerKVExporter:
         pool read, and record_stream protects temporary storage through D2H.
         The caller records completion and retains Host storage until it fires.
         """
-        if slots.ndim != 1 or slots.numel() != end - start or not 0 <= start < end:
+        if (
+            slots.ndim != 1
+            or slots.dtype not in (torch.int32, torch.int64)
+            or slots.numel() != end - start
+            or not 0 <= start < end
+        ):
             raise ContractError("invalid KV export position mapping")
+        # index_select accepts the request pool's int32 indices without an upcast.
+        indices = slots.to(device=self.device)
+        stream = torch.cuda.current_stream(self.device) if indices.is_cuda else None
+        if stream is not None:
+            indices.record_stream(stream)
         for name, source in self.buffers.items():
             destination = destinations[name][start:end]
             if destination.shape[0] != end - start or destination.device.type != "cpu":
@@ -85,9 +95,7 @@ class SelectedLayerKVExporter:
                 raise ContractError(
                     "asynchronous KV export requires pinned Host storage"
                 )
-            gathered = source.index_select(
-                0, slots.to(dtype=torch.long, device=source.device)
-            )
+            gathered = source.index_select(0, indices)
             destination.copy_(gathered, non_blocking=source.is_cuda)
-            if source.is_cuda:
-                gathered.record_stream(torch.cuda.current_stream(source.device))
+            if stream is not None:
+                gathered.record_stream(stream)
