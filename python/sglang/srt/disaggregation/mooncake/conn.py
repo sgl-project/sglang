@@ -82,6 +82,16 @@ FAILED_SESSION_RECOVERIES = Counter(
     "Number of mooncake_session_ids un-blacklisted via probe.",
 )
 
+_UINT64_MASK = (1 << 64) - 1
+
+
+def _mix_room_id(room: int) -> int:
+    """Return the SplitMix64 hash of an integer room ID."""
+    mixed = (room + 0x9E3779B97F4A7C15) & _UINT64_MASK
+    mixed = ((mixed ^ (mixed >> 30)) * 0xBF58476D1CE4E5B9) & _UINT64_MASK
+    mixed = ((mixed ^ (mixed >> 27)) * 0x94D049BB133111EB) & _UINT64_MASK
+    return (mixed ^ (mixed >> 31)) & _UINT64_MASK
+
 
 # decode
 @dataclasses.dataclass
@@ -2671,12 +2681,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             # add further chunks into the transfer queue.
             return
 
-        # NOTE(shangming): sharding according to the dst_infos to make sure
-        # requests with the same dst_sessions will be added into the same
-        # queue, which enables early abort with failed sessions.
-        dst_infos = self.transfer_infos[bootstrap_room].keys()
-        session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
-        shard_idx = session_port_sum % len(self.transfer_queues)
+        # Room IDs can be congruent with their DP rank, so mix all bits first.
+        shard_idx = _mix_room_id(bootstrap_room) % len(self.transfer_queues)
 
         if trace_ctx is None:
             trace_ctx = TraceNullContext()

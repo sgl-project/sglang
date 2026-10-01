@@ -7,12 +7,72 @@ from unittest.mock import MagicMock, call, patch
 
 import numpy as np
 
-from sglang.srt.disaggregation.base.conn import StateType
+from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
+
+class TestMooncakeTransferQueueSharding(CustomTestCase):
+    @staticmethod
+    def _make_manager(rooms, queue_count=4):
+        queued_rooms = [[] for _ in range(queue_count)]
+        queues = [
+            SimpleNamespace(
+                put=lambda chunk, queue_index=queue_index: queued_rooms[
+                    queue_index
+                ].append(chunk.room)
+            )
+            for queue_index in range(queue_count)
+        ]
+        sessions = {
+            f"decode-host:{port}": object() for port in (15001, 15002, 15003, 15004)
+        }
+        manager = SimpleNamespace(
+            disaggregation_mode=DisaggregationMode.PREFILL,
+            request_status={room: KVPoll.WaitingForInput for room in rooms},
+            transfer_infos={room: sessions for room in rooms},
+            transfer_queues=queues,
+        )
+        manager.check_status = lambda room: manager.request_status[room]
+        return manager, queued_rooms
+
+    @staticmethod
+    def _enqueue(manager, room):
+        MooncakeKVManager.add_transfer_request(
+            manager,
+            bootstrap_room=room,
+            kv_indices=np.array([room], dtype=np.int32),
+            index_slice=slice(None),
+            is_last_chunk=False,
+        )
+
+    def test_congruent_rooms_distribute_across_queues(self):
+        room_count = 32
+        queue_count = 4
+        # These rooms model one DP shard: their low queue bits are identical.
+        rooms = range(100, 100 + room_count * queue_count, queue_count)
+        manager, queued_rooms = self._make_manager(rooms, queue_count)
+
+        for room in rooms:
+            self._enqueue(manager, room)
+
+        used_queues = [items for items in queued_rooms if items]
+        self.assertEqual(len(used_queues), min(room_count, queue_count))
+
+    def test_chunks_from_same_room_stay_on_one_queue(self):
+        room = 100
+        manager, queued_rooms = self._make_manager([room])
+
+        self._enqueue(manager, room)
+        self._enqueue(manager, room)
+
+        used_queues = [items for items in queued_rooms if items]
+        self.assertEqual(len(used_queues), 1)
+        self.assertEqual(used_queues[0], [room, room])
 
 
 class TestMooncakeTransferBatching(unittest.TestCase):
