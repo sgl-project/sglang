@@ -88,6 +88,7 @@ pub fn to_chat(req: Value) -> Result<Converted, String> {
         }
         Some(_) => return Err("`input` must be a string or an array of input items".into()),
     }
+    merge_leading_system(&mut messages);
 
     let mut chat = Map::new();
     // Passthrough first so the translations below win.
@@ -239,6 +240,8 @@ fn convert_items(items: &[Value], messages: &mut Vec<Value>) -> Result<(), Strin
                     }
                     "user" | "system" | "developer" => {
                         pending.flush(messages);
+                        // Chat templates know `system`, not `developer` (Step-5's drops it).
+                        let role = if role == "developer" { "system" } else { role };
                         messages.push(json!({
                             "role": role,
                             "content": convert_content(content, i)?,
@@ -309,6 +312,24 @@ fn convert_items(items: &[Value], messages: &mut Vec<Value>) -> Result<(), Strin
     }
     pending.flush(messages);
     Ok(())
+}
+
+/// Join leading text-only system messages into one: templates treat only the
+/// first message as the system prompt.
+fn merge_leading_system(messages: &mut Vec<Value>) {
+    let n = messages
+        .iter()
+        .take_while(|m| m["role"] == "system" && m["content"].is_string())
+        .count();
+    if n < 2 {
+        return;
+    }
+    let text = messages[..n]
+        .iter()
+        .filter_map(|m| m["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    messages.splice(..n, [json!({"role": "system", "content": text})]);
 }
 
 /// `content[].text`, else `summary[].text`.
@@ -634,6 +655,24 @@ mod tests {
         assert_eq!(
             c["messages"],
             json!([{"role": "user", "content": "a"}, {"role": "user", "content": "b"}])
+        );
+    }
+
+    #[test]
+    fn developer_becomes_system_and_leading_system_merges() {
+        let c = chat(json!({"model": "m", "instructions": "A", "input": [
+            {"role": "developer", "content": "B"},
+            {"role": "system", "content": [{"type": "input_text", "text": "C"}]},
+            {"role": "user", "content": "hi"},
+            {"role": "developer", "content": "D"},
+        ]}));
+        assert_eq!(
+            c["messages"],
+            json!([
+                {"role": "system", "content": "A\n\nB\n\nC"},
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "D"},
+            ])
         );
     }
 
