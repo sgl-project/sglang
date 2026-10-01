@@ -3425,11 +3425,9 @@ class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):
             self.assertEqual(os.environ["NCCL_GRAPH_REGISTER"], "1")
             self.assertIn("NCCL_GRAPH_REGISTER=1", "\n".join(logs.output))
 
-    @patch.object(parallel_hook, "_dp_attention_replays_decode_graphs", lambda _: False)
     def test_without_all_to_all_env_is_untouched(self):
         # Unified serving keeps the all-to-all off by default, and a decode
-        # node with the DP LM head never takes the all-to-all. The DP-attention
-        # decode-graph rule is stubbed out of this check.
+        # node with the DP LM head never takes the all-to-all.
         for kwargs in (
             {},
             {"disaggregation_mode": "decode", "enable_dp_lm_head": True},
