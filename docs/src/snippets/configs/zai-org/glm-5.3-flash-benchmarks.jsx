@@ -209,7 +209,7 @@ export const benchmarks = [
     notes:
       "FP8 KV cache with TRT-LLM DSA on 4x GB300, final weights (c5b82b63e37b) on the current release-image tree (d6ab04bdf1), same protocol as the BF16 rows: 1,227.07 / 2,738.61 / 4,977.02 aggregate output tok/s at concurrency 16 / 64 / 256 — 2.9–5.7% above BF16 + TileLang across the curve, and the FP8 pool holds 12.6M tokens per rank vs 7.0M at BF16 (1.8x capacity at identical pool bytes). Accuracy is the full GSM8K gate on this variant: 97.35% vs 97.50% on BF16 KV, a 0.15-point gap inside sampling noise, with a 100% stop rate over all 1,319 problems. With HiCache L1+L2 (32 GB host tier, 16k prefill chunks) the same protocol measured 1,263.85 / 2,763.31 / 4,773.95 tok/s — within 5% of the non-HiCache rows; the random dataset has no prefix reuse, so L2 benefit was not exercised. Re-verified on the current release image (tree fe236ea6c3) within 1.5% on 4x GB300.",
   },
-  // TODO: speed measured with adaptive MTP; re-measure with fixed MTP 5/1/6.
+  // TODO: measured with adaptive MTP on the earlier flashinfer_cutlass command; re-measure on the current recipe.
   {
     match: { hw: "gb300", strategy: "low-latency", quant: "nvfp4", kvDsaPair: "bf16-tilelang" },
     sglang_version: "fe236ea6c3",
@@ -244,6 +244,7 @@ export const benchmarks = [
     notes:
       "RadixArk/GLM-5.3-Flash-NVFP4 — NVFP4 W4A4 post-training quantization of zai-org/GLM-5.3-Flash-BF16 with NVIDIA Model Optimizer 0.46.0 (abs-max scaling, group size 16): routed and shared experts plus the dense MLPs are FP4, while all attention (KDA, DSA indexer, MLA), the router, norms, the vision tower, the MTP layer, embeddings, and the LM head stay BF16. Accuracy measured on 4x GB300 with the lmsysorg/sglang:glm-5.3-flash image (PR #36507 head 033446bb05), adaptive MTP 5/1/6, BF16 KV + TileLang DSA, and the flashinfer_cutlass MoE runner. GSM8K 97.14% over the full 1,319-example split x 4 seeds (per-seed range 96.89-97.42%, stop rate 99.85-100%) and AIME 2026 92.45% (30 problems x 16 repeats x 4 seeds = 1,920 generations, per-seed range 91.67-93.54%), both at temperature 1.0 / top_p 0.95. The accuracy runs used the NEXTN spelling of --speculative-algorithm, which resolves to the same runtime path as the published EAGLE command on this tree. Speed measured on 4x GB300 with the current release image (tree fe236ea6c3) with SGLANG_SIMULATE_ACC_LEN=3 pinning the accept length (3.00): 8 requests at concurrency 1 and 80 at concurrency 16 (1,024 input / 256 output tokens) produced 221.39 and 1,949.82 aggregate output tok/s after two discarded warmups — the c16 cell lands within 5.3% of the B300 measurement, while the c1 cell runs ~20% lower on the Grace host (a host-latency effect visible only at bs1). Simulated accept length makes these throughput-mechanism numbers.",
   },
+  // TODO: measured on the earlier flashinfer_cutlass command; re-measure on the current recipe.
   {
     match: { hw: "gb300", strategy: "high-throughput", quant: "nvfp4", kvDsaPair: "bf16-tilelang" },
     sglang_version: "fe236ea6c3",
@@ -290,7 +291,7 @@ export const benchmarks = [
     notes:
       "RadixArk/GLM-5.3-Flash-NVFP4 with speculative decoding off — same checkpoint, image, and 4x GB300 measurement stack as the NVFP4 Low Latency row (ModelOpt 0.46.0 NVFP4 W4A4, abs-max, group size 16; MoE and dense MLPs in FP4, attention/router/MTP/embeddings BF16). Accuracy is a checkpoint-level result carried from that arm: GSM8K 97.14% over the full 1,319-example split x 4 seeds (per-seed range 96.89-97.42%, stop rate 99.85-100%) and AIME 2026 92.45% (30 problems x 16 repeats x 4 seeds, per-seed range 91.67-93.54%). Those runs used the NEXTN spelling of --speculative-algorithm on the adaptive-MTP arm, which resolves to the same runtime path as the published EAGLE command. Speed measured on 4x GB300 with the current release image (tree fe236ea6c3): 80 / 320 / 1,280 random requests at concurrency 16 / 64 / 256 (1,024 input / 256 output tokens) produced 1,352.86 / 3,291.36 / 5,919.49 aggregate output tok/s after two discarded warmups — at or above B300 parity, and above the FP8 gb300 High Throughput row at c256 (5,919.49 vs 4,828.33), as expected for W4A4.",
   },
-  // TODO: speed measured with adaptive MTP; re-measure with fixed MTP 5/1/6.
+  // TODO: measured with adaptive MTP on the earlier flashinfer_cutlass command; re-measure on the current recipe.
   {
     match: { hw: "gb300", strategy: "low-latency", quant: "nvfp4", kvDsaPair: "fp8-trtllm" },
     sglang_version: "fe236ea6c3",
@@ -324,6 +325,7 @@ export const benchmarks = [
     notes:
       "FP8 KV + TRT-LLM DSA pairing of the NVFP4 recipe, TP4-only with the flashinfer_cutlass MoE runner and adaptive MTP 5/1/6. Speed measured on 4x GB300 with the current release image (tree fe236ea6c3) with SGLANG_SIMULATE_ACC_LEN=3 pinning the accept length (3.00): 8 requests at concurrency 1 and 80 at concurrency 16 (1,024 input / 256 output tokens) produced 233.31 and 2,013.68 aggregate output tok/s after two discarded warmups — the c16 cell lands within 3.4% of the B300 measurement, while the c1 cell runs ~20% lower on the Grace host (a host-latency effect visible only at bs1). Simulated accept length makes these throughput-mechanism numbers.",
   },
+  // TODO: measured on the earlier flashinfer_cutlass command; re-measure on the current recipe.
   {
     match: { hw: "gb300", strategy: "high-throughput", quant: "nvfp4", kvDsaPair: "fp8-trtllm" },
     sglang_version: "fe236ea6c3",
