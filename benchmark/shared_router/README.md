@@ -2,8 +2,8 @@
 
 This opt-in AMD optimization combines the shared MLP and router into two GPU
 launches for small DSpark verification batches. The current public-main port
-is undergoing qualification. Historical results below do not qualify this new
-revision or establish incremental benefit over other pending upstream PRs.
+is undergoing qualification. Current evidence and historical results are
+separated below; incomplete sweep and reverse-order checks remain explicit.
 
 ## Motivation and implementation
 
@@ -84,6 +84,49 @@ remain in progress. Do not add the two gains or claim statistical significance.
 The preparation tree changes only formatting and reproduction support relative
 to the main measured runtime: Python AST is identical, C++/Triton unchanged.
 
+### Completed public-main fallback checks
+
+The same public-main source and protocol completed C4 and C8 qualification:
+
+| C | Native P50 TPOT (ms) | Fused-enabled P50 TPOT (ms) | Change | Output tokens/s change | Full GSM8K correct, native/fused-enabled |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 4 | 4.066732 | 4.060509 | -0.153% | +0.137% | 1278/1284 of 1319 |
+| 8 | 5.616812 | 5.612190 | -0.082% | +0.022% | 1285/1285 of 1319 |
+
+Both accuracy pairs had zero request errors. Hash-checked traces show graph
+replay on all four ranks but no horizontal-fusion launches in steady decode.
+These are native-fallback checks with no observed material regression, not
+evidence of a fusion speedup at these batch sizes. Tail batches can still enter
+the supported small-M path. Other current-main and incremental cases remain
+pending; the historical sweep below cannot substitute for them.
+
+### Completed common-source folded-expert comparison
+
+A separate C2 comparison includes both #42055 and #42011 on common source
+`3a413c574fab8f2842b16bdf7269471c8b1eff51`. The three mutually exclusive arms
+ran in horizontal/native/folded order in one co-located allocation. Values are
+medians of three repetitions; percentage changes compare with this native arm.
+
+| Arm | P50 TPOT (ms) | Change | Output tokens/s | Change | Full GSM8K correct /1319 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Native | 2.962887 | Reference | 618.036 | Reference | 1289 |
+| Horizontal fusion | 2.921339 | -1.402% | 623.674 | +0.912% | 1283 |
+| Folded shared expert (#42011) | 2.806228 | -5.287% | 650.176 | +5.200% | 1283 |
+
+All arms had zero request errors. Both candidates lost 0.455 percentage points,
+inside the local 0.5 pp gate but not proof of equivalent accuracy. Folded
+execution was confirmed on every rank by graph-correlated top-k7 reductions,
+router and MoE calls, plus an unambiguous width7 router specialization; the
+native negative control has width6 and no top-k7 reductions.
+
+**The folded alternative is faster in this case.** Horizontal fusion retains
+the native shared MXFP8 weights, whereas the folded path requantizes shared
+weights to MXFP4. This result demonstrates neither an accuracy advantage nor
+general superiority for horizontal fusion. The paths are not additive. One
+sequential, co-located three-arm order is not an order-balanced or statistical
+significance study. Do not combine these percentages with the independent
+public-main or incremental #42055 pairs above.
+
 ## Historical evidence
 
 On the earlier isolated source `aca7cf81d6`, compared with serving prerequisite
@@ -122,8 +165,8 @@ confirmation remain pending.
 - [SGLang 42011](https://github.com/sgl-project/sglang/pull/42011) optimizes an
   alternative shared expert folded into routed MoE; it is not simply additive.
 
-Before submission: complete all-concurrency and reverse-order qualification,
-review the folded-expert alternative, and attach raw evidence. Public full-model
+Before submission: complete all-concurrency and reverse-order qualification
+and attach raw evidence, including the faster folded alternative. Public full-model
 C2 reproduction and per-rank startup/memory logs are available; process peak
 memory remains unmeasured. Real-checkpoint cases and registered fallback tests
 are in place; their scope is described above.
