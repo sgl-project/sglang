@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use clap::Parser;
 use sgl_kv_indexer::{GrpcPrefixIndex, PrefixIndex, PrefixIndexConfig};
 use sgl_router::{
@@ -106,6 +106,13 @@ async fn main() -> Result<()> {
             )
         }
     };
+
+    // Ask the built policies, so any term or filter that reads the prompt is covered.
+    ensure!(
+        config.model.tokenizer_path.is_some()
+            || !chat_routing.needs_request_tokens(&routing_policies),
+        "--no-tokenizer is incompatible with cache-aware routing and prefix-cache terms or filters"
+    );
 
     // Track this router's local view of in-flight requests.
     let (local_inflight_requests, inflight_cleanup) = start_local_inflight_tracker(&config);
