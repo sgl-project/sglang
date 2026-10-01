@@ -681,13 +681,15 @@ def scatter_mamba_states_after_mtp_verify(
     last_correct_step_indices: torch.Tensor,
     mamba_track_indices: torch.Tensor | None,
     mamba_steps_to_track: torch.Tensor | None,
+    *,
+    skip_ssm: bool = False,
 ) -> None:
     """Scatter per-step verify states (ssm + all conv types) into the
     persistent caches, plus the interval-crossing track slots."""
     ssm_states = mamba_caches.temporal
     intermediate_state_cache = mamba_caches.intermediate_ssm
 
-    if ssm_states.numel() > 0:
+    if not skip_ssm and ssm_states.numel() > 0:
         fused_mamba_state_scatter_with_mask(
             ssm_states,
             intermediate_state_cache,

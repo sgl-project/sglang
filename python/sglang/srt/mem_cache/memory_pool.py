@@ -441,6 +441,15 @@ class MambaPool:
         # full-state snapshots are never produced or consumed.
         intermediate_ssm: Optional[torch.Tensor]
         intermediate_conv_window: List[torch.Tensor]
+        # Mamba2: slot-indexed ephemeral verify records. Eager acceptance commit
+        # makes live states self-contained, so these are not checkpoint state.
+        mamba2_replay_x: Optional[torch.Tensor] = None
+        mamba2_replay_dt: Optional[torch.Tensor] = None
+        mamba2_replay_B: Optional[torch.Tensor] = None
+        mamba2_replay_cum_adt: Optional[torch.Tensor] = None
+        mamba2_replay_bank: Optional[torch.Tensor] = None
+        mamba2_replay_pending: Optional[torch.Tensor] = None
+        mamba2_replay_seed: Optional[torch.Tensor] = None
 
     def _detect_conv_window_axis(
         self, conv_state_shape: List[Tuple[int, int]], win_len: int
@@ -525,6 +534,8 @@ class MambaPool:
         linear_replayssm_cache_len: int = 16,
         envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        enable_mamba2_spec_replay: bool = False,
+        mamba2_replay_dtype: Optional[torch.dtype] = None,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -547,6 +558,17 @@ class MambaPool:
         # fold-every-commit for KDA. The shared g allocation gates on
         # `_replayssm_on`.
         self.enable_linear_replayssm_spec = enable_linear_replayssm_spec
+        self.enable_mamba2_spec_replay = enable_mamba2_spec_replay
+        if enable_mamba2_spec_replay:
+            assert speculative_num_draft_tokens == 4
+            assert speculative_eagle_topk == 1
+            assert not enable_linear_replayssm_spec and not enable_linear_replayssm
+            assert mamba2_replay_dtype == torch.bfloat16
+            assert cache_params.dtype.temporal == torch.float16
+            assert cache_params.shape.temporal[1:] == (64, 128)
+            from sglang.kernels.ops.mamba.mamba2_spec_replay import checkpointing_kernel
+
+            checkpointing_kernel()  # fail on an unsupported package before allocation
         self.replayssm_spec_fold = bool(
             enable_linear_replayssm_spec and cache_params.is_kda
         )
@@ -759,7 +781,7 @@ class MambaPool:
                 # KDA verify kernel takes intermediate_states_buffer=None (skips the
                 # per-step write, CACHE_INTERMEDIATE_STATES=False) and the commit
                 # replays the ring into the checkpoint instead. This is the memory win.
-                if enable_linear_replayssm_spec:
+                if enable_linear_replayssm_spec or enable_mamba2_spec_replay:
                     intermediate_ssm_state_cache = None
                 else:
                     intermediate_ssm_state_cache = torch.zeros(
@@ -845,11 +867,94 @@ class MambaPool:
                         for conv_shape in dense_conv_shapes
                     ]
                     self._intermediate_conv_window_phys = intermediate_conv_window_cache
+                mamba2_records = {}
+                if enable_mamba2_spec_replay:
+                    heads, dim, dstate = temporal_state_shape
+                    groups = (conv_state_shape[0][0] - heads * dim) // (2 * dstate)
+                    prefix = (
+                        num_mamba_layers,
+                        size + 1,
+                        speculative_num_draft_tokens,
+                    )
+                    mamba2_records = dict(
+                        mamba2_replay_x=torch.empty(
+                            (*prefix, heads, dim),
+                            dtype=mamba2_replay_dtype,
+                            device=device,
+                        ),
+                        mamba2_replay_dt=torch.empty(
+                            (
+                                num_mamba_layers,
+                                size + 1,
+                                2,
+                                heads,
+                                speculative_num_draft_tokens,
+                            ),
+                            dtype=torch.float32,
+                            device=device,
+                        ),
+                        mamba2_replay_B=torch.empty(
+                            (
+                                num_mamba_layers,
+                                size + 1,
+                                2,
+                                speculative_num_draft_tokens,
+                                groups,
+                                dstate,
+                            ),
+                            dtype=mamba2_replay_dtype,
+                            device=device,
+                        ),
+                        mamba2_replay_cum_adt=torch.empty(
+                            (
+                                num_mamba_layers,
+                                size + 1,
+                                2,
+                                heads,
+                                speculative_num_draft_tokens,
+                            ),
+                            dtype=torch.float32,
+                            device=device,
+                        ),
+                        mamba2_replay_bank=torch.zeros(
+                            (num_mamba_layers, size + 1),
+                            dtype=torch.int32,
+                            device=device,
+                        ),
+                        mamba2_replay_pending=torch.zeros(
+                            (num_mamba_layers, size + 1),
+                            dtype=torch.int32,
+                            device=device,
+                        ),
+                        mamba2_replay_seed=torch.zeros(
+                            (num_mamba_layers,), dtype=torch.int64, device=device
+                        ),
+                    )
+                    logger.info(
+                        "Mamba2 spec replay: K=%d, R=%d, D=%d, avoided_ssm_bytes=%d, "
+                        "record_and_parameter_bytes=%d, conv_scratch_bytes=%d",
+                        size,
+                        spec_state_size,
+                        speculative_num_draft_tokens,
+                        num_mamba_layers
+                        * (spec_state_size + 1)
+                        * speculative_num_draft_tokens
+                        * heads
+                        * dim
+                        * dstate
+                        * ssm_dtype.itemsize,
+                        sum(
+                            t.numel() * t.element_size()
+                            for t in mamba2_records.values()
+                        ),
+                        get_tensor_size_bytes(self._intermediate_conv_window_phys),
+                    )
                 self.mamba_cache = self.SpeculativeState(
                     conv=conv_state,
                     temporal=temporal_state,
                     intermediate_ssm=intermediate_ssm_state_cache,
                     intermediate_conv_window=intermediate_conv_window_cache,
+                    **mamba2_records,
                     replayssm_d=replayssm_d,
                     replayssm_k=replayssm_k,
                     replayssm_g=replayssm_g,
@@ -1105,6 +1210,13 @@ class MambaPool:
         {
             "intermediate_ssm",
             "intermediate_conv_window",
+            "mamba2_replay_x",
+            "mamba2_replay_dt",
+            "mamba2_replay_B",
+            "mamba2_replay_cum_adt",
+            "mamba2_replay_bank",
+            "mamba2_replay_pending",
+            "mamba2_replay_seed",
             "replayssm_d",
             "replayssm_k",
             "replayssm_g",
@@ -1235,6 +1347,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        enable_mamba2_spec_replay: bool = False,
+        mamba2_replay_dtype: Optional[torch.dtype] = None,
         short_conv_layer_ids: Optional[List[int]] = None,
         short_conv_state_shape: Optional[Tuple[int, int]] = None,
         ngram_context_len: int = 0,
@@ -1267,6 +1381,14 @@ class HybridReqToTokenPool(ReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             mamba_envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
+            **(
+                dict(
+                    enable_mamba2_spec_replay=True,
+                    mamba2_replay_dtype=mamba2_replay_dtype,
+                )
+                if enable_mamba2_spec_replay
+                else {}
+            ),
             short_conv_layer_ids=short_conv_layer_ids,
             short_conv_state_shape=short_conv_state_shape,
             ngram_context_len=ngram_context_len,
@@ -1287,6 +1409,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        enable_mamba2_spec_replay: bool = False,
+        mamba2_replay_dtype: Optional[torch.dtype] = None,
         short_conv_layer_ids: Optional[List[int]] = None,
         short_conv_state_shape: Optional[Tuple[int, int]] = None,
         ngram_context_len: int = 0,
@@ -1305,6 +1429,14 @@ class HybridReqToTokenPool(ReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
+            **(
+                dict(
+                    enable_mamba2_spec_replay=True,
+                    mamba2_replay_dtype=mamba2_replay_dtype,
+                )
+                if enable_mamba2_spec_replay
+                else {}
+            ),
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,
