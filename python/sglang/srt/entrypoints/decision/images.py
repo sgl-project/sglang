@@ -2,6 +2,7 @@
 
 import binascii
 import io
+import struct
 from contextlib import contextmanager
 from typing import List, Optional, Tuple
 
@@ -86,8 +87,11 @@ def _upright_rgb_png(data: bytes, content_type: Optional[str], loc: Tuple) -> by
             )
         if source.width * source.height > MAX_IMAGE_PIXELS:
             raise DecisionInputError("each image is limited to 16 million pixels", loc)
-        # Pillow defines n_frames only on formats that can hold several frames.
-        if getattr(source, "n_frames", 1) != 1:
+        with _pillow_errors(loc):
+            # Pillow defines n_frames only on formats that can hold several frames,
+            # and counts them by parsing every frame descriptor.
+            frames = getattr(source, "n_frames", 1)
+        if frames != 1:
             raise DecisionInputError("animated images are not supported", loc)
         with _pillow_errors(loc):
             source.load()
@@ -102,5 +106,13 @@ def _upright_rgb_png(data: bytes, content_type: Optional[str], loc: Tuple) -> by
 def _pillow_errors(loc: Tuple):
     try:
         yield
-    except (OSError, ValueError, Image.DecompressionBombError) as e:
+    # Pillow's parsers also surface malformed data as struct.error, EOFError, or SyntaxError.
+    except (
+        OSError,
+        ValueError,
+        struct.error,
+        EOFError,
+        SyntaxError,
+        Image.DecompressionBombError,
+    ) as e:
         raise DecisionInputError("invalid, incomplete, or oversized image", loc) from e

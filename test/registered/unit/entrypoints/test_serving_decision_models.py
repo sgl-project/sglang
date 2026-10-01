@@ -383,6 +383,9 @@ class TestDecisionModels(unittest.TestCase):
         request = {"state": {}, "questions": NOUL}
         frames = [Image.new("RGB", (2, 2), color) for color in ("red", "blue")]
         animated = _encoded(frames[0], "GIF", save_all=True, append_images=frames[1:])
+        # A static GIF followed by a truncated frame descriptor, which Pillow's
+        # frame count trips on with struct.error.
+        truncated_frame = _encoded(frames[0], "GIF")[:-1] + b",\0"
         small = _encoded(Image.new("RGB", (8, 8)))
         padded = small + b"\0" * (11 * 1024 * 1024)
         over_limit = small + b"\0" * (12 * 1024 * 1024 + 1 - len(small))
@@ -402,6 +405,10 @@ class TestDecisionModels(unittest.TestCase):
             (
                 [png, {"type": "image/gif", "data": _b64(animated)}],
                 ["body", "images", 1],
+            ),
+            (
+                [{"type": "image/gif", "data": _b64(truncated_frame)}],
+                ["body", "images", 0],
             ),
             ([_b64(_png_header(20000, 20000))], ["body", "images", 0]),
             ([_png("red", size=(5000, 4000))], ["body", "images", 0]),
