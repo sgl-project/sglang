@@ -1133,6 +1133,114 @@ class TestStreamingChunkSizeInvariance(CustomTestCase):
         one_shot = make_detector().detect_and_parse(text)
         self.assertEqual((one_shot.reasoning_text, one_shot.normal_text), expected)
 
+    def test_prefilled_and_generated_openers_preserve_answer_tags(self):
+        """After the first block closes, answer tags must survive every chunk width."""
+        for detector_type in (
+            BaseReasoningFormatDetector,
+            Qwen3Detector,
+            DeepSeekR1Detector,
+        ):
+            for stream_reasoning in (False, True):
+                for answer in (
+                    "Answer mentions `<think>` and continues.",
+                    "Answer quotes `<think>example</think>`.",
+                    "Answer quotes `</think>`.",
+                    "Answer mentions `&lt;think&gt;`.",
+                ):
+                    for generated_opener in (False, True):
+                        with self.subTest(
+                            detector=detector_type.__name__,
+                            stream_reasoning=stream_reasoning,
+                            answer=answer,
+                            generated_opener=generated_opener,
+                        ):
+
+                            def make_detector():
+                                kwargs = dict(
+                                    force_reasoning=True,
+                                    stream_reasoning=stream_reasoning,
+                                )
+                                if detector_type is BaseReasoningFormatDetector:
+                                    return detector_type(
+                                        "<think>", "</think>", **kwargs
+                                    )
+                                return detector_type(**kwargs)
+
+                            text = (
+                                ("<think>" if generated_opener else "")
+                                + "plan</think>"
+                                + answer
+                            )
+                            self._assert_invariant(
+                                make_detector, text, ("plan", answer)
+                            )
+
+    def test_prefilled_custom_markers_preserve_later_opener(self):
+        """Implicit opener bookkeeping must work for base detectors with other tags."""
+        self._assert_invariant(
+            lambda: BaseReasoningFormatDetector(
+                "<reason>", "</reason>", force_reasoning=True
+            ),
+            "plan</reason>Answer quotes `<reason>`.",
+            ("plan", "Answer quotes `<reason>`."),
+        )
+
+    def test_tool_interruption_preserves_opener_in_tool_content(self):
+        """Implicit reasoning closure must not consume an opener in a tool argument."""
+        tool = '<tool_call>{"tag":"<think>"}</tool_call>'
+        for stream_reasoning in (False, True):
+            for generated_opener in (False, True):
+                with self.subTest(
+                    stream_reasoning=stream_reasoning, generated_opener=generated_opener
+                ):
+                    self._assert_invariant(
+                        lambda: Qwen3Detector(
+                            force_reasoning=True, stream_reasoning=stream_reasoning
+                        ),
+                        ("<think>" if generated_opener else "") + "plan" + tool,
+                        ("plan", tool),
+                    )
+
+    def test_literal_closer_in_content_does_not_disable_initial_opener(self):
+        """A closer outside reasoning must stay content and leave opener detection active."""
+        literal = "Answer quotes `</think>`."
+        for chunk_size in self.CHUNK_SIZES:
+            with self.subTest(chunk_size=chunk_size):
+                detector = BaseReasoningFormatDetector("<think>", "</think>")
+                self.assertEqual(
+                    self._feed(detector, literal, chunk_size), ("", literal)
+                )
+                result = detector.parse_streaming_increment("<think>plan</think>answer")
+                self.assertEqual(
+                    (result.reasoning_text, result.normal_text), ("plan", "answer")
+                )
+
+    def test_continuation_closing_prefilled_block_preserves_answer_tags(self):
+        """A block opened in prior content must not reopen on a later answer tag."""
+        self._assert_invariant(
+            lambda: BaseReasoningFormatDetector(
+                "<think>",
+                "</think>",
+                continue_final_message=True,
+                previous_content="<think>earlier ",
+            ),
+            "plan</think>Answer quotes `<think>`.",
+            ("plan", "Answer quotes `<think>`."),
+        )
+
+    def test_closed_continuation_can_start_explicit_new_block(self):
+        """A completed prior message must retain its existing fresh-block behavior."""
+        self._assert_invariant(
+            lambda: BaseReasoningFormatDetector(
+                "<think>",
+                "</think>",
+                continue_final_message=True,
+                previous_content="<think>earlier</think>answer",
+            ),
+            "<think>new plan</think>new answer",
+            ("new plan", "new answer"),
+        )
+
     def test_think_end_split_across_chunks(self):
         """`</think>` straddling a chunk boundary must still end the block."""
         self._assert_invariant(
