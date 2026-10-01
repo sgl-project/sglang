@@ -31,7 +31,6 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
-    reduce_moe_output,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -146,8 +145,6 @@ class SDARMoeSparseMoeBlock(nn.Module):
         router_logits, _ = self.gate(hidden_states)  # (T, E)
         topk_output = self.topk(hidden_states, router_logits)
         out = self.experts(hidden_states, topk_output)  # (T, H)
-
-        out = reduce_moe_output(out)
 
         return out.view(num_tokens, hidden_dim)
 

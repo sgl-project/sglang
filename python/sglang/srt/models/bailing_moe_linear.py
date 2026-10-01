@@ -32,7 +32,6 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import reduce_moe_output
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
@@ -365,7 +364,6 @@ class BailingMoE(nn.Module):
             if self.num_shared_experts > 0:
                 final_hidden_states = final_hidden_states + shared_output
 
-        final_hidden_states = reduce_moe_output(final_hidden_states)
         return final_hidden_states
 
 
@@ -671,6 +669,7 @@ class BailingMoEAttention(nn.Module):
             bias=config.use_bias,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
+            reduce_results=False,
         )
         if hasattr(config, "rotary_dim"):
             self.rotary_dim = config.rotary_dim
@@ -792,6 +791,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
+                reduce_results=False,
             )
         else:
             if is_nextn or self.layer_id >= config.first_k_dense_replace:
@@ -810,6 +810,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
                     intermediate_size=config.intermediate_size,
                     quant_config=quant_config,
                     prefix=add_prefix("mlp", prefix),
+                    reduce_results=False,
                 )
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-5))
         self.input_layernorm = RMSNorm(self.hidden_size, eps=rms_norm_eps)

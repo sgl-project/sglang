@@ -27,7 +27,6 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
-    reduce_moe_output,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
@@ -226,7 +225,6 @@ class Step3p5MoEMLP(nn.Module):
         final_hidden_states = self.experts(hidden_states, topk_output)
         if shared_output is not None:
             final_hidden_states += shared_output
-        final_hidden_states = reduce_moe_output(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -506,6 +504,7 @@ class Step3p5DecoderLayer(nn.Module):
                 swiglu_limit=swiglu_limit_shared,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
+                reduce_results=False,
             )
 
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
