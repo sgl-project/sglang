@@ -53,7 +53,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoiceFuncName,
 )
 from sglang.srt.observability.req_time_stats import monotonic_time
-from sglang.srt.parser.template_detection import detect_inline_system_support
 
 if TYPE_CHECKING:
     from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
@@ -190,18 +189,7 @@ class AnthropicServing:
 
     def __init__(self, openai_serving_chat: OpenAIServingChat):
         self.openai_serving_chat = openai_serving_chat
-        self._merge_inline_system = not detect_inline_system_support(
-            self._chat_template()
-        )
-
-    def _chat_template(self) -> Optional[str]:
-        tokenizer_manager = getattr(self.openai_serving_chat, "tokenizer_manager", None)
-        if tokenizer_manager is None:
-            return None
-        tokenizer = getattr(tokenizer_manager, "tokenizer", None)
-        if tokenizer is None:
-            return None
-        return getattr(tokenizer, "chat_template", None)
+        self._merge_inline_system = not openai_serving_chat.supports_inline_system
 
     async def handle_messages(
         self,
@@ -567,11 +555,7 @@ class AnthropicServing:
             "model": anthropic_request.model,
             "max_tokens": anthropic_request.max_tokens,
             "stream": anthropic_request.stream or False,
-            "bootstrap_host": anthropic_request.bootstrap_host,
-            "bootstrap_port": anthropic_request.bootstrap_port,
-            "bootstrap_room": anthropic_request.bootstrap_room,
-            "routed_dp_rank": anthropic_request.routed_dp_rank,
-            "disagg_prefill_dp_rank": anthropic_request.disagg_prefill_dp_rank,
+            **anthropic_request.pd_routing_kwargs(),
         }
 
         if anthropic_request.temperature is not None:

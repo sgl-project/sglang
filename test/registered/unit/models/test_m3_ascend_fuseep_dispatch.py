@@ -4,7 +4,7 @@ Tests for the bug where ``MiniMaxM3MoE.forward()`` checked only
 ``is_deepep()`` and omitted ``is_ascend_fuseep()``, causing:
  1. A spurious ``tensor_model_parallel_all_reduce`` on already-combined output.
  2. Shared experts not replicated (``tp_size=1``).
- 3. ``ep_size`` / ``top_k`` left unset.
+ 3. ``top_k`` left unset.
 
 All tests are CPU-only and run in CI without NPU hardware.
 """
@@ -136,11 +136,11 @@ class TestMiniMaxM3MoEAscendFuseEPDispatch(unittest.TestCase):
             self.assertEqual(result, "normal_result")
 
     # ------------------------------------------------------------------ #
-    #  Test: __init__ sets ep_size / top_k under ascend_fuseep            #
+    #  Test: __init__ sets top_k under ascend_fuseep                     #
     # ------------------------------------------------------------------ #
-    def test_ep_size_and_top_k_set_for_ascend_fuseep(self):
-        """``self.ep_size`` and ``self.top_k`` must be initialised for
-        ``ascend_fuseep``, matching the ``deepep`` behaviour."""
+    def test_top_k_set_for_ascend_fuseep(self):
+        """``self.top_k`` must be initialised for ``ascend_fuseep``,
+        matching the ``deepep`` behaviour."""
         import sglang.srt.models.minimax_m3 as m3_mod
 
         with (
@@ -153,15 +153,11 @@ class TestMiniMaxM3MoEAscendFuseEPDispatch(unittest.TestCase):
         ):
             moe = self._build_moe_stub(m3_mod)
 
-            self.assertTrue(
-                hasattr(moe, "ep_size"), "ep_size not set for ascend_fuseep"
-            )
-            self.assertEqual(moe.ep_size, 8)
             self.assertTrue(hasattr(moe, "top_k"), "top_k not set for ascend_fuseep")
             self.assertEqual(moe.top_k, 2)
 
-    def test_ep_size_and_top_k_set_for_deepep(self):
-        """Sanity check: ``deepep`` still sets ``ep_size`` / ``top_k``."""
+    def test_top_k_set_for_deepep(self):
+        """Sanity check: ``deepep`` still sets ``top_k``."""
         import sglang.srt.models.minimax_m3 as m3_mod
 
         with (
@@ -174,8 +170,6 @@ class TestMiniMaxM3MoEAscendFuseEPDispatch(unittest.TestCase):
         ):
             moe = self._build_moe_stub(m3_mod)
 
-            self.assertTrue(hasattr(moe, "ep_size"))
-            self.assertEqual(moe.ep_size, 8)
             self.assertTrue(hasattr(moe, "top_k"))
             self.assertEqual(moe.top_k, 2)
 

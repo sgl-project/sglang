@@ -19,6 +19,8 @@ from pydantic import (
     model_validator,
 )
 
+from sglang.srt.entrypoints.openai.protocol import PDRoutingFields
+
 
 class AnthropicError(BaseModel):
     """Error structure for Anthropic API."""
@@ -357,7 +359,7 @@ class AnthropicCountTokensResponse(BaseModel):
     input_tokens: int
 
 
-class AnthropicMessagesRequest(BaseModel):
+class AnthropicMessagesRequest(PDRoutingFields):
     """Anthropic Messages API request."""
 
     model: str
@@ -377,13 +379,6 @@ class AnthropicMessagesRequest(BaseModel):
     # when targeting non-Anthropic backends, so the schema must accept them.
     output_config: Optional[AnthropicOutputConfig] = None
     betas: Optional[list[str]] = None
-
-    # Native Messages requests use the same PD rendezvous as Chat Completions.
-    bootstrap_host: Optional[Union[list[str], str]] = None
-    bootstrap_port: Optional[Union[list[Optional[int]], int]] = None
-    bootstrap_room: Optional[Union[list[int], int]] = None
-    routed_dp_rank: Optional[int] = None
-    disagg_prefill_dp_rank: Optional[int] = None
 
     @field_validator("model")
     @classmethod

@@ -45,7 +45,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.layer_boundary import (
     declare_attn,
     declare_ffn,
-    enable_moe_dense_fully_dp,
+    is_dense_ffn_fully_dp,
     make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
@@ -99,7 +99,7 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     log_info_on_rank0,
-    make_layers,
+    make_pp_layers,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -163,7 +163,6 @@ class MultiHeadRMSNorm(nn.Module):
     ) -> None:
         super().__init__()
         self.tp_world = get_parallel().attn_tp_size
-        self.tp_rank = get_parallel().attn_tp_rank
         self.num_heads = num_heads
         self.num_heads_per_tp = num_heads // self.tp_world
         self.head_dim = head_dim
@@ -428,7 +427,6 @@ class MiniMaxM3MoE(nn.Module):
             get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_ascend_fuseep()
         ):
-            self.ep_size = get_parallel().moe_ep_size
             self.top_k = config.num_experts_per_tok
 
     @staticmethod
@@ -573,7 +571,6 @@ class MiniMaxM3Attention(nn.Module):
         attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_size = attn_tp_size
-        self.attn_tp_rank = attn_tp_rank
 
         self.total_num_heads = config.num_attention_heads
         assert self.total_num_heads % attn_tp_size == 0
@@ -1326,7 +1323,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
             )
         else:
-            if enable_moe_dense_fully_dp():
+            if is_dense_ffn_fully_dp():
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
@@ -1368,12 +1365,12 @@ class MiniMaxM3DecoderLayer(nn.Module):
             (
                 declare_ffn(
                     sparse=self.is_layer_sparse,
-                    next_sparse=is_next_layer_sparse,
+                    next_layer_sparse=is_next_layer_sparse,
                 ),
                 self.post_attention_layernorm,
             ),
             previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_sparse=self.is_layer_sparse
+                sparse=is_previous_layer_sparse, next_layer_sparse=self.is_layer_sparse
             )
             if layer_id != 0
             else None,
@@ -1391,7 +1388,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
-            captured_last_layer_outputs=captured_last_layer_outputs,
+            capture_gathered=captured_last_layer_outputs,
             **kwargs,
         )
 
@@ -1455,11 +1452,9 @@ class MiniMaxM3Model(nn.Module):
                 prefix=prefix,
             )
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             layer_fn,
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
@@ -1526,9 +1521,9 @@ class MiniMaxM3Model(nn.Module):
 
         if not self.pp_group.is_last_rank:
             return residual_batch.to_pp(hidden_states, forward_batch)
-        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
-        if hidden_states.shape[0] != 0:
-            hidden_states = residual_batch.norm(hidden_states, forward_batch, self.norm)
+        hidden_states = residual_batch.final_norm(
+            hidden_states, forward_batch, self.norm, skip_empty=True
+        )
 
         if len(aux_hidden_states) == 0:
             return hidden_states
