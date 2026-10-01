@@ -230,6 +230,11 @@ class PreparedTinyGlm:
         self.record(x.shape[0], "candidate", "native supplied9")
         return output
 
+    def record_routing_count(self, batch, rows):
+        # Presence only: never inspect the scalar value or synchronize a GPU.
+        kind = "none" if batch.moe_num_token_non_padded() is None else "gpu"
+        self.record(rows, "routing", f"num_token_non_padded={kind}")
+
     def record(self, rows, event, reason):
         import torch
 

@@ -208,6 +208,21 @@ class TestTinyGlm(TestCase):
                 with tiny.warmup_stream(captured) as value:
                     self.assertIsNone(value)
 
+    def test_routing_count_census_does_not_read_device_data(self):
+        obj = tiny.PreparedTinyGlm.__new__(tiny.PreparedTinyGlm)
+        calls = []
+        obj.record = lambda *args: calls.append(args)
+        scalar = NS(item=lambda: self.fail("device scalar read"))
+        for value in (None, scalar):
+            obj.record_routing_count(NS(moe_num_token_non_padded=lambda: value), 8)
+        self.assertEqual(
+            calls,
+            [
+                (8, "routing", "num_token_non_padded=none"),
+                (8, "routing", "num_token_non_padded=gpu"),
+            ],
+        )
+
     def test_no_factory_or_jit_inside_capture(self):
         # Exercise real host method with a mocked capture probe. The preparation
         # must exit before querying a stream or accessing a factory.
