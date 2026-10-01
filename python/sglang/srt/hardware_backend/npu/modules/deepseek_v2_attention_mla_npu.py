@@ -1,12 +1,10 @@
 import logging
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
 import torch
 import torch_npu
 from sgl_kernel_npu.norm.fused_split_qk_norm import fused_split_qk_norm
 
-import sglang.srt.model_executor.forward_context as forward_context
-import sglang.srt.runtime_context as runtime_context
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     NPUFusedMLAPreprocess,
@@ -53,15 +51,18 @@ logger = logging.getLogger(__name__)
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 _is_npu_arch35 = is_npu_arch35()
 _debug_dcp_extend_memory = envs.SGLANG_DEBUG_NPU_DCP_EXTEND_MEMORY.get()
+_prefetch_dcp_extend_gather = envs.SGLANG_NPU_ENABLE_DCP_EXTEND_GATHER_PREFETCH.get()
+_dcp_gather_prefetch_stream = None
 
 
-def _use_dsa_dcp_partial_attention(forward_batch: "ForwardBatch") -> bool:
-    return (
-        runtime_context.get_parallel().dcp_enabled
-        and not forward_context.get_attn_backend().is_draft_worker
-        and not dsa_use_prefill_cp(forward_batch)
-        and not forward_batch.forward_mode.is_idle()
-    )
+def _get_dcp_gather_prefetch_stream():
+    """One side stream per process, built lazily: the module is imported
+    before the device is selected, and a stream made on the wrong device
+    would run the gathers where no rank is looking."""
+    global _dcp_gather_prefetch_stream
+    if _dcp_gather_prefetch_stream is None:
+        _dcp_gather_prefetch_stream = torch.npu.Stream()
+    return _dcp_gather_prefetch_stream
 
 
 # region MHA
@@ -580,7 +581,7 @@ def forward_dsa_prepare_npu(
         # only when a fresh global top-k is produced so shared-index layers do
         # not repeat the same DCP partitioning work.
         if is_dcp_mla_decode_phase(forward_batch):
-            # Decode only, unlike upstream's _use_dsa_dcp_partial_attention:
+            # Decode only, unlike upstream, which covers extend as well:
             # our extend reads the GATHERED context, whose coordinates are
             # global, so remapping there would point every index at the wrong
             # row. The interleave must match the pool's owner rule exactly.
@@ -653,6 +654,110 @@ def _pad_dcp_extend_send(shards: torch.Tensor, plan) -> torch.Tensor:
     return send
 
 
+class _DcpGatherPrefetch:
+    """Per-forward state for running each layer's prefix gather a layer ahead.
+
+    Profiles say compute and communication never overlap on this path -- 0.00 s
+    of an 83 s span on A3 -- although they sit on different streams and the
+    transfers use no AI cores. Each gather is issued and immediately awaited,
+    with nothing queued behind it.
+
+    THE HANDSHAKE. Two scratch slots by layer parity, two events per direction,
+    both unconditional because getting either wrong corrupts silently:
+      * before the side stream writes a slot it waits the main stream's
+        ``release`` for it -- the index_select two layers back must be done;
+      * before the main stream reads a slot it waits the side stream's
+        ``ready`` for the gather that filled it.
+
+    The two one-time syncs in __init__ are per forward, never per layer:
+    ``wait_stream`` depends on everything already queued, which at layer L
+    includes layer L's compute and would serialise what this exists to overlap.
+    Main-waits-side covers the previous forward's last layer, which prefetched
+    a layer the model does not have -- with 78 layers that stale gather targets
+    slot 0 and the next forward's layer 0 wants slot 0.
+    """
+
+    __slots__ = ("stream", "pending", "release")
+
+    def __init__(self, stream: "torch.npu.Stream"):
+        self.stream = stream
+        # layer_id -> (slot, ready_event, sends). ``sends`` is held only so the
+        # caching allocator cannot reissue those buffers mid-collective.
+        self.pending: Dict[int, tuple] = {}
+        self.release: Dict[int, torch.npu.Event] = {}
+        self.stream.wait_stream(torch.npu.current_stream())
+        torch.npu.current_stream().wait_stream(self.stream)
+
+    def slot_of(self, layer_id: int, start_layer: int) -> int:
+        return (layer_id - start_layer) & 1
+
+
+_logged_dcp_gather_prefetch = False
+
+
+def _log_dcp_gather_prefetch_once(prefetching: bool, plan) -> None:
+    """Say once whether the prefetch engaged; the fallback is otherwise silent."""
+    global _logged_dcp_gather_prefetch
+    if _logged_dcp_gather_prefetch:
+        return
+    _logged_dcp_gather_prefetch = True
+    if prefetching:
+        logger.info(
+            "DCP extend gather prefetch is ACTIVE: %d scratch rows per slot, "
+            "2 keys, 2 slots",
+            plan.scratch_rows,
+        )
+    elif _prefetch_dcp_extend_gather:
+        logger.info(
+            "DCP extend gather prefetch was REQUESTED but is OFF: the plan has "
+            "%d pieces and it needs exactly 1. Set "
+            "SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS=0.",
+            len(plan.pieces),
+        )
+    else:
+        logger.info("DCP extend gather prefetch is off (inline gathers)")
+
+
+def _dcp_extend_gather_scratches(slot: int, k_nope, k_pe, rows: int):
+    """``[(scratch, own), ...]`` for both keys. Slot 1 exists only under the
+    prefetch, so slot 0 keeps the historical buffer names."""
+    suffix = "" if slot == 0 else "_b"
+    return [
+        (dcp_extend_gather_buffer("latent_scratch" + suffix, k_nope, rows), k_nope),
+        (dcp_extend_gather_buffer("rope_scratch" + suffix, k_pe, rows), k_pe),
+    ]
+
+
+def _dcp_extend_send_rows(pool, layer, md, plan, layer_id: int):
+    """This rank's padded prefix shard for ``layer_id`` -- the gather's input.
+
+    Prefix rows only, so it reads nothing the current forward wrote. That is
+    what lets the prefetch call it a layer early.
+    """
+    if not plan.send_rows:
+        return [None, None]
+    send_nope, send_rope = pool.get_mla_kv_buffer(
+        layer, md.dcp_local_prefix_kv_indices, layer_id=layer_id
+    )
+    if plan.local_lens != plan.padded_lens:
+        # Served prefixes are cycle-aligned and need no padding; this is the
+        # general case.
+        send_nope = _pad_dcp_extend_send(send_nope, plan)
+        send_rope = _pad_dcp_extend_send(send_rope, plan)
+    return [send_nope, send_rope]
+
+
+def _dcp_extend_all_gather(parallel, piece, pairs) -> None:
+    """The collectives for one piece; ``pairs`` is [(scratch, send), ...]."""
+    gathered = (piece.send_end - piece.send_start) * parallel.dcp_size
+    if not gathered:
+        return
+    for scratch, send in pairs:
+        parallel.dcp_group.all_gather_into_tensor(
+            scratch[:gathered], send[piece.send_start : piece.send_end]
+        )
+
+
 def _dcp_gather_extend_kv_npu(
     m: "DeepseekV2AttentionMLA",
     forward_batch: "ForwardBatch",
@@ -717,45 +822,103 @@ def _dcp_gather_extend_kv_npu(
                 sum(forward_batch.extend_seq_lens_cpu),
             )
 
+    pool = get_token_to_kv_pool()
     total_rows = plan.pieces[-1].out_end if plan.pieces else 0
     out_nope = dcp_extend_gather_buffer("latent", k_nope, total_rows)
     out_rope = dcp_extend_gather_buffer("rope", k_pe, total_rows)
 
-    # One scratch per key, sized for the widest piece and sliced per piece.
-    scratch_nope = dcp_extend_gather_buffer("latent_scratch", k_nope, plan.scratch_rows)
-    scratch_rope = dcp_extend_gather_buffer("rope_scratch", k_pe, plan.scratch_rows)
+    # Prefetching needs every piece's rows resident at once, which only a
+    # single-piece plan gives: a multi-piece scratch is one piece wide and
+    # reused. SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS <= 0 produces that.
+    layer_id = m.attn_mqa.layer_id
+    prefetching = _prefetch_dcp_extend_gather and len(plan.pieces) == 1
+    _log_dcp_gather_prefetch_once(prefetching, plan)
+    slot = 0
+    state = None
+    if prefetching:
+        state = getattr(forward_batch, "npu_dcp_gather_prefetch", None)
+        if state is None:
+            state = _DcpGatherPrefetch(_get_dcp_gather_prefetch_stream())
+            forward_batch.npu_dcp_gather_prefetch = state
+        slot = state.slot_of(layer_id, pool.start_layer)
 
-    send_nope = send_rope = None
-    if plan.send_rows:
-        send_nope, send_rope = get_token_to_kv_pool().get_mla_kv_buffer(
-            m.attn_mqa,
-            md.dcp_local_prefix_kv_indices,
-        )
-        if plan.local_lens != plan.padded_lens:
-            # Served prefixes are dcp_size-aligned (the widened allocator page)
-            # and need no padding; this is the general case.
-            send_nope = _pad_dcp_extend_send(send_nope, plan)
-            send_rope = _pad_dcp_extend_send(send_rope, plan)
+    # One scratch per key, sized for the widest piece and sliced per piece.
+    scratches = _dcp_extend_gather_scratches(slot, k_nope, k_pe, plan.scratch_rows)
 
     # Every rank plans the same pieces, so every rank runs -- or, for a piece
     # with no prefix rows, skips -- the same collectives in the same order.
+    #
+    # Gather and index_select stay INTERLEAVED per piece: pieces share one
+    # scratch, so hoisting every gather ahead would have piece n+1 overwrite
+    # piece n before it is read. The prefetch is exempt only because it needs
+    # a single-piece plan, where the two orders are the same thing.
+    done = state.pending.pop(layer_id, None) if prefetching else None
+    sends = None
+    if done is not None:
+        torch.npu.current_stream().wait_event(done[1])
+    else:
+        sends = _dcp_extend_send_rows(pool, m.attn_mqa, md, plan, layer_id)
+
     for piece in plan.pieces:
         gathered = (piece.send_end - piece.send_start) * parallel.dcp_size
         rows = gathered + piece.extend_end - piece.extend_start
-        for out, buf, send, own in (
-            (out_nope, scratch_nope, send_nope, k_nope),
-            (out_rope, scratch_rope, send_rope, k_pe),
-        ):
+        if sends is not None:
+            _dcp_extend_all_gather(
+                parallel, piece, [(buf, s) for (buf, _), s in zip(scratches, sends)]
+            )
+        for out, (buf, own) in zip((out_nope, out_rope), scratches):
             scratch = buf[:rows]
-            if gathered:
-                parallel.dcp_group.all_gather_into_tensor(
-                    scratch[:gathered], send[piece.send_start : piece.send_end]
-                )
             scratch[gathered:] = own[piece.extend_start : piece.extend_end]
             torch.index_select(
                 scratch, 0, piece.index, out=out[piece.out_start : piece.out_end]
             )
+
+    if prefetching:
+        # The slot is free only after the index_select above; the side stream
+        # must see that before refilling it two layers from now.
+        release = torch.npu.Event()
+        release.record()
+        state.release[slot] = release
+        _issue_dcp_gather_prefetch(
+            state, pool, m, md, plan, parallel, layer_id, k_nope, k_pe
+        )
     return out_nope, out_rope
+
+
+def _issue_dcp_gather_prefetch(
+    state: "_DcpGatherPrefetch",
+    pool,
+    m: "DeepseekV2AttentionMLA",
+    md,
+    plan,
+    parallel,
+    layer_id: int,
+    k_nope: torch.Tensor,
+    k_pe: torch.Tensor,
+) -> None:
+    """Start the next layer's prefix all-gathers on the side stream."""
+    nxt = layer_id + 1
+    # start_layer + layer_num - 1, not end_layer: layer_num is what this pool
+    # indexes its buffers by.
+    if nxt > pool.start_layer + pool.layer_num - 1 or nxt in state.pending:
+        return
+    slot = state.slot_of(nxt, pool.start_layer)
+    scratches = _dcp_extend_gather_scratches(slot, k_nope, k_pe, plan.scratch_rows)
+    release = state.release.get(slot)
+    with torch.npu.stream(state.stream):
+        if release is not None:
+            state.stream.wait_event(release)
+        sends = _dcp_extend_send_rows(pool, m.attn_mqa, md, plan, nxt)
+        pairs = [(scratch, s) for (scratch, _), s in zip(scratches, sends)]
+        for piece in plan.pieces:
+            _dcp_extend_all_gather(parallel, piece, pairs)
+        # The main stream's allocator owns the sends; without this it can hand
+        # them out again mid-collective.
+        for send in sends:
+            if send is not None:
+                send.record_stream(state.stream)
+        ready = state.stream.record_event()
+    state.pending[nxt] = (slot, ready, sends)
 
 
 def forward_dsa_core_npu(

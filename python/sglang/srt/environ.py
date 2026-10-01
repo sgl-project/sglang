@@ -1018,6 +1018,13 @@ class Envs:
     # the scratch a layer holds beside the gathered context. The default is
     # 256 MiB of latent KV; <= 0 gathers the whole prefix in one collective.
     SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS = EnvInt(1 << 18)
+    # DCP extend on NPU: run each layer's prefix all-gather a layer ahead on a
+    # side stream, so it overlaps the previous layer's compute. Profiles show
+    # the two never overlap today -- each gather is issued and immediately
+    # awaited -- while the prefix it reads was written by earlier forwards.
+    # Costs a second context-sized scratch, and needs a single-piece plan
+    # (SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS <= 0); stays off otherwise.
+    SGLANG_NPU_ENABLE_DCP_EXTEND_GATHER_PREFETCH = EnvBool(False)
     # DCP on NPU: shard the latent KV in page_size-sized runs instead of one
     # position per rank, matching #37787 and vLLM-Ascend. Same allocator, rows
     # and block table; only which positions a rank holds changes, so the
