@@ -424,6 +424,17 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_fast_match_prefix(self) -> bool:
         return False
 
+    def refresh_device_prefix(self, key: RadixKey) -> int:
+        """Touch the device-resident prefix of ``key`` so LRU eviction sees it as recent.
+
+        Returns the number of device tokens matched. Must never reach a host tier,
+        storage backend or external connector: the scheduler calls this for every
+        waiting request on every round, and ``match_prefix`` on those caches can
+        allocate, load or enqueue lookups as a side effect. Caches without a
+        device tree (or whose device match has side effects) leave this a no-op.
+        """
+        return 0
+
     def dfs_weight_order(self, node_handles: Sequence[Any]) -> list[int]:
         """Return request indices in depth-first, subtree-weight order."""
         return _dfs_weight_order(self.root_node, node_handles, self.resolve_node_handle)

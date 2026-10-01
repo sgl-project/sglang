@@ -1,5 +1,6 @@
 import time
 import unittest
+import unittest.mock
 from array import array
 
 import torch
@@ -14,6 +15,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.runtime_context import publish, reset_context
@@ -97,7 +99,7 @@ class TestFcfsWaitingPrefixRefresh(CustomTestCase):
     def test_refresh_keeps_the_waiting_request_prefix_resident(self):
         with envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH.override(True):
             self.policy.calc_priority([self.waiting])
-        self.assertEqual(len(self.waiting.prefix_indices), len(OLDER_PREFIX))
+        self.assertEqual(self.waiting.num_matched_prefix_tokens, len(OLDER_PREFIX))
         self.cache.evict(EvictParams(num_tokens=len(NEWER_PREFIX)))
         self.assertEqual(self._matched_len(OLDER_PREFIX), len(OLDER_PREFIX))
         self.assertEqual(self._matched_len(NEWER_PREFIX), 0)
@@ -105,10 +107,58 @@ class TestFcfsWaitingPrefixRefresh(CustomTestCase):
     def test_refresh_disabled_restores_plain_lru(self):
         with envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH.override(False):
             self.policy.calc_priority([self.waiting])
-        self.assertEqual(len(self.waiting.prefix_indices), 0)
+        self.assertEqual(self.waiting.num_matched_prefix_tokens, 0)
         self.cache.evict(EvictParams(num_tokens=len(OLDER_PREFIX)))
         self.assertEqual(self._matched_len(OLDER_PREFIX), 0)
         self.assertEqual(self._matched_len(NEWER_PREFIX), len(NEWER_PREFIX))
+
+    def test_refresh_never_calls_the_general_matcher(self):
+        # External-cache implementations (FlexKV, LMCache, hierarchical tiers) give
+        # match_prefix side effects: lookups enqueued, KV allocated or loaded per call.
+        # The per-round refresh must stay on the device tree.
+        calls = []
+        original = type(self.cache).match_prefix
+
+        def spy(cache, params):
+            calls.append(params)
+            return original(cache, params)
+
+        with (
+            unittest.mock.patch.object(type(self.cache), "match_prefix", spy),
+            envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH.override(True),
+        ):
+            self.policy.calc_priority([self.waiting])
+        self.assertEqual(calls, [])
+        self.assertEqual(self.waiting.num_matched_prefix_tokens, len(OLDER_PREFIX))
+
+    def test_chunk_cache_skips_the_refresh(self):
+        # --disable-radix-cache deployments have no tree or LRU state to refresh; the
+        # scheduler hot path must not build keys or match for every waiting request.
+        chunk_cache = ChunkCache(
+            CacheInitParams(
+                disable=True,
+                req_to_token_pool=self.cache.req_to_token_pool,
+                token_to_kv_pool_allocator=self.cache.token_to_kv_pool_allocator,
+                page_size=1,
+                eviction_policy="lru",
+                enable_kv_cache_events=False,
+            )
+        )
+        policy = SchedulePolicy(
+            policy="fcfs",
+            tree_cache=chunk_cache,
+            enable_hierarchical_cache=False,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+        )
+        with (
+            unittest.mock.patch.object(ChunkCache, "match_prefix") as match_prefix,
+            unittest.mock.patch.object(ChunkCache, "refresh_device_prefix") as refresh,
+            envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH.override(True),
+        ):
+            policy.calc_priority([self.waiting])
+        match_prefix.assert_not_called()
+        refresh.assert_not_called()
 
 
 if __name__ == "__main__":

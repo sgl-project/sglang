@@ -160,6 +160,29 @@ def estimate_prefill_extend_tile_metrics(
     }
 
 
+def refresh_waiting_prefix(tree_cache: BasePrefixCache, req: Req) -> None:
+    """Touch ``req``'s device-resident prefix and record its length on the request.
+
+    Device-tree-only counterpart of :func:`match_prefix_for_req` for the per-round
+    waiting-queue refresh: it never calls ``match_prefix``, whose external-cache
+    implementations can allocate, load or enqueue lookups per call.
+    """
+    token_ids = req.origin_input_ids + req.output_ids
+    reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
+    key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
+    matched = tree_cache.refresh_device_prefix(
+        RadixKey(
+            token_ids=token_ids,
+            extra_key=req.extra_key,
+            limit=key_limit,
+            cache_salt=req.cache_salt,
+        )
+    )
+    req.num_matched_prefix_tokens = min(
+        matched, req._compute_max_prefix_len(len(token_ids))
+    )
+
+
 def match_prefix_for_req(
     tree_cache: BasePrefixCache,
     req: Req,
@@ -271,24 +294,29 @@ class SchedulePolicy:
     ) -> None:
         policy = self._determine_active_policy(waiting_queue)
 
-        # Populate req.num_matched_prefix_tokens at schedule time. Cache-aware policies
-        # set it in _compute_prefix_matches; do the same full match for cache-agnostic
-        # policies. The match also refreshes last_access_time on the waiting request's
-        # prefix; without it the LRU evicts that prefix while the request waits behind
-        # prompts that exhaust the budget. Skip on decode (never prefills).
+        # Skip on decode (never prefills).
         if (
             not isinstance(policy, CacheAwarePolicy)
-            and (
-                self.tree_cache.supports_fast_match_prefix()
-                or (
-                    envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH.get()
-                    and len(waiting_queue) <= WAITING_PREFIX_REFRESH_MAX_QUEUE
-                )
-            )
             and get_disagg().disaggregation_mode != "decode"
         ):
-            for r in waiting_queue:
-                match_prefix_for_req(self.tree_cache, r, include_req=True)
+            # Populate req.num_matched_prefix_tokens at schedule time. Cache-aware
+            # policies set it in _compute_prefix_matches; do the same full match for
+            # cache-agnostic policies when the radix supports it, so the load
+            # snapshot has it.
+            if self.tree_cache.supports_fast_match_prefix():
+                for r in waiting_queue:
+                    match_prefix_for_req(self.tree_cache, r, include_req=True)
+            # Otherwise keep the waiting requests' cached prefixes resident: without a
+            # touch the LRU evicts a prefix while its request waits behind prompts that
+            # exhaust the budget. Device tree only, so no host-tier or storage lookup
+            # runs as a side effect; nothing to touch under a chunk cache.
+            elif (
+                envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH.get()
+                and not self.tree_cache.is_chunk_cache()
+                and len(waiting_queue) <= WAITING_PREFIX_REFRESH_MAX_QUEUE
+            ):
+                for r in waiting_queue:
+                    refresh_waiting_prefix(self.tree_cache, r)
 
         if self.policy == CacheAgnosticPolicy.FCFS:
             if self.enable_priority_scheduling:
