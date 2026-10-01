@@ -157,6 +157,9 @@ class TestBlockTable(unittest.TestCase):
             )
 
     def test_block_table_matches_reference(self):
+        """The v2p gather alone is the whole translation, and it must not be
+        skipped: a block table left in virtual id space differs from the
+        reference here."""
         for page_size in (1, 32, 64):
             rt, rpi, sl, v2p = self._make_batch(page_size)
             got = _fill_block_table(rt, rpi, sl, page_size, v2p=v2p)
@@ -165,21 +168,8 @@ class TestBlockTable(unittest.TestCase):
                 torch.equal(got.long(), want),
                 f"page_size={page_size}:\ngot ={got}\nwant={want}",
             )
-
-    def test_single_full_attention_layer_still_maps_v2p(self):
-        """The kernel-facing id IS the physical id, so the v2p gather alone is
-        the whole translation -- it must not be skipped. Regression guard for
-        detecting the unified pool via `multiplier > 1`: that predicate would
-        treat every unified pool as static and leave the block table in
-        virtual id space.
-        """
-        for page_size in (1, 64):
-            rt, rpi, sl, v2p = self._make_batch(page_size)
-            got = _fill_block_table(rt, rpi, sl, page_size, v2p=v2p).long()
-            want = _reference(rt, rpi, sl, page_size, v2p=v2p)
-            self.assertTrue(torch.equal(got, want), f"page_size={page_size}")
-            # ... and the v2p permutation is non-trivial here, so a skipped
-            # translation would be visibly different rather than accidentally equal.
+            # The v2p permutation is non-trivial here, so a skipped translation
+            # would be visibly different rather than accidentally equal.
             virtual = _reference(rt, rpi, sl, page_size, v2p=None)
             self.assertFalse(
                 torch.equal(want, virtual),
@@ -307,8 +297,21 @@ class TestFa3MetadataBlockTable(unittest.TestCase):
                 f"got ={got[r, :n_pages]}\nwant={want[r, :n_pages]}",
             )
 
+    def _assert_translated(self, want, page_size):
+        """The v2p permutation is non-trivial on the pages used, so a skipped
+        translation would differ from `want` rather than match it by accident."""
+        virtual = _reference(
+            *TestBlockTable._make_batch(self, page_size)[:3],
+            page_size,
+            v2p=None,
+        )
+        self.assertFalse(
+            torch.equal(want, virtual),
+            "test batch degenerated: v2p is the identity on the pages used",
+        )
+
     def test_identity_when_hooks_absent(self):
-        """Static pool: no v2p, multiplier 1 -> byte-identical to pre-change."""
+        """Static pool: no v2p -> byte-identical to pre-change."""
         for page_size in (1, 64):
             got, want, sl = self._run(page_size, v2p=False)
             self._assert_live_prefix(got, want, sl, page_size)
@@ -316,25 +319,12 @@ class TestFa3MetadataBlockTable(unittest.TestCase):
     def test_translated_mapping_ps1_fast_path(self):
         got, want, sl = self._run(1, v2p=True)
         self._assert_live_prefix(got, want, sl, 1)
+        self._assert_translated(want, 1)
 
     def test_translated_mapping_general_path(self):
         got, want, sl = self._run(64, v2p=True)
         self._assert_live_prefix(got, want, sl, 64)
-
-    def test_single_full_attention_layer(self):
-        """multiplier 1 with a real v2p: the gather alone is the translation."""
-        for page_size in (1, 64):
-            got, want, sl = self._run(page_size, v2p=True)
-            self._assert_live_prefix(got, want, sl, page_size)
-            virtual = _reference(
-                *TestBlockTable._make_batch(self, page_size)[:3],
-                page_size,
-                v2p=None,
-            )
-            self.assertFalse(
-                torch.equal(want, virtual),
-                "test batch degenerated: v2p is the identity on the pages used",
-            )
+        self._assert_translated(want, 64)
 
     # (The old fa3<->flashmla agreement case is gone: both families now
     # consume the SAME canonical builder, so cross-family agreement holds by
