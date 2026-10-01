@@ -153,6 +153,12 @@ def c2_decode_norm_rope_store(
 
     The cache store uses ``raw_out_loc // 2`` as its slot.
 
+    A padded graph row is marked by ``raw_out_loc == 0`` and writes nothing, but
+    decode and verify rows issue their ring load before that check, so a padded
+    row's ``req`` and ``positions`` must still address an in-bounds ring slot.
+    The decode graph buffers zero both tails (``PaddingPolicy.ZERO``); a runner
+    that left stale request indices there would read out of the ring pool.
+
     :param freqs_cis: ``[max_pos, rope_dim]`` fp32, real/imag interleaved --
                       ``torch.view_as_real(freqs).flatten(-2)``. Indexed
                       in-kernel at ``positions - 1``, the position the latent
