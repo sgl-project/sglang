@@ -37,6 +37,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.device = device
         self.page_size = page_size
         self.need_sort = need_sort
+        self._spec_scratch_capacity = 0
 
         self.logical_attn_allocator = PagedTokenToKVPoolAllocator(
             self._size_full,
@@ -72,6 +73,17 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self._kvcache.register_mapping(
             weakref.proxy(self.full_to_hisparse_device_index_mapping)
         )
+
+    def configure_spec_scratch(self, capacity: int) -> None:
+        if capacity < 0 or capacity % self.page_size != 0:
+            raise ValueError(
+                "HiSparse spec scratch capacity must be a non-negative multiple "
+                f"of page_size, got capacity={capacity}, page_size={self.page_size}."
+            )
+        self._spec_scratch_capacity = capacity
+
+    def request_slot_reserve(self, *, has_req_pool_slot: bool) -> int:
+        return 0 if has_req_pool_slot else self._spec_scratch_capacity
 
     @property
     def size_full(self) -> int:
@@ -165,7 +177,10 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return buffer_indices
 
     def free_hisparse_indices(self, buffer_indices: torch.Tensor):
-        self.hisparse_attn_allocator.free(buffer_indices[buffer_indices > 0])
+        # Page zero is the padding sink and is never owned by a request.
+        self.hisparse_attn_allocator.free(
+            buffer_indices[buffer_indices >= self.page_size]
+        )
 
     def get_last_loc_compressed(self, last_locs: torch.Tensor):
         return last_locs
@@ -507,7 +522,9 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return buffer_indices
 
     def free_hisparse_indices(self, buffer_indices: torch.Tensor):
-        self.hisparse_attn_allocator.free(buffer_indices[buffer_indices > 0])
+        self.hisparse_attn_allocator.free(
+            buffer_indices[buffer_indices >= self.hisparse_page_size]
+        )
 
     def get_last_loc_compressed(self, last_locs: torch.Tensor):
         # Last complete C4 block of a prefix of last_loc + 1 tokens; -1 stays -1.
