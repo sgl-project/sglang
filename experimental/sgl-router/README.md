@@ -155,6 +155,43 @@ original messages, and `/v1/tokenize` and `/v1/detokenize` are unavailable.
 Cache-aware routing, prefix-cache terms or filters, and `--bucket-config` still
 require a tokenizer.
 
+### DP-rank routing
+
+An engine launched with `--dp-size N` or `--attn-dp-size N` runs N DP ranks
+behind one endpoint, each with its own scheduler and KV cache. By default the
+engine's DP controller spreads requests over them itself, so a conversation can
+land on a rank that holds none of its cache. `--dp-aware` has the router choose
+the rank as well:
+
+```bash
+sgl-router --model-id qwen3 --worker-urls http://10.0.0.1:30000 \
+  --policy sticky --routing-key-header x-conversation-id --dp-aware
+```
+
+The worker is chosen by the usual policy, legacy or reorg. Then the router
+picks a rank inside it and sends it as `X-Data-Parallel-Rank`, which SGLang
+honors over both its own load balancing and any `routed_dp_rank` in the body.
+The rank count is read from each worker's `/server_info` as
+`dp_size * attn_dp_size`. Single-rank workers are left alone.
+
+The rank is the first of these that applies:
+
+1. **Affinity.** If the request carries the sticky routing-key header or the
+   session-id header, a SHA-256 hash of it picks the rank. That rank keeps
+   receiving the conversation, and router replicas agree on it without
+   sharing state.
+2. **Prefix.** With `--policy cache_aware` and the local radix tree, the
+   worker's rank holding the longest cached prefix of the prompt wins.
+3. **Least load.** Otherwise, the rank with the fewest requests this router
+   has in flight on it wins. Ties rotate.
+
+In PD mode, prefill is ranked as above. Decode is ranked by load only, because
+its KV cache arrives from prefill. The bootstrap room is chosen so that
+`bootstrap_room % prefill_dp_size` equals the prefill rank, which is how a
+decode engine finds the prefill rank. The router overwrites any client-sent
+`X-Data-Parallel-Rank`. Each choice is counted in
+`sgl_router_dp_rank_selections_total{mode, reason}`.
+
 ### Fleet-wide sampling contract
 
 `--override-sampling-params` fixes the sampling configuration for every client

@@ -216,6 +216,12 @@ pub struct RoutingArgs {
     #[arg(long, value_enum, default_value = "power_of_two")]
     pub decode_policy: DecodePolicyKind,
 
+    /// Also pick the DP rank inside each selected worker that runs several
+    /// (--dp-size / --attn-dp-size): by sticky/session key hash, then deepest
+    /// cached prefix, then fewest in-flight requests.
+    #[arg(long)]
+    pub dp_aware: bool,
+
     /// Static P/D bucket configuration. Omit to use the global candidate domain.
     #[arg(long)]
     pub bucket_config: Option<String>,
@@ -496,6 +502,7 @@ impl Cli {
                 },
                 policy: self.routing.policy,
                 decode_policy: self.routing.decode_policy,
+                dp_aware: self.routing.dp_aware,
                 bucket_config,
                 circuit_breaker,
                 cache_aware,

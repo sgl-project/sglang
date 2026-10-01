@@ -428,6 +428,20 @@ pub(super) fn generate_room_id() -> u64 {
     rand::random::<u64>() & (i64::MAX as u64)
 }
 
+/// A bootstrap room congruent to `rank` modulo `dp_ranks`, still within the
+/// 63-bit range of [`generate_room_id`].
+///
+/// A decode engine that is not told the prefill rank resolves it as
+/// `bootstrap_room % prefill_dp_size` (SGLang's `follow_bootstrap_room`
+/// default), so pinning the prefill engine to `rank` with
+/// `X-Data-Parallel-Rank` must pick a room that maps to the same rank.
+pub(super) fn generate_room_id_for_rank(rank: u32, dp_ranks: u32) -> u64 {
+    let dp_ranks = u64::from(dp_ranks.max(1));
+    let rank = u64::from(rank) % dp_ranks;
+    let slots = (i64::MAX as u64 - rank) / dp_ranks + 1;
+    rand::random::<u64>() % slots * dp_ranks + rank
+}
+
 pub(super) struct BootstrapFields {
     pub(super) host: String,
     pub(super) port: Option<u16>,
@@ -785,6 +799,17 @@ mod tests {
     fn bucket_routing_requests_tokens_even_for_a_non_token_policy() {
         assert!(should_tokenize_request(false, false, true));
         assert!(!should_tokenize_request(false, false, false));
+    }
+
+    #[test]
+    fn rank_aligned_room_ids_map_back_to_their_rank() {
+        for (rank, dp_ranks) in [(0, 1), (0, 4), (3, 4), (6, 7), (u32::MAX - 1, u32::MAX)] {
+            for _ in 0..1_000 {
+                let room = generate_room_id_for_rank(rank, dp_ranks);
+                assert!(room <= i64::MAX as u64);
+                assert_eq!(room % u64::from(dp_ranks), u64::from(rank));
+            }
+        }
     }
 
     #[test]

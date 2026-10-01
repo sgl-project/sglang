@@ -3,7 +3,7 @@
 
 use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use crate::health::circuit_breaker::CircuitBreakerConfig;
-use crate::workers::worker::{WireProtocol, Worker};
+use crate::workers::worker::{EngineProfile, WireProtocol, Worker};
 use dashmap::DashMap;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -55,8 +55,8 @@ impl WorkerRegistry {
     }
 
     /// Add a worker, optionally supplying a circuit-breaker config, and with
-    /// the forwarding protocol resolved for it. Pass `None` to use the
-    /// circuit-breaker default (threshold = 3).
+    /// the engine profile (forwarding protocol and DP rank count) resolved
+    /// for it. Pass `None` to use the circuit-breaker default (threshold = 3).
     ///
     /// Re-adding an existing `WorkerId` is an upsert: the prior entry's
     /// `by_model` memberships are cleared first so a model that the new
@@ -84,7 +84,7 @@ impl WorkerRegistry {
         &self,
         spec: WorkerSpec,
         cb: Option<CircuitBreakerConfig>,
-        protocol: WireProtocol,
+        profile: impl Into<EngineProfile>,
     ) -> Result<(), AddWorkerError> {
         let incoming_mode = spec.mode;
         // Hold the write lock for the entire validate→insert sequence.
@@ -123,7 +123,7 @@ impl WorkerRegistry {
                 }
             }
         }
-        let mut w = Worker::with_cb_config(spec, cb, protocol);
+        let mut w = Worker::with_cb_config(spec, cb, profile);
         // An upsert (e.g. bootstrap repair racing the grace expiry) must not reset
         // live state or extend the bootstrap-port grace.
         if let Some(prev) = self.by_id.get(&w.id) {

@@ -32,6 +32,7 @@
 //! | `sgl_router_stale_requests_total` | Counter | `outcome` |
 //! | `sgl_router_decode_affinity_total` | Counter | `outcome` |
 //! | `sgl_router_sticky_total` | Counter | `outcome` |
+//! | `sgl_router_dp_rank_selections_total` | Counter | `mode`, `reason` |
 //! | `sgl_router_policy_decisions_total` | Counter | `policy`, `reason` |
 //! | `sgl_router_policy_selection_failures_total` | Counter | `policy`, `reason` |
 //! | `sgl_router_cache_admission_evaluated_total` | Counter | — |
@@ -112,6 +113,7 @@
 //! The exposition is text/plain; version=0.0.4 per the Prometheus spec.
 
 use crate::config::PolicyKind;
+use crate::policies::dp_rank::DpRankReason;
 use crate::proxy::sse::{StreamEnd, StreamEndReason};
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -310,6 +312,16 @@ impl WorkerModeLabel {
     }
 }
 
+impl From<crate::discovery::WorkerMode> for WorkerModeLabel {
+    fn from(mode: crate::discovery::WorkerMode) -> Self {
+        match mode {
+            crate::discovery::WorkerMode::Prefill => Self::Prefill,
+            crate::discovery::WorkerMode::Decode => Self::Decode,
+            crate::discovery::WorkerMode::Plain => Self::Plain,
+        }
+    }
+}
+
 /// Decode-affinity outcome — see `select_decode_with_affinity` for the
 /// three reasons the affinity may not be honored.
 #[derive(Debug, Clone, Copy)]
@@ -468,6 +480,7 @@ pub struct MetricsRegistry {
     stale_requests_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     decode_affinity_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     sticky_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
+    dp_rank_selections_total: Mutex<HashMap<(&'static str, &'static str), Arc<AtomicU64>>>,
     policy_decisions_total: Mutex<HashMap<PolicyDecisionKey, Arc<AtomicU64>>>,
     policy_selection_failures_total: Mutex<HashMap<PolicyDecisionKey, Arc<AtomicU64>>>,
     cache_admission_evaluated_total: AtomicU64,
@@ -766,6 +779,18 @@ impl MetricsRegistry {
         let mut guard = self.sticky_total.lock();
         let counter = guard
             .entry(outcome.as_str())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_dp_rank_selections_total{mode, reason}`: one per DP
+    /// rank chosen under `--dp-aware`, labeled by the worker's mode.
+    pub fn record_dp_rank_selection(&self, mode: WorkerModeLabel, reason: DpRankReason) {
+        let mut guard = self.dp_rank_selections_total.lock();
+        let counter = guard
+            .entry((mode.as_str(), reason.as_str()))
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
             .clone();
         drop(guard);
@@ -1202,6 +1227,25 @@ impl MetricsRegistry {
             out.push_str(&format!(
                 "sgl_router_sticky_total{{outcome=\"{}\"}} {}\n",
                 outcome, value,
+            ));
+        }
+        drop(guard);
+
+        // dp_rank_selections_total
+        out.push_str(
+            "# HELP sgl_router_dp_rank_selections_total DP ranks chosen under --dp-aware, by worker mode and selection tier.\n",
+        );
+        out.push_str("# TYPE sgl_router_dp_rank_selections_total counter\n");
+        let guard = self.dp_rank_selections_total.lock();
+        let mut entries: Vec<(&(&str, &str), u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by_key(|e| *e.0);
+        for ((mode, reason), value) in entries {
+            out.push_str(&format!(
+                "sgl_router_dp_rank_selections_total{{mode=\"{}\",reason=\"{}\"}} {}\n",
+                mode, reason, value,
             ));
         }
         drop(guard);
@@ -1797,6 +1841,21 @@ mod tests {
         assert!(out.contains(r#"sgl_router_decode_affinity_total{outcome="fallback_breaker"} 1"#));
         assert!(out
             .contains(r#"sgl_router_decode_affinity_total{outcome="fallback_load_imbalance"} 1"#,));
+    }
+
+    #[test]
+    fn dp_rank_selections_are_keyed_by_mode_and_reason() {
+        let reg = MetricsRegistry::new();
+        reg.record_dp_rank_selection(WorkerModeLabel::Plain, DpRankReason::Affinity);
+        reg.record_dp_rank_selection(WorkerModeLabel::Plain, DpRankReason::Affinity);
+        reg.record_dp_rank_selection(WorkerModeLabel::Decode, DpRankReason::LeastLoad);
+        let out = reg.render();
+        assert!(out.contains("# TYPE sgl_router_dp_rank_selections_total counter"));
+        assert!(out
+            .contains(r#"sgl_router_dp_rank_selections_total{mode="plain",reason="affinity"} 2"#));
+        assert!(out.contains(
+            r#"sgl_router_dp_rank_selections_total{mode="decode",reason="least_load"} 1"#
+        ));
     }
 
     #[test]
