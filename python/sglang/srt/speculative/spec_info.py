@@ -243,9 +243,9 @@ class SpeculativeAlgorithm(Enum):
         from sglang.srt.arg_groups.speculative_hook import (
             _handle_dflash,
             _handle_dspark,
-            _handle_mamba_attn_hybrid,
             _handle_eagle_family,
             _handle_frozen_kv_mtp,
+            _handle_mamba_attn_hybrid,
             _handle_ngram,
             _handle_uno,
         )
