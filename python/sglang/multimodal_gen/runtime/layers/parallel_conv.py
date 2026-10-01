@@ -290,9 +290,7 @@ def gather_variable_height(
     if x.shape[-2] < max_height:
         x = _tensor_pad(x, max_height - x.shape[-2], dim=-2)
 
-    gathered = parallel_group.all_gather(
-        _maybe_contiguous_for_sp_gather(x), dim=-2
-    )
+    gathered = parallel_group.all_gather(_maybe_contiguous_for_sp_gather(x), dim=-2)
     chunks = torch.split(gathered, max_height, dim=-2)
     return (
         torch.cat(

@@ -780,7 +780,9 @@ class WanAttentionBlock(nn.Module):
         if parallel_group is not None:
             self.world_size = parallel_group.world_size
         else:
-            self.world_size = get_decode_parallel_world_size() if spatial_parallel else 1
+            self.world_size = (
+                get_decode_parallel_world_size() if spatial_parallel else 1
+            )
 
         # layers
         self.norm = WanRMS_norm(dim)
@@ -918,12 +920,8 @@ class WanDistResidualBlock(WanResidualBlock):
 
 
 class WanDistAttentionBlock(WanAttentionBlock):
-    def __init__(
-        self, dim, parallel_group: GroupCoordinator | None = None
-    ) -> None:
-        super().__init__(
-            dim, spatial_parallel=True, parallel_group=parallel_group
-        )
+    def __init__(self, dim, parallel_group: GroupCoordinator | None = None) -> None:
+        super().__init__(dim, spatial_parallel=True, parallel_group=parallel_group)
 
 
 class WanDistMidBlock(WanMidBlock):
