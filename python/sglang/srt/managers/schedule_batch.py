@@ -3557,32 +3557,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
     def cumulate_penalty_output_tokens_since_last(self):
-        """Feed every token committed since the previous call (all accepted
-        speculative tokens, not only the last) to the penalizers. The first
-        call also feeds the last prompt token, matching the non-spec path."""
+        """Feed every output token committed since the previous call (all
+        accepted speculative tokens, not only the last) to the penalizers."""
         new_tokens = []
         for req in self.reqs:
-            seq_len = 1 + len(req.output_ids)
-            start = req.penalty_cumulated_len
-            if start == 0:
-                toks = [req.origin_input_ids[-1]] + list(req.output_ids)
-            else:
-                toks = list(req.output_ids[start - 1 :])
-            new_tokens.append(toks)
-            req.penalty_cumulated_len = seq_len
+            new_tokens.append(req.output_ids[req.penalty_cumulated_len :])
+            req.penalty_cumulated_len = len(req.output_ids)
 
         k = max((len(t) for t in new_tokens), default=0)
         if k == 0:
             return
 
         pin_memory = is_pin_memory_available(self.device)
-        ids = torch.zeros((len(self.reqs), k), dtype=torch.int64, pin_memory=pin_memory)
+        ids = torch.tensor(
+            [list(t) + [0] * (k - len(t)) for t in new_tokens],
+            dtype=torch.int64,
+            pin_memory=pin_memory,
+        )
         num_valid = torch.tensor(
             [len(t) for t in new_tokens], dtype=torch.int64, pin_memory=pin_memory
         )
-        for i, t in enumerate(new_tokens):
-            if t:
-                ids[i, : len(t)] = torch.tensor(t, dtype=torch.int64)
 
         self.sampling_info.penalizer_orchestrator.cumulate_output_tokens_multi(
             ids.to(self.device, non_blocking=True),

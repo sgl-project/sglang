@@ -22,6 +22,7 @@ from sglang.srt.sampling.penaltylib.repetition_penalty import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative import spec_utils
+from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -117,6 +118,20 @@ class TestDFlashPenalizerCumulate(CustomTestCase):
             min_new.len_output_tokens[:, 0], torch.tensor([3, 1], dtype=torch.int32)
         )
 
+        states = (
+            repetition.cumulated_repetition_penalties,
+            frequency.cumulated_frequency_penalties,
+            presence.cumulated_presence_penalties,
+            min_new.len_output_tokens,
+        )
+        before = [state.clone() for state in states]
+        orchestrator.cumulate_output_tokens_multi(
+            torch.tensor([[0, 0], [0, 0]], dtype=torch.int64),
+            torch.tensor([0, 0], dtype=torch.int64),
+        )
+        for state, expected in zip(states, before):
+            assert torch.equal(state, expected)
+
     def test_multi_token_matches_single_token_cumulate(self):
         reqs = [
             _make_req(
@@ -190,8 +205,8 @@ class TestDFlashPenalizerCumulate(CustomTestCase):
 
         ScheduleBatch.cumulate_penalty_output_tokens_since_last(batch)
         ids, num_valid = orchestrator.cumulate_output_tokens_multi.call_args.args
-        assert torch.equal(ids, torch.tensor([[42, 1, 2, 3], [43, 9, 0, 0]]))
-        assert torch.equal(num_valid, torch.tensor([4, 2]))
+        assert torch.equal(ids, torch.tensor([[1, 2, 3], [9, 0, 0]]))
+        assert torch.equal(num_valid, torch.tensor([3, 1]))
 
         orchestrator.reset_mock()
         req0.output_ids.extend([4, 5])
@@ -203,6 +218,41 @@ class TestDFlashPenalizerCumulate(CustomTestCase):
         orchestrator.reset_mock()
         ScheduleBatch.cumulate_penalty_output_tokens_since_last(batch)
         orchestrator.cumulate_output_tokens_multi.assert_not_called()
+
+    def test_verify_adjustments_apply_repetition_to_logits(self):
+        reqs = [_make_req(repetition_penalty=2.0), _make_req()]
+        orchestrator = _make_orchestrator(reqs, vocab_size=4)
+        orchestrator.cumulate_output_tokens_multi(
+            torch.tensor([[1, 3]], dtype=torch.int64).expand(2, -1),
+            torch.tensor([2, 2], dtype=torch.int64),
+        )
+
+        class FakeSamplingInfo:
+            has_custom_logit_processor = False
+            penalizer_orchestrator = orchestrator
+            grammar_mask = None
+            logit_bias = None
+            acc_scaling_penalties = None
+            apply_logits_bias = staticmethod(orchestrator.apply)
+
+            def __len__(self):
+                return 2
+
+        sampling_info = FakeSamplingInfo()
+        draft_token_num = 3
+        logits = torch.tensor([[1.0, 4.0, 1.0, -4.0]]).repeat(2 * draft_token_num, 1)
+
+        apply_dflash_verify_logits_adjustments(
+            next_token_logits=logits,
+            sampling_info=sampling_info,
+            draft_token_num=draft_token_num,
+        )
+
+        expected = torch.tensor(
+            [[1.0, 2.0, 1.0, -8.0]] * draft_token_num
+            + [[1.0, 4.0, 1.0, -4.0]] * draft_token_num
+        )
+        assert torch.equal(logits, expected)
 
     def test_spec_prepare_for_decode_gates_penalty_cumulate(self):
         calls = []
