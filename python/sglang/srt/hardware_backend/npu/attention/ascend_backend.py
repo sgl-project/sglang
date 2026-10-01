@@ -707,11 +707,20 @@ class AscendAttnBackend(AttentionBackend):
                     )
                 )
 
+        # Skipped under DCP, where it is dead work with a wrong answer. Its two
+        # outputs feed only the FIA and ring-MLA branches of forward_extend,
+        # which a DSA model never reaches (it returns at forward_sparse); and
+        # the table below strides by self.page_size, while a DCP pool pages at
+        # page_size * attn_dcp_size, so reaching it would read other ranks'
+        # pages. Leaving it unbuilt turns that into a None rather than silence.
+        # Draft workers keep allocator-global slots, so they still build it --
+        # the same carve-out as the DCP metadata above.
         if (
             self.use_mla
             and forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_draft_extend_v2()
             and not forward_batch.forward_mode.is_target_verify()
+            and not (get_parallel().dcp_enabled and not self.is_draft_worker)
             and sum(forward_batch.extend_prefix_lens_cpu) > 0
         ):
             self.forward_metadata.prefix_lens = forward_batch.extend_prefix_lens.to(
