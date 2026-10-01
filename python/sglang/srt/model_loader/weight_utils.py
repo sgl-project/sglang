@@ -1171,6 +1171,15 @@ def safetensors_weights_iterator(
         prefetch_handle.stop()
 
 
+def get_pp_stage_load_group() -> LoadGroup:
+    """Select a group for stage-local loads, not all-rank cold startup.
+
+    Call before draft contexts override the target's parallel topology.
+    """
+    parallel = get_parallel()
+    return parallel.tp_group if parallel.pp_size > 1 else _DEFAULT_LOAD_GROUP
+
+
 def instanttensor_weights_iterator(
     hf_weights_files: List[str],
     extra_config: Optional[dict] = None,

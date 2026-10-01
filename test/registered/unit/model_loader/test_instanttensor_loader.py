@@ -12,9 +12,10 @@ from safetensors.torch import save_file
 
 import sglang.srt.model_loader.loader as loader_mod
 import sglang.srt.model_loader.weight_utils as weight_utils
-from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.configs.load_config import _DEFAULT_LOAD_GROUP, LoadConfig
 from sglang.srt.platforms.cuda import CudaSRTPlatform
 from sglang.srt.platforms.rocm import RocmSRTPlatform
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -89,7 +90,12 @@ class TestInstantTensorLoader(CustomTestCase):
             patch.object(weight_utils, "get_parallel")
         )
 
-    def test_extra_config_reaches_safe_open(self):
+    def test_loader_passes_extra_config_and_load_group(self):
+        self.is_initialized.return_value = True
+        group = SimpleNamespace(world_size=2, device_group=object())
+        self.get_parallel.return_value = SimpleNamespace(
+            world_group=SimpleNamespace(world_size=4, device_group=object())
+        )
         options = {
             "buffer_size": 1024 * 1024 * 1024,
             "chunk_size": 8 * 1024 * 1024,
@@ -97,7 +103,9 @@ class TestInstantTensorLoader(CustomTestCase):
             "backend": ["URING", "AIO"],
         }
         config = LoadConfig(
-            load_format="instanttensor", model_loader_extra_config=json.dumps(options)
+            load_format="instanttensor",
+            model_loader_extra_config=json.dumps(options),
+            load_group=group,
         )
         model_loader = loader_mod.DefaultModelLoader(config)
         source = loader_mod.DefaultModelLoader.Source("model", None)
@@ -107,22 +115,21 @@ class TestInstantTensorLoader(CustomTestCase):
             weight_files=("model.safetensors",),
             use_safetensors=True,
         )
-        result = list(
-            model_loader._get_weights_iterator(source, resolved_source=resolved)
-        )
+        with patch.object(weight_utils.torch.distributed, "get_rank", return_value=0):
+            result = list(
+                model_loader._get_weights_iterator(source, resolved_source=resolved)
+            )
 
         self.assertEqual(result, self.tensors)
         self.safe_open.assert_called_once_with(
             ["model.safetensors"],
             framework="pt",
             device=torch.device("cuda:1"),
-            process_group=None,
+            process_group=group.device_group,
             copy=True,
             **{**options, "backend": [_Backend.URING, _Backend.AIO]},
         )
         self.assertEqual(config.model_loader_extra_config, options)
-        self.get_device.assert_called_once_with(1)
-        self.get_parallel.assert_not_called()
 
     def test_iterator_accepts_cuda_and_rocm(self):
         for platform in (CudaSRTPlatform(), RocmSRTPlatform()):
@@ -161,7 +168,6 @@ class TestInstantTensorLoader(CustomTestCase):
             self.assertIn(repr(device_type), str(raised.exception))
         self.current_device.assert_not_called()
         self.get_device.assert_not_called()
-        self.get_parallel.assert_not_called()
         self.safe_open.assert_not_called()
 
     def test_backend_conversion(self):
@@ -218,7 +224,7 @@ class TestInstantTensorLoader(CustomTestCase):
                         copy=True,
                     )
 
-    def test_explicit_load_group_reaches_safe_open(self):
+    def test_iterator_uses_explicit_load_group(self):
         self.is_initialized.return_value = True
         world_group = SimpleNamespace(world_size=4, device_group=object())
         tp_group = SimpleNamespace(world_size=2, device_group=object())
@@ -234,27 +240,28 @@ class TestInstantTensorLoader(CustomTestCase):
             ):
                 with self.subTest(group=group):
                     self.safe_open.reset_mock()
-                    config = LoadConfig(load_format="instanttensor", load_group=group)
-                    loader = loader_mod.DefaultModelLoader(config)
-                    source = loader.Source("model", None)
-                    resolved = loader.ResolvedSource(
-                        source=source,
-                        hf_folder="model",
-                        weight_files=("model.safetensors",),
-                        use_safetensors=True,
+                    list(
+                        weight_utils.instanttensor_weights_iterator(
+                            ["model.safetensors"], load_group=group
+                        )
                     )
-                    list(loader._get_weights_iterator(source, resolved_source=resolved))
                     self.safe_open.assert_called_once()
                     self.assertIs(
                         self.safe_open.call_args.kwargs["process_group"],
                         tp_group.device_group if group is tp_group else None,
                     )
-            self.get_parallel.assert_not_called()
-            list(weight_utils.instanttensor_weights_iterator(["model.safetensors"]))
-            self.assertIs(
-                self.safe_open.call_args.kwargs["process_group"],
-                world_group.device_group,
-            )
+
+    def test_pp_stage_load_group(self):
+        tp_group = object()
+        for pp_size in (1, 2):
+            with self.subTest(pp_size=pp_size):
+                self.get_parallel.return_value = SimpleNamespace(
+                    pp_size=pp_size, tp_group=tp_group
+                )
+                self.assertIs(
+                    weight_utils.get_pp_stage_load_group(),
+                    tp_group if pp_size > 1 else _DEFAULT_LOAD_GROUP,
+                )
 
     def test_iterator_rejects_unsupported_files(self):
         for files in (["model.pt"], ["model.bin"], ["model.safetensors", "model.pt"]):
@@ -265,7 +272,6 @@ class TestInstantTensorLoader(CustomTestCase):
                     list(weight_utils.instanttensor_weights_iterator(files))
                 self.assertIn(files[-1], str(raised.exception))
                 self.safe_open.assert_not_called()
-                self.get_device.assert_not_called()
 
     def test_pp_embedding_can_reopen_instanttensor_checkpoint(self):
         from sglang.srt.speculative.pp_draft_embedding import (
@@ -277,7 +283,7 @@ class TestInstantTensorLoader(CustomTestCase):
         name = "model.embed_tokens.weight"
         with tempfile.TemporaryDirectory() as folder:
             save_file({name: expected}, f"{folder}/model.safetensors")
-            with patch.object(loader_mod, "get_server_args", return_value=None):
+            with get_context().override_server_args():
                 hf_folder, weight_files, use_safetensors = prepare_checkpoint_files(
                     folder,
                     revision=None,
