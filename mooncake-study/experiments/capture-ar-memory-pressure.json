@@ -1,0 +1,468 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-01",
+  "base_commit": "dc7ec110ac7cdeb2ba6c79092346d9f4c991d605",
+  "feature": "Ordinary AR capture retirement, physical KV reuse and fresh admission after automatic scheduler retraction under real KV pool exhaustion",
+  "environment": {
+    "job": "job-fe1ce1dcdea6-20261001023258",
+    "node": "node064",
+    "gpu": "GPU-9b3a4d59-4935-f3b7-5135-d46c7c6c5495",
+    "gpu_model": "NVIDIA H100 80GB HBM3",
+    "image": "harbor.local.clusters/bp/lmsysorg/sglang:v0.5.15",
+    "versions": {
+      "python": "3.12.3",
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "packages": {
+        "mooncake-transfer-engine-cuda13": "0.3.11.post1",
+        "sglang-kernel": "0.4.6.post1",
+        "flashinfer-python": "0.6.17",
+        "transformers": "5.12.1"
+      }
+    },
+    "model": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+    "dtype": "bfloat16",
+    "selected_layers": [
+      0,
+      14,
+      27
+    ],
+    "tp": 1,
+    "pp": 1,
+    "dp": 1,
+    "attention": "triton",
+    "transport": "tcp",
+    "catalog": "HTTP TestCaptureCatalog double",
+    "python": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+    "gpu_checkout": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang"
+  },
+  "configuration": {
+    "kv_pool_tokens": 256,
+    "schedule_conservativeness": 0.05,
+    "debug_retract": false,
+    "requests": 4,
+    "prompt_tokens_each": 16,
+    "response_tokens_each": 80,
+    "requested_path_tokens": 384,
+    "prefill_graphs": false,
+    "decode_graph_buckets": [
+      1,
+      2,
+      4
+    ],
+    "max_sample_tokens": 128,
+    "max_inflight_samples": 4,
+    "max_host_bytes": 67108864,
+    "max_device_bytes": 8388608,
+    "kv_d2h_batch_tokens": 16,
+    "storage_chunk_tokens": 64
+  },
+  "implementation": [
+    "New four-case registered runtime test uses real normal serving and the existing Store/Catalog fixture.",
+    "Test-only wrapper observes actual allocator capacity and committed slots, calls the original retract_decode unchanged and records released capture identities and state.",
+    "No production capture, scheduler, allocator or wire-format change was required."
+  ],
+  "invariants": [
+    "Debug retract is disabled. Every observed call has available capacity below next-decode requirements and increases available capacity after release.",
+    "All pressure requests finish full responses without aborting. Scheduler, per-request and Prometheus retraction counts agree.",
+    "Every retired capture ID reaches FAILED with request_aborted_or_retracted, never publishes and never restarts capture after generation resumes.",
+    "All four reservations become available after pressure with zero quarantined slots; a fresh request is admitted and published.",
+    "Later successful source frames reuse physical slots owned by retired requests before release.",
+    "Graph cases execute actual batch-size-three graph decode; overlap cases observe pending-result lookahead.",
+    "New Store client reads after serving exit validate every manifest/object digest and exact online source KV/raw top-128 values, top-k vocab IDs, LSE (rtol=atol=1e-6), generated tokens, masks, positions, teacher alignment and KV validity. No target recomputation runs."
+  ],
+  "cases": [
+    {
+      "cuda_graph": false,
+      "overlap": true,
+      "kv_pool_tokens": 256,
+      "requested_path_tokens": 384,
+      "completed_requests": 4,
+      "output_tokens": 320,
+      "num_retractions": 2,
+      "retired_requests": [
+        "ar-pressure-False-True-2",
+        "ar-pressure-False-True-3"
+      ],
+      "reused_kv_slots": 64,
+      "source_frames": 286,
+      "ready_samples": 3,
+      "tensor_objects": 54,
+      "tensor_bytes": 2777272,
+      "producer_exited": true,
+      "events": [
+        {
+          "available_before": 0,
+          "required_next_decode": 4,
+          "debug_retract": false,
+          "reference_boundary": 195,
+          "available_after": 64,
+          "aborted": [],
+          "retracted": [
+            {
+              "rid": "ar-pressure-False-True-3",
+              "committed_tokens": 64,
+              "context_detached": true,
+              "finalizer_detached": true,
+              "capture_attempted": true,
+              "is_retracted": true
+            }
+          ]
+        },
+        {
+          "available_before": 1,
+          "required_next_decode": 3,
+          "debug_retract": false,
+          "reference_boundary": 258,
+          "available_after": 70,
+          "aborted": [],
+          "retracted": [
+            {
+              "rid": "ar-pressure-False-True-2",
+              "committed_tokens": 85,
+              "context_detached": true,
+              "finalizer_detached": true,
+              "capture_attempted": true,
+              "is_retracted": true
+            }
+          ]
+        }
+      ],
+      "capture_counters": {
+        "considered": 6,
+        "excluded_health_check": 1,
+        "admitted": 5,
+        "overlap_forwards": 87,
+        "eager_forwards": 87,
+        "failed_request_aborted_or_retracted": 2,
+        "writer_started": 5,
+        "copies_completed": 5,
+        "sealed": 3,
+        "snapshot_built": 3,
+        "ready": 3
+      },
+      "reservations": 4,
+      "states": {
+        "available": 4
+      },
+      "host_pool": {
+        "allocated_bytes": 11021312,
+        "device_allocated_bytes": 786432,
+        "device_limit_bytes": 8388608,
+        "free": 0,
+        "filling": 4,
+        "quarantined": 0
+      }
+    },
+    {
+      "cuda_graph": true,
+      "overlap": true,
+      "kv_pool_tokens": 256,
+      "requested_path_tokens": 384,
+      "completed_requests": 4,
+      "output_tokens": 320,
+      "num_retractions": 2,
+      "retired_requests": [
+        "ar-pressure-True-True-2",
+        "ar-pressure-True-True-3"
+      ],
+      "reused_kv_slots": 64,
+      "source_frames": 286,
+      "ready_samples": 3,
+      "tensor_objects": 54,
+      "tensor_bytes": 2777272,
+      "producer_exited": true,
+      "events": [
+        {
+          "available_before": 0,
+          "required_next_decode": 4,
+          "debug_retract": false,
+          "reference_boundary": 195,
+          "available_after": 64,
+          "aborted": [],
+          "retracted": [
+            {
+              "rid": "ar-pressure-True-True-3",
+              "committed_tokens": 64,
+              "context_detached": true,
+              "finalizer_detached": true,
+              "capture_attempted": true,
+              "is_retracted": true
+            }
+          ]
+        },
+        {
+          "available_before": 1,
+          "required_next_decode": 3,
+          "debug_retract": false,
+          "reference_boundary": 258,
+          "available_after": 70,
+          "aborted": [],
+          "retracted": [
+            {
+              "rid": "ar-pressure-True-True-2",
+              "committed_tokens": 85,
+              "context_detached": true,
+              "finalizer_detached": true,
+              "capture_attempted": true,
+              "is_retracted": true
+            }
+          ]
+        }
+      ],
+      "capture_counters": {
+        "considered": 6,
+        "excluded_health_check": 1,
+        "admitted": 5,
+        "overlap_forwards": 87,
+        "eager_forwards": 3,
+        "cuda_graph_forwards": 84,
+        "failed_request_aborted_or_retracted": 2,
+        "writer_started": 5,
+        "copies_completed": 5,
+        "sealed": 3,
+        "snapshot_built": 3,
+        "ready": 3
+      },
+      "reservations": 4,
+      "states": {
+        "available": 4
+      },
+      "host_pool": {
+        "allocated_bytes": 11021312,
+        "device_allocated_bytes": 786432,
+        "device_limit_bytes": 8388608,
+        "free": 0,
+        "filling": 4,
+        "quarantined": 0
+      }
+    },
+    {
+      "cuda_graph": false,
+      "overlap": false,
+      "kv_pool_tokens": 256,
+      "requested_path_tokens": 384,
+      "completed_requests": 4,
+      "output_tokens": 320,
+      "num_retractions": 2,
+      "retired_requests": [
+        "ar-pressure-False-False-2",
+        "ar-pressure-False-False-3"
+      ],
+      "reused_kv_slots": 62,
+      "source_frames": 283,
+      "ready_samples": 3,
+      "tensor_objects": 54,
+      "tensor_bytes": 2740408,
+      "producer_exited": true,
+      "events": [
+        {
+          "available_before": 0,
+          "required_next_decode": 4,
+          "debug_retract": false,
+          "reference_boundary": 195,
+          "available_after": 64,
+          "aborted": [],
+          "retracted": [
+            {
+              "rid": "ar-pressure-False-False-3",
+              "committed_tokens": 64,
+              "context_detached": true,
+              "finalizer_detached": true,
+              "capture_attempted": true,
+              "is_retracted": true
+            }
+          ]
+        },
+        {
+          "available_before": 1,
+          "required_next_decode": 3,
+          "debug_retract": false,
+          "reference_boundary": 258,
+          "available_after": 70,
+          "aborted": [],
+          "retracted": [
+            {
+              "rid": "ar-pressure-False-False-2",
+              "committed_tokens": 85,
+              "context_detached": true,
+              "finalizer_detached": true,
+              "capture_attempted": true,
+              "is_retracted": true
+            }
+          ]
+        }
+      ],
+      "capture_counters": {
+        "considered": 6,
+        "excluded_health_check": 1,
+        "admitted": 5,
+        "eager_forwards": 85,
+        "failed_request_aborted_or_retracted": 2,
+        "writer_started": 5,
+        "copies_completed": 5,
+        "sealed": 3,
+        "snapshot_built": 3,
+        "ready": 3
+      },
+      "reservations": 4,
+      "states": {
+        "available": 4
+      },
+      "host_pool": {
+        "allocated_bytes": 11021312,
+        "device_allocated_bytes": 786432,
+        "device_limit_bytes": 8388608,
+        "free": 0,
+        "filling": 4,
+        "quarantined": 0
+      }
+    },
+    {
+      "cuda_graph": true,
+      "overlap": false,
+      "kv_pool_tokens": 256,
+      "requested_path_tokens": 384,
+      "completed_requests": 4,
+      "output_tokens": 320,
+      "num_retractions": 2,
+      "retired_requests": [
+        "ar-pressure-True-False-2",
+        "ar-pressure-True-False-3"
+      ],
+      "reused_kv_slots": 62,
+      "source_frames": 283,
+      "ready_samples": 3,
+      "tensor_objects": 54,
+      "tensor_bytes": 2740408,
+      "producer_exited": true,
+      "events": [
+        {
+          "available_before": 0,
+          "required_next_decode": 4,
+          "debug_retract": false,
+          "reference_boundary": 195,
+          "available_after": 64,
+          "aborted": [],
+          "retracted": [
+            {
+              "rid": "ar-pressure-True-False-3",
+              "committed_tokens": 64,
+              "context_detached": true,
+              "finalizer_detached": true,
+              "capture_attempted": true,
+              "is_retracted": true
+            }
+          ]
+        },
+        {
+          "available_before": 1,
+          "required_next_decode": 3,
+          "debug_retract": false,
+          "reference_boundary": 258,
+          "available_after": 70,
+          "aborted": [],
+          "retracted": [
+            {
+              "rid": "ar-pressure-True-False-2",
+              "committed_tokens": 85,
+              "context_detached": true,
+              "finalizer_detached": true,
+              "capture_attempted": true,
+              "is_retracted": true
+            }
+          ]
+        }
+      ],
+      "capture_counters": {
+        "considered": 6,
+        "excluded_health_check": 1,
+        "admitted": 5,
+        "eager_forwards": 3,
+        "cuda_graph_forwards": 82,
+        "failed_request_aborted_or_retracted": 2,
+        "writer_started": 5,
+        "copies_completed": 5,
+        "sealed": 3,
+        "snapshot_built": 3,
+        "ready": 3
+      },
+      "reservations": 4,
+      "states": {
+        "available": 4
+      },
+      "host_pool": {
+        "allocated_bytes": 11021312,
+        "device_allocated_bytes": 786432,
+        "device_limit_bytes": 8388608,
+        "free": 0,
+        "filling": 4,
+        "quarantined": 0
+      }
+    }
+  ],
+  "totals": {
+    "completed_pressure_requests": 16,
+    "pressure_output_tokens": 1280,
+    "retired_captures": 8,
+    "snapshots": 12,
+    "tensor_objects": 216,
+    "tensor_bytes": 11035360
+  },
+  "runtime": {
+    "job_id": "01790891297814747080-fb8137e37772",
+    "outcome": "completed",
+    "returncode": 0,
+    "finished_unix": 1790891461.221851,
+    "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790891297814747080-fb8137e37772.log",
+    "test_file": "test/registered/storage/test_training_capture_ar_pressure.py",
+    "tests": 4,
+    "seconds": 151.445,
+    "command": "'kubectl' 'exec' '-n' 'qiji' 'job-fe1ce1dcdea6-20261001023258-master-0' '-c' 'master' '--' 'python3' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py' '--state-dir' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/state' 'submit' '--cwd' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang' '--env' 'PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/specforge-reference' '--env' 'PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' '--env' 'TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B' '--timeout' '1200' '--' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python' 'test/registered/storage/test_training_capture_ar_pressure.py' '-v' '-f'",
+    "log_sha256": "9d0587b7ddb211792a11dd026e6a652f903445bd2a1704fbc694055a86394c40",
+    "result_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790891297814747080-fb8137e37772.json"
+  },
+  "oom_logs": [
+    "[2026-10-01 21:49:01] KV cache pool is full. Retract requests. #retracted_reqs: 1, #new_tokens_gained: 64, #new_token_ratio: 0.0326 -> 0.8465",
+    "[2026-10-01 21:49:02] KV cache pool is full. Retract requests. #retracted_reqs: 1, #new_tokens_gained: 69, #new_token_ratio: 0.8455 -> 1.0000",
+    "[2026-10-01 21:49:37] KV cache pool is full. Retract requests. #retracted_reqs: 1, #new_tokens_gained: 64, #new_token_ratio: 0.0326 -> 0.8465",
+    "[2026-10-01 21:49:38] KV cache pool is full. Retract requests. #retracted_reqs: 1, #new_tokens_gained: 69, #new_token_ratio: 0.8455 -> 1.0000",
+    "[2026-10-01 21:50:16] KV cache pool is full. Retract requests. #retracted_reqs: 1, #new_tokens_gained: 64, #new_token_ratio: 0.0326 -> 0.8589",
+    "[2026-10-01 21:50:16] KV cache pool is full. Retract requests. #retracted_reqs: 1, #new_tokens_gained: 69, #new_token_ratio: 0.8579 -> 1.0000",
+    "[2026-10-01 21:50:52] KV cache pool is full. Retract requests. #retracted_reqs: 1, #new_tokens_gained: 64, #new_token_ratio: 0.0326 -> 0.8589",
+    "[2026-10-01 21:50:52] KV cache pool is full. Retract requests. #retracted_reqs: 1, #new_tokens_gained: 69, #new_token_ratio: 0.8579 -> 1.0000"
+  ],
+  "source_hashes": {
+    "python/sglang/test/training_capture_pressure_runtime.py": "feded313c7d5bc00a5e04282b2ff5f39d0e5a42bff4d5652790ae3c91bb78d28",
+    "python/sglang/test/training_capture_pressure_server.py": "e2bf8df0610c66ec9cc60b77183a3d7277c97a2665b80fe980907ff266e81256",
+    "test/registered/storage/test_training_capture_ar_pressure.py": "bfb4ac1d89cd6f985b1aba2a1bbe627a3d62b54e349b61167c0f51c7650ecd85",
+    "python/sglang/srt/training_capture/coordinator.py": "e74b955334cc58ab98a0e5a903345e52329e81ebed6c9157ace2fd1ba34d2f7e",
+    "python/sglang/srt/managers/schedule_batch.py": "794578dbe890bf83da39d644835054a48e2841375ac3d4cee16f4615da9f4e2a",
+    "python/sglang/srt/mem_cache/common.py": "3296e9fa50279105de0115e94fad9fe1c3f1161f504318b4edcafee7a1ea49fb"
+  },
+  "checks": {
+    "source_sync": "All six source hashes agree with the GPU checkout.",
+    "black": "3 new Python files pass",
+    "ruff": "I,F pass on all 3 new Python files",
+    "original_staged_index_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9"
+  },
+  "worker_after": {
+    "worker_id": "4837ce82e955447dbf70da0cf2ee55f3",
+    "hostname": "job-fe1ce1dcdea6-20261001023258-master-0",
+    "pid": 1,
+    "mode": "idle_load",
+    "heartbeat_unix": 1790891506.493834,
+    "idle_pid": 28117,
+    "active_job": null,
+    "active_pid": null,
+    "queued": 0,
+    "paused": false,
+    "heartbeat_age_seconds": 0.08510065078735352
+  },
+  "limitations": [
+    "Normal scheduler KV-capacity retraction, not CUDA allocator exceptions, device failure or aborting a last unfit request.",
+    "Single-rank Qwen3 MHA, Triton, ordinary AR and TCP Store; distributed pressure, simultaneous prefill graphs, production Catalog retention and consumer replay remain separate scopes.",
+    "The test-only observer synchronizes and copies full logits/KV to CPU. These timings do not measure production overhead or serving SLOs.",
+    "Responses use forced token IDs and do not establish trained draft quality."
+  ]
+}

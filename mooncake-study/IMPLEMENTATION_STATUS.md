@@ -42,7 +42,7 @@ it does not redefine the goal as the modules already implemented.
 | Draft checkpoint validation | Exact packed/split shapes, supported floating dtypes and finite destination values before parameter writes | Malformed exports fail without changing parameters or projection caches; real GQA/MLP loaders, cross-dtype loads and fixed-input export/reload parity pass |
 | Speculative collection | Static DSpark raw verify ticket, commit mapping and terminal truncation | Actual KV-input draft requests publish and read back through Mooncake in ordinary and graph modes; see evidence below |
 | Overlap collection | AR lookahead and static DSpark pending-token ledgers, capacity boundary and terminal trimming | Real ordinary/graph requests, prefix reuse, delayed grammar and exact KV/teacher readback pass; see per-mode evidence below |
-| AR cache lifecycle | Snapshot ownership across RadixCache eviction and explicit retract/resume | Real 256-token KV pool eviction, physical slot reuse, failed-capture exclusion and subsequent admission pass in synchronous and overlap/graph modes; automatic AR OOM remains open |
+| AR cache lifecycle | Snapshot ownership across RadixCache eviction and explicit/automatic retract/resume | Real 256-token KV pool exhaustion passes synchronous/overlap and eager/graph combinations; retired captures fail once, released slots are reused, fresh admission and exact post-exit Store reads pass; distributed pressure and SLOs remain open |
 | DSpark memory pressure | Draft context reset/rebuild and capture retirement after automatic retraction | Real 512-token KV pool exhaustion passes in all four synchronous/overlap and eager/graph combinations; failed captures are excluded and fresh capture admission recovers |
 | PD collection | D-owned complete snapshot with fenced first-teacher handoff and cohort publication | AR matching/asymmetric TP and matching/reduced PP pass; target-KV DSpark TP1/TP2 and cross-node TP1 RDMA pass eager and graph/overlap, source parity and failure exclusion; pipeline speculation and wider distributed RDMA remain open |
 | Deployment coverage | Partial | TP2/PP1 and TP1/PP2 AR, TP confidence-scheduled DSpark, TP/PP AR PD, TP1/TP2 target-KV DSpark PD, single-rank cross-node RDMA and single-GPU AR prefill graphs have runtime evidence below; combined topologies, pipeline speculation and workload SLO gates remain open |
@@ -1083,9 +1083,9 @@ has terminated and the H100 has resumed its idle workload. Results, source/log
 hashes and observed counters are retained in
 [`capture-cache-lifecycle.json`](experiments/capture-cache-lifecycle.json).
 
-The retraction trigger here is the public pause API. Automatic OOM retraction,
-speculative retraction/cache eviction, concurrent reader retention, TP/PP/PD and
-cross-node RDMA still need their own acceptance evidence. These correctness
+The retraction trigger here is the public pause API. Automatic AR/DSpark
+retraction and TP/PP/PD/RDMA have separate evidence in later sections;
+speculative cache eviction and concurrent reader retention remain open. These correctness
 observers synchronize/copy tensors and do not measure serving overhead or SLOs.
 
 ## Static DSpark Automatic Retraction
@@ -2668,11 +2668,55 @@ Inductor compilation, production Catalog retention or performance/SLO gates.
 The test-only source observer deliberately synchronizes and copies full logits
 to CPU; these copies are absent from normal serving.
 
+## AR Automatic KV Pool Retraction
+
+The complete registered `test_training_capture_ar_pressure.py` passed four
+tests in **151.445 seconds**, job `01790891297814747080-fb8137e37772`, on the
+resident H100. These cross synchronous/overlap scheduling with eager/Full
+decode CUDA graphs. They use ordinary Qwen3-0.6B AR, Triton attention and a
+256-token KV pool; prefill graphs are disabled. Four disjoint 16-token prompts
+each request 80 output tokens, exceeding the pool in aggregate while each
+request fits individually. Scheduling conservativeness is 0.05 and the debug
+retract flag is explicitly false.
+
+Test-only instrumentation wraps the original scheduler retraction function
+without changing its result. In every case, the first retraction sees zero
+available tokens against four required and gains 64 tokens. The second sees
+one available against three required and gains 69. The requests being released
+have 64 and 85 committed tokens, respectively. Their capture contexts and
+finalizers detach, and the attempted-capture flag remains set after reset.
+
+All four requests still complete their full 80-token response. Per-request,
+Prometheus and observed scheduler retraction counts agree. The two retired
+capture IDs reach Catalog `FAILED` exactly once and never publish or restart
+capture after the request resumes. The two surviving samples and one fresh
+short request publish normally. All four reservations recover with zero
+quarantined Host slots. Successful later source frames use 62 released physical
+slots in synchronous cases and 64 in overlap cases; graph cases also execute
+the three-request batch through CUDA graph replay.
+
+After each producer exits, a newly connected Store client validates every
+manifest/object digest and compares all sample tensors to the actual online
+source. Across the four cases this covers **12 snapshots, 216 tensor objects
+and 11,035,360 tensor bytes**. Selected KV and raw top-128 values match exactly;
+IDs, LSE (`rtol=atol=1e-6`), tokens, loss masks, positions, teacher alignment and
+KV validity pass without any target recomputation. Eight incomplete captures
+are excluded while 16 pressure requests finish 1,280 output tokens.
+
+No production capture or scheduler changes were necessary. The new observer
+is enabled only by the test entrypoint; its synchronization and full-logit CPU
+copies are not performance evidence. This proves normal scheduler retraction
+under KV capacity pressure, not CUDA allocator exceptions, distributed pressure,
+production Catalog retention or trained-model quality. It does not compose
+prefill graphs with memory pressure. The H100 returned to its idle workload.
+See [the runbook](experiments/AR_PRESSURE.md) and
+[retained evidence](experiments/capture-ar-memory-pressure.json).
+
 ## Next Implementation
 
 1. Extend passing single-GPU AR prefill graph coverage to distributed/speculative
-   and mixed-batch execution. Broaden real-request coverage to automatic AR OOM retraction,
-   speculative cache eviction, target weight replacement and
+   and mixed-batch execution. Extend automatic AR/DSpark retraction evidence to
+   distributed pressure. Broaden real-request coverage to speculative cache eviction, target weight replacement and
    saturated backpressure.
 2. Extend P8's passing retained BF16 fixture to production-exported and trained
    checkpoints, complete exporter compatibility and artifact/quality validation.

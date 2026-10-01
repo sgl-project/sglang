@@ -448,6 +448,25 @@ Store: WRITTEN -> SAMPLE_READY -> LEASED/RETAINED -> GC_ELIGIBLE -> REMOVED
 
 多 worker 进程不能直接使用其他进程的 Python tensor 地址。V1 writer 放在持有/注册 Host buffer 的同一进程；独立进程 writer 需要共享内存映射和该进程注册流程，另行实现。
 
+#### 7.5.1 当前自动 KV 容量回收验收
+
+`test_training_capture_ar_pressure.py` 已在 H100 上验证普通 AR 的同步/overlap
+与 eager/Full decode graph 四种组合。四条请求合计需要 384-token KV，实际池为
+256 tokens；关闭 debug retract，不调用 pause API，也不修改 allocator 的判断。
+实际两次回收分别观察到可用容量 0<4 和 1<3，释放后增加 64 和 69 个 token。
+
+被回收请求继续生成完全部回复，其原 capture 则立即脱离 request，最终进入 Catalog
+`FAILED`；恢复生成不重开 capture，也不发布不完整样本。测试检查原 capture ID、
+请求 retraction 计数、服务 metrics、后续成功请求对释放 slot 的复用，以及四个
+采集 reservation 恢复可用。每组再提交一个新请求验证采集准入恢复。
+
+四组共排除 8 份中断采集，12 份有效样本在服务退出后由新 Store client 完整读回，
+KV/raw top128/ID/LSE/token/mask/position/validity 均与实际在线来源一致。
+此验收使用单卡 Qwen3 MHA、Triton、TCP Store 和 Catalog test double；不包含
+CUDA allocator 异常、分布式压力、prefill graph 与容量压力的组合或生产 SLO。
+复现与原始数据见 [`experiments/AR_PRESSURE.md`](experiments/AR_PRESSURE.md) 和
+[`experiments/capture-ar-memory-pressure.json`](experiments/capture-ar-memory-pressure.json)。
+
 ## 8. Mooncake 接入与存储协议
 
 ### 8.1 复用的接口
