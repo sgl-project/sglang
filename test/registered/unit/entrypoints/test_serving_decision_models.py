@@ -3,8 +3,11 @@
 import base64
 import io
 import math
+import struct
 import unittest
+import zlib
 from types import SimpleNamespace
+from unittest import mock
 
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
@@ -15,13 +18,19 @@ from transformers import AutoTokenizer
 
 from sglang.srt.entrypoints.decision.families.intern import (
     ANSWER_SYMBOLS,
+    InternDecisionFamily,
     compile_decision,
 )
-from sglang.srt.entrypoints.decision.request_id import TypesafeRequestIdMiddleware
+from sglang.srt.entrypoints.decision.request_id import (
+    TypesafeRequestIdMiddleware,
+    install_typesafe_request_id,
+)
 from sglang.srt.entrypoints.openai.serving_decisions import OpenAIServingDecisions
 from sglang.srt.entrypoints.systemone.serving import SystemOneServing
+from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.managers.tokenizer_manager import resolve_readout_anchor
 from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
+from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
 from sglang.srt.parser.template_detection import detect_reasoning_pattern
 from sglang.srt.runtime_context import (
     get_schedule,
@@ -30,6 +39,7 @@ from sglang.srt.runtime_context import (
     snapshot_context,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.auth import add_api_key_middleware
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
@@ -154,10 +164,34 @@ def _logs(*ps):
     return [math.log(p) for p in ps]
 
 
-def _png(color):
+def _encoded(image, image_format="PNG", **save):
     buffer = io.BytesIO()
-    Image.new("RGB", (8, 8), color).save(buffer, format="PNG")
-    return base64.b64encode(buffer.getvalue()).decode()
+    image.save(buffer, format=image_format, **save)
+    return buffer.getvalue()
+
+
+def _png(color, size=(8, 8)):
+    return base64.b64encode(_encoded(Image.new("RGB", size, color))).decode()
+
+
+def _b64(data):
+    return base64.b64encode(data).decode()
+
+
+def _png_header(width, height):
+    """A PNG whose header declares width x height, a few bytes long."""
+
+    def chunk(kind, data):
+        crc = zlib.crc32(kind + data) & 0xFFFFFFFF
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", crc)
+
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(b"\0"))
+        + chunk(b"IEND", b"")
+    )
 
 
 class TestDecisionModels(unittest.TestCase):
@@ -168,7 +202,9 @@ class TestDecisionModels(unittest.TestCase):
     def setUp(self):
         self.addCleanup(restore_context, snapshot_context())
 
-    def _client(self, rows=(_logs(0.2, 0.6),), tokenizer=None, **server_args):
+    def _client(
+        self, rows=(_logs(0.2, 0.6),), tokenizer=None, api_key=None, **server_args
+    ):
         from sglang.srt.entrypoints import http_server as server
 
         app = FastAPI()
@@ -176,11 +212,11 @@ class TestDecisionModels(unittest.TestCase):
         app.router.routes.extend(
             r for r in routes if isinstance(r, APIRoute) and r.path in ROUTES
         )
-        app.user_middleware = [
-            m
-            for m in server.app.user_middleware
-            if m.cls is TypesafeRequestIdMiddleware
-        ]
+        # The server's middleware, with auth added at launch as the server does.
+        app.user_middleware = list(server.app.user_middleware)
+        install_typesafe_request_id(app)
+        if api_key is not None:
+            add_api_key_middleware(app, api_key=api_key, admin_api_key=None)
         app.add_exception_handler(
             RequestValidationError, server.validation_exception_handler
         )
@@ -206,7 +242,29 @@ class TestDecisionModels(unittest.TestCase):
             ({f"f{i}": NOUL["u"] for i in range(17)}, ["body", "questions"]),
             ({"f": {"type": "score", "criteria": {"x": ""}}}, ["body", "questions"]),
         ]
-        marker = {"state": "a <decision>", "questions": NOUL}
+        markers = [
+            ({"state": "a <decision>", "questions": NOUL}, ["body", "state"]),
+            (
+                {"state": {}, "questions": {"x<decision>": NOUL["u"]}},
+                ["body", "questions", "x<decision>"],
+            ),
+            (
+                {
+                    "state": {},
+                    "questions": {"u": {"type": "noul", "instructions": "<decision>"}},
+                },
+                ["body", "questions", "u", "instructions"],
+            ),
+            (
+                {
+                    "state": {},
+                    "questions": {
+                        "u": {"type": "choice", "criteria": {"a": "<decision>"}}
+                    },
+                },
+                ["body", "questions", "u", "criteria"],
+            ),
+        ]
         for route in ROUTES:
             for questions, loc in cases:
                 with self.subTest(route=route, loc=loc):
@@ -216,8 +274,11 @@ class TestDecisionModels(unittest.TestCase):
                     detail = response.json()["detail"][0]
                     self.assertEqual(detail["loc"][: len(loc)], loc)
                     self.assertIn("x-typesafe-request-id", response.headers)
-            detail = client.post(route, json=marker).json()["detail"][0]
-            self.assertIn("reserved decision marker", detail["msg"])
+            for body, loc in markers:
+                with self.subTest(route=route, marker_loc=loc):
+                    detail = client.post(route, json=body).json()["detail"][0]
+                    self.assertIn("reserved decision marker", detail["msg"])
+                    self.assertEqual(detail["loc"], loc)
 
     def test_routes_dispatch_by_body_shape_and_checkpoint(self):
         client, _ = self._client()
@@ -288,26 +349,80 @@ class TestDecisionModels(unittest.TestCase):
         self.assertEqual(markers[0] - text_only.index(marker), shift)
         self.assertEqual(response.json()["usage"]["input_tokens"], len(ids))
 
+    def test_images_reach_the_loader_upright_in_rgb(self):
+        # Orientation 6: stored 4x2, shown 2x4; the official service decodes it upright.
+        exif = Image.Exif()
+        exif[274] = 6
+        rotated = _encoded(Image.new("RGBA", (4, 2), "red"), exif=exif)
+        images = [
+            {"type": "image/png", "data": _b64(rotated)},
+            {"type": "ignored", "data": "data:image/png;base64," + _png("blue")},
+            _png("green"),
+        ]
+        client, manager = self._client(rows=[[0.0, 0.0]])
+        body = {"state": {}, "questions": NOUL, "images": images}
+        response = client.post("/v1/jev", json=body)
+        self.assertEqual(response.status_code, 200, response.text)
+        ((request, _),) = manager.requests
+        forwarded = [
+            Image.open(io.BytesIO(base64.b64decode(url.split(",", 1)[1])))
+            for url in request.image_data
+        ]
+        self.assertEqual({(i.format, i.mode) for i in forwarded}, {("PNG", "RGB")})
+        loaded = [
+            QwenVLImageProcessor._load_single_item(url, Modality.IMAGE)
+            for url in request.image_data
+        ]
+        self.assertEqual([(i.size, i.mode) for i in loaded][0], ((2, 4), "RGB"))
+        self.assertEqual(
+            [i.getpixel((0, 0)) for i in loaded[1:]], [(0, 0, 255), (0, 128, 0)]
+        )
+
     def test_invalid_images_are_422(self):
         client, _ = self._client()
         request = {"state": {}, "questions": NOUL}
+        frames = [Image.new("RGB", (2, 2), color) for color in ("red", "blue")]
+        animated = _encoded(frames[0], "GIF", save_all=True, append_images=frames[1:])
+        small = _encoded(Image.new("RGB", (8, 8)))
+        padded = small + b"\0" * (11 * 1024 * 1024)
+        over_limit = small + b"\0" * (12 * 1024 * 1024 + 1 - len(small))
+        png = {"type": "image/png", "data": _png("red")}
         cases = [
             ([_png("red")] * 9, ["body", "images"]),
             ([_png("red"), "not-base64!"], ["body", "images", 1]),
             (["data:text/plain;base64," + _png("red")], ["body", "images", 0]),
-            ([base64.b64encode(b"not an image").decode()], ["body", "images", 0]),
+            ([_b64(b"not an image")], ["body", "images", 0]),
             (["/etc/passwd"], ["body", "images", 0]),
+            (
+                [{"type": "image/png", "data": "https://example.com/a.png"}],
+                ["body", "images", 0],
+            ),
+            ([{"data": _png("red")}], ["body", "images", 0]),
+            ([{"type": "image/jpeg", "data": _png("red")}], ["body", "images", 0]),
+            (
+                [png, {"type": "image/gif", "data": _b64(animated)}],
+                ["body", "images", 1],
+            ),
+            ([_b64(_png_header(20000, 20000))], ["body", "images", 0]),
+            ([_png("red", size=(5000, 4000))], ["body", "images", 0]),
+            ([_b64(over_limit)], ["body", "images", 0]),
+            ([_b64(padded)] * 3, ["body", "images"]),
         ]
         for images, loc in cases:
-            with self.subTest(loc=loc):
+            with self.subTest(loc=loc, first=str(images[-1])[:40]):
                 response = client.post("/v1/jev", json={**request, "images": images})
                 self.assertEqual(response.status_code, 422, response.text)
                 self.assertEqual(response.json()["detail"][0]["loc"], loc)
         # A literal image placeholder would take an attached image's slot.
-        conflict = {"state": {"note": "see <image>"}, "questions": NOUL}
+        conflict = {
+            "state": {},
+            "questions": {"u": {"type": "noul", "instructions": "see <image>"}},
+        }
         response = client.post("/v1/jev", json={**conflict, "images": [_png("red")]})
         self.assertEqual(response.status_code, 422)
-        self.assertIn("image placeholder", response.json()["detail"][0]["msg"])
+        detail = response.json()["detail"][0]
+        self.assertIn("image placeholder", detail["msg"])
+        self.assertEqual(detail["loc"], ["body", "questions", "u", "instructions"])
         self.assertEqual(client.post("/v1/jev", json=conflict).status_code, 200)
 
     def test_answers_follow_the_typesafe_shapes(self):
@@ -347,6 +462,50 @@ class TestDecisionModels(unittest.TestCase):
             self.assertAlmostEqual(p, weight / sum(weights))
         self.assertEqual(body["answers"]["route"]["decision"], "b")
         self.assertEqual(body["calibration"]["temperature"], 2.0)
+
+    def test_temperature_never_changes_the_decision(self):
+        client, _ = self._client(rows=[_logs(0.25, 0.75)])
+        body = {"state": {}, "questions": NOUL}
+        calibrated = client.post("/v1/jev", json={**body, "temperature": 1e3}).json()
+        self.assertEqual(calibrated["answers"]["u"]["decision"], "yes")
+        # Both weights round to 1, which would tie and hand the decision to "no".
+        response = client.post("/v1/jev", json={**body, "temperature": 1e20})
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertEqual(response.json()["detail"][0]["loc"], ["body", "temperature"])
+
+    def test_systemone_openapi_documents_both_bodies(self):
+        client, _ = self._client()
+        body = client.app.openapi()["paths"]["/v1/systemone"]["post"]["requestBody"]
+        self.assertTrue(body["required"])
+        schema = body["content"]["application/json"]["schema"]
+        refs = {option["$ref"].rsplit("/", 1)[-1] for option in schema["anyOf"]}
+        self.assertEqual(refs, {"SystemOneRequest", "JevRequest"})
+        self.assertIn("decision model", schema["description"])
+
+    def test_request_id_tags_auth_rejections_and_server_errors(self):
+        from sglang.srt.entrypoints import http_server as server
+
+        stack = server.app.build_middleware_stack()
+        self.assertIsInstance(stack, TypesafeRequestIdMiddleware)
+        client, _ = self._client(api_key="secret")
+        body = {"state": {}, "questions": NOUL}
+        for route in ROUTES:
+            with self.subTest(route=route):
+                sent = {"x-typesafe-request-id": "req-9"}
+                response = client.post(route, json=body, headers=sent)
+                self.assertEqual(response.status_code, 401)
+                self.assertEqual(response.headers["x-typesafe-request-id"], "req-9")
+        authorized = {"Authorization": "Bearer secret"}
+        response = client.post("/v1/jev", json=body, headers=authorized)
+        self.assertEqual(response.status_code, 200)
+        unhandled = TestClient(client.app, raise_server_exceptions=False)
+        boom = mock.patch.object(
+            InternDecisionFamily, "validate", side_effect=RuntimeError("boom")
+        )
+        with boom:
+            response = unhandled.post("/v1/jev", json=body, headers=authorized)
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(len(response.headers["x-typesafe-request-id"]), 32)
 
     def test_refusals(self):
         request = {"state": {}, "questions": NOUL}
