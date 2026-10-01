@@ -33,7 +33,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase, popen_launch_server
 from sglang.test.training_capture_catalog import TestCaptureCatalog
 
-register_cuda_ci(est_time=360, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=480, stage="base-b", runner_config="1-gpu-small")
 
 MODEL_PATH = "Qwen/Qwen3-0.6B"
 ASSERT_HF_KV = False
@@ -101,7 +101,7 @@ class TestTrainingCaptureRuntime(CustomTestCase):
             except OSError:
                 time.sleep(0.1)
         # Storage lifetime is independent of the serving producer's process.
-        cls.segment = MooncakeSnapshotStore.connect(store_setup(address, 128 << 20))
+        cls.segment = MooncakeSnapshotStore.connect(store_setup(address, 256 << 20))
         cls.reader = MooncakeSnapshotStore.connect(store_setup(address))
         config = dict(
             dataset_id="runtime-test",
@@ -360,6 +360,17 @@ class TestTrainingCaptureRuntime(CustomTestCase):
         exercise_latency_capture(
             self, model_path=self.model_path, directory=self.temporary.name
         )
+        from sglang.test.training_capture_lifecycle_runtime import (
+            exercise_capture_lifecycle,
+        )
+
+        for cuda_graph in (False, True):
+            exercise_capture_lifecycle(
+                self,
+                model_path=self.model_path,
+                directory=self.temporary.name,
+                cuda_graph=cuda_graph,
+            )
 
     def check_graph_replay(self, samples):
         type(self).url = f"http://127.0.0.1:{free_port()}"

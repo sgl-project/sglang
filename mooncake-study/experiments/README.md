@@ -247,6 +247,18 @@ H100 results: decode KV DMA calls fall from 7,920 to 720 with unchanged bytes;
 the two normal 10%-capture phases still lose 15.5% and 16.3% throughput against
 their bracketed off baselines. Reduced DMA work alone is not a service SLO.
 
+### Cache Lifecycle
+
+The registered `test_training_capture_runtime.py` also exercises real RadixCache
+eviction with a 256-token serving KV pool, then streaming pause/retract/resume.
+It checks eviction metrics, physical slot reuse, cache misses after eviction,
+failed-capture exclusion, continued generation and fresh capture admission in
+synchronous and overlap/graph modes. Successful snapshots are compared to the
+online observer and read again after producer exit. The test Store uses 256MiB
+to retain all snapshots. This is a correctness check with tensor observers,
+not a performance benchmark. The H100 result is retained in
+[`capture-cache-lifecycle.json`](capture-cache-lifecycle.json).
+
 ### BF16 Rounding Isolation
 
 The actual fixed-input parity command remains the serving gate. The following

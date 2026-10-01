@@ -36,6 +36,7 @@ it does not redefine the goal as the modules already implemented.
 | Draft serving | Explicit KV-input architecture, contract, encoder, incremental injector and invalidation | Real Qwen3 target plus synthetic KV draft passes ordinary/batched/graph generation; retained BF16 fixture passes full backbone/logit parity against pinned FlexAttention, with production exporter and trained-model validation still open |
 | Speculative collection | Static DSpark raw verify ticket, commit mapping and terminal truncation | Actual KV-input draft requests publish and read back through Mooncake in ordinary and graph modes; see evidence below |
 | Overlap collection | AR lookahead and static DSpark pending-token ledgers, capacity boundary and terminal trimming | Real ordinary/graph requests, prefix reuse, delayed grammar and exact KV/teacher readback pass; see per-mode evidence below |
+| AR cache lifecycle | Snapshot ownership across RadixCache eviction and explicit retract/resume | Real 256-token KV pool eviction, physical slot reuse, failed-capture exclusion and subsequent admission pass in synchronous and overlap/graph modes; automatic OOM and speculative retraction remain open |
 | Deployment coverage | Partial | TP/PP, non-static speculative verify, PD, RDMA and workload SLO gates remain open |
 
 Initial test evidence (shared lab state under
@@ -1033,13 +1034,59 @@ Local and GPU source hashes match. New code passes Ruff, modified legacy
 diagnostics match HEAD, and formatting/whitespace checks pass. All submitted
 jobs have terminated and the resident H100 has resumed its idle workload.
 
+## Real Cache Eviction And Retract/Resume
+
+`training_capture_lifecycle_runtime.py` extends the registered runtime test with
+two ordinary AR servers: synchronous eager execution and overlap with decode
+CUDA graphs. Each uses a 256-token serving KV pool and the existing 16-token
+capture staging. A repeated 160-token prompt first demonstrates a 159-token
+cache hit. An unrelated prompt then forces actual RadixCache eviction; a later
+repeat has zero cached tokens. HTTP eviction metrics and the observer's physical
+KV slot indices confirm both eviction and reuse.
+
+After the first streaming response token, the test calls the public
+`/pause_generation` endpoint with `mode=retract`. It waits for the Catalog's
+fenced capture failure before calling `/continue_generation`. The final response
+must report at least one retraction and complete all 128 requested output tokens.
+Its capture must never become READY or be admitted again after resume. A fresh
+request then publishes normally. All five successful snapshots in each mode
+retain exact raw KV and teacher values, token/position alignment and loss masks
+against the online observer, including snapshots whose serving slots were reused.
+They are read again after the producer exits.
+
+| Execution | Tokens Evicted By Replacement | Original KV Slots Reused | Resumed Output Tokens | READY Samples | Failed Retracted Capture |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Synchronous eager | 164 | 70 | 128 | 5 | 1 |
+| Overlap + decode graphs | 166 | 72 | 128 | 5 | 1 |
+
+Job `01790835514030791687-52c6d1f92435` completes the full runtime test in
+444.223s with exit code zero. Its 78 validated snapshots include the previous
+68 AR/DSpark/admission cases and these ten lifecycle samples. Neither new mode
+quarantines a slot. The graph mode observes 22 capture forwards using actual
+CUDA graph replay. `/metrics` reports the same staging allocation (786,432 bytes)
+and budget (8,388,608 bytes) as `/server_info` in both modes. The registered
+estimate is now 480s, and the independent test Store segment is 256MiB to retain
+the expanded snapshot set.
+
+This change adds runtime coverage; no production capture behavior changes were
+needed. New code passes Ruff, modified legacy diagnostics match HEAD, and
+formatting/whitespace checks pass. Source hashes match the GPU checkout. The job
+has terminated and the H100 has resumed its idle workload. Results, source/log
+hashes and observed counters are retained in
+[`capture-cache-lifecycle.json`](experiments/capture-cache-lifecycle.json).
+
+The retraction trigger here is the public pause API. Automatic OOM retraction,
+speculative retraction/cache eviction, concurrent reader retention, TP/PP/PD and
+cross-node RDMA still need their own acceptance evidence. These correctness
+observers synchronize/copy tensors and do not measure serving overhead or SLOs.
+
 ## Next Implementation
 
-1. Broaden real-request coverage to prefill graphs, real retraction, cache eviction,
-   target weight replacement and saturated backpressure.
+1. Broaden real-request coverage to prefill graphs, automatic OOM retraction,
+   speculative cache eviction/retraction, target weight replacement and
+   saturated backpressure.
 2. Extend P8's passing retained BF16 fixture to production-exported and trained
-   checkpoints, complete exporter compatibility and artifact/quality validation. Broaden the runtime
-   lifecycle tests to cache eviction and real request retraction.
+   checkpoints, complete exporter compatibility and artifact/quality validation.
 3. Complete P9's topology work: TP/PP, non-static speculative layouts,
    PD transfer and cross-node RDMA. Existing capability gates do
    not constitute implementation of these paths.
