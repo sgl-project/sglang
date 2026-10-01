@@ -70,6 +70,7 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Arbitrary; bounds how often an unreachable peer's dlists are rebuilt.
 _PEER_RELOAD_MIN_INTERVAL_S = 1.0
 
 GUARD = "NixlMsgGuard".encode("ascii")
@@ -1205,6 +1206,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             room = kv_chunk.room
             handles: List[Any] = []
             settle_timed_out = False
+            room_transfer_infos = None
             try:
                 if room not in self.request_status:
                     logger.debug(
@@ -1523,7 +1525,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     logger.exception(
                         f"Unexpected transfer worker error for room {room}"
                     )
-                self._reload_invalidated_peers(self.transfer_infos.get(room) or {})
                 self.exceptions[room] = e
                 # An exception raised while the batch was still being built
                 # leaves the handles posted so far running, so settle here too
@@ -1547,6 +1548,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     # than telling it those pages are free.
                     self.record_failure(room, str(e))
                     self.update_status(room, KVPoll.Failed)
+                # Settle first; NIXL 1.3.0 undoes a reload when an old handle fails.
+                # room_transfer_infos survives the sender's clear() of this room.
+                self._reload_invalidated_peers(room_transfer_infos or {})
 
     def register_buffer_to_engine(self):
         self.kv_descs = []
@@ -1622,9 +1626,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             self._prepare_payload_xfer(decode_kv_args)
 
     def _reload_invalidated_peers(self, room_transfer_infos: Dict[str, Any]) -> None:
-        # NIXL drops a peer's metadata after a single remote-disconnect error and
-        # never restores it, so every later transfer to that peer fails with
-        # NIXL_ERR_NOT_FOUND. Reload it from the registration we already hold.
+        # NIXL drops a peer's metadata after a remote-disconnect error and never
+        # restores it; reload it from the registration we already hold.
         for agent_name in list(room_transfer_infos):
             peer_info = self.decode_kv_args_table.get(agent_name)
             if peer_info is None:
@@ -1644,12 +1647,18 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         "NIXL invalidated remote agent %s; reloading its metadata",
                         agent_name,
                     )
+                    # No other thread holds these dlists: every room with this
+                    # peer has the same peer set, so all shard to this worker.
                     self.prep_handles.pop(agent_name, None)
                     self.prep_handles_slice_dst.pop(agent_name, None)
                     peer_info.kv_xfer_segments = None
                     self.agent.add_remote_agent(peer_info.agent_metadata)
-                    if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                    try:
                         self._prepare_payload_xfer(peer_info)
+                    except Exception:
+                        # Leave the peer invalid so a later failure retries.
+                        self.agent.remove_remote_agent(agent_name)
+                        raise
             except Exception:
                 logger.exception(
                     "Failed to reload NIXL metadata for remote agent %s", agent_name
