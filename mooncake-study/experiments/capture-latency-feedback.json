@@ -1,0 +1,97 @@
+{
+  "purpose": "Functional verification of optional scheduler-latency capture admission feedback",
+  "source_baseline": "ef32f2365",
+  "runtime": {
+    "environment_lock": "h100-runtime-lock.json",
+    "gpu": "one H100 80GB",
+    "model": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+    "transport": "local TCP",
+    "catalog": "HTTP test double",
+    "job_id": "01790825671730805923-8f31456badb2",
+    "outcome": "completed",
+    "returncode": 0,
+    "unittest_seconds": 376.703,
+    "log_sha256": "58e303db35d51c4ccad058d5760fe0b62bc2b7e65a0088963ef3d32100a841e2",
+    "command": [
+      "python",
+      "test/registered/storage/test_training_capture_runtime.py",
+      "--model-path",
+      "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+      "-v"
+    ],
+    "snapshots": {
+      "synchronous_ar": 6,
+      "overlap_ar": 18,
+      "synchronous_dspark": 18,
+      "overlap_dspark": 22,
+      "writer_pressure_feedback": 2,
+      "latency_feedback": 2,
+      "total": 68
+    },
+    "teardown_note": "The HTTP Catalog double logged BrokenPipeError when writing to a disconnected client during teardown; snapshot assertions and producer-exit readback completed, and the authoritative worker result is exit 0."
+  },
+  "latency_scenario": {
+    "overlap": true,
+    "cuda_graphs": false,
+    "sample_ratio": 1.0,
+    "adaptive": {
+      "interval_seconds": 0.05,
+      "cooldown_seconds": 0.2,
+      "latency": {
+        "ttft_seconds": 0.5,
+        "tpot_seconds": 0.5,
+        "min_observations": 1,
+        "max_observations": 64,
+        "window_seconds": 1.5,
+        "percentile": 0.95,
+        "recovery_fraction": 0.8
+      }
+    },
+    "test_only_result_delay_seconds": 0.75,
+    "asserted_behavior": [
+      "The first admitted request publishes after latency protection blocks new capture.",
+      "A second delayed request completes without adding a publication.",
+      "Expired observations leave effective admission at zero.",
+      "A healthy unsampled request supplies fresh observations and allows gradual recovery.",
+      "A fourth request is captured after the ratio reaches one.",
+      "All four generated token sequences are equal.",
+      "Both snapshots contain the prompt plus four response tokens and pass Store read validation after producer exit.",
+      "The real HTTP metrics endpoint reports enabled control, the TTFT budget and at least four TTFT observations."
+    ],
+    "final_observation": {
+      "admitted": 2,
+      "ready": 2,
+      "adaptive_sampled_out": 2,
+      "effective_ratio": 1.0,
+      "state": "healthy",
+      "blocked": false,
+      "recovery_ready": true,
+      "ttft_observations": 4,
+      "tpot_observations": 12,
+      "invalid_observations": 0,
+      "quarantined_slots": 0
+    }
+  },
+  "unit_jobs": [
+    {"file": "test_latency.py", "job_id": "01790826289374789054-5ff9e2eddca6", "tests": 7, "subtests": 7, "seconds": 10.65, "returncode": 0},
+    {"file": "test_metrics.py", "job_id": "01790825544842875032-362600dbb0cb", "tests": 4, "subtests": 0, "seconds": 10.28, "returncode": 0},
+    {"file": "test_coordinator.py", "job_id": "01790825545170019788-859329b9f88e", "tests": 21, "subtests": 3, "seconds": 26.54, "returncode": 0},
+    {"file": "test_config.py", "job_id": "01790825545596690587-c88557088484", "tests": 5, "subtests": 28, "seconds": 9.69, "returncode": 0},
+    {"file": "test_admission.py", "job_id": "01790825545933812277-20aac7428458", "tests": 5, "subtests": 2, "seconds": 9.93, "returncode": 0}
+  ],
+  "tested_source_sha256": {
+    "python/sglang/srt/training_capture/latency.py": "483942c37807da9156bdf4ef96b994ab2894b8d94602c510d48c938d95c810dc",
+    "python/sglang/srt/training_capture/config.py": "395fe440b09e0eb506003be900578aeea29278e7820ba339c719bf77134aacd4",
+    "python/sglang/srt/training_capture/coordinator.py": "fd45dc245b2999b6923f104f7d080518621a4bde09446c3f8164eedd89936524",
+    "python/sglang/srt/training_capture/metrics.py": "58394b6a56012629e1416350e77e211c8387b543b19f81dd60649711b54ce60b",
+    "python/sglang/srt/managers/scheduler.py": "1a51ffc9ef058df0ddd1ca2b9ccf33b8cec1ff009e11e07b2eb29a226bdd3bdb",
+    "python/sglang/srt/managers/schedule_batch.py": "ae57dc9e654684394921c5c678dffd4f35ccd15909efeb0c39c16c024a84994b"
+  },
+  "limits": [
+    "Scheduler TTFT excludes tokenization, detokenization and network delivery.",
+    "Scheduler TPOT is a committed-token-normalized output interval, not per-request mean TPOT.",
+    "No capture-off baseline or service SLO threshold is established by this fault-injection test.",
+    "Dashboard JSON and layout bounds were checked; Grafana runtime rendering has not been verified.",
+    "No production Catalog, trained draft quality, TP/PP, PD or cross-node RDMA is certified."
+  ]
+}

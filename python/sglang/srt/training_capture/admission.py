@@ -1,8 +1,9 @@
-"""Host-pressure feedback for capture admission; callers serialize state access."""
+"""Host pressure and latency feedback; callers serialize state access."""
 
 from __future__ import annotations
 
 from sglang.srt.training_capture.config import AdaptiveCaptureConfig
+from sglang.srt.training_capture.latency import CaptureLatency
 
 
 class CaptureAdmission:
@@ -16,6 +17,11 @@ class CaptureAdmission:
         self.occupancy = 0.0
         self.writer_age_seconds = 0.0
         self.decreases = self.recoveries = self.failures = self.pauses = 0
+        self.latency = (
+            CaptureLatency(config.latency, config.interval_seconds)
+            if config is not None and config.latency is not None
+            else None
+        )
 
     def _decrease(self, now, reason):
         if now >= self.next_adjustment:
@@ -41,8 +47,15 @@ class CaptureAdmission:
         self.writer_age_seconds = writer_age_seconds
         if self.config is None:
             return self.ratio(now)
+        if self.latency is not None:
+            self.latency.assess(now)
         if writer_age_seconds >= self.config.writer_stall_seconds:
             self._pause(now, "writer_stall")
+        elif self.latency is not None and self.latency.blocked:
+            if self.latency.state == "breached":
+                self._pause(now, self.latency.reason)
+            else:
+                self.reason = self.latency.reason
         elif now < self.pause_until:
             pass
         elif occupancy >= self.config.high_watermark:
@@ -51,6 +64,7 @@ class CaptureAdmission:
             occupancy <= self.config.low_watermark
             and now >= self.next_adjustment
             and self.target_ratio < self.ceiling
+            and (self.latency is None or self.latency.recovery_ready)
         ):
             self.target_ratio = min(
                 self.ceiling, self.target_ratio + self.ceiling * 0.1
@@ -67,9 +81,15 @@ class CaptureAdmission:
             self.config is not None
             and self.writer_age_seconds >= self.config.writer_stall_seconds
         )
-        return 0.0 if stalled or now < self.pause_until else self.target_ratio
+        latency_blocked = self.latency is not None and self.latency.blocked
+        return (
+            0.0
+            if stalled or latency_blocked or now < self.pause_until
+            else self.target_ratio
+        )
 
     def stats(self, now, *, disabled=False):
+        latency = self.latency.stats(now) if self.latency is not None else None
         return {
             "adaptive": self.config is not None,
             "configured_ratio": self.ceiling,
@@ -83,4 +103,5 @@ class CaptureAdmission:
             "recoveries": self.recoveries,
             "failures": self.failures,
             "pauses": self.pauses,
+            "latency": latency,
         }

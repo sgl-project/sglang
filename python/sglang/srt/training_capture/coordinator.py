@@ -710,7 +710,18 @@ class CaptureCoordinator:
                 token_id=int(outputs[index]),
             )
 
-    def after_result(self, ticket: CaptureBatch | None):
+    def after_result(self, ticket: CaptureBatch | None, *, requests=()):
+        if self.admission.latency is not None:
+            from sglang.srt.training_capture.latency import request_latency
+
+            observed_at = time.perf_counter()
+            with self.lock:
+                now = time.monotonic()
+                for req in requests:
+                    if not req.rid.startswith(HEALTH_CHECK_RID_PREFIX):
+                        ttft, tpot = request_latency(req, observed_at)
+                        self.admission.latency.observe(now, ttft=ttft, tpot=tpot)
+            self._admission_ratio()
         if ticket is None:
             return
         for step in ticket.steps:

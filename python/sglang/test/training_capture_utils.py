@@ -46,6 +46,8 @@ class CaptureTestRequest(SimpleNamespace):
             training_capture_attempted=False,
             training_capture_context=None,
             training_capture_finalize=None,
+            training_capture_latency=None,
+            time_stats=SimpleNamespace(scheduler_recv_time=0.0),
         )
 
     def finished(self):

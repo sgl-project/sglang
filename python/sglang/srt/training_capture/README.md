@@ -111,8 +111,63 @@ apply.
 `training_capture.admission` exposes configured/target/effective ratios, the last
 control reason, cooldown remaining, observed occupancy/writer age, and decrease,
 recovery, failure and pause counters. `adaptive_sampled_out` counts requests that
-fixed sampling would have selected but the controller excluded. These are local
-pressure signals, not TTFT/TPOT measurements or a latency SLO guarantee.
+fixed sampling would have selected but the controller excluded. Without the
+optional latency configuration below, these are local pressure signals only.
+
+### Scheduler Latency Protection
+
+Optional `adaptive.latency` adds explicit scheduler-side budgets. Set budgets
+from a capture-off baseline for the deployment's input distribution; the values
+below illustrate configuration and are not established production thresholds:
+
+```json
+{
+  "adaptive": {
+    "latency": {
+      "ttft_seconds": 0.5,
+      "tpot_seconds": 0.03,
+      "window_seconds": 30.0,
+      "min_observations": 16,
+      "max_observations": 2048,
+      "percentile": 0.95,
+      "recovery_fraction": 0.8
+    }
+  }
+}
+```
+
+At least one budget is required. These are scheduler observations, independent
+of `--enable-metrics` and of capture selection:
+
+- TTFT: scheduler request creation to processing the first committed output.
+  This includes scheduler queueing/chunked prefill, but excludes API tokenization,
+  detokenization and client/network delivery.
+- TPOT: elapsed time between processed output updates divided by the newly
+  committed output-token count. This normalizes speculative multi-token updates;
+  rejected drafts, pending tokens, duplicate callbacks and a stop-truncated tail
+  do not inflate the count. It is an interval statistic, not per-request mean TPOT.
+- Health checks and aborted results are excluded. Retraction does not erase
+  previous output timing. Finished request state prevents duplicate observations.
+
+Each enabled metric has a bounded recent-observation deque. At most
+`max_observations` values from `window_seconds` are retained; nearest-rank
+quantiles are assessed at most once per adaptive interval. A metric needs
+`min_observations` before it can trigger a budget breach. Any ready metric above
+its budget pauses new capture and applies the existing cooldown/decrease policy.
+Generation, existing capture work and lease renewal continue.
+
+Recovery requires every enabled metric to have enough fresh observations at or
+below `budget * recovery_fraction`, followed by the normal cooldown and gradual
+ratio recovery. Missing or expired data cannot clear an existing breach or
+increase a reduced ratio. Unsampled requests continue supplying observations,
+so a paused collector can recover without admitting new samples. No baseline
+overhead is inferred automatically and no client-facing SLO is certified.
+
+`admission.latency` reports warmup/healthy/breached/stale state, observed quantiles,
+budgets, counts, observation age and whether fresh values permit recovery. It is
+`null` when unconfigured. Prometheus exports bounded state, quantiles, budgets
+and counts; observation age and invalid counts are available in `/server_info`.
+The dashboard plots scheduler quantiles/budgets separately from serving histograms.
 
 ## Ownership
 
@@ -191,7 +246,7 @@ With both `--training-capture-config` and `--enable-metrics`, the existing
 No capture metrics or monitoring thread are created when either flag is absent.
 The producer inherits the scheduler's model/rank and configured extra labels.
 Request IDs, dataset contents, object keys, exception text and per-sample identity
-are never metric labels. Event/action/state/kind labels have bounded value sets.
+are never metric labels. Event/action/state/kind/metric labels have bounded value sets.
 
 | Suffix | Type / Extra Label | Meaning |
 | --- | --- | --- |
@@ -207,6 +262,14 @@ are never metric labels. Event/action/state/kind labels have bounded value sets.
 | `adaptive_enabled` | Gauge | Whether adaptive admission is configured |
 | `disabled` | Gauge | Capture disabled by a failure or shutdown, distinct from adaptive cooldown |
 | `cooldown_seconds` | Gauge | Remaining adaptive cooldown |
+| `latency_control_enabled` | Gauge | Whether scheduler latency protection is configured |
+| `latency_blocked` | Gauge | New capture paused by a latency breach or missing recovery evidence |
+| `latency_recovery_ready` | Gauge | All enabled metrics have enough fresh values below the recovery threshold |
+| `latency_state` | Gauge / `state` | One-hot disabled, warming, healthy, breached or stale state |
+| `latency_percentile` | Gauge | Configured quantile, NaN when latency control is disabled |
+| `scheduler_latency_seconds` | Gauge / `metric`, `kind` | TTFT/TPOT observed quantile and budget; missing or unconfigured values are NaN |
+| `latency_window_observations` | Gauge / `metric` | Number of TTFT/TPOT observations in the bounded window |
+| `latency_observations_total` | Counter / `metric` | Valid TTFT/TPOT observations, including requests excluded from capture |
 | `metrics_update_timestamp_seconds` | Gauge | Unix time of last successful metrics update |
 
 A dedicated background thread snapshots CPU state once per second. It keeps
@@ -228,9 +291,9 @@ allocated capacity, not payload transfer volume. These metrics also work with
 fixed sampling (`adaptive` absent).
 
 The [monitoring example](../../../../examples/monitoring/README.md) provisions
-a training-capture Grafana dashboard alongside serving metrics. The metrics are
-observations; TTFT/TPOT feedback, service-specific alerts and measured rollout
-thresholds are separate work.
+a training-capture Grafana dashboard alongside serving metrics. Scheduler
+TTFT/TPOT feedback requires `adaptive.latency`; service-specific alerts, measured
+capture overhead and rollout thresholds still require deployment validation.
 
 ## Verification
 
@@ -254,13 +317,19 @@ valid top-128 IDs, and match full-vocabulary LSE within 1e-5. The test verifies
 readback after producer exit, then runs the same requests on normal serving with
 decode CUDA graphs and compares every captured tensor. This currently covers
 ordinary and padded graph batches; current mode coverage is listed in the
-implementation status document. A final controlled-writer experiment enables
+implementation status document. A controlled-writer experiment enables
 adaptive admission with normal overlap: generation continues with a spare Host
 slot while new capture is paused, the original snapshot publishes after release,
 and a later request is captured after recovery. Both snapshots are read from the
 real Store and validated. The adaptive server also enables Prometheus, scrapes
 the HTTP multiprocess endpoint during the writer stall and after recovery, and
 checks ratios, event counters, reservation resets and quarantine state.
+Another ordinary overlap server enables latency protection. A test-only result
+processing delay causes new capture to pause while generation and existing
+publication continue. Expired observations retain the pause; fresh unsampled
+requests restore admission after cooldown. All four responses agree, both
+captured samples survive producer exit, and the HTTP metrics include all four
+requests. Production code contains no delay injection hook.
 This is a functional test, not a performance benchmark.
 
 A Transformers reference additionally checks teacher logits/LSE and reports KV

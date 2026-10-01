@@ -134,6 +134,25 @@
       "datasource": {"type": "prometheus", "uid": "$datasource"},
       "fieldConfig": {"defaults": {"unit": "bytes", "min": 0}, "overrides": []},
       "targets": [{"refId": "A", "expr": "sglang:training_capture_host_allocated_bytes{model_name=~\"$model_name\",instance=~\"$instance\"}", "legendFormat": "{{instance}} TP{{tp_rank}} PP{{pp_rank}}"}]
+    },
+    {
+      "id": 10,
+      "title": "Scheduler Latency Budgets",
+      "description": "Bounded-window configured percentile. TTFT starts at scheduler request creation; TPOT is output interval divided by newly committed tokens. Not client/network latency. Missing observations are NaN.",
+      "type": "timeseries",
+      "gridPos": {"x": 0, "y": 32, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "fieldConfig": {"defaults": {"unit": "s", "min": 0}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "sglang:training_capture_scheduler_latency_seconds{model_name=~\"$model_name\",instance=~\"$instance\"}", "legendFormat": "{{instance}} {{metric}} {{kind}}"}]
+    },
+    {
+      "id": 11,
+      "title": "Latency Protection State",
+      "type": "timeseries",
+      "gridPos": {"x": 12, "y": 32, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0, "max": 1}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "sglang:training_capture_latency_state{model_name=~\"$model_name\",instance=~\"$instance\"}", "legendFormat": "{{instance}} {{state}}"}]
     }
   ]
 }

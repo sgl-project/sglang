@@ -14,6 +14,7 @@ from sglang.srt.training_capture.catalog import HTTPCaptureCatalog
 from sglang.srt.training_capture.config import (
     AdaptiveCaptureConfig,
     CaptureConfig,
+    CaptureLatencyConfig,
     StoreSetup,
 )
 from sglang.srt.training_capture.coordinator import CaptureCoordinator
@@ -443,6 +444,43 @@ class TestCaptureCoordinator(CustomTestCase):
             self.assertIsNotNone(following.training_capture_context)
             self.assertEqual(self.coordinator.stats()["host_pool"]["quarantined"], 0)
             self.assertGreater(self.coordinator.stats()["admission"]["recoveries"], 0)
+
+    def test_unsampled_results_supply_latency_and_health_checks_are_excluded(self):
+        self.coordinator.admission = CaptureAdmission(
+            1.0,
+            AdaptiveCaptureConfig(
+                interval_seconds=0.01,
+                cooldown_seconds=0.03,
+                latency=CaptureLatencyConfig(
+                    ttft_seconds=0.1, min_observations=1, window_seconds=0.05
+                ),
+            ),
+        )
+        request = self.request("unsampled-slow")
+        request.time_stats.scheduler_recv_time = time.perf_counter() - 1
+        request.output_ids = [10]
+        self.assertIsNone(request.training_capture_context)
+        self.coordinator.after_result(None, requests=[request])
+        self.wait_until(
+            lambda: self.coordinator.stats()["admission"]["effective_ratio"] == 0
+        )
+        self.wait_until(
+            lambda: self.coordinator.stats()["admission"]["latency"]["state"] == "stale"
+        )
+        from sglang.srt.training_capture.coordinator import HEALTH_CHECK_RID_PREFIX
+
+        health = self.request(HEALTH_CHECK_RID_PREFIX + "latency")
+        health.output_ids = [10]
+        health.time_stats.scheduler_recv_time = time.perf_counter() - 10
+        self.coordinator.after_result(None, requests=[health])
+        self.assertIsNone(health.training_capture_latency)
+        recovered = self.request("unsampled-healthy")
+        recovered.output_ids = [10]
+        recovered.time_stats.scheduler_recv_time = time.perf_counter() - 0.001
+        self.coordinator.after_result(None, requests=[recovered])
+        self.wait_until(lambda: self.coordinator._admission_ratio() > 0)
+        self.assertEqual(self.coordinator.admission.latency.observation_ct["ttft"], 2)
+        self.assertIsNone(recovered.training_capture_context)
 
     def test_uncertain_write_keeps_quarantine_during_admission_recovery(self):
         self.wait_until(lambda: len(self.coordinator.available) == 1)

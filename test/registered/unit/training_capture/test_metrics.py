@@ -1,9 +1,14 @@
 """Prometheus lifecycle counters, bounded labels and zeroed state transitions."""
 
+import math
 import unittest
 
 from prometheus_client import CollectorRegistry, generate_latest
 from sglang.srt.training_capture.admission import CaptureAdmission
+from sglang.srt.training_capture.config import (
+    AdaptiveCaptureConfig,
+    CaptureLatencyConfig,
+)
 from sglang.srt.training_capture.metrics import CaptureMetrics
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -86,6 +91,40 @@ class TestCaptureMetrics(CustomTestCase):
         self.assertNotIn(
             "private-error-details", generate_latest(self.registry).decode()
         )
+
+    def test_latency_series_distinguish_missing_observations_and_budget_breach(self):
+        controller = CaptureAdmission(
+            1.0,
+            AdaptiveCaptureConfig(
+                latency=CaptureLatencyConfig(
+                    ttft_seconds=1.0, min_observations=1, window_seconds=2
+                )
+            ),
+        )
+        self.stats["admission"] = controller.stats(0)
+        self.metrics.update(self.stats)
+        self.assertEqual(self.value("latency_control_enabled"), 1)
+        self.assertTrue(
+            math.isnan(
+                self.value("scheduler_latency_seconds", metric="ttft", kind="observed")
+            )
+        )
+        controller.latency.observe(1, ttft=2)
+        controller.observe(1, occupancy=0, writer_age_seconds=0)
+        self.stats["admission"] = controller.stats(1)
+        self.metrics.update(self.stats)
+        self.metrics.update(self.stats)
+        self.assertEqual(self.value("latency_blocked"), 1)
+        self.assertEqual(
+            self.value("scheduler_latency_seconds", metric="ttft", kind="observed"), 2
+        )
+        self.assertEqual(self.value("latency_observations_total", metric="ttft"), 1)
+        self.stats["admission"] = controller.stats(4)
+        self.metrics.update(self.stats)
+        self.assertEqual(self.value("latency_state", state="stale"), 1)
+        self.assertEqual(self.value("latency_state", state="breached"), 0)
+        self.assertEqual(self.value("latency_blocked"), 1)
+        self.assertEqual(self.value("latency_window_observations", metric="ttft"), 0)
 
 
 if __name__ == "__main__":

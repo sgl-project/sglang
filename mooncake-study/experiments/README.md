@@ -108,6 +108,19 @@ updates, exporter failure/retry and a blocked Catalog. The provisioned dashboard
 is `examples/monitoring/grafana/dashboards/json/training-capture-dashboard.json`;
 its serving-latency panels do not establish capture-overhead thresholds.
 
+An additional ordinary overlap server enables `adaptive.latency` with 500ms
+scheduler TTFT/TPOT budgets, a 1.5s observation window and one-observation
+minimum. These short settings are test parameters. The test-only server delays
+result processing by 750ms while `latency.pause` exists in its journal directory.
+The first admitted request still publishes, while the next request completes
+without capture. After removing the delay and expiring the window, the controller
+remains paused until an unsampled healthy request supplies fresh observations.
+Capture then recovers and a fourth request publishes. All four output sequences
+agree, both snapshots are validated again after producer exit, and HTTP metrics
+report four TTFT observations. This verifies feedback wiring and recovery, not
+capture-induced overhead or a service SLO. The retained result and scope are in
+[`capture-latency-feedback.json`](capture-latency-feedback.json).
+
 The runtime fixture uses the Mooncake master's default read lease (5 seconds
 in the pinned SDK). An earlier 100ms override produced `LEASE_EXPIRED (-707)`
 during readback after a producer exited. This is the transfer's read lease,

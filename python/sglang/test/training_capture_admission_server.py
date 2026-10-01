@@ -4,6 +4,7 @@ import os
 import sys
 import time
 
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.training_capture.snapshot_writer import SnapshotWriter
 
 _write = SnapshotWriter.write
@@ -22,6 +23,18 @@ def controlled_write(self, *args, **kwargs):
 
 
 SnapshotWriter.write = controlled_write
+
+_process_batch_result = Scheduler.process_batch_result
+
+
+def delayed_result(self, batch, result):
+    capture = self.tp_worker.training_capture
+    if capture is not None and (capture.journal.root / "latency.pause").exists():
+        time.sleep(0.75)
+    return _process_batch_result(self, batch, result)
+
+
+Scheduler.process_batch_result = delayed_result
 
 
 if __name__ == "__main__":

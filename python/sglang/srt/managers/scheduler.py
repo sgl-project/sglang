@@ -3938,7 +3938,9 @@ class Scheduler(
             self.batch_result_processor.process_batch_result_idle(batch, result)
 
         if self.tp_worker.training_capture is not None:
-            self.tp_worker.training_capture.after_result(result.training_capture)
+            self.tp_worker.training_capture.after_result(
+                result.training_capture, requests=batch.reqs
+            )
 
         self._record_step_counters(batch, result)
 

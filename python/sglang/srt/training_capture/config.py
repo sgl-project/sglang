@@ -30,22 +30,53 @@ class StoreSetup(StrictStruct):
     rdma_devices: str = ""
 
 
+class CaptureLatencyConfig(StrictStruct):
+    ttft_seconds: Annotated[float, msgspec.Meta(gt=0)] | None = None
+    tpot_seconds: Annotated[float, msgspec.Meta(gt=0)] | None = None
+    window_seconds: Annotated[float, msgspec.Meta(gt=0)] = 30.0
+    min_observations: Annotated[int, msgspec.Meta(ge=1)] = 16
+    max_observations: Annotated[int, msgspec.Meta(ge=1, le=65536)] = 2048
+    percentile: Annotated[float, msgspec.Meta(gt=0, le=1)] = 0.95
+    recovery_fraction: Annotated[float, msgspec.Meta(gt=0, lt=1)] = 0.8
+
+    def validate(self):
+        if self.ttft_seconds is None and self.tpot_seconds is None:
+            raise ContractError("latency control requires a TTFT or TPOT budget")
+        if not all(
+            value is None or math.isfinite(value)
+            for value in msgspec.to_builtins(self).values()
+        ):
+            raise ContractError("capture latency limits must be finite")
+        if self.min_observations > self.max_observations:
+            raise ContractError("latency minimum observations exceeds buffer capacity")
+
+
 class AdaptiveCaptureConfig(StrictStruct):
     interval_seconds: Annotated[float, msgspec.Meta(gt=0)] = 1.0
     low_watermark: Annotated[float, msgspec.Meta(ge=0, lt=1)] = 0.25
     high_watermark: Annotated[float, msgspec.Meta(gt=0, le=1)] = 0.75
     writer_stall_seconds: Annotated[float, msgspec.Meta(gt=0)] = 10.0
     cooldown_seconds: Annotated[float, msgspec.Meta(gt=0)] = 5.0
+    latency: CaptureLatencyConfig | None = None
 
     def validate(self):
         if not all(
-            math.isfinite(value) for value in msgspec.to_builtins(self).values()
+            math.isfinite(value)
+            for value in (
+                self.interval_seconds,
+                self.low_watermark,
+                self.high_watermark,
+                self.writer_stall_seconds,
+                self.cooldown_seconds,
+            )
         ):
             raise ContractError("adaptive capture limits must be finite")
         if self.low_watermark >= self.high_watermark:
             raise ContractError(
                 "adaptive capture requires low_watermark < high_watermark"
             )
+        if self.latency is not None:
+            self.latency.validate()
 
 
 class CaptureConfig(StrictStruct):

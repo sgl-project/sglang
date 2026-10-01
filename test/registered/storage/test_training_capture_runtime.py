@@ -349,9 +349,13 @@ class TestTrainingCaptureRuntime(CustomTestCase):
         self.check_reference(samples)
         from sglang.test.training_capture_admission_runtime import (
             exercise_adaptive_capture,
+            exercise_latency_capture,
         )
 
         exercise_adaptive_capture(
+            self, model_path=self.model_path, directory=self.temporary.name
+        )
+        exercise_latency_capture(
             self, model_path=self.model_path, directory=self.temporary.name
         )
 

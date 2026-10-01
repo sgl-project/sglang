@@ -872,6 +872,7 @@ class Req(ReqDllmMixin):
         self.training_capture_attempted = False
         self.training_capture_context = None
         self.training_capture_finalize = None
+        self.training_capture_latency = None
         self.dspark_projected_context = None
         # Full untruncated sequence: origin + output (+ DLLM mask block).
         # Kept in sync by _refresh_fill_ids; admission only updates

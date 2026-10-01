@@ -99,15 +99,43 @@ class CaptureMetrics:
         self.cooldown = gauge(
             "cooldown_seconds", "Remaining adaptive admission cooldown."
         )
+        self.latency_enabled = gauge(
+            "latency_control_enabled", "Scheduler latency protection configured."
+        )
+        self.latency_blocked = gauge(
+            "latency_blocked", "Capture paused by scheduler latency protection."
+        )
+        self.latency_recovery_ready = gauge(
+            "latency_recovery_ready", "Fresh observations permit latency recovery."
+        )
+        self.latency_state = gauge(
+            "latency_state", "Scheduler latency control state.", ("state",)
+        )
+        self.latency_seconds = gauge(
+            "scheduler_latency_seconds",
+            "Scheduler-side latency quantile/budget, not client latency.",
+            ("metric", "kind"),
+        )
+        self.latency_count = gauge(
+            "latency_window_observations",
+            "Observations in the bounded latency window.",
+            ("metric",),
+        )
+        self.latency_observations = counter(
+            "latency_observations", "Valid scheduler latency observations.", ("metric",)
+        )
+        self.latency_percentile = gauge(
+            "latency_percentile", "Quantile used for scheduler latency protection."
+        )
         self.updated = gauge(
             "metrics_update_timestamp_seconds",
             "Unix time of the last successful capture metrics update.",
         )
 
-    def _increment(self, metric, key, value, **labels):
+    def _increment(self, collector, key, value, **labels):
         previous = self.previous.get(key, 0)
         # Retrying a snapshot must not count the same event again.
-        metric.labels(**self.labels, **labels).inc(max(0, value - previous))
+        collector.labels(**self.labels, **labels).inc(max(0, value - previous))
         self.previous[key] = max(value, previous)
 
     def update(self, stats):
@@ -127,6 +155,41 @@ class CaptureMetrics:
         for event in self.EVENTS:
             self._increment(self.events, ("event", event), events[event], event=event)
         admission = stats["admission"]
+        latency = admission.get("latency")
+        self.latency_enabled.labels(**self.labels).set(int(latency is not None))
+        self.latency_blocked.labels(**self.labels).set(
+            int(bool(latency and latency["blocked"]))
+        )
+        self.latency_recovery_ready.labels(**self.labels).set(
+            int(bool(latency and latency["recovery_ready"]))
+        )
+        self.latency_percentile.labels(**self.labels).set(
+            latency["percentile"] if latency else float("nan")
+        )
+        for state in ("disabled", "warming", "healthy", "breached", "stale"):
+            current = latency["state"] if latency else "disabled"
+            self.latency_state.labels(**self.labels, state=state).set(
+                int(current == state)
+            )
+        for name in ("ttft", "tpot"):
+            observation = latency["metrics"].get(name, {}) if latency else {}
+            for kind, field in (
+                ("observed", "percentile_seconds"),
+                ("budget", "budget_seconds"),
+            ):
+                value = observation.get(field)
+                self.latency_seconds.labels(**self.labels, metric=name, kind=kind).set(
+                    value if value is not None else float("nan")
+                )
+            self.latency_count.labels(**self.labels, metric=name).set(
+                observation.get("window_observations", 0)
+            )
+            self._increment(
+                self.latency_observations,
+                ("latency", name),
+                observation.get("observations", 0),
+                metric=name,
+            )
         for action in self.ACTIONS:
             self._increment(
                 self.adjustments, ("action", action), admission[action], action=action

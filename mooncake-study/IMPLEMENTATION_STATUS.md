@@ -785,6 +785,64 @@ to HEAD. Formatting and `git diff --check` pass. All experiment jobs have
 terminated and the resident H100 has resumed its idle workload. The original
 worktree's staged-diff digest is unchanged.
 
+## Scheduler Latency Feedback
+
+Optional `adaptive.latency` now adds scheduler TTFT and committed-token-normalized
+output-interval budgets to capture admission. The scheduler supplies observations
+after processing results, including when there is no capture ticket. This lets
+unsampled requests drive recovery after new capture is paused. Health checks,
+aborted results, duplicate callbacks, rejected drafts and stop-truncated tails
+do not add successful observations or inflate committed-token counts. Retraction
+preserves prior output timing. The disabled configuration adds no latency monitor.
+
+Each configured metric uses a bounded recent-observation buffer and nearest-rank
+percentile. A sufficiently populated metric above its budget pauses new capture
+using the existing decrease/cooldown policy. Existing work and generation
+continue. Recovery requires fresh observations for all enabled metrics below a
+separate lower threshold. Stale data cannot clear a breach or increase a reduced
+ratio; healthy data cannot bypass cooldown. There is no CUDA synchronization or
+client/network latency inference in this observer.
+
+Prometheus now exposes bounded latency states, budgets, quantiles, observation
+counts and recovery readiness. Missing observations are NaN, not successful
+zero-latency measurements. The existing dashboard adds scheduler-budget and
+protection-state panels. JSON parsing, unique panel IDs and grid bounds pass;
+Grafana rendering/runtime acceptance is still open.
+
+The final per-file checks pass 42 tests and 40 subtests:
+
+| File | Job | Tests / Subtests |
+| --- | --- | --- |
+| `test_latency.py` | `01790826289374789054-5ff9e2eddca6` | 7 / 7 |
+| `test_metrics.py` | `01790825544842875032-362600dbb0cb` | 4 / 0 |
+| `test_coordinator.py` | `01790825545170019788-859329b9f88e` | 21 / 3 |
+| `test_config.py` | `01790825545596690587-c88557088484` | 5 / 28 |
+| `test_admission.py` | `01790825545933812277-20aac7428458` | 5 / 2 |
+
+`01790825671730805923-8f31456badb2` passes the complete H100 runtime test in
+376.703s, with 68 validated snapshots. An additional ordinary overlap server
+uses test-only 750ms result-processing delays against 500ms TTFT/TPOT budgets.
+Its first admitted request publishes despite the breach; the next request
+continues generating without capture. After the delayed observations expire,
+admission stays zero until an unsampled healthy request supplies fresh values.
+A fourth request is captured after gradual recovery. All four output sequences
+match, both snapshots survive producer exit, and HTTP metrics report four TTFT
+observations. The final controller state records twelve TPOT intervals and an
+effective ratio of one, with no quarantine.
+The earlier AR/DSpark ordinary/graph/overlap checks also pass.
+
+The HTTP Catalog double logs a disconnected-client `BrokenPipeError` during
+teardown after these assertions. The authoritative worker result is completed
+with exit code zero. The test still uses local TCP and a Catalog double.
+The retained result, source digests and test scope are in
+[`capture-latency-feedback.json`](experiments/capture-latency-feedback.json).
+
+New code passes Ruff; diagnostics in modified legacy files match HEAD.
+Formatting and whitespace checks pass. This implements P10's configurable
+latency feedback, but it does not establish capture overhead or a service SLO:
+capture-off baselines, input-distribution controls, measured rollout thresholds
+and runtime dashboard acceptance remain required.
+
 ## Next Implementation
 
 1. Broaden real-request coverage to prefill graphs, real retraction, cache eviction,
@@ -795,7 +853,7 @@ worktree's staged-diff digest is unchanged.
 3. Complete P9's topology work: TP/PP, non-static speculative layouts,
    PD transfer and cross-node RDMA. Existing capability gates do
    not constitute implementation of these paths.
-4. Complete P10's latency-aware limits, dashboard runtime acceptance, capture-on/off SLO benchmarks
+4. Complete P10's dashboard runtime acceptance, capture-on/off SLO benchmarks
    and rollout/rollback checks. Per-model numerical/runtime validation and
    runtime identity coverage also need expansion beyond the tested combination.
 5. Integrate with the SpecForge-owned production Catalog and consumer when
