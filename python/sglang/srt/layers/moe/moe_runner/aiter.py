@@ -328,6 +328,24 @@ class AiterRunnerCore(MoeRunnerCore):
         if self.config.no_combine:
             extra["no_combine"] = True
 
+        from sglang.srt.runtime_context import get_forward
+
+        tiny = getattr(self, "_tiny_glm", None)
+        scoped_x = (
+            get_forward().aiter_tiny_glm_input
+            if tiny is not None and tiny.weights and not torch.compiler.is_compiling()
+            else None
+        )
+        if (
+            tiny is not None
+            and scoped_x is not None
+            and scoped_x.data_ptr() == runner_input.hidden_states.data_ptr()
+            and not hooks
+        ):
+            output = tiny.run_if_supported(runner_input, quant_info, self.config)
+            if output is not None:
+                return AiterRunnerOutput(hidden_states=output)
+
         # gfx950 small-M MXFP4 kernel (on by default, SGLANG_ROCM_SMALLM_MOE=0 disables): same layouts as aiter, bf16 activations.
         if _SMALLM_MOE_ON and quant_info.w13_weight.element_size() == 1:
             from sglang.kernels.ops.moe import smallm_moe_gfx950 as _smallm

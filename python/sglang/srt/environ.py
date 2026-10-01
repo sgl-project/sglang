@@ -866,6 +866,7 @@ class Envs:
     # ===================================================================
     # AMD, ROCm, and AITER
     # ===================================================================
+    SGLANG_AITER_TINY_GLM_MOE = EnvBool(False)
     SGLANG_USE_AITER = EnvBool(False)
     SGLANG_USE_AITER_AG = EnvBool(True)
     # Use reduce_scatter (instead of all_reduce + dp_scatter) for the equal-chunk

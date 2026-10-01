@@ -138,19 +138,21 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         # Two warmups so kernels are loaded and one-time setup is paid before capture.
         # post_warmup_hook lets the attention backend reset state that warmup mutated.
         warmup_output = None
-        for warmup_step in range(2):
-            self._device_module.synchronize()
-            self._tp_group.barrier()
-            with self._precarve.measure():
-                output = forward_fn()
-            if self._reuse_output_buffer and warmup_step == 1:
-                warmup_output = output
-            del output
-            if profiler is not None:
-                profiler.step()
-            if post_warmup_hook is not None:
-                post_warmup_hook()
+        from sglang.srt.layers.moe.moe_runner.aiter_tiny_glm import warmup_stream
 
+        with warmup_stream(self._capture_stream):
+            for warmup_step in range(2):
+                self._device_module.synchronize()
+                self._tp_group.barrier()
+                with self._precarve.measure():
+                    output = forward_fn()
+                if self._reuse_output_buffer and warmup_step == 1:
+                    warmup_output = output
+                del output
+                if profiler is not None:
+                    profiler.step()
+                if post_warmup_hook is not None:
+                    post_warmup_hook()
         if self._reuse_output_buffer and self._output_buffer is None:
             # Prefill captures the largest shape first and replays one shape at
             # a time, so all graphs can share this eager-tail input buffer.
