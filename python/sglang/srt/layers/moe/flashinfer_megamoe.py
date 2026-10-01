@@ -453,6 +453,11 @@ def prepare_fp4_moe_weights_for_flashinfer_megamoe(
     current moe_ep API owns backend-specific weight preprocessing, including
     DeepGEMM scale layout transforms.
     """
+    if (
+        not layer.moe_runner_config.is_gated
+        or layer.moe_runner_config.activation != "silu"
+    ):
+        raise ValueError("FlashInfer DeepGEMM MegaMOE only supports gated SiLU.")
     _init_flashinfer_megamoe_layer_state(layer)
 
     from flashinfer.moe_ep import (
@@ -593,6 +598,11 @@ def prepare_nvfp4_moe_weights_for_flashinfer_megamoe(
 def prepare_mxfp8_moe_weights_for_flashinfer_megamoe(
     layer: FusedMoE,
 ) -> None:
+    if (
+        not layer.moe_runner_config.is_gated
+        or layer.moe_runner_config.activation != "silu"
+    ):
+        raise ValueError("FlashInfer MXFP8 MegaMOE only supports gated SiLU.")
     _init_flashinfer_megamoe_layer_state(layer)
 
     from flashinfer.moe_ep import (
