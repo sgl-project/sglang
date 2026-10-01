@@ -121,7 +121,7 @@ def test_qsa_host_roundtrip_and_consumer_fence(pools):
                 ),
             )
         ],
-        layer_num=8,
+        transfer_layer_id_max=8,
         on_layer_done=counter.events[producer].complete,
     )
     # Read through the production accessor without a global synchronize. The
@@ -180,7 +180,7 @@ def test_qsa_file_restart_and_missing_sidecar(pools):
         destination = slots([4, 2], "cuda")
         engine.submit_host_to_device(
             [L2Transfer(host, device, transfer.host_indices, destination.cpu())],
-            layer_num=2,
+            transfer_layer_id_max=2,
         ).finish_event.synchronize()
         for restored, saved in zip(device.qsa_compressed_k_buffer_pool, expected):
             torch.testing.assert_close(
@@ -223,7 +223,7 @@ def test_packed_mtp_indexer_roundtrip(pools):
                     host, draft, host_indices, destination, {0: 2}.get, is_draft=True
                 ),
             ],
-            layer_num=8,
+            transfer_layer_id_max=8,
         ).finish_event.synchronize()
         for buffer, saved in zip(all_buffers, expected):
             torch.testing.assert_close(
