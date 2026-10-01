@@ -521,6 +521,9 @@ class Envs:
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
     SGLANG_SIMULATE_ACC_METHOD = EnvStr("match-expected")
     SGLANG_SIMULATE_ACC_TOKEN_MODE = EnvStr("fixed")
+    # DSpark on HIP: with SGLANG_SIMULATE_ACC_LEN set, temperature-only sampling requests
+    # run the greedy draft/accept path and only the bonus token is temperature-sampled.
+    SGLANG_SIMULATE_ACC_GREEDY = EnvBool(True)
     SGLANG_SIMULATE_UNIFORM_EXPERTS = EnvBool(False)
     SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS = EnvBool(False)
 
@@ -947,6 +950,10 @@ class Envs:
     # import and Triton cga_layout prerequisites hold. Set to 0 to force the
     # zero-pad mla_decode_fwd fallback (benchmarking / emergency disable).
     SGLANG_AITER_MLA_GLUON = EnvBool(True)
+    # Select the AITER MLA kernel for DCP decode. "gluon" preserves the native
+    # low-head Triton path; "asm" quantizes the DCP-gathered query to FP8 and
+    # runs mla_decode_fwd with persistent metadata and return_lse=True.
+    SGLANG_AITER_MLA_DCP_DECODE_BACKEND = EnvStr("gluon")
 
     # DSV4 Aiter flags
     SGLANG_OPT_USE_AITER_SILU_MUL = EnvBool(False)
@@ -1537,7 +1544,7 @@ class Envs:
     SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE = EnvBool(False)
     # Paged KV layout of the DeepSeek-V4 family pools: "v4" (584 B/token, every
     # GPU), "v41" (the SM100 FlashMLA V4.1 formats: 528 B fp8 SWA cache, fp8 or
-    # fp4 compressed caches) or "auto" (v41 on SM100 when FlashMLA supports it).
+    # fp4 compressed caches) or "auto" (v41 on SM100, v4 elsewhere).
     SGLANG_DSV4_KV_LAYOUT = EnvStr("v4")
     # Compressed-cache layout under "v41": "auto" (fp4 for the fp4-rounded
     # ratio-1 / ratio-2 latents, fp8 for ratios 4 / 128), "fp8" or "fp4" for all.
@@ -1578,6 +1585,12 @@ class Envs:
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
+    # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
+    # dequant of the chunk's SWA and compressed history, instead of the decode kernel.
+    SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL = EnvBool(False)
+    # DSpark draft block on the HIP radix backend: build the attention metadata inside the
+    # draft CUDA graph from the raw inputs instead of eagerly before every replay.
+    SGLANG_HIP_DSPARK_DRAFT_RAW_METADATA = EnvBool(_default_hip)
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)

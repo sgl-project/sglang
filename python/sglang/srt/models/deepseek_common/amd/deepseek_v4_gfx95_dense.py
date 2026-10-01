@@ -59,22 +59,23 @@ def fused_rmsnorm_fake_quant_eligible(
     quant_config: Optional[QuantizationConfig],
 ) -> bool:
     """Whether rmsnorm_fake_quant_fp8 applies: gfx950 with a 32-wide-block checkpoint
-    (V4.1), whose dense route takes the norm output already on the fp8 grid as an
-    Fp8GridActivation."""
+    (V4.1), whose native or aiter dense route takes the norm output already on the fp8
+    grid (Fp8GridActivation) or as fp8 + ue8m0 (Mxfp8Activation)."""
     if not (_is_hip and _is_gfx95_supported and isinstance(quant_config, Fp8Config)):
         return False
     block = quant_config.weight_block_size
+    backend = resolve_block_fp8_mxfp8_backend()
     return (
         block is not None
         and block[1] == 32
         and quant_config.scale_fmt == "ue8m0"
-        and resolve_block_fp8_mxfp8_backend().is_gfx95_mxfp8_native()
+        and (backend.is_gfx95_mxfp8_native() or backend.is_gfx95_mxfp8_aiter())
     )
 
 
-def _native_mxfp8_consumer(linear: Optional[nn.Module]) -> bool:
-    """Whether linear runs the gfx950 native MXFP8 route, which consumes fp8 + ue8m0
-    scales directly at every M."""
+def _mxfp8_consumer(linear: Optional[nn.Module]) -> bool:
+    """Whether linear runs a gfx950 MXFP8 route that consumes fp8 + ue8m0 scales directly
+    at every M: aiter's MXFP8 GEMM, or the native kernels on a tiled weight."""
     if linear is None:
         return False
     quant_method = linear.quant_method
@@ -82,8 +83,13 @@ def _native_mxfp8_consumer(linear: Optional[nn.Module]) -> bool:
         isinstance(quant_method, Fp8LinearMethod)
         and quant_method.block_fp8_as_mxfp8
         and linear.block_fp8_mxfp8_ready
-        and quant_method.mxfp8_dense_backend.is_gfx95_mxfp8_native()
-        and linear.mxfp8_native_ready
+        and (
+            quant_method.mxfp8_dense_backend.is_gfx95_mxfp8_aiter()
+            or (
+                quant_method.mxfp8_dense_backend.is_gfx95_mxfp8_native()
+                and linear.mxfp8_native_ready
+            )
+        )
     )
 
 
@@ -99,7 +105,7 @@ def q_norm_fake_quant(attn, q_lora: torch.Tensor) -> Tuple[torch.Tensor, object]
         q_lora = attn.q_norm(q_lora)
         return q_lora, q_lora
     if not attn._wq_b_native_consumer_checked:
-        attn._wq_b_native_consumer = _native_mxfp8_consumer(attn.wq_b)
+        attn._wq_b_native_consumer = _mxfp8_consumer(attn.wq_b)
         attn._wq_b_native_consumer_checked = True
     q_for_wq_b, q_lora = rmsnorm_fake_quant_fp8(
         q_lora,
@@ -123,7 +129,7 @@ def input_norm_fake_quant(
         return norm(hidden_states), None
     if not layer._wqkv_a_native_consumer_checked:
         # wqkv_a exists only when the q / kv projections are fused
-        layer._wqkv_a_native_consumer = _native_mxfp8_consumer(
+        layer._wqkv_a_native_consumer = _mxfp8_consumer(
             layer.self_attn.wqkv_a if layer.self_attn.fuse_wqa_wkv else None
         )
         layer._wqkv_a_native_consumer_checked = True

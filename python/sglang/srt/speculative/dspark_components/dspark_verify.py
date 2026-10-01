@@ -26,6 +26,9 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     build_unified_commit_inject_layout,
     scatter_compact_to_strided_into,
 )
+from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
+    simulated_bonus_sample,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
@@ -50,12 +53,13 @@ from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_METHOD,
     sample_simulated_acc_len,
 )
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_hip, is_npu
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult
 
+_is_hip = is_hip()
 _is_npu = is_npu()
 
 # Draft proposal probs feeding rejection sampling; the data layer is the
@@ -156,6 +160,7 @@ class TargetVerifyExecutor:
         layout: Optional[RaggedVerifyLayout],
         prefix_lens: torch.Tensor,
         draft_tokens: torch.Tensor,
+        simulate_bonus_sampling_info=None,
     ) -> AcceptOuts:
         """Produce the per-request accept outcome after target verify.
 
@@ -167,25 +172,38 @@ class TargetVerifyExecutor:
         if folded_accept:
             return self.verify_epilogue.read_accept(bs)
 
+        simulate = self._simulate_acc_len > 0
+        # Simulated acceptance overwrites correct_len below, so a sampling accept
+        # (draft/target softmax + rejection) would be computed only to be discarded.
+        accept_sampling_info = None if simulate and _is_hip else sampling_info
         correct_len, bonus, cap_trim_lens = accept_draft_tokens(
             candidates=verify_ids_2d,
             target_logits=target_logits,
             draft_block=draft_block,
-            sampling_info=sampling_info,
+            sampling_info=accept_sampling_info,
             draft_input=draft_input,
             gamma=self.gamma,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             cutoff_layout=layout,
             fused_argmax=self._target_is_dsv41,
         )
-        if self._simulate_acc_len > 0:
+        if simulate:
             correct_len = self._simulated_correct_len(
                 bs=bs, dtype=correct_len.dtype, device=correct_len.device
             )
+            if simulate_bonus_sampling_info is not None:
+                bonus = sample_simulated_bonus(
+                    target_logits=target_logits,
+                    correct_len=correct_len,
+                    greedy_bonus=bonus,
+                    sampling_info=simulate_bonus_sampling_info,
+                    bs=bs,
+                    verify_num_draft_tokens=self.verify_num_draft_tokens,
+                )
 
         site = (
             SpecTpSyncSite.DSPARK_ACCEPT_GREEDY
-            if sampling_info is None or sampling_info.is_all_greedy
+            if accept_sampling_info is None or accept_sampling_info.is_all_greedy
             else SpecTpSyncSite.DSPARK_ACCEPT_SAMPLE
         )
         self._tp_sync.sync(site, correct_len)
@@ -834,6 +852,27 @@ class DsparkVerifyEpilogue:
                 positions=inject_layout.positions,
                 pool=pool,
             )
+
+
+def sample_simulated_bonus(
+    *,
+    target_logits: torch.Tensor,
+    correct_len: torch.Tensor,
+    greedy_bonus: torch.Tensor,
+    sampling_info,
+    bs: int,
+    verify_num_draft_tokens: int,
+) -> torch.Tensor:
+    """Temperature-sample every verify row and return the row at the (simulated)
+    correct_len as the bonus token. Temperature only: callers exclude top-p/top-k/min-p."""
+    bonus = simulated_bonus_sample(
+        target_logits=target_logits,
+        correct_len=correct_len,
+        temperatures=sampling_info.temperatures,
+        bs=bs,
+        rows_per_request=verify_num_draft_tokens,
+    )
+    return bonus.to(greedy_bonus.dtype).view_as(greedy_bonus)
 
 
 def accept_draft_tokens(
