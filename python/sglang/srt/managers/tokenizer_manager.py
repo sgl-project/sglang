@@ -417,7 +417,6 @@ _SCHEDULER_EXIT_TIMEOUT_SECS = 15
 def resolve_readout_anchor(
     input_ids: List[int], anchor: Tuple[int, int], chunked_prefill_size: Optional[int]
 ) -> List[int]:
-    """Readout positions at an offset from every anchor token of the final prompt."""
     token_id, offset = anchor
     positions = [i + offset for i, token in enumerate(input_ids) if token == token_id]
     if not positions or not all(0 <= p < len(input_ids) for p in positions):

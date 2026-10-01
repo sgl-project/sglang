@@ -73,19 +73,14 @@ class QuestionView(msgspec.Struct, frozen=True):
 
 
 class DecisionPromptSource(Protocol):
-    """Where the prompts of one decision request shape come from, and who answers it."""
+    """Answers whole requests, not questions: a trained prompt reads every field from one prefill."""
 
     name: str
-    # Requests are dispatched to the first source whose request model they are.
     request_model: type
 
     @staticmethod
     def detect(tokenizer: Any) -> bool:
-        """Whether the served checkpoint is native to this source.
-
-        The first native source picks the request model of a route whose body
-        shape alone cannot tell the sources apart.
-        """
+        """The first native source picks the body model of a route whose shapes look alike."""
         ...
 
     async def handle(self, request: Any, raw_request: Request): ...
@@ -174,7 +169,6 @@ class OpenAIServingDecisions(OpenAIServingBase):
 
     @staticmethod
     def detect(tokenizer: Any) -> bool:
-        # Any checkpoint; the refusals run per request.
         return True
 
     async def handle_request(self, request, raw_request: Request):

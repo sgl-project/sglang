@@ -2140,7 +2140,6 @@ async def jev_decisions(request: JevRequest, raw_request: Request):
 def decision_route_servings(
     chat_serving: OpenAIServingChat,
 ) -> Tuple[OpenAIServingDecisions, SystemOneServing]:
-    """The handlers of /v1/decisions and /v1/jev, and of /v1/systemone, with every prompt source."""
     return (
         OpenAIServingDecisions(chat_serving, prompt_sources=PROMPT_SOURCES),
         SystemOneServing(chat_serving, prompt_sources=PROMPT_SOURCES),

@@ -97,12 +97,7 @@ class TokenizerManagerScoreMixin:
         temperature: float = 1.0,
         request: Optional[Any] = None,
     ) -> ScoreResult:
-        """Score label tokens at several positions of one prompt, in one prefill.
-
-        Readout i is taken at `offset` from the i-th `token_id` of the prompt, with
-        `(token_id, offset) = readout_anchor`, located after multimodal expansion.
-        Returns one softmaxed row and one full-vocabulary logprob row per readout.
-        """
+        """Score label tokens at every anchor readout of one prompt, in one prefill."""
         if not math.isfinite(temperature) or temperature <= 0:
             raise ValueError("temperature must be finite and greater than zero")
         batch_request = GenerateReqInput(
