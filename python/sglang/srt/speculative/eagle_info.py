@@ -1,15 +1,37 @@
 import logging
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Union
 
 import torch
 
-from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.kernels.ops.attention.utils import (
+    create_flashinfer_kv_indices_triton,
+    kv_indices_num_token_blocks,
+)
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
 logger = logging.getLogger(__name__)
+
+# Token-block parallel KV-index building pays only on long-context servers;
+# below this the verify / draft-extend paths keep the one-program-per-request grid.
+_KV_INDEX_BLOCKS_MIN_CONTEXT = 32768
+
+
+def _kv_index_blocks(
+    table_width: int, paged_kernel_lens_sum: Union[int, torch.Tensor], batch_size: int
+) -> int:
+    if table_width < _KV_INDEX_BLOCKS_MIN_CONTEXT or batch_size <= 0:
+        return 1
+    if isinstance(paged_kernel_lens_sum, int):
+        # Mean KV length, not the table width: a batch of short prefixes on a
+        # long-context server must not fan out into idle programs.
+        width = (paged_kernel_lens_sum + batch_size - 1) // batch_size
+    else:
+        # The length sum lives on the device; the table width is the sync-free bound.
+        width = table_width
+    return kv_indices_num_token_blocks(width, batch_size)
 
 
 @dataclass
@@ -109,7 +131,12 @@ class EagleVerifyInput(SpecInput):
             dtype=torch.int32,
             device=device,
         )
-        create_flashinfer_kv_indices_triton[(batch_size,)](
+        num_token_blocks = _kv_index_blocks(
+            table_width=req_to_token.size(1),
+            paged_kernel_lens_sum=paged_kernel_lens_sum,
+            batch_size=batch_size,
+        )
+        create_flashinfer_kv_indices_triton[(batch_size, num_token_blocks)](
             req_to_token,
             req_pool_indices,
             paged_kernel_lens,
@@ -117,6 +144,7 @@ class EagleVerifyInput(SpecInput):
             None,
             kv_indices,
             req_to_token.size(1),
+            TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
         )
         mask_numel = (
             paged_kernel_lens_sum * self.draft_token_num
@@ -419,7 +447,12 @@ class EagleDraftExtendInput(SpecInput):
             paged_kernel_lens_sum, dtype=torch.int32, device=device
         )
 
-        create_flashinfer_kv_indices_triton[(bs,)](
+        num_token_blocks = _kv_index_blocks(
+            table_width=req_to_token.size(1),
+            paged_kernel_lens_sum=paged_kernel_lens_sum,
+            batch_size=bs,
+        )
+        create_flashinfer_kv_indices_triton[(bs, num_token_blocks)](
             req_to_token,
             req_pool_indices,
             paged_kernel_lens,
@@ -427,5 +460,6 @@ class EagleDraftExtendInput(SpecInput):
             None,
             kv_indices,
             req_to_token.size(1),
+            TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
         )
         return kv_indices, cum_kv_seq_len, qo_indptr, None
