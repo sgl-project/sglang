@@ -1,21 +1,4 @@
-"""Numerical tests for the varlen absorbed-MLA extend path.
-
-Under a captured tc_piecewise prefill graph, trtllm_mla runs absorbed MLA over a
-ragged q against a freshly built paged block table. These cases check the output
-still matches the reference across prefix lengths, page boundaries, ragged batches
-and shuffled pages.
-
-Backends without a varlen kernel are covered by test_mla_varlen_absorbed_gate.py:
-the kit builds MLA shapes (576, 512), which they reject, so every case here would
-skip.
-
-The case list and assertions are shared with test_trtllm_mla_breakable.py via
-sglang.test.kits.attention_unittest.attention_methods.varlen_absorbed_extend_kit:
-the two exercise the same numerical contract under the two halves of
-use_varlen_absorbed (is_in_tc_piecewise_cuda_graph() vs
-is_in_breakable_cuda_graph()), so only the capture-mode kwarg and the case-name
-prefix differ.
-"""
+"""Varlen absorbed-MLA extend under a tc_piecewise captured prefill graph."""
 
 import unittest
 
@@ -50,14 +33,7 @@ class TestTRTLLMMLAPiecewiseExtend(VarlenAbsorbedExtendMixin, CustomTestCase):
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
 class TestVarlenAbsorbedArchGate(CustomTestCase):
-    """The arch gate must be asserted, not merely skipped over.
-
-    On SM != 10.x flashinfer resolves backend="auto" to XQA, which rejects
-    cum_seq_lens_q. The class above skips there, so without this test the
-    non-SM10 half of the gate would have no coverage at all -- and that gate
-    exists because trusting the ``backend == "trtllm-gen"`` string was wrong.
-    1-gpu-large (H100, SM 9.0) is a per-commit runner, so this runs every PR.
-    """
+    """Off SM100, FlashInfer's auto backend is XQA, which rejects cum_seq_lens_q."""
 
     def test_arch_gate_matches_flashinfer_resolution(self):
         major, minor = torch.cuda.get_device_capability()
