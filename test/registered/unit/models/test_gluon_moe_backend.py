@@ -473,10 +473,11 @@ def test_glm_dispatch_covers_tp4_and_tp8_target_and_nextn_ranges():
 def test_glm_nextn_low_m_reuses_three_kernel_target_schedule():
     from sglang.srt.layers.moe.glm_mxfp4_gluon import _kernel_name
 
-    for m in range(1, 9):
+    for m in (*range(1, 9), 12, 16):
         assert _kernel_name(8, 1, True, m) == "fused_moe_tp8_m1_16"
-    for m in range(9, 18):
+    for m in (9, 10, 11, 13, 14, 15, 17):
         assert _kernel_name(8, 1, True, m) == "fused_moe_tp8_m1_16_mtp"
+    assert _kernel_name(8, 1, True, 24) == "fused_moe_tp8_m32_256_mtp"
 
 
 @pytest.mark.parametrize(
