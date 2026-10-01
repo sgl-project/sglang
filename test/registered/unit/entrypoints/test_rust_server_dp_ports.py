@@ -13,7 +13,7 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 @pytest.mark.parametrize(
-    "nnodes,tp_size,dp_size,ep_join_mode,ranks,expected",
+    "nnodes,tp_size,attn_dp_size,ep_join_mode,ranks,expected",
     [
         (2, 4, 4, None, (0, 1, 2, 3), [0, 1, 0, 1]),
         (4, 4, 2, None, (0, 2), [0, 0]),
@@ -22,14 +22,13 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
     ids=["multiple-listeners-per-node", "dp-spans-nodes", "scale-joiner"],
 )
 def test_dp_leaders_reuse_node_local_ports(
-    nnodes, tp_size, dp_size, ep_join_mode, ranks, expected
+    nnodes, tp_size, attn_dp_size, ep_join_mode, ranks, expected
 ):
     with (
         get_context().override_server_args(
             nnodes=nnodes,
             tp_size=tp_size,
-            dp_size=dp_size,
-            enable_dp_attention=True,
+            attn_dp_size=attn_dp_size,
             ep_join_mode=ep_join_mode,
             host="0.0.0.0",
             port=30000,
@@ -70,8 +69,7 @@ def test_node_listener_placement(pp_size, expected, node_rank):
         node_rank=node_rank,
         tp_size=4,
         pp_size=pp_size,
-        dp_size=2,
-        enable_dp_attention=True,
+        attn_dp_size=2,
         attn_cp_size=2,
     ):
         assert node_hosts_rust_server() == expected[node_rank]
@@ -82,8 +80,6 @@ def test_scale_joiner_hosts_listener():
         nnodes=2,
         node_rank=1,
         tp_size=1,
-        dp_size=1,
-        enable_dp_attention=True,
         ep_join_mode="scale",
     ):
         assert node_hosts_rust_server()
