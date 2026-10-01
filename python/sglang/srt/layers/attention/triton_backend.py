@@ -139,6 +139,9 @@ class TritonAttnBackend(AttentionBackend):
         from sglang.kernels.ops.attention.verify_splitkv import (
             verify_splitkv_fwd,
         )
+        from sglang.kernels.ops.speculative.dspark.target_kv_attention import (
+            target_kv_attention,
+        )
 
         super().__init__()
 
@@ -148,6 +151,7 @@ class TritonAttnBackend(AttentionBackend):
             extend_attention_fwd_unified
         )
         self.build_unified_kv_indices = torch.compiler.disable(build_unified_kv_indices)
+        self.target_kv_attention = torch.compiler.disable(target_kv_attention)
         # Split-KV EAGLE-verify kernel; enabled below once topk is known (valid only at topk == 1).
         self.verify_splitkv_fwd = torch.compiler.disable(verify_splitkv_fwd)
         # MLA split-KV EAGLE-verify kernel; enabled below once topk is known (valid only at topk == 1).
@@ -1353,6 +1357,43 @@ class TritonAttnBackend(AttentionBackend):
             )
         ):
             causal = False
+
+        if getattr(layer, "use_target_kv_attention", False):
+            if (
+                causal
+                or self.dcp_size > 1
+                or (
+                    layer.sliding_window_size is not None
+                    and layer.sliding_window_size > -1
+                )
+                or logits_soft_cap != 0
+                or sinks is not None
+                or score_mod is not None
+                or aux_tensors is not None
+                or self.forward_metadata.custom_mask is not None
+                or layer.k_scale is not None
+                or layer.v_scale is not None
+                or layer.xai_temperature_len > 0
+            ):
+                raise ValueError(
+                    "KV draft attention requires unmasked, unscaled local KV"
+                )
+            extend_indices = self.forward_metadata.out_cache_loc_full_physical
+            if extend_indices is None:
+                extend_indices = forward_batch.out_cache_loc
+            self.target_kv_attention(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                self.forward_metadata.qo_indptr,
+                self.forward_metadata.kv_indptr,
+                self.forward_metadata.kv_indices,
+                max_query=self.forward_metadata.max_extend_len,
+                scale=layer.scaling,
+                extend_indices=extend_indices,
+            )
+            return o
 
         if self.dcp_size > 1:
             if score_mod is not None:

@@ -42,6 +42,7 @@ class TargetKVAttention(DFlashAttention):
 
     def __init__(self, config, layer_id, quant_config=None):
         super().__init__(config, layer_id, quant_config)
+        self.attn.use_target_kv_attention = True
         rotary = self.rotary_emb
         if (
             not hasattr(rotary, "cos_sin_cache")

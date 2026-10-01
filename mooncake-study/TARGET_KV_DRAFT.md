@@ -2,9 +2,10 @@
 
 This implements the SGLang serving side of design package P8. It consumes an
 explicit KV-input checkpoint. A fixed-input numerical gate now exercises the
-existing SpecForge backbone through a test-only KV adapter. The real Qwen3 BF16
-fixture does not yet pass this gate; a production SpecForge exporter and complete
-training versus serving parity remain integration work. Synthetic test
+existing SpecForge backbone through a test-only KV adapter. The retained Qwen3
+BF16 fixture passes against the pinned FlexAttention reference with exact layer
+and logit equality. A production SpecForge exporter and trained-checkpoint
+validation remain integration work. Synthetic test
 checkpoints are wiring fixtures, not trained drafts or acceptance benchmarks.
 
 ## Checkpoint Identity
@@ -166,9 +167,36 @@ SGLANG_RAGGED_VERIFY_MODE=static python -m sglang.launch_server \
 
 The checkpoint's golden-fixture/acceptance metadata is recorded and validated
 structurally; startup does not execute or certify a SpecForge validation report.
-Full training/serving backbone and logits parity, quality/throughput gates,
+Production exporter compatibility, trained-model quality/throughput gates,
 parallel topology, non-static verification, PD, RDMA and production rollout
-remain open.
+remain open. The retained Qwen3 BF16 fixture now passes the complete backbone
+and logits gate against the pinned FlexAttention training reference; this is
+not a certificate for other models, backends or runtime versions.
+
+### KV-Draft Attention
+
+`TargetKVAttention` explicitly selects a logical-order Triton kernel. It reads
+prefix and current-block slot indices directly from the existing backend
+metadata, including non-contiguous physical slots. The logical 64-token tiles
+can straddle the prefix/block boundary; attention never restarts softmax at
+that boundary. Grouped query heads share a KV tile, with FP32 accumulation,
+exp2 softmax and probabilities rounded to the input dtype before the value
+product. The short-block path uses two warps and one pipeline stage.
+
+This follows the arithmetic observed in the pinned training reference. Its
+generated FlexAttention decoding kernel has 32 nominal splits, but its default
+mask covers a single enormous sparse block, so only the first split contains
+valid KV for the retained fixture. Dividing the actual short context among
+32 splits changes the BF16 result. The serving kernel has no split scratch
+buffers and does not gather or concatenate context KV.
+
+The wrapper checks NHD shapes, dtype, index layout and block bounds using host
+metadata, including during CUDA graph capture. It supports block lengths 1..64,
+head dimensions 16..256 and 1..64 query heads per KV head. The backend rejects
+custom masks, sliding windows, scaled/quantized KV, sinks and distributed
+context attention for this path. Other SGLang attention layers keep their
+existing selection. Independent kernel tests cover ragged lengths, empty KV,
+strided tensors, tile boundaries and changing graph inputs.
 
 ## Online Capture
 

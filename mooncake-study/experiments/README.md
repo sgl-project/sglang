@@ -108,6 +108,15 @@ updates, exporter failure/retry and a blocked Catalog. The provisioned dashboard
 is `examples/monitoring/grafana/dashboards/json/training-capture-dashboard.json`;
 its serving-latency panels do not establish capture-overhead thresholds.
 
+The runtime fixture uses the Mooncake master's default read lease (5 seconds
+in the pinned SDK). An earlier 100ms override produced `LEASE_EXPIRED (-707)`
+during readback after a producer exited. This is the transfer's read lease,
+separate from object hard pinning and Catalog retention. The adapter continues
+to reject the read and quarantine its destination on negative SDK status;
+the unit test explicitly covers `-707`. The transport-focused small-object test
+still uses its short lease. Runtime correctness does not require a 100ms
+transport deadline during process teardown.
+
 ### BF16 Rounding Isolation
 
 The actual fixed-input parity command remains the serving gate. The following
@@ -154,6 +163,24 @@ The pinned SpecForge DSpark offline example uses `flex_attention`. To compare
 that training choice explicitly, run the earlier BF16 diagnostic with
 `--reference-attention flex_attention`. Keep reports for different training
 backends separate; one backend's result does not certify another backend.
+Add `--dump-flex-code /path/to/generated-code` to save the actual Inductor
+kernel source selected by those reference calls. This is diagnostic output,
+not a production dependency. The diagnostic separately disables the KV-draft
+kernel when comparing the legacy two-stage and unified kernels.
+
+The KV-draft logical-order kernel is now the normal Triton serving path for
+`DSparkTargetKVDraftModel`. To measure its CUDA-graph attention latency against
+the old prefix/block kernel on identical paged inputs, run:
+
+```bash
+PYTHONPATH=python python mooncake-study/experiments/benchmark_target_kv_attention.py
+```
+
+The microbenchmark covers BF16, 16 query heads, 8 KV heads, dimension 128,
+batch sizes 1/4/16, prefix lengths 160/1024/8192 and block widths 3/16. It
+includes direct prefix/block index reads, but excludes KV writes, projections,
+sampling, capture publication and HTTP scheduling. It cannot establish an
+end-to-end throughput gain or the P10 capture-on/off SLO.
 
 `target-kv-log2-probe.patch` preserves a failed numerical experiment outside the
 production kernel. It changes the unified kernel's exponential base and uses

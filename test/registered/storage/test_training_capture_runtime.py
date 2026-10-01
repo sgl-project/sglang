@@ -84,7 +84,8 @@ class TestTrainingCaptureRuntime(CustomTestCase):
                 f"--rpc_port={port}",
                 f"--metrics_port={free_port()}",
                 f"--http_metadata_server_port={free_port()}",
-                "--default_kv_lease_ttl=100ms",
+                # Use the master's operational read lease. A 100ms lease can
+                # expire during process teardown even for hard-pinned objects.
             ],
             stdout=cls.master_log,
             stderr=subprocess.STDOUT,

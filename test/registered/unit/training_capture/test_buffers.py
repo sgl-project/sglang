@@ -142,11 +142,13 @@ class TestMooncakeTransferContract(CustomTestCase):
         with self.assertRaisesRegex(ContractError, "short"):
             self.store.get_tensor("test", [128], torch.int32, self.digest)
         self.assertEqual(len(self.store.registered), 1)
-        self.client.get_count = -1
-        with self.assertRaises(TransportError):
-            self.store.get_tensor("test", [128], torch.int32, self.digest)
-        self.assertEqual(len(self.store.registered), 2)
-        self.assertEqual(len(self.store.quarantined), 1)
+        for index, status in enumerate((-1, -707)):
+            with self.subTest(status=status):
+                self.client.get_count = status
+                with self.assertRaises(TransportError):
+                    self.store.get_tensor("test", [128], torch.int32, self.digest)
+                self.assertEqual(len(self.store.registered), index + 2)
+                self.assertEqual(len(self.store.quarantined), index + 1)
 
     def test_unregistered_or_changed_source_never_reaches_transport(self):
         with self.assertRaises(ContractError):

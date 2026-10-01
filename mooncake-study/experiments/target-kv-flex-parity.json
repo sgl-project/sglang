@@ -1,0 +1,251 @@
+{
+  "description": "Retained BF16 fixed-input gate for the production logical-order KV draft attention kernel. Synthetic checkpoint; not trained-model quality, general backend equivalence, topology or SLO certification.",
+  "serving_source_sha256": {
+    "python/sglang/kernels/ops/speculative/dspark/target_kv_attention.py": "6032b586efa5d20dacd04c5a60361f1233f063d5b3ba273b39984442f544882f",
+    "python/sglang/srt/models/dspark_target_kv.py": "97c59e1119eb80a7756076145c480e40de602d243327e33844d97cdbeea926c4",
+    "python/sglang/srt/layers/attention/triton_backend.py": "10392c9e65839256197fc0660455b5b97b59e4229a4d7c160065b777d33a159f"
+  },
+  "reference_codegen": {
+    "job_id": "01790822364547542737-f27603573da7",
+    "directory": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/fixtures/flex-attention-code-20261001",
+    "sha256": {
+      "kernel-0.py": "789508a84549875a1be1b227b82431e5750762493e8576730552ae39202fb2ba",
+      "kernel-1.py": "b341e2c798e244bed647e18be4b154511a39239b29bd1c2e6609c585db9bb896"
+    },
+    "block_m": 16,
+    "block_n": 64,
+    "num_warps": 2,
+    "num_stages": 1,
+    "nominal_splits": 32,
+    "sparse_kv_block_size": 1073741824,
+    "inference": "With the retained KV lengths, all valid tiles belong to the first split; remaining splits are empty."
+  },
+  "parity_job": "01790823641652995870-6ef7c685763a",
+  "parity_report_sha256": "994fb020c41eb7db4fb2adc99764ccce64dc81af49cf12e383400c4c142fb0e1",
+  "parity": {
+    "status": "passed",
+    "reference_adapter": "specforge_backbone_with_shared_kv_encoder",
+    "reference_attention": "flex_attention",
+    "serving_attention": "triton",
+    "dtype": "bfloat16",
+    "device": "NVIDIA H100 80GB HBM3",
+    "torch_version": "2.13.0+cu130",
+    "cuda_version": "13.0",
+    "cudnn_version": 92000,
+    "transformers_version": "5.12.1",
+    "specforge_sources": {
+      "specforge.modeling.draft.dflash": "d0cbb0dafb77fe6cc64c9a2850515aaca6f11b811af767b141a5aa473e4213ba",
+      "specforge.modeling.draft.dflash_kernels": "ce6496a07282b8d3ab4b69942191d27a8ba2d0a107613b2ae74e60604b0faf46",
+      "specforge.modeling.draft.dspark": "4ec764996b8a48c24e1ba15513503255ae9165a2c3abb9ad2d3e988c6a526be7"
+    },
+    "artifact_sha256": {
+      "config.json": "4b74ae312ce217dae27d1346a617245f370ebd0fbb80feeeccbc2b0e12bf6dbd",
+      "model.safetensors": "1bad9b3c7fdf78e75a180d3cc08fc536a643e6a70a82fd9c856f9249dbd69982",
+      "validation/inputs.safetensors": "75f2a38ab933a0112a2de1365511782c101578d00d0503c991cd1e752fdcc472"
+    },
+    "rtol": 0.03,
+    "atol": 0.03,
+    "stages": {
+      "layer.0": {
+        "passed": true,
+        "elements": 9216,
+        "mismatched": 0,
+        "nonfinite": 0,
+        "max_abs": 0,
+        "rms": 0
+      },
+      "layer.1": {
+        "passed": true,
+        "elements": 9216,
+        "mismatched": 0,
+        "nonfinite": 0,
+        "max_abs": 0,
+        "rms": 0
+      },
+      "hidden": {
+        "passed": true,
+        "elements": 9216,
+        "mismatched": 0,
+        "nonfinite": 0,
+        "max_abs": 0,
+        "rms": 0
+      },
+      "base": {
+        "passed": true,
+        "elements": 1367424,
+        "mismatched": 0,
+        "nonfinite": 0,
+        "max_abs": 0,
+        "rms": 0
+      },
+      "corrected": {
+        "passed": true,
+        "elements": 1367424,
+        "mismatched": 0,
+        "nonfinite": 0,
+        "max_abs": 0,
+        "rms": 0
+      }
+    },
+    "max_abs": {
+      "layer.0": 0,
+      "layer.1": 0,
+      "hidden": 0,
+      "base": 0,
+      "corrected": 0
+    },
+    "anchors": [
+      159,
+      160,
+      162
+    ],
+    "valid_labels": 7,
+    "loss": 8556.904296875,
+    "gradient_l1": {
+      "layers": 644639.2390060425,
+      "norm": 18.816329956054688,
+      "markov_head": 8545.822575569153,
+      "kv_encoder": 151947.00708007812
+    },
+    "fixture_sha256": "75f2a38ab933a0112a2de1365511782c101578d00d0503c991cd1e752fdcc472",
+    "weights_sha256": "1bad9b3c7fdf78e75a180d3cc08fc536a643e6a70a82fd9c856f9249dbd69982",
+    "observed_sdpa_operators": []
+  },
+  "regression": {
+    "job_id": "01790823641338941244-db46a88dfb98",
+    "tests": 159,
+    "subtests": 121,
+    "seconds": 38.08
+  },
+  "read_lease_regression": {
+    "failed_runtime_job": "01790823725746885359-973f1a4a8ef0",
+    "sdk_error": "LEASE_EXPIRED (-707)",
+    "sdk_log": "lease_expired_before_data_transfer_completed",
+    "failed_stage": "Mooncake readback after the producer process exited",
+    "test_read_lease_override_ms": 100,
+    "installed_master_default_read_lease_ms": 5000,
+    "change": "Runtime test uses the master's default read lease; production errors still reject reads and quarantine destinations.",
+    "quarantine_test_job": "01790824208583279715-b47abbbda7e1",
+    "quarantine_tests": 7,
+    "quarantine_subtests": 4,
+    "quarantine_test_seconds": 10.03
+  },
+  "diagnostic_job": "01790823797275492601-64120bb55cdf",
+  "final_runtime": {
+    "job_id": "01790824208934763806-34c2884f502f",
+    "outcome": "completed",
+    "returncode": 0,
+    "seconds": 333.872,
+    "snapshots": 66,
+    "synchronous_ar_snapshots": 6,
+    "overlap_ar_snapshots": 18,
+    "synchronous_dspark_snapshots": 18,
+    "overlap_dspark_snapshots": 22,
+    "adaptive_admission_snapshots": 2,
+    "catalog": "test double",
+    "transport": "local TCP",
+    "read_lease": "installed master default, 5000ms"
+  },
+  "microbenchmark": {
+    "job_id": "01790823641976918474-3c0d5b61ec3c",
+    "excluded": [
+      "KV writes",
+      "projection",
+      "sampling",
+      "capture publication",
+      "HTTP scheduling"
+    ],
+    "measurements": [
+      {
+        "microbenchmark_only": true,
+        "device": "NVIDIA H100 80GB HBM3",
+        "torch_version": "2.13.0+cu130",
+        "dtype": "torch.bfloat16",
+        "batch": 1,
+        "prefix": 160,
+        "width": 3,
+        "heads": 16,
+        "kv_heads": 8,
+        "dim": 128,
+        "legacy_two_stage_us": 14.27397155761719,
+        "target_kv_logical_us": 9.380248752116145,
+        "logical_over_legacy": 0.6571575902510784
+      },
+      {
+        "microbenchmark_only": true,
+        "device": "NVIDIA H100 80GB HBM3",
+        "torch_version": "2.13.0+cu130",
+        "dtype": "torch.bfloat16",
+        "batch": 4,
+        "prefix": 160,
+        "width": 3,
+        "heads": 16,
+        "kv_heads": 8,
+        "dim": 128,
+        "legacy_two_stage_us": 14.597000495967439,
+        "target_kv_logical_us": 9.482740774094685,
+        "logical_over_legacy": 0.649636257580068
+      },
+      {
+        "microbenchmark_only": true,
+        "device": "NVIDIA H100 80GB HBM3",
+        "torch_version": "2.13.0+cu130",
+        "dtype": "torch.bfloat16",
+        "batch": 1,
+        "prefix": 1024,
+        "width": 3,
+        "heads": 16,
+        "kv_heads": 8,
+        "dim": 128,
+        "legacy_two_stage_us": 58.24222904493829,
+        "target_kv_logical_us": 45.69566277011668,
+        "logical_over_legacy": 0.7845795657109725
+      },
+      {
+        "microbenchmark_only": true,
+        "device": "NVIDIA H100 80GB HBM3",
+        "torch_version": "2.13.0+cu130",
+        "dtype": "torch.bfloat16",
+        "batch": 4,
+        "prefix": 1024,
+        "width": 16,
+        "heads": 16,
+        "kv_heads": 8,
+        "dim": 128,
+        "legacy_two_stage_us": 57.63129526174043,
+        "target_kv_logical_us": 51.07338493639003,
+        "logical_over_legacy": 0.8862092150529195
+      },
+      {
+        "microbenchmark_only": true,
+        "device": "NVIDIA H100 80GB HBM3",
+        "torch_version": "2.13.0+cu130",
+        "dtype": "torch.bfloat16",
+        "batch": 1,
+        "prefix": 8192,
+        "width": 3,
+        "heads": 16,
+        "kv_heads": 8,
+        "dim": 128,
+        "legacy_two_stage_us": 497.8370819091797,
+        "target_kv_logical_us": 419.33806088096213,
+        "logical_over_legacy": 0.8423198594866059
+      },
+      {
+        "microbenchmark_only": true,
+        "device": "NVIDIA H100 80GB HBM3",
+        "torch_version": "2.13.0+cu130",
+        "dtype": "torch.bfloat16",
+        "batch": 16,
+        "prefix": 8192,
+        "width": 16,
+        "heads": 16,
+        "kv_heads": 8,
+        "dim": 128,
+        "legacy_two_stage_us": 1035.1490599946826,
+        "target_kv_logical_us": 513.3948414596085,
+        "logical_over_legacy": 0.4959622351028805
+      }
+    ]
+  }
+}

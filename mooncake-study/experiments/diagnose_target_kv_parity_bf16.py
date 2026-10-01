@@ -3,7 +3,9 @@
 import argparse
 import inspect
 import json
+from contextlib import ExitStack
 from functools import partial
+from pathlib import Path
 from types import MethodType
 from unittest.mock import patch
 
@@ -50,7 +52,16 @@ class ProbeDone(Exception):
 
 @torch.no_grad()
 def probe(
-    reference, serving, embed, head, tensors, anchors, *, probe_log2=False, **kwargs
+    reference,
+    serving,
+    embed,
+    head,
+    tensors,
+    anchors,
+    *,
+    probe_log2=False,
+    dump_flex_code=None,
+    **kwargs,
 ):
     from specforge.modeling.draft.dflash import eager_attention_forward
     from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
@@ -60,16 +71,34 @@ def probe(
     for row, anchor in enumerate(anchors):
         tokens = tensors["token_ids"][anchor : anchor + width]
         previous[row, : len(tokens)] = tokens.cuda().long()
-    expected = [
-        reference(
-            tensors=tensors,
-            anchor=anchor,
-            embed=embed,
-            head=head,
-            previous_tokens=previous[row : row + 1],
+
+    def reference_outputs():
+        return [
+            reference(
+                tensors=tensors,
+                anchor=anchor,
+                embed=embed,
+                head=head,
+                previous_tokens=previous[row : row + 1],
+            )
+            for row, anchor in enumerate(anchors)
+        ]
+
+    if dump_flex_code is None:
+        expected = reference_outputs()
+    else:
+        from torch._inductor.utils import run_and_get_code
+
+        expected, codes = run_and_get_code(reference_outputs)
+        dump_flex_code.mkdir(parents=True, exist_ok=True)
+        for index, code in enumerate(codes):
+            (dump_flex_code / f"kernel-{index}.py").write_text(code)
+        print(
+            json.dumps(
+                {"generated_code_files": len(codes), "directory": str(dump_flex_code)}
+            ),
+            flush=True,
         )
-        for row, anchor in enumerate(anchors)
-    ]
 
     def compare(mode):
         actual = serving.forward(
@@ -88,7 +117,13 @@ def probe(
         print(json.dumps(report), flush=True)
 
     compare("production")
-    with patch.object(serving.backend, "enable_deterministic", True):
+    with ExitStack() as stack:
+        for layer in serving.model.layers:
+            stack.enter_context(
+                patch.object(layer.self_attn.attn, "use_target_kv_attention", False)
+            )
+        compare("legacy_two_stage_extend")
+        stack.enter_context(patch.object(serving.backend, "enable_deterministic", True))
         compare("production_unified_extend")
         if probe_log2:
             with patch.object(
@@ -175,6 +210,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--target-path", required=True)
+    parser.add_argument("--dump-flex-code", type=Path)
     parser.add_argument(
         "--probe-log2",
         action="store_true",
@@ -203,7 +239,11 @@ def main():
         patch.object(
             parity,
             "check_fixed_input_parity",
-            partial(probe, probe_log2=args.probe_log2),
+            partial(
+                probe,
+                probe_log2=args.probe_log2,
+                dump_flex_code=args.dump_flex_code,
+            ),
         ),
         patch(
             "transformers.models.qwen3.modeling_qwen3.Qwen3Model.forward",

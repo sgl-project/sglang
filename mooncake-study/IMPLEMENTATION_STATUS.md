@@ -33,7 +33,7 @@ it does not redefine the goal as the modules already implemented.
 | Publication | Catalog producer client, manifest-last writer, durable metadata journal, fenced replay | Lost responses, failed puts, stale fences, missing/corrupt objects and identical retries tested; actual Catalog service is SpecForge-owned |
 | Runtime collection | Opt-in CLI config, capability gates, request ledger, prefill/decode hooks, invalidation and counters | Six real Qwen3-0.6B requests published through Mooncake; ordinary and CUDA graph replay executions pass |
 | Real model identity/parity | Weight/tokenizer artifact digests, actual selected-layer geometry, K norm and RoPE | Captured KV and teacher scores match online tensors exactly; full-vocabulary LSE matches within 1e-5; HF teacher logits pass numerical comparison, but cross-engine KV equivalence is not certified |
-| Draft serving | Explicit KV-input architecture, contract, encoder, incremental injector and invalidation | Real Qwen3 target plus synthetic KV draft passes ordinary/batched/graph generation and per-layer projected-KV checks; full SpecForge backbone/logit parity remains open |
+| Draft serving | Explicit KV-input architecture, contract, encoder, incremental injector and invalidation | Real Qwen3 target plus synthetic KV draft passes ordinary/batched/graph generation; retained BF16 fixture passes full backbone/logit parity against pinned FlexAttention, with production exporter and trained-model validation still open |
 | Speculative collection | Static DSpark raw verify ticket, commit mapping and terminal truncation | Actual KV-input draft requests publish and read back through Mooncake in ordinary and graph modes; see evidence below |
 | Overlap collection | AR lookahead and static DSpark pending-token ledgers, capacity boundary and terminal trimming | Real ordinary/graph requests, prefix reuse, delayed grammar and exact KV/teacher readback pass; see per-mode evidence below |
 | Deployment coverage | Partial | TP/PP, non-static speculative verify, PD, RDMA and workload SLO gates remain open |
@@ -668,7 +668,7 @@ implementation also partitions KV into independent reductions; aligning the
 remaining partition/reduction behavior still requires work. Neither a different
 training backend nor a smaller error count constitutes a passed gate.
 
-The complete numerical records, current failed serving report, fixture/source
+The complete numerical records, this experiment's failed SDPA report, fixture/source
 digests and attention-dump digest are retained in
 [target-kv-attention-comparison.json](experiments/target-kv-attention-comparison.json).
 The sampled Q/K/V dump remains in the H100 lab fixtures, outside Git.
@@ -694,15 +694,103 @@ Ruff, JSON validation and patch applicability checks pass. The original
 worktree's staged-diff digest is unchanged; all experiments have terminated and
 the resident H100 resumed its idle workload.
 
-The serving implementation remains at the previous verified numerical policy.
-P8, P9 and P10 remain open; these experiments add no topology or SLO evidence.
+At that point the serving implementation remained at the previous numerical
+policy. The subsequent logical-order kernel below resolves the retained fixture's
+FlexAttention comparison. P8, P9 and P10 still need their remaining deliverables.
+
+## Logical-Order KV Draft Attention
+
+The generated reference kernels from
+`01790822364547542737-f27603573da7` establish `BLOCK_M=16`, `BLOCK_N=64`,
+two warps and one pipeline stage for the retained three-query/eight-KV-head
+case. Although `SPLIT_KV=32`, the default sparse block size is `2**30`:
+the first split contains all valid KV and the other splits are empty. Splitting
+the actual context length into 32 pieces did not reproduce the reference.
+With one logical KV stream and two warps, diagnostic substitution reached exact
+equality (`01790822773838850981-1f3a5479ff01`).
+
+The final production implementation is
+`python/sglang/kernels/ops/speculative/dspark/target_kv_attention.py`, selected
+only by `TargetKVAttention` through the normal Triton backend. A single kernel
+reads existing prefix/block indices directly and preserves the logical 64-token
+tiles across their boundary. There are no copied KV tensors, merged-index
+allocations, split scratch buffers or reference-attention replacements.
+It validates tensor/index metadata and rejects unsupported attention modifiers.
+Existing attention paths retain their selection.
+
+`01790823641652995870-6ef7c685763a` runs the actual, unpatched serving gate on
+the retained Qwen3-0.6B BF16 fixture. Both layers, final hidden, base logits and
+all 1,367,424 corrected logits are **exactly equal** to the pinned SpecForge
+FlexAttention reference; `rtol=0.03, atol=0.03` is unchanged. Cached CE+TV128
+backpropagation has finite, nonzero encoder/backbone/Markov gradients and frozen
+shared weights. Target decoder execution remains forbidden. The resulting
+`validation/parity.json` hash is
+`994fb020c41eb7db4fb2adc99764ccce64dc81af49cf12e383400c4c142fb0e1`.
+
+`01790823641338941244-db46a88dfb98` passes 159 tests and 121 subtests in
+38.08s. The four new kernel tests cover FP16/BF16/FP32, strided tensors,
+non-contiguous slots, zero-length rows/KV, non-power-of-two GQA, dimensions
+64/80/128/256, widths up to 64, KV length 8193, invalid metadata and CUDA graph
+replay with modified lengths/slots/Q/V. Separate and combined slot indices give
+bit-exact output across prefix lengths 0/63/64/65/159/160. Existing capture,
+injection, parity, normalization, graph-helper and legacy DSpark tests also pass.
+
+The first final runtime run (`01790823725746885359-973f1a4a8ef0`) failed
+on post-producer-exit Mooncake readback with SDK `LEASE_EXPIRED (-707)`.
+The log explicitly reports `lease_expired_before_data_transfer_completed`.
+The runtime test had forced a 100ms read lease; the installed master's
+`--helpfull` reports a 5000ms default. This is separate from the objects'
+hard pins and Catalog retention. The runtime test now uses the default read
+lease. Production read error handling is unchanged: it rejects the result
+and retains the destination in quarantine. An explicit `-707` regression,
+`01790824208583279715-b47abbbda7e1`, passes 7 tests / 4 subtests in 10.03s.
+
+The final runtime rerun, `01790824208934763806-34c2884f502f`, passes in
+333.872s with 66 completed snapshots: six synchronous AR, 18 overlap AR,
+18 synchronous DSpark, 22 overlap DSpark and two adaptive-admission samples.
+It includes ordinary/graph modes, exact online KV/teacher observations,
+producer-exit readback, prefix reuse, batch padding, terminal truncation and
+streamed cancellation. The test still uses a Catalog double and local TCP;
+it adds no cross-node RDMA or production Catalog evidence.
+
+`01790823797275492601-64120bb55cdf` also verifies the updated diagnostic:
+production has zero error while the old two-stage/unified paths retain
+24,668/1,762 failing corrected logits on the same FlexAttention inputs. The
+diagnostic does not overwrite the production gate report.
+
+`01790823641976918474-3c0d5b61ec3c` measures identical randomly paged BF16
+inputs under CUDA graph replay, with 16 query heads, 8 KV heads and dimension
+128. These are attention-only times on the resident H100:
+
+| Batch / Prefix / Block | Old two-stage kernel (us) | Logical KV kernel (us) |
+| --- | ---: | ---: |
+| 1 / 160 / 3 | 14.27 | 9.38 |
+| 4 / 160 / 3 | 14.60 | 9.48 |
+| 1 / 1024 / 3 | 58.24 | 45.70 |
+| 4 / 1024 / 16 | 57.63 | 51.07 |
+| 1 / 8192 / 3 | 497.84 | 419.34 |
+| 16 / 8192 / 16 | 1035.15 | 513.39 |
+
+This does not establish end-to-end throughput, capture overhead or the P10 SLO.
+The checkpoint still has synthetic encoder/Markov weights and copied target
+layers. Exactness is demonstrated for this fixture/runtime/reference, not for
+SDPA/cuDNN, arbitrary checkpoints or all FlexAttention kernel configurations.
+Production exporter compatibility and trained-draft quality remain open.
+
+The serving report, generated-code parameters/source digests, regression result
+and raw timing measurements are retained in
+[target-kv-flex-parity.json](experiments/target-kv-flex-parity.json).
+New modules pass Ruff; the modified legacy files add no diagnostics relative
+to HEAD. Formatting and `git diff --check` pass. All experiment jobs have
+terminated and the resident H100 has resumed its idle workload. The original
+worktree's staged-diff digest is unchanged.
 
 ## Next Implementation
 
 1. Broaden real-request coverage to prefill graphs, real retraction, cache eviction,
    target weight replacement and saturated backpressure.
-2. Resolve P8's real BF16 backbone/logit parity failure, complete production
-   exporter compatibility and artifact/quality validation. Broaden the runtime
+2. Extend P8's passing retained BF16 fixture to production-exported and trained
+   checkpoints, complete exporter compatibility and artifact/quality validation. Broaden the runtime
    lifecycle tests to cache eviction and real request retraction.
 3. Complete P9's topology work: TP/PP, non-static speculative layouts,
    PD transfer and cross-node RDMA. Existing capability gates do
