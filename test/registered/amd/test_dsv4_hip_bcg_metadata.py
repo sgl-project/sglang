@@ -10,6 +10,7 @@ from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
     DeepseekV4MultiStepBackend,
     DSV4AttnMetadata,
     DSV4Metadata,
+    DSV4RawDSparkDraftMetadata,
     UnifiedKvMetadata,
     _match_num_queries,
 )
@@ -27,6 +28,12 @@ MAX_CONTEXT = 512
 # Block slots (out_cache_loc) live past every req_to_token slot.
 OUT_LOC_BASE = NUM_REQ_SLOTS * MAX_CONTEXT + 1
 NUM_FULL_SLOTS = OUT_LOC_BASE + 4096
+# Module flag picking how the DSpark draft bucket is prepared out of graph: raw
+# inputs materialized in init_forward_metadata_in_graph, or eager DSV4Metadata.
+_RAW_DSPARK_FLAG = (
+    "sglang.srt.layers.attention.deepseek_v4_backend_hip_radix."
+    "_DSPARK_DRAFT_RAW_METADATA"
+)
 
 
 def _make_backend(*, block_size, device, is_dspark_draft=True, low_ratios=()):
@@ -520,10 +527,15 @@ class TestDsparkDraftBlockWindowHip(CustomTestCase):
         """A TARGET_VERIFY capture on the DSpark draft must build the block window, and
         a replay must refresh it in place for new lengths and slots, whether or not the
         replay batch carries a CPU mirror of the lengths (the draft-window bucket must
-        not read seq_lens_cpu)."""
-        for cpu_mirror in (True, False):
-            with self.subTest(cpu_mirror=cpu_mirror):
-                self._check_block_window_replay(cpu_mirror=cpu_mirror)
+        not read seq_lens_cpu), and whether the bucket holds eager metadata or raw
+        inputs materialized in the graph."""
+        for raw in (False, True):
+            for cpu_mirror in (True, False):
+                with (
+                    self.subTest(raw=raw, cpu_mirror=cpu_mirror),
+                    mock.patch(_RAW_DSPARK_FLAG, raw),
+                ):
+                    self._check_block_window_replay(cpu_mirror=cpu_mirror, raw=raw)
 
     def test_dsv4_draft_keeps_the_causal_verify_indices(self):
         """Only V4.1's DSpark draft takes the block window; DSv4's (V4-Pro) keeps main's."""
@@ -532,7 +544,7 @@ class TestDsparkDraftBlockWindowHip(CustomTestCase):
         backend.is_dsv41 = False
         self.assertFalse(backend._uses_dspark_draft_window())
 
-    def _check_block_window_replay(self, *, cpu_mirror):
+    def _check_block_window_replay(self, *, cpu_mirror, raw):
         block = 3
         bs = 2
         backend = _make_backend(block_size=block, device=self.device)
@@ -567,7 +579,10 @@ class TestDsparkDraftBlockWindowHip(CustomTestCase):
         capture_batch = make_batch([1, 1], OUT_LOC_BASE, cpu_extended=False)
         backend.init_forward_metadata_out_graph(capture_batch, in_capture=True)
         captured = backend.forward_metadata
-        core = captured.core_attn_metadata
+        if raw:
+            self.assertIsInstance(captured, DSV4RawDSparkDraftMetadata)
+            backend.init_forward_metadata_in_graph(capture_batch)
+        core = backend.forward_metadata.core_attn_metadata
         width = core.swa_page_indices.shape[1]
 
         replay_batch = make_batch([150, 7], OUT_LOC_BASE + 100, cpu_extended=True)
@@ -576,6 +591,11 @@ class TestDsparkDraftBlockWindowHip(CustomTestCase):
             replay_batch.seq_lens_sum = None
         backend.init_forward_metadata_out_graph(replay_batch)
         self.assertIs(backend.forward_metadata, captured)
+        if raw:
+            # The raw bucket only carries inputs; the graph rebuilds the window.
+            backend.init_forward_metadata_in_graph(replay_batch)
+            core = backend.forward_metadata.core_attn_metadata
+            width = core.swa_page_indices.shape[1]
         for b, p in enumerate([150, 7]):
             row, ctx = _expected_block_row(
                 backend,
@@ -596,6 +616,13 @@ class TestDsparkDraftBlockWindowHip(CustomTestCase):
 class TestAiterSparseLengthFoldPerStep(CustomTestCase):
     """The length-fold cache must not outlive the forward: a TARGET_VERIFY bucket keeps
     one core object across steps, so the warmup's lists would be replayed."""
+
+    def setUp(self):
+        # Only an eager-built bucket keeps its core across steps; the raw path
+        # materializes a fresh one inside the graph every forward.
+        patcher = mock.patch(_RAW_DSPARK_FLAG, False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_graph_bucket_refold_follows_the_new_lengths(self):
         from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
