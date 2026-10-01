@@ -11,6 +11,7 @@ from typing import Optional, TypeGuard
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.host_memory import available_host_memory_bytes
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.mem_cache.pool_host.common import (
@@ -164,6 +165,9 @@ class HostKVCache(abc.ABC):
     dcp_size = 1
     dcp_rank = 0
     shared_allocation_domain = None
+    # Pages per direct-I/O D2H backup batch; 0 issues each backup as one batch.
+    d2h_issue_chunk_pages = 0
+    _d2h_issue_chunks_logged = False
     stores_page_envelope = False
     # Names this pool's page byte format in storage keys when it has one of its
     # own, so pages persisted in another format miss instead of loading.
@@ -200,6 +204,9 @@ class HostKVCache(abc.ABC):
         self.device = device
         self.allocator = get_allocator_from_storage(allocator_type)
         self.can_use_write_back_jit = False
+        self.d2h_issue_chunk_pages = max(
+            0, envs.SGLANG_HICACHE_D2H_ISSUE_CHUNK_PAGES.get()
+        )
 
         self.dtype = device_pool.store_dtype
         self.size_per_token = self.get_size_per_token()
@@ -527,6 +534,34 @@ class HostKVCache(abc.ABC):
     def logical_page_size(self) -> int:
         """Page size in that same logical space (the widened DCP page)."""
         return self.page_size * self.dcp_size
+
+    def d2h_issue_chunks(
+        self,
+        device_indices: torch.Tensor,
+        host_indices: torch.Tensor,
+        *,
+        slots_per_page: int,
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """(device, host) index slices of d2h_issue_chunk_pages pages, in order;
+        one pair holding the inputs themselves when unset or small."""
+        chunk = self.d2h_issue_chunk_pages * slots_per_page
+        num_slots = device_indices.numel()
+        if chunk <= 0 or num_slots <= chunk:
+            return [(device_indices, host_indices)]
+        if not self._d2h_issue_chunks_logged:
+            self._d2h_issue_chunks_logged = True
+            logger.info(
+                "HiCache D2H issue chunking engaged (SGLANG_HICACHE_D2H_ISSUE_CHUNK_PAGES=%d): "
+                "first split backup is %d pages in %d batches (%s)",
+                self.d2h_issue_chunk_pages,
+                num_slots // slots_per_page,
+                -(-num_slots // chunk),
+                type(self).__name__,
+            )
+        return [
+            (device_indices[start : start + chunk], host_indices[start : start + chunk])
+            for start in range(0, num_slots, chunk)
+        ]
 
     @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:

@@ -142,6 +142,7 @@ class DSAIndexerPoolHost(HostKVCache):
         self.device_pool = device_pool
         self.page_size = anchor_host.page_size
         self.layout = anchor_host.layout
+        self.d2h_issue_chunk_pages = anchor_host.d2h_issue_chunk_pages
         self.pin_memory = pin_memory
         self.device = device
         self.allocator = get_allocator_from_storage(allocator_type)
@@ -528,13 +529,16 @@ class DSAIndexerPoolHost(HostKVCache):
                     page_size=1,
                 )
             elif self.layout == "page_first_direct":
-                transfer_kv_all_layer_direct_lf_pf(
-                    src_ptrs=self.packed_device_index_buffers,
-                    dst_ptrs=[self.index_k_with_scale_buffer],
-                    src_indices=device_page_indices,
-                    dst_indices=host_page_indices,
-                    page_size=1,
-                )
+                for chunk_device_indices, chunk_host_indices in self.d2h_issue_chunks(
+                    device_page_indices, host_page_indices, slots_per_page=1
+                ):
+                    transfer_kv_all_layer_direct_lf_pf(
+                        src_ptrs=self.packed_device_index_buffers,
+                        dst_ptrs=[self.index_k_with_scale_buffer],
+                        src_indices=chunk_device_indices,
+                        dst_indices=chunk_host_indices,
+                        page_size=1,
+                    )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         else:

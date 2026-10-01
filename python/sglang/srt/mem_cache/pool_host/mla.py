@@ -979,13 +979,16 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     page_size=self.page_size,
                 )
             elif self.layout == "page_first_direct":
-                transfer_kv_all_layer_direct_lf_pf(
-                    src_ptrs=device_kv_buffers,
-                    dst_ptrs=[self.kv_buffer],
-                    src_indices=device_indices,
-                    dst_indices=host_indices,
-                    page_size=self.page_size,
-                )
+                for chunk_device_indices, chunk_host_indices in self.d2h_issue_chunks(
+                    device_indices, host_indices, slots_per_page=self.page_size
+                ):
+                    transfer_kv_all_layer_direct_lf_pf(
+                        src_ptrs=device_kv_buffers,
+                        dst_ptrs=[self.kv_buffer],
+                        src_indices=chunk_device_indices,
+                        dst_indices=chunk_host_indices,
+                        page_size=self.page_size,
+                    )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
