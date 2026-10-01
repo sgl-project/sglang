@@ -2,6 +2,7 @@ import asyncio
 import pickle
 import threading
 import unittest
+from contextlib import ExitStack, contextmanager
 from http import HTTPStatus
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -1454,9 +1455,10 @@ class TestEncoderDelivery(CustomTestCase):
             ctx = self._global_cache_context()
 
             hit_hashes, failed = encoder._prefetch_global_cache_hits(ctx, [0, 1])
-            fallback_indices = await encoder._wait_global_cache_prefetch(
-                ctx, [0, 1], hit_hashes, failed
-            )
+            with ExitStack() as retained_entries:
+                fallback_indices = await encoder._wait_global_cache_prefetch(
+                    ctx, [0, 1], hit_hashes, failed, retained_entries
+                )
 
             self.assertTrue(failed)
             self.assertEqual(hit_hashes, [])
@@ -1465,6 +1467,182 @@ class TestEncoderDelivery(CustomTestCase):
                 encoder._broadcast_global_cache_mask.call_args.args[0],
                 torch.ones(2, dtype=torch.int32),
             )
+
+        asyncio.run(run())
+
+    def test_global_cache_hits_are_retained_during_staging_and_assembly(self):
+        async def run(keep_on_gpu, error):
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder.rank = 0
+            ready = {"hash-0"}
+            retained = set()
+            events = []
+
+            @contextmanager
+            def retain_ready_entries(hashes):
+                held = ready.intersection(hashes)
+                retained.update(held)
+                events.append("retain")
+                try:
+                    yield held
+                finally:
+                    retained.difference_update(held)
+                    events.append("release")
+
+            def store(*args):
+                # Model the real allocator's eviction of an unpinned hit when
+                # a newly encoded item needs its page. CUDA copies are excluded.
+                if "hash-0" not in retained:
+                    ready.discard("hash-0")
+                events.append("stage")
+                return []
+
+            def assemble(*args):
+                self.assertIn("hash-0", ready)
+                self.assertIn("hash-0", retained)
+                events.append("assemble")
+                if error is not None:
+                    raise error()
+                return torch.ones(4, 4)
+
+            encoder.mm_global_cache = SimpleNamespace(
+                batch_is_exist=AsyncMock(
+                    return_value=[True, False] if keep_on_gpu else [True, True]
+                ),
+                prefetch=Mock(),
+                check_prefetch_progress=lambda req_id: True,
+                has_local_embedding=lambda key: key in ready,
+                retain_ready_entries=retain_ready_entries,
+                store_to_pool_async=store,
+            )
+            encoder._broadcast_global_cache_mask = Mock(
+                side_effect=lambda mask: events.append("broadcast")
+            )
+            encoder._encode_missing = Mock(return_value=[torch.ones(2, 4)])
+            encoder._assemble_global_cache_gpu = assemble
+            encoder._assemble_global_cache_cpu = assemble
+            encoder._launch_global_cache_insert = Mock()
+            ctx = self._global_cache_context()
+            ctx.mm_feature = None
+            ctx.get_feature_fn = None
+            if error is None:
+                result = await encoder._compute_global_cache_embedding(
+                    ctx, keep_on_gpu=keep_on_gpu
+                )
+                torch.testing.assert_close(result, torch.ones(4, 4))
+            else:
+                with self.assertRaises(error):
+                    await encoder._compute_global_cache_embedding(
+                        ctx, keep_on_gpu=keep_on_gpu
+                    )
+            self.assertFalse(retained)
+            self.assertEqual(events.count("broadcast"), 2)
+            self.assertLess(events.index("retain"), events.index("stage"))
+            self.assertLess(events.index("assemble"), events.index("release"))
+            self.assertEqual(encoder._encode_missing.call_args.args[2], [1])
+
+        for keep_on_gpu in (False, True):
+            for error in (None, RuntimeError, asyncio.CancelledError):
+                with self.subTest(keep_on_gpu=keep_on_gpu, error=error):
+                    asyncio.run(run(keep_on_gpu, error))
+
+    def test_global_cache_broadcast_error_releases_retained_hits(self):
+        async def run():
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder.rank = 0
+            retained = set()
+            events = []
+
+            @contextmanager
+            def retain_ready_entries(hashes):
+                retained.update(hashes)
+                events.append("retain")
+                try:
+                    yield set(hashes)
+                finally:
+                    retained.clear()
+                    events.append("release")
+
+            encoder.mm_global_cache = SimpleNamespace(
+                batch_is_exist=AsyncMock(return_value=[True, True]),
+                prefetch=Mock(),
+                check_prefetch_progress=lambda req_id: True,
+                retain_ready_entries=retain_ready_entries,
+                has_local_embedding=lambda key: True,
+            )
+            encoder._broadcast_global_cache_mask = Mock(
+                side_effect=[None, RuntimeError("broadcast failed")]
+            )
+            with self.assertRaisesRegex(RuntimeError, "broadcast failed"):
+                await encoder._compute_global_cache_embedding(
+                    self._global_cache_context(), keep_on_gpu=True
+                )
+            self.assertEqual(events, ["retain", "release"])
+            self.assertFalse(retained)
+            self.assertEqual(encoder._broadcast_global_cache_mask.call_count, 2)
+
+        asyncio.run(run())
+
+    def test_global_cache_hit_evicted_before_retention_falls_back(self):
+        async def run():
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder.rank = 0
+            ready = {"hash-0", "hash-1"}
+            retained = set()
+
+            def finish_prefetch(req_id):
+                # A hit may disappear before the atomic READY check and retain.
+                ready.remove("hash-1")
+                return True
+
+            @contextmanager
+            def retain_ready_entries(hashes):
+                retained.update(ready.intersection(hashes))
+                try:
+                    yield set(retained)
+                finally:
+                    retained.clear()
+
+            encoder.mm_global_cache = SimpleNamespace(
+                check_prefetch_progress=finish_prefetch,
+                retain_ready_entries=retain_ready_entries,
+            )
+            encoder._broadcast_global_cache_mask = Mock()
+            ctx = self._global_cache_context()
+            with ExitStack() as retained_entries:
+                fallback = await encoder._wait_global_cache_prefetch(
+                    ctx, [0, 1], ctx.str_mm_hashes, False, retained_entries
+                )
+                self.assertEqual(fallback, [1])
+                self.assertEqual(retained, {"hash-0"})
+                torch.testing.assert_close(
+                    encoder._broadcast_global_cache_mask.call_args.args[0],
+                    torch.tensor([0, 1], dtype=torch.int32),
+                )
+            self.assertFalse(retained)
+            encoder._broadcast_global_cache_mask.assert_called_once()
+
+        asyncio.run(run())
+
+    def test_global_cache_non_primary_rank_does_not_retain_local_entries(self):
+        async def run():
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder.rank = 1
+            encoder.mm_global_cache = None
+            masks = iter(([1, 0], [0, 0]))
+            encoder._broadcast_global_cache_mask = Mock(
+                side_effect=lambda mask: mask.copy_(torch.tensor(next(masks)))
+            )
+            encoder._encode_missing = Mock(return_value=[torch.ones(2, 4)])
+            ctx = self._global_cache_context()
+            ctx.mm_feature = None
+            ctx.get_feature_fn = None
+            result = await encoder._compute_global_cache_embedding(
+                ctx, keep_on_gpu=True
+            )
+            self.assertIsNone(result)
+            self.assertEqual(encoder._broadcast_global_cache_mask.call_count, 2)
+            self.assertEqual(encoder._encode_missing.call_args.args[2], [1])
 
         asyncio.run(run())
 
