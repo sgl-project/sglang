@@ -226,7 +226,6 @@ class TestDSparkPPOutput(CustomTestCase):
         payloads = []
         scheduler = SimpleNamespace(
             _pp_spec_relay=False,
-            pp_dspark_draft=SimpleNamespace(on_relayed_idle=lambda *_: None),
             pp_group=SimpleNamespace(is_first_rank=False),
             future_map=SimpleNamespace(
                 stash=lambda indices, value: payloads.append(value)
@@ -248,8 +247,6 @@ class TestDSparkPPOutput(CustomTestCase):
                     bonus_tokens=tokens, new_seq_lens=batch.seq_lens
                 ),
                 logits_output=None,
-                pp_dspark_projected_context=None,
-                pp_dspark_draft_idle=False,
             ),
             batch,
         )

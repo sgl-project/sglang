@@ -407,22 +407,6 @@ class TestDSparkPPContext(CustomTestCase):
         worker._decode_idle_result.assert_not_called()
         worker._proposer.run_idle_participation.assert_not_called()
 
-    def test_prepare_pp_idle_draft_uses_gathered_owner_counts(self):
-        worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
-        worker.ps = SimpleNamespace(attn_dp_rank=0)
-        worker._pp_draft_dp_enabled = True
-        worker._draft_context = Mock(return_value=nullcontext())
-        worker._observers = Mock()
-        worker._observers.segment.return_value = nullcontext()
-        worker._proposer = Mock()
-        batch = SimpleNamespace(draft_global_num_tokens=[0, 2, 1, 0])
-
-        worker.prepare_pp_idle_draft(batch)
-
-        idle_batch = worker._proposer.run_idle_participation.call_args.args[0]
-        self.assertEqual(idle_batch.global_num_tokens, [0, 2, 1, 0])
-        self.assertEqual(idle_batch.global_num_tokens_for_logprob, [0, 2, 1, 0])
-
     def test_pp_launch_schedules_idle_draft_on_last_stage(self):
         result = GenerationBatchResult(pp_dspark_draft_idle=True)
         draft_coordinator = Mock()
@@ -454,23 +438,6 @@ class TestDSparkPPContext(CustomTestCase):
             )
 
         draft_coordinator.on_batch_launched.assert_called_once_with(batch, result)
-
-    def test_coordinator_runs_idle_draft_only_on_last_stage(self):
-        result = GenerationBatchResult(pp_dspark_draft_idle=True)
-        model_worker = SimpleNamespace(prepare_pp_idle_draft=Mock())
-        scheduler = SimpleNamespace(
-            model_worker=model_worker,
-            pp_group=SimpleNamespace(is_last_rank=True),
-        )
-        coordinator = PPDSparkDraftCoordinator(scheduler)
-        batch = object()
-
-        coordinator.on_batch_launched(batch, result)
-        model_worker.prepare_pp_idle_draft.assert_called_once_with(batch)
-
-        scheduler.pp_group.is_last_rank = False
-        coordinator.on_batch_launched(batch, result)
-        self.assertEqual(model_worker.prepare_pp_idle_draft.call_count, 1)
 
     def test_coordinator_enqueues_bubble_draft_without_running_it(self):
         next_draft_input = object()

@@ -945,12 +945,15 @@ class SchedulerPPMixin:
                     result.next_verify_top_scores_index
                 )
 
-        if result.pp_dspark_projected_context is not None:
+        pp_dspark_projected_context = getattr(
+            result, "pp_dspark_projected_context", None
+        )
+        if pp_dspark_projected_context is not None:
             tensor_dict["dspark_identities"] = [
                 identity.to_wire()
                 for identity in result.pp_dspark_commit_state.identities
             ]
-            tensor_dict["dspark_projected_context"] = result.pp_dspark_projected_context
+            tensor_dict["dspark_projected_context"] = pp_dspark_projected_context
             tensor_dict["dspark_new_seq_lens"] = result.new_seq_lens
             tensor_dict["dspark_bonus_tokens"] = result.next_draft_input.bonus_tokens
             if result.accept_lens is not None:
@@ -967,7 +970,7 @@ class SchedulerPPMixin:
                 tensor_dict["dspark_block_accept_lens"] = result.block_accept_lens
                 if result.cap_lens is not None:
                     tensor_dict["dspark_cap_lens"] = result.cap_lens
-        elif result.pp_dspark_draft_idle:
+        elif getattr(result, "pp_dspark_draft_idle", False):
             tensor_dict["dspark_draft_idle"] = result.next_token_ids.new_ones(
                 (1,), dtype=torch.uint8
             )
@@ -976,7 +979,7 @@ class SchedulerPPMixin:
         # output to fill PD auxiliary buffers.
         draft_input = result.next_draft_input
         if (
-            result.pp_dspark_projected_context is None
+            pp_dspark_projected_context is None
             and draft_input is not None
             and not batch.spec_algorithm.is_dspark()
             and draft_input.topk_p is not None
