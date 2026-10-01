@@ -763,10 +763,15 @@ class ExecMoe(msgspec.Struct):
         "Select the mode when enable DeepEP or MoriEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
     ] = "auto"
     mscclpp_mode: A[
-        Literal["low_latency"],
-        "Select the mode for the `mscclpp` MoE A2A backend. Only `low_latency` "
-        "is currently supported.",
-    ] = "low_latency"
+        Literal["latency", "throughput"],
+        "Select the transport mode for the `mscclpp` MoE A2A backend. "
+        "`throughput` is reserved for future support.",
+    ] = "latency"
+    mscclpp_ep_layout: A[
+        Literal["rank_major", "expert_major", "token_major"],
+        "Select the MSCCL++ EP dispatch layout. "
+        "`token_major` is reserved for future throughput support.",
+    ] = "expert_major"
     fuseep_mode: A[
         Literal[1, 2],
         "Select the mode when enable Ascend FuseEP MoE, 1 -> dispatch_gmm_combine_decode is executed；2 -> dispatch_ffn_combine is executed (support hybrid deployment when 2).",

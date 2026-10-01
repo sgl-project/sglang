@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
 from typing import TYPE_CHECKING, ClassVar, Optional
 
 import torch
@@ -11,13 +10,15 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.layers.moe.utils import MSCCLPPEPLayout, MSCCLPPMode
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 from .utils import (
     MSCCLPPCombineInputBase,
     MSCCLPPDispatchOutputBase,
+    MSCCLPPExpertMajorLLCombineInput,
     MSCCLPPExpertMajorLLDispatchOutput,
-    MSCCLPPOutputLayout,
+    MSCCLPPRankMajorLLCombineInput,
     MSCCLPPRankMajorLLDispatchOutput,
 )
 
@@ -66,7 +67,8 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
                 int,
                 int,
                 int,
-                MSCCLPPOutputLayout,
+                MSCCLPPEPLayout,
+                bool,
                 Optional[tuple[int, int]],
             ],
             tuple[object, object, Optional[torch.Tensor], int],
@@ -134,7 +136,8 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
         hidden_size: int,
         router_topk: int,
         allocation_capacity: int,
-        output_layout: MSCCLPPOutputLayout,
+        output_layout: MSCCLPPEPLayout,
+        enable_direct_send: bool,
         num_blocks: Optional[tuple[int, int]],
     ) -> tuple[object, object, Optional[torch.Tensor], int]:
         key = (
@@ -145,6 +148,7 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
             router_topk,
             allocation_capacity,
             output_layout,
+            enable_direct_send,
             num_blocks,
         )
         cached = cls._shared_resources.get(key)
@@ -175,27 +179,27 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
                 "the new mscclpp.ep API build."
             )
         native_output_layout = getattr(DispatchLayout, output_layout.name)
-        moe_comm = MoECommunicator(
-            MoECommunicatorConfig(
-                comm=ep_group,
-                device=torch.cuda.current_device(),
-                num_experts=num_experts,
-                num_local_experts=num_local_experts,
-                local_expert_start=ep_group.my_rank * num_local_experts,
-                hidden_size=hidden_size,
-                topk=router_topk,
-                max_tokens_per_rank=allocation_capacity,
-                mode=MoEMode.LATENCY,
-                output_layout=native_output_layout,
-                invalid_token_expert_id=num_experts,
-                combine_mode=CombineMode.RANK_LOCAL_REDUCE,
-                num_blocks=num_blocks,
-            )
+        communicator_config = dict(
+            comm=ep_group,
+            device=torch.cuda.current_device(),
+            num_experts=num_experts,
+            num_local_experts=num_local_experts,
+            local_expert_start=ep_group.my_rank * num_local_experts,
+            hidden_size=hidden_size,
+            topk=router_topk,
+            max_tokens_per_rank=allocation_capacity,
+            mode=MoEMode.LATENCY,
+            output_layout=native_output_layout,
+            invalid_token_expert_id=num_experts,
+            num_blocks=num_blocks,
         )
+        if enable_direct_send:
+            communicator_config["combine_mode"] = CombineMode.DIRECT_SEND
+        moe_comm = MoECommunicator(MoECommunicatorConfig(**communicator_config))
         if not moe_comm.is_available():
             raise RuntimeError("MSCCL++ EP low-latency runtime is unavailable")
 
-        if output_layout == MSCCLPPOutputLayout.RANK_MAJOR:
+        if output_layout == MSCCLPPEPLayout.RANK_MAJOR:
             dispatch_output_buffer = moe_comm.get_dispatch_output_buffer()
         else:
             dispatch_output_buffer = torch.empty(
@@ -212,6 +216,15 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
         cls._shared_resources[key] = resources
         return resources
 
+    @staticmethod
+    def _resolve_enable_direct_send(
+        output_layout: MSCCLPPEPLayout,
+    ) -> bool:
+        enable_direct_send = envs.SGLANG_MSCCLPP_ENABLE_DIRECT_SEND.get()
+        if enable_direct_send and output_layout != MSCCLPPEPLayout.RANK_MAJOR:
+            raise ValueError("MSCCL++ direct send requires rank-major output")
+        return enable_direct_send
+
     def __init__(
         self,
         group: torch.distributed.ProcessGroup,
@@ -220,10 +233,10 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
         num_local_experts: int,
         hidden_size: int,
         params_dtype: torch.dtype,
-        output_layout: MSCCLPPOutputLayout = MSCCLPPOutputLayout.EXPERT_MAJOR,
+        output_layout: MSCCLPPEPLayout = MSCCLPPEPLayout.EXPERT_MAJOR,
     ):
-        if not isinstance(output_layout, MSCCLPPOutputLayout):
-            raise TypeError("output_layout must be an MSCCLPPOutputLayout")
+        if not isinstance(output_layout, MSCCLPPEPLayout):
+            raise TypeError("output_layout must be an MSCCLPPEPLayout")
         from sglang.srt.runtime_context import get_parallel, get_schedule
 
         parallel = get_parallel()
@@ -243,9 +256,10 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
         self.hidden_size = hidden_size
         self.params_dtype = params_dtype
         self.output_layout = output_layout
+        self.enable_direct_send = self._resolve_enable_direct_send(output_layout)
         self.overlap_enabled = (
-            output_layout == MSCCLPPOutputLayout.RANK_MAJOR
-            and envs.SGLANG_MSCCLPP_LL_OVERLAP.get()
+            output_layout == MSCCLPPEPLayout.RANK_MAJOR
+            and envs.SGLANG_MSCCLPP_ENABLE_SHARED_EXPERTS_OVERLAP.get()
         )
         num_blocks = (130, 32) if self.overlap_enabled else None
 
@@ -264,6 +278,7 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
             router_topk,
             self._allocation_capacity,
             output_layout,
+            self.enable_direct_send,
             num_blocks,
         )
 
@@ -309,7 +324,7 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
             output_buffer=self._dispatch_output_buffer,
             runtime_max_tokens_per_rank=(
                 active_capacity
-                if self.output_layout == MSCCLPPOutputLayout.RANK_MAJOR
+                if self.output_layout == MSCCLPPEPLayout.RANK_MAJOR
                 else None
             ),
         )
@@ -319,7 +334,7 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
             None if dispatch_out.quant is None else dispatch_out.quant.block_scales
         )
 
-        if self.output_layout == MSCCLPPOutputLayout.RANK_MAJOR:
+        if self.output_layout == MSCCLPPEPLayout.RANK_MAJOR:
             assert dispatch_out.topk_ids is not None
             assert dispatch_out.weights is not None
             assert dispatch_out.layout.num_tokens_per_rank is not None
@@ -334,6 +349,7 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
                     topk_output.router_logits,
                 ),
                 expert_output_buffer=dispatch_out.combine_input_buffer,
+                enable_direct_send=self.enable_direct_send,
             )
 
         masked_m = dispatch_out.layout.num_tokens_per_expert
@@ -346,21 +362,41 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
         )
 
     def combine(self, combine_input: MSCCLPPCombineInputBase) -> torch.Tensor:
-        assert (
-            self._combine_handle is not None
-        ), "MSCCL++ low-latency combine called before dispatch"
+        assert self._combine_handle is not None, (
+            "MSCCL++ low-latency combine called before dispatch"
+        )
 
         # The handle carries the layout-specific routing and scatter metadata.
-        combined_x = self._moe_comm.combine(
-            combine_input.hidden_states, self._combine_handle
-        )
+        if self.enable_direct_send:
+            if not isinstance(combine_input, MSCCLPPRankMajorLLCombineInput):
+                raise TypeError("MSCCL++ direct send requires rank-major combine input")
+            combined_x = self._moe_comm.combine(
+                combine_input.hidden_states,
+                self._combine_handle,
+                apply_router_weights=combine_input.apply_router_weights,
+            )
+        else:
+            if (
+                isinstance(combine_input, MSCCLPPRankMajorLLCombineInput)
+                and combine_input.apply_router_weights
+            ):
+                raise ValueError(
+                    "rank-local-reduce outputs already include router weights"
+                )
+            combined_x = self._moe_comm.combine(
+                combine_input.hidden_states,
+                self._combine_handle,
+                apply_router_weights=isinstance(
+                    combine_input, MSCCLPPExpertMajorLLCombineInput
+                ),
+            )
 
         self._combine_handle = None
         return combined_x
 
 
 class MSCCLPPDispatcher(BaseDispatcher):
-    """MSCCL++ low-latency expert-parallel dispatcher."""
+    """MSCCL++ expert-parallel dispatcher."""
 
     def __init__(
         self,
@@ -370,15 +406,23 @@ class MSCCLPPDispatcher(BaseDispatcher):
         num_local_experts: int,
         hidden_size: int,
         params_dtype: torch.dtype,
-        output_layout: MSCCLPPOutputLayout = MSCCLPPOutputLayout.EXPERT_MAJOR,
+        mode: MSCCLPPMode = MSCCLPPMode.LATENCY,
+        output_layout: MSCCLPPEPLayout = MSCCLPPEPLayout.EXPERT_MAJOR,
     ):
         super().__init__()
 
-        if not isinstance(output_layout, MSCCLPPOutputLayout):
-            raise TypeError("output_layout must be an MSCCLPPOutputLayout")
+        if not isinstance(mode, MSCCLPPMode):
+            raise TypeError("mode must be an MSCCLPPMode")
+        if not mode.is_latency():
+            raise NotImplementedError("MSCCL++ throughput mode is not implemented")
+        if not isinstance(output_layout, MSCCLPPEPLayout):
+            raise TypeError("output_layout must be an MSCCLPPEPLayout")
+        if output_layout is MSCCLPPEPLayout.TOKEN_MAJOR:
+            raise ValueError("MSCCL++ does not support token-major layout yet")
 
+        self.mode = mode
         self.output_layout = output_layout
-        self._low_latency_dispatcher = _MSCCLPPDispatcherImplLowLatency(
+        self._dispatcher = _MSCCLPPDispatcherImplLowLatency(
             group=group,
             router_topk=router_topk,
             num_experts=num_experts,
@@ -391,7 +435,7 @@ class MSCCLPPDispatcher(BaseDispatcher):
         self._active_dispatcher: Optional[_MSCCLPPDispatcherImplBase] = None
 
     def _resolve_dispatcher(self) -> _MSCCLPPDispatcherImplBase:
-        return self._low_latency_dispatcher
+        return self._dispatcher
 
     @staticmethod
     def clear_shared_resources() -> None:

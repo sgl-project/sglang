@@ -367,6 +367,13 @@ def _run_flashinfer_cutlass(
 
 
 class FlashInferCutlassRunnerCore(MoeRunnerCore):
+    """Non-fused FlashInfer CUTLASS runner interface.
+
+    This core allows dispatcher-specific pre/post-permute adapters to execute
+    FlashInfer CUTLASS through MoeRunner's dispatch-run-combine pipeline. It is
+    used by the MSCCL++ latency rank-major layout.
+    """
+
     def run(
         self,
         runner_input: FlashInferCutlassRunnerInput,
@@ -400,8 +407,8 @@ class FlashInferCutlassRunnerCore(MoeRunnerCore):
         return MoeRunnerBackend.FLASHINFER_CUTLASS
 
 
-@register_pre_permute("mscclpp_ll_rank_major", "flashinfer_cutlass")
-def pre_permute_mscclpp_rank_major_ll_to_flashinfer_cutlass(
+@register_pre_permute("mscclpp_latency_rank_major", "flashinfer_cutlass")
+def pre_permute_mscclpp_latency_rank_major_to_flashinfer_cutlass(
     dispatch_output: MSCCLPPRankMajorLLDispatchOutput,
     quant_info: MoeQuantInfo,
     runner_config: MoeRunnerConfig,
@@ -410,6 +417,12 @@ def pre_permute_mscclpp_rank_major_ll_to_flashinfer_cutlass(
     del quant_info, runner_config, running_state
     if dispatch_output.hidden_states.dim() != 2:
         raise ValueError("MSCCL++ rank-major dispatch tokens must be two-dimensional")
+
+    if dispatch_output.enable_direct_send:
+        raise NotImplementedError(
+            "The standard FlashInfer CUTLASS runner produces locally reduced "
+            "2-D output and cannot populate MSCCL++ direct-send route output"
+        )
 
     return FlashInferCutlassRunnerInput(
         hidden_states=dispatch_output.hidden_states,
@@ -420,8 +433,8 @@ def pre_permute_mscclpp_rank_major_ll_to_flashinfer_cutlass(
     )
 
 
-@register_post_permute("flashinfer_cutlass", "mscclpp_ll_rank_major")
-def post_permute_flashinfer_cutlass_to_mscclpp_rank_major_ll(
+@register_post_permute("flashinfer_cutlass", "mscclpp_latency_rank_major")
+def post_permute_flashinfer_cutlass_to_mscclpp_latency_rank_major(
     runner_output: FlashInferCutlassRunnerOutput,
     quant_info: MoeQuantInfo,
     runner_config: MoeRunnerConfig,

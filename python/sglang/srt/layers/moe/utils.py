@@ -285,13 +285,26 @@ class MSCCLPPMode(Enum):
     """MSCCL++ EP transport mode.
 
     The configuration surface is retained so additional modes can be added
-    without introducing a new flag. LL is the only supported mode today.
+    without introducing a new flag.
     """
 
-    LOW_LATENCY = "low_latency"
+    LATENCY = "latency"
+    THROUGHPUT = "throughput"
 
-    def is_low_latency(self) -> bool:
-        return self == MSCCLPPMode.LOW_LATENCY
+    def is_latency(self) -> bool:
+        return self == MSCCLPPMode.LATENCY
+
+    def is_throughput(self) -> bool:
+        return self == MSCCLPPMode.THROUGHPUT
+
+
+class MSCCLPPEPLayout(str, Enum):
+    """MSCCL++ EP dispatch layout."""
+
+    AUTO = "auto"
+    RANK_MAJOR = "rank_major"
+    EXPERT_MAJOR = "expert_major"
+    TOKEN_MAJOR = "token_major"
 
 
 class DispatcherOutputDtype(Enum):
@@ -478,6 +491,9 @@ def initialize_moe_config():
     )
     moe.deepep_mode = DeepEPMode(exec_moe.deepep_mode)
     moe.mscclpp_mode = MSCCLPPMode(exec_moe.mscclpp_mode)
+    moe.mscclpp_ep_layout = MSCCLPPEPLayout(exec_moe.mscclpp_ep_layout)
+    if moe.a2a_backend.is_mscclpp():
+        get_mscclpp_ep_layout()
     moe.deepep_config = exec_moe.deepep_config or ""
     moe.tbo_enabled = overlap.enable_two_batch_overlap
     moe.sbo_enabled = overlap.enable_single_batch_overlap
@@ -621,17 +637,24 @@ def get_deepep_mode() -> DeepEPMode:
 def get_mscclpp_mode() -> MSCCLPPMode:
     moe = get_flags().moe
     if moe.mscclpp_mode is None:
-        logger.warning("MSCCLPP_MODE is not initialized, using low-latency mode")
-        moe.mscclpp_mode = MSCCLPPMode.LOW_LATENCY
+        logger.warning("MSCCLPP_MODE is not initialized, using latency mode")
+        moe.mscclpp_mode = MSCCLPPMode.LATENCY
     return moe.mscclpp_mode
 
 
-def is_mscclpp_ll_rank_major() -> bool:
-    return (
-        get_moe_a2a_backend().is_mscclpp()
-        and get_mscclpp_mode().is_low_latency()
-        and get_moe_runner_backend().is_flashinfer_cutlass()
-    )
+def get_mscclpp_ep_layout() -> MSCCLPPEPLayout:
+    moe = get_flags().moe
+    if moe.mscclpp_ep_layout is None:
+        logger.warning(
+            "MSCCLPP_EP_LAYOUT is not initialized, using expert-major layout"
+        )
+        moe.mscclpp_ep_layout = MSCCLPPEPLayout.EXPERT_MAJOR
+    return moe.mscclpp_ep_layout
+
+
+def get_mscclpp_format_name() -> str:
+    """Return the registered permutation format for the active mode and layout."""
+    return f"mscclpp_{get_mscclpp_mode().value}_{get_mscclpp_ep_layout().value}"
 
 
 def get_deepep_config() -> str:

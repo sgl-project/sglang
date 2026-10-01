@@ -343,16 +343,16 @@ def post_permute_triton_to_standard(
     )
 
 
-@register_pre_permute("mscclpp_ll_expert_major", "triton")
-def pre_permute_mscclpp_expert_major_ll_to_triton(
+@register_pre_permute("mscclpp_latency_expert_major", "triton")
+def pre_permute_mscclpp_latency_expert_major_to_triton(
     dispatch_output: MSCCLPPExpertMajorLLDispatchOutput,
     quant_info: TritonMoeQuantInfo,
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> TritonRunnerInput:
-    """Bridge an MSCCL++ EP *low-latency* dispatch output into the Triton runner.
+    """Bridge an MSCCL++ EP latency dispatch output into the Triton runner.
 
-    The LL dispatch leaves a *padded expert-major* buffer ``hidden_states``
+    Latency dispatch leaves a *padded expert-major* buffer ``hidden_states``
     [num_local_experts, slots_per_expert, hidden] together with ``masked_m``
     [num_local_experts] (the number of valid slots per local expert). The Triton
     fused kernel is token-major, so we flatten the buffer to
@@ -363,7 +363,7 @@ def pre_permute_mscclpp_expert_major_ll_to_triton(
     != ``num_local_experts``), so the kernel skips the ``-1`` padding slots and
     processes every valid slot exactly once.
 
-    Weighting is the mirror image of the HT path: the MSCCL++ LL *combine*
+    Weighting is the mirror image of the HT path: the MSCCL++ latency *combine*
     applies the routing weights, so the GEMM here runs with **unit** weights. The
     kernel still applies ``routed_scaling_factor`` (per-slot, top_k=1), and the
     combine applies ``topk_weights``, so each is applied exactly once.
@@ -378,8 +378,8 @@ def pre_permute_mscclpp_expert_major_ll_to_triton(
 
     if hidden_states_scale is not None:
         raise NotImplementedError(
-            "MSCCL++ LL fp8 dispatch (pre-quantized activations) is not yet "
-            "supported by the Triton runner; use BF16 LL dispatch."
+            "MSCCL++ latency fp8 dispatch (pre-quantized activations) is not yet "
+            "supported by the Triton runner; use BF16 latency dispatch."
         )
 
     num_local_experts, slots_per_expert, hidden_dim = hidden_states.shape
@@ -405,7 +405,7 @@ def pre_permute_mscclpp_expert_major_ll_to_triton(
     # the ``-1`` padding value on-device so ``torch.where`` stays capture-safe.
     pad_id = expert_col.new_full((), -1)
     triton_topk_ids = torch.where(valid, expert_col, pad_id).reshape(-1, 1)
-    # Unit weights: the LL combine re-applies the real routing weights.
+    # Unit weights: latency combine re-applies the real routing weights.
     triton_topk_weights = torch.ones(
         (num_local_experts * slots_per_expert, 1),
         dtype=torch.float32,
@@ -437,7 +437,7 @@ def pre_permute_mscclpp_expert_major_ll_to_triton(
     running_state["down_config"] = down_config
     running_state["down_moe_use_tma"] = down_moe_use_tma
     running_state["up_moe_use_tma"] = up_moe_use_tma
-    running_state["mscclpp_ll_shape"] = (
+    running_state["mscclpp_latency_shape"] = (
         num_local_experts,
         slots_per_expert,
         hidden_dim,
@@ -453,14 +453,14 @@ def pre_permute_mscclpp_expert_major_ll_to_triton(
     )
 
 
-@register_post_permute("triton", "mscclpp_ll_expert_major")
-def post_permute_triton_to_mscclpp_expert_major_ll(
+@register_post_permute("triton", "mscclpp_latency_expert_major")
+def post_permute_triton_to_mscclpp_latency_expert_major(
     runner_output: TritonRunnerOutput,
     quant_info: TritonMoeQuantInfo,
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> MSCCLPPExpertMajorLLCombineInput:
-    """Package the Triton runner output for the MSCCL++ EP low-latency combine.
+    """Package the Triton runner output for the MSCCL++ EP latency combine.
 
     The kernel produced a flat [num_local_experts * slots_per_expert, hidden]
     output (one row per slot, ``routed_scaling_factor`` already applied, unit
@@ -475,7 +475,9 @@ def post_permute_triton_to_mscclpp_expert_major_ll(
         MSCCLPPExpertMajorLLCombineInput,
     )
 
-    num_local_experts, slots_per_expert, hidden_dim = running_state["mscclpp_ll_shape"]
+    num_local_experts, slots_per_expert, hidden_dim = running_state[
+        "mscclpp_latency_shape"
+    ]
     masked_output = runner_output.hidden_states.reshape(
         num_local_experts, slots_per_expert, hidden_dim
     )

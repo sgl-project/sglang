@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from enum import Enum
 from typing import Optional
 
 import torch
@@ -14,11 +13,6 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutputFormat,
 )
 from sglang.srt.layers.moe.topk import StandardTopKOutput
-
-
-class MSCCLPPOutputLayout(str, Enum):
-    RANK_MAJOR = "rank_major"
-    EXPERT_MAJOR = "expert_major"
 
 
 @dataclass(frozen=True)
@@ -63,19 +57,20 @@ class MSCCLPPExpertMajorLLDispatchOutput(MSCCLPPLLDispatchOutput):
 
     @property
     def format(self) -> DispatchOutputFormat:
-        return DispatchOutputFormat.MSCCLPP_LL_EXPERT_MAJOR
+        return DispatchOutputFormat.MSCCLPP_LATENCY_EXPERT_MAJOR
 
 
 @dataclass(frozen=True)
 class MSCCLPPRankMajorLLDispatchOutput(MSCCLPPLLDispatchOutput):
-    """Fixed-capacity rank-major output consumed by FlashInfer CUTLASS."""
+    """Fixed-capacity rank-major output consumed by a compatible MoE runner."""
 
     topk_output: StandardTopKOutput
     expert_output_buffer: torch.Tensor
+    enable_direct_send: bool
 
     @property
     def format(self) -> DispatchOutputFormat:
-        return DispatchOutputFormat.MSCCLPP_LL_RANK_MAJOR
+        return DispatchOutputFormat.MSCCLPP_LATENCY_RANK_MAJOR
 
 
 @dataclass(frozen=True)
@@ -89,13 +84,15 @@ class MSCCLPPExpertMajorLLCombineInput(MSCCLPPLLCombineInput):
 
     @property
     def format(self) -> CombineInputFormat:
-        return CombineInputFormat.MSCCLPP_LL_EXPERT_MAJOR
+        return CombineInputFormat.MSCCLPP_LATENCY_EXPERT_MAJOR
 
 
 @dataclass(frozen=True)
 class MSCCLPPRankMajorLLCombineInput(MSCCLPPLLCombineInput):
     """Rank-major registered output consumed by handle-driven combine."""
 
+    apply_router_weights: bool = False
+
     @property
     def format(self) -> CombineInputFormat:
-        return CombineInputFormat.MSCCLPP_LL_RANK_MAJOR
+        return CombineInputFormat.MSCCLPP_LATENCY_RANK_MAJOR
