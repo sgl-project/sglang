@@ -36,6 +36,7 @@ from sglang.srt.configs.hybrid_arch import (
 from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
+from sglang.srt.mem_cache.allocator.swa import DraftSWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -115,6 +116,9 @@ def prepare_hicache_staging(
                 pool.swa_kv_pool if isinstance(pool, BaseSWAKVPool) else pool,
                 sidecar=True,
             )
+    allocator = runner.token_to_kv_pool_allocator
+    if isinstance(allocator, DraftSWATokenToKVPoolAllocator):
+        prepare(allocator.draft_kv_pool.swa_kv_pool)
 
 
 def maybe_register_hicache_draft(

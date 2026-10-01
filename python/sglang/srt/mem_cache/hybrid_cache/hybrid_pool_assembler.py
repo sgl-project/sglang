@@ -33,6 +33,7 @@ from sglang.srt.runtime_context import get_memory, get_parallel, get_serving
 if TYPE_CHECKING:
     import torch
 
+    from sglang.srt.mem_cache.allocator.swa import DraftSWATokenToKVPoolAllocator
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
     from sglang.srt.server_args import ServerArgs
@@ -2223,6 +2224,43 @@ def _apply_stack_result(
     )
 
 
+def _add_draft_swa_host_pool(
+    *,
+    cache: UnifiedRadixCache,
+    allocator: DraftSWATokenToKVPoolAllocator,
+    result: StackBuildResult,
+) -> None:
+    """Register a bounded speculative draft pool as the tree's SWA host pool."""
+    draft_pool = allocator.draft_kv_pool.swa_kv_pool
+    controller = result.cache_controller
+    # Draft layer i is loaded with target transfer layer i.
+    assert draft_pool.layer_num <= controller.transfer_layer_id_max
+    # Matches the target's host size at any draft ratio: host memory is cheap, and
+    # the draft windows the smaller GPU pool evicts stay available for hits.
+    host_pool = _build_mha_mla_host_pool(
+        pool=draft_pool,
+        host_to_device_ratio=result.host_pool_group.logical_size / draft_pool.size,
+        page_size=controller.page_size,
+        layout=get_memory().hicache_mem_layout,
+        allocator_type=_get_allocator_type(),
+        pool_label="swa",
+    )
+    controller.register_host_pool_entry(
+        build_pool_entry(
+            name=PoolName.SWA,
+            host_pool=host_pool,
+            device_pool=draft_pool,
+            layer_mapping={i: i for i in range(draft_pool.layer_num)},
+            transfer_layer_id_max=draft_pool.layer_num,
+            host_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
+            device_evict_fn=lambda n: _evict_swa_for_device_alloc(cache, n),
+            **_swa_allocation_callbacks(allocator.swa_attn_allocator),
+        )
+    )
+    result.component_host_pools[ComponentType.SWA] = host_pool
+    result.pools_desc += " + draft SWA"
+
+
 def attach_hybrid_pool_to_unified_cache(
     cache: UnifiedRadixCache,
     params: CacheInitParams,
@@ -2234,9 +2272,16 @@ def attach_hybrid_pool_to_unified_cache(
     storage_prefetch_threshold: int = 256,
 ) -> None:
     """Attach HostPoolGroup + HybridCacheController to UnifiedRadixCache."""
+    from sglang.srt.mem_cache.allocator.swa import DraftSWATokenToKVPoolAllocator
+
     try:
-        kvcache = params.token_to_kv_pool_allocator.get_kvcache()
+        allocator = params.token_to_kv_pool_allocator
+        kvcache = allocator.get_kvcache()
         components = set(cache.components.keys())
+        # A bounded draft pool is the SWA component, added after the target's stack.
+        bounded_draft = isinstance(allocator, DraftSWATokenToKVPoolAllocator)
+        if bounded_draft:
+            components.discard(ComponentType.SWA)
         strategy = _select_strategy(kvcache, components)
         result = strategy.build(
             cache=cache,
@@ -2250,6 +2295,8 @@ def attach_hybrid_pool_to_unified_cache(
             model_name=get_serving().served_model_name,
             enable_storage_metrics=cache._enable_metrics_flag,
         )
+        if bounded_draft:
+            _add_draft_swa_host_pool(cache=cache, allocator=allocator, result=result)
         _apply_stack_result(cache, kvcache, params, result)
     except Exception:
         logger.exception("attach_hybrid_pool_to_unified_cache failed")

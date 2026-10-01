@@ -424,7 +424,7 @@ def _handle_dflash_draft_kv_ratio(server_args: ServerArgs) -> None:
     unsupported = [
         flag
         for flag, enabled in (
-            ("--enable-hierarchical-cache", cfg.enable_hierarchical_cache),
+            ("--hicache-storage-backend", cfg.hicache_storage_backend is not None),
             ("--enable-unified-memory", cfg.enable_unified_memory),
             ("--enable-hisparse", cfg.enable_hisparse),
             ("--disaggregation-mode", cfg.disaggregation_mode != "null"),

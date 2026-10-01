@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.mem_cache.allocator.swa import DraftSWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
@@ -73,6 +74,9 @@ def _estimate_hicache_bytes(
     total = _pool_bytes(pool)
     if isinstance(params.req_to_token_pool, HybridReqToTokenPool):
         total += _pool_bytes(params.req_to_token_pool.mamba_pool)
+    allocator = params.token_to_kv_pool_allocator
+    if isinstance(allocator, DraftSWATokenToKVPoolAllocator):
+        total += _draft_bytes(pool, allocator.draft_kv_pool.swa_kv_pool)
     drafts = params.mtp_draft_device_pools
     if draft_plan is not None and draft_plan.mode == "sidecar":
         drafts = draft_plan.device_pools

@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _evict_mamba_for_device_alloc,
@@ -21,6 +22,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
 )
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -309,6 +311,61 @@ def _build_unified_host_pair(bundle):
         pin_memory=False,
         allocator_type="default",
     )
+
+
+class TestDraftSwaHostPool(CustomTestCase):
+    """HiCache with a bounded speculative draft pool as the tree's SWA component,
+    on top of the target's own stack."""
+
+    def setUp(self):
+        from sglang.srt.runtime_context import publish, reset_context
+        from sglang.srt.server_args import ServerArgs
+
+        publish(
+            ServerArgs(model_path="dummy", hicache_mem_layout="page_first"),
+            role="scheduler",
+        )
+        self.addCleanup(reset_context)
+
+    def test_adds_draft_pool_as_swa_host_entry(self):
+        draft_swa_pool = SimpleNamespace(layer_num=2, size=750)
+        draft_host_pool = object()
+        allocator = SimpleNamespace(
+            draft_kv_pool=SimpleNamespace(swa_kv_pool=draft_swa_pool),
+            swa_attn_allocator=SimpleNamespace(alloc=object(), free=object()),
+        )
+        entries = []
+        result = hybrid_pool_assembler.StackBuildResult(
+            host_pool_group=SimpleNamespace(logical_size=3000),
+            cache_controller=SimpleNamespace(
+                transfer_layer_id_max=4,
+                page_size=64,
+                register_host_pool_entry=entries.append,
+            ),
+            component_host_pools={ComponentType.FULL: object()},
+            pools_desc="KV",
+        )
+
+        with (
+            patch(
+                _ASSEMBLER + "_build_mha_mla_host_pool", return_value=draft_host_pool
+            ) as build_host_pool,
+            patch(_ASSEMBLER + "_get_allocator_type", return_value="default"),
+        ):
+            hybrid_pool_assembler._add_draft_swa_host_pool(
+                cache=SimpleNamespace(), allocator=allocator, result=result
+            )
+
+        self.assertIs(build_host_pool.call_args.kwargs["pool"], draft_swa_pool)
+        # One host slot per target host slot.
+        self.assertEqual(build_host_pool.call_args.kwargs["host_to_device_ratio"], 4.0)
+        (entry,) = entries
+        self.assertEqual(entry.name, PoolName.SWA)
+        self.assertIs(entry.host_pool, draft_host_pool)
+        self.assertIs(entry.device_pool, draft_swa_pool)
+        self.assertEqual([entry.layer_mapper(i) for i in range(4)], [0, 1, None, None])
+        self.assertIs(entry.device_alloc_fn, allocator.swa_attn_allocator.alloc)
+        self.assertIs(result.component_host_pools[ComponentType.SWA], draft_host_pool)
 
 
 class TestUnifiedPageEnvelopeHostPool(CustomTestCase):

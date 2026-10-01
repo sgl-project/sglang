@@ -284,6 +284,9 @@ class BaseSpecWorker(ABC):
             raise NotImplementedError(
                 "The external linker only supports packed draft KV caches."
             )
+        if target_model_runner.draft_kv_ratio < 1:
+            # The bounded draft pool is the tree's SWA component, with its own host pool.
+            return HiCacheDraftPlan()
 
         return HiCacheDraftPlan(
             mode=HiCacheDraftMode.SIDECAR,

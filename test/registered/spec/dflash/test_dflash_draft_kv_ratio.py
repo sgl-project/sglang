@@ -26,7 +26,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=500, stage="nightly", runner_config="1-gpu-large")
+register_cuda_ci(est_time=800, stage="nightly", runner_config="1-gpu-large")
 
 TARGET_MODEL = "Qwen/Qwen3.8-27B"
 DRAFT_MODEL = "z-lab/Qwen3.8-27B-DFlash2"
@@ -63,6 +63,7 @@ class TestDFlashDraftKVRatio(CustomTestCase, GSM8KMixin):
     model = TARGET_MODEL
     draft_model = DRAFT_MODEL
     page_size = 1
+    extra_launch_args = []
     gsm8k_accuracy_thres = 0.80
     gsm8k_accept_length_thres = 3.0
     gsm8k_num_questions = 200
@@ -89,6 +90,7 @@ class TestDFlashDraftKVRatio(CustomTestCase, GSM8KMixin):
             str(cls.page_size),
             "--mem-fraction-static",
             "0.8",
+            *cls.extra_launch_args,
         ]
         with ExitStack() as stack:
             for env, value in (
@@ -189,7 +191,8 @@ class TestDFlashDraftKVRatio(CustomTestCase, GSM8KMixin):
 
     def _overflow_draft_pool(self) -> tuple:
         """Cache more window-sized prompts than the draft pool holds windows for,
-        oldest first. Returns the oldest prompt and its first response."""
+        oldest first. Returns the oldest prompt, its cold response and its
+        response to a hit while still on the GPU."""
         self._flush_cache()
         _, _, draft_tokens, _ = self._pool_sizing()
         # Requests run one at a time, so cached windows can fill nearly the whole
@@ -201,15 +204,16 @@ class TestDFlashDraftKVRatio(CustomTestCase, GSM8KMixin):
         ]
         cold = self._generate(prompts[0], 64)
         self.assertGreater(cold["meta_info"]["prompt_tokens"], DRAFT_WINDOW)
+        resident = self._generate(prompts[0], 64)
         for prompt in prompts[1:]:
             self._generate(prompt, 8)
         print(f"cached {num_prompts} prompts for {draft_tokens} draft slots")
-        return prompts[0], cold
+        return prompts[0], cold, resident
 
     def test_evicted_window_falls_back(self):
         """More cached prefixes than the draft pool holds: the oldest loses its
         window, and a hit on it re-prefills instead of reading freed slots."""
-        prompt, cold = self._overflow_draft_pool()
+        prompt, cold, _ = self._overflow_draft_pool()
         prompt_tokens = cold["meta_info"]["prompt_tokens"]
         warm = self._generate(prompt, 64)
         cached_tokens = warm["meta_info"]["cached_tokens"]
@@ -227,6 +231,45 @@ class TestDFlashDraftKVRatioPaged(TestDFlashDraftKVRatio):
 
     def test_gsm8k(self):
         self.skipTest("accuracy does not depend on the page size")
+
+
+class TestDFlashDraftKVRatioHiCache(TestDFlashDraftKVRatio):
+    """With a host tier, a prompt evicted from the GPU by draft pool pressure is
+    restored from host memory, draft window included."""
+
+    extra_launch_args = [
+        "--enable-hierarchical-cache",
+        "--hicache-write-policy",
+        "write_through",
+    ]
+
+    def test_evicted_window_falls_back(self):
+        self.skipTest("covered by test_evicted_window_is_restored_from_host")
+
+    def test_evicted_window_is_restored_from_host(self):
+        prompt, _, resident = self._overflow_draft_pool()
+        warm = self._generate(prompt, 64)
+        meta = warm["meta_info"]
+        details = meta.get("cached_tokens_details") or {}
+        print(
+            f"oldest prompt: cached_tokens={meta['cached_tokens']}, "
+            f"details={details}, resident cached_tokens="
+            f"{resident['meta_info']['cached_tokens']}, accept_length "
+            f"resident={resident['meta_info'].get('spec_accept_length')} "
+            f"warm={meta.get('spec_accept_length')}"
+        )
+        self.assertGreater(details.get("host", 0), 0)
+        # A reload resumes where a resident hit does, so both compute the same
+        # tokens in the same order. A cold prefill sums in a different order.
+        self.assertEqual(meta["cached_tokens"], resident["meta_info"]["cached_tokens"])
+        self.assertEqual(warm["text"], resident["text"])
+        # Verification keeps the text right, so a wrong draft window shows up as
+        # lower acceptance.
+        self.assertGreaterEqual(
+            meta["spec_accept_length"],
+            0.8 * resident["meta_info"]["spec_accept_length"],
+        )
+        self.assertIsNone(self.process.poll())
 
 
 if __name__ == "__main__":

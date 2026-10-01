@@ -936,6 +936,10 @@ class DraftSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def attach_draft_kv_pool(self, draft_kv_pool: BaseSWAKVPool) -> None:
         self._kvcache.attach_swa_kv_pool(draft_kv_pool)
 
+    @property
+    def draft_kv_pool(self) -> BaseSWAKVPool:
+        return self._kvcache.swa_kv_pool
+
     def get_kvcache(self):
         # Backends check this to detect a hybrid-SWA target.
         return self._kvcache.full_kv_pool
