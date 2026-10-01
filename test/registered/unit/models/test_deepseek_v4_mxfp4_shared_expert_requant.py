@@ -1,7 +1,9 @@
 import unittest
+from unittest import mock
 
 import torch
 
+from sglang.srt.layers.quantization import fp8_utils
 from sglang.srt.layers.quantization.fp8_utils import quantize_block_fp8_weight_to_mxfp4
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -68,9 +70,10 @@ class TestQuantizeBlockFp8WeightToMxfp4(CustomTestCase):
         deq = _dequant_mxfp4(packed, scales)
         self.assertTrue((deq[0, 4:] == 0).all())
 
+    @mock.patch.object(fp8_utils, "_is_hip", True)
     def test_ties_round_to_even(self):
         # FP8 sources land exactly on e2m1 midpoints; rounding them toward zero
-        # biases the whole matrix low, so ties must go to the even mantissa.
+        # biases the whole matrix low, so ROCm rounds ties to the even mantissa.
         w = torch.zeros(1, 32, dtype=torch.bfloat16)
         w[0, 0] = 6.0  # pins scale 2**0
         ties = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0]
