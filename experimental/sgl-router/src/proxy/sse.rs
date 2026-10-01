@@ -4,6 +4,7 @@
 //! SSE passthrough — bridges a reqwest `bytes_stream()` into an axum Body.
 
 use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use axum::body::Body;
@@ -20,6 +21,8 @@ pub enum StreamEndReason {
     IdleTimeout,
     /// The router's stale-request deadline expired, regardless of worker health.
     Expired,
+    /// The router aborted the stream before its first chunk.
+    Aborted,
     ClientDisconnect,
     PumpPanicked,
 }
@@ -69,6 +72,11 @@ impl ErrorEventScanner {
     }
 }
 
+/// Whether a buffered SSE body carries an error event.
+pub fn has_error_event(body: &[u8]) -> bool {
+    ErrorEventScanner::default().feed(body)
+}
+
 /// Bounds on a streaming response beyond what the upstream stream itself provides.
 #[derive(Debug, Clone, Default)]
 pub struct StreamLimits {
@@ -76,6 +84,8 @@ pub struct StreamLimits {
     pub idle_timeout: Option<Duration>,
     /// Fires when the stale-request janitor expires the request.
     pub expiration: Option<CancellationToken>,
+    /// Aborts the stream if it fires before the first upstream chunk.
+    pub abort: Option<CancellationToken>,
 }
 
 /// Bridge a byte stream into an axum Body that streams chunks unchanged.
@@ -83,7 +93,8 @@ pub struct StreamLimits {
 /// One tokio task pumps upstream chunks through a bounded 64-slot channel so a
 /// slow client backpressures the upstream read. The pump stops as soon as the
 /// client disconnects, even while upstream is silent, when `limits.idle_timeout`
-/// elapses between chunks, or when `limits.expiration` fires.
+/// elapses between chunks, when `limits.expiration` fires, or when
+/// `limits.abort` fires before the first chunk.
 ///
 /// The terminal result travels on a separate channel and is chained after the
 /// data, so a full queue cannot block cleanup or turn a failed stream into a
@@ -111,10 +122,12 @@ where
         };
         let mut scanner = ErrorEventScanner::default();
         let idle = limits.idle_timeout.unwrap_or(Duration::MAX);
-        let expired = async {
-            match limits.expiration {
-                Some(token) => token.cancelled().await,
-                None => std::future::pending().await,
+        let started = AtomicBool::new(false);
+        let expired = cancelled(limits.expiration);
+        let aborted = async {
+            cancelled(limits.abort).await;
+            if started.load(Ordering::Relaxed) {
+                std::future::pending::<()>().await;
             }
         };
         // Disconnect and expiration race the whole forwarding loop, so they
@@ -130,6 +143,10 @@ where
                     end.reason = StreamEndReason::Expired;
                     Err(std::io::Error::other("SSE stream exceeded stale_request_timeout"))
                 }
+                _ = aborted => {
+                    end.reason = StreamEndReason::Aborted;
+                    Err(std::io::Error::other("SSE stream aborted by the router"))
+                }
                 result = async {
                     loop {
                         let bytes = match tokio::time::timeout(idle, stream.next()).await {
@@ -144,6 +161,7 @@ where
                                 Err(std::io::Error::other("SSE upstream idle timeout")),
                             ),
                         };
+                        started.store(true, Ordering::Relaxed);
                         if let Some(hook) = on_first_byte.take() {
                             hook();
                         }
@@ -189,6 +207,13 @@ where
         })
     });
     Body::from_stream(ReceiverStream::new(rx).map(Ok).chain(terminal))
+}
+
+async fn cancelled(token: Option<CancellationToken>) {
+    match token {
+        Some(token) => token.cancelled().await,
+        None => std::future::pending().await,
+    }
 }
 
 #[cfg(test)]
@@ -249,6 +274,7 @@ mod tests {
             StreamLimits {
                 idle_timeout: Some(Duration::from_secs(1)),
                 expiration: None,
+                abort: None,
             },
         );
         assert!(body
@@ -282,6 +308,7 @@ mod tests {
             StreamLimits {
                 idle_timeout: None,
                 expiration: Some(token.clone()),
+                abort: None,
             },
         );
         tokio::task::yield_now().await;
@@ -300,6 +327,39 @@ mod tests {
             .to_string()
             .contains("stale_request_timeout"));
     }
+
+    #[tokio::test]
+    async fn abort_ends_the_stream_only_before_its_first_chunk() {
+        for started in [false, true] {
+            let token = CancellationToken::new();
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            let (body, end) = limited_body(
+                ReceiverStream::new(rx),
+                StreamLimits {
+                    abort: Some(token.clone()),
+                    ..Default::default()
+                },
+            );
+            let mut data = body.into_data_stream();
+            if started {
+                tx.send(Ok(Bytes::from_static(b"data: a\n\n")))
+                    .await
+                    .unwrap();
+                data.next().await.unwrap().unwrap();
+            }
+            token.cancel();
+            drop(tx);
+            let rest: Vec<_> = StreamExt::collect(data).await;
+            assert_eq!(rest.iter().any(Result::is_err), !started);
+            let expected = if started {
+                StreamEndReason::Completed
+            } else {
+                StreamEndReason::Aborted
+            };
+            assert_eq!(end.await.unwrap().reason, expected);
+        }
+    }
+
     #[tokio::test]
     async fn passes_through_a_simple_byte_stream() {
         let chunks = vec![
