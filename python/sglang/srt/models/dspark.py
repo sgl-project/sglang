@@ -522,6 +522,8 @@ class DSparkDraftMixin:
                 return None
             if attn.k_norm.variance_epsilon != eps:
                 return None
+            if attn.k_norm.cast_x_before_out_mul != attn0.k_norm.cast_x_before_out_mul:
+                return None
             k_buf = pool.get_key_buffer(attn.attn.layer_id)
             v_buf = pool.get_value_buffer(attn.attn.layer_id)
             nh = kv_size // head_dim
@@ -559,10 +561,15 @@ class DSparkDraftMixin:
             return cached
         weights, biases, k_norm_weights = [], [], []
         eps = None
+        cast_before_weight = self.layers[0].self_attn.k_norm.cast_x_before_out_mul
         for layer in self.layers:
             attn = layer.self_attn
             can_slice, _ = can_dflash_slice_qkv_weight(attn.qkv_proj)
-            if not can_slice or eps not in (None, attn.k_norm.variance_epsilon):
+            if (
+                not can_slice
+                or eps not in (None, attn.k_norm.variance_epsilon)
+                or attn.k_norm.cast_x_before_out_mul != cast_before_weight
+            ):
                 self._stacked_ctx_kv_cache = None
                 return None
             eps = attn.k_norm.variance_epsilon
@@ -581,6 +588,7 @@ class DSparkDraftMixin:
             "bias": torch.cat(biases, dim=0) if all(has_bias) else None,
             "k_norm_weight": torch.stack(k_norm_weights, dim=0).float(),
             "eps": eps,
+            "cast_x_before_out_mul": cast_before_weight,
         }
         return self._stacked_ctx_kv_cache
 
@@ -631,6 +639,7 @@ class DSparkDraftMixin:
                 locs = cache_loc
                 write_commit_lens = None
                 locs_row_width = None
+            k_norm = self.layers[0].self_attn.k_norm
             fused_kv_norm_rope_write(
                 kv_all,
                 meta,
@@ -644,6 +653,7 @@ class DSparkDraftMixin:
                 eps,
                 commit_lens=write_commit_lens,
                 locs_row_width=locs_row_width,
+                cast_x_before_out_mul=k_norm.cast_x_before_out_mul,
             )
             return
 
@@ -707,6 +717,8 @@ class DSparkDraftMixin:
         )
         variance = k32.pow(2).mean(dim=-1, keepdim=True)
         k32 = k32 * torch.rsqrt(variance + stacked["eps"])
+        if stacked["cast_x_before_out_mul"]:
+            k32 = k32.to(ctx_hidden.dtype).float()
         k32 = k32 * stacked["k_norm_weight"].view(1, num_layers, 1, head_dim)
         k_all = k32.to(ctx_hidden.dtype)
         # One RoPE over all layers' heads (shared rotary params + positions).

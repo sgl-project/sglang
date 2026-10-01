@@ -42,13 +42,12 @@ def rotate_split_half(value, positions, base, rotary_dim, inverse=False):
     )
 
 
-def rms(value, weight, epsilon):
+def rms(value, weight, epsilon, *, cast_before_weight=False):
     source = value.float()
-    return (
-        source
-        * torch.rsqrt(source.square().mean(-1, keepdim=True) + epsilon)
-        * weight.float()
-    ).to(value.dtype)
+    normalized = source * torch.rsqrt(source.square().mean(-1, keepdim=True) + epsilon)
+    if cast_before_weight:
+        normalized = normalized.to(value.dtype).float()
+    return (normalized * weight.float()).to(value.dtype)
 
 
 original_write = DSparkTargetKVDraftModel.write_target_kv
@@ -96,6 +95,7 @@ def observed_write(self, *, target_kv, pool, positions, cache_loc):
             key.reshape(-1, attn.num_kv_heads, attn.head_dim),
             attn.k_norm.weight,
             attn.k_norm.variance_epsilon,
+            cast_before_weight=True,
         )
         key = rotate_split_half(
             key, positions, attn.rotary_emb.base, attn.rotary_emb.rotary_dim

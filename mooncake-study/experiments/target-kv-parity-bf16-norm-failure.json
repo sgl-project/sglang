@@ -1,0 +1,72 @@
+{
+  "status": "failed",
+  "reference_adapter": "specforge_backbone_with_shared_kv_encoder",
+  "reference_attention": "sdpa",
+  "serving_attention": "triton",
+  "dtype": "bfloat16",
+  "device": "NVIDIA H100 80GB HBM3",
+  "torch_version": "2.13.0+cu130",
+  "transformers_version": "5.12.1",
+  "specforge_sources": {
+    "specforge.modeling.draft.dflash": "d0cbb0dafb77fe6cc64c9a2850515aaca6f11b811af767b141a5aa473e4213ba",
+    "specforge.modeling.draft.dflash_kernels": "ce6496a07282b8d3ab4b69942191d27a8ba2d0a107613b2ae74e60604b0faf46",
+    "specforge.modeling.draft.dspark": "4ec764996b8a48c24e1ba15513503255ae9165a2c3abb9ad2d3e988c6a526be7"
+  },
+  "artifact_sha256": {
+    "config.json": "4b74ae312ce217dae27d1346a617245f370ebd0fbb80feeeccbc2b0e12bf6dbd",
+    "model.safetensors": "1bad9b3c7fdf78e75a180d3cc08fc536a643e6a70a82fd9c856f9249dbd69982",
+    "validation/inputs.safetensors": "75f2a38ab933a0112a2de1365511782c101578d00d0503c991cd1e752fdcc472"
+  },
+  "rtol": 0.03,
+  "atol": 0.03,
+  "stages": {
+    "layer.0": {
+      "passed": true,
+      "elements": 9216,
+      "mismatched": 0,
+      "nonfinite": 0,
+      "max_abs": 0.01953125,
+      "rms": 0.0028481704648584127
+    },
+    "layer.1": {
+      "passed": false,
+      "elements": 9216,
+      "mismatched": 6,
+      "nonfinite": 0,
+      "max_abs": 0.0625,
+      "rms": 0.0110724912956357
+    },
+    "hidden": {
+      "passed": false,
+      "elements": 9216,
+      "mismatched": 266,
+      "nonfinite": 0,
+      "max_abs": 0.25,
+      "rms": 0.034373462200164795
+    },
+    "base": {
+      "passed": false,
+      "elements": 1367424,
+      "mismatched": 77992,
+      "nonfinite": 0,
+      "max_abs": 0.21875,
+      "rms": 0.036620065569877625
+    },
+    "corrected": {
+      "passed": false,
+      "elements": 1367424,
+      "mismatched": 78083,
+      "nonfinite": 0,
+      "max_abs": 0.21875,
+      "rms": 0.036620065569877625
+    }
+  },
+  "max_abs": {
+    "layer.0": 0.01953125,
+    "layer.1": 0.0625,
+    "hidden": 0.25,
+    "base": 0.21875,
+    "corrected": 0.21875
+  },
+  "error": "fixed-input parity failed: layer.1, hidden, base, corrected"
+}

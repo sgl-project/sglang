@@ -21,6 +21,7 @@ def _fused_kv_norm_rope_write_kernel(
     L: tl.constexpr,
     EPS: tl.constexpr,
     HAS_COMMIT_LENS: tl.constexpr,
+    CAST_BEFORE_WEIGHT: tl.constexpr,
 ):
     t = tl.program_id(0).to(tl.int64)
     l = tl.program_id(1).to(tl.int64)
@@ -53,8 +54,13 @@ def _fused_kv_norm_rope_write_kernel(
         k = tl.load(row + h * D + d_ar).to(tl.float32)
         ms = tl.sum(k * k, 0) / D
         inv = 1.0 / tl.sqrt(ms + EPS)
-        k1 = tl.load(row + h * D + half_ar).to(tl.float32) * inv * knw1
-        k2 = tl.load(row + h * D + HALF + half_ar).to(tl.float32) * inv * knw2
+        k1 = tl.load(row + h * D + half_ar).to(tl.float32) * inv
+        k2 = tl.load(row + h * D + HALF + half_ar).to(tl.float32) * inv
+        if CAST_BEFORE_WEIGHT:
+            k1 = k1.to(tl.bfloat16).to(tl.float32)
+            k2 = k2.to(tl.bfloat16).to(tl.float32)
+        k1 = k1 * knw1
+        k2 = k2 * knw2
         k1 = k1.to(tl.bfloat16).to(tl.float32)
         k2 = k2.to(tl.bfloat16).to(tl.float32)
         o1 = k1 * cos - k2 * sin
@@ -79,6 +85,8 @@ def fused_kv_norm_rope_write(
     eps: float,
     commit_lens: Optional[torch.Tensor] = None,
     locs_row_width: Optional[int] = None,
+    *,
+    cast_x_before_out_mul: bool = False,
 ) -> None:
     """Write per-layer normed+roped K and raw V rows into the KV pools.
 
@@ -123,4 +131,5 @@ def fused_kv_norm_rope_write(
         L=num_layers,
         EPS=eps,
         HAS_COMMIT_LENS=has_commit_lens,
+        CAST_BEFORE_WEIGHT=cast_x_before_out_mul,
     )

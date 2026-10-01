@@ -108,6 +108,27 @@ updates, exporter failure/retry and a blocked Catalog. The provisioned dashboard
 is `examples/monitoring/grafana/dashboards/json/training-capture-dashboard.json`;
 its serving-latency panels do not establish capture-overhead thresholds.
 
+### BF16 Rounding Isolation
+
+The actual fixed-input parity command remains the serving gate. The following
+separate diagnostic runs three comparisons on one retained checkpoint/fixture:
+production, reference auxiliary arithmetic with real Triton attention, and
+reference auxiliary/attention arithmetic while retaining real paged KV writes
+and reads. It never writes `validation/parity.json` or certifies serving, and
+blocks execution of the target decoder.
+
+```bash
+PYTHONPATH=python:/path/to/SpecForge python mooncake-study/experiments/diagnose_target_kv_parity_bf16.py \
+  --checkpoint /path/to/retained-draft \
+  --target-path /models/Qwen3-0.6B \
+  --reference-attention sdpa
+```
+
+This distinguishes layout/checkpoint errors from numerical differences in the
+same-input operators. It deliberately recomputes diagnostic attention after
+the actual paged backend runs, so its timing is not production performance and
+its equality result is not evidence for the unmodified attention backend.
+
 Focused regressions:
 
 ```bash

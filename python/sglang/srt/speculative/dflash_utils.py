@@ -919,6 +919,7 @@ def _table_qk_norm_rope_kernel(
     NHQ: tl.constexpr,
     D: tl.constexpr,
     EPS: tl.constexpr,
+    CAST_BEFORE_WEIGHT: tl.constexpr,
 ):
     t = tl.program_id(0).to(tl.int64)
     h = tl.program_id(1)
@@ -942,8 +943,13 @@ def _table_qk_norm_rope_kernel(
     inv = 1.0 / tl.sqrt(ms + EPS)
     w1 = tl.load(w_ptr + half_ar).to(tl.float32)
     w2 = tl.load(w_ptr + HALF + half_ar).to(tl.float32)
-    x1 = tl.load(row + half_ar).to(tl.float32) * inv * w1
-    x2 = tl.load(row + HALF + half_ar).to(tl.float32) * inv * w2
+    x1 = tl.load(row + half_ar).to(tl.float32) * inv
+    x2 = tl.load(row + HALF + half_ar).to(tl.float32) * inv
+    if CAST_BEFORE_WEIGHT:
+        x1 = x1.to(tl.bfloat16).to(tl.float32)
+        x2 = x2.to(tl.bfloat16).to(tl.float32)
+    x1 = x1 * w1
+    x2 = x2 * w2
     x1 = x1.to(tl.bfloat16).to(tl.float32)
     x2 = x2.to(tl.bfloat16).to(tl.float32)
     o1 = x1 * cos - x2 * sin
@@ -962,6 +968,8 @@ def table_qk_norm_rope_(
     num_k_heads: int,
     head_dim: int,
     eps: float,
+    *,
+    cast_x_before_out_mul: bool = False,
 ) -> None:
     """In-place QK RMSNorm + table-lookup neox RoPE on the fused QKV tensor.
 
@@ -984,4 +992,5 @@ def table_qk_norm_rope_(
         NHQ=num_q_heads,
         D=head_dim,
         EPS=eps,
+        CAST_BEFORE_WEIGHT=cast_x_before_out_mul,
     )

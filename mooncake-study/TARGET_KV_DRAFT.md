@@ -72,8 +72,21 @@ source KV dtype.
 
 Cast features to the projection weight dtype, apply the linear projection,
 compute RMS variance and norm-weight multiplication in FP32, then cast back.
-Draft context projections use the existing dense DSpark K/V projection,
-K-normalization and draft RoPE implementation. The target shared output head's
+This encoder rule is separate from the backbone's Qwen3 RMSNorm semantics:
+backbone residual addition rounds to the activation dtype before computing its
+FP32 variance, and normalized activations round again before multiplying by the
+norm weight. The KV-input model uses the existing HF-cast norm kernel after an
+explicit narrow residual addition. Fused Q/K processing, fused context writes
+and stacked context projection honor the same before-weight cast; their legacy
+default retains the previous semantics. A mixed norm policy falls back to
+individual operations. Parameter names and checkpoint weight layout are unchanged.
+
+Draft context projections use the dense DSpark K/V projection and draft RoPE
+implementation. RoPE, activation and attention rounding still require the full
+fixed-input gate against the chosen training implementation; matching RMSNorm
+alone does not certify backbone/logit parity. The current reference uses
+SpecForge's default Qwen3 modules, not its optional Liger provider.
+The target shared output head's
 scale and softcap are applied in FP32 exactly once, before Markov correction.
 No random confidence head is created; static verification is required.
 

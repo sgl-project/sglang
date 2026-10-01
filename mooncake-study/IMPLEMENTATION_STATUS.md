@@ -500,6 +500,73 @@ The original worktree's staged
 diff hash is unchanged. These tests do not certify service SLOs or production
 SpecForge integration.
 
+## KV-Draft Normalization Semantics
+
+The KV-input draft now follows the default SpecForge Qwen3 normalization
+boundaries: residual addition rounds in the activation dtype before the FP32
+variance calculation, and normalized activations round before norm-weight
+multiplication. The existing HF-cast RMSNorm kernel is reused after an explicit
+narrow residual addition. The encoder's separately specified FP32-weight norm
+is unchanged. Checkpoint parameter names and shapes are unchanged.
+
+The fused Q/K norm+RoPE path, fused context-KV writer and stacked context
+projection now honor the before-weight cast. Their new option defaults to the
+legacy behavior. Inconsistent policies between Q/K or context layers fall back
+to individual operations. The runtime projection observer independently checks
+the corrected normalization definition.
+
+Numerical isolation on the retained Qwen3 fixture:
+
+- `01790817129609730345-9664e885c7ab`: before the fix, the SDPA reference
+  comparison has 32 mismatches in layer 1, 442 in hidden states and 94,993 in
+  corrected logits. Logit maximum absolute error is 0.3125. Replacing auxiliary
+  arithmetic with the reference's exact rounding still leaves Triton attention
+  differences: corrected-logit maximum error 0.137207, with 31,040 mismatches.
+  Recomputing attention using the reference SDPA on the serving path's actual
+  paged KV contents makes all decoder layers, hidden states and logits bit-exact
+  for these three anchors. This isolates numerical differences on this fixture;
+  it does not certify the unmodified serving backend.
+- `01790817632178834033-0ba38279548f`: 37 tests and 42 subtests pass in 39.78s.
+  New direct-kernel tests pin normalization rounding, untouched V columns,
+  strided QKV inputs and masked context writes. Stacked/per-layer parity covers
+  both BF16 and FP16 norm modes; mixed layer policies correctly reject fusion.
+- `01790817791869330693-1ed205f56281`: the actual BF16 serving gate **still
+  fails** at `rtol=0.03, atol=0.03` after the normalization fix. Layer 1 has six
+  mismatches, hidden states have 266, and corrected logits have 78,083, with
+  maximum logit error 0.21875. The report is retained in
+  [target-kv-parity-bf16-norm-failure.json](experiments/target-kv-parity-bf16-norm-failure.json).
+  This report uses SDPA, while the earlier committed baseline report used eager;
+  the comparable pre-fix SDPA numbers are from the isolation run above.
+
+The reproducible BF16 diagnostic is now in
+`experiments/diagnose_target_kv_parity_bf16.py`. It prints production, reference
+auxiliary and reference auxiliary-plus-attention comparisons without writing a
+serving certificate. It retains real pool writes/reads, blocks target decoder
+execution, and does not measure production latency or verify gradients.
+
+Further completed validation:
+
+- `01790817792230398995-aefa32c204fe`: full runtime test passes in 335.755s,
+  including all 66 snapshots, ordinary/static-speculative overlap, padded graphs,
+  fenced aborts, adaptive admission and real HTTP Prometheus checks. The revised
+  projection observer independently validates the new K-normalization boundary.
+  Catalog remains a test double and Store transport remains TCP.
+- `01790817911067030073-3988949cc5f4`: the expanded regression passes with
+  150 tests and 99 subtests in 31.87s, covering capture, observability, IPC, graph
+  helpers, legacy DSpark, KV-draft normalization and the small SpecForge fixture.
+- `01790817911390127075-2e01bc05c440`: the committed BF16 diagnostic reproduces
+  the real gate's remaining production differences and bit-exact agreement only
+  after the auxiliary and attention substitutions. The existing failed
+  `validation/parity.json` hash is unchanged by the diagnostic.
+
+New model/test/diagnostic code passes full Ruff, and `git diff --check` passes.
+Unchanged import-order diagnostics in the existing DFlash/DSpark helpers and
+stacked test were verified against HEAD; unrelated formatting was preserved.
+
+P8 remains open: normalization agreement alone does not establish full BF16
+backbone/logit agreement. RoPE, activation and attention arithmetic require
+further work, with existing tolerances unchanged.
+
 ## Next Implementation
 
 1. Broaden real-request coverage to prefill graphs, real retraction, cache eviction,

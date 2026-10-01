@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections import defaultdict
 
 import torch.nn.functional as F
+from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.models.dflash import DFlashDecoderLayer
 from sglang.srt.models.dspark import DSparkDraftModel, gather_and_crop_vocab
 from sglang.srt.speculative.dspark_components.dspark_target_kv_contract import (
     SharedHeadTransform,
@@ -20,7 +22,30 @@ from sglang.srt.speculative.ragged_verify import (
 from sglang.srt.training_capture.protocol import ContractError
 
 
+class TargetKVRMSNorm(RMSNorm):
+    """Preserve the training backbone's narrow residual-add boundary."""
+
+    def __init__(self, hidden_size, eps):
+        super().__init__(hidden_size, eps=eps, cast_x_before_out_mul=True)
+
+    def forward(self, x, residual=None):
+        if residual is None:
+            return super().forward(x)
+        residual = x + residual
+        return super().forward(residual), residual
+
+
+class TargetKVDecoderLayer(DFlashDecoderLayer):
+    def __init__(self, config, layer_id, quant_config=None):
+        super().__init__(config, layer_id, quant_config)
+        eps = float(getattr(config, "rms_norm_eps", 1e-6))
+        self.input_layernorm = TargetKVRMSNorm(config.hidden_size, eps)
+        self.post_attention_layernorm = TargetKVRMSNorm(config.hidden_size, eps)
+
+
 class DSparkTargetKVDraftModel(DSparkDraftModel):
+    decoder_layer_cls = TargetKVDecoderLayer
+
     def __init__(self, config, quant_config=None, prefix=""):
         contract = read_target_kv_draft_contract(config)
         if contract is None:
@@ -36,12 +61,18 @@ class DSparkTargetKVDraftModel(DSparkDraftModel):
                 "confidence-disabled KV draft requires static verify scheduling"
             )
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+        self.norm = TargetKVRMSNorm(
+            config.hidden_size, float(getattr(config, "rms_norm_eps", 1e-6))
+        )
         self.target_kv_contract = contract
         self.shared_head_transform = SharedHeadTransform.decode(
             contract.teacher.output_transform
         )
-        # The inherited attention/backbone remains identical. The old hidden
-        # projection is not part of the new architecture or its state_dict.
+        # SpecForge's Qwen3 norms round normalized activations before weighting.
+        for module in self.modules():
+            if isinstance(module, RMSNorm):
+                module.cast_x_before_out_mul = True
+        # The old hidden projection is absent from this architecture/state_dict.
         del self.fc, self.hidden_norm
         self.kv_encoder = TargetKVContextEncoder(contract)
         if self.gamma != contract.sequence.prediction_count:

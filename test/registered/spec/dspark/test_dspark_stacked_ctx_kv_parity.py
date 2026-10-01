@@ -99,7 +99,9 @@ class TestDSparkStackedCtxKvParity(CustomTestCase):
             is_neox_style=True,
         ).to(DEVICE)
 
-    def _check_parity(self, *, num_layers=4, tokens=5, has_bias=False, dtype):
+    def _check_parity(
+        self, *, num_layers=4, tokens=5, has_bias=False, dtype, cast_before_weight=False
+    ):
         g = torch.Generator(device=DEVICE).manual_seed(0)
         model = _make_model(self.rope, num_layers, has_bias=has_bias, g=g)
         for layer in model.layers:
@@ -108,6 +110,7 @@ class TestDSparkStackedCtxKvParity(CustomTestCase):
             if attn.qkv_proj.bias is not None:
                 attn.qkv_proj.bias = attn.qkv_proj.bias.to(dtype)
             attn.k_norm.to(dtype)
+            attn.k_norm.cast_x_before_out_mul = cast_before_weight
         ctx_hidden = torch.randn(
             tokens, HIDDEN, device=DEVICE, dtype=dtype, generator=g
         )
@@ -135,6 +138,16 @@ class TestDSparkStackedCtxKvParity(CustomTestCase):
 
     def test_parity_with_bias(self):
         self._check_parity(dtype=torch.float16, has_bias=True)
+
+    def test_parity_with_training_norm_semantics(self):
+        for dtype in (torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                self._check_parity(dtype=dtype, cast_before_weight=True)
+
+    def test_fallback_inconsistent_norm_semantics(self):
+        model = _make_model(self.rope, 3)
+        model.layers[1].self_attn.k_norm.cast_x_before_out_mul = True
+        self.assertIsNone(model._stacked_ctx_kv_params())
 
     def test_fallback_quantized_layer(self):
         g = torch.Generator(device=DEVICE).manual_seed(0)
