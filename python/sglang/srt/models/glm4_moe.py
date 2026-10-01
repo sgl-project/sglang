@@ -1446,6 +1446,18 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
     _NEXTN_SPEC_WEIGHT_NAMES = ("shared_head.norm", "eh_proj", "enorm", "hnorm")
 
     @classmethod
+    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
+        if enable_glm_nextn_moe_ptpc(quant_config):
+            layer_id = hf_config.num_hidden_layers
+            if should_apply_glm_nextn_moe_ptpc(quant_config, layer_id) and any(
+                name.startswith(f"model.layers.{layer_id}.")
+                and ".mlp.shared_experts" in name
+                for name in (getattr(quant_config, "exclude_layers", None) or [])
+            ):
+                return "GLM NextN PTPC does not support fused BF16 shared experts."
+        return super().shared_experts_fusion_disable_reason(hf_config, quant_config)
+
+    @classmethod
     def _map_mtp_ckpt_name(cls, name: str, layer_prefix: str) -> str:
         # Keep this mapping in sync with DeepseekV2WeightLoaderMixin's
         # NextN rule: MTP-specific weights live under model.*, while the
