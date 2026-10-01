@@ -781,7 +781,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 self.assertEqual(split_overrides["prefill_attention_backend"], "fa3")
                 self.assertEqual(split_overrides["decode_attention_backend"], "fa3")
 
-    def _construct(self, arch, model_type, config_extra=None, **server_kwargs):
+    def _construct(
+        self, arch, model_type, config_extra=None, hf_quant_config=None, **server_kwargs
+    ):
         from sglang.srt.server_args import ServerArgs
 
         # Golden resolution must be host-independent: accelerator-less CI
@@ -793,6 +795,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.addCleanup(shutil.rmtree, config_dir, ignore_errors=True)
         with open(os.path.join(config_dir, "config.json"), "w") as f:
             json.dump(config, f)
+        if hf_quant_config is not None:
+            with open(os.path.join(config_dir, "hf_quant_config.json"), "w") as f:
+                json.dump(hf_quant_config, f)
         server_args = ServerArgs(model_path=config_dir, **server_kwargs)
         server_args.resolve_once()
         return server_args
@@ -871,6 +876,28 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         # publish still projects the whitelisted leaf with the pristine
         # value: readers only ever read flags.
         self.assertEqual((self._publish(sa), self._leaf("dtype"))[1], "auto")
+
+    def test_beam_standalone_modelopt_nvfp4_config_selects_trtllm_moe(self):
+        """A ModelOpt export may declare NVFP4 only in hf_quant_config.json;
+        quantized BeamMoE rejects the auto runner, so auto must still resolve."""
+        from sglang.srt.arg_groups.model_override_base import model_config_of
+
+        with override_platform(is_sm100=True):
+            sa = self._construct(
+                "BeamForCausalLM",
+                "beam",
+                config_extra={"layer_types": ["full_attention"] * 2},
+                hf_quant_config={
+                    "producer": {"name": "modelopt"},
+                    "quantization": {
+                        "quant_algo": "NVFP4",
+                        "group_size": 16,
+                        "exclude_modules": ["lm_head"],
+                    },
+                },
+            )
+        self.assertEqual(model_config_of(sa).quantization, "modelopt_fp4")
+        self.assertEqual(self._resolved(sa, "moe_runner_backend"), "flashinfer_trtllm")
 
     def test_qwen4_pd_support_and_remaining_limits(self):
         qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
@@ -3705,9 +3732,10 @@ class TestBeamOverrides(CustomTestCase):
             attention_backend=None,
             prefill_attention_backend=None,
             decode_attention_backend=None,
-            quantization=None,
             moe_runner_backend="auto",
             moe_a2a_backend="none",
+            # What model_config_of hands back, so no checkpoint is needed.
+            _model_config=SimpleNamespace(quantization=None),
         )
         defaults.update(kw)
         return SimpleNamespace(**defaults)
@@ -3746,30 +3774,28 @@ class TestBeamOverrides(CustomTestCase):
         flashinfer_trtllm; BF16 and explicit choices keep their backend."""
         from sglang.srt.arg_groups.model_overrides.beam import _beam_overrides
 
-        bf16 = SimpleNamespace(architectures=["BeamForCausalLM"])
-        nvfp4 = SimpleNamespace(
-            architectures=["BeamForCausalLM"],
-            quantization_config={"quant_method": "compressed-tensors"},
-        )
+        hf_config = SimpleNamespace(architectures=["BeamForCausalLM"])
+        nvfp4 = {"_model_config": SimpleNamespace(quantization="modelopt_fp4")}
         trtllm = {"moe_runner_backend": "flashinfer_trtllm"}
         cases = [
-            (nvfp4, {}, trtllm),
-            (bf16, {"quantization": "modelopt_fp4"}, trtllm),
-            (bf16, {}, {}),
-            (nvfp4, {"moe_runner_backend": "flashinfer_cutlass"}, {}),
-            (nvfp4, {"moe_a2a_backend": "deepep"}, {}),
+            (nvfp4, trtllm),
+            ({}, {}),
+            (dict(nvfp4, moe_runner_backend="flashinfer_cutlass"), {}),
+            (dict(nvfp4, moe_a2a_backend="deepep"), {}),
         ]
         # Pin the attention backend so only the MoE decision is compared.
         pinned = {"attention_backend": "flashinfer"}
         with override_platform(is_sm100=True):
-            for hf_config, kw, expected in cases:
-                with self.subTest(hf_config=hf_config, kw=kw):
+            for kw, expected in cases:
+                with self.subTest(kw=kw):
                     self.assertEqual(
                         _beam_overrides(self._args(**pinned, **kw), hf_config),
                         expected,
                     )
         with override_platform(is_sm100=False):
-            self.assertEqual(_beam_overrides(self._args(**pinned), nvfp4), {})
+            self.assertEqual(
+                _beam_overrides(self._args(**pinned, **nvfp4), hf_config), {}
+            )
 
     def test_beam_family_is_registered(self):
         with (

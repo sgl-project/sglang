@@ -43,6 +43,9 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsConfig,
+)
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -187,19 +190,20 @@ class BeamMoE(nn.Module):
             renormalize=True,
             scoring_func="sigmoid",
             correction_bias=self.gate.e_score_correction_bias,
-            # The TRTLLM NVFP4 runner routes inside the kernel (DeepSeek-V3
-            # grouping) and applies the routed scale once there.
+            # NVFP4 routes and applies the routed scale in the TRT-LLM kernel;
+            # routing materialized here (one-token compile) must carry the scale.
             routed_scaling_factor=(
                 config.routed_scaling_factor if quant_config is not None else None
             ),
+            apply_routed_scaling_factor_on_output=quant_config is not None,
             output_format=(
                 TopKOutputFormat.BYPASSED
                 if quant_config is not None
                 else TopKOutputFormat.STANDARD
             ),
         )
-        # Keep normalized routing coefficients in FP32. The runner applies the
-        # routed scale during combination, after weighting each expert output.
+        # BF16 keeps normalized routing coefficients in FP32 and applies the
+        # routed scale in the runner, after weighting each expert output.
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.num_experts,
             top_k=config.num_experts_per_tok,
@@ -215,6 +219,14 @@ class BeamMoE(nn.Module):
             ),
             prefix=add_prefix("experts", prefix),
         )
+        # Exporters hand an excluded MoE layer to the generic BF16 method, whose
+        # one-token compile path cannot read the TRT-LLM block weight layout.
+        if quant_config is not None and isinstance(
+            self.experts.quant_method, UnquantizedFusedMoEMethod
+        ):
+            raise NotImplementedError(
+                "Beam NVFP4 checkpoints must quantize every sparse layer's experts"
+            )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if hidden_states.shape[0] > 0:
@@ -483,14 +495,14 @@ class BeamModel(nn.Module):
         return self.norm(hidden_states)
 
 
-def is_serialized_w4a4_nvfp4(quant_config: QuantizationConfig) -> bool:
-    """Whether the checkpoint stores NVFP4 weights with NVFP4 activations.
-
-    Both exporters feed the same TRTLLM FP4 MoE kernel. Load-time
-    quantization, AWQ pre-scales and weight-only NVFP4 use other kernels.
-    """
-    if quant_config.get_name() == "compressed_tensors":
-        return getattr(quant_config, "quant_format", None) == "nvfp4-pack-quantized"
+def _is_serialized_w4a4_nvfp4(quant_config: QuantizationConfig) -> bool:
+    # The TRT-LLM FP4 MoE kernel needs serialized NVFP4 weights and activations;
+    # load-time quantization, AWQ pre-scales and weight-only NVFP4 do not fit.
+    if isinstance(quant_config, CompressedTensorsConfig):
+        return quant_config.quant_format == "nvfp4-pack-quantized" and all(
+            quant_config._is_fp4a4_nvfp4(scheme["weights"], scheme["input_activations"])
+            for scheme in quant_config.target_scheme_map.values()
+        )
     return (
         isinstance(quant_config, ModelOptFp4Config)
         and quant_config.is_checkpoint_nvfp4_serialized
@@ -512,7 +524,7 @@ class BeamForCausalLM(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        if quant_config is not None and not is_serialized_w4a4_nvfp4(quant_config):
+        if quant_config is not None and not _is_serialized_w4a4_nvfp4(quant_config):
             raise NotImplementedError(
                 "Beam supports BF16 or serialized W4A4 NVFP4 weights from "
                 "compressed-tensors or ModelOpt"
@@ -532,7 +544,9 @@ class BeamForCausalLM(nn.Module):
                 "redundant experts; use trivial expert placement"
             )
         self.config = config
-        self.model = BeamModel(config, quant_config, prefix=add_prefix("model", prefix))
+        self.model = BeamModel(
+            config, quant_config=quant_config, prefix=add_prefix("model", prefix)
+        )
         self.start_layer = self.model.start_layer
         self.end_layer = self.model.end_layer
         self.lm_head = (
