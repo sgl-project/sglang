@@ -164,11 +164,7 @@ def prepare_for_draft_extend(
     # gpu_only emits device tensors to skip H2D.
     fused_lengths = gpu_only and batch.seq_lens.is_cuda
     extend_position_info = None
-    if (
-        fused_lengths
-        and not widen
-        and getattr(draft_extend_input, "positions", None) is None
-    ):
+    if fused_lengths and not widen and draft_extend_input.positions is None:
         batch.prefix_lens, batch.extend_lens, post_seq_lens, extend_position_info = (
             prepare_draft_extend_layout(
                 batch.seq_lens,

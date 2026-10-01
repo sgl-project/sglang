@@ -802,7 +802,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 "QSA backend requires a ModelRunner to initialize CUDA graph state"
             )
         self._verify_mask = maybe_create_verify_mask(
-            is_draft_runner=getattr(self.runner, "is_draft_worker", False),
+            is_draft_runner=self.runner is not None and self.runner.is_draft_worker,
             skip_prefill=False,
             max_bs=max_bs,
             max_context_len=self.max_context_len,

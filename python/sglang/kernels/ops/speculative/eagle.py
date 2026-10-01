@@ -277,6 +277,7 @@ def _prepare_draft_extend_lengths_kernel(
     tl.store(extend_lens + row, WIDTH + FRONT, row < BS)
     tl.store(post_lens + row, base + WIDTH, row < BS)
     if MAKE_POSITIONS:
+        tl.static_assert(FRONT == 0)
         tl.store(start_locs + row, row * WIDTH, row < BS)
         req = row // WIDTH
         token_base = tl.load(seq_lens + req * STRIDE, row < BS * WIDTH, other=0).to(
