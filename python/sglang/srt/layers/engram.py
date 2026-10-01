@@ -29,6 +29,7 @@ from sglang.kernels.ops.embeddings.engram_hash import (
     MODE_EXTEND,
     MODE_VERIFY,
     engram_commit_history,
+    engram_hash_extend_and_commit,
     engram_hash_ids,
     engram_hash_ids_and_commit,
 )
@@ -285,6 +286,33 @@ class EngramHasher(nn.Module):
                 device=input_ids.device,
             )
         mode = forward_batch.forward_mode
+        if (
+            mode.is_extend()
+            and not mode.is_target_verify()
+            and envs.SGLANG_OPT_ENGRAM_EXTEND_HASH.get()
+            and _cuda_kernels(input_ids)
+            and forward_batch.extend_seq_lens_cpu is not None
+        ):
+            history = forward_batch.engram_history
+            return engram_hash_extend_and_commit(
+                input_ids,
+                forward_batch.positions,
+                history=self.history if history is None else history,
+                commit_history=self.history,
+                req_slots=forward_batch.req_pool_indices,
+                starts=forward_batch.extend_start_loc,
+                lengths=forward_batch.extend_seq_lens,
+                num_real=sum(forward_batch.extend_seq_lens_cpu),
+                history_via_slots=history is None,
+                out_cache_loc=forward_batch.out_cache_loc,
+                token_map=self.token_map,
+                multipliers=self.multipliers,
+                primes=self.primes,
+                offsets=self.offsets,
+                pad_id=self.pad_id,
+                image_token_id=self.image_token_id,
+                mm_pad_shift=MM_PAD_SHIFT_VALUE,
+            )
         req_slots = forward_batch.req_pool_indices
         bs = req_slots.shape[0]
         device = input_ids.device
