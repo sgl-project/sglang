@@ -1,6 +1,6 @@
-"""CPU unit test: DSA-CP's narrow all-to-all is exact.
+"""CPU unit test: the DSA token shard's narrow all-to-all is exact.
 
-DSA-CP swaps "my heads for every token" for "every head for my tokens" after
+the DSA token shard swaps "my heads for every token" for "every head for my tokens" after
 ``q_b_proj`` and the absorb through ``w_kc``, so the wire carries the 512-wide
 absorbed latent in and the 512-wide attention output back. Both are linear
 functions of narrower tensors beside them: q is 256 wide out of ``q_b_proj``
@@ -274,7 +274,7 @@ class TestTheGatherFollowsTheFlag(CustomTestCase):
         self.assertEqual(attn.w_kc_full.stride()[1:], attn.w_kc.stride()[1:])
 
     def test_it_still_needs_dsa_token_shard_itself(self):
-        """The narrow exchange rearranges DSA-CP's own exchange, so with DSA-CP
+        """The narrow exchange rearranges the DSA token shard's own exchange, so with the DSA token shard
         off there is nothing to rearrange and the weights would be pure cost."""
         from sglang.srt.layers.attention.dsa import (
             dsa_token_shard as dsa_token_shard_module,

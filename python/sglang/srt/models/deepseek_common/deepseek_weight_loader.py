@@ -776,9 +776,8 @@ class DeepseekV2WeightLoaderMixin:
                     self_attn.w_vc = (
                         self_attn.w_vc.to(torch.bfloat16) * self_attn.w_scale
                     )
-                # A no-op unless SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD_NARROW_A2A is set, and
-                # placed here because it reads the two matrices this branch has
-                # just finished laying out. It does not modify them.
+                # No-op unless the narrow all-to-all is on; reads the matrices
+                # just laid out above, without modifying them.
                 dsa_token_shard_attach_full_kv_b(self_attn)
             else:
                 num_tiles_k = self_attn.qk_nope_head_dim // weight_block_size[1]

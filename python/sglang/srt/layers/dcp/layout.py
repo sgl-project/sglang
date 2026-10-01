@@ -276,24 +276,16 @@ _dcp_extend_gather_buffers: Dict[Tuple, torch.Tensor] = {}
 
 
 def dcp_extend_gather_buffer(name: str, ref: torch.Tensor, rows: int) -> torch.Tensor:
-    """Return a reusable ``rows``-row buffer shaped and typed like ``ref``.
+    """A reusable ``rows``-row buffer shaped and typed like ``ref``. Grow-only.
 
-    The extend gather's context-sized tensors were allocated fresh on each of
-    the model's layers, so the peak depended on what the allocator happened to
-    hold when a layer asked for another ~1.1 GiB. Reserving them once turns
-    that into a budget that no longer moves between layers.
-
-    Grow-only, so a longer context raises the reservation and keeps it; warm-up
-    prefills the longest context a deployment serves, so the growth lands
-    there. ``name`` is part of the key with dtype, device and row shape, so
-    buffers that must not alias do not -- two callers sharing a key share one
-    buffer and must not hold their slices across each other's calls.
+    Allocated per layer, the peak moved with whatever the allocator held when a
+    layer asked for another ~1.1 GiB. Two callers sharing ``name`` share the
+    buffer and must not hold slices across each other's calls.
     """
     key = (name, ref.dtype, ref.device, tuple(ref.shape[1:]))
     buf = _dcp_extend_gather_buffers.get(key)
     if buf is None or buf.shape[0] < rows:
-        # Release the old buffer before asking for the new one, or the peak is
-        # briefly both of them.
+        # Drop every reference first, or the peak is briefly both buffers.
         _dcp_extend_gather_buffers.pop(key, None)
         buf = None
         buf = torch.empty((rows, *ref.shape[1:]), dtype=ref.dtype, device=ref.device)
@@ -308,14 +300,9 @@ def dcp_extend_gather_buffer(name: str, ref: torch.Tensor, rows: int) -> torch.T
 
 
 class DcpExtendGatherPiece(NamedTuple):
-    """One collective of the extend-time prefix gather.
-
-    Every rank sends rows ``[send_start, send_end)`` of its padded send, and the
-    all-gather lays them out rank-major; rows ``[extend_start, extend_end)`` of
-    this chunk's own KV are appended after them. ``index`` maps the output rows
-    ``[out_start, out_end)`` -- a contiguous run of the position-ordered output
-    -- to rows of that scratch.
-    """
+    """One collective of the extend gather. The all-gather lays the sends out
+    rank-major, this chunk's own KV follows, and ``index`` maps output rows
+    ``[out_start, out_end)`` onto that scratch."""
 
     send_start: int
     send_end: int
@@ -328,13 +315,9 @@ class DcpExtendGatherPiece(NamedTuple):
 
 
 class DcpExtendGatherPlan(NamedTuple):
-    """How one rank gathers a batch's prefix KV at extend.
-
-    ``local_lens[i]`` rows of request i live on this rank; each rank sends them
-    padded to ``padded_lens[i]`` so every rank's send is ``send_rows`` long. The
-    output is position-ordered -- request 0's prefix then extend, request 1's
-    prefix then extend, ... -- and ``pieces`` tile it in order.
-    """
+    """How one rank gathers a batch's prefix KV at extend. Sends are padded
+    to ``padded_lens`` so every rank's is ``send_rows`` long; the output is each
+    request's prefix then its extend, in order, tiled by ``pieces``."""
 
     local_lens: List[int]
     padded_lens: List[int]
@@ -357,25 +340,16 @@ def plan_dcp_extend_gather(
     ``(p // (B * dcp_size)) * B + p % B``, ``B = interleave_size``. Local shards
     are concatenated per request, as ``dcp_local_prefix_kv_indices`` lists them.
 
-    Piece cuts fall on whole ``B``-blocks. That is what keeps local rows
-    ``[row, row + take)`` covering global positions ``[row * dcp_size,
-    (row + take) * dcp_size)`` on every rank, which the index assumes.
-
-    The sends are cut into pieces of ``max_piece_gather_rows // dcp_size`` rows
-    (at least one), so no collective gathers more than ``max_piece_gather_rows``
-    rows (at least ``dcp_size``) and the caller can write each piece into place
-    before gathering the next. Cuts fall on whole local rows, which keeps every
-    piece's output a contiguous run; small requests share a piece, and a
-    request's own KV rides in the piece its prefix ends in. The pieces and their
-    indices are the same on every rank; only ``local_lens`` depends on
-    ``dcp_rank``.
+    Pieces gather at most ``max_piece_gather_rows`` rows each, and cut on whole
+    ``B``-blocks: that keeps local rows ``[row, row + take)`` covering global
+    positions ``[row * dcp_size, (row + take) * dcp_size)`` on every rank. The
+    pieces are identical on every rank; only ``local_lens`` is not.
     """
     prefix_lens = [int(p) for p in prefix_lens]
     extend_lens = [int(e) for e in extend_lens]
     b = interleave_size
     local_lens = [dcp_owner_count(p, dcp_size, dcp_rank, b) for p in prefix_lens]
-    # The widest rank's local length, which is rank 0's: every rank pads to it
-    # so one all-gather covers the group.
+    # Rank 0 holds the most; every rank pads to it.
     padded_lens = [dcp_owner_count(p, dcp_size, 0, b) for p in prefix_lens]
     # Rounded down to a whole block, so a cut never splits one rank's run.
     piece_rows = max(b, (max_piece_gather_rows // dcp_size) // b * b)
@@ -462,12 +436,7 @@ def _dcp_extend_gather_piece(
     index = []
     for kind, first, second in parts:
         if kind == "prefix":
-            # Position p of a request whose send starts at `second` is owned by
-            # rank (p // b) % dcp_size, at local row
-            # (p // (b * dcp_size)) * b + p % b. At b == 1 that is p % dcp_size
-            # and p // dcp_size.
             positions, request_send_offset = first, second
-            # Host-side, once per forward, so this stays the plain expression.
             owner = (positions // b) % dcp_size
             local_row = (positions // (b * dcp_size)) * b + positions % b
             index.append(
@@ -491,11 +460,9 @@ def _dcp_extend_gather_piece(
 def dcp_crop_free_extend(forward_batch, index_topk: Optional[int]) -> bool:
     """May this extend forward drop the operator's causal crop (sparse_mode 0)?
 
-    Only if every request's prefix reaches ``index_topk``: below that the top-k
-    selects every key it is offered, so the crop is what makes the result
-    causal. The crop is set once per call, so the answer is decided once per
-    forward and cached. ``index_topk`` of None answers False -- keeping the
-    crop is always correct.
+    Only if every prefix reaches ``index_topk``: below it the top-k takes every
+    key, so the crop is what keeps the result causal. Cached per forward, and
+    the FIRST caller's ``index_topk`` wins -- the cache does not key on it.
     """
     cached = getattr(forward_batch, "npu_dcp_crop_free", None)
     if cached is not None:

@@ -463,22 +463,12 @@ class AscendAttnBackend(AttentionBackend):
 
         self.attn_cp_size = model_runner.attn_cp_size
 
-        # ``sgl_sparse_flash_attention`` is sgl-kernel-npu's operator, not a CANN
-        # one. CANN refuses ``return_softmax_lse`` under PA_BSND, its only paged
-        # layout, so the DCP partial-output merge has nowhere else to get an LSE
-        # from. Checked once here so a stock install says what is missing at
-        # startup instead of raising a bare AttributeError on the first DCP
-        # decode, naming neither DCP nor the package to install.
-        #
-        # The ``sgl_`` prefix is deliberate upstream: it keeps the operator in
-        # the ``npu`` namespace without colliding with torch_npu's own
-        # ``npu_sparse_flash_attention`` schema, which is the one the non-DCP
-        # call below uses. The two names differ by more than a suffix on purpose.
+        # sgl-kernel-npu's operator: CANN refuses return_softmax_lse under
+        # PA_BSND, so DCP decode has no other LSE source. Checked at startup so a
+        # stock install names the missing package rather than an AttributeError.
         self.has_sparse_fa_lse = hasattr(torch.ops.npu, "sgl_sparse_flash_attention")
         if self.use_mla and get_parallel().dcp_enabled and not self.has_sparse_fa_lse:
-            # A warning, not a raise: a prefill-only node (PD disaggregation) can
-            # run with --dcp-size > 1 and never reach the decode that needs it.
-            # The call site raises with the same message if it does.
+            # Not a raise: a prefill-only PD node never reaches DCP decode.
             logger.warning(_MISSING_SPARSE_FA_LSE)
 
     def _is_swa_layer(self, layer: RadixAttention) -> bool:
@@ -601,8 +591,6 @@ class AscendAttnBackend(AttentionBackend):
         loc_rows = self.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices, :seq_lens_max
         ]
-        # Unchanged on purpose: dividing by the unscaled page_size already gives
-        # page ids over the whole virtual span, which is the indexer's view.
         self.forward_metadata.block_tables = (
             loc_rows[:, :: self.page_size] // self.page_size
         )
@@ -1412,8 +1400,7 @@ class AscendAttnBackend(AttentionBackend):
         q_nope, q_pe = q, q_rope
         k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
-        # DSA-CP replaces both length vectors. Built once per forward: they do
-        # not vary by layer, and each build is a blocking host-to-device copy.
+        # The token shard replaces both length vectors, built once per forward.
         dsa_token_shard_plan = get_dsa_token_shard_plan(forward_batch)
         dsa_token_shard_qlen = dsa_token_shard_kvlen = None
         if dsa_token_shard_plan is not None:
@@ -1479,17 +1466,14 @@ class AscendAttnBackend(AttentionBackend):
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
-            # Must keep mirroring is_dcp_mla_decode_phase (forward_mla.py),
-            # where the caller decides to unpack (attn_output, lse). Restated
-            # rather than imported: a backend importing a model inverts layering.
+            # Mirrors is_dcp_mla_decode_phase; restated, because a backend
+            # importing a model would invert the layering.
             dcp_decode = get_parallel().dcp_enabled and (
                 forward_batch.forward_mode.is_decode()
                 or forward_batch.forward_mode.is_target_verify()
             )
 
-            # The mirror image of decode: the query stays rank-local and the
-            # context was gathered by _dcp_gather_extend_kv_npu, whose condition
-            # this one must match exactly.
+            # Must match the condition under which the model gathered.
             dcp_meta = forward_batch.attn_dcp_metadata
             dcp_extend = (
                 get_parallel().dcp_enabled
@@ -1502,11 +1486,8 @@ class AscendAttnBackend(AttentionBackend):
             layout_kv = "PA_BSND"
 
             if dcp_decode:
-                # #37787 owns decode (dsa_dcp.py): it reads rank-local metadata
-                # off forward_metadata and ignores block_table/seq_lengths_kv/
-                # sparse_mode, so it returns before the branches below set them.
-                # Extend stays ours -- gathering the context beats gathering the
-                # query above a tail of prefix/178, and we serve well above it.
+                # #37787's decode reads its own rank-local metadata, so it
+                # returns before the branches below.
                 if self.kv_cache_dtype == torch.float8_e4m3fn:
                     raise NotImplementedError(
                         "FP8 KV cache with decode context parallelism is not "
@@ -1527,9 +1508,8 @@ class AscendAttnBackend(AttentionBackend):
                     scaling=layer.scaling,
                 )
             if dcp_extend:
-                # Indices relative to each request's KV start, cumulative KV
-                # lengths. Three of the four index/length conventions run and
-                # return plausible garbage, so re-probe before changing this.
+                # Relative indices, cumulative lengths. Three of the four
+                # conventions return plausible garbage: re-probe before changing.
                 gathered = getattr(forward_batch, "npu_dcp_extend_kv", None)
                 assert gathered is not None, (
                     "DCP extend reached the sparse operator without the model "
@@ -1546,15 +1526,13 @@ class AscendAttnBackend(AttentionBackend):
                         topk_indices.shape[-1] if topk_indices is not None else None,
                     )
                 ):
-                    # The lift: keep the full per-request KV lengths so no
-                    # request's start moves, and drop the crop the shortening
-                    # existed for. dcp_crop_free_extend has checked the bound.
+                    # Full per-request KV lengths, no crop: no request's start
+                    # moves. dcp_crop_free_extend has checked the bound.
                     sparse_mode = 0
                 else:
                     if dsa_token_shard_plan is not None:
-                        # This rank's queries end partway through the request.
-                        # Cumulative lengths double as request boundaries, so
-                        # shortening is only safe for a single request.
+                        # Lengths double as request boundaries: shortening is
+                        # safe only for a single request.
                         seq_lengths_kv = dsa_token_shard_kvlen
                     sparse_mode = 3
                 # layout_kv must equal layout_query unless it is PA_BSND.

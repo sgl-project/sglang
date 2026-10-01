@@ -910,24 +910,14 @@ class ModelRunner:
         self._init_post_memory_pool_components()
 
     def _warn_if_pool_cannot_hold_context(self) -> None:
-        """Say so when the KV pool is too small for one full-length request.
-
-        ``MemoryPoolConfig.__post_init__`` only rejects a pool of zero or less. A
-        pool that is positive but smaller than ``--context-length`` starts
-        cleanly and then refuses or truncates long requests at serving time,
-        which is a much worse place to find out.
-
-        A warning rather than an error: a deployment that never sends
-        max-length requests is entitled to a smaller pool, and turning that into
-        a startup failure would break working setups.
-        """
+        """Warn when the KV pool cannot hold one full-length request, which would
+        otherwise surface only as refusals at serving time. Not an error: a
+        deployment that never sends max-length requests may want a small pool."""
         context_len = getattr(self.model_config, "context_len", None)
         if not context_len or self.max_total_num_tokens >= context_len:
             return
         extra = ""
-        # Anything that takes memory *before* the pool is sized shrinks it, and
-        # these are the ones this branch adds. Named because the pool line alone
-        # gives no clue which knob bought the shortfall.
+        # Name what this branch takes before the pool is sized.
         if envs.SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD_NARROW_A2A.get():
             extra = (
                 " SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD_NARROW_A2A is set, which holds the "

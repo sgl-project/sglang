@@ -1029,12 +1029,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             spec_info=batch.spec_info,
         )
 
-        # The replicated index-K buffer is written through allocator-global
-        # slots, so the indexer needs this view even where the latent KV does
-        # not. out_cache_loc is deliberately NOT localized here: this pool
-        # localizes per write in _resolve_dcp_write, and doing both stacks two
-        # partitions on one tensor -- the second pass reads an already-local
-        # row as global, and -1 survives `loc % dcp_size` on the top rank.
+        # The replicated index-K is written through allocator-global slots.
+        # out_cache_loc is deliberately NOT localized here: the pool localizes
+        # per write in _resolve_dcp_write, and doing both corrupts the write.
         if _is_npu and get_parallel().dcp_enabled and not model_runner.is_draft_worker:
             ret.origin_out_cache_loc = ret.out_cache_loc
         ret._maybe_init_non_generation_fields(batch)

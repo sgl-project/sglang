@@ -1563,12 +1563,9 @@ class KVCacheConfigurator:
         else:
             index_size = max_total_num_tokens * dcp_size
         is_arch35 = is_npu_arch35()
-        # Deliberately not gated on `is_arch35`. Which layers own an Indexer is a
-        # property of the model config -- `dsa_layer_skips_topk` reads
-        # `index_topk_freq` and `index_skip_topk_offset` -- not of the die, and a
-        # layer with `self.indexer is None` (deepseek_v2.py) never writes index-K
-        # on any hardware. The arch test only ever described where the layout had
-        # been exercised.
+        # Not gated on is_arch35: which layers own an Indexer is a property of
+        # the model config, not the die, and a layer without one never writes
+        # index-K on any hardware.
         use_compact_indexer_layout = is_dsa_model and _should_elide_dsa_index_k(
             is_draft_worker=self.is_draft_worker
         )

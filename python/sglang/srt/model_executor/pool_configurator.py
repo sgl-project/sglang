@@ -465,38 +465,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         return cell_size
 
     @staticmethod
-    def _is_ascend_mla_pool(kvc: KVCacheConfigurator) -> bool:
-        """Will ``NPUMLATokenToKVPool`` be the pool for this model?
-
-        Mirrors the gate on ``_build_ascend_mla_kv_pool``. Two budget terms
-        depend on it, and both were wrong before this predicate existed,
-        because that pool differs from the CUDA ``DSATokenToKVPool`` twice over:
-
-        1. **It widens index-K under DCP.** Its ``index_size`` spans the whole
-           virtual loc space rather than one rank's shard.
-        2. **It stores index-K unquantized.** Plain ``index_head_dim`` at the
-           pool's own dtype, where the CUDA pool packs k-with-scale into uint8.
-
-        **Keep this in step with the builder.** If another backend adopts either
-        behaviour without teaching this predicate, it gets the same unexplained
-        load-time OOM Ascend did -- and CI will not catch it, because every
-        configuration CI runs has ``dcp_size == 1`` and a CUDA pool.
-
-        On CUDA the indexer is not widened today (``_build_dsa_kv_pool`` omits
-        ``index_buf_size`` entirely), so this returns False there and the CUDA
-        budget is untouched. That omission is a separate, known under-allocation
-        on the CUDA side; this predicate describes what the code does, not what
-        it should do.
-        """
-        return (
-            get_exec().kernel.attention_backend == "ascend"
-            and kvc.use_mla_backend
-            and not kvc.is_hybrid_swa
-            and not is_minimax_sparse(kvc.model_config.hf_config)
-            and mambaish_config(kvc.model_config) is None
-        )
-
-    @staticmethod
     def _compute_qsa_cell_size(*, hf_config, num_layers: int) -> int:
         from sglang.srt.layers.attention.qsa.config import (
             parse_qsa_profile,
@@ -527,7 +495,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         allocate_all_layers: bool = False,
     ) -> int:
         index_head_dim = get_dsa_index_head_dim(kvc.model_config.hf_config)
-        # Price index-K unquantized at index_head_dim unless the cache is FP8.
         indexer_size_per_token = (
             index_head_dim + index_head_dim // DSATokenToKVPool.quant_block_size * 4
         )

@@ -990,46 +990,27 @@ class Envs:
     # Delay all-gather after qlora for better performance for Deepseek v3.2
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
     # DSA prefill: each attention-TP rank scores only its shard of the indexer
-    # queries and the top-k is all-gathered. Set 0 for the unsharded indexer.
+    # queries, and the top-k is all-gathered.
     SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING = EnvBool(True)
-    # DSA prefill: shard the attention block's tokens across attention-TP, so
-    # every rank computes every head for its own slice, with the query
-    # redistributed by all-to-all. Consumes no ranks, so it composes with DCP.
+    # DSA prefill: each attention-TP rank computes every head for its slice of
+    # the tokens. Consumes no ranks, so it composes with DCP.
     SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD = EnvBool(True)
-    # DSA-CP: also shard batches carrying more than one request, by passing
-    # full per-request KV lengths and dropping the operator's causal crop.
-    # Only engages where every request's prefix reaches index_topk.
+    # DSA token-shard: also shard multi-request extends, where every prefix
+    # reaches index_topk.
     SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD_MULTI_REQUEST = EnvBool(True)
-    # DSA-CP: exchange the query BEFORE the w_kc absorb and take the head output
-    # through w_vc BEFORE the return leg, so the wire carries 256-wide tensors
-    # instead of the 512-wide latent, in two collectives instead of three. Needs
-    # the full w_kc and w_vc on every rank, 28 MB per layer. Bitwise identical.
-    # At tp16 it is 3.7-7.8% faster at 6007 tokens and 3-4.5% at 16007, but
-    # 8-13% SLOWER below 3000, and it costs 4.06 GiB of KV pool -- 2.13 GiB of
-    # weights plus 2 x HCCL_BUFFSIZE, which HCCL charges the attention-TP
-    # communicator on its first sizeable collective. Hence off by default. See
-    # DSA_CP_HANDOFF_2026-09-24.md section 8; the legs were separately
-    # switchable while that was being measured and neither is worth running
-    # alone.
+    # DSA token-shard: exchange 256-wide tensors instead of the 512-wide latent.
+    # Slower below 3k tokens and costs 4 GiB of KV pool, hence off.
     SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD_NARROW_A2A = EnvBool(False)
     # DCP extend on NPU: log each extend forward's peak device memory, per rank.
     SGLANG_DEBUG_NPU_DCP_EXTEND_MEMORY = EnvBool(False)
-    # DCP extend on NPU: gathered rows per prefix-gather collective, which caps
-    # the scratch a layer holds beside the gathered context. The default is
-    # 256 MiB of latent KV; <= 0 gathers the whole prefix in one collective.
+    # DCP extend on NPU: rows per prefix-gather collective, capping the scratch.
+    # <= 0 gathers the whole prefix in one.
     SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS = EnvInt(1 << 18)
-    # DCP extend on NPU: run each layer's prefix all-gather a layer ahead on a
-    # side stream, so it overlaps the previous layer's compute. Profiles show
-    # the two never overlap today -- each gather is issued and immediately
-    # awaited -- while the prefix it reads was written by earlier forwards.
-    # Costs a second context-sized scratch, and needs a single-piece plan
-    # (SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS <= 0); stays off otherwise.
+    # DCP extend on NPU: run each layer's prefix gather a layer ahead on a side
+    # stream. Costs a second scratch; needs GATHER_PIECE_ROWS <= 0.
     SGLANG_NPU_ENABLE_DCP_EXTEND_GATHER_PREFETCH = EnvBool(False)
-    # DCP on NPU: shard the latent KV in page_size-sized runs instead of one
-    # position per rank, matching #37787 and vLLM-Ascend. Same allocator, rows
-    # and block table; only which positions a rank holds changes, so the
-    # gathered context is identical and only the wire order differs. CUDA is
-    # unaffected. Off until the box confirms parity and timing.
+    # DCP on NPU: shard the latent KV in page_size runs, as #37787 and
+    # vLLM-Ascend do, instead of one position per rank.
     SGLANG_NPU_DCP_PAGE_INTERLEAVE = EnvBool(False)
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)

@@ -8,6 +8,10 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_token_shard import get_dsa_token_shard_plan
+from sglang.srt.layers.attention.dsa.dsa_token_shard_layout import (
+    cumulative,
+    plan_dsa_token_shard,
+)
 from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
@@ -29,12 +33,8 @@ _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 
 @lru_cache(maxsize=1)
 def _shard_indexer_queries() -> bool:
-    """``SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING``. Cached per process.
-
-    A function, not a module-level read, for the same reason as
-    ``dsa_token_shard._dsa_token_shard_flag``: an import-time read lands before any test can set
-    the variable. Tests call ``reset_indexer_shard_flag()``.
-    """
+    """Cached, not read at import, so tests can set it; see
+    ``reset_indexer_shard_flag``."""
     return envs.SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING.get()
 
 
@@ -78,33 +78,25 @@ def plan_indexer_query_shard(
 ):
     """One attention-TP rank's share of an extend batch's indexer queries.
 
-    Follows vLLM-Ascend DSA-CP (``_prepare_parallel_metadata`` in ``sfa_cp.py``):
-    the batch's flat token rows are padded to a multiple of ``tp_size`` and rank
-    r owns rows ``[r * rows, (r + 1) * rows)``. A request's local query count is
-    its overlap with that range, and its key length ends at its last local
-    token -- prefix plus local end -- which is what ``sparse_mode=3``'s
-    right-down causal crop needs. A request with no token here gets key length 0.
+    The token shard's partition, derived rather than recomputed: the token
+    shard skips this top-k's all-gather on the strength of both picking the
+    same rows (W2), so they must not be two implementations.
 
-    Returns ``(start, rows, num_real, cum_query_lens, key_lens)``; the first
-    ``num_real`` of the rank's ``rows`` rows are real tokens.
+    Returns ``(start, rows, num_real, cum_query_lens, key_lens)``.
     """
-    total = sum(extend_lens)
-    rows = -(-total // tp_size)
-    start = tp_rank * rows
-    end = start + rows
-    num_real = max(0, min(end, total) - start)
-    cum_query_lens, key_lens = [], []
-    num_local = 0
-    req_start = 0
-    for prefix_len, extend_len in zip(prefix_lens, extend_lens):
-        req_end = req_start + extend_len
-        local_end = min(req_end, end)
-        req_local = max(0, local_end - max(req_start, start))
-        num_local += req_local
-        cum_query_lens.append(num_local)
-        key_lens.append(prefix_len + local_end - req_start if req_local else 0)
-        req_start = req_end
-    return start, rows, num_real, cum_query_lens, key_lens
+    plan = plan_dsa_token_shard(
+        extend_lens,
+        [p + e for p, e in zip(prefix_lens, extend_lens)],
+        tp_size,
+        tp_rank,
+    )
+    return (
+        plan.local_start,
+        plan.rows,
+        max(0, plan.local_end - plan.local_start),
+        cumulative(plan.query_lens),
+        plan.key_lens,
+    )
 
 
 @dataclass
@@ -122,21 +114,13 @@ class _IndexerQueryShard:
     def take(self, x: torch.Tensor) -> torch.Tensor:
         if self.num_real == self.rows:
             return x[self.start : self.start + self.rows]
-        # Padding rows lie past actual_seq_lengths_q[-1]. The operator leaves
-        # uninitialized values in their top-k, which gather() slices off.
+        # Padding rows lie past actual_seq_lengths_q[-1]; gather() drops them.
         out = x.new_zeros((self.rows, *x.shape[1:]))
         out[: self.num_real] = x[self.start : self.start + self.num_real]
         return out
 
     def gather(self, topk_indices: torch.Tensor, num_tokens: int) -> torch.Tensor:
-        """All-gather the per-rank top-k back to ``num_tokens`` rows.
-
-        ``num_tokens`` is the width of the query tensor this call was sliced
-        from: ``total`` padded up to a multiple of ``tp_size`` (see the gate in
-        ``_get_indexer_query_shard``). ``rows * tp_size`` is that same padded
-        width, so the gather buffer is already the right length and the slice
-        only trims when the caller passed an unpadded tensor.
-        """
+        """All-gather the per-rank top-k back to ``num_tokens`` rows."""
         out = topk_indices.new_empty((self.rows * self.tp_size, topk_indices.shape[-1]))
         attn_tp_all_gather_into_tensor(out, topk_indices.contiguous())
         return out[:num_tokens]
@@ -144,31 +128,20 @@ class _IndexerQueryShard:
     def resolve(
         self, topk_indices: torch.Tensor, num_tokens: int, forward_batch
     ) -> torch.Tensor:
-        """Full-width top-k, or this rank's own rows when DSA-CP will slice anyway.
+        """Full-width top-k, or this rank's own rows when the token shard will
+        slice the gathered tensor straight back to them anyway (W2).
 
-        Under DSA-CP the gather is waste: attention cuts the gathered tensor
-        straight back to ``[local_start, local_end)``, the range this rank
-        already holds. Both planners compute ``rows = ceil(total / tp_size)``
-        and ``start = rank * rows``, which
-        ``test/registered/dcp/test_dsa_token_shard_indexer_row_agreement.py`` pins --
-        that agreement was incidental while the gather hid it, and skipping the
-        gather makes it load-bearing.
-
-        Sets ``forward_batch.npu_indexer_topk_is_local`` so attention knows
-        which of the two it was handed. It describes the most recent top-k,
-        which is the tensor the skip-topk layers pass along, and a layer that
-        declines to shard rewrites it to False before its own attention runs.
-
-        Rows past ``num_real`` are zeroed to match what ``dsa_token_shard_slice`` pads,
-        keeping the result bitwise identical rather than merely equivalent.
+        Sets ``npu_indexer_topk_is_local`` so attention knows which it got. Rows
+        past ``num_real`` are zeroed to match ``dsa_token_shard_slice``'s
+        padding, keeping the result bitwise identical.
         """
         plan = get_dsa_token_shard_plan(forward_batch)
         local = plan is not None
         if local and (plan.rows != self.rows or plan.local_start != self.start):
-            # Cannot happen while the row-agreement test passes. Gather anyway
-            # rather than fail: the gathered path stays correct either way.
+            # Same arithmetic, but the two sites read their inputs separately;
+            # if those ever drift, the gather stays correct where this would not.
             print_info_once(
-                "DSA-CP and indexer sharding disagree on the row range "
+                "DSA token-shard and indexer sharding disagree on the row range "
                 f"(plan {plan.local_start}+{plan.rows} against shard "
                 f"{self.start}+{self.rows}); keeping the top-k all-gather"
             )
@@ -176,12 +149,11 @@ class _IndexerQueryShard:
         forward_batch.npu_indexer_topk_is_local = local
         if not local:
             return self.gather(topk_indices, num_tokens)
-        # Not gated on attn_tp_rank, so a grep returns the rank count: the
-        # output is identical whether or not this engaged, only the timing
-        # differs, so this line is the only evidence it ran.
+        # Every rank logs, so a grep counts ranks: the output is identical either
+        # way, which makes this line the only evidence it ran.
         print_info_once(
-            "DSA-CP W2: skipping the indexer top-k all-gather; each rank keeps "
-            "the rows it scored"
+            "DSA token-shard W2: skipping the indexer top-k all-gather; each rank "
+            "keeps the rows it scored"
         )
         if self.num_real < self.rows:
             topk_indices[self.num_real :] = 0
@@ -205,13 +177,11 @@ def _build_indexer_query_shard(
     start, rows, num_real, cum_query_lens, key_lens = plan_indexer_query_shard(
         prefix_lens, extend_lens, parallel.attn_tp_size, parallel.attn_tp_rank
     )
-    if parallel.attn_tp_rank == 0:
-        # The switch is an env var and /server_info cannot show it, so this line
-        # is the evidence that a run was sharded at all.
-        print_info_once(
-            "DSA indexer query sharding is active: prefill indexer queries split "
-            f"across attn_tp_size={parallel.attn_tp_size}"
-        )
+    # Every rank logs, so a grep counts ranks; /server_info cannot show it.
+    print_info_once(
+        "DSA indexer query sharding is active: prefill indexer queries split "
+        f"across attn_tp_size={parallel.attn_tp_size}"
+    )
     device = forward_batch.seq_lens.device
     return _IndexerQueryShard(
         start=start,
@@ -231,20 +201,13 @@ def _get_indexer_query_shard(
 ) -> Optional[_IndexerQueryShard]:
     """The query shard for a prefill indexer call, or None to score every row.
 
-    Every attention-TP rank holds the same full batch and has already written
-    the full index-K cache, so each rank can score only its own
-    ``1/attn_tp_size`` of the queries and all-gather the top-k. The kernel's
-    work per call drops by the TP size -- measured 15.97x at 1M context and
-    TP 16 on A3 -- and the indexer is the part of long-context prefill that
-    grows with n^2. Top-k sets match the unsharded call row for row; order
-    within a row may differ, which sparse attention does not see.
-
-    Planned once per forward. Every input to the decision is identical across
-    the attention-TP group, so all ranks take the collective or none do.
+    Every rank already holds the full index-K, so each scores 1/attn_tp_size of
+    the queries and all-gathers the top-k: 15.97x less indexer work at 1M and
+    tp16. Planned once per forward from inputs identical across the group, so
+    all ranks take the collective or none do.
     """
     if get_attn_tp_context().input_scattered:
-        # The plan assumes this rank was handed the whole batch; a
-        # scattered attention input would slice a slice.
+        # A scattered input is already sliced.
         print_info_once(
             "DSA indexer query sharding is off: the attention input "
             "is scattered across the TP group"
@@ -257,9 +220,8 @@ def _get_indexer_query_shard(
     shard = forward_batch.npu_indexer_query_shard
     if shard is None:
         return None
-    # SGLang pads the query width to a multiple of attn_tp_size, which is what
-    # ``rows * tp_size`` is, so admit anything inside [total, padded]. Comparing
-    # against total alone disables sharding for 15 token counts in 16.
+    # SGLang pads the width to a multiple of attn_tp_size; comparing against
+    # total alone would disable sharding for 15 token counts in 16.
     padded = shard.rows * shard.tp_size
     if not shard.total <= num_tokens <= padded:
         print_info_once(
@@ -293,22 +255,11 @@ class DSANPUIndexerMixin:
 
         bs = q_lora.shape[0]
 
-        # When this rank will only SCORE its own rows, project only those rows.
-        # ``wq_b`` is [T, 1536] @ [1536, 64 * 128], 25.2 MFLOP per token against
-        # ``weights_proj``'s 0.46, so this removes (tp - 1)/tp of the indexer's
-        # projection work. The k path below stays full width on purpose: every
-        # attention-TP rank writes the whole index-K cache, which is what lets
-        # any of them score a subset. Row-wise exact, so the result is bitwise
-        # what the late ``shard.take`` produced.
-        #
-        # Neox only: the other branch rotates q and k in one
-        # ``rotary_emb(positions, q_pe, k_pe)`` call, so q cannot take a
-        # different row slice than k without splitting it in two.
-        #
-        # Prefill CP is excluded explicitly -- its own indexer further down knows
-        # nothing about this shard and would get a slice of a slice. CP forces
-        # attn_tp_size to 1 today so the planner declines anyway, but that is a
-        # property of the tp8/cp8 layout, not a guarantee.
+        # A rank that scores only its own rows projects only those (W3): wq_b is
+        # 25.2 MFLOP per token. k stays full width -- every rank writes the whole
+        # index-K, which is what lets any of them score a subset. Neox only: the
+        # other branch rotates q and k in one call. Prefill CP is excluded: its
+        # indexer below knows nothing of this shard.
         uses_prefill_cp = (
             self.dsa_enable_prefill_cp and forward_batch.attn_cp_metadata is not None
         )
@@ -580,16 +531,13 @@ class DSANPUIndexerMixin:
                 else block_table
             )
             query = q.view(-1, self.n_heads, self.head_dim)
-            # The full width, for the gather to rebuild -- NOT query.shape[0],
-            # which is already cut to shard.rows when q is sliced early.
+            # The full width for the gather, NOT query.shape[0] (already cut).
             num_query_tokens = bs
             if shard is not None:
                 if not q_sliced_early:
                     query = shard.take(query)
-                # weights stays a late take: under _use_ag_after_qlora with a
-                # SCATTERED input it is all-gathered to full width above, so
-                # slicing it earlier would cut a slice twice. At 0.46 MFLOP per
-                # token against wq_b's 25.2 it is ~2% of the saving anyway.
+                # A late take: under _use_ag_after_qlora weights is gathered
+                # to full width above, so an earlier slice would cut twice.
                 weights = shard.take(weights)
                 actual_seq_lengths_q = shard.actual_seq_lengths_q
                 actual_seq_lengths_kv = shard.actual_seq_lengths_kv

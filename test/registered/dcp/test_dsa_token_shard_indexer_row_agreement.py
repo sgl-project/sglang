@@ -1,4 +1,4 @@
-"""CPU unit test: Stage A and DSA-CP must shard an extend batch the same way.
+"""CPU unit test: Stage A and the DSA token shard must shard an extend batch the same way.
 
 Two planners, written separately, in modules that do not import each other:
 
@@ -12,10 +12,10 @@ Both take ``ceil(sum(extend_lens) / tp_size)`` rows starting at
 function, and nothing in the tree says it has to hold.
 
 **Today it does not have to.** Stage A all-gathers the top-k back to full width
-before anything reads it, so DSA-CP then slices that full-width tensor with its
+before anything reads it, so the DSA token shard then slices that full-width tensor with its
 own plan and Stage A's row choice cannot be observed.
 
-**The handoff's W2 removes that all-gather** -- when DSA-CP runs, each rank
+**The handoff's W2 removes that all-gather** -- when the DSA token shard runs, each rank
 already holds exactly the top-k rows it is about to attend, so the gather sends
 ``(tp-1)/tp`` of the data to be discarded. Dropping it makes the agreement
 load-bearing: the rows one planner produced are consumed as the rows the other
@@ -23,7 +23,7 @@ planner designated, with no full-width tensor in between to hide a mismatch.
 
 A mismatch would then be silent in the worst way. Every shape stays valid, the
 operator runs, and each query attends a top-k list computed for a *different
-token*. The output is fluent and wrong -- the same failure mode the DSA-CP shard
+token*. The output is fluent and wrong -- the same failure mode the the DSA token shard shard
 plan's own test was written to catch.
 
 So this pins the agreement before the optimisation depends on it, and it checks
@@ -82,14 +82,14 @@ class TestStageAAndDsaTokenShardAgree(CustomTestCase):
             where = f"{label} rank={tp_rank}/{tp_size}"
 
             # The row range. This is what W2 makes load-bearing: the rows Stage A
-            # scored are consumed as the rows DSA-CP expected.
+            # scored are consumed as the rows the DSA token shard expected.
             self.assertEqual(start, plan.local_start, f"{where} start")
             self.assertEqual(rows, plan.rows, f"{where} rows")
             self.assertEqual(
                 num_real, plan.num_local_tokens, f"{where} real token count"
             )
 
-            # The per-request split. Stage A keeps it cumulative and DSA-CP keeps
+            # The per-request split. Stage A keeps it cumulative and the DSA token shard keeps
             # it per-request, so compare in one form.
             self.assertEqual(
                 cum_query_lens,
@@ -147,7 +147,7 @@ class TestStageAAndDsaTokenShardAgree(CustomTestCase):
             )
 
     def test_fewer_tokens_than_ranks(self):
-        # DSA-CP's runtime gate declines this, but the planners still have to
+        # the DSA token shard's runtime gate declines this, but the planners still have to
         # agree: a rank past the tokens gets an empty slice, not a negative one.
         self._check([100], [3], 16, "3 tokens over 16 ranks")
 
@@ -202,9 +202,9 @@ def _shard_for(extend_lens, prefix_lens, tp_size, tp_rank):
 class TestW2LocalTopk(CustomTestCase):
     """``_IndexerQueryShard.resolve`` -- handoff §8 W2.
 
-    It drops the top-k all-gather when DSA-CP is about to slice the result back
+    It drops the top-k all-gather when the DSA token shard is about to slice the result back
     to the rows this rank already holds. The decision has to be exactly right:
-    taking the local path when DSA-CP is NOT running hands attention a tensor
+    taking the local path when the DSA token shard is NOT running hands attention a tensor
     a sixteenth of the width it expects, and skipping it when the two planners
     disagree hands every query a top-k computed for a different token, with no
     shape error to catch it.
@@ -255,7 +255,7 @@ class TestW2LocalTopk(CustomTestCase):
         """No plan means attention reads full width, so the gather must happen."""
         out, local, gathered, _ = self._resolve([16384], [0], 16, 3, plan_rank=None)
         self.assertFalse(local)
-        self.assertTrue(gathered, "dropped the gather with DSA-CP off")
+        self.assertTrue(gathered, "dropped the gather with the DSA token shard off")
 
     def test_skips_the_gather_when_dsa_token_shard_planned_the_same_rows(self):
         for tp_size in TP_SIZES:

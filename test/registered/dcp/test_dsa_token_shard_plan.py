@@ -1,6 +1,6 @@
-"""CPU unit test for the DSA-CP token-shard plan.
+"""CPU unit test for the the DSA token shard token-shard plan.
 
-Pins ``plan_dsa_token_shard`` (``layers/attention/dsa/dsa_token_shard_layout.py``). DSA-CP
+Pins ``plan_dsa_token_shard`` (``layers/attention/dsa/dsa_token_shard_layout.py``). the DSA token shard
 cuts an extend batch's TOKENS across the attention-TP group, so a rank computes
 every head for its slice instead of its own heads for every token. The cut is by
 position, not by request, and at a 13,855-token tail over 16 ranks a request
