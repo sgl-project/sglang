@@ -239,7 +239,7 @@ def _merge_weights_as_views(
     if merged is None:
         merged = torch.cat(ws, dim=0).contiguous()
     else:
-        # Keep the buffer address stable for graph replay after weight reloads.
+        # Keep the buffer address stable for graph replay after weight reloads
         assert merged.shape == (sum(w.shape[0] for w in ws), ws[0].shape[1])
         assert merged.dtype == ws[0].dtype and merged.device == ws[0].device
         off = 0
