@@ -292,8 +292,11 @@ def compute_local_gpu_id(
     """
     return (
         base_gpu_id
-        + (pp_rank % pp_size_per_node) * tp_size_per_node
-        + (tp_rank % tp_size_per_node) * gpu_id_step
+        + (
+            (pp_rank % pp_size_per_node) * tp_size_per_node
+            + (tp_rank % tp_size_per_node)
+        )
+        * gpu_id_step
     )
 
 
