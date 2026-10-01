@@ -108,8 +108,8 @@ inline bool try_copy_page_first_pages_batch(
   // paravirtualization), the batch call faults asynchronously, so take the
   // per-page fallback, whose cudaMemcpyAsync does the translation instead.
   int can_use_host_pointer = 0;
-  const cudaError_t attr_err = cudaDeviceGetAttribute(
-      &can_use_host_pointer, cudaDevAttrCanUseHostPointerForRegisteredMem, device_id);
+  const cudaError_t attr_err =
+      cudaDeviceGetAttribute(&can_use_host_pointer, cudaDevAttrCanUseHostPointerForRegisteredMem, device_id);
   if (attr_err != cudaSuccess) {
     (void)cudaGetLastError();
     return false;
