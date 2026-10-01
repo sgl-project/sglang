@@ -462,7 +462,16 @@ class TestAutotuneStoreAttach(CustomTestCase):
             self.assertEqual(store_root.call_count, 1)
         self.assertEqual(self.tuner._managed_cache.root, target)
 
-    def test_attach_alone_roots_the_process_store_and_holds_it(self):
+    def _as_tp_group(self, agree):
+        """Attach as a rank of a TP group, with ``agree`` standing in for the gate."""
+        return (
+            patch.object(
+                autotune, "_autotune_tactic_sync_group", return_value=object()
+            ),
+            patch.object(autotune, "_agree_on_autotune_store", side_effect=agree),
+        )
+
+    def test_attach_alone_roots_the_process_store(self):
         # Warmup attaches before PCIe-IPC tunes, outside any tuning context.
         root = self.dir / "early"
         with patch.object(
@@ -470,6 +479,30 @@ class TestAutotuneStoreAttach(CustomTestCase):
         ):
             autotune.attach_flashinfer_autotune_store(self.runner)
         self.assertEqual(self.tuner._managed_cache.root, root)
+
+    def test_single_ranks_share_a_store(self):
+        # Co-located single-rank servers resolve the same root; with no group
+        # to split, a second one must not be pushed off the store.
+        root = self.dir / "shared"
+        other_server = _lock_autotune_store(root)
+        self.addCleanup(other_server.close)
+        with patch.object(
+            autotune, "flashinfer_autotune_store_root", return_value=root
+        ):
+            autotune.attach_flashinfer_autotune_store(self.runner)
+        self.assertEqual(autotune._attached_store.root, root)
+        self.assertEqual(self.tuner._managed_cache.root, root)
+
+    def test_a_tp_group_holds_its_store_for_the_process(self):
+        root = self.dir / "held"
+        group, gate = self._as_tp_group(lambda root, locked, group, env: locked)
+        with (
+            patch.object(autotune, "flashinfer_autotune_store_root", return_value=root),
+            group,
+            gate,
+        ):
+            autotune.attach_flashinfer_autotune_store(self.runner)
+        self.assertEqual(autotune._attached_store.root, root)
         # Held for the process lifetime, not just while attaching.
         self.assertIsNone(_lock_autotune_store(root))
 
@@ -488,24 +521,27 @@ class TestAutotuneStoreAttach(CustomTestCase):
             autotune._wipe_autotune_store(root)
             return True
 
+        group, gate = self._as_tp_group(wipe_and_agree)
         with (
             patch.object(autotune, "flashinfer_autotune_store_root", return_value=root),
-            patch.object(
-                autotune, "_agree_on_autotune_store", side_effect=wipe_and_agree
-            ),
+            group,
+            gate,
         ):
             autotune.attach_flashinfer_autotune_store(self.runner)
         self.assertIsNone(self.tuner._managed_cache.lookup(str(fields)))
 
-    def test_a_store_held_elsewhere_tunes_in_memory(self):
-        root = self.dir / "held"
-        held = _lock_autotune_store(root)
-        self.addCleanup(held.close)
-        with patch.object(
-            autotune, "flashinfer_autotune_store_root", return_value=root
+    def test_a_tp_group_store_held_elsewhere_tunes_in_memory(self):
+        # The gate turns an unlocked rank into in-memory tuning on every rank.
+        root = self.dir / "contended"
+        other_server = _lock_autotune_store(root)
+        self.addCleanup(other_server.close)
+        group, gate = self._as_tp_group(lambda root, locked, group, env: locked)
+        with (
+            patch.object(autotune, "flashinfer_autotune_store_root", return_value=root),
+            group,
+            gate,
         ):
-            with autotune.flashinfer_autotune_context(self.runner, run_lm_head=False):
-                self.assertIsNone(self.tuner._active_managed_store)
+            autotune.attach_flashinfer_autotune_store(self.runner)
         self.assertIsNone(autotune._attached_store.root)
 
 

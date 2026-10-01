@@ -227,6 +227,7 @@ def _lock_autotune_store(root: Path) -> Optional[IO[bytes]]:
     FlashInfer snapshots the store when it attaches but reads a key published
     after that from disk on first lookup, so a second server publishing into
     the same root while this one tunes could split a TP group's ranks on a hit.
+    Only TP groups take it; a single rank has no group to split.
     """
     try:
         root.mkdir(parents=True, exist_ok=True)
@@ -368,11 +369,17 @@ def attach_flashinfer_autotune_store(model_runner: ModelRunner) -> _AutotuneStor
     from flashinfer.autotuner import _collect_metadata
 
     root = flashinfer_autotune_store_root(model_runner)
-    lock = _lock_autotune_store(root)
     sync_group = _autotune_tactic_sync_group(get_parallel().tp_group)
-    # The environment autotune_v2 namespaces the store by.
-    env = _collect_metadata()
-    if _agree_on_autotune_store(root, lock is not None, sync_group, env):
+    if sync_group is None:
+        # No group to split, and FlashInfer publishes each entry atomically, so
+        # servers that resolve the same root share the store without a lock.
+        lock, use_store = None, True
+    else:
+        lock = _lock_autotune_store(root)
+        # The environment autotune_v2 namespaces the store by.
+        env = _collect_metadata()
+        use_store = _agree_on_autotune_store(root, lock is not None, sync_group, env)
+    if use_store:
         # Attach and load only; tuning happens in flashinfer_autotune_context.
         with autotune_v2(mode="replay", cache_root=root):
             pass
