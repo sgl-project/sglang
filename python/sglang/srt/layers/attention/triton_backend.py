@@ -1560,7 +1560,7 @@ class TritonAttnBackend(AttentionBackend):
             )
             if (
                 forward_batch.positions is not None
-                and forward_batch.positions.numel() == loc.numel()
+                and forward_batch.positions.numel() == loc.loc.numel()
             ):
                 dcp_kv_mask = forward_batch.positions % self.dcp_size == self.dcp_rank
             else:
