@@ -945,10 +945,11 @@ class BufferModePipeline:
             if not (req.host_hit_is_storage and req.host_loaded_length > 0):
                 self._clear_storage_hit(req)
             return True
-        if len(req.prefix_indices) >= f.matched_len + f.num_tokens:
+        joint_len = len(req.prefix_indices)
+        if joint_len >= f.matched_len + f.num_tokens:
             # The joint match already covers the staged span; a shorter FULL-only
             # prefix would strand the slots recomputed below cache_protected_len.
-            self._resolve_device_covered(req, f)
+            self._resolve_device_covered(req)
             return True
         key = RadixKey(
             f.key_tokens,
@@ -989,25 +990,24 @@ class BufferModePipeline:
             if t.name == PoolName.MAMBA and t.host_indices is not None
         )
         if full_tokens == 0 and swa_tokens == 0 and mamba_slots == 0:
-            self._resolve_device_covered(req, f)
+            self._resolve_device_covered(req)
             return True
         req.host_hit_length = full_tokens
         req.swa_host_hit_length = swa_tokens
         req.mamba_host_hit_length = mamba_slots
-        req.storage_hit_length = full_tokens
-        req.storage_hit_start = matched_len if full_tokens else None
+        # The device alone serves only this pass's joint match; the rest of the
+        # span, fetched FULL or resident FULL the aux tail unlocks, is storage's.
+        req.storage_hit_length = f.matched_len + f.num_tokens - joint_len
+        req.storage_hit_start = joint_len
         req.host_hit_is_storage = True
         req.staged_prefetch_plan = StagedPrefetchPlan(
             f.operation_id, key, matched_len, full_tokens, swa_tokens, mamba_slots
         )
         return True
 
-    def _resolve_device_covered(self, req: Req, f: _StagedPrefetch) -> None:
+    def _resolve_device_covered(self, req: Req) -> None:
         self._clear_staged_hit(req)
-        self._cache._resolve_storage_prefetch_tokens(
-            req.cache_request_handle, f.num_tokens, reason="device_covered"
-        )
-        self.release_staged_hold(req.cache_request_handle, reason=None)
+        self.release_staged_hold(req.cache_request_handle, reason="device_covered")
 
     def _drop_staged_hit(self, req: Req, reason: str) -> None:
         self.release_staged_hold(req.cache_request_handle, reason=reason)
@@ -1296,8 +1296,8 @@ class BufferModePipeline:
         del self.staged_prefetches[request]
         self._staged_admission_defers.pop(request, None)
         req.staged_prefetch_plan = None
-        cache._resolve_storage_prefetch_tokens(
-            request, trim_tokens, reason="device_covered"
+        cache._settle_storage_prefetch_hit(
+            request, credited_tokens=req.storage_hit_length
         )
 
         swa_dev = next(

@@ -51,6 +51,19 @@ Omit `--service-discovery-namespace` to watch all namespaces (requires
 cluster-wide RBAC). For prefill/decode disaggregation, replace `--selector`
 with `--prefill-selector` and `--decode-selector`.
 
+To run two engine versions side by side in PD mode (e.g. during a rollout),
+pass `--pd-version-group-label <key>`. A prefill worker is then paired only with
+decode workers that have the same value for that EndpointSlice label (inherited
+from the Service, so use one Service per role and version), so KV never crosses
+versions. Unlabeled workers form their own group.
+
+```bash
+sgl-router --model-id qwen3 --service-discovery \
+  --prefill-selector app=engines-qwen3,role=prefill \
+  --decode-selector app=engines-qwen3,role=decode \
+  --pd-version-group-label sglang.ai/version-group
+```
+
 External KV indexer as the cache-aware signal source:
 
 ```bash
@@ -87,6 +100,14 @@ fail at startup. Legacy `--bucket-config` files cannot define complete reorg PD
 buckets and are not accepted on this path.
 
 Omitting `--chat-routing` keeps the existing policies and defaults.
+
+### Optional tokenizer for load-only routing
+
+`--no-tokenizer` skips tokenizer loading for load-only policies such as
+`power_of_two` and `session_aware`, on either routing path. Workers tokenize the
+original messages, and `/v1/tokenize` and `/v1/detokenize` are unavailable.
+Cache-aware routing, prefix-cache terms or filters, and `--bucket-config` still
+require a tokenizer.
 
 ### Fleet-wide sampling contract
 

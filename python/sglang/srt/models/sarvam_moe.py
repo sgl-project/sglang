@@ -72,7 +72,7 @@ from sglang.srt.utils import (
     bind_or_assign,
     is_cuda,
     is_nvidia_cublas_version_ge_12_9,
-    make_layers,
+    make_pp_layers,
     next_power_of_2,
 )
 
@@ -1111,7 +1111,7 @@ class SarvamMLAModel(nn.Module):
         else:
             self.embed_tokens = nn.Identity()
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: SarvamMoEMLADecoderLayer(
                 config=config,
@@ -1120,8 +1120,6 @@ class SarvamMLAModel(nn.Module):
                 prefix=prefix,
                 alt_stream=self.alt_stream,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix="model.layers",
         )
 
