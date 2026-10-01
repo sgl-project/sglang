@@ -1068,7 +1068,11 @@ async def clear_hicache_storage_backend():
     """Clear the hierarchical cache storage backend."""
     ret = await _global_state.tokenizer_manager.clear_hicache_storage()
     return Response(
-        content="Hierarchical cache storage backend cleared.\n",
+        content=(
+            "Hierarchical cache storage backend cleared.\n"
+            if ret.success
+            else "Failed to clear hierarchical cache storage backend.\n"
+        ),
         status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
     )
 
