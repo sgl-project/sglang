@@ -703,6 +703,64 @@ fn tokenize_failure_deregisters_via_intake() {
     assert!(detok_rx.try_recv().is_err(), "no further shard messages");
 }
 
+#[test]
+fn cancelled_tokenizer_returns_clear_tracking_with_or_without_prior_abort() {
+    use crate::tokenizer_manager::tokenizer::{TextTokenizer, TokenizerWorker};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    struct CountingTokenizer(Arc<AtomicUsize>);
+    impl TextTokenizer for CountingTokenizer {
+        fn encode(&self, _text: &str) -> Result<Vec<i64>, Error> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![1])
+        }
+    }
+
+    for abort_first in [false, true] {
+        let (mut intake, tok_rx, _mm_rx, consumer, detok_rx) = make_intake_with_tokenizer(false);
+        let (sink_tx, sink_rx) = mpsc::channel(4);
+        let mut req = generate_req(19, SamplingParams::default());
+        req.sink = ResponseSink::Local(sink_tx);
+        if let RequestKind::Generate(g) = &mut req.kind {
+            g.input_ids = None;
+            g.text = Some("cancelled prompt".into());
+        }
+        intake.drive(req);
+        assert!(intake.request_states.contains_key(&"19".into()));
+        assert!(matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { .. })));
+        drop(sink_rx);
+        if abort_first {
+            intake.on_abort(AbortSource::Guard("19".into()));
+        }
+        // Close the work queue after its one admitted request, keeping Intake
+        // itself available to process the real worker's returned state.
+        intake.senders.tokenizer_tx = flume::unbounded().0;
+        let (tm_tx, tm_rx) = flume::unbounded();
+        let calls = Arc::new(AtomicUsize::new(0));
+        TokenizerWorker::new(
+            tok_rx,
+            tm_tx,
+            Arc::new(CountingTokenizer(Arc::clone(&calls))),
+        )
+        .run();
+        let TmEvent::Tokenized(returned) = tm_rx.try_recv().unwrap() else {
+            panic!("expected Tokenized");
+        };
+        intake.drive(returned);
+
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert!(!intake.request_states.contains_key(&"19".into()));
+        assert!(consumer.drain(16).is_empty());
+        assert!(
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == "19")
+        );
+        assert!(detok_rx.try_recv().is_err(), "deregister exactly once");
+    }
+}
+
 /// An abort deregisters (by the id hashed from the rid string), so a request
 /// aborted before any terminal chunk can't leak.
 #[test]

@@ -202,7 +202,11 @@ impl Runnable for TokenizerWorker {
             // A request is never dropped here: a kind this pool cannot serve
             // goes back as `Failed`, so intake rejects it and releases its
             // tracking entry instead of leaving the client hung.
-            let event = if let RequestKind::Generate(g) = &mut req.kind {
+            let event = if req.sink.is_closed() {
+                // Still return the request so Intake can clear its tracking
+                // entry and registration even if the abort lane arrives later.
+                Event::Error(Error::Disconnected)
+            } else if let RequestKind::Generate(g) = &mut req.kind {
                 // Size the scheduler's stop-match window in TOKENS, as Python's
                 // `normalize(tokenizer)` does.
                 let stop_tokens = g
@@ -259,6 +263,107 @@ mod tests {
         fn encode(&self, text: &str) -> Result<TokenIds, Error> {
             Ok(text.split_whitespace().map(|_| 1i64).collect())
         }
+    }
+
+    #[test]
+    fn cancelled_queued_requests_skip_prompt_and_stop_tokenization() {
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        struct GatedTokenizer {
+            calls: Arc<Mutex<Vec<String>>>,
+            entered: flume::Sender<()>,
+            release: flume::Receiver<()>,
+        }
+        impl TextTokenizer for GatedTokenizer {
+            fn encode(&self, text: &str) -> Result<TokenIds, Error> {
+                self.calls.lock().unwrap().push(text.to_string());
+                if text == "first" {
+                    self.entered.send(()).unwrap();
+                    self.release.recv().unwrap();
+                }
+                Ok(vec![1])
+            }
+        }
+
+        let make_request = |rid: &str, text: &str, stops: Vec<String>| {
+            let (tx, rx) = mpsc::channel(4);
+            (
+                Request {
+                    rid: rid.into(),
+                    state: RequestState::Tokenizing {
+                        then: AfterTokenize::PreSend,
+                    },
+                    sink: ResponseSink::Local(tx),
+                    kind: RequestKind::Generate(Box::new(GenerateRequest {
+                        rid: rid.into(),
+                        text: Some(text.into()),
+                        sampling_params: SamplingParams {
+                            stop_strs: stops,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    })),
+                },
+                rx,
+            )
+        };
+        let (req_tx, req_rx) = flume::unbounded();
+        let (tm_tx, tm_rx) = flume::unbounded();
+        let (entered_tx, entered_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let worker = TokenizerWorker::new(
+            req_rx,
+            tm_tx,
+            Arc::new(GatedTokenizer {
+                calls: Arc::clone(&calls),
+                entered: entered_tx,
+                release: release_rx,
+            }),
+        );
+        let (first, _first_response) = make_request("first", "first", vec![]);
+        req_tx.send(first).unwrap();
+        let worker = std::thread::spawn(move || worker.run());
+        let entered = entered_rx.recv_timeout(Duration::from_secs(5));
+        let (cancelled, cancelled_response) = make_request(
+            "cancelled",
+            "cancelled prompt",
+            vec!["cancelled stop".into()],
+        );
+        req_tx.send(cancelled).unwrap();
+        drop(cancelled_response);
+        let (live, _live_response) = make_request("live", "live prompt", vec!["live stop".into()]);
+        req_tx.send(live).unwrap();
+        drop(req_tx);
+        // Release and join before assertions, including on the original code.
+        let _ = release_tx.send(());
+        worker.join().unwrap();
+        assert!(entered.is_ok(), "first request did not start encoding");
+
+        let returned: Vec<_> = tm_rx.try_iter().collect();
+        assert_eq!(returned.len(), 3, "Intake must receive every request back");
+        for (i, event) in returned.into_iter().enumerate() {
+            let TmEvent::Tokenized(req) = event else {
+                panic!("expected Tokenized");
+            };
+            if i == 1 {
+                assert!(matches!(
+                    req.state,
+                    RequestState::Failed(Error::Disconnected)
+                ));
+                let RequestKind::Generate(g) = req.kind else {
+                    panic!("expected generate");
+                };
+                assert!(g.input_ids.is_none());
+            } else {
+                assert!(matches!(req.state, RequestState::PreSendValidating));
+            }
+        }
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["first", "live stop", "live prompt"]
+        );
     }
 
     /// The scheduler's stop-match window must reach the wire as a TOKEN count, as
@@ -376,13 +481,14 @@ mod tests {
         let run = |skip_special_tokens: bool| {
             let (req_tx, req_rx) = flume::unbounded::<Request>();
             let (tm_tx, tm_rx) = flume::unbounded::<TmEvent>();
+            let (sink_tx, _sink_rx) = mpsc::channel(4);
             req_tx
                 .send(Request {
                     rid: "1".into(),
                     state: RequestState::Tokenizing {
                         then: AfterTokenize::PreSend,
                     },
-                    sink: ResponseSink::Local(tokio::sync::mpsc::channel(4).0),
+                    sink: ResponseSink::Local(sink_tx),
                     kind: RequestKind::Generate(Box::new(GenerateRequest {
                         rid: "1".into(),
                         text: Some("hi".into()),
