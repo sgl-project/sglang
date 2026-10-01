@@ -173,5 +173,72 @@ class TestSmallMMoeGfx950(CustomTestCase):
         self.assertTrue(torch.equal(gout, eager))
 
 
+@unittest.skipUnless(_gfx950(), "gfx950 (MI35x) only")
+class TestSmallMMoeFp8Gfx950(CustomTestCase):
+    """FP8 block-scale (e4m3fn, fp32 scale per 128x128 tile) at the TP4 / TP8 per-rank intermediates 256 / 128."""
+
+    E, DIM, TOPK, CAPS = 16, 4096, 10, {256: 20, 128: 48}
+
+    @classmethod
+    def setUpClass(cls):
+        from aiter.ops.shuffle import shuffle_weight
+
+        from sglang.kernels.ops.moe import smallm_moe_gfx950 as M
+
+        cls.M, cls.dev, cls.w = M, torch.device("cuda", 0), {}
+        torch.manual_seed(0)
+        for inter in cls.CAPS:
+            q = []
+            for n, k in ((2 * inter, cls.DIM), (cls.DIM, inter)):
+                t = (
+                    torch.randn(cls.E, n // 128, 128, k // 128, 128, device=cls.dev)
+                    * 0.05
+                )
+                s = t.abs().amax(dim=(2, 4), keepdim=True) / 448.0
+                wq = (t / s).to(torch.float8_e4m3fn)
+                deq = (wq.float() * s).view(cls.E, n, k)
+                ws = shuffle_weight(wq.view(cls.E, n, k), layout=(16, 16)).contiguous()
+                ws.is_shuffled = True
+                q.append((ws, s.view(cls.E, n // 128, k // 128).contiguous(), deq))
+            cls.w[inter] = q
+
+    def _case(self, tok):
+        # distinct routed experts per token plus the fused shared expert (E-1) in slot 10 for every token
+        ids = torch.stack([torch.randperm(self.E - 1)[: self.TOPK] for _ in range(tok)])
+        ids = torch.cat([ids, torch.full((tok, 1), self.E - 1)], 1)
+        ids = ids.to(self.dev, torch.int32).contiguous()
+        wts = torch.softmax(torch.randn(tok, self.TOPK + 1, device=self.dev), -1)
+        x = torch.randn(tok, self.DIM, device=self.dev, dtype=torch.bfloat16)
+        return x, ids, wts
+
+    def _supported(self, x, ids, w13, s13, w2, s2):
+        return self.M.smallm_moe_supported(
+            x, w13, w2, ids, None, False, True, False, None, s13, s2
+        )
+
+    def test_matches_reference_and_guards(self):
+        for inter, cap in self.CAPS.items():
+            (w13, s13, d13), (w2, s2, d2) = self.w[inter]
+            for tok in (1, 3, 8, cap):
+                x, ids, wts = self._case(tok)
+                self.assertTrue(self._supported(x, ids, w13, s13, w2, s2))
+                out = self.M.smallm_moe_fwd(x, w13, w2, wts, ids, s13, s2).float()
+                gu = torch.einsum("tjnk,tk->tjn", d13[ids.long()], x.float())
+                h = (
+                    torch.nn.functional.silu(gu[..., :inter]) * gu[..., inter:]
+                ).bfloat16()
+                ref = torch.einsum("tjdn,tjn,tj->td", d2[ids.long()], h.float(), wts)
+                ref = ref.bfloat16().float()
+                rel = ((out - ref).norm() / ref.norm()).item()
+                self.assertLess(rel, 5e-3, f"inter={inter} tok={tok}: rel_l2={rel:.3e}")
+            # above the cap, with per-channel FP8 scales, or unshuffled weights: stay on aiter
+            x, ids, _ = self._case(cap + 1)
+            self.assertFalse(self._supported(x, ids, w13, s13, w2, s2))
+            x, ids = x[:4], ids[:4]
+            per_channel = torch.ones(self.E, 2 * inter, 1, device=self.dev)
+            self.assertFalse(self._supported(x, ids, w13, per_channel, w2, s2))
+            self.assertFalse(self._supported(x, ids, w13.clone(), s13, w2, s2))
+
+
 if __name__ == "__main__":
     unittest.main()
