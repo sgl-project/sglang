@@ -11,14 +11,27 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
-def make_pool(free, *, lazy=False):
+def make_pool(free, *, lazy=False, extra_buffer=True, track_buffer_size=2):
     pool = object.__new__(HybridReqToTokenPool)
     pool.mamba_allocator = MambaSlotAllocator(5, "cpu")
+    pool.enable_mamba_extra_buffer = extra_buffer
     pool.enable_mamba_extra_buffer_lazy = lazy
+    pool.mamba_ping_pong_track_buffer_size = track_buffer_size
     held = pool.mamba_allocator.alloc(5 - free)
     pool.available_size = lambda: 1
     pool.alloc = MagicMock(return_value=[1])
     return pool, held
+
+
+def make_req(*, holds_mamba=False, has_buffer=False):
+    return SimpleNamespace(
+        kv=SimpleNamespace(
+            holds_mamba=holds_mamba,
+            mamba_ping_pong_track_buffer=object() if has_buffer else None,
+            req_pool_idx=None,
+            mamba_pool_idx=object() if holds_mamba else None,
+        )
+    )
 
 
 def make_cache(pool, held, release):
@@ -42,7 +55,7 @@ class TestMambaCapacity(unittest.TestCase):
             with self.subTest(free=free):
                 pool, held = make_pool(free)
                 cache = make_cache(pool, held, expected_eviction)
-                self.assertTrue(ensure_mamba_capacity(pool, [object()], cache))
+                self.assertTrue(ensure_mamba_capacity(pool, [make_req()], cache))
                 self.assertGreaterEqual(pool.mamba_allocator.available_size(), 3)
                 if expected_eviction:
                     self.assertEqual(
@@ -55,9 +68,7 @@ class TestMambaCapacity(unittest.TestCase):
     def test_partial_eviction_defers_before_mutating_request(self):
         pool, held = make_pool(1)
         cache = make_cache(pool, held, 1)
-        req = SimpleNamespace(
-            kv=SimpleNamespace(req_pool_idx=None, mamba_pool_idx=None)
-        )
+        req = make_req()
         self.assertFalse(ensure_mamba_capacity(pool, [req], cache))
         self.assertEqual(pool.mamba_allocator.available_size(), 2)
         self.assertIsNone(req.kv.req_pool_idx)
@@ -66,16 +77,52 @@ class TestMambaCapacity(unittest.TestCase):
             alloc_req_slots(pool, [req], cache)
         pool.alloc.assert_not_called()
 
-    def test_lazy_and_no_cache_costs(self):
+    def test_uses_only_missing_slots_for_each_request(self):
+        pool, held = make_pool(2)
+        cache = make_cache(pool, held, 1)
+        reqs = [make_req(), make_req(holds_mamba=True, has_buffer=True)]
+        self.assertTrue(ensure_mamba_capacity(pool, reqs, cache))
+        self.assertEqual(cache.evict_for_alloc.call_args.args[0].mamba_num, 1)
+
+        for holds_mamba, has_buffer, free, release, expected_eviction in [
+            (True, False, 1, 1, 1),
+            (False, True, 1, 0, 0),
+            (True, True, 0, 0, 0),
+        ]:
+            with self.subTest(holds_mamba=holds_mamba, has_buffer=has_buffer):
+                pool, held = make_pool(free)
+                cache = make_cache(pool, held, release)
+                req = make_req(holds_mamba=holds_mamba, has_buffer=has_buffer)
+                self.assertTrue(ensure_mamba_capacity(pool, [req], cache))
+                if expected_eviction:
+                    self.assertEqual(
+                        cache.evict_for_alloc.call_args.args[0].mamba_num,
+                        expected_eviction,
+                    )
+                else:
+                    cache.evict_for_alloc.assert_not_called()
+
+    def test_tracking_buffer_settings(self):
         pool, held = make_pool(1, lazy=True)
         cache = make_cache(pool, held, 1)
-        self.assertTrue(ensure_mamba_capacity(pool, [object()], cache))
+        self.assertTrue(ensure_mamba_capacity(pool, [make_req()], cache))
         self.assertEqual(cache.evict_for_alloc.call_args.args[0].mamba_num, 1)
+
+        pool, held = make_pool(1, track_buffer_size=1)
+        cache = make_cache(pool, held, 1)
+        self.assertTrue(ensure_mamba_capacity(pool, [make_req()], cache))
+        self.assertEqual(cache.evict_for_alloc.call_args.args[0].mamba_num, 1)
+
+        pool, held = make_pool(1, extra_buffer=False)
+        cache = make_cache(pool, held, 0)
+        cache.supports_mamba = lambda: False
+        self.assertTrue(ensure_mamba_capacity(pool, [make_req()], cache))
+        cache.evict_for_alloc.assert_not_called()
 
         pool, held = make_pool(1)
         cache = make_cache(pool, held, 0)
         cache.supports_mamba = lambda: False
-        self.assertTrue(ensure_mamba_capacity(pool, [object()], cache))
+        self.assertFalse(ensure_mamba_capacity(pool, [make_req()], cache))
         cache.evict_for_alloc.assert_not_called()
 
     def test_pd_preallocation_leaves_blocked_request_queued(self):
@@ -87,7 +134,7 @@ class TestMambaCapacity(unittest.TestCase):
             output_ids=[],
             finished_reason=None,
             is_retracted=True,
-            kv=SimpleNamespace(req_pool_idx=None, mamba_pool_idx=None),
+            kv=make_req().kv,
         )
         decode_req = SimpleNamespace(
             req=req, waiting_for_input=True, is_rebootstrap=False

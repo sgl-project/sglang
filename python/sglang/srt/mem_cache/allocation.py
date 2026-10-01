@@ -20,9 +20,6 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.common import (
-    MAMBA_STATE_PER_REQ_NO_CACHE,
-    MAMBA_STATE_PER_REQ_PREFIX_CACHE,
-    MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY,
     available_and_evictable_str,
     evict_from_tree_cache,
 )
@@ -295,18 +292,25 @@ def ensure_mamba_capacity(
     if not isinstance(req_to_token_pool, HybridReqToTokenPool):
         return True
 
+    # Count the slots HybridReqToTokenPool.alloc will allocate for each request.
+    needed = 0
+    for req in reqs:
+        if not req.kv.holds_mamba:
+            needed += 1
+
+        if not req_to_token_pool.enable_mamba_extra_buffer:
+            continue
+        if req.kv.mamba_ping_pong_track_buffer is not None:
+            continue
+
+        if req_to_token_pool.enable_mamba_extra_buffer_lazy:
+            needed += 1
+        else:
+            needed += req_to_token_pool.mamba_ping_pong_track_buffer_size
+
     # Byte-coordinated for the shared allocator; plain free slots otherwise.
     allocator = req_to_token_pool.mamba_allocator
     supports_mamba = tree_cache is not None and tree_cache.supports_mamba()
-    if supports_mamba:
-        factor = (
-            MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY
-            if req_to_token_pool.enable_mamba_extra_buffer_lazy
-            else MAMBA_STATE_PER_REQ_PREFIX_CACHE
-        )
-    else:
-        factor = MAMBA_STATE_PER_REQ_NO_CACHE
-    needed = len(reqs) * factor
     available = allocator.schedulable_available_size()
     if available < needed and supports_mamba:
         tree_cache.evict_for_alloc(
