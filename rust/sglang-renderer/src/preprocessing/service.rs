@@ -279,6 +279,108 @@ mod tests {
         }
     }
 
+    struct GatedTokenizer {
+        calls: Arc<std::sync::Mutex<Vec<String>>>,
+        started: flume::Sender<()>,
+        resume: flume::Receiver<()>,
+    }
+
+    impl TextTokenizer for GatedTokenizer {
+        fn encode(
+            &self,
+            text: &str,
+            _add_special_tokens: bool,
+        ) -> Result<crate::TokenIds, sglang_processor::ProcessorError> {
+            self.calls.lock().unwrap().push(text.to_owned());
+            if text == "active" {
+                self.started.send(()).unwrap();
+                self.resume
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("test must release the active tokenizer job");
+            }
+            Ok(vec![7])
+        }
+    }
+
+    #[test]
+    fn dropped_tokenize_call_skips_queued_work() {
+        futures::executor::block_on(async {
+            let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (started, entered) = flume::bounded(1);
+            let (resume, gate) = flume::bounded(1);
+            let service = RendererService::with_tokenizer(
+                model_config(String::new()),
+                Arc::new(GatedTokenizer {
+                    calls: calls.clone(),
+                    started,
+                    resume: gate,
+                }),
+                1,
+                2,
+            );
+            let mut active = Box::pin(service.tokenize_prompt("active".into(), false));
+            assert!(futures::poll!(&mut active).is_pending());
+            entered
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+
+            let mut cancelled = Box::pin(service.tokenize_prompt("cancelled".into(), false));
+            assert!(futures::poll!(&mut cancelled).is_pending());
+            drop(cancelled);
+            let mut live = Box::pin(service.tokenize_prompt("live".into(), false));
+            assert!(futures::poll!(&mut live).is_pending());
+
+            resume.send(()).unwrap();
+            assert_eq!(active.await.unwrap(), [7]);
+            assert_eq!(live.await.unwrap(), [7]);
+            assert_eq!(*calls.lock().unwrap(), ["active", "live"]);
+        });
+    }
+
+    #[test]
+    fn rejected_batch_skips_queued_sibling_tokenization() {
+        futures::executor::block_on(async {
+            let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (started, entered) = flume::bounded(1);
+            let (resume, gate) = flume::bounded(1);
+            let service = RendererService::with_tokenizer(
+                model_config(String::new()),
+                Arc::new(GatedTokenizer {
+                    calls: calls.clone(),
+                    started,
+                    resume: gate,
+                }),
+                1,
+                3,
+            );
+            let mut active = Box::pin(service.tokenize_prompt("active".into(), false));
+            assert!(futures::poll!(&mut active).is_pending());
+            entered
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+
+            let request = |rid: &str, prompt: &str| {
+                TextRequest::text(rid, prompt, false, GenerationOptions::default())
+            };
+            let error = service
+                .prepare_text_requests(vec![
+                    request("first", "cancelled-first"),
+                    request("second", "cancelled-second"),
+                    request(&"x".repeat(129), "invalid"),
+                ])
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("128-byte limit"));
+            let mut live = Box::pin(service.tokenize_prompt("live".into(), false));
+            assert!(futures::poll!(&mut live).is_pending());
+
+            resume.send(()).unwrap();
+            assert_eq!(active.await.unwrap(), [7]);
+            assert_eq!(live.await.unwrap(), [7]);
+            assert_eq!(*calls.lock().unwrap(), ["active", "live"]);
+        });
+    }
+
     #[test]
     fn text_choices_tokenize_once_per_prompt() {
         futures::executor::block_on(async {
