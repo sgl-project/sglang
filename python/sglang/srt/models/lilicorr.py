@@ -510,6 +510,8 @@ def check_conv_weight_coverage(model: DFlashDraftModel, seen: set) -> None:
 
 
 class LiLiCorrDraftModel(DFlashDraftModel):
+    supports_quantization = True
+
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
         self.lilicorr = LiLiCorrHead(
