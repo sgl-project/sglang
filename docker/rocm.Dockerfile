@@ -569,12 +569,18 @@ RUN pip uninstall -y aiter
 # produced by a fresh `git clone` above, so there are no real user changes to
 # preserve.
 # cherry pick ROCm/aiter#6042 to unpeel the 64-bit sparse MLA loop below Triton 3.8, may be removed in next aiter upgrade
+# apply the DSV4.1 TP2 fp8/fp4 FMoE tuning CSVs from ROCm/aiter#5967, may be removed in next aiter upgrade
 # apply fix for v4 fp4 indexer, may be removed in next aiter upgrade
 RUN git clone ${AITER_REPO} \
  && cd aiter \
  && git checkout -f ${AITER_COMMIT} \
  && git fetch origin pull/6042/head \
  && git cherry-pick --no-commit 042a289183e5b47e193df6c10160915a6e8b69f5 \
+ && git fetch origin pull/5967/head \
+ && git diff -U0 89a47b84ac4b576339a50047e290c383c2377389 2bd147293d887c91fd10da10b1dbbf4690844270 -- \
+      aiter/configs/model_configs/dsv41_fp4_tuned_fmoe.csv \
+      aiter/configs/model_configs/dsv41_fp4_untuned_fmoe.csv \
+    | git apply --unidiff-zero \
  && sed -i 's/from functools import lru_cache/from functools import cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py \
  && sed -i 's/@lru_cache(maxsize=32)/@cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py \
  && git submodule update --init --recursive \
