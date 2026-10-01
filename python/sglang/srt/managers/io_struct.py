@@ -361,9 +361,8 @@ class GenerateReqInput:
     # are read AT these positions instead of the last token).
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
     token_indices_to_pool: Optional[Union[List[List[int]], List[int]]] = None
-    # (token_id, offset): the tokenizer manager sets token_indices_to_pool to this
-    # offset from every token_id in the final, multimodal-expanded input ids.
-    # Batch-level: one pair per request. After __getitem__: one pair.
+    # (token_id, offset), one per request: token_indices_to_pool becomes offset from
+    # every token_id of the final, multimodal-expanded input ids.
     readout_anchor: Optional[Union[List[Tuple[int, int]], Tuple[int, int]]] = None
 
     # Cache namespace used to isolate otherwise-identical prefixes.

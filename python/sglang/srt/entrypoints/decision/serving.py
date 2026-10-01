@@ -1,5 +1,3 @@
-"""Decisions from a checkpoint's own trained prompt: every field of a request is read from one prefill."""
-
 from __future__ import annotations
 
 import asyncio
@@ -37,8 +35,6 @@ _SUBJECT = "Decision model requests"
 
 
 class TrainedDecisions(OpenAIServingBase):
-    """The prompt source of the decision routes for checkpoints trained on their own decision prompt."""
-
     name = "trained"
     request_model = JevRequest
 
@@ -47,7 +43,6 @@ class TrainedDecisions(OpenAIServingBase):
     ):
         super().__init__(tokenizer_manager)
         self.family = detect_family(tokenizer_manager.tokenizer)
-        # The host route's server refusals, shared by every prompt source.
         self.validate_server = validate_server
 
     @staticmethod
@@ -160,12 +155,10 @@ class TrainedDecisions(OpenAIServingBase):
         return ORJSONResponse(content=response.model_dump(exclude_none=True))
 
 
-# The prompt sources of decision model checkpoints, for the decision route handlers.
 PROMPT_SOURCES = (TrainedDecisions,)
 
 
 def _unprocessable(error: DecisionInputError) -> ORJSONResponse:
-    # The FastAPI detail list that request validation returns on these routes.
     detail = [
         {"type": "value_error", "loc": list(error.loc), "msg": f"Value error, {error}"}
     ]

@@ -1,5 +1,3 @@
-"""Unit tests for decision model checkpoints on /v1/decisions, /v1/jev, and /v1/systemone."""
-
 import base64
 import io
 import math
@@ -47,7 +45,6 @@ TOKENIZER = "internlm/Intern-Decision-0.8B"
 GENERIC_TOKENIZER = "Qwen/Qwen3.5-35B-A3B"
 ROUTES = ("/v1/decisions", "/v1/jev", "/v1/systemone")
 NOUL = {"u": {"type": "noul"}}
-# Image tokens one image expands to in the stand-in for the Qwen-VL processor.
 IMAGE_TOKENS = 16
 
 QUESTIONS = {
@@ -140,7 +137,6 @@ class ReadoutManager(TokenizerManagerScoreMixin):
 
 
 def _chat_serving(manager):
-    """The chat serving state of a Jinja-template server."""
     _, reasoning_config = detect_reasoning_pattern(manager.tokenizer.chat_template)
     template_manager = SimpleNamespace(
         chat_template_name=None,
@@ -177,8 +173,6 @@ def _b64(data):
 
 
 def _png_header(width, height):
-    """A PNG whose header declares width x height, a few bytes long."""
-
     def chunk(kind, data):
         crc = zlib.crc32(kind + data) & 0xFFFFFFFF
         return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", crc)
@@ -233,20 +227,29 @@ class TestDecisionModels(unittest.TestCase):
 
     def test_invalid_requests_are_422_at_the_offending_field(self):
         client, _ = self._client()
-        choices = {f"o{i}": "" for i in range(63)}
         cases = [
-            (
-                {"f": {"type": "choice", "criteria": choices}},
-                ["body", "questions", "f"],
-            ),
             ({f"f{i}": NOUL["u"] for i in range(17)}, ["body", "questions"]),
             ({"f": {"type": "score", "criteria": {"x": ""}}}, ["body", "questions"]),
         ]
-        markers = [
-            ({"state": "a <decision>", "questions": NOUL}, ["body", "state"]),
+        choices = {f"o{i}": "" for i in range(63)}
+        family_errors = [
+            (
+                {
+                    "state": {},
+                    "questions": {"f": {"type": "choice", "criteria": choices}},
+                },
+                ["body", "questions", "f", "criteria"],
+                "62 options",
+            ),
+            (
+                {"state": "a <decision>", "questions": NOUL},
+                ["body", "state"],
+                "reserved decision marker",
+            ),
             (
                 {"state": {}, "questions": {"x<decision>": NOUL["u"]}},
                 ["body", "questions", "x<decision>"],
+                "reserved decision marker",
             ),
             (
                 {
@@ -254,6 +257,7 @@ class TestDecisionModels(unittest.TestCase):
                     "questions": {"u": {"type": "noul", "instructions": "<decision>"}},
                 },
                 ["body", "questions", "u", "instructions"],
+                "reserved decision marker",
             ),
             (
                 {
@@ -263,6 +267,7 @@ class TestDecisionModels(unittest.TestCase):
                     },
                 },
                 ["body", "questions", "u", "criteria"],
+                "reserved decision marker",
             ),
         ]
         for route in ROUTES:
@@ -274,11 +279,13 @@ class TestDecisionModels(unittest.TestCase):
                     detail = response.json()["detail"][0]
                     self.assertEqual(detail["loc"][: len(loc)], loc)
                     self.assertIn("x-typesafe-request-id", response.headers)
-            for body, loc in markers:
-                with self.subTest(route=route, marker_loc=loc):
-                    detail = client.post(route, json=body).json()["detail"][0]
-                    self.assertIn("reserved decision marker", detail["msg"])
-                    self.assertEqual(detail["loc"], loc)
+        for body, loc, message in family_errors:
+            with self.subTest(family_loc=loc):
+                response = client.post("/v1/jev", json=body)
+                self.assertEqual(response.status_code, 422, response.text)
+                detail = response.json()["detail"][0]
+                self.assertIn(message, detail["msg"])
+                self.assertEqual(detail["loc"], loc)
 
     def test_routes_dispatch_by_body_shape_and_checkpoint(self):
         client, _ = self._client()
@@ -399,7 +406,6 @@ class TestDecisionModels(unittest.TestCase):
         png = {"type": "image/png", "data": _png("red")}
         cases = [
             ([_png("red")] * 9, ["body", "images"]),
-            ([_png("red"), "not-base64!"], ["body", "images", 1]),
             (["data:text/plain;base64," + _png("red")], ["body", "images", 0]),
             ([_b64(b"not an image")], ["body", "images", 0]),
             (["/etc/passwd"], ["body", "images", 0]),

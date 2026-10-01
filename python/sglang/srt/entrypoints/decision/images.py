@@ -1,5 +1,3 @@
-"""Admission and normalization of uploaded images, with the limits and pixel representation of the Intern-Decision HTTP service."""
-
 import binascii
 import io
 import struct
@@ -12,6 +10,7 @@ from PIL import Image, ImageOps
 from sglang.srt.entrypoints.decision.families.base import DecisionInputError
 from sglang.srt.entrypoints.decision.protocol import JevImage, JevImageUpload
 
+# The limits of the official upload handler, Intern-Decision src/service/uploads.py.
 MAX_IMAGE_BYTES = 12 * 1024 * 1024
 MAX_TOTAL_BYTES = 32 * 1024 * 1024
 MAX_IMAGE_PIXELS = 16_000_000
@@ -26,7 +25,6 @@ _MAX_ENCODED_CHARS = 4 * ((MAX_IMAGE_BYTES + 2) // 3) + 128
 
 
 def normalize_images(images: List[JevImage]) -> List[str]:
-    """PNG data URLs of the upright RGB pixels, raising DecisionInputError at the offending image."""
     urls: List[str] = []
     total = normalized_total = 0
     for index, image in enumerate(images):
@@ -88,8 +86,8 @@ def _upright_rgb_png(data: bytes, content_type: Optional[str], loc: Tuple) -> by
         if source.width * source.height > MAX_IMAGE_PIXELS:
             raise DecisionInputError("each image is limited to 16 million pixels", loc)
         with _pillow_errors(loc):
-            # Pillow defines n_frames only on formats that can hold several frames,
-            # and counts them by parsing every frame descriptor.
+            # Not a passive read: n_frames parses every frame descriptor and fails on
+            # truncated data. Pillow defines it only on multi-frame formats.
             frames = getattr(source, "n_frames", 1)
         if frames != 1:
             raise DecisionInputError("animated images are not supported", loc)

@@ -1,5 +1,3 @@
-"""Jev (TypeSafe System One) request and response models, served for decision model checkpoints."""
-
 import math
 from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 
@@ -56,7 +54,6 @@ class JevScoreQuestion(_Question):
 
 class JevNoulQuestion(_Question):
     type: Literal["noul"]
-    # yes/true/1 and no/false/0 keys override the default descriptions.
     criteria: Any = None
 
 
@@ -67,23 +64,17 @@ JevQuestion = Annotated[
 
 
 class JevImageUpload(BaseModel):
-    """The upload object of the official service; a data URL in data overrides type."""
-
     type: str = ""
     data: str
 
 
-# Base64 or a base64 data URL; paths and remote URLs are never loaded.
 JevImage = Union[JevImageUpload, str]
 
 
 class JevRequest(BaseModel):
     state: Any
     questions: Dict[str, JevQuestion] = Field(min_length=1, max_length=MAX_QUESTIONS)
-    # In prompt order; decoded and normalized only after the server refusals pass.
     images: Optional[List[JevImage]] = Field(default=None, max_length=MAX_IMAGES)
-    # Divides the candidate logits, softmax(log p / T); a value whose rounding would
-    # change an argmax is refused.
     temperature: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
     thinking: Optional[Dict[str, Any]] = None
     model: Optional[str] = None

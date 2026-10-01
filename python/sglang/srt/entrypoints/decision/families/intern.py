@@ -1,4 +1,4 @@
-"""The Intern-Decision family: checkpoints that ship a <decision> token, with the prompt of compile_row in internlm/Intern-Decision src/inputs/schema.py."""
+"""Port of compile_row in internlm/Intern-Decision src/inputs/schema.py; the prompt must match it byte for byte."""
 
 from __future__ import annotations
 
@@ -30,7 +30,6 @@ SYSTEM_PROMPT = (
 )
 NOUL_YES = "The answer is yes (affirmative, or align with the claim)."
 NOUL_NO = "The answer is no (negative, or disagree with the claim)."
-# Text the Qwen-VL processor reads as an image slot.
 IMAGE_PLACEHOLDERS = (
     "<image>",
     "<|vision_start|>",
@@ -50,7 +49,6 @@ CHAT_TEMPLATE_KWARGS = {
 class CompiledDecision(msgspec.Struct, frozen=True):
     messages: List[Dict[str, Any]]
     fields: List[str]
-    # Per field: the original option labels and their descriptions, in symbol order.
     options: Dict[str, List[Tuple[str, str]]]
 
 
@@ -86,7 +84,6 @@ def question_options(question: Mapping[str, Any]) -> List[Tuple[str, str]]:
 def compile_decision(
     state: Any, questions: Mapping[str, Mapping[str, Any]]
 ) -> CompiledDecision:
-    """Chat messages whose assistant skeleton holds one decision marker per field, in field order."""
     fields: List[str] = []
     options: Dict[str, List[Tuple[str, str]]] = {}
     schema_lines: List[str] = []
@@ -174,12 +171,13 @@ class InternDecisionFamily:
         ]
         messages = compiled.messages
         if request.images:
-            # The official layout: every image, in order, before the user text.
+            # As the official backend: every image, in order, before the user text.
             parts = [{"type": "image"} for _ in request.images]
             parts.append({"type": "text", "text": messages[1]["content"]})
             messages = [messages[0], {"role": "user", "content": parts}, messages[2]]
         text = self.tokenizer.apply_chat_template(messages, **CHAT_TEMPLATE_KWARGS)
-        # The distribution predicting a marker slot is read one position before it.
+        # Logits at position i predict token i + 1, as in training, so a marker's
+        # answer is read one position before the marker.
         anchor = (self.marker_id, -1)
         if request.images:
             return DecisionPrompt(
@@ -201,7 +199,6 @@ class InternDecisionFamily:
 def _source_loc(
     state: Any, questions: Mapping[str, Mapping[str, Any]], text: str
 ) -> Tuple[Any, ...]:
-    """The request part whose rendering holds text; the fixed prompt text never does."""
     if text in json.dumps(state, ensure_ascii=False, indent=2, sort_keys=False):
         return ("body", "state")
     for field, question in questions.items():

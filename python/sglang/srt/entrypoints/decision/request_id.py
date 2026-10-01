@@ -1,5 +1,3 @@
-"""Pure-ASGI middleware that tags every response of the decision routes with the TypeSafe request id."""
-
 import uuid
 
 from starlette.datastructures import Headers, MutableHeaders
@@ -9,8 +7,6 @@ DECISION_ROUTES = frozenset({"/v1/decisions", "/v1/jev", "/v1/systemone"})
 
 
 class TypesafeRequestIdMiddleware:
-    """Echo the client's x-typesafe-request-id, or generate one, on success and error responses alike."""
-
     def __init__(self, app):
         self.app = app
 
@@ -29,9 +25,9 @@ class TypesafeRequestIdMiddleware:
 
 
 def install_typesafe_request_id(app) -> None:
-    """Tag responses outside every middleware, so auth rejections and unhandled 500s carry the id too."""
     build_middleware_stack = app.build_middleware_stack
-    # Starlette builds the stack on the first call, after all middleware is added.
+    # Wrapping the built stack, unlike add_middleware, also covers auth and unhandled 500s;
+    # Starlette builds it on the first call, after all middleware is added.
     app.build_middleware_stack = lambda: TypesafeRequestIdMiddleware(
         build_middleware_stack()
     )
