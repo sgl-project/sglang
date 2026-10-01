@@ -1693,9 +1693,10 @@ class IndexerKPool(MultiPlatformOp):
         if metadata is None:
             return None
 
-        assert forward_batch.seq_lens_cpu is not None
+        # Spec-v2 decode/verify batches may carry no CPU seq_lens mirror (the
+        # backend opts out of the D2H); test emptiness on the device shape.
         mode = forward_batch.forward_mode
-        if mode.is_idle() or len(forward_batch.seq_lens_cpu) == 0:
+        if mode.is_idle() or forward_batch.seq_lens.shape[0] == 0:
             return torch.full(
                 (x.shape[0], self.index_topk + self.index_kpool - 1),
                 -1,
