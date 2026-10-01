@@ -59,6 +59,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("m".into())],
             bootstrap_port: None,
+            version_group: None,
         };
         let profile = EngineProfile {
             protocol: WireProtocol::default(),

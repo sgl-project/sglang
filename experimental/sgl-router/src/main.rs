@@ -366,6 +366,10 @@ fn build_app_context(
         routing_policies,
         local_inflight_requests,
     );
+    // An external indexer leaves the local tree empty.
+    app_context.dp_rank_prefix_provider = (config.model.dp_aware
+        && external_kv_indexer_client.is_none())
+    .then(|| RadixTreePrefixProvider::new(engine_state.tree(), Arc::clone(&block_size_oracle)));
     app_context.prefix_index = external_kv_indexer_client;
     app_context.radix_tree_prefix_provider = (config.model.policy == PolicyKind::CacheAware
         && config
@@ -562,6 +566,32 @@ mod tests {
         assert_eq!(config.endpoint, "http://127.0.0.1:50051");
         assert_eq!(config.query_deadline, Duration::from_millis(25));
         assert_eq!(config.max_inflight, 17);
+    }
+
+    #[tokio::test]
+    async fn dp_aware_gets_the_local_tree_under_any_policy() {
+        let config = Cli::try_parse_from([
+            "sgl-router",
+            "--model-id=tiny",
+            "--tokenizer-path=tests/fixtures/tiny_tokenizer.json",
+            "--worker-urls=http://127.0.0.1:1",
+            "--policy=power_of_two",
+            "--dp-aware",
+        ])
+        .unwrap()
+        .into_config()
+        .unwrap();
+        let ctx = build_app_context(
+            &config,
+            Arc::new(TokenizerRegistry::load_from_config(&config).unwrap()),
+            Default::default(),
+            Default::default(),
+            start_local_inflight_tracker(&config).0,
+            &start_engine_state_monitor(&config, false),
+            None,
+        )
+        .unwrap();
+        assert!(ctx.dp_rank_prefix_provider.is_some());
     }
 
     #[tokio::test]
