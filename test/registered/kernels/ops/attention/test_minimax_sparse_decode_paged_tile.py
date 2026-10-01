@@ -18,8 +18,7 @@ register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-l
 register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 BS, NQH, NKH, HD, BLK, TOPK = 4, 64, 1, 128, 128, 16
-# A whole number of blocks; a partial last block goes through pos_mask on both paths.
-SEQ_LEN = 1024
+SEQ_LEN = 1024  # req_to_token width; each request's seq_len stops short of it
 NUM_SLOTS = BS * SEQ_LEN
 
 
@@ -40,11 +39,18 @@ def _inputs(page_size=None):
             pages = torch.randperm(npages, device="cuda") + b * npages
             slots = pages[:, None] * page_size + torch.arange(page_size, device="cuda")
         req_to_token[b] = slots.reshape(-1).to(torch.int32)
-    seq_lens = torch.full((BS,), SEQ_LEN, dtype=torch.int32, device="cuda")
+    # Decode always reads the local block, which is usually partial;
+    # on the tile path only pos_mask keeps its tail lanes off unwritten slots.
+    seq_lens = SEQ_LEN - torch.randint(1, BLK, (BS,), dtype=torch.int32, device="cuda")
+    for b in range(BS):
+        # Unwritten slots hold garbage; NaN there makes any read of them show.
+        unwritten = req_to_token[b, int(seq_lens[b]) :].long()
+        k_cache[unwritten] = float("nan")
+        v_cache[unwritten] = float("nan")
     slot_ids = torch.arange(BS, dtype=torch.int64, device="cuda")
-    num_blocks = SEQ_LEN // BLK
     topk_idx = torch.full((NKH, BS, TOPK), -1, dtype=torch.int32, device="cuda")
     for b in range(BS):
+        num_blocks = (int(seq_lens[b]) + BLK - 1) // BLK
         chosen = torch.randperm(num_blocks, device="cuda")[:TOPK]
         topk_idx[0, b, : chosen.numel()] = chosen.to(torch.int32)
     return q, k_cache, v_cache, req_to_token, seq_lens, slot_ids, topk_idx
@@ -91,10 +97,14 @@ def test_hisparse_slots_override_paged_tile():
     """Pre-resolved HiSparse slots win over the paged tile."""
     torch.manual_seed(0)
     inputs = _inputs(BLK)
-    _, _, _, req_to_token, _, _, topk_idx = inputs
-    # Resolve every selected block through another slot permutation,
+    _, _, _, req_to_token, seq_lens, _, topk_idx = inputs
+    # Resolve every selected block through a permutation of the written slots,
     # laid out like the coordinator's output: [1, batch, topk * block] int32.
-    remap = torch.randperm(NUM_SLOTS, device="cuda").to(torch.int32)
+    written = torch.cat([req_to_token[b, : int(seq_lens[b])] for b in range(BS)])
+    written = written.long()
+    remap = torch.full((NUM_SLOTS,), -1, dtype=torch.int32, device="cuda")
+    shuffled = written[torch.randperm(written.numel(), device="cuda")]
+    remap[written] = shuffled.to(torch.int32)
     hisparse_slots = torch.full(
         (1, BS, TOPK * BLK), -1, dtype=torch.int32, device="cuda"
     )
