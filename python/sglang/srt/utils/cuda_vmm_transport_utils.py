@@ -192,8 +192,8 @@ def _contains_tensor_container(value) -> bool:
 
 
 def get_vmm_feature_consumer_count() -> int:
-    if get_parallel().enable_dp_attention:
-        return get_parallel().tp_size // get_parallel().dp_size
+    if get_parallel().attn_dp_enabled:
+        return get_parallel().tp_size // get_parallel().num_dp_ranks
     return get_parallel().tp_size
 
 

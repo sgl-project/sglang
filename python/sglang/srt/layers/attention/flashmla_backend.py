@@ -110,7 +110,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
         # get dcp info
         self.dcp_world_size = get_parallel().attn_dcp_size
-        self.dcp_rank = get_parallel().attn_dcp_rank
 
     def init_forward_metadata_out_graph(
         self,

@@ -774,6 +774,14 @@ sglang generate \
   --save-output
 ```
 
+Qwen-Image 2.1 also supports independent NVFP4 DiT and native language-encoder
+component directories through `--component-paths.transformer` and
+`--component-paths.text_encoder`. Private max-calibrated exports passed B200
+generation, editing, transparent RGBA, offload, and TP2 checks. These checks
+do not cover arbitrary exports or RTX 5090. See its
+[cookbook](/cookbook/diffusion/Qwen-Image/Qwen-Image-2.1#nvfp4-components) for
+component-loading instructions and hardware requirements.
+
 ### Notes
 
 - Use `--transformer-path` for mixed ModelOpt NVFP4 transformer repos or local
@@ -784,8 +792,9 @@ sglang generate \
   primary `--transformer-path` override targets only `transformer`. Use a
   per-component override such as `--transformer-2-path` only when you
   intentionally want a non-default `transformer_2`.
-- On Blackwell, the diffusion ModelOpt NVFP4 path defaults to FlashInfer
-  TensorRT-LLM FP4 GEMM (`flashinfer_trtllm`).
+- On B200, the diffusion ModelOpt NVFP4 path defaults to FlashInfer
+  TensorRT-LLM FP4 GEMM (`flashinfer_trtllm`). On SM120, including RTX 5090,
+  the default is `auto`; TensorRT-LLM FP4 GEMM does not support that architecture.
 - The published Qwen Image NVFP4 exports keep the `img_mod`/`txt_mod`
   modulation projections and first/last transformer blocks in BF16.
 - Qwen-Image NVFP4 does not always improve latency at 1024x1024. On B200, the
@@ -916,13 +925,21 @@ startup rejects a degree that cuts a row-parallel matrix inside a GGML block.
 | MiniMax-H3 `fl2va`, pruned AdaLN curve | [`unsloth/MiniMax-H3-GGUF`](https://huggingface.co/unsloth/MiniMax-H3-GGUF) `minimax_h3_fl2va_pruned-Q4_K.gguf` (10.7 GiB loaded DiT) | 1x H200 (141 GiB) | 2-step t2va 1344x768, 107 frames, H.264 + AAC |
 | MiniMax-H3 `fl2va`, pruned AdaLN curve | `minimax_h3_fl2va_pruned-Q4_K.gguf` | 1x GB300 (CUDA 13, PyTorch 2.13) | 50-step t2va 1344x768, 107 frames, H.264 + AAC; 105.38 s and 80.88 GB peak |
 | MiniMax-H3 `fl2va`, pruned AdaLN curve | `minimax_h3_fl2va_pruned-Q4_K.gguf` | 2x GB300, TP2 (CUDA 13, PyTorch 2.13) | 2-step t2va 1344x768, 107 frames, H.264 + AAC; 7.55 s and 51.90 GB peak per rank |
+| Qwen-Image 2.1 | Private native-name Q4_0 exports; DiT 3.91 GiB, encoder 7.03 GiB | 1x B200; separate TP2 check | 1024px/40-step generation, editing, and transparent RGBA; each component and both together; combined offload matched resident pixels |
 
-The DiT loads at 17.5 GiB against 61.7 GiB for the BF16 checkpoint. Weight
+The unpruned MiniMax-H3 DiT loads at 17.5 GiB against 61.7 GiB for the BF16 checkpoint. Weight
 fidelity was checked tensor-by-tensor against the BF16 reference: cosine
 1.00000 for the F32/BF16 tensors and 0.9973 for Q4_K/Q4_0.
 
-Not validated in the measurements above: any other quantization type, the
-`ref2va` partition, and a BF16-vs-GGUF output comparison.
+The MiniMax-H3 measurements do not validate other quantization types, the
+`ref2va` partition, or a BF16-vs-GGUF output comparison.
+
+Qwen-Image 2.1's Q4_0 exports use the base component configs and native tensor
+names. Its [cookbook](/cookbook/diffusion/Qwen-Image/Qwen-Image-2.1#gguf-components)
+describes how to load compatible component files and choose precision settings.
+These private exports establish loading
+and execution compatibility, not general output quality or compatibility with
+other GGUF exports.
 
 ## Nunchaku (SVDQuant)
 

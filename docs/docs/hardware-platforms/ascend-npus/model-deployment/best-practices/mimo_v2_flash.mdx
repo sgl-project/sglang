@@ -83,7 +83,6 @@ export SGLANG_DEEPEP_BF16_DISPATCH=0
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=3600
 export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=3600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
@@ -167,8 +166,7 @@ do
         --speculative-num-draft-tokens 4 \
         --enable-multi-layer-eagle \
         --disable-radix-cache \
-        --dp-size 2 \
-        --enable-dp-attention \
+        --attn-dp-size 2 \
         --enable-dp-lm-head \
         --moe-a2a-backend deepep \
         --deepep-mode low_latency
@@ -268,7 +266,6 @@ export SGLANG_DEEPEP_BF16_DISPATCH=0
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=3600
 export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=3600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
@@ -352,8 +349,7 @@ do
         --speculative-num-draft-tokens 4 \
         --enable-multi-layer-eagle \
         --disable-radix-cache \
-        --dp-size 2 \
-        --enable-dp-attention \
+        --attn-dp-size 2 \
         --enable-dp-lm-head \
         --moe-a2a-backend deepep \
         --deepep-mode low_latency
@@ -453,7 +449,6 @@ export SGLANG_DEEPEP_BF16_DISPATCH=0
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=3600
 export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=3600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
@@ -537,8 +532,7 @@ do
         --speculative-num-draft-tokens 4 \
         --enable-multi-layer-eagle \
         --disable-radix-cache \
-        --dp-size 2 \
-        --enable-dp-attention \
+        --attn-dp-size 2 \
         --enable-dp-lm-head \
         --moe-a2a-backend deepep \
         --deepep-mode low_latency
@@ -638,7 +632,6 @@ export SGLANG_DEEPEP_BF16_DISPATCH=0
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=3600
 export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=3600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
@@ -722,8 +715,7 @@ do
         --speculative-num-draft-tokens 4 \
         --enable-multi-layer-eagle \
         --disable-radix-cache \
-        --dp-size 2 \
-        --enable-dp-attention \
+        --attn-dp-size 2 \
         --enable-dp-lm-head \
         --moe-a2a-backend deepep \
         --deepep-mode low_latency

@@ -15,7 +15,6 @@ from torch.nn.parameter import Parameter, UninitializedParameter
 from sglang.kernels.kernel_api_logging import wrap_method_with_debug_kernel_once
 from sglang.srt.distributed import (
     divide,
-    get_tp_group,
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
@@ -864,7 +863,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 shard_offset=rank_shard_offset,
                 shard_size=rank_shard_size,
                 tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
                 use_presharded_weights=self.use_presharded_weights,
             )
 
@@ -896,7 +894,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                         loaded_weight=loaded_weight,
                         shard_id=shard_id,
                         tp_rank=self.tp_rank,
-                        tp_size=self.tp_size,
                     )
                 return
             elif isinstance(param, BlockQuantScaleParameter):
@@ -906,7 +903,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 param.load_merged_column_weight(
                     loaded_weight=loaded_weight,
                     tp_rank=self.tp_rank,
-                    tp_size=self.tp_size,
                 )
                 return
             output_sizes = (
@@ -945,7 +941,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             shard_size=shard_size,
             use_presharded_weights=self.use_presharded_weights,
             tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
         )
 
 
@@ -1648,7 +1643,7 @@ class RowParallelLinear(LinearBase):
             symm_ctx = use_symmetric_memory(get_parallel().attn_tp_group)
         else:
             symm_ctx = use_symmetric_memory(
-                get_tp_group(), disabled=not is_allocation_symmetric()
+                get_parallel().tp_group, disabled=not is_allocation_symmetric()
             )
         with symm_ctx:
             if output_tensor is None:

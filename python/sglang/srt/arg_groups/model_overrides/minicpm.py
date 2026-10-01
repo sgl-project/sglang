@@ -1,7 +1,4 @@
-"""Config-time override declarations for minicpm.
-
-Architectures: MiniCPMForCausalLM, MiniCPMSALAForCausalLM.
-"""
+"""Config-time override declarations for minicpm."""
 
 from typing import Any, Dict
 
@@ -11,13 +8,13 @@ from sglang.srt.arg_groups.model_override_base import (
     resolving_view,
 )
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 
 
 @_register_for("MiniCPMForCausalLM", "MiniCPMSALAForCausalLM")
 def _minicpm_sala_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
-    if cfg.enable_dp_attention:
+    if attn_dp_enabled_of(cfg):
         raise ValueError("MiniCPM does not support DP attention")
     has_sparse_attention = getattr(hf_config, "has_minicpm_sparse_attention", False)
     has_hybrid_attention = has_sparse_attention or getattr(

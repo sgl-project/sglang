@@ -51,11 +51,12 @@ dependencies = [
   "pydantic",
   "python-multipart",
   "pyzmq>=25.1.2",
+  "regex",
   "requests",
   "scipy",
-  "sentencepiece",
+  "sentencepiece==0.2.1",  # 0.2.2 rejects null pieces in InternVL tokenizers.
   "setproctitle",
-  "sglang-kernel-xpu @ https://github.com/sgl-project/whl/releases/download/v0.2.0+xpu/sglang_kernel_xpu-0.2.0-cp310-abi3-manylinux_2_38_x86_64.whl",
+  "sglang-kernel-xpu @ https://github.com/sgl-project/whl/releases/download/v0.3.0+xpu/sglang_kernel_xpu-0.3.0-cp310-abi3-manylinux_2_38_x86_64.whl",
   "smg-grpc-servicer>=0.9.0",
   "soundfile==0.13.1",
   "tiktoken",
@@ -65,11 +66,11 @@ dependencies = [
   "torchcodec==0.13.0 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # torch==2.13.0 on XPU uses torchcodec 0.13.0
   "torchvision==0.28.0+xpu",
   "tqdm",
-  "transformers==5.12.1",
+  "transformers==5.17.0",
   "uvicorn",
   "xxhash",
   "uvloop",
-  # "xgrammar==0.2.1", xgrammar depends on CUDA PyTorch and Triton only
+  # "xgrammar==0.2.7", xgrammar depends on CUDA PyTorch and Triton only
 ]
 
 [project.optional-dependencies]
@@ -141,6 +142,10 @@ sglang = "sglang.cli.main:main"
   "srt/**/*",
   "kernels/**/*"
 ]
+
+[tool.setuptools.exclude-package-data]
+# .claude/skills is a directory symlink; setuptools build_py cannot copy it.
+"sglang.multimodal_gen" = [".claude/*"]
 
 [tool.setuptools.packages.find]
 exclude = [

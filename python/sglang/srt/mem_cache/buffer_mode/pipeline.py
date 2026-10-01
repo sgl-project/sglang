@@ -507,8 +507,13 @@ class BufferModePipeline:
         return states
 
     def flush_pending_writes(self) -> None:
-        """Launch D2H transfers for admitted intents, head-of-line: device
-        locks and staging slots are taken only here, when capacity allows."""
+        """Stage admitted intents, then submit their D2H as one operation.
+
+        Preparation must not allocate or free L1 KV slots: it only allocates
+        host staging, and buffer-mode evict_host is a no-op. Flush before
+        returning to scheduler admission, where L1 slots can be reused.
+        Each staged source stays locked until its D2H ack.
+        """
         if not self.pending_write_queue:
             return
         cc = self._cache.cache_controller
@@ -560,24 +565,29 @@ class BufferModePipeline:
                 # instead of failing the alloc inside cc.write; acks free
                 # aux staging, retry next round.
                 break
-            if not self._launch_backup_intent(intent, device_value, comp_xfers):
+            if not self._stage_backup_intent(intent, device_value, comp_xfers):
                 # Pool full of in-flight staging and nothing reclaimable
                 # (the tree never holds host values in buffer mode):
                 # defer, head-of-line; pending acks will free slots.
                 break
             self.pending_write_queue.popleft()
 
-    def _launch_backup_intent(
+        # Submit earlier successes even if a later intent ran out of staging.
+        # Do not leave prepared copies deferred across scheduler admission.
+        cc.start_writing()
+
+    def _stage_backup_intent(
         self,
         intent: _UnifiedBackupIntent,
         device_value: torch.Tensor,
         comp_xfers: dict[ComponentType, list[PoolTransfer]],
     ) -> bool:
-        """Launch one admitted intent's D2H (staging alloc + device lock +
-        async copy); the caller removes it from pending_write_queue. Returns
-        False when staging cannot be allocated. From a successful launch the
-        intent always reaches its storage-ack, so its content joins the
-        LAUNCHED cover consulted by admission."""
+        """Allocate host staging and pin one admitted intent's source.
+
+        The caller removes successful intents from pending_write_queue and
+        submits them together before returning. Return False when staging
+        cannot be allocated.
+        """
         cache = self._cache
         cc = cache.cache_controller
         snapshot = intent.snapshot
@@ -591,6 +601,7 @@ class BufferModePipeline:
             device_value,
             node_id=snapshot.node_id,
             extra_pools=aux_xfers or None,
+            flush=False,
         )
         if host_indices is None:
             return False
@@ -886,10 +897,11 @@ class BufferModePipeline:
             if not (req.host_hit_is_storage and req.host_loaded_length > 0):
                 self._clear_storage_hit(req)
             return True
-        if len(req.prefix_indices) >= f.matched_len + f.num_tokens:
+        joint_len = len(req.prefix_indices)
+        if joint_len >= f.matched_len + f.num_tokens:
             # The joint match already covers the staged span; a shorter FULL-only
             # prefix would strand the slots recomputed below cache_protected_len.
-            self._resolve_device_covered(req, f)
+            self._resolve_device_covered(req)
             return True
         key = RadixKey(
             f.key_tokens,
@@ -924,26 +936,25 @@ class BufferModePipeline:
             if t.name == PoolName.SWA and t.host_indices is not None
         )
         if full_tokens == 0 and swa_tokens == 0:
-            self._resolve_device_covered(req, f)
+            self._resolve_device_covered(req)
             return True
         req.host_hit_length = full_tokens
         req.swa_host_hit_length = swa_tokens
-        req.storage_hit_length = full_tokens
-        req.storage_hit_start = matched_len if full_tokens else None
+        # The device alone serves only this pass's joint match; the rest of the
+        # span, fetched FULL or resident FULL the aux tail unlocks, is storage's.
+        req.storage_hit_length = f.matched_len + f.num_tokens - joint_len
+        req.storage_hit_start = joint_len
         req.host_hit_is_storage = True
         req.staged_prefetch_plan = StagedPrefetchPlan(
             f.operation_id, key, matched_len, full_tokens, swa_tokens
         )
         return True
 
-    def _resolve_device_covered(self, req: Req, f: _StagedPrefetch) -> None:
+    def _resolve_device_covered(self, req: Req) -> None:
         req.host_hit_length = 0
         req.swa_host_hit_length = 0
         self._clear_storage_hit(req)
-        self._cache._resolve_storage_prefetch_tokens(
-            req.cache_request_handle, f.num_tokens, reason="device_covered"
-        )
-        self.release_staged_hold(req.cache_request_handle, reason=None)
+        self.release_staged_hold(req.cache_request_handle, reason="device_covered")
 
     @staticmethod
     def _clear_storage_hit(req: Req) -> None:
@@ -1151,8 +1162,8 @@ class BufferModePipeline:
         del self.staged_prefetches[request]
         self._staged_admission_defers.pop(request, None)
         req.staged_prefetch_plan = None
-        cache._resolve_storage_prefetch_tokens(
-            request, trim_tokens, reason="device_covered"
+        cache._settle_storage_prefetch_hit(
+            request, credited_tokens=req.storage_hit_length
         )
 
         swa_dev = next(
@@ -1224,7 +1235,9 @@ class BufferModePipeline:
                 key=key,
                 value=torch.cat([req.prefix_indices, device_indices]),
                 prev_prefix_len=splice_base,
-                swa_evicted_seqlen=(span_end - staged_swa) if staged_swa else 0,
+                component_evicted_seqlens={
+                    ComponentType.SWA: (span_end - staged_swa) if staged_swa else 0
+                },
             )
         )
         self.ongoing_buffer_load_back[load_back_id] = _OngoingBufferLoadBack(

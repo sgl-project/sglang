@@ -15,9 +15,8 @@ DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":9
 
 BALANCED_ARGS = [
     "--trust-remote-code",
-    "--dp",
+    "--attn-dp-size",
     "4",
-    "--enable-dp-attention",
     "--moe-a2a-backend",
     "deepep",
     "--speculative-algorithm",

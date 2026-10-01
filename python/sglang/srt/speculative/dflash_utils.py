@@ -41,7 +41,16 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
 )
 
 
-if is_cuda() or is_musa():
+if is_cuda():
+    from flashinfer.sampling import top_k_renorm_probs as top_k_renorm_prob
+    from flashinfer.sampling import top_p_renorm_probs as top_p_renorm_prob
+
+    from sglang.kernels.ops.speculative.sampling import (
+        tree_speculative_sampling_target_only,
+    )
+
+    _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
+elif is_musa():
     try:
         from sgl_kernel import (
             top_k_renorm_prob,
@@ -1077,7 +1086,7 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
                 dtype=torch.float32,
             )
 
-        target_probs = build_dflash_verify_target_probs(
+        target_probs = build_speculative_verify_target_probs(
             next_token_logits=next_token_logits,
             sampling_info=sampling_info,
             draft_token_num=draft_token_num,
@@ -1118,7 +1127,7 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     return correct_len, bonus
 
 
-def build_dflash_verify_target_probs(
+def build_speculative_verify_target_probs(
     *,
     next_token_logits: torch.Tensor,
     sampling_info: Any,

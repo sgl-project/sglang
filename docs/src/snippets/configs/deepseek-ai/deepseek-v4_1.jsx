@@ -4,10 +4,9 @@
 // real weights.
 //
 // Every DSpark cell caps --cuda-graph-max-bs-decode: the derived batch list does
-// not fit while capturing the DSpark decode graphs, on any NVIDIA platform. The
-// MI350X cell already carried the equivalent --cuda-graph-max-bs. H200 is the
+// not fit while capturing the DSpark decode graphs, on any platform. H200 is the
 // tightest board at 140 GiB and needs the cap on both cells plus a lower memory
-// fraction; the three other High-Throughput cells start without either.
+// fraction; the B200 / B300 / GB300 High-Throughput cells start without either.
 //
 // DP-Attention, DeepEP and MegaMoE are absent by design: they have never been
 // enabled on this model. EP is set equal to TP on every shape here.
@@ -122,9 +121,8 @@ export const config = {
       },
     },
 
-    // GPU → CPU KV offload (L2 only; no storage tier). Hidden on MI350X: both
-    // ROCm cells run `--disable-radix-cache`, which the server rejects alongside
-    // `--enable-hierarchical-cache`.
+    // GPU → CPU KV offload (L2 only; no storage tier). Hidden on MI350X: not
+    // validated on ROCm for this model yet.
     hicache: {
       excludesHw: ["mi350x"],
       writePolicies: [
@@ -343,35 +341,36 @@ export const config = {
       ],
     },
 
-    // ---------- MI350X: 4x MI350X (gfx950), TP4 + EP4. Speculative decoding is
-    // rejected on ROCm, so there is one recipe. ----------
+    // ---------- MI350X: 4x MI350X (gfx950), TP4 + EP4. The backends resolve
+    // automatically on HIP, and the radix cache works (turning it off cost ~10% at
+    // 32 concurrent requests). Both cells keep DSpark: on MI350X it beat plain decode
+    // at every load measured, up to 256 concurrent requests. Decoder SWA bounded
+    // replay cuts prefill work at no decode cost (TTFT -33% at 128K input with a 90%
+    // prefix hit, and +17-23% throughput at 64-256 requests). ----------
     {
-      // DSpark runs on MI350X but is off by default; this cell turns it on.
       match: { hw: "mi350x", strategy: "low-latency" },
       nnodes: 1,
       verified: true,
       env: [
-        // Load-bearing: without it the fp4 experts land in the Triton
-        // fused-experts runner and assert on the hidden size.
-        "SGLANG_USE_AITER=1",
-        "SGLANG_MOE_PADDING=1",
-        // Required for run-to-run repeatable output: forces the FlyDSL MoE
-        // down-projection onto a per-slot reduce instead of atomics.
+        // Run-to-run repeatable output: forces the FlyDSL MoE down-projection onto
+        // a per-slot reduce instead of atomics; measured free at 8-32 requests.
         "AITER_FLYDSL_FORCE_REDUCE=1",
-        "ROCM_QUICK_REDUCE_QUANTIZATION=NONE",
+        // Required until ROCm/aiter#5802 is in the aiter pin: below 256 tokens aiter
+        // routes these fp4 experts to a bf16-activation MoE path the pin cannot run.
+        "AITER_BF16_FP8_MOE_BOUND=0",
       ],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--ep-size 4",
-        "--disable-radix-cache",
         "--mem-fraction-static 0.8",
         "--speculative-algorithm DSPARK",
         "--speculative-dspark-block-size 5",
-        "--cuda-graph-max-bs 64",
-        "--cuda-graph-backend-prefill breakable",
-        "--cuda-graph-max-bs-prefill 4096",
+        // Decode CUDA graphs: the derived batch list does not fit here; a cap of 128
+        // fits and keeps 128-request decode batches on the graph.
+        "--cuda-graph-max-bs-decode 128",
+        "--enable-decoder-swa-bounded-replay",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--host {{HOST_IP}}",
@@ -379,29 +378,26 @@ export const config = {
       ],
     },
     {
-      // The attention backend and mem-fraction-static are the resolved
-      // defaults on HIP, so this cell leaves both alone.
       match: { hw: "mi350x", strategy: "high-throughput" },
       nnodes: 1,
       verified: true,
       env: [
-        // Load-bearing: without it the fp4 experts land in the Triton
-        // fused-experts runner and assert on the hidden size.
-        "SGLANG_USE_AITER=1",
-        "SGLANG_MOE_PADDING=1",
-        // Required for run-to-run repeatable output: forces the FlyDSL MoE
-        // down-projection onto a per-slot reduce instead of atomics.
         "AITER_FLYDSL_FORCE_REDUCE=1",
-        "ROCM_QUICK_REDUCE_QUANTIZATION=NONE",
+        "AITER_BF16_FP8_MOE_BOUND=0",
       ],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--ep-size 4",
-        "--disable-radix-cache",
-        "--cuda-graph-backend-prefill breakable",
-        "--cuda-graph-max-bs-prefill 4096",
+        "--mem-fraction-static 0.8",
+        // DSpark with graphs up to the running-request cap: 47% more throughput
+        // than plain decode at 256 concurrent requests.
+        "--speculative-algorithm DSPARK",
+        "--speculative-dspark-block-size 5",
+        "--cuda-graph-max-bs-decode 256",
+        "--max-running-requests 256",
+        "--enable-decoder-swa-bounded-replay",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--host {{HOST_IP}}",

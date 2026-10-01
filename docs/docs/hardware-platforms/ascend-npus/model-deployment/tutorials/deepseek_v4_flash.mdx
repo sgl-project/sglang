@@ -31,7 +31,7 @@ recommended to use v0.5.16 or a later version.
 | Speculative Decoding          | `--speculative-algorithm EAGLE \`<br/>`--speculative-num-steps 2 \`<br/>`--speculative-eagle-topk 1 \`<br/>`--speculative-num-draft-tokens 3` |
 | Overlap Schedule              | `export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                                                  |
 | DP LM Head                    | `--enable-dp-lm-head`                                                                         |
-| DP Attention                  | `--enable-dp-attention`                                                                       |
+| DP Attention                  | `--attn-dp-size 16`                                                                           |
 
 <Note>
 The values in the **Example usage** column are for illustration only. Adjust them according to your hardware, deployment
@@ -188,7 +188,6 @@ export INF_NAN_MODE_FORCE_DISABLE=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DSV4_FP4_EXPERTS=False
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_OPT_BF16_FP32_GEMM_ALGO=torch
 export SGLANG_OPT_DEEPGEMM_HC_PRENORM=False
@@ -219,7 +218,7 @@ python3 -m sglang.launch_server \
     --max-prefill-tokens 80000 \
     --chunked-prefill-size 131072 \
     --max-running-requests 160 \
-    --dp-size 8 --enable-dp-attention \
+    --attn-dp-size 8 \
     --moe-a2a-backend deepep --deepep-mode auto \
     --quantization modelslim --enable-dp-lm-head \
     --kv-cache-dtype bfloat16
