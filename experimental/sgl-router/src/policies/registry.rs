@@ -310,7 +310,7 @@ mod tests {
             url: format!("http://{id}"),
             mode,
             model_ids: vec![ModelId(model.into())],
-            bootstrap_port: None,
+            bootstrap_port: (mode == WorkerMode::Prefill).then_some(8997),
         }
     }
 
