@@ -63,6 +63,51 @@ Guidelines:
 - For MHA models with Mooncake and `page_head` layout, HiCache will split head shards based on `tp_lcm_size` to make keys reusable across heterogeneous TP deployments.
 - If all clusters use the same TP size, this option is not needed.
 
+### Decode context parallelism and storage
+
+For MLA models, `--dcp-size > 1` supports HiCache L3 through the `file` and
+`mooncake` backends. Use the same TP, DCP and PP sizes, physical page size,
+KV dtype, host layout and model identity for writers and readers of a cache
+namespace. `tp_lcm_size` does not convert persisted DCP shards between layouts.
+Other L3 backends remain rejected under DCP, including at runtime attach.
+
+Each logical page spans `--page-size * --dcp-size` tokens. A cache hit requires
+every DCP shard. For a hybrid model with recurrent state, the checkpoint also
+requires every TP state shard at the same legal prefix boundary. Missing state
+or KV shortens reuse to a complete checkpoint; it cannot be treated as a full hit.
+
+The supported host-pool shape is one materialized MLA pool, optionally with one
+independent materialized Mamba/KDA pool. Packed draft pools, additional side
+pools and separate KV scale buffers are outside this storage support. The
+general DCP and model-specific attention-backend restrictions still apply.
+Use `--hicache-host-memory-mode cache`; DCP L3 rejects `buffer_only` and
+speculative decoding. DSPARK with DCP remains supported at L1/L2 without L3.
+
+In P/D deployments, keep persisted cache namespaces role-local when the roles
+use different layouts. Use separate file directories or Mooncake
+`extra_backend_tag` values. Live P-to-D transfer remains responsible for moving
+the request's KV and current recurrent state; L3 does not convert the stored
+objects between the roles' topologies. Decode-side radix reuse requires
+`--disaggregation-decode-enable-radix-cache`.
+For decode with DCP L3, also set
+`--hicache-storage-prefetch-policy wait_complete`. The default `timeout` and
+`best_effort` policies can stop before fulfilling the prefix promised to
+prefill, so startup and runtime attachment reject them on decode. Prefill and
+aggregated servers may use all three policies. Decode KV offload
+(`--disaggregation-decode-enable-offload-kvcache`) is not supported with DCP L3.
+
+DCP keys include shard and layout identity. Recurrent file keys also preserve
+TP ownership independently of MLA replication, including when long filenames
+are compacted. Older incompatible recurrent files become cache misses and are
+recomputed, including at DCP1. DCP1 MLA KV keys keep their format except for
+long namespaces compacted to fit the filesystem filename limit; those objects
+also become cold misses. Hybrid write-through now publishes completed chunk
+checkpoints during prefill, including at DCP1 and with L2 alone.
+
+L2 remains host DRAM. To use local SSD as L3, select `file` and place its storage
+directory on an SSD filesystem. Mooncake's own SSD offload is configured in the
+Mooncake store service; selecting `mooncake` in SGLang alone does not enable it.
+
 ### Prefetch Policies
 
 ```bash Command

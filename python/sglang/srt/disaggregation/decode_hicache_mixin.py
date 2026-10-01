@@ -141,6 +141,8 @@ class DecodeHiCachePreallocMixin:
             prefix_match.prefetch_registered = self.tree_cache.has_ongoing_prefetch(
                 req.cache_request_handle
             )
+            if not prefix_match.prefetch_registered:
+                prefix_match.l3_storage_hit_length = 0
         except Exception as e:
             logger.warning(
                 "HiCache L3 prefetch failed for rid=%s: %s; falling back to L2-only LoadingBack",
@@ -227,6 +229,7 @@ class DecodeHiCacheTransferMixin:
                 best_match_node=rematch.best_match_node,
                 host_hit_length=rematch.host_hit_length,
                 req=dr.req,
+                restore_request_state=False,
             )
         )
         # The rematch repointed req.last_node to feed init_load_back's device

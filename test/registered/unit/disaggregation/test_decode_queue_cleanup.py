@@ -3,16 +3,20 @@ from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
     HiCacheRestoreResult,
 )
+from sglang.srt.disaggregation.decode_hicache_mixin import DecodePrefixMatch
 from sglang.srt.disaggregation.fake.conn import FakeKVManager, FakeKVReceiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -105,6 +109,245 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertEqual(physical_available, 3 * page_size)
         self.assertEqual(queue._pre_alloc.call_count, 3)
 
+    def test_declined_l3_prefetch_is_excluded_from_transfer_promise(self):
+        """A positive probe cannot omit transfer rows when prefetch is declined."""
+        override = get_context().override_server_args(
+            disaggregation_decode_enable_radix_cache=True
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        for admission in (
+            "accepted",
+            "declined",
+            "error",
+            "state_full",
+            "state_reclaim",
+            "state_pending",
+        ):
+            with self.subTest(admission=admission):
+                req = SimpleNamespace(
+                    rid="prefetch-admission",
+                    cache_request_handle=CacheRequestHandle("prefetch-admission", 0),
+                    origin_input_ids=list(range(8)),
+                    output_ids=[],
+                    finished_reason=None,
+                    sampling_params=SimpleNamespace(max_new_tokens=1),
+                    kv=SimpleNamespace(
+                        req_pool_idx=0,
+                        cache_protected_len=0,
+                        holds_mamba=False,
+                        mamba_ping_pong_track_buffer=None,
+                    ),
+                    extra_key=None,
+                    cache_salt=None,
+                )
+                dr = SimpleNamespace(
+                    req=req, waiting_for_input=True, is_rebootstrap=False
+                )
+                pm = DecodePrefixMatch(
+                    prefix_indices=torch.tensor([10, 11]),
+                    l2_host_hit_length=2,
+                    l3_storage_hit_length=2,
+                    last_device_node=11,
+                    last_host_node=22,
+                )
+                queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+                queue.pp_size = 1
+                queue.queue = [dr]
+                queue.pending_reqs = []
+                queue.retracted_queue = []
+                queue.num_reserved_decode_tokens = 0
+                queue._resolve_pending_reqs = lambda: None
+                queue._update_handshake_waiters = lambda *_: None
+                queue._uses_swa_tail_prealloc = lambda: False
+                queue._uses_swa_reservation = lambda: False
+                queue._allocatable_token_budgets = lambda **_: 1024
+                queue._hicache_pending_restore_tokens = lambda: 0
+                queue._match_prefix_and_lock = lambda _: pm
+                queue.scheduler = SimpleNamespace(
+                    running_batch=SimpleNamespace(reqs=[]),
+                    enable_priority_scheduling=False,
+                    enable_hisparse=False,
+                    enable_lora=False,
+                    enable_decode_hicache=True,
+                )
+                queue.req_to_metadata_buffer_idx_allocator = SimpleNamespace(
+                    available_size=lambda: 1
+                )
+                queue.req_to_token_pool = SimpleNamespace(
+                    available_size=lambda: 1,
+                    mamba_allocator=None,
+                    req_to_token=torch.arange(10, 18).reshape(1, 8),
+                )
+                queue.token_to_kv_pool_allocator = SimpleNamespace(
+                    page_size=1, translate_kv_indices_for_transfer=lambda x: x
+                )
+                bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
+                queue.kv_manager = SimpleNamespace(
+                    kv_args=SimpleNamespace(state_types=[])
+                )
+                queue.tree_cache = SimpleNamespace(
+                    hicache_storage_pass_prefix_keys=False,
+                    get_last_hash_value=lambda _: "h2",
+                    prefetch_from_storage=MagicMock(
+                        side_effect=RuntimeError("store unavailable")
+                        if admission == "error"
+                        else None
+                    ),
+                    has_ongoing_prefetch=lambda _: admission == "accepted",
+                )
+                queue.transfer_queue = SimpleNamespace(queue=[])
+                state_free = [1]
+                if admission.startswith("state_"):
+                    queue.req_to_token_pool.mamba_allocator = SimpleNamespace(
+                        available_size=lambda: state_free[0]
+                    )
+                    queue.req_to_token_pool.enable_mamba_extra_buffer = False
+                    queue.tree_cache.supports_mamba = lambda: True
+
+                    def evict(params):
+                        if admission == "state_reclaim":
+                            state_free[0] += params.mamba_num
+
+                    queue.tree_cache.evict_for_alloc = evict
+                    queue.tree_cache.has_ongoing_prefetch = lambda _: True
+                    if admission == "state_pending":
+                        state_free[0] = 2
+                        queue.transfer_queue.queue = [
+                            SimpleNamespace(
+                                prefix_match=DecodePrefixMatch(
+                                    torch.tensor([]), 2, 0, 0
+                                ),
+                                hicache_restore_status=HiCacheRestoreResult.PENDING,
+                                hicache_restored_node=None,
+                            )
+                        ]
+                allocated_prefix = []
+                sent = []
+
+                def allocate(_req, _indices, _l1, total):
+                    allocated_prefix.append(total)
+                    return torch.arange(10 + total, 18)
+
+                def send(_dr, indices, _page, _state, **metadata):
+                    sent.append((indices.tolist(), metadata["decode_prefix_len"]))
+
+                queue._pre_alloc = allocate
+                queue._send_kv_metadata = send
+                admitted, failed = queue.pop_preallocated()
+                expected = {
+                    "accepted": 6,
+                    "declined": 4,
+                    "error": 4,
+                    "state_full": 2,
+                    "state_reclaim": 6,
+                    "state_pending": 2,
+                }[admission]
+                self.assertEqual(admitted, [dr])
+                self.assertEqual(failed, [])
+                self.assertEqual(allocated_prefix, [expected])
+                self.assertEqual(sent, [(list(range(10 + expected, 18)), expected)])
+                self.assertEqual(req.kv.cache_protected_len, expected)
+                self.assertEqual(pm.decode_prefix_len, expected)
+                if expected == 2:
+                    queue.tree_cache.prefetch_from_storage.assert_not_called()
+
+    def test_mamba_preallocation_reserves_tracking_slots_before_prefix_match(self):
+        # (free, extra buffer, lazy, overlap slots, holds state, holds buffer,
+        #  reclaimable, admitted, slots requested from eviction)
+        cases = [
+            (2, True, False, 2, False, False, 1, True, 1),
+            (2, True, False, 2, False, False, 0, False, 1),
+            (0, True, False, 2, False, False, 1, False, 3),
+            (2, True, False, 1, False, False, 0, True, 0),
+            (2, True, True, 2, False, False, 0, True, 0),
+            (1, False, False, 2, False, False, 0, True, 0),
+            (2, True, False, 2, True, False, 0, True, 0),
+            (1, True, False, 2, False, True, 0, True, 0),
+        ]
+        for (
+            free,
+            extra,
+            lazy,
+            slots,
+            state,
+            buffer,
+            reclaimable,
+            admitted,
+            evicted,
+        ) in cases:
+            with self.subTest(
+                free=free,
+                extra=extra,
+                lazy=lazy,
+                slots=slots,
+                state=state,
+                buffer=buffer,
+                reclaimable=reclaimable,
+            ):
+                req = SimpleNamespace(
+                    finished_reason=None,
+                    kv=SimpleNamespace(
+                        holds_mamba=state,
+                        mamba_ping_pong_track_buffer=object() if buffer else None,
+                    ),
+                )
+                dr = SimpleNamespace(req=req, waiting_for_input=True)
+                queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+                queue.pp_size = 1
+                queue.queue = [dr]
+                queue.pending_reqs = []
+                queue._resolve_pending_reqs = lambda: None
+                queue._update_handshake_waiters = lambda *_: None
+                queue._uses_swa_tail_prealloc = lambda: False
+                queue._uses_swa_reservation = lambda: False
+                queue._allocatable_token_budgets = lambda **_: 1024
+                queue._hicache_pending_restore_tokens = lambda: 0
+                queue.scheduler = SimpleNamespace(
+                    running_batch=SimpleNamespace(reqs=[]),
+                    enable_priority_scheduling=False,
+                    enable_hisparse=False,
+                    enable_lora=False,
+                    enable_decode_hicache=False,
+                )
+                queue.req_to_metadata_buffer_idx_allocator = SimpleNamespace(
+                    available_size=lambda: 1
+                )
+                queue.req_to_token_pool = SimpleNamespace(
+                    available_size=lambda: 1,
+                    mamba_allocator=SimpleNamespace(available_size=lambda: free),
+                    enable_mamba_extra_buffer=extra,
+                    enable_mamba_extra_buffer_lazy=lazy,
+                    mamba_ping_pong_track_buffer_size=slots,
+                )
+
+                def evict(params):
+                    nonlocal_free[0] = min(params.mamba_num, reclaimable)
+
+                nonlocal_free = [0]
+                queue.req_to_token_pool.mamba_allocator.available_size = lambda: (
+                    free + nonlocal_free[0]
+                )
+                reclaim = MagicMock(side_effect=evict)
+                queue.tree_cache = SimpleNamespace(
+                    supports_mamba=lambda: True, evict=reclaim, evict_for_alloc=reclaim
+                )
+                # Stop at the first operation after admission, before matching
+                # can COW state or acquire a prefix lock.
+                queue._rebootstrap_prefill_len = MagicMock(side_effect=StopIteration)
+                if admitted:
+                    with self.assertRaises(StopIteration):
+                        queue.pop_preallocated()
+                else:
+                    self.assertEqual(queue.pop_preallocated(), ([], []))
+                    queue._rebootstrap_prefill_len.assert_not_called()
+                self.assertEqual(queue.queue, [dr])
+                if evicted:
+                    self.assertEqual(reclaim.call_args.args[0].mamba_num, evicted)
+                    self.assertEqual(reclaim.call_count, 1)
+                else:
+                    reclaim.assert_not_called()
+
     def test_prealloc_abort_clears_receiver_before_removing_request(self):
         receiver = FakeReceiver()
         req = SimpleNamespace(
@@ -133,6 +376,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
         queue._allocatable_token_budgets = MagicMock(return_value=0)
         queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
+        queue.req_to_token_pool = SimpleNamespace(mamba_allocator=None)
 
         scheduler = MagicMock()
         scheduler.running_batch.reqs = []
@@ -193,6 +437,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
         queue._allocatable_token_budgets = MagicMock(return_value=0)
         queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
+        queue.req_to_token_pool = SimpleNamespace(mamba_allocator=None)
 
         scheduler = MagicMock()
         scheduler.running_batch.reqs = []
@@ -405,6 +650,30 @@ class TestDecodeQueueCleanup(CustomTestCase):
         mock_release_kv_cache.assert_called_once_with(
             req, queue.tree_cache, is_insert=False
         )
+
+        # A successful P→D transfer cannot commit a failed local L3 promise.
+        receiver = FakeReceiver()
+        decode_req.kv_receiver = receiver
+        decode_req.hicache_restore_status = HiCacheRestoreResult.FAILED
+        queue.queue = [decode_req]
+        queue.req_to_metadata_buffer_idx_allocator.reset_mock()
+        queue._clean_hicache_prefetch_resources.reset_mock()
+        mock_prepare_abort.reset_mock()
+        mock_release_kv_cache.reset_mock()
+        with patch.object(
+            queue, "_poll_with_metadata_gate", return_value=[KVPoll.Success]
+        ):
+            self.assertEqual(queue.pop_transferred(), [])
+        self.assertEqual(queue.queue, [])
+        self.assertTrue(receiver.clear_called)
+        self.assertIsNone(decode_req.kv_receiver)
+        queue.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(3)
+        queue._clean_hicache_prefetch_resources.assert_called_once_with(decode_req)
+        mock_prepare_abort.assert_called_once()
+        mock_release_kv_cache.assert_called_once_with(
+            req, queue.tree_cache, is_insert=False
+        )
+        decode_req.hicache_restore_status = HiCacheRestoreResult.READY
 
         receiver = FakeReceiver()
         receiver.kv_mgr = FakeKVManager.__new__(FakeKVManager)
