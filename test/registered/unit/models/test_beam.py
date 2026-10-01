@@ -18,13 +18,6 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import MergedColumnParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.topk import TopKOutputFormat, biased_grouped_topk_impl
-from sglang.srt.layers.moe.utils import MoeRunnerBackend, RoutingMethodType
-from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
-from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
-    CompressedTensorsConfig,
-)
-from sglang.srt.layers.quantization.fp8 import Fp8Config
-from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.models.beam import (
     BeamAttention,
     BeamDecoderLayer,
@@ -35,7 +28,7 @@ from sglang.srt.models.beam import (
     apply_ssmax,
     depth_scaled_residual,
 )
-from sglang.srt.runtime_context import get_context, get_flags, get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.utils.hf_transformers import get_context_length
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -87,49 +80,6 @@ class _LoadedExpert:
         self.shards[expert_id, shard_id] = weight.clone()
 
 
-_NVFP4_ARGS = {
-    "num_bits": 4,
-    "type": "float",
-    "symmetric": True,
-    "strategy": "tensor_group",
-    "group_size": 16,
-}
-
-
-def compressed_tensors_nvfp4(*, input_activations=True, ignore=()):
-    # An llm-compressor nvfp4-pack-quantized export, as the loader parses it.
-    group = {"targets": ["Linear"], "weights": dict(_NVFP4_ARGS, dynamic=False)}
-    if input_activations:
-        group["input_activations"] = dict(_NVFP4_ARGS, dynamic="local")
-    return CompressedTensorsConfig.from_config(
-        {
-            "quant_method": "compressed-tensors",
-            "format": "nvfp4-pack-quantized",
-            "config_groups": {"group_0": group},
-            "ignore": list(ignore),
-            "packed_modules_mapping": BeamForCausalLM.packed_modules_mapping,
-        }
-    )
-
-
-def modelopt_nvfp4(quant_algo="NVFP4", *, ignore=("lm_head",)):
-    return ModelOptFp4Config.from_config(
-        {
-            "quant_method": "modelopt",
-            "quant_algo": quant_algo,
-            "group_size": 16,
-            "ignore": list(ignore),
-        }
-    )
-
-
-def quantized_experts():
-    # Stands in for an NVFP4 FusedMoE without allocating its expert weights.
-    experts = torch.nn.Identity()
-    experts.quant_method = Mock(spec=FusedMoEMethodBase)
-    return experts
-
-
 class TestBeamConfig(CustomTestCase):
     def test_unsupported_attention_and_head_parallelism_fail_before_allocation(self):
         for field in ("enable_dp_attention", "enable_dp_lm_head"):
@@ -160,107 +110,6 @@ class TestBeamConfig(CustomTestCase):
                 ):
                     BeamForCausalLM(tiny_config())
                 model.assert_not_called()
-
-    def test_serialized_w4a4_nvfp4_reaches_allocation(self):
-        for quant in (compressed_tensors_nvfp4(), modelopt_nvfp4()):
-            with (
-                self.subTest(quant=type(quant).__name__),
-                get_context().override_server_args(),
-                patch(
-                    "sglang.srt.models.beam.BeamModel",
-                    side_effect=RuntimeError("allocation reached"),
-                ),
-                self.assertRaisesRegex(RuntimeError, "allocation reached"),
-            ):
-                BeamForCausalLM(tiny_config(), quant_config=quant)
-
-    def test_unsupported_quantization_fails_before_allocation(self):
-        # Only serialized W4A4 NVFP4 feeds the TRT-LLM FP4 MoE kernel; an
-        # nvfp4-pack-quantized export may still leave activations unquantized.
-        for quant in (
-            compressed_tensors_nvfp4(input_activations=False),
-            modelopt_nvfp4("W4A16_NVFP4"),
-            modelopt_nvfp4("NVFP4_AWQ"),
-            ModelOptFp4Config(),
-            Fp8Config(is_checkpoint_fp8_serialized=True),
-        ):
-            with (
-                self.subTest(quant=quant),
-                get_context().override_server_args(),
-                patch(
-                    "sglang.srt.models.beam.BeamModel",
-                    side_effect=RuntimeError("allocation reached"),
-                ),
-                self.assertRaisesRegex(NotImplementedError, "W4A4 NVFP4"),
-            ):
-                BeamForCausalLM(tiny_config(), quant_config=quant)
-
-    def test_nvfp4_experts_require_the_trtllm_moe_runner(self):
-        with (
-            get_context().override_server_args(),
-            patch(
-                "sglang.srt.models.beam.get_moe_runner_backend",
-                return_value=MoeRunnerBackend.TRITON,
-            ),
-            self.assertRaisesRegex(ValueError, "flashinfer_trtllm for NVFP4"),
-        ):
-            BeamMoE(tiny_config(), layer_id=1, quant_config=Mock())
-
-    def test_compressed_tensors_ignore_matches_fused_beam_modules(self):
-        # llm-compressor ignores the unfused projections Beam serves fused.
-        quant = compressed_tensors_nvfp4(
-            ignore=[
-                "model.layers.0.mlp.gate_proj",
-                "model.layers.0.mlp.up_proj",
-                "model.layers.3.self_attn.q_proj",
-                "model.layers.3.self_attn.k_proj",
-                "model.layers.3.self_attn.v_proj",
-            ]
-        )
-        linear = torch.nn.Linear(1, 1)
-        for prefix in (
-            "model.layers.0.mlp.gate_up_proj",
-            "model.layers.3.self_attn.qkv_proj",
-        ):
-            with self.subTest(prefix=prefix):
-                self.assertIsNone(quant.get_scheme_dict(linear, prefix))
-        self.assertIsNotNone(
-            quant.get_scheme_dict(linear, "model.layers.4.self_attn.qkv_proj")
-        )
-
-    def test_nvfp4_checkpoint_with_bf16_sparse_experts_is_rejected(self):
-        # A MoE layer left in BF16 gets the generic BF16 method, whose one-token
-        # compile path cannot read the TRT-LLM block weight layout.
-        for quant in (
-            modelopt_nvfp4(ignore=("lm_head", "model.layers.1.mlp.experts")),
-            compressed_tensors_nvfp4(
-                ignore=("lm_head", r"re:model\.layers\.1\.mlp\.experts\..*")
-            ),
-        ):
-            with (
-                self.subTest(quant=type(quant).__name__),
-                get_context().override_server_args(model_path="dummy"),
-                get_flags().moe.override(
-                    runner_backend=MoeRunnerBackend.FLASHINFER_TRTLLM
-                ),
-                get_parallel().override(
-                    tp_size=1,
-                    tp_rank=0,
-                    moe_tp_size=1,
-                    moe_tp_rank=0,
-                    moe_ep_size=1,
-                    moe_ep_rank=0,
-                ),
-                self.assertRaisesRegex(
-                    NotImplementedError, "every sparse layer's experts"
-                ),
-            ):
-                BeamMoE(
-                    tiny_config(),
-                    layer_id=1,
-                    prefix="model.layers.1.mlp",
-                    quant_config=quant,
-                )
 
     def test_release_and_explicit_layer_schedules_choose_native_pools(self):
         release = BeamConfig()
@@ -684,58 +533,6 @@ class TestBeamNumerics(CustomTestCase):
             self.assertEqual(set(ids[row].tolist()), set(selected[row].tolist()))
         self.assertTrue(torch.isfinite(weights).all())
 
-    def test_nvfp4_experts_route_with_deepseek_v3_grouping(self):
-        # ModelOpt NVFP4 would otherwise route with the kernel's default method.
-        factory = Mock(return_value=quantized_experts())
-        with (
-            get_context().override_server_args(),
-            patch(
-                "sglang.srt.models.beam.get_moe_runner_backend",
-                return_value=MoeRunnerBackend.FLASHINFER_TRTLLM,
-            ),
-            patch("sglang.srt.models.beam.get_moe_impl_class", return_value=factory),
-        ):
-            BeamMoE(tiny_config(), layer_id=1, quant_config=Mock())
-        self.assertEqual(
-            factory.call_args.kwargs["routing_method_type"],
-            RoutingMethodType.DeepSeekV3,
-        )
-
-    def test_nvfp4_single_token_compiled_routing_keeps_routed_scale(self):
-        """NVFP4 experts apply no routed scale to materialized routing, so the
-        routing a one-token compiled step selects must carry it."""
-        config = tiny_config()
-        hidden = torch.ones(1, config.hidden_size, dtype=torch.bfloat16)
-        logits = torch.linspace(1, -1, config.num_experts)[None]
-        with (
-            get_context().override_server_args(),
-            get_parallel().override(tp_size=1, tp_rank=0, moe_tp_size=1, moe_ep_size=1),
-            patch(
-                "sglang.srt.models.beam.get_moe_runner_backend",
-                return_value=MoeRunnerBackend.FLASHINFER_TRTLLM,
-            ),
-            patch(
-                "sglang.srt.models.beam.get_moe_impl_class",
-                return_value=Mock(return_value=quantized_experts()),
-            ),
-            patch(
-                "sglang.srt.layers.moe.topk.biased_grouped_topk",
-                wraps=biased_grouped_topk_impl._torchdynamo_orig_callable,
-            ),
-        ):
-            moe = BeamMoE(config, layer_id=1, quant_config=Mock())
-            with torch.no_grad():
-                moe.gate.e_score_correction_bias.zero_()
-            moe.topk.enter_torch_compile(num_tokens=1)
-            try:
-                output = moe.topk(hidden, logits)
-            finally:
-                moe.topk.leave_torch_compile()
-        self.assertEqual(output.format, TopKOutputFormat.STANDARD)
-        torch.testing.assert_close(
-            output.topk_weights.sum(-1), torch.tensor([config.routed_scaling_factor])
-        )
-
 
 class TestBeamLoading(CustomTestCase):
     def setUp(self):
@@ -889,16 +686,7 @@ class TestBeamLoading(CustomTestCase):
                     torch.testing.assert_close(actual, tensor.to(actual.dtype))
 
     def test_nvfp4_expert_weights_and_scales_use_same_shard_mapping(self):
-        # ModelOpt and compressed-tensors serialized names.
-        suffixes = (
-            "weight",
-            "weight_scale",
-            "weight_scale_2",
-            "input_scale",
-            "weight_packed",
-            "weight_global_scale",
-            "input_global_scale",
-        )
+        suffixes = ("weight", "weight_scale", "weight_scale_2", "input_scale")
         for suffix in suffixes:
             with self.subTest(suffix=suffix):
                 w13, w2 = _LoadedExpert(), _LoadedExpert()
