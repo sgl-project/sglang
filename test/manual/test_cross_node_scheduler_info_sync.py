@@ -44,7 +44,7 @@ from sglang.test.test_utils import (
 class TestCase:
     name: str
     tp_size: int
-    dp_size: int
+    attn_dp_size: int
     nnodes: int
     gpus_per_node: int
     expected_ranks: int
@@ -55,7 +55,7 @@ TEST_CASES = {
     "tp4_nodes2": TestCase(
         name="tp4_nodes2",
         tp_size=4,
-        dp_size=1,
+        attn_dp_size=1,
         nnodes=2,
         gpus_per_node=2,
         expected_ranks=4,
@@ -64,20 +64,20 @@ TEST_CASES = {
     "dp2_single_node": TestCase(
         name="dp2_single_node",
         tp_size=2,
-        dp_size=2,
+        attn_dp_size=2,
         nnodes=1,
         gpus_per_node=2,
         expected_ranks=2,
-        extra_args=["--enable-dp-attention", "--dp", "2", "--attention-backend", "fa3"],
+        extra_args=["--attn-dp-size", "2", "--attention-backend", "fa3"],
     ),
     "dp2_tp2_nodes2": TestCase(
         name="dp2_tp2_nodes2",
         tp_size=4,
-        dp_size=2,
+        attn_dp_size=2,
         nnodes=2,
         gpus_per_node=2,
         expected_ranks=4,
-        extra_args=["--enable-dp-attention", "--dp", "2", "--attention-backend", "fa3"],
+        extra_args=["--attn-dp-size", "2", "--attention-backend", "fa3"],
     ),
 }
 

@@ -88,6 +88,7 @@ jobs:
           MALLOC_ARENA_MAX: "2"
           MAX_JOBS: "1"
           PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+          PYTEST_ADDOPTS: "-s"
           TORCH_EXTENSIONS_DIR: ${{ runner.temp }}/torch-extensions
         run: |
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_sglang_runner.py

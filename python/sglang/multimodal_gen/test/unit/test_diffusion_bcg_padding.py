@@ -37,6 +37,10 @@ class OtherTransformer2DModel(torch.nn.Module):
     pass
 
 
+class FluxTransformer2DModel(torch.nn.Module):
+    pass
+
+
 class Ideogram4Transformer2DModel(torch.nn.Module):
     pass
 
@@ -132,6 +136,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.zimage_model = ZImageTransformer2DModel()
         self.sana_video_model = SanaVideoTransformer3DModel()
         self.other_model = OtherTransformer2DModel()
+        self.flux_model = FluxTransformer2DModel()
 
     def _patch_buckets(self, *buckets: int):
         resolved = tuple(sorted({b for b in buckets if b > 0}))
@@ -219,6 +224,23 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.assertIs(out, kwargs)
         self.assertEqual(out["encoder_hidden_states"].shape, (1, 512, 3584))
         self.assertEqual(out["txt_ids"].shape, (512, 3))
+
+    def test_longcat_edit_keeps_vl_prefix_and_image_grid(self):
+        kwargs = {
+            "hidden_states": torch.zeros(1, 8374, 64),
+            "encoder_hidden_states": torch.zeros(1, 859, 64),
+            "encoder_hidden_states_mask": [torch.ones(1, 859, dtype=torch.bool)],
+            "txt_ids": torch.zeros(859, 3),
+            "img_ids": torch.zeros(8374, 3),
+        }
+        with self._patch_buckets(64, 128, 256, 512, 1024):
+            out = self.stage._bcg_pad_prompt_kwargs(
+                kwargs, current_model=self.longcat_model
+            )
+        self.assertIs(out, kwargs)
+        self.assertEqual(out["encoder_hidden_states"].shape[1], 859)
+        self.assertEqual(out["txt_ids"].shape, (859, 3))
+        self.assertEqual(out["img_ids"].shape, (8374, 3))
 
     def test_qwen_default_bucket_preserves_mask(self):
         def kwargs(valid_len: int):
@@ -468,6 +490,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
     def test_image_generation_models_are_registered_as_bcg_supported(self):
         for model_id in (
             "meituan-longcat/longcat-image",
+            "meituan-longcat/longcat-image-edit-turbo",
             "qwen/qwen-image",
             "qwen/qwen-image-2512",
             "tongyi-mai/z-image",
@@ -479,6 +502,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         for config_name in (
             "GlmImagePipelineConfig",
             "LongCatImagePipelineConfig",
+            "LongCatImageEditPipelineConfig",
             "QwenImagePipelineConfig",
             "ZImagePipelineConfig",
         ):
@@ -519,6 +543,26 @@ class TestDiffusionBCGPadding(unittest.TestCase):
             "SanaVideoPipelineConfig",
             BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS,
         )
+
+    def test_flux_unmasked_conditioning_keeps_one_signature_for_all_buckets(self):
+        # FLUX attends to all 512 T5 tokens, including tokenizer padding.
+        # Adding unmasked tokens would change attention and generated pixels.
+        kwargs = {
+            "hidden_states": torch.zeros(1, 4096, 64, dtype=torch.bfloat16),
+            "encoder_hidden_states": torch.ones(1, 512, 4096, dtype=torch.bfloat16),
+            "pooled_projections": torch.ones(1, 768, dtype=torch.bfloat16),
+            "timestep": torch.zeros(1),
+            "guidance": torch.full((1,), 3.5, dtype=torch.bfloat16),
+            "freqs_cis": (torch.zeros(4608, 64), torch.ones(4608, 64)),
+        }
+        signature = _signature_kwargs(kwargs)
+        for bucket in (64, 128, 256, 512, 1024):
+            with self.subTest(bucket=bucket):
+                out = self.stage._bcg_pad_prompt_kwargs(
+                    kwargs, current_model=self.flux_model, force_bucket=bucket
+                )
+                self.assertIs(out, kwargs)
+                self.assertEqual(_signature_kwargs(out), signature)
 
     def test_dynamic_varlen_mask_meta_rebuilds_once_per_replay_token(self):
         builder = DynamicVarlenMaskMeta()

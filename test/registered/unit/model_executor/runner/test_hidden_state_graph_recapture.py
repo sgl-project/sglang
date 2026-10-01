@@ -19,7 +19,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestHiddenStateGraphRecapture(CustomTestCase):
@@ -73,6 +73,7 @@ class TestHiddenStateGraphRecapture(CustomTestCase):
         runner._capture_chunked_prefix = False
         runner.capture_hidden_mode = capture_hidden_mode
         runner.capture_num_tokens = [4]
+        runner.max_context_size = None
         runner.max_num_tokens = 4
         return runner
 

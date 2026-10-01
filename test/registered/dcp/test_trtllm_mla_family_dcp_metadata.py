@@ -5,6 +5,7 @@ The rank-local KV-length and page-table plumbing lives on
 backend and for both subclasses that inherit it.
 """
 
+import contextlib
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -19,15 +20,20 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLADecodeMetadata,
 )
 from sglang.srt.layers.dcp.layout import get_dcp_lens
+from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=60, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="4-gpu-b200")
 
 NUM_DRAFT_TOKENS = 8
 DCP_SIZE = 4
 DCP_RANK = 2
+
+
+class _RealVerifyPath(Exception):
+    """Raised by the stubs the real verify path reaches first."""
 
 
 def _make_backend(backend_cls, bs: int):
@@ -97,6 +103,63 @@ class _DCPMetadataTests:
         # Plain decode keeps both views in the capture-stable buffers.
         torch.testing.assert_close(metadata.global_seq_lens_k, seq_lens)
         torch.testing.assert_close(metadata.seq_lens_k, expected_local)
+
+    def _verify_extend(self, *, dcp_enabled: bool, in_autotune: bool):
+        heads, v_head_dim, n = 4, 512, 3 * NUM_DRAFT_TOKENS
+        backend = object.__new__(self.backend_cls)
+        backend.data_type = backend.q_data_type = torch.bfloat16
+        backend._decode_kernel_loc = None
+
+        def real_path(*args, **kwargs):
+            raise _RealVerifyPath
+
+        backend.token_to_kv_pool = SimpleNamespace(set_mla_kv_buffer=real_path)
+        backend._run_decode_kernel = real_path
+        layer = SimpleNamespace(tp_q_head_num=heads, v_head_dim=v_head_dim)
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY, out_cache_loc=None
+        )
+        k = torch.zeros((n, 1, v_head_dim), dtype=torch.bfloat16, device="cuda")
+        k_rope = torch.zeros((n, 1, 64), dtype=torch.bfloat16, device="cuda")
+        parallel = SimpleNamespace(dcp_enabled=dcp_enabled)
+        autotune = (
+            autotune_dummy_run_mode(run_lm_head=False)
+            if in_autotune
+            else contextlib.nullcontext()
+        )
+        with (
+            patch.object(backend_module, "get_parallel", return_value=parallel),
+            autotune,
+        ):
+            return backend.forward_extend(
+                torch.zeros(
+                    (n, heads, v_head_dim), dtype=torch.bfloat16, device="cuda"
+                ),
+                k,
+                None,
+                layer,
+                forward_batch,
+                save_kv_cache=True,
+                q_rope=torch.zeros((n, heads, 64), dtype=torch.bfloat16, device="cuda"),
+                k_rope=k_rope,
+            )
+
+    def test_autotune_verify_under_dcp_skips_the_kernel(self):
+        """A speculative autotune dummy verify under DCP must not run the kernel;
+        a FlashInfer kernel would start its own tuning, which can hang ranks."""
+        out, lse = self._verify_extend(dcp_enabled=True, in_autotune=True)
+        n = 3 * NUM_DRAFT_TOKENS
+        self.assertEqual((out.shape, out.dtype), ((n, 4 * 512), torch.bfloat16))
+        self.assertEqual((lse.shape, lse.dtype), ((n, 4), torch.float32))
+        self.assertFalse(out.any() or lse.any())
+
+    def test_real_verify_under_dcp_takes_the_real_path(self):
+        with self.assertRaises(_RealVerifyPath):
+            self._verify_extend(dcp_enabled=True, in_autotune=False)
+
+    def test_autotune_verify_without_dcp_takes_the_real_path(self):
+        with self.assertRaises(_RealVerifyPath):
+            self._verify_extend(dcp_enabled=False, in_autotune=True)
 
 
 class TestTRTLLMMLADCPMetadata(_DCPMetadataTests, CustomTestCase):
@@ -430,6 +493,89 @@ class TestFusedFp8WriteGate(CustomTestCase):
                     k=torch.zeros((n, 512), dtype=torch.bfloat16, device="cuda"),
                     k_rope=torch.zeros((n, 64), dtype=torch.bfloat16, device="cuda"),
                 )
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "the fused translate is Triton")
+class TestFusedWriteLocTranslateCuda(CustomTestCase):
+    """The fused write-loc translate must agree with its own CPU branch.
+
+    The two implementations must not drift: Triton truncates division toward
+    zero where torch floors it, so a negative loc and a tombstoned v2p row are
+    where a divergence would appear -- and the CPU branch is all the CPU suites
+    ever exercise.
+    """
+
+    def test_cuda_matches_the_cpu_branch(self):
+        from sglang.kernels.ops.memory.virtual_slot import write_loc_to_kernel_ids
+
+        for page_size in (1, 64):
+            span = page_size * 4
+            loc = torch.tensor(
+                [-1, 0, 1, page_size, span, span + 1, 2 * span + 3, 5 * page_size],
+                dtype=torch.int64,
+            )
+            # Size the table past the highest page any loc can name, then
+            # scramble it and tombstone one row (-1), so neither a dropped
+            # clamp nor a skipped gather can coincide with the right answer.
+            num_pages = int(loc.max()) // page_size + 2
+            v2p = torch.tensor(
+                [(5 * i + 2) % num_pages for i in range(num_pages)] + [-1],
+                dtype=torch.int64,
+            )
+            v2p[1] = -1
+            for dcp_size, dcp_rank in ((1, 0), (2, 1), (4, 2)):
+                kw = dict(
+                    page_size=page_size,
+                    stride=page_size * 3,
+                    dcp_size=dcp_size,
+                    dcp_rank=dcp_rank,
+                )
+                cpu = write_loc_to_kernel_ids(loc=loc, v2p=v2p, **kw)
+                gpu = write_loc_to_kernel_ids(loc=loc.cuda(), v2p=v2p.cuda(), **kw)
+                self.assertEqual(
+                    cpu.tolist(),
+                    gpu.cpu().tolist(),
+                    f"ps={page_size} dcp_size={dcp_size} rank={dcp_rank}",
+                )
+
+    def test_wide_out_clears_the_stale_tail(self):
+        """`out_width` past the batch must zero the tail in the same launch.
+
+        This is what lets a backend hand in its whole capture-stable buffer:
+        a shorter replay leaves stale kernel-facing ids past the batch, and the
+        captured write kernel consumes the full buffer, so an uncleared tail
+        scatters pad rows into live KV pages.
+        """
+        from sglang.kernels.ops.memory.virtual_slot import write_loc_to_kernel_ids
+
+        v2p = torch.tensor([2, 5, 1, 3, 4], dtype=torch.int64, device="cuda")
+        loc = torch.tensor([0, 64, 128], dtype=torch.int64, device="cuda")
+        width = 8
+        # Poison the whole buffer so an unwritten or uncleared cell is visible.
+        buf = torch.full((width,), -999, dtype=torch.int64, device="cuda")
+        write_loc_to_kernel_ids(
+            loc=loc, v2p=v2p, page_size=64, stride=64 * 2, out=buf, out_width=width
+        )
+        self.assertEqual(buf[:3].tolist(), [2 * 128, 5 * 128, 1 * 128])
+        self.assertEqual(buf[3:].tolist(), [0] * (width - 3))
+
+        # And it must agree with the narrow call on the live prefix.
+        narrow = write_loc_to_kernel_ids(loc=loc, v2p=v2p, page_size=64, stride=64 * 2)
+        self.assertEqual(narrow.tolist(), buf[:3].tolist())
+
+    def test_out_is_written_in_place(self):
+        # The captured decode path hands in a capture-stable buffer; rebinding
+        # instead of filling it would leave the graph on a stale pointer.
+        from sglang.kernels.ops.memory.virtual_slot import write_loc_to_kernel_ids
+
+        v2p = torch.tensor([2, 5, -1, 3], dtype=torch.int64, device="cuda")
+        loc = torch.tensor([0, 64, 128, 192], dtype=torch.int64, device="cuda")
+        dst = torch.full_like(loc, -7)
+        ret = write_loc_to_kernel_ids(
+            loc=loc, v2p=v2p, page_size=64, stride=64 * 2, out=dst
+        )
+        self.assertIs(ret, dst)
+        self.assertEqual(dst.tolist(), [2 * 128, 5 * 128, 0, 3 * 128])
 
 
 class TestDcpDecodeLayout(CustomTestCase):

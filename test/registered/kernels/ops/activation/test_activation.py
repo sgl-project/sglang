@@ -166,6 +166,36 @@ def test_activation_filter_expert_none_skipped(op_name: str) -> None:
     torch.testing.assert_close(out_filtered, out_unfiltered, atol=0.0, rtol=0.0)
 
 
+def test_activation_filter_expert_int64_under_torch_compile() -> None:
+    """torch.topk routing ids remain usable after AOTAutograd realizes int64."""
+    shape = (32, 512)
+    dtype = torch.bfloat16
+    x = torch.randn(shape, dtype=dtype, device="cuda")
+    expert_ids = torch.zeros((shape[0],), dtype=torch.int64, device="cuda")
+    expert_ids[::3] = -1
+    out = torch.full(
+        shape[:-1] + (shape[-1] // 2,),
+        float("nan"),
+        dtype=dtype,
+        device="cuda",
+    )
+
+    def compiled_activation(input, output, routing_ids):
+        return run_activation("silu", input, output, routing_ids, 1)
+
+    result = torch.compile(compiled_activation, fullgraph=True)(x, out, expert_ids)
+    assert result is out
+
+    skipped = expert_ids == -1
+    assert torch.isnan(out[skipped]).all()
+    torch.testing.assert_close(
+        out[~skipped],
+        _reference("silu", x)[~skipped],
+        atol=1e-2,
+        rtol=1e-2,
+    )
+
+
 UNARY_SHAPES = get_ci_test_range(
     full_range=[
         (7, 16),
