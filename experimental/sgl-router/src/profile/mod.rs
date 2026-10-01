@@ -29,6 +29,26 @@ pub struct ApiProfile {
     pub params: BTreeMap<String, ParamRule>,
     pub errors: Errors,
     pub protocols: Protocols,
+    pub messages: MessagesOpts,
+}
+
+/// `/v1/messages` behaviour.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MessagesOpts {
+    pub thinking_blocks: ThinkingBlocks,
+}
+
+/// When `thinking` blocks are returned.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingBlocks {
+    /// Whenever the model reasons.
+    #[default]
+    Always,
+    /// Only when the request sets `thinking.type` to `enabled` or `adaptive`
+    /// (Anthropic's default). The model still reasons; the blocks are dropped.
+    OnRequest,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]

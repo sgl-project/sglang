@@ -88,6 +88,9 @@ protocols:                   # each enables its routes; a disabled route answers
   chat: true
   messages: true
   responses: true
+
+messages:
+  thinking_blocks: always    # always (default) | on_request
 ```
 
 ### `params`
@@ -146,6 +149,15 @@ own rejections and the engine's. The envelope stays the protocol's own: the
 OpenAI `{"error": {...}}` form for chat and Responses, the Anthropic
 `{"type": "error", "error": {...}}` form for Messages, and sglang's flat
 `{"type", "message", …}` for engine chat errors.
+
+### `messages.thinking_blocks`
+
+When `/v1/messages` replies include `thinking` blocks.
+
+| Value | Behaviour |
+|---|---|
+| `always` (default) | Whenever the model reasons. Suits always-reasoning models such as Step-5, and clients that time the reasoning phase |
+| `on_request` | Only when the request sets `thinking.type` to `enabled` or `adaptive`, which is Anthropic's default. Otherwise the router drops the blocks from buffered and streamed replies. The model still reasons and those tokens are still billed |
 
 ## `extends` and merging
 

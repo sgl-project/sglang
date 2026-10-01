@@ -285,3 +285,49 @@ async fn oversized_body_gets_a_json_413_in_each_protocol_envelope() {
     assert_eq!(v["error"]["type"], "request_too_large", "{v}");
     assert!(sent(&mock).is_none());
 }
+
+#[tokio::test]
+async fn thinking_blocks_on_request_hides_unrequested_thinking() {
+    let path = std::env::temp_dir().join(format!("api-profile-think-{}.yaml", std::process::id()));
+    std::fs::write(
+        &path,
+        "extends: stepfun-step5\nmessages: {thinking_blocks: on_request}\n",
+    )
+    .unwrap();
+    let mock = MockWorker::start(vec![
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"hm\"},\"finish_reason\":null}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":1}}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"OK\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n\n",
+        "data: [DONE]\n\n",
+    ])
+    .await;
+    let flags = ["--api-profile-file", path.to_str().unwrap()];
+    let stream_text = |thinking: Option<Value>| {
+        let mut body = json!({"model": MODEL, "max_tokens": 64, "stream": true,
+                              "messages": [{"role": "user", "content": "hi"}]});
+        if let Some(t) = thinking {
+            body["thinking"] = t;
+        }
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let app = build_router(ctx(&mock.url, &flags));
+        async move {
+            String::from_utf8(
+                collect_body(app.oneshot(req).await.unwrap().into_body())
+                    .await
+                    .to_vec(),
+            )
+            .unwrap()
+        }
+    };
+    let hidden = stream_text(None).await;
+    assert!(
+        !hidden.contains("thinking") && hidden.contains("\"text\":\"OK\""),
+        "{hidden}"
+    );
+    let shown = stream_text(Some(json!({"type": "enabled", "budget_tokens": 1024}))).await;
+    assert!(shown.contains("thinking_delta"), "{shown}");
+}

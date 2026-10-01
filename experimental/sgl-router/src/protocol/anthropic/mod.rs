@@ -121,6 +121,7 @@ mod tests {
         EchoContext {
             model: "m".into(),
             stop_sequences: stops.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
         }
     }
 

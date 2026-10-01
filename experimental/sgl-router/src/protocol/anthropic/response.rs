@@ -17,7 +17,7 @@ pub fn chat_to_message(chat: &Value, echo: &EchoContext) -> Value {
             .filter(|s| !s.is_empty())
     };
     let mut content = Vec::new();
-    if let Some(r) = str_field("reasoning_content") {
+    if let Some(r) = str_field("reasoning_content").filter(|_| !echo.hide_thinking) {
         content.push(json!({"type": "thinking", "thinking": r, "signature": ""}));
     }
     if let Some(t) = str_field("content") {
@@ -67,6 +67,7 @@ mod tests {
         EchoContext {
             model: "m".into(),
             stop_sequences: vec![],
+            ..Default::default()
         }
     }
 
@@ -115,5 +116,27 @@ mod tests {
         assert_eq!(m["stop_reason"], "max_tokens");
         assert_eq!(m["content"].as_array().unwrap().len(), 1);
         assert_eq!(m["content"][0]["type"], "thinking");
+    }
+
+    #[test]
+    fn hidden_thinking_is_dropped() {
+        let echo = EchoContext {
+            hide_thinking: true,
+            ..echo()
+        };
+        let m = chat_to_message(
+            &json!({"choices": [{"finish_reason": "stop", "message": {"role": "assistant",
+                    "content": "OK", "reasoning_content": "hm"}}]}),
+            &echo,
+        );
+        assert_eq!(m["content"], json!([{"type": "text", "text": "OK"}]));
+        // Truncated inside reasoning: nothing left to show but an empty text block.
+        let m = chat_to_message(
+            &json!({"choices": [{"finish_reason": "length", "message": {"role": "assistant",
+                    "content": null, "reasoning_content": "long"}}]}),
+            &echo,
+        );
+        assert_eq!(m["content"], json!([{"type": "text", "text": ""}]));
+        assert_eq!(m["stop_reason"], "max_tokens");
     }
 }

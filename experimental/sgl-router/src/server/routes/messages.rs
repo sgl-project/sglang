@@ -31,10 +31,13 @@ pub(crate) async fn messages(
     // Body-consuming extractor: MUST stay last (see `chat_completions`).
     body: Bytes,
 ) -> Response<Body> {
-    let converted = match parse(&body, false) {
+    let mut converted = match parse(&body, false) {
         Ok(c) => c,
         Err(e) => return adapt(e.into_response(), None).await,
     };
+    converted.echo.hide_thinking = ctx.config.model.profile.messages.thinking_blocks
+        == crate::profile::ThinkingBlocks::OnRequest
+        && !converted.echo.thinking_requested;
     let chat_body = Bytes::from(serde_json::to_vec(&converted.chat).expect("serialize chat"));
     let chat_body = match ctx
         .config

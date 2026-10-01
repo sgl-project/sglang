@@ -74,7 +74,7 @@ impl MessagesStream {
                     .and_then(Value::as_str)
                     .filter(|s| !s.is_empty())
             };
-            if let Some(r) = text("reasoning_content") {
+            if let Some(r) = text("reasoning_content").filter(|_| !self.echo.hide_thinking) {
                 self.open_block(Kind::Thinking, None, out);
                 self.delta(json!({"type": "thinking_delta", "thinking": r}), out);
             }
@@ -255,6 +255,7 @@ mod tests {
         EchoContext {
             model: "m".into(),
             stop_sequences: vec!["<END>".into()],
+            ..Default::default()
         }
     }
 
@@ -432,5 +433,34 @@ mod tests {
         assert_eq!(evs[0].0, "message_start");
         let md = &evs.iter().find(|(e, _)| e == "message_delta").unwrap().1;
         assert_eq!(md["usage"]["input_tokens"], 4);
+    }
+
+    #[test]
+    fn hidden_thinking_emits_no_thinking_block() {
+        let mut s = MessagesStream::new(EchoContext {
+            hide_thinking: true,
+            ..echo()
+        });
+        let mut raw = Vec::new();
+        for c in [
+            chunk(json!({"reasoning_content": "hm"}), None, true),
+            chunk(json!({"content": "OK"}), Some("stop"), true),
+        ] {
+            raw.extend(s.feed(c.as_bytes()));
+        }
+        raw.extend(s.finish());
+        let evs = events(&raw);
+        assert!(evs
+            .iter()
+            .all(|(_, d)| d.pointer("/content_block/type") != Some(&json!("thinking"))));
+        assert!(evs
+            .iter()
+            .all(|(_, d)| d.pointer("/delta/type") != Some(&json!("thinking_delta"))));
+        let start = evs
+            .iter()
+            .find(|(e, _)| e == "content_block_start")
+            .unwrap();
+        assert_eq!(start.1["index"], 0);
+        assert_eq!(start.1["content_block"]["type"], "text");
     }
 }

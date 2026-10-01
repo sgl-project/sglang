@@ -7,10 +7,14 @@
 
 use serde_json::{json, Map, Value};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct EchoContext {
     pub model: String,
     pub stop_sequences: Vec<String>,
+    /// The request set `thinking.type` to `enabled` or `adaptive`.
+    pub thinking_requested: bool,
+    /// Drop `thinking` blocks from the reply (set by the route from the profile).
+    pub hide_thinking: bool,
 }
 
 #[derive(Debug)]
@@ -121,6 +125,7 @@ pub fn to_chat(req: Value, count_only: bool) -> Result<Converted, String> {
         chat.insert("stop".into(), json!(stop_sequences));
     }
 
+    let mut thinking_requested = false;
     if let Some(thinking) = req.get("thinking").filter(|v| !v.is_null()) {
         let enabled = match thinking.get("type").and_then(Value::as_str) {
             Some("enabled") | Some("adaptive") => true,
@@ -132,6 +137,7 @@ pub fn to_chat(req: Value, count_only: bool) -> Result<Converted, String> {
                 ))
             }
         };
+        thinking_requested = enabled;
         // Templates read different keys; explicit client values win.
         let ctk = chat
             .entry("chat_template_kwargs")
@@ -191,6 +197,8 @@ pub fn to_chat(req: Value, count_only: bool) -> Result<Converted, String> {
         echo: EchoContext {
             model,
             stop_sequences,
+            thinking_requested,
+            hide_thinking: false,
         },
         stream,
     })
@@ -712,6 +720,21 @@ mod tests {
                             "response_format": {"type": "json_object"}}),
         );
         assert_eq!(c["response_format"], json!({"type": "json_object"}));
+    }
+
+    #[test]
+    fn thinking_requested_only_for_enabled_or_adaptive() {
+        let req = |t: Value| {
+            let mut r = json!({"model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": "x"}]});
+            if !t.is_null() {
+                r["thinking"] = t;
+            }
+            to_chat(r, false).unwrap().echo.thinking_requested
+        };
+        assert!(!req(Value::Null));
+        assert!(!req(json!({"type": "disabled"})));
+        assert!(req(json!({"type": "enabled", "budget_tokens": 1024})));
+        assert!(req(json!({"type": "adaptive"})));
     }
 
     #[test]
