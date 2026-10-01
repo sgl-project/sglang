@@ -32,6 +32,7 @@ it does not redefine the goal as the modules already implemented.
 | Mooncake adapter | Required hard pin, registered raw buffers, immutable retry verification, exact read length | Real cross-process TCP roundtrip passes; cross-node RDMA is pending |
 | Publication | Catalog producer client, manifest-last writer, durable metadata journal, fenced replay | Lost responses, failed puts, stale fences, missing/corrupt objects and identical retries tested; actual Catalog service is SpecForge-owned |
 | Partition publication | Owner-local writes and fenced all-owner publication receipts | Two independent writer processes publish logical head shards through real TCP Store; distributed inference admission and scheduler integration remain open |
+| Partition ownership | Canonical replicated-head owners, PP-local Host/device staging, local KV export and metadata assembly | Native QKV loader agreement at TP1/2/4/8, exact CUDA source-reuse checks and independent Store writers pass; global identity binding and distributed coordination remain open |
 | Runtime collection | Opt-in CLI config, capability gates, request ledger, prefill/decode hooks, invalidation and counters | Six real Qwen3-0.6B requests published through Mooncake; ordinary and CUDA graph replay executions pass |
 | Real model identity/parity | Weight/tokenizer artifact digests, actual selected-layer geometry, K norm and RoPE | Captured KV and teacher scores match online tensors exactly; full-vocabulary LSE matches within 1e-5; HF teacher logits pass numerical comparison, but cross-engine KV equivalence is not certified |
 | Draft serving | Explicit KV-input architecture, contract, encoder, incremental injector and invalidation | Real Qwen3 target plus synthetic KV draft passes ordinary/batched/graph generation; retained BF16 fixture passes full backbone/logit parity against pinned FlexAttention, with production exporter and trained-model validation still open |
@@ -1216,6 +1217,65 @@ HEAD, and format/whitespace checks pass. All jobs terminated and the H100 resume
 its idle workload. Commands, observations and source/log hashes are retained in
 [`capture-partition-publication.json`](experiments/capture-partition-publication.json).
 
+## Canonical KV Ownership and Local Snapshot Preparation
+
+`plan_capture_layout` maps global selected-layer geometry onto explicit ordinary
+dense TP/PP stages. It uses the native QKV loader's head placement, selects the
+first rank of each replicated-head group as canonical owner, and assigns aux
+tensors to a designated rank on the final PP stage. Inactive ranks remain
+explicit partitions rather than falling back to full-model allocation.
+
+`HostBufferPool` now accepts a partition and reserves only that rank's selected
+KV layers and local heads. Only the aux owner reserves tokens, teacher values,
+masks and manifest capacity. KV staging budgets remain independent per rank;
+an aux-only owner needs no device staging. `SelectedLayerKVExporter.from_pool`
+reads only owned PP layers and validates rank-local head shapes. No KV tensor
+gather is introduced.
+
+After local D2H completion, `prepare_snapshot_partition` produces registered
+views and descriptors bound to common snapshot metadata. `assemble_snapshot`
+validates the complete owner set, matching metadata, consistent KV validity and
+canonical head ranges before constructing one manifest. Swapping two owners'
+head labels is rejected even when global coverage remains complete. The
+existing single-owner `build_snapshot` uses the same preparation/assembly path.
+
+Job `01790840979211010701-7b614e301c6b` passes 111 tests and 104 subtests
+in 89.09s, including both real Mooncake Store tests. Ownership is independently
+checked against loaded K weights from `QKVParallelLinear`, at TP1/2/4/8 for
+layers with eight and two KV heads. A TP4/PP3 fixture checks heterogeneous heads,
+inactive replicas and an aux-only final stage. Its KV-only rank allocates exactly
+256 Host bytes and 96 device-staging bytes; lowering either budget by one byte
+fails before registration. CUDA batching also preserves exact local KV after
+immediate source-slot reuse, including the final partial batch.
+
+The two independent Store writers now use a fixture prepared through these
+production APIs. Their 32 objects / 4,532 tensor bytes reconstruct exactly by
+logical ranges, and a fresh reader succeeds after both writers exit. Descriptors
+are still assembled in the test coordinator; this is not distributed model
+execution or cross-rank metadata transport.
+
+Since ordinary `build_snapshot` now shares this implementation, job
+`01790841385378621132-77011d7c17ca` reruns the complete existing single-H100
+serving test and passes in 462.301s, with 90 READY snapshots. AR and static
+DSpark, eager/graph replay, overlap, adaptive and latency protection, RadixCache
+eviction and retract/resume remain covered. All four DSpark pressure modes
+complete 768 output tokens across four requests despite two automatic
+retractions per mode. Successful samples remain readable after producer exit.
+
+Serving TP/PP/DP gates remain closed. Global identity binding from local model
+instances, distributed admission/failure agreement, descriptor exchange, global
+teacher top-128/LSE and scheduler integration remain open. Inactive ranks will
+still need to participate in collective/control ordering. No CP/sparse KV,
+cross-node RDMA, production Catalog or performance SLO is certified by these
+tests.
+
+Source and log hashes, commands and observations are retained in
+[`capture-topology-ownership.json`](experiments/capture-topology-ownership.json).
+GPU sources match the local checkout. New code passes Ruff; the exporter's
+existing `UP035` diagnostic is unchanged. Format and whitespace checks pass,
+the original worktree index is unchanged, both jobs have terminated, and the
+resident H100 has resumed its idle workload.
+
 ## Next Implementation
 
 1. Broaden real-request coverage to prefill graphs, automatic AR OOM retraction,
@@ -1223,8 +1283,9 @@ its idle workload. Commands, observations and source/log hashes are retained in
    saturated backpressure.
 2. Extend P8's passing retained BF16 fixture to production-exported and trained
    checkpoints, complete exporter compatibility and artifact/quality validation.
-3. Connect P9's owner-local Store interface to distributed capture admission,
-   canonical KV head ownership, rank-local Host pools and TP/PP scheduling.
+3. Connect P9's implemented layout, rank-local buffers and owner-local Store
+   interface to global target identity, distributed capture admission/failure
+   agreement, descriptor exchange, global teacher scores and TP/PP scheduling.
    Complete TP/PP runtime validation, non-static speculative layouts,
    PD transfer and cross-node RDMA. Existing capability gates do
    not constitute implementation of these paths.

@@ -208,18 +208,51 @@ The writer also exposes the transport/publication boundary needed by a future
 TP/PP capture coordinator. These methods do not enable distributed inference
 capture; the current serving capability gates remain in force.
 
-1. After owner-local D2H completion, the coordinator collects object descriptors
-   and builds one immutable full manifest, including all logical token/head
-   ranges. Every owner receives the same canonical manifest and capture lease.
-2. Each owner calls `write_partition(manifest, local_tensors, lease, owner_id=...)`.
+1. Build one `plan_capture_layout(global_kv, tp_size=...,
+   pp_layer_ranges=..., aux_tp_rank=..., dp_rank=...)`. The explicit half-open
+   PP ranges must be contiguous from layer zero and cover every selected layer.
+   `global_kv` describes logical heads before TP sharding. The designated rank
+   on the last PP stage owns aux tensors and the manifest buffer.
+2. Pass the rank's `CapturePartition` to `HostBufferPool` and, when it owns KV,
+   `SelectedLayerKVExporter.from_pool`. Each owner allocates and exports only
+   its local selected layers and head count. Source pool tensors already have
+   the rank-local head axis; no tensor gather is performed.
+3. After local D2H completion, call `prepare_snapshot_partition` with the same
+   `SnapshotMetadata` on every owner. It returns local registered tensor views
+   and metadata-only `PreparedSnapshotPartition`. The coordinator collects these
+   descriptions and calls `assemble_snapshot(metadata, parts, layout=layout)`.
+   Assembly checks exact expected owners, metadata identity, canonical head
+   ranges, complete coverage and consistent final-token validity. Every owner
+   then receives the same immutable full manifest and capture lease.
+4. Each owner calls `write_partition(manifest, local_tensors, lease, owner_id=...)`.
    It validates complete manifest coverage and exactly that owner's payloads,
    sends REGISTERED, completes registered-buffer puts, and waits for WRITTEN ACK.
    The aux owner also checks token/teacher alignment, masks and vocabulary values.
-3. The designated aux coordinator calls
+5. The designated aux coordinator calls
    `publish_partitions(manifest, receipts, manifest_buffer, lease)` with exactly
    one `OwnerWriteReceipt` per declared owner. Capture ID, fence, owner and
    manifest digest must all match. It then registers the manifest and uses the
    existing journal, seal and manifest-last publication path.
+
+For ordinary dense TP, heads are either split evenly or replicated evenly.
+When TP exceeds the global KV head count, the first rank in each replica group
+is the canonical owner, matching the native QKV weight loader's head placement.
+An inactive partition is explicit (`active=False`); it is excluded from the
+manifest's owners and must skip payload allocation/export. Passing it to a Host
+pool fails, while `partition=None` retains the full single-owner behavior.
+Inactive ranks must still participate in the future distributed control and
+collective protocol. An aux-only owner allocates no KV/device staging and must
+skip construction of a KV exporter. Non-aux owners allocate no aux or manifest
+capacity. Host and device budgets are enforced independently per rank.
+
+Preparation and assembly are background work after CUDA completion. Their views
+do not extend a buffer lease: each owner retains its Host slot until its Store
+writes complete, and the coordinator retains the manifest buffer until
+publication completes. Existing uncertain-transfer quarantine rules still apply.
+These APIs do not exchange descriptors between processes or bind local attention
+metadata into a global target contract. Admission agreement, rank identity,
+metadata transport, failure coordination and scheduler wiring remain required.
+The planner covers ordinary dense TP/PP, not context parallelism or sparse KV.
 
 Receipts contain metadata only. They are trusted producer acknowledgements,
 not retention leases or signed Catalog attestations. The Catalog must verify
@@ -333,11 +366,16 @@ PYTHONPATH=python python3 -m pytest test/registered/storage/test_training_snapsh
 PYTHONPATH=python python3 test/registered/storage/test_training_capture_runtime.py --model-path /models/Qwen3-0.6B -v
 ```
 
-The first command includes one CUDA ownership test. The second requires the
+The first command includes CUDA ownership tests and compares canonical TP head
+ownership against the actual native QKV loader at TP sizes 1, 2, 4 and 8. It
+also checks rank-local budgets, PP layer selection, aux-only/inactive ranks and
+metadata assembly failures. The second requires the
 Mooncake SDK and `mooncake_master`. It starts an isolated master, writes through
 `SnapshotWriter` and a registered arena, and reads/validates every object from a
 different process over TCP. Its Catalog is a test double, not a real SpecForge
-service. Every process it starts is cleaned up by the test.
+service. The two-owner case prepares descriptors through the production layout,
+pool and assembly APIs before independent processes publish their local tensors.
+Every process it starts is cleaned up by the test.
 
 The third command adds actual SGLang prefill/decode, a prefix hit, a one-token
 response and a serving logit bias. A test-only observer records each selected

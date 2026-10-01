@@ -291,6 +291,29 @@ The retained results are in
 [`capture-partition-publication.json`](capture-partition-publication.json).
 This exercises owner-local storage/publication, not TP/PP inference or RDMA.
 
+### Canonical Ownership and Local Buffers
+
+The production layout planner now selects canonical replicated KV heads and
+maps selected layers to explicit PP stages. The Store fixture uses rank-local
+Host pools, snapshot preparation and metadata assembly before starting its two
+independent writer processes. The capture suite compares ownership against the
+actual QKV weight loader at TP1/2/4/8, checks local byte budgets and aux-only
+stages, and rejects missing/mismatched owners and swapped logical head labels.
+Its CUDA tests overwrite source slots immediately after export and verify exact
+contents after full and partial staging flushes.
+
+```bash
+python -m pytest -q -s test/registered/unit/training_capture \
+  test/registered/storage/test_training_snapshot_mooncake.py
+```
+
+Run this through the resident queue. It validates library interfaces and real
+local TCP storage; distributed model admission, identity binding, metadata
+exchange, global logits and TP/PP scheduler integration remain open.
+[`capture-topology-ownership.json`](capture-topology-ownership.json) records
+111 passing tests / 104 subtests and a complete single-H100 runtime regression
+with 90 READY snapshots in 462.301s, including source/log hashes.
+
 ### BF16 Rounding Isolation
 
 The actual fixed-input parity command remains the serving gate. The following

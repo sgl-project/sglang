@@ -1,0 +1,201 @@
+{
+  "purpose": "Canonical logical KV ownership, rank-local Host/device buffers and metadata-only snapshot assembly for ordinary dense TP/PP",
+  "source_baseline": "0a6e9c60648ab645e5bb022b23d8cc5f866e2a5b",
+  "environment_lock": "h100-runtime-lock.json",
+  "source_sha256": {
+    "python/sglang/srt/training_capture/topology.py": "b35eef08cd7ac804817c5b22c232e9c1e6dd76fc292220acc928eb58af5f1a35",
+    "python/sglang/srt/training_capture/host_pool.py": "d18bdf4620c0508a16a52dafc0c55e12106abde9289e6d62c2989e905d86d549",
+    "python/sglang/srt/training_capture/kv_exporter.py": "2cecaf4db75bd9b2b0adf664f12fd6c56cfaba74be01b1c755b40cfd62299c8f",
+    "python/sglang/srt/training_capture/snapshot.py": "13475b85dff0677a463e8118bb0ee21f66656e4787e74e4d6a1040fc6725c851",
+    "python/sglang/test/training_capture_partition.py": "26c063e4bd1c3306b1d103d56317188412c790f4eb632afc8a3b29e2532aee3e",
+    "test/registered/unit/training_capture/test_topology.py": "6ebc85ad3c06777f31542f757eaf5be5ce2d272fe2b73b27bb1f12d01880008a",
+    "test/registered/unit/training_capture/test_cuda_snapshot.py": "efacbbb20ed56311e5746354911b3c29e3b8b2f8ed16922abcab3d07c646fc85",
+    "test/registered/storage/test_training_snapshot_mooncake.py": "514db0f87f9d23cc77b6893adbbef64c4bfcc262402b6b9867436ba41d2c23e0",
+    "test/registered/storage/test_training_capture_runtime.py": "55253d35aa64c700a9c2ec48388a65a6953d0f4b403b7dd362507e86fa9142a3"
+  },
+  "interfaces": {
+    "plan_capture_layout": "Maps global logical heads and explicit contiguous PP stage ranges to canonical owners; keeps inactive ranks explicit and assigns aux to a chosen final-stage TP rank.",
+    "HostBufferPool(partition=...)": "Allocates only locally owned KV geometry; aux and manifest capacity belong only to the aux owner. Rejects inactive ranks before registration.",
+    "SelectedLayerKVExporter.from_pool(partition=...)": "Reads only owned local PP layers and validates rank-local head axes, without gathering KV tensors.",
+    "prepare_snapshot_partition": "Returns registered tensor views plus descriptors bound to common metadata after owner-local D2H completion.",
+    "assemble_snapshot": "Requires every expected owner once, identical metadata, canonical owner head ranges and consistent full logical coverage before constructing a manifest."
+  },
+  "jobs": [
+    {
+      "job_id": "01790840979211010701-7b614e301c6b",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790841071.5290327,
+      "tests": 111,
+      "subtests": 104,
+      "seconds": 89.09,
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "-s",
+        "test/registered/unit/training_capture",
+        "test/registered/storage/test_training_snapshot_mooncake.py"
+      ],
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790840979211010701-7b614e301c6b.log",
+      "log_sha256": "15355f6617dfa6ca165c06056e6ac60b97fd377185ba82bd5126be74ee3e3e0c"
+    },
+    {
+      "job_id": "01790841385378621132-77011d7c17ca",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790841859.960069,
+      "tests": 1,
+      "seconds": 462.301,
+      "published_snapshots": 90,
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/storage/test_training_capture_runtime.py",
+        "--model-path",
+        "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+      ],
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790841385378621132-77011d7c17ca.log",
+      "log_sha256": "ede3963353e430dc48c206e05888b3d051549f612bbf0f9363a9204e0aab8a06",
+      "note": "Full existing single-H100 serving regression because build_snapshot now shares the partition preparation and assembly implementation."
+    }
+  ],
+  "ownership_checks": {
+    "reference": "Actual QKVParallelLinear K weight loader with global head IDs encoded in source rows; observed local heads independently identify each head's first owner.",
+    "tp_sizes": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "global_kv_head_counts": [
+      8,
+      2
+    ],
+    "pp_fixture": {
+      "tp_size": 4,
+      "pp_layer_ranges": [
+        [
+          0,
+          2
+        ],
+        [
+          2,
+          4
+        ],
+        [
+          4,
+          6
+        ]
+      ],
+      "aux_tp_rank": 1,
+      "active_owners": [
+        "dp0-pp0-tp0",
+        "dp0-pp0-tp1",
+        "dp0-pp0-tp2",
+        "dp0-pp0-tp3",
+        "dp0-pp1-tp0",
+        "dp0-pp1-tp2",
+        "dp0-pp2-tp1"
+      ]
+    },
+    "kv_only_budget": {
+      "owner": "dp0-pp0-tp0",
+      "max_tokens": 6,
+      "local_tensor_shape": [
+        6,
+        2,
+        4
+      ],
+      "host_bytes": 256,
+      "device_staging_bytes": 96,
+      "one_byte_under_budget_rejected_before_registration": true
+    },
+    "cuda": "TP4 canonical rank 2 exports one logical head per selected layer, with three-token staging and a five-token noncontiguous source path; immediate source-slot overwrite does not alter Host contents, including the partial tail."
+  },
+  "store_observation": {
+    "owners": [
+      "dp0-pp0-tp1",
+      "dp0-pp0-tp0"
+    ],
+    "aux_owner": "dp0-pp0-tp1",
+    "writer_processes": 2,
+    "writers_exited_before_publish": true,
+    "objects": 32,
+    "tensor_bytes": 4532,
+    "logical_head_reassembly_exact": true,
+    "independent_reader_passed": true,
+    "protocol": "tcp",
+    "catalog": "HTTP test double",
+    "preparation": "Fixture uses production layout, local Host pools, prepare_snapshot_partition and assemble_snapshot before independent owner writers start."
+  },
+  "assertions": [
+    "Only canonical head owners export replicated KV; all logical heads remain covered exactly once.",
+    "Inactive partitions cannot fall back to full-model allocation. Aux-only owners need no KV exporter or device staging.",
+    "Per-rank Host/device limits are checked before any buffer registration.",
+    "The local PP exporter never accesses another stage's selected layers.",
+    "Assembly rejects missing/duplicate owners, changed metadata and inconsistent valid-token counts.",
+    "Swapping owner head labels fails even when generic manifest validation sees complete logical coverage.",
+    "Ordinary single-owner snapshot construction uses the same preparation and assembly interfaces."
+  ],
+  "limits": [
+    "Serving TP/PP/DP gates remain closed. Global identity binding from local models, synchronized admission/failure agreement, metadata transport, global teacher top-128/LSE and scheduler integration remain pending.",
+    "The topology planner assumes ordinary dense TP/PP with nonempty contiguous PP stage intervals. CP, sparse KV and quantized KV are not supported.",
+    "Source rank identity and the global KV contract must be established by the future coordinator. Local tensor shape alone cannot prove logical head identity.",
+    "Preparation does not extend buffer ownership. Callers retain local Host slots through D2H and Store completion and quarantine uncertain transfers.",
+    "Inactive ranks still need to participate in future collective/control ordering.",
+    "Unit and Store partition fixtures do not execute a distributed model forward; transport is local TCP, not RDMA. No production Catalog, consumer or SLO is certified.",
+    "Runtime regression uses one H100 and a synthetic KV-input draft. The optional cross-engine HF KV gate is not enabled; trained-model quality and TP/PP numerical parity remain unverified."
+  ],
+  "checks": {
+    "local_gpu_source_hashes_equal": true,
+    "new_code_ruff_passed": true,
+    "legacy_ruff_codes_unchanged": [
+      "UP035"
+    ],
+    "format_and_whitespace_passed": true,
+    "original_worktree_index_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9",
+    "resident_gpu_idle_resumed": true
+  },
+  "runtime_observation": {
+    "model": "Qwen/Qwen3-0.6B",
+    "tp_size": 1,
+    "pp_size": 1,
+    "ready_log_records": 90,
+    "coverage": [
+      "AR prefill/decode and raw teacher collection",
+      "Prefix hits, chunked prefill and one-token responses",
+      "Eager and decode graph replay",
+      "AR and static DSpark overlap",
+      "All four static DSpark eager/graph and synchronous/overlap memory-pressure cases",
+      "Adaptive capture and scheduler latency protection",
+      "Real RadixCache eviction and explicit retract/resume",
+      "Mooncake readback after producer exit"
+    ],
+    "dspark_memory_pressure": {
+      "modes": 4,
+      "retractions_per_mode": 2,
+      "completed_requests_per_mode": 4,
+      "output_tokens_per_mode": 768,
+      "ready_samples_per_mode": 3
+    },
+    "cache_lifecycle": [
+      {
+        "cuda_graph": false,
+        "enable_overlap": false,
+        "ready_samples": 5,
+        "evicted_tokens": 164,
+        "reused_kv_slots": 70,
+        "resumed_output_tokens": 128
+      },
+      {
+        "cuda_graph": true,
+        "enable_overlap": true,
+        "ready_samples": 5,
+        "evicted_tokens": 166,
+        "reused_kv_slots": 72,
+        "resumed_output_tokens": 128
+      }
+    ]
+  }
+}

@@ -7,8 +7,10 @@ import torch
 from sglang.srt.training_capture.context import RequestCaptureContext
 from sglang.srt.training_capture.host_pool import HostBufferPool
 from sglang.srt.training_capture.kv_exporter import SelectedLayerKVExporter
+from sglang.srt.training_capture.kv_staging import KVStaging
 from sglang.srt.training_capture.protocol import CaptureError, ContractError
 from sglang.srt.training_capture.teacher import capture_teacher
+from sglang.srt.training_capture.topology import plan_capture_layout
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.training_capture_utils import Registrar, make_kv_spec
@@ -18,6 +20,62 @@ register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestCudaSnapshot(CustomTestCase):
+    def test_partition_staging_survives_canonical_rank_source_slot_reuse(self):
+        kv = make_kv_spec()
+        partition = plan_capture_layout(
+            kv, tp_size=4, pp_layer_ranges=[(0, 4)]
+        ).partition("dp0-pp0-tp2")
+        pool = HostBufferPool(
+            kv=kv,
+            max_tokens=8,
+            slots=1,
+            max_bytes=4096,
+            registrar=Registrar(),
+            device=torch.device("cuda"),
+            kv_d2h_batch_tokens=3,
+            max_device_bytes=4096,
+            partition=partition,
+        )
+        slot = pool.acquire()
+        sources = {
+            f"target_{component}.{layer.layer_id}": (
+                torch.arange(16 * 4, device="cuda").reshape(16, 1, 4).bfloat16()
+                + layer.layer_id * 100
+            )
+            for layer in kv.layers
+            for component in ("k", "v")
+        }
+        indices = torch.tensor([7, 1, 15, 3, 8], device="cuda", dtype=torch.int32)
+        expected = {name: source[indices].cpu() for name, source in sources.items()}
+        exporter = SelectedLayerKVExporter(kv, sources, partition=partition)
+        staging = KVStaging(slot.device_tensors, slot.tensors)
+        stream, event = torch.cuda.Stream(), torch.cuda.Event()
+        stream.wait_stream(torch.cuda.current_stream())
+        try:
+            with torch.cuda.stream(stream):
+                for position in range(5):
+                    staging.export(
+                        exporter,
+                        indices[position : position + 1],
+                        start=position,
+                        end=position + 1,
+                    )
+                    for source in sources.values():
+                        source[indices[position]] = 77
+                staging.flush()
+                event.record(stream)
+            event.synchronize()
+            self.assertEqual(set(slot.tensors), set(sources))
+            self.assertEqual(slot.manifest_buffer.numel(), 0)
+            for name, reference in expected.items():
+                torch.testing.assert_close(
+                    slot.tensors[name][:5], reference, rtol=0, atol=0
+                )
+        finally:
+            stream.synchronize()
+            pool.release(slot, transfer_complete=True)
+            pool.close()
+
     def test_finalization_waits_for_last_lookahead_copy_on_forward_stream(self):
         kv = make_kv_spec()
         pool = HostBufferPool(

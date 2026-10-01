@@ -6,17 +6,25 @@ from typing import Mapping
 
 import torch
 from sglang.srt.training_capture.protocol import DTYPES, ContractError, KVSpec
+from sglang.srt.training_capture.topology import CapturePartition
 
 
 class SelectedLayerKVExporter:
-    def __init__(self, kv: KVSpec, buffers: Mapping[str, torch.Tensor]):
+    def __init__(
+        self,
+        kv: KVSpec,
+        buffers: Mapping[str, torch.Tensor],
+        *,
+        partition: CapturePartition | None = None,
+    ):
         self.kv = kv
         self.buffers = dict(buffers)
         if not self.buffers:
             raise ContractError("KV exporter requires selected source buffers")
         self.device = next(iter(self.buffers.values())).device
         expected = set()
-        for layer in kv.layers:
+        layers = kv.layers if partition is None else partition.local_layers(kv)
+        for layer in layers:
             for component, dim in (
                 ("k", layer.key_head_dim),
                 ("v", layer.value_head_dim),
@@ -38,7 +46,7 @@ class SelectedLayerKVExporter:
             raise ContractError("KV source layers differ from the capture contract")
 
     @classmethod
-    def from_pool(cls, kv: KVSpec, pool):
+    def from_pool(cls, kv: KVSpec, pool, *, partition: CapturePartition | None = None):
         from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 
         if (
@@ -52,14 +60,15 @@ class SelectedLayerKVExporter:
         if pool.page_size != kv.source_page_size:
             raise ContractError("configured source page size disagrees with the pool")
         buffers = {}
-        for layer in kv.layers:
+        layers = kv.layers if partition is None else partition.local_layers(kv)
+        for layer in layers:
             if not 0 <= layer.layer_id - pool.start_layer < pool.layer_num:
                 raise ContractError("selected layer is not local to this worker")
             buffers[f"target_k.{layer.layer_id}"] = pool.get_key_buffer(layer.layer_id)
             buffers[f"target_v.{layer.layer_id}"] = pool.get_value_buffer(
                 layer.layer_id
             )
-        return cls(kv, buffers)
+        return cls(kv, buffers, partition=partition)
 
     @torch.no_grad()
     def export(

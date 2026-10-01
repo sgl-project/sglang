@@ -12,9 +12,11 @@ from sglang.srt.training_capture.protocol import (
     DTYPES,
     ELEMENT_BYTES,
     CaptureError,
+    ContractError,
     KVSpec,
     aux_specs,
 )
+from sglang.srt.training_capture.topology import CapturePartition
 
 
 class BufferRegistrar(Protocol):
@@ -52,14 +54,19 @@ class HostBufferPool:
         device: torch.device | None = None,
         kv_d2h_batch_tokens: int = 1,
         max_device_bytes: int = 0,
+        partition: CapturePartition | None = None,
     ):
         if min(max_tokens, slots, max_bytes, manifest_bytes) <= 0:
             raise ValueError("Host pool sizes must be positive")
         if kv_d2h_batch_tokens < 1 or max_device_bytes < 0:
             raise ValueError("invalid KV staging limits")
-        specs = aux_specs(max_tokens, max_tokens)
+        layers = kv.layers if partition is None else partition.local_layers(kv)
+        include_aux = partition is None or partition.include_aux
+        if partition is not None and not partition.active:
+            raise ContractError("rank does not own a capture payload")
+        specs = aux_specs(max_tokens, max_tokens) if include_aux else {}
         kv_names = []
-        for layer in kv.layers:
+        for layer in layers:
             for component, dim in (
                 ("k", layer.key_head_dim),
                 ("v", layer.value_head_dim),
@@ -78,14 +85,14 @@ class HostBufferPool:
             layout[name] = (offset, length, dtype, shape)
             offset += length
         manifest_offset = (offset + 63) // 64 * 64
-        slot_bytes = manifest_offset + manifest_bytes
+        slot_bytes = manifest_offset + (manifest_bytes if include_aux else 0)
         if slot_bytes * slots > max_bytes:
             raise ValueError(
                 f"Host pool requires {slot_bytes * slots} bytes, budget is {max_bytes}"
             )
         device_layout = {}
         device_bytes = 0
-        if kv_d2h_batch_tokens > 1:
+        if kv_d2h_batch_tokens > 1 and kv_names:
             if device is None or not max_device_bytes:
                 raise ValueError("KV staging requires a device and a byte budget")
             capacity = min(kv_d2h_batch_tokens, max_tokens)

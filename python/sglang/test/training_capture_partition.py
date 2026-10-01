@@ -9,58 +9,81 @@ import msgspec
 from safetensors.torch import load_file
 
 from sglang.srt.training_capture.catalog import CaptureLease, HTTPCaptureCatalog
+from sglang.srt.training_capture.host_pool import HostBufferPool
 from sglang.srt.training_capture.mooncake_store import MooncakeSnapshotStore
 from sglang.srt.training_capture.protocol import (
-    Topology,
     canonical_bytes,
     decode_manifest,
-    digest_bytes,
-    tensor_bytes,
     validate_tensors,
+)
+from sglang.srt.training_capture.snapshot import (
+    SnapshotMetadata,
+    assemble_snapshot,
+    prepare_snapshot_partition,
 )
 from sglang.srt.training_capture.snapshot_writer import (
     PublicationJournal,
     SnapshotWriter,
 )
-from sglang.test.training_capture_utils import make_snapshot
+from sglang.srt.training_capture.topology import plan_capture_layout
+from sglang.test.training_capture_utils import Registrar, make_snapshot
 
 
 def make_partitioned_snapshot():
-    manifest, original = make_snapshot(response_length=4)
-    manifest = msgspec.structs.replace(manifest, generation_id="partitioned")
-    owners = ["dp0-pp0-tp0", "dp0-pp0-tp1"]
-    objects, tensors = [], {}
-    for obj in manifest.objects:
-        if obj.kind == "aux":
-            key = manifest.key_prefix + "aux/" + obj.name
-            objects.append(msgspec.structs.replace(obj, key=key, owner_id=owners[1]))
-            tensors[key] = original[obj.key]
-            continue
-        for head, owner in enumerate(owners):
-            tensor = original[obj.key][:, head : head + 1].contiguous()
-            chunk = obj.token_range[0] // manifest.kv.storage_chunk_tokens
-            suffix = f"kv/{obj.layer_id}/{owner}/{chunk}/{obj.component}"
-            key = manifest.key_prefix + suffix
-            objects.append(
-                msgspec.structs.replace(
-                    obj,
-                    object_id=suffix.replace("/", "-"),
-                    key=key,
-                    shape=list(tensor.shape),
-                    nbytes=tensor.numel() * tensor.element_size(),
-                    sha256=digest_bytes(tensor_bytes(tensor)),
-                    owner_id=owner,
-                    head_range=(head, head + 1),
-                )
-            )
-            tensors[key] = tensor
-    manifest = msgspec.structs.replace(
-        manifest,
-        objects=list(reversed(objects)),
-        topology=Topology(
-            tp_size=2, owners=list(reversed(owners)), aux_owner=owners[1]
+    original_manifest, original = make_snapshot(response_length=4)
+    layout = plan_capture_layout(
+        original_manifest.kv, tp_size=2, pp_layer_ranges=[(0, 4)], aux_tp_rank=1
+    )
+    metadata = SnapshotMetadata(
+        **{
+            name: getattr(original_manifest, name)
+            for name in SnapshotMetadata.__struct_fields__
+        }
+    )
+    metadata = msgspec.structs.replace(
+        metadata,
+        generation_id="partitioned",
+        topology=msgspec.structs.replace(
+            layout.topology, owners=list(reversed(layout.topology.owners))
         ),
     )
+    prepared, tensors = [], {}
+    for partition in reversed(layout.partitions):
+        pool = HostBufferPool(
+            kv=metadata.kv,
+            max_tokens=metadata.sequence.total_length,
+            slots=1,
+            max_bytes=2 << 20,
+            registrar=Registrar(),
+            pin_memory=False,
+            partition=partition,
+        )
+        slot = pool.acquire()
+        try:
+            ranges = {part.layer_id: part for part in partition.heads}
+            for obj in original_manifest.objects:
+                if obj.kind == "aux" and partition.include_aux:
+                    slot.tensors[obj.name][: obj.shape[0]].copy_(original[obj.key])
+                elif obj.kind == "kv" and obj.layer_id in ranges:
+                    heads = ranges[obj.layer_id]
+                    start, end = obj.token_range
+                    slot.tensors[obj.name][start:end].copy_(
+                        original[obj.key][:, heads.start : heads.end]
+                    )
+            part, payloads = prepare_snapshot_partition(
+                metadata,
+                slot.tensors,
+                valid_kv_tokens=metadata.sequence.total_length - 1,
+                partition=partition,
+            )
+            prepared.append(
+                msgspec.structs.replace(part, objects=tuple(reversed(part.objects)))
+            )
+            tensors.update(payloads)
+        finally:
+            pool.release(slot, transfer_complete=True)
+            pool.close()
+    manifest = assemble_snapshot(metadata, prepared, layout=layout)
     validate_tensors(manifest, tensors)
     return manifest, tensors
 
