@@ -1365,6 +1365,25 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         return topk_result
 
     _tp_split_logged = False
+    _tp_split_graph_logged = False
+
+    @staticmethod
+    def _tp_split_in_graph_replay() -> bool:
+        # The BCG indexer break op re-runs eagerly between segment replays, so its
+        # all-gather is never captured; capture and warmup stay replicated.
+        if not envs.SGLANG_ENABLE_DSA_TP_SPLIT_IN_GRAPH.get():
+            return False
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+            is_breakable_cuda_graph_replaying,
+        )
+        from sglang.srt.model_executor.runner_utils import capture_mode
+
+        return (
+            is_in_breakable_cuda_graph()
+            and is_breakable_cuda_graph_replaying()
+            and not capture_mode.is_capture_mode
+            and not torch.cuda.is_current_stream_capturing()
+        )
 
     def _indexer_tp_split(
         self, forward_batch: ForwardBatch, q_offset: int
@@ -1376,7 +1395,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             return None
         if self.dsa_enable_prefill_cp or is_cp_active(forward_batch):
             return None
-        if get_is_capture_mode() or torch.cuda.is_current_stream_capturing():
+        in_graph = get_is_capture_mode() or torch.cuda.is_current_stream_capturing()
+        if in_graph and not self._tp_split_in_graph_replay():
             return None
         group = get_attn_tp_group()
         tp = group.world_size
@@ -1403,6 +1423,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 f"this rank [{bounds[rank]}, {bounds[rank + 1]})"
             )
         sizes = [hi - lo for lo, hi in zip(bounds[:-1], bounds[1:])]
+        if in_graph and not Indexer._tp_split_graph_logged:
+            Indexer._tp_split_graph_logged = True
+            logger.info(
+                "DSA indexer: TP split in breakable prefill CUDA graph replay "
+                f"(SGLANG_ENABLE_DSA_TP_SPLIT_IN_GRAPH=1, tp={tp}): {q_offset} rows, "
+                f"rows per rank {sizes}, this rank [{bounds[rank]}, {bounds[rank + 1]})"
+            )
         return group, bounds[rank], bounds[rank + 1], sizes
 
     @staticmethod
