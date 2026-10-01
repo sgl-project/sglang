@@ -13,8 +13,9 @@ import { config } from "/src/snippets/configs/MiniMaxAI/minimax-h3.jsx";
 
 ## 1. Quick start
 
-Install with `uv pip install "sglang[diffusion]" --prerelease=allow`, then choose
-a verified recipe below. Setup changes the deployment; Server and Request expose
+Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation),
+then choose a verified recipe below. Docker is recommended where the picker offers it.
+Setup changes the deployment; Server and Request expose
 orthogonal startup and sampling choices.
 
 <Deployment config={config} />
@@ -25,8 +26,8 @@ Change a Server option only for a deliberate trade-off; Request options do not
 reload the model.
 </Note>
 
-The Docker form installs the platform-specific diffusion extra from the source
-bundled in the image. For conditioned requests, set **Host media directory**
+The Docker form uses the image's bundled diffusion dependencies without reinstalling
+them at startup. For conditioned requests, set **Host media directory**
 under **Variables**; the builder mounts it read-only at `/data/minimax-h3`.
 AMD and Grace Blackwell currently offer the Python form; the other NVIDIA
 recipes also offer Docker.

@@ -19,9 +19,11 @@ use dynamo_protocols::types::{
     ChatCompletionToolChoiceOption, CreateChatCompletionStreamResponse, FinishReason, Role,
 };
 use futures::{Stream, StreamExt};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 
-use crate::ResponseError;
-use crate::preprocessing::dynamo_parser_name;
+use crate::ProcessorError;
+use crate::tool_parser::dynamo_tool_parser_name;
 
 /// Engine-neutral terminal reason understood by chat response processing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,7 +95,7 @@ pub struct ChatResponseProcessor {
 }
 
 impl ChatResponseProcessor {
-    pub(crate) fn new(
+    pub fn new(
         tool_parser: Option<String>,
         reasoning_parser: Option<String>,
         tools: Option<Vec<ToolDefinition>>,
@@ -116,7 +118,7 @@ impl ChatResponseProcessor {
         }
     }
 
-    pub(crate) fn with_reasoning_state(mut self, reasoning_state: Option<bool>) -> Self {
+    pub fn with_reasoning_state(mut self, reasoning_state: Option<bool>) -> Self {
         for choice in &mut self.choices {
             choice.reasoning.initial_reasoning = reasoning_state;
         }
@@ -129,12 +131,16 @@ impl ChatResponseProcessor {
     /// stateful tool-call jail. They are removed before events leave this
     /// crate, so response identity, model metadata, usage policy, and wire
     /// framing remain outside this semantic processor.
-    pub fn process_stream<S>(
+    ///
+    /// Host errors in `input` pass through unchanged; errors raised here are
+    /// converted from [`ProcessorError`].
+    pub fn process_stream<S, E>(
         mut self,
         input: S,
-    ) -> Pin<Box<dyn Stream<Item = Result<ChatEvent, ResponseError>> + Send>>
+    ) -> Pin<Box<dyn Stream<Item = Result<ChatEvent, E>> + Send>>
     where
-        S: Stream<Item = Result<DecodedChatEvent, ResponseError>> + Send + 'static,
+        S: Stream<Item = Result<DecodedChatEvent, E>> + Send + 'static,
+        E: Serialize + DeserializeOwned + From<ProcessorError> + Send + 'static,
     {
         let count = self.choices.len();
         let raw = async_stream::stream! {
@@ -169,10 +175,9 @@ impl ChatResponseProcessor {
                         id: None,
                         event: None,
                         comment: None,
-                        error: serde_json::to_string(&ResponseError {
-                            kind: crate::ResponseErrorKind::Internal,
-                            message: format!("output choice {} is out of range", decoded.choice),
-                        }).ok(),
+                        error: serde_json::to_string(&E::from(ProcessorError::Internal(
+                            format!("output choice {} is out of range", decoded.choice),
+                        ))).ok(),
                     };
                     continue;
                 }
@@ -247,7 +252,7 @@ impl ChatResponseProcessor {
         };
 
         let post_tool_terminal_markers = self.tool_parser.as_deref().map_or(&[][..], |parser| {
-            match dynamo_parser_name(parser) {
+            match dynamo_tool_parser_name(parser) {
                 "qwen25" => &["<|im_end|>"],
                 "glm47" => &["<|user|>", "<|endoftext|>", "<|observation|>"],
                 _ => &[],
@@ -257,7 +262,7 @@ impl ChatResponseProcessor {
             Box<dyn Stream<Item = Annotated<CreateChatCompletionStreamResponse>> + Send>,
         > = if let Some(parser) = self.tool_parser {
             Box::pin(apply_tool_calling_jail(
-                Some(dynamo_parser_name(&parser).to_owned()),
+                Some(dynamo_tool_parser_name(&parser).to_owned()),
                 self.tool_choice,
                 self.tools,
                 self.uses_tool_call_structural_tag,
@@ -336,10 +341,8 @@ impl ChatResponseProcessor {
                         });
                     }
                 } else if let Some(error) = item.error {
-                    let error = serde_json::from_str(&error).unwrap_or(ResponseError {
-                        kind: crate::ResponseErrorKind::Internal,
-                        message: error,
-                    });
+                    let error = serde_json::from_str(&error)
+                        .unwrap_or_else(|_| E::from(ProcessorError::Internal(error)));
                     yield Err(error);
                 }
             }
@@ -522,7 +525,7 @@ mod tests {
         )
     }
 
-    fn chunk(choice: usize, text: &str, done: bool) -> Result<DecodedChatEvent, ResponseError> {
+    fn chunk(choice: usize, text: &str, done: bool) -> Result<DecodedChatEvent, ProcessorError> {
         Ok(DecodedChatEvent {
             choice,
             text: text.into(),

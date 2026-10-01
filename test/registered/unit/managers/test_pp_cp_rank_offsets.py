@@ -36,9 +36,8 @@ def _published_topology():
         ranks={"world_rank": 12, "dp_rank": 1},
         tp_size=8,
         pp_size=2,
-        dp_size=2,
+        attn_dp_size=2,
         attn_cp_size=2,
-        enable_dp_attention=True,
     )
 
 
@@ -59,13 +58,10 @@ def _make_receiver() -> SchedulerRequestReceiver:
         mm_receiver=None,
         tp_group=tp_group,
         tp_cpu_group=tp_group,
-        attn_tp_group=attn_tp_group,
         attn_tp_cpu_group=attn_tp_group,
-        attn_cp_group=attn_cp_group,
         attn_cp_cpu_group=attn_cp_group,
         world_group=world_group,
         server_args=SimpleNamespace(
-            enable_dp_attention=True,
             enable_dp_attention_local_control_broadcast=False,
         ),
         model_config=SimpleNamespace(is_multimodal=False),
@@ -83,7 +79,7 @@ class TestRequestReceiverBroadcast(unittest.TestCase):
         receiver = _make_receiver()
         control_req = SimpleNamespace(kind="control")
         parallel = SimpleNamespace(
-            enable_dp_attention=True,
+            attn_dp_enabled=True,
             enable_dp_attention_local_control_broadcast=True,
             attn_tp_rank=0,
             attn_cp_rank=0,
@@ -117,7 +113,7 @@ class TestRequestReceiverBroadcast(unittest.TestCase):
         receiver = _make_receiver()
         control_req = SimpleNamespace(kind="control")
         parallel = SimpleNamespace(
-            enable_dp_attention=True,
+            attn_dp_enabled=True,
             enable_dp_attention_local_control_broadcast=False,
             attn_tp_rank=0,
             attn_cp_rank=0,
