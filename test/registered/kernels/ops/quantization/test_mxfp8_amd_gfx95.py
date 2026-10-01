@@ -1,10 +1,13 @@
-"""The gfx950 native MXFP8 GEMV and dense route against fp64 and the bf16-dequant route: within one bf16 ulp, repeatable, batch-invariant."""
+"""The gfx950 native MXFP8 GEMV and the native / aiter dense routes against fp64 and the bf16-dequant route: within one bf16 ulp, repeatable, batch-invariant."""
 
+import types
 import unittest
 
 import torch
 
 from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+    Fp8GridActivation,
+    Mxfp8Activation,
     bf16_dequant_blockscaled_linear,
     dequant_block_fp8_weight_to_bf16,
     fake_quant_fp8_activation,
@@ -14,6 +17,11 @@ from sglang.kernels.ops.quantization.mxfp8_native_amd_gfx95 import (
     mxfp8_gemv,
     mxfp8_native_blockscaled_linear,
     prepare_mxfp8_native_weight,
+)
+from sglang.srt.layers.quantization import fp8_hip
+from sglang.srt.layers.quantization.fp8_utils import (
+    Mxfp8DenseGemmBackend,
+    dispatch_block_fp8_mxfp8_linear,
 )
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
@@ -137,6 +145,66 @@ class TestMxfp8NativeRouteGfx95(CustomTestCase):
                 self.assertTrue(torch.equal(out_grid, out), (n, k, m))
                 xq, xs = fp8_grid_quantize(x)
                 out_q = mxfp8_native_blockscaled_linear(xq, w_sh, ws8, input_scale=xs)
+                self.assertTrue(torch.equal(out_q, out), (n, k, m))
+
+
+def _aiter_mxfp8_gemm_available() -> bool:
+    try:
+        from aiter.ops.triton.gemm.basic import (  # noqa: F401
+            gemm_a8w8_blockscale_group32,
+        )
+    except ImportError:
+        return False
+    return True
+
+
+# decode / verify rows and the dot_scaled buckets the native test covers
+AITER_MS = (1, 6, 33, 1025)
+
+
+@unittest.skipUnless(
+    is_hip() and is_gfx95_supported() and _aiter_mxfp8_gemm_available(),
+    "gfx950 aiter MXFP8 route (ROCm/aiter#5750)",
+)
+class TestMxfp8AiterRouteGfx95(CustomTestCase):
+    def _route(self, wq, ws):
+        """apply_dense of a layer on the aiter route, its weights processed as at load time."""
+        layer = torch.nn.Module()
+        layer.weight = torch.nn.Parameter(wq.clone(), requires_grad=False)
+        layer.weight_scale_inv = torch.nn.Parameter(ws.clone(), requires_grad=False)
+        layer.block_fp8_mxfp8_ready = True
+        backend = Mxfp8DenseGemmBackend.GFX95_MXFP8_AITER
+        method = types.SimpleNamespace(
+            mxfp8_dense_backend=backend,
+            weight_block_size=[32, 32],
+            w8a8_mxfp8_linear=dispatch_block_fp8_mxfp8_linear(backend),
+        )
+        fp8_hip.process_dense_weights(method, layer, None)
+        return lambda x: fp8_hip.apply_dense(method, layer, x, None)
+
+    def test_within_one_bf16_ulp_of_the_bf16_route(self):
+        for n, k in ROUTE_SHAPES:
+            torch.manual_seed(0)
+            w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+            wq, ws = _quant_weight_block32(w)
+            w_bf16 = dequant_block_fp8_weight_to_bf16(wq, ws, [32, 32])
+            route = self._route(wq, ws)
+            for m in AITER_MS:
+                x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+                ref = bf16_dequant_blockscaled_linear(x, w_bf16)
+                out = route(x)
+                row_max = ref.float().abs().amax(dim=1, keepdim=True).clamp(min=1.0)
+                ulp_of_row_max = torch.exp2(torch.floor(torch.log2(row_max)) - 7)
+                diff = (out.float() - ref.float()).abs()
+                self.assertTrue(
+                    bool((diff <= ulp_of_row_max).all()),
+                    (n, k, m, (diff / ulp_of_row_max).max().item()),
+                )
+                # the producers' fp8-grid and fp8 + scales operands quantize to the same codes
+                out_grid = route(Fp8GridActivation(fake_quant_fp8_activation(x)))
+                self.assertTrue(torch.equal(out_grid, out), (n, k, m))
+                xq, xs = fp8_grid_quantize(x)
+                out_q = route(Mxfp8Activation(xq, xs))
                 self.assertTrue(torch.equal(out_q, out), (n, k, m))
 
 
