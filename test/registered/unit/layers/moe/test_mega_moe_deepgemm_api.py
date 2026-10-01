@@ -13,8 +13,11 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.layers.moe import mega_moe
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.layers.moe import MoeA2ABackend, MoeRunnerBackend, mega_moe
+from sglang.srt.layers.moe.fused_moe_triton import layer as fused_moe_layer_module
+from sglang.srt.layers.moe.utils import draft_model_build_scope
+from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+from sglang.srt.runtime_context import get_context, get_exec, get_flags, get_parallel
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
@@ -405,6 +408,61 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         actual = mega_moe._interleave_mega_moe_gate_up(source, gran=16)
 
         torch.testing.assert_close(actual, expected)
+
+    def test_draft_layers_keep_their_own_w4a4_choice(self):
+        """Draft MegaMoE layers must not follow the target's MMA type once built.
+
+        The draft forward runs outside draft_model_build_scope, so a layer that
+        re-read the global flag would pair draft weights with the wrong kernel.
+        """
+        for draft_flag, expected_draft in (
+            (False, "fp8xfp4"),
+            (None, "mxf4xmxf4"),
+        ):
+            with self.subTest(speculative_enable_w4a4_mxfp4_megamoe=draft_flag):
+                with get_context().override_server_args(
+                    model_path="dummy",
+                    enable_w4a4_mxfp4_megamoe=True,
+                    speculative_enable_w4a4_mxfp4_megamoe=draft_flag,
+                ):
+                    target = self._build_fused_moe()
+                    with draft_model_build_scope():
+                        draft = self._build_fused_moe()
+
+                    self.assertTrue(get_exec().moe.enable_w4a4_mxfp4_megamoe)
+                    self.assertEqual(mega_moe._mega_moe_mma_type(target), "mxf4xmxf4")
+                    self.assertEqual(mega_moe._mega_moe_mma_type(draft), expected_draft)
+
+    def _build_fused_moe(self):
+        method = UnquantizedFusedMoEMethod()
+        with (
+            patch.object(method, "create_weights"),
+            patch.object(method, "create_moe_runner"),
+            patch.object(
+                fused_moe_layer_module,
+                "create_moe_dispatcher",
+                return_value=SimpleNamespace(),
+            ),
+            get_flags().moe.override(
+                runner_backend=MoeRunnerBackend.AUTO,
+                a2a_backend=MoeA2ABackend.MEGAMOE,
+            ),
+            get_parallel().override(
+                moe_ep_size=1,
+                moe_ep_rank=0,
+                moe_tp_size=1,
+                moe_tp_rank=0,
+                tp_size=1,
+                tp_rank=0,
+            ),
+        ):
+            return fused_moe_layer_module.FusedMoE(
+                num_experts=2,
+                hidden_size=4,
+                intermediate_size=8,
+                layer_id=0,
+                quant_method=method,
+            )
 
     def _get_test_buffer(self, group):
         with (

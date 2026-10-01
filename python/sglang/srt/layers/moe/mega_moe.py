@@ -54,9 +54,14 @@ def _use_amd_flydsl_mega_moe() -> bool:
 
 
 def _mega_moe_mma_type(experts=None) -> str:
-    if experts is not None and experts._mega_moe_nvfp4:
+    if experts is None:
+        w4a4 = get_exec().moe.enable_w4a4_mxfp4_megamoe
+    elif experts._mega_moe_nvfp4:
         return "nvfp4xnvfp4"
-    return "mxf4xmxf4" if get_exec().moe.enable_w4a4_mxfp4_megamoe else "fp8xfp4"
+    else:
+        # Per layer: a draft may differ from the target (draft_model_build_scope).
+        w4a4 = experts._mega_moe_w4a4
+    return "mxf4xmxf4" if w4a4 else "fp8xfp4"
 
 
 @functools.lru_cache(maxsize=1)
@@ -513,7 +518,7 @@ def build_mega_moe_experts_weights(experts) -> None:
     if getattr(experts, "_mega_moe_weights_built", False):
         return
 
-    mma_type = _mega_moe_mma_type()
+    mma_type = _mega_moe_mma_type(experts)
     w13 = experts.w13_weight.data
     w13_sf_fp32 = experts.w13_weight_scale_inv.data
     w2 = experts.w2_weight.data
