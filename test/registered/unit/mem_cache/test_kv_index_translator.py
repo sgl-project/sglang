@@ -344,9 +344,9 @@ class TestPoolOwnership(unittest.TestCase):
 
     Guarded shape: a runner handed a SHARED allocator while owning a SEPARATE
     KV buffer sized to the allocator's SLOT count. Probing the allocator alone
-    reports "unified" for that runner, so its indices would be mapped into the
-    composite's kernel-facing space (ids up to num_pages * multiplier) and used
-    to address a buffer with only num_slots rows.
+    reports "unified" for that runner, so its indices would be translated into
+    physical ids of the composite -- a pool this runner neither reads nor
+    writes -- and used to address its own buffer of num_slots rows.
     """
 
     def setUp(self):
