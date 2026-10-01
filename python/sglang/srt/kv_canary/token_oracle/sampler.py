@@ -39,6 +39,8 @@ class _OracleSampler(Sampler):
         top_logprobs_nums: List[int],
         token_ids_logprobs: List[List[int]],
         positions: torch.Tensor,
+        *,
+        logprob_logits: torch.Tensor | None = None,
     ) -> torch.Tensor:
         vanilla_req_ids = sampling_info.rids_int
         if vanilla_req_ids is None:
