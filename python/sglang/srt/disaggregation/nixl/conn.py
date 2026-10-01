@@ -356,8 +356,8 @@ def num_kv_slots(kv_data_lens: List[int], kv_item_lens: List[int]) -> int:
     """Slots every registered KV entry can address.
 
     Prepared dlists index entry i's slot p as i * num_slots + p, so every entry
-    must expose the same count. Entries can have different lengths (e.g.
-    DeepSeek-V4's C4 KV, C4 indexer and C128 KV pools), so use the shortest.
+    must expose the same count. Entries can have different lengths, so use
+    the shortest.
     """
     return min(
         (
