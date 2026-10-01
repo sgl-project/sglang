@@ -304,14 +304,17 @@ class UnifiedRadixCache(BasePrefixCache):
             f"Tree Core: {type(self.tree_core).__name__}"
         )
 
+    def _attn_sync_groups(self):
+        groups = [
+            group
+            for group in (self.attn_cp_group, self.attn_tp_group)
+            if group is not None and torch.distributed.get_world_size(group=group) > 1
+        ]
+        return groups or ([self.tp_group] if self.tp_world_size > 1 else [])
+
     def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
-        reduced = False
-        for group in (self.attn_cp_group, self.attn_tp_group):
-            if group is not None and torch.distributed.get_world_size(group=group) > 1:
-                torch.distributed.all_reduce(tensor, op=op, group=group)
-                reduced = True
-        if not reduced and self.tp_world_size > 1:
-            torch.distributed.all_reduce(tensor, op=op, group=self.tp_group)
+        for group in self._attn_sync_groups():
+            torch.distributed.all_reduce(tensor, op=op, group=group)
 
     def _drain_async_work(self):
         """
@@ -1229,6 +1232,17 @@ class UnifiedRadixCache(BasePrefixCache):
 
         insert_params.key = radix_key
         insert_params.value = values
+        if (
+            chunked
+            and insert_params.mamba_value is not None
+            and self.cache_controller is not None
+            and self.cache_controller.write_policy == "write_through"
+        ):
+            # This chunk donates an immutable recurrent checkpoint, not a
+            # partial live state. A short final chunk may never produce another
+            # snapshot, so it cannot trigger a later backup of this node.
+            # Selective write-through still requires an independent reuse.
+            insert_params.chunked = False
         result = self.insert(insert_params)
 
         if result.rotation_tail_declined:
@@ -1946,6 +1960,44 @@ class UnifiedRadixCache(BasePrefixCache):
             return None
         return self.tree_core.rotation_base_of(node_id)
 
+    def _build_prefetch_transfers(
+        self,
+        last_host_node_id: NodeId,
+        prefetch_key: RadixKey,
+        last_hash: Optional[str],
+    ) -> tuple[dict[ComponentType, list[PoolTransfer]], list[PoolTransfer]]:
+        """Describe every pool required by a restorable prefix without allocating."""
+        comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
+        for ct in self.tree_components:
+            if ct == BASE_COMPONENT_TYPE:
+                continue
+            # Size the component's staging now; it is allocated at hit time,
+            # next to the KV staging, so the query holds no host memory.
+            prep = self.components[ct].prepare_prefetch(
+                last_host_node_id, prefetch_tokens=len(prefetch_key)
+            )
+            if prep.staging_tokens == 0:
+                continue
+            transfers = self.tree_core.build_hicache_transfers(
+                ct,
+                last_host_node_id,
+                CacheTransferPhase.PREFETCH,
+                token_ids=prefetch_key.token_ids,
+                prefetch_tokens=len(prefetch_key),
+                staging_tokens=prep.staging_tokens,
+                last_hash=last_hash,
+            )
+            if transfers:
+                comp_xfers[ct] = transfers
+        kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=None)
+        sidecar_xfers = self._build_sidecar_transfers(
+            CacheTransferPhase.PREFETCH, kv_xfer, comp_xfers
+        )
+
+        aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
+        aux_xfers.extend(sidecar_xfers)
+        return comp_xfers, aux_xfers
+
     def query_storage_hit_length(
         self,
         last_host_node_id: NodeId,
@@ -1972,20 +2024,23 @@ class UnifiedRadixCache(BasePrefixCache):
         if len(prefetch_key) < self.prefetch_threshold:
             return 0
 
+        _, aux_xfers = self._build_prefetch_transfers(
+            last_host_node_id, prefetch_key, last_hash
+        )
         operation = PrefetchOperation(
             CacheRequestHandle("__storage_hit_query__", 0),
             prefetch_key,
             last_hash,
             prefix_keys,
+            pool_transfers=aux_xfers or None,
         )
         _, storage_hit_count = self.cache_controller._storage_hit_query(operation)
-        storage_hit_count_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
-        self._all_reduce_attn_groups(
-            storage_hit_count_tensor, torch.distributed.ReduceOp.MIN
+        # Decode promises this prefix before IO. Use the same complete-pool,
+        # sparse-checkpoint intersection as prefetch, on scheduler groups so
+        # this collective cannot collide with the background query worker.
+        return self.cache_controller._reduce_storage_hit_count(
+            operation, storage_hit_count, sync_groups=self._attn_sync_groups()
         )
-        storage_hit_count = storage_hit_count_tensor.item()
-        storage_hit_count -= storage_hit_count % self.page_size
-        return storage_hit_count
 
     @rank_consensus(same_params=["request.rid", "len(new_input_tokens)"])
     def prefetch_from_storage(
@@ -2074,35 +2129,9 @@ class UnifiedRadixCache(BasePrefixCache):
             if buffer_mode
             else self.inc_host_lock_ref(last_host_node_id).to_dec_params()
         )
-        comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
-        for ct in self.tree_components:
-            if ct == BASE_COMPONENT_TYPE:
-                continue
-            # Size the component's staging now; it is allocated at hit time,
-            # next to the KV staging, so the query holds no host memory.
-            prep = self.components[ct].prepare_prefetch(
-                last_host_node_id, prefetch_tokens=len(prefetch_key)
-            )
-            if prep.staging_tokens == 0:
-                continue
-            transfers = self.tree_core.build_hicache_transfers(
-                ct,
-                last_host_node_id,
-                CacheTransferPhase.PREFETCH,
-                token_ids=prefetch_key.token_ids,
-                prefetch_tokens=len(prefetch_key),
-                staging_tokens=prep.staging_tokens,
-                last_hash=last_hash,
-            )
-            if transfers:
-                comp_xfers[ct] = transfers
-        kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=None)
-        sidecar_xfers = self._build_sidecar_transfers(
-            CacheTransferPhase.PREFETCH, kv_xfer, comp_xfers
+        comp_xfers, aux_xfers = self._build_prefetch_transfers(
+            last_host_node_id, prefetch_key, last_hash
         )
-
-        aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
-        aux_xfers.extend(sidecar_xfers)
         submission = self.cache_controller.submit_prefetch(
             request,
             prefetch_key,
