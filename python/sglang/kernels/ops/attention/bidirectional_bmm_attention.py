@@ -94,7 +94,14 @@ def bidirectional_bmm_attention(q, k, v, pk, pv, ids, ptr, cap, scale=1.0):
     scores = torch.bmm(qq, keys.transpose(1, 2), out_dtype=torch.float32)
     probs = torch.empty_like(scores, dtype=torch.bfloat16)
     _masked_softmax[(hk * qq.shape[1],)](
-        scores, probs, ptr, n, cap, scale, triton.next_power_of_2(n), num_warps=16
+        scores,
+        probs,
+        ptr,
+        n,
+        cap,
+        scale,
+        triton.next_power_of_2(n),
+        num_warps=4 if n <= 2048 else 16,
     )
     out = torch.bmm(probs, vals, out_dtype=torch.float32).bfloat16()
     return out.reshape(hq, m, d).transpose(0, 1).contiguous()
