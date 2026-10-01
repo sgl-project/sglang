@@ -252,6 +252,11 @@ class BaseGrammarBackend:
     def dispatch_ebnf(self, key_string: str) -> BaseGrammarObject:
         return self._not_supported("ebnf", key_string)
 
+    def wrap_full_assistant_grammar(
+        self, grammar: BaseGrammarObject, key_string: str
+    ) -> BaseGrammarObject:
+        return grammar
+
     def dispatch_structural_tag(self, key_string: str) -> BaseGrammarObject:
         return self._not_supported("structural_tag", key_string)
 
