@@ -74,7 +74,10 @@ from sglang.srt.mem_cache.unified_cache.session_ref_tracker import (
     UnifiedSessionRefTracker,
 )
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
-from sglang.srt.mem_cache.unified_cache.tree_core_registry import create_tree_core
+from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
+    create_tree_core,
+    select_tree_core_backend,
+)
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinker,
     UnifiedCacheLinkerWrapper,
@@ -204,11 +207,7 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         # The TreeCore owns the tree member-var state (structure, LRUs, sizes,
         # evictable leaves) and drives the components' tree-level hooks.
-        self._tree_core_backend = (
-            params.tree_core_backend
-            if params.tree_core_backend is not None
-            else envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get()
-        )
+        self._tree_core_backend = select_tree_core_backend(params)
         self.tree_core = create_tree_core(
             name=self._tree_core_backend,
             params=params,
@@ -756,6 +755,35 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> tuple[Optional[NodeId], bool]:
         """Advance the eviction walk one node, consuming its step result."""
         result = self.tree_core.evict_device_next_node(component_type, tracker)
+        if result.mamba_backup_node_id is not None:
+            assert component_type == ComponentType.MAMBA and result.node_id is None
+            assert (
+                not result.device_frees and not result.host_frees and not result.tracker
+            )
+            # Reserve a host state slot and wait for the backup acknowledgment
+            # before freeing device state. If allocation fails, eviction still
+            # proceeds to make room on the device.
+            node_id = result.mamba_backup_node_id
+            mamba_host_pool = self.host_pool_group.get_pool(PoolName.MAMBA)
+            if mamba_host_pool is not None and mamba_host_pool.available_size() < 1:
+                self.evict_host(1, ComponentType.MAMBA)
+            self.backup_node_for_write_back(node_id)
+            result = self.tree_core.finish_mamba_state_eviction(node_id)
+        elif result.swa_backup_node_id is not None:
+            assert component_type == ComponentType.SWA and result.node_id is None
+            assert (
+                not result.device_frees and not result.host_frees and not result.tracker
+            )
+            # The backup can cover several unbacked SWA segments. Reserve host
+            # space for the whole window before copying it, then resume eviction
+            # even if host allocation fails.
+            node_id = result.swa_backup_node_id
+            needed = result.swa_backup_num_tokens
+            swa_host_pool = self.host_pool_group.get_pool(PoolName.SWA)
+            if swa_host_pool is not None and swa_host_pool.available_size() < needed:
+                self.evict_host(needed, ComponentType.SWA)
+            self.backup_node_for_write_back(node_id)
+            result = self.tree_core.finish_swa_state_eviction(node_id)
         self._free_values(result.device_frees, result.host_frees)
         if self._tracks_write_through_unbacked_evictions():
             self._record_dropped_tokens(
@@ -887,8 +915,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _tracks_write_through_unbacked_evictions(self) -> bool:
         return (
-            isinstance(self.tree_core, UnifiedTreeCore)
-            and self.host_memory_mode == "cache"
+            self.host_memory_mode == "cache"
             and self.cache_controller is not None
             and self.cache_controller.write_policy == "write_through"
         )
@@ -2532,6 +2559,17 @@ class UnifiedRadixCache(BasePrefixCache):
                 unfulfilled, reason
             )
 
+    def _settle_storage_prefetch_hit(
+        self, request: CacheRequestHandle, credited_tokens: int
+    ) -> None:
+        """At buffer-mode admission, hit tokens not credited to storage were
+        covered by the device's joint match; the rest resolve at the fill ack."""
+        remaining = self._storage_prefetch_hit_remaining_by_reqid.get(request)
+        if remaining is not None:
+            self._resolve_storage_prefetch_tokens(
+                request, remaining - credited_tokens, reason="device_covered"
+            )
+
     def finish_storage_prefetch_admission(
         self, request: CacheRequestHandle, fulfilled_tokens: int, reason: Optional[str]
     ) -> None:
@@ -2748,9 +2786,8 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         self.ongoing_prefetch[request] = info
         self.cache_controller.trim_prefetch_full_head(operation, trim_tokens)
-        self._resolve_storage_prefetch_tokens(
-            request, trim_tokens, reason="device_covered"
-        )
+        # Labeled at admission: FULL reusable only with the fetched aux tail is a
+        # storage hit there, not device_covered.
         return info, hit_tokens - trim_tokens, original_hit_tokens
 
     def revoke_pending_prefetch(self, request: CacheRequestHandle) -> None:
@@ -3496,25 +3533,19 @@ class UnifiedRadixCache(BasePrefixCache):
         return 0
 
     def is_load_back_event_done(self, consumer_index: int) -> bool:
-        """Return True after the local load-back event is complete.
-
-        Lets the disagg decode restore state machine
-        (``DecodeHiCacheTransferMixin``) gate on load-back completion; the
-        controller-level ``layer_done_counter`` event is shared across cache
-        implementations, while the tree-side bookkeeping runs in
-        ``loading_check``.
-        """
+        """Return True after this rank's load-back event is complete."""
         if consumer_index < 0 or self.cache_controller is None:
             return True
 
         finish_event = self.cache_controller.layer_done_counter.events[
             consumer_index
         ].finish_event
-        if not finish_event.query():
-            return False
+        return finish_event.query()
 
-        self.loading_check()
-        return True
+    def has_free_load_back_slot(self) -> bool:
+        """Acks are reaped in lockstep, so every rank agrees on this."""
+        cc = self.cache_controller
+        return len(cc.ack_load_queue) < cc.layer_done_counter.num_counters
 
     # ---- Query / Inspection APIs ----
     # These APIs exist for compatibility with other RadixTree implementations.
