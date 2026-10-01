@@ -896,7 +896,6 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
         shard_dim: int,
-        tp_rank: int,
     ) -> bool:
         """Quantize an unquantized fused shared expert into its FP4 slot.
 
@@ -937,14 +936,12 @@ class FusedMoE(torch.nn.Module):
             expert_data=weight_param.data[expert_id],
             shard_id=shard_id,
             loaded_weight=fp4_weight,
-            tp_rank=tp_rank,
         )
         self._load_model_weight_or_group_weight_scale(
             shard_dim=shard_dim,
             expert_data=scale_param.data[expert_id],
             shard_id=shard_id,
             loaded_weight=fp4_scale,
-            tp_rank=tp_rank,
         )
         return True
 
@@ -1317,7 +1314,6 @@ class FusedMoE(torch.nn.Module):
             shard_id=shard_id,
             expert_id=expert_id,
             shard_dim=shard_dim,
-            tp_rank=tp_rank,
         ):
             return
 
