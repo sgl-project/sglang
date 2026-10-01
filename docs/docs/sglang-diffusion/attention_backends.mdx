@@ -15,7 +15,7 @@ When using the diffusers backend, `--attention-backend` is passed through to dif
 `set_attention_backend` (e.g., `flash`, `_flash_3_hub`, `sage`, `xformers`, `native`).
 
 - **CUDA**: prefers FlashAttention (FA3/FA4) when supported; otherwise falls back to PyTorch SDPA. On SM100/B200, dense non-causal fp16/bf16 native attention prefers cuDNN SDPA and falls back to FA4 if cuDNN has no compatible kernel.
-- **ROCm**: defaults to AITER. gfx1250 also supports the explicit Gluon FAv3 backend for compatible BF16 dense attention. Unsupported dense contracts that reach the backend fall back to AITER; shared masked-attention routing may use SDPA.
+- **ROCm**: AITER is the default. On gfx1250, enabling the qualified Wan2.2 fast path below selects Gluon FAv3; unsupported dense Gluon contracts fall back to AITER, while shared masked-attention routing may use SDPA.
 - **Intel XPU**: uses XPU Flash Attention backend (fp16/bf16, head sizes 64/96/128/192/256); otherwise falls back to PyTorch SDPA.
 - **MUSA**: uses FlashAttention when available; also supports Sage Attention when installed; otherwise falls back to PyTorch SDPA.
 - **MPS**: always uses PyTorch SDPA.
@@ -107,7 +107,7 @@ For SGLang-native pipelines, the CLI accepts the lowercase names of `AttentionBa
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`gluon_fav3`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)", whiteSpace: "nowrap"}}>`GLUON_FAV3`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Dense gfx1250 Gluon/Triton FAv3. The optimized path supports non-causal BF16 MHA with head dimension 128 and rectangular Q/KV lengths. Unsupported dtype, head, causal, dropout, or GQA contracts that reach this backend use AITER; shared masked-attention routing may use SDPA.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Dense gfx1250 Gluon/Triton FAv3. Supports non-causal BF16 MHA with head dimension 128 and rectangular Q/KV lengths, with dedicated Wan2.2 cross/self schedules for B2/S176400/H40. Unsupported dtype, head, causal, dropout, or GQA contracts that reach this backend use AITER; shared masked-attention routing may use SDPA.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>aiter_sage</code></td>
@@ -841,9 +841,9 @@ sglang generate \
   --attention-backend torch_sdpa
 ```
 
-On gfx1250, select `gluon_fav3` explicitly to use the in-tree Gluon/Triton
-kernel. The default remains AITER because it is faster on the currently
-qualified Wan2.2 shapes:
+gfx1250 selects `gluon_fav3` automatically when the qualified Wan fast path
+below is enabled. It can also be selected explicitly; use `aiter` to force the
+comparison/fallback backend:
 
 ```bash
 sglang generate \
@@ -851,6 +851,18 @@ sglang generate \
   --prompt "..." \
   --attention-backend gluon_fav3
 ```
+
+The qualified Wan2.2 self-attention fast path uses a fixed softmax shift to
+remove redundant online rescaling. Enable it only for the validated
+`B2/S176400/H40/D128` Wan workload:
+
+```bash
+export SGLANG_GLUON_FAV3_WAN_FIXED_SHIFT=1
+```
+
+Other shapes continue to use stable online softmax. The runtime rejects an
+explicit `wan_self` launch unless both the exact shape and this opt-in are
+present. Without the opt-in, ROCm keeps AITER as the default backend.
 
 ### Override one component
 
@@ -1008,6 +1020,6 @@ sglang generate \
 
 ### Notes for ROCm / MPS
 
-- ROCm gfx1250: use `--attention-backend gluon_fav3` for compatible BF16 D128 dense MHA, or `--attention-backend aiter` for the default comparison/fallback path.
+- ROCm gfx1250: enabling `SGLANG_GLUON_FAV3_WAN_FIXED_SHIFT=1` makes `gluon_fav3` the automatic default; otherwise the default is AITER. Use `--attention-backend aiter` to force AITER.
 - Other ROCm GPUs: `aiter` is the automatic default.
 - MPS: the platform implementation always uses `torch_sdpa`.
