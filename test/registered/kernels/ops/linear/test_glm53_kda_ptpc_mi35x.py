@@ -5,8 +5,8 @@ import unittest
 import torch
 
 from sglang.srt.layers.quantization.unquant import (
-    Glm53KdaPackedPtpcLinearMethod,
     Glm53KdaPtpcLinearMethod,
+    Glm53KdaSplitPtpcLinearMethod,
     UnquantizedLinearMethod,
 )
 from sglang.srt.models.glm5_next import (
@@ -172,7 +172,7 @@ class TestGLM53KDAPTPC(CustomTestCase):
         self.assertTrue(torch.isfinite(output).all())
         self.assertIn("_fp8_ptpc_weight", dict(layer.named_buffers()))
 
-    def test_packed_first_stage_preserves_decode_and_uses_ptpc_prefill(self):
+    def test_split_first_stage_preserves_decode_and_uses_ptpc_prefill(self):
         for tp, (qkv_size, beta_size) in {
             4: (6144, 16),
             8: (3072, 8),
@@ -196,7 +196,7 @@ class TestGLM53KDAPTPC(CustomTestCase):
                 torch.nn.Parameter(weight, requires_grad=False),
             )
             baseline = UnquantizedLinearMethod()
-            candidate = Glm53KdaPackedPtpcLinearMethod(
+            candidate = Glm53KdaSplitPtpcLinearMethod(
                 bf16_max_m=4095 if tp == 4 else 8191,
                 fp8_max_m=16384,
                 qkv_size=qkv_size,
@@ -204,10 +204,9 @@ class TestGLM53KDAPTPC(CustomTestCase):
                 fg_size=fg_size,
             )
             candidate.process_weights_after_loading(layer)
-            self.assertEqual(
-                layer._fp8_ptpc_weight.shape[0],
-                qkv_size + fg_size,
-            )
+            self.assertEqual(layer._fp8_ptpc_qkv_weight.shape[0], qkv_size)
+            self.assertEqual(layer._fp8_ptpc_f_weight.shape[0], fg_size // 2)
+            self.assertEqual(layer._fp8_ptpc_g_weight.shape[0], fg_size // 2)
             for m in (1, 8192):
                 x = (
                     torch.randn(
@@ -220,11 +219,16 @@ class TestGLM53KDAPTPC(CustomTestCase):
                     * 0.1
                 )
                 expected = baseline.apply(layer, x)
-                actual = candidate.apply(layer, x)
                 with self.subTest(tp=tp, m=m):
                     if m == 1:
+                        actual = candidate.apply(layer, x)
                         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
                     else:
+                        qkv, beta, (f_a, g_a) = candidate.apply_ptpc_prefill(
+                            layer,
+                            x,
+                        )
+                        actual = torch.cat((qkv, beta, f_a, g_a), dim=-1)
                         cosine = torch.nn.functional.cosine_similarity(
                             actual.float().flatten(),
                             expected.float().flatten(),
@@ -234,6 +238,9 @@ class TestGLM53KDAPTPC(CustomTestCase):
                         self.assertGreater(cosine.item(), 0.995)
                         self.assertLess(mean_abs.item(), 0.01)
                     self.assertTrue(torch.isfinite(actual).all())
+            self.assertNotIn("_fp8_ptpc_qkv_weight", layer.state_dict())
+            self.assertNotIn("_fp8_ptpc_f_weight", layer.state_dict())
+            self.assertNotIn("_fp8_ptpc_g_weight", layer.state_dict())
             del actual, baseline, candidate, expected, layer, weight, x
             torch.cuda.empty_cache()
 

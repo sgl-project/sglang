@@ -711,8 +711,8 @@ class Glm53KdaPtpcLinearMethod(UnquantizedLinearMethod):
         return super().apply(layer, x, bias)
 
 
-class Glm53KdaPackedPtpcLinearMethod(Glm53KdaPtpcLinearMethod):
-    """Packed qkv/f/g PTPC prefill with a retained fused BF16 decode path."""
+class Glm53KdaSplitPtpcLinearMethod(Glm53KdaPtpcLinearMethod):
+    """Split qkv/f/g PTPC prefill with a retained fused BF16 decode path."""
 
     def __init__(
         self,
@@ -727,6 +727,9 @@ class Glm53KdaPackedPtpcLinearMethod(Glm53KdaPtpcLinearMethod):
         self.qkv_size = qkv_size
         self.beta_size = beta_size
         self.fg_size = fg_size
+        if fg_size % 2 != 0:
+            raise ValueError(f"GLM-5.3 KDA f/g size must be even, got {fg_size}")
+        self.fg_a_size = fg_size // 2
 
     def is_active(self, num_tokens: int) -> bool:
         return super().is_active(num_tokens) and num_tokens <= self.fp8_max_m
@@ -745,31 +748,32 @@ class Glm53KdaPackedPtpcLinearMethod(Glm53KdaPtpcLinearMethod):
             or weight.shape[0] != expected_size
         ):
             raise ValueError(
-                "GLM-5.3 KDA packed PTPC requires a 2-D BF16 fused weight with "
+                "GLM-5.3 KDA split PTPC requires a 2-D BF16 fused weight with "
                 f"{expected_size} rows, got dtype={weight.dtype}, "
                 f"shape={tuple(weight.shape)}"
             )
-        packed_weight = torch.cat(
-            (
-                weight[: self.qkv_size],
-                weight[self.qkv_size + self.beta_size :],
+
+        fg_offset = self.qkv_size + self.beta_size
+        split_weights = {
+            "qkv": weight[: self.qkv_size],
+            "f": weight[fg_offset : fg_offset + self.fg_a_size],
+            "g": weight[fg_offset + self.fg_a_size :],
+        }
+        for name, split_weight in split_weights.items():
+            fp8_weight, weight_scale = aiter.pertoken_quant(
+                split_weight,
+                quant_dtype=aiter.dtypes.fp8,
             )
-        )
-        fp8_weight, weight_scale = aiter.pertoken_quant(
-            packed_weight,
-            quant_dtype=aiter.dtypes.fp8,
-        )
-        layer.register_buffer(
-            "_fp8_ptpc_weight",
-            shuffle_weight(fp8_weight, (16, 16)).contiguous(),
-            persistent=False,
-        )
-        layer.register_buffer(
-            "_fp8_ptpc_weight_scale",
-            weight_scale.contiguous(),
-            persistent=False,
-        )
-        self.output_size = self.qkv_size + self.fg_size
+            layer.register_buffer(
+                f"_fp8_ptpc_{name}_weight",
+                shuffle_weight(fp8_weight, (16, 16)).contiguous(),
+                persistent=False,
+            )
+            layer.register_buffer(
+                f"_fp8_ptpc_{name}_weight_scale",
+                weight_scale.contiguous(),
+                persistent=False,
+            )
         self._fp8_ptpc_ready = True
 
     def apply(
@@ -778,27 +782,34 @@ class Glm53KdaPackedPtpcLinearMethod(Glm53KdaPtpcLinearMethod):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if not self.is_active(x.numel() // x.shape[-1]):
-            return UnquantizedLinearMethod.apply(self, layer, x, bias)
-        assert bias is None, "GLM-5.3 KDA packed PTPC does not support bias"
+        return UnquantizedLinearMethod.apply(self, layer, x, bias)
+
+    def apply_ptpc_prefill(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        assert self.is_active(x.numel() // x.shape[-1]), (
+            "GLM-5.3 KDA split PTPC prefill requires an active token shape"
+        )
         import aiter
 
         from sglang.srt.layers.quantization.fp8_utils import apply_fp8_ptpc_linear
 
         q_input = aiter.per_token_quant_hip(x, quant_dtype=aiter.dtypes.fp8)
-        packed_output = apply_fp8_ptpc_linear(
-            q_input,
-            layer._fp8_ptpc_weight,
-            layer._fp8_ptpc_weight_scale,
-        )
-        qkv, fg = torch.split(
-            packed_output,
-            (self.qkv_size, self.fg_size),
-            dim=-1,
-        )
+        outputs = []
+        for name in ("qkv", "f", "g"):
+            outputs.append(
+                apply_fp8_ptpc_linear(
+                    q_input,
+                    getattr(layer, f"_fp8_ptpc_{name}_weight"),
+                    getattr(layer, f"_fp8_ptpc_{name}_weight_scale"),
+                )
+            )
         beta_weight = layer.weight[self.qkv_size : self.qkv_size + self.beta_size]
         beta = tgemm.mm(x, beta_weight, otype=x.dtype)
-        return torch.cat((qkv, beta, fg), dim=-1)
+        qkv, f_a, g_a = outputs
+        return qkv, beta, (f_a, g_a)
 
 
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):

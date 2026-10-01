@@ -12,8 +12,8 @@ import torch.nn.functional as F
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import fp8_utils, unquant
 from sglang.srt.layers.quantization.unquant import (
-    Glm53KdaPackedPtpcLinearMethod,
     Glm53KdaPtpcLinearMethod,
+    Glm53KdaSplitPtpcLinearMethod,
     UnquantizedLinearMethod,
 )
 from sglang.srt.models.glm5_next import (
@@ -291,9 +291,27 @@ class TestGLM53KDAPTPC(CustomTestCase):
             attention._configure_ptpc_modules()
         self.assertIsInstance(
             attention.fused_qkvbfg_a_proj.quant_method,
-            Glm53KdaPackedPtpcLinearMethod,
+            Glm53KdaSplitPtpcLinearMethod,
         )
         self.assertTrue(attention.do_fuse_qkvbfg)
+
+    def test_model_selector_rejects_unsupported_fused_qkv_size(self):
+        model_module = sys.modules[Glm5NextLinearAttention.__module__]
+        attention = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
+        torch.nn.Module.__init__(attention)
+        attention.do_fuse_qkvbfg = True
+        attention.fuse_bfg = False
+        attention.split_sizes = [12288, 32, 256]
+        attention.fused_qkvbfg_a_proj = _Linear()
+        attention.o_proj = _Linear()
+        with (
+            envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.override(
+                "qkv_proj,f_a_proj,g_a_proj"
+            ),
+            patch.object(model_module, "_use_aiter_gfx95", True),
+            self.assertRaisesRegex(ValueError, "supports fused qkv sizes"),
+        ):
+            attention._configure_ptpc_modules()
 
     def test_fused_first_stage_keeps_decode_bf16_and_uses_ptpc_for_prefill(self):
         attention = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
@@ -302,9 +320,12 @@ class TestGLM53KDAPTPC(CustomTestCase):
         attention.split_sizes = [12, 2, 8]
         attention.fused_qkvbfg_a_proj = _RecordingFusedLinear(22)
         attention.fused_fg_b_proj = _RecordingBatchedLinear()
-        method = Glm53KdaPtpcLinearMethod(
-            "qkv_proj,f_a_proj,g_a_proj",
+        method = Glm53KdaSplitPtpcLinearMethod(
             bf16_max_m=3,
+            fp8_max_m=8,
+            qkv_size=12,
+            beta_size=2,
+            fg_size=8,
         )
         method._fp8_ptpc_ready = True
         attention.fused_qkvbfg_a_proj.quant_method = method
@@ -313,16 +334,23 @@ class TestGLM53KDAPTPC(CustomTestCase):
         attention.forward_qkvbfg_fused(decode_input, forward_batch=None)
         self.assertIs(attention.fused_qkvbfg_a_proj.inputs[-1], decode_input)
 
-        qinput = torch.empty(4, 8)
-        scale = torch.ones(4, 1)
-        fake_aiter = types.ModuleType("aiter")
-        fake_aiter.dtypes = SimpleNamespace(fp8=object())
-        fake_aiter.per_token_quant_hip = MagicMock(return_value=(qinput, scale))
         prefill_input = torch.empty(4, 8)
-        with patch.dict(sys.modules, {"aiter": fake_aiter}):
+        split_outputs = (
+            torch.empty(4, 12),
+            torch.empty(4, 2),
+            (torch.empty(4, 4), torch.empty(4, 4)),
+        )
+        with patch.object(
+            method,
+            "apply_ptpc_prefill",
+            return_value=split_outputs,
+        ) as apply_ptpc:
             attention.forward_qkvbfg_fused(prefill_input, forward_batch=None)
-        self.assertIsInstance(attention.fused_qkvbfg_a_proj.inputs[-1], tuple)
-        fake_aiter.per_token_quant_hip.assert_called_once()
+        self.assertEqual(len(attention.fused_qkvbfg_a_proj.inputs), 1)
+        apply_ptpc.assert_called_once_with(
+            attention.fused_qkvbfg_a_proj,
+            prefill_input,
+        )
 
     def test_fused_o_norm_dispatch_uses_local_k_and_token_boundaries(self):
         model_module = sys.modules[Glm5NextLinearAttention.__module__]

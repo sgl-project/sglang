@@ -11,7 +11,6 @@ from pathlib import Path
 import torch
 
 from sglang.srt.layers.quantization.fp8_utils import apply_fp8_ptpc_linear
-from sglang.srt.models.glm5_next import GLM53_KDA_PTPC_BF16_MAX_M
 
 TP_SHAPES = {
     4: {
@@ -257,7 +256,7 @@ def run_case(tp: int, module_name: str, m: int, args) -> dict:
 @torch.inference_mode()
 def run_fused_decode_case(tp: int, m: int, args) -> dict:
     from sglang.srt.layers.quantization.unquant import (
-        Glm53KdaPackedPtpcLinearMethod,
+        Glm53KdaSplitPtpcLinearMethod,
         UnquantizedLinearMethod,
     )
 
@@ -295,7 +294,7 @@ def run_fused_decode_case(tp: int, m: int, args) -> dict:
     baseline = UnquantizedLinearMethod()
     qkv_size = TP_SHAPES[tp]["qkv_proj"][0]
     beta_size = TP_SHAPES[tp]["b_proj"][0]
-    candidate = Glm53KdaPackedPtpcLinearMethod(
+    candidate = Glm53KdaSplitPtpcLinearMethod(
         bf16_max_m=4095 if tp == 4 else 8191,
         fp8_max_m=16384,
         qkv_size=qkv_size,
@@ -305,8 +304,12 @@ def run_fused_decode_case(tp: int, m: int, args) -> dict:
     candidate.process_weights_after_loading(layer)
 
     expected = baseline.apply(layer, x)
-    actual = candidate.apply(layer, x)
-    if m <= GLM53_KDA_PTPC_BF16_MAX_M["qkv_proj"]:
+    if candidate.is_active(m):
+        qkv, beta, (f_a, g_a) = candidate.apply_ptpc_prefill(layer, x)
+        actual = torch.cat((qkv, beta, f_a, g_a), dim=-1)
+    else:
+        actual = candidate.apply(layer, x)
+    if not candidate.is_active(m):
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     else:
         cosine = torch.nn.functional.cosine_similarity(
@@ -317,7 +320,7 @@ def run_fused_decode_case(tp: int, m: int, args) -> dict:
         mean_abs = (actual.float() - expected.float()).abs().mean()
         if cosine.item() <= 0.995 or mean_abs.item() >= 0.01:
             raise AssertionError(
-                f"packed PTPC mismatch: cosine={cosine.item():.6f}, "
+                f"split PTPC mismatch: cosine={cosine.item():.6f}, "
                 f"mean_abs={mean_abs.item():.6f}"
             )
 
@@ -328,8 +331,15 @@ def run_fused_decode_case(tp: int, m: int, args) -> dict:
         iters,
         args.inner_iters,
     )
+
+    def run_candidate():
+        if not candidate.is_active(m):
+            return candidate.apply(layer, x)
+        qkv, beta, (f_a, g_a) = candidate.apply_ptpc_prefill(layer, x)
+        return qkv, beta, torch.stack((f_a, g_a))
+
     candidate_samples = measure_samples(
-        lambda: candidate.apply(layer, x),
+        run_candidate,
         args.warmup,
         iters,
         args.inner_iters,
