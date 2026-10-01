@@ -12,6 +12,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4A16LinearMethod
 from sglang.srt.models.dflash import DFlashDraftModel
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.lilicorr_utils import (
     LiLiCorrConfig,
     parse_lilicorr_draft_config,
@@ -522,6 +523,13 @@ class LiLiCorrDraftModel(DFlashDraftModel):
             quant_config=quant_config,
             prefix=add_prefix("lilicorr", prefix),
         )
+        # Every TP rank runs the replicated head, so its draft must match bit for bit.
+        # Marlin's atomic-add reduce at the head's shapes does not.
+        if get_parallel().tp_size > 1 and any(
+            isinstance(getattr(m, "quant_method", None), ModelOptNvFp4A16LinearMethod)
+            for m in self.lilicorr.modules()
+        ):
+            raise ValueError("A W4A16 LiLiCorr head requires tp_size 1.")
 
     def set_block_size(self, block_size: int) -> None:
         super().set_block_size(block_size)
