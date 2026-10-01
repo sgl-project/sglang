@@ -1785,8 +1785,10 @@ class KVWriteLoc:
         full_loc: Optional[torch.Tensor] = None,
     ) -> KVWriteLoc:
         """The batch's ``out_cache_loc`` as a write loc, carrying the batch's
-        physical mark. It wraps nothing else, because the mark describes that
-        tensor only; a loc produced separately states its own mark."""
+        physical mark. A ``swa_loc`` or ``full_loc`` passed here travels under
+        the same mark, so it must be derived from that rebound loc (as
+        ``sliding_window_write_loc_for`` does); a loc produced separately
+        states its own mark with ``KVWriteLoc(loc, physical=...)``."""
         return cls(
             forward_batch.out_cache_loc,
             swa_loc,
@@ -1963,7 +1965,9 @@ class KVCache(abc.ABC):
     requires_physical_write_loc = False
 
     def _check_physical_write_loc(self, loc_info, where: str) -> None:
-        # A flag read, no device sync: cheap enough to run on every write.
+        # A flag read, no device sync: cheap enough to run on every write-door
+        # call. Fused writers that scatter through `get_kv_buffer`, and a
+        # replayed cuda graph, do not pass through here.
         if self.requires_physical_write_loc and not write_loc_is_physical(loc_info):
             raise ValueError(
                 f"{where}: write loc is not marked physical. Hand the pool "
