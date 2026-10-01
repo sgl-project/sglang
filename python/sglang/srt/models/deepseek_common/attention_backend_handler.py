@@ -169,10 +169,19 @@ def handle_attention_fa4(attn, forward_batch):
 
 
 def handle_attention_trtllm_mla(attn, forward_batch):
-    if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
+    if is_in_tc_piecewise_cuda_graph():
         return AttnForwardMethod.MLA
 
     sum_extend_prefix_lens = _get_sum_extend_prefix_lens(forward_batch)
+    if is_in_breakable_cuda_graph():
+        # A captured graph cannot switch methods per replay, and prefix presence
+        # varies per replay; without chunked prefix cache keep the MLA fallback.
+        if attn.disable_chunked_prefix_cache:
+            return AttnForwardMethod.MLA
+        if forward_batch.forward_mode.is_extend_without_speculative():
+            return AttnForwardMethod.MHA_CHUNKED_KV
+        return _dispatch_mla_subtype(attn, forward_batch)
+
     if forward_batch.forward_mode.is_extend_without_speculative() and (
         not attn.disable_chunked_prefix_cache or sum_extend_prefix_lens == 0
     ):
@@ -184,6 +193,9 @@ def handle_attention_trtllm_mla(attn, forward_batch):
 def handle_attention_tokenspeed_mla(attn, forward_batch):
     # tokenspeed_mla shares the trtllm_mla dispatch pattern: pure prefill goes
     # via MHA chunked KV (TRT-LLM ragged), spec decode / decode goes via MLA.
+    # Its prefill kernel has not been validated as a breakable eager region.
+    if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
+        return AttnForwardMethod.MLA
     return handle_attention_trtllm_mla(attn, forward_batch)
 
 
