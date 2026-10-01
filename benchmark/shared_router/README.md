@@ -82,9 +82,12 @@ Four-rank untimed traces confirm both fused stages in graph replay. These are
 candidate-first sequential pairs. The #42055 native-first confirmation also
 passed: P50 TPOT 2.954854 to 2.921790 ms (-1.119%), output throughput +1.022%.
 It uses three new timing repetitions and reuses the exact-source full GSM8K
-pair above, not a new accuracy score. The positive incremental result occurs
-in both run orders. Public-main reverse-order and remaining all-concurrency
-checks are in progress. Do not add the two gains or claim significance.
+pair above, not a new accuracy score. Public-main native-first confirmation
+also passed: P50 TPOT 2.994267 to 2.934059 ms (-2.011%), output throughput
++2.012%, with exact-source full GSM8K reused from the main pair. Both main
+and incremental C2 results are positive in both run orders. C1 reverse-order
+and remaining all-concurrency checks are in progress. Do not add gains from
+different common sources or claim statistical significance.
 The preparation tree changes only formatting and reproduction support relative
 to the main measured runtime: Python AST is identical, C++/Triton unchanged.
 
@@ -111,6 +114,15 @@ rescore; all four steady-decode graph traces show zero fused launches. This
 small measured regression is reported, not treated as a fusion gain. One
 co-located pair is insufficient to establish significance or universal
 absence of regression.
+
+The #42055 C4 fallback check measured P50 TPOT 3.959699 to 3.954063 ms
+(-0.142%), but output throughput declined 0.223% and P50 TTFT increased
+258.767720 to 262.779394 ms (+1.550%). Full GSM8K was 1285 to 1283/1319,
+with zero errors and independently rescored responses. All four steady-decode
+traces show graph replay with zero fused launches. The TTFT regression remains
+visible: its cause is not established, and co-location alone does not prove it
+is noise. The minimum per-repeat TPOT increased 0.206%, unlike the median;
+neither summary establishes a meaningful fusion gain at C4.
 
 ### Completed common-source folded-expert comparison
 
