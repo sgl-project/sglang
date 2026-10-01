@@ -838,9 +838,15 @@ def test_pipeline_parallel_dspark_commit_round_trip():
         speculative_num_draft_tokens=2,
     )
 
-    with patch(
-        "sglang.srt.managers.scheduler_pp_mixin.get_parallel",
-        return_value=SimpleNamespace(pp_size=2),
+    with (
+        patch(
+            "sglang.srt.managers.scheduler_pp_mixin.get_parallel",
+            return_value=SimpleNamespace(pp_size=2),
+        ),
+        patch(
+            "sglang.srt.managers.scheduler_components.pp_dspark_draft.get_parallel",
+            return_value=SimpleNamespace(pp_size=2),
+        ),
     ):
         output_result = Scheduler._pp_prep_batch_result(
             receiver,

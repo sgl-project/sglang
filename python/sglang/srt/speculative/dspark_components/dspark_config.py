@@ -66,27 +66,6 @@ def resolve_single_owner_pp_rank(
     return None
 
 
-def use_empty_draft_model_for_pp_prefill(
-    *,
-    disaggregation_mode: str,
-    pp_rank: int,
-    pp_size: int,
-    target_layer_ids: List[int],
-    num_hidden_layers: int,
-) -> bool:
-    owner_pp_rank = resolve_single_owner_pp_rank(
-        target_layer_ids=target_layer_ids,
-        num_hidden_layers=num_hidden_layers,
-        pp_size=pp_size,
-    )
-    return (
-        disaggregation_mode == "prefill"
-        and pp_size > 1
-        and owner_pp_rank == pp_size - 1
-        and pp_rank != owner_pp_rank
-    )
-
-
 def dspark_gamma_from_num_draft_tokens(num_draft_tokens: int) -> int:
     gamma = int(num_draft_tokens) - 1
     if gamma < 1:

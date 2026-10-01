@@ -1,7 +1,7 @@
 import copy
 import logging
 import weakref
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkable
 
 import torch
@@ -147,12 +147,6 @@ def _configure_target_hidden_projection(
     )
 
 
-def _is_context_only_pp_prefill_rank(
-    *, disaggregation_mode: str, pp_rank: int, pp_size: int
-) -> bool:
-    return disaggregation_mode == "prefill" and pp_size > 1 and pp_rank < pp_size - 1
-
-
 @dataclass(frozen=True)
 class PPDSparkCommitState:
     rids: tuple[str, ...]
@@ -190,8 +184,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.device = target_worker.device
         self._draft_worker = None
         self._next_pp_proxy_tensors = None
-        self._is_lifecycle_only_pp_prefill_rank = False
-        self._pp_context_feature_indices: Optional[list[int]] = None
         self.enable_dp_spec_prefill_coordination = (
             envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
         )
@@ -219,40 +211,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             and not get_memory().disable_radix_cache
         )
         self._pp_candidates = weakref.WeakKeyDictionary()
-        self._is_context_only_pp_prefill_rank = (
-            _is_context_only_pp_prefill_rank(
-                disaggregation_mode=disaggregation_mode,
-                pp_rank=parallel.pp_rank,
-                pp_size=parallel.pp_size,
-            )
-            and not self._replicated_pp_draft
-        )
         if not self._hosts_draft:
             return
 
         self._use_full_projection_prefill = False
-        if (
-            self._is_pd_prefill
-            and self._draft_is_moe
-            and parallel.pp_size > 1
-            and not self._replicated_pp_draft
-        ):
-            target_layer_ids = [
-                int(layer_id)
-                for layer_id in (
-                    self.model_runner.spec_aux_config.dflash_target_layer_ids or []
-                )
-            ]
-            owner_pp_rank = resolve_single_owner_pp_rank(
-                target_layer_ids=target_layer_ids,
-                num_hidden_layers=self.model_runner.model_config.num_hidden_layers,
-                pp_size=parallel.pp_size,
-            )
-            self._use_full_projection_prefill = (
-                owner_pp_rank == parallel.pp_size - 1
-                and parallel.pp_rank == owner_pp_rank
-            )
-        if self._replicated_pp_draft:
+        if self._is_pd_prefill and self._draft_is_moe and parallel.pp_size > 1:
             target_layer_ids = [
                 int(layer_id)
                 for layer_id in (
@@ -266,10 +229,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
             if owner_pp_rank != parallel.pp_size - 1:
                 raise ValueError(
-                    "Replicated PP DSpark requires all target context layers on "
+                    "PP DSpark requires all target context layers on "
                     f"the final PP stage, got target_layer_ids={target_layer_ids} "
                     f"and owner_pp_rank={owner_pp_rank}."
                 )
+            self._use_full_projection_prefill = (
+                not self._replicated_pp_draft and parallel.pp_rank == owner_pp_rank
+            )
         self._decode_graph_allowed = (
             get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
             and not self._is_pd_prefill
@@ -304,9 +270,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_model_runner = bundle.draft_model_runner
         self.draft_model = bundle.draft_model
         self._draft_sampler = None
-        self._is_lifecycle_only_pp_prefill_rank = (
-            self._draft_is_moe and self.draft_model.is_lifecycle_only
-        )
         self._linear_accept_index_cache = None
 
         # The mask token is input-only (it is embedded, never sampled), so its
@@ -335,10 +298,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.query_token_num = self.gamma if self.sample_from_anchor else self.gamma + 1
         self.speculative_num_draft_tokens = self.verify_num_draft_tokens
         self._mask_token_id = runtime_config.mask_token_id
-
-        if self._is_lifecycle_only_pp_prefill_rank:
-            self._init_lifecycle_only_prefill()
-            return
 
         parallel = get_parallel()
         self._tp_sync = SpecTpSync(
@@ -379,21 +338,19 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
         else:
             target_model = self.target_worker.model_runner.model
-            needs_lm_head = not self._is_context_only_pp_prefill_rank
-            if needs_lm_head:
-                try:
-                    lm_head = unwrap_lora_layer(target_model.lm_head)
-                    lm_head.weight
-                except AttributeError as exc:
-                    raise RuntimeError(
-                        "DSpark requires the target model to expose `lm_head` with `weight`."
-                    ) from exc
-                self.draft_model.attach_shared_modules(
-                    embed_tokens=unwrap_lora_layer(
-                        self._resolve_target_embed_tokens(target_model)
-                    ),
-                    lm_head=lm_head,
-                )
+            try:
+                lm_head = unwrap_lora_layer(target_model.lm_head)
+                lm_head.weight
+            except AttributeError as exc:
+                raise RuntimeError(
+                    "DSpark requires the target model to expose `lm_head` with `weight`."
+                ) from exc
+            self.draft_model.attach_shared_modules(
+                embed_tokens=unwrap_lora_layer(
+                    self._resolve_target_embed_tokens(target_model)
+                ),
+                lm_head=lm_head,
+            )
         self._target_hidden_projection_enabled = False
 
         self._verify_planner = DSparkVerifyPlanner(
@@ -522,76 +479,22 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
         if self._is_pd_prefill:
-            if self._draft_is_moe and self._is_context_only_pp_prefill_rank:
-                self.draft_model.prune_to_ctx_projection()
-            elif not self._draft_is_moe:
+            if not self._draft_is_moe:
                 self.draft_model.prune_to_ctx_kv_injection()
-            self._init_pp_context_feature_indices()
-
-    def _init_lifecycle_only_prefill(self) -> None:
-        self._verify_planner = None
-        self._kv_injector = None
-        self._proposer = None
-        self._verify_epilogue = None
-        self._verify_executor = None
-        self._simulate_acc_len = float(envs.SGLANG_SIMULATE_ACC_LEN.get())
-        self._forced_budget_frac = None
-        self._need_mamba_verify_commit = False
-        self._observers = None
 
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
             return target_model.get_input_embeddings()
         return target_model.model.get_input_embeddings()
 
-    def _init_pp_context_feature_indices(self) -> None:
-        if self.ps.pp_size <= 1:
-            return
-
-        target_layer_ids = self.model_runner.spec_aux_config.dflash_target_layer_ids
-        if not target_layer_ids:
-            return
-
-        target_model = self.target_worker.model_runner.model
-        start_layer = int(target_model.start_layer)
-        end_layer = int(target_model.end_layer)
-        target_layer_to_feature = {
-            int(layer_id): idx for idx, layer_id in enumerate(target_layer_ids)
-        }
-        local_feature_indices = [
-            target_layer_to_feature[layer_id]
-            for layer_id in range(start_layer, end_layer)
-            if layer_id in target_layer_to_feature
-        ]
-        if not local_feature_indices:
-            return
-
-        self._pp_context_feature_indices = local_feature_indices
-        if self._draft_is_moe and not self._use_full_projection_prefill:
-            self.draft_model.prepare_target_hidden_partial(local_feature_indices)
-        if self.ps.tp_rank == 0:
-            logger.info(
-                "DSpark PP-local context projection will accumulate feature indices %s "
-                "from target layers %s for PP rank %s local layers [%s, %s).",
-                local_feature_indices,
-                list(target_layer_ids),
-                self.ps.pp_rank,
-                start_layer,
-                end_layer,
-            )
-
     @property
     def carries_confidence(self) -> bool:
-        if not self._hosts_draft or self._is_lifecycle_only_pp_prefill_rank:
+        if not self._hosts_draft:
             return False
         return self._verify_planner.carries_confidence
 
-    @property
-    def is_lifecycle_only_pp_prefill_rank(self) -> bool:
-        return self._is_lifecycle_only_pp_prefill_rank
-
     def _draft_model_runners(self) -> tuple:
-        if not self._hosts_draft or self._is_lifecycle_only_pp_prefill_rank:
+        if not self._hosts_draft:
             return ()
         return super()._draft_model_runners()
 
@@ -599,8 +502,6 @@ class DSparkWorkerV2(BaseSpecWorker):
     def spec_v2_attn_backends(self) -> tuple:
         if not self._hosts_draft:
             return super().spec_v2_attn_backends
-        if self._is_context_only_pp_prefill_rank:
-            return (self._target_worker.model_runner.attn_backend,)
         return (
             self._target_worker.model_runner.attn_backend,
             self.draft_model_runner.attn_backend,
@@ -620,26 +521,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         req_to_token_pool=None,
         token_to_kv_pool_allocator=None,
     ):
-        if not self._hosts_draft or self._is_lifecycle_only_pp_prefill_rank:
+        if not self._hosts_draft:
             return
-        if memory_pool_config is not None and self._is_context_only_pp_prefill_rank:
-            page_size = int(self.page_size)
-
-            def _minimal_capacity(capacity):
-                if capacity is None or capacity == 0:
-                    return capacity
-                return page_size
-
-            memory_pool_config = replace(
-                memory_pool_config,
-                max_total_num_tokens=page_size,
-                full_max_total_num_tokens=_minimal_capacity(
-                    memory_pool_config.full_max_total_num_tokens
-                ),
-                swa_max_total_num_tokens=_minimal_capacity(
-                    memory_pool_config.swa_max_total_num_tokens
-                ),
-            )
         self._draft_worker.alloc_memory_pool(
             memory_pool_config=memory_pool_config,
             req_to_token_pool=req_to_token_pool,
@@ -648,9 +531,6 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def init_attention_backends(self):
         if not self._hosts_draft:
-            return
-        if self._is_context_only_pp_prefill_rank:
-            self._need_mamba_verify_commit = False
             return
         with draft_pp_context(), self._draft_context():
             self._draft_worker.init_attention_backends()
@@ -672,7 +552,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def init_cuda_graphs(self):
-        if not self._hosts_draft or self._is_context_only_pp_prefill_rank:
+        if not self._hosts_draft:
             return
         capture_decode_cuda_graph = self._decode_graph_allowed
         available_mem = self._tp_sync.available_memory_gb(
@@ -734,54 +614,29 @@ class DSparkWorkerV2(BaseSpecWorker):
     def clear_cache_pool(self):
         pass
 
-    def _refresh_partial_projection(self) -> None:
-        if (
-            self._draft_is_moe
-            and not self._is_lifecycle_only_pp_prefill_rank
-            and not self._use_full_projection_prefill
-            and self._pp_context_feature_indices is not None
-        ):
-            self.draft_model.prepare_target_hidden_partial(
-                self._pp_context_feature_indices
-            )
-
-    def update_weights_from_disk(self, recv_req):
-        success, message = super().update_weights_from_disk(recv_req)
-        if success:
-            self._refresh_partial_projection()
-        return success, message
-
-    def update_weights_from_ipc(self, recv_req):
-        success, message = super().update_weights_from_ipc(recv_req)
-        if success:
-            self._refresh_partial_projection()
-        return success, message
-
     def set_dspark_forced_budget_frac(self, frac: Optional[float]) -> None:
         if not self._hosts_draft:
             return
         self._forced_budget_frac = frac
-        if self._is_lifecycle_only_pp_prefill_rank:
-            return
         self._verify_planner.set_forced_budget_frac(frac)
 
     def dump_info_records(self) -> Optional[dict]:
-        if not self._hosts_draft or self._is_lifecycle_only_pp_prefill_rank:
+        if not self._hosts_draft:
             return None
         return self._observers.dump_info_records()
 
     def clear_info_records(self) -> None:
-        if not self._hosts_draft or self._is_lifecycle_only_pp_prefill_rank:
+        if not self._hosts_draft:
             return
         self._observers.clear_info_records()
 
     def block_accept_estimate_log_suffix(self) -> Optional[str]:
-        if not self._hosts_draft or self._is_lifecycle_only_pp_prefill_rank:
+        if not self._hosts_draft:
             return None
         return self._observers.block_accept_estimate_log_suffix()
 
     def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
-        if not self._hosts_draft or self._is_lifecycle_only_pp_prefill_rank:
+        if not self._hosts_draft:
             return
         self._observers.note_request_finished(rid=rid, natural_stop=natural_stop)
 
@@ -811,13 +666,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 on_publish(batch_output.new_seq_lens)
             return batch_output
 
-        if self._is_lifecycle_only_pp_prefill_rank:
-            return self._forward_lifecycle_only_prefill(
-                batch=batch,
-                on_publish=on_publish,
-                pp_proxy_tensors=pp_proxy_tensors,
-            )
-
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             if batch.is_extend_in_batch and self.enable_dp_spec_prefill_coordination:
                 plan = DPSpecPrefillCoordinationPlan(
@@ -839,33 +687,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             grammar_barrier,
             pp_proxy_tensors=pp_proxy_tensors,
         )
-
-    def _forward_lifecycle_only_prefill(
-        self, *, batch: ScheduleBatch, on_publish, pp_proxy_tensors
-    ) -> GenerationBatchResult:
-        if batch.forward_mode.is_idle():
-            return self._forward_idle_prefill(
-                batch=batch,
-                on_publish=on_publish,
-                pp_proxy_tensors=pp_proxy_tensors,
-                capture_hidden_mode=CaptureHiddenMode.NULL,
-            )
-        if not (batch.forward_mode.is_extend() or batch.is_extend_in_batch):
-            raise RuntimeError(
-                "Lifecycle-only DSpark worker only supports prefill batches."
-            )
-
-        batch_output = self.target_worker.forward_batch_generation(
-            batch,
-            pp_proxy_tensors=pp_proxy_tensors,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
-        )
-        batch_output.new_seq_lens = batch.seq_lens
-        if on_publish is not None:
-            on_publish(batch_output.new_seq_lens)
-        if batch_output.logits_output is not None:
-            batch_output.logits_output.hidden_states = None
-        return batch_output
 
     def _forward_dp_spec_prefill_coordination(
         self, batch, plan, on_publish, grammar_barrier, pp_proxy_tensors
@@ -1044,13 +865,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 else None
             )
             local_ctx = None
-            if (
-                self.ps.pp_size > 1
-                and has_local_target_hidden
-                and self._pp_context_feature_indices is not None
-            ):
-                local_ctx = self.draft_model.project_target_hidden_partial(
-                    target_hidden, self._pp_context_feature_indices
+            if self._draft_is_moe and has_local_target_hidden:
+                local_ctx = self.draft_model.project_target_hidden_for_transfer(
+                    target_hidden
                 )
             if output_pp_proxy_tensors is not None:
                 output_pp_proxy_tensors.tensors.pop("dspark_aux_hidden_states", None)
@@ -1839,6 +1656,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def get_confidence_budget_prepare(self):
-        if not self._hosts_draft or self._is_lifecycle_only_pp_prefill_rank:
+        if not self._hosts_draft:
             return None
         return self._verify_planner.confidence_budget_prepare()

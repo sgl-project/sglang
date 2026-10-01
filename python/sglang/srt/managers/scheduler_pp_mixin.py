@@ -18,6 +18,9 @@ from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.overlap_utils import RelayPayload, resolve_forward_inputs
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
+from sglang.srt.managers.scheduler_components.pp_dspark_draft import (
+    PPDSparkDraftCoordinator,
+)
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
     allocate_distinct_stream,
@@ -36,7 +39,6 @@ from sglang.srt.sampling.sampling_observer_pp import (
 )
 from sglang.srt.speculative.dspark_components.dspark_pp import (
     pack_proposal,
-    unpack_proposal,
 )
 from sglang.srt.utils import DynamicGradMode, point_to_point_pyobj
 from sglang.srt.utils.common import is_npu, is_xpu
@@ -103,11 +105,13 @@ class PPBatchMetadata:
     verify_out_cache_loc: Optional[torch.Tensor] = None
 
 
-@dataclass
-class PPDSparkDraftWork:
-    batch: ScheduleBatch
-    draft_input: object
-    pp_outputs: Optional[PPProxyTensors] = None
+def _pp_get_dspark_draft_coordinator(
+    scheduler: Scheduler,
+) -> PPDSparkDraftCoordinator:
+    coordinator = getattr(scheduler, "pp_dspark_draft", None)
+    if coordinator is None:
+        coordinator = scheduler.pp_dspark_draft = PPDSparkDraftCoordinator(scheduler)
+    return coordinator
 
 
 class SchedulerPPMixin:
@@ -207,7 +211,7 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
-                self._pp_drain_dspark_draft_work()
+                _pp_get_dspark_draft_coordinator(self).drain()
                 if self.mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
                     process_batch = self._pp_result_process_batch(next_mb_id)
@@ -513,7 +517,7 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
-                self._pp_drain_dspark_draft_work()
+                _pp_get_dspark_draft_coordinator(self).drain()
 
                 # reach consensus on last rank and send to PP=0
                 # otherwise, just pass along previous consensus
@@ -635,8 +639,7 @@ class SchedulerPPMixin:
         self.send_req_work = []
         self.send_proxy_work = []
         self.send_output_work = []
-        self.send_dspark_draft_work = []
-        self.pp_dspark_draft_queue: deque[PPDSparkDraftWork] = deque()
+        self.pp_dspark_draft = PPDSparkDraftCoordinator(self)
         self.send_proxy_requires_forward_fence = False
         self.launch_event = None
         self.pp_proxy_recv_event = None
@@ -1199,7 +1202,8 @@ class SchedulerPPMixin:
 
         next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
 
-        self._pp_schedule_relayed_dspark_idle_draft(batch, pp_outputs)
+        dspark_draft = _pp_get_dspark_draft_coordinator(self)
+        dspark_draft.on_relayed_idle(batch, pp_outputs)
 
         if "dspark_projected_context" in pp_outputs.tensors:
             from sglang.srt.speculative.dspark_components.dspark_draft import (
@@ -1254,44 +1258,11 @@ class SchedulerPPMixin:
 
             is_decode = accept_lens is not None
             if is_decode:
-                bubble_draft = (
-                    "dspark_next_1_identities" not in pp_outputs.tensors
-                    and get_spec().speculative_draft_scheduling_policy == "bubble"
+                dspark_draft.on_relayed_proposals(
+                    fwd_batch,
+                    next_draft_input,
+                    pp_outputs,
                 )
-                if bubble_draft:
-                    if not self.pp_group.is_first_rank:
-                        raise RuntimeError(
-                            "Only the first PP rank may receive a deferred "
-                            "DSpark verify result."
-                        )
-                    self.pp_dspark_draft_queue.append(
-                        PPDSparkDraftWork(
-                            batch=fwd_batch,
-                            draft_input=next_draft_input,
-                            pp_outputs=pp_outputs,
-                        )
-                    )
-                elif self.pp_group.is_first_rank:
-                    # Keep draft execution on the forward stream: it follows the
-                    # current verify, while the peer can verify another batch.
-                    self.forward_stream.wait_stream(self.copy_stream)
-                    with self.forward_stream_ctx:
-                        pp_outputs.tensors.update(
-                            pack_proposal(
-                                0,
-                                self._pp_schedule_dspark_draft(
-                                    fwd_batch, next_draft_input
-                                ),
-                            )
-                        )
-                    self.copy_stream.wait_stream(self.forward_stream)
-                if not bubble_draft:
-                    for owner in range(get_parallel().pp_size):
-                        self.model_worker.install_pp_draft(
-                            fwd_batch,
-                            owner,
-                            unpack_proposal(owner, pp_outputs.tensors),
-                        )
             output_result = GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
@@ -1408,67 +1379,6 @@ class SchedulerPPMixin:
         if metadata is not None and metadata.fwd_batch is not None:
             return metadata.fwd_batch
         return self.mbs[mb_id]
-
-    def _pp_schedule_dspark_draft(self: Scheduler, batch: ScheduleBatch, draft_input):
-        if get_spec().speculative_draft_scheduling_policy == "tail":
-            return self.model_worker.prepare_pp_draft(batch, draft_input)
-
-        with torch.profiler.record_function("pp_dspark_draft_bubble"):
-            return self.model_worker.prepare_pp_draft(batch, draft_input)
-
-    def _pp_drain_dspark_draft_work(self: Scheduler) -> None:
-        if not self.pp_dspark_draft_queue:
-            return
-
-        work = self.pp_dspark_draft_queue.popleft()
-        self._pp_commit_comm_work(self.send_dspark_draft_work)
-        with self.forward_stream_ctx:
-            proposal = self._pp_schedule_dspark_draft(work.batch, work.draft_input)
-            ready_event = self.device_module.Event()
-            ready_event.record(self.device_module.current_stream())
-
-        if self.pp_group.is_last_rank:
-            self.send_dspark_draft_work = self._pp_send_dict_to_next_stage(
-                pack_proposal(get_parallel().pp_rank, proposal),
-                async_send=True,
-                msg_type="dspark_draft",
-                ready_event=ready_event,
-            )
-            return
-
-        if not self.pp_group.is_first_rank or work.pp_outputs is None:
-            raise RuntimeError("Invalid PP DSpark deferred draft work owner.")
-        tensor_dict, recv_event = self._pp_recv_typed_dict(
-            expected_kind="dspark_draft",
-            all_gather_group=self.attn_tp_group,
-        )
-        if recv_event is not None:
-            self.forward_stream.wait_event(recv_event)
-        work.pp_outputs.tensors.update(pack_proposal(0, proposal))
-        work.pp_outputs.tensors.update(tensor_dict)
-        for owner in range(get_parallel().pp_size):
-            self.model_worker.install_pp_draft(
-                work.batch,
-                owner,
-                unpack_proposal(owner, work.pp_outputs.tensors),
-            )
-
-    def _pp_schedule_dspark_idle_draft(self: Scheduler, batch: ScheduleBatch) -> None:
-        with torch.profiler.record_function("pp_dspark_draft_bubble"):
-            self.model_worker.prepare_pp_idle_draft(batch)
-
-    def _pp_schedule_relayed_dspark_idle_draft(
-        self: Scheduler, batch: ScheduleBatch, pp_outputs: PPProxyTensors
-    ) -> None:
-        if (
-            "dspark_draft_idle" not in pp_outputs.tensors
-            or not self.pp_group.is_first_rank
-        ):
-            return
-        self.forward_stream.wait_stream(self.copy_stream)
-        with self.forward_stream_ctx:
-            self._pp_schedule_dspark_idle_draft(batch)
-        self.copy_stream.wait_stream(self.forward_stream)
 
     def _pp_process_batch_result(
         self: Scheduler, batch: ScheduleBatch, output_result: GenerationBatchResult
@@ -2016,24 +1926,9 @@ class SchedulerPPMixin:
                     trace_only=True,
                     attrs={"pp_mb_id": mb_id},
                 )
-                if result.pp_dspark_draft_idle and self.pp_group.is_last_rank:
-                    self._pp_schedule_dspark_idle_draft(cur_batch)
-                elif (
-                    result.pp_dspark_projected_context is not None
-                    and result.accept_lens is not None
-                    and result.pp_dspark_next_proposal is None
-                ):
-                    if get_spec().speculative_draft_scheduling_policy == "bubble":
-                        self.pp_dspark_draft_queue.append(
-                            PPDSparkDraftWork(
-                                batch=cur_batch,
-                                draft_input=result.next_draft_input,
-                            )
-                        )
-                    else:
-                        result.pp_dspark_next_proposal = self._pp_schedule_dspark_draft(
-                            cur_batch, result.next_draft_input
-                        )
+                _pp_get_dspark_draft_coordinator(self).on_batch_launched(
+                    cur_batch, result
+                )
                 mb_metadata[mb_id] = PPBatchMetadata(
                     can_run_cuda_graph=result.can_run_cuda_graph,
                     fwd_batch=_pp_snapshot_forward_batch(cur_batch),
