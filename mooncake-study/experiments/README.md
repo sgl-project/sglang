@@ -22,8 +22,10 @@ FlashInfer 0.6.12 cubin/JIT-cache distributions were removed because they are
 incompatible with FlashInfer 0.6.17. Supported source JIT is used with version
 checks enabled. The idle worker continues to use the base Python/Torch pair.
 
-Every GPU experiment goes through the resident worker so the idle load is
-stopped and reaped before test execution, then resumed afterward:
+Experiments on the resident GPU go through its worker so the idle load is
+stopped and reaped before test execution, then resumed afterward. Distributed
+experiments use separately allocated jobs; the two-node Store lane is described
+in [Remote RDMA Store Validation](RDMA.md).
 
 ```bash
 LAB=/gpfs/users/fuxuanwei-1/dspark-maas-lab

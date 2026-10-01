@@ -2495,6 +2495,72 @@ retention, cross-node RDMA, pipeline speculation, combined TP/PP, DP/CP or
 other model identities. Target-KV v1 remains static verify; confidence-scheduled
 ragged verification here uses the existing hidden-input draft path.
 
+## Cross-Node RDMA Snapshot Store
+
+The existing registered-buffer adapter now has real cross-node RDMA coverage.
+Node174 runs Qwen3-0.6B P/D serving and readers; node199 owns the sole 256 MiB
+Store segment. All producer/read clients mount zero storage bytes, explicitly
+select RDMA on `mlx5_00` with GID index 3 and disable Store memcpy. SDK logs
+confirm the explicit HCA path, and Master logs show only the remote segment.
+Master and TransferEngine control RPCs still use TCP. No new Master schema or
+transport API was needed.
+
+`PDCaptureRuntimeBase.start_store()` separates Store setup from the existing
+PD fixture, retaining the default local TCP path. The dedicated
+`test_training_capture_rdma.py` overrides setup with the remote client config.
+Its four cases pass in 420.402 seconds: AR and target-KV DSpark, each with eager
+execution and decode/verify CUDA graphs. The complete TCP PD regression file
+also passes two tests in 152.218 seconds.
+
+The RDMA cases publish 22 complete samples and exclude 12 selected requests
+with missing/stale handoffs or cancellation. The existing independent online
+oracle compares every selected KV value and raw top-128 score/ID exactly;
+full-vocabulary LSE uses `rtol=atol=1e-6`. Token IDs, prediction positions,
+prompt/response masks, KV validity and accepted-path boundaries also match.
+Graph cases require actual graph execution with overlap; speculative D source
+frames remain verify frames, with no target prefill added for capture.
+
+After each case all its serving processes exit, then a fresh interpreter reads
+all published manifests and tensors from the surviving remote Store. The
+cumulative readbacks contain 5, 10, 17 and 23 snapshots. The last set includes
+one seed snapshot used to construct the untrained target-KV draft, outside the
+22 main samples. It contains 418 tensor objects and 16,960,108 tensor bytes,
+excluding manifest bytes. These are validated payload sizes, not wire counters
+or throughput measurements.
+
+`sglang.test.training_capture_rdma` supplies the remote fixture, a registered
+1 MiB probe and the independent reader. Probe cleanup waits for the normal
+Store read lease and uses `force=False`. On this RoCE deployment, exposing HCA
+device files in an isolated pod network namespace was insufficient: real writes
+failed QP RTR with `ENODEV`. Explicit RDMA resources plus host networking allow
+the probe and complete capture tests to pass. The ordinary northjob CLI removed
+RDMA resources for small GPU jobs, so the temporary two-node allocation used
+the same platform YAML submission API with those explicit resources.
+
+The fixture restores its Python signal handlers after SDK initialization and
+reaps the actual Master child behind the wheel's CLI wrapper. Commands and
+deployment conditions are documented in `experiments/RDMA.md`; results, failed
+attempts, source/log hashes and cleanup evidence are in
+`experiments/capture-rdma-store.json`. This registered test is explicitly
+disabled on ordinary single-node CI and requires a dedicated RDMA environment.
+
+The final fixture passes a fresh 1 MiB RDMA probe and SIGTERM check: its process,
+CLI wrapper and native Master are all gone. The change from the runtime-tested
+helper only affects fixture cleanup; both source hashes are retained. All three
+changed Python files pass Black, isort, repository Ruff and compilation, and the
+new helper/test also pass broader Ruff. Registered-test checks pass, giving six
+passing runtime tests across the RDMA lane and default TCP regression.
+The temporary two-node job was deleted after checking no live serving/Store
+processes or GPU allocations remained. All six pods from the three allocation
+attempts are NotFound. The resident H100 has resumed idle load with no active or
+queued experiment, and the original checkout's staged-index digest is unchanged.
+
+P/D serving in these cases shares node174's GPU and uses TCP for its own KV
+handoff. This evidence does not certify cross-node PD transport, distributed
+TP/PP over RDMA, GPUDirect, replica failure recovery, production Catalog/consumer
+retention, trained draft quality or performance acceptance. The Catalog remains
+a test double. These paths remain part of the broader implementation goal.
+
 ## Next Implementation
 
 1. Broaden real-request coverage to prefill graphs, automatic AR OOM retraction,
@@ -2505,7 +2571,9 @@ ragged verification here uses the existing hidden-input draft path.
 3. Extend P9's real TP2/PP1 and TP1/PP2 Qwen3 capture validation to combined
    TP2/PP2, replicated heads, distributed cancellation/backpressure and additional
    model identities. Complete pipeline speculative collection, extend real
-   speculative PD topology coverage and validate cross-node RDMA. AR PD transfers the
+   speculative PD topology coverage and validate cross-node PD RDMA. The separate
+   cross-node Store RDMA path has passed AR/DSpark eager/graph correctness tests.
+   AR PD transfers the
    first teacher row and publishes from D across matching/asymmetric TP groups
    and matching/reduced PP groups supported by the Mooncake transport.
    Ordinary AR uses the distributed serving

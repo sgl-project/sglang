@@ -58,6 +58,12 @@ class PDCaptureRuntimeBase(CustomTestCase):
             cls.model = snapshot_download(cls.model)
         cls.catalog = TestCaptureCatalog()
         cls.addClassCleanup(cls.catalog.close)
+        cls.start_store()
+        cls.reader = MooncakeSnapshotStore.connect(cls.store_setup)
+        cls.addClassCleanup(cls.reader.close)
+
+    @classmethod
+    def start_store(cls):
         port = free_port()
         cls.master_log = tempfile.TemporaryFile()  # noqa: SIM115
         cls.addClassCleanup(cls.master_log.close)
@@ -95,8 +101,6 @@ class PDCaptureRuntimeBase(CustomTestCase):
             cls.store_setup | {"global_segment_size": 256 << 20}
         )
         cls.addClassCleanup(cls.segment.close)
-        cls.reader = MooncakeSnapshotStore.connect(cls.store_setup)
-        cls.addClassCleanup(cls.reader.close)
 
     @staticmethod
     def stop_process(process):

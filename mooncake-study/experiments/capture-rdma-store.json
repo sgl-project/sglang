@@ -1,0 +1,415 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-01",
+  "base_commit": "d29cb2f7c2c056bbaf7e37f0e0f24c2618f6112f",
+  "feature": "Real online AR/DSpark capture to a remote-only RDMA Mooncake Store, with independent readback after serving exits",
+  "environment": {
+    "temporary_job": "job-ea02689eb686-20261002041826",
+    "producer": {
+      "node": "node174",
+      "host_ip": "10.51.10.14",
+      "gpu": "GPU-4c7775e2-ea56-51f4-1afa-3c77c508c128"
+    },
+    "store": {
+      "node": "node199",
+      "host_ip": "10.51.11.7",
+      "allocated_gpu": "GPU-a1a12d9d-32a7-7f7d-b7d4-6393e2ab46de",
+      "uses_gpu": false,
+      "segment_bytes": 268435456
+    },
+    "gpu_model": "NVIDIA H100 80GB HBM3",
+    "pod_resources_per_node": {
+      "gpu": 1,
+      "memory": "96Gi",
+      "rdma/hca_shared_devices": 1,
+      "host_network": true
+    },
+    "model": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+    "selected_layers": [
+      0,
+      14,
+      27
+    ],
+    "versions": {
+      "python": "3.12.3",
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "packages": {
+        "mooncake-transfer-engine-cuda13": "0.3.11.post1",
+        "sglang-kernel": "0.4.6.post1",
+        "flashinfer-python": "0.6.17",
+        "transformers": "5.12.1"
+      }
+    },
+    "image": "harbor.local.clusters/bp/lmsysorg/sglang:v0.5.15",
+    "python": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+    "gpu_checkout": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang",
+    "capture_transport": "RDMA between physical nodes; explicit mlx5_00, GID index 3, MC_STORE_MEMCPY=0, no client-owned storage segment",
+    "pd_transport": "Mooncake TransferEngine TCP, with P and D sharing node174's GPU",
+    "catalog": "TestCaptureCatalog HTTP double",
+    "allocation": "The standard northjob small-GPU launcher forced isolated networking and omitted RDMA resources. Used its platform YAML upload API with hostNetwork and RDMA resources; two one-GPU nodes, unchanged resource count.",
+    "dependency_adjustment": "Removed only the temporary containers' inherited flashinfer-cubin/flashinfer-jit-cache 0.6.12, retaining the locked 0.6.17 runtime."
+  },
+  "client_setup": {
+    "local_hostname": "10.51.10.14",
+    "master_server_addr": "10.51.11.7:50925",
+    "protocol": "rdma",
+    "metadata_server": "P2PHANDSHAKE",
+    "global_segment_size": 0,
+    "local_buffer_size": 16777216,
+    "rdma_devices": "mlx5_00"
+  },
+  "store_ready": {
+    "pid": 460,
+    "master_pid": 594,
+    "hostname": "node199",
+    "setup": {
+      "local_hostname": "10.51.11.7",
+      "master_server_addr": "10.51.11.7:50925",
+      "protocol": "rdma",
+      "metadata_server": "P2PHANDSHAKE",
+      "global_segment_size": 0,
+      "local_buffer_size": 16777216,
+      "rdma_devices": "mlx5_00"
+    },
+    "segment_bytes": 268435456
+  },
+  "source_sha256": {
+    "python/sglang/test/pd_capture_runtime.py": "f1dd8947a420933310b11716b183516bcfa2b8a2ee291844c693968e1fa5f80e",
+    "python/sglang/test/training_capture_rdma.py": "daa024a74a49476da7dcc3dc35941f4560fe3ea559456a239755c93276f1ec31",
+    "test/registered/storage/test_training_capture_rdma.py": "aefd3c788edcf44b137977e5c6d48f6d85dfc9fd141a67a15f5039ee49cc4846"
+  },
+  "gpu_source_hashes_match": true,
+  "runtime_helper_sha256_before_lifecycle_fix": "3e3b63896d26172ad4a2f973aec5d02699f3d894636c85b0156fa8877ab25ec7",
+  "source_validation_scope": "The complete runtime file used the recorded pre-lifecycle helper. The final change only imports kill_process_tree and reaps Master descendants in serve() finally; load_setup/probe/read and the test file are unchanged. Final helper was synced after runtime and its Store terminated, then exercised with a fresh RDMA probe and SIGTERM lifecycle check.",
+  "invariants": [
+    "Only node199 mounted a storage segment; all writer and readback clients configured global_segment_size=0. Explicit RDMA device configuration disables automatic transport discovery.",
+    "Every selected KV value and raw top-128 score/vocab ID exactly matches an independent observer of the actual online source; full-vocabulary LSE uses rtol=atol=1e-6.",
+    "Token IDs, response/loss masks, prediction positions, KV validity and final accepted/terminal boundaries match the response. No target prefill is added on speculative D for collection.",
+    "One-token responses, chunked prompts, cached prefixes, actual decode batches and accepted/rejected verify paths are included.",
+    "Missing/stale teacher handoffs and cancellation fail capture without publishing partial training snapshots; normal generation survives.",
+    "Each case stops its serving processes before launching a separate interpreter to validate all published manifest/tensor hashes and coverage via remote RDMA.",
+    "Graph cases execute real decode/verify CUDA graphs with overlap. Host quarantine is zero at the end of every case."
+  ],
+  "tests": [
+    {
+      "test_file": "test/registered/storage/test_training_capture_rdma.py",
+      "command": "'kubectl' 'exec' '-n' 'qiji' 'job-ea02689eb686-20261002041826-master-0' '-c' 'master' '--' 'env' 'PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/specforge-reference' 'PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' 'MC_STORE_MEMCPY=0' 'MC_GID_INDEX=3' 'MC_TE_METRIC=1' 'MC_TE_METRIC_INTERVAL_SECONDS=1' 'TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B' 'TRAINING_CAPTURE_RDMA_SETUP=/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/rdma-final-client-20261001.json' 'timeout' '--signal=TERM' '--kill-after=30s' '1200' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/test/registered/storage/test_training_capture_rdma.py' '-v' '-f' > /gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-rdma-runtime-20261001.log 2>&1",
+      "returncode": 0,
+      "tests": 4,
+      "seconds": 420.402,
+      "readback_counts": [
+        5,
+        10,
+        17,
+        23
+      ],
+      "samples": 23,
+      "objects": 418,
+      "tensor_bytes": 16960108,
+      "main_samples": 22,
+      "seed_samples": 1,
+      "excluded_fault_or_cancelled_requests": 12,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-rdma-runtime-20261001.log"
+    },
+    {
+      "test_file": "test/registered/storage/test_training_capture_pd.py",
+      "job_id": "01790886295512191588-6b4aa556982f",
+      "command": "'kubectl' 'exec' '-n' 'qiji' 'job-fe1ce1dcdea6-20261001023258-master-0' '-c' 'master' '--' 'python3' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py' '--state-dir' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/state' 'submit' '--cwd' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang' '--env' 'PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/specforge-reference' '--env' 'PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' '--env' 'TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B' '--timeout' '420' '--' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python' 'test/registered/storage/test_training_capture_pd.py' '-v' '-f'",
+      "returncode": 0,
+      "tests": 2,
+      "seconds": 152.218,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790886295512191588-6b4aa556982f.log"
+    }
+  ],
+  "runtime_cases": [
+    {
+      "replay": false,
+      "draft_kind": null,
+      "prefill_tp": 1,
+      "decode_tp": 1,
+      "prefill_pp": 1,
+      "decode_pp": 1,
+      "enable_overlap": false,
+      "counters": {
+        "admitted": 8,
+        "considered": 8,
+        "copies_completed": 8,
+        "eager_forwards": 14,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "pd_handoff_committed": 6,
+        "ready": 5,
+        "sealed": 5,
+        "snapshot_built": 5,
+        "writer_started": 8
+      },
+      "quarantined_host_slots": 0
+    },
+    {
+      "replay": true,
+      "draft_kind": null,
+      "prefill_tp": 1,
+      "decode_tp": 1,
+      "prefill_pp": 1,
+      "decode_pp": 1,
+      "enable_overlap": true,
+      "counters": {
+        "admitted": 8,
+        "considered": 8,
+        "copies_completed": 8,
+        "cuda_graph_forwards": 17,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "overlap_forwards": 17,
+        "pd_handoff_committed": 6,
+        "ready": 5,
+        "sealed": 5,
+        "snapshot_built": 5,
+        "writer_started": 8
+      },
+      "quarantined_host_slots": 0
+    },
+    {
+      "replay": false,
+      "draft_kind": "target_kv",
+      "prefill_tp": 1,
+      "decode_tp": 1,
+      "prefill_pp": 1,
+      "decode_pp": 1,
+      "enable_overlap": false,
+      "counters": {
+        "admitted": 9,
+        "considered": 9,
+        "copies_completed": 9,
+        "eager_forwards": 11,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "snapshot_built": 6,
+        "speculative_commits_copied": 12,
+        "speculative_verify_forwards": 11,
+        "writer_started": 9
+      },
+      "quarantined_host_slots": 0
+    },
+    {
+      "replay": true,
+      "draft_kind": "target_kv",
+      "prefill_tp": 1,
+      "decode_tp": 1,
+      "prefill_pp": 1,
+      "decode_pp": 1,
+      "enable_overlap": true,
+      "counters": {
+        "admitted": 9,
+        "considered": 9,
+        "copies_completed": 9,
+        "cuda_graph_forwards": 15,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1,
+        "overlap_forwards": 15,
+        "pd_handoff_committed": 7,
+        "ready": 6,
+        "sealed": 6,
+        "snapshot_built": 6,
+        "speculative_commits_copied": 17,
+        "speculative_verify_forwards": 15,
+        "writer_started": 9
+      },
+      "quarantined_host_slots": 0
+    }
+  ],
+  "post_producer_readbacks": [
+    {
+      "host": "node174",
+      "snapshots": 5,
+      "tensor_objects": 94,
+      "tensor_bytes": 4128546,
+      "capture_modes": {
+        "pd_autoregressive": 5
+      }
+    },
+    {
+      "host": "node174",
+      "snapshots": 10,
+      "tensor_objects": 188,
+      "tensor_bytes": 8306244,
+      "capture_modes": {
+        "pd_autoregressive": 10
+      }
+    },
+    {
+      "host": "node174",
+      "snapshots": 17,
+      "tensor_objects": 310,
+      "tensor_bytes": 12653198,
+      "capture_modes": {
+        "pd_autoregressive": 11,
+        "pd_speculative_accepted_target_path": 6
+      }
+    },
+    {
+      "host": "node174",
+      "snapshots": 23,
+      "tensor_objects": 418,
+      "tensor_bytes": 16960108,
+      "capture_modes": {
+        "pd_autoregressive": 11,
+        "pd_speculative_accepted_target_path": 12
+      }
+    }
+  ],
+  "probes": [
+    {
+      "command": "'kubectl' 'exec' '-n' 'qiji' 'job-ea02689eb686-20261002041826-master-0' '-c' 'master' '--' 'env' 'PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/specforge-reference' 'PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' 'MC_STORE_MEMCPY=0' 'MC_GID_INDEX=3' 'MC_TE_METRIC=1' 'MC_TE_METRIC_INTERVAL_SECONDS=1' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python' '-m' 'sglang.test.training_capture_rdma' 'probe' '--setup' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/rdma-final-client-20261001.json' > /gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-rdma-final-probe-20261001.log 2>&1",
+      "returncode": 0,
+      "bytes": 1048576,
+      "sha256": "fbbab289f7f94b25736c58be46a994c441fd02552cc6022352e3d86d2fab7c83",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-rdma-final-probe-20261001.log"
+    },
+    {
+      "command": "'kubectl' 'exec' '-n' 'qiji' 'job-ea02689eb686-20261002041826-master-0' '-c' 'master' '--' 'env' 'PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/specforge-reference' 'PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' 'MC_STORE_MEMCPY=0' 'MC_GID_INDEX=3' 'MC_TE_METRIC=1' 'MC_TE_METRIC_INTERVAL_SECONDS=1' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python' '-m' 'sglang.test.training_capture_rdma' 'probe' '--setup' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/rdma-lifecycle-client-20261001.json' > /gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-rdma-lifecycle-probe-20261001.log 2>&1",
+      "returncode": 0,
+      "bytes": 1048576,
+      "sha256": "fbbab289f7f94b25736c58be46a994c441fd02552cc6022352e3d86d2fab7c83",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-rdma-lifecycle-probe-20261001.log"
+    }
+  ],
+  "store_commands": {
+    "runtime": "'kubectl' 'exec' '-n' 'qiji' 'job-ea02689eb686-20261002041826-worker-0' '-c' 'master' '--' 'env' 'PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/specforge-reference' 'PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' 'MC_STORE_MEMCPY=0' 'MC_GID_INDEX=3' 'MC_TE_METRIC=1' 'MC_TE_METRIC_INTERVAL_SECONDS=1' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python' '-m' 'sglang.test.training_capture_rdma' 'serve' '--host' '10.51.11.7' '--devices' 'mlx5_00' '--ready' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/rdma-final-ready-20261001.json' '--lifetime' '1800' > /gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-rdma-final-store-20261001.log 2>&1",
+    "lifecycle": "'kubectl' 'exec' '-n' 'qiji' 'job-ea02689eb686-20261002041826-worker-0' '-c' 'master' '--' 'env' 'PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/specforge-reference' 'PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' 'MC_STORE_MEMCPY=0' 'MC_GID_INDEX=3' 'MC_TE_METRIC=1' 'MC_TE_METRIC_INTERVAL_SECONDS=1' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python' '-m' 'sglang.test.training_capture_rdma' 'serve' '--host' '10.51.11.7' '--devices' 'mlx5_00' '--ready' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/rdma-lifecycle-ready-20261001.json' '--lifetime' '180' > /gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-rdma-lifecycle-store-20261001.log 2>&1"
+  },
+  "failed_attempts": [
+    {
+      "job": "job-d4303b326083-20261002040730",
+      "reason": "The ordinary small-GPU launcher removed RDMA resources and host networking. No transport experiment was run on these pods.",
+      "deleted": true
+    },
+    {
+      "job": "job-5643f9d4a6d7-20261002040959",
+      "probe_log": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-rdma-probe-20261001.log",
+      "store_log": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-rdma-store-20261001.log",
+      "store_command": "'kubectl' 'exec' '-n' 'qiji' 'job-5643f9d4a6d7-20261002040959-worker-0' '-c' 'master' '--' 'env' 'PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/specforge-reference' 'PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' 'MC_STORE_MEMCPY=0' 'MC_GID_INDEX=3' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python' '-m' 'sglang.test.training_capture_rdma' 'serve' '--host' '10.233.121.242' '--devices' 'mlx5_00' '--ready' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/rdma-ready-20261001.json' '--lifetime' '1800' > /gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-rdma-store-20261001.log 2>&1",
+      "probe_command": "'kubectl' 'exec' '-n' 'qiji' 'job-5643f9d4a6d7-20261002040959-master-0' '-c' 'master' '--' 'env' 'PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/specforge-reference' 'PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' 'MC_STORE_MEMCPY=0' 'MC_GID_INDEX=3' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python' '-m' 'sglang.test.training_capture_rdma' 'probe' '--setup' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/rdma-client-20261001.json' > /gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-rdma-probe-20261001.log 2>&1",
+      "probe_exit": 1,
+      "cause": "RDMA RTR failed with ENODEV in isolated network namespace despite visible verbs devices.",
+      "deleted": true
+    },
+    {
+      "probe_command": "'kubectl' 'exec' '-n' 'qiji' 'job-ea02689eb686-20261002041826-master-0' '-c' 'master' '--' 'env' 'PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/specforge-reference' 'PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' 'MC_STORE_MEMCPY=0' 'MC_GID_INDEX=3' 'MC_TE_METRIC=1' 'MC_TE_METRIC_INTERVAL_SECONDS=1' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python' '-m' 'sglang.test.training_capture_rdma' 'probe' '--setup' '/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/rdma-host-client-20261001.json' > /gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-rdma-host-probe-20261001.log 2>&1",
+      "probe_log": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-rdma-host-probe-20261001.log",
+      "returncode": 1,
+      "reason": "RDMA write and post-writer read succeeded with exact 1 MiB digest. Immediate normal deletion was rejected with OBJECT_HAS_LEASE=-706; probe cleanup now waits with a bounded deadline and force=False."
+    },
+    {
+      "reason": "The initial fixture lost its Python signal handler during SDK setup. Restoring it allowed parent shutdown, but terminating the wheel's Python CLI still left the native Master child. The final fixture closes the segment and reaps descendants while the wrapper can still wait for them.",
+      "runtime_store_pid": 460,
+      "wrapper_pid": 594,
+      "orphan_native_master_pid": 595,
+      "manual_cleanup": "Confirmed native child PID/command, sent SIGTERM, waited for the original Store exec handle to exit 0; no serving test or Store process was restarted on an observation timeout."
+    }
+  ],
+  "lifecycle": {
+    "ready": {
+      "pid": 905,
+      "master_pid": 1039,
+      "hostname": "node199",
+      "setup": {
+        "local_hostname": "10.51.11.7",
+        "master_server_addr": "10.51.11.7:55945",
+        "protocol": "rdma",
+        "metadata_server": "P2PHANDSHAKE",
+        "global_segment_size": 0,
+        "local_buffer_size": 16777216,
+        "rdma_devices": "mlx5_00"
+      },
+      "segment_bytes": 268435456
+    },
+    "native_master_pid": 1040,
+    "action": "SIGTERM to fixture PID 905 after successful fresh-client probe",
+    "returncode": 0,
+    "all_owned_pids_gone": [
+      905,
+      1039,
+      1040
+    ],
+    "probe_normal_lease_cleanup": true
+  },
+  "checks": {
+    "tests_passed": 6,
+    "black": "passed",
+    "isort": "passed",
+    "repository_ruff": "passed",
+    "new_helpers_broader_ruff": "passed",
+    "compileall": "passed",
+    "registered_test_registry": "passed",
+    "no_registered_tests_in_package": "passed"
+  },
+  "cleanup": {
+    "temporary_job_deleted": true,
+    "all_temporary_pods_not_found": true,
+    "pod_observation": "Error from server (NotFound): pods \"job-ea02689eb686-20261002041826-master-0\" not found\nError from server (NotFound): pods \"job-ea02689eb686-20261002041826-worker-0\" not found\nError from server (NotFound): pods \"job-5643f9d4a6d7-20261002040959-master-0\" not found\nError from server (NotFound): pods \"job-5643f9d4a6d7-20261002040959-worker-0\" not found\nError from server (NotFound): pods \"job-d4303b326083-20261002040730-master-0\" not found\nError from server (NotFound): pods \"job-d4303b326083-20261002040730-worker-0\" not found",
+    "process_checks_before_deletion": [
+      {
+        "node": "node174",
+        "check": "non-zombie process list",
+        "returncode": 0,
+        "output": "PID  PPID STAT COMMAND\n    1     0 Ss   sleep 7200\n 9684     0 Ss   bash -c ps -eo pid,ppid,stat,args | awk 'NR == 1 || $3 !~ /^Z/'\n 9690  9684 R    ps -eo pid,ppid,stat,args\n 9691  9684 S    awk NR == 1 || $3 !~ /^Z/"
+      },
+      {
+        "node": "node174",
+        "check": "GPU compute allocations",
+        "returncode": 0,
+        "output": ""
+      },
+      {
+        "node": "node199",
+        "check": "non-zombie process list",
+        "returncode": 0,
+        "output": "PID  PPID STAT COMMAND\n    1     0 Ss   sleep 7200\n 1318     0 Ss   bash -c ps -eo pid,ppid,stat,args | awk 'NR == 1 || $3 !~ /^Z/'\n 1324  1318 R    ps -eo pid,ppid,stat,args\n 1325  1318 S    awk NR == 1 || $3 !~ /^Z/"
+      },
+      {
+        "node": "node199",
+        "check": "GPU compute allocations",
+        "returncode": 0,
+        "output": ""
+      }
+    ],
+    "resident": {
+      "worker_id": "4837ce82e955447dbf70da0cf2ee55f3",
+      "hostname": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "pid": 1,
+      "mode": "idle_load",
+      "heartbeat_unix": 1790887311.993793,
+      "idle_pid": 6685,
+      "active_job": null,
+      "active_pid": null,
+      "queued": 0,
+      "paused": false,
+      "heartbeat_age_seconds": 0.9176080226898193
+    },
+    "original_index_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9",
+    "original_index_unchanged": true
+  },
+  "log_sha256": {
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-rdma-probe-20261001.log": "5b80376ccb021831c0387b7558b69786fd2dc7202b218eb537af08be02c4814c",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-rdma-store-20261001.log": "3bfb3a9dbeb67bcf1f56dde8f5f270b9cec2d56cf29dfb05127dc53020c3b011",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-rdma-host-probe-20261001.log": "8ed5dfb3da39c443f0cf6fa9ae5c143491193cc9d36f91cc672c61738fb16364",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-rdma-host-store-20261001.log": "2ec2ce002d4372f3ef186c19274207c7ff6bdd8be7ca26cfc7a9abab8dbf5ab7",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-rdma-final-probe-20261001.log": "26423fa5f8edf2f067e0ac52a3c89f46c186269b7a000739f9cdd99365c0c388",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-rdma-final-store-20261001.log": "5fa86e86bea5d33f7536609f03f540d6828309564a656f5fcb91212a016b2b4e",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-rdma-runtime-20261001.log": "69fec40fb4aaff6f1a964b806e6d79a5038accaf468af7a34bf788c06212c3b3",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-rdma-lifecycle-probe-20261001.log": "add9e24368a427481ffb22460065399573b1fe701ff14c3587046cf62c4f9e86",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-rdma-lifecycle-store-20261001.log": "8835ded3b8826a0fc6c55c980bd7e390a06dc3677beded85587f64b849101187",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790886295512191588-6b4aa556982f.log": "379fc627cba69928ab3f4f1c248260ef481aac3609ad55dbb051879b9d48682f"
+  },
+  "limitations": [
+    "The PD KV handoff itself remains local TCP in this experiment; cross-node P/D RDMA and distributed TP/PP RDMA remain open.",
+    "Test Catalog, synthetic untrained target-KV draft and one Qwen3 target identity do not validate production retention/consumer recovery, real training quality, trained exports or other target identities.",
+    "CPU registered-buffer transport only; no GPUDirect, replica failure recovery, storage persistence or production security deployment is certified.",
+    "Payload bytes and TransferEngine diagnostic metrics are not a workload throughput benchmark or SLO acceptance."
+  ]
+}

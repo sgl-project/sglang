@@ -465,6 +465,17 @@ Master 承担控制元数据，不是所有 tensor 的中转站。RDMA 只能依
 
 “直接读 Mooncake”是训练端独立读取数据，不承诺 V1 已实现 GPUDirect。GPU 直读是可选优化，需要验证 GPU buffer 注册、NIC/GPU 拓扑、SDK staging 行为、CUDA 可见性与错误时资源释放。
 
+当前已完成跨物理节点的 Host registered-buffer RDMA 验证：A 节点运行真实 Qwen3
+采集服务，B 节点独占 Store 数据段；所有 producer/reader 的 `global_segment_size=0`，
+指定 `protocol=rdma`、HCA 和 GID，并禁用本机 memcpy 路径。普通 AR 与 target-KV
+DSpark 的 eager/graph 四组用例通过，服务退出后由新进程读回全部 23 份样本
+（22 份正式测试样本及 1 份构造未训练 draft 的种子样本）。选层 KV、原始 top-128
+分数及 vocab IDs 与在线独立观测精确一致；全词表 LSE 使用 `rtol=atol=1e-6`。
+12 个 missing/stale handoff 或取消请求没有发布训练样本。
+此处 P/D 本身仍在 A 节点使用 TCP 交接 KV，不能据此宣称跨节点 PD RDMA 已验收。
+部署步骤见 [RDMA.md](experiments/RDMA.md)，证据见
+[capture-rdma-store.json](experiments/capture-rdma-store.json)。
+
 ### 8.3 提交协议
 
 1. Catalog 先登记 capture lease、owner 集合、预算和 generation，拿到 fencing token。
@@ -798,7 +809,8 @@ PD 的 TransferEngine KV 交接不是 Store 样本提交，两个完成事件分
 
 `pd_capture.py` 实现 D 统一导出路径。当前接入 Mooncake backend、DP=1，
 普通 AR 支持 TP 分片与 PP；DSpark 推测采集支持 TP、要求 PP=1。
-PP speculative 和跨节点 RDMA 仍需后续实现与验证。
+PP speculative 和跨节点 P/D RDMA 仍需后续实现与验证；跨节点 Store RDMA 的
+独立验收范围见第 8.2 节。
 AR 的 P/D TP 数可以不同，模型必须满足全局 teacher/KV 契约。
 PP 遵守现有 Mooncake 传输约束：P/D 的 PP 数相同，或 D 的 PP 数为 1；
 P=PP1、D=PP2 等展开拓扑仍不受底层传输支持。
