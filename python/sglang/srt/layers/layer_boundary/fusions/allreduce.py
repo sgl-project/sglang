@@ -130,6 +130,7 @@ def attn_input_fusions(plan, read=NORM_QUANT_READOUT) -> Tuple[Callable, ...]:
         return given
     declares_quant = (
         isinstance(read, NormQuantReadout)
+    )
     fuses_quant = (
         isinstance(read, NormQuantReadout)
         and read.fp8_input is not None
