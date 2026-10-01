@@ -984,6 +984,34 @@ class TestCosmosDreamsUnifiedContract(unittest.TestCase):
                 root, parse_cosmos_dreams_manifest(bad).action_contract
             )
 
+    def test_unified_normalizer_resolves_hub_ids_through_the_snapshot(self):
+        # --model-path nvidia/Cosmos3-Nano-Sim-Bimanual: the statistics file lives in
+        # the cached snapshot, not under the literal id.
+        requested = []
+
+        def fake_component_path(component: str) -> str:
+            requested.append(component)
+            return os.path.join(root, "cosmos3_nano_sim_bimanual_action_sources")
+
+        with tempfile.TemporaryDirectory() as root:
+            _write_unified_export(root)
+            with mock.patch(
+                "sglang.multimodal_gen.runtime.utils.hf_diffusers_utils."
+                "prepare_diffusers_component_path_for_loading",
+                side_effect=fake_component_path,
+            ):
+                normalizer = load_unified_normalizer(
+                    "nvidia/Cosmos3-Nano-Sim-Bimanual",
+                    UNIFIED_MANIFEST.action_contract,
+                )
+        self.assertEqual(
+            requested,
+            [
+                "nvidia/Cosmos3-Nano-Sim-Bimanual/cosmos3_nano_sim_bimanual_action_sources"
+            ],
+        )
+        self.assertEqual(normalizer.scale, (1.0,) * 59)
+
     def test_unified_request_defaults_follow_the_training_loader(self):
         config = CosmosDreamsConfig()
         config.unified_actions = True

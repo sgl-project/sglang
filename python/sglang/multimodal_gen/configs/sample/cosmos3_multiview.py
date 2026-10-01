@@ -280,20 +280,31 @@ def validate_multiview_request(multiview: Any) -> list[dict[str, Any]]:
     return views
 
 
-def validate_lidar_request(lidar: Any) -> dict[str, Any]:
-    """Validate the joint camera/LiDAR ``lidar`` object: one prepared control clip.
+# Measured sweeps conditioned when ``lidar.condition_path`` omits a count, as in
+# the reference inference.
+COSMOS3_LIDAR_DEFAULT_CONDITION_SWEEPS = 1
 
-    ``decode`` (default false) asks for the LiDAR output as well: the denoised
-    LiDAR latents are decoded to range maps and written next to the camera
-    video. By default a joint request returns only the camera video.
+
+def validate_lidar_request(lidar: Any) -> dict[str, Any]:
+    """Validate the joint camera/LiDAR ``lidar`` object.
+
+    ``control_path`` is the prepared HD-map range-map clip every joint request
+    needs. ``decode`` (default false) asks for the LiDAR output as well: the
+    denoised LiDAR latents are decoded to range maps and written next to the
+    camera video. ``condition_path`` (optional) holds measured sweeps in the same
+    tensor format; the first ``num_conditional_sweeps`` (default 1) of them are
+    kept clean as the start of the generated LiDAR, the way the camera's first
+    frame anchors the RGB targets.
     """
     if not isinstance(lidar, dict):
         raise ValueError(f"lidar must be a JSON object, got {type(lidar).__name__}.")
-    unknown = set(lidar) - {"control_path", "decode"}
+    allowed = {"control_path", "decode", "condition_path", "num_conditional_sweeps"}
+    unknown = set(lidar) - allowed
     if unknown or not isinstance(lidar.get("control_path"), str):
         raise ValueError(
             "Cosmos3 lidar requires a control_path string and accepts only the "
-            f"optional decode flag; got keys {sorted(lidar)}."
+            f"optional decode, condition_path and num_conditional_sweeps fields; "
+            f"got keys {sorted(lidar)}."
         )
     path = lidar["control_path"].strip()
     if os.path.splitext(path)[1].lower() not in COSMOS3_LIDAR_CONTROL_SUFFIXES:
@@ -304,7 +315,36 @@ def validate_lidar_request(lidar: Any) -> dict[str, Any]:
     decode = lidar.get("decode", False)
     if isinstance(decode, bool) is False:
         raise ValueError(f"Cosmos3 lidar.decode must be a boolean, got {decode!r}.")
-    return {"control_path": path, "decode": decode}
+    condition = lidar.get("condition_path")
+    if condition is not None:
+        if (
+            not isinstance(condition, str)
+            or os.path.splitext(condition.strip())[1].lower()
+            not in COSMOS3_LIDAR_CONTROL_SUFFIXES
+        ):
+            raise ValueError(
+                "Cosmos3 lidar.condition_path must be a prepared range-map tensor "
+                f"({sorted(COSMOS3_LIDAR_CONTROL_SUFFIXES)}), got {condition!r}."
+            )
+        condition = condition.strip()
+    count = lidar.get("num_conditional_sweeps")
+    if count is not None:
+        if condition is None:
+            raise ValueError(
+                "Cosmos3 lidar.num_conditional_sweeps requires lidar.condition_path."
+            )
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+            raise ValueError(
+                f"Cosmos3 lidar.num_conditional_sweeps must be a positive integer, got {count!r}."
+            )
+    elif condition is not None:
+        count = COSMOS3_LIDAR_DEFAULT_CONDITION_SWEEPS
+    return {
+        "control_path": path,
+        "decode": decode,
+        "condition_path": condition,
+        "num_conditional_sweeps": count,
+    }
 
 
 @dataclass
@@ -348,6 +388,12 @@ class Cosmos3MultiviewSamplingParams(Cosmos3SamplingParams):
     condition_video_as_image: bool | None = None
     # Metadata sentences carried by the negative prompt: none, same, or inverse.
     negative_metadata_mode: str = "same"
+    # Per-camera-caption exports ignore negative_prompt: their unconditional
+    # branch is one empty caption per camera, as training's caption dropout
+    # produced. This opts into a shared negative caption instead, formatted with
+    # the same duration/resolution metadata as every positive caption and
+    # tokenized once per camera.
+    per_view_negative_prompt: str | None = None
     # Append the control-adherence sentence to every caption (checkpoint default).
     emphasize_control_in_prompt: bool | None = None
     # Rescale the guided velocity to the conditional branch's norm.
@@ -370,6 +416,7 @@ class Cosmos3MultiviewSamplingParams(Cosmos3SamplingParams):
                 "aspect_ratio",
                 "condition_video_as_image",
                 "negative_metadata_mode",
+                "per_view_negative_prompt",
                 "emphasize_control_in_prompt",
                 "normalize_cfg",
             }
@@ -398,7 +445,12 @@ class Cosmos3MultiviewSamplingParams(Cosmos3SamplingParams):
                     kwargs.pop(name)
                 else:
                     kwargs[name] = value
-        for name in ("negative_metadata_mode", "resolution", "aspect_ratio"):
+        for name in (
+            "negative_metadata_mode",
+            "resolution",
+            "aspect_ratio",
+            "per_view_negative_prompt",
+        ):
             if name in kwargs:
                 value = kwargs[name]
                 if value is None or not str(value).strip():
@@ -548,6 +600,10 @@ class Cosmos3MultiviewSamplingParams(Cosmos3SamplingParams):
             value = getattr(self, name)
             if value is not None and not isinstance(value, bool):
                 raise ValueError(f"{name} must be a boolean or null.")
+        if self.per_view_negative_prompt is not None and not isinstance(
+            self.per_view_negative_prompt, str
+        ):
+            raise ValueError("per_view_negative_prompt must be a string or null.")
 
     def _apply_deployment_defaults(self, deployment: Any) -> None:
         """Fill request fields the caller left unset from the export's defaults."""

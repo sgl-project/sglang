@@ -19,6 +19,8 @@ import torch
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3_multiview import (
     COSMOS3_MADS_CAMERAS,
+    COSMOS3_MULTIVIEW_CONTRACT_FIELDS,
+    MULTIVIEW_BACKEND_ENV_VAR,
     Cosmos3MultiviewConfig,
     parse_multiview_deployment_config,
     validate_lidar_config,
@@ -41,8 +43,24 @@ from sglang.multimodal_gen.runtime.models.dits import (
     cosmos3_multiview_maskless as maskless_module,
 )
 from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview import (
+    add_rig_view_rows,
+    lidar_patch_grid,
     pack_state,
+    patchify_lidar,
+    spatial_patch_hw,
     unpack_state,
+    unpatchify_lidar,
+)
+from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_attention import (
+    TRITON_SPARSE_BLOCK_SIZES,
+    MultiviewBlockSparsity,
+    build_multiview_block_sparsity,
+    build_multiview_flex_metadata,
+    fa4_sparse_block_sizes,
+    get_multiview_attention_plan,
+    layout_sparse_block_sizes,
+    multiview_pair_predicate,
+    padded_multiview_flex_attention,
 )
 from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_layout import (
     MaskItem,
@@ -86,6 +104,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     Cosmos3MultiviewInputStage,
     fit_uint8_cthw,
     format_multiview_prompts,
+    format_per_view_negative_prompt,
     format_per_view_prompts,
     format_separate_view_captions,
     media_kind,
@@ -95,7 +114,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
 from sglang.multimodal_gen.runtime.utils.vision import load_video
 
 # ``transformer/config.json["multiview"]`` of the Sep-14 2026 export (HF 3e7d669): masked
-# Triton backend, unversioned. Kept only to pin that such exports are refused.
+# Triton backend, unversioned, no temporal window.
 LEGACY_BLOCK = {
     "align_temporal_positions_across_views": True,
     "attention_scope": "decomposed",
@@ -191,6 +210,37 @@ SCHEMA2_BLOCK = {
     "lidar_attends_captions": True,
 }
 DEPLOYMENT_BLOCK = SCHEMA2_BLOCK
+# The physical MADS camera ids of the Oct-1 2026 export's rig view embedding.
+RIG_VIEW_EMBEDDING = {
+    "camera_ids": {
+        "camera_cross_left_120fov": 5,
+        "camera_cross_right_120fov": 1,
+        "camera_front_fisheye_200fov": 7,
+        "camera_front_tele_30fov": 6,
+        "camera_front_wide_120fov": 0,
+        "camera_left_fisheye_200fov": 8,
+        "camera_rear_fisheye_200fov": 10,
+        "camera_rear_left_70fov": 4,
+        "camera_rear_right_70fov": 2,
+        "camera_rear_tele_30fov": 3,
+        "camera_right_fisheye_200fov": 9,
+    },
+    "lidar_id": 11,
+    "num_embeddings": 12,
+}
+# ``transformer/config.json["multiview"]`` of the Oct-1 2026 joint export (HF b3176c9):
+# masked family with a 0.4 s past window, rig view embedding, 1x1 LiDAR patch,
+# LiDAR tokenizer streaming 20 sweeps per chunk with 21 of context.
+SCHEMA3_BLOCK = {
+    **{k: v for k, v in SCHEMA2_BLOCK.items() if k != "separate_view_text_tokenization"},
+    "backend": "triton",
+    "decomposed_temporal_window_seconds": 0.4,
+    "schema_version": 3,
+    "per_view_captions": True,
+    "lidar": {**LIDAR_BLOCK, "streaming_chunk_frames": 20, "streaming_context_frames": 21},
+    "lidar_patch_spatial_hw": [1, 1],
+    "rig_view_embedding": RIG_VIEW_EMBEDDING,
+}
 
 
 def _adjust_multiview(params, deployment):
@@ -204,10 +254,773 @@ def _adjust_multiview(params, deployment):
 def _transformer_config(multiview=None, backbone_type="cosmos3_multiview"):
     return {
         "backbone_type": backbone_type,
+        "latent_patch_size": 2,
         "multiview": copy.deepcopy(
             DEPLOYMENT_BLOCK if multiview is None else multiview
         ),
     }
+
+
+def _fa4_available() -> bool:
+    """FA4 CuTe block-sparse kernels exist for SM90 and SM100 and need the package."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (
+        9,
+        10,
+    ):
+        return False
+    try:
+        import cutlass  # noqa: F401
+        import flash_attn.cute  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def _tiny_metadata(
+    attention_scope="decomposed",
+    *,
+    decomposed_temporal_window_seconds=None,
+    control_attends_sensor=False,
+):
+    """Two views x two frames x one patch per item, two real text tokens, no padding.
+
+    Sequence: [T0 T1 | Wa0 Wa1 Wb0 Wb1 | Ra0 Ra1 Rb0 Rb1].
+    """
+    item = MaskItem(token_shape=(4, 1, 1), num_views=2, seconds_per_frame=0.5)
+    control = MaskItem(
+        token_shape=(4, 1, 1), num_views=2, is_control=True, seconds_per_frame=0.5
+    )
+    return build_multiview_flex_metadata(
+        seq_len=10,
+        full_q_offsets=(2, 6, 10),
+        items_per_sample=(control, item),
+        device="cpu",
+        num_und=2,
+        attention_scope=attention_scope,
+        decomposed_temporal_window_seconds=decomposed_temporal_window_seconds,
+        control_attends_sensor=control_attends_sensor,
+    )
+
+
+# Truth table transcribed from the Multiview-AV visibility spec, one row per
+# (query role, key role). Deliberately not the boolean expression the
+# implementation evaluates, so a sign error cannot cancel out.
+_SPEC_VISIBILITY = {
+    ("control", "und"): "always",
+    ("control", "control"): "same_view",
+    ("control", "sensor"): "configured_same_view",
+    ("sensor", "und"): "always",
+    ("sensor", "control"): "same_view",
+    ("sensor", "sensor"): "in_scope",
+}
+
+
+def _token_role(vectors, index):
+    if bool(vectors[4][index]):
+        return "und"
+    if bool(vectors[3][index]):
+        return "control"
+    return "sensor"
+
+
+def _spec_visible(
+    q_role,
+    k_role,
+    *,
+    same_sample,
+    same_view,
+    same_frame,
+    within_temporal_window,
+    attention_scope,
+    has_temporal_window,
+    control_attends_sensor,
+):
+    if not same_sample:
+        return False
+    rule = _SPEC_VISIBILITY[(q_role, k_role)]
+    if rule == "always":
+        return True
+    if rule == "same_view":
+        return same_view
+    if rule == "configured_same_view":
+        return control_attends_sensor and same_view
+    if attention_scope == "all_views":
+        return True
+    if attention_scope == "same_view":
+        return same_view
+    return same_view or (within_temporal_window if has_temporal_window else same_frame)
+
+
+def _dense_masked_oracle(q, k, v, k_und, v_und, layout, real_und_len):
+    """Dense masked GQA attention over [text | GEN] in float32, from the pair predicate."""
+    padded_und = ((layout.max_und_tokens + 63) // 64) * 64
+    padded_q = ((layout.gen_tokens + 63) // 64) * 64
+    offsets = [padded_und]
+    for item in layout.items:
+        offsets.append(offsets[-1] + item.num_tokens)
+    metadata = build_multiview_flex_metadata(
+        seq_len=padded_und + padded_q,
+        full_q_offsets=tuple(offsets),
+        items_per_sample=layout.items,
+        device="cpu",
+        num_und=real_und_len,
+        attention_scope=layout.attention_scope,
+        decomposed_temporal_window_seconds=layout.decomposed_temporal_window_seconds,
+        control_attends_sensor=layout.control_attends_sensor,
+        caption_lengths=layout.caption_lengths,
+        lidar_attends_captions=layout.lidar_attends_captions,
+    )
+    gen = layout.gen_tokens
+    q_index = torch.arange(gen)[:, None]
+    key_index = torch.cat([torch.arange(real_und_len), padded_und + torch.arange(gen)])[
+        None, :
+    ]
+    mask = multiview_pair_predicate(metadata, q_index, key_index)
+    keys = torch.cat([k_und, k], dim=1).float()
+    values = torch.cat([v_und, v], dim=1).float()
+    group = q.shape[2] // k.shape[2]
+    keys = keys.repeat_interleave(group, dim=2)
+    values = values.repeat_interleave(group, dim=2)
+    scores = torch.einsum("bqhd,bkhd->bhqk", q.float(), keys) / (q.shape[-1] ** 0.5)
+    scores = scores.masked_fill(~mask[None, None], float("-inf"))
+    probs = scores.softmax(dim=-1)
+    return torch.einsum("bhqk,bkhd->bqhd", probs, values)
+
+
+class TestVisibilityPredicate(unittest.TestCase):
+    def test_metadata_is_camera_major_and_marks_padding(self):
+        item = MaskItem(token_shape=(6, 1, 2), num_views=2, seconds_per_frame=0.4)
+        metadata = build_multiview_flex_metadata(
+            seq_len=18,
+            full_q_offsets=(4, 16),
+            items_per_sample=(item,),
+            device="cpu",
+            num_und=3,
+            attention_scope="same_view",
+        )
+        self.assertEqual(
+            metadata.sample_id.tolist(), [0, 0, 0, -1] + [0] * 12 + [-1, -1]
+        )
+        self.assertEqual(metadata.is_und.tolist(), [True] * 3 + [False] * 15)
+        self.assertEqual(
+            metadata.frame_id[4:16].tolist(), [0, 0, 1, 1, 2, 2, 0, 0, 1, 1, 2, 2]
+        )
+        self.assertEqual(metadata.view_id[4:16].tolist(), [0] * 6 + [1] * 6)
+        torch.testing.assert_close(
+            metadata.timestamp[4:16],
+            torch.tensor([0.0, 0.0, 0.4, 0.4, 0.8, 0.8] * 2),
+        )
+        self.assertEqual(metadata.q_len, 14)
+        self.assertEqual(metadata.kv_len, 18)
+
+    def test_predicate_matches_spec_truth_table(self):
+        for attention_scope in ("all_views", "same_view", "decomposed"):
+            for control_attends_sensor in (False, True):
+                for temporal_window in (None, 0.5):
+                    with self.subTest(
+                        scope=attention_scope,
+                        control_attends_sensor=control_attends_sensor,
+                        window=temporal_window,
+                    ):
+                        metadata = _tiny_metadata(
+                            attention_scope,
+                            decomposed_temporal_window_seconds=temporal_window,
+                            control_attends_sensor=control_attends_sensor,
+                        )
+                        q_index = torch.arange(metadata.q_len)[:, None]
+                        kv_index = torch.arange(metadata.kv_len)[None, :]
+                        actual = multiview_pair_predicate(metadata, q_index, kv_index)
+                        q_vectors = metadata.query_vectors()
+                        k_vectors = metadata.key_vectors()
+                        expected = torch.zeros_like(actual)
+                        covered = set()
+                        for q in range(metadata.q_len):
+                            q_role = _token_role(q_vectors, q)
+                            for k in range(metadata.kv_len):
+                                k_role = _token_role(k_vectors, k)
+                                covered.add((q_role, k_role))
+                                gap = float(q_vectors[5][q]) - float(k_vectors[5][k])
+                                expected[q, k] = _spec_visible(
+                                    q_role,
+                                    k_role,
+                                    same_sample=int(q_vectors[0][q])
+                                    == int(k_vectors[0][k]),
+                                    same_view=int(q_vectors[2][q])
+                                    == int(k_vectors[2][k]),
+                                    same_frame=int(q_vectors[1][q])
+                                    == int(k_vectors[1][k]),
+                                    within_temporal_window=(
+                                        -1e-4 <= gap <= (temporal_window or 0.0) + 1e-4
+                                    ),
+                                    attention_scope=attention_scope,
+                                    has_temporal_window=temporal_window is not None,
+                                    control_attends_sensor=control_attends_sensor,
+                                )
+                        self.assertEqual(covered, set(_SPEC_VISIBILITY))
+                        self.assertTrue(actual[:, :2].all())
+                        torch.testing.assert_close(actual, expected)
+
+    def test_visibility_rule_examples(self):
+        metadata = _tiny_metadata()
+
+        def visible(q, keys):
+            return multiview_pair_predicate(
+                metadata, torch.tensor(q), torch.tensor(keys)
+            ).tolist()
+
+        # Control token camera A frame 0: text and own-camera control only.
+        self.assertEqual(
+            visible(0, [0, 1, 2, 3, 4, 6]), [True, True, True, True, False, False]
+        )
+        # RGB camera A frame 0: own-camera RGB at every frame, camera B RGB at
+        # frame 0 only, own-camera control at every frame.
+        self.assertEqual(
+            visible(4, [2, 3, 6, 7, 8, 9]), [True, True, True, True, True, False]
+        )
+        self.assertEqual(
+            visible(5, [2, 3, 6, 7, 8, 9]), [True, True, True, True, False, True]
+        )
+        # control_attends_sensor opens the own-camera RGB keys to control queries.
+        enabled = _tiny_metadata(control_attends_sensor=True)
+        self.assertEqual(
+            multiview_pair_predicate(
+                enabled, torch.tensor(0), torch.tensor([6, 7, 8])
+            ).tolist(),
+            [True, True, False],
+        )
+
+    def test_padding_queries_attend_only_padding(self):
+        for attention_scope in ("all_views", "same_view", "decomposed"):
+            with self.subTest(scope=attention_scope):
+                item = MaskItem(token_shape=(2, 1, 2), num_views=1)
+                metadata = build_multiview_flex_metadata(
+                    seq_len=9,
+                    full_q_offsets=(3, 7),
+                    items_per_sample=(item,),
+                    device="cpu",
+                    num_und=2,
+                    attention_scope=attention_scope,
+                )
+                allowed = multiview_pair_predicate(
+                    metadata,
+                    torch.arange(metadata.q_len)[:, None],
+                    torch.arange(metadata.kv_len)[None, :],
+                )
+                q_padding = metadata.query_vectors()[0] == -1
+                kv_padding = metadata.sample_id == -1
+                self.assertTrue(allowed[q_padding][:, kv_padding].all())
+                self.assertFalse(allowed[q_padding][:, ~kv_padding].any())
+                self.assertFalse(allowed[~q_padding][:, kv_padding].any())
+                self.assertTrue(allowed[q_padding].any(dim=-1).all())
+
+    def test_decomposed_temporal_window_boundaries(self):
+        cases = [
+            (1.0, 1.0, 0.5, True),
+            (1.0, 0.5, 0.5, True),
+            (1.0, 0.4998, 0.5, False),
+            (1.0, 1.00009, 0.5, True),
+            (1.0, 1.0002, 0.5, False),
+        ]
+        for q_timestamp, k_timestamp, window, expected in cases:
+            with self.subTest(q=q_timestamp, k=k_timestamp):
+                metadata = _tiny_metadata(decomposed_temporal_window_seconds=window)
+                # Two RGB tokens of different cameras and frames: only the
+                # temporal window decides.
+                metadata.timestamp[6] = q_timestamp
+                metadata.timestamp[9] = k_timestamp
+                allowed = multiview_pair_predicate(
+                    metadata, torch.tensor(4), torch.tensor([9])
+                )
+                self.assertEqual(bool(allowed[0]), expected)
+
+    def test_window_is_past_only_and_registers_lidar_sweeps_by_capture_time(self):
+        """The Oct-1 export's 0.4 s window: a sensor query reaches other views'
+        sensor keys captured at the same instant or up to 0.4 s earlier, never
+        later; 10 Hz LiDAR sweeps register against 7.5 Hz camera latents by
+        wall-clock time, each key counted once."""
+        camera = (4, 1, 1)  # 2 views x 2 frames at 0.4 s: t = 0.0, 0.4
+        lidar = (8, 1, 1)  # 8 sweeps at 0.1 s: t = 0.0 .. 0.7
+        items = (
+            MaskItem(camera, 2, is_control=True, seconds_per_frame=0.4),
+            MaskItem(camera, 2, seconds_per_frame=0.4),
+            MaskItem(lidar, 1, view_offset=2, is_control=True, seconds_per_frame=0.1, is_lidar=True),
+            MaskItem(lidar, 1, view_offset=2, seconds_per_frame=0.1, is_lidar=True),
+        )
+        offsets = [2]
+        for item in items:
+            offsets.append(offsets[-1] + item.num_tokens)
+        metadata = build_multiview_flex_metadata(
+            seq_len=offsets[-1],
+            full_q_offsets=tuple(offsets),
+            items_per_sample=items,
+            device="cpu",
+            num_und=2,
+            decomposed_temporal_window_seconds=0.4,
+            control_attends_sensor=True,
+        )
+        rgb = offsets[1]  # [A0 A1 B0 B1]
+        sweeps = offsets[3]  # [S0 .. S7]
+        query_start = offsets[0]
+
+        def sees(token, keys):
+            # Query indexes are relative to the first GEN token; keys are absolute.
+            return multiview_pair_predicate(
+                metadata, torch.tensor(token - query_start), torch.tensor(keys)
+            ).tolist()
+
+        # Camera A frame 1 (t=0.4): camera B at t=0.4 and t=0.0, LiDAR sweeps 0..4.
+        self.assertEqual(sees(rgb + 1, [rgb + 2, rgb + 3]), [True, True])
+        self.assertEqual(
+            sees(rgb + 1, [sweeps + s for s in range(8)]),
+            [True, True, True, True, True, False, False, False],
+        )
+        # Camera A frame 0 (t=0.0): only the same instant of camera B, sweep 0.
+        self.assertEqual(sees(rgb, [rgb + 2, rgb + 3]), [True, False])
+        self.assertEqual(sees(rgb, [sweeps, sweeps + 1]), [True, False])
+        # LiDAR sweep 7 (t=0.7): camera frame 1 (t=0.4) but not frame 0 (0.7 s back).
+        self.assertEqual(sees(sweeps + 7, [rgb, rgb + 1]), [False, True])
+        # Own view is always reachable at every frame (same-view rule), once.
+        self.assertEqual(sees(rgb + 1, [rgb, rgb + 1]), [True, True])
+        full = multiview_pair_predicate(
+            metadata,
+            torch.arange(metadata.q_len)[:, None],
+            torch.arange(metadata.kv_len)[None, :],
+        )
+        self.assertEqual(full.dtype, torch.bool)
+
+    def test_rejects_mixed_view_offsets_without_window(self):
+        first = MaskItem(token_shape=(2, 1, 1), num_views=1)
+        second = MaskItem(token_shape=(2, 1, 1), num_views=1, view_offset=1)
+        with self.assertRaisesRegex(ValueError, "mixed view offsets"):
+            build_multiview_flex_metadata(
+                seq_len=6,
+                full_q_offsets=(2, 4, 6),
+                items_per_sample=(first, second),
+                device="cpu",
+                num_und=2,
+            )
+
+
+class TestBlockSparsity(unittest.TestCase):
+    def _metadata(self, control_attends_sensor=True):
+        control = MaskItem(token_shape=(4, 1, 2), num_views=2, is_control=True)
+        target = MaskItem(token_shape=(4, 1, 2), num_views=2)
+        # 8 padded text slots (3 real) + 8 control + 8 target tokens.
+        return build_multiview_flex_metadata(
+            seq_len=24,
+            full_q_offsets=(8, 16, 24),
+            items_per_sample=(control, target),
+            device="cpu",
+            num_und=3,
+            control_attends_sensor=control_attends_sensor,
+        )
+
+    def test_block_classification_matches_dense_projection(self):
+        metadata = self._metadata()
+        q_block, kv_block = 4, 4
+        sparsity = build_multiview_block_sparsity(
+            metadata, q_block_size=q_block, kv_block_size=kv_block
+        )
+        dense = multiview_pair_predicate(
+            metadata,
+            torch.arange(metadata.q_len)[:, None],
+            torch.arange(metadata.kv_len)[None, :],
+        )
+        num_q_blocks = metadata.q_len // q_block
+        num_kv_blocks = metadata.kv_len // kv_block
+        for qb in range(num_q_blocks):
+            full = set(
+                sparsity.full_indices[qb, : int(sparsity.full_counts[qb])].tolist()
+            )
+            partial = set(
+                sparsity.partial_indices[
+                    qb, : int(sparsity.partial_counts[qb])
+                ].tolist()
+            )
+            self.assertFalse(full & partial)
+            for kb in range(num_kv_blocks):
+                tile = dense[
+                    qb * q_block : (qb + 1) * q_block,
+                    kb * kv_block : (kb + 1) * kv_block,
+                ]
+                if tile.all():
+                    self.assertIn(kb, full, (qb, kb))
+                elif tile.any():
+                    self.assertIn(kb, partial, (qb, kb))
+                else:
+                    self.assertNotIn(kb, full | partial, (qb, kb))
+        # Full-width contiguous index layout, as create_block_mask produces.
+        self.assertEqual(sparsity.full_indices.shape, (num_q_blocks, num_kv_blocks))
+        self.assertEqual(sparsity.partial_indices.shape, (num_q_blocks, num_kv_blocks))
+
+    def test_run_table_reproduces_the_pair_predicate(self):
+        metadata = self._metadata()
+        sparsity = build_multiview_block_sparsity(
+            metadata, q_block_size=4, kv_block_size=4
+        )
+        dense = multiview_pair_predicate(
+            metadata,
+            torch.arange(metadata.q_len)[:, None],
+            torch.arange(metadata.kv_len)[None, :],
+        )
+        q_groups = (sparsity.q_word_base // sparsity.words_per_row).long()
+        k_groups = sparsity.k_group_ids.long()
+        via_table = sparsity.group_allowed[q_groups[:, None], k_groups[None, :]]
+        torch.testing.assert_close(via_table, dense)
+        # Packed words round-trip bit by bit.
+        words = (
+            sparsity.allowed_words.view(-1, sparsity.words_per_row).to(torch.int64)
+            & 0xFFFFFFFF
+        )
+        bits = (words[:, :, None] >> torch.arange(32)) & 1
+        unpacked = bits.reshape(words.shape[0], -1)[
+            :, : sparsity.group_allowed.shape[1]
+        ]
+        torch.testing.assert_close(unpacked.bool(), sparsity.group_allowed)
+
+    def test_block_mask_carries_block_visibility_and_exact_mask_mod(self):
+        metadata = self._metadata()
+        q_block, kv_block = 4, 4
+        sparsity = build_multiview_block_sparsity(
+            metadata, q_block_size=q_block, kv_block_size=kv_block
+        )
+        block_mask = sparsity.to_block_mask()
+        self.assertEqual(block_mask.seq_lengths, (metadata.q_len, metadata.kv_len))
+        dense = multiview_pair_predicate(
+            metadata,
+            torch.arange(metadata.q_len)[:, None],
+            torch.arange(metadata.kv_len)[None, :],
+        )
+        # ``to_dense`` is block-granular: a block is visible when any pair is.
+        visible_blocks = dense.view(
+            metadata.q_len // q_block, q_block, metadata.kv_len // kv_block, kv_block
+        ).any(dim=(1, 3))
+        torch.testing.assert_close(block_mask.to_dense()[0, 0].bool(), visible_blocks)
+        # Inside partial blocks the kernel consults mask_mod, which must be the
+        # exact predicate.
+        q_idx = torch.arange(metadata.q_len)[:, None]
+        kv_idx = torch.arange(metadata.kv_len)[None, :]
+        torch.testing.assert_close(
+            block_mask.mask_mod(torch.tensor(0), torch.tensor(0), q_idx, kv_idx), dense
+        )
+
+
+class TestPaddedFlexAttention(unittest.TestCase):
+    """Backends 'triton'/'fa4': one masked attention over [UND | GEN]."""
+
+    def _run(self, device, dtype, atol, rtol, backend="triton", layout=None):
+        torch.manual_seed(0)
+        if layout is None:
+            layout = MultiviewLayout(
+                num_views=2,
+                latent_frames=6,
+                patch_height=2,
+                patch_width=3,
+                control_attends_sensor=True,
+                seconds_per_frame=0.2,
+                backend=backend,
+                max_und_tokens=70,
+            )
+        heads, kv_heads, head_dim = 4, 2, 16
+        real_und_len = sum(layout.caption_lengths) or 7
+        gen = layout.gen_tokens
+        q = torch.randn(1, gen, heads, head_dim, device=device, dtype=dtype)
+        k = torch.randn(1, gen, kv_heads, head_dim, device=device, dtype=dtype)
+        v = torch.randn(1, gen, kv_heads, head_dim, device=device, dtype=dtype)
+        k_und = torch.randn(
+            1, real_und_len, kv_heads, head_dim, device=device, dtype=dtype
+        )
+        v_und = torch.randn(
+            1, real_und_len, kv_heads, head_dim, device=device, dtype=dtype
+        )
+        context = MultiviewAttentionContext(layout, {}, {}, {})
+        out = padded_multiview_flex_attention(q, k, v, k_und, v_und, context)
+        self.assertEqual(tuple(out.shape), (1, gen, heads, head_dim))
+        expected = _dense_masked_oracle(
+            q.cpu(), k.cpu(), v.cpu(), k_und.cpu(), v_und.cpu(), layout, real_und_len
+        )
+        torch.testing.assert_close(out.float().cpu(), expected, atol=atol, rtol=rtol)
+        return context
+
+    def test_cpu_matches_dense_masked_gqa_oracle(self):
+        context = self._run(torch.device("cpu"), torch.float32, atol=1e-4, rtol=1e-4)
+        # One plan per (layout, text length) and reusable packing buffers.
+        self.assertEqual(len(context.mask_cache), 1)
+        self.assertEqual(
+            {key[0].split(":")[1] for key in context.buffer_cache}, {"q", "k", "v"}
+        )
+
+    def test_cpu_windowed_joint_layout_matches_dense_oracle(self):
+        """The Oct-1 contract: 0.4 s past window, per-camera captions, LiDAR at 10 Hz."""
+        camera = (4, 1, 2)  # 2 views x 2 frames at 0.4 s
+        lidar = (8, 1, 1)  # 8 sweeps at 0.1 s
+        layout = MultiviewLayout(
+            num_views=2,
+            latent_frames=4,
+            patch_height=1,
+            patch_width=2,
+            control_attends_sensor=True,
+            seconds_per_frame=0.4,
+            decomposed_temporal_window_seconds=0.4,
+            backend="triton",
+            max_und_tokens=70,
+            items=(
+                MaskItem(camera, 2, is_control=True, seconds_per_frame=0.4),
+                MaskItem(camera, 2, seconds_per_frame=0.4),
+                MaskItem(lidar, 1, view_offset=2, is_control=True, seconds_per_frame=0.1, is_lidar=True),
+                MaskItem(lidar, 1, view_offset=2, seconds_per_frame=0.1, is_lidar=True),
+            ),
+            caption_lengths=(3, 2),
+        )
+        self._run(torch.device("cpu"), torch.float32, atol=1e-4, rtol=1e-4, layout=layout)
+
+    def test_padding_capacity_does_not_change_the_output(self):
+        torch.manual_seed(1)
+        base = dict(
+            num_views=2,
+            latent_frames=4,
+            patch_height=1,
+            patch_width=2,
+            seconds_per_frame=0.5,
+            backend="triton",
+        )
+        small = MultiviewLayout(max_und_tokens=10, **base)
+        large = MultiviewLayout(max_und_tokens=200, **base)
+        gen = small.gen_tokens
+        q = torch.randn(1, gen, 2, 8)
+        k = torch.randn(1, gen, 1, 8)
+        v = torch.randn(1, gen, 1, 8)
+        k_und = torch.randn(1, 5, 1, 8)
+        v_und = torch.randn(1, 5, 1, 8)
+        out_small = padded_multiview_flex_attention(
+            q, k, v, k_und, v_und, MultiviewAttentionContext(small, {}, {}, {})
+        )
+        out_large = padded_multiview_flex_attention(
+            q, k, v, k_und, v_und, MultiviewAttentionContext(large, {}, {}, {})
+        )
+        torch.testing.assert_close(out_small, out_large, atol=1e-5, rtol=1e-5)
+
+    def test_plan_geometry_is_independent_of_prompt_length(self):
+        layout = MultiviewLayout(
+            num_views=2,
+            latent_frames=4,
+            patch_height=1,
+            patch_width=2,
+            backend="triton",
+            max_und_tokens=100,
+        )
+        context = MultiviewAttentionContext(layout, {}, {}, {})
+        _, short = get_multiview_attention_plan(
+            context,
+            real_und_len=5,
+            real_q_len=layout.gen_tokens,
+            device=torch.device("cpu"),
+        )
+        _, long = get_multiview_attention_plan(
+            context,
+            real_und_len=90,
+            real_q_len=layout.gen_tokens,
+            device=torch.device("cpu"),
+        )
+        self.assertEqual(short.padded_und_len, 128)
+        self.assertEqual(short.padded_und_len, long.padded_und_len)
+        self.assertEqual(short.padded_q_len, long.padded_q_len)
+        self.assertEqual(len(context.mask_cache), 2)
+        with self.assertRaisesRegex(ValueError, "exceeds the layout capacity"):
+            get_multiview_attention_plan(
+                context,
+                real_und_len=101,
+                real_q_len=layout.gen_tokens,
+                device=torch.device("cpu"),
+            )
+        with self.assertRaisesRegex(ValueError, "does not match the request layout"):
+            get_multiview_attention_plan(
+                context,
+                real_und_len=5,
+                real_q_len=layout.gen_tokens + 1,
+                device=torch.device("cpu"),
+            )
+
+    @unittest.skipUnless(
+        torch.cuda.is_available(), "needs a CUDA device for the Triton kernel"
+    )
+    def test_cuda_triton_kernel_matches_dense_oracle(self):
+        self._run(torch.device("cuda"), torch.bfloat16, atol=3e-2, rtol=3e-2)
+
+    @unittest.skipUnless(
+        _fa4_available(),
+        "needs an SM90 or SM100 device with the flash-attn-4 CuTe package",
+    )
+    def test_cuda_fa4_kernel_matches_dense_oracle(self):
+        context = self._run(
+            torch.device("cuda"), torch.bfloat16, atol=3e-2, rtol=3e-2, backend="fa4"
+        )
+        plan = next(iter(context.mask_cache.values()))
+        self.assertIsInstance(plan, MultiviewBlockSparsity)
+        self.assertEqual(
+            (plan.q_block_size, plan.kv_block_size),
+            fa4_sparse_block_sizes(torch.device("cuda")),
+        )
+
+    def test_fa4_block_map_matches_dense_projection(self):
+        """Both FA4 geometries must classify tiles exactly like the 64x64 map does."""
+        for block_sizes in ((256, 128), (128, 128)):
+            with self.subTest(block_sizes=block_sizes):
+                layout = MultiviewLayout(
+                    num_views=2,
+                    latent_frames=4,
+                    patch_height=4,
+                    patch_width=16,
+                    control_attends_sensor=True,
+                    backend="fa4",
+                    max_und_tokens=100,
+                    fa4_block_sizes=block_sizes,
+                )
+                context = MultiviewAttentionContext(layout, {}, {}, {})
+                plan, geometry = get_multiview_attention_plan(
+                    context,
+                    real_und_len=9,
+                    real_q_len=layout.gen_tokens,
+                    device=torch.device("cpu"),
+                )
+                self.assertIsInstance(plan, MultiviewBlockSparsity)
+                self.assertEqual((plan.q_block_size, plan.kv_block_size), block_sizes)
+                self.assertEqual(
+                    (geometry.padded_q_len, geometry.padded_und_len), (512, 128)
+                )
+                self.assertEqual(plan.q_word_base.numel(), geometry.padded_q_len)
+                self.assertEqual(
+                    plan.k_group_ids.numel(),
+                    geometry.padded_und_len + geometry.padded_q_len,
+                )
+                metadata = plan.metadata
+                dense = multiview_pair_predicate(
+                    metadata,
+                    torch.arange(metadata.q_len)[:, None],
+                    torch.arange(metadata.kv_len)[None, :],
+                )
+                q_block, kv_block = block_sizes
+                for qb in range(metadata.q_len // q_block):
+                    full = set(
+                        plan.full_indices[qb, : int(plan.full_counts[qb])].tolist()
+                    )
+                    partial = set(
+                        plan.partial_indices[
+                            qb, : int(plan.partial_counts[qb])
+                        ].tolist()
+                    )
+                    for kb in range(metadata.kv_len // kv_block):
+                        tile = dense[
+                            qb * q_block : (qb + 1) * q_block,
+                            kb * kv_block : (kb + 1) * kv_block,
+                        ]
+                        if tile.all():
+                            self.assertIn(kb, full, (qb, kb))
+                        elif tile.any():
+                            self.assertIn(kb, partial, (qb, kb))
+                        else:
+                            self.assertNotIn(kb, full | partial, (qb, kb))
+
+    def test_fa4_block_geometry_follows_compute_capability(self):
+        self.assertEqual(fa4_sparse_block_sizes(capability_major=9), (128, 128))
+        self.assertEqual(fa4_sparse_block_sizes(capability_major=10), (256, 128))
+        self.assertEqual(fa4_sparse_block_sizes(capability_major=11), (256, 128))
+        for unsupported in (8, 12):
+            with self.subTest(capability=unsupported):
+                with self.assertRaisesRegex(ValueError, "not available"):
+                    fa4_sparse_block_sizes(capability_major=unsupported)
+        with self.assertRaisesRegex(ValueError, "CUDA device"):
+            fa4_sparse_block_sizes(torch.device("cpu"))
+        common = dict(num_views=1, latent_frames=1, patch_height=1, patch_width=1)
+        self.assertEqual(
+            layout_sparse_block_sizes(
+                MultiviewLayout(backend="triton", **common), torch.device("cpu")
+            ),
+            TRITON_SPARSE_BLOCK_SIZES,
+        )
+        pinned = MultiviewLayout(backend="fa4", fa4_block_sizes=(128, 128), **common)
+        self.assertEqual(
+            layout_sparse_block_sizes(pinned, torch.device("cpu")), (128, 128)
+        )
+        self.assertIn((128, 128), pinned.cache_key())
+        with self.assertRaisesRegex(ValueError, "CUDA device"):
+            layout_sparse_block_sizes(
+                MultiviewLayout(backend="fa4", **common), torch.device("cpu")
+            )
+        with self.assertRaisesRegex(ValueError, "no sparse block map"):
+            layout_sparse_block_sizes(MultiviewLayout(**common), torch.device("cpu"))
+        with self.assertRaisesRegex(ValueError, "fa4_block_sizes"):
+            MultiviewLayout(backend="fa4", fa4_block_sizes=(0, 128), **common)
+        with self.assertRaisesRegex(ValueError, "backend must be one of"):
+            MultiviewLayout(backend="flex", **common)
+
+
+class TestSchema3Helpers(unittest.TestCase):
+    """Rig view embedding rows and the per-stream LiDAR patch of the Oct-1 export."""
+
+    def test_lidar_patch_grid_and_patchify_roundtrip(self):
+        self.assertEqual(spatial_patch_hw(1), (1, 1))
+        self.assertEqual(spatial_patch_hw([1, 2]), (1, 2))
+        with self.assertRaisesRegex(ValueError, "positive int"):
+            spatial_patch_hw((0, 2))
+        # 1x1: every latent cell is a token, no padding.
+        self.assertEqual(lidar_patch_grid(8, 113, (1, 1)), (8, 113, 8, 113))
+        # 2x2: the odd width pads to the patch like the camera's _pad_to_patch_size.
+        self.assertEqual(lidar_patch_grid(8, 113, (2, 2)), (4, 57, 8, 114))
+        latent = torch.arange(2 * 3 * 2 * 3 * 5, dtype=torch.float32).view(2, 3, 2, 3, 5)
+        for patch in ((1, 1), (2, 2), (1, 2)):
+            with self.subTest(patch=patch):
+                tokens = patchify_lidar(latent, patch)
+                patch_h, patch_w, _, _ = lidar_patch_grid(3, 5, patch)
+                self.assertEqual(
+                    tuple(tokens.shape), (2, 2 * patch_h * patch_w, patch[0] * patch[1] * 3)
+                )
+                back = unpatchify_lidar(tokens, latent.shape[1:], patch)
+                torch.testing.assert_close(back, latent)
+        # With a 1x1 patch the token order is frame-major then row-major, as the
+        # camera's patchify would be with p=1.
+        tokens = patchify_lidar(latent, (1, 1))
+        torch.testing.assert_close(tokens[0, 0], latent[0, :, 0, 0, 0])
+        torch.testing.assert_close(tokens[0, 1], latent[0, :, 0, 0, 1])
+
+    def test_add_rig_view_rows(self):
+        hidden = torch.zeros(1, 6, 4)  # 2 views x 3 tokens
+        rows = torch.tensor([[1.0, 1, 1, 1], [2.0, 2, 2, 2]])
+        out = add_rig_view_rows(hidden, rows, num_views=2)
+        self.assertIs(out, hidden)
+        torch.testing.assert_close(hidden[0, :3], torch.ones(3, 4))
+        torch.testing.assert_close(hidden[0, 3:], torch.full((3, 4), 2.0))
+        shared = add_rig_view_rows(torch.zeros(1, 6, 4), torch.full((1, 4), 7.0), 2)
+        torch.testing.assert_close(shared, torch.full((1, 6, 4), 7.0))
+        with self.assertRaisesRegex(ValueError, "rows must be"):
+            add_rig_view_rows(torch.zeros(1, 6, 4), torch.zeros(3, 4), 2)
+        with self.assertRaisesRegex(ValueError, "camera-major view blocks"):
+            add_rig_view_rows(torch.zeros(1, 7, 4), rows, 2)
+
+    def test_deployment_rig_view_ids_follow_physical_camera_ids(self):
+        deployment = parse_multiview_deployment_config(_transformer_config(SCHEMA3_BLOCK))
+        # Subsets and reordered views keep their trained rows.
+        self.assertEqual(
+            deployment.rig_view_ids(["camera_rear_tele_30fov", "camera_front_wide_120fov"]),
+            [3, 0],
+        )
+        self.assertEqual(deployment.rig_view_ids(COSMOS3_MADS_CAMERAS), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+        with self.assertRaisesRegex(ValueError, "no row"):
+            deployment.rig_view_ids(["camera_rear_tele_30fov", "camera_x"])
+        schema2 = parse_multiview_deployment_config(_transformer_config(SCHEMA2_BLOCK))
+        self.assertIsNone(schema2.rig_view_ids(COSMOS3_MADS_CAMERAS))
+
+    def test_per_view_negative_prompt_formatting(self):
+        negative = format_per_view_negative_prompt(
+            "Blurry, smeared motion", num_frames=17, fps=30.0, height=480, width=832
+        )
+        # Same whole-second duration and resolution sentences as the positive
+        # captions, no rig header and no emphasis.
+        self.assertTrue(negative.startswith("Blurry, smeared motion"))
+        self.assertIn("0.0 second", negative)
+        self.assertIn("480", negative)
+        self.assertNotIn("vehicle-mounted", negative)
+        self.assertNotIn("wsm", negative.lower())
 
 
 class TestLayoutHelpers(unittest.TestCase):
@@ -460,19 +1273,22 @@ class TestDeploymentConfig(unittest.TestCase):
             ("decomposed_temporal_window_seconds", 0.4, "temporal window"),
             ("attention_scope", "all_views", "all_views"),
             ("lidar_attends_captions", "yes", "boolean"),
-            ("schema_version", None, "schema_version=2"),
+            ("schema_version", None, "versioned"),
         ):
             with self.subTest(field=field):
                 bad = {**block, field: value}
                 with self.assertRaisesRegex((ValueError, TypeError), message):
                     parse_multiview_deployment_config(_transformer_config(bad))
 
-    def test_refuses_masked_exports_with_the_revision_hint(self):
-        # Exports trained under the masked FlexAttention backends (the Sep-14
-        # revision and earlier) are a different attention this build no longer
-        # implements; the error names the first maskless revision.
-        with self.assertRaisesRegex(ValueError, "75f2199"):
-            parse_multiview_deployment_config(_transformer_config(LEGACY_BLOCK))
+    def test_accepts_masked_exports_of_both_vintages(self):
+        # The unversioned Sep-14 export: masked Triton, no window, the earlier
+        # system prompt wording.
+        legacy = parse_multiview_deployment_config(_transformer_config(LEGACY_BLOCK))
+        self.assertEqual(legacy.backend, "triton")
+        self.assertTrue(legacy.uses_masked_attention)
+        self.assertTrue(legacy.is_legacy)
+        self.assertEqual(legacy.system_prompt_variant, "provided_controls")
+        # The masked family expresses a temporal window directly; maskless cannot.
         for backend in ("triton", "fa4"):
             with self.subTest(backend=backend):
                 block = {
@@ -480,8 +1296,114 @@ class TestDeploymentConfig(unittest.TestCase):
                     "backend": backend,
                     "decomposed_temporal_window_seconds": 0.4,
                 }
-                with self.assertRaisesRegex(ValueError, "75f2199"):
-                    parse_multiview_deployment_config(_transformer_config(block))
+                deployment = parse_multiview_deployment_config(_transformer_config(block))
+                self.assertEqual(deployment.decomposed_temporal_window_seconds, 0.4)
+                self.assertEqual(deployment.system_prompt_variant, "wsm_controls")
+        with self.assertRaisesRegex(ValueError, "temporal window"):
+            parse_multiview_deployment_config(
+                _transformer_config(
+                    {**SCHEMA2_BLOCK, "decomposed_temporal_window_seconds": 0.4}
+                )
+            )
+        with self.assertRaisesRegex(ValueError, "backend must be one of"):
+            parse_multiview_deployment_config(
+                _transformer_config({**SCHEMA2_BLOCK, "backend": "flex"})
+            )
+
+    def test_accepts_the_schema3_contract(self):
+        deployment = parse_multiview_deployment_config(_transformer_config(SCHEMA3_BLOCK))
+        self.assertEqual(deployment.schema_version, 3)
+        self.assertEqual(deployment.backend, "triton")
+        self.assertTrue(deployment.uses_masked_attention)
+        self.assertEqual(deployment.decomposed_temporal_window_seconds, 0.4)
+        self.assertTrue(deployment.per_view_captions)
+        self.assertEqual(deployment.lidar_patch_spatial_hw, (1, 1))
+        self.assertEqual(deployment.rig_view_embedding["lidar_id"], 11)
+        self.assertEqual(deployment.rig_view_embedding["camera_ids"]["camera_rear_fisheye_200fov"], 10)
+        self.assertEqual(deployment.lidar["streaming_chunk_frames"], 20)
+        self.assertEqual(deployment.lidar["streaming_context_frames"], 21)
+        self.assertEqual(deployment.system_prompt_variant, "wsm_controls")
+        # A schema-2 joint export keeps the camera patch for LiDAR.
+        schema2 = parse_multiview_deployment_config(_transformer_config(SCHEMA2_BLOCK))
+        self.assertEqual(schema2.lidar_patch_spatial_hw, (2, 2))
+        self.assertIsNone(schema2.rig_view_embedding)
+        self.assertFalse(schema2.uses_masked_attention)
+
+    def test_schema3_contract_validation(self):
+        def parse(block):
+            return parse_multiview_deployment_config(_transformer_config(block))
+
+        with self.assertRaisesRegex(ValueError, "Unknown Cosmos3 multiview contract fields"):
+            parse({**SCHEMA3_BLOCK, "radar": {}})
+        self.assertIn("system_prompt_variant", COSMOS3_MULTIVIEW_CONTRACT_FIELDS)
+        with self.assertRaisesRegex(ValueError, "requires schema_version=3"):
+            parse({**SCHEMA2_BLOCK, "rig_view_embedding": RIG_VIEW_EMBEDDING})
+        with self.assertRaisesRegex(ValueError, "exactly the exported cameras"):
+            rig = copy.deepcopy(RIG_VIEW_EMBEDDING)
+            del rig["camera_ids"]["camera_rear_tele_30fov"]
+            parse({**SCHEMA3_BLOCK, "rig_view_embedding": rig})
+        with self.assertRaisesRegex(ValueError, "lidar_id must be the final row"):
+            parse({**SCHEMA3_BLOCK, "rig_view_embedding": {**RIG_VIEW_EMBEDDING, "lidar_id": 3}})
+        with self.assertRaisesRegex(ValueError, "distinct rows"):
+            rig = copy.deepcopy(RIG_VIEW_EMBEDDING)
+            rig["camera_ids"]["camera_rear_tele_30fov"] = 0
+            parse({**SCHEMA3_BLOCK, "rig_view_embedding": rig})
+        with self.assertRaisesRegex(ValueError, "requires rig_view_embedding or a LiDAR patch"):
+            parse(
+                {
+                    k: v
+                    for k, v in {**SCHEMA3_BLOCK, "lidar_patch_spatial_hw": [2, 2]}.items()
+                    if k != "rig_view_embedding"
+                }
+            )
+        with self.assertRaisesRegex(ValueError, "schema_version=2 requires the LiDAR patch"):
+            parse({**SCHEMA2_BLOCK, "lidar_patch_spatial_hw": [1, 1]})
+        with self.assertRaisesRegex(ValueError, "requires a lidar block"):
+            parse(
+                {
+                    k: v
+                    for k, v in {**SCHEMA3_BLOCK, "lidar_patch_spatial_hw": [1, 1]}.items()
+                    if k != "lidar"
+                }
+            )
+        with self.assertRaisesRegex(ValueError, "two positive integers"):
+            parse({**SCHEMA3_BLOCK, "lidar_patch_spatial_hw": [1, 0]})
+        with self.assertRaisesRegex(ValueError, "schema_version=4"):
+            parse({**SCHEMA3_BLOCK, "schema_version": 4})
+        # A LiDAR tokenizer whose context is shorter than its chunk is malformed.
+        with self.assertRaisesRegex(ValueError, "streaming context"):
+            validate_lidar_config(
+                {**LIDAR_BLOCK, "streaming_chunk_frames": 20, "streaming_context_frames": 19}
+            )
+
+    def test_backend_resolution_follows_the_export_family(self):
+        config = Cosmos3MultiviewConfig()
+        config.multiview_deployment = parse_multiview_deployment_config(
+            _transformer_config(SCHEMA3_BLOCK)
+        )
+        with mock.patch.dict(os.environ, {MULTIVIEW_BACKEND_ENV_VAR: ""}):
+            # A masked export with no pin defers the kernel to the device.
+            self.assertEqual(config.resolved_multiview_backend(), "auto")
+        with mock.patch.dict(os.environ, {MULTIVIEW_BACKEND_ENV_VAR: "fa4"}):
+            self.assertEqual(config.resolved_multiview_backend(), "fa4")
+            # The config field wins over the environment.
+            config.multiview_attention_backend = "triton"
+            self.assertEqual(config.resolved_multiview_backend(), "triton")
+            config.multiview_attention_backend = None
+        with mock.patch.dict(os.environ, {MULTIVIEW_BACKEND_ENV_VAR: "maskless"}):
+            with self.assertRaisesRegex(ValueError, "different attention patterns"):
+                config.resolved_multiview_backend()
+        with mock.patch.dict(os.environ, {MULTIVIEW_BACKEND_ENV_VAR: "flex"}):
+            with self.assertRaisesRegex(ValueError, "must be one of"):
+                config.resolved_multiview_backend()
+        config.multiview_deployment = parse_multiview_deployment_config(
+            _transformer_config(SCHEMA2_BLOCK)
+        )
+        with mock.patch.dict(os.environ, {MULTIVIEW_BACKEND_ENV_VAR: ""}):
+            self.assertEqual(config.resolved_multiview_backend(), "maskless")
+        with mock.patch.dict(os.environ, {MULTIVIEW_BACKEND_ENV_VAR: "triton"}):
+            with self.assertRaisesRegex(ValueError, "different attention patterns"):
+                config.resolved_multiview_backend()
 
     def test_accepts_the_schema2_joint_contract(self):
         deployment = parse_multiview_deployment_config(
@@ -520,7 +1442,7 @@ class TestDeploymentConfig(unittest.TestCase):
                     parse_multiview_deployment_config(_transformer_config(block))
         block = copy.deepcopy(LEGACY_BLOCK)
         block["lidar"] = LIDAR_BLOCK
-        with self.assertRaisesRegex(ValueError, "schema_version=2"):
+        with self.assertRaisesRegex(ValueError, "schema_version >= 2"):
             parse_multiview_deployment_config(_transformer_config(block))
 
     def test_lidar_contract_validation(self):
@@ -720,7 +1642,12 @@ class TestSamplingParamsAndInputStage(unittest.TestCase):
             validate_lidar_request({"control_path": "sweeps.tar"})
         self.assertEqual(
             validate_lidar_request({"control_path": "sweeps.safetensors"}),
-            {"control_path": "sweeps.safetensors", "decode": False},
+            {
+                "control_path": "sweeps.safetensors",
+                "decode": False,
+                "condition_path": None,
+                "num_conditional_sweeps": None,
+            },
         )
         with self.assertRaisesRegex(ValueError, "control_path"):
             validate_multiview_request({"views": [{"camera_key": "front"}]})
@@ -1597,6 +2524,68 @@ class TestMasklessAttention(unittest.TestCase):
                     3e-2,
                     kernel=kernel,
                 )
+
+
+class TestSchema3Requests(unittest.TestCase):
+    """Measured LiDAR prefix fields and the opt-in per-view negative prompt."""
+
+    def test_lidar_request_condition_fields(self):
+        base = {"control_path": "hdmap.safetensors"}
+        self.assertEqual(
+            validate_lidar_request(base),
+            {
+                "control_path": "hdmap.safetensors",
+                "decode": False,
+                "condition_path": None,
+                "num_conditional_sweeps": None,
+            },
+        )
+        with_prefix = validate_lidar_request({**base, "condition_path": " measured.pt "})
+        self.assertEqual(with_prefix["condition_path"], "measured.pt")
+        # The reference conditions one measured sweep when no count is given.
+        self.assertEqual(with_prefix["num_conditional_sweeps"], 1)
+        self.assertEqual(
+            validate_lidar_request(
+                {**base, "condition_path": "m.safetensors", "num_conditional_sweeps": 3}
+            )["num_conditional_sweeps"],
+            3,
+        )
+        for bad, message in (
+            ({**base, "num_conditional_sweeps": 2}, "requires lidar.condition_path"),
+            ({**base, "condition_path": "m.tar"}, "condition_path must be"),
+            ({**base, "condition_path": "m.pt", "num_conditional_sweeps": 0}, "positive integer"),
+            ({**base, "condition_path": "m.pt", "num_conditional_sweeps": True}, "positive integer"),
+            ({**base, "conditional_path": "m.pt"}, "accepts only"),
+        ):
+            with self.subTest(bad=bad):
+                with self.assertRaisesRegex(ValueError, message):
+                    validate_lidar_request(bad)
+        params = Cosmos3MultiviewSamplingParams(
+            lidar={"control_path": "hdmap.pt", "condition_path": "measured.pt"}
+        )
+        self.assertEqual(params.resolved_lidar()["num_conditional_sweeps"], 1)
+
+    def test_per_view_negative_prompt_request_field(self):
+        self.assertIn(
+            "per_view_negative_prompt",
+            Cosmos3MultiviewSamplingParams.video_request_extra_fields(),
+        )
+        lowered = Cosmos3MultiviewSamplingParams.lower_video_request_kwargs(
+            None, {"per_view_negative_prompt": "  blurry  "}
+        )
+        self.assertEqual(lowered["per_view_negative_prompt"], "blurry")
+        self.assertNotIn(
+            "per_view_negative_prompt",
+            Cosmos3MultiviewSamplingParams.lower_video_request_kwargs(
+                None, {"per_view_negative_prompt": "   "}
+            ),
+        )
+        self.assertEqual(
+            Cosmos3MultiviewSamplingParams(per_view_negative_prompt="blurry").per_view_negative_prompt,
+            "blurry",
+        )
+        with self.assertRaisesRegex(ValueError, "per_view_negative_prompt"):
+            Cosmos3MultiviewSamplingParams(per_view_negative_prompt=7)  # type: ignore[arg-type]
 
 
 class TestRegistry(unittest.TestCase):

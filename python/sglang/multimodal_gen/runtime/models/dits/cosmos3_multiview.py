@@ -2,25 +2,31 @@
 """Cosmos3 Multiview-AV transformer.
 
 Same weights and layer stack as ``Cosmos3OmniTransformer``. Two things change
-inside the network. The GEN cross-attention runs the maskless multiview folds
-from ``cosmos3_multiview_maskless`` whenever the pipeline hands over a
-``MultiviewLayout``. And the GEN sequence is assembled from packed sensor
+inside the network. The GEN cross-attention runs the multiview attention of the
+layout's backend whenever the pipeline hands over a ``MultiviewLayout``: the
+masked FlexAttention / FA4 kernels of ``cosmos3_multiview_attention`` for
+``triton``/``fa4`` exports, the three unmasked folds of
+``cosmos3_multiview_maskless`` for ``maskless`` exports. And the GEN sequence is assembled from packed sensor
 items instead of one video clip: the WSM control cameras, the RGB target
 cameras, and on joint checkpoints the HD-map control and LiDAR target range
 maps, each patchified through its own input projection and sharing one
 temporal origin. Per-camera captions are encoded by separate causal UND passes
 so no caption attends another; their K/V are concatenated for the GEN layers.
-The transformer also owns the request-local plan cache so 36 layers and every
-denoising step reuse one set of gathers and varlen offsets.
+Schema-3 exports add a learned rig identity (``rig_view_embed``) to every
+sensor token and may patchify LiDAR with its own spatial patch. The transformer
+also owns the request-local attention caches so 36 layers and every denoising
+step reuse one plan, one block mask, and one set of padded q/k/v buffers.
 """
 
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from typing import Any
 
 import msgspec
 import torch
+import torch.nn as nn
 
 from sglang.multimodal_gen.configs.models.dits.cosmos3video import Cosmos3VideoConfig
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3_multiview import (
@@ -34,12 +40,16 @@ from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
+from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_attention import (
+    padded_multiview_flex_attention,
+)
 from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_layout import (
     MaskItem,
     MultiviewAttentionContext,
     MultiviewLayout,
 )
 from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_maskless import (
+    MASKLESS_BACKEND,
     multiview_maskless_attention,
 )
 from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
@@ -73,8 +83,82 @@ def unpack_state(
     )
 
 
+def spatial_patch_hw(patch: int | Sequence[int]) -> tuple[int, int]:
+    """Normalize a square or ``(height, width)`` spatial patch size."""
+    sides = (patch, patch) if isinstance(patch, int) else tuple(patch)
+    if len(sides) != 2 or any(
+        isinstance(side, bool) or not isinstance(side, int) or side <= 0
+        for side in sides
+    ):
+        raise ValueError(
+            f"Spatial patch size must be a positive int or (height, width), got {patch!r}."
+        )
+    return sides  # type: ignore[return-value]
+
+
+def lidar_patch_grid(
+    height: int, width: int, patch_hw: tuple[int, int]
+) -> tuple[int, int, int, int]:
+    """``(patch_h, patch_w, padded_h, padded_w)`` of a latent zero-padded to its patch."""
+    ph, pw = patch_hw
+    patch_h, patch_w = math.ceil(height / ph), math.ceil(width / pw)
+    return patch_h, patch_w, patch_h * ph, patch_w * pw
+
+
+def patchify_lidar(latent: torch.Tensor, patch_hw: tuple[int, int]) -> torch.Tensor:
+    """``[B, C, T, H, W]`` range-map latents to ``[B, T*Hp*Wp, ph*pw*C]`` with edge padding."""
+    batch, channels, frames, height, width = latent.shape
+    ph, pw = patch_hw
+    patch_h, patch_w, padded_h, padded_w = lidar_patch_grid(height, width, patch_hw)
+    if (padded_h, padded_w) != (height, width):
+        latent = torch.nn.functional.pad(
+            latent, (0, padded_w - width, 0, padded_h - height)
+        )
+    x = latent.reshape(batch, channels, frames, patch_h, ph, patch_w, pw)
+    x = x.permute(0, 2, 3, 5, 4, 6, 1)
+    return x.reshape(batch, frames * patch_h * patch_w, ph * pw * channels)
+
+
+def unpatchify_lidar(
+    tokens: torch.Tensor, shape: Sequence[int], patch_hw: tuple[int, int]
+) -> torch.Tensor:
+    channels, frames, height, width = (int(dim) for dim in shape)
+    ph, pw = patch_hw
+    patch_h, patch_w, padded_h, padded_w = lidar_patch_grid(height, width, patch_hw)
+    x = tokens.reshape(tokens.shape[0], frames, patch_h, patch_w, ph, pw, channels)
+    x = x.permute(0, 6, 1, 2, 4, 3, 5)
+    x = x.reshape(tokens.shape[0], channels, frames, padded_h, padded_w)
+    return x[:, :, :, :height, :width]
+
+
+def add_rig_view_rows(
+    hidden: torch.Tensor, rows: torch.Tensor, num_views: int
+) -> torch.Tensor:
+    """Add one rig-identity row to each camera-major view block of ``hidden`` in place.
+
+    ``hidden`` is ``[B, N, D]`` with the ``N`` tokens of an item ordered view by
+    view; ``rows`` is ``[num_views, D]``, or ``[1, D]`` for one row shared by every
+    token (LiDAR). The per-view blocks are broadcast views, so no ``[N, D]``
+    offset tensor is materialized.
+    """
+    batch, tokens, dim = hidden.shape
+    if rows.ndim != 2 or rows.shape[-1] != dim or rows.shape[0] not in (1, num_views):
+        raise ValueError(
+            f"Rig view embedding rows must be [1 or {num_views}, {dim}], got {tuple(rows.shape)}."
+        )
+    blocks = rows.shape[0]
+    if tokens % blocks:
+        raise ValueError(
+            f"{tokens} tokens cannot be split into {blocks} camera-major view blocks."
+        )
+    hidden.view(batch, blocks, tokens // blocks, dim).add_(
+        rows.to(hidden.dtype).view(1, blocks, 1, dim)
+    )
+    return hidden
+
+
 class Cosmos3MultiviewCrossAttention(Cosmos3CrossAttention):
-    """GEN cross-attention that runs the maskless multiview folds for a layout."""
+    """GEN cross-attention that runs the layout's multiview attention family."""
 
     def _forward_multiview(
         self,
@@ -90,11 +174,13 @@ class Cosmos3MultiviewCrossAttention(Cosmos3CrossAttention):
                 "Cosmos3 multiview cross-attention expected MultiviewAttentionContext, "
                 f"got {type(multiview_layout).__name__}."
             )
-        return multiview_maskless_attention(q, k, v, k_und, v_und, multiview_layout)
+        if multiview_layout.layout.backend == MASKLESS_BACKEND:
+            return multiview_maskless_attention(q, k, v, k_und, v_und, multiview_layout)
+        return padded_multiview_flex_attention(q, k, v, k_und, v_und, multiview_layout)
 
 
 class Cosmos3MultiviewTransformer(Cosmos3OmniTransformer):
-    """Cosmos3 Nano weights with packed sensor items and request-local plan caching."""
+    """Cosmos3 Nano weights with packed sensor items and request-local attention caches."""
 
     _cross_attention_cls = Cosmos3MultiviewCrossAttention
 
@@ -116,12 +202,22 @@ class Cosmos3MultiviewTransformer(Cosmos3OmniTransformer):
         multiview = hf_config.get("multiview") if isinstance(hf_config, dict) else None
         lidar = multiview.get("lidar") if isinstance(multiview, dict) else None
         self.lidar_config: dict[str, Any] | None = None
+        # Schema-2 exports patchify LiDAR with the camera patch; schema 3 exports
+        # record their own ``lidar_patch_spatial_hw`` (1x1 on the Oct-1 export).
+        lidar_patch = (
+            multiview.get("lidar_patch_spatial_hw") if isinstance(multiview, dict) else None
+        )
+        self.lidar_patch_hw = spatial_patch_hw(
+            self.latent_patch_size if lidar_patch is None else lidar_patch
+        )
         if lidar is not None:
             self.lidar_config = validate_lidar_config(lidar)
             # Joint checkpoints project LiDAR range-map latents through their
             # own input/output linears; the GEN stack is shared with cameras.
-            lidar_width = self.latent_patch_size**2 * int(
-                self.lidar_config["latent_channels"]
+            lidar_width = (
+                self.lidar_patch_hw[0]
+                * self.lidar_patch_hw[1]
+                * int(self.lidar_config["latent_channels"])
             )
             self.lidar_proj_in = ReplicatedLinear(
                 lidar_width,
@@ -137,14 +233,38 @@ class Cosmos3MultiviewTransformer(Cosmos3OmniTransformer):
                 quant_config=quant_config,
                 prefix="lidar_proj_out",
             )
-        # Maskless plans (gathers and varlen offsets) keyed by layout, UND length,
-        # batch and device; built once per request rather than once per layer.
+        # Physical rig identity of schema-3 exports: one trained row per MADS
+        # camera id plus a final LiDAR row, added to control and target tokens
+        # alike. The loader rejects a checkpoint whose tensors disagree with the
+        # contract (missing or unexpected ``rig_view_embed.weight``).
+        rig = (
+            multiview.get("rig_view_embedding") if isinstance(multiview, dict) else None
+        )
+        self.rig_view_embed: nn.Embedding | None = None
+        self.rig_lidar_id: int | None = None
+        if isinstance(rig, dict):
+            self.rig_view_embed = nn.Embedding(
+                int(rig["num_embeddings"]), self.hidden_size
+            )
+            self.rig_lidar_id = int(rig["lidar_id"])
+        # Request-local attention caches, built once per request rather than
+        # once per layer: maskless plans (gathers and varlen offsets), masked
+        # block masks / block sparsity, and the masked kernels' padded q/k/v
+        # packing buffers.
         self._multiview_plan_cache: dict[tuple[Any, ...], Any] = {}
+        self._multiview_mask_cache: dict[tuple[Any, ...], Any] = {}
+        self._multiview_buffer_cache: dict[tuple[Any, ...], torch.Tensor] = {}
 
     def reset_cache(self, cache_key: str | None = None) -> None:
         super().reset_cache(cache_key)
         if cache_key is None:
             self._multiview_plan_cache.clear()
+            self._multiview_mask_cache.clear()
+            self._multiview_buffer_cache.clear()
+
+    def lidar_patch_grid(self, height: int, width: int) -> tuple[int, int]:
+        """LiDAR token grid ``(patch_h, patch_w)`` of a latent of this height and width."""
+        return lidar_patch_grid(height, width, self.lidar_patch_hw)[:2]
 
     # -- Packed forward -----------------------------------------------------
 
@@ -275,13 +395,15 @@ class Cosmos3MultiviewTransformer(Cosmos3OmniTransformer):
         lidar_fps: float | None,
         lidar_temporal_compression_factor: int,
         temporal_position_period: int | None,
+        rig_view_ids: torch.Tensor | None,
     ) -> torch.Tensor:
         del text_mask  # Captions arrive compacted; their boundaries are the lengths.
         targets = unpack_state(hidden_states, packed_shapes)
         camera = targets[0]
         batch_size = camera.shape[0]
         device = camera.device
-        dtype = camera.dtype
+        # The sampler state may be float32; the transformer runs in its weight dtype.
+        dtype = self.proj_in.weight.dtype
         controls = (
             list(control_latents)
             if isinstance(control_latents, (list, tuple))
@@ -323,7 +445,10 @@ class Cosmos3MultiviewTransformer(Cosmos3OmniTransformer):
             )
         for item, latent in zip(items, streams, strict=True):
             _, _, latent_t, latent_h, latent_w = latent.shape
-            patch_h, patch_w, _, _ = self._pad_to_patch_size(latent_h, latent_w)
+            if item.is_lidar:
+                patch_h, patch_w = self.lidar_patch_grid(latent_h, latent_w)
+            else:
+                patch_h, patch_w, _, _ = self._pad_to_patch_size(latent_h, latent_w)
             if item.token_shape != (latent_t, patch_h, patch_w):
                 raise ValueError(
                     "Packed sensor latent does not match its layout item: "
@@ -338,7 +463,25 @@ class Cosmos3MultiviewTransformer(Cosmos3OmniTransformer):
             items=items,
             caption_lengths=lengths if separate_captions else (),
         )
-        context = MultiviewAttentionContext(layout, self._multiview_plan_cache)
+        context = MultiviewAttentionContext(
+            layout,
+            self._multiview_plan_cache,
+            self._multiview_mask_cache,
+            self._multiview_buffer_cache,
+        )
+        if self.rig_view_embed is None:
+            if rig_view_ids is not None:
+                raise ValueError(
+                    "Rig view IDs were supplied, but the checkpoint has no rig view embedding."
+                )
+        elif rig_view_ids is None:
+            raise ValueError(
+                "Checkpoints with a rig view embedding require the request's physical camera IDs."
+            )
+        elif rig_view_ids.numel() != multiview_layout.num_views:
+            raise ValueError(
+                f"Expected {multiview_layout.num_views} rig view IDs, got {rig_view_ids.numel()}."
+            )
 
         self._ensure_cache_dicts()
         if (
@@ -365,25 +508,43 @@ class Cosmos3MultiviewTransformer(Cosmos3OmniTransformer):
         cached_kv = self.cached_kv[cache_key]
 
         # Every target gets the same diffusion timestep; controls never do, and
-        # anchored camera frames receive zero through the velocity mask.
+        # conditioned frames (anchored camera frames, a measured LiDAR prefix)
+        # receive zero through the velocity mask of their stream.
         time_embed = self.time_embedder(timestep.float()).to(dtype).unsqueeze(1)
-        camera_frame_mask = None
+        target_frame_masks: tuple[torch.Tensor, ...] | None = None
         if noisy_frame_mask is not None:
-            camera_frame_mask = unpack_state(noisy_frame_mask, packed_shapes)[0][
-                :, 0, :, 0, 0
-            ]
-        embeddings = []
-        for item, latent in zip(items, streams, strict=True):
-            project = self.lidar_proj_in if item.is_lidar else self.proj_in
-            hidden, _ = project(
-                self.patchify(latent.to(dtype), *latent.shape[2:])
-                if not item.is_lidar
-                else self._patchify_lidar(latent.to(dtype))
+            target_frame_masks = tuple(
+                mask[:, 0, :, 0, 0]
+                for mask in unpack_state(noisy_frame_mask, packed_shapes)
             )
+        embeddings = []
+        target_index = 0
+        for item, latent in zip(items, streams, strict=True):
+            if item.is_lidar:
+                hidden, _ = self.lidar_proj_in(
+                    patchify_lidar(latent.to(dtype), self.lidar_patch_hw)
+                )
+            else:
+                hidden, _ = self.proj_in(
+                    self.patchify(latent.to(dtype), *latent.shape[2:])
+                )
+            if self.rig_view_embed is not None:
+                # Reference order: projection, then rig identity, then timestep.
+                if item.is_lidar:
+                    rows = self.rig_view_embed.weight[self.rig_lidar_id].unsqueeze(0)
+                else:
+                    rows = self.rig_view_embed.weight[rig_view_ids]
+                hidden = add_rig_view_rows(hidden, rows, item.num_views)
             if not item.is_control:
-                if not item.is_lidar and camera_frame_mask is not None:
+                frame_mask = (
+                    target_frame_masks[target_index]
+                    if target_frame_masks is not None
+                    else None
+                )
+                target_index += 1
+                if frame_mask is not None:
                     hidden = hidden + time_embed * self._frame_token_mask(
-                        camera_frame_mask, item, dtype
+                        frame_mask, item, dtype
                     )
                 else:
                     hidden = hidden + time_embed
@@ -414,37 +575,13 @@ class Cosmos3MultiviewTransformer(Cosmos3OmniTransformer):
             normed = self.norm_moe_gen(part)
             if item.is_lidar:
                 projected, _ = self.lidar_proj_out(normed)
-                outputs.append(self._unpatchify_lidar(projected, latent.shape[1:]))
+                outputs.append(
+                    unpatchify_lidar(projected, latent.shape[1:], self.lidar_patch_hw)
+                )
             else:
                 projected, _ = self.proj_out(normed)
                 outputs.append(self.unpatchify(projected, *latent.shape[2:]))
         return pack_state(outputs)
-
-    def _patchify_lidar(self, latent: torch.Tensor) -> torch.Tensor:
-        """``[B, C, T, H, W]`` range-map latents to ``[B, T*Hp*Wp, p*p*C]`` with edge padding."""
-        batch, channels, frames, height, width = latent.shape
-        patch = self.latent_patch_size
-        patch_h, patch_w, padded_h, padded_w = self._pad_to_patch_size(height, width)
-        if (padded_h, padded_w) != (height, width):
-            latent = torch.nn.functional.pad(
-                latent, (0, padded_w - width, 0, padded_h - height)
-            )
-        x = latent.reshape(batch, channels, frames, patch_h, patch, patch_w, patch)
-        x = x.permute(0, 2, 3, 5, 4, 6, 1)
-        return x.reshape(batch, frames * patch_h * patch_w, patch * patch * channels)
-
-    def _unpatchify_lidar(
-        self, tokens: torch.Tensor, shape: tuple[int, ...]
-    ) -> torch.Tensor:
-        channels, frames, height, width = (int(dim) for dim in shape)
-        patch = self.latent_patch_size
-        patch_h, patch_w, padded_h, padded_w = self._pad_to_patch_size(height, width)
-        x = tokens.reshape(
-            tokens.shape[0], frames, patch_h, patch_w, patch, patch, channels
-        )
-        x = x.permute(0, 6, 1, 2, 4, 3, 5)
-        x = x.reshape(tokens.shape[0], channels, frames, padded_h, padded_w)
-        return x[:, :, :, :height, :width]
 
     def forward(
         self,
@@ -492,6 +629,7 @@ class Cosmos3MultiviewTransformer(Cosmos3OmniTransformer):
                 kwargs.get("lidar_temporal_compression_factor", 1)
             ),
             temporal_position_period=kwargs.get("temporal_position_period"),
+            rig_view_ids=kwargs.get("rig_view_ids"),
         )
 
 

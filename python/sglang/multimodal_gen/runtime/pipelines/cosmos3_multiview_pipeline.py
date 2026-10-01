@@ -7,18 +7,23 @@ camera, and one caption per rig or per camera. Joint exports also take an
 HD-map range-map control and denoise a LiDAR target alongside the cameras.
 Same Nano weights, VAE, tokenizer, and FlowUniPC schedule as
 ``Cosmos3Pipeline``; the difference is camera-major packing, per-camera VAE
-calls, wrapped temporal positions, and the maskless cross-camera attention
-installed by ``Cosmos3MultiviewTransformer``.
+calls, wrapped temporal positions, and the cross-camera attention installed by
+``Cosmos3MultiviewTransformer`` (masked FlexAttention / FA4 for ``triton``/``fa4``
+exports, the maskless folds for ``maskless`` exports).
 """
 
 import importlib.util
 
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3_multiview import (
+    COSMOS3_MULTIVIEW_AUTO_BACKEND,
     Cosmos3MultiviewConfig,
 )
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview import (
     Cosmos3MultiviewTransformer,
+)
+from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_attention import (
+    resolve_masked_backend,
 )
 from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar_decoder import (
     Cosmos3LidarDecoder,
@@ -65,7 +70,7 @@ class Cosmos3MultiviewPipeline(ComposedPipelineBase):
         2. Cosmos3MultiviewTokenizationStage - transfer prompt + WSM emphasis
         3. Cosmos3MultiviewLatentStage - per-camera VAE encode, anchors, layout
         4. Cosmos3TimestepPreparationStage - FlowUniPC timesteps (shift 10)
-        5. Cosmos3DenoisingStage - sequential text CFG with the maskless folds
+        5. Cosmos3DenoisingStage - sequential text CFG with the multiview attention
         6. Cosmos3MultiviewDecodingStage - per-camera VAE decode, camera-major,
            plus LiDAR range-map decode for joint requests
         """
@@ -91,6 +96,14 @@ class Cosmos3MultiviewPipeline(ComposedPipelineBase):
             )
         vae = self.get_module("vae")
         scheduler = self.get_module("scheduler")
+        backend = pipeline_config.resolved_multiview_backend()
+        if backend == COSMOS3_MULTIVIEW_AUTO_BACKEND:
+            backend = resolve_masked_backend(get_local_torch_device())
+        logger.info(
+            "Cosmos3 multiview attention backend: %s (export declares %s)",
+            backend,
+            deployment.backend,
+        )
         lidar_encoder = None
         lidar_decoder = None
         if deployment.supports_lidar:
@@ -126,6 +139,7 @@ class Cosmos3MultiviewPipeline(ComposedPipelineBase):
                 transformer=transformer,
                 deployment=deployment,
                 lidar_encoder=lidar_encoder,
+                attention_backend=backend,
             )
         )
         self.add_stage(Cosmos3TimestepPreparationStage(scheduler))
@@ -146,7 +160,7 @@ class Cosmos3MultiviewPipeline(ComposedPipelineBase):
             deployment.num_views,
             deployment.attention_scope,
             deployment.control_attends_sensor,
-            deployment.backend,
+            backend,
             deployment.schema_version,
             deployment.per_view_captions,
             deployment.supports_lidar,

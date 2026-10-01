@@ -1150,6 +1150,24 @@ class UnifiedNormalizer(msgspec.Struct, frozen=True):
         return [normalized[i] if i in set(filled) else 0.0 for i in range(len(raw))]
 
 
+def resolve_export_file(model_path: str, relative_path: str) -> str:
+    """Local path of ``relative_path`` inside the export.
+
+    ``model_path`` is either the export directory or a Hub id such as
+    ``nvidia/Cosmos3-Nano-Sim-Bimanual``; Hub ids resolve to the cached snapshot,
+    fetching the file's folder when the pipeline download skipped it.
+    """
+    if os.path.isdir(model_path):
+        return os.path.join(model_path, relative_path)
+    from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+        prepare_diffusers_component_path_for_loading,
+    )
+
+    folder, name = os.path.split(relative_path)
+    component = os.path.join(model_path, folder) if folder else model_path
+    return os.path.join(prepare_diffusers_component_path_for_loading(component), name)
+
+
 def load_unified_normalizer(
     model_path: str, contract: CosmosDreamsUnifiedActionContract
 ) -> UnifiedNormalizer:
@@ -1160,7 +1178,7 @@ def load_unified_normalizer(
         raise ValueError(
             "Cosmos-Dreams unified normalizer source has no artifact_path."
         )
-    path = os.path.join(model_path, artifact_path)
+    path = resolve_export_file(model_path, artifact_path)
     with open(path, "rb") as handle:
         data = handle.read()
     expected = source.get("sha256")

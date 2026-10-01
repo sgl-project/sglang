@@ -14,12 +14,13 @@ maskless cross-camera attention.
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
 import msgspec
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import (
     Cosmos3Config,
@@ -34,14 +35,54 @@ logger = init_logger(__name__)
 
 COSMOS3_MULTIVIEW_BACKBONE_TYPE = "cosmos3_multiview"
 COSMOS3_MULTIVIEW_ATTENTION_SCOPES = ("all_views", "same_view", "decomposed")
-# The only attention this port implements. Exports trained under the masked
-# FlexAttention backends ("triton"/"fa4": the Sep-14 2026 HF revision 3e7d669 and
-# earlier) are a different attention pattern and are refused at load time.
-COSMOS3_MULTIVIEW_ATTENTION_BACKEND = "maskless"
+# ``triton``/``fa4`` name the masked attention family: one visibility mask that
+# counts every permitted key once (the Sep-14 and the Oct-1 2026 exports; the
+# latter trained its folds exact-count with a 0.4 s past window, which the mask
+# expresses directly). ``maskless`` is the three-fold attention of the Sep-18/22
+# exports, which double-counts the query's own cell. A checkpoint is served
+# faithfully only by its own family; within the masked family the kernel is a
+# speed knob.
+COSMOS3_MULTIVIEW_ATTENTION_BACKENDS = ("triton", "fa4", "maskless")
+COSMOS3_MULTIVIEW_MASKED_BACKENDS = ("triton", "fa4")
+# Masked-family kernel left to the device: FA4 block-sparse on Blackwell,
+# FlexAttention's Triton kernel elsewhere.
+COSMOS3_MULTIVIEW_AUTO_BACKEND = "auto"
+MULTIVIEW_BACKEND_ENV_VAR = "SGLANG_DIFFUSION_COSMOS3_MULTIVIEW_ATTENTION_BACKEND"
+# Versioned exports this build reads. Version 3 (Oct 1 2026) adds the rig view
+# embedding and a LiDAR patch that may differ from the camera patch.
+COSMOS3_MULTIVIEW_SCHEMA_VERSIONS = (2, 3)
+# Every top-level field the imaginaire4 exporter writes for a servable artifact.
+# A versioned contract carrying anything else fails loudly instead of being
+# silently ignored.
+COSMOS3_MULTIVIEW_CONTRACT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "causal_training_strategy",
+        "attention_scope",
+        "backend",
+        "decomposed_temporal_window_seconds",
+        "control_attends_sensor",
+        "lidar_attends_captions",
+        "align_temporal_positions_across_views",
+        "share_vision_temporal_positions",
+        "cameras",
+        "max_views",
+        "per_view_captions",
+        "variable_view_count",
+        "inference_defaults",
+        "lidar",
+        "lidar_patch_spatial_hw",
+        "rig_view_embedding",
+        # Written by 2026-09 exporters before per_view_captions replaced it.
+        "separate_view_text_tokenization",
+        # Optional: an export may pin which system prompt wording it trained under.
+        "system_prompt_variant",
+    }
+)
 # AV system prompt wordings: "wsm_controls" is the Sep-15-2026-onward training text
-# every maskless export was trained with (names WSM, adds a control-adherence
-# paragraph); "provided_controls" is the earlier wording, selectable through the
-# ``system_prompt_variant`` key for an export that records it.
+# (names WSM, adds a control-adherence paragraph) every versioned export trained
+# under; "provided_controls" is the earlier wording of the unversioned Sep-14
+# export. ``system_prompt_variant`` in the export overrides the vintage rule.
 COSMOS3_SYSTEM_PROMPT_VARIANTS = ("provided_controls", "wsm_controls")
 
 # The fixed 11-camera MADS rig order the v1 checkpoint was exported with.
@@ -186,14 +227,39 @@ class Cosmos3MultiviewDeploymentConfig(msgspec.Struct, frozen=True):
     inference_defaults: dict[str, Any] | None = None
     lidar: dict[str, Any] | None = None
     lidar_attends_captions: bool = True
-    #: Which AV system prompt wording the captions were trained under; every
-    #: maskless export trained after the Sep-15-2026 prompt change, so this is
-    #: "wsm_controls" unless the export records ``system_prompt_variant``.
+    #: Which AV system prompt wording the captions were trained under: the
+    #: export vintage decides unless the export records ``system_prompt_variant``.
     system_prompt_variant: str = "wsm_controls"
+    #: LiDAR token patch ``(height, width)`` in latent cells; None follows the
+    #: camera patch (schema-2 exports). The Oct-1 2026 joint export uses (1, 1).
+    lidar_patch_spatial_hw: tuple[int, int] | None = None
+    #: Physical rig identity table of schema-3 exports: ``camera_ids`` maps every
+    #: exported camera to its trained embedding row, ``lidar_id`` is the final row.
+    rig_view_embedding: dict[str, Any] | None = None
 
     @property
     def num_views(self) -> int:
         return len(self.cameras)
+
+    @property
+    def uses_masked_attention(self) -> bool:
+        return self.backend in COSMOS3_MULTIVIEW_MASKED_BACKENDS
+
+    def rig_view_ids(self, camera_keys: Sequence[str]) -> list[int] | None:
+        """Trained embedding rows for the request's cameras, in request order.
+
+        Subsets and reordered views keep each camera's physical id. None when
+        the export has no rig table.
+        """
+        if self.rig_view_embedding is None:
+            return None
+        table = self.rig_view_embedding["camera_ids"]
+        unknown = [key for key in camera_keys if key not in table]
+        if unknown:
+            raise ValueError(
+                f"Cosmos3 multiview rig view embedding has no row for cameras {unknown}."
+            )
+        return [int(table[key]) for key in camera_keys]
 
     @property
     def is_legacy(self) -> bool:
@@ -369,6 +435,107 @@ def _validate_inference_defaults(raw: Any) -> dict[str, Any]:
     return defaults
 
 
+def _positive_int(value: Any) -> bool:
+    return not isinstance(value, bool) and isinstance(value, int) and value > 0
+
+
+def _validated_lidar_patch(
+    raw: Mapping[str, Any], schema_version: int | None, camera_patch: int
+) -> tuple[int, int] | None:
+    """The LiDAR stream's ``(height, width)`` patch, defaulting to the camera patch."""
+    patch = raw.get("lidar_patch_spatial_hw")
+    if raw.get("lidar") is None:
+        if patch is not None:
+            raise ValueError(
+                "Cosmos3 multiview lidar_patch_spatial_hw requires a lidar block."
+            )
+        return None
+    if patch is None:
+        return (camera_patch, camera_patch)
+    if (
+        not isinstance(patch, list | tuple)
+        or len(patch) != 2
+        or not all(_positive_int(side) for side in patch)
+    ):
+        raise ValueError(
+            "Cosmos3 multiview lidar_patch_spatial_hw must be two positive integers, "
+            f"got {patch!r}."
+        )
+    patch = (int(patch[0]), int(patch[1]))
+    if schema_version == 2 and patch != (camera_patch, camera_patch):
+        raise ValueError(
+            "Cosmos3 multiview schema_version=2 requires the LiDAR patch to equal the "
+            f"camera patch {camera_patch}, got {list(patch)}; a different LiDAR patch "
+            "requires schema_version=3."
+        )
+    return patch
+
+
+def _validated_rig_view_embedding(
+    raw: Mapping[str, Any], schema_version: int | None, cameras: Sequence[str]
+) -> dict[str, Any] | None:
+    """Validate the physical rig-id table: one row per exported camera plus a final LiDAR row."""
+    rig = raw.get("rig_view_embedding")
+    if rig is None:
+        return None
+    if schema_version != 3:
+        raise ValueError(
+            "Cosmos3 multiview rig_view_embedding requires schema_version=3."
+        )
+    if not isinstance(rig, Mapping):
+        raise TypeError("Cosmos3 multiview rig_view_embedding must be an object.")
+    if unknown := set(rig) - {"num_embeddings", "camera_ids", "lidar_id"}:
+        raise ValueError(
+            f"Unknown Cosmos3 multiview rig_view_embedding fields: {sorted(unknown)}."
+        )
+    num_embeddings = rig.get("num_embeddings")
+    if not _positive_int(num_embeddings) or num_embeddings < 2:
+        raise ValueError(
+            "Cosmos3 multiview rig_view_embedding.num_embeddings must be an integer "
+            f">= 2, got {num_embeddings!r}."
+        )
+    camera_ids = rig.get("camera_ids")
+    if not isinstance(camera_ids, Mapping):
+        raise TypeError(
+            "Cosmos3 multiview rig_view_embedding.camera_ids must be an object."
+        )
+    if set(camera_ids) != set(cameras):
+        raise ValueError(
+            "Cosmos3 multiview rig_view_embedding.camera_ids must name exactly the "
+            f"exported cameras: expected={sorted(cameras)}, got={sorted(camera_ids)}."
+        )
+    for camera, row in camera_ids.items():
+        # The final row is reserved for LiDAR.
+        if (
+            isinstance(row, bool)
+            or not isinstance(row, int)
+            or not 0 <= row <= num_embeddings - 2
+        ):
+            raise ValueError(
+                f"Cosmos3 multiview rig_view_embedding.camera_ids[{camera!r}] must be an "
+                f"integer in [0, {num_embeddings - 2}], got {row!r}."
+            )
+    if len(set(camera_ids.values())) != len(camera_ids):
+        raise ValueError(
+            "Cosmos3 multiview rig_view_embedding.camera_ids must assign distinct rows."
+        )
+    lidar_id = rig.get("lidar_id")
+    if (
+        isinstance(lidar_id, bool)
+        or not isinstance(lidar_id, int)
+        or lidar_id != num_embeddings - 1
+    ):
+        raise ValueError(
+            "Cosmos3 multiview rig_view_embedding.lidar_id must be the final row "
+            f"{num_embeddings - 1}, got {lidar_id!r}."
+        )
+    return {
+        "num_embeddings": int(num_embeddings),
+        "camera_ids": {str(camera): int(row) for camera, row in camera_ids.items()},
+        "lidar_id": int(lidar_id),
+    }
+
+
 def parse_multiview_deployment_config(
     transformer_config: Mapping[str, Any],
 ) -> Cosmos3MultiviewDeploymentConfig:
@@ -463,12 +630,21 @@ def parse_multiview_deployment_config(
         )
 
     schema_version = raw.get("schema_version")
-    if schema_version is not None and schema_version != 2:
+    if schema_version is not None and (
+        isinstance(schema_version, bool)
+        or schema_version not in COSMOS3_MULTIVIEW_SCHEMA_VERSIONS
+    ):
         raise ValueError(
-            f"Unsupported Cosmos3 multiview schema_version={schema_version!r}; "
-            "expected null (v1 WSM artifact) or 2."
+            f"Unsupported Cosmos3 multiview schema_version={schema_version!r}; expected "
+            f"null (v1 WSM artifact) or one of {list(COSMOS3_MULTIVIEW_SCHEMA_VERSIONS)}."
         )
-    if schema_version is None and tuple(cameras) != COSMOS3_MADS_CAMERAS:
+    versioned = schema_version is not None
+    if versioned and (unknown := set(raw) - COSMOS3_MULTIVIEW_CONTRACT_FIELDS):
+        raise ValueError(
+            f"Unknown Cosmos3 multiview contract fields {sorted(unknown)} "
+            f"(schema_version={schema_version}); this build cannot honour them."
+        )
+    if not versioned and tuple(cameras) != COSMOS3_MADS_CAMERAS:
         raise ValueError(
             "Unversioned Cosmos3 multiview artifacts require the fixed 11-camera MADS "
             f"order: expected={list(COSMOS3_MADS_CAMERAS)}, got={cameras}."
@@ -476,7 +652,7 @@ def parse_multiview_deployment_config(
     separate_captions = False
     variable_view_count = False
     inference_defaults: dict[str, Any] | None = None
-    if schema_version == 2:
+    if versioned:
         if not isinstance(_required_field(raw, "variable_view_count"), bool):
             raise TypeError("Cosmos3 multiview variable_view_count must be boolean.")
         separate_captions = _per_view_captions_flag(raw)
@@ -493,39 +669,56 @@ def parse_multiview_deployment_config(
                 )
     lidar = raw.get("lidar")
     if lidar is not None:
-        if schema_version != 2:
+        if not versioned:
             raise ValueError(
-                "Cosmos3 joint camera/LiDAR artifacts require schema_version=2 metadata."
+                "Cosmos3 joint camera/LiDAR artifacts require versioned "
+                "(schema_version >= 2) multiview metadata."
             )
         lidar = validate_lidar_config(lidar)
+    camera_patch = transformer_config.get("latent_patch_size", 2)
+    if not _positive_int(camera_patch):
+        raise TypeError(
+            "Cosmos3 transformer latent_patch_size must be a positive integer."
+        )
+    lidar_patch = _validated_lidar_patch(raw, schema_version, int(camera_patch))
+    rig_view_embedding = _validated_rig_view_embedding(raw, schema_version, cameras)
+    if (
+        schema_version == 3
+        and rig_view_embedding is None
+        and lidar_patch in (None, (camera_patch, camera_patch))
+    ):
+        raise ValueError(
+            "Cosmos3 multiview schema_version=3 requires rig_view_embedding or a LiDAR "
+            "patch that differs from the camera patch; export version 2 otherwise."
+        )
 
     backend = _required_field(raw, "backend")
     if not isinstance(backend, str):
         raise TypeError("Cosmos3 multiview backend must be a string.")
-    if backend != COSMOS3_MULTIVIEW_ATTENTION_BACKEND:
+    if backend not in COSMOS3_MULTIVIEW_ATTENTION_BACKENDS:
         raise ValueError(
-            f"Cosmos3 multiview backend {backend!r} is not supported: this build serves "
-            f"{COSMOS3_MULTIVIEW_ATTENTION_BACKEND!r} exports only (nvidia/Cosmos3-Nano-"
-            "Transfer-Auto revision 75f2199 or later). Exports trained under the masked "
-            "FlexAttention backends are a different attention pattern; use a maskless "
-            "export or an sglang build from before Sep 21 2026."
+            "Cosmos3 multiview backend must be one of "
+            f"{list(COSMOS3_MULTIVIEW_ATTENTION_BACKENDS)}, got {backend!r}."
         )
-    if schema_version != 2:
-        raise ValueError(
-            "Cosmos3 multiview maskless exports carry schema_version=2 metadata; "
-            f"got {schema_version!r}. Re-export the checkpoint."
+    if backend == "maskless":
+        if not versioned:
+            raise ValueError(
+                "Cosmos3 multiview maskless exports carry versioned metadata; "
+                f"got schema_version={schema_version!r}. Re-export the checkpoint."
+            )
+        reason = maskless_unavailable_reason(
+            attention_scope=attention_scope,
+            decomposed_temporal_window_seconds=temporal_window,
+            control_attends_sensor=bool(raw["control_attends_sensor"]),
         )
-    reason = maskless_unavailable_reason(
-        attention_scope=attention_scope,
-        decomposed_temporal_window_seconds=temporal_window,
-        control_attends_sensor=bool(raw["control_attends_sensor"]),
-    )
-    if reason is not None:
-        raise ValueError(f"Cosmos3 multiview backend 'maskless': {reason}")
+        if reason is not None:
+            raise ValueError(f"Cosmos3 multiview backend 'maskless': {reason}")
     lidar_attends_captions = raw.get("lidar_attends_captions", True)
     if not isinstance(lidar_attends_captions, bool):
         raise TypeError("Cosmos3 multiview lidar_attends_captions must be boolean.")
-    system_prompt_variant = raw.get("system_prompt_variant", "wsm_controls")
+    system_prompt_variant = raw.get(
+        "system_prompt_variant", "wsm_controls" if versioned else "provided_controls"
+    )
     if system_prompt_variant not in COSMOS3_SYSTEM_PROMPT_VARIANTS:
         raise ValueError(
             "Cosmos3 multiview system_prompt_variant must be one of "
@@ -549,6 +742,8 @@ def parse_multiview_deployment_config(
         lidar=lidar,
         lidar_attends_captions=lidar_attends_captions,
         system_prompt_variant=system_prompt_variant,
+        lidar_patch_spatial_hw=lidar_patch,
+        rig_view_embedding=rig_view_embedding,
     )
 
 
@@ -569,6 +764,13 @@ class Cosmos3MultiviewConfig(Cosmos3Config):
     use_duration_template: bool = True
     use_system_prompt: bool = True
 
+    # Attention kernel for masked exports: None follows the environment override,
+    # then the device ("auto": FA4 block-sparse on Blackwell, FlexAttention
+    # Triton elsewhere); "triton" and "fa4" pin one. Swapping triton and fa4 is
+    # safe for A/B measurement; the masked family and "maskless" are different
+    # attention patterns and cannot be swapped.
+    multiview_attention_backend: str | None = None
+
     # Parsed once from transformer/config.json in update_config_from_dict.
     multiview_deployment: Cosmos3MultiviewDeploymentConfig | None = None
 
@@ -583,6 +785,57 @@ class Cosmos3MultiviewConfig(Cosmos3Config):
                     "Cosmos3 multiview expects the FlowUniPC schedule; a distilled "
                     "fixed-step scheduler is not supported."
                 )
+            # Fail on a bad backend name or family at launch, not on the first request.
+            backend, source = self._resolve_multiview_backend()
+            logger.info(
+                "Cosmos3 multiview attention backend: %s (from %s)", backend, source
+            )
+
+    def _resolve_multiview_backend(self) -> tuple[str, str]:
+        """Explicit config field, then the env override, then the checkpoint.
+
+        Returns ``"auto"`` for a masked export with no pin; the pipeline resolves
+        that against the device it runs on.
+        """
+        if self.multiview_deployment is None:
+            raise ValueError(
+                "Cosmos3 multiview deployment config has not been resolved; "
+                "set model_path first."
+            )
+        exported = self.multiview_deployment.backend
+        backend = self.multiview_attention_backend
+        source = "pipeline config multiview_attention_backend"
+        if backend is None:
+            backend = envs.SGLANG_DIFFUSION_COSMOS3_MULTIVIEW_ATTENTION_BACKEND
+            source = MULTIVIEW_BACKEND_ENV_VAR
+        if not backend:
+            backend = COSMOS3_MULTIVIEW_AUTO_BACKEND
+            source = "transformer/config.json multiview.backend"
+        allowed = (*COSMOS3_MULTIVIEW_ATTENTION_BACKENDS, COSMOS3_MULTIVIEW_AUTO_BACKEND)
+        if backend not in allowed:
+            raise ValueError(
+                "Cosmos3 multiview attention backend must be one of "
+                f"{list(allowed)}, got {backend!r} (from {source})."
+            )
+        if backend == COSMOS3_MULTIVIEW_AUTO_BACKEND:
+            resolved = (
+                "maskless" if exported == "maskless" else COSMOS3_MULTIVIEW_AUTO_BACKEND
+            )
+            return resolved, source
+        if (backend == "maskless") != (exported == "maskless"):
+            # triton <-> fa4 is a kernel swap; masked <-> maskless changes the
+            # attention the weights were trained with, so it is not an override.
+            raise ValueError(
+                f"Cosmos3 multiview attention backend {backend!r} (from {source}) is not "
+                f"the family the checkpoint was exported for ({exported!r}). The masked "
+                "(triton/fa4) and maskless backends are different attention patterns; "
+                "pick a backend from the checkpoint's family or re-export the checkpoint."
+            )
+        return backend, source
+
+    def resolved_multiview_backend(self) -> str:
+        """``triton``, ``fa4``, ``maskless``, or ``auto`` (masked family, device decides)."""
+        return self._resolve_multiview_backend()[0]
 
     def validate_server_args(self, server_args: Any) -> None:
         super().validate_server_args(server_args)
