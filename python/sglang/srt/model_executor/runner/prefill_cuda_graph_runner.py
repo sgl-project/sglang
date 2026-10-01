@@ -381,7 +381,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.mamba_track_enabled = self._is_mamba_track_enabled()
 
         # --- buffers ---------------------------------------------------
-        self._qwen_bcg_mtp_embeddings = None
         # `hidden_size` here sizes only the multimodal `input_embeds` buffer,
         # which `general_mm_embed_routine` copies the merged text+media
         # embeddings into. A model whose merge happens above the embedding width
@@ -2019,18 +2018,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             output, self.layer_model.last_hc_hidden_states = output
         return output
 
-    def _pad_qwen_bcg_mtp_embeddings(self, live, raw_num_tokens, static_num_tokens):
-        if raw_num_tokens == static_num_tokens:
-            return live
-        buf = self._qwen_bcg_mtp_embeddings
-        if buf is None:
-            buf = live.new_empty((max(self.capture_num_tokens), live.shape[1]))
-            self._qwen_bcg_mtp_embeddings = buf
-        view = buf[:static_num_tokens]
-        view[:raw_num_tokens].copy_(live)
-        view[raw_num_tokens:].zero_()
-        return view
-
     def _execute_body_capture(
         self,
         forward_batch: ForwardBatch,
@@ -2082,12 +2069,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             # MTP consumes the target model's live multimodal embeddings in its
             # eager wrapper before the captured transformer body is replayed.
             tail_batch.mm_input_embeds = forward_batch.mm_input_embeds
-            if tail_batch.mm_input_embeds is not None and self._qwen_bcg_pad_mtp_embeds:
-                tail_batch.mm_input_embeds = self._pad_qwen_bcg_mtp_embeddings(
-                    live=tail_batch.mm_input_embeds,
-                    raw_num_tokens=raw_num_tokens,
-                    static_num_tokens=static_num_tokens,
-                )
         model_kwargs = kwargs
         if self._use_draft_input_embeds:
             # Draft forwards that accept `input_embeds` (all current EAGLE
