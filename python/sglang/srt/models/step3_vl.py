@@ -22,6 +22,7 @@ from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
+    reject_attn_tp_shard_with_tp_reduce,
 )
 from sglang.srt.layers.layer_boundary import (
     declare_attn,
@@ -546,6 +547,12 @@ class Step3VisionMLP(nn.Module):
             prefix=add_prefix("gate_proj", prefix),
         )
         self.act = ACT2FN[hidden_act]  # quick_gelu
+        # TODO: this layer shards over attention TP but reduces over the full TP
+        # group; reduce over the attention-TP group so attention DP and attention
+        # CP narrower than TP can run it.
+        reject_attn_tp_shard_with_tp_reduce(
+            type(self).__name__, shard_tp_size=attn_tp_size, reduces_over_attn_tp=False
+        )
         self.fc2 = RowParallelLinear(
             intermediate_size,
             dim,

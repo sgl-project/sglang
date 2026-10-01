@@ -17,7 +17,10 @@ from sglang.srt.layers.attention.vision import (
     VisionAttentionMetadata,
     prepare_vision_attention_metadata,
 )
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.dp_attention import (
+    is_dp_attention_enabled,
+    reject_attn_tp_shard_with_tp_reduce,
+)
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -83,6 +86,15 @@ class MiniMaxVLMultiModalProjector(nn.Module):
 
         tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
         tp_rank = 0 if use_data_parallel else get_parallel().attn_tp_rank
+        # TODO: this layer shards over attention TP but reduces over the full TP
+        # group without attention DP; reduce over the attention-TP group so
+        # attention CP narrower than TP can run it.
+        reject_attn_tp_shard_with_tp_reduce(
+            type(self).__name__,
+            shard_tp_size=tp_size,
+            reduces_over_attn_tp=is_dp_attention_enabled(),
+            hint=", or --mm-enable-dp-encoder where the model supports it",
+        )
 
         self.linear_1 = ColumnParallelLinear(
             vision_hidden_size,
@@ -138,6 +150,15 @@ class MiniMaxVLPatchMerger(nn.Module):
 
         tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
         tp_rank = 0 if use_data_parallel else get_parallel().attn_tp_rank
+        # TODO: this layer shards over attention TP but reduces over the full TP
+        # group without attention DP; reduce over the attention-TP group so
+        # attention CP narrower than TP can run it.
+        reject_attn_tp_shard_with_tp_reduce(
+            type(self).__name__,
+            shard_tp_size=tp_size,
+            reduces_over_attn_tp=is_dp_attention_enabled(),
+            hint=", or --mm-enable-dp-encoder where the model supports it",
+        )
 
         self.linear_1 = ColumnParallelLinear(
             text_hidden_size * spatial_merge_size**2,
@@ -260,6 +281,15 @@ class CLIPEncoderLayer(nn.Module):
         self.use_data_parallel = use_data_parallel
         tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
         tp_rank = 0 if use_data_parallel else get_parallel().attn_tp_rank
+        # TODO: this layer shards over attention TP but reduces over the full TP
+        # group without attention DP; reduce over the attention-TP group so
+        # attention CP narrower than TP can run it.
+        reject_attn_tp_shard_with_tp_reduce(
+            type(self).__name__,
+            shard_tp_size=tp_size,
+            reduces_over_attn_tp=is_dp_attention_enabled(),
+            hint=", or --mm-enable-dp-encoder where the model supports it",
+        )
 
         self.self_attn = VisionAttention(
             embed_dim=config.hidden_size,

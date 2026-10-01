@@ -455,6 +455,28 @@ def is_dp_attention_enabled() -> bool:
     return get_flags().dp.enabled
 
 
+def reject_attn_tp_shard_with_tp_reduce(
+    layer: str, *, shard_tp_size: int, reduces_over_attn_tp: bool, hint: str = ""
+) -> None:
+    """Reject a layer that shards over attention TP but all-reduces over the TP group.
+
+    The two groups differ only when attention DP or attention CP makes attention
+    TP narrower than TP. There the all-reduce mixes ranks that hold other
+    requests or replicated inputs, so the output is wrong; a one-rank shard does
+    not reduce at all.
+    """
+    tp_size = get_parallel().tp_size
+    if reduces_over_attn_tp or not 1 < shard_tp_size < tp_size:
+        return
+    raise ValueError(
+        f"{layer} shards over the attention TP group ({shard_tp_size} ranks) "
+        f"but all-reduces over the full TP group ({tp_size} ranks), so it does "
+        "not support attention data parallelism or attention context "
+        "parallelism narrower than --tp-size yet. Use --attn-dp-size equal to "
+        f"--tp-size, or no attention context parallelism{hint}."
+    )
+
+
 def is_allocation_symmetric() -> bool:
     return not is_dp_attention_enabled() or is_dp_max_padding()
 

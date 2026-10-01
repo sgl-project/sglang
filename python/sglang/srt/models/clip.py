@@ -12,6 +12,7 @@ from transformers import CLIPConfig, CLIPTextConfig, CLIPVisionConfig
 
 from sglang.srt.layers.activation import QuickGELU, get_act_fn
 from sglang.srt.layers.conv import Conv2dLayer
+from sglang.srt.layers.dp_attention import reject_attn_tp_shard_with_tp_reduce
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
@@ -199,6 +200,14 @@ class CLIPAttention(nn.Module):
             prefix=add_prefix("qkv_proj", prefix),
             tp_rank=parallel.attn_tp_rank,
             tp_size=parallel.attn_tp_size,
+        )
+        # TODO: this layer shards over attention TP but reduces over the full TP
+        # group; reduce over the attention-TP group so attention DP and attention
+        # CP narrower than TP can run it.
+        reject_attn_tp_shard_with_tp_reduce(
+            type(self).__name__,
+            shard_tp_size=parallel.attn_tp_size,
+            reduces_over_attn_tp=False,
         )
         self.proj = RowParallelLinear(
             input_size=config.hidden_size,
