@@ -5,6 +5,10 @@ import torch
 import triton
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.mqa_logits_utils import (
+    mqa_logits_needs_budget_check,
+    mqa_logits_static_budget_bytes,
+)
 from sglang.srt.layers.dp_attention import DpPaddingMode, dp_slot_in
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
@@ -301,6 +305,43 @@ def _fp8_paged_mqa_logits_torch(
             f"(got {context_lens.shape[1]}); disable speculative decoding."
         )
         context_lens = context_lens[:, 0]
+    batch_size = q_fp8.shape[0]
+    block_size = kv_cache_fp8.shape[1]
+    head_dim = q_fp8.shape[-1]
+    padded_seq_len = block_table.shape[1] * block_size
+    per_token_work_bytes = 2 * (head_dim + 4) + 2 * head_dim + 4
+    per_row_bytes = padded_seq_len * per_token_work_bytes + max_seq_len * 4
+    if (
+        q_fp8.is_cuda
+        and per_row_bytes > 0
+        and mqa_logits_needs_budget_check(
+            num_rows=batch_size, num_cols=max(max_seq_len, padded_seq_len)
+        )
+    ):
+        device_index = q_fp8.device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        budget_bytes = mqa_logits_static_budget_bytes(device_index=device_index)
+        rows_per_chunk = max(budget_bytes // per_row_bytes, 1)
+    else:
+        rows_per_chunk = batch_size
+    if rows_per_chunk < batch_size:
+        logits_chunks = []
+        for start in range(0, batch_size, rows_per_chunk):
+            end = min(start + rows_per_chunk, batch_size)
+            logits_chunks.append(
+                fp8_paged_mqa_logits_torch(
+                    q_fp8[start:end],
+                    kv_cache_fp8,
+                    weights[start:end],
+                    context_lens[start:end],
+                    block_table[start:end],
+                    schedule_metadata,
+                    max_seq_len,
+                    clean_logits=clean_logits,
+                )
+            )
+        return torch.cat(logits_chunks, dim=0)
     return fp8_paged_mqa_logits_torch(
         q_fp8,
         kv_cache_fp8,

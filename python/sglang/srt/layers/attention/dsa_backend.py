@@ -773,6 +773,7 @@ class DeepseekSparseAttnBackend(
             and next_n
             and next_n >= 2
             and get_platform().is_sm100
+            and not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
         ):
             return cache_seqlens_int32.view(-1, 1).expand(-1, next_n).contiguous()
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
