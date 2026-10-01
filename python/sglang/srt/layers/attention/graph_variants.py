@@ -221,7 +221,7 @@ def create_dllm_bmm_graph_variants(
         return None
     # Keep a full-prefix fallback: the final canvas can be padded beyond the
     # request's logical context limit. Ascending captures share their pool.
-    capacities = tuple(range(2048, config.context_len, 2048)) + (config.context_len,)
+    capacities = tuple(range(512, config.context_len, 512)) + (config.context_len,)
     if len(capacities) < 2:
         return None
     logger.info("DLLM attention graph prefix capacities: %s", capacities)

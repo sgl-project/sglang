@@ -22,17 +22,20 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 class TestDllmBmmGraphVariants(CustomTestCase):
     def test_prefix_boundaries_include_full_canvas(self):
-        variants = DllmBmmGraphVariants(256, tuple(range(2048, 16385, 2048)))
+        variants = DllmBmmGraphVariants(256, tuple(range(512, 16385, 512)))
         batch = SimpleNamespace(
             batch_size=1, input_ids=torch.empty(256), seq_lens_cpu=None
         )
         for prefix, expected in [
-            (0, 2048),
+            (0, 512),
+            (512, 512),
+            (513, 1024),
             (2048, 2048),
-            (2049, 4096),
+            (2049, 2560),
             (8000, 8192),
-            (8256, 10240),
-            (8768, 10240),
+            (8256, 8704),
+            (8512, 8704),
+            (8768, 9216),
             (16384, 16384),
             (-1, 16384),
         ]:
@@ -45,7 +48,7 @@ class TestDllmBmmGraphVariants(CustomTestCase):
                     self.assertEqual(get_dllm_bmm_capture_prefix_capacity(), expected)
                 finally:
                     _set_capture_attention_variant(None)
-        self.assertEqual(variants.capture_labels[0], "dllm_bmm_prefix_2048")
+        self.assertEqual(variants.capture_labels[0], "dllm_bmm_prefix_512")
         self.assertEqual(variants.capture_labels[-1], "dllm_bmm_prefix_16384")
         self.assertIsNone(get_dllm_bmm_capture_prefix_capacity())
 
