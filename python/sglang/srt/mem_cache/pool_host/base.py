@@ -7,15 +7,23 @@ from collections.abc import Iterable
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
-from typing import Optional, TypeGuard
+from typing import Optional, TypeGuard, Union
 
 import torch
 
 from sglang.srt.mem_cache.host_memory import available_host_memory_bytes
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.mem_cache.pool_host.common import (
+    HostTensorAllocator,
     _cuda_host_unregister,
+    device_uses_allocator,
     get_allocator_from_storage,
+)
+from sglang.srt.mem_cache.storage.mmap.mmap_allocator import (
+    HUGEPAGE_MODE_PREFER,
+    HUGEPAGE_MODE_REQUIRED,
+    hugepage_mode,
+    hugepage_size_requested,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda, is_hip
@@ -82,7 +90,11 @@ def ranks_per_host() -> int:
     return max(launch_world_size // get_parallel().nnodes, 1)
 
 
-def host_memory_budget_bytes(requested_bytes: int = 0) -> int:
+def host_memory_budget_bytes(
+    requested_bytes: int = 0,
+    allocator: Optional[HostTensorAllocator] = None,
+    device: Optional[Union[str, torch.device]] = None,
+) -> int:
     """Host RAM this rank may claim for a HiCache pool.
 
     Bound machine availability by the visible cgroup limits before splitting
@@ -91,6 +103,16 @@ def host_memory_budget_bytes(requested_bytes: int = 0) -> int:
 
     Inside host_memory_budget_scope, requested_bytes is booked against the
     snapshot when it fits; the allowance before booking is returned.
+
+    When ``allocator`` maps MAP_HUGETLB (SGLANG_HUGEPAGE_SIZE) the pool may
+    come from the kernel's hugetlb pool instead, which MemAvailable excludes.
+    The two are alternatives, not a sum: one mapping is served entirely by one
+    or the other, so the larger of them is the budget, and the reserve stays
+    on plain RAM. The credit needs ``device`` to dispatch to the allocator
+    (npu/musa pin through torch). Unsupported allocator/device paths ignore the
+    hugepage policy and retain the plain-RAM budget. On supported paths,
+    ``required`` uses only hugetlb; in ``prefer`` mode an unexpected hugetlb
+    allocation failure may fall back to plain RAM that was not budgeted for.
     """
     available = _host_memory_budget.get()
     if available is not None:
@@ -99,6 +121,27 @@ def host_memory_budget_bytes(requested_bytes: int = 0) -> int:
         return available
 
     free = available_host_memory_bytes() - HICACHE_HOST_MEMORY_RESERVE_BYTES
+    hugetlb_supported = (
+        allocator is not None
+        and device is not None
+        and device_uses_allocator(device)
+        and allocator.supports_hugetlb()
+    )
+
+    if hugetlb_supported:
+        size = hugepage_size_requested()
+        mode = hugepage_mode(size)
+        if mode == HUGEPAGE_MODE_REQUIRED:
+            if size == 0:
+                raise ValueError(
+                    "SGLANG_HUGEPAGE_MODE=required requires "
+                    "SGLANG_HUGEPAGE_SIZE=2MB or 1GB."
+                )
+            free = allocator.free_hugetlb_bytes()
+        elif mode == HUGEPAGE_MODE_PREFER:
+            hugetlb_free = allocator.free_hugetlb_bytes()
+            if hugetlb_free > 0:
+                free = max(free, hugetlb_free)
     return free // ranks_per_host()
 
 
@@ -221,7 +264,9 @@ class HostKVCache(abc.ABC):
 
         # Verify there is enough available host memory.
         requested_bytes = self.size * self.size_per_token
-        available_bytes = host_memory_budget_bytes(requested_bytes)
+        available_bytes = host_memory_budget_bytes(
+            requested_bytes, self.allocator, self.device_pool.device
+        )
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
@@ -424,7 +469,7 @@ class HostKVCache(abc.ABC):
         """
         logger.warning(
             "%s does not implement is_stride_page_aligned(); assuming not aligned. "
-            "O_DIRECT with a file-based NIXL backend will fall back to copy mode for this pool.",
+            "An alignment-constrained NIXL backend will fall back to copy mode for this pool.",
             type(self).__name__,
         )
         return False
