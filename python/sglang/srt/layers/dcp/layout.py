@@ -22,6 +22,7 @@ from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.unified_cache.component_type import BASE_COMPONENT_TYPE
 from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.utils import print_info_once
 
@@ -313,6 +314,23 @@ class DcpSharedPrefix(NamedTuple):
     union_rows: int
 
 
+def _dcp_node_rows(node: object) -> Optional[int]:
+    """Tokens a radix node holds on device, or None when it holds none.
+
+    Two node shapes reach here. ``UnifiedTreeNode`` -- what the default
+    ``UnifiedRadixCache`` builds, so what a served run uses -- keeps the Full KV
+    under ``component_data``; ``RadixCache``'s ``TreeNode`` has a plain
+    ``value``. Reading only the latter counts every node as empty.
+    """
+    data = getattr(node, "component_data", None)
+    value = (
+        data[BASE_COMPONENT_TYPE].value
+        if data is not None
+        else getattr(node, "value", None)
+    )
+    return None if value is None else len(value)
+
+
 def dcp_shared_prefix(
     last_nodes: Sequence[object], protected_lens: Sequence[int]
 ) -> DcpSharedPrefix:
@@ -332,10 +350,11 @@ def dcp_shared_prefix(
     walked: List[int] = []
     for last_node in last_nodes:
         node, rows = last_node, 0
-        while node is not None and getattr(node, "value", None) is not None:
-            n = len(node.value)
-            rows += n
-            seen.setdefault(id(node), n)
+        while node is not None:
+            n = _dcp_node_rows(node)
+            if n:
+                rows += n
+                seen.setdefault(id(node), n)
             node = getattr(node, "parent", None)
         walked.append(rows)
     return DcpSharedPrefix(

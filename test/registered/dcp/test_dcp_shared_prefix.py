@@ -18,7 +18,11 @@ Three claims, and the first is the one that decides the design:
     3. a chunked request's partial page is outside both -- it lives in
        ``prefix_indices`` but not in the tree, so a dedup must still send it
        per request, and comparing the walk against ``len(prefix_indices)``
-       instead would call every chunked request a failure.
+       instead would call every chunked request a failure;
+    4. it reads BOTH node shapes. The default cache is UnifiedRadixCache, whose
+       UnifiedTreeNode keeps the Full KV under ``component_data`` and has no
+       ``.value`` at all -- a walk that reads only ``.value`` reports every
+       served batch as empty.
 
 Usage:
     python -m pytest test_dcp_shared_prefix.py -v
@@ -34,18 +38,31 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class FakeNode:
-    """The two attributes the walk reads. The real TreeNode carries a device
-    tensor in ``value``; only its length is read."""
+    """RadixCache's TreeNode shape: a plain ``value``, only its length read."""
 
     def __init__(self, rows, parent=None):
         self.value = [0] * rows
         self.parent = parent
 
 
-def chain(parent, *lengths):
+class FakeComponentData:
+    def __init__(self, value):
+        self.value = value
+
+
+class FakeUnifiedNode:
+    """UnifiedTreeNode's shape: the Full KV sits in ``component_data`` and there
+    is no ``.value``. BASE_COMPONENT_TYPE is ComponentType.FULL == 0."""
+
+    def __init__(self, rows, parent=None):
+        self.component_data = [FakeComponentData(None if rows is None else [0] * rows)]
+        self.parent = parent
+
+
+def chain(parent, *lengths, cls=FakeNode):
     """Extend a path by one node per length, returning the last."""
     for rows in lengths:
-        parent = FakeNode(rows, parent)
+        parent = cls(rows, parent)
     return parent
 
 
@@ -114,6 +131,39 @@ class TestDcpSharedPrefix(unittest.TestCase):
         prefix_lens = [768 + 37, 768 + 91]
         private = sum(prefix_lens) - sum(got.protected)
         self.assertEqual(private, 37 + 91)
+
+    def test_the_unified_node_shape_the_live_cache_builds(self):
+        # UnifiedRadixCache is the fall-through in mem_cache/registry.py and
+        # nothing passes cache_class, so this is the shape a served run has.
+        # Reading .value here yields nothing, which is a silent zero rather
+        # than an error -- the probe would print saved=0% on every batch.
+        base = chain(ROOT, 512, 512, cls=FakeUnifiedNode)
+        reqs = [
+            chain(base, 64, cls=FakeUnifiedNode),
+            chain(base, 32, cls=FakeUnifiedNode),
+        ]
+        got = dcp_shared_prefix(reqs, [1088, 1056])
+        self.assertEqual(got.walked, [1088, 1056])
+        self.assertEqual(got.union_rows, 1024 + 64 + 32)
+
+    def test_a_unified_root_holds_an_empty_value(self):
+        # UnifiedTreeNode's root carries value=[], not None, so the walk cannot
+        # use "value is None" as its stop condition; it stops at parent None.
+        root = FakeUnifiedNode(0)
+        got = dcp_shared_prefix([chain(root, 256, cls=FakeUnifiedNode)], [256])
+        self.assertEqual(got.walked, [256])
+        self.assertEqual(got.union_rows, 256)
+
+    def test_a_value_less_node_is_stepped_over_not_stopped_at(self):
+        # Under HiCache the match skips an evicted-but-backuped node and keeps
+        # walking, so device_indices has a hole. Stopping there instead would
+        # under-count every ancestor above it.
+        base = chain(ROOT, 256, cls=FakeUnifiedNode)
+        evicted = FakeUnifiedNode(None, base)
+        leaf = chain(evicted, 64, cls=FakeUnifiedNode)
+        got = dcp_shared_prefix([leaf], [320])
+        self.assertEqual(got.walked, [320])
+        self.assertEqual(got.union_rows, 320)
 
     def test_an_empty_batch(self):
         got = dcp_shared_prefix([], [])
