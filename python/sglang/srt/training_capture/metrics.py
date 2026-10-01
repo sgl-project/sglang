@@ -1,0 +1,154 @@
+"""Bounded Prometheus series for one training-capture producer."""
+
+from collections import Counter
+from time import time
+
+
+class CaptureMetrics:
+    EVENTS = (
+        "considered",
+        "admitted",
+        "sampled_out",
+        "adaptive_sampled_out",
+        "excluded_disabled",
+        "excluded_health_check",
+        "excluded_length",
+        "excluded_unsupported",
+        "admission_backpressure",
+        "admission_invalid_request",
+        "admission_catalog_error",
+        "lease_rejected",
+        "lease_renew_error",
+        "capture_failed",
+        "writer_started",
+        "writer_failed",
+        "copies_completed",
+        "snapshot_built",
+        "sealed",
+        "ready",
+        "failure_report_error",
+        "eager_forwards",
+        "cuda_graph_forwards",
+        "overlap_forwards",
+        "speculative_verify_forwards",
+        "speculative_commits_copied",
+        "other",
+    )
+    STATES = ("available", "active", "queued", "writing", "pending_publication")
+    ACTIONS = ("decreases", "recoveries", "failures", "pauses")
+
+    def __init__(self, labels, *, registry=None):
+        # Import after the server configures PROMETHEUS_MULTIPROC_DIR.
+        from prometheus_client import REGISTRY, Counter, Gauge
+
+        registry = REGISTRY if registry is None else registry
+        self.labels = dict(labels)
+        self.previous = {}
+
+        def gauge(name, documentation, extra=()):
+            return Gauge(
+                "sglang:training_capture_" + name,
+                documentation,
+                labelnames=[*labels, *extra],
+                multiprocess_mode="mostrecent",
+                registry=registry,
+            )
+
+        def counter(name, documentation, extra):
+            return Counter(
+                "sglang:training_capture_" + name,
+                documentation,
+                labelnames=[*labels, *extra],
+                registry=registry,
+            )
+
+        self.events = counter(
+            "events",
+            "Capture lifecycle events; event categories may overlap.",
+            ("event",),
+        )
+        self.adjustments = counter(
+            "admission_adjustments", "Adaptive capture control actions.", ("action",)
+        )
+        self.ratio = gauge("sample_ratio", "Capture admission probability.", ("kind",))
+        self.reservations = gauge(
+            "reservations", "Capture reservations by lifecycle state.", ("state",)
+        )
+        self.host_slots = gauge(
+            "host_slots", "Registered Host slots by ownership state.", ("state",)
+        )
+        self.disabled = gauge(
+            "disabled", "One when capture is disabled by a failure or shutdown."
+        )
+        self.adaptive = gauge(
+            "adaptive_enabled", "One when adaptive admission is configured."
+        )
+        self.queued = gauge(
+            "queue_depth", "Reservations awaiting background processing."
+        )
+        self.host_bytes = gauge(
+            "host_allocated_bytes", "Allocated registered Host arena bytes."
+        )
+        self.occupancy = gauge(
+            "occupied_fraction", "Busy or quarantined fraction of capture capacity."
+        )
+        self.writer_age = gauge(
+            "writer_age_seconds",
+            "Age of the oldest queued, writing or pending publication.",
+        )
+        self.cooldown = gauge(
+            "cooldown_seconds", "Remaining adaptive admission cooldown."
+        )
+        self.updated = gauge(
+            "metrics_update_timestamp_seconds",
+            "Unix time of the last successful capture metrics update.",
+        )
+
+    def _increment(self, metric, key, value, **labels):
+        previous = self.previous.get(key, 0)
+        # Retrying a snapshot must not count the same event again.
+        metric.labels(**self.labels, **labels).inc(max(0, value - previous))
+        self.previous[key] = max(value, previous)
+
+    def update(self, stats):
+        events = Counter()
+        for name, value in stats["counters"].items():
+            if name in self.EVENTS:
+                event = name
+            elif name.startswith("failed_"):
+                event = "capture_failed"
+            elif name.startswith("writer_failed_"):
+                event = "writer_failed"
+            elif name.startswith("excluded_"):
+                event = "excluded_unsupported"
+            else:
+                event = "other"
+            events[event] += value
+        for event in self.EVENTS:
+            self._increment(self.events, ("event", event), events[event], event=event)
+        admission = stats["admission"]
+        for action in self.ACTIONS:
+            self._increment(
+                self.adjustments, ("action", action), admission[action], action=action
+            )
+        for kind in ("configured", "target", "effective"):
+            self.ratio.labels(**self.labels, kind=kind).set(admission[kind + "_ratio"])
+        for state in self.STATES:
+            self.reservations.labels(**self.labels, state=state).set(
+                stats["states"].get(state, 0)
+            )
+        for state in ("free", "filling", "quarantined"):
+            self.host_slots.labels(**self.labels, state=state).set(
+                stats["host_pool"][state]
+            )
+        for metric, value in (
+            (self.disabled, int(stats["disabled_reason"] is not None)),
+            (self.adaptive, int(admission["adaptive"])),
+            (self.queued, stats["queued"]),
+            (self.host_bytes, stats["host_pool"]["allocated_bytes"]),
+            (self.occupancy, stats["occupied_fraction"]),
+            (self.writer_age, stats["writer_age_seconds"]),
+            (self.cooldown, admission["cooldown_remaining_seconds"]),
+        ):
+            metric.labels(**self.labels).set(value)
+        self.updated.labels(**self.labels).set(time())

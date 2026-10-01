@@ -1,0 +1,139 @@
+{
+  "id": null,
+  "uid": "sglang-training-capture",
+  "title": "SGLang Training Capture",
+  "schemaVersion": 41,
+  "version": 1,
+  "editable": true,
+  "tags": ["sglang", "training-capture"],
+  "timezone": "browser",
+  "refresh": "5s",
+  "time": {"from": "now-30m", "to": "now"},
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Prometheus",
+        "type": "datasource",
+        "query": "prometheus",
+        "refresh": 1
+      },
+      {
+        "name": "model_name",
+        "label": "Model",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "$datasource"},
+        "query": "label_values(sglang:training_capture_disabled, model_name)",
+        "refresh": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*"
+      },
+      {
+        "name": "instance",
+        "label": "Instance",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "$datasource"},
+        "query": "label_values(sglang:training_capture_disabled{model_name=~\"$model_name\"}, instance)",
+        "refresh": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Capture Admission Probability",
+      "type": "timeseries",
+      "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "sglang:training_capture_sample_ratio{model_name=~\"$model_name\",instance=~\"$instance\"}", "legendFormat": "{{instance}} TP{{tp_rank}} PP{{pp_rank}} {{kind}}"}]
+    },
+    {
+      "id": 2,
+      "title": "Capture Events / Second",
+      "description": "Events overlap: adaptive_sampled_out is a subset of sampled_out. READY counts direct writer confirmations, not journal recovery or consumer acknowledgements.",
+      "type": "timeseries",
+      "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "fieldConfig": {"defaults": {"unit": "ops", "min": 0}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "sum by (instance,event) (rate(sglang:training_capture_events_total{model_name=~\"$model_name\",instance=~\"$instance\",event=~\"admitted|ready|sampled_out|adaptive_sampled_out|admission_backpressure|capture_failed|writer_failed|admission_catalog_error|lease_renew_error\"}[$__rate_interval]))", "legendFormat": "{{instance}} {{event}}"}]
+    },
+    {
+      "id": 3,
+      "title": "Reservations by State",
+      "type": "timeseries",
+      "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "sglang:training_capture_reservations{model_name=~\"$model_name\",instance=~\"$instance\"}", "legendFormat": "{{instance}} TP{{tp_rank}} PP{{pp_rank}} {{state}}"}]
+    },
+    {
+      "id": 4,
+      "title": "Registered Host Slots",
+      "description": "filling includes spare reserved leases. occupied_fraction excludes spare leases. Quarantined slots remain unavailable until the transport is stopped.",
+      "type": "timeseries",
+      "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "sglang:training_capture_host_slots{model_name=~\"$model_name\",instance=~\"$instance\"}", "legendFormat": "{{instance}} TP{{tp_rank}} PP{{pp_rank}} {{state}}"}]
+    },
+    {
+      "id": 5,
+      "title": "Oldest Writer Work and Cooldown",
+      "type": "timeseries",
+      "gridPos": {"x": 0, "y": 16, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "fieldConfig": {"defaults": {"unit": "s", "min": 0}, "overrides": []},
+      "targets": [
+        {"refId": "A", "expr": "sglang:training_capture_writer_age_seconds{model_name=~\"$model_name\",instance=~\"$instance\"}", "legendFormat": "{{instance}} writer age"},
+        {"refId": "B", "expr": "sglang:training_capture_cooldown_seconds{model_name=~\"$model_name\",instance=~\"$instance\"}", "legendFormat": "{{instance}} cooldown"}
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Capture Disabled",
+      "type": "stat",
+      "gridPos": {"x": 12, "y": 16, "w": 6, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "fieldConfig": {"defaults": {"unit": "short", "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "colorMode": "value"},
+      "targets": [{"refId": "A", "expr": "sglang:training_capture_disabled{model_name=~\"$model_name\",instance=~\"$instance\"}", "legendFormat": "{{instance}} TP{{tp_rank}} PP{{pp_rank}}", "instant": true}]
+    },
+    {
+      "id": 7,
+      "title": "Metrics Age",
+      "description": "Monitor with Prometheus up. A missing producer is not evidence of healthy capture.",
+      "type": "timeseries",
+      "gridPos": {"x": 18, "y": 16, "w": 6, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "fieldConfig": {"defaults": {"unit": "s", "min": 0}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "time() - sglang:training_capture_metrics_update_timestamp_seconds{model_name=~\"$model_name\",instance=~\"$instance\"}", "legendFormat": "{{instance}} TP{{tp_rank}} PP{{pp_rank}}"}]
+    },
+    {
+      "id": 8,
+      "title": "Serving p99 TTFT and Inter-token Latency",
+      "description": "Existing serving metrics; inter-token latency follows response streaming semantics. This panel does not define or certify a capture overhead SLO.",
+      "type": "timeseries",
+      "gridPos": {"x": 0, "y": 24, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "fieldConfig": {"defaults": {"unit": "s", "min": 0}, "overrides": []},
+      "targets": [
+        {"refId": "A", "expr": "histogram_quantile(0.99, sum by (le,instance,is_streaming) (rate(sglang:time_to_first_token_seconds_bucket{model_name=~\"$model_name\",instance=~\"$instance\"}[$__rate_interval])))", "legendFormat": "{{instance}} TTFT streaming={{is_streaming}}"},
+        {"refId": "B", "expr": "histogram_quantile(0.99, sum by (le,instance) (rate(sglang:inter_token_latency_seconds_bucket{model_name=~\"$model_name\",instance=~\"$instance\"}[$__rate_interval])))", "legendFormat": "{{instance}} inter-token"}
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Allocated Capture Host Memory",
+      "type": "timeseries",
+      "gridPos": {"x": 12, "y": 24, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "fieldConfig": {"defaults": {"unit": "bytes", "min": 0}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "sglang:training_capture_host_allocated_bytes{model_name=~\"$model_name\",instance=~\"$instance\"}", "legendFormat": "{{instance}} TP{{tp_rank}} PP{{pp_rank}}"}]
+    }
+  ]
+}

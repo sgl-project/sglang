@@ -63,7 +63,11 @@ class CaptureAdmission:
         return self.ratio(now)
 
     def ratio(self, now):
-        return 0.0 if now < self.pause_until else self.target_ratio
+        stalled = (
+            self.config is not None
+            and self.writer_age_seconds >= self.config.writer_stall_seconds
+        )
+        return 0.0 if stalled or now < self.pause_until else self.target_ratio
 
     def stats(self, now, *, disabled=False):
         return {

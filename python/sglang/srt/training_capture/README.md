@@ -95,7 +95,9 @@ satisfy `0 <= low < high <= 1`.
 If the oldest queued/writing task exceeds `writer_stall_seconds`, new capture
 admission pauses. Catalog admission/heartbeat failures and writer failures also
 pause admission. Repeated faults or an ongoing stall extend the cooldown; they
-do not repeatedly reduce the ratio within the same adjustment interval. New
+do not repeatedly reduce the ratio within the same adjustment interval. A known
+stall keeps the effective ratio at zero until a fresh pressure observation clears
+it, even if a short cooldown expires between observations. New
 Catalog reservations pause during cooldown, while existing lease renewals and
 writer work continue. Healthy recovery never exceeds the configured ratio;
 `sample_ratio=0` stays zero.
@@ -182,6 +184,54 @@ raw Store objects. Journal files should live on a durable volume; one process
 owns a directory through a filesystem lock. A rejected fence leaves its entry
 for Catalog/operator reconciliation and never triggers unconditional deletion.
 
+## Prometheus Metrics
+
+With both `--training-capture-config` and `--enable-metrics`, the existing
+`/metrics` endpoint exports the following `sglang:training_capture_` families.
+No capture metrics or monitoring thread are created when either flag is absent.
+The producer inherits the scheduler's model/rank and configured extra labels.
+Request IDs, dataset contents, object keys, exception text and per-sample identity
+are never metric labels. Event/action/state/kind labels have bounded value sets.
+
+| Suffix | Type / Extra Label | Meaning |
+| --- | --- | --- |
+| `events_total` | Counter / `event` | Admission, exclusions, forwards and writer lifecycle events |
+| `admission_adjustments_total` | Counter / `action` | Decreases, recoveries, failures and pause transitions |
+| `sample_ratio` | Gauge / `kind` | Configured ceiling, adaptive target and effective admission probability |
+| `reservations` | Gauge / `state` | Available, active, queued, writing and pending-publication reservations |
+| `host_slots` | Gauge / `state` | Free, filling and quarantined registered Host slots |
+| `host_allocated_bytes` | Gauge | Allocated Host arena capacity, including manifest buffers |
+| `occupied_fraction` | Gauge | Busy reservations plus quarantined slots divided by configured capacity |
+| `queue_depth` | Gauge | Work awaiting background processing |
+| `writer_age_seconds` | Gauge | Age of oldest queued, writing or pending-publication work |
+| `adaptive_enabled` | Gauge | Whether adaptive admission is configured |
+| `disabled` | Gauge | Capture disabled by a failure or shutdown, distinct from adaptive cooldown |
+| `cooldown_seconds` | Gauge | Remaining adaptive cooldown |
+| `metrics_update_timestamp_seconds` | Gauge | Unix time of last successful metrics update |
+
+A dedicated background thread snapshots CPU state once per second. It keeps
+running while Catalog RPCs or Store writes block, requires no GPU synchronization
+and performs no Prometheus work on the inference thread. Export failures are
+logged and retried without changing capture ownership or disabling serving.
+Gauges use the existing server's multiprocess `mostrecent` convention; monitor
+their freshness together with Prometheus `up`, especially after worker failures.
+
+Counters aggregate observed lifecycle events, not mutually exclusive outcomes:
+`adaptive_sampled_out` is a subset of `sampled_out`; `capture_failed` and
+`writer_failed` can refer to the same request. `ready` counts direct successful
+writer publications in this process, excluding journal recovery and consumer
+acknowledgements. Do not infer exact dataset completeness from a rate ratio.
+`writer_age_seconds` includes queue waiting, CUDA completion, serialization and
+Catalog work; it is not RDMA latency. `host_slots{state="filling"}` includes
+spare leases, whereas `occupied_fraction` excludes them. Host bytes report
+allocated capacity, not payload transfer volume. These metrics also work with
+fixed sampling (`adaptive` absent).
+
+The [monitoring example](../../../../examples/monitoring/README.md) provisions
+a training-capture Grafana dashboard alongside serving metrics. The metrics are
+observations; TTFT/TPOT feedback, service-specific alerts and measured rollout
+thresholds are separate work.
+
 ## Verification
 
 ```bash
@@ -208,7 +258,10 @@ implementation status document. A final controlled-writer experiment enables
 adaptive admission with normal overlap: generation continues with a spare Host
 slot while new capture is paused, the original snapshot publishes after release,
 and a later request is captured after recovery. Both snapshots are read from the
-real Store and validated. This is a functional test, not a performance benchmark.
+real Store and validated. The adaptive server also enables Prometheus, scrapes
+the HTTP multiprocess endpoint during the writer stall and after recovery, and
+checks ratios, event counters, reservation resets and quarantine state.
+This is a functional test, not a performance benchmark.
 
 A Transformers reference additionally checks teacher logits/LSE and reports KV
 errors. BF16 intermediate KV is sensitive to the target implementation; the

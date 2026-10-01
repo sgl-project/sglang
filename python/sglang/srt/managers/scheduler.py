@@ -1008,7 +1008,13 @@ class Scheduler(
         ):
             model_runner.post_capture_elastic_ep_recover()
 
-        self.tp_worker.init_training_capture()
+        self.tp_worker.init_training_capture(
+            metrics_labels=(
+                self.metrics_collector.labels
+                if self.metrics_collector is not None
+                else None
+            )
+        )
 
         # Dispatch the model worker
         if self.spec_algorithm.is_none():

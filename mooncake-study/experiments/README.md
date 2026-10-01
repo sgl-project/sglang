@@ -98,6 +98,16 @@ writer's cooldown. Removing the pause lets the original snapshot publish; after
 ratio recovery, a later request produces another validated Store snapshot. This
 exercise adds two completed snapshots and does not measure a latency SLO.
 
+That adaptive server also enables `--enable-metrics`. The test scrapes the
+actual HTTP `/metrics` endpoint while the writer is held and after release,
+checking multiprocess export of the zero/recovered sampling ratio, READY and
+adaptive-exclusion counters, writer age, reset reservation gauges and zero
+quarantine. The producer's monitoring thread is independent of its writer and
+Catalog threads. Unit tests additionally cover bounded labels, repeated metric
+updates, exporter failure/retry and a blocked Catalog. The provisioned dashboard
+is `examples/monitoring/grafana/dashboards/json/training-capture-dashboard.json`;
+its serving-latency panels do not establish capture-overhead thresholds.
+
 Focused regressions:
 
 ```bash

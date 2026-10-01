@@ -441,9 +441,64 @@ Ruff F/I and `git diff --check`. Pre-existing broad-catch/style diagnostics were
 left in place. The original worktree's staged diff hash is unchanged.
 
 This implements P10's initial automatic pressure limit and local observability.
-TTFT/TPOT-aware feedback, Prometheus/dashboard integration, capture-on/off SLO
+TTFT/TPOT-aware feedback, capture-on/off SLO
 benchmarks and production rollout remain open. No production SpecForge Catalog,
 cross-node RDMA or trained-draft quality claim follows from this controller.
+
+## Capture Prometheus Metrics
+
+Capture now integrates with the existing HTTP `/metrics` endpoint when both
+capture and service metrics are enabled. It inherits scheduler model/rank/extra
+labels. A separate one-second background sampler exports bounded event counters,
+admission ratios/actions, reservation and Host-slot gauges, allocated bytes,
+queue depth, occupancy, writer age, cooldown, disabled state and update time.
+No per-request Prometheus operation, network call or CUDA synchronization is
+added. Fixed sampling also exposes current occupancy and writer age. The worker
+continues sampling during a blocked Catalog or writer and retries export errors.
+
+Event labels group detailed capture failures, writer exception types and
+unsupported request features into fixed categories. No request IDs, sample keys
+or failure text enter labels. Repeated snapshots only increment counter deltas,
+and absent reservation states are explicitly zeroed. The existing multiprocess
+`mostrecent` gauge convention is retained; freshness and endpoint `up` must be
+checked alongside gauges after process failures. Counter semantics and limits
+are documented in the producer guide.
+
+The associated Grafana dashboard is provisioned by the existing monitoring
+example. It includes admission, events, reservations, Host slots, pending-writer
+age, disabled state, freshness, Host capacity and existing TTFT/inter-token
+histograms. It does not define alerts or claim an SLO. JSON structure has been
+validated; rendering in a running Grafana has not yet been verified.
+
+The new sampling test exposed a short-cooldown observation edge: the cooldown
+could expire between pressure polls while a known writer stall remained. The
+controller now keeps its effective ratio at zero until a fresh observation clears
+that stall. Actual request admission still observes current pressure first.
+
+Completed H100 evidence:
+
+- `01790816480474825947-f39eb4d53d0e`: 145 tests and 89 subtests passed in
+  31.73s. Coverage includes capture, admission/metrics, scheduler observability,
+  DSpark, graph and request IPC regressions. New cases verify stable counter
+  totals across repeated updates, bounded labels under hundreds of distinct
+  failure names, inactive-state reset, quarantine reporting, short-cooldown stall
+  persistence and successful metrics retry while Catalog admission is blocked.
+- `01790816410979032574-67710e94c0a0`: full real runtime test passed in
+  333.775s. All 66 snapshots pass the existing capture/readback checks. The
+  adaptive server's real HTTP multiprocess endpoint reports zero effective ratio
+  while its writer is held, two available reservations and ratio 1.0 after
+  recovery, two READY events, one adaptive exclusion, zero writer age and zero
+  quarantined slots. Missing-state gauges return to zero. The test still uses a
+  Catalog double, TCP and a controlled writer stall before Store I/O.
+
+New controller/metrics/helper tests pass full Ruff; touched capture, worker and
+coordinator tests pass Ruff F/I. The scheduler's two pre-existing duplicate-import
+diagnostics are unchanged, confirmed against HEAD. `git diff --check` passes.
+The dashboard JSON has unique panel IDs and valid data-source/target structure;
+Grafana rendering and Prometheus query-engine acceptance have not been tested.
+The original worktree's staged
+diff hash is unchanged. These tests do not certify service SLOs or production
+SpecForge integration.
 
 ## Next Implementation
 
@@ -455,7 +510,7 @@ cross-node RDMA or trained-draft quality claim follows from this controller.
 3. Complete P9's topology work: TP/PP, non-static speculative layouts,
    PD transfer and cross-node RDMA. Existing capability gates do
    not constitute implementation of these paths.
-4. Complete P10's latency-aware limits, exported metrics, capture-on/off SLO benchmarks
+4. Complete P10's latency-aware limits, dashboard runtime acceptance, capture-on/off SLO benchmarks
    and rollout/rollback checks. Per-model numerical/runtime validation and
    runtime identity coverage also need expansion beyond the tested combination.
 5. Integrate with the SpecForge-owned production Catalog and consumer when

@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import msgspec
 import torch
+from prometheus_client import CollectorRegistry
 from sglang.srt.training_capture.admission import CaptureAdmission
 from sglang.srt.training_capture.catalog import HTTPCaptureCatalog
 from sglang.srt.training_capture.config import (
@@ -17,6 +18,7 @@ from sglang.srt.training_capture.config import (
 )
 from sglang.srt.training_capture.coordinator import CaptureCoordinator
 from sglang.srt.training_capture.kv_exporter import SelectedLayerKVExporter
+from sglang.srt.training_capture.metrics import CaptureMetrics
 from sglang.srt.training_capture.mooncake_store import (
     MooncakeSnapshotStore,
     TransportError,
@@ -45,6 +47,8 @@ class TestCaptureCoordinator(CustomTestCase):
         manifest, _ = make_snapshot()
         self.sdk = BufferStore()
         self.store = MooncakeSnapshotStore(self.sdk, FakeReplicateConfig())
+        self.metrics_registry = CollectorRegistry()
+        metrics = CaptureMetrics({"model_name": "test"}, registry=self.metrics_registry)
         config = CaptureConfig(
             dataset_id=manifest.dataset_id,
             model_id="test",
@@ -74,6 +78,7 @@ class TestCaptureCoordinator(CustomTestCase):
             store=self.store,
             catalog=HTTPCaptureCatalog(self.catalog.endpoint),
             pin_memory=False,
+            metrics=metrics,
         )
 
     def tearDown(self):
@@ -90,6 +95,11 @@ class TestCaptureCoordinator(CustomTestCase):
 
     def request(self, rid):
         return CaptureTestRequest(rid)
+
+    def metric(self, name, **labels):
+        return self.metrics_registry.get_sample_value(
+            "sglang:training_capture_" + name, {"model_name": "test", **labels}
+        )
 
     def test_overlap_finalizes_previous_result_with_owned_lookahead_kv(self):
         from sglang.srt.managers.schedule_batch import FINISH_LENGTH
@@ -414,6 +424,11 @@ class TestCaptureCoordinator(CustomTestCase):
                 self.assertEqual(
                     self.coordinator.stats()["admission"]["reason"], "writer_stall"
                 )
+                self.wait_until(
+                    lambda: self.metric("sample_ratio", kind="effective") == 0
+                )
+                self.assertEqual(self.metric("reservations", state="writing"), 1)
+                self.assertGreater(self.metric("writer_age_seconds"), 0)
             finally:
                 release.set()
             manifest, tensors = read_snapshot(
@@ -452,6 +467,8 @@ class TestCaptureCoordinator(CustomTestCase):
             self.coordinator.before_forward([request])
             self.assertIsNone(request.training_capture_context)
         self.assertEqual(fixture.record.slot.state, "quarantined")
+        self.wait_until(lambda: self.metric("host_slots", state="quarantined") == 1)
+        self.assertEqual(self.metric("events_total", event="writer_failed"), 1)
 
     def test_catalog_failure_pauses_reservation_retry_then_recovers(self):
         self.wait_until(lambda: len(self.coordinator.available) == 1)
@@ -511,9 +528,52 @@ class TestCaptureCoordinator(CustomTestCase):
         self.assertTrue(self.sdk.closed)
         self.assertFalse(self.coordinator.writer_thread.is_alive())
         self.assertFalse(self.coordinator.lease_thread.is_alive())
+        self.assertFalse(self.coordinator.metrics_thread.is_alive())
         self.assertEqual(
             self.catalog.captures[record.lease.capture_id]["state"], "FAILED"
         )
+
+    def test_metrics_recover_from_export_error_while_catalog_is_blocked(self):
+        self.wait_until(lambda: len(self.coordinator.available) == 1)
+        entered, release = threading.Event(), threading.Event()
+        original_begin = self.coordinator.catalog.begin
+        original_update = self.coordinator.metrics.update
+        failed_once = False
+
+        def blocked_begin(*args):
+            entered.set()
+            if not release.wait(5):
+                raise TimeoutError("test did not release Catalog")
+            return original_begin(*args)
+
+        def flaky_update(stats):
+            nonlocal failed_once
+            if not failed_once:
+                failed_once = True
+                raise RuntimeError("test exporter failure")
+            return original_update(stats)
+
+        with (
+            self.assertLogs("sglang.srt.training_capture.coordinator", level="ERROR"),
+            patch.object(self.coordinator.catalog, "begin", side_effect=blocked_begin),
+            patch.object(self.coordinator.metrics, "update", side_effect=flaky_update),
+        ):
+            try:
+                initial = self.metric("metrics_update_timestamp_seconds") or 0
+                record = self.coordinator.available[0]
+                record.invalid_reason = "test_recycle"
+                self.coordinator._queue_record(record)
+                self.assertTrue(entered.wait(2))
+                self.wait_until(
+                    lambda: self.metric("metrics_update_timestamp_seconds") > initial
+                )
+                self.assertTrue(failed_once)
+                self.assertTrue(self.coordinator.metrics_thread.is_alive())
+                self.assertEqual(self.metric("events_total", event="writer_started"), 1)
+                self.assertEqual(self.metric("disabled"), 0)
+            finally:
+                release.set()
+        self.wait_until(lambda: len(self.coordinator.available) == 1)
 
     def test_config_roundtrip_is_strict(self):
         path = self.directory.name + "/config.json"

@@ -93,11 +93,13 @@ class CaptureCoordinator:
         pool,
         req_to_token,
         enable_overlap=False,
+        metrics_labels=None,
     ):
         if config_path is None:
             return None
         from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
         from sglang.srt.runtime_context import get_spec
+        from sglang.srt.training_capture.metrics import CaptureMetrics
 
         if not isinstance(pool, MHATokenToKVPool):
             raise ContractError("training capture requires a dense MHA/GQA KV pool")
@@ -121,6 +123,7 @@ class CaptureCoordinator:
             timeout=config.http_timeout_seconds,
             attempts=config.http_attempts,
         )
+        metrics = CaptureMetrics(metrics_labels) if metrics_labels is not None else None
         store = MooncakeSnapshotStore.connect(
             msgspec.to_builtins(config.store),
             replica_num=config.replica_num,
@@ -136,6 +139,7 @@ class CaptureCoordinator:
                 store=store,
                 catalog=catalog,
                 enable_overlap=enable_overlap,
+                metrics=metrics,
                 capture_mode=(
                     "speculative_accepted_target_path"
                     if get_spec().speculative_algorithm == "DSPARK"
@@ -161,6 +165,7 @@ class CaptureCoordinator:
         pin_memory=True,
         capture_mode="autoregressive",
         enable_overlap=False,
+        metrics=None,
     ):
         self.config, self.teacher, self.kv = config, teacher, kv
         self.capture_mode = capture_mode
@@ -194,6 +199,14 @@ class CaptureCoordinator:
         self.closed = False
         self.rng = random.Random(config.sample_seed)
         self.admission = CaptureAdmission(config.sample_ratio, config.adaptive)
+        self.metrics = metrics
+        self.metrics_thread = (
+            threading.Thread(
+                target=self._metrics_loop, name="training-capture-metrics", daemon=True
+            )
+            if metrics is not None
+            else None
+        )
         self.writer_thread = threading.Thread(
             target=self._writer_loop, name="training-snapshot-writer", daemon=True
         )
@@ -202,6 +215,8 @@ class CaptureCoordinator:
         )
         self.writer_thread.start()
         self.lease_thread.start()
+        if self.metrics_thread is not None:
+            self.metrics_thread.start()
 
     def _count(self, name):
         with self.lock:
@@ -209,6 +224,7 @@ class CaptureCoordinator:
 
     def stats(self):
         with self.lock:
+            occupancy, writer_age = self._pressure(time.monotonic())
             return {
                 "counters": dict(self.counters),
                 "disabled_reason": self.disabled_reason,
@@ -218,37 +234,48 @@ class CaptureCoordinator:
                     Counter(record.state for record in self.records.values())
                 ),
                 "queued": self.work.qsize(),
+                "occupied_fraction": occupancy,
+                "writer_age_seconds": writer_age,
                 "host_pool": self.pool.stats(),
                 "admission": self.admission.stats(
                     time.monotonic(), disabled=self.disabled_reason is not None
                 ),
             }
 
+    def _pressure(self, now):
+        busy = [r for r in self.records.values() if r.state != "available"]
+        quarantined = self.pool.stats()["quarantined"]
+        writer_age = max(
+            (
+                now - record.queued_at
+                for record in busy
+                if record.state in ("queued", "writing", "pending_publication")
+            ),
+            default=0.0,
+        )
+        return (
+            min(1.0, (len(busy) + quarantined) / self.config.max_inflight_samples),
+            max(0.0, writer_age),
+        )
+
+    def _metrics_loop(self):
+        while not self.stop.is_set():
+            try:
+                self.metrics.update(self.stats())
+            except Exception:
+                logger.exception("Training capture metrics update failed")
+            self.stop.wait(1.0)
+
     def _admission_ratio(self):
         with self.lock:
             if self.admission.config is None:
                 return self.config.sample_ratio
             now = time.monotonic()
-            busy = [
-                record
-                for record in self.records.values()
-                if record.state != "available"
-            ]
-            quarantined = self.pool.stats()["quarantined"]
-            writer_age = max(
-                (
-                    now - record.queued_at
-                    for record in busy
-                    if record.state in ("queued", "writing", "pending_publication")
-                ),
-                default=0.0,
-            )
+            occupancy, writer_age = self._pressure(now)
             return self.admission.observe(
                 now,
-                occupancy=min(
-                    1.0, (len(busy) + quarantined) / self.config.max_inflight_samples
-                ),
-                writer_age_seconds=max(0.0, writer_age),
+                occupancy=occupancy,
+                writer_age_seconds=writer_age,
             )
 
     def _admission_failure(self, reason):
@@ -872,6 +899,8 @@ class CaptureCoordinator:
             return
         self.disable("producer_shutdown")
         self.stop.set()
+        if self.metrics_thread is not None:
+            self.metrics_thread.join(timeout=5)
         self.lease_thread.join(timeout=20)
         if self.lease_thread.is_alive():
             logger.error(

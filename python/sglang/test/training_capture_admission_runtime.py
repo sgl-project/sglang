@@ -62,6 +62,40 @@ def exercise_adaptive_capture(test, *, model_path, directory):
                 raise AssertionError(current)
             time.sleep(0.05)
 
+    def wait_metrics(predicate):
+        from prometheus_client.parser import text_string_to_metric_families
+
+        deadline = time.monotonic() + 20
+        while True:
+            response = requests.get(url + "/metrics", timeout=10)
+            response.raise_for_status()
+            samples = [
+                sample
+                for family in text_string_to_metric_families(response.text)
+                for sample in family.samples
+                if sample.name.startswith("sglang:training_capture_")
+            ]
+
+            def value(name, _samples=samples, **labels):
+                matching = [
+                    sample
+                    for sample in _samples
+                    if sample.name == "sglang:training_capture_" + name
+                    and all(
+                        sample.labels.get(key) == val for key, val in labels.items()
+                    )
+                ]
+                test.assertEqual(len(matching), 1, (name, labels, _samples))
+                test.assertIn("model_name", matching[0].labels)
+                test.assertEqual(matching[0].labels["tp_rank"], "0")
+                return matching[0].value
+
+            if samples and predicate(value):
+                return value
+            if time.monotonic() >= deadline:
+                raise AssertionError(samples)
+            time.sleep(0.1)
+
     def generate(prompt):
         response = requests.post(
             url + "/generate",
@@ -95,6 +129,7 @@ def exercise_adaptive_capture(test, *, model_path, directory):
                 timeout=240,
                 other_args=[
                     "--skip-server-warmup",
+                    "--enable-metrics",
                     "--skip-tokenizer-init",
                     "--attention-backend",
                     "triton",
@@ -125,6 +160,15 @@ def exercise_adaptive_capture(test, *, model_path, directory):
         )
         test.assertTrue((journal / "writer.started").exists())
         test.assertEqual(paused["states"].get("available"), 1)
+        paused_metrics = wait_metrics(
+            lambda value: (
+                value("sample_ratio", kind="effective") == 0
+                and value("reservations", state="writing") == 1
+            )
+        )
+        test.assertGreater(paused_metrics("writer_age_seconds"), 0)
+        test.assertEqual(paused_metrics("disabled"), 0)
+        test.assertEqual(paused_metrics("reservations", state="available"), 1)
         test.assertEqual(generate(prompt), output)
         test.assertEqual(len(test.catalog.publications), first_publication)
         skipped = state()
@@ -144,6 +188,22 @@ def exercise_adaptive_capture(test, *, model_path, directory):
         final = wait_for(lambda current: current["states"].get("available") == 2)
         test.assertEqual(final["host_pool"]["quarantined"], 0)
         test.assertEqual(final["counters"]["ready"], 2)
+        recovered_metrics = wait_metrics(
+            lambda value: (
+                value("events_total", event="ready") == 2
+                and value("reservations", state="available") == 2
+                and value("sample_ratio", kind="effective") == 1
+            )
+        )
+        test.assertEqual(
+            recovered_metrics("events_total", event="adaptive_sampled_out"), 1
+        )
+        test.assertEqual(recovered_metrics("reservations", state="writing"), 0)
+        test.assertEqual(recovered_metrics("host_slots", state="quarantined"), 0)
+        test.assertEqual(recovered_metrics("writer_age_seconds"), 0)
+        test.assertGreater(
+            recovered_metrics("admission_adjustments_total", action="pauses"), 0
+        )
         print(json.dumps({"adaptive_capture": final, "samples": 2}), flush=True)
     finally:
         pause.unlink(missing_ok=True)

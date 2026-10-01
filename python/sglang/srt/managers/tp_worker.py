@@ -392,7 +392,7 @@ class TpModelWorker(BaseTpWorker):
         self.hicache_layer_transfer_counter = None
         self.training_capture = None
 
-    def init_training_capture(self):
+    def init_training_capture(self, *, metrics_labels=None):
         from sglang.srt.training_capture.coordinator import CaptureCoordinator
 
         self.training_capture = CaptureCoordinator.create(
@@ -403,6 +403,7 @@ class TpModelWorker(BaseTpWorker):
             pool=self.model_runner.token_to_kv_pool,
             req_to_token=self.model_runner.req_to_token_pool,
             enable_overlap=self.enable_overlap,
+            metrics_labels=metrics_labels,
         )
 
     def alloc_memory_pool(

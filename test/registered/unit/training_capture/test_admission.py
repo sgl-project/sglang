@@ -78,6 +78,15 @@ class TestCaptureAdmission(CustomTestCase):
         self.assertEqual(controller.ratio(200), 0.01)
         self.assertLess(controller.stats(200)["decreases"], 10)
 
+    def test_expired_cooldown_requires_a_fresh_observation_to_clear_a_stall(self):
+        controller = CaptureAdmission(
+            1.0, AdaptiveCaptureConfig(writer_stall_seconds=0.02, cooldown_seconds=0.01)
+        )
+        controller.observe(1, occupancy=0.5, writer_age_seconds=0.03)
+        self.assertEqual(controller.stats(2)["effective_ratio"], 0)
+        self.assertEqual(controller.stats(2)["cooldown_remaining_seconds"], 0)
+        self.assertGreater(controller.observe(2, occupancy=0, writer_age_seconds=0), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
