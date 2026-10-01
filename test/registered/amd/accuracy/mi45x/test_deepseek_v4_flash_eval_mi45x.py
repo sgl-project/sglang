@@ -77,7 +77,7 @@ MI45X_DEEPSEEK_V4_FLASH_MODELS = [
             "deepseek-v4",
             "--chunked-prefill-size",
             "8192",
-            "--cuda-graph-max-bs",
+            "--cuda-graph-max-bs-decode",
             "256",
             "--max-running-requests",
             "256",
@@ -196,9 +196,9 @@ class TestDeepSeekV4FlashEvalMI45x(unittest.TestCase):
 
         for config in self.models:
             with self.subTest(model=config.model_path):
-                print(f"\n{'='*60}")
+                print(f"\n{'=' * 60}")
                 print(f"Testing: {config.model_path}")
-                print(f"{'='*60}")
+                print(f"{'=' * 60}")
 
                 env = os.environ.copy()
                 for key, value in config.env_vars.items():

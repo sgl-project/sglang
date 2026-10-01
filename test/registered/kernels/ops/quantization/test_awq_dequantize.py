@@ -11,13 +11,6 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=9, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
-try:
-    from sgl_kernel import awq_dequantize as aot_awq_dequantize
-
-    AOT_AVAILABLE = True
-except ImportError:
-    AOT_AVAILABLE = False
-
 
 def reverse_awq_order(t: torch.Tensor):
     bits = 4
@@ -115,55 +108,6 @@ def test_awq_dequantize_jit_vs_torch(
     torch.testing.assert_close(
         torch_out.to(torch.float32), jit_out.to(torch.float32), rtol=1e-3, atol=1e-5
     )
-
-
-@pytest.mark.parametrize(
-    "qweight_row,qweight_col,is_bf16_act",
-    list(
-        itertools.product(
-            [128, 256, 512, 1024, 3584],
-            [16, 32, 64, 128, 448],
-            [True, False],
-        )
-    ),
-)
-def test_awq_dequantize_jit_vs_aot(
-    qweight_row: int, qweight_col: int, is_bf16_act: bool
-):
-    if not AOT_AVAILABLE:
-        pytest.skip("sgl_kernel AOT not available")
-
-    device = torch.device("cuda")
-    qweight = torch.randint(
-        0,
-        torch.iinfo(torch.int32).max,
-        (qweight_row, qweight_col),
-        dtype=torch.int32,
-        device=device,
-    )
-    group_size = qweight_row
-    scales_row = qweight_row // group_size
-    scales_col = qweight_col * 8
-
-    if is_bf16_act:
-        scales = torch.rand(scales_row, scales_col, dtype=torch.bfloat16, device=device)
-    else:
-        scales = torch.rand(scales_row, scales_col, dtype=torch.float16, device=device)
-
-    qzeros = torch.randint(
-        0,
-        torch.iinfo(torch.int32).max,
-        (scales_row, qweight_col),
-        dtype=torch.int32,
-        device=device,
-    )
-
-    # Run both implementations
-    aot_out = aot_awq_dequantize(qweight, scales, qzeros)
-    jit_out = jit_awq_dequantize(qweight, scales, qzeros)
-
-    # Bitwise equality
-    torch.testing.assert_close(jit_out, aot_out, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
+    drain_until_released,
     run_until,
     run_until_all_finished,
     run_until_finished,
@@ -28,16 +29,6 @@ def _expected_chunks(prompt_len: int, chunk_size: int) -> int:
     return (prompt_len + chunk_size - 1) // chunk_size
 
 
-def _drain_until_released(t, *handles):
-    for _ in range(16):
-        if all(
-            h.kv_pages == 0 and (h.req is None or h.req.kv.req_pool_idx is None)
-            for h in handles
-        ):
-            return
-        yield
-
-
 class TestPPBasic(ScriptedTestCase):
     ENGINE_KWARGS = _pp_engine_kwargs()
 
@@ -49,7 +40,7 @@ class TestPPBasic(ScriptedTestCase):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
         t.abort(r)
-        yield from _drain_until_released(t, r)
+        yield from drain_until_released(t, r, max_steps=16)
         assert r.kv_pages == 0
         assert r.lock_refs == 0
 
@@ -80,9 +71,7 @@ class TestPPBasic(ScriptedTestCase):
     @staticmethod
     def _script_pp_static_chunk_size_predictor_returns_none(t: ScriptedContext):
         sched = t.scheduler
-        assert sched.enable_dynamic_chunking is False
-        assert sched.predict_next_chunk_size(0) is None
-        assert sched.predict_next_chunk_size(VERY_LONG_PROMPT_LEN // 2) is None
+        assert sched.dynamic_chunk_sizer is None
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until_finished(r, max_steps=800)
         assert r.finished
@@ -177,9 +166,9 @@ class TestPPPdmux(ScriptedTestCase):
     def _script_pp_split_prefill_chunked_no_merge_assert(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until_finished(r, max_steps=800)
-        assert (
-            r.finished
-        ), "engine died before req finished — merge_batch assert may have tripped"
+        assert r.finished, (
+            "engine died before req finished — merge_batch assert may have tripped"
+        )
         assert r.chunks_done >= 2, (
             f"pdmux + chunked path must produce >=2 chunks to exercise "
             f"split_prefill_batch filter; got chunks_done={r.chunks_done}"
@@ -211,12 +200,9 @@ class TestPPDynamic(ScriptedTestCase):
 
     @staticmethod
     def _script_pp_dynamic_chunk_size_recompute_branch_taken(t: ScriptedContext):
-        sched = t.scheduler
-        assert sched.enable_dynamic_chunking is True
-        assert sched.length_predictor is not None
-        assert sched.length_predictor.is_ready is True
-        dynamic_size = sched.predict_next_chunk_size(0)
-        assert dynamic_size is not None
+        sizer = t.scheduler.dynamic_chunk_sizer
+        assert sizer is not None
+        dynamic_size = sizer.predict(0)
         assert isinstance(dynamic_size, int) and dynamic_size > 0
         r = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=4

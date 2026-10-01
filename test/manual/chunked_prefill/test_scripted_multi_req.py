@@ -11,6 +11,7 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     run_until,
     run_until_all_finished,
     run_until_finished,
+    run_until_finished_then_settle,
 )
 
 
@@ -20,9 +21,9 @@ def _drain_flush_then_assert_no_kv_leak(t: ScriptedContext, baseline: dict):
     t.flush_cache()
     yield
     final = t.engine_stats()
-    assert (
-        final["kv_pool_free"] >= baseline["kv_pool_free"]
-    ), f"KV leak: {baseline['kv_pool_free']} -> {final['kv_pool_free']}"
+    assert final["kv_pool_free"] >= baseline["kv_pool_free"], (
+        f"KV leak: {baseline['kv_pool_free']} -> {final['kv_pool_free']}"
+    )
 
 
 class TestMultiReqBasic(ScriptedTestCase):
@@ -39,9 +40,9 @@ class TestMultiReqBasic(ScriptedTestCase):
         yield
 
         assert r1.is_chunking, "r1 should still be chunking"
-        assert (
-            not r2.is_chunking
-        ), "r2 must wait for r1's chunk loop to clear before chunking"
+        assert not r2.is_chunking, (
+            "r2 must wait for r1's chunk loop to clear before chunking"
+        )
 
         yield from run_until_all_finished([r1, r2])
         assert r1.finished and r2.finished
@@ -144,9 +145,9 @@ class TestMultiReqBasic(ScriptedTestCase):
         r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN + 8, max_new_tokens=2)
         yield from run_until_finished(r2)
         assert r1.finished and r2.finished
-        assert (
-            r2.chunks_done < r1.chunks_done
-        ), "r2 reuses r1's cached prefix, so it should chunk fewer times"
+        assert r2.chunks_done < r1.chunks_done, (
+            "r2 reuses r1's cached prefix, so it should chunk fewer times"
+        )
 
     def test_trickle_per_yield_50(self):
         self.server.execute_script(self._script_trickle_per_yield_50)
@@ -182,7 +183,7 @@ class TestMultiReqBasic(ScriptedTestCase):
     def _script_rid_reuse_after_finish(t: ScriptedContext):
         baseline = t.engine_stats()
         r1 = t.start_req(prompt_len=16, max_new_tokens=2, rid="reuse-rid")
-        yield from run_until_finished(r1)
+        yield from run_until_finished_then_settle(r1)
         r2 = t.start_req(prompt_len=16, max_new_tokens=2, rid="reuse-rid")
         yield from run_until_finished(r2)
         assert r1.finished and r2.finished

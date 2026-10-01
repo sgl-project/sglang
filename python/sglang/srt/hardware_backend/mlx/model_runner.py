@@ -1081,9 +1081,9 @@ class MlxModelRunner:
         output the scheduler discards; the logit head is skipped when the
         model exposes a headless trunk.
         """
-        assert (
-            req_id in self._req_caches
-        ), f"extend_start called for unknown request {req_id}"
+        assert req_id in self._req_caches, (
+            f"extend_start called for unknown request {req_id}"
+        )
 
         cache = self._req_caches[req_id]
 
@@ -1491,8 +1491,7 @@ class MlxModelRunner:
             cache.state = new_cache.state
             return
         raise RuntimeError(
-            f"Cannot copy {type(new_cache).__name__} state into "
-            f"{type(cache).__name__}"
+            f"Cannot copy {type(new_cache).__name__} state into {type(cache).__name__}"
         )
 
     def _decode_with_native_cache(

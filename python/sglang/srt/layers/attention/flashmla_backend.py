@@ -110,7 +110,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
         # get dcp info
         self.dcp_world_size = get_parallel().attn_dcp_size
-        self.dcp_rank = get_parallel().attn_dcp_rank
 
     def init_forward_metadata_out_graph(
         self,
@@ -440,9 +439,9 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
         reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
         if self.is_fp8_kvcache:
-            assert (
-                self.dcp_world_size == 1
-            ), "FlashMLA does not support DCP for FP8 kv cache"
+            assert self.dcp_world_size == 1, (
+                "FlashMLA does not support DCP for FP8 kv cache"
+            )
             if layer.k_scale is not None:
                 q_scale = layer.k_scale
                 descale_q = layer.k_scale.reshape(1)

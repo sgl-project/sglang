@@ -340,9 +340,9 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
         # A2A path: bounded by the dispatcher's own workspace limit.
         max_num_tokens = dispatcher.max_num_tokens * getattr(dispatcher, "ep_size", 1)
     else:
-        # Standard allgather path: the MoE sees up to dp_size local forwards
-        # gathered together, so scale the per-rank forward bound by dp_size.
-        max_num_tokens = get_parallel().dp_size * cutedsl_moe_max_num_tokens()
+        # Standard allgather path: the MoE sees up to num_dp_ranks local forwards
+        # gathered together, so scale the per-rank forward bound by num_dp_ranks.
+        max_num_tokens = get_parallel().num_dp_ranks * cutedsl_moe_max_num_tokens()
     top_k = layer.top_k if layer.top_k is not None else layer.moe_runner_config.top_k
     # inference_mode(False) ensures the wrapper's pre-allocated CUDA-graph
     # buffers are normal tensors.  This call typically happens inside
@@ -448,7 +448,9 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
     assert runner_config.activation in (
         "silu",
         "relu2",
-    ), f"CuteDSL MoE supports 'silu' (gated) or 'relu2' (non-gated), got {runner_config.activation!r}."
+    ), (
+        f"CuteDSL MoE supports 'silu' (gated) or 'relu2' (non-gated), got {runner_config.activation!r}."
+    )
     assert quant_info.wrapper is not None, "CuteDSL v2 path requires CuteDslMoEWrapper."
 
     hidden_states = dispatch_output.hidden_states
@@ -535,7 +537,9 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
     assert runner_config.activation in (
         "silu",
         "relu2",
-    ), f"CuteDSL MoE supports 'silu' (gated) or 'relu2' (non-gated), got {runner_config.activation!r}."
+    ), (
+        f"CuteDSL MoE supports 'silu' (gated) or 'relu2' (non-gated), got {runner_config.activation!r}."
+    )
     assert quant_info.wrapper is not None, "CuteDSL v2 path requires CuteDslMoEWrapper."
 
     hidden_states = dispatch_output.hidden_states
@@ -630,10 +634,12 @@ def fused_experts_deepep_to_flashinfer_cutedsl_fp4(
     assert runner_config.activation in (
         "silu",
         "relu2",
-    ), f"CuteDSL masked MoE supports 'silu' or 'relu2', got {runner_config.activation!r}."
-    assert (
-        not runner_config.apply_router_weight_on_input
-    ), "apply_router_weight_on_input is not supported for Flashinfer"
+    ), (
+        f"CuteDSL masked MoE supports 'silu' or 'relu2', got {runner_config.activation!r}."
+    )
+    assert not runner_config.apply_router_weight_on_input, (
+        "apply_router_weight_on_input is not supported for Flashinfer"
+    )
 
     hidden_states, hidden_states_scale, _, _, masked_m, _ = dispatch_output
 

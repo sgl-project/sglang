@@ -6,7 +6,7 @@ from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 MAMBA_STATE = object()
 
@@ -30,10 +30,12 @@ class _Allocator:
     def get_kvcache(self):
         return self._kv
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         return "kv"
 
-    def load_cpu_copy(self, cpu_tensors, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self, cpu_tensors, indices, mamba_indices=None, req_pool_index=None
+    ):
         self.loaded_kv = cpu_tensors
 
 

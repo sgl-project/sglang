@@ -19,8 +19,9 @@ else
 fi
 
 
-# Default base tags (can be overridden by command line arguments)
-ROCM_VERSION="rocm700"
+# Default base tags (can be overridden by command line arguments).
+# Keep this aligned with the default AMD PR and Nightly CI lane.
+ROCM_VERSION="rocm10"
 DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
 DEFAULT_MI35X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi35x"
 LOCAL_DOCKER_REGISTRY="10.44.14.109:5000"
@@ -52,8 +53,8 @@ while [[ $# -gt 0 ]]; do
       echo "  --mi35x-base-tag TAG       Override MI35x base image tag"
       echo "  --custom-image IMAGE       Use a specific Docker image directly (or set AMD_CI_IMAGE)"
       echo "  --build-from-dockerfile    Build image from docker/rocm.Dockerfile"
-      echo "  --gpu-arch ARCH            GPU architecture for Dockerfile build (e.g., gfx950-rocm720)"
-      echo "  --rocm-version VERSION     Override ROCm version for image lookup (e.g., rocm720)"
+      echo "  --gpu-arch ARCH            GPU architecture for Dockerfile build (e.g., gfx950-rocm1000)"
+      echo "  --rocm-version VERSION     Override ROCm version for image lookup (e.g., rocm10)"
       echo ""
       echo "Environment:"
       echo "  ENABLE_CACHE_HOST=1|0"
@@ -211,13 +212,6 @@ find_latest_image() {
         echo "rocm/sgl-dev:v0.5.8.post1-rocm720-mi30x-20260211-preview"
       fi
       ;;
-    rocm700)
-      if [[ "${gpu_arch}" == "mi35x" ]]; then
-        echo "rocm/sgl-dev:v0.5.8.post1-rocm700-mi35x-20260211"
-      else
-        echo "rocm/sgl-dev:v0.5.8.post1-rocm700-mi30x-20260211"
-      fi
-      ;;
     *)
       echo "Error: no hard-coded fallback available for ${ROCM_VERSION}" >&2
       return 1
@@ -253,7 +247,7 @@ elif [[ -n "${BUILD_FROM_DOCKERFILE}" ]]; then
   IMAGE="sglang-ci:${GPU_ARCH_BUILD}-$(date +%Y%m%d)"
   echo "Building Docker image from ${DOCKERFILE} with GPU_ARCH=${GPU_ARCH_BUILD}..."
 
-  # Pass full GPU_ARCH (e.g., gfx950-rocm720) - Dockerfile handles stripping suffix
+  # Pass full GPU_ARCH (e.g., gfx950-rocm1000) - Dockerfile handles stripping suffix
   docker build \
     --build-arg GPU_ARCH="${GPU_ARCH_BUILD}" \
     --build-arg SGL_BRANCH="main" \

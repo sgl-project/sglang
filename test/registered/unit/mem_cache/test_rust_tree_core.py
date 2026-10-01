@@ -3,25 +3,24 @@
 Requires a Rust toolchain: the extension builds with cargo on first use.
 """
 
-import shutil
+import os
 from array import array
+from unittest import mock
 
 import pytest
 import torch
 from unified_tree_core_inspection_interface import UnifiedTreeCoreInspectionInterface
 
-from sglang.test.ci.ci_register import register_cpu_ci
-
-register_cpu_ci(est_time=90, suite="base-a-test-cpu")
-
-if shutil.which("cargo") is None:
-    pytest.skip("the rust backend builds with cargo", allow_module_level=True)
-
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import create_tree_core
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=17, suite="base-a-test-cpu")
 
 
 def _tree_core():
@@ -57,6 +56,22 @@ def test_registry_resolves_the_rust_backend_lazily():
     assert not any(name.startswith("inspect_") for name in dir(core._binding))
 
 
+def test_unset_backend_constructs_the_rust_cache():
+    with mock.patch.dict(os.environ):
+        envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.clear()
+        cache = UnifiedRadixCache(
+            CacheInitParams(
+                disable=True,
+                req_to_token_pool=None,
+                token_to_kv_pool_allocator=None,
+                page_size=1,
+                tree_components=(ComponentType.FULL,),
+            )
+        )
+    assert type(cache.tree_core).__name__ == "RustUnifiedTreeCore"
+    assert not isinstance(cache.tree_core, UnifiedTreeCoreInspectionInterface)
+
+
 def test_insert_then_match_round_trips():
     core = _tree_core()
     _pump_insert(
@@ -76,10 +91,10 @@ def test_lock_moves_tokens_between_evictable_and_protected():
         InsertParams(key=_key([1, 2]), value=torch.tensor([10, 11], dtype=torch.int64)),
     )
     matched = core.match_prefix(MatchPrefixParams(key=_key([1, 2])))
-    core.inc_lock_ref(matched.best_match_node)
+    lock = core.inc_lock_ref(matched.best_match_node)
     assert core.protected_size() == 2
     assert core.evictable_size() == 0
-    core.dec_lock_ref(matched.best_match_node)
+    core.dec_lock_ref(matched.best_match_node, lock.to_dec_params())
     assert core.evictable_size() == 2
 
 

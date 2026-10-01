@@ -17,6 +17,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 
 COSMOS3_DEFAULT_GUIDANCE_SCALE = 4.0
 COSMOS3_EDGE_T2I_GUIDANCE_SCALE = 7.0
@@ -405,6 +406,15 @@ class Cosmos3SamplingParams(SamplingParams):
         return kwargs
 
     def _adjust(self, server_args) -> None:
+        if (
+            self.task_type is None
+            and self.num_frames == 1
+            and self.image_path is None
+            and self.video_path is None
+            and self.action_mode is None
+        ):
+            self.task_type = ModelTaskType.T2I
+
         # adjust distil and edge args — read from the pre-computed config fields
         # so no checkpoint download happens at request time.
         pipeline_config = server_args.pipeline_config
@@ -501,8 +511,7 @@ class Cosmos3SamplingParams(SamplingParams):
             raise ValueError("num_conditional_frames must be non-negative")
         if self.num_conditional_frames >= self.num_video_frames_per_chunk:
             raise ValueError(
-                "num_conditional_frames must be smaller than "
-                "num_video_frames_per_chunk"
+                "num_conditional_frames must be smaller than num_video_frames_per_chunk"
             )
         if self.num_first_chunk_conditional_frames < 0:
             raise ValueError("num_first_chunk_conditional_frames must be non-negative")

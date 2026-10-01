@@ -29,9 +29,9 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         self.state_indices_list_gdn = []
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
-        assert (
-            max_num_tokens % max_bs == 0
-        ), f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
+        assert max_num_tokens % max_bs == 0, (
+            f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
+        )
         draft_token_num = max_num_tokens // max_bs
         for i in range(max_bs):
             self.state_indices_list.append(
@@ -252,9 +252,7 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
             ]
         )
 
-        mamba_caches = (
-            self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
-        )
+        mamba_caches = self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
 
         conv_states = mamba_caches.conv[0]
         ssm_states = mamba_caches.temporal
@@ -292,11 +290,8 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
             track_mask = mamba_steps_to_track >= 0
             # Track conv state from the verify-time window before rolling back
             # the working slot; NPU does not keep per-step conv intermediates.
-            track_indices = mamba_track_indices[track_mask]
-            if track_indices.numel() > 0:
-                conv_states[:, track_indices] = conv_states[
-                    :, dst_indices_tensor[track_mask]
-                ]
+            src_slots = torch.where(track_mask, dst_indices_tensor, mamba_track_indices)
+            conv_states[:, mamba_track_indices] = conv_states[:, src_slots]
 
         if dst_indices_tensor.numel() > 0:
             conv_state_rollback(

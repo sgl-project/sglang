@@ -95,7 +95,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
         model_runner = cuda_graph_runner.model_runner
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
-        self._tp_group = model_runner.tp_group
+        self._tp_group = get_parallel().tp_group
         self._capture_stream: Optional[torch.cuda.Stream] = None
         self._compile_config: CompilationConfig = self.build_compilation_config(
             model_runner.server_args
@@ -125,7 +125,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
         config = CompilationConfig(
             num_tokens,
             compiler,
-            server_args.enable_torch_compile_debug_mode,
+            get_exec().graph.enable_torch_compile_debug_mode,
         )
 
         if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():

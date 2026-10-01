@@ -17,7 +17,6 @@ logger = init_logger(__name__)
 
 @dataclass
 class LongLive2T2VConfig(Wan2_2_TI2V_5B_Config):
-
     is_causal: bool = True
     task_type: ModelTaskType = ModelTaskType.TI2V
     vae_precision: str = "bf16"
@@ -38,8 +37,10 @@ class LongLive2T2VConfig(Wan2_2_TI2V_5B_Config):
             keep_resident_components=("dit", "text_encoder", "vae"),
         )
 
-    def adjust_num_frames(self, num_frames: int) -> int:
-        num_frames = super().adjust_num_frames(num_frames)
+    def adjust_num_frames(self, num_frames: int, *, log_adjustment: bool = True) -> int:
+        num_frames = super().adjust_num_frames(
+            num_frames, log_adjustment=log_adjustment
+        )
         vae_scale_factor_temporal = self.vae_config.arch_config.scale_factor_temporal
         latent_frames = (num_frames - 1) // vae_scale_factor_temporal + 1
         block_size = self.dit_config.arch_config.num_frames_per_block
@@ -52,13 +53,14 @@ class LongLive2T2VConfig(Wan2_2_TI2V_5B_Config):
         adjusted_num_frames = (
             adjusted_latent_frames - 1
         ) * vae_scale_factor_temporal + 1
-        logger.warning(
-            "`num_frames` must map to latent frames divisible by %s for "
-            "LongLive2 causal denoising. Rounding from %s to %s.",
-            block_size,
-            num_frames,
-            adjusted_num_frames,
-        )
+        if log_adjustment:
+            logger.warning(
+                "`num_frames` must map to latent frames divisible by %s for "
+                "LongLive2 causal denoising. Rounding from %s to %s.",
+                block_size,
+                num_frames,
+                adjusted_num_frames,
+            )
         return adjusted_num_frames
 
     def postprocess_image_latent(self, latent_condition, batch):
@@ -68,3 +70,19 @@ class LongLive2T2VConfig(Wan2_2_TI2V_5B_Config):
         super().__post_init__()
         self.vae_config.load_encoder = True
         self.vae_config.load_decoder = True
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.longlive2 import (
+        LongLive2SamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=LongLive2SamplingParams,
+        pipeline_config_cls=LongLive2T2VConfig,
+        hf_model_paths=[
+            "Rabinovich/LongLive-2.0-5B-Diffusers",
+            "Efficient-Large-Model/LongLive-2.0-5B",
+        ],
+    )

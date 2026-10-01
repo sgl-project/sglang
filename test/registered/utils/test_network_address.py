@@ -7,7 +7,7 @@ from sglang.srt.utils.network import NetworkAddress, is_zmq_endpoint_ipv6
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
-register_cpu_ci(est_time=5, suite="base-c-test-cpu")
+register_cpu_ci(est_time=5, suite="stage-b-test-cpu-intel")
 
 # Mock get_device() so ServerArgs tests run on CPU-only CI runners
 _mock_device = patch(
@@ -246,7 +246,7 @@ class TestPortArgsIPv6(unittest.TestCase):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
-        server_args.enable_dp_attention = True
+        server_args.attn_dp_size = 2
         server_args.nnodes = 2
         server_args.dist_init_addr = "[2001:db8::1]:25000"
 
@@ -265,7 +265,7 @@ class TestPortArgsIPv6(unittest.TestCase):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
-        server_args.enable_dp_attention = True
+        server_args.attn_dp_size = 2
         server_args.nnodes = 2
         server_args.dist_init_addr = "[invalid-ipv6]:25000"
 
@@ -277,7 +277,7 @@ class TestPortArgsIPv6(unittest.TestCase):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
-        server_args.enable_dp_attention = True
+        server_args.attn_dp_size = 2
         server_args.nnodes = 2
         server_args.dist_init_addr = "[2001:db8::1:25000"
 
@@ -289,7 +289,7 @@ class TestPortArgsIPv6(unittest.TestCase):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
-        server_args.enable_dp_attention = True
+        server_args.attn_dp_size = 2
         server_args.nnodes = 2
         server_args.dist_init_addr = "[2001:db8::1]"
 
@@ -301,7 +301,7 @@ class TestPortArgsIPv6(unittest.TestCase):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
-        server_args.enable_dp_attention = True
+        server_args.attn_dp_size = 2
         server_args.nnodes = 2
         server_args.dist_init_addr = "[2001:db8::1]:abcde"
 
@@ -313,7 +313,7 @@ class TestPortArgsIPv6(unittest.TestCase):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
-        server_args.enable_dp_attention = True
+        server_args.attn_dp_size = 2
         server_args.nnodes = 2
         server_args.dist_init_addr = "[2001:db8::1]#25000"
 

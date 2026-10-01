@@ -1,6 +1,6 @@
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=420, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=606, stage="extra-b", runner_config="4-gpu-b200")
 
 import time
 import unittest
@@ -207,9 +207,8 @@ class TestServerUpdateWeightsFromDiskMXFP8(UpdateWeightsFromDiskBase, CustomTest
             "other_args": (
                 "--tp-size",
                 "4",
-                "--dp-size",
+                "--attn-dp-size",
                 "4",
-                "--enable-dp-attention",
                 "--fp8-gemm-backend",
                 "flashinfer_trtllm",
                 "--moe-runner-backend",
@@ -286,9 +285,8 @@ class TestServerUpdateWeightsFromDiskNVFP4W4A16CuteDSL(
             "other_args": (
                 "--tp-size",
                 "4",
-                "--dp-size",
+                "--attn-dp-size",
                 "4",
-                "--enable-dp-attention",
                 "--ep-size",
                 "4",
                 "--fp4-gemm-backend",

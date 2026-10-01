@@ -9,6 +9,10 @@ export const config = {
   supportedHardware: [
     "h100", "h200", "b200", "b300", "gb200", "gb300",
     "rtx6000", "rtx5090",
+    // NVIDIA DGX Spark (GB10, SM121) — Flash Official FP4 only, as a 2-node
+    // TP=2 pair over ConnectX-7 RoCE; the shared HARDWARE_CATALOG carries the
+    // entry and its multi-node Docker flags.
+    "dgx-spark",
     // AMD ROCm — MI300X (Flash FP8) + MI355X (Flash/Pro, FP4/FP8).
     "mi300x", "mi355x",
   ],
@@ -94,13 +98,13 @@ export const config = {
   --warmup-requests 64 --flush-cache`,
     accuracy: {
       gsm8k_pct:
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run gsm8k \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
   --num-threads 32`,
       gpqa_pct: {
         flash:
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run gpqa \\
   --model {{MODEL_NAME}} --api-key <api-key> \\
   --n-repeats 16 --max-tokens 200000 \\
@@ -108,7 +112,7 @@ sgl-eval run gpqa \\
   --out-dir /sgl-workspace/logs \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1`,
         "flash-official":
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run gpqa \\
   --model {{MODEL_NAME}} --api-key <api-key> \\
   --n-repeats 16 --max-tokens 200000 \\
@@ -116,7 +120,7 @@ sgl-eval run gpqa \\
   --out-dir /sgl-workspace/logs \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1`,
         pro:
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run gpqa \\
   --model {{MODEL_NAME}} --api-key <api-key> \\
   --n-repeats 16 --max-tokens 400000 \\
@@ -126,7 +130,7 @@ sgl-eval run gpqa \\
       },
       aime25_pct: {
         "flash-official":
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run aime25 \\
   --model {{MODEL_NAME}} --api-key <api-key> \\
   --n-repeats 16 --max-tokens 200000 \\
@@ -134,7 +138,7 @@ sgl-eval run aime25 \\
   --out-dir /sgl-workspace/logs \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1`,
         flash:
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run aime25 \\
   --model {{MODEL_NAME}} --api-key <api-key> \\
   --n-repeats 16 --max-tokens 200000 \\
@@ -142,7 +146,7 @@ sgl-eval run aime25 \\
   --out-dir /sgl-workspace/logs \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1`,
         pro:
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run aime25 \\
   --model {{MODEL_NAME}} --api-key <api-key> \\
   --n-repeats 16 --max-tokens 400000 \\
@@ -152,7 +156,7 @@ sgl-eval run aime25 \\
       },
       mmmu_pro_pct: {
         "flash-vision":
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run mmmu_pro \\
   --reasoning-effort max \\
   --temperature 1.0 --top-p 0.95 \\
@@ -192,6 +196,16 @@ sgl-eval run mmmu_pro \\
     // (sgl-project/sglang#37253) — until it does, the variant needs this
     // preview build on every hardware.
     "flash-vision|fp4": "lmsysorg/sglang:dev-dsv4-flash-vision",
+    // DGX Spark ONLY. A dedicated preview build for the 2x GB10 pair: it bakes
+    // in the SM12x b12x MoE/attention kernels (sgl-project/sglang#34878,
+    // #35899, #34018), the b12x dual-cache image-prefill fix that makes Flash
+    // Vision serve images on SM12x, the NVFP4 MTP-layer dispatch fix, and the
+    // CuTeDSL/NCCL pins the GB10 recipe needs — none of which are in `latest`.
+    // v2 = branch b12x-vision @ 452239a74f. It is not built for, and must not
+    // be used on, any other hardware — every other row keeps its own image.
+    "dgx-spark|flash-official|fp4":   "lmsysorg/sglang:dev-v4f-2dgx-v2",
+    "dgx-spark|flash-official|nvfp4": "lmsysorg/sglang:dev-v4f-2dgx-v2",
+    "dgx-spark|flash-vision|fp4":     "lmsysorg/sglang:dev-v4f-2dgx-v2",
     // NVFP4 checkpoints crash at weight load on v0.5.18 (the MXFP4-packed MTP
     // layer's FP8 delegate needs the #36275 guard, merged 2026-08-26) — route
     // every NVFP4 cell to the nightly until a release contains that fix.
@@ -207,8 +221,10 @@ sgl-eval run mmmu_pro \\
     gb300: "lmsysorg/sglang:latest",
     // AMD daily-updated lmsysorg/sglang-rocm images. Bump the dated tag when you
     // re-verify on a newer build.
-    mi300x: "lmsysorg/sglang-rocm:v0.5.18-rocm720-mi30x-20260829",
-    mi355x: "lmsysorg/sglang-rocm:v0.5.18-rocm720-mi35x-20260829",
+    // Pro Official agentic + DSpark PD + UMBP pairs ran end-to-end on this build.
+    "mi355x|pro-official|fp4": "lmsysorg/sglang-rocm:v0.5.20-rocm720-mi35x-20260923",
+    mi300x: "lmsysorg/sglang-rocm:v0.5.20-rocm720-mi30x-20260926",
+    mi355x: "lmsysorg/sglang-rocm:v0.5.20-rocm720-mi35x-20260926",
   },
 
   // Pre-selects the issue template's `model` dropdown on "Submit verified cell".
@@ -219,11 +235,11 @@ sgl-eval run mmmu_pro \\
   playgroundFeatures: {
 
     // ----- Card 1: "Attention Parallelism" -----
-    // DP-Attention is a combined knob: value is the DP degree AND toggles `--enable-dp-attention`.
+    // DP-Attention is a single knob: value is the attention DP size, emitted as `--attn-dp-size N`.
     // CP sizes auto-gate in the engine to the runtime derivation
     // attn_cp_size = tp/dp (a user-passed --attn-cp-size is overridden).
     // CP is single-machine only (tp_size <= 8). Interleave CP + DP-Attention
-    // currently fails the runtime's dp_size == 1 assert but is allowed here
+    // currently fails the runtime's attn_dp_size == 1 assert but is allowed here
     // with a warning (combined support is planned upstream). No `cpStrategy`
     // knob: DeepSeek-V4 supports only interleave (the runtime rejects zigzag).
     attention: {
@@ -244,6 +260,24 @@ sgl-eval run mmmu_pro \\
               reason: "Prefill Context Parallel is single-machine only (SGLang asserts tp_size <= 8; cross-machine CP has precision issues)." },
           ] },
         { id: "dpAttn", label: "DP-Attention",
+          // The low-latency and balanced PD roles run TP-only. That is what lets
+          // their decode ladders run to the full ceiling (8, 32 on Pro Official
+          // low-latency, and 96): the ceiling
+          // is server-wide and floor-divided by attn_dp_size, so only at attn_dp_size
+          // 1 is it also the per-rank batch. Forced rather than left to the
+          // reader, because switching DP on would cut the slots per rank without
+          // changing either flag in the command — the ladder would still read 96
+          // while the role could only ever fill 12. High-throughput is the DP
+          // point and is deliberately absent here.
+          forceOff: [
+            { when: { hw: ["mi355x"], strategy: ["low-latency", "balanced"],
+                      pdMode: ["prefill", "decode"] },
+              stripEnv: ["SGLANG_SHARED_EXPERT_TP1",
+                         "SGLANG_DP_SHARED_EXPERT_LOCAL",
+                         "SGLANG_DP_USE_GATHERV",
+                         "SGLANG_DP_USE_REDUCE_SCATTER"],
+              reason: "The low-latency and balanced PD roles are TP-only, which is what makes --cuda-graph-bs-decode equal the full ceiling. --max-running-requests is server-wide and floor-divided by attn_dp_size, so DP would cut the per-rank batch below the captured graphs." },
+          ],
           values: [
             null,
             false,
@@ -310,10 +344,14 @@ sgl-eval run mmmu_pro \\
       options: [
         { id: "current",    label: "Inherited from base" },
         { id: "off",        label: "Off (greedy)" },
+        // Shown on pro-official as well as the originals: the 0813 checkpoint
+        // bundles a DSpark head but keeps its MTP head, so this shape stays
+        // available as the MTP fallback. The 1-1-2 shape stays hidden there —
+        // DSpark is the better pick, so only one fallback is offered.
         { id: "mtp-314",    label: "EAGLE / MTP 3-1-4",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 3",
                   "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 4"],
-          hide: { variant: ["flash-official", "flash-vision", "pro-official"] } },
+          hide: { variant: ["flash-official", "flash-vision"] } },
         { id: "mtp-112",    label: "EAGLE / MTP 1-1-2",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 1",
                   "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 2"],
@@ -323,9 +361,9 @@ sgl-eval run mmmu_pro \\
           hide: { variant: ["flash", "pro"] },
           disable: [
             { when: { dpAttnOn: [true] },
-              reason: "DSpark is not compatible with DP Attention on the current release." },
-            { when: { hw: ["mi300x", "mi355x"] },
-              reason: "DSpark currently requires CUDA." },
+              reason: "DSpark is not compatible with DP Attention on the current release. For a DP + DSpark agentic recipe, see the cookbook §3.6 (B200) / §3.7 (MI355X) notes." },
+            { when: { hw: ["mi300x"] },
+              reason: "DSpark on ROCm is documented for MI355X Pro Official (0813); MI300X still requires CUDA." },
           ] },
         { id: "ngram",      label: "NGRAM",
           flags: ["--speculative-algorithm NGRAM",
@@ -340,11 +378,44 @@ sgl-eval run mmmu_pro \\
 
     // ----- Card 5: "PD Disaggregation" -----
     pdDisagg: {
-      incompatibleSpeculativeAlgorithms: ["DSPARK"],
       modes: [
         { id: "off",     label: "Off" },
-        { id: "prefill", label: "Prefill role" },
-        { id: "decode",  label: "Decode role" },
+        // The AMD role flags are the MI355X 1P x 1D agentic recipe. Both roles
+        // are gated by `when` because the sizing is ROCm-specific, and they
+        // differ in two places: the prefill worker runs eager (the dsv4 indexer's
+        // prefill path is not graph-captured) and dispatches whole chunked-prefill
+        // batches over MORI, while the decode worker captures graphs for its
+        // small batch ladder and dispatches at most a step's worth of tokens.
+        { id: "prefill", label: "Prefill role",
+          when: { hw: ["mi355x"], strategy: ["low-latency"] },
+          env: ["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16384"],
+          flags: [
+            "--load-balance-method round_robin",
+            "--tokenizer-worker-num 8",
+            "--stream-interval 20",
+            "--mem-fraction-static 0.86",
+            "--max-running-requests 8",
+            "--swa-full-tokens-ratio 0.1",
+            "--disable-cuda-graph",
+            "--context-length 1048576",
+            "--watchdog-timeout 3600",
+            "--enable-metrics",
+          ] },
+        { id: "decode",  label: "Decode role",
+          when: { hw: ["mi355x"], strategy: ["low-latency"] },
+          env: ["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"],
+          flags: [
+            "--load-balance-method round_robin",
+            "--tokenizer-worker-num 8",
+            "--stream-interval 20",
+            "--mem-fraction-static 0.86",
+            "--max-running-requests 8",
+            "--swa-full-tokens-ratio 0.1",
+            "--cuda-graph-bs-decode 1 2 3 4 5 6 7 8",
+            "--context-length 1048576",
+            "--watchdog-timeout 3600",
+            "--enable-metrics",
+          ] },
       ],
       transferBackends: [
         { id: "mooncake", label: "Mooncake",
@@ -358,10 +429,31 @@ sgl-eval run mmmu_pro \\
         { id: "nixl",     label: "NiXL" },
         // MORI-IO transport is AMD-only — hidden on every non-ROCm platform.
         { id: "mori",     label: "MORI",
-          hide: { hw: ["h100", "h200", "b200", "b300", "gb200", "gb300", "rtx6000"] } },
+          hide: { hw: ["h100", "h200", "b200", "b300", "gb200", "gb300", "rtx6000"] },
+          defaultWhen: { hw: ["mi300x", "mi355x"] },
+          // Transport-wide only. The per-rank dispatch budget is sized per role
+          // (see `modes` above), so it lives on the role, not here.
+          env: [
+            "SGLANG_MORI_COMBINE_DTYPE=auto",
+            "MORI_IO_SQ_BACKOFF_TIMEOUT_US=500000",
+            "MORI_IO_QP_MAX_SEND_WR=32767",
+          ],
+          envWhen: { hw: ["mi300x", "mi355x"] } },
       ],
       // `auto` is a sentinel (emits no --disaggregation-ib-device flag).
-      ibDevices: [{ id: "auto", label: "Auto" }, "mlx5_0", "mlx5_7"],
+      // The mlx5 names are ConnectX; ROCm nodes enumerate their NICs as rdmaN,
+      // so the two families are mutually hidden. The AMD entry is the full
+      // 8-NIC list in one value because --disaggregation-ib-device takes a
+      // comma list, and the order is the MI355X NUMA-local pairing.
+      ibDevices: [
+        { id: "auto", label: "Auto" },
+        { id: "mlx5_0", label: "mlx5_0", hide: { hw: ["mi300x", "mi355x"] } },
+        { id: "mlx5_7", label: "mlx5_7", hide: { hw: ["mi300x", "mi355x"] } },
+        { id: "rdma3,rdma0,rdma2,rdma1,rdma7,rdma4,rdma6,rdma5",
+          label: "rdma0-7 (all NICs)",
+          defaultWhen: { hw: ["mi355x"] },
+          hide: { hw: ["h100", "h200", "b200", "b300", "gb200", "gb300", "rtx6000", "rtx5090", "dgx-spark"] } },
+      ],
       // Router fronting the prefill + decode roles; substitute <prefill-host>/<decode-host>.
       router: {
         port: 8000,
@@ -374,6 +466,228 @@ sgl-eval run mmmu_pro \\
   --disable-circuit-breaker \\
   --health-check-interval-secs 999999`,
       },
+      // The MI355X roles above size for low latency: TP-only, a running-request
+      // ceiling in the single digits, and a MORI dispatch budget per role. The
+      // high-throughput point is the same two roles re-sized against the DP
+      // base cell — TP8/DP8 and the wider batch come from that cell, so these
+      // only carry what the operating point itself changes. The decode graph
+      // ladder grows to 32 to cover the larger steady-state batch, and
+      // --enable-cache-report surfaces the prefix hit rate that decides whether
+      // the offload tier is paying for itself at this concurrency.
+      // The balanced point sits between the two: TP-only like low-latency, but
+      // with a 96-request ceiling and a HiCache tier under the prefill role
+      // (see the hicache roleOverride below) instead of low-latency's bare KV
+      // pool or high-throughput's UMBP. It re-sizes more of the base cell than
+      // the other two because the balanced cell is a DP recipe for aggregated
+      // serving — its 0.90 / 0.15 / 65536 sizing does not carry over.
+      // Low-latency on Pro Official (0813) is its own pair: an asymmetric TP4
+      // prefill / TP8 decode that keeps the bundled DSpark head on both roles
+      // (gamma 6; steps / topk / draft tokens are derived from it), with a
+      // 32-request ceiling and a UMBP tier under the prefill role (see the umbp
+      // roleOverride below). The base cell's --prefill-decode-interval and the
+      // decode role's --chunked-prefill-size are aggregated-serving knobs, so
+      // the roles drop them.
+      roleOverrides: [
+        { mode: "prefill",
+          when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
+                  strategy: ["low-latency"] },
+          env: ["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16384"],
+          stripFlags: ["--prefill-decode-interval"],
+          flags: [
+            "--tp 4",
+            "--load-balance-method round_robin",
+            "--tokenizer-worker-num 8",
+            "--stream-interval 20",
+            "--speculative-dspark-block-size 6",
+            "--mem-fraction-static 0.86",
+            "--max-running-requests 32",
+            "--swa-full-tokens-ratio 0.1",
+            "--chunked-prefill-size 16384",
+            "--disable-cuda-graph",
+            "--context-length 1048576",
+            "--optimistic-prefill-attempts 2",
+            "--watchdog-timeout 3600",
+            "--enable-metrics",
+            "--enable-cache-report",
+          ] },
+        { mode: "decode",
+          when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
+                  strategy: ["low-latency"] },
+          env: ["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"],
+          stripFlags: ["--prefill-decode-interval", "--chunked-prefill-size"],
+          flags: [
+            "--load-balance-method round_robin",
+            "--tokenizer-worker-num 8",
+            "--stream-interval 20",
+            "--speculative-dspark-block-size 6",
+            "--mem-fraction-static 0.86",
+            "--max-running-requests 32",
+            "--swa-full-tokens-ratio 0.1",
+            "--cuda-graph-bs-decode 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32",
+            "--context-length 1048576",
+            "--watchdog-timeout 3600",
+            "--enable-metrics",
+          ] },
+        // Balanced on Pro Official is the same asymmetric TP4 / TP8 DSpark pair
+        // re-sized for a 96-request ceiling, at gamma 3 rather than 6: the
+        // larger batch leaves less verify headroom per request. The balanced
+        // base cell is a target-only DP recipe, so the roles add DSpark back.
+        { mode: "prefill",
+          when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
+                  strategy: ["balanced"] },
+          env: ["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16384"],
+          stripFlags: ["--prefill-decode-interval"],
+          flags: [
+            "--tp 4",
+            "--load-balance-method round_robin",
+            "--speculative-algorithm DSPARK",
+            "--speculative-dspark-block-size 3",
+            "--mem-fraction-static 0.86",
+            "--max-running-requests 96",
+            "--swa-full-tokens-ratio 0.1",
+            "--chunked-prefill-size 16384",
+            "--disable-cuda-graph",
+            "--context-length 1048576",
+            "--optimistic-prefill-attempts 2",
+            "--watchdog-timeout 3600",
+            "--enable-metrics",
+            "--enable-cache-report",
+          ] },
+        { mode: "decode",
+          when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
+                  strategy: ["balanced"] },
+          env: ["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"],
+          stripFlags: ["--prefill-decode-interval", "--chunked-prefill-size"],
+          flags: [
+            "--load-balance-method round_robin",
+            "--speculative-algorithm DSPARK",
+            "--speculative-dspark-block-size 3",
+            "--mem-fraction-static 0.86",
+            "--max-running-requests 96",
+            "--swa-full-tokens-ratio 0.1",
+            "--cuda-graph-bs-decode 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96",
+            "--context-length 1048576",
+            "--watchdog-timeout 3600",
+            "--enable-metrics",
+          ] },
+        { mode: "prefill",
+          when: { hw: ["mi355x"], strategy: ["balanced"] },
+          env: ["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16384"],
+          flags: [
+            "--load-balance-method round_robin",
+            "--mem-fraction-static 0.86",
+            "--max-running-requests 96",
+            "--swa-full-tokens-ratio 0.1",
+            "--chunked-prefill-size 16384",
+            "--disable-cuda-graph",
+            "--context-length 1048576",
+            "--watchdog-timeout 3600",
+            "--enable-metrics",
+          ] },
+        // TP-only, so the server-wide ceiling is also the per-rank batch and
+        // the graph ladder runs all the way to 96.
+        { mode: "decode",
+          when: { hw: ["mi355x"], strategy: ["balanced"] },
+          env: ["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"],
+          flags: [
+            "--load-balance-method round_robin",
+            "--mem-fraction-static 0.86",
+            "--max-running-requests 96",
+            "--swa-full-tokens-ratio 0.1",
+            "--cuda-graph-bs-decode 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96",
+            "--context-length 1048576",
+            "--watchdog-timeout 3600",
+            "--enable-metrics",
+          ] },
+        // High-throughput on Pro Official keeps the base cell's TP8 / DP8 on both
+        // roles and adds DSpark at gamma 3, as balanced does. A 512-request
+        // ceiling is 64 per DP rank, which is where the decode ladder stops.
+        { mode: "prefill",
+          when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
+                  strategy: ["high-throughput"] },
+          env: ["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16384"],
+          stripFlags: ["--prefill-decode-interval"],
+          flags: [
+            "--load-balance-method round_robin",
+            "--speculative-algorithm DSPARK",
+            "--speculative-dspark-block-size 3",
+            "--enable-dp-lm-head",
+            "--mem-fraction-static 0.92",
+            "--max-running-requests 512",
+            "--disable-cuda-graph",
+            "--context-length 1048576",
+            "--optimistic-prefill-attempts 2",
+            "--watchdog-timeout 3600",
+            "--enable-metrics",
+            "--enable-cache-report",
+          ] },
+        { mode: "decode",
+          when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
+                  strategy: ["high-throughput"] },
+          env: ["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"],
+          stripFlags: ["--prefill-decode-interval", "--chunked-prefill-size"],
+          flags: [
+            "--load-balance-method round_robin",
+            "--speculative-algorithm DSPARK",
+            "--speculative-dspark-block-size 3",
+            "--enable-dp-lm-head",
+            "--mem-fraction-static 0.92",
+            "--max-running-requests 512",
+            "--cuda-graph-bs-decode 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64",
+            "--context-length 1048576",
+            "--watchdog-timeout 3600",
+            "--enable-metrics",
+          ] },
+        { mode: "prefill",
+          when: { hw: ["mi355x"], strategy: ["high-throughput"] },
+          env: ["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16384"],
+          flags: [
+            "--load-balance-method round_robin",
+            "--mem-fraction-static 0.92",
+            "--max-running-requests 256",
+            "--disable-cuda-graph",
+            "--context-length 1048576",
+            "--watchdog-timeout 3600",
+            "--enable-metrics",
+            "--enable-cache-report",
+          ] },
+        { mode: "decode",
+          when: { hw: ["mi355x"], strategy: ["high-throughput"] },
+          env: ["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"],
+          flags: [
+            "--load-balance-method round_robin",
+            "--mem-fraction-static 0.92",
+            "--max-running-requests 256",
+            "--cuda-graph-bs-decode 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32",
+            "--context-length 1048576",
+            "--watchdog-timeout 3600",
+            "--enable-metrics",
+          ] },
+      ],
+      // MI355X fronts the 1P x 1D agentic pair with a cache-aware router rather
+      // than the default round-robin: consistent_hashing keeps a conversation on
+      // the prefill worker that already holds its prefix (decode holds no
+      // reusable prefix, so it stays round-robin), and the tight balance
+      // thresholds stop that affinity from starving the peer at the small
+      // running-request ceiling the roles above use. Health checking stays
+      // enabled here (unlike the default's 999999s interval) because a long
+      // agentic run should notice a wedged worker, but it is slack enough that
+      // a multi-minute prefill is not mistaken for a failure.
+      routerOverrides: [
+        { when: { hw: ["mi355x"] },
+          command:
+`python3 -m sglang_router.launch_router \\
+  --pd-disaggregation \\
+  --prefill http://<prefill-host>:{{PREFILL_PORT}} \\
+  --decode http://<decode-host>:{{DECODE_PORT}} \\
+  --host 0.0.0.0 --port {{ROUTER_PORT}} \\
+  --policy consistent_hashing --dp-aware \\
+  --decode-policy round_robin \\
+  --cache-threshold 0.3 \\
+  --balance-abs-threshold 2 --balance-rel-threshold 1.1 \\
+  --disable-circuit-breaker --health-failure-threshold 100 \\
+  --health-check-timeout-secs 600 --health-check-interval-secs 30` },
+      ],
     },
 
     // ----- Card 6: "Hierarchical KV Cache" -----
@@ -395,12 +709,39 @@ sgl-eval run mmmu_pro \\
           writePolicy: "write_through",
           prefetchPolicy: "best_effort",
         },
+        // Balanced on Pro Official: the same shape at a smaller ratio. 2.5 is
+        // what the 96-request ceiling leaves room for once mem-fraction-static
+        // drops to 0.86 — the host tier competes with the KV pool for the
+        // headroom the prefill role gives up. The role defaults to UMBP
+        // instead; this applies once the UMBP card is switched off.
+        {
+          when: {
+            hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
+            strategy: ["balanced"], nodes: ["single"],
+          },
+          mode: "prefill",
+          transferBackend: "mori",
+          memLayout: "page_first",
+          ioBackend: "direct",
+          ratio: 2.5,
+          writePolicy: "write_through",
+          prefetchPolicy: "best_effort",
+        },
       ],
       notices: [
         {
           when: {
             hw: ["mi355x"], variant: ["pro"], quant: ["fp4"],
             strategy: ["low-latency"], nodes: ["single"],
+          },
+          mode: "decode",
+          transferBackend: "mori",
+          text: "HiCache is not recommended on the decode role with MORI.",
+        },
+        {
+          when: {
+            hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
+            strategy: ["balanced"], nodes: ["single"],
           },
           mode: "decode",
           transferBackend: "mori",
@@ -426,7 +767,45 @@ sgl-eval run mmmu_pro \\
       ],
     },
 
-    // ----- Card 7: "HiSparse" -----
+    // ----- Card 7: "UMBP" (unified cache external linker) -----
+    // Sits beside HiCache rather than inside it. HiCache is a tiered cache
+    // (GPU -> pinned host -> optional storage); UMBP links the unified radix
+    // tree DIRECTLY to an external store with no host tier at all, so the two
+    // are alternatives and sglang rejects them together. Enabling this card
+    // therefore strips the HiCache family from the command.
+    //
+    // ROCm-only in practice: the store is MORI's buffer pool, the same
+    // transport the PD roles use, and there is no CUDA recipe for it yet.
+    umbp: {
+      onlyHw: ["mi300x", "mi355x"],
+      // Under pure TP the linker keys by rank, so an 8-rank prefill worker
+      // opens eight keyspaces and the pool holds eight copies of the same MLA
+      // KV — a tier an eighth the size its byte budget suggests. DP attention
+      // collapses the keys onto one shared keyspace.
+      requiresDpAttention: true,
+      // The Pro Official prefill roles ship with UMBP on. Low-latency and
+      // balanced are TP-only: at TP4 the store holds four copies rather than
+      // eight, and that shape is the one that ran end-to-end. The tier lives
+      // in a standalone umbp_standalone_server on the prefill node (cookbook
+      // §3.9), reached over the socket in UMBP_STANDALONE_ADDRESS.
+      roleOverrides: [
+        { mode: "prefill",
+          when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
+                  strategy: ["low-latency", "balanced", "high-throughput"] },
+          enable: true,
+          allowTp: true,
+          env: ["UMBP_STANDALONE_ADDRESS=unix:///tmp/umbp_sa/sa.grpc.sock"],
+          flags: ["--hicache-storage-backend-extra-config '{\"standalone_startup_timeout_ms\":120000}'"],
+          note: "Start the UMBP tier server on the prefill node first (cookbook §3.9): UMBP_DRAM_CAPACITY=1500000000000 UMBP_DRAM_USE_HUGEPAGES=1 UMBP_SSD_ENABLED=0 umbp_standalone_server unix:///tmp/umbp_sa/sa.grpc.sock" },
+      ],
+      defaultBackend: "mori",
+      backends: [
+        { id: "mori",     label: "MORI (UMBP)" },
+        { id: "mooncake", label: "Mooncake" },
+      ],
+    },
+
+    // ----- Card 8: "HiSparse" -----
     // Decode-only: shown/emitted only when the live PD-Disagg mode is `decode`.
     hisparse: {
       requiredFlags: [
@@ -456,6 +835,7 @@ sgl-eval run mmmu_pro \\
           { id: "3", label: "3", flags: ["--speculative-dspark-block-size 3"] },
           { id: "4", label: "4", flags: ["--speculative-dspark-block-size 4"] },
           { id: "5", label: "5", flags: ["--speculative-dspark-block-size 5"] },
+          { id: "6", label: "6", flags: ["--speculative-dspark-block-size 6"] },
         ],
       },
     ],
@@ -509,8 +889,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-a2a-backend deepep",
         "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
         "--host {{HOST_IP}}",
@@ -525,8 +904,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend deepep",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 1",
@@ -547,8 +925,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-a2a-backend megamoe",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -564,8 +941,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend megamoe",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -602,8 +978,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-a2a-backend megamoe",
         "--chunked-prefill-size 32768",
         "--swa-full-tokens-ratio 0.1",
@@ -627,8 +1002,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-a2a-backend megamoe",
         "--mem-fraction-static 0.835",
         "--cuda-graph-max-bs-decode 544",
@@ -683,8 +1057,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend deepep",
         "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
         "--host {{HOST_IP}}",
@@ -699,8 +1072,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend deepep",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 1",
@@ -721,8 +1093,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend megamoe",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -738,8 +1109,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend megamoe",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -774,8 +1144,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-runner-backend flashinfer_mxfp4",
         "--disable-flashinfer-autotune",
         "--chunked-prefill-size 32768",
@@ -801,8 +1170,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-a2a-backend megamoe",
         "--mem-fraction-static 0.835",
         "--cuda-graph-max-bs-decode 544",
@@ -1028,8 +1396,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend deepep",
         "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
         "--host {{HOST_IP}}",
@@ -1044,8 +1411,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend deepep",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 1",
@@ -1066,8 +1432,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend megamoe",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -1083,8 +1448,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend megamoe",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -1127,8 +1491,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-a2a-backend deepep",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 1",
@@ -1153,8 +1516,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-a2a-backend megamoe",
         "--mem-fraction-static 0.78",
         "--cuda-graph-max-bs-decode 64",
@@ -1293,8 +1655,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend deepep",
         "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
         "--host {{HOST_IP}}",
@@ -1309,8 +1670,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend deepep",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 1",
@@ -1331,8 +1691,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend megamoe",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -1348,8 +1707,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend megamoe",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -1384,8 +1742,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend deepep",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 1",
@@ -1409,8 +1766,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend megamoe",
         "--mem-fraction-static 0.9",
         "--cuda-graph-max-bs-decode 128",
@@ -1453,8 +1809,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend deepep",
         "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
         "--host {{HOST_IP}}",
@@ -1475,8 +1830,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend megamoe",
         "--mem-fraction-static 0.9",
         "--cuda-graph-max-bs-decode 128",
@@ -1494,7 +1848,7 @@ sgl-eval run mmmu_pro \\
     {
       match: { hw: "b200", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
       verified: false,
-      env: [],
+      env: ["SGLANG_OPT_USE_JIT_NORM=1", "SGLANG_OPT_USE_TOPK_V2=1"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -1513,13 +1867,12 @@ sgl-eval run mmmu_pro \\
       // DSpark is incompatible with DP attention -> target-only.
       match: { hw: "b200", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "single" },
       verified: false,
-      env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096"],
+      env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096", "SGLANG_OPT_USE_JIT_NORM=1", "SGLANG_OPT_USE_TOPK_V2=1"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-a2a-backend megamoe",
         "--chunked-prefill-size 32768",
         "--swa-full-tokens-ratio 0.1",
@@ -1532,13 +1885,12 @@ sgl-eval run mmmu_pro \\
     {
       match: { hw: "b200", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
       verified: false,
-      env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320"],
+      env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320", "SGLANG_OPT_USE_JIT_NORM=1", "SGLANG_OPT_USE_TOPK_V2=1"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-a2a-backend megamoe",
         "--mem-fraction-static 0.835",
         "--cuda-graph-max-bs-decode 544",
@@ -1582,8 +1934,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-runner-backend flashinfer_mxfp4",
         "--disable-flashinfer-autotune",
         "--chunked-prefill-size 32768",
@@ -1603,8 +1954,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-a2a-backend megamoe",
         "--mem-fraction-static 0.835",
         "--cuda-graph-max-bs-decode 544",
@@ -1648,8 +1998,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-a2a-backend deepep",
         "--mem-fraction-static 0.78",
         "--cuda-graph-max-bs-decode 64",
@@ -1666,8 +2015,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--moe-a2a-backend megamoe",
         "--mem-fraction-static 0.78",
         "--cuda-graph-max-bs-decode 64",
@@ -1780,11 +2128,11 @@ sgl-eval run mmmu_pro \\
     },
     // ====================================================================
     // MI355X + FP4 — Pro Official (0813)
-    // Mirrors the verified Pro cells; speculative decoding re-fitted to the
-    // bundled DSpark head. NOT yet run end-to-end on this hardware.
+    // Bundled DSpark head. Low-latency is TP-only + DSPARK; balanced /
+    // high-throughput stay target-only in the Deploy panel (DP Attention).
+    // The DP + DSpark agentic path is documented in cookbook §3.7.
     // ====================================================================
     {
-      // DSpark requires CUDA; EAGLE binds a head that accepts nothing on 0813 -> target-only.
       match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
       verified: false,
       env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true"],
@@ -1792,19 +2140,22 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
+        "--prefill-decode-interval 20",
         "--attention-backend dsv4",
+        "--enable-deepseek-v4-fp4-indexer",
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
         "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 16384",
+        "--speculative-algorithm DSPARK",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
     },
     {
-      // DSpark requires CUDA; EAGLE binds a head that accepts nothing on 0813 -> target-only.
+      // DSpark + DP Attention is documented in cookbook §3.7, not this cell.
       match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "single" },
       verified: false,
       env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true"],
@@ -1812,10 +2163,13 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
-        "--enable-two-batch-overlap",
+        "--attn-dp-size 8",
+        "--enable-dp-attention-local-control-broadcast",
+        "--tokenizer-worker-num 8",
+        "--stream-interval 20",
+        "--prefill-decode-interval 20",
         "--attention-backend dsv4",
+        "--enable-deepseek-v4-fp4-indexer",
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
@@ -1827,7 +2181,8 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      // DSpark requires CUDA; EAGLE binds a head that accepts nothing on 0813 -> target-only.
+      // DSpark + DP Attention is documented in cookbook §3.7 and in the PD roles
+      // above (§3.8), not this cell.
       match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
       verified: false,
       env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true"],
@@ -1835,10 +2190,13 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
-        "--enable-two-batch-overlap",
+        "--attn-dp-size 8",
+        "--enable-dp-attention-local-control-broadcast",
+        "--tokenizer-worker-num 8",
+        "--stream-interval 20",
+        "--prefill-decode-interval 20",
         "--attention-backend dsv4",
+        "--enable-deepseek-v4-fp4-indexer",
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
@@ -1964,8 +2322,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend deepep",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 1",
@@ -1989,8 +2346,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend deepep",
         "--cuda-graph-max-bs-decode 128",
         "--max-running-requests 256",
@@ -2010,8 +2366,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 16",
-        "--dp 16",
-        "--enable-dp-attention",
+        "--attn-dp-size 16",
         "--moe-a2a-backend deepep",
         "--cuda-graph-max-bs-decode 8",
         "--max-running-requests 32",
@@ -2035,8 +2390,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 16",
-        "--dp 16",
-        "--enable-dp-attention",
+        "--attn-dp-size 16",
         "--moe-a2a-backend deepep",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 1",
@@ -2060,8 +2414,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 16",
-        "--dp 16",
-        "--enable-dp-attention",
+        "--attn-dp-size 16",
         "--moe-a2a-backend deepep",
         "--mem-fraction-static 0.88",
         "--cuda-graph-max-bs-decode 128",
@@ -2465,8 +2818,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--enable-prefill-delayer",
         "--prefill-delayer-max-delay-ms 5000",
         "--attention-backend dsv4",
@@ -2498,8 +2850,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
         "--enable-prefill-delayer",
         "--prefill-delayer-max-delay-ms 5000",
         "--attention-backend dsv4",
@@ -2591,8 +2942,11 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
+        "--enable-dp-attention-local-control-broadcast",
+        "--tokenizer-worker-num 8",
+        "--stream-interval 20",
+        "--prefill-decode-interval 10",
         "--enable-two-batch-overlap",
         "--attention-backend dsv4",
         "--page-size 256",
@@ -2623,8 +2977,11 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
+        "--enable-dp-attention-local-control-broadcast",
+        "--tokenizer-worker-num 8",
+        "--stream-interval 20",
+        "--prefill-decode-interval 10",
         "--enable-two-batch-overlap",
         "--attention-backend dsv4",
         "--page-size 256",
@@ -2659,8 +3016,11 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
+        "--enable-dp-attention-local-control-broadcast",
+        "--tokenizer-worker-num 8",
+        "--stream-interval 20",
+        "--prefill-decode-interval 10",
         "--enable-two-batch-overlap",
         "--attention-backend dsv4",
         "--page-size 256",
@@ -2691,8 +3051,11 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
+        "--enable-dp-attention-local-control-broadcast",
+        "--tokenizer-worker-num 8",
+        "--stream-interval 20",
+        "--prefill-decode-interval 10",
         "--enable-two-batch-overlap",
         "--attention-backend dsv4",
         "--page-size 256",
@@ -2758,8 +3121,11 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
+        "--enable-dp-attention-local-control-broadcast",
+        "--tokenizer-worker-num 8",
+        "--stream-interval 20",
+        "--prefill-decode-interval 10",
         "--enable-two-batch-overlap",
         "--attention-backend dsv4",
         "--page-size 256",
@@ -2794,8 +3160,11 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
+        "--enable-dp-attention-local-control-broadcast",
+        "--tokenizer-worker-num 8",
+        "--stream-interval 20",
+        "--prefill-decode-interval 10",
         "--enable-two-batch-overlap",
         "--attention-backend dsv4",
         "--page-size 256",
@@ -2829,6 +3198,7 @@ sgl-eval run mmmu_pro \\
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--attention-backend dsv4",
+        "--enable-deepseek-v4-fp4-indexer",
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
@@ -2861,10 +3231,13 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
-        "--enable-two-batch-overlap",
+        "--attn-dp-size 8",
+        "--enable-dp-attention-local-control-broadcast",
+        "--tokenizer-worker-num 8",
+        "--stream-interval 20",
+        "--prefill-decode-interval 10",
         "--attention-backend dsv4",
+        "--enable-deepseek-v4-fp4-indexer",
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
@@ -2897,10 +3270,13 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
-        "--enable-two-batch-overlap",
+        "--attn-dp-size 8",
+        "--enable-dp-attention-local-control-broadcast",
+        "--tokenizer-worker-num 8",
+        "--stream-interval 20",
+        "--prefill-decode-interval 10",
         "--attention-backend dsv4",
+        "--enable-deepseek-v4-fp4-indexer",
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
@@ -2964,8 +3340,11 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
+        "--enable-dp-attention-local-control-broadcast",
+        "--tokenizer-worker-num 8",
+        "--stream-interval 20",
+        "--prefill-decode-interval 10",
         "--enable-two-batch-overlap",
         "--attention-backend dsv4",
         "--page-size 256",
@@ -3000,8 +3379,11 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
+        "--attn-dp-size 8",
+        "--enable-dp-attention-local-control-broadcast",
+        "--tokenizer-worker-num 8",
+        "--stream-interval 20",
+        "--prefill-decode-interval 10",
         "--enable-two-batch-overlap",
         "--attention-backend dsv4",
         "--page-size 256",
@@ -3020,6 +3402,125 @@ sgl-eval run mmmu_pro \\
     },
 
     // ====================================================================
+    // DGX Spark (GB10 / SM121) — 2-node TP=2, Balanced: Flash Official FP4,
+    // Flash Official NVFP4, Flash Vision FP4
+    // ====================================================================
+    // Three cells, all on the GB10 recipe: SM12x b12x compressed-MLA attention
+    // with DSpark, split TP=2 across two DGX Sparks over ConnectX-7 RoCE, image
+    // `lmsysorg/sglang:dev-v4f-2dgx-v2` (b12x-vision @ 452239a74f). Every other
+    // DGX Spark combination (other strategies / single node / Flash / Pro) is
+    // intentionally absent and greys out: a single 128GB GB10 cannot hold the
+    // checkpoints, and only Balanced has been run.
+    // - Flash Official FP4: b12x W4A8 MoE (verified on the v2 image: GSM8K
+    //   96.5%; earlier same-recipe runs: ~224 tok/s plateau, AgentX c1/c2 clean,
+    //   decode microbench at parity with the qualified stack).
+    // - Flash Official NVFP4: the NVFP4 routed experts need the flashinfer
+    //   cutlass runner (b12x's MoE is MXFP4-only; trtllm-gen is sm100-only); the
+    //   DSpark draft's MTP experts stay MXFP4 and run on b12x
+    //   (--speculative-moe-runner-backend b12x); HashTopK rejects fused shared
+    //   experts under the cutlass runner (--disable-shared-experts-fusion).
+    //   Verified on the v2 image: GSM8K 97.5%, DSpark accept 3.96, throughput
+    //   at parity with the FP4 cell.
+    // - Flash Vision FP4: same flags as Flash Official; images are served
+    //   natively on b12x (dual-cache prefill gate fix in the v2 image).
+    //   Verified on the v2 image with the cookbook Reproduce commands:
+    //   sgl-eval gsm8k 97.5% (200 q), sgl-eval mmmu_pro 85% / 0% errors
+    //   (20-q subset, --reasoning-effort max, temp 1.0, top-p 0.95).
+    // Env: b12x attention + FP8 wo_a opt-in + MHC post/pre fusion are the GB10
+    // tuning knobs; SGLANG_B12X_MAX_TOKENS must track --chunked-prefill-size;
+    // expandable_segments avoids unified-memory fragmentation OOMs.
+    {
+      match: { hw: "dgx-spark", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "multi-2" },
+      verified: true,
+      warn: "The Docker image lmsysorg/sglang:dev-v4f-2dgx-v2 is a DGX Spark-only preview build (2x GB10, TP=2 over ConnectX-7) — do not use it on other hardware. Use Docker mode: the bare Python command needs the b12x kernel package this image ships. See [DGX Spark notes](#spark-note).",
+      env: [
+        "SGLANG_SM120_FLASHMLA_BACKEND=b12x",
+        "B12X_MLA_SM120_DSV4_H16_NATIVE=1",
+        "SGLANG_OPT_FUSE_MHC_POST_PRE=1",
+        "SGLANG_OPT_FP8_WO_A_GEMM=1",
+        "SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1",
+        "SGLANG_B12X_MAX_TOKENS=8192",
+        "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 2",
+        "--moe-runner-backend b12x",
+        "--speculative-algorithm DSPARK",
+        "--chunked-prefill-size 8192",
+        "--context-length 327680",
+        "--mem-fraction-static 0.80",
+        "--swa-full-tokens-ratio 0.2",
+        "--cuda-graph-max-bs-decode 32",
+        "--max-running-requests 32",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    {
+      match: { hw: "dgx-spark", variant: "flash-official", quant: "nvfp4", strategy: "balanced", nodes: "multi-2" },
+      verified: true,
+      warn: "The Docker image lmsysorg/sglang:dev-v4f-2dgx-v2 is a DGX Spark-only preview build — do not use it on other hardware, and use Docker mode. NVFP4 on DGX Spark needs the three extra MoE flags shown (cutlass runner for the NVFP4 experts, b12x for the DSpark draft's MXFP4 MTP experts, shared-experts fusion off). See [DGX Spark notes](#spark-note).",
+      env: [
+        "SGLANG_SM120_FLASHMLA_BACKEND=b12x",
+        "B12X_MLA_SM120_DSV4_H16_NATIVE=1",
+        "SGLANG_OPT_FUSE_MHC_POST_PRE=1",
+        "SGLANG_OPT_FP8_WO_A_GEMM=1",
+        "SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1",
+        "SGLANG_B12X_MAX_TOKENS=8192",
+        "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 2",
+        "--moe-runner-backend flashinfer_cutlass",
+        "--speculative-moe-runner-backend b12x",
+        "--disable-shared-experts-fusion",
+        "--speculative-algorithm DSPARK",
+        "--chunked-prefill-size 8192",
+        "--context-length 327680",
+        "--mem-fraction-static 0.80",
+        "--swa-full-tokens-ratio 0.2",
+        "--cuda-graph-max-bs-decode 32",
+        "--max-running-requests 32",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "dgx-spark", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "multi-2" },
+      verified: true,
+      warn: "The Docker image lmsysorg/sglang:dev-v4f-2dgx-v2 is a DGX Spark-only preview build — do not use it on other hardware, and use Docker mode. Images go in as OpenAI image_url content on /v1/chat/completions (see Vision below); text-only requests work unchanged. See [DGX Spark notes](#spark-note).",
+      env: [
+        "SGLANG_SM120_FLASHMLA_BACKEND=b12x",
+        "B12X_MLA_SM120_DSV4_H16_NATIVE=1",
+        "SGLANG_OPT_FUSE_MHC_POST_PRE=1",
+        "SGLANG_OPT_FP8_WO_A_GEMM=1",
+        "SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1",
+        "SGLANG_B12X_MAX_TOKENS=8192",
+        "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 2",
+        "--moe-runner-backend b12x",
+        "--speculative-algorithm DSPARK",
+        "--chunked-prefill-size 8192",
+        "--context-length 327680",
+        "--mem-fraction-static 0.80",
+        "--swa-full-tokens-ratio 0.2",
+        "--cuda-graph-max-bs-decode 32",
+        "--max-running-requests 32",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    // ====================================================================
     // B200 + FP4 — Flash Vision (Exp)
     //
     // DeepSeek-V4-Flash-Vision-Exp (sgl-project/sglang#37253): the 0731
@@ -3029,7 +3530,8 @@ sgl-eval run mmmu_pro \\
     // verified on B200 via the MMMU-Pro round (4×B200, image batches).
     // Balanced / high-throughput stay target-only: those recipes run DP
     // attention, which DSpark is incompatible with on the current release.
-    // Non-B200 hardware — final verification in progress.
+    // GB300 verified via the same MMMU-Pro round (4×GB300); B300 /
+    // GB200 / H200 / H100 — final verification in progress.
     // ====================================================================
     {
       match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" },
@@ -3047,15 +3549,13 @@ sgl-eval run mmmu_pro \\
     },
     {
       match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" },
-      verified: false,
-      verificationStatus: "in-progress",
+      verified: true,
       warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend deepep",
         "--mem-fraction-static 0.85",
         "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
@@ -3065,8 +3565,7 @@ sgl-eval run mmmu_pro \\
     },
     {
       match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "high-throughput", nodes: "single" },
-      verified: false,
-      verificationStatus: "in-progress",
+      verified: true,
       warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
       env: [
         "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
@@ -3074,8 +3573,7 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend megamoe",
         "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
@@ -3110,8 +3608,7 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend deepep",
         "--mem-fraction-static 0.85",
         "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
@@ -3130,8 +3627,7 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend megamoe",
         "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
@@ -3162,8 +3658,7 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend deepep",
         "--mem-fraction-static 0.85",
         "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
@@ -3182,8 +3677,7 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend megamoe",
         "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
@@ -3192,8 +3686,7 @@ sgl-eval run mmmu_pro \\
     },
     {
       match: { hw: "gb300", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" },
-      verified: false,
-      verificationStatus: "in-progress",
+      verified: true,
       warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
       env: [],
       flags: [
@@ -3207,15 +3700,13 @@ sgl-eval run mmmu_pro \\
     },
     {
       match: { hw: "gb300", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" },
-      verified: false,
-      verificationStatus: "in-progress",
+      verified: true,
       warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend deepep",
         "--mem-fraction-static 0.85",
         "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
@@ -3225,8 +3716,7 @@ sgl-eval run mmmu_pro \\
     },
     {
       match: { hw: "gb300", variant: "flash-vision", quant: "fp4", strategy: "high-throughput", nodes: "single" },
-      verified: false,
-      verificationStatus: "in-progress",
+      verified: true,
       warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
       env: [
         "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
@@ -3234,8 +3724,7 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--moe-a2a-backend megamoe",
         "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",

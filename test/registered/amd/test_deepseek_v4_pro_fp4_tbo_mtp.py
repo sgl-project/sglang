@@ -70,9 +70,8 @@ class TestDeepseekV4ProFp4TboMTP(CustomTestCase):
             "8",
             # DP attention + TBO: non-EP DP TP-MoE two-batch-overlap. DP TBO is
             # selected because moe_a2a_backend stays 'none'; no opt-in env needed.
-            "--dp",
+            "--attn-dp-size",
             "8",
-            "--enable-dp-attention",
             "--enable-prefill-delayer",
             "--enable-two-batch-overlap",
             "--disable-radix-cache",
@@ -93,7 +92,7 @@ class TestDeepseekV4ProFp4TboMTP(CustomTestCase):
             "4",
             "--max-running-requests",
             "512",
-            "--cuda-graph-max-bs",
+            "--cuda-graph-max-bs-decode",
             "512",
             "--page-size",
             "256",
@@ -101,7 +100,7 @@ class TestDeepseekV4ProFp4TboMTP(CustomTestCase):
             "0.90",
             "--swa-full-tokens-ratio",
             "0.15",
-            # global chunk; DP-attention divides by dp_size=8 -> 8192/rank.
+            # global chunk; DP-attention divides by attn_dp_size=8 -> 8192/rank.
             "--chunked-prefill-size",
             "65536",
             "--disable-shared-experts-fusion",
@@ -130,7 +129,7 @@ class TestDeepseekV4ProFp4TboMTP(CustomTestCase):
             num_questions=1319,
             parallel=512,
             max_new_tokens=512,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)

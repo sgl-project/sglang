@@ -31,7 +31,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _temp_path() -> str:
@@ -47,7 +47,6 @@ class _FakeTokenizerManager(TokenizerControlMixin):
         self.elastic_worker_count = dp_size
         self.server_args = SimpleNamespace(
             dp_size=dp_size,
-            enable_dp_attention=False,
             nnodes=1,
         )
 
@@ -64,7 +63,7 @@ class _FakeHttpTokenizerManager:
         tp_size=1,
         dp_size=1,
         pp_size=1,
-        enable_dp_attention=False,
+        attn_dp_size=1,
     ):
         from sglang.srt.runtime_context import get_context
 
@@ -78,7 +77,7 @@ class _FakeHttpTokenizerManager:
             tp_size=tp_size,
             dp_size=dp_size,
             pp_size=pp_size,
-            enable_dp_attention=enable_dp_attention,
+            attn_dp_size=attn_dp_size,
         )
         self._override.install()
 
@@ -136,8 +135,7 @@ class TestLoadsAcceleratorField(CustomTestCase):
         manager = _FakeHttpTokenizerManager(
             [LoadSnapshot(dp_rank=rank) for rank in range(8)],
             tp_size=8,
-            dp_size=8,
-            enable_dp_attention=True,
+            attn_dp_size=8,
         )
         self.addCleanup(manager.restore)
 

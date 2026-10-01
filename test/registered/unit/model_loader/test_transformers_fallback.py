@@ -5,10 +5,11 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.models.transformers import TransformersBase
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestTransformersFallbackWeightMapper(CustomTestCase):
@@ -54,10 +55,7 @@ class TestTransformersFallbackSkipSubstrs(CustomTestCase):
             pass
 
         with (
-            patch(
-                "sglang.srt.models.transformers.get_pp_group",
-                return_value=SimpleNamespace(),
-            ),
+            get_parallel().override(pp_group=SimpleNamespace()),
             patch(
                 "sglang.srt.models.transformers.get_hf_text_config",
                 return_value=SimpleNamespace(),

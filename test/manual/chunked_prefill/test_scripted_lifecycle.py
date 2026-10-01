@@ -8,21 +8,10 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_MAX_STEPS,
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
+    drain_until_released,
     run_until,
     run_until_finished,
 )
-
-
-def _drain_until_released(t, *handles):
-    for _ in range(12):
-        if all(
-            h.kv_pages == 0
-            and h.lock_refs == 0
-            and (h.req is None or h.req.kv.req_pool_idx is None)
-            for h in handles
-        ):
-            return
-        yield
 
 
 class TestLifecycleBasic(ScriptedTestCase):
@@ -171,9 +160,9 @@ class TestLifecycleBasic(ScriptedTestCase):
         assert "running" in seen, f"never observed running status; seen={seen}"
         assert seen[-1] == "finished", f"final status must be finished; seen={seen}"
         finished_idx = seen.index("finished")
-        assert all(
-            s in ("finished",) for s in seen[finished_idx:]
-        ), f"status regressed after finish; seen={seen}"
+        assert all(s in ("finished",) for s in seen[finished_idx:]), (
+            f"status regressed after finish; seen={seen}"
+        )
 
     def test_long_prompt_only_one_decode(self):
         self.server.execute_script(self._script_long_prompt_only_one_decode)
@@ -234,13 +223,13 @@ class TestLifecycleBasic(ScriptedTestCase):
     def _script_two_seq_clean_handoff(t: ScriptedContext):
         r1 = t.start_req(prompt_len=16, max_new_tokens=2, ignore_eos=True)
         yield from run_until_finished(r1)
-        yield from _drain_until_released(t, r1)
+        yield from drain_until_released(t, r1)
         assert r1.req.kv.req_pool_idx is None and r1.kv_pages == 0 and r1.lock_refs == 0
         r1_output_len = len(r1.req.output_ids)
 
         r2 = t.start_req(prompt_len=16, max_new_tokens=2, ignore_eos=True)
         yield from run_until_finished(r2)
-        yield from _drain_until_released(t, r2)
+        yield from drain_until_released(t, r2)
         assert r1.finished and r2.finished
         assert r1_output_len == 2 and len(r2.req.output_ids) == 2
         assert r2.req.kv.req_pool_idx is None and r2.kv_pages == 0 and r2.lock_refs == 0
@@ -279,8 +268,7 @@ class TestLifecycleBasic(ScriptedTestCase):
         assert r1.finished and r2.finished
         assert r2.chunks_done == 0
         assert r2.req.cached_tokens > 0, (
-            f"r2 must hit r1's radix prefix; got cached_tokens="
-            f"{r2.req.cached_tokens}"
+            f"r2 must hit r1's radix prefix; got cached_tokens={r2.req.cached_tokens}"
         )
         assert len(r2.req.output_ids) == 2
 
@@ -320,7 +308,7 @@ class TestLifecycleBasic(ScriptedTestCase):
             yield from run_until_finished(r)
             assert r.finished
             assert len(r.req.output_ids) == 1
-            yield from _drain_until_released(t, r)
+            yield from drain_until_released(t, r)
             assert r.req is None or r.req.kv.req_pool_idx is None
             assert r.kv_pages == 0 and r.lock_refs == 0
             if L > DEFAULT_CHUNK_SIZE:
@@ -342,7 +330,7 @@ class TestLifecycleBasic(ScriptedTestCase):
             yield from run_until_finished(r)
             assert r.finished
             assert len(r.req.output_ids) == 1
-            yield from _drain_until_released(t, r)
+            yield from drain_until_released(t, r)
             assert r.req is None or r.req.kv.req_pool_idx is None
             assert r.kv_pages == 0 and r.lock_refs == 0
             if L > DEFAULT_CHUNK_SIZE:
@@ -408,9 +396,9 @@ class TestLifecycleBasic(ScriptedTestCase):
         t.flush_cache()
         yield
         final = t.engine_stats()["kv_pool_free"]
-        assert (
-            final >= baseline - 1
-        ), f"KV pool drift: baseline={baseline}, final={final}"
+        assert final >= baseline - 1, (
+            f"KV pool drift: baseline={baseline}, final={final}"
+        )
 
     def test_abort_all_during_chunked(self):
         self.server.execute_script(self._script_abort_all_during_chunked)

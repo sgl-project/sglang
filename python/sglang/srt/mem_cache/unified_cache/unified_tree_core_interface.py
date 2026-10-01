@@ -35,9 +35,9 @@ class BaseEvictionResult(msgspec.Struct):
 
     def __del__(self) -> None:
         # Drop tripwire: every returned value must be drained before disposal.
-        assert (
-            not self.device_frees and not self.host_frees
-        ), "BaseEvictionResult dropped with undrained values"
+        assert not self.device_frees and not self.host_frees, (
+            "BaseEvictionResult dropped with undrained values"
+        )
 
 
 class EvictDeviceNextNodeResult(BaseEvictionResult):
@@ -45,15 +45,23 @@ class EvictDeviceNextNodeResult(BaseEvictionResult):
 
     ``node_id`` selects a leaf for the Controller to evict. ``made_progress``
     also covers an internal tombstone that returned no leaf, distinguishing it
-    from true walk exhaustion.
+    from true walk exhaustion. ``mamba_backup_node_id`` and
+    ``swa_backup_node_id`` pause an internal eviction until the Controller
+    finishes its best-effort host backup. ``swa_backup_num_tokens`` includes
+    all unbacked SWA segments in the backup window, not just the victim.
     """
 
     node_id: Optional[NodeId] = None
     made_progress: bool = False
+    unbacked_tokens: int = 0
+    mamba_backup_node_id: Optional[NodeId] = None
+    swa_backup_node_id: Optional[NodeId] = None
+    swa_backup_num_tokens: int = 0
 
 
 class EvictDeviceLeafResult(BaseEvictionResult):
     backup_kv: Optional[BackupKV] = None
+    unbacked_tokens: int = 0
 
 
 class DemoteResult(BaseEvictionResult):
@@ -146,9 +154,12 @@ class UnifiedTreeCoreInterface(ABC):
     device: torch.device
     enable_hicache: bool
     enable_storage: bool
+    enable_external_cache_linker: bool
     write_through_threshold: int
     is_write_back: bool
     has_swa_host_pool: bool
+    # Whether the host tier stages one node per FIFO backup intent.
+    is_host_memory_buffer_only: bool
     kv_events: KVCacheEventRecorder
 
     # ==== Tree API ====
@@ -181,6 +192,22 @@ class UnifiedTreeCoreInterface(ABC):
     def is_root(self, node_id: NodeId) -> bool:
         """Whether the node is the tree root."""
         ...
+
+    # Logical-page KV sharding: whether this core stamps and honors
+    # UnifiedTreeNode.rotation_base. A core that does not cannot serve a
+    # sharded allocator (it would never decline a cross-base graft), and
+    # UnifiedRadixCache.__init__ rejects that pairing at construction.
+    supports_rotation_base: bool = False
+
+    def rotation_base_of(self, node_id: NodeId) -> Optional[int]:
+        """Logical-page KV sharding: the node's chain rotation base, or None
+        when sharding is off (and on the root, which starts no chain).
+
+        Concrete, not abstract: a core that does not track rotation bases
+        stays constructible, and its None means "sharding is off" -- never
+        "sharding is on but unknown", which the constructor gate rules out.
+        """
+        return None
 
     @abstractmethod
     def get_last_hash_value(self, node_id: NodeId) -> Optional[str]:
@@ -235,30 +262,40 @@ class UnifiedTreeCoreInterface(ABC):
     def inc_lock_ref(
         self, node_id: NodeId, skip_lock_components: Sequence[ComponentType] = ()
     ) -> IncLockRefResult:
-        """Bump the reference count on a node's component locks, leaving any
-        component in skip_lock_components evictable and recorded in the result."""
+        """Bump the reference count on a node's component locks. Components in
+        ``skip_lock_components`` are left untaken; the receipt records the
+        anchor node and the skipped set so the paired release mirrors them."""
         ...
 
     @abstractmethod
     def dec_lock_ref(
         self,
         node_id: NodeId,
-        params: Optional[DecLockRefParams] = None,
+        params: DecLockRefParams,
         skip_swa: bool = False,
     ) -> DecLockRefResult:
-        """Decrease the reference count on a node's component locks."""
+        """Decrease the reference count on a node's component locks. The
+        receipt is required: a release must replay its acquire's evidence."""
         ...
 
     @abstractmethod
     def dec_swa_lock_only(
         self,
         node_id: NodeId,
-        swa_uuid_for_lock: Optional[int],
-        skip_lock_node_ids: Optional[dict] = None,
+        params: DecLockRefParams,
     ) -> DecSwaLockOnlyResult:
         """Decrease only the SWA (and lower-priority co-located) reference
         counts; the result carries the freed slots."""
         ...
+
+    def dec_window_lock_only(
+        self,
+        node_id: NodeId,
+        component_type: ComponentType,
+        params: DecLockRefParams,
+    ) -> DecSwaLockOnlyResult:
+        """Release one window's receipt without releasing peer components."""
+        raise NotImplementedError("This tree core does not support independent windows")
 
     # ==== Device eviction (driven step-wise by the Controller's evict()) ====
 
@@ -289,6 +326,24 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def finish_mamba_state_eviction(self, node_id: NodeId) -> EvictDeviceNextNodeResult:
+        """Resume the pending internal Mamba eviction after its backup attempt.
+
+        The controller must finish any submitted D->H transfer before calling.
+        A failed allocation still permits eviction to make device space.
+        """
+        ...
+
+    @abstractmethod
+    def finish_swa_state_eviction(self, node_id: NodeId) -> EvictDeviceNextNodeResult:
+        """Resume the pending internal SWA eviction after its backup attempt.
+
+        The controller must finish any submitted D->H transfer before calling.
+        A failed allocation still permits eviction to make device space.
+        """
+        ...
+
+    @abstractmethod
     def drop_subtree_no_host(self, node_id: NodeId) -> DropSubtreeNoHostResult:
         """Drop an unbacked D-leaf's subtree when its write-back backup failed
         under host pressure; declines (is_dropped=False) if any node is locked."""
@@ -311,7 +366,7 @@ class UnifiedTreeCoreInterface(ABC):
 
     @abstractmethod
     def dec_host_lock_ref(
-        self, node_id: NodeId, params: Optional[DecLockRefParams] = None
+        self, node_id: NodeId, params: DecLockRefParams
     ) -> DecLockRefResult:
         """Decrease the reference count on a node's host-side component locks."""
         ...
@@ -326,6 +381,10 @@ class UnifiedTreeCoreInterface(ABC):
     def component_evictable_size(self, component_type: ComponentType) -> int:
         """Evictable token count for one component (0 if the component is absent)."""
         ...
+
+    def component_protected_size(self, component_type: ComponentType) -> int:
+        """Protected token count for one component (0 if absent)."""
+        raise NotImplementedError("This tree core does not expose per-component sizes")
 
     @abstractmethod
     def full_evictable_size(self) -> int: ...
@@ -368,6 +427,25 @@ class UnifiedTreeCoreInterface(ABC):
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Match a key against the tree; returns device indices + boundary NodeIds."""
         ...
+
+    @abstractmethod
+    def match_full_device_prefix(self, key: RadixKey) -> tuple[int, NodeId, int]:
+        """Return (matched tokens, deepest node, FULL tokens pinned by it)."""
+        ...
+
+    @abstractmethod
+    def inc_full_pin(self, node_id: NodeId) -> None:
+        """Pin only FULL device values on the node's root path."""
+        ...
+
+    @abstractmethod
+    def dec_full_pin(self, node_id: NodeId) -> None:
+        """Release a pin acquired by inc_full_pin."""
+        ...
+
+    def supports_fast_match_prefix(self) -> bool:
+        """Whether matching every waiting request is cheap enough for scheduling."""
+        return False
 
     @property
     @abstractmethod
@@ -433,6 +511,11 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def set_host_memory_buffer_only(self) -> None:
+        """Mark the host tier as buffer-only: one node staged per backup intent."""
+        ...
+
+    @abstractmethod
     def insert_host(
         self,
         node_id: NodeId,
@@ -464,9 +547,13 @@ class UnifiedTreeCoreInterface(ABC):
         node_id: NodeId,
         phase: CacheTransferPhase,
         *,
+        # TODO(Jialin): Remove the legacy `host_indices` argument from the
+        # interface and bindings. Prefetch uses `staging_tokens`;
+        # `PoolTransfer.host_indices` is populated after the storage hit.
         host_indices: Optional[torch.Tensor] = None,
         token_ids: Optional[Sequence[int]] = None,
         prefetch_tokens: int = 0,
+        staging_tokens: int = 0,
         last_hash: Optional[str] = None,
     ) -> Optional[list[PoolTransfer]]:
         """Build a component's HiCache transfers for the given node and phase."""
@@ -526,19 +613,80 @@ class UnifiedTreeCoreInterface(ABC):
         """Clear the in-flight H->D marks on the anchor's root path at ack time."""
         ...
 
+    # ==== External Cache Linker ====
+
+    @abstractmethod
+    def build_external_linker_offload_transfers(
+        self, node_id: NodeId
+    ) -> Optional[list[PoolTransfer]]:
+        """Build direct device-to-external-store transfers for an eligible node.
+
+        Return None when the node is stored externally or has an offload pending.
+        """
+        ...
+
+    @abstractmethod
+    def mark_external_cache_stored_path(
+        self, from_node_id: NodeId, until_node_id: NodeId
+    ) -> None:
+        """Mark the path from ``from_node_id`` to, but excluding, ``until_node_id``."""
+        ...
+
+    @abstractmethod
+    def mark_external_linker_offload_pending(self, node_id: NodeId) -> None:
+        """Publish an accepted external offload as pending."""
+        ...
+
+    @abstractmethod
+    def finish_external_linker_offload(
+        self, node_ids: Sequence[NodeId], ack_id: NodeId, success: bool
+    ) -> None:
+        """Finish one external offload for every current fragment of its node.
+
+        A successful write confirms external storage. A failed redundant write
+        preserves storage already confirmed independently by a concurrent load.
+        """
+        ...
+
     # Order-sensitive digest of write_back duplicate-reclaim victim ids,
     # cross-checked across TP ranks; cores that never reclaim keep 0.
     write_back_duplicate_reclaim_digest: int = 0
 
     @abstractmethod
-    def mark_write_through_pending(self, node_id: NodeId) -> None:
-        """Mark a node as having an in-flight write-through backup."""
+    def mark_write_through_pending(
+        self, node_ids: list[NodeId], ack_id: NodeId
+    ) -> list[NodeId]:
+        """Mark every node covered by one in-flight write-through backup, and return
+        them ancestors first: publish links each host store event to its parent."""
         ...
 
     @abstractmethod
     def finish_write_through(self, node_ids: list[NodeId], ack_id: int) -> None:
         """Clear the write-through-pending mark (when it matches ack_id) and record the
         host store event for each acked node."""
+        ...
+
+    @abstractmethod
+    def swa_tombstone_ranges(
+        self, key: RadixKey, start: int, end: int
+    ) -> list[tuple[int, int]]:
+        """Return maximal missing SWA ranges within the matched [start, end) span."""
+        ...
+
+    @abstractmethod
+    def attach_swa_window(
+        self,
+        key: RadixKey,
+        window_start: int,
+        window_end: int,
+        swa_values: torch.Tensor,
+    ) -> list[CacheAction | ComponentAction]:
+        """Attach a loaded SWA window to tombstoned spans, returning split actions.
+
+        The shared pipeline supplies page-aligned logical token offsets and
+        int64 values on the core's device. The entire span must be matched and
+        tombstoned before publication.
+        """
         ...
 
     @abstractmethod

@@ -247,9 +247,6 @@ def _handle_output_by_index(output, i):
             output_token_sampling_mask=_extract_field_by_index(
                 output, "output_token_sampling_mask", i, check_length=False
             ),
-            output_token_sampling_logprobs=_extract_field_by_index(
-                output, "output_token_sampling_logprobs", i, check_length=False
-            ),
             output_hidden_states=_extract_field_by_index(
                 output, "output_hidden_states", i, check_length=False
             ),
@@ -367,9 +364,6 @@ def _handle_output_by_index(output, i):
             ),
             output_token_sampling_mask=_extract_field_by_index(
                 output, "output_token_sampling_mask", i, check_length=False
-            ),
-            output_token_sampling_logprobs=_extract_field_by_index(
-                output, "output_token_sampling_logprobs", i, check_length=False
             ),
             output_hidden_states=_extract_field_by_index(
                 output, "output_hidden_states", i, check_length=False
@@ -598,9 +592,9 @@ class MultiDetokenizerRouter:
 
             # Single request: route by its own http_worker_ipc.
             if isinstance(recv_obj, BaseReq):
-                assert (
-                    recv_obj.http_worker_ipc is not None
-                ), f"Single req {recv_obj.rid=} missing http_worker_ipc"
+                assert recv_obj.http_worker_ipc is not None, (
+                    f"Single req {recv_obj.rid=} missing http_worker_ipc"
+                )
                 self._send(self._pick(recv_obj.http_worker_ipc), recv_obj)
                 continue
 

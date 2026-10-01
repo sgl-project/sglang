@@ -81,9 +81,9 @@ def adapt_config_dict(
             else:
                 config_dict["architectures"] = ["MistralLarge3ForCausalLM"]
 
-            assert (
-                "llama_4_scaling" in config_dict
-            ), "MistralLarge3 expect llama4 scaling config."
+            assert "llama_4_scaling" in config_dict, (
+                "MistralLarge3 expect llama4 scaling config."
+            )
             llama_4_scaling_config_keys = ["original_max_position_embeddings", "beta"]
             assert all(
                 [
@@ -497,7 +497,8 @@ def patch_mistral_common_tokenizer(tokenizer):
     if not hasattr(tokenizer, "get_added_vocab"):
         tokenizer.get_added_vocab = lambda: {}
 
-    # Keep the old no-op pad add working on transformers 5.12 MistralCommon.
+    # MistralCommonBackend.add_special_tokens raises NotImplementedError by design;
+    # a pad-token-only call sets `pad_token` directly and adds nothing.
     _orig_add_special_tokens = tokenizer.add_special_tokens
 
     def _safe_add_special_tokens(special_tokens_dict, *args, **kwargs):

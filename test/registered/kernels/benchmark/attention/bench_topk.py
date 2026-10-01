@@ -3,8 +3,8 @@ import torch
 from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
-    topk_transform_512,
-    topk_transform_512_v2,
+    topk_transform_paged,
+    topk_transform_paged_v2,
     topk_transform_ragged_v2,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -42,10 +42,10 @@ def _build_paged_fn(
 
     def fn(scores, seq_lens, page_table):
         if provider == "jit_v1":
-            topk_transform_512(scores, seq_lens, page_table, out, N)
+            topk_transform_paged(scores, seq_lens, page_table, out, N)
             return out
         elif provider == "jit_v2":
-            topk_transform_512_v2(scores, seq_lens, page_table, out, N, metadata)
+            topk_transform_paged_v2(scores, seq_lens, page_table, out, N, metadata)
             return out
         elif provider == "flashinfer":
             from flashinfer import top_k_page_table_transform
@@ -104,14 +104,16 @@ if not DISABLE_TORCH:
     PRROVIDERS.append("torch")
 
 
+@marker.parametrize("page_size", [1, 64], [1, 64])
 @marker.parametrize("k", [512, 1024, 2048], [512])
 @marker.parametrize("seq_len", [2**x for x in range(10, 19)], [4096, 65536])
 @marker.parametrize("batch_size", [2**x for x in range(13)], [1, 128, 1024])
-@marker.parametrize("page_size", [1, 64], [1, 64])
 @marker.benchmark("provider", PRROVIDERS)
 def benchmark_paged(
     seq_len: int, batch_size: int, k: int, page_size: int, provider: str
 ):
+    seed = seq_len ^ (batch_size << 16) ^ (k << 32) ^ (page_size << 48)
+    torch.random.manual_seed(seed)
     if k > seq_len:
         marker.skip("k cannot be larger than seq_len")
     if k == 2048 and provider == "jit_v1":
@@ -127,6 +129,8 @@ def benchmark_paged(
 @marker.parametrize("batch_size", [2**x for x in range(7, 14)], [128, 1024])
 @marker.benchmark("provider", PRROVIDERS)
 def benchmark_ragged(seq_len: int, batch_size: int, k: int, provider: str):
+    seed = seq_len ^ (batch_size << 16) ^ (k << 32)
+    torch.random.manual_seed(seed)
     if k > seq_len:
         marker.skip("k cannot be larger than seq_len")
     if k != 2048 and provider == "jit_v1":

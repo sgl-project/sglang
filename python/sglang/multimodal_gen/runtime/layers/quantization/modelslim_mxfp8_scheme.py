@@ -25,7 +25,6 @@ MXFP8_BLOCK_SIZE = 32
 
 
 class ModelSlimMXFP8Scheme(ModelSlimLinearScheme):
-
     def create_weights(
         self,
         layer: torch.nn.Module,

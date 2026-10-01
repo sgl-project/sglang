@@ -7,16 +7,16 @@ metatags:
 <Note>
 This page focuses on optimal configuration and benchmark results for DeepSeek-V4-Flash on the Ascend NPU.
 
-On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware) for details.
+On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware) for details.
 </Note>
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| DeepSeek-V4-Flash | Atlas 800I A3 | 16 | PD Disaggregation | 8k+1k | 50ms | W8A8 INT8 | [Optimal Configuration](#deepseek-v4-flash-w8a8-1p1d-16p-in8k-out1k-50ms) |
-| DeepSeek-V4-Flash | Atlas 800I A3 | 8 | PD Mixed | 32k+1k | 50ms | W8A8 INT8 | [Optimal Configuration](#deepseek-v4-flash-w8a8-8p-in32k-out1k-50ms) |
-| DeepSeek-V4-Flash | Atlas 800I A3 | 8 | PD Mixed | 8k+1k | 50ms | W8A8 INT8 | [Optimal Configuration](#deepseek-v4-flash-w8a8-8p-in8k-out1k-50ms) |
+| DeepSeek-V4-Flash | Ascend A3 Series Products | 16 | PD Disaggregation | 8k+1k | 50ms | W8A8 INT8 | [Optimal Configuration](#deepseek-v4-flash-w8a8-1p1d-16p-in8k-out1k-50ms) |
+| DeepSeek-V4-Flash | Ascend A3 Series Products | 8 | PD Mixed | 32k+1k | 50ms | W8A8 INT8 | [Optimal Configuration](#deepseek-v4-flash-w8a8-8p-in32k-out1k-50ms) |
+| DeepSeek-V4-Flash | Ascend A3 Series Products | 8 | PD Mixed | 8k+1k | 50ms | W8A8 INT8 | [Optimal Configuration](#deepseek-v4-flash-w8a8-8p-in8k-out1k-50ms) |
 
 ## Optimal Configuration
 
@@ -26,7 +26,7 @@ On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend 
 
 **Model**: DeepSeek-V4-Flash
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 16
 
@@ -75,7 +75,6 @@ export INF_NAN_MODE_FORCE_DISABLE=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DSV4_FP4_EXPERTS=False
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_OPT_BF16_FP32_GEMM_ALGO=torch
 export SGLANG_OPT_DEEPGEMM_HC_PRENORM=False
 export SGLANG_OPT_FP8_WO_A_GEMM=0
@@ -132,8 +131,7 @@ do
         --max-prefill-tokens 70000 \
         --chunked-prefill-size -1 \
         --max-running-requests 112 \
-        --dp-size 16 \
-        --enable-dp-attention \
+        --attn-dp-size 16 \
         --moe-a2a-backend deepep \
         --deepep-mode normal \
         --quantization modelslim \
@@ -178,14 +176,13 @@ do
         --chunked-prefill-size 32768 \
         --disaggregation-transfer-backend ascend \
         --max-running-requests 896 \
-        --dp-size 16 \
-        --enable-dp-attention \
+        --attn-dp-size 16 \
         --moe-a2a-backend deepep \
         --deepep-mode auto \
         --quantization modelslim \
         --enable-dp-lm-head \
         --kv-cache-dtype bfloat16 \
-        --cuda-graph-bs 1 2 4 8 16 24 36 40 48 56 \
+        --cuda-graph-bs-decode 1 2 4 8 16 24 36 40 48 56 \
         --speculative-algorithm EAGLE \
         --speculative-num-steps 2 \
         --speculative-eagle-topk 1 \
@@ -237,7 +234,7 @@ python -m sglang.bench_serving \
 
 **Model**: DeepSeek-V4-Flash
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 8
 
@@ -289,7 +286,6 @@ export SGLANG_DSV4_FP4_EXPERTS=False
 export SGLANG_DSV4_NPU_FUSED_COMPRESSOR=1
 export SGLANG_DSV4_NPU_FUSED_COMPRESSOR_PREFILL=0
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_NPU_USE_MULTI_STREAM=1
 export SGLANG_OPT_BF16_FP32_GEMM_ALGO=torch
@@ -321,15 +317,14 @@ python3 -m sglang.launch_server \
     --mem-fraction-static 0.7 \
     --chunked-prefill-size 131072 \
     --max-running-requests 64 \
-    --dp-size 16 \
-    --enable-dp-attention \
+    --attn-dp-size 16 \
     --moe-a2a-backend deepep \
     --deepep-mode auto \
     --quantization modelslim \
     --enable-dp-lm-head \
     --kv-cache-dtype auto \
     --skip-server-warmup \
-    --cuda-graph-bs 1 2 4 8 \
+    --cuda-graph-bs-decode 1 2 4 8 \
     --speculative-algorithm EAGLE \
     --speculative-num-steps 2 \
     --speculative-eagle-topk 1 \
@@ -363,7 +358,7 @@ python -m sglang.bench_serving \
 
 **Model**: DeepSeek-V4-Flash
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 8
 
@@ -415,7 +410,6 @@ export SGLANG_DSV4_FP4_EXPERTS=False
 export SGLANG_DSV4_NPU_FUSED_COMPRESSOR=1
 export SGLANG_DSV4_NPU_FUSED_COMPRESSOR_PREFILL=1
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_NPU_USE_MULTI_STREAM=1
 export SGLANG_OPT_BF16_FP32_GEMM_ALGO=torch
@@ -447,15 +441,14 @@ python3 -m sglang.launch_server \
     --mem-fraction-static 0.7 \
     --chunked-prefill-size 131072 \
     --max-running-requests 160 \
-    --dp-size 16 \
-    --enable-dp-attention \
+    --attn-dp-size 16 \
     --moe-a2a-backend deepep \
     --deepep-mode auto \
     --quantization modelslim \
     --enable-dp-lm-head \
     --kv-cache-dtype auto \
     --skip-server-warmup \
-    --cuda-graph-bs 1 2 4 8 10 \
+    --cuda-graph-bs-decode 1 2 4 8 10 \
     --speculative-algorithm EAGLE \
     --speculative-num-steps 2 \
     --speculative-eagle-topk 1 \

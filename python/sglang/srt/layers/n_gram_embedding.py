@@ -9,7 +9,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 class NgramEmbedding(torch.nn.Module):
-
     def __init__(
         self,
         num_embeddings: int,
@@ -20,9 +19,9 @@ class NgramEmbedding(torch.nn.Module):
         eos_token_id: int,
     ):
         super().__init__()
-        assert (
-            over_embedding_n > 1
-        ), f"over_embedding_n must be > 1, got {over_embedding_n}"
+        assert over_embedding_n > 1, (
+            f"over_embedding_n must be > 1, got {over_embedding_n}"
+        )
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
         self.over_embedding_m = over_embedding_m
@@ -105,9 +104,9 @@ class NgramEmbedding(torch.nn.Module):
             )
             oe_weight_start = self.exclusive_oe_embedder_size_sums[index]
             oe_weight_end = self.exclusive_oe_embedder_size_sums[index + 1]
-            assert (
-                oe_weight_end - oe_weight_start == loaded_weight.shape[0]
-            ), f"{oe_weight_end - oe_weight_start=} {loaded_weight.shape[0]=}"
+            assert oe_weight_end - oe_weight_start == loaded_weight.shape[0], (
+                f"{oe_weight_end - oe_weight_start=} {loaded_weight.shape[0]=}"
+            )
             tp_start = self.oe_embeder.shard_indices.org_vocab_start_index
             tp_end = self.oe_embeder.shard_indices.org_vocab_end_index
             to_load_start = max(oe_weight_start, tp_start)

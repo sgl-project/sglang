@@ -20,9 +20,9 @@ import torch
 import torch.multiprocessing as mp
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, publish_build_topology
 
-register_cuda_ci(est_time=120, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=28, stage="base-c", runner_config="4-gpu-b200")
 
 LAYER_NUM = 4
 PAGE_SIZE = 64
@@ -54,10 +54,8 @@ def _run(rank: int, world: int, port: int):
         distributed_init_method=f"tcp://127.0.0.1:{port}",
         backend="nccl",
     )
-    initialize_model_parallel(
-        tensor_model_parallel_size=world,
-        attention_context_model_parallel_size=world,
-    )
+    publish_build_topology(tp_size=world, attn_cp_size=world, world_rank=rank)
+    initialize_model_parallel()
 
     from sglang.srt.mem_cache.dsa_cache_layer_split import (
         LayerSplitDSATokenToKVPool,
