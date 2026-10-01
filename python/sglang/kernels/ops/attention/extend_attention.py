@@ -946,6 +946,31 @@ def extend_attention_fwd(
         _get_block_sizes_for_extend_attention(Lq, Lv)
     )
 
+    use_bf16_hd512_denoise = (
+        _is_cuda
+        and CUDA_CAPABILITY[0] == 10
+        and Lq == Lk == Lv == 512
+        and 32 <= max_len_extend <= 256
+        and not is_causal
+        and custom_mask is None
+        and sliding_window_size <= 0
+        and logit_cap <= 0
+        and xai_temperature_len <= 0
+        and sinks is None
+        and score_mod is None
+        and not skip_prefix
+        and not skip_extend
+        and page_size == 1
+        and all(
+            tensor.dtype == torch.bfloat16
+            for tensor in (q_extend, k_extend, v_extend, k_buffer, v_buffer)
+        )
+    )
+    if use_bf16_hd512_denoise:
+        # A wider query tile halves prefix reads for bidirectional denoising.
+        # Pair it with two stages below to overlap the prefix loads on SM100.
+        BLOCK_M, BLOCK_N, num_warps = 32, 64, 8
+
     USE_CUSTOM_MASK = custom_mask is not None
     # Skip custom mask for prefix part
     SKIP_PREFIX_CUSTOM_MASK = skip_prefix_custom_mask
@@ -1008,6 +1033,8 @@ def extend_attention_fwd(
     num_stages = (
         _get_num_stages_for_extend_attention(Lq, Lv, BLOCK_N) if kimi_k3_shape else 1
     )
+    if use_bf16_hd512_denoise:
+        num_stages = 2
 
     extra_kargs = {}
     if _is_hip:
