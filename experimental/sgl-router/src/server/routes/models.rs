@@ -51,6 +51,7 @@ mod tests {
             id: "qwen3".into(),
             tokenizer_path: "x".into(),
             disable_input_ids_forwarding: false,
+            tokenizer: Default::default(),
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),
             bucket_config: None,
@@ -61,6 +62,7 @@ mod tests {
             fused: None,
             eligibility: None,
             sampling_overrides: Default::default(),
+            default_chat_template_kwargs: Default::default(),
         };
         let app = crate::server::app::build_router(std::sync::Arc::new(ctx));
         let res = app

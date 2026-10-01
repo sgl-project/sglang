@@ -525,7 +525,7 @@ class AiterAttnBackend(AttentionBackend):
                 16 if _gathered_num_head < 16 else _gathered_num_head
             )
 
-            self.enable_dp_attention = is_dp_attention_enabled()
+            self.attn_dp_enabled = is_dp_attention_enabled()
             self.qo_indptr_ = torch.zeros(
                 (max_bs + 1,), dtype=torch.int32, device=model_runner.device
             )
@@ -543,7 +543,7 @@ class AiterAttnBackend(AttentionBackend):
             # need to fall back to non-persist
             # only use mla_ps_kernel when fp8 kv_cache
             # for non-fp8 kv_cache on tp8, use non-persist kernel to avoid performance degradation
-            # head_num=16 (tp8 perf issue), head_num=128 (unsupported, like tp1 or --enable-dp-attention with tp8-dp8)
+            # head_num=16 (tp8 perf issue), head_num=128 (unsupported, like tp1 or tp8 with --attn-dp-size 8)
             # Native 16-head persist is slow on TP8; keep disabled unless zero-pad
             # (e.g. Kimi K3 h12 -> qh16) where persist ASM is the fast path.
             if (
@@ -644,7 +644,7 @@ class AiterAttnBackend(AttentionBackend):
         nhead = self.mla_kernel_num_head_padded
         dtype = self.kv_cache_dtype
 
-        if self.enable_dp_attention:
+        if self.attn_dp_enabled:
             gpu = torch.cuda.current_device()
             device_properties = torch.cuda.get_device_properties(gpu)
             cu_num = device_properties.multi_processor_count
