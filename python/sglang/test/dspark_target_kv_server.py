@@ -57,6 +57,7 @@ def rms(value, weight, epsilon, *, cast_before_weight=False):
 
 original_write = DSparkTargetKVDraftModel.write_target_kv
 original_verify = TargetKVInjector.inject_verify
+original_context = TargetKVInjector.ensure_context
 original_target_verify = TargetVerifyExecutor.run_non_compact
 
 
@@ -146,6 +147,25 @@ def observed_verify(self, *, batch, verify_window, commit_lens):
     )
 
 
+def observed_context(self, batch):
+    previous = [req.dspark_projected_context for req in batch.reqs]
+    original_context(self, batch)
+    for req, before, end in zip(
+        batch.reqs, previous, batch.seq_lens_cpu.tolist(), strict=True
+    ):
+        record(
+            self.draft_model,
+            {
+                "kind": "context",
+                "rid": req.rid,
+                "retraction_ct": req.retraction_count,
+                "previous_end": before.end if before is not None else None,
+                "projected_end": req.dspark_projected_context.end,
+                "prefix_end": end,
+            },
+        )
+
+
 def observed_target_verify(self, **kwargs):
     result = original_target_verify(self, **kwargs)
     assert result.logits_output.hidden_states is None
@@ -158,6 +178,7 @@ def observed_target_verify(self, **kwargs):
 
 DSparkTargetKVDraftModel.write_target_kv = observed_write
 TargetKVInjector.inject_verify = observed_verify
+TargetKVInjector.ensure_context = observed_context
 TargetVerifyExecutor.run_non_compact = observed_target_verify
 install_capture_observer()
 

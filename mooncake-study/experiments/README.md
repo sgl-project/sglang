@@ -259,6 +259,20 @@ to retain all snapshots. This is a correctness check with tensor observers,
 not a performance benchmark. The H100 result is retained in
 [`capture-cache-lifecycle.json`](capture-cache-lifecycle.json).
 
+### DSpark Memory Pressure
+
+The same registered runtime test also drives four disjoint requests beyond a
+512-token serving KV pool, with the debug retract flag disabled. It requires
+actual automatic retraction in all synchronous/overlap and eager/graph modes,
+complete serving responses, draft projection reset and reconstruction, exclusion
+of failed captures, and subsequent capture admission. Successful snapshots are
+compared to the online observer and reread after producer exit. The retained
+run validates 90 snapshots overall, including twelve pressure/recovery samples,
+in 461.341s. See
+[`capture-dspark-memory-pressure.json`](capture-dspark-memory-pressure.json).
+The workload uses a synthetic draft and forced output tokens; it does not
+measure trained-model quality or service performance.
+
 ### BF16 Rounding Isolation
 
 The actual fixed-input parity command remains the serving gate. The following

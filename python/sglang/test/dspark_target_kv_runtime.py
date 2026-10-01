@@ -13,6 +13,7 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
+from sglang.srt.environ import envs
 from sglang.srt.speculative.dspark_components.dspark_target_kv_contract import (
     KVCompatibility,
     KVEncoderConfig,
@@ -132,7 +133,8 @@ def exercise_target_kv_draft(
             time.sleep(0.05)
 
     with (
-        patch.dict("os.environ", {"SGLANG_RAGGED_VERIFY_MODE": "static"}),
+        envs.SGLANG_RAGGED_VERIFY_MODE.override("static"),
+        envs.SGLANG_TEST_RETRACT.override(False),
         patch.object(test_utils, "_launch_server_process", observed_server),
     ):
         server = test_utils.popen_launch_server(
@@ -148,6 +150,7 @@ def exercise_target_kv_draft(
                 str(destination),
                 *([] if enable_overlap else ["--disable-overlap-schedule"]),
                 "--skip-server-warmup",
+                "--enable-metrics",
                 "--attention-backend",
                 "triton",
                 "--speculative-draft-attention-backend",
@@ -155,7 +158,9 @@ def exercise_target_kv_draft(
                 "--mem-fraction-static",
                 "0.25",
                 "--max-total-tokens",
-                "4096",
+                "512",
+                "--schedule-conservativeness",
+                "0.05",
                 "--max-running-requests",
                 "4",
                 "--chunked-prefill-size",
@@ -418,6 +423,15 @@ def exercise_target_kv_draft(
                 {"target_kv_serving": observations, "cuda_graph_enabled": cuda_graph}
             ),
             flush=True,
+        )
+        from sglang.test.dspark_capture_pressure import exercise_dspark_capture_pressure
+
+        publications += exercise_dspark_capture_pressure(
+            test,
+            url=url,
+            directory=destination,
+            cuda_graph=cuda_graph,
+            enable_overlap=enable_overlap,
         )
     finally:
         kill_process_tree(server.pid)

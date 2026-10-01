@@ -1,0 +1,1104 @@
+{
+  "purpose": "Verify static DSpark draft KV reconstruction and training capture retirement after actual serving KV pool exhaustion",
+  "source_baseline": "62d2eb245437e16849c54abd3d4b3d3ee90e215c",
+  "environment_lock": "h100-runtime-lock.json",
+  "runtime": {
+    "job_id": "01790836944459482077-87511189724e",
+    "outcome": "completed",
+    "returncode": 0,
+    "finished_unix": 1790837417.6638806,
+    "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790836944459482077-87511189724e.log",
+    "log_sha256": "5e93ed5f58b47ccf45ad59d27e15a88303ea83960094ef757328dcb41a08f169",
+    "seconds": 461.341,
+    "tests": 1,
+    "command": [
+      "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+      "test/registered/storage/test_training_capture_runtime.py",
+      "--model-path",
+      "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+    ],
+    "snapshots": {
+      "synchronous_ar": 6,
+      "overlap_ar": 18,
+      "synchronous_dspark": 18,
+      "overlap_dspark": 22,
+      "writer_pressure_feedback": 2,
+      "latency_feedback": 2,
+      "cache_lifecycle_synchronous": 5,
+      "cache_lifecycle_overlap_graph": 5,
+      "dspark_memory_pressure": 12,
+      "total": 90
+    },
+    "ready_log_entries": 90
+  },
+  "source_sha256": {
+    "python/sglang/test/dspark_capture_pressure.py": "f4e82d2535abdcf9f5916fc0fccbe936c5026a4c87f21ea3fbed53fba232184c",
+    "python/sglang/test/dspark_target_kv_runtime.py": "cb45b5e854e393948c7bf98746a5d097df17a3e8adaa9431d21d8ceed2700377",
+    "python/sglang/test/dspark_target_kv_server.py": "f36f843eb039fc84b668f716852db4a5f69cd8eba90464bdc6066130ad684313",
+    "python/sglang/srt/speculative/dspark_components/dspark_target_kv_inject.py": "46b36806b0ec7c6d89c7794322e6bdc4e4f461681a01c4352941a739d4591383",
+    "python/sglang/srt/managers/schedule_batch.py": "ae57dc9e654684394921c5c678dffd4f35ccd15909efeb0c39c16c024a84994b",
+    "test/registered/storage/test_training_capture_runtime.py": "55253d35aa64c700a9c2ec48388a65a6953d0f4b403b7dd362507e86fa9142a3"
+  },
+  "config": {
+    "model": "Qwen3-0.6B",
+    "dtype": "bfloat16",
+    "attention_backend": "triton",
+    "tp": 1,
+    "selected_layer_ids": [
+      0,
+      14,
+      27
+    ],
+    "draft": "synthetic two-layer target-KV draft with forced token-100 proposals",
+    "ragged_verify_mode": "static",
+    "test_retract": false,
+    "kv_pool_tokens": 512,
+    "schedule_conservativeness": 0.05,
+    "max_running_requests": 4,
+    "chunked_prefill_size": 128,
+    "kv_d2h_batch_tokens": 16,
+    "max_device_bytes": 8388608,
+    "max_sample_tokens": 256,
+    "max_inflight_samples": 4,
+    "max_host_bytes": 67108864,
+    "store_segment_bytes": 268435456,
+    "store_protocol": "tcp",
+    "capture_ratio": 1,
+    "adaptive_admission": false,
+    "pressure_workload": {
+      "requests": 4,
+      "prompt_tokens_per_request": 16,
+      "max_new_tokens_per_request": 192,
+      "requested_path_tokens": 832,
+      "ignore_eos": true,
+      "temperature": 0,
+      "logit_bias": {
+        "100": 100
+      }
+    },
+    "recovery_workload": {
+      "requests": 1,
+      "prompt_tokens": 16,
+      "max_new_tokens": 4
+    },
+    "modes": [
+      {
+        "overlap": false,
+        "cuda_graph": false
+      },
+      {
+        "overlap": false,
+        "cuda_graph": true
+      },
+      {
+        "overlap": true,
+        "cuda_graph": false
+      },
+      {
+        "overlap": true,
+        "cuda_graph": true
+      }
+    ]
+  },
+  "assertions": [
+    "Four disjoint request paths exceed the 512-token serving KV pool; the debug retract flag is explicitly disabled.",
+    "All four requests complete their 192-token responses after real automatic retraction; response metadata and the HTTP retraction metric agree.",
+    "Each unique retracted request fails capture exactly once; none becomes READY or is admitted again after resume.",
+    "Test-only context observations show the previous projection is absent after retraction and the resumed request rebuilds to the current target prefix end.",
+    "The existing independent projection observer checks actual draft KV writes against reference encoder/projection/normalization/RoPE arithmetic, including reconstruction.",
+    "A fresh request after pressure is admitted and published normally; all four reservations are available and no host/device slot is quarantined.",
+    "Every surviving trace ID and the fresh trace ID matches exact token paths, raw online KV and top-128 values, independently checked top-128 IDs and LSE tolerance, positions and loss masks.",
+    "All twelve new pressure/recovery snapshots are read again after their producer exits.",
+    "The full registered runtime regression passes; its 90 READY log entries agree with the per-scenario snapshot totals."
+  ],
+  "observations": [
+    {
+      "dspark_memory_pressure": {
+        "cuda_graph": false,
+        "enable_overlap": false,
+        "kv_pool_tokens": 512,
+        "requested_path_tokens": 832,
+        "completed_requests": 4,
+        "output_tokens": 768,
+        "num_retractions": 2,
+        "retired_capture_requests": [
+          "pressure-False-False-2",
+          "pressure-False-False-3"
+        ],
+        "ready_samples": 3,
+        "rebuilt_contexts": [
+          {
+            "kind": "context",
+            "rid": "pressure-False-False-3",
+            "retraction_ct": 1,
+            "previous_end": null,
+            "projected_end": 125,
+            "prefix_end": 125
+          },
+          {
+            "kind": "context",
+            "rid": "pressure-False-False-2",
+            "retraction_ct": 1,
+            "previous_end": null,
+            "projected_end": 144,
+            "prefix_end": 144
+          }
+        ],
+        "capture_after": {
+          "counters": {
+            "considered": 15,
+            "excluded_health_check": 1,
+            "admitted": 14,
+            "eager_forwards": 85,
+            "sealed": 12,
+            "writer_started": 14,
+            "copies_completed": 14,
+            "snapshot_built": 12,
+            "ready": 12,
+            "speculative_verify_forwards": 73,
+            "speculative_commits_copied": 186,
+            "failed_request_aborted_or_retracted": 2
+          },
+          "disabled_reason": null,
+          "enable_overlap": false,
+          "reservations": 4,
+          "states": {
+            "available": 4
+          },
+          "queued": 0,
+          "occupied_fraction": 0,
+          "writer_age_seconds": 0,
+          "host_pool": {
+            "allocated_bytes": 17848320,
+            "device_allocated_bytes": 786432,
+            "device_limit_bytes": 8388608,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "admission": {
+            "adaptive": false,
+            "configured_ratio": 1,
+            "target_ratio": 1,
+            "effective_ratio": 1,
+            "reason": "configured",
+            "cooldown_remaining_seconds": 0,
+            "occupied_fraction": 0,
+            "writer_age_seconds": 0,
+            "decreases": 0,
+            "recoveries": 0,
+            "failures": 0,
+            "pauses": 0,
+            "latency": null
+          }
+        }
+      }
+    },
+    {
+      "dspark_memory_pressure": {
+        "cuda_graph": true,
+        "enable_overlap": false,
+        "kv_pool_tokens": 512,
+        "requested_path_tokens": 832,
+        "completed_requests": 4,
+        "output_tokens": 768,
+        "num_retractions": 2,
+        "retired_capture_requests": [
+          "pressure-True-False-2",
+          "pressure-True-False-3"
+        ],
+        "ready_samples": 3,
+        "rebuilt_contexts": [
+          {
+            "kind": "context",
+            "rid": "pressure-True-False-3",
+            "retraction_ct": 1,
+            "previous_end": null,
+            "projected_end": 125,
+            "prefix_end": 125
+          },
+          {
+            "kind": "context",
+            "rid": "pressure-True-False-2",
+            "retraction_ct": 1,
+            "previous_end": null,
+            "projected_end": 144,
+            "prefix_end": 144
+          }
+        ],
+        "capture_after": {
+          "counters": {
+            "considered": 15,
+            "excluded_health_check": 1,
+            "admitted": 14,
+            "eager_forwards": 12,
+            "sealed": 12,
+            "writer_started": 14,
+            "copies_completed": 14,
+            "snapshot_built": 12,
+            "ready": 12,
+            "speculative_verify_forwards": 73,
+            "cuda_graph_forwards": 73,
+            "speculative_commits_copied": 186,
+            "failed_request_aborted_or_retracted": 2
+          },
+          "disabled_reason": null,
+          "enable_overlap": false,
+          "reservations": 4,
+          "states": {
+            "available": 4
+          },
+          "queued": 0,
+          "occupied_fraction": 0,
+          "writer_age_seconds": 0,
+          "host_pool": {
+            "allocated_bytes": 17848320,
+            "device_allocated_bytes": 786432,
+            "device_limit_bytes": 8388608,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "admission": {
+            "adaptive": false,
+            "configured_ratio": 1,
+            "target_ratio": 1,
+            "effective_ratio": 1,
+            "reason": "configured",
+            "cooldown_remaining_seconds": 0,
+            "occupied_fraction": 0,
+            "writer_age_seconds": 0,
+            "decreases": 0,
+            "recoveries": 0,
+            "failures": 0,
+            "pauses": 0,
+            "latency": null
+          }
+        }
+      }
+    },
+    {
+      "dspark_memory_pressure": {
+        "cuda_graph": false,
+        "enable_overlap": true,
+        "kv_pool_tokens": 512,
+        "requested_path_tokens": 832,
+        "completed_requests": 4,
+        "output_tokens": 768,
+        "num_retractions": 2,
+        "retired_capture_requests": [
+          "pressure-False-True-2",
+          "pressure-False-True-3"
+        ],
+        "ready_samples": 3,
+        "rebuilt_contexts": [
+          {
+            "kind": "context",
+            "rid": "pressure-False-True-3",
+            "retraction_ct": 1,
+            "previous_end": null,
+            "projected_end": 125,
+            "prefix_end": 125
+          },
+          {
+            "kind": "context",
+            "rid": "pressure-False-True-2",
+            "retraction_ct": 1,
+            "previous_end": null,
+            "projected_end": 144,
+            "prefix_end": 144
+          }
+        ],
+        "capture_after": {
+          "counters": {
+            "considered": 18,
+            "excluded_health_check": 1,
+            "admitted": 17,
+            "overlap_forwards": 101,
+            "eager_forwards": 101,
+            "speculative_verify_forwards": 87,
+            "speculative_commits_copied": 208,
+            "sealed": 14,
+            "writer_started": 17,
+            "copies_completed": 17,
+            "snapshot_built": 14,
+            "ready": 14,
+            "failed_request_aborted_or_retracted": 3
+          },
+          "disabled_reason": null,
+          "enable_overlap": true,
+          "reservations": 4,
+          "states": {
+            "available": 4
+          },
+          "queued": 0,
+          "occupied_fraction": 0,
+          "writer_age_seconds": 0,
+          "host_pool": {
+            "allocated_bytes": 17848320,
+            "device_allocated_bytes": 786432,
+            "device_limit_bytes": 8388608,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "admission": {
+            "adaptive": false,
+            "configured_ratio": 1,
+            "target_ratio": 1,
+            "effective_ratio": 1,
+            "reason": "configured",
+            "cooldown_remaining_seconds": 0,
+            "occupied_fraction": 0,
+            "writer_age_seconds": 0,
+            "decreases": 0,
+            "recoveries": 0,
+            "failures": 0,
+            "pauses": 0,
+            "latency": null
+          }
+        }
+      }
+    },
+    {
+      "dspark_memory_pressure": {
+        "cuda_graph": true,
+        "enable_overlap": true,
+        "kv_pool_tokens": 512,
+        "requested_path_tokens": 832,
+        "completed_requests": 4,
+        "output_tokens": 768,
+        "num_retractions": 2,
+        "retired_capture_requests": [
+          "pressure-True-True-2",
+          "pressure-True-True-3"
+        ],
+        "ready_samples": 3,
+        "rebuilt_contexts": [
+          {
+            "kind": "context",
+            "rid": "pressure-True-True-3",
+            "retraction_ct": 1,
+            "previous_end": null,
+            "projected_end": 125,
+            "prefix_end": 125
+          },
+          {
+            "kind": "context",
+            "rid": "pressure-True-True-2",
+            "retraction_ct": 1,
+            "previous_end": null,
+            "projected_end": 144,
+            "prefix_end": 144
+          }
+        ],
+        "capture_after": {
+          "counters": {
+            "considered": 18,
+            "excluded_health_check": 1,
+            "admitted": 17,
+            "overlap_forwards": 101,
+            "eager_forwards": 14,
+            "speculative_verify_forwards": 87,
+            "cuda_graph_forwards": 87,
+            "speculative_commits_copied": 208,
+            "sealed": 14,
+            "writer_started": 17,
+            "copies_completed": 17,
+            "snapshot_built": 14,
+            "ready": 14,
+            "failed_request_aborted_or_retracted": 3
+          },
+          "disabled_reason": null,
+          "enable_overlap": true,
+          "reservations": 4,
+          "states": {
+            "available": 4
+          },
+          "queued": 0,
+          "occupied_fraction": 0,
+          "writer_age_seconds": 0,
+          "host_pool": {
+            "allocated_bytes": 17848320,
+            "device_allocated_bytes": 786432,
+            "device_limit_bytes": 8388608,
+            "free": 0,
+            "filling": 4,
+            "quarantined": 0
+          },
+          "admission": {
+            "adaptive": false,
+            "configured_ratio": 1,
+            "target_ratio": 1,
+            "effective_ratio": 1,
+            "reason": "configured",
+            "cooldown_remaining_seconds": 0,
+            "occupied_fraction": 0,
+            "writer_age_seconds": 0,
+            "decreases": 0,
+            "recoveries": 0,
+            "failures": 0,
+            "pauses": 0,
+            "latency": null
+          }
+        }
+      }
+    }
+  ],
+  "automatic_retraction_log_lines": [
+    "[2026-10-01 06:45:24] KV cache pool is full. Retract requests. #retracted_reqs: 1, #new_tokens_gained: 112, #new_token_ratio: 0.0336 -> 0.6707",
+    "[2026-10-01 06:45:25] KV cache pool is full. Retract requests. #retracted_reqs: 1, #new_tokens_gained: 152, #new_token_ratio: 0.6703 -> 0.8779",
+    "[2026-10-01 06:46:12] KV cache pool is full. Retract requests. #retracted_reqs: 1, #new_tokens_gained: 112, #new_token_ratio: 0.0336 -> 0.6707",
+    "[2026-10-01 06:46:13] KV cache pool is full. Retract requests. #retracted_reqs: 1, #new_tokens_gained: 152, #new_token_ratio: 0.6703 -> 0.8779",
+    "[2026-10-01 06:46:53] KV cache pool is full. Retract requests. #retracted_reqs: 1, #new_tokens_gained: 112, #new_token_ratio: 0.0336 -> 0.6707",
+    "[2026-10-01 06:46:53] KV cache pool is full. Retract requests. #retracted_reqs: 1, #new_tokens_gained: 152, #new_token_ratio: 0.6703 -> 0.8779",
+    "[2026-10-01 06:47:42] KV cache pool is full. Retract requests. #retracted_reqs: 1, #new_tokens_gained: 112, #new_token_ratio: 0.0336 -> 0.6707",
+    "[2026-10-01 06:47:42] KV cache pool is full. Retract requests. #retracted_reqs: 1, #new_tokens_gained: 152, #new_token_ratio: 0.6703 -> 0.8779"
+  ],
+  "regression_observations": [
+    {
+      "graph_capture": {
+        "counters": {
+          "considered": 4,
+          "excluded_health_check": 1,
+          "admitted": 3,
+          "eager_forwards": 4,
+          "sealed": 3,
+          "writer_started": 3,
+          "copies_completed": 3,
+          "snapshot_built": 3,
+          "ready": 3,
+          "cuda_graph_forwards": 5
+        },
+        "disabled_reason": null,
+        "enable_overlap": false,
+        "reservations": 3,
+        "states": {
+          "available": 3
+        },
+        "queued": 0,
+        "occupied_fraction": 0,
+        "writer_age_seconds": 0,
+        "host_pool": {
+          "allocated_bytes": 17848320,
+          "device_allocated_bytes": 786432,
+          "device_limit_bytes": 8388608,
+          "free": 1,
+          "filling": 3,
+          "quarantined": 0
+        },
+        "admission": {
+          "adaptive": false,
+          "configured_ratio": 1,
+          "target_ratio": 1,
+          "effective_ratio": 1,
+          "reason": "configured",
+          "cooldown_remaining_seconds": 0,
+          "occupied_fraction": 0,
+          "writer_age_seconds": 0,
+          "decreases": 0,
+          "recoveries": 0,
+          "failures": 0,
+          "pauses": 0,
+          "latency": null
+        }
+      }
+    },
+    {
+      "overlap_capture": {
+        "counters": {
+          "considered": 11,
+          "excluded_health_check": 1,
+          "admitted": 10,
+          "overlap_forwards": 43,
+          "eager_forwards": 43,
+          "sealed": 9,
+          "writer_started": 10,
+          "copies_completed": 10,
+          "snapshot_built": 9,
+          "ready": 9,
+          "failed_request_aborted_or_retracted": 1
+        },
+        "disabled_reason": null,
+        "enable_overlap": true,
+        "reservations": 3,
+        "states": {
+          "available": 3
+        },
+        "queued": 0,
+        "occupied_fraction": 0,
+        "writer_age_seconds": 0,
+        "host_pool": {
+          "allocated_bytes": 13581568,
+          "device_allocated_bytes": 786432,
+          "device_limit_bytes": 8388608,
+          "free": 1,
+          "filling": 3,
+          "quarantined": 0
+        },
+        "admission": {
+          "adaptive": false,
+          "configured_ratio": 1,
+          "target_ratio": 1,
+          "effective_ratio": 1,
+          "reason": "configured",
+          "cooldown_remaining_seconds": 0,
+          "occupied_fraction": 0,
+          "writer_age_seconds": 0,
+          "decreases": 0,
+          "recoveries": 0,
+          "failures": 0,
+          "pauses": 0,
+          "latency": null
+        }
+      },
+      "samples": 9,
+      "cuda_graph_enabled": false,
+      "padded_graph": false,
+      "aborted": true,
+      "canonical_remaps": 6
+    },
+    {
+      "overlap_capture": {
+        "counters": {
+          "considered": 11,
+          "excluded_health_check": 1,
+          "admitted": 10,
+          "overlap_forwards": 43,
+          "eager_forwards": 9,
+          "cuda_graph_forwards": 34,
+          "sealed": 9,
+          "writer_started": 10,
+          "copies_completed": 10,
+          "snapshot_built": 9,
+          "ready": 9,
+          "failed_request_aborted_or_retracted": 1
+        },
+        "disabled_reason": null,
+        "enable_overlap": true,
+        "reservations": 3,
+        "states": {
+          "available": 3
+        },
+        "queued": 0,
+        "occupied_fraction": 0,
+        "writer_age_seconds": 0,
+        "host_pool": {
+          "allocated_bytes": 13581568,
+          "device_allocated_bytes": 786432,
+          "device_limit_bytes": 8388608,
+          "free": 1,
+          "filling": 3,
+          "quarantined": 0
+        },
+        "admission": {
+          "adaptive": false,
+          "configured_ratio": 1,
+          "target_ratio": 1,
+          "effective_ratio": 1,
+          "reason": "configured",
+          "cooldown_remaining_seconds": 0,
+          "occupied_fraction": 0,
+          "writer_age_seconds": 0,
+          "decreases": 0,
+          "recoveries": 0,
+          "failures": 0,
+          "pauses": 0,
+          "latency": null
+        }
+      },
+      "samples": 9,
+      "cuda_graph_enabled": true,
+      "padded_graph": true,
+      "aborted": true,
+      "canonical_remaps": 6
+    },
+    {
+      "speculative_capture": {
+        "counters": {
+          "considered": 10,
+          "excluded_health_check": 1,
+          "admitted": 9,
+          "eager_forwards": 33,
+          "sealed": 9,
+          "writer_started": 9,
+          "copies_completed": 9,
+          "snapshot_built": 9,
+          "ready": 9,
+          "speculative_verify_forwards": 24,
+          "speculative_commits_copied": 25
+        },
+        "disabled_reason": null,
+        "enable_overlap": false,
+        "reservations": 3,
+        "states": {
+          "available": 3
+        },
+        "queued": 0,
+        "occupied_fraction": 0,
+        "writer_age_seconds": 0,
+        "host_pool": {
+          "allocated_bytes": 17848320,
+          "device_allocated_bytes": 786432,
+          "device_limit_bytes": 8388608,
+          "free": 0,
+          "filling": 4,
+          "quarantined": 0
+        },
+        "admission": {
+          "adaptive": false,
+          "configured_ratio": 1,
+          "target_ratio": 1,
+          "effective_ratio": 1,
+          "reason": "configured",
+          "cooldown_remaining_seconds": 0,
+          "occupied_fraction": 0,
+          "writer_age_seconds": 0,
+          "decreases": 0,
+          "recoveries": 0,
+          "failures": 0,
+          "pauses": 0,
+          "latency": null
+        }
+      },
+      "samples": 9,
+      "cuda_graph_enabled": false,
+      "overlap_enabled": false,
+      "aborted": false,
+      "padded_graph": false
+    },
+    {
+      "speculative_capture": {
+        "counters": {
+          "considered": 10,
+          "excluded_health_check": 1,
+          "admitted": 9,
+          "eager_forwards": 9,
+          "sealed": 9,
+          "writer_started": 9,
+          "copies_completed": 9,
+          "snapshot_built": 9,
+          "ready": 9,
+          "speculative_verify_forwards": 24,
+          "cuda_graph_forwards": 24,
+          "speculative_commits_copied": 25
+        },
+        "disabled_reason": null,
+        "enable_overlap": false,
+        "reservations": 3,
+        "states": {
+          "available": 3
+        },
+        "queued": 0,
+        "occupied_fraction": 0,
+        "writer_age_seconds": 0,
+        "host_pool": {
+          "allocated_bytes": 17848320,
+          "device_allocated_bytes": 786432,
+          "device_limit_bytes": 8388608,
+          "free": 0,
+          "filling": 4,
+          "quarantined": 0
+        },
+        "admission": {
+          "adaptive": false,
+          "configured_ratio": 1,
+          "target_ratio": 1,
+          "effective_ratio": 1,
+          "reason": "configured",
+          "cooldown_remaining_seconds": 0,
+          "occupied_fraction": 0,
+          "writer_age_seconds": 0,
+          "decreases": 0,
+          "recoveries": 0,
+          "failures": 0,
+          "pauses": 0,
+          "latency": null
+        }
+      },
+      "samples": 9,
+      "cuda_graph_enabled": true,
+      "overlap_enabled": false,
+      "aborted": false,
+      "padded_graph": false
+    },
+    {
+      "speculative_capture": {
+        "counters": {
+          "considered": 13,
+          "excluded_health_check": 1,
+          "admitted": 12,
+          "overlap_forwards": 47,
+          "eager_forwards": 47,
+          "speculative_verify_forwards": 36,
+          "speculative_commits_copied": 42,
+          "sealed": 11,
+          "writer_started": 12,
+          "copies_completed": 12,
+          "snapshot_built": 11,
+          "ready": 11,
+          "failed_request_aborted_or_retracted": 1
+        },
+        "disabled_reason": null,
+        "enable_overlap": true,
+        "reservations": 3,
+        "states": {
+          "available": 3
+        },
+        "queued": 0,
+        "occupied_fraction": 0,
+        "writer_age_seconds": 0,
+        "host_pool": {
+          "allocated_bytes": 17848320,
+          "device_allocated_bytes": 786432,
+          "device_limit_bytes": 8388608,
+          "free": 1,
+          "filling": 3,
+          "quarantined": 0
+        },
+        "admission": {
+          "adaptive": false,
+          "configured_ratio": 1,
+          "target_ratio": 1,
+          "effective_ratio": 1,
+          "reason": "configured",
+          "cooldown_remaining_seconds": 0,
+          "occupied_fraction": 0,
+          "writer_age_seconds": 0,
+          "decreases": 0,
+          "recoveries": 0,
+          "failures": 0,
+          "pauses": 0,
+          "latency": null
+        }
+      },
+      "samples": 11,
+      "cuda_graph_enabled": false,
+      "overlap_enabled": true,
+      "aborted": true,
+      "padded_graph": false
+    },
+    {
+      "speculative_capture": {
+        "counters": {
+          "considered": 13,
+          "excluded_health_check": 1,
+          "admitted": 12,
+          "overlap_forwards": 47,
+          "eager_forwards": 11,
+          "speculative_verify_forwards": 36,
+          "cuda_graph_forwards": 36,
+          "speculative_commits_copied": 42,
+          "sealed": 11,
+          "writer_started": 12,
+          "copies_completed": 12,
+          "snapshot_built": 11,
+          "ready": 11,
+          "failed_request_aborted_or_retracted": 1
+        },
+        "disabled_reason": null,
+        "enable_overlap": true,
+        "reservations": 3,
+        "states": {
+          "available": 3
+        },
+        "queued": 0,
+        "occupied_fraction": 0,
+        "writer_age_seconds": 0,
+        "host_pool": {
+          "allocated_bytes": 17848320,
+          "device_allocated_bytes": 786432,
+          "device_limit_bytes": 8388608,
+          "free": 0,
+          "filling": 4,
+          "quarantined": 0
+        },
+        "admission": {
+          "adaptive": false,
+          "configured_ratio": 1,
+          "target_ratio": 1,
+          "effective_ratio": 1,
+          "reason": "configured",
+          "cooldown_remaining_seconds": 0,
+          "occupied_fraction": 0,
+          "writer_age_seconds": 0,
+          "decreases": 0,
+          "recoveries": 0,
+          "failures": 0,
+          "pauses": 0,
+          "latency": null
+        }
+      },
+      "samples": 11,
+      "cuda_graph_enabled": true,
+      "overlap_enabled": true,
+      "aborted": true,
+      "padded_graph": true
+    },
+    {
+      "adaptive_capture": {
+        "counters": {
+          "considered": 4,
+          "excluded_health_check": 1,
+          "admitted": 2,
+          "overlap_forwards": 10,
+          "eager_forwards": 10,
+          "sealed": 2,
+          "writer_started": 2,
+          "copies_completed": 2,
+          "snapshot_built": 2,
+          "sampled_out": 1,
+          "adaptive_sampled_out": 1,
+          "ready": 2
+        },
+        "disabled_reason": null,
+        "enable_overlap": true,
+        "reservations": 2,
+        "states": {
+          "available": 2
+        },
+        "queued": 0,
+        "occupied_fraction": 0,
+        "writer_age_seconds": 0,
+        "host_pool": {
+          "allocated_bytes": 8924160,
+          "device_allocated_bytes": 393216,
+          "device_limit_bytes": 8388608,
+          "free": 0,
+          "filling": 2,
+          "quarantined": 0
+        },
+        "admission": {
+          "adaptive": true,
+          "configured_ratio": 1,
+          "target_ratio": 1,
+          "effective_ratio": 1,
+          "reason": "configured",
+          "cooldown_remaining_seconds": 0,
+          "occupied_fraction": 0,
+          "writer_age_seconds": 0,
+          "decreases": 7,
+          "recoveries": 10,
+          "failures": 0,
+          "pauses": 1,
+          "latency": null
+        }
+      },
+      "samples": 2
+    },
+    {
+      "latency_capture": {
+        "counters": {
+          "considered": 5,
+          "excluded_health_check": 1,
+          "admitted": 2,
+          "overlap_forwards": 10,
+          "eager_forwards": 10,
+          "sealed": 2,
+          "writer_started": 2,
+          "copies_completed": 2,
+          "snapshot_built": 2,
+          "ready": 2,
+          "sampled_out": 2,
+          "adaptive_sampled_out": 2
+        },
+        "disabled_reason": null,
+        "enable_overlap": true,
+        "reservations": 1,
+        "states": {
+          "available": 1
+        },
+        "queued": 0,
+        "occupied_fraction": 0,
+        "writer_age_seconds": 0,
+        "host_pool": {
+          "allocated_bytes": 8924160,
+          "device_allocated_bytes": 393216,
+          "device_limit_bytes": 8388608,
+          "free": 0,
+          "filling": 2,
+          "quarantined": 0
+        },
+        "admission": {
+          "adaptive": true,
+          "configured_ratio": 1,
+          "target_ratio": 1,
+          "effective_ratio": 1,
+          "reason": "configured",
+          "cooldown_remaining_seconds": 0,
+          "occupied_fraction": 0,
+          "writer_age_seconds": 0,
+          "decreases": 7,
+          "recoveries": 10,
+          "failures": 0,
+          "pauses": 1,
+          "latency": {
+            "state": "healthy",
+            "blocked": false,
+            "recovery_ready": true,
+            "percentile": 0.95,
+            "window_seconds": 1.5,
+            "invalid_observations": 0,
+            "metrics": {
+              "ttft": {
+                "budget_seconds": 0.5,
+                "percentile_seconds": 0.03307333216071129,
+                "window_observations": 1,
+                "observations": 4,
+                "last_observation_age_seconds": 0.49143724516034126
+              },
+              "tpot": {
+                "budget_seconds": 0.5,
+                "percentile_seconds": 0.016500800848007202,
+                "window_observations": 3,
+                "observations": 12,
+                "last_observation_age_seconds": 0.442876972258091
+              }
+            }
+          }
+        }
+      },
+      "samples": 2,
+      "observed_requests": 4
+    },
+    {
+      "lifecycle_capture": {
+        "counters": {
+          "considered": 7,
+          "excluded_health_check": 1,
+          "admitted": 6,
+          "eager_forwards": 26,
+          "sealed": 5,
+          "writer_started": 6,
+          "copies_completed": 6,
+          "snapshot_built": 5,
+          "ready": 5,
+          "failed_request_aborted_or_retracted": 1
+        },
+        "disabled_reason": null,
+        "enable_overlap": false,
+        "reservations": 3,
+        "states": {
+          "available": 3
+        },
+        "queued": 0,
+        "occupied_fraction": 0,
+        "writer_age_seconds": 0,
+        "host_pool": {
+          "allocated_bytes": 17848320,
+          "device_allocated_bytes": 786432,
+          "device_limit_bytes": 8388608,
+          "free": 1,
+          "filling": 3,
+          "quarantined": 0
+        },
+        "admission": {
+          "adaptive": false,
+          "configured_ratio": 1,
+          "target_ratio": 1,
+          "effective_ratio": 1,
+          "reason": "configured",
+          "cooldown_remaining_seconds": 0,
+          "occupied_fraction": 0,
+          "writer_age_seconds": 0,
+          "decreases": 0,
+          "recoveries": 0,
+          "failures": 0,
+          "pauses": 0,
+          "latency": null
+        }
+      },
+      "cuda_graph_enabled": false,
+      "samples": 5,
+      "evicted_tokens": 164,
+      "reused_kv_slots": 70,
+      "cached_tokens": [
+        0,
+        159,
+        0,
+        0,
+        0
+      ],
+      "resumed_output_tokens": 128,
+      "num_retractions": 1,
+      "staging_http_metrics_verified": true
+    },
+    {
+      "lifecycle_capture": {
+        "counters": {
+          "considered": 7,
+          "excluded_health_check": 1,
+          "admitted": 6,
+          "overlap_forwards": 32,
+          "eager_forwards": 10,
+          "cuda_graph_forwards": 22,
+          "sealed": 5,
+          "writer_started": 6,
+          "copies_completed": 6,
+          "snapshot_built": 5,
+          "ready": 5,
+          "failed_request_aborted_or_retracted": 1
+        },
+        "disabled_reason": null,
+        "enable_overlap": true,
+        "reservations": 3,
+        "states": {
+          "available": 3
+        },
+        "queued": 0,
+        "occupied_fraction": 0,
+        "writer_age_seconds": 0,
+        "host_pool": {
+          "allocated_bytes": 17848320,
+          "device_allocated_bytes": 786432,
+          "device_limit_bytes": 8388608,
+          "free": 1,
+          "filling": 3,
+          "quarantined": 0
+        },
+        "admission": {
+          "adaptive": false,
+          "configured_ratio": 1,
+          "target_ratio": 1,
+          "effective_ratio": 1,
+          "reason": "configured",
+          "cooldown_remaining_seconds": 0,
+          "occupied_fraction": 0,
+          "writer_age_seconds": 0,
+          "decreases": 0,
+          "recoveries": 0,
+          "failures": 0,
+          "pauses": 0,
+          "latency": null
+        }
+      },
+      "cuda_graph_enabled": true,
+      "samples": 5,
+      "evicted_tokens": 166,
+      "reused_kv_slots": 72,
+      "cached_tokens": [
+        0,
+        159,
+        0,
+        0,
+        0
+      ],
+      "resumed_output_tokens": 128,
+      "num_retractions": 1,
+      "staging_http_metrics_verified": true
+    }
+  ],
+  "limitations": [
+    "One H100, TP1, dense BF16 Qwen3-0.6B, static DSpark, local TCP Store and test Catalog only.",
+    "The synthetic draft and forced token-100 output test correctness, not trained draft quality or representative acceptance rates.",
+    "Tensor observers synchronize and copy tensors; the run does not measure serving overhead or production SLOs.",
+    "Automatic AR OOM retraction, speculative cache eviction, non-static verify, TP/PP/PD and cross-node RDMA remain outside this evidence.",
+    "Production Catalog/consumer retention and real training checkpoint replay are not exercised."
+  ],
+  "checks": {
+    "local_gpu_source_hashes_equal": true,
+    "registered_estimate_seconds": 480,
+    "original_worktree_index_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9",
+    "resident_gpu_idle_resumed": true
+  }
+}

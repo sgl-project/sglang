@@ -36,7 +36,8 @@ it does not redefine the goal as the modules already implemented.
 | Draft serving | Explicit KV-input architecture, contract, encoder, incremental injector and invalidation | Real Qwen3 target plus synthetic KV draft passes ordinary/batched/graph generation; retained BF16 fixture passes full backbone/logit parity against pinned FlexAttention, with production exporter and trained-model validation still open |
 | Speculative collection | Static DSpark raw verify ticket, commit mapping and terminal truncation | Actual KV-input draft requests publish and read back through Mooncake in ordinary and graph modes; see evidence below |
 | Overlap collection | AR lookahead and static DSpark pending-token ledgers, capacity boundary and terminal trimming | Real ordinary/graph requests, prefix reuse, delayed grammar and exact KV/teacher readback pass; see per-mode evidence below |
-| AR cache lifecycle | Snapshot ownership across RadixCache eviction and explicit retract/resume | Real 256-token KV pool eviction, physical slot reuse, failed-capture exclusion and subsequent admission pass in synchronous and overlap/graph modes; automatic OOM and speculative retraction remain open |
+| AR cache lifecycle | Snapshot ownership across RadixCache eviction and explicit retract/resume | Real 256-token KV pool eviction, physical slot reuse, failed-capture exclusion and subsequent admission pass in synchronous and overlap/graph modes; automatic AR OOM remains open |
+| DSpark memory pressure | Draft context reset/rebuild and capture retirement after automatic retraction | Real 512-token KV pool exhaustion passes in all four synchronous/overlap and eager/graph combinations; failed captures are excluded and fresh capture admission recovers |
 | Deployment coverage | Partial | TP/PP, non-static speculative verify, PD, RDMA and workload SLO gates remain open |
 
 Initial test evidence (shared lab state under
@@ -1080,10 +1081,55 @@ speculative retraction/cache eviction, concurrent reader retention, TP/PP/PD and
 cross-node RDMA still need their own acceptance evidence. These correctness
 observers synchronize/copy tensors and do not measure serving overhead or SLOs.
 
+## Static DSpark Automatic Retraction
+
+The DSpark runtime fixture now uses a 512-token serving KV pool and a 0.05
+scheduling conservativeness setting. Four disjoint 16-token prompts each request
+192 output tokens, exceeding that pool. The debug retract flag is explicitly
+disabled. Actual pool exhaustion causes the scheduler to retract two requests
+in each synchronous/overlap and eager/CUDA graph combination.
+
+All four requests still complete their 192-token responses. HTTP retraction
+metrics agree with the per-request counts. Each retracted request retires its
+capture exactly once and never publishes or starts a second capture after
+resume. The two surviving requests publish normally; a fresh four-token request
+then confirms that capture capacity has recovered. All four reservations are
+available afterward, with zero quarantined slots.
+
+Test-only observations around `TargetKVInjector.ensure_context` verify that
+each resumed request has no previous draft projection and reconstructs through
+its current target prefix. The two reconstructed prefixes contain 125 and 144
+tokens in every tested mode. The existing independent encoder/projection/RoPE
+observer also checks the actual draft KV written during reconstruction.
+Successful samples retain exact token paths, raw selected KV and top-128
+values, independently checked top-128 IDs/LSE, positions and response masks.
+All twelve new samples remain readable from Mooncake after producer exit.
+
+| Execution | Completed Pressure Requests | Output Tokens | Automatic Retractions | Rebuilt Draft Contexts | READY Including Fresh Request |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Synchronous eager | 4 | 768 | 2 | 2 | 3 |
+| Synchronous graphs | 4 | 768 | 2 | 2 | 3 |
+| Overlap eager | 4 | 768 | 2 | 2 | 3 |
+| Overlap graphs | 4 | 768 | 2 | 2 | 3 |
+
+Job `01790836944459482077-87511189724e` passes the full registered runtime
+test in 461.341s. Its 90 snapshots comprise the previous 78 cases plus these
+twelve pressure/recovery samples. The existing AR eviction/retract cases also
+pass again. The 480s registered estimate remains appropriate. No production
+code changes were needed for this coverage.
+
+Source hashes match the GPU checkout, Ruff and formatting/whitespace checks
+pass, and the resident H100 has resumed its idle workload. Retained counters,
+actual OOM log messages and source/log hashes are in
+[`capture-dspark-memory-pressure.json`](experiments/capture-dspark-memory-pressure.json).
+This is a TP1/TCP correctness test with a synthetic draft and forced outputs;
+it does not establish trained-model quality, serving SLOs, non-static verify
+correctness or cross-node behavior.
+
 ## Next Implementation
 
-1. Broaden real-request coverage to prefill graphs, automatic OOM retraction,
-   speculative cache eviction/retraction, target weight replacement and
+1. Broaden real-request coverage to prefill graphs, automatic AR OOM retraction,
+   speculative cache eviction, target weight replacement and
    saturated backpressure.
 2. Extend P8's passing retained BF16 fixture to production-exported and trained
    checkpoints, complete exporter compatibility and artifact/quality validation.
