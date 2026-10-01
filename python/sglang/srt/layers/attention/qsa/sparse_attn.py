@@ -6,6 +6,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+
 _H20_CONFIGS = [
     (32, (32, 8, 2)),
     (64, (64, 8, 2)),
@@ -22,6 +24,8 @@ _L20_CONFIGS = [
 
 
 def _get_best_config(total_q: int):
+    if is_batch_invariant_mode_enabled():
+        return (32, 4, 2)
     table = _H20_CONFIGS if "H20" in torch.cuda.get_device_name(0) else _L20_CONFIGS
     return next(cfg for limit, cfg in table if total_q <= limit)
 
