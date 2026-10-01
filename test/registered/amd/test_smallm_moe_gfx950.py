@@ -11,7 +11,7 @@ import torch
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=180, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
 def _gfx950():
@@ -140,7 +140,24 @@ class TestSmallMMoeGfx950(CustomTestCase):
                 x, self.w13, self.w2, ids, None, False, True, False, None
             )
         )
-        # the TP2 shape (per-rank intermediate 512) is not dispatched yet
+        # 8 or 9 slots are dispatched only at intermediate 512
+        x = torch.randn(4, self.DIM, device=self.dev, dtype=torch.bfloat16)
+        ids, _ = self._routing(4)
+        for slots in (8, 9):
+            self.assertFalse(
+                M.smallm_moe_supported(
+                    x,
+                    self.w13,
+                    self.w2,
+                    ids[:, :slots].contiguous(),
+                    None,
+                    False,
+                    True,
+                    False,
+                    None,
+                )
+            )
+        # intermediate 512 does not take Qwen3.5 TP2's 10 or 11 slots
         w13_512 = torch.empty(
             self.E, 1024, self.DIM // 2, device=self.dev, dtype=torch.uint8
         )
@@ -171,6 +188,55 @@ class TestSmallMMoeGfx950(CustomTestCase):
         g.replay()
         torch.cuda.synchronize()
         self.assertTrue(torch.equal(gout, eager))
+
+
+class TestSmallMMoeGfx950I512(TestSmallMMoeGfx950):
+    """GLM-5.3-Flash MXFP4 at TP4: per-rank intermediate 512, top-8 plus the fused shared expert."""
+
+    E, INTER, DIM, TOPK = 16, 512, 4096, 9
+
+    def test_matches_reference_and_falls_back_above_cap(self):
+        M = self.M
+        for slots in (8, 9):
+            for tok in (1, 4, 16):
+                with self.subTest(slots=slots, tok=tok):
+                    x = torch.randn(
+                        tok, self.DIM, device=self.dev, dtype=torch.bfloat16
+                    )
+                    ids, wts = self._routing(tok)
+                    ids = ids[:, :slots].contiguous()
+                    wts = wts[:, :slots].contiguous()
+                    self.assertTrue(
+                        M.smallm_moe_supported(
+                            x, self.w13, self.w2, ids, None, False, True, False, None
+                        )
+                    )
+                    out = M.smallm_moe_fwd(
+                        x, self.w13, self.w2, wts, ids, self.w13_scale, self.w2_scale
+                    )
+                    torch.cuda.synchronize()
+                    ref = self._reference(x, ids, wts)
+                    rel = (
+                        (out.float() - ref.float()).norm() / ref.float().norm()
+                    ).item()
+                    self.assertLess(rel, 5e-3, f"rel_l2={rel:.3e}")
+        # above 16 tokens, and at Qwen3.5 TP2's 10 slots, aiter's fused_moe stays faster
+        x = torch.randn(17, self.DIM, device=self.dev, dtype=torch.bfloat16)
+        ids, _ = self._routing(17)
+        self.assertFalse(
+            M.smallm_moe_supported(
+                x, self.w13, self.w2, ids, None, False, True, False, None
+            )
+        )
+        x = torch.randn(4, self.DIM, device=self.dev, dtype=torch.bfloat16)
+        ids = torch.stack(
+            [torch.randperm(self.E, device=self.dev)[:10] for _ in range(4)]
+        ).to(torch.int32)
+        self.assertFalse(
+            M.smallm_moe_supported(
+                x, self.w13, self.w2, ids, None, False, True, False, None
+            )
+        )
 
 
 if __name__ == "__main__":

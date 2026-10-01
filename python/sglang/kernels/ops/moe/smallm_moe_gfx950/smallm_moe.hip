@@ -376,3 +376,5 @@ extern "C" __global__ void __launch_bounds__(256) smallm_p2_i256_s10(Args a) { p
 extern "C" __global__ void __launch_bounds__(256) smallm_p2b_i256(Args a) { p2b_body<256>(a); }
 extern "C" __global__ void __launch_bounds__(256) smallm_p2_i512_s11(Args a) { p2_body<512, 11>(a); }
 extern "C" __global__ void __launch_bounds__(256) smallm_p2_i512_s10(Args a) { p2_body<512, 10>(a); }
+extern "C" __global__ void __launch_bounds__(256) smallm_p2_i512_s9(Args a) { p2_body<512, 9>(a); }
+extern "C" __global__ void __launch_bounds__(256) smallm_p2_i512_s8(Args a) { p2_body<512, 8>(a); }
