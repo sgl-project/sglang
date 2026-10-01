@@ -1189,6 +1189,23 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 _mimo_v2_overrides(_args(), _hf("mxfp4")),
                 {"attention_backend": "fa4"},
             )
+            # FP8 checkpoints with mxfp4 routed experts (MiMo-V2.6 declares them
+            # via store_dtype) cannot load into the FP8 block-scale runner.
+            for marker in (
+                {"store_dtype": "mxfp4"},
+                {"routed_experts_quant_method": "mxfp4"},
+            ):
+                with self.subTest(marker=marker):
+                    hf = SimpleNamespace(
+                        quantization_config={"quant_method": "fp8", **marker}
+                    )
+                    self.assertEqual(
+                        _mimo_v2_overrides(_args(), hf),
+                        {
+                            "attention_backend": "fa4",
+                            "moe_runner_backend": "flashinfer_mxfp4",
+                        },
+                    )
             for field in (
                 "attention_backend",
                 "prefill_attention_backend",
