@@ -2561,6 +2561,65 @@ TP/PP over RDMA, GPUDirect, replica failure recovery, production Catalog/consume
 retention, trained draft quality or performance acceptance. The Catalog remains
 a test double. These paths remain part of the broader implementation goal.
 
+## Cross-Node P/D RDMA Capture
+
+Real P/D RDMA now has an independent correctness lane. P and the sole CPU Store
+segment run on node064; D and readers run on node208. Both roles explicitly
+select Mooncake RDMA on `mlx5_00`, GID index 3. Store clients mount zero local
+storage, and memcpy is disabled. The first raw teacher row remains in the
+existing bounded control message; control RPC/ZMQ is still TCP. No production
+wire format or Master API change was required.
+
+`PDCaptureRuntimeBase` now accepts host addresses, transfer protocol and HCA,
+while retaining loopback/TCP defaults. Its source-path and bootstrap-port hooks
+allow `sglang.test.pd_capture_remote` to supervise a separate P. P keeps overlap
+and radix prefix reuse across cases. It uses a deliberately unreachable Catalog
+endpoint because it owns neither a reservation nor a Store client. The driver
+checks the peer's model, Store endpoint, RDMA protocol and distinct hostname;
+actual physical node placement is also recorded in the experiment evidence.
+
+The complete `test_training_capture_pd_rdma.py` passes four tests in 269.863
+seconds: AR and target-KV DSpark, each with eager D and decode/verify CUDA graphs.
+P needs only the target for the target-KV draft path. The cases publish 22 main
+snapshots, plus one AR seed for the synthetic draft, and exclude 12 selected
+missing/stale-handoff or cancelled requests. Independent online observations
+match selected KV and raw top-128 scores/vocab IDs exactly; full-vocabulary LSE
+uses `rtol=atol=1e-6`. Tokens, masks, positions, validity and accepted/terminal
+boundaries also match. Chunked/cached prompts, real batches and verify
+accept/reject branches are included. Speculative D adds no target prefill.
+
+Each D exits before independent readback. After the complete file, the remote
+P supervisor is stopped and its owned serving processes are reaped. With both
+P and D gone and no serving GPU allocations, another interpreter reads all
+23 retained publications through RDMA: 418 tensor objects and 16,960,108 tensor
+bytes, excluding manifests. Shared files contain configuration, reference
+observations and manifest refs; payloads use Mooncake. These byte counts are
+logical payload sizes, not a bandwidth or performance result.
+
+`RDMACaptureRuntimeBase` shares the existing post-producer readback assertions
+with the Store-only lane and can retain manifest refs for the final external-P
+readback. The two new files are a test helper and a CI-registered manual lane,
+explicitly disabled without the required two-node environment. Commands and
+ownership/cleanup steps are in `experiments/PD_RDMA.md`; source/log hashes,
+counters and runtime evidence are in `experiments/capture-pd-rdma.json`.
+
+The complete Store-only RDMA regression also passes four tests in 376.393
+seconds, and the default TCP PD file passes two tests in 134.365 seconds, for
+ten passing runtime tests. The five changed Python files pass Black, isort,
+repository Ruff and compilation; RDMA helpers/tests also pass broader Ruff.
+Registered-test checks pass and the GPU checkout matches the recorded source
+hashes. The separately supervised P and Store commands both exit zero after
+SIGTERM, with their owned process trees gone. The temporary two-H100 job
+`job-bd67001a7536-20261002044939` was deleted after confirming no live serving
+or Store processes and no GPU allocations; both pods are NotFound. The resident
+H100 has resumed idle load with no active or queued experiment. The original
+checkout's staged-index digest is unchanged.
+
+This validates Qwen3-0.6B with TP=PP=DP=1 and a synthetic untrained target-KV
+draft. Distributed TP/PP/DP/CP over RDMA, trained draft quality, production
+Catalog/consumer retention and replay, direct trainer GPU reads, replica loss
+recovery and workload SLO acceptance remain open.
+
 ## Next Implementation
 
 1. Broaden real-request coverage to prefill graphs, automatic AR OOM retraction,
@@ -2571,8 +2630,9 @@ a test double. These paths remain part of the broader implementation goal.
 3. Extend P9's real TP2/PP1 and TP1/PP2 Qwen3 capture validation to combined
    TP2/PP2, replicated heads, distributed cancellation/backpressure and additional
    model identities. Complete pipeline speculative collection, extend real
-   speculative PD topology coverage and validate cross-node PD RDMA. The separate
-   cross-node Store RDMA path has passed AR/DSpark eager/graph correctness tests.
+   speculative PD topology coverage and cross-node distributed RDMA. Both the
+   separate Store RDMA lane and single-rank cross-node P/D RDMA lane have passed
+   AR/DSpark eager/graph correctness tests.
    AR PD transfers the
    first teacher row and publishes from D across matching/asymmetric TP groups
    and matching/reduced PP groups supported by the Mooncake transport.

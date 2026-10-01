@@ -12,6 +12,9 @@ transport, GPUDirect, multi-replica recovery, production Catalog retention,
 training quality or performance SLOs. Its Catalog is a test double and its
 target-KV draft is synthetic and untrained.
 
+The separate [Cross-Node P/D RDMA Capture](PD_RDMA.md) lane also places P and D
+on different nodes and enables RDMA for their KV handoff.
+
 ## Environment
 
 Use the runtime in `h100-runtime-lock.json`, the implementation checkout on A

@@ -6,6 +6,7 @@ import os
 import signal
 import socket
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -21,6 +22,7 @@ from sglang.srt.training_capture.mooncake_store import (
 )
 from sglang.srt.training_capture.protocol import digest_bytes, tensor_bytes
 from sglang.srt.utils import kill_process_tree
+from sglang.test.pd_capture_runtime import PDCaptureRuntimeBase
 from sglang.test.training_capture_utils import read_snapshot
 
 
@@ -29,6 +31,62 @@ def load_setup(path):
     if setup.protocol != "rdma" or setup.global_segment_size != 0:
         raise ValueError("RDMA clients must use rdma with no local storage segment")
     return msgspec.to_builtins(setup)
+
+
+class RDMACaptureRuntimeBase(PDCaptureRuntimeBase):
+    @classmethod
+    def start_store(cls):
+        cls.setup_path = os.environ["TRAINING_CAPTURE_RDMA_SETUP"]
+        cls.store_setup = load_setup(cls.setup_path)
+
+    def setUp(self):
+        super().setUp()
+        self.servers = []
+
+    def launch(self, *args, **kwargs):
+        process, url = super().launch(*args, **kwargs)
+        self.servers.append(process)
+        return process, url
+
+    def exercise_remote(self, *, replay, draft_kind=None):
+        self.exercise(replay=replay, draft_kind=draft_kind)
+        for process in reversed(self.servers):
+            self.stop_process(process)
+            self.assertIsNotNone(process.poll())
+        publications = self.root / "publications.json"
+        payload = json.dumps(list(self.catalog.publications.values()))
+        publications.write_text(payload)
+        # A supervised external P can outlive the test driver. Retain only
+        # manifest references for another readback after that fixture exits.
+        if destination := os.environ.get("TRAINING_CAPTURE_RDMA_PUBLICATIONS"):
+            Path(destination).write_text(payload)
+        output = self.root / "readback.json"
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "sglang.test.training_capture_rdma",
+                "read",
+                "--setup",
+                self.setup_path,
+                "--publications",
+                str(publications),
+                "--output",
+                str(output),
+            ],
+            check=True,
+            timeout=120,
+        )
+        snapshots = json.loads(output.read_text())["snapshots"]
+        self.assertEqual(len(snapshots), len(self.catalog.publications))
+        self.assertEqual(
+            {(row["sample_id"], row["generation_id"]) for row in snapshots},
+            {
+                (row["sample_id"], row["generation_id"])
+                for row in self.catalog.publications.values()
+            },
+        )
+        self.assertTrue(all(row["tensor_bytes"] > 0 for row in snapshots))
 
 
 def free_port(host):

@@ -472,9 +472,11 @@ DSpark 的 eager/graph 四组用例通过，服务退出后由新进程读回全
 （22 份正式测试样本及 1 份构造未训练 draft 的种子样本）。选层 KV、原始 top-128
 分数及 vocab IDs 与在线独立观测精确一致；全词表 LSE 使用 `rtol=atol=1e-6`。
 12 个 missing/stale handoff 或取消请求没有发布训练样本。
-此处 P/D 本身仍在 A 节点使用 TCP 交接 KV，不能据此宣称跨节点 PD RDMA 已验收。
+上述 Store 独立测试的 P/D 本身在 A 节点使用 TCP 交接 KV，其证据仅覆盖 Store。
 部署步骤见 [RDMA.md](experiments/RDMA.md)，证据见
 [capture-rdma-store.json](experiments/capture-rdma-store.json)。
+另外，第 13.3.1 节的独立双节点用例已验证 P→D 的 RDMA KV 交接，以及随后 D→Store
+的 RDMA 样本提交；不能把这两个传输完成事件合并处理。
 
 ### 8.3 提交协议
 
@@ -809,8 +811,9 @@ PD 的 TransferEngine KV 交接不是 Store 样本提交，两个完成事件分
 
 `pd_capture.py` 实现 D 统一导出路径。当前接入 Mooncake backend、DP=1，
 普通 AR 支持 TP 分片与 PP；DSpark 推测采集支持 TP、要求 PP=1。
-PP speculative 和跨节点 P/D RDMA 仍需后续实现与验证；跨节点 Store RDMA 的
-独立验收范围见第 8.2 节。
+PP speculative 与跨节点 TP/PP 组合仍需后续实现与验证。TP=PP=1 的普通 AR 和
+target-KV DSpark 已通过跨节点 P/D RDMA 的 eager/graph 验证；跨节点 Store RDMA
+的独立验收范围见第 8.2 节。
 AR 的 P/D TP 数可以不同，模型必须满足全局 teacher/KV 契约。
 PP 遵守现有 Mooncake 传输约束：P/D 的 PP 数相同，或 D 的 PP 数为 1；
 P=PP1、D=PP2 等展开拓扑仍不受底层传输支持。
@@ -902,6 +905,17 @@ cap-accept/compact 按原有 ragged verify 布局采集。
 不重跑 target 作为回读 oracle。指定的双请求在测试服务器的 ready queue 会合后
 再调度，以保证实际 batch 覆盖；这个约束不进入生产调度器。
 Catalog 在该测试中仍是 test double，不能据此宣称生产保留策略或训练消费已验收。
+
+`test_training_capture_pd_rdma.py` 将 P 与 Store 数据段放在 B 节点，D 与 reader 放在
+A 节点。P 保持 overlap 与 radix cache，D 分别运行 AR、target-KV DSpark 的
+eager/graph 路径；P/D KV 交接显式使用 RDMA，首条 teacher 继续使用有界控制消息。
+P 不连接 Catalog/Store，D 的 Store client 不挂载本地数据段。四组用例发布 22 份
+正式样本及 1 份 draft fixture 种子样本，排除 12 个故障或取消请求；在线 KV、raw
+top-128 IDs/logits、LSE、mask、位置与 accepted-path 边界沿用相同独立 oracle。
+在两端 serving 进程均退出后，新进程通过 RDMA 完整回读 23 份样本。共享目录仅用于
+测试配置、在线 source 观测和 manifest 引用，不承担 serving KV 或 Store payload
+传输。部署步骤与证据见 [PD_RDMA.md](experiments/PD_RDMA.md) 和
+[capture-pd-rdma.json](experiments/capture-pd-rdma.json)。
 
 ### 13.4 speculative verify
 

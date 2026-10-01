@@ -31,9 +31,9 @@ from sglang.test.training_capture_catalog import TestCaptureCatalog
 from sglang.test.training_capture_utils import read_snapshot
 
 
-def free_port():
+def free_port(host="127.0.0.1"):
     with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
+        sock.bind((host, 0))
         return sock.getsockname()[1]
 
 
@@ -44,6 +44,17 @@ def free_port():
     "CUDA and Mooncake required",
 )
 class PDCaptureRuntimeBase(CustomTestCase):
+    prefill_host = "127.0.0.1"
+    decode_host = "127.0.0.1"
+    transfer_protocol = "tcp"
+    ib_device = None
+
+    def new_bootstrap_port(self):
+        return free_port(self.prefill_host)
+
+    def reference_paths(self, root):
+        return sorted(root.rglob("*.pt"))
+
     @classmethod
     def setUpClass(cls):
         torch.set_num_threads(1)
@@ -133,7 +144,8 @@ class PDCaptureRuntimeBase(CustomTestCase):
         }
         path = folder / "capture.json"
         path.write_text(json.dumps(config))
-        url = f"http://127.0.0.1:{free_port()}"
+        host = self.prefill_host if role == "prefill" else self.decode_host
+        url = f"http://{host}:{free_port(host)}"
         launch = test_utils._launch_server_process
 
         def observed_server(command, *args):
@@ -149,10 +161,15 @@ class PDCaptureRuntimeBase(CustomTestCase):
                 timeout=240,
                 env={
                     **os.environ,
-                    "MOONCAKE_PROTOCOL": "tcp",
+                    "MOONCAKE_PROTOCOL": self.transfer_protocol,
                     "SGLANG_RAGGED_VERIFY_MODE": ragged_mode if draft else "static",
                 },
                 other_args=[
+                    *(
+                        ["--disaggregation-ib-device", self.ib_device]
+                        if self.ib_device
+                        else []
+                    ),
                     *(
                         [
                             "--speculative-algorithm",
@@ -233,7 +250,7 @@ class PDCaptureRuntimeBase(CustomTestCase):
 
             root = self.root / "draft-seed"
             root.mkdir()
-            self.bootstrap_port, self.bootstrap_room = free_port(), 4000
+            self.bootstrap_port, self.bootstrap_room = self.new_bootstrap_port(), 4000
             prefill, self.prefill_url = self.launch(
                 "prefill", root, replay=False, tp_size=1, pp_size=1
             )
@@ -263,7 +280,7 @@ class PDCaptureRuntimeBase(CustomTestCase):
         payload = {
             "rid": rid,
             "input_ids": prompt,
-            "bootstrap_host": "127.0.0.1",
+            "bootstrap_host": self.prefill_host,
             "bootstrap_port": self.bootstrap_port,
             "bootstrap_room": rooms if batched else rooms[0],
         }
@@ -299,7 +316,7 @@ class PDCaptureRuntimeBase(CustomTestCase):
         payload = {
             "rid": rid,
             "input_ids": [1, 2, 3, 4],
-            "bootstrap_host": "127.0.0.1",
+            "bootstrap_host": self.prefill_host,
             "bootstrap_port": self.bootstrap_port,
             "bootstrap_room": self.bootstrap_room,
         }
@@ -399,7 +416,7 @@ class PDCaptureRuntimeBase(CustomTestCase):
             f"p{prefill_tp}x{prefill_pp}-d{decode_tp}x{decode_pp}-replay-{suffix}"
         )
         root.mkdir()
-        self.bootstrap_port, self.bootstrap_room = free_port(), 5000
+        self.bootstrap_port, self.bootstrap_room = self.new_bootstrap_port(), 5000
         prefill, self.prefill_url = self.launch(
             "prefill",
             root,
@@ -473,7 +490,7 @@ class PDCaptureRuntimeBase(CustomTestCase):
             responses[hashlib.sha256(name.encode()).hexdigest()] = (tokens, result)
         expected = len(responses)
         publications = self.catalog.wait_publications(first + expected, timeout=45)
-        paths = sorted(root.rglob("*.pt"))
+        paths = self.reference_paths(root)
         if draft:
             paths.extend(sorted(draft.rglob("*.pt")))
         references = [
