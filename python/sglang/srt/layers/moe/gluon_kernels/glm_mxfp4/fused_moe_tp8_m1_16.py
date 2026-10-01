@@ -793,7 +793,11 @@ def fused_moe(x, router, correction_bias, w13, w13_scale, w2, w2_scale, routed_s
     m, h = x.shape
     intermediate = w13.shape[1] // 2
     routes = m * 9
-    direct = m in (1, 2, 4, 8, 12, 16)
+    # M=6 is the TP8/EP1 verify shape for the 5/6/1 speculative profile.
+    # It already uses the fused low-M projection schedule below, so keep its
+    # router on the direct path as well and avoid building the unused grouped
+    # expert-membership table on every verify step.
+    direct = m in (1, 2, 4, 6, 8, 12, 16)
     grouped = not direct
     stagger = m <= 8
     splits = 4 if direct else 12
