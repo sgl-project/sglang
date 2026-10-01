@@ -24,6 +24,21 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestDSV4CompressedPools(CustomTestCase):
+    def test_swa_key_page_size_uses_physical_paged_size(self):
+        pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
+        pool.request_window = None
+        pool.swa_page_size = 256
+        for physical_page_size in (256, 64):
+            with self.subTest(physical_page_size=physical_page_size):
+                pool.swa_kv_pool = SimpleNamespace(page_size=physical_page_size)
+                self.assertEqual(pool.get_swa_key_page_size(), physical_page_size)
+
+    def test_swa_key_page_size_without_paged_pool(self):
+        pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
+        pool.swa_kv_pool = None
+        pool.request_window = SimpleNamespace(page_size=256)
+        self.assertEqual(pool.get_swa_key_page_size(), 256)
+
     def test_physical_kv_pages_cover_reserved_logical_page(self):
         size = 8192
         self.assertEqual(_num_dsv4_physical_kv_pages(size, 256, 256), 33)
