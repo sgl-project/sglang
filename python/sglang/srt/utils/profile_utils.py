@@ -48,7 +48,7 @@ def graph_capture_profile_dir() -> str:
     )
 
 
-def export_cuda_graph_capture_trace(prof_context, *, runner_name: str, tp_rank: int):
+def export_cuda_graph_capture_trace(prof_context, *, runner_name: str):
     """Persist a CUDA-graph capture profiler trace (chrome trace) to disk.
 
     Opt-in via ``SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE`` (no-op otherwise). The
@@ -60,6 +60,7 @@ def export_cuda_graph_capture_trace(prof_context, *, runner_name: str, tp_rank: 
     """
     if not envs.SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE.get():
         return
+    tp_rank = get_parallel().tp_rank
     output_dir = graph_capture_profile_dir()
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(
@@ -356,7 +357,7 @@ class _ProfilerTorch(_ProfilerConcreteBase):
             filename_parts = [self.profile_id, f"TP-{get_parallel().tp_rank}"]
 
             # Only add other ranks if parallelism is enabled (size > 1)
-            if get_parallel().dp_size > 1:
+            if get_parallel().num_dp_ranks > 1:
                 filename_parts.append(f"DP-{get_parallel().dp_rank}")
             if get_parallel().pp_size > 1:
                 filename_parts.append(f"PP-{get_parallel().pp_rank}")

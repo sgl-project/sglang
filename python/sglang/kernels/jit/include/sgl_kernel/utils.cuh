@@ -11,6 +11,7 @@
 /// - Typed `load_as` / `store_as` for void-pointer access.
 /// - `pointer::offset` for safe void-pointer arithmetic.
 /// - `host::LaunchKernel` - kernel launcher with optional PDL.
+/// - `host::prefer_l1_carveout` / `host::ensure_prefer_l1` - occupancy-preserving L1 carveout preference.
 /// - `host::RuntimeDeviceCheck` - CUDA error checking.
 
 #pragma once
@@ -24,9 +25,14 @@
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <map>
+#include <mutex>
 #include <optional>
 #include <type_traits>
+#include <utility>
 #ifndef USE_ROCM
+#include <tvm/ffi/extra/cuda/device_guard.h>
+
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -53,6 +59,10 @@ inline constexpr auto cudaSuccess = hipSuccess;
 #define cudaDeviceGetAttribute hipDeviceGetAttribute
 #define cudaDevAttrComputeCapabilityMajor hipDeviceAttributeComputeCapabilityMajor
 #define cudaDevAttrComputeCapabilityMinor hipDeviceAttributeComputeCapabilityMinor
+#define cudaGetDevice hipGetDevice
+#ifndef cudaOccupancyMaxActiveBlocksPerMultiprocessor
+#define cudaOccupancyMaxActiveBlocksPerMultiprocessor hipOccupancyMaxActiveBlocksPerMultiprocessor
+#endif
 #define cudaFuncSetAttribute hipFuncSetAttribute
 #define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
 #endif
@@ -342,6 +352,58 @@ inline void RuntimeDeviceCheck(DebugInfo location = {}) {
   return RuntimeDeviceCheck(::cudaGetLastError(), location);
 }
 
+/// \brief Where `prefer_l1_carveout` settled: the carveout percentage and the kernel's blocks/SM there.
+struct L1Carveout {
+  int carveout_pct;
+  uint32_t blocks_per_sm;
+};
+
+/// \brief Prefer the largest L1 carveout that keeps `kernel`'s default occupancy on `device_id`
+/// (PDL secondaries inherit the primary's carveout). Per device, sticky for the process; panics
+/// when no carveout restores occupancy. ROCm has no such attribute and reports pct -1.
+template <typename T>
+inline auto prefer_l1_carveout(T&& kernel, int device_id, uint32_t block_threads, std::size_t dyn_smem_bytes = 0)
+    -> L1Carveout {
+  const auto blocks_per_sm = [&] {
+    int blocks = 0;
+    RuntimeDeviceCheck(::cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel, block_threads, dyn_smem_bytes));
+    return static_cast<uint32_t>(blocks);
+  };
+#ifdef USE_ROCM
+  (void)device_id;
+  return {-1, blocks_per_sm()};
+#else
+  // The attribute and the occupancy query both act on the current device.
+  tvm::ffi::CUDADeviceGuard guard(device_id);
+  const auto set_carveout = [&](int pct) {
+    RuntimeDeviceCheck(::cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, pct));
+  };
+  set_carveout(cudaSharedmemCarveoutDefault);
+  const uint32_t occupancy = blocks_per_sm();
+  RuntimeCheck(occupancy > 0, "kernel does not fit on an SM");
+  for (int pct = cudaSharedmemCarveoutMaxL1;; ++pct) {
+    set_carveout(pct);
+    if (const uint32_t now = blocks_per_sm(); now >= occupancy) return {pct, now};
+    RuntimeCheck(pct < cudaSharedmemCarveoutMaxShared, "no carveout restores occupancy ", occupancy);
+  }
+#endif
+}
+
+/// \brief `prefer_l1_carveout` memoized per (kernel, device): the attribute is sticky, so a hit returns the
+/// settled value without touching the device. Load-time configure() and the launch builder share the memo.
+/// Callers must keep the block size and dynamic shared memory fixed for each (kernel, device), and
+/// must not change the kernel's carveout attribute after configuration.
+template <typename T>
+inline auto ensure_prefer_l1(T kernel, int device_id, uint32_t block_threads, std::size_t dyn_smem_bytes = 0)
+    -> L1Carveout {
+  static std::mutex mutex;
+  static std::map<std::pair<const void*, int>, L1Carveout> settled;
+  const std::lock_guard<std::mutex> lock(mutex);
+  const auto key = std::make_pair(reinterpret_cast<const void*>(kernel), device_id);
+  if (const auto it = settled.find(key); it != settled.end()) return it->second;
+  return settled.emplace(key, prefer_l1_carveout(kernel, device_id, block_threads, dyn_smem_bytes)).first->second;
+}
+
 /**
  * \brief Kernel launcher with automatic stream resolution and PDL support.
  *
@@ -351,6 +413,8 @@ inline void RuntimeDeviceCheck(DebugInfo location = {}) {
  *       .enable_pdl(true)(my_kernel, arg0, arg1);
  *   host::LaunchKernel(grid, block, stream)
  *       .config({.use_pdl = true, .cluster_dim = cluster_dim})(my_kernel, arg0);
+ *   host::LaunchKernel(grid, block, device)
+ *       .config({.use_pdl = true, .prefer_l1 = true})(my_kernel, arg0);
  * \endcode
  *
  * The constructor resolves the CUDA stream from a `DLDevice` (via `TVMFFIEnvGetStream`)
@@ -361,6 +425,7 @@ struct LaunchKernel {
   struct KernelConfig {
     bool use_pdl = false;
     std::optional<dim3> cluster_dim = std::nullopt;
+    bool prefer_l1 = false;  // `ensure_prefer_l1` on the launch device before the first launch
   };
 
  public:
@@ -371,7 +436,8 @@ struct LaunchKernel {
       std::size_t dynamic_shared_mem_bytes = 0,
       DebugInfo location = {}) noexcept
       : m_config(s_make_config(grid_dim, block_dim, resolve_device(device), dynamic_shared_mem_bytes)),
-        m_location(location) {}
+        m_location(location),
+        m_device_id(device.device_id) {}
 
   explicit LaunchKernel(
       dim3 grid_dim,
@@ -379,7 +445,9 @@ struct LaunchKernel {
       cudaStream_t stream,
       std::size_t dynamic_shared_mem_bytes = 0,
       DebugInfo location = {}) noexcept
-      : m_config(s_make_config(grid_dim, block_dim, stream, dynamic_shared_mem_bytes)), m_location(location) {}
+      : m_config(s_make_config(grid_dim, block_dim, stream, dynamic_shared_mem_bytes)),
+        m_location(location),
+        m_device_id(-1) {}
 
   LaunchKernel(const LaunchKernel&) = delete;
   LaunchKernel& operator=(const LaunchKernel&) = delete;
@@ -415,6 +483,11 @@ struct LaunchKernel {
     return *this;
   }
 
+  auto prefer_l1(bool enabled = true) -> LaunchKernel& {
+    m_prefer_l1 = enabled;
+    return *this;
+  }
+
   /**
    * \brief Configure the kernel launch with the given options.
    * \param config The kernel configuration options.
@@ -426,11 +499,13 @@ struct LaunchKernel {
   auto config(const KernelConfig& config) -> LaunchKernel& {
     if (config.use_pdl) this->enable_pdl(true);
     if (config.cluster_dim) this->enable_cluster(*config.cluster_dim);
+    if (config.prefer_l1) this->prefer_l1(true);
     return *this;
   }
 
   template <typename T, typename... Args>
   auto operator()(T&& kernel, Args&&... args) const -> void {
+    if (m_prefer_l1) apply_prefer_l1(kernel);
 #ifdef USE_ROCM
     hipLaunchKernelGGL(
         std::forward<T>(kernel),
@@ -465,9 +540,20 @@ struct LaunchKernel {
     return config;
   }
 
+  // Memo hit after load-time configure(); stream-constructed launches use the current device.
+  template <typename T>
+  void apply_prefer_l1(T&& kernel) const {
+    int device_id = m_device_id;
+    if (device_id < 0) RuntimeDeviceCheck(::cudaGetDevice(&device_id));
+    const dim3 block = m_config.blockDim;
+    ensure_prefer_l1(+kernel, device_id, block.x * block.y * block.z, m_config.dynamicSmemBytes);
+  }
+
   cudaLaunchConfig_t m_config;
   const DebugInfo m_location;
   cudaLaunchAttribute m_attrs[2];
+  int m_device_id;
+  bool m_prefer_l1 = false;
 };
 
 // The empty-true-branch if/else form keeps a trailing `else` in user code

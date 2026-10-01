@@ -162,10 +162,8 @@ class WeightCacheDaemon:
         self.tp_rank = tp_rank
         self.pp_size = cfg.pp_size
         self.pp_rank = pp_rank
-        self.dp_size = cfg.dp_size
         self.ep_size = cfg.ep_size
         self.moe_dp_size = cfg.moe_dp_size
-        self.enable_dp_attention = cfg.enable_dp_attention
         self.enable_dp_lm_head = cfg.enable_dp_lm_head
         self.attn_cp_size = cfg.attn_cp_size
         self.moe_dense_tp_size = cfg.moe_dense_tp_size
@@ -338,12 +336,12 @@ class WeightCacheDaemon:
             tp_rank=self.tp_rank,
             pp_size=self.pp_size,
             pp_rank=self.pp_rank,
-            dp_size=self.dp_size,
+            dp_size=get_parallel().dp_size,
             ep_size=self.ep_size,
             moe_dp_size=self.moe_dp_size,
             moe_dp_rank=moe_dp_rank,
             moe_ep_rank=moe_ep_rank,
-            enable_dp_attention=self.enable_dp_attention,
+            attn_dp_size=get_parallel().attn_dp_size,
             enable_dp_lm_head=self.enable_dp_lm_head,
             attn_cp_size=self.attn_cp_size,
             moe_dense_tp_size=self.moe_dense_tp_size,

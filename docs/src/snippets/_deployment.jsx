@@ -810,7 +810,8 @@ export const Deployment = ({ config, benchmarks }) => {
       // Insert the multi-node trio after the last parallelism flag,
       // falling back to right after --model-path.
       const PARALLELISM_ANCHORS = new Set([
-        "--enable-dp-attention", "--dp-size", "--dp", "--tp-size", "--tp",
+        "--attn-dp-size", "--attention-data-parallel-size",
+        "--dp-size", "--dp", "--tp-size", "--tp",
         "--sp-degree", "--ulysses-degree", "--ring-degree",
       ]);
       let i = flags.reduce(
@@ -1865,16 +1866,19 @@ export const Deployment = ({ config, benchmarks }) => {
       && Number(sel.nodes) === recommendedRecipe.nodes
       && Number(sel.gpus_per_node) === recommendedRecipe.gpus_per_node
       && sel.topology_mode === "auto"
-      && ["auto", recommendedRecipe.placement].includes(sel.placement)
-      && sel.attention === "platform"
-      && sel.precision === "native"
-      && ["auto", recommendedRecipe.encoder].includes(sel.encoder)
-      && sel.execution === "eager";
+      && serveDims.every((dim) => {
+        const expected = recommendedRecipe[dim.id] ?? dim.default;
+        if (dim.id === "attention") return sel.attention === "platform";
+        return expected === undefined || sel[dim.id] === expected
+          || (["placement", "encoder"].includes(dim.id) && sel[dim.id] === "auto");
+      });
 
     const restoreRecommendedRecipe = () => {
       if (!recommendedRecipe) return;
       setSel((prev) => reseatHiddenPicks(normalizeBuilderSelection({
         ...prev,
+        ...Object.fromEntries(serveDims
+          .map((dim) => [dim.id, recommendedRecipe[dim.id] ?? dim.default ?? dim.options?.[0]?.id])),
         nodes: recommendedRecipe.nodes,
         gpus_per_node: recommendedRecipe.gpus_per_node,
         topology_mode: "auto",
@@ -1885,7 +1889,7 @@ export const Deployment = ({ config, benchmarks }) => {
         attention: "platform",
         precision: "native",
         encoder: recommendedRecipe.encoder || "auto",
-        execution: "eager",
+        execution: recommendedRecipe.execution || "eager",
       })));
     };
 
