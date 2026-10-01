@@ -722,3 +722,137 @@ async fn default_pd_groups_apply_configured_inflight_admission() {
         );
     }
 }
+
+/// Runs on both routing paths: the portless-prefill exclusion lives in the
+/// registry both of them read.
+#[tokio::test]
+async fn portless_prefill_is_not_dispatched_until_bootstrap_is_resolved() {
+    for reorg in [true, false] {
+        let prefill = MockWorker::start(vec![]).await;
+        let decode = MockWorker::start(vec![]).await;
+        let policy = Arc::new(FirstPolicy::default());
+        let mut ctx = context(
+            &[
+                ("p", Stage::Prefill, &prefill),
+                ("d", Stage::Decode, &decode),
+            ],
+            vec![Bucket::new(
+                "pd",
+                BucketGroups::Pd {
+                    prefill: group("p", policy.clone()),
+                    decode: group("d", policy.clone()),
+                },
+            )],
+        );
+        if !reorg {
+            ctx = Arc::new(AppContext::new(
+                ctx.config.clone(),
+                ctx.tokenizers.clone(),
+                ctx.proxy.clone(),
+                ctx.registry.clone(),
+                Arc::new(build_policy_registry(&ctx.config).unwrap()),
+            ));
+        }
+        let mut spec = WorkerSpec {
+            id: WorkerId("p".into()),
+            url: prefill.url.clone(),
+            mode: Stage::Prefill,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: None,
+        };
+        ctx.registry.add(spec.clone()).unwrap();
+        let app = build_router(ctx.clone());
+        let response = app.clone().oneshot(request(body("hello"))).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "reorg={reorg}"
+        );
+        assert!(policy.calls.lock().unwrap().is_empty());
+        assert!(prefill.captured.lock().unwrap().last_body.is_none());
+        assert!(decode.captured.lock().unwrap().last_body.is_none());
+        spec.bootstrap_port = Some(8997);
+        ctx.registry.add(spec).unwrap();
+        let response = app.oneshot(request(body("hello"))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "reorg={reorg}");
+        let d: serde_json::Value =
+            serde_json::from_slice(decode.captured.lock().unwrap().last_body.as_ref().unwrap())
+                .unwrap();
+        assert_eq!(d["bootstrap_port"], 8997, "reorg={reorg}");
+    }
+}
+
+#[tokio::test]
+async fn load_only_routing_forwards_messages_without_a_tokenizer() {
+    for (reorg, pd) in [(false, false), (false, true), (true, false), (true, true)] {
+        let prefill = MockWorker::start(vec![]).await;
+        let decode = MockWorker::start(vec![]).await;
+        let workers: &[_] = if pd {
+            &[
+                ("p", Stage::Prefill, &prefill),
+                ("d", Stage::Decode, &decode),
+            ]
+        } else {
+            &[("d", Stage::Plain, &decode)]
+        };
+        let mut ctx = context(workers, vec![]);
+        let mutable = Arc::get_mut(&mut ctx).unwrap();
+        mutable.config.model.policy = PolicyKind::PowerOfTwo;
+        mutable.config.model.tokenizer_path = None;
+        mutable.tokenizers =
+            Arc::new(TokenizerRegistry::load_from_config(&mutable.config).unwrap());
+        if reorg {
+            let state = sgl_router::state::kv_events::KvEventIndex::new();
+            let (resolver, _) = sgl_router::policies_reorg::factory::build_resolver(
+                &mutable.config.model,
+                &state,
+                None,
+            )
+            .unwrap();
+            mutable.chat_routing = ChatRouting::Reorg([(ModelId("tiny".into()), resolver)].into());
+        } else {
+            mutable.chat_routing = ChatRouting::Legacy;
+            mutable.policies = Arc::new(build_policy_registry(&mutable.config).unwrap());
+        }
+        let response = build_router(ctx)
+            .oneshot(request(body("hello")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "reorg={reorg} pd={pd}");
+        let forwarded: serde_json::Value =
+            serde_json::from_slice(decode.captured.lock().unwrap().last_body.as_ref().unwrap())
+                .unwrap();
+        assert_eq!(forwarded["messages"], body("hello")["messages"]);
+        assert!(
+            forwarded.get("input_ids").is_none(),
+            "reorg={reorg} pd={pd}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn only_prefix_reading_routing_needs_request_tokens() {
+    for (policy, needs) in [
+        (PolicyKind::PowerOfTwo, false),
+        (PolicyKind::SessionAware, false),
+        (PolicyKind::CacheAware, true),
+    ] {
+        let mut cfg = config_for("");
+        cfg.model.policy = policy;
+        let legacy = build_policy_registry(&cfg).unwrap();
+        assert_eq!(
+            ChatRouting::Legacy.needs_request_tokens(&legacy),
+            needs,
+            "legacy {policy:?}"
+        );
+        let state = sgl_router::state::kv_events::KvEventIndex::new();
+        let (resolver, _) =
+            sgl_router::policies_reorg::factory::build_resolver(&cfg.model, &state, None).unwrap();
+        let reorg = ChatRouting::Reorg([(ModelId("tiny".into()), resolver)].into());
+        assert_eq!(
+            reorg.needs_request_tokens(&PolicyRegistry::default()),
+            needs,
+            "reorg {policy:?}"
+        );
+    }
+}
