@@ -63,6 +63,34 @@ Guidelines:
 - For MHA models with Mooncake and `page_head` layout, HiCache will split head shards based on `tp_lcm_size` to make keys reusable across heterogeneous TP deployments.
 - If all clusters use the same TP size, this option is not needed.
 
+### Hybrid model file checkpoints
+
+Hybrid MLA models share attention KV across TP ranks, but their recurrent state
+is rank-local. File storage separates these checkpoints by TP rank, TP size and
+host tensor schema. Readers must use a compatible topology and state layout;
+host cache capacity may differ.
+
+Legacy rank-less `.mamba` files are intentionally cold misses because they may
+contain another rank's state. Ordinary KV filenames are unchanged. Very long
+model namespaces are compacted to fit filesystem filename limits and also start
+with a cold cache. With file eviction enabled, each rank manages its own state
+files; the MLA KV writer also manages the shared KV files.
+
+### Decode context parallelism and storage
+
+For MLA models in aggregated serving, `--dcp-size > 1` supports file and
+Mooncake L3. Writers and readers must use the same TP/DCP/PP topology, page
+size, KV dtype, host layout and model identity. All DCP shards are required
+for a hit; `tp_lcm_size` does not convert persisted DCP layouts.
+
+Use host cache mode. Buffer-only mode, speculative L3, additional state pools
+and P/D with DCP L3 are rejected. DSPARK with L1/L2 remains available. All
+three prefetch policies are supported for aggregated storage. Failed runtime
+attachment preserves the previous cache policies.
+
+L2 remains host DRAM. Place the file directory on SSD for local SSD L3;
+configure Mooncake SSD offloading in the Mooncake store service.
+
 ### Prefetch Policies
 
 ```bash Command

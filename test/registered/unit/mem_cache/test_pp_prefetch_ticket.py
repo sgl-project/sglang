@@ -6,6 +6,7 @@ import unittest
 from array import array
 from contextlib import nullcontext
 from queue import Empty, Queue
+from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 import torch
@@ -26,16 +27,18 @@ from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
-class TestPPPrefetchTicket(unittest.TestCase):
+class TestPPPrefetchTicket(CustomTestCase):
     def setUp(self):
         self.c = c = HybridCacheController.__new__(HybridCacheController)
         c.page_size = c.prefetch_threshold = 4
         c.pp_rank = c.tp_rank = 0
         c.pp_size, c.tp_size = 4, 2
+        c.storage_config = SimpleNamespace(dcp_size=1)
         c.pp_group, c.pp_prefetch_command_group = "pp", "command"
         c.pp_prefetch_command_thread = None
         c.prefetch_hits_sync_groups = c.prefetch_completion_sync_groups = ["pp", "tp"]

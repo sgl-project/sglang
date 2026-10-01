@@ -329,6 +329,10 @@ class HybridCacheController(BaseHiCacheController):
     def register_host_pool_entry(self, entry: PoolEntry) -> None:
         if not isinstance(self.mem_pool_host, HostPoolGroup):
             raise TypeError("Dynamic HiCache sidecars require HostPoolGroup.")
+        if self.enable_storage and self.storage_config.dcp_size > 1:
+            raise NotImplementedError(
+                "HiCache L3 with DCP requires one materialized MLA host pool."
+            )
         self.mem_pool_host.add_entry(entry)
         if not entry.is_primary_index_anchor:
             self.extra_host_mem_release_queues.setdefault(entry.name, Queue())
@@ -1350,8 +1354,8 @@ class HybridCacheController(BaseHiCacheController):
             return self._page_backup_with_stable_layout(operation)
 
     def _page_backup_with_stable_layout(self, operation):
-        # MLA KV is replicated across TP ranks and should still be written only
-        # by TP0. Rank-sharded sidecars still need every TP rank.
+        # Write primary KV only on its selected shard writer. Rank-sharded
+        # sidecars can still need every TP rank.
         backup_transfers = [
             transfer
             for transfer in operation.pool_transfers or []

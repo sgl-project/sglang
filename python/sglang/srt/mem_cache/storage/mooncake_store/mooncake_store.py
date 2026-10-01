@@ -433,6 +433,20 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             if storage_config is not None and storage_config.model_name:
                 model_name = "-".join(storage_config.model_name.split("/"))
                 config_prefix_parts.append(model_name)
+            self._dcp_namespace = None
+            if storage_config is not None and storage_config.dcp_size > 1:
+                # Fixed-topology reuse only. Keep shard rank in the object
+                # suffix so equivalent TP replicas share objects, and all
+                # shards of a logical page can share a Mooncake group id.
+                cfg = storage_config
+                dtype_name = str(cfg.kv_cache_dtype).removeprefix("torch.")
+                config_prefix_parts.append(
+                    f"dcp_v1_tp{cfg.tp_size}_ds{cfg.dcp_size}_pp{cfg.pp_size}"
+                    f"_cp{cfg.attn_cp_rank}of{cfg.attn_cp_size}"
+                    f"_page{cfg.logical_page_size}_{dtype_name}_{cfg.host_layout}"
+                )
+                self._dcp_namespace = "_".join(config_prefix_parts)
+                config_prefix_parts.append(f"pp{cfg.pp_rank}")
             if config_prefix_parts:
                 self.config_prefix = "_".join(config_prefix_parts)
                 logger.info(f"Using Mooncake config prefix: {self.config_prefix}")
@@ -598,6 +612,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             else:
                 self.mha_suffix = f"{self.local_rank}"
                 self.mla_suffix = ""
+
+            if self._dcp_namespace is not None:
+                self.mla_suffix = f"dcp{storage_config.dcp_rank}"
 
             self.storage_config = storage_config
             self.should_split_heads = storage_config.should_split_heads
@@ -929,10 +946,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         for transfer in transfers:
             host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
             keys = transfer.keys
-            page_size = getattr(host_pool, "page_size", 1) or 1
+            page_size = host_pool.logical_page_size
             host_indices = transfer.host_indices
             assert len(keys) > 0
-            assert len(keys) == len(host_indices) // page_size
+            assert len(host_indices) == len(keys) * page_size
 
             tagged_keys = self._tag_keys(keys)
             key_strs, key_multiplier = self._get_hybrid_page_component_keys(
@@ -1049,7 +1066,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def _batch_preprocess(self, keys, host_indices):
         assert len(keys) > 0
-        assert len(keys) == len(host_indices) // self.mem_pool_host.page_size
+        page_size = self.mem_pool_host.logical_page_size
+        assert len(host_indices) == len(keys) * page_size
         if self.is_mla_backend:
             return self._get_mla_buffer_meta(keys, host_indices)
         else:
@@ -1353,26 +1371,58 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             config = self._replicate_config_cls()
             config.group_ids = group_ids
 
-        if self._uses_multi_buffer(buffer_ptrs):
-            config = config or self._replicate_config_cls()
-            return self.store.batch_put_from_multi_buffers(
-                key_strs, buffer_ptrs, buffer_sizes, config
-            )
-        elif config is not None:
-            return self.store.batch_put_from(
-                key_strs, buffer_ptrs, buffer_sizes, config
-            )
-        else:
-            return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
+        try:
+            if self._uses_multi_buffer(buffer_ptrs):
+                config = config or self._replicate_config_cls()
+                results = self.store.batch_put_from_multi_buffers(
+                    key_strs, buffer_ptrs, buffer_sizes, config
+                )
+            elif config is not None:
+                results = self.store.batch_put_from(
+                    key_strs, buffer_ptrs, buffer_sizes, config
+                )
+            else:
+                results = self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
+        except Exception:
+            # Native calls are synchronous: after return/raise their buffers
+            # can be released by the normal controller completion protocol.
+            logger.exception("Mooncake batch PUT failed")
+            return [-1] * len(key_strs)
+        return self._checked_batch_results(results, len(key_strs), "PUT")
 
     def _get_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]
     ) -> List[int]:
-        if self._uses_multi_buffer(buffer_ptrs):
-            return self.store.batch_get_into_multi_buffers(
-                key_strs, buffer_ptrs, buffer_sizes
+        multi_buffer = self._uses_multi_buffer(buffer_ptrs)
+        expected_sizes = (
+            [sum(sizes) for sizes in buffer_sizes] if multi_buffer else buffer_sizes
+        )
+        try:
+            if multi_buffer:
+                results = self.store.batch_get_into_multi_buffers(
+                    key_strs, buffer_ptrs, buffer_sizes
+                )
+            else:
+                results = self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
+        except Exception:
+            logger.exception("Mooncake batch GET failed")
+            return [-1] * len(key_strs)
+        results = self._checked_batch_results(results, len(key_strs), "GET")
+        # A positive count can still be a truncated object. Only a complete
+        # physical shard is safe for the controller to publish as restored.
+        return [
+            result if result == expected else -1
+            for result, expected in zip(results, expected_sizes)
+        ]
+
+    @staticmethod
+    def _checked_batch_results(results, count: int, operation: str) -> List[int]:
+        if not isinstance(results, Sequence) or len(results) != count:
+            logger.warning(
+                "Mooncake batch %s returned an invalid result count", operation
             )
-        return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
+            return [-1] * count
+        return results
 
     def _batch_exist(
         self, key_strs: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
@@ -1383,13 +1433,27 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             else None
         )
         if pp_rank is not None:
-            # PP is the last rank field before the pool suffix. Replace from
-            # the right so an identical TP rank or backend tag stays unchanged.
-            key_strs = [
-                f"_{pp_rank}_".join(key.rsplit(f"_{self.pp_rank}_", 1))
-                for key in key_strs
-            ]
-        return self.store.batch_is_exist(key_strs)
+            if self._dcp_namespace is not None:
+                # PP is a structured namespace field for new DCP objects.
+                # Do not rewrite numeric substrings in hashes or shard suffixes.
+                prefix = f"{self.config_prefix}_"
+                key_strs = [
+                    f"{self._dcp_namespace}_pp{pp_rank}_{key[len(prefix) :]}"
+                    for key in key_strs
+                ]
+            else:
+                # PP is the last rank field before the pool suffix. Replace from
+                # the right so an identical TP rank or backend tag stays unchanged.
+                key_strs = [
+                    f"_{pp_rank}_".join(key.rsplit(f"_{self.pp_rank}_", 1))
+                    for key in key_strs
+                ]
+        try:
+            results = self.store.batch_is_exist(key_strs)
+        except Exception:
+            logger.exception("Mooncake batch EXISTS failed")
+            return [-1] * len(key_strs)
+        return self._checked_batch_results(results, len(key_strs), "EXISTS")
 
     def get_stats(self):
         storage_metrics = StorageMetrics()

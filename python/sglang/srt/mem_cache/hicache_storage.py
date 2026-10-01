@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import threading
@@ -16,6 +18,7 @@ from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.pool_host import HostKVCache
+    from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +43,44 @@ class HiCacheStorageConfig:
     # with dp-attention, tp_rank is attention-group-local; dp_rank disambiguates
     dp_rank: int = 0
     extra_config: Optional[dict] = None
+    dcp_size: int = 1
+    dcp_rank: int = 0
+    logical_page_size: Optional[int] = None
+    kv_cache_dtype: Optional[torch.dtype] = None
+    host_layout: Optional[str] = None
+
+    def __post_init__(self):
+        if self.dcp_size < 1 or not 0 <= self.dcp_rank < self.dcp_size:
+            raise ValueError("Invalid DCP size or rank for HiCache storage.")
+        if self.dcp_size == 1:
+            return
+        if not self.is_mla_model:
+            raise ValueError("DCP storage shard identity currently requires MLA.")
+        if (
+            self.tp_size % self.dcp_size != 0
+            or not 0 <= self.tp_rank < self.tp_size
+            or self.tp_rank % self.dcp_size != self.dcp_rank
+        ):
+            raise ValueError("DCP storage requires contiguous DCP groups within TP.")
+        if (
+            self.logical_page_size is None
+            or self.logical_page_size <= 0
+            or self.logical_page_size % self.dcp_size != 0
+            or self.kv_cache_dtype is None
+            or not self.host_layout
+        ):
+            raise ValueError(
+                "DCP storage requires a DCP-aligned logical page size, KV dtype, "
+                "and host layout."
+            )
+
+    @property
+    def is_storage_writer(self) -> bool:
+        """MLA replicas share one writer per DCP shard, in the first DCP group.
+
+        With DCP disabled, MLA uses rank 0 and non-MLA uses every TP rank.
+        """
+        return not self.is_mla_model or self.tp_rank == self.dcp_rank
 
 
 @dataclass
@@ -165,6 +206,21 @@ def count_pool_hits(results: dict[str, List[bool]]) -> dict[str, int]:
         name: (rs.index(False) if False in rs else len(rs))
         for name, rs in results.items()
     }
+
+
+def get_mamba_pool_schema_fingerprint(pool: MambaPoolHost) -> str:
+    # Pool layout and tensor schemas are fixed at allocation. Exclude capacity
+    # so a new engine can restore checkpoints into a differently sized cache.
+    schema = [
+        pool.layout,
+        [
+            (str(buf.dtype), list(buf.shape[1:]))
+            for buf in pool.get_hybrid_pool_buffer()
+        ],
+    ]
+    return hashlib.sha256(
+        json.dumps(schema, separators=(",", ":")).encode()
+    ).hexdigest()
 
 
 class HiCacheStorage(ABC):
@@ -383,6 +439,12 @@ class HiCacheFile(HiCacheStorage):
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
     ):
         self.file_path = envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.get() or file_path
+        self._state_tp_rank = (
+            storage_config.tp_rank if storage_config.is_mla_model else None
+        )
+        self._state_tp_size = storage_config.tp_size
+        self._dcp_size = storage_config.dcp_size
+        self._mamba_schema_fingerprint = None
 
         tp_rank, tp_size, pp_rank, pp_size, model_name, is_mla_model = (
             storage_config.tp_rank,
@@ -405,6 +467,35 @@ class HiCacheFile(HiCacheStorage):
         # page, so give each rank its own file key to avoid a cross-rank write race.
         if attn_cp_size > 1:
             self.config_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
+        if storage_config.dcp_size > 1:
+            # Equivalent MLA shards in different DCP groups share a file. TP
+            # size restricts reuse to matching topologies; TP rank is omitted.
+            dtype_name = str(storage_config.kv_cache_dtype).removeprefix("torch.")
+            self.config_suffix += (
+                f"_tp{tp_size}_dcp{storage_config.dcp_rank}_{storage_config.dcp_size}"
+                f"_page{storage_config.logical_page_size}"
+                f"_{dtype_name}_{storage_config.host_layout}"
+            )
+
+        # Reserve 67 bytes for h1_<SHA256> and 4 for .bin within NAME_MAX=255.
+        # Metadata scans and LRU ownership require an intact namespace suffix.
+        if len(os.fsencode(self.config_suffix)) > 184:
+            self.config_suffix = (
+                "_ns1_" + hashlib.sha256(os.fsencode(self.config_suffix)).hexdigest()
+            )
+
+        # Keep state ownership outside the compacted key. A replica of MLA KV
+        # still owns its recurrent state, including during a fresh LRU scan.
+        self._state_config_suffix = self.config_suffix
+        if self._state_tp_rank is not None:
+            owner = f"_mamba_tp{self._state_tp_rank}_{self._state_tp_size}"
+            self._state_config_suffix += owner
+            if len(os.fsencode(self._state_config_suffix)) > 184:
+                self._state_config_suffix = (
+                    "_ns1_"
+                    + hashlib.sha256(os.fsencode(self.config_suffix)).hexdigest()
+                    + owner
+                )
 
         if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
             os.makedirs(self.file_path)
@@ -444,20 +535,36 @@ class HiCacheFile(HiCacheStorage):
             self.file_path,
             self.config_suffix,
             tp_rank=tp_rank,
-            is_mla_model=is_mla_model,
+            is_storage_owner=storage_config.is_storage_writer,
             extra_config=storage_config.extra_config,
             on_evict=(
                 self.metadata_cache.remove if self.metadata_cache is not None else None
             ),
         )
 
+    def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
+        if host_pool_name == PoolName.MAMBA and self._state_tp_rank is not None:
+            self._mamba_schema_fingerprint = get_mamba_pool_schema_fingerprint(
+                host_pool
+            )
+            self._evictor.add_owned_suffix(self._state_config_suffix)
+        super().register_mem_host_pool_v2(host_pool, host_pool_name)
+
     def _get_suffixed_key(self, key: str) -> str:
-        return key + self.config_suffix
+        suffix = self.config_suffix
+        if (
+            self._state_tp_rank is not None
+            and f".mamba_tp{self._state_tp_rank}_" in key
+        ):
+            suffix = self._state_config_suffix
+        if len(os.fsencode(key + suffix + ".bin")) > 255:
+            key = "h1_" + hashlib.sha256(os.fsencode(key)).hexdigest()
+        return key + suffix
 
     def _get_component_key(self, key: str, component_name: Optional[str] = None) -> str:
         if component_name is None or component_name in ("__default__", PoolName.KV):
             return self._get_suffixed_key(key)
-        return self._get_suffixed_key(f"{key}.{component_name}")
+        return self._get_suffixed_key(self._log_key(component_name, key))
 
     def _scan_existing_files_to_metadata_cache(self) -> None:
         try:
@@ -469,7 +576,7 @@ class HiCacheFile(HiCacheStorage):
                 continue
             stem = fn[:-4]
             # Only files belonging to this rank/model.
-            if stem.endswith(self.config_suffix):
+            if stem.endswith((self.config_suffix, self._state_config_suffix)):
                 self.metadata_cache.add(stem)
 
     def get(
@@ -490,10 +597,10 @@ class HiCacheFile(HiCacheStorage):
             if self.metadata_cache is not None:
                 self.metadata_cache.add(suffixed)
             return target_location
-        except FileNotFoundError:
+        except OSError as e:
             if self.metadata_cache is not None:
                 self.metadata_cache.remove(suffixed)
-            logger.warning(f"Failed to fetch {key} from HiCacheFile storage.")
+            logger.warning(f"Failed to fetch {key} from HiCacheFile storage: {e}")
             return None
 
     def batch_get(
@@ -659,7 +766,19 @@ class HiCacheFile(HiCacheStorage):
         return PoolTransferResult(final_pages, hit_count)
 
     def _log_key(self, pool_name: str, key: str) -> str:
-        return key if pool_name == PoolName.KV else f"{key}.{pool_name}"
+        if pool_name == PoolName.KV:
+            return key
+        component = f"{key}.{pool_name}"
+        if pool_name == PoolName.MAMBA and self._state_tp_rank is not None:
+            if self._mamba_schema_fingerprint is None:
+                raise ValueError(f"Unregistered file hybrid pool: {pool_name}")
+            owner = str(self._state_tp_rank)
+            # DCP1 MLA keys omit TP topology, but recurrent state is TP-sharded.
+            # Legacy `.mamba` files alias ranks and cannot be reused safely.
+            if self._dcp_size == 1:
+                owner += f"_{self._state_tp_size}"
+            component = f"{key}.mamba_tp{owner}_v1_{self._mamba_schema_fingerprint}"
+        return component
 
     def _read_page(self, pool_name: str, key: str, host_pool, page_offset: int) -> bool:
         """Read one page from storage into host_pool at page_offset."""
@@ -683,7 +802,9 @@ class HiCacheFile(HiCacheStorage):
         for transfer in transfers:
             host_pool = self.registered_pools[transfer.name]
             keys = transfer.keys or []
-            page_size = getattr(host_pool, "page_size", 1) or 1
+            # MLA receives logical DCP indices; recurrent state still uses
+            # independent one-slot indices. Each pool defines that boundary.
+            page_size = host_pool.logical_page_size
             expected = len(keys) * page_size
             host_indices = transfer.host_indices
 
