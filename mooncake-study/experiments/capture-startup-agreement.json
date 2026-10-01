@@ -1,0 +1,242 @@
+{
+  "purpose": "Exchange bounded rank-local target metadata and require all-rank startup validation before capture resources are connected",
+  "source_baseline": "a9e84fb7ab47c0413dce12655af44de09ac3c0d0",
+  "environment_lock": "h100-runtime-lock.json",
+  "source_sha256": {
+    "python/sglang/srt/training_capture/startup.py": "992d5f0d781cc308def5d62d633b0ba488101963d70bf5218129fe7f18151497",
+    "python/sglang/srt/training_capture/coordinator.py": "333d52e6e866514e7ea5119375b793bafcbb95dc8b3dbbfdd26362939ed4c02d",
+    "python/sglang/srt/managers/tp_worker.py": "faa05bb57a4ddb100a6d31a4a7f0df47af0dfbd5fa480b6407e1d4c0cf61c657",
+    "test/registered/unit/training_capture/test_startup.py": "8efec9692065ec6e03d0b11506b56a44514713d51a0be2f06f7b961759cfcd8c"
+  },
+  "interfaces": {
+    "coordinate_target_startup": "Uses the existing PP-major/TP-minor Gloo CPU group. Votes binding/serialization, receive allocation and global validation status; exchanges bounded strict JSON; requires identical final teacher/KV/layout digests.",
+    "CaptureStartupError": "Reports phase and failed vote group ranks; remote exception text is never included.",
+    "CaptureCoordinator.create": "Loads capture configuration inside the startup callback; connects Store/Catalog resources only after identity agreement. Disabled capture skips collective work.",
+    "TpModelWorker.init_training_capture": "Supplies the existing world CPU group and actual TP/PP/DP rank coordinates."
+  },
+  "protocol": {
+    "version": 1,
+    "control_header": "Seven int64 CPU values: version, error flag, byte length and four signed SHA-256 words.",
+    "encoding": "JSON metadata, no pickle or tensor payloads",
+    "max_record_bytes": 1048576,
+    "max_padded_receive_bytes_per_rank": 67108864,
+    "collective_timeout_seconds": 120,
+    "phases": [
+      "binding status and payload lengths",
+      "payload allocation status",
+      "JSON byte transfer",
+      "validation status and final SHA-256 agreement"
+    ],
+    "transport_failure": "Abort startup and tear down workers/group; no retry on the failed process group."
+  },
+  "jobs": [
+    {
+      "job_id": "01790844323918830249-675c182b4d55",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790844365.2662892,
+      "tests": 3,
+      "subtests": 25,
+      "seconds": 38.3,
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "-s",
+        "test/registered/unit/training_capture/test_startup.py"
+      ],
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790844323918830249-675c182b4d55.log",
+      "log_sha256": "52fcafa99a1106e0d91b63b8990b205585c1712511f6dece707fa80f758c62a2"
+    },
+    {
+      "job_id": "01790844400351228227-0a62d5cf56e8",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790844874.1658974,
+      "tests": 1,
+      "seconds": 461.685,
+      "published_snapshots": 90,
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/storage/test_training_capture_runtime.py",
+        "--model-path",
+        "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+      ],
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790844400351228227-0a62d5cf56e8.log",
+      "log_sha256": "a7af6939bbbabd1a22f3a21135e3e162c631e7ee82b7854121eba1e7bd8cb30a",
+      "note": "Real serving uses the existing single-rank world CPU group; AR/DSpark, graph/overlap, pressure, adaptive/latency and cache lifecycle regression passes."
+    },
+    {
+      "job_id": "01790844400690933229-88827fe808dd",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790844950.5813327,
+      "tests": 138,
+      "subtests": 202,
+      "seconds": 73.72,
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "-s",
+        "test/registered/unit/training_capture",
+        "test/registered/unit/spec/test_dspark_target_kv.py"
+      ],
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790844400690933229-88827fe808dd.log",
+      "log_sha256": "ab35ad93cbf8ffcc38d82aabfcb5759c56d32c3eb32a8686d533085e2d7ab61f"
+    }
+  ],
+  "gloo_observation": {
+    "processes": 4,
+    "layouts": [
+      {
+        "tp_size": 2,
+        "pp_size": 2
+      },
+      {
+        "tp_size": 4,
+        "pp_size": 1
+      }
+    ],
+    "rank_records": "Synthetic typed metadata, no distributed model forward.",
+    "recoverable_cases": [
+      {
+        "case": "binding",
+        "phase": "binding",
+        "failed_vote_ranks": [
+          1
+        ]
+      },
+      {
+        "case": "record_limit",
+        "phase": "binding",
+        "failed_vote_ranks": [
+          1
+        ]
+      },
+      {
+        "case": "aggregate_limit",
+        "phase": "allocation",
+        "failed_vote_ranks": [
+          1
+        ]
+      },
+      {
+        "case": "receive_allocation",
+        "phase": "allocation",
+        "failed_vote_ranks": [
+          1
+        ]
+      },
+      {
+        "case": "malformed_json",
+        "phase": "validation",
+        "failed_vote_ranks": [
+          0,
+          1,
+          2,
+          3
+        ]
+      },
+      {
+        "case": "teacher_identity",
+        "phase": "validation",
+        "failed_vote_ranks": [
+          0,
+          1,
+          2,
+          3
+        ]
+      },
+      {
+        "case": "cyclic_origin_relabeling",
+        "phase": "validation",
+        "failed_vote_ranks": [
+          0,
+          1,
+          2,
+          3
+        ]
+      },
+      {
+        "case": "declared_topology",
+        "phase": "validation",
+        "failed_vote_ranks": [
+          0,
+          1,
+          2,
+          3
+        ]
+      },
+      {
+        "case": "one_validator",
+        "phase": "validation",
+        "failed_vote_ranks": [
+          1
+        ]
+      },
+      {
+        "case": "different_final_digest",
+        "phase": "agreement",
+        "failed_vote_ranks": [
+          0,
+          1,
+          2,
+          3
+        ]
+      },
+      {
+        "case": "protocol_version",
+        "phase": "protocol",
+        "failed_vote_ranks": [
+          0,
+          1,
+          2,
+          3
+        ]
+      }
+    ],
+    "success_after_each_recoverable_failure": true,
+    "peer_exit": {
+      "rank": 3,
+      "payload_owner": false,
+      "peers": 3,
+      "all_peers_failed_transport": true,
+      "asserted_peer_seconds_upper_bound": 15
+    },
+    "slow_binding": {
+      "rank": 3,
+      "callback_delay_seconds": 5,
+      "collective_timeout_seconds": 0.5,
+      "all_ranks_failed_transport": true,
+      "asserted_peer_seconds_upper_bound": 4,
+      "asserted_delayed_rank_seconds_upper_bound": 10
+    },
+    "config_failure": "Missing config file is observed inside the startup callback; Store connection is not attempted."
+  },
+  "limits": [
+    "Serving TP/PP/DP gates remain closed. The current request coordinator explicitly rejects distributed capture after startup identity agreement.",
+    "Distributed Store/resource initialization, common request configuration, admission/failure agreement, per-sample descriptors, global teacher top-128/LSE and scheduler wiring remain pending.",
+    "All group members must enter the same protocol invocation order with a valid Gloo group and valid finite timeout.",
+    "A permanently blocked local callback, initial small-control-buffer allocation failure, or a failure before process-group creation still requires the serving supervisor.",
+    "The byte caps bound encoded records and padded receive tensors, not total process/model memory or JSON object allocation.",
+    "Tests use local Gloo with synthetic records. They do not establish TP/PP numerical inference, RDMA, production Catalog integration, trained-draft quality or throughput SLOs.",
+    "Runtime integration remains TP1/PP1 on one H100 with a synthetic draft, HTTP Catalog double and local TCP Store. The existing optional cross-engine HF KV diagnostic is not enabled."
+  ],
+  "checks": {
+    "local_gpu_source_hashes_equal": true,
+    "new_code_ruff_passed": true,
+    "legacy_ruff_diagnostics_unchanged": [
+      "BLE001",
+      "UP035",
+      "UP045",
+      "UP006"
+    ],
+    "host_python310_syntax_passed": true,
+    "format_and_whitespace_passed": true,
+    "original_worktree_index_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9",
+    "resident_gpu_idle_resumed": true
+  }
+}

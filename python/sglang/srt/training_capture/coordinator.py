@@ -26,7 +26,10 @@ from sglang.srt.training_capture.catalog import (
 from sglang.srt.training_capture.config import CaptureConfig
 from sglang.srt.training_capture.context import RequestCaptureContext
 from sglang.srt.training_capture.host_pool import HostBufferPool, HostSlot
-from sglang.srt.training_capture.identity import bind_contract
+from sglang.srt.training_capture.identity import (
+    assemble_target_contract,
+    bind_rank_target_contract,
+)
 from sglang.srt.training_capture.kv_exporter import SelectedLayerKVExporter
 from sglang.srt.training_capture.mooncake_store import (
     MooncakeSnapshotStore,
@@ -37,6 +40,7 @@ from sglang.srt.training_capture.snapshot_writer import (
     PublicationJournal,
     SnapshotWriter,
 )
+from sglang.srt.training_capture.startup import coordinate_target_startup
 from sglang.srt.training_capture.teacher import TeacherRows, capture_teacher
 
 logger = logging.getLogger(__name__)
@@ -94,23 +98,49 @@ class CaptureCoordinator:
         req_to_token,
         enable_overlap=False,
         metrics_labels=None,
+        startup_group=None,
+        tp_rank=0,
+        tp_size=1,
+        pp_rank=0,
+        pp_size=1,
+        dp_rank=0,
     ):
         if config_path is None:
             return None
-        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
         from sglang.srt.runtime_context import get_spec
         from sglang.srt.training_capture.metrics import CaptureMetrics
 
-        if not isinstance(pool, MHATokenToKVPool):
-            raise ContractError("training capture requires a dense MHA/GQA KV pool")
-        config = CaptureConfig.load(config_path)
-        teacher, kv = bind_contract(
-            config=config,
-            model=model,
-            model_config=model_config,
-            tokenizer_path=tokenizer_path,
-            pool=pool,
-        )
+        config = None
+
+        def build_local():
+            nonlocal config
+            config = CaptureConfig.load(config_path)
+            return bind_rank_target_contract(
+                model_id=config.model_id,
+                selected_layer_ids=config.selected_layer_ids,
+                storage_chunk_tokens=config.storage_chunk_tokens,
+                expected_weights_revision=config.expected_weights_revision,
+                expected_tokenizer_revision=config.expected_tokenizer_revision,
+                model=model,
+                model_config=model_config,
+                tokenizer_path=tokenizer_path,
+                pool=pool,
+                tp_rank=tp_rank,
+                tp_size=tp_size,
+                pp_rank=pp_rank,
+                pp_size=pp_size,
+                dp_rank=dp_rank,
+            )
+
+        topology = {"tp_size": tp_size, "pp_size": pp_size, "dp_rank": dp_rank}
+        if startup_group is None:
+            teacher, kv, _ = assemble_target_contract([build_local()], **topology)
+        else:
+            teacher, kv, _ = coordinate_target_startup(
+                group=startup_group, build_local=build_local, **topology
+            )
+        if (tp_size, pp_size, dp_rank) != (1, 1, 0):
+            raise ContractError("distributed request capture is not yet connected")
         exporter = SelectedLayerKVExporter.from_pool(kv, pool)
         if exporter.device.type != "cuda":
             raise ContractError("serving capture currently requires CUDA")

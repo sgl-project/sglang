@@ -337,6 +337,29 @@ startup transport or certifies TP/PP inference.
 initial fixture setup failure, corrected six tests / 31 subtests, and the
 464.049s H100 runtime regression with 90 READY snapshots and source/log hashes.
 
+### Startup Identity Exchange
+
+The registered startup test launches four real Gloo processes. It checks TP2/PP2
+and TP4/PP1 global agreement, then injects binding, allocation, metadata,
+validation and digest/version failures. A successful exchange follows every
+recoverable error to check collective alignment. Separate cases terminate a
+non-owning rank or delay its binding beyond the configured wait timeout.
+
+```bash
+python -m pytest -q -s test/registered/unit/training_capture/test_startup.py
+```
+
+The fixture exercises the actual metadata transport with synthetic rank records;
+it does not run TP/PP model inference. The full runtime regression exercises the
+same protocol over the serving worker's existing single-rank Gloo CPU group
+before connecting the real Mooncake Store. Collective timeout or peer loss
+requires process-group teardown, while local voted failures leave collective
+ordering intact. The serving supervisor still owns earlier startup failures and
+callbacks that never reach a collective.
+[`capture-startup-agreement.json`](capture-startup-agreement.json) records
+three focused tests / 25 subtests, the 138-test / 202-subtest broad run, and a
+461.685s real serving regression publishing 90 snapshots, with source/log hashes.
+
 ### BF16 Rounding Isolation
 
 The actual fixed-input parity command remains the serving gate. The following

@@ -228,10 +228,51 @@ The result can directly configure the partitioned buffers and snapshot APIs.
 
 The existing `bind_target_contract` and capture/DSpark callers use this path for
 a complete single-rank target. Passing a sharded target to that single-rank API
-fails instead of treating local heads as the complete model. These interfaces
-perform synchronous startup inspection; they do not implement cross-rank
-transport, startup error agreement, serving admission or live weight updates.
-The caller must bind immutable artifacts corresponding to the loaded model.
+fails instead of treating local heads as the complete model. These identity
+helpers perform synchronous inspection. The caller must bind immutable artifacts
+corresponding to the loaded model; live weight updates remain outside this path.
+
+### Startup Exchange
+
+`coordinate_target_startup(group=..., build_local=..., tp_size=..., pp_size=...,
+dp_rank=..., aux_tp_rank=..., timeout_seconds=120)` exchanges identity records
+through the existing Gloo CPU group. Its members must be one complete TP/PP
+replica in PP-major, TP-minor order. Every serving rank participates, including
+ranks with no Store payload ownership. The callback performs local configuration
+loading and target binding before any Store or Catalog resource is created.
+
+| Phase | Exchange | Failure Handling |
+| --- | --- | --- |
+| Binding | Fixed-size version/status/length headers | A local callback, serialization or size failure is reported before any payload collective |
+| Allocation | A second status vote | All ranks confirm bounded CPU send/receive allocation before transferring metadata |
+| Metadata | Padded CPU byte buffers containing strict JSON | Decode, group-origin, topology and global identity checks run independently on every rank |
+| Agreement | Status and SHA-256 of the resulting teacher/KV/layout | No rank returns a contract until all validators succeed and all resulting digests match |
+
+The wire payload is metadata-only JSON, not a pickled Python object. Each record
+is limited to 1MiB; padded receive buffers across the group are limited to 64MiB
+per receiver. Small control buffers are reserved before local binding and reused
+for failure votes. Exception messages and tensor payloads are not transmitted.
+`CaptureStartupError` reports the failed phase and the group ranks whose vote
+failed. For shared metadata validation errors, every validator may report failure;
+these rank IDs are not necessarily the origin of the invalid record.
+
+Each collective wait is bounded by `timeout_seconds` (120 seconds by default),
+subject also to the process group's transport timeout. A `transport` failure
+requires worker/group teardown; never retry on that group. A callback stuck
+before entering a collective, failure to reserve the initial small control
+buffers, or a failure before process-group initialization still requires the
+serving supervisor's watchdog. All members must enter the same startup invocation
+order with a compatible protocol and a valid Gloo group.
+
+The serving worker now supplies its existing world CPU group and actual rank
+coordinates to `CaptureCoordinator.create`. Enabled capture loads configuration
+inside the binding callback; configuration errors therefore participate in the
+startup vote. Disabled capture returns before invoking the protocol. The current
+request coordinator still rejects distributed capture after identity agreement,
+and the server's TP/PP/DP gates remain closed. Store/Catalog resource-creation
+agreement, request-level configuration/admission/failure decisions, snapshot
+descriptor exchange, global teacher scores and distributed scheduling remain
+separate work. This protocol exchanges startup target identity only.
 
 ## Catalog Producer API
 
@@ -284,9 +325,9 @@ Preparation and assembly are background work after CUDA completion. Their views
 do not extend a buffer lease: each owner retains its Host slot until its Store
 writes complete, and the coordinator retains the manifest buffer until
 publication completes. Existing uncertain-transfer quarantine rules still apply.
-These APIs do not exchange descriptors between processes. Distributed startup
-and admission agreement, metadata transport, failure coordination and scheduler
-wiring remain required.
+These APIs do not exchange per-sample descriptors between processes. Distributed
+resource/admission agreement, sample metadata transport, failure coordination
+and scheduler wiring remain required.
 The planner covers ordinary dense TP/PP, not context parallelism or sparse KV.
 
 Receipts contain metadata only. They are trusted producer acknowledgements,

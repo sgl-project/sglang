@@ -33,7 +33,8 @@ it does not redefine the goal as the modules already implemented.
 | Publication | Catalog producer client, manifest-last writer, durable metadata journal, fenced replay | Lost responses, failed puts, stale fences, missing/corrupt objects and identical retries tested; actual Catalog service is SpecForge-owned |
 | Partition publication | Owner-local writes and fenced all-owner publication receipts | Two independent writer processes publish logical head shards through real TCP Store; distributed inference admission and scheduler integration remain open |
 | Partition ownership | Canonical replicated-head owners, PP-local Host/device staging, local KV export and metadata assembly | Native QKV loader agreement at TP1/2/4/8, exact CUDA source-reuse checks and independent Store writers pass; distributed coordination remains open |
-| Global target binding | Rank-local projection/pool inspection and all-rank global identity assembly | TP4/PP3 metadata fixture matches a full target contract; cross-rank transport and startup agreement remain open |
+| Global target binding | Rank-local projection/pool inspection and all-rank global identity assembly | TP4/PP3 metadata fixture matches a full target contract; deployed TP/PP model validation remains open |
+| Startup identity exchange | Bounded JSON over the existing CPU group, phase failure votes and final digest agreement | Real four-process Gloo TP2/PP2 and TP4/PP1 cases pass, including local failures, peer exit and finite waits; distributed request/resource coordination remains open |
 | Runtime collection | Opt-in CLI config, capability gates, request ledger, prefill/decode hooks, invalidation and counters | Six real Qwen3-0.6B requests published through Mooncake; ordinary and CUDA graph replay executions pass |
 | Real model identity/parity | Weight/tokenizer artifact digests, actual selected-layer geometry, K norm and RoPE | Captured KV and teacher scores match online tensors exactly; full-vocabulary LSE matches within 1e-5; HF teacher logits pass numerical comparison, but cross-engine KV equivalence is not certified |
 | Draft serving | Explicit KV-input architecture, contract, encoder, incremental injector and invalidation | Real Qwen3 target plus synthetic KV draft passes ordinary/batched/graph generation; retained BF16 fixture passes full backbone/logit parity against pinned FlexAttention, with production exporter and trained-model validation still open |
@@ -1337,6 +1338,70 @@ GPU and local source hashes match. Ruff, formatting, whitespace and host Python
 3.10 syntax checks pass. The original worktree index remains unchanged; all four
 jobs are terminal and the H100 has resumed its idle workload.
 
+## Collective Startup Identity Agreement
+
+`coordinate_target_startup` now exchanges rank identity through the serving
+replica's existing Gloo CPU group, using fixed control headers and bounded JSON
+byte tensors. The protocol checks PP-major/TP-minor source rank identity and
+declared topology before calling the global contract assembler. It sends no
+pickled objects, model tensor contents or exception text.
+
+All ranks vote after local binding, after payload allocation and after global
+validation. The final vote includes a SHA-256 digest of teacher/KV/layout; no
+rank returns a contract on partial validation success or differing output.
+Records are capped at 1MiB and padded receive capacity at 64MiB per rank. Control
+buffers are allocated before binding so a failed payload allocation can still
+participate in the failure vote. Collective waits default to 120 seconds each;
+transport failure requires group/worker teardown rather than retry.
+
+`TpModelWorker.init_training_capture` supplies the existing world CPU group and
+actual rank coordinates. `CaptureCoordinator.create` loads configuration inside
+the voted callback and creates Store/Catalog resources only after target identity
+agreement. Disabled capture still returns before collective work. The existing
+TP/PP/DP server gates stay closed and the request coordinator explicitly rejects
+distributed capture after identity agreement until its resource/admission and
+request lifecycle are connected.
+
+Focused job `01790844323918830249-675c182b4d55` passes three tests and
+25 subtests in 38.30s. Four real Gloo processes assemble TP2/PP2 and TP4/PP1
+metadata. Eleven injected failures cover local artifact binding, record and
+aggregate byte limits, receive allocation, malformed JSON, conflicting teacher
+identity, cyclic rank-origin relabeling, topology disagreement, one validator
+failing, different final digests and protocol-version disagreement. Each
+recoverable failure is followed by a successful exchange on the same group,
+proving the collective sequence remains aligned.
+
+An inactive payload rank then exits before entering startup; all three peers
+fail transport within 15 seconds. In a separate four-process case, a rank delays
+binding for five seconds while collective waits are 0.5 seconds. The other three
+return transport failures within four seconds and the delayed rank fails within
+ten seconds; no partial contract returns. A focused coordinator test also
+requires a configuration-file failure to occur inside the startup callback and
+verifies that Store connection has not started.
+
+Full runtime job `01790844400351228227-0a62d5cf56e8` passes in 461.685s
+and publishes 90 snapshots through the real local TCP Store. This exercises the
+new protocol on the actual serving world CPU group before capture initialization,
+including AR/static DSpark, graph/overlap, memory pressure, admission/latency
+controls and cache lifecycle checks. The broader capture and DSpark unit run
+`01790844400690933229-88827fe808dd` passes 138 tests and 202 subtests in
+73.72s, including the multi-process Gloo failure scenarios.
+
+This is a real multi-process metadata protocol, not distributed model inference.
+It assumes every group member enters the same invocation sequence. Earlier
+model/group initialization failure, an indefinitely blocked local callback or
+failure to allocate the small control buffers still requires the serving
+supervisor. Distributed Store/resource initialization, common request policy,
+admission/failure agreement, per-sample descriptor exchange and global teacher
+scores remain open; no RDMA or production Catalog claim is made.
+
+Commands, protocol bounds, fault cases and source/log hashes are retained in
+[`capture-startup-agreement.json`](experiments/capture-startup-agreement.json).
+Local/GPU source hashes match. New files pass Ruff, legacy coordinator/worker
+diagnostics match HEAD, and formatting, whitespace and Python 3.10 syntax checks
+pass. The original worktree index is unchanged; all three jobs are terminal and
+the resident GPU has resumed its idle workload.
+
 ## Next Implementation
 
 1. Broaden real-request coverage to prefill graphs, automatic AR OOM retraction,
@@ -1344,9 +1409,10 @@ jobs are terminal and the H100 has resumed its idle workload.
    saturated backpressure.
 2. Extend P8's passing retained BF16 fixture to production-exported and trained
    checkpoints, complete exporter compatibility and artifact/quality validation.
-3. Connect P9's implemented global target binding, layout, rank-local buffers and
-   owner-local Store interface to distributed startup/admission/failure agreement,
-   descriptor exchange, global teacher scores and TP/PP scheduling.
+3. Connect P9's implemented startup identity exchange, layout, rank-local buffers
+   and owner-local Store interface to distributed resource initialization and
+   request admission/failure agreement, descriptor exchange, global teacher scores
+   and TP/PP scheduling.
    Complete TP/PP runtime validation, non-static speculative layouts,
    PD transfer and cross-node RDMA. Existing capability gates do
    not constitute implementation of these paths.

@@ -404,6 +404,12 @@ class TpModelWorker(BaseTpWorker):
             req_to_token=self.model_runner.req_to_token_pool,
             enable_overlap=self.enable_overlap,
             metrics_labels=metrics_labels,
+            startup_group=self.world_group.cpu_group,
+            tp_rank=self.ps.tp_rank,
+            tp_size=self.ps.tp_size,
+            pp_rank=self.ps.pp_rank,
+            pp_size=self.ps.pp_size,
+            dp_rank=self.ps.dp_rank or 0,
         )
 
     def alloc_memory_pool(
