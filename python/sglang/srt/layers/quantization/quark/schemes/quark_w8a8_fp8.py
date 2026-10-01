@@ -189,14 +189,19 @@ class QuarkW8A8Fp8(QuarkLinearScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # Activations must be a plain bf16 tensor: per-channel FP8 (weight_scale
-        # [N, 1]) is gated off the aiter fused RMSNorm+quant kernel upstream by
-        # _is_block_scale_fp8, so the per-token quant happens in apply_fp8_linear.
-        assert not isinstance(x, tuple), (
-            "quark W8A8 FP8 linear received a pre-quantized tuple; a fused "
-            "RMSNorm+quant producer was not gated off by _is_block_scale_fp8 "
-            "(per-channel FP8 must fall through to the plain bf16 path)."
-        )
+        # The only pre-quantized input allowed is a per-token (fp8, scale [M, 1])
+        # pair (Qwen3.5 SGLANG_ROCM_SMALLM_FP8_PROJ producers). Per-channel FP8 is
+        # gated off the aiter fused RMSNorm+quant kernel by _is_block_scale_fp8,
+        # so block-scaled tuples must never reach here.
+        if isinstance(x, tuple):
+            q, scale = x
+            assert (
+                self.per_token
+                and layer.weight_scale is not None
+                and q.dtype == torch.float8_e4m3fn
+                and scale.dtype == torch.float32
+                and scale.numel() == q.shape[0]
+            ), "quark W8A8 FP8 only accepts a per-token (fp8, scale) tuple"
         if _is_hip and layer.weight_scale is None:
             # Dequantized at load; weight is [in, out] like the fp8 path's.
             output = torch.matmul(x, layer.weight)
