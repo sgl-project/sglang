@@ -149,7 +149,7 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         # Prefill can capture before init_cuda_graph_state. Keep the translated
         # checkpoint destinations at one address across both graph phases.
         self._graph_track_indices = torch.empty(max_bs, dtype=torch.int64, device=dev)
-        # Inert track fields for graph capture: a capture warmup batch that
+        # Inert prefill track fields (excluding draft extend): a warmup batch that
         # carries no tracking metadata must still LAUNCH the track scatter
         # (all rows masked off), or the python-level `if` specializes the
         # scatter out of the captured graph.
@@ -160,8 +160,6 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         self._graph_track_inert_seqlens = torch.zeros(
             max_bs, dtype=torch.int64, device=dev
         )
-        # Graph-static: captured track scatters read this address.
-        self._track_indices_buf = torch.zeros(max_bs, dtype=torch.int64, device=dev)
         # Same address-stability requirement; the base only sizes this from
         # init_cuda_graph_state, which the prefill graph never calls.
         self._alloc_cache_indices_buf(max_bs)
@@ -277,22 +275,6 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
             return
         self.forward_metadata = self._forward_metadata(forward_batch)
         self._refresh_cache_indices()
-        if not self._slot_gather_recordable:
-            self._translate_track_indices(forward_batch)
-
-    def _translate_track_indices(self, forward_batch: ForwardBatch):
-        """Translate virtual track ids to the physical slots the conv kernels write."""
-        track_indices = forward_batch.mamba_track_indices
-        buf = self._track_indices_buf
-        # Prep may re-run on the same batch; never translate twice.
-        if track_indices is None or track_indices.data_ptr() == buf.data_ptr():
-            return
-        n = track_indices.shape[0]
-        assert n <= buf.shape[0], (
-            f"track-index buffer too small: rows={n} vs bound {buf.shape[0]}"
-        )
-        buf[:n].copy_(self._translate_mamba_indices(track_indices))
-        forward_batch.mamba_track_indices = buf[:n]
 
     def _prepare_track_indices(self, forward_batch: ForwardBatch):
         # Every metadata view must explicitly provide virtual IDs or None.
