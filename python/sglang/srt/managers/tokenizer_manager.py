@@ -2299,19 +2299,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
-        # Immediately update the weights if the engine is in paused state
+        # Hold is_pause_cond while paused: updates share one result future,
+        # so overlapping ones must not interleave, and unpause must not race.
         async with self.is_pause_cond:
             is_paused = self.is_pause
+            if is_paused:
+                result = await self._wait_for_model_update_from_disk(obj)
 
-        lock_context = (
-            self.model_update_lock.writer_lock if not is_paused else nullcontext()
-        )
-        async with lock_context:
-            (
-                success,
-                message,
-                num_paused_requests,
-            ) = await self._wait_for_model_update_from_disk(obj)
+        if not is_paused:
+            async with self.model_update_lock.writer_lock:
+                result = await self._wait_for_model_update_from_disk(obj)
+        success, message, num_paused_requests = result
 
         if success and obj.flush_cache and self.mm_processor is not None:
             self.mm_processor.clear_preprocess_cache()

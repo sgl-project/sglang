@@ -12,6 +12,7 @@ Covers:
   - Resubmission succeeds after cleanup
   - Handler failures clean up pending and dispatched requests
   - _handle_batch_output takes non-streaming first_token_time from the scheduler
+  - Overlapping disk weight updates while paused each get their own reply
 """
 
 import asyncio
@@ -35,6 +36,8 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
     BatchStrOutput,
     EmbeddingReqInput,
     GenerateReqInput,
+    UpdateWeightFromDiskReqInput,
+    UpdateWeightFromDiskReqOutput,
     wrap_as_pickle,
 )
 from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
@@ -46,6 +49,7 @@ from sglang.srt.observability.req_time_stats import (  # noqa: E402
     SchedulerReqTimeStats,
 )
 from sglang.srt.runtime_context import get_context
+from sglang.srt.utils.aio_rwlock import RWLock
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -1428,6 +1432,42 @@ class TestPriorityRange(CustomTestCase):
                         with self.assertRaisesRegex(ValueError, "signed 64-bit"):
                             asyncio.run(tm.generate_request(obj).__anext__())
                         tm._init_req_state.assert_not_called()
+
+
+class TestPausedDiskWeightUpdates(unittest.IsolatedAsyncioTestCase):
+    async def test_overlapping_paused_updates_each_get_their_own_reply(self):
+        """Two disk updates sent while paused shared one reply slot: the second
+        caller got the first reply, and the next reply crashed the tokenizer loop."""
+        tm = _make_tokenizer_manager(self)
+        tm.auto_create_handle_loop = Mock()
+        tm._update_model_path_info = Mock()
+        tm.mm_processor = None
+        tm.elastic_worker_count = 1
+        tm.is_pause = True
+        tm.is_pause_cond = asyncio.Condition()
+        tm.model_update_lock = RWLock()
+        # A request admitted before the pause still holds a reader slot,
+        # so a paused update that waited for the writer lock would hang.
+        await tm.model_update_lock.acquire_reader()
+        scheduler = asyncio.Queue()
+        tm._dispatch_to_scheduler = scheduler.put_nowait
+
+        def update(path):
+            obj = UpdateWeightFromDiskReqInput(model_path=path, load_format="auto")
+            return asyncio.create_task(tm.update_weights_from_disk(obj))
+
+        first, second = update("ckpt-a"), update("ckpt-b")
+        await asyncio.sleep(0)
+        self.assertEqual(scheduler.qsize(), 1)
+
+        for path in ("ckpt-a", "ckpt-b"):
+            req = await asyncio.wait_for(scheduler.get(), timeout=5)
+            self.assertEqual(req.model_path, path)
+            tm._handle_update_weights_from_disk_req_output(
+                UpdateWeightFromDiskReqOutput(success=True, message=path)
+            )
+        self.assertEqual(await first, (True, "ckpt-a", 0))
+        self.assertEqual(await second, (True, "ckpt-b", 0))
 
 
 if __name__ == "__main__":
