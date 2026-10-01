@@ -44,6 +44,11 @@ impl Config {
     /// Validate invariants not enforced by the CLI parser.
     pub(crate) fn validate(&self) -> Result<()> {
         ensure!(!self.model.id.is_empty(), "model id must be non-empty");
+        // Policies that read the prompt are checked against the built routing at startup.
+        ensure!(
+            self.model.tokenizer_path.is_some() || self.model.bucket_config.is_none(),
+            "--no-tokenizer is incompatible with --bucket-config"
+        );
         if let Some(bucket_config) = self.model.bucket_config.as_ref() {
             validate_bucket_config(bucket_config)?;
         }
@@ -243,7 +248,7 @@ mod tests {
             observability: ObservabilityConfig::default(),
             model: ModelConfig {
                 id: model_id.into(),
-                tokenizer_path: "/tmp/tok.json".into(),
+                tokenizer_path: Some("/tmp/tok.json".into()),
                 disable_input_ids_forwarding: false,
                 tokenizer: Default::default(),
                 policy: PolicyKind::RoundRobin,
@@ -269,6 +274,20 @@ mod tests {
     #[test]
     fn accepts_minimal_static_config() {
         cfg("qwen3", &["http://10.0.0.1:30000"]).validate().unwrap();
+    }
+
+    #[test]
+    fn disabled_tokenizer_rejects_length_buckets() {
+        let mut c = cfg("qwen3", &["http://10.0.0.1:30000"]);
+        c.model.tokenizer_path = None;
+        c.validate().unwrap();
+        c.model.bucket_config = Some(BucketConfig {
+            buckets: vec![],
+            ttft_slo_policy: SloBucketPolicy::Disabled,
+            tps_slo_policy: SloBucketPolicy::Disabled,
+        });
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("--no-tokenizer"), "{err}");
     }
 
     #[test]
