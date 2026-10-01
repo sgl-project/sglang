@@ -479,6 +479,10 @@ class DiffusionGemmaForBlockDiffusion(PreTrainedModel):
         **kwargs,
     ):
         is_context_encoding = not forward_batch.forward_mode.is_dllm_extend()
+        if not is_context_encoding and input_embeds is None:
+            input_embeds = self.prepare_dllm_input_embeds(
+                input_ids, forward_batch.input_preparation_state
+            )
         if is_context_encoding and forward_batch.contains_image_inputs():
             Gemma4ForConditionalGeneration.prepare_attn_masks(
                 self, forward_batch, input_ids, torch.bool

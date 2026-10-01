@@ -44,6 +44,8 @@ class Gemma4Renoise(DllmAlgorithm):
     requires_separate_context_encoding = True
     required_attention_backend = "triton"
     reuse_forward_metadata = True
+    supported_attention_backends = ("triton", "fa4")
+    capture_input_preparation = True
 
     @classmethod
     def configure_server_args(cls, server_args: ServerArgs) -> None:
@@ -67,16 +69,17 @@ class Gemma4Renoise(DllmAlgorithm):
         ):
             raise ValueError("DiffusionGemma requires tied word embeddings")
 
+        graph_config = cfg.cuda_graph_config
+        if graph_config.prefill.backend != Backend.FULL:
+            graph_config = with_phase(
+                graph_config, Phase.PREFILL, backend=Backend.DISABLED
+            )
         declare_resolution(
             server_args,
             cls.__name__,
             disable_radix_cache=True,
             chunked_prefill_size=-1,
-            cuda_graph_config=with_phase(
-                cfg.cuda_graph_config,
-                Phase.PREFILL,
-                backend=Backend.DISABLED,
-            ),
+            cuda_graph_config=graph_config,
         )
 
     @classmethod
@@ -154,6 +157,9 @@ class Gemma4Renoise(DllmAlgorithm):
         self.seed = algorithm_config.get("seed")
         self.vocab_size = None
         self.embed_tokens = None
+        self._temperature_tables = {}
+        self.use_temperature_table = algorithm_config.get("use_temperature_table", True)
+        self.use_graph_input_preparation = config.capture_input_preparation
 
         if (
             not isinstance(self.max_denoising_steps, int)
@@ -254,9 +260,45 @@ class Gemma4Renoise(DllmAlgorithm):
                     batched[index].copy_(value)
             signal = batched.view(len(states) * self.block_size, -1)
 
-        forward_batch.input_embeds = model_runner.model.prepare_dllm_input_embeds(
-            forward_batch.input_ids, signal
-        )
+        if self.use_graph_input_preparation:
+            if signal is None:
+                signal = torch.zeros(
+                    (
+                        forward_batch.input_ids.numel(),
+                        self.embed_tokens.weight.shape[-1],
+                    ),
+                    dtype=self.embed_tokens.weight.dtype,
+                    device=forward_batch.input_ids.device,
+                )
+            forward_batch.input_preparation_state = signal
+            forward_batch.input_embeds = None
+        else:
+            forward_batch.input_embeds = model_runner.model.prepare_dllm_input_embeds(
+                forward_batch.input_ids, signal
+            )
+
+    @staticmethod
+    def prepare_graph_inputs(model, input_ids, state):
+        return model.prepare_dllm_input_embeds(input_ids, state)
+
+    def _temperatures(self, logits, states):
+        if not self.use_temperature_table:
+            return logits.new_tensor(
+                [self._temperature(state["step"]) for state in states]
+            )
+        key = (logits.device, logits.dtype)
+        if key not in self._temperature_tables:
+            self._temperature_tables[key] = logits.new_tensor(
+                [
+                    self._temperature(step)
+                    for step in range(self.max_denoising_steps + 1)
+                ]
+            )
+        table = self._temperature_tables[key]
+        if len(states) == 1:
+            step = states[0]["step"]
+            return table[step : step + 1]
+        return torch.stack([table[state["step"]] for state in states])
 
     def _write_input_ids(self, forward_batch: ForwardBatch, states: List[Any]) -> None:
         current = torch.stack([state["current"] for state in states])
@@ -293,9 +335,7 @@ class Gemma4Renoise(DllmAlgorithm):
             self._write_input_ids(forward_batch, states)
             return [True] * len(states)
 
-        temperatures = logits.new_tensor(
-            [self._temperature(state["step"]) for state in states]
-        )
+        temperatures = self._temperatures(logits, states)
         statistics = (
             _compiled_denoiser_statistics if logits.is_cuda else _denoiser_statistics
         )

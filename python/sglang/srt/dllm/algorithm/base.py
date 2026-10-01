@@ -35,6 +35,8 @@ class DllmAlgorithm:
     requires_separate_context_encoding = False
     required_attention_backend: Optional[str] = None
     reuse_forward_metadata: bool = False
+    supported_attention_backends: Tuple[str, ...] = ()
+    capture_input_preparation: bool = False
 
     def __init__(self, config: DllmConfig):
         self.block_size = config.block_size

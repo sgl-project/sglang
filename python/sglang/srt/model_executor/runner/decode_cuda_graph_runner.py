@@ -63,6 +63,8 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
+    GraphSlot,
+    PaddingPolicy,
     build_decode_registry,
 )
 from sglang.srt.model_executor.forward_batch_info import (
@@ -230,6 +232,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     pluggable self.backend that handles the actual capture/replay.
     """
 
+    input_preparation = None
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -278,6 +282,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm = self.dllm_config is not None
+        self.input_preparation = None
+        if self.is_dllm and self.dllm_config.capture_input_preparation:
+            from sglang.srt.dllm.algorithm import get_algorithm_cls
+
+            self.input_preparation = get_algorithm_cls(
+                self.dllm_config.algorithm
+            ).prepare_graph_inputs
         self.dllm_uses_input_embeds = (
             self.is_dllm and self.dllm_config.requires_separate_context_encoding
         )
@@ -461,6 +472,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             num_dp_ranks=self.num_dp_ranks,
             source=self.buffers,
         )
+        if self.input_preparation is not None:
+            width = self.buffers.input_embeds.shape[-1]
+            self.buffer_registry.register_slot(
+                GraphSlot(
+                    "input_preparation_state",
+                    lambda bs, tokens: (tokens, width),
+                    self.buffers.input_embeds.dtype,
+                    axis="tokens",
+                    padding_policy=PaddingPolicy.ZERO,
+                )
+            )
 
         # Captures the per-replay attention-metadata prep into a small CUDA
         # graph; see metadata_glue_graph.py for the correctness contract.
@@ -1220,7 +1242,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     and "input_embeds" in inspect.signature(forward).parameters
                     and not hasattr(self.model_runner.model, "forward_embed")
                 ):
-                    kwargs["input_embeds"] = self.buffers.input_embeds[:num_tokens]
+                    if self.input_preparation is None:
+                        kwargs["input_embeds"] = self.buffers.input_embeds[:num_tokens]
+                    else:
+                        state = self.buffer_registry.get_slot(
+                            "input_preparation_state"
+                        ).buffer[:num_tokens]
+                        kwargs["input_embeds"] = self.input_preparation(
+                            self.model_runner.model, forward_batch.input_ids, state
+                        )
 
                 out = forward(
                     forward_batch.input_ids,
@@ -1280,7 +1310,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
-        if self.dllm_uses_input_embeds and forward_batch.input_embeds is None:
+        if (
+            self.dllm_uses_input_embeds
+            and self.input_preparation is None
+            and forward_batch.input_embeds is None
+        ):
             raise ValueError(
                 "Diffusion graph replay requires prepared input embeddings"
             )
@@ -1294,6 +1328,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.deepep_adapter.replay()
 
         if not forward_batch.needs_forward_metadata_init():
+            if self.input_preparation is not None:
+                state = self.buffer_registry.get_slot("input_preparation_state").buffer
+                source = forward_batch.input_preparation_state
+                state[: source.shape[0]].copy_(source)
+                state[source.shape[0] :].zero_()
+                self.buffers.input_ids[source.shape[0] :].zero_()
             # Pre-planned (plan-stream load_batch already ran).
             # In speculative decoding, these two fields are still needed.
             graph_size_key = (

@@ -499,7 +499,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # This flag controls whether the model dispatches through the distinct
         # chunked-prefix topology; backend capability is validated separately.
         self._capture_chunked_prefix = (
-            self._is_full_backend and not get_schedule().disable_chunked_prefix_cache
+            self._is_full_backend
+            and not get_schedule().disable_chunked_prefix_cache
+            and model_runner.attn_backend.full_cuda_graph_uses_chunked_prefix
         )
         self._prefix_chunk_len = 0
         self._prefix_chunk_capacity = 0
@@ -2126,7 +2128,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     def _finalize_execute_output(
         self, output
-    ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
+    ) -> Optional[Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]]:
+        if output is None:
+            return None
         if isinstance(output, LogitsProcessorOutput):
             return self._trim_logits_output(output)
         if isinstance(output, EmbeddingPoolerOutput):
@@ -2143,7 +2147,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     def execute(
         self, forward_batch: ForwardBatch, **kwargs
-    ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
+    ) -> Optional[Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]]:
         self._validate_capture_hidden_mode(forward_batch)
         with self.backend.replay_session():
             static_forward_batch = self.load_batch(forward_batch, **kwargs)

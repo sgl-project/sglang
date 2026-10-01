@@ -141,6 +141,7 @@ class ForwardMetadata:
 
 
 class TritonAttnBackend(AttentionBackend):
+    full_cuda_graph_uses_chunked_prefix = False
     # CUDA-graph replay rebuilds metadata from preallocated kv_indptr/kv_indices
     # buffers; it never reads seq_lens_cpu / seq_lens_sum.
     needs_cpu_seq_lens: bool = False
@@ -156,6 +157,14 @@ class TritonAttnBackend(AttentionBackend):
         kv_indptr_buf: Optional[torch.Tensor] = None,
     ):
         # Lazy import to avoid the initialization of cuda context
+        self._prefill_graph_metadata = {}
+        self._decode_graph_metadata = {}
+        self._prefill_capture_sizes = set(
+            get_exec().graph.cuda_graph_config.prefill.bs or ()
+        )
+        self.supports_prefill_cuda_graph_max_context_size = check_cuda_graph_backend(
+            Phase.PREFILL, Backend.FULL
+        )
         from sglang.kernels.ops.attention.decode_attention import (
             _LEAN_BLOCK_M,
             _lean_decode_launch_params,
@@ -498,8 +507,10 @@ class TritonAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
         kv_indices: torch.Tensor,
+        kv_indptr: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        kv_indptr = self.kv_indptr[: bs + 1]
+        if kv_indptr is None:
+            kv_indptr = self.kv_indptr[: bs + 1]
         kv_indptr[1:] = torch.cumsum(seq_lens, dim=0)
         self.kv_index_translator.fill_packed_read_stream(
             req_pool_indices=req_pool_indices[:bs],
@@ -703,6 +714,9 @@ class TritonAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        if forward_batch.forward_mode == ForwardMode.EXTEND:
+            self._init_full_prefill_metadata(forward_batch, in_capture)
+            return
         bs = forward_batch.batch_size
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
@@ -734,6 +748,7 @@ class TritonAttnBackend(AttentionBackend):
                     lean_Op=self.cuda_graph_lean_Op,
                     lean_locks=self.cuda_graph_lean_locks,
                 )
+                self._decode_graph_metadata[bs] = self.forward_metadata
                 return
 
             self._apply_cuda_graph_metadata(
@@ -756,7 +771,9 @@ class TritonAttnBackend(AttentionBackend):
                 swa_out_cache_loc,
                 out_cache_loc_full_physical,
             )
+            self._decode_graph_metadata[bs] = self.forward_metadata
         else:
+            self.forward_metadata = self._decode_graph_metadata[bs]
             self._apply_cuda_graph_metadata(
                 bs=bs,
                 req_pool_indices=req_pool_indices,
@@ -767,6 +784,92 @@ class TritonAttnBackend(AttentionBackend):
             # Metadata view is reused from capture; just refill the buffers.
             self._fill_cuda_graph_write_locs(forward_batch, bs)
             self._fill_cuda_graph_swa_out_cache_loc(forward_batch)
+
+    def _init_full_prefill_metadata(self, batch, in_capture):
+        bs, tokens = batch.batch_size, batch.input_ids.numel()
+        key = (bs, tokens)
+        if in_capture:
+            capacity = batch.max_seq_len_override or self.max_context_len
+            swa = self.sliding_window_size is not None and self.sliding_window_size > 0
+            self._prefill_graph_metadata[key] = ForwardMetadata(
+                attn_logits=None,
+                attn_lse=None,
+                num_kv_splits=None,
+                max_extend_len=tokens,
+                kv_indptr=torch.zeros(bs + 1, dtype=torch.int32, device=self.device),
+                kv_indices=torch.empty(
+                    bs * capacity, dtype=torch.int64, device=self.device
+                ),
+                qo_indptr=torch.zeros(bs + 1, dtype=torch.int32, device=self.device),
+                custom_mask=None,
+                mask_indptr=None,
+                window_kv_indptr=torch.zeros(
+                    bs + 1, dtype=torch.int32, device=self.device
+                )
+                if swa
+                else None,
+                window_kv_indices=torch.empty(
+                    bs * self.sliding_window_size, dtype=torch.int64, device=self.device
+                )
+                if swa
+                else None,
+                window_num_kv_splits=None,
+                window_kv_offsets=torch.empty(bs, dtype=torch.int64, device=self.device)
+                if swa
+                else None,
+                swa_out_cache_loc=torch.empty_like(batch.out_cache_loc)
+                if self.use_sliding_window_kv_pool
+                else None,
+                out_cache_loc_full_physical=torch.empty_like(batch.out_cache_loc)
+                if self.kv_index_translator.is_translating
+                else None,
+            )
+        metadata = self._prefill_graph_metadata[key]
+        self._fill_kv_indptr_and_indices(
+            bs,
+            batch.extend_prefix_lens,
+            batch.req_pool_indices,
+            metadata.kv_indices,
+            kv_indptr=metadata.kv_indptr,
+        )
+        metadata.qo_indptr[0].zero_()
+        torch.cumsum(batch.extend_seq_lens, dim=0, out=metadata.qo_indptr[1:])
+        if metadata.window_kv_indices is not None:
+            _, _, _, offsets = update_sliding_window_buffer(
+                metadata.window_kv_indptr,
+                self.kv_index_translator,
+                batch.req_pool_indices,
+                self.sliding_window_size,
+                batch.extend_prefix_lens,
+                bs,
+                self.device,
+                self.token_to_kv_pool,
+                window_kv_indices=metadata.window_kv_indices,
+            )
+            metadata.window_kv_offsets.copy_(offsets)
+        if metadata.swa_out_cache_loc is not None:
+            metadata.swa_out_cache_loc.copy_(
+                self.kv_index_translator.sliding_window_write_loc_for(
+                    batch.out_cache_loc
+                )
+            )
+        if metadata.out_cache_loc_full_physical is not None:
+            self.kv_index_translator.fill_capture_write_loc(
+                out=metadata.out_cache_loc_full_physical,
+                forward_batch=batch,
+                width=metadata.out_cache_loc_full_physical.numel(),
+            )
+        self.forward_metadata = metadata
+
+    def can_run_prefill_cuda_graph(self, batch):
+        if not check_cuda_graph_backend(Phase.PREFILL, Backend.FULL):
+            return True
+        return (
+            batch.forward_mode == ForwardMode.EXTEND
+            and batch.input_ids.numel() in self._prefill_capture_sizes
+            and self.dcp_size == 1
+            and not batch.contains_image_inputs()
+        )
 
     def _fill_cuda_graph_swa_out_cache_loc(
         self, forward_batch: ForwardBatch, in_capture: bool = False

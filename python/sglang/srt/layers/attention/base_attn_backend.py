@@ -182,6 +182,7 @@ class AttentionBackend(ABC):
     # assume that generic ForwardBatch metadata is sufficient for every
     # attention implementation.
     supports_full_cuda_graph_chunked_prefix: bool = False
+    full_cuda_graph_uses_chunked_prefix: bool = True
 
     def prepare_full_cuda_graph_chunked_prefix(
         self,

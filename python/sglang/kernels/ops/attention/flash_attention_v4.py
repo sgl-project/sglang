@@ -38,13 +38,15 @@ def flash_attn_gqa_512(
     out: torch.Tensor,
     *,
     cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
     page_table: Optional[torch.Tensor] = None,
     softmax_scale: float = 1.0,
     lse: Optional[torch.Tensor] = None,
     pack_gqa: bool = True,
+    causal: bool = False,
 ) -> torch.Tensor:
-    """Noncausal BF16 GQA with 512-dimensional keys and separate values."""
+    """GQA with 512-dimensional keys and separate values."""
     import cutlass.cute as cute
 
     from sglang.kernels.ops.attention.flash_attn.cute.cute_dsl_utils import (
@@ -67,7 +69,7 @@ def flash_attn_gqa_512(
         None,
         None,
         cu_seqlens_q,
-        None,
+        cu_seqlens_k,
         None,
         seqused_k,
         None,
@@ -78,6 +80,7 @@ def flash_attn_gqa_512(
     )
     key = (
         pack_gqa,
+        causal,
         q.device,
         tuple(
             (tuple(t.shape), t.stride(), t.dtype) if isinstance(t, torch.Tensor) else t
@@ -97,7 +100,7 @@ def flash_attn_gqa_512(
             for t in args
         ]
         kernel = FlashAttentionMLAForwardSm100(
-            is_causal=False,
+            is_causal=causal,
             use_cpasync_load_KV=page_table is not None and k.shape[1] != 128,
             is_topk_gather=False,
             pack_gqa=pack_gqa,
