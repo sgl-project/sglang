@@ -32,7 +32,7 @@ class TestGlm52Fp8(unittest.TestCase):
     """GLM-5.2 FP8 on H200/B200 (8-GPU, tp=8)."""
 
     def test_glm52_fp8(self):
-        dp_args = ["--dp=8", "--enable-dp-attention"]
+        dp_args = ["--attn-dp-size=8"]
 
         variants = [
             ModelLaunchSettings(
