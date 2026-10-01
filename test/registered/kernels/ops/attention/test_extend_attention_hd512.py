@@ -4,8 +4,10 @@ import unittest
 
 import torch
 
+from sglang.kernels.ops.attention.bidirectional_bmm_attention import (
+    bidirectional_bmm_attention,
+)
 from sglang.kernels.ops.attention.extend_attention import extend_attention_fwd
-from sglang.kernels.ops.attention.hd512_bmm_attention import hd512_bmm_attention
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -126,24 +128,33 @@ class TestExtendAttentionHD512(CustomTestCase):
         old_tf32 = torch.backends.cuda.matmul.allow_tf32
         torch.backends.cuda.matmul.allow_tf32 = False
         try:
-            for capacity, canvas, scale in [
-                (0, 32, 1.0),
-                (905, 255, 0.125),
-                (16384, 256, 1.0),
+            for capacity, canvas, scale, dim, hk in [
+                (0, 32, 1.0, 512, 2),
+                (905, 255, 0.125, 512, 2),
+                (16384, 256, 1.0, 512, 2),
+                (1024, 256, 1.0, 256, 8),
+                (1024, 33, 0.125, 256, 8),
             ]:
                 with self.subTest(capacity=capacity, canvas=canvas, scale=scale):
                     packed = (
                         torch.randn(
-                            canvas, 20 * 512, device="cuda", dtype=torch.bfloat16
+                            canvas,
+                            (16 + 2 * hk) * dim,
+                            device="cuda",
+                            dtype=torch.bfloat16,
                         )
                         * 0.15
                     )
-                    q = packed[:, : 16 * 512].view(canvas, 16, 512)
-                    k = packed[:, 16 * 512 : 18 * 512].contiguous().view(canvas, 2, 512)
-                    v = packed[:, 18 * 512 :].contiguous().view(canvas, 2, 512)
+                    q = packed[:, : 16 * dim].view(canvas, 16, dim)
+                    k = (
+                        packed[:, 16 * dim : (16 + hk) * dim]
+                        .contiguous()
+                        .view(canvas, hk, dim)
+                    )
+                    v = packed[:, (16 + hk) * dim :].contiguous().view(canvas, hk, dim)
                     pool_k = (
                         torch.randn(
-                            capacity + 17, 2, 512, device="cuda", dtype=torch.bfloat16
+                            capacity + 17, hk, dim, device="cuda", dtype=torch.bfloat16
                         )
                         * 0.15
                     )
@@ -156,7 +167,7 @@ class TestExtendAttentionHD512(CustomTestCase):
                     indptr = torch.tensor([7, 7], device="cuda", dtype=torch.int32)
 
                     def run():
-                        return hd512_bmm_attention(
+                        return bidirectional_bmm_attention(
                             q, k, v, pool_k, pool_v, indices, indptr, capacity, scale
                         )
 
@@ -185,13 +196,13 @@ class TestExtendAttentionHD512(CustomTestCase):
                         slots = indices[7 : prefix + 7]
                         keys = (
                             torch.cat((pool_k[slots], k))
-                            .repeat_interleave(8, dim=1)
+                            .repeat_interleave(16 // hk, dim=1)
                             .transpose(0, 1)
                             .float()
                         )
                         values = (
                             torch.cat((pool_v[slots], v))
-                            .repeat_interleave(8, dim=1)
+                            .repeat_interleave(16 // hk, dim=1)
                             .transpose(0, 1)
                             .float()
                         )

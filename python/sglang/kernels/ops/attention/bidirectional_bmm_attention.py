@@ -60,7 +60,7 @@ def _masked_softmax(
     tl.store(P + row * N + c, p, mask=c < N)
 
 
-def hd512_bmm_attention(q, k, v, pk, pv, ids, ptr, cap, scale=1.0):
+def bidirectional_bmm_attention(q, k, v, pk, pv, ids, ptr, cap, scale=1.0):
     # K/V canvas and the last two pool dimensions must be contiguous. Q may
     # retain the token stride of a packed QKV projection.
     assert k.is_contiguous() and v.is_contiguous()

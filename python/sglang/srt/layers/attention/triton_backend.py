@@ -1785,7 +1785,7 @@ class TritonAttnBackend(AttentionBackend):
         ):
             return o
 
-        # Independent-K/V HD512 denoising benefits from packing the GQA
+        # Independent-K/V denoising benefits from packing the GQA
         # query heads into larger GEMMs. Cap the materialized score workspace;
         # all dynamic prefix lengths and padding are handled on the GPU.
         if (
@@ -1793,13 +1793,27 @@ class TritonAttnBackend(AttentionBackend):
             and torch.cuda.get_device_capability()[0] == 10
             and forward_batch.forward_mode.is_dllm_extend()
             and forward_batch.batch_size == 1
-            and layer.qk_head_dim == layer.v_head_dim == 512
             and layer.tp_q_head_num == 16
-            and layer.tp_k_head_num == 2
+            and (
+                (
+                    layer.qk_head_dim == layer.v_head_dim == 512
+                    and layer.tp_k_head_num == 2
+                    and (
+                        layer.sliding_window_size is None
+                        or layer.sliding_window_size <= -1
+                    )
+                    and self.max_context_len <= 16384
+                )
+                or (
+                    layer.qk_head_dim == layer.v_head_dim == 256
+                    and layer.tp_k_head_num == 8
+                    and layer.attn_type == AttentionType.DECODER_BIDIRECTIONAL
+                    and layer.sliding_window_size is not None
+                    and 0 < layer.sliding_window_size <= 1024
+                )
+            )
             and 32 <= q.shape[0] <= 256
-            and self.max_context_len <= 16384
             and not causal
-            and (layer.sliding_window_size is None or layer.sliding_window_size <= -1)
             and self.forward_metadata.custom_mask is None
             and logits_soft_cap <= 0
             and sinks is None
@@ -1816,11 +1830,20 @@ class TritonAttnBackend(AttentionBackend):
             == torch.bfloat16
             and hasattr(torch.ops.aten.bmm, "dtype")
         ):
-            from sglang.kernels.ops.attention.hd512_bmm_attention import (
-                hd512_bmm_attention,
+            from sglang.kernels.ops.attention.bidirectional_bmm_attention import (
+                bidirectional_bmm_attention,
             )
 
-            result = hd512_bmm_attention(
+            # SWA metadata already contains only the allowed prefix window.
+            # Keep the current canvas fully bidirectional, as extend_attention
+            # does above. Round padding up for aligned GEMM leading dimensions.
+            prefix_capacity = (
+                triton.cdiv(layer.sliding_window_size, 64) * 64
+                if layer.sliding_window_size is not None
+                and layer.sliding_window_size > 0
+                else min(self.max_context_len, kv_indices.numel())
+            )
+            result = bidirectional_bmm_attention(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                 k.contiguous(),
                 v.contiguous(),
@@ -1828,7 +1851,7 @@ class TritonAttnBackend(AttentionBackend):
                 self.token_to_kv_pool.get_value_buffer(layer.layer_id),
                 kv_indices,
                 kv_indptr,
-                min(self.max_context_len, kv_indices.numel()),
+                prefix_capacity,
                 scale=layer.scaling,
             )
             o.copy_(result.view_as(o))
