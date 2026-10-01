@@ -37,8 +37,8 @@ def branch_input(
     """The FFN input and residual that ``source``'s boundary read for its
     own FFN, for this layer's FFN, which branches from the same input: moved
     to the rows this FFN needs and its residual's rows."""
-    rows, residual_rows, _ = source._branch_rows(forward_batch)
-    to, residual_to, _ = plan._branch_rows(forward_batch)
+    rows, residual_rows, _ = source.branch_rows(forward_batch)
+    to, residual_to, _ = plan.branch_rows(forward_batch)
     if stream.pending is not None:
         raise RuntimeError("a branch must start from a prepared stage input")
     residual = stream.residual
@@ -56,7 +56,7 @@ def branch_output(
     """This layer's complete FFN output as a branch's contribution, which
     adds to the layer's output without writing the residual: moved to the
     rows the layer hands on."""
-    rows, _, to = plan._branch_rows(forward_batch)
+    rows, _, to = plan.branch_rows(forward_batch)
     return move_rows(hidden_states, rows, to, forward_batch)
 
 
@@ -71,15 +71,15 @@ def merge_branch(
     """A contribution from ``branch_output`` summed with what ``source``'s
     layer hands on, ``hidden_states`` and ``residual``, moved to the rows
     this layer hands on."""
-    _, _, rows = source._branch_rows(forward_batch)
-    _, _, to = plan._branch_rows(forward_batch)
+    _, _, rows = source.branch_rows(forward_batch)
+    _, _, to = plan.branch_rows(forward_batch)
     stream.check(hidden_states)
     if stream.pending is None:
         raise RuntimeError("branch merge requires a pending producer contribution")
     update = stream.pending.update
-    hidden_states, residual = stream.finish(hidden_states)
+    hidden_states, residual = stream.export(hidden_states)
     hidden_states = move_rows(hidden_states, rows, to, forward_batch)
     residual = move_rows(residual, rows, to, forward_batch)
     output = contribution + hidden_states
     stream.write(residual)
-    return stream.leave(output, update), stream
+    return stream.record(output, update), stream
