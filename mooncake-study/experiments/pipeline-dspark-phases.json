@@ -1,0 +1,355 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-01",
+  "base_commit": "cd82fd11f07e1599a4f2b379a415ff0ec39e5f3a",
+  "feature": "DSpark prefill and decode stage APIs separate static target forward from accepted-context commit",
+  "environment": {
+    "resident_job": "job-fe1ce1dcdea6-20261001023258",
+    "resident_node": "node064",
+    "resident_gpu": "GPU-9b3a4d59-4935-f3b7-5135-d46c7c6c5495",
+    "gpu_model": "NVIDIA H100 80GB HBM3",
+    "model": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+    "python": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+    "gpu_checkout": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang",
+    "versions": {
+      "python": "3.12.3",
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "packages": {
+        "flashinfer-python": "0.6.17",
+        "mooncake-transfer-engine-cuda13": "0.3.11.post1",
+        "sglang-kernel": "0.4.6.post1",
+        "transformers": "5.12.1"
+      }
+    }
+  },
+  "implementation": [
+    "The single-stage worker entry point now calls the same prefill forward/commit and decode prepare/forward/accept/commit APIs.",
+    "Static target verification forwards and returns PP activations; a stage without logits skips logit adjustment and cannot perform local acceptance.",
+    "Commit uses final-stage acceptance with each stage's own verify window; raw capture and accepted capture retain their existing ordering.",
+    "One outstanding step owns live batch and graph buffers. Failed preparation/forward/acceptance/commit prevents reuse; stale, duplicate and foreign calls are rejected.",
+    "Prefill waits for its matching result and final sample before projecting draft context. Local acceptance attempts cannot be overwritten.",
+    "Restore temporary CPU verify lengths even if preparation raises; preserve existing hidden-input compact graph epilogues.",
+    "No PP scheduler loop, serving capability gate, Mooncake object format or storage API changed."
+  ],
+  "source_sha256": {
+    "python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py": "02cb7ac49d41d0cdf31e455b210863bac8563f4ccf270bfce6e6138c84ff1989",
+    "python/sglang/srt/speculative/dspark_components/dspark_verify.py": "a4ed64ec70f801a711bf661ab267c597301bac8507a28e10f8de5b3abe1f246d",
+    "test/registered/unit/spec/test_dspark_execution_phases.py": "863214f14d4e97349d22c6dfee084739080d31c44e21a54fbf044d3483d36ed4",
+    "test/registered/unit/spec/test_dspark_target_kv.py": "495892314e73931e1ebafebd18cf1ceb5c882da51d3b7a9b838086264a8d19ee",
+    "test/registered/storage/test_training_capture_pd_dspark.py": "2842b2114bdc99cea4cc3fd1621f3b516178b25f46499ced899f6d79f9d19668",
+    "test/registered/storage/test_training_capture_pd_dspark_hidden.py": "f439c71f93b63154ac3e3463a894d2a0137fda79a1668518f9aeb7ad8fa0a1fa",
+    "python/sglang/test/pd_capture_runtime.py": "7eb84d1125c3eebb36aba007959151d97d207645dd21ae794c77293983b00467",
+    "python/sglang/test/dspark_capture_observer.py": "f8641c14df5a0ea30ea2b2d56c005894c9039da501c82e836e87b13be090dab7",
+    "python/sglang/test/dspark_capture_server.py": "6af462b474e8f12b09c57ffecf85d360059ca3a4360a2287d2dd6bb3324baedc"
+  },
+  "gpu_source_hashes_match": true,
+  "tests": [
+    {
+      "file": "test/registered/unit/spec/test_dspark_execution_phases.py",
+      "job_id": "01790896925439893070-5a63672cbf75",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790896939.2652123,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790896925439893070-5a63672cbf75.log",
+      "tests": 7,
+      "seconds": 0.014,
+      "log_sha256": "731eb5364f7e14862983c9a0e92a7d6607f04cade54a7c42d6559979eb9768c7"
+    },
+    {
+      "file": "test/registered/unit/spec/test_dspark_target_kv.py",
+      "job_id": "01790896997722869711-0ad652141db8",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790897011.3695755,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790896997722869711-0ad652141db8.log",
+      "tests": 23,
+      "seconds": 1.613,
+      "log_sha256": "bc2d0e75f1e20234ed86b35fb03203c15ff995ace49a213508c7de23f99e436f"
+    },
+    {
+      "file": "test/registered/storage/test_training_capture_pd_dspark.py",
+      "job_id": "01790896998055130762-fee590c68f43",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790897349.8528814,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790896998055130762-fee590c68f43.log",
+      "tests": 4,
+      "seconds": 327.297,
+      "log_sha256": "8a4617fa448985ac1d39f1e833c4c0ab8e57d315a7b63249ed01a026c559a1b8"
+    },
+    {
+      "file": "test/registered/storage/test_training_capture_pd_dspark_hidden.py",
+      "job_id": "01790896998383203044-ec1ef864932a",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790897749.8236492,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790896998383203044-ec1ef864932a.log",
+      "tests": 6,
+      "seconds": 388.992,
+      "log_sha256": "fa4fab324f01c054d7d332257029819ab759bab80ea355ab9a5bb289e85899f1"
+    }
+  ],
+  "additional_cpu_only_run": {
+    "file": "test/registered/unit/spec/test_dspark_execution_phases.py",
+    "tests": 7,
+    "seconds": 0.015,
+    "outcome": "completed",
+    "returncode": 0,
+    "exec_session_id": 34282,
+    "command_argv": [
+      "kubectl",
+      "exec",
+      "-n",
+      "qiji",
+      "job-fe1ce1dcdea6-20261001023258-master-0",
+      "-c",
+      "master",
+      "--",
+      "env",
+      "CUDA_VISIBLE_DEVICES=9",
+      "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/specforge-reference",
+      "timeout",
+      "120",
+      "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+      "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/test/registered/unit/spec/test_dspark_execution_phases.py",
+      "-v",
+      "-f"
+    ],
+    "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/dspark-phases-cpu-only-final-20261001.log",
+    "log_sha256": "11fed996281e0892393fd90f9e9c066b97cfff4b4883fec2fd3df72e56d7e89d",
+    "scope": "GPU hidden on the same CUDA-package container; not a separate hosted CPU dependency environment."
+  },
+  "real_model_cases": [
+    {
+      "draft_kind": "target_kv",
+      "prefill_draft": false,
+      "ragged_mode": "static",
+      "replay": false,
+      "enable_overlap": false,
+      "counters": {
+        "sealed": 6,
+        "speculative_verify_forwards": 11,
+        "speculative_commits_copied": 12,
+        "eager_forwards": 11,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1
+      },
+      "quarantined_host_slots": 0
+    },
+    {
+      "draft_kind": "target_kv",
+      "prefill_draft": false,
+      "ragged_mode": "static",
+      "replay": true,
+      "enable_overlap": true,
+      "counters": {
+        "sealed": 6,
+        "speculative_verify_forwards": 15,
+        "speculative_commits_copied": 17,
+        "cuda_graph_forwards": 15,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1
+      },
+      "quarantined_host_slots": 0
+    },
+    {
+      "draft_kind": "target_kv",
+      "prefill_draft": true,
+      "ragged_mode": "static",
+      "replay": false,
+      "enable_overlap": false,
+      "counters": {
+        "sealed": 6,
+        "speculative_verify_forwards": 11,
+        "speculative_commits_copied": 12,
+        "eager_forwards": 11,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1
+      },
+      "quarantined_host_slots": 0
+    },
+    {
+      "draft_kind": "target_kv",
+      "prefill_draft": true,
+      "ragged_mode": "static",
+      "replay": true,
+      "enable_overlap": true,
+      "counters": {
+        "sealed": 6,
+        "speculative_verify_forwards": 15,
+        "speculative_commits_copied": 17,
+        "cuda_graph_forwards": 15,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1
+      },
+      "quarantined_host_slots": 0
+    },
+    {
+      "draft_kind": "target_hidden",
+      "prefill_draft": true,
+      "ragged_mode": "cap-accept",
+      "replay": false,
+      "enable_overlap": false,
+      "counters": {
+        "sealed": 6,
+        "speculative_verify_forwards": 13,
+        "speculative_commits_copied": 14,
+        "eager_forwards": 13,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1
+      },
+      "quarantined_host_slots": 0
+    },
+    {
+      "draft_kind": "target_hidden",
+      "prefill_draft": true,
+      "ragged_mode": "cap-accept",
+      "replay": true,
+      "enable_overlap": true,
+      "counters": {
+        "sealed": 6,
+        "speculative_verify_forwards": 16,
+        "speculative_commits_copied": 18,
+        "cuda_graph_forwards": 16,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1
+      },
+      "quarantined_host_slots": 0
+    },
+    {
+      "draft_kind": "target_hidden",
+      "prefill_draft": true,
+      "ragged_mode": "compact",
+      "replay": false,
+      "enable_overlap": false,
+      "counters": {
+        "sealed": 6,
+        "speculative_verify_forwards": 13,
+        "speculative_commits_copied": 14,
+        "eager_forwards": 13,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1
+      },
+      "quarantined_host_slots": 0
+    },
+    {
+      "draft_kind": "target_hidden",
+      "prefill_draft": true,
+      "ragged_mode": "compact",
+      "replay": true,
+      "enable_overlap": true,
+      "counters": {
+        "sealed": 6,
+        "speculative_verify_forwards": 16,
+        "speculative_commits_copied": 18,
+        "cuda_graph_forwards": 16,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1
+      },
+      "quarantined_host_slots": 0
+    },
+    {
+      "draft_kind": "target_hidden",
+      "prefill_draft": true,
+      "ragged_mode": "static",
+      "replay": false,
+      "enable_overlap": false,
+      "counters": {
+        "sealed": 6,
+        "speculative_verify_forwards": 11,
+        "speculative_commits_copied": 12,
+        "eager_forwards": 11,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1
+      },
+      "quarantined_host_slots": 0
+    },
+    {
+      "draft_kind": "target_hidden",
+      "prefill_draft": true,
+      "ragged_mode": "static",
+      "replay": true,
+      "enable_overlap": true,
+      "counters": {
+        "sealed": 6,
+        "speculative_verify_forwards": 15,
+        "speculative_commits_copied": 17,
+        "cuda_graph_forwards": 15,
+        "failed_pd_handoff_failed": 2,
+        "failed_request_aborted_or_retracted": 1
+      },
+      "quarantined_host_slots": 0
+    }
+  ],
+  "real_model_topology": {
+    "prefill_tp": 1,
+    "decode_tp": 1,
+    "prefill_pp": 1,
+    "decode_pp": 1,
+    "transport": "actual Mooncake TCP P/D and Store",
+    "catalog": "HTTP test double"
+  },
+  "checked_snapshots": 60,
+  "earlier_validation": [
+    {
+      "job_id": "01790896039803802910-a3eecd850dd4",
+      "tests": 4,
+      "seconds": 327.305,
+      "returncode": 0
+    },
+    {
+      "job_id": "01790896040142450312-2267bc413085",
+      "tests": 6,
+      "seconds": 389.193,
+      "returncode": 0
+    }
+  ],
+  "corrected_attempts": [
+    {
+      "job_id": "01790896292211417748-86e2ae6cb4f6",
+      "returncode": 1,
+      "reason": "Test fixture assigned the read-only target_worker property; fixed to use the actual _target_worker field.",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790896292211417748-86e2ae6cb4f6.log",
+      "log_sha256": "2b2e063afa25ed838bbbd8b001f79d94e836ef4dfb500ce9a2abcbef9220781c"
+    },
+    {
+      "exec_session_id": 72946,
+      "returncode": 1,
+      "reason": "Existing test_utils port selection cannot parse CUDA_VISIBLE_DEVICES=-1. Retried with nonexistent device 9 in the one-GPU container.",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/dspark-phases-cpu-only-20261001.log",
+      "log_sha256": "42c3f5de6d825c6f9de873b214a6662402d7618fd01d92540f24ad40b4f324d7"
+    }
+  ],
+  "checks": {
+    "black": "All three changed Python files pass.",
+    "ruff_new_test": "Passed.",
+    "ruff_production": "19 preexisting diagnostics remain (6 worker, 13 verifier); no new diagnostics versus HEAD. The prior import-order diagnostic was removed.",
+    "git_diff_check": true,
+    "original_staged_index_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9"
+  },
+  "cleanup": {
+    "resident_status": {
+      "worker_id": "4837ce82e955447dbf70da0cf2ee55f3",
+      "hostname": "job-fe1ce1dcdea6-20261001023258-master-0",
+      "pid": 1,
+      "mode": "idle_load",
+      "heartbeat_unix": 1790897807.9658604,
+      "idle_pid": 4878,
+      "active_job": null,
+      "active_pid": null,
+      "queued": 0,
+      "paused": false,
+      "heartbeat_age_seconds": 0.2470846176147461
+    },
+    "live_processes": "  PID  PPID STAT COMMAND\n    1     0 Ss   python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py --state-dir /gpfs/users/fuxuanwei-1/dspark-maas-lab/state serve --duty-cycle 0.60\n 4878     1 Ssl  /usr/bin/python3 /gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/cuda_load.py --duty-cycle 0.6\n 4950     0 Rs   ps -eo pid,ppid,stat,args\n",
+    "temporary_gpu_jobs_created": 0
+  },
+  "limitations": [
+    "Phase tests use deterministic model-boundary fixtures; they do not run a PP model or communicate across ranks.",
+    "The PP loop still needs ordered request/proposal agreement, activation delivery before collective projection, final acceptance validation and coordinated commit.",
+    "Draft embedding/output-head availability, actual PP speculative serving and distributed cancellation/recovery are not implemented by these APIs.",
+    "Compact folded graph epilogues retain the existing non-PP behavior; this is not a split compact pipeline implementation.",
+    "No source-KV NCCL assembly, trained-checkpoint quality, production Catalog/consumer or performance-SLO claim."
+  ]
+}

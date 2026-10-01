@@ -2791,11 +2791,68 @@ workload with no active or queued experiment.
 
 These tests exercise deterministic result tensors and the real transport,
 scheduler result methods and token resolver. They do not execute a pipeline
-DSpark target/draft model. The PP worker must still separate target forward from
-cross-stage KV projection/commit, relay proposals and activations, and make
-shared embedding/output-head modules available. Existing PP speculative gates
+DSpark target/draft model. The worker phase APIs below separate target forward
+from cross-stage KV projection/commit. The PP loop must still coordinate those
+phases, relay proposals/activations, and make shared embedding/output-head modules
+available. Existing PP speculative gates
 remain. See [the runbook](experiments/PIPELINE_RESULT.md) and
 [retained evidence](experiments/pipeline-dspark-result.json).
+
+## DSpark Stage Execution Phases
+
+The worker now exposes prefill forward/commit and decode
+prepare/forward/accept/commit operations. Its existing single-stage entry point
+uses these operations in order. Static verification passes incoming PP
+activations to the target worker and returns outgoing activations without
+requiring local logits. The final stage owns acceptance; an intermediate stage
+can commit caller-validated acceptance against its own verify window and slots.
+Raw capture remains before logit/grammar mutation, and accepted capture remains
+before publication and context projection. Temporary CPU verify lengths are
+restored even when forward preparation fails.
+
+One outstanding step owns each worker's live buffers. Missing prerequisites,
+duplicate/stale/foreign steps and overwriting a local acceptance fail. Failure
+during preparation, forward, acceptance or commit blocks further reuse; no
+partial-commit retry is supported. Prefill likewise requires its matching result
+and the final sample before draft projection. Existing hidden-input compact
+graphs retain their folded accept/commit epilogue; that is not a PP path.
+
+The complete phase unit file passed **seven tests** in **0.014 seconds**, job
+`01790896925439893070-5a63672cbf75`, and again in **0.015 seconds** with the GPU
+hidden. Deterministic model-boundary fixtures call the actual worker and verify
+executor, checking two stages with different physical slots, no early commit,
+raw-logit/grammar ordering and failure ownership. They do not execute a real
+pipeline model or transport. The target-KV contract unit file passed all **23
+tests** in **1.613 seconds**, job `01790896997722869711-0ad652141db8`.
+
+On the resident H100, the complete target-KV P/D suite passed **four tests** in
+**327.297 seconds**, job `01790896998055130762-fee590c68f43`; drafts run on D alone
+and on P/D together, each with eager and graph/overlap execution. The complete
+hidden-input suite passed **six tests** in **388.992 seconds**, job
+`01790896998383203044-ec1ef864932a`, covering static, cap-accept and compact paths
+with eager and graph/overlap execution, including folded compact acceptance.
+These **10 real-model cases** checked **60 published snapshots** against online
+KV/logit sources using actual Mooncake TCP P/D and Store with the Catalog test
+double. Missing/stale handoffs and cancellation remained excluded. All **40
+final tests** passed; the seven phase tests also passed with the GPU hidden.
+The first unit attempt had a fixture-only read-only-property assignment error;
+the corrected complete file passed. Full final suites were rerun after adding
+the failed-prepare ownership guard. Tested GPU source hashes match the checkout.
+
+Black passes for all three changed Python files; the new test passes Ruff. The
+two production files retain 19 preexisting Ruff diagnostics, with no new ones.
+The resident worker has no active or queued experiment and resumed its idle
+workload; a live-process check found no remaining test, model or Store server.
+No temporary GPU allocation was needed. The original checkout's staged index
+checksum is unchanged.
+
+The PP scheduler is not wired to these phases. Request/proposal agreement,
+activation/acceptance ordering, shared draft modules, actual multi-GPU
+speculative serving and cancellation/recovery validation remain required.
+PP speculative serving gates are unchanged. See
+[the worker contract](TARGET_KV_DRAFT.md#pipeline-execution-phases-prerequisite),
+[the runbook](experiments/PIPELINE_PHASES.md) and
+[retained evidence](experiments/pipeline-dspark-phases.json).
 
 ## Next Implementation
 

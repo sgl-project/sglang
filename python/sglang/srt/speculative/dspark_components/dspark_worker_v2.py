@@ -3,8 +3,8 @@ from contextlib import nullcontext
 from dataclasses import replace
 from typing import Optional
 
+import msgspec
 import torch
-
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
 )
@@ -16,6 +16,7 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
+    PPProxyTensors,
     compute_position,
 )
 from sglang.srt.runtime_context import (
@@ -42,6 +43,7 @@ from sglang.srt.speculative.dspark_components.dspark_config import (
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftBlockProposer,
+    DraftProposal,
     make_next_draft_input,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
@@ -56,6 +58,7 @@ from sglang.srt.speculative.dspark_components.dspark_observability import (
 )
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkVerifyPlanner,
+    VerifyWindow,
     alloc_verify_window,
     dp_global_verify_tier_num_tokens,
     idle_ragged_layout,
@@ -67,9 +70,11 @@ from sglang.srt.speculative.dspark_components.dspark_target_kv_inject import (
     TargetKVInjector,
 )
 from sglang.srt.speculative.dspark_components.dspark_verify import (
+    AcceptOuts,
     CommitInjectCtx,
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
+    TargetVerifyResult,
     verify_logits_adjustments_are_noop,
 )
 from sglang.srt.speculative.spec_utils import (
@@ -81,6 +86,36 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.utils import get_available_gpu_memory, is_cuda
 
 logger = logging.getLogger(__name__)
+
+
+class DSparkDecodeStep(msgspec.Struct, kw_only=True):
+    """Borrowed batch/graph buffers owned by one worker until commit completes."""
+
+    batch: ScheduleBatch
+    draft_input: DFlashDraftInputV2
+    prefix_lens: torch.Tensor
+    verify_window: VerifyWindow
+    sampling_info: object
+    proposal: DraftProposal
+    confidence: torch.Tensor | None
+    verify_token_budget: object
+    layout: object
+    run_compact: bool
+    verify_ids_2d: torch.Tensor
+    grammar_tree: GrammarTree | None
+    fold_eligible: bool
+    forward_started: bool = False
+    accept_started: bool = False
+    committed: bool = False
+    target_verify: TargetVerifyResult | None = None
+    hidden_strided: torch.Tensor | None = None
+    acceptance: AcceptOuts | None = None
+
+
+class _DSparkPrefillStep(msgspec.Struct):
+    batch: ScheduleBatch
+    result: GenerationBatchResult | None = None
+    committed: bool = False
 
 
 class DSparkWorkerV2(BaseSpecWorker):
@@ -103,6 +138,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.model_runner = target_worker.model_runner
         self.page_size = server_args.page_size
         self.device = target_worker.device
+        self._pending_decode_step = None
+        self._pending_prefill_step = None
 
         self._draft_is_moe = draft_is_deepseek_v4(server_args=server_args)
         self._draft_dp_context_enabled = (
@@ -463,6 +500,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         on_publish=None,
         grammar_barrier=None,
     ) -> GenerationBatchResult:
+        self._check_no_pending_step()
         if getattr(batch, "return_logprob", False):
             raise ValueError(
                 "DSpark speculative decoding does not support return_logprob yet."
@@ -492,9 +530,47 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
-        batch_output = self.target_worker.forward_batch_generation(
-            batch, capture_hidden_mode=self._capture_hidden_mode
+        batch_output = self.forward_prefill_stage(batch)
+        return self.commit_prefill_stage(batch, batch_output, on_publish=on_publish)
+
+    def forward_prefill_stage(
+        self, batch: ScheduleBatch, pp_proxy_tensors: PPProxyTensors | None = None
+    ) -> GenerationBatchResult:
+        """Produce local target KV and activations, deferring draft projection."""
+        self._check_no_pending_step()
+        step = _DSparkPrefillStep(batch)
+        self._pending_prefill_step = step
+        step.result = self.target_worker.forward_batch_generation(
+            batch,
+            capture_hidden_mode=self._capture_hidden_mode,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
+        return step.result
+
+    def commit_prefill_stage(
+        self,
+        batch: ScheduleBatch,
+        batch_output: GenerationBatchResult,
+        *,
+        next_token_ids: torch.Tensor | None = None,
+        on_publish=None,
+    ) -> GenerationBatchResult:
+        step = self._pending_prefill_step
+        if (
+            step is None
+            or step.batch is not batch
+            or step.result is None
+            or step.result is not batch_output
+            or step.committed
+        ):
+            raise RuntimeError("DSpark prefill step is stale or already committed")
+        if next_token_ids is not None:
+            batch_output.next_token_ids = next_token_ids
+        if batch_output.next_token_ids is None:
+            raise RuntimeError(
+                "DSpark prefill commit requires the final stage's sample"
+            )
+        step.committed = True
         logits_output = batch_output.logits_output
         next_token_ids = batch_output.next_token_ids
         batch_output.new_seq_lens = batch.seq_lens
@@ -510,9 +586,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                 bonus_tokens=next_token_ids,
                 new_seq_lens=batch.seq_lens,
             )
+            self._pending_prefill_step = None
             return batch_output
 
-        if logits_output.hidden_states is None:
+        if logits_output is None or logits_output.hidden_states is None:
             raise RuntimeError(
                 "DSpark requires target aux hidden capture for prefill, but got None. "
                 "Make sure the target model has DFlash layers-to-capture configured."
@@ -564,6 +641,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             bonus_tokens=next_token_ids,
             new_seq_lens=batch.seq_lens,
         )
+        self._pending_prefill_step = None
         return batch_output
 
     def _idle_verify_ragged_layout(self, batch: ScheduleBatch):
@@ -635,6 +713,21 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
+        step = self.prepare_decode_step(batch)
+        self.forward_decode_stage(step)
+        self.accept_decode_step(step, grammar_barrier=grammar_barrier)
+        return self.commit_decode_step(step, on_publish=on_publish)
+
+    def prepare_decode_step(self, batch: ScheduleBatch) -> DSparkDecodeStep:
+        self._check_no_pending_step()
+        if not batch.forward_mode.is_decode() or not isinstance(
+            batch.spec_info, DFlashDraftInputV2
+        ):
+            raise RuntimeError("DSpark decode preparation requires a live draft batch")
+        # Preparation also borrows graph buffers and reserves KV. On failure the
+        # worker must restart instead of reusing a partially prepared window.
+        self._pending_decode_step = object()
+        draft_input = batch.spec_info
         batch.seq_lens.record_stream(
             torch.get_device_module(self.device).current_stream()
         )
@@ -730,28 +823,84 @@ class DSparkWorkerV2(BaseSpecWorker):
             and self._simulate_acc_len <= 0
             and not batch.has_grammar
         )
+        step = DSparkDecodeStep(
+            batch=batch,
+            draft_input=draft_input,
+            prefix_lens=prefix_lens,
+            verify_window=verify_window,
+            sampling_info=sampling_info,
+            proposal=proposal,
+            confidence=confidence,
+            verify_token_budget=verify_token_budget,
+            layout=layout,
+            run_compact=run_compact,
+            verify_ids_2d=verify_ids_2d,
+            grammar_tree=grammar_tree,
+            fold_eligible=fold_eligible,
+        )
+        self._pending_decode_step = step
+        return step
+
+    def _check_no_pending_step(self):
+        if (
+            self._pending_decode_step is not None
+            or self._pending_prefill_step is not None
+        ):
+            raise RuntimeError("DSpark must commit its pending step first")
+
+    def _check_decode_step(self, step):
+        if step is not self._pending_decode_step or step.committed:
+            raise RuntimeError("DSpark decode step is stale or already committed")
+
+    def forward_decode_stage(
+        self, step: DSparkDecodeStep, pp_proxy_tensors: PPProxyTensors | None = None
+    ) -> TargetVerifyResult:
+        self._check_decode_step(step)
+        if step.forward_started:
+            raise RuntimeError("DSpark decode step has already launched target verify")
+        if step.run_compact and pp_proxy_tensors is not None:
+            raise RuntimeError("DSpark pipeline stages require static verify")
+        step.forward_started = True
+        batch = step.batch
+        bs = len(step.prefix_lens)
         prepare_mamba_track_for_verify(batch)
         with self._observers.segment(InfoSegment.TARGET_VERIFY):
-            if run_compact:
+            if step.run_compact:
                 target_verify, hidden_strided = self._verify_executor.run_compact(
                     batch=batch,
-                    layout=layout,
-                    draft_block_ids=draft_block_ids,
-                    draft_tokens=draft_tokens,
+                    layout=step.layout,
+                    draft_block_ids=step.proposal.draft_block_ids,
+                    draft_tokens=step.proposal.draft_block.draft_tokens,
                     bs=bs,
-                    device=device,
-                    sampling_info=sampling_info,
-                    inject_gate=fold_eligible,
+                    device=self.device,
+                    sampling_info=step.sampling_info,
+                    inject_gate=step.fold_eligible,
                 )
             else:
                 target_verify = self._verify_executor.run_non_compact(
                     batch=batch,
-                    draft_input=draft_input,
-                    verify_ids_2d=verify_ids_2d,
-                    verify_window=verify_window,
-                    sampling_info=sampling_info,
+                    draft_input=step.draft_input,
+                    verify_ids_2d=step.verify_ids_2d,
+                    verify_window=step.verify_window,
+                    sampling_info=step.sampling_info,
+                    pp_proxy_tensors=pp_proxy_tensors,
                 )
                 hidden_strided = None
+        step.target_verify = target_verify
+        step.hidden_strided = hidden_strided
+        return target_verify
+
+    def accept_decode_step(
+        self, step: DSparkDecodeStep, *, grammar_barrier=None
+    ) -> AcceptOuts:
+        self._check_decode_step(step)
+        target_verify = step.target_verify
+        if target_verify is None or target_verify.logits_output is None:
+            raise RuntimeError("DSpark accept requires logits from the final stage")
+        if step.accept_started:
+            raise RuntimeError("DSpark decode step has already launched acceptance")
+        step.accept_started = True
+        batch = step.batch
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
 
@@ -760,28 +909,59 @@ class DSparkWorkerV2(BaseSpecWorker):
             # lines up with the logits on both verify paths.
             grammar_mask = build_grammar_vocab_mask(
                 reqs=batch.reqs,
-                tree=grammar_tree,
-                sampling_info=sampling_info,
+                tree=step.grammar_tree,
+                sampling_info=step.sampling_info,
                 device=logits_output.next_token_logits.device,
                 barrier=grammar_barrier,
             )
             if grammar_mask is not None:
                 grammar_mask.apply(logits_output.next_token_logits)
 
-        epilogue = self._verify_executor.verify_epilogue
-        folded_accept = fold_eligible and run_compact and can_run_cuda_graph
+        folded_accept = step.fold_eligible and step.run_compact and can_run_cuda_graph
         accept = self._verify_executor.accept_and_finalize(
             folded_accept=folded_accept,
-            bs=bs,
-            verify_ids_2d=verify_ids_2d,
+            bs=len(step.prefix_lens),
+            verify_ids_2d=step.verify_ids_2d,
             target_logits=logits_output.next_token_logits,
-            draft_block=draft_block,
-            sampling_info=sampling_info,
-            draft_input=draft_input,
-            layout=layout,
-            prefix_lens=prefix_lens,
-            draft_tokens=draft_tokens,
+            draft_block=step.proposal.draft_block,
+            sampling_info=step.sampling_info,
+            draft_input=step.draft_input,
+            layout=step.layout,
+            prefix_lens=step.prefix_lens,
+            draft_tokens=step.proposal.draft_block.draft_tokens,
         )
+        step.acceptance = accept
+        return accept
+
+    def commit_decode_step(
+        self,
+        step: DSparkDecodeStep,
+        *,
+        acceptance: AcceptOuts | None = None,
+        on_publish=None,
+    ) -> GenerationBatchResult:
+        """Commit local or caller-validated remote acceptance after target forward."""
+        self._check_decode_step(step)
+        if (
+            acceptance is not None
+            and step.accept_started
+            and acceptance is not step.acceptance
+        ):
+            raise RuntimeError("DSpark cannot replace local acceptance")
+        target_verify = step.target_verify
+        accept = step.acceptance if acceptance is None else acceptance
+        if target_verify is None or accept is None:
+            raise RuntimeError(
+                "DSpark commit requires target forward and final acceptance"
+            )
+        # A failed commit cannot be retried against potentially reused KV or graph
+        # buffers. Keep the step pending until the whole commit succeeds.
+        step.committed = True
+        batch = step.batch
+        logits_output = target_verify.logits_output
+        can_run_cuda_graph = target_verify.can_run_cuda_graph
+        confidence = step.confidence
+        bs = len(step.prefix_lens)
         training_capture = None
         if self.target_worker.training_capture is not None:
             training_capture = self.target_worker.training_capture.after_verify_accept(
@@ -797,66 +977,72 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         self._commit_target_mamba_states_after_verify(
             batch=batch,
-            seq_lens_pre_verify=prefix_lens,
+            seq_lens_pre_verify=step.prefix_lens,
             seq_lens_post_verify=accept.new_seq_lens,
             commit_lens=accept.commit_lens,
         )
 
+        folded_accept = step.fold_eligible and step.run_compact and can_run_cuda_graph
+        epilogue = self._verify_executor.verify_epilogue
         folded_commit = folded_accept and epilogue.folds_commit
         if not folded_commit:
             self._verify_executor.commit_target_context(
                 batch=batch,
-                layout=layout,
-                hidden_strided=hidden_strided,
-                verify_window=verify_window,
+                layout=step.layout,
+                hidden_strided=step.hidden_strided,
+                verify_window=step.verify_window,
                 logits_output=logits_output,
                 commit_lens=accept.commit_lens,
                 bs=bs,
-                run_compact=run_compact,
+                run_compact=step.run_compact,
             )
-        logits_output.hidden_states = None
-
-        self._observers.observe_verify_step(
-            forward_ct=int(batch.forward_iter),
-            reqs=batch.reqs,
-            bs=bs,
-            proposal_folded=proposal.folded,
-            verify_ids_2d=verify_ids_2d,
-            target_logits=logits_output.next_token_logits,
-            layout=layout,
-            confidence=confidence,
-            prefix_lens=prefix_lens,
-            draft_tokens=draft_tokens,
-            draft_block=draft_block,
-            sampling_info=sampling_info,
-            correct_len=accept.correct_len,
-            cap_trim_lens=accept.cap_trim_lens,
-            bonus=accept.bonus,
-            commit_lens=accept.commit_lens,
-            verify_token_budget=verify_token_budget,
-            req_pool_indices=batch.req_pool_indices,
-            verify_tier_num_tokens=int(batch.spec_verify_tier_num_tokens),
-            dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
-        )
+        if logits_output is not None:
+            logits_output.hidden_states = None
+            self._observers.observe_verify_step(
+                forward_ct=int(batch.forward_iter),
+                reqs=batch.reqs,
+                bs=bs,
+                proposal_folded=step.proposal.folded,
+                verify_ids_2d=step.verify_ids_2d,
+                target_logits=logits_output.next_token_logits,
+                layout=step.layout,
+                confidence=confidence,
+                prefix_lens=step.prefix_lens,
+                draft_tokens=step.proposal.draft_block.draft_tokens,
+                draft_block=step.proposal.draft_block,
+                sampling_info=step.sampling_info,
+                correct_len=accept.correct_len,
+                cap_trim_lens=accept.cap_trim_lens,
+                bonus=accept.bonus,
+                commit_lens=accept.commit_lens,
+                verify_token_budget=step.verify_token_budget,
+                req_pool_indices=batch.req_pool_indices,
+                verify_tier_num_tokens=int(batch.spec_verify_tier_num_tokens),
+                dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
+            )
 
         next_draft_input = make_next_draft_input(
             bonus_tokens=accept.bonus,
             new_seq_lens=accept.new_seq_lens,
         )
-        return GenerationBatchResult(
+        result = GenerationBatchResult(
             logits_output=logits_output,
             training_capture=training_capture,
             next_token_ids=accept.out_tokens.reshape(-1),
             accept_lens=accept.commit_lens,
             block_accept_lens=accept.commit_lens + accept.cap_trim_lens,
             cap_lens=(
-                layout.verify_lens.to(torch.int32) if layout is not None else None
+                step.layout.verify_lens.to(torch.int32)
+                if step.layout is not None
+                else None
             ),
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=accept.new_seq_lens,
         )
+        self._pending_decode_step = None
+        return result
 
     def _commit_target_mamba_states_after_verify(
         self,

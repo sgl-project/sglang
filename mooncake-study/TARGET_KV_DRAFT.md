@@ -199,6 +199,50 @@ activation transport, accepted-token propagation, shared embedding/output-head
 availability and request-state alignment remain required before enabling PP.
 See [the reproduction commands](experiments/PIPELINE_KV.md).
 
+### Pipeline Execution Phases Prerequisite
+
+`DSparkWorkerV2` exposes stage operations for a future PP scheduler. Its existing
+single-stage entry point calls them in order, preserving the ordinary serving
+path:
+
+- `forward_prefill_stage(batch, pp_proxy_tensors)` executes the local target
+  stage and returns its output/activation without projecting draft context.
+  `commit_prefill_stage(batch, result, next_token_ids=...)` consumes the final
+  stage's sample and initializes draft state after target KV is available.
+- `prepare_decode_step(batch)` reserves the local verify window, prepares draft
+  context, proposes tokens and plans verification. It returns a worker-owned
+  `DSparkDecodeStep` holding the batch and live graph-buffer references.
+- `forward_decode_stage(step, pp_proxy_tensors)` executes target verification
+  and preserves raw capture before sampling adjustments. Non-final stages return
+  `TargetVerifyResult.pp_proxy_tensors` without requiring local logits.
+- `accept_decode_step(step, grammar_barrier=...)` applies grammar constraints and
+  acceptance on the final stage. `commit_decode_step(step, acceptance=...)`
+  consumes that result, records accepted capture, publishes lengths and projects
+  accepted target context using this stage's local slots.
+
+Only one prefill or decode step may be outstanding on a worker. Its buffers may
+not be reused until commit succeeds. Duplicate, foreign or out-of-order calls
+fail; a failed preparation, forward, acceptance or commit leaves the worker
+unavailable for reuse. Recovery requires the existing worker failure/restart
+path, not retrying a partially executed step. An explicit remote acceptance
+cannot overwrite a local acceptance attempt. These are synchronous ownership checks, not a
+multi-microbatch buffer allocator or a wire protocol.
+
+The static target-KV path separates activation production from cross-stage
+projection. Existing single-stage hidden-input compact graphs may already fold
+acceptance/projection into their graph epilogue; they retain that behavior and
+are not a PP execution path. Passing a PP activation to compact verification is
+rejected. The scheduler must align requests/proposals and deliver activations to
+all target stages before entering collective commit, and must validate remote
+acceptance against its request/step identity before calling this trusted worker
+API. Neither projection nor commit may be inserted before forwarding a PP frame
+that another participating rank is waiting for.
+
+The serving gates remain closed. Wiring the PP loop to these phases, synchronizing
+proposals, exposing shared embedding/output-head modules and validating actual
+multi-GPU speculative serving remain required. See
+[the phase test runbook](experiments/PIPELINE_PHASES.md).
+
 ### Pipeline Result Relay Prerequisite
 
 The existing PP output channel now has a DSpark result codec. Its versioned
