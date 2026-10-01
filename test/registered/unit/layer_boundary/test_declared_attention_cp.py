@@ -17,9 +17,7 @@ import torch
 
 from sglang.srt.layers import layer_boundary as comm
 from sglang.srt.layers import layernorm_sp
-from sglang.srt.layers.layer_boundary.adapters import (
-    context_parallel as dsa_token_shard,
-)
+from sglang.srt.layers.layer_boundary.adapters import context_parallel as dsa_cp
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.test.boundary_fixtures import finish_exit, make_test_stages, prepare_input
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -106,7 +104,7 @@ class TestAttentionCpBoundary(CustomTestCase):
         with ExitStack() as stack:
             for target, value in [
                 ((comm, "get_parallel"), lambda: parallel),
-                ((dsa_token_shard, "get_parallel"), lambda: parallel),
+                ((dsa_cp, "get_parallel"), lambda: parallel),
                 ((comm, "is_dsa_enable_prefill_cp"), lambda: True),
                 ((comm, "is_mla_cp_enabled"), lambda: False),
                 (
@@ -146,15 +144,12 @@ class TestAttentionCpBoundary(CustomTestCase):
                 ((comm, "use_symmetric_memory"), lambda *a, **k: nullcontext()),
                 ((comm, "is_allocation_symmetric"), lambda: False),
                 (
-                    (dsa_token_shard, "get_local_dp_buffer"),
+                    (dsa_cp, "get_local_dp_buffer"),
                     lambda g: torch.empty(ROWS * CP_SIZE, HIDDEN).double(),
                 ),
+                ((dsa_cp, "attn_cp_all_gather_into_tensor"), collectives["gather"]),
                 (
-                    (dsa_token_shard, "attn_cp_all_gather_into_tensor"),
-                    collectives["gather"],
-                ),
-                (
-                    (dsa_token_shard, "attn_cp_reduce_scatter_tensor"),
+                    (dsa_cp, "attn_cp_reduce_scatter_tensor"),
                     collectives["reduce_scatter"],
                 ),
             ]:

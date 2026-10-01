@@ -190,8 +190,8 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         # Without a DP gather in the graph, an eager idle rank matches the
         # replaying peers, so the sparse batch keeps per-rank buckets.
         runner = self._make_runner()
-        flags, a2a, dsa_token_shard, mla_cp = self._megamoe_no_prefill_cp()
-        with flags, a2a, dsa_token_shard, mla_cp:
+        flags, a2a, dsa_cp, mla_cp = self._megamoe_no_prefill_cp()
+        with flags, a2a, dsa_cp, mla_cp:
             self.assertTrue(prefill_graph_tolerates_sum_len())
             self.assertFalse(
                 runner._has_inactive_dp_rank(
@@ -201,8 +201,8 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
 
     def test_megamoe_all_ranks_busy_keeps_per_rank_buckets(self):
         runner = self._make_runner()
-        flags, a2a, dsa_token_shard, mla_cp = self._megamoe_no_prefill_cp()
-        with flags, a2a, dsa_token_shard, mla_cp:
+        flags, a2a, dsa_cp, mla_cp = self._megamoe_no_prefill_cp()
+        with flags, a2a, dsa_cp, mla_cp:
             self.assertTrue(prefill_graph_tolerates_sum_len())
             self.assertFalse(
                 runner._has_inactive_dp_rank(
@@ -214,10 +214,10 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         # A DP gather captured in the graph has fixed MAX_LEN geometry; per-rank
         # buckets or an eager idle rank would deadlock its all_gather.
         runner = self._make_runner()
-        flags, a2a, dsa_token_shard, mla_cp = self._megamoe_no_prefill_cp(
+        flags, a2a, dsa_cp, mla_cp = self._megamoe_no_prefill_cp(
             graph_has_dp_gather=True
         )
-        with flags, a2a, dsa_token_shard, mla_cp:
+        with flags, a2a, dsa_cp, mla_cp:
             self.assertFalse(prefill_graph_tolerates_sum_len())
             self.assertTrue(
                 runner._has_inactive_dp_rank(

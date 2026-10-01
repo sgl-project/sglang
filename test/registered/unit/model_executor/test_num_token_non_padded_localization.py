@@ -165,14 +165,14 @@ class TestMoeNumTokenNonPaddedTable(CustomTestCase):
         """A CP prefill must route every row: DSA / MLA CP put a MoE on the
         FFN rows but all-gather across CP, which zigzag-permutes the real rows."""
         for sharded in (False, True):
-            for dsa_token_shard, mla_cp in ((True, False), (False, True)):
+            for dsa_cp, mla_cp in ((True, False), (False, True)):
                 with (
-                    self.subTest(sharded=sharded, dsa_token_shard=dsa_token_shard),
+                    self.subTest(sharded=sharded, dsa_cp=dsa_cp),
                     get_parallel().override(attn_dp_size=1, attn_cp_size=2),
                     sparse_moe_input("ffn"),
                     patch(
                         "sglang.srt.layers.attention.dsa.utils.dsa_use_prefill_cp",
-                        return_value=dsa_token_shard,
+                        return_value=dsa_cp,
                     ),
                     patch(
                         "sglang.srt.layers.cp.utils.is_mla_cp_active",

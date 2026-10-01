@@ -103,7 +103,7 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                 )
                 # Note(kpham-sgl): Keep attn_tp_size == 1 under DSA CP.
                 # The DSA / MLA CP gather and reduce-scatter
-                # (the dsa_token_shard_* helpers in adapters/context_parallel.py) assume it.
+                # (the dsa_cp_* helpers in adapters/context_parallel.py) assume it.
                 attn_cp_size = cfg.tp_size // cfg.dp_size
                 overrides["attn_cp_size"] = attn_cp_size
                 logger.warning(
@@ -168,7 +168,7 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
             )
             # FIXME(kpham-sgl): Keep attn_tp_size == 1 under MLA CP.
             # The DSA / MLA CP gather and reduce-scatter
-            # (the dsa_token_shard_* helpers in adapters/context_parallel.py) assume it.
+            # (the dsa_cp_* helpers in adapters/context_parallel.py) assume it.
             attn_cp_size = cfg.tp_size // cfg.dp_size
             overrides["attn_cp_size"] = attn_cp_size
             logger.warning(

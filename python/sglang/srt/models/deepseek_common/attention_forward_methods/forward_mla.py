@@ -108,7 +108,7 @@ if _is_cuda:
     from sglang.kernels.ops.gemm import bmm_fp8
 
 
-def should_defer_dsa_token_shard_kv_gather(
+def should_defer_dsa_cp_kv_gather(
     *,
     dsa_prefill_cp: bool,
     fuse_rope_for_trtllm_mla: bool,

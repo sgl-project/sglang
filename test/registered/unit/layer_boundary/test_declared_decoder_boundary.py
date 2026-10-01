@@ -101,12 +101,12 @@ def planning(
     *,
     sp=False,
     a2a=False,
-    dsa_token_shard=False,
+    dsa_cp=False,
     boundary_reduction="rs+rsv",
 ):
     """What layer planning and communicator construction read, without the
     process-wide parallel state. ``parallel`` may be a callable, for a
-    per-thread parallel state. ``dsa_token_shard``: the prefill CP is DSA's (MLA's is
+    per-thread parallel state. ``dsa_cp``: the prefill CP is DSA's (MLA's is
     the same to the communicator)."""
     get_parallel = parallel if callable(parallel) else (lambda: parallel)
 
@@ -115,7 +115,7 @@ def planning(
 
     with (
         patch_communicator("get_parallel", get_parallel),
-        patch_communicator("is_dsa_enable_prefill_cp", lambda: dsa_token_shard),
+        patch_communicator("is_dsa_enable_prefill_cp", lambda: dsa_cp),
         patch_communicator("is_mla_cp_enabled", lambda: False),
         patch_communicator(
             "get_moe_cp_size",
@@ -189,14 +189,14 @@ def build(
     *,
     sp=False,
     a2a=False,
-    dsa_token_shard=False,
+    dsa_cp=False,
     **kwargs,
 ):
     with planning(
         parallel,
         sp=sp,
         a2a=a2a,
-        dsa_token_shard=dsa_token_shard,
+        dsa_cp=dsa_cp,
         boundary_reduction=kwargs.pop("boundary_reduction", "rs+rsv"),
     ):
         return make_test_stages(
@@ -284,13 +284,7 @@ class TestStageLayoutSelection(CustomTestCase):
 
 
 def build_mhc(
-    facts,
-    parallel,
-    *,
-    a2a=False,
-    dsa_token_shard=False,
-    two_batch_overlap=False,
-    **kwargs,
+    facts, parallel, *, a2a=False, dsa_cp=False, two_batch_overlap=False, **kwargs
 ):
     overlap = SimpleNamespace(
         comm=SimpleNamespace(
@@ -299,7 +293,7 @@ def build_mhc(
         overlap=SimpleNamespace(enable_two_batch_overlap=two_batch_overlap),
     )
     with (
-        planning(parallel, a2a=a2a, dsa_token_shard=dsa_token_shard),
+        planning(parallel, a2a=a2a, dsa_cp=dsa_cp),
         patch_communicator("get_exec", lambda: overlap),
     ):
         mhc = mhc_module.MHCState(
@@ -586,10 +580,10 @@ class TestMhcOnTheDeclarations(CustomTestCase):
         )
         facts = layer_case(1, 3, sparse=True, previous_sparse=False)
         with self.assertRaises(NotImplementedError):
-            build_mhc(facts, parallel, dsa_token_shard=True)
+            build_mhc(facts, parallel, dsa_cp=True)
         # A dense layer on every rank computes on its own shard: nothing moves.
         facts = layer_case(1, 3, sparse=False, previous_sparse=False)
-        build_mhc(facts, parallel, dsa_token_shard=True)
+        build_mhc(facts, parallel, dsa_cp=True)
 
     def test_input_scattered_attention_under_attention_cp_is_rejected(self):
         scattered = dict(enable_attn_tp_input_scattered=True)
@@ -1078,11 +1072,11 @@ class TestPrefillCP(CustomTestCase):
             **overrides,
         )
 
-    def test_a_dsa_token_shard_extend_leaves_its_sum_to_the_reduce_scatter(self):
+    def test_a_dsa_cp_extend_leaves_its_sum_to_the_reduce_scatter(self):
         # A MoE on the TP group, as under DSA interleave CP without a2a.
         parallel = self.dsa_parallel()
         facts = layer_case(1, 3, sparse=True, previous_sparse=False)
-        communicator = build(facts, parallel, dsa_token_shard=True)
+        communicator = build(facts, parallel, dsa_cp=True)
         cp, ordinary = (
             communicator.ffn.plan.paths.get(BatchVariant.CONTEXT_PARALLEL),
             communicator.ffn.plan.paths.get(BatchVariant.ORDINARY),
@@ -1137,7 +1131,7 @@ class TestPrefillCP(CustomTestCase):
                         leaves,
                     )
 
-    def test_dsa_token_shard_asks_its_own_predicates_for_a_cp_extend(self):
+    def test_dsa_cp_asks_its_own_predicates_for_a_cp_extend(self):
         def batch(cp_extend):
             return SimpleNamespace(
                 forward_mode=SimpleNamespace(
@@ -1145,7 +1139,7 @@ class TestPrefillCP(CustomTestCase):
                 )
             )
 
-        with planning(self.dsa_parallel(), dsa_token_shard=True):
+        with planning(self.dsa_parallel(), dsa_cp=True):
             for cp_extend, active, shards in (
                 (True, True, True),
                 (True, False, False),
@@ -1160,10 +1154,10 @@ class TestPrefillCP(CustomTestCase):
                         comm_layout._batch_shards_over_cp(batch(cp_extend)), shards
                     )
 
-    def test_dsa_token_shard_dense_layers_run_on_their_shard(self):
+    def test_dsa_cp_dense_layers_run_on_their_shard(self):
         parallel = self.dsa_parallel()
         facts = layer_case(1, 3, sparse=False, previous_sparse=False)
-        communicator = build(facts, parallel, dsa_token_shard=True)
+        communicator = build(facts, parallel, dsa_cp=True)
         for steps in (
             communicator.ffn.plan.paths.get(BatchVariant.ORDINARY),
             communicator.ffn.plan.paths.get(BatchVariant.CONTEXT_PARALLEL),
@@ -1248,12 +1242,12 @@ class TestPrefillCP(CustomTestCase):
         self.assertIs(chunk.keywords["fusions"][0].func, fused_ffn_input)
         self.assertEqual(chunk.keywords["fusions"][0].args, (communicator.ffn.plan,))
 
-    def cp_outcome(self, parallel, *, sparse=True, a2a=False, dsa_token_shard=False):
+    def cp_outcome(self, parallel, *, sparse=True, a2a=False, dsa_cp=False):
         """A layer under attention CP: "cp steps" for the batches that shard
         their tokens, "ordinary" when no batch does, or "refused"."""
         facts = layer_case(1, 3, sparse=sparse, previous_sparse=sparse)
         try:
-            layer = build(facts, parallel, a2a=a2a, dsa_token_shard=dsa_token_shard)
+            layer = build(facts, parallel, a2a=a2a, dsa_cp=dsa_cp)
         except NotImplementedError:
             return "refused"
         return (
@@ -1267,17 +1261,12 @@ class TestPrefillCP(CustomTestCase):
         moe_dp_eq_cp = dict(attn_cp=2, enable_prefill_cp=True, moe_dp_size=2)
         dense = dict(sparse=False)
         for expected, name, parallel, kwargs in (
-            (
-                "cp steps",
-                "DSA or MLA CP",
-                self.dsa_parallel(),
-                dict(dsa_token_shard=True),
-            ),
+            ("cp steps", "DSA or MLA CP", self.dsa_parallel(), dict(dsa_cp=True)),
             (
                 "cp steps",
                 "DSA or MLA CP, an a2a MoE under attention DP",
                 parallel_of(**dp_cp, moe_dense_tp_size=1),
-                dict(dsa_token_shard=True, a2a=True),
+                dict(dsa_cp=True, a2a=True),
             ),
             ("cp steps", "prefill CP", self.cp_parallel(), dense),
             ("cp steps", "CP under attention DP", parallel_of(**dp_cp), dense),
@@ -1315,7 +1304,7 @@ class TestPrefillCP(CustomTestCase):
                 "refused",
                 "DSA or MLA CP, MoE DP equal to CP",
                 self.dsa_parallel(moe_dp_size=2, moe_tp_size=1),
-                dict(dsa_token_shard=True),
+                dict(dsa_cp=True),
             ),
             (
                 "refused",
