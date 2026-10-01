@@ -1168,6 +1168,24 @@ class TestPrefillCP(CustomTestCase):
             self.assertIsNone(steps.output.group)
             self.assertIs(steps.output_move, keep_output)
 
+    def test_cp8_ep8_keeps_moe_rows_scattered(self):
+        parallel = parallel_of(
+            attn_dp=1,
+            attn_tp=1,
+            attn_cp=8,
+            enable_prefill_cp=True,
+            moe_dense_tp_size=1,
+            moe_ep_size=8,
+            moe_tp_size=1,
+        )
+        layer = build(layer_case(1, 3, sparse=True), parallel, a2a=True, dsa_cp=True)
+        cp = layer.ffn.plan.paths[BatchVariant.CONTEXT_PARALLEL]
+        self.assertEqual(cp.entry.input_rows.sharded, {TokenAxis.ATTN_CP})
+        self.assertEqual(cp.output.layout.sharded, {TokenAxis.ATTN_CP})
+        self.assertIsNone(cp.output.group)
+        self.assertIs(cp.output_move, keep_output)
+        self.assertIs(cp.entry.prepare.keywords["step"].func, comm_ops._update_read)
+
     def test_a_cp_extend_gathers_over_cp_and_takes_its_chunk_back(self):
         communicator = build(layer_case(1, 3), self.cp_parallel())
         cp = communicator.ffn.plan.paths.get(BatchVariant.CONTEXT_PARALLEL)
