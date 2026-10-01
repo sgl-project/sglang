@@ -41,10 +41,10 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-# Register for AMD CI - DeepSeek-V4.1-Flash accuracy test on MI35x (~90 min:
-# checkpoint download and load, graph capture, then 1319 GSM8K questions at TP4)
+# Register for AMD CI - DeepSeek-V4.1-Flash accuracy test on MI35x (~18 min in
+# run 36797490320: ~16 min of server startup, then 1319 GSM8K questions in ~1 min)
 register_amd_ci(
-    est_time=5400, suite="nightly-amd-4-gpu-mi35x-deepseek-v41-flash", nightly=True
+    est_time=1200, suite="nightly-amd-4-gpu-mi35x-deepseek-v41-flash", nightly=True
 )
 
 DEEPSEEK_V41_FLASH_MODEL_PATH = os.environ.get(
