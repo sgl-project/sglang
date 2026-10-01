@@ -39,7 +39,9 @@ def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
         elif get_platform().is_xpu:
             overrides["attention_backend"] = "intel_xpu"
         elif get_platform().is_hip:
-            overrides["attention_backend"] = "aiter"
+            overrides["attention_backend"] = (
+                "aiter" if envs.SGLANG_USE_AITER.get() else "triton"
+            )
         elif not (is_mps() and use_mlx()):
             # Exempt MLX only -- it owns attention in its own runner.  macOS
             # without MLX still falls through to triton and fails fast below,
@@ -93,6 +95,17 @@ def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
             ## callers default to INTERLEAVE; opt this path out
             ## unless the user explicitly overrode it.
             # envs.SGLANG_USE_AITER_MOE_GU_ITLV.set(False)
+        elif (
+            get_platform().is_hip
+            and is_mxfp4_quant_format
+            and cfg.ep_size == 1
+            and is_triton_kernels_available()
+        ):
+            overrides["moe_runner_backend"] = "triton_kernel"
+            logger.warning(
+                "Detected ROCm without AITER and MXFP4 quantization for GPT-OSS, "
+                "enabling the triton_kernels MoE kernel."
+            )
         elif get_platform().is_hip and envs.SGLANG_USE_AITER.get():
             # For GPT-OSS bf16 on ROCm with aiter, use triton backend
             # because aiter CK kernel doesn't support all GEMM dimensions
