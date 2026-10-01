@@ -70,7 +70,6 @@ class DbrxRouter(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.tp_size = get_parallel().tp_size
         self.num_total_experts = config.ffn_config.moe_num_experts
         self.d_model = config.d_model
         self.layer = ReplicatedLinear(
@@ -97,6 +96,7 @@ class DbrxExperts(nn.Module):
     def __init__(
         self,
         config: DbrxConfig,
+        layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         params_dtype: Optional[torch.dtype] = None,
         prefix: str = "",
@@ -115,6 +115,7 @@ class DbrxExperts(nn.Module):
         self.router = DbrxRouter(config, self.params_dtype)
         self.topk = TopK(
             self.top_k,
+            layer_id=layer_id,
             renormalize=True,
         )
         self.moe_runner_config = MoeRunnerConfig(inplace=True)
@@ -242,7 +243,6 @@ class DbrxAttention(nn.Module):
         )
 
         tp_world_size = get_parallel().tp_size
-        self.tp_size = tp_world_size
         assert self.total_num_heads % tp_world_size == 0
         self.num_heads = self.total_num_heads // tp_world_size
         if self.total_num_kv_heads >= tp_world_size:
@@ -336,7 +336,7 @@ class DbrxBlock(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("norm_attn_norm", prefix),
         )
-        self.ffn = DbrxExperts(config, quant_config=quant_config)
+        self.ffn = DbrxExperts(config, layer_id, quant_config=quant_config)
 
     def forward(
         self,

@@ -183,7 +183,7 @@ class BailingMoEModelNextN(nn.Module):
 
         hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
         if not forward_batch.forward_mode.is_idle():
-            hidden_states = residual_batch.norm(
+            hidden_states = residual_batch.final_norm(
                 hidden_states, forward_batch, self.final_layernorm
             )
 
@@ -219,7 +219,6 @@ class BailingMoeForCausalLMNextN(nn.Module):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
-        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.num_fused_shared_experts = 0
         is_bailing_moe_v3 = _is_bailing_moe_v3_config(config)

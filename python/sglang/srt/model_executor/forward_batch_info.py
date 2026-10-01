@@ -43,6 +43,7 @@ from sglang.srt.environ import envs
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     compute_req_all_ids_info,
 )
+from sglang.srt.layers.dcp.layout import localize_dcp_indices
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     dp_slot_in,
@@ -189,6 +190,21 @@ def _elastic_should_preserve_local_token_counts(
 
     uneven_token_count = len(set(global_num_tokens)) > 1
     return uneven_token_count
+
+
+def _localize_npu_dcp_out_cache_loc(
+    out_cache_loc: torch.Tensor,
+    *,
+    interleave_size: int,
+) -> torch.Tensor:
+    """Map allocator-global NPU DCP slots to this target rank."""
+    parallel = get_parallel()
+    return localize_dcp_indices(
+        out_cache_loc,
+        parallel.dcp_size,
+        parallel.dcp_rank,
+        interleave_size,
+    )
 
 
 class ForwardMode(IntEnum):
@@ -505,6 +521,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # The sum of all sequence lengths
     seq_lens_sum: int
 
+    # Allocator-global output slots before NPU DCP localizes ``out_cache_loc``.
+    # DSA's replicated indexer cache uses the global slot identity.
+    origin_out_cache_loc: Optional[torch.Tensor] = None
+
     # === Borrowed from ScheduleBatch: GPU tensors (cross-stream; clone targets for stream isolation) ===
     # FIXME(lsyin): these are currently aliased by reference from ScheduleBatch. Once
     # they are cloned/relayed into FB-owned copies at the boundary, move them out of
@@ -680,6 +700,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # === Runtime-filled (set during the forward pass / cuda graph / managers; not at construction) ===
     # Preallocated piecewise-graph attention output, set by RadixAttention.
     _attn_output: Optional[torch.Tensor] = None
+
+    # Decode-graph-owned destination for AuxHiddenStatePacker; None when eager.
+    aux_hidden_states_buffer: Optional[torch.Tensor] = None
 
     # Prefill body-CUDA-graph context limit. Attention backends that allocate
     # context-shaped metadata use this fixed maximum instead of deriving a
@@ -1022,6 +1045,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             spec_info=batch.spec_info,
         )
 
+        # ScheduleBatch and req_to_token keep allocator-global slot identities.
+        # Preserve that view before exposing rank-local NPU DCP write slots.
+        if _is_npu and get_parallel().dcp_enabled and not model_runner.is_draft_worker:
+            ret.origin_out_cache_loc = ret.out_cache_loc
+            if ret.out_cache_loc is not None:
+                ret.out_cache_loc = _localize_npu_dcp_out_cache_loc(
+                    ret.out_cache_loc,
+                    interleave_size=model_runner.page_size,
+                )
         ret._maybe_init_non_generation_fields(batch)
 
         device = model_runner.device
@@ -1154,7 +1186,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # Init lora information
         if (
             model_runner.lora_manager is not None
-            and not model_runner.lora_manager.enable_dp_attention
+            and not model_runner.lora_manager.attn_dp_enabled
         ):
             # In the non-LoRA overlap loading case, we fetch LoRA adapters into the memory pool
             # as a batch, right before running the batch
@@ -1163,13 +1195,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
             model_runner.lora_manager.prepare_lora_batch(ret)
 
-        if (
-            model_runner.attn_dcp_size > 1
-            and ret.out_cache_loc is not None
-            and is_hip()
-        ):
+        parallel = get_parallel()
+        if parallel.attn_dcp_size > 1 and ret.out_cache_loc is not None and is_hip():
             ret.dcp_kv_mask = (
-                ret.positions % model_runner.attn_dcp_size == model_runner.attn_dcp_rank
+                ret.positions % parallel.attn_dcp_size == parallel.attn_dcp_rank
             )
 
         return ret
@@ -1257,7 +1286,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     def moe_num_token_non_padded(self) -> Optional[torch.Tensor]:
         """Bound for masking a sparse MoE's padded rows, or None when the MoE
         input is a gathered buffer whose real rows are not a prefix of it."""
-        from sglang.srt.layers.layer_boundary import moe_cp_gathers_sparse_moe_input
+        from sglang.srt.layers.layer_boundary import batch_gathers_over_moe_cp
         from sglang.srt.layers.moe.utils import is_moe_input_scattered_across_dp_ranks
 
         if self.num_token_non_padded is None:
@@ -1266,7 +1295,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if is_moe_input_scattered_across_dp_ranks():
             # a2a dispatch, FP4 all-gather and dwdp all route the local shard.
             return self.num_token_non_padded
-        if moe_cp_gathers_sparse_moe_input(self):
+        if batch_gathers_over_moe_cp(self):
             return None
         # DSA / MLA CP all-gather across attention CP on a prefill, which leaves
         # the real rows zigzag-permuted rather than in a prefix.
@@ -1817,6 +1846,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
         self.out_cache_loc = self._pad_tensor_to_size(self.out_cache_loc, num_tokens)
+        if self.origin_out_cache_loc is not None:
+            self.origin_out_cache_loc = self._pad_tensor_to_size(
+                self.origin_out_cache_loc, num_tokens
+            )
         if self.encoder_lens is not None:
             self.encoder_lens = self._pad_tensor_to_size(self.encoder_lens, bs)
         self.positions = self._pad_tensor_to_size(self.positions, num_tokens)
@@ -2083,6 +2116,7 @@ def build_inner_fb_view(
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         # A caller may hand in another view that does not carry this field.
         out_cache_loc_virtual=getattr(forward_batch, "out_cache_loc_virtual", None),
+        origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
         spec_info=forward_batch.spec_info,
     )

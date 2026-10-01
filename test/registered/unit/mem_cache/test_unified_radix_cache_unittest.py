@@ -4770,9 +4770,9 @@ class UnifiedRadixCacheSuite:
         after = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
         self.assertEqual(after.full_kv_hit_length, len(seq))
         self.assertEqual(len(after.device_indices), len(seq))
-        cons.storage_metrics_collector.log_storage_prefetch_unfulfilled_tokens.assert_called_once_with(
-            len(seq), "device_covered"
-        )
+        # Only the fetched SWA tail made the resident FULL reusable.
+        self.assertEqual((req.storage_hit_start, req.storage_hit_length), (0, len(seq)))
+        cons.storage_metrics_collector.log_storage_prefetch_unfulfilled_tokens.assert_not_called()
         cons.sanity_check()
 
     def test_buffer_only_load_back_reuses_partial_masked_full(self):
