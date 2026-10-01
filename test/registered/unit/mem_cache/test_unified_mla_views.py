@@ -384,8 +384,8 @@ class TestTranslateKvLoc(unittest.TestCase):
             self.assertTrue(bool((got == 0).all()), f"ps={ps}: {got}")
 
     def test_an_out_of_range_loc_lands_on_the_sink(self):
-        """A misuse -- re-running a full->swa map on already-translated ids --
-        indexes past the table; the read must resolve, not fault."""
+        """An id past the v2p table resolves to the sink instead of reading
+        out of bounds."""
         for ps in (1, 4):
             alloc = self._build(ps=ps)
             self.assertIsNotNone(alloc.alloc(4 * ps))

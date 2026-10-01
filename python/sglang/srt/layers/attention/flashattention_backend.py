@@ -788,9 +788,10 @@ class FlashAttentionBackend(AttentionBackend):
                 "full-CG prefill SWA write-location buffer",
             )
             # Under the unified pool `out_cache_loc` was rebound to FULL-side
-            # KERNEL-FACING ids at ForwardBatch construction, so the full->swa
-            # map cannot be re-run on it -- those values index past the swa v2p
-            # table and resolve to the sink, silently. Phase 2 of the write
+            # physical ids at ForwardBatch construction, so the full->swa map
+            # cannot be re-run on it: a full physical page number is also a
+            # valid virtual page of the swa v2p, so the map would silently
+            # resolve it to an unrelated token's swa slot. Phase 2 of the write
             # contract derives the swa loc from them instead.
             swa_write_loc = (
                 self.kv_index_translator.sliding_window_write_loc_for(
