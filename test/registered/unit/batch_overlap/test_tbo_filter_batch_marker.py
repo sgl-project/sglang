@@ -75,6 +75,10 @@ class TestTboFilterBatchMarker(CustomTestCase):
     def test_filter_batch_resets_plan_marker_on_children(self):
         child = _filter(_make_target_verify_batch(8), lo=0, hi=4)
         self.assertEqual(child.batch_size, 4)
+        self.assertFalse(child.forward_metadata_ready)
+        self.assertIsNone(child.forward_metadata_planned_bs)
+        self.assertIsNone(child.forward_metadata_planned_num_tokens)
+        self.assertFalse(child.forward_metadata_replan_equivalent)
 
     def test_a_rebound_parent_hands_its_mark_to_the_child(self):
         parent = _make_target_verify_batch(8)
@@ -85,10 +89,6 @@ class TestTboFilterBatchMarker(CustomTestCase):
     def test_an_untranslated_parent_stays_unmarked(self):
         child = _filter(_make_target_verify_batch(8), lo=0, hi=4)
         self.assertFalse(child.out_cache_loc_is_physical)
-        self.assertFalse(child.forward_metadata_ready)
-        self.assertIsNone(child.forward_metadata_planned_bs)
-        self.assertIsNone(child.forward_metadata_planned_num_tokens)
-        self.assertFalse(child.forward_metadata_replan_equivalent)
 
     def test_pre_planned_parent_does_not_leak_ready_into_children(self):
         parent = _make_target_verify_batch(8)
