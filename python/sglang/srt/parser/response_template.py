@@ -414,7 +414,6 @@ class ResponseTemplateReasoningDetector:
     _default_think_end = ""
     thinks_internally = False
     reasoning_default = "explicit_enable_thinking"
-    # Open grammar-held output at the message start with the reasoning.
     grammar_requires_reasoning = False
 
     def __init__(
@@ -499,8 +498,6 @@ class ResponseTemplateReasoningDetector:
     def answer_rest_structural_tag(self, prefix: str) -> dict[str, Any] | None:
         """A structural tag for the rest of an answer that `prefix` leaves open,
         or `None` if it leaves none open."""
-        if self._content_field is None:
-            return None
         parser = ResponseParser(self.response_template, prefix=prefix)
         regions = [
             (event.get("field"), event["type"])
@@ -587,9 +584,7 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
     """Tool-call detector driven by a `response_template` grammar."""
 
     response_template: dict | None = None
-    # Hold turns nothing else constrains to the template's grammar.
     constrains_every_turn = False
-    # Open grammar-held output at the message start with the reasoning.
     grammar_requires_reasoning = False
 
     def __init__(

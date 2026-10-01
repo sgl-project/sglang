@@ -475,19 +475,16 @@ class OpenAIServingChat(OpenAIServingBase):
         Returns:
             Updated prompt_ids with assistant prefix appended
         """
-        tokenizer = self.tokenizer_manager.tokenizer
         detector = self._reasoning_detector
         if isinstance(detector, ResponseTemplateReasoningDetector):
-            # The generation prompt only starts the message, so the continued
-            # text resumes inside the template's answer.
-            prompt = tokenizer.decode(
+            prompt = self.tokenizer_manager.tokenizer.decode(
                 prompt_ids,
                 skip_special_tokens=False,
                 spaces_between_special_tokens=False,
             )
             assistant_prefix = detector.answer_opener(prompt) + assistant_prefix
-        encoded = tokenizer.encode(assistant_prefix)
-        if encoded and encoded[0] == tokenizer.bos_token_id:
+        encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
+        if encoded and encoded[0] == self.tokenizer_manager.tokenizer.bos_token_id:
             encoded = encoded[1:]
         return prompt_ids + encoded
 
@@ -1540,7 +1537,6 @@ class OpenAIServingChat(OpenAIServingBase):
         return text[: -len(closer)] if trim else text
 
     def _template_turn_grammar(self) -> bool:
-        """Whether turns nothing else constrains take the template's grammar."""
         tool_detector = FunctionCallParser.ToolCallParserEnum.get(self.tool_call_parser)
         return (
             envs.SGLANG_RESPONSE_TEMPLATE_TURN_GRAMMAR.get()
@@ -1570,10 +1566,7 @@ class OpenAIServingChat(OpenAIServingBase):
         is_multimodal: bool,
         output_constrained: bool = False,
     ) -> MessageProcessingResult:
-        """Process chat messages and apply chat template.
-
-        `output_constrained` marks output that a constraint outside `request`
-        holds, such as a Responses `text.format`."""
+        """Process chat messages and apply chat template"""
         if self.default_chat_template_kwargs:
             ctk = dict(request.chat_template_kwargs or {})
             for k, v in self.default_chat_template_kwargs.items():
