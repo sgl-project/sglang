@@ -872,6 +872,52 @@ class GroupCoordinator:
         )
         return fused_outputs
 
+    def fused_allreduce_mhc_post(
+        self,
+        input_: torch.Tensor,
+        residual: torch.Tensor,
+        post_layer_mix: torch.Tensor,
+        comb_res_mix: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Fused all-reduce + mHC post via the aiter custom all-reduce: writes
+        ``residual`` combined through ``comb_res_mix`` plus the reduced
+        ``input_`` spread by ``post_layer_mix`` into new streams. ROCm/HIP only;
+        None when the communicator cannot take the input."""
+        ca_comm = self.ca_comm
+        if (
+            ca_comm is None
+            or getattr(ca_comm, "disabled", True)
+            or not hasattr(ca_comm, "_pool")
+            or not ca_comm.should_custom_ar(input_)
+        ):
+            return None
+        try:
+            from aiter.ops.custom_all_reduce import fused_allreduce_mhc_post_only
+        except ImportError:
+            return None
+
+        registered = False
+        if ca_comm._IS_CAPTURING:
+            if not torch.cuda.is_current_stream_capturing():
+                return torch.zeros_like(residual)
+            registered = ca_comm.enable_register_for_capturing
+        reg = 0 if registered else ca_comm._pool["input"].data_ptr
+        reg_bytes = 0 if registered else ca_comm._pool["input"].max_size
+        out = torch.empty_like(residual)
+        fused_allreduce_mhc_post_only(
+            ca_comm._ptr,
+            input_,
+            out,
+            residual,
+            post_layer_mix,
+            comb_res_mix,
+            True,
+            False,
+            reg,
+            reg_bytes,
+        )
+        return out
+
     def fused_allreduce_rmsnorm_quant_per_group(
         self,
         input_: torch.Tensor,

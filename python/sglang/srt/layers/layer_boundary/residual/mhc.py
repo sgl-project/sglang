@@ -95,6 +95,20 @@ class MHCState:
     def apply_post(self, hidden_states, residual):
         return self.hc_post(hidden_states, residual, self.h_res, self.h_post)
 
+    def reduce_and_apply_post(self, group, hidden_states, residual):
+        """``apply_post`` of a partial sum, all-reduced over ``group`` in the
+        same kernel; None when the fused kernel declines."""
+        num_tokens, hidden_size = hidden_states.shape
+        out = group.fused_allreduce_mhc_post(
+            hidden_states,
+            residual.view(num_tokens, self.hc_mult, hidden_size),
+            self.h_post.view(num_tokens, self.hc_mult, 1),
+            self.h_res.view(num_tokens, self.hc_mult, self.hc_mult),
+        )
+        if out is None:
+            return None
+        return out.view(num_tokens, -1)
+
     def clear_coefficients(self):
         self.h_res = None
         self.h_post = None
@@ -200,7 +214,17 @@ class _FfnUpdate:
         self.state = state
 
     def update(self, hidden_states, residual):
-        hidden_states = self.state.apply_post(hidden_states, residual)
+        return self._finish(self.state.apply_post(hidden_states, residual))
+
+    def reduce_and_update(self, group, hidden_states, residual):
+        """``update`` of a partial sum, all-reduced over ``group`` in the same
+        kernel as hc_post; None when the fused kernel declines."""
+        hidden_states = self.state.reduce_and_apply_post(group, hidden_states, residual)
+        if hidden_states is None:
+            return None
+        return self._finish(hidden_states)
+
+    def _finish(self, hidden_states):
         self.state.clear_coefficients()
         if self.state.is_last_layer:
             hidden_states = hc_contract(hidden_states, self.state.hc_mult)

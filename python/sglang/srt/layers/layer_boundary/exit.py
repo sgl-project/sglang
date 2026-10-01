@@ -31,6 +31,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.layer_boundary.adapters.attention import get_attn_tp_context
 from sglang.srt.layers.layer_boundary.layout import (
     SumGroup,
+    _batch_size,
     _ffn_has_tokens,
     _sum_group,
 )
@@ -39,6 +40,7 @@ from sglang.srt.layers.layer_boundary.ops import (
     all_reduce_to_dp_local,
     dp_reduce_scatter,
     dp_reduce_scatterv,
+    keep_output,
     to_dp_local,
 )
 from sglang.srt.layers.layer_boundary.output import (
@@ -48,6 +50,7 @@ from sglang.srt.layers.layer_boundary.residual.add_norm import (
     aiter_ar_fusion_applies,
     flashinfer_ar_fusion_applies,
 )
+from sglang.srt.layers.layer_boundary.residual.mhc import _FfnUpdate as _MhcFfnUpdate
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.layers.moe import (
     can_merge_post_experts_all_reduce,
@@ -65,6 +68,11 @@ from sglang.srt.runtime_context import (
     get_lora,
     get_parallel,
 )
+from sglang.srt.utils import get_bool_env_var, is_hip
+
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+# Decode batches, where the fused all-reduce + mHC post beats the two launches.
+_FUSED_AR_MHC_POST_MAX_TOKENS = 16
 
 
 def _select_dp_reduce_scatter(
@@ -193,6 +201,18 @@ class ExitPolicy:
             self.plan.fusions is not None
             and self.plan.fusions.can_defer_finalize(self.plan, forward_batch)
         )
+        if (
+            not defer_moe_finalize
+            and dp_step is None
+            and not mlp_reduce_scatter
+            and self._fuses_all_reduce_into_mhc_post(forward_batch, steps)
+        ):
+            return ExitDecision(
+                defer_moe_finalize=False,
+                fuse_mlp_allreduce=True,
+                mlp_reduce_scatter=False,
+                complete=partial(self._complete_with_mhc_post, steps=steps),
+            )
         if not steps.output.may_defer_to_next and not (
             self.plan.terminal and defer_moe_finalize
         ):
@@ -241,6 +261,40 @@ class ExitPolicy:
             mlp_reduce_scatter=mlp_reduce_scatter,
             complete=complete,
         )
+
+    def _fuses_all_reduce_into_mhc_post(
+        self, forward_batch: ForwardBatch, steps
+    ) -> bool:
+        """Whether this layer's FFN leaves its TP sum to aiter's all-reduce +
+        mHC post: an MHC write-back of a plain TP sum that stays on this rank's
+        rows, on a decode-sized batch."""
+        if not (_use_aiter and envs.SGLANG_ROCM_FUSED_AR_MHC_POST.get()):
+            return False
+        return (
+            isinstance(steps.output.update, _MhcFfnUpdate)
+            and steps.output.transform is None
+            and steps.output_move is keep_output
+            and not steps.returns_over_dp
+            and get_parallel().tp_size > 1
+            and not is_dp_attention_enabled()
+            and not is_enable_moe_cp_allgather()
+            and get_moe_a2a_backend().is_none()
+            and not get_attn_tp_context().input_scattered
+            and self._sum_deferral_allowed(steps)
+            and post_experts_sum_is_one_all_reduce()
+            and self.ffn_reduction_group(steps) is get_parallel().tp_group
+            and 0 < _batch_size(forward_batch) <= _FUSED_AR_MHC_POST_MAX_TOKENS
+        )
+
+    def _complete_with_mhc_post(
+        self, hidden_states: torch.Tensor, residual: torch.Tensor, *, steps
+    ) -> Tuple[torch.Tensor, None]:
+        group = self.ffn_reduction_group(steps)
+        update = steps.output.update
+        written = update.reduce_and_update(group, hidden_states, residual)
+        if written is None:
+            written = update.update(group.all_reduce(hidden_states), residual)
+        return written, None
 
     def _complete_now(
         self,
