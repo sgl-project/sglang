@@ -1371,6 +1371,65 @@ fn match_prefix_restamps_the_matched_path_newest_first() {
 }
 
 #[test]
+fn refresh_lru_to_root_restamps_the_path_newest_first() {
+    let mut tc = core();
+    let (a, b) = matched_chain(&mut tc);
+    let before = tc.arena.node(b).last_access_counter;
+    assert!(tc.refresh_lru_to_root(tc.arena.node(b).id));
+    let root_tick = tc.arena.node(tc.arena.root()).last_access_counter;
+    let a_tick = tc.arena.node(a).last_access_counter;
+    let b_tick = tc.arena.node(b).last_access_counter;
+    assert!(b_tick > before);
+    assert!(b_tick > a_tick);
+    assert!(a_tick > root_tick);
+}
+
+#[test]
+fn refresh_lru_to_root_dispatches_the_match_end_refresh() {
+    let mut tc = core();
+    let recorder = Arc::new(RecordingComponentForTest::default());
+    tc.register_component_(recorder.clone());
+    let (_a, b) = matched_chain(&mut tc);
+    recorder.refreshes.lock().unwrap().clear();
+    assert!(tc.refresh_lru_to_root(tc.arena.node(b).id));
+    let refreshes = recorder.refreshes.lock().unwrap();
+    assert_eq!(*refreshes, vec![(LRURefreshPhase::MatchEnd, b)]);
+}
+
+#[test]
+fn refresh_lru_to_root_outranks_a_newer_leaf_for_eviction() {
+    let mut tc = core();
+    let older = tc
+        .insert(&insert_params(&vec![1, 2], &[10, 11]))
+        .last_device_node_id
+        .expect("inserted device node");
+    let newer = tc
+        .insert(&insert_params(&vec![3, 4], &[12, 13]))
+        .last_device_node_id
+        .expect("inserted device node");
+    assert!(tc.refresh_lru_to_root(older));
+    tc.evict_device_start(FULL, 1);
+    let (candidate, _) = tc.evict_device_next_node(FULL, &HashMap::new());
+    assert_eq!(candidate, Some(newer));
+    tc.evict_device_end(FULL);
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn refresh_lru_to_root_misses_a_stale_handle() {
+    let mut tc = core();
+    let (_a, b) = matched_chain(&mut tc);
+    let stale = tc.arena.node(b).id;
+    tc.reset();
+    let root_tick = tc.arena.node(tc.arena.root()).last_access_counter;
+    assert!(!tc.refresh_lru_to_root(stale));
+    assert_eq!(
+        tc.arena.node(tc.arena.root()).last_access_counter,
+        root_tick
+    );
+}
+
+#[test]
 fn insert_first_write_creates_the_namespace() {
     let mut tc = core();
     matched_chain(&mut tc);
@@ -4361,6 +4420,61 @@ fn build_load_back_spec_collects_the_evicted_chain_ancestors_first() {
         Some(vec![tc.arena.node(parent).id, tc.arena.node(child).id])
     );
     assert!(comp_xfers.is_empty());
+}
+
+#[test]
+fn split_full_load_back_spec_yields_one_transfer_per_node_root_first() {
+    let mut tc = core();
+    let (parent, child) = backuped_chain(&mut tc);
+    demote_node(&mut tc, child);
+    demote_node(&mut tc, parent);
+    let (kv_xfer, _) = tc
+        .build_load_back_spec(tc.arena.node(child).id, /* req = */ None)
+        .expect("live test node");
+    let steps = tc
+        .split_full_load_back_spec(&kv_xfer)
+        .expect("live transfer nodes");
+    assert_eq!(steps.len(), 2);
+    for (step, (node, host)) in steps
+        .iter()
+        .zip([(parent, [20i64, 21]), (child, [22i64, 23])])
+    {
+        assert_eq!(step.name, PoolName::Kv);
+        assert_eq!(step.nodes_to_load, Some(vec![tc.arena.node(node).id]));
+        assert!(
+            step.host_indices
+                .as_ref()
+                .unwrap()
+                .equal(&Tensor::from_slice(&host))
+        );
+        assert!(step.device_indices.is_none());
+    }
+}
+
+#[test]
+fn split_full_load_back_spec_of_an_empty_transfer_is_empty() {
+    let mut tc = core();
+    let (_parent, child) = backuped_chain(&mut tc);
+    let (kv_xfer, _) = tc
+        .build_load_back_spec(tc.arena.node(child).id, /* req = */ None)
+        .expect("live test node");
+    let steps = tc
+        .split_full_load_back_spec(&kv_xfer)
+        .expect("live transfer nodes");
+    assert!(steps.is_empty());
+}
+
+#[test]
+fn split_full_load_back_spec_rejects_a_stale_handle() {
+    let mut tc = core();
+    let (parent, child) = backuped_chain(&mut tc);
+    demote_node(&mut tc, child);
+    demote_node(&mut tc, parent);
+    let (kv_xfer, _) = tc
+        .build_load_back_spec(tc.arena.node(child).id, /* req = */ None)
+        .expect("live test node");
+    tc.reset();
+    assert!(tc.split_full_load_back_spec(&kv_xfer).is_err());
 }
 
 #[test]

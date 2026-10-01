@@ -73,6 +73,23 @@ class UnifiedTreeCoreInspector(UnifiedTreeCore, UnifiedTreeCoreInspectionInterfa
         """The component's device lock count on the node."""
         return self.node_by_id(node_id).component_data[component_type].lock_ref
 
+    def get_component_host_lock_ref(
+        self, node_id: NodeId, component_type: ComponentType
+    ) -> int:
+        """The component's host lock count on the node."""
+        return self.node_by_id(node_id).component_data[component_type].host_lock_ref
+
+    def is_full_host_duplicate(self, node_id: NodeId) -> bool:
+        """Whether the node is registered and still settled as a Full host/device
+        duplicate; registration is dropped lazily, so membership alone may be stale."""
+        return node_id in self.full_host_duplicates and (
+            self._is_settled_full_host_duplicate(self.node_by_id(node_id))
+        )
+
+    def can_reclaim_full_host_duplicate(self, node_id: NodeId) -> bool:
+        """Whether the node's Full host copy may be reclaimed right now."""
+        return self._can_reclaim_full_host_duplicate(self.node_by_id(node_id))
+
     def get_node_hit_count(self, node_id: NodeId) -> int:
         """The node's accumulated match count."""
         return self.node_by_id(node_id).hit_count
