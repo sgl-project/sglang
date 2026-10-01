@@ -202,8 +202,11 @@ class SamplingBatchInfo:
         sampling_mask_batch_indices = cls._make_sampling_mask_batch_indices(
             return_sampling_masks, device
         )
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+
         features = get_exec().features
-        if features.enable_watermark:
+        # Only scheduler-built batches carry watermark policy; stand-ins skip it.
+        if isinstance(batch, ScheduleBatch) and features.enable_watermark:
             watermark_config = build_watermark_batch_config(
                 reqs,
                 default_key=features.watermark_key,

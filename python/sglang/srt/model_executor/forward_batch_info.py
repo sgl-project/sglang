@@ -934,7 +934,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if batch.seq_lens_sum is None and seq_lens_cpu is not None:
             batch.seq_lens_sum = int(seq_lens_cpu.sum())
 
-        watermark_state = model_runner.watermark_state
+        from sglang.srt.model_executor.model_runner import ModelRunner
+
+        # Only a real ModelRunner owns watermark state; lightweight stand-ins skip it.
+        watermark_state = (
+            model_runner.watermark_state
+            if isinstance(model_runner, ModelRunner)
+            else None
+        )
         ret = cls(
             # Required core inputs
             forward_mode=batch.forward_mode,

@@ -5,6 +5,8 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.sampling.watermarking.core import (
     build_watermark_batch_config,
     normalize_watermark_request,
@@ -165,6 +167,62 @@ def test_per_request_batch_config_and_admission():
             default_enabled=False,
             enforce_all=False,
         )
+
+
+def _sampling_info(batch_size, **overrides):
+    return SamplingBatchInfo(
+        temperatures=torch.ones(batch_size, 1),
+        top_ps=torch.ones(batch_size),
+        top_ks=torch.full((batch_size,), TOP_K_ALL, dtype=torch.int32),
+        min_ps=torch.zeros(batch_size),
+        is_all_greedy=False,
+        is_any_greedy=False,
+        need_top_p_sampling=False,
+        need_top_k_sampling=False,
+        need_min_p_sampling=False,
+        vocab_size=32,
+        device="cpu",
+        penalizer_orchestrator=Mock(is_required=False),
+        **overrides,
+    )
+
+
+def test_watermark_rows_track_filter_and_merge():
+    info = _sampling_info(
+        2,
+        watermark_enabled=torch.tensor([False, True]),
+        watermark_candidates_host=[False, True],
+        has_watermark_candidates=True,
+    )
+    info.filter_batch([0], torch.tensor([0]))
+    assert info.watermark_enabled.tolist() == [False]
+    assert info.watermark_candidates_host == [False]
+    assert not info.has_watermark_candidates
+
+    info.merge_batch(
+        _sampling_info(
+            1,
+            watermark_enabled=torch.tensor([True]),
+            watermark_candidates_host=[True],
+            has_watermark_candidates=True,
+        )
+    )
+    assert info.watermark_enabled.tolist() == [False, True]
+    assert info.watermark_candidates_host == [False, True]
+    assert info.has_watermark_candidates
+
+
+def test_idle_batch_max_top_k_is_merge_identity():
+    exec_context = SimpleNamespace(
+        deterministic=SimpleNamespace(enable_deterministic_inference=False),
+        features=SimpleNamespace(enable_custom_logit_processor=False),
+    )
+    with patch(
+        "sglang.srt.sampling.sampling_batch_info.get_exec", return_value=exec_context
+    ):
+        info = SamplingBatchInfo.from_schedule_batch(Mock(reqs=[], device="cpu"), 32)
+    assert len(info) == 0
+    assert info.max_top_k == 1
 
 
 def test_disabled_speculative_batch_skips_watermark_state():
