@@ -790,13 +790,24 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             parts.append(f"stream_{stream_idx}")
         self._profile_trace_tag = "_".join(parts)
 
+    def _profile_runner_name(self) -> str:
+        """Runner name used in capture-trace filenames. DSPARK / DFLASH draft
+        workers capture their verify graphs with this base class too, at the
+        same shapes as the target, so the name alone would collide; prefix it.
+        Draft-specific subclasses (EAGLEDraft*, Uno*, ...) are already unique.
+        """
+        name = type(self).__name__
+        if type(self) is DecodeCudaGraphRunner and self.model_runner.is_draft_worker:
+            return f"Draft{name}"
+        return name
+
     def _init_profile_context_and_memory_record(self):
         if self._graph_batch_capture_active():
             # SGLANG_GRAPH_BATCH_CAPTURE: the profiler is stepped once per
             # captured shape (see FullCudaGraphBackend.capture_one), so
             # on_trace_ready writes one chrome trace per shape.
             rank = get_parallel().tp_rank
-            runner_name = type(self).__name__
+            runner_name = self._profile_runner_name()
             trace_dir = graph_capture_profile_dir()
             os.makedirs(trace_dir, exist_ok=True)
 
@@ -867,7 +878,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # and the per-bs on_trace_ready handles export instead.
         export_cuda_graph_capture_trace(
             prof_context,
-            runner_name=type(self).__name__,
+            runner_name=self._profile_runner_name(),
             tp_rank=get_parallel().tp_rank,
         )
 

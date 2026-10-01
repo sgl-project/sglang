@@ -55,7 +55,18 @@ def _make_fake_self(capture_bs):
     fake_self._set_profile_trace_tag = (
         DecodeCudaGraphRunner._set_profile_trace_tag.__get__(fake_self)
     )
+    fake_self._profile_runner_name = DecodeCudaGraphRunner._profile_runner_name.__get__(
+        fake_self
+    )
     return fake_self
+
+
+def _make_runner(cls, *, is_draft_worker):
+    """Uninitialized runner of ``cls`` with only the model_runner flag the
+    trace-naming helper reads."""
+    runner = cls.__new__(cls)
+    runner.model_runner = SimpleNamespace(is_draft_worker=is_draft_worker)
+    return runner
 
 
 class TestInitProfileBatchMode(CustomTestCase):
@@ -181,8 +192,11 @@ class TestInitProfileOriginalMode(CustomTestCase):
 
 
 class TestOnTraceReadyNaming(CustomTestCase):
-    def _build_on_trace_ready(self, *, capture_bs, rank, tmp):
+    @staticmethod
+    def _build_on_trace_ready(*, capture_bs, rank, tmp, runner_name=None):
         fake_self = _make_fake_self(capture_bs)
+        if runner_name is not None:
+            fake_self._profile_runner_name = lambda: runner_name
         with (
             mock.patch.dict(
                 os.environ,
@@ -309,6 +323,44 @@ class TestProfileTraceTag(CustomTestCase):
         fake_self._profiler = None
         fake_self._set_profile_trace_tag(8, None, None, "sparse")
         self.assertFalse(hasattr(fake_self, "_profile_trace_tag"))
+
+
+class TestProfileRunnerName(CustomTestCase):
+    """DSPARK / DFLASH drafts capture with the base class at the target's
+    shapes, so their traces must not share the target's runner name."""
+
+    def test_target_keeps_class_name(self):
+        runner = _make_runner(DecodeCudaGraphRunner, is_draft_worker=False)
+        self.assertEqual(runner._profile_runner_name(), "DecodeCudaGraphRunner")
+
+    def test_base_class_draft_worker_is_prefixed(self):
+        runner = _make_runner(DecodeCudaGraphRunner, is_draft_worker=True)
+        self.assertEqual(runner._profile_runner_name(), "DraftDecodeCudaGraphRunner")
+
+    def test_draft_subclass_keeps_class_name(self):
+        class EAGLEDraftLikeRunner(DecodeCudaGraphRunner):
+            pass
+
+        runner = _make_runner(EAGLEDraftLikeRunner, is_draft_worker=True)
+        self.assertEqual(runner._profile_runner_name(), "EAGLEDraftLikeRunner")
+
+    def test_target_and_draft_traces_do_not_collide(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            exported = []
+            for is_draft_worker in (False, True):
+                name = _make_runner(
+                    DecodeCudaGraphRunner, is_draft_worker=is_draft_worker
+                )._profile_runner_name()
+                fake_self, on_trace_ready = (
+                    TestOnTraceReadyNaming._build_on_trace_ready(
+                        capture_bs=[1, 2], rank=0, tmp=tmp, runner_name=name
+                    )
+                )
+                for bs in (2, 1):
+                    fake_self._set_profile_trace_tag(bs, None, None, None)
+                    TestOnTraceReadyNaming._flush(on_trace_ready, exported)
+            self.assertEqual(len(exported), 4)
+            self.assertEqual(len(set(exported)), len(exported))
 
 
 class TestOriginalTraceExport(CustomTestCase):
