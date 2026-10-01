@@ -519,10 +519,11 @@ close does not destroy the dedicated group, close Store, synchronize CUDA, or
 unregister memory. The supervisor owns those actions after a successful close;
 uncertain transfers require explicit transport/device teardown or process exit.
 
-The scheduler request hooks below can carry these tickets, but distributed
-coordinator construction, accepted tokens, owner descriptors, receipts and global
-teacher logits still need integration before opening the distributed serving
-gates. In particular, an all-PP collective inside `before_forward` would deadlock
+The scheduler request hooks below can carry these tickets, and the metadata
+exchange below coordinates completed owner partitions. Distributed coordinator
+construction, accepted tokens and global teacher logits still need integration
+before opening the distributed serving gates. In particular, an all-PP
+collective inside `before_forward` would deadlock
 against PP proxy receive/send ordering. All service collectives remain on its
 dedicated group.
 
@@ -576,6 +577,56 @@ keeps its established first-forward admission. Distributed construction still
 rejects unsupported topology. The hooks and real TP/PP request transport are
 tested independently with a cohort service; this is not yet a distributed model
 forward, teacher-logit or Store-publication workflow.
+
+### Owner Metadata And Receipts
+
+The cohort service exposes a writer-side protocol for completed partitioned
+snapshots. Its control thread chooses each exchange from the registry state
+agreed by every rank; submission and polling never execute a collective. Run
+descriptor preparation, submission, polling and Store I/O in writer actors,
+after `RequestCaptureContext.wait_for_copies()` / `prepare_partition()` has
+confirmed D2H completion. No tensor payload enters the control group.
+
+| Method | Writer Contract |
+| --- | --- |
+| `submit_snapshot(handle, execution_sha256=..., prepared=..., metadata=...)` | Every rank submits once. Active owners supply their prepared partition; only the aux owner supplies `SnapshotMetadata`. Inactive ranks submit the effective execution digest with both optional fields unset. |
+| `get_manifest(handle)` | Returns `None` until all descriptors validate and every rank acknowledges the same manifest digest. Returns a newly decoded view once ready. |
+| `submit_receipt(handle, receipt)` | Each active owner submits once, after `SnapshotWriter.write_partition()` completes. Receipt identity, fence, owner and full manifest SHA-256 must match. |
+| `get_receipts(handle)` | Returns `None` until all active owner receipts agree, then a fresh tuple for aux `SnapshotWriter.publish_partitions()`. |
+
+The descriptor exchange binds the original ingress request digest, the effective
+execution digest, the capture identity/fence and the canonical owner layout.
+Inactive ranks also vote on execution identity. Aux metadata must match the
+reserved dataset/sample/generation, teacher, KV contract and contract ID.
+`assemble_snapshot()` additionally verifies complete logical head/token coverage,
+metadata hashes, identical committed token ledgers, KV validity and the sole aux
+payload. A single timestamp supplied by aux makes the manifest identical across
+ranks. Every rank votes its final manifest hash before writers can retrieve it.
+Submission freezes bytes; subsequent caller mutations cannot change the vote.
+
+Control protocol version 3 first votes metadata kind, capacity and payload
+lengths, then allocates explicit CPU buffers. Per-rank offers and agreed results
+are bounded by `manifest_buffer_bytes + 4096`; the padded send/receive tensor
+arena is limited to 64 MiB. The manifest must also fit `manifest_buffer_bytes`.
+Encoder, allocation, parser and validator failures are voted before advancing,
+and a final vote checks the conservative local lease deadline. Transport failure
+poisons the allocator. Metadata rejection invalidates the capture without
+releasing any actor-owned transfer storage.
+
+KV owners may `finish(..., outcome="stored")` after submitting their local
+receipt; their frozen metadata remains available to the background protocol.
+Inactive actors finish after manifest agreement. Aux must collect all receipts,
+publish through `SnapshotWriter` and resolve any ambiguous journal outcome
+before reporting `published`. For handles using this exchange, successful finish
+rejects missing manifests, local receipts or (for aux) the agreed receipt set.
+These acknowledgements are trusted producer statements; the Catalog still must
+validate every WRITTEN descriptor at seal and enforce retention/fencing.
+
+The four-process Gloo/HTTP Catalog fixture validates failure ordering. A real
+TCP Mooncake test also writes all partitions, exchanges receipts, publishes from
+aux and reads the entire sample after the producer processes exit. These are
+storage/control tests with synthetic tensors, not distributed model inference.
+The serving coordinator and global teacher/token delivery remain to be connected.
 
 ### HTTP Contract
 

@@ -1,0 +1,156 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-01",
+  "base_commit": "2c5e0875d2be1c5bb3b54074b950a93af113b35d",
+  "feature": "Background canonical owner descriptor and receipt agreement",
+  "environment": {
+    "resident_job": "job-fe1ce1dcdea6-20261001023258",
+    "pod": "job-fe1ce1dcdea6-20261001023258-master-0",
+    "namespace": "qiji",
+    "container": "master",
+    "resident_gpu": "one H100 80GB; tests exercise CPU Gloo and TCP Store",
+    "world_size": 4,
+    "control_backend": "dedicated Gloo",
+    "store_transport": "TCP",
+    "catalog": "TestCaptureCatalog HTTP test double",
+    "host_python": "3.10.12",
+    "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang",
+    "submit_prefix": [
+      "kubectl",
+      "exec",
+      "-n",
+      "qiji",
+      "job-fe1ce1dcdea6-20261001023258-master-0",
+      "-c",
+      "master",
+      "--",
+      "python3",
+      "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py",
+      "--state-dir",
+      "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+      "submit",
+      "--cwd",
+      "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang",
+      "--env",
+      "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/specforge-reference",
+      "--env",
+      "PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    ]
+  },
+  "source_sha256": {
+    "python/sglang/srt/training_capture/cohort.py": "13072c61683b59ecf08f25982698257753074c0476e5a7cb0b2bb9b554a23d53",
+    "python/sglang/srt/training_capture/cohort_service.py": "8567bfc34e0a94e0ec4707e5f1a9eab278302d627d2d7da277d7fb9292da116f",
+    "python/sglang/srt/training_capture/cohort_exchange.py": "b37abb0499a23fa8650521fe28c04a7219b887f5d2920e6f8070d4bfacae2ed3",
+    "python/sglang/test/training_capture_partition.py": "06c21cc65c2334b47d575f09a010e327e4ca95a379706641e6bf814981c4d796",
+    "test/registered/unit/training_capture/test_cohort_exchange.py": "b8ef489959833ca7bde41484cf30a13ca5876dfbc2c90646d4a459fc7fcadc04",
+    "test/registered/storage/test_training_snapshot_mooncake.py": "e71cb2fd4ff8b169674b86a31debba977247aa24bc90b142ac1ea6e44c5af08b"
+  },
+  "local_gpu_hashes_match": true,
+  "jobs": [
+    {
+      "job_id": "01790858228655961823-7f7f7ccb5430",
+      "outcome": "failed",
+      "returncode": 2,
+      "collection_errors": 2,
+      "elapsed_seconds": 10.51,
+      "scope": "Initial new offer failed import: default version field preceded required fields. Fixed by moving the default field last.",
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "test/registered/unit/training_capture/test_cohort_exchange.py",
+        "test/registered/unit/training_capture/test_cohort_service.py",
+        "test/registered/unit/training_capture/test_cohort.py"
+      ],
+      "log_sha256": "2e077b31ddd99f64b1b7c4180927556de1631bf4164117260d99a9bacb9c1465",
+      "result_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790858228655961823-7f7f7ccb5430.json",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790858228655961823-7f7f7ccb5430.log"
+    },
+    {
+      "job_id": "01790858279987384724-38b6654dcc79",
+      "outcome": "completed",
+      "returncode": 0,
+      "tests_passed": 3,
+      "subtests_passed": 59,
+      "elapsed_seconds": 53.51,
+      "scope": "Final production allocator/service/exchange source: 22 new metadata exchange cases plus existing allocator and lifecycle cases.",
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "test/registered/unit/training_capture/test_cohort_exchange.py",
+        "test/registered/unit/training_capture/test_cohort_service.py",
+        "test/registered/unit/training_capture/test_cohort.py"
+      ],
+      "log_sha256": "a758ae5e6162401f3683f6be309a23c1dc36b67a15cc21a1e2ab3b52869aa67f",
+      "result_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790858279987384724-38b6654dcc79.json",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790858279987384724-38b6654dcc79.log"
+    },
+    {
+      "job_id": "01790858457183417432-3cfd60ece81c",
+      "outcome": "failed",
+      "returncode": 1,
+      "tests_passed": 35,
+      "tests_failed": 1,
+      "subtests_passed": 26,
+      "elapsed_seconds": 103.33,
+      "scope": "Existing Store/partition/writer/router tests passed. New Store test published and compared all tensors, then fixture incorrectly asserted Catalog READY instead of AVAILABLE.",
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "test/registered/storage/test_training_snapshot_mooncake.py",
+        "test/registered/unit/training_capture/test_partition_context.py",
+        "test/registered/unit/training_capture/test_snapshot_writer.py",
+        "test/registered/unit/training_capture/test_request_router.py"
+      ],
+      "log_sha256": "e25b174a962835778a443f10b7f2d8a5d909b0c350478a2aa1162c98211d82cd",
+      "result_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790858457183417432-3cfd60ece81c.json",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790858457183417432-3cfd60ece81c.log"
+    },
+    {
+      "job_id": "01790858613107821195-07c37f4ddb39",
+      "outcome": "completed",
+      "returncode": 0,
+      "tests_passed": 1,
+      "elapsed_seconds": 36.55,
+      "scope": "Final real Store test including independent reader after producer exit. Corrected only the fixture Catalog state assertion.",
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "-s",
+        "test/registered/storage/test_training_snapshot_mooncake.py::TestTrainingSnapshotMooncake::test_background_cohort_publishes_complete_sample_after_owner_writes"
+      ],
+      "log_sha256": "99a0776d71f6e7b937e2e325daef9aadc9fc7922fc0bd4e4289da019999386a6",
+      "result_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790858613107821195-07c37f4ddb39.json",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790858613107821195-07c37f4ddb39.log"
+    }
+  ],
+  "verified": {
+    "exchange_cases": 22,
+    "owner_producers": 3,
+    "inactive_ranks": 1,
+    "producer_processes_exited_before_reader": true,
+    "reader_objects": 32,
+    "reader_tensor_bytes": 4532,
+    "exact_reconstructed_tensor_comparison": true,
+    "format": "All six Python files pass Ruff format --check",
+    "lint": "Five files pass Ruff; Store test retains only baseline SIM115/PLW1510",
+    "compile": "All six files pass python3 -m py_compile on Python 3.10",
+    "git_diff_check": "passed",
+    "original_index_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9",
+    "resident_idle_load_resumed": true
+  },
+  "limitations": [
+    "Synthetic completed partitions, no distributed model forward",
+    "Serving TP/PP capture gates remain closed",
+    "One host, no cross-node RDMA",
+    "Catalog test double does not establish production retention/consumer replay",
+    "No trained draft quality or performance SLO claim"
+  ]
+}

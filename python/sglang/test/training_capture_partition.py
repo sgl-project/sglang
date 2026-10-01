@@ -22,6 +22,7 @@ from sglang.srt.training_capture.protocol import (
 from sglang.srt.training_capture.snapshot import (
     SnapshotMetadata,
     assemble_snapshot,
+    prepare_snapshot_partition,
 )
 from sglang.srt.training_capture.snapshot_writer import (
     PublicationJournal,
@@ -30,6 +31,46 @@ from sglang.srt.training_capture.snapshot_writer import (
 from sglang.srt.training_capture.teacher import TeacherRows
 from sglang.srt.training_capture.topology import plan_capture_layout
 from sglang.test.training_capture_utils import Registrar, make_snapshot
+
+
+def prepare_cohort_partition(cohort, layout, rank):
+    """Fill a reserved, registered slot with the same deterministic global sample."""
+    base, original = make_snapshot(response_length=4)
+    lease = cohort.lease
+    metadata = SnapshotMetadata(
+        **{name: getattr(base, name) for name in SnapshotMetadata.__struct_fields__}
+    )
+    metadata = msgspec.structs.replace(
+        metadata,
+        dataset_id=lease.dataset_id,
+        sample_id=lease.sample_id,
+        generation_id=lease.generation_id,
+        topology=layout.topology,
+    )
+    partition = layout.partitions[rank]
+    if not partition.active:
+        return metadata, None, {}
+    heads = {head.layer_id: head for head in partition.heads}
+    tokens = None
+    for obj in base.objects:
+        if obj.name == "token_ids":
+            tokens = original[obj.key].tolist()
+        if obj.kind == "aux" and partition.include_aux:
+            cohort.slot.tensors[obj.name][: obj.shape[0]].copy_(original[obj.key])
+        elif obj.kind == "kv" and obj.layer_id in heads:
+            start, end = obj.token_range
+            head = heads[obj.layer_id]
+            cohort.slot.tensors[obj.name][start:end].copy_(
+                original[obj.key][:, head.start : head.end]
+            )
+    prepared, tensors = prepare_snapshot_partition(
+        metadata,
+        cohort.slot.tensors,
+        valid_kv_tokens=metadata.sequence.total_length - 1,
+        partition=partition,
+        token_ids=tokens,
+    )
+    return metadata, prepared, tensors
 
 
 def make_partitioned_snapshot():

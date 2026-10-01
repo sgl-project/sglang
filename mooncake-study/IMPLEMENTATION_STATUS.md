@@ -1770,6 +1770,72 @@ teacher rows still need integration. Existing TP/PP serving gates remain closed.
 Validation results and the final source/log hashes are recorded in
 `experiments/capture-request-routing.json`.
 
+## Cohort Descriptor And Receipt Agreement
+
+Control protocol version 3 now exchanges completed owner descriptors and write
+receipts through the dedicated background Gloo group. Writer actors submit
+immutable metadata bytes and poll local results; model forward does not enter
+these collectives. Every rank, including inactive partitions, agrees on ingress
+identity and the effective execution digest. Canonical owner placement, the
+reserved teacher/KV contract, committed token ledgers, metadata hashes and full
+logical coverage are validated before any agreed manifest is exposed. The aux
+owner supplies one timestamp so every rank assembles identical manifest bytes.
+
+The allocator votes metadata policy, lengths, allocation success, validation
+and final lease freshness. The padded CPU send/receive arena is bounded to
+64 MiB, individual offers/results to the configured manifest capacity plus
+4096 bytes, and the final manifest to its reserved buffer. Local encoding,
+allocation and parser failures cannot advance a peer into a different phase.
+Validation failure invalidates the capture while leaving live transfer buffers
+owned by their actors. Transport failure retains the existing poisoned-control
+shutdown behavior.
+
+Each active writer submits a receipt bound to capture ID, fence, canonical owner
+and the entire agreed manifest SHA-256. KV actors may finish after their own
+writes; the service retains their frozen receipt until aux receives the complete
+set. Inactive actors finish after manifest agreement. Aux publishes through the
+existing journaled `SnapshotWriter`, then reports publication. Successful finish
+for handles using this protocol rejects missing manifest/local-write/global-
+receipt stages. Catalog WRITTEN validation and retention remain independent of
+these trusted producer acknowledgements.
+
+Job `01790858228655961823-7f7f7ccb5430` stopped at collection because the new
+msgspec offer declared a default field before required fields. Reordering the
+field fixed the import. Job `01790858279987384724-38b6654dcc79` then passed three
+tests and 59 subtests in 53.51s. Its 22 new four-process cases cover delayed
+descriptors/receipts, inactive ingress, execution mismatch on an inactive rank,
+token/metadata/contract/owner/fence mismatch, malformed/oversized payloads,
+encoder/allocation/parser faults, inconsistent result hashes, expiry and
+cancellation during exchange, invalid receipts and local submission failure.
+Every failed capture retains its actor-owned slot until explicit completion.
+
+Job `01790858457183417432-3cfd60ece81c` passed 35 tests and 26 subtests across
+partition contexts, snapshot writers, request routing and the existing real
+Store suite. Its new Store test completed publication and exact tensor comparison,
+then failed a fixture assertion that confused Catalog AVAILABLE with manifest
+READY. After correcting that assertion, final job
+`01790858613107821195-07c37f4ddb39` passed the full new test in 36.55s. Four real
+producer processes agree a manifest, three canonical owners write registered
+buffers, and aux publishes after all receipts. Once every producer exits, an
+independent reader retrieves and validates all 32 tensor objects (4532 bytes).
+The parent reader also checks every reconstructed tensor exactly against the
+global synthetic fixture, including selected KV, tokens, mask, top-128 IDs/raw
+logits and LSE.
+
+All six Python files format and compile on host Python 3.10. Five pass Ruff;
+the existing Store test retains only its two baseline diagnostics. Local/GPU
+source hashes match. All four jobs are terminal and the resident idle load has
+resumed. Commands, source/log hashes and terminal results are recorded in
+`experiments/capture-cohort-exchange.json`.
+
+This completes the descriptor/receipt control and Store publication path for
+completed synthetic partitions. It does not activate distributed serving:
+coordinator ownership, partitioned runtime contexts, accepted-token propagation,
+global teacher rows and TP/PP model scheduling still require integration and
+runtime validation. The tests use one host, four Gloo processes, TCP Mooncake
+and a Catalog double; they do not establish multi-GPU inference, RDMA,
+production Catalog retention, training quality or performance SLO compliance.
+
 ## Next Implementation
 
 1. Broaden real-request coverage to prefill graphs, automatic AR OOM retraction,
@@ -1778,10 +1844,11 @@ Validation results and the final source/log hashes are recorded in
 2. Extend P8's passing retained BF16 fixture to production-exported and trained
    checkpoints, complete exporter compatibility and artifact/quality validation.
 3. Connect P9's implemented identity/resource startup agreement, cohort
-   reservations and background lifecycle, scheduler ticket routing, layout,
+   reservations and background lifecycle, scheduler ticket routing, descriptor
+   and receipt agreement, layout,
    partitioned request contexts, rank-local buffers and
    owner-local Store interface
-   to distributed request admission/failure agreement, descriptor exchange,
+   to distributed request admission/failure agreement,
    global teacher scores
    and TP/PP scheduling.
    Complete TP/PP runtime validation, non-static speculative layouts,

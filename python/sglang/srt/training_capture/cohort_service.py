@@ -11,9 +11,16 @@ from typing import ClassVar, Literal
 import msgspec
 import torch
 from sglang.srt.training_capture.cohort import (
+    STATE_COLUMNS,
     CaptureCohort,
     CaptureCohortAllocator,
     CaptureCohortError,
+)
+from sglang.srt.training_capture.cohort_exchange import (
+    agree_receipts,
+    agree_snapshot,
+    check_receipt,
+    snapshot_offer,
 )
 from sglang.srt.training_capture.protocol import (
     ContractError,
@@ -21,7 +28,10 @@ from sglang.srt.training_capture.protocol import (
     Identifier,
     Positive,
     StrictStruct,
+    canonical_bytes,
+    decode_manifest,
 )
+from sglang.srt.training_capture.snapshot_writer import OwnerWriteReceipt
 
 
 class CaptureTicket(StrictStruct):
@@ -48,6 +58,10 @@ class CaptureHandle:
     transfer_complete: bool = True
     claimed_at: float | None = None
     renewal_failed: bool = False
+    snapshot_payload: bytes | None = None
+    manifest_payload: bytes | None = None
+    receipt_payload: bytes | None = None
+    receipts_payload: bytes | None = None
 
 
 def _request_words(fingerprint):
@@ -92,7 +106,7 @@ class CaptureCohortService:
         self.stopping = False
         self.error: Exception | None = None
         self.thread: threading.Thread | None = None
-        shape = (allocator.config.max_inflight_samples + 1, 10)
+        shape = (allocator.config.max_inflight_samples + 1, STATE_COLUMNS)
         if math.prod(shape) * 8 * (allocator.size + 1) > 64 << 20:
             raise ContractError("cohort registry exceeds its control memory budget")
         self.frame = torch.zeros(shape, dtype=torch.int64, device="cpu")
@@ -201,6 +215,83 @@ class CaptureCohortService:
             handle.invalid_reason = handle.invalid_reason or reason or "capture_failed"
             self.wake.set()
 
+    def _check_live_handle(self, handle):
+        self._check_handle(handle)
+        if (
+            handle.invalid_reason is not None
+            or self.stopping
+            or self.error is not None
+            or time.monotonic() >= handle.cohort.deadline
+        ):
+            raise ContractError("capture handle is no longer writable")
+
+    def submit_snapshot(
+        self, handle, *, execution_sha256, prepared=None, metadata=None
+    ):
+        """Submit completed descriptors from a writer actor; performs no collective.
+
+        Every rank submits, including inactive ranks. Only the aux owner passes
+        metadata; each active owner passes its own prepared partition. Tensor
+        storage remains owned by the actor until finish().
+        """
+        try:
+            with self.lock:
+                self._check_live_handle(handle)
+                cohort, ticket = handle.cohort, handle.ticket
+            payload = snapshot_offer(
+                cohort, ticket, self.partition, execution_sha256, prepared, metadata
+            )
+            if len(payload) > self.allocator.config.manifest_buffer_bytes + 4096:
+                raise ContractError("snapshot offer exceeds the control budget")
+            with self.lock:
+                self._check_live_handle(handle)
+                if handle.snapshot_payload is not None:
+                    raise ContractError("snapshot descriptors were already submitted")
+                handle.snapshot_payload = payload
+                self.wake.set()
+        except Exception:
+            self.fail(handle, "snapshot_submission_failed")
+            raise
+
+    def get_manifest(self, handle):
+        """Return a fresh decoded view, or None while peer descriptors are pending."""
+        with self.lock:
+            self._check_live_handle(handle)
+            payload = handle.manifest_payload
+        return None if payload is None else decode_manifest(payload)
+
+    def submit_receipt(self, handle, receipt):
+        """Report a completed owner write to the exact agreed manifest."""
+        try:
+            with self.lock:
+                self._check_live_handle(handle)
+                if not self.partition.active or handle.manifest_payload is None:
+                    raise ContractError("receipt requires an active owner and manifest")
+                checked = check_receipt(
+                    receipt,
+                    cohort=handle.cohort,
+                    owner_id=self.partition.owner_id,
+                    manifest_payload=handle.manifest_payload,
+                )
+                if handle.receipt_payload is not None:
+                    raise ContractError("owner receipt was already submitted")
+                handle.receipt_payload = canonical_bytes(checked)
+                self.wake.set()
+        except Exception:
+            self.fail(handle, "receipt_submission_failed")
+            raise
+
+    def get_receipts(self, handle):
+        """Return fresh receipts after every canonical owner has completed writes."""
+        with self.lock:
+            self._check_live_handle(handle)
+            payload = handle.receipts_payload
+        return (
+            None
+            if payload is None
+            else msgspec.json.decode(payload, type=tuple[OwnerWriteReceipt, ...])
+        )
+
     def finish(
         self,
         handle: CaptureHandle,
@@ -223,6 +314,16 @@ class CaptureCohortService:
                 or (outcome != "failed" and not transfer_complete)
             ):
                 raise ContractError("invalid local capture completion")
+            if (
+                outcome != "failed"
+                and handle.snapshot_payload is not None
+                and (
+                    handle.manifest_payload is None
+                    or (self.partition.active and handle.receipt_payload is None)
+                    or (outcome == "published" and handle.receipts_payload is None)
+                )
+            ):
+                raise ContractError("completion precedes agreed metadata or writes")
             handle.drained = True
             handle.transfer_complete = transfer_complete
             handle.published = outcome == "published"
@@ -269,6 +370,16 @@ class CaptureCohortService:
                         _request_words(handle.ticket.request_sha256), start=6
                     ):
                         self.frame[index, column] = value
+                for column, payload in enumerate(
+                    (
+                        handle.snapshot_payload,
+                        handle.receipt_payload,
+                        handle.manifest_payload,
+                        handle.receipts_payload,
+                    ),
+                    start=10,
+                ):
+                    self.frame[index, column] = int(payload is not None)
                 ledger.append((cohort.lease, cohort.reserved_bytes))
             return ledger, self.frame, self.frames
 
@@ -297,7 +408,7 @@ class CaptureCohortService:
             self.stopping |= any(frame[0][0] for frame in frames)
             for index, handle in enumerate(handles, start=1):
                 rows = [frame[index] for frame in frames]
-                fingerprints = {tuple(row[6:]) for row in rows if row[5]}
+                fingerprints = {tuple(row[6:10]) for row in rows if row[5]}
                 if len(fingerprints) > 1:
                     handle.invalid_reason = "request_identity_mismatch"
                 elif fingerprints and handle.ticket is None:
@@ -353,6 +464,24 @@ class CaptureCohortService:
                 else:
                     with self.lock:
                         handle.cohort = renewed
+            elif not published and not any(row[0] for row in rows):
+                kind = None
+                if all(row[10] for row in rows) and not any(row[12] for row in rows):
+                    kind = "snapshot"
+                elif (
+                    all(row[12] for row in rows)
+                    and not any(row[13] for row in rows)
+                    and all(
+                        row[11]
+                        for part, row in zip(
+                            self.allocator.layout.partitions, rows, strict=True
+                        )
+                        if part.active
+                    )
+                ):
+                    kind = "receipts"
+                if kind is not None:
+                    self._exchange(handle, kind)
 
         # Admission/stop changes during the exchange are applied on the NEXT
         # exchange. Every rank must choose reserve using the same voted state.
@@ -365,6 +494,52 @@ class CaptureCohortService:
                     self.records[cohort.lease.capture_id] = CaptureHandle(cohort=cohort)
         with self.lock:
             return any(frame[0][0] for frame in frames) and not self.records
+
+    def _exchange(self, handle, kind):
+        cohort = handle.cohort
+        if kind == "snapshot":
+            build_local = lambda: handle.snapshot_payload
+
+            def validate(payloads):
+                return agree_snapshot(
+                    payloads,
+                    cohort=cohort,
+                    request_sha256=handle.ticket.request_sha256,
+                    allocator=self.allocator,
+                )
+
+        else:
+            build_local = lambda: (
+                handle.receipt_payload if self.partition.active else b"null"
+            )
+
+            def validate(payloads):
+                return agree_receipts(
+                    payloads,
+                    cohort=cohort,
+                    manifest_payload=handle.manifest_payload,
+                    layout=self.allocator.layout,
+                )
+
+        try:
+            payload = self.allocator.exchange(
+                cohort,
+                kind=kind,
+                max_bytes=self.allocator.config.manifest_buffer_bytes + 4096,
+                build_local=build_local,
+                validate=validate,
+            )
+        except CaptureCohortError as error:
+            if self.allocator.poisoned:
+                raise
+            with self.lock:
+                handle.invalid_reason = f"{kind}_exchange_failed:{error.phase}"
+        else:
+            with self.lock:
+                if kind == "snapshot":
+                    handle.manifest_payload = payload
+                else:
+                    handle.receipts_payload = payload
 
     def _run(self):
         try:

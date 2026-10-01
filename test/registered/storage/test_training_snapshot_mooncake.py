@@ -51,7 +51,10 @@ from sglang.srt.training_capture.topology import plan_capture_layout
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.training_capture_catalog import TestCaptureCatalog
-from sglang.test.training_capture_partition import make_partitioned_snapshot
+from sglang.test.training_capture_partition import (
+    make_partitioned_snapshot,
+    prepare_cohort_partition,
+)
 from sglang.test.training_capture_utils import (
     make_kv_spec,
     make_snapshot,
@@ -260,6 +263,122 @@ def prepare_store_rank(rank, root, master, catalog):
         dist.destroy_process_group()
 
 
+def publish_cohort_rank(rank, root, master, endpoint):
+    """Independent producers share descriptors/receipts, never tensor pointers."""
+    torch.set_num_threads(1)
+    dist.init_process_group(
+        "gloo",
+        init_method=(Path(root) / "rendezvous").as_uri(),
+        rank=rank,
+        world_size=4,
+        timeout=timedelta(seconds=30),
+    )
+    base, _ = make_snapshot(response_length=4)
+    layout = plan_capture_layout(
+        base.kv, tp_size=4, pp_layer_ranges=[(0, 4)], aux_tp_rank=1
+    )
+    partition = layout.partitions[rank]
+    config = CaptureConfig(
+        dataset_id="cohort-publication",
+        model_id="fixture",
+        producer_revision="test",
+        selected_layer_ids=base.kv.selected_layer_ids,
+        catalog_endpoint=endpoint,
+        journal_directory=str(Path(root) / f"journal-{rank}"),
+        store=StoreSetup(
+            local_hostname=f"127.0.0.1:{free_port()}", master_server_addr=master
+        ),
+        max_sample_tokens=8,
+        max_inflight_samples=1,
+        max_host_bytes=2 << 20,
+    )
+    resources = CaptureResources()
+    resources.catalog = HTTPCaptureCatalog(endpoint)
+    control = dist.new_group(backend="gloo", timeout=timedelta(seconds=20))
+    service = None
+    try:
+        if partition.active:
+            resources.store = connect(master, segment_bytes=0)
+            resources._allocate(config, base.kv, partition, pin_memory=False)
+        allocator = CaptureCohortAllocator(
+            group=control,
+            layout=layout,
+            config=config,
+            teacher=base.teacher,
+            kv=base.kv,
+            resources=resources,
+            timeout_seconds=15,
+        )
+        service = CaptureCohortService(allocator, poll_seconds=0.01)
+        service.start()
+
+        def wait_for(call):
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                if service.error is not None:
+                    raise service.error
+                result = call()
+                if result is not None:
+                    return result
+                time.sleep(0.01)
+            raise TimeoutError("cohort publication stage did not complete")
+
+        request_digest = digest_bytes(b"cohort-publication-request")
+        tickets = [
+            wait_for(lambda: service.claim(request_digest)) if rank == 0 else None
+        ]
+        dist.broadcast_object_list(tickets, src=0)
+        handle = service.bind(tickets[0], request_digest)
+        assert handle is not None
+        cohort, reason = service.status(handle)
+        assert reason is None
+        metadata, prepared, tensors = prepare_cohort_partition(cohort, layout, rank)
+        service.submit_snapshot(
+            handle,
+            execution_sha256=digest_bytes(b"cohort-effective-request"),
+            prepared=prepared,
+            metadata=metadata if partition.include_aux else None,
+        )
+        manifest = wait_for(lambda: service.get_manifest(handle))
+        result = {
+            "capture_id": cohort.lease.capture_id,
+            "manifest_sha256": digest_bytes(canonical_bytes(manifest)),
+            "owner_id": partition.owner_id,
+            "objects_written": len(tensors),
+        }
+        if partition.active:
+            writer = SnapshotWriter(
+                resources.store, resources.catalog, resources.journal
+            )
+            receipt = writer.write_partition(
+                manifest, tensors, cohort.lease, owner_id=partition.owner_id
+            )
+            service.submit_receipt(handle, receipt)
+        if partition.include_aux:
+            receipts = wait_for(lambda: service.get_receipts(handle))
+            writer.publish_partitions(
+                manifest, receipts, cohort.slot.manifest_buffer, cohort.lease
+            )
+            assert not list(resources.journal.pending())
+            service.finish(handle, outcome="published", transfer_complete=True)
+            result["receipt_count"] = len(receipts)
+        else:
+            # A completed KV actor may exit while control still collects receipts.
+            service.finish(handle, outcome="stored", transfer_complete=True)
+        dist.barrier()
+        assert service.close(timeout=20)
+        assert service.error is None
+        if resources.pool is not None:
+            assert resources.pool.stats()["free"] == 1
+        (Path(root) / f"rank-{rank}.json").write_bytes(canonical_bytes(result))
+    finally:
+        if service is not None and not service.close(timeout=20):
+            raise RuntimeError("cohort actors still own registered transfer storage")
+        resources.close()
+        dist.destroy_process_group(control)
+        dist.destroy_process_group()
+
+
 @unittest.skipUnless(
     shutil.which("mooncake_master") and importlib.util.find_spec("mooncake"),
     "Mooncake master and SDK required",
@@ -364,6 +483,94 @@ class TestTrainingSnapshotMooncake(CustomTestCase):
                     "3 registered writes readable after exit",
                     flush=True,
                 )
+        finally:
+            for worker in workers:
+                if worker.pid is not None and worker.is_alive():
+                    worker.terminate()
+                    worker.join(timeout=5)
+                    if worker.is_alive():
+                        worker.kill()
+                        worker.join(timeout=5)
+            catalog.close()
+            store.close()
+
+    @unittest.skipUnless(dist.is_gloo_available(), "Gloo required")
+    def test_background_cohort_publishes_complete_sample_after_owner_writes(self):
+        store = connect(self.master_address, segment_bytes=64 << 20)
+        catalog = TestCaptureCatalog()
+        workers = []
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                context = mp.get_context("spawn")
+                workers = [
+                    context.Process(
+                        target=publish_cohort_rank,
+                        args=(rank, root, self.master_address, catalog.endpoint),
+                    )
+                    for rank in range(4)
+                ]
+                for worker in workers:
+                    worker.start()
+                deadline = time.monotonic() + 100
+                for worker in workers:
+                    worker.join(timeout=max(0, deadline - time.monotonic()))
+                self.assertEqual([worker.exitcode for worker in workers], [0] * 4)
+                results = [
+                    json.loads((Path(root) / f"rank-{rank}.json").read_bytes())
+                    for rank in range(4)
+                ]
+                self.assertEqual(len({row["capture_id"] for row in results}), 1)
+                publication = catalog.wait_publications(1)[0]
+                self.assertEqual(
+                    {row["manifest_sha256"] for row in results},
+                    {publication["manifest_sha256"]},
+                )
+                self.assertEqual(results[1]["receipt_count"], 3)
+                self.assertEqual(results[3]["objects_written"], 0)
+                manifest, actual = read_snapshot(store, publication)
+                base, expected = make_snapshot(response_length=4)
+                for obj in base.objects:
+                    observed = actual[obj.name]
+                    if obj.kind == "kv":
+                        observed = observed[obj.token_range[0] : obj.token_range[1]]
+                    torch.testing.assert_close(
+                        observed, expected[obj.key], rtol=0, atol=0
+                    )
+                self.assertEqual(
+                    sum(row["objects_written"] for row in results),
+                    len(manifest.objects),
+                )
+                self.assertEqual(
+                    catalog.captures[results[0]["capture_id"]]["state"], "AVAILABLE"
+                )
+                self.assertEqual(len(catalog.publications), 1)
+                self.assertFalse(catalog.errors)
+                # This reader starts only after every producer has exited.
+                reader = subprocess.run(
+                    [
+                        sys.executable,
+                        __file__,
+                        "--reader",
+                        "--master",
+                        self.master_address,
+                        "--manifest-key",
+                        publication["manifest_key"],
+                        "--manifest-size",
+                        str(publication["manifest_nbytes"]),
+                        "--manifest-sha256",
+                        publication["manifest_sha256"],
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    check=False,
+                )
+                self.assertEqual(reader.returncode, 0, reader.stdout + reader.stderr)
+                self.assertIn(
+                    f'"validated_tensor_bytes": {manifest.total_tensor_bytes}',
+                    reader.stdout,
+                )
+                print("Background cohort publication: " + reader.stdout, flush=True)
         finally:
             for worker in workers:
                 if worker.pid is not None and worker.is_alive():

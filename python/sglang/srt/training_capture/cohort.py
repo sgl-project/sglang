@@ -20,8 +20,9 @@ from sglang.srt.training_capture.protocol import (
     digest_bytes,
 )
 
-_VERSION = 2
+_VERSION = 3
 _LEASE_BYTES = 4096
+STATE_COLUMNS = 14
 _PHASES = (
     "policy",
     "slots",
@@ -35,6 +36,12 @@ _PHASES = (
     "state",
     "state_validation",
     "state_ready",
+    "exchange",
+    "exchange_policy",
+    "exchange_sizes",
+    "exchange_buffers",
+    "exchange_validated",
+    "exchange_ready",
 )
 
 
@@ -379,7 +386,7 @@ class CaptureCohortAllocator:
             send, outputs = None, None
             try:
                 ledger, send, outputs = build_local()
-                shape = (self.config.max_inflight_samples + 1, 10)
+                shape = (self.config.max_inflight_samples + 1, STATE_COLUMNS)
                 if (
                     tuple(send.shape) != shape
                     or send.dtype != torch.int64
@@ -412,7 +419,7 @@ class CaptureCohortAllocator:
                     value not in (0, 1)
                     for rows in values
                     for row in rows
-                    for value in row[:6]
+                    for value in row[:6] + row[10:]
                 ):
                     raise ContractError("invalid cohort state flags")
             except Exception as cause:  # noqa: BLE001 - validate before choosing an action
@@ -420,6 +427,77 @@ class CaptureCohortAllocator:
             self._vote("state_validation", error)
             self._vote("state_ready")
             return values
+
+    def exchange(self, cohort, *, kind, max_bytes, build_local, validate):
+        """Agree immutable metadata bytes, with voted allocation/validation failures.
+
+        Payload tensors never enter this protocol. Callbacks run on the control
+        thread; callers retain ownership of their registered transfer buffers.
+        """
+        with self._operation():
+            self._agree_cohort("exchange", cohort)
+            error, fingerprint = None, ()
+            try:
+                if kind not in ("snapshot", "receipts") or not (
+                    type(max_bytes) is int and 0 < max_bytes <= 64 << 20
+                ):
+                    raise ContractError("invalid metadata exchange policy")
+                fingerprint = _digest_words(canonical_bytes((kind, max_bytes)))
+            except Exception as cause:  # noqa: BLE001 - no peer may advance alone
+                error = cause
+            votes = self._vote("exchange_policy", error, fingerprint=fingerprint)
+            if len({tuple(item[6:]) for item in votes}) != 1:
+                raise CaptureCohortError("exchange_policy_agreement", range(self.size))
+
+            error, payload = None, b""
+            try:
+                payload = build_local()
+                if type(payload) is not bytes or not 0 < len(payload) <= max_bytes:
+                    raise ContractError("invalid or oversized local metadata")
+            except Exception as cause:  # noqa: BLE001 - include local encoder failures
+                error, payload = cause, b""
+            votes = self._vote("exchange_sizes", error, length=len(payload))
+
+            error, send, outputs = None, None, None
+            try:
+                lengths = [vote[5] for vote in votes]
+                size = max(lengths)
+                if any(not 0 < length <= max_bytes for length in lengths) or (
+                    size * (self.size + 1) > 64 << 20
+                ):
+                    raise ContractError("metadata exchange exceeds control capacity")
+                send = torch.zeros(size, dtype=torch.uint8, device="cpu")
+                outputs = [torch.empty_like(send) for _ in range(self.size)]
+                send[: len(payload)].copy_(
+                    torch.frombuffer(bytearray(payload), dtype=torch.uint8)
+                )
+            except Exception as cause:  # noqa: BLE001 - allocate before payload gather
+                error = cause
+            self._vote("exchange_buffers", error)
+            self._gather(outputs, send)
+
+            error, result, fingerprint = None, None, ()
+            try:
+                values = [
+                    output[:length].numpy().tobytes()
+                    for output, length in zip(outputs, lengths, strict=True)
+                ]
+                result = validate(values)
+                if type(result) is not bytes or not 0 < len(result) <= max_bytes:
+                    raise ContractError("invalid or oversized agreed metadata")
+                fingerprint = _digest_words(result)
+            except Exception as cause:  # noqa: BLE001 - parser failures are collective
+                error = cause
+            votes = self._vote("exchange_validated", error, fingerprint=fingerprint)
+            if len({tuple(item[6:]) for item in votes}) != 1:
+                raise CaptureCohortError("exchange_result_agreement", range(self.size))
+            error = (
+                ContractError("lease expired during metadata exchange")
+                if time.monotonic() >= cohort.deadline
+                else None
+            )
+            self._vote("exchange_ready", error)
+            return result
 
     def _rollback(self, slot, lease):
         error = None
