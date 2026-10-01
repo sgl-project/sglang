@@ -1,4 +1,5 @@
 use crate::config::sampling::SamplingOverrides;
+use reqwest::header::HeaderValue;
 use serde::Deserialize;
 use std::num::NonZeroU32;
 
@@ -259,6 +260,8 @@ pub struct ServerConfig {
     pub shutdown_drain_secs: u64,
     /// Declared pod termination grace period; `None` uses the Kubernetes default for advisories.
     pub termination_grace_secs: Option<u64>,
+    /// `Authorization` for the router's own requests to workers, from `--worker-api-key`.
+    pub worker_auth: Option<HeaderValue>,
 }
 
 impl ServerConfig {
@@ -288,6 +291,7 @@ impl Default for ServerConfig {
             port: default_port(),
             shutdown_drain_secs: default_shutdown_drain_secs(),
             termination_grace_secs: None,
+            worker_auth: None,
         }
     }
 }

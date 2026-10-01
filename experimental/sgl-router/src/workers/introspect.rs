@@ -27,6 +27,7 @@
 
 use std::time::Duration;
 
+use reqwest::header::{HeaderValue, AUTHORIZATION};
 use serde::Deserialize;
 use tracing::warn;
 use url::Url;
@@ -35,7 +36,7 @@ use crate::state::kv_events::EventConfig;
 
 /// Default timeout for `/server_info`. Conservative for a small JSON
 /// payload served by SGLang's HTTP server.
-const SERVER_INFO_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const SERVER_INFO_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Retry budget for transient `/server_info` failures (connect/timeout/5xx).
 /// 4xx + JSON-parse errors short-circuit — they're authoritative.
@@ -85,6 +86,16 @@ pub enum DisaggregationRole {
     Decode,
 }
 
+/// Client for the router's own requests to workers, sending `auth` (from
+/// `--worker-api-key`) as the `Authorization` header when set.
+pub fn worker_client(timeout: Duration, auth: Option<HeaderValue>) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .default_headers(auth.map(|v| (AUTHORIZATION, v)).into_iter().collect())
+        .build()
+        .expect("worker http client builds")
+}
+
 /// Performs the two round-trips concurrently and projects the responses into
 /// `ServerInfo`. Cheap to clone — wraps a `reqwest::Client` (which is
 /// internally `Arc`-backed).
@@ -94,15 +105,9 @@ pub struct WorkerIntrospector {
 }
 
 impl WorkerIntrospector {
-    /// Build with a private `reqwest::Client` carrying the supplied
-    /// request timeout.  Production callers pass `SERVER_INFO_TIMEOUT`
-    /// via `default()`; tests may pass shorter timeouts.
+    /// Build with an unauthenticated client and the given request timeout.
     pub fn new(timeout: Duration) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
-            .expect("introspector http client builds");
-        Self { client }
+        Self::with_client(worker_client(timeout, None))
     }
 
     /// Reuse a caller-owned `reqwest::Client`. Useful in tests that want
@@ -294,12 +299,6 @@ fn resolve_disaggregation_role(
     }
 }
 
-impl Default for WorkerIntrospector {
-    fn default() -> Self {
-        Self::new(SERVER_INFO_TIMEOUT)
-    }
-}
-
 /// Substitute a wildcard bind host (`*`, `0.0.0.0`, `::`, `[::]`) with
 /// the host parsed from the worker URL — the gateway has to connect to
 /// a routable address.  An unparsable worker URL leaves the host
@@ -467,6 +466,34 @@ mod tests {
 
     fn fast_introspector() -> WorkerIntrospector {
         WorkerIntrospector::new(Duration::from_millis(500))
+    }
+
+    /// An engine started with `--api-key` answers `/server_info` only to the key.
+    #[tokio::test]
+    async fn fetch_sends_worker_api_key() {
+        let app = Router::new().route(
+            "/server_info",
+            get(|headers: axum::http::HeaderMap| async move {
+                match headers.get(AUTHORIZATION) {
+                    Some(v) if v == "Bearer k" => Ok(Json(json!({"served_model_name": "m"}))),
+                    _ => Err(axum::http::StatusCode::UNAUTHORIZED),
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let auth = Some(HeaderValue::from_static("Bearer k"));
+        let keyed = WorkerIntrospector::with_client(worker_client(Duration::from_secs(1), auth));
+        assert_eq!(
+            keyed.fetch(&url).await.served_model_name.as_deref(),
+            Some("m")
+        );
+        assert_eq!(
+            fast_introspector().fetch(&url).await.served_model_name,
+            None
+        );
     }
 
     /// The PRIMARY `/server_info` path (the introspector, not the discovery.rs
