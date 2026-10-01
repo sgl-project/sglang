@@ -2047,6 +2047,68 @@ diagnostics respectively. Final files match the GPU checkout. Complete job
 outcomes, commands, source/log hashes and limits are in
 `experiments/capture-cohort-startup.json`.
 
+## Real TP And PP Serving Capture
+
+Ordinary AR capture now accepts TP/PP configurations through the CLI and uses
+the distributed factory implemented above. DP/context parallelism and
+distributed speculation remain rejected. The existing single-rank static
+DSpark path remains enabled. Runtime binding still validates actual model
+artifacts, rank-local projection/pool geometry, layer ownership and global
+teacher scores before any capture actor activates.
+
+`test_training_capture_distributed.py` runs Qwen3-0.6B with real TP2/PP1 and
+TP1/PP2 model workers on two distinct H100 80GB devices. The temporary Northjob
+allocation is `job-a3c85e8db374-20261001223747` on node199. It uses the shared
+capture venv and a separate TCP Mooncake segment; the Catalog is the existing
+HTTP test double. No target identity, forward, CUDA KV pool or capture factory
+is mocked. The image's old FlashInfer 0.6.12 cubin/JIT-cache packages were
+removed from the temporary container to match the existing 0.6.17 environment.
+
+For each topology, three requests exercise 160-token chunked prefill, prefix
+reuse, one-token completion and biased multi-token decode. Independent attention
+hooks observe all selected layers (0, 14, 27) on their actual TP/PP ranks.
+After the producer exits, an independent Store client reconstructs every global
+head/token range and compares K/V and raw top-128 scores exactly. Global vocab
+IDs, response alignment, masks and logsumexp are also verified. The initial
+eager-only run passed both tests in 83.815s, publishing six samples.
+
+Each topology also restarts with decode CUDA Graphs. TP enables normal overlap;
+PP uses its non-overlap pipeline scheduler. A separate test-only observer runs
+after ModelRunner.forward, reads KV directly from the actual source pool using
+forward output slots, and records logits before sampling. It does not call the
+capture exporter or read the captured Host buffers. The complete observed replay
+run passes both tests in 133.880s, publishing eight samples: six eager and two
+graph samples. Every rank executes at least two graph forwards; TP overlap
+executes three. Reconstructed tensors again match the corresponding online
+observations exactly after all serving workers exit.
+
+The first replay comparison used a different eager run as its oracle and failed:
+PP's BF16 KV differed beyond that comparison's tolerance, and TP overlap had
+already materialized the final output token's KV. The final test checks the
+actual run, including its observed `kv_valid`; it does not force the last bit to
+zero or loosen the numerical equality check. An earlier test fixture incorrectly
+expected plaintext trace IDs and was corrected to assert the existing SHA-256
+contract. These failures did not require changing the collection data plane.
+
+The configuration suite passes seven tests in job
+`01790865985013380000-d40c4af38659`, including the boundary between distributed AR
+and distributed speculative execution. Test observer I/O synchronizes device
+work, so these runs establish numerical and lifecycle correctness, not latency
+or performance acceptance. Combined TP2/PP2, real replicated-head topologies,
+distributed cancellation/backpressure, multi-node/RDMA and other models still
+need runtime validation. Production Catalog and draft training quality remain
+open.
+
+The final distributed file, including cleanup of the Mooncake launcher's child
+binary, passes in 134.717s. Process inspection confirms no model or Store child
+remained, and the temporary two-H100 job was deleted. The complete single-H100
+runtime regression passes in 464.148s in job
+`01790866847066766265-eb3d9ce77e8b`; the resident worker has resumed its idle
+task. All five changed/added Python files compile and format. Four pass Ruff;
+the configuration test retains its two baseline C408 diagnostics. Source hashes
+match the tested checkout. Commands, all failed/successful attempts, log hashes
+and scope limits are recorded in `experiments/capture-real-tp-pp.json`.
+
 ## Next Implementation
 
 1. Broaden real-request coverage to prefill graphs, automatic AR OOM retraction,
@@ -2054,14 +2116,12 @@ outcomes, commands, source/log hashes and limits are in
    saturated backpressure.
 2. Extend P8's passing retained BF16 fixture to production-exported and trained
    checkpoints, complete exporter compatibility and artifact/quality validation.
-3. Validate P9's connected distributed factory, coordinator and worker callbacks
-   with real TP/PP model scheduling and global teacher scores, then open the CLI
-   gate for verified configurations. Factory lifecycle now passes four-process
-   fault injection and GPU-buffer/real-Store collection, while target binding
-   and distributed model inference still need end-to-end validation together.
-   Complete TP/PP runtime validation, non-static speculative layouts,
-   PD transfer and cross-node RDMA. Existing capability gates do
-   not constitute implementation of these paths.
+3. Extend P9's real TP2/PP1 and TP1/PP2 Qwen3 capture validation to combined
+   TP2/PP2, replicated heads, distributed cancellation/backpressure and additional
+   model identities. Complete distributed and non-static speculative collection,
+   PD transfer and cross-node RDMA. Ordinary AR now uses the distributed serving
+   path; the remaining capability gates do not constitute implementation of
+   those paths.
 4. Reduce P10's measured capture overhead, extend capture-on/off benchmarks to
    representative workloads and SLO thresholds, and complete dashboard runtime
    acceptance and rollout/rollback checks. Per-model numerical/runtime validation and

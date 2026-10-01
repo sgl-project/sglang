@@ -6,7 +6,7 @@ import sys
 from sglang.srt.debug_utils import tensor_dump_forward_hook
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 
 
 class CaptureReferenceDumper(tensor_dump_forward_hook.TensorDumper):
@@ -27,7 +27,9 @@ class CaptureReferenceDumper(tensor_dump_forward_hook.TensorDumper):
                 self.add_tensor(tensor_name + ".input_k", inputs[1])
                 self.add_tensor(tensor_name + ".input_v", inputs[2])
             output_hook(module, inputs, output)
-            if isinstance(module, LogitsProcessor):
+            if isinstance(module, LogitsProcessor) or (
+                do_dump and isinstance(output, PPProxyTensors)
+            ):
                 self.dump_current_tensors()
 
         return observe

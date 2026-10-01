@@ -36,9 +36,15 @@ An example for an unquantized Qwen3-0.6B target with layers 0, 14 and 27:
 ```
 
 Synchronous and normal overlap scheduling are supported for ordinary AR and
-static DSpark verification. The configuration is checked before weights load;
-unsupported TP/PP/DP, non-static or other speculative algorithms, PD, mixed-chunk,
-LoRA, quantized or embedding execution is rejected. Model/pool
+single-rank static DSpark verification. Ordinary AR can use TP/PP with DP=1;
+the complete worker group must participate in capture startup. Real-model
+numerical validation currently covers Qwen3-0.6B on two H100s with TP2/PP1 and
+TP1/PP2, including chunked prefill, prefix reuse, decode CUDA Graphs and TP
+overlap scheduling. Other topologies and model families still require deployment
+validation. PP uses SGLang's non-overlap pipeline scheduler.
+The configuration is checked before weights load; unsupported DP/context
+parallelism, distributed speculation, non-static or other speculative algorithms,
+PD, mixed-chunk, LoRA, quantized or embedding execution is rejected. Model/pool
 binding additionally requires a local safetensors target, local tokenizer
 artifacts, standard unscaled RoPE, full attention, and dense unquantized NHD
 BF16/FP16 KV. Initial codecs recognize Qwen3, Qwen2 and Llama implementations;
@@ -54,7 +60,19 @@ producer with a newly bound identity after changing the model.
 The Catalog endpoint must implement the protocol below. A separate Mooncake
 data node owns storage when the producer uses `global_segment_size=0`; its
 lifetime must exceed producer shutdown. A process-exclusive durable journal
-directory is required per worker. RDMA uses the existing SDK's `protocol=rdma`
+directory is required for each publisher. In TP/PP, only the auxiliary owner
+(TP0 of the final PP stage) opens the journal and publishes the global manifest.
+Every KV owner writes its own local layer/head shards; all owners agree before
+the auxiliary owner publishes READY. A separate Gloo group carries capture
+control messages, while tensor payloads travel through Mooncake.
+
+For multiple ranks on one host, set `store.local_hostname` to a bare address
+such as `10.0.0.11`, without a port. The Mooncake SDK then allocates independent
+ports for each client; sharing one explicit port would make rank startup fail.
+Different nodes need their own reachable local addresses and journal paths;
+these rank-local settings are excluded from common startup policy comparison.
+Keep each serving instance's publisher journal directory exclusive.
+RDMA uses the existing SDK's `protocol=rdma`
 and `rdma_devices` settings and requires a separately validated NIC allocation.
 
 Admission samples requests only once, excludes health checks and unsupported

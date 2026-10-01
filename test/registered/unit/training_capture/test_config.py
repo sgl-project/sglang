@@ -65,8 +65,6 @@ class TestCaptureConfiguration(CustomTestCase):
 
     def test_unsupported_modes_fail_before_loading_weights(self):
         cases = {
-            "tp_size": 2,
-            "pp_size": 2,
             "dp_size": 2,
             "dcp_size": 2,
             "speculative_algorithm": "DSpark",
@@ -90,6 +88,23 @@ class TestCaptureConfiguration(CustomTestCase):
                         validate_capture_server_args(self.args)
                 finally:
                     setattr(self.args, name, previous)
+
+    def test_distributed_ar_does_not_enable_distributed_speculation(self):
+        for tp, pp in ((2, 1), (1, 2), (2, 2)):
+            with self.subTest(tp=tp, pp=pp):
+                self.args.tp_size, self.args.pp_size = tp, pp
+                self.args.speculative_algorithm = None
+                validate_capture_server_args(self.args)
+                self.args.speculative_algorithm = "DSPARK"
+                with (
+                    patch.object(
+                        envs.SGLANG_RAGGED_VERIFY_MODE, "get", return_value="static"
+                    ),
+                    self.assertRaisesRegex(
+                        ValueError, "distributed speculative capture"
+                    ),
+                ):
+                    validate_capture_server_args(self.args)
 
     def test_static_dspark_capture_rejects_compact_or_simulated_paths(self):
         self.args.speculative_algorithm = "DSPARK"

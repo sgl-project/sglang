@@ -1,0 +1,217 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-01",
+  "base_commit": "8bbbf4f5995e04fbb689983ff1f6389ef0ab1e49",
+  "feature": "Enable ordinary AR TP/PP serving capture and validate real Qwen3 inference with independent online observations",
+  "environment": {
+    "temporary_job": "job-a3c85e8db374-20261001223747",
+    "temporary_node": "node199",
+    "temporary_gpus": [
+      "GPU-d509370c-2949-982e-9f93-c0653fe393c0",
+      "GPU-a1a12d9d-32a7-7f7d-b7d4-6393e2ab46de"
+    ],
+    "gpu_model": "H100 80GB HBM3",
+    "priority": "low-priority-job",
+    "reclaimable": true,
+    "temporary_job_deleted": true,
+    "temporary_pod_not_found_confirmed": true,
+    "resident_job": "job-fe1ce1dcdea6-20261001023258",
+    "resident_idle_resumed": true,
+    "namespace": "qiji",
+    "image": "harbor.local.clusters/bp/lmsysorg/sglang:v0.5.15",
+    "python": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+    "versions": {
+      "torch": {
+        "version": "2.13.0",
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/lib/python3.12/site-packages"
+      },
+      "sglang-kernel": {
+        "version": "0.4.6.post1",
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/lib/python3.12/site-packages"
+      },
+      "flashinfer-python": {
+        "version": "0.6.17",
+        "path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/lib/python3.12/site-packages"
+      },
+      "transformers": {
+        "version": "5.12.1",
+        "path": "/usr/local/lib/python3.12/dist-packages"
+      },
+      "mooncake-transfer-engine-cuda13": {
+        "version": "0.3.11.post1",
+        "path": "/usr/local/lib/python3.12/dist-packages"
+      }
+    },
+    "model": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+    "store": "independent Mooncake storage segment over TCP",
+    "catalog": "HTTP TestCaptureCatalog double",
+    "environment_notes": [
+      "Removed stale system flashinfer-cubin and flashinfer-jit-cache 0.6.12 from the temporary container; shared venv unchanged.",
+      "Initial temporary job job-4b0023e73353-20261001223637 failed because the installed northjob passes a literal -- to bash. It was deleted after confirmed failure; the corrected job omitted the separator.",
+      "The new test reaps the Mooncake SDK launcher's child binary, verified by process inspection after the final run."
+    ]
+  },
+  "distributed_command": [
+    "kubectl",
+    "exec",
+    "-n",
+    "qiji",
+    "job-a3c85e8db374-20261001223747-master-0",
+    "-c",
+    "master",
+    "--",
+    "env",
+    "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/python",
+    "PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "TRAINING_CAPTURE_TEST_MODEL=/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+    "timeout",
+    "600",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+    "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/test/registered/storage/test_training_capture_distributed.py",
+    "-v"
+  ],
+  "source_sha256": {
+    "python/sglang/srt/training_capture/config.py": "2b85d647f30e348cdb08de0055f721de178e590b9b90669d1b7ed2b2f9efab01",
+    "python/sglang/test/training_capture_server.py": "4ee7ae21d2cba0cc288fc31c046c14b7c6b14247fab6503a26ea076878619611",
+    "python/sglang/test/training_capture_distributed_server.py": "3cf9e81b2b0e6113e90822d0c638ff78269865edb27415fc6b1715adb38fe364",
+    "test/registered/unit/training_capture/test_config.py": "bce9efb30215d0da001937658808c5ab7486b46bfc7dc60c570f2d242503fbea",
+    "test/registered/storage/test_training_capture_distributed.py": "0ece879bec91c96d010dfd98c37c9cd3ddf8c1c95c990aa049c652d079de25ec"
+  },
+  "gpu_source_hashes_match": true,
+  "jobs": [
+    {
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-real-tp2-initial.log",
+      "log_sha256": "589e70e9c54607888c2b7eeea634c08d867e3fac4e76c1a22a274ee18f6d9e25",
+      "returncode": 1,
+      "tests_run": 0,
+      "elapsed_seconds": null,
+      "scope": "Import failed: image FlashInfer 0.6.12 cubin/JIT packages conflicted with venv FlashInfer 0.6.17."
+    },
+    {
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-real-tp2-sdk.log",
+      "log_sha256": "232e284ee2215cf4ac451a167da74577e4803c330c680e5ede5dff94b29a3a3a",
+      "returncode": 1,
+      "tests_run": 1,
+      "elapsed_seconds": 106.52,
+      "scope": "Three samples published; fixture expected plaintext trace ID instead of SHA-256. Exclude health-check dumps too."
+    },
+    {
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-real-tp2-pp2.log",
+      "log_sha256": "c959ce2bf093a89667d6511edcdb280ead17ecc13203c76f2071f315738c7d28",
+      "returncode": 0,
+      "tests_run": 2,
+      "elapsed_seconds": 83.815,
+      "scope": "Six eager samples, exact all-rank online KV and global teacher verification after serving exit."
+    },
+    {
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-real-tp2-pp2-graphs.log",
+      "log_sha256": "65550151dc3f31c88205deccd2b961e5e382a649c13d392f9a97814ba120690c",
+      "returncode": 1,
+      "tests_run": 2,
+      "elapsed_seconds": 133.746,
+      "scope": "Comparing separate eager/replay executions failed: PP BF16 KV tolerance and TP overlap's materialized final KV."
+    },
+    {
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-real-tp2-pp2-observed-replay.log",
+      "log_sha256": "e22b3f80575692a0bd826aa4934f6edeb0de2b8fb11d60b8fb896e9972bb529b",
+      "returncode": 0,
+      "tests_run": 2,
+      "elapsed_seconds": 133.88,
+      "scope": "Eight samples; replay now compared exactly to independent same-run ModelRunner outputs and source KV."
+    },
+    {
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/capture-real-tp2-pp2-final.log",
+      "log_sha256": "f6db4aace0712e0d81dbd9d2b7cb7f027a57dc13f5692d711d71c05c9255c054",
+      "returncode": 0,
+      "tests_run": 2,
+      "elapsed_seconds": 134.717,
+      "scope": "Final file including full master process-tree teardown; eight samples, eager and graph/TP-overlap exact parity."
+    },
+    {
+      "job_id": "01790865985013380000-d40c4af38659",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790865985013380000-d40c4af38659.log",
+      "log_sha256": "5f844e7e5ead1595b4074a7c806608a0131472b419d1c49dc7590c1103f66fd9",
+      "returncode": 0,
+      "tests_run": 7,
+      "elapsed_seconds": 0.009,
+      "command": [
+        "python",
+        "test/registered/unit/training_capture/test_config.py",
+        "-v"
+      ]
+    },
+    {
+      "job_id": "01790866847066766265-eb3d9ce77e8b",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790867323.2674525,
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790866847066766265-eb3d9ce77e8b.log",
+      "log_sha256": "2bc6d68940ac7c26e55257a0af416ee40ef165f07ca60ade74fe2a856db84fbe",
+      "tests_run": 1,
+      "elapsed_seconds": 464.148,
+      "scope": "Complete single-H100 AR/static-DSpark runtime regression including graph, overlap, pressure, adaptive/latency and lifecycle cases.",
+      "command": [
+        "python",
+        "test/registered/storage/test_training_capture_runtime.py",
+        "--model-path",
+        "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "-v"
+      ]
+    }
+  ],
+  "validation": {
+    "topologies": [
+      [
+        2,
+        1
+      ],
+      [
+        1,
+        2
+      ]
+    ],
+    "selected_layers": [
+      0,
+      14,
+      27
+    ],
+    "ready_samples_final": 8,
+    "eager_samples": 6,
+    "replay_samples": 2,
+    "prompt_tokens": 160,
+    "chunked_prefill_tokens": 128,
+    "eager_response_lengths": [
+      1,
+      4,
+      3
+    ],
+    "prefix_reuse": true,
+    "logit_bias_target": 100,
+    "logit_bias_value": 100,
+    "bit_exact": [
+      "rank-local attention K/V -> global head order after producer exit",
+      "same-run replay source-pool KV -> captured tensor ranges",
+      "global-vocab raw top-128 logits before sampler",
+      "token IDs, masks, positions and observed KV validity"
+    ],
+    "logsumexp_atol": 0.00001,
+    "pp_replay_forwards": 2,
+    "tp_overlap_replay_forwards": 3,
+    "teacher_and_target_binding": "real immutable artifacts and live model/KV/projection geometry; no mocks"
+  },
+  "checks": {
+    "python_files_compile": 5,
+    "python_files_formatted": 5,
+    "ruff_clean_files": 4,
+    "ruff_baseline": "test_config.py retains two pre-existing C408 diagnostics",
+    "root_staged_index_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9"
+  },
+  "limits": [
+    "No combined TP2/PP2 or real replicated-head inference in this two-device run.",
+    "Distributed speculation, DP/context parallelism and PD remain gated.",
+    "TCP only; no multi-node RDMA result.",
+    "Observers synchronize GPU work; numerical correctness is not a performance/SLO result.",
+    "Distributed cancellation/backpressure and additional models need runtime coverage.",
+    "Production Catalog retention/consumer replay and trained draft quality remain open."
+  ]
+}
