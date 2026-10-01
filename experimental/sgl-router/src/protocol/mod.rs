@@ -4,6 +4,7 @@
 //! Client protocols served by converting to and from chat completions.
 
 pub mod anthropic;
+pub mod chat;
 pub mod responses;
 
 use std::task::Poll;

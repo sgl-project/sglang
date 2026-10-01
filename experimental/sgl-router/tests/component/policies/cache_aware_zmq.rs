@@ -79,8 +79,7 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
             cache_aware: None,
             decode_policy: None,
             sticky: None,
-            max_output_tokens: None,
-            sampling_overrides: Default::default(),
+            profile: Default::default(),
             forward_input_ids: true,
         },
         discovery: sgl_router::config::DiscoveryBackend::StaticUrls(

@@ -50,8 +50,7 @@ fn config(forward_input_ids: bool) -> Config {
             cache_aware: None,
             decode_policy: None,
             sticky: None,
-            max_output_tokens: None,
-            sampling_overrides: Default::default(),
+            profile: Default::default(),
             forward_input_ids,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {

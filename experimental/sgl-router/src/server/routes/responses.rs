@@ -37,6 +37,12 @@ pub(crate) async fn responses(
         serde_json::to_vec(&converted.chat)
             .map_err(|e| ApiError::Internal(anyhow::anyhow!("serialize chat request: {e}")))?,
     );
+    let chat_body = ctx
+        .config
+        .model
+        .profile
+        .apply(chat_body, &ctx.config.model.id)?
+        .body;
     let resp = chat_completions_inner(ctx, headers, phase.map(|Extension(p)| p), chat_body).await?;
     Ok(adapt(resp, converted.echo, converted.stream).await)
 }

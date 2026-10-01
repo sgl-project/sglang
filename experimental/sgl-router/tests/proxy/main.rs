@@ -10,6 +10,7 @@
 
 mod common;
 
+mod api_profile;
 mod cache_aware_input_ids;
 mod cache_sim_extend_tee;
 mod chat_routing;

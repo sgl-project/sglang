@@ -11,7 +11,7 @@ use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
 use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::Response;
-use axum::routing::{get, post};
+use axum::routing::{get, post, MethodRouter};
 use axum::Router;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -400,6 +400,83 @@ async fn method_not_allowed(method: axum::http::Method, uri: axum::http::Uri) ->
     )
 }
 
+/// The inference routes the API profile enables, with its body limit and
+/// `errors.bad_request_type` rewrite.
+fn inference_routes(
+    mut router: Router<Arc<AppContext>>,
+    ctx: &Arc<AppContext>,
+) -> Router<Arc<AppContext>> {
+    use crate::server::routes::{chat, messages, responses};
+    let profile = &ctx.config.model.profile;
+    let limit = profile.limits.max_body_bytes.unwrap_or(MAX_CHAT_BODY_BYTES);
+    let retype = profile.errors.bad_request_type.is_some();
+    let layered = |h: MethodRouter<Arc<AppContext>>| {
+        let h = h
+            .layer(DefaultBodyLimit::max(limit))
+            .layer(middleware::from_fn(log_413));
+        if retype {
+            h.layer(middleware::from_fn_with_state(
+                Arc::clone(ctx),
+                retype_bad_request,
+            ))
+        } else {
+            h
+        }
+    };
+    let p = &profile.protocols;
+    if p.chat {
+        router = router.route(
+            "/v1/chat/completions",
+            layered(post(chat::chat_completions)),
+        );
+    }
+    if p.messages {
+        router = router
+            .route("/v1/messages", layered(post(messages::messages)))
+            .route(
+                "/v1/messages/count_tokens",
+                layered(post(messages::count_tokens)),
+            );
+    }
+    if p.responses {
+        router = router.route("/v1/responses", layered(post(responses::responses)));
+    }
+    router
+}
+
+/// Set the profile's `errors.bad_request_type` on every 400 body, in either
+/// envelope (`error.type`, or sglang's flat top-level `type`).
+async fn retype_bad_request(
+    State(ctx): State<Arc<AppContext>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let resp = next.run(req).await;
+    let typ = ctx.config.model.profile.errors.bad_request_type.as_deref();
+    let (Some(typ), StatusCode::BAD_REQUEST) = (typ, resp.status()) else {
+        return resp;
+    };
+    let (mut parts, body) = resp.into_parts();
+    let bytes = axum::body::to_bytes(body, 1 << 20)
+        .await
+        .unwrap_or_default();
+    let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Response::from_parts(parts, axum::body::Body::from(bytes));
+    };
+    let target = match v.get_mut("error") {
+        Some(e @ serde_json::Value::Object(_)) => e,
+        _ => &mut v,
+    };
+    if let serde_json::Value::Object(m) = target {
+        m.insert("type".into(), typ.into());
+    }
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    Response::from_parts(
+        parts,
+        axum::body::Body::from(serde_json::to_vec(&v).expect("serialize")),
+    )
+}
+
 pub fn build_router(ctx: Arc<AppContext>) -> Router {
     let router = Router::new()
         .route("/healthz", get(crate::server::routes::health::healthz))
@@ -416,30 +493,6 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
         .route(
             "/v1/detokenize",
             post(crate::server::routes::tokenize::detokenize),
-        )
-        .route(
-            "/v1/chat/completions",
-            post(crate::server::routes::chat::chat_completions)
-                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
-                .layer(middleware::from_fn(log_413)),
-        )
-        .route(
-            "/v1/messages",
-            post(crate::server::routes::messages::messages)
-                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
-                .layer(middleware::from_fn(log_413)),
-        )
-        .route(
-            "/v1/messages/count_tokens",
-            post(crate::server::routes::messages::count_tokens)
-                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
-                .layer(middleware::from_fn(log_413)),
-        )
-        .route(
-            "/v1/responses",
-            post(crate::server::routes::responses::responses)
-                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
-                .layer(middleware::from_fn(log_413)),
         )
         .route(
             "/flush_cache",
@@ -476,6 +529,8 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
                     .quality(CompressionLevel::Fastest),
             ),
         );
+
+    let router = inference_routes(router, &ctx);
 
     // Debug-only CPU flamegraph endpoint — compiled in only with `--features
     // profiling` (see Cargo.toml and `routes::pprof`'s module doc), never

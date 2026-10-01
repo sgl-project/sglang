@@ -75,6 +75,7 @@ fn install_signal_handlers() -> Result<(Signal, Signal)> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let print_profile = cli.print_profile;
     // Bootstrap subscriber so a config-resolution error has structured
     // output. The configured-format subscriber installs after this and
     // becomes a no-op via try_init's idempotency.
@@ -83,7 +84,18 @@ async fn main() -> Result<()> {
         .into_config()
         .context("resolve configuration from CLI flags")?;
 
+    if print_profile {
+        let p = &cfg.model.profile;
+        print!("# api profile from {}\n{}", p.origin, p.to_yaml());
+        return Ok(());
+    }
+
     init_tracing(&cfg.observability.log_level, cfg.observability.log_format)?;
+    tracing::info!(
+        profile = %cfg.model.profile.name,
+        origin = %cfg.model.profile.origin,
+        "api profile loaded"
+    );
 
     tracing::info!(
         "sgl-router {} starting on {}:{}",

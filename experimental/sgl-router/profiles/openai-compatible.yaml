@@ -1,0 +1,2 @@
+# Default: no rules, nothing injected. A router without a profile behaves as before profiles existed.
+name: openai-compatible

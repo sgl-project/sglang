@@ -79,6 +79,8 @@ RUN cargo chef cook --release --recipe-path recipe.json
 COPY experimental/sgl-router/Cargo.toml ./
 COPY experimental/sgl-router/src ./src
 COPY experimental/sgl-router/examples ./examples
+# API profile presets are compiled in (include_str!).
+COPY experimental/sgl-router/profiles ./profiles
 
 # --locked is intentionally omitted: the lockfile is generated in-container
 # (gitignored upstream) and `cargo chef cook` may have mutated it during the
@@ -90,6 +92,8 @@ RUN cargo build --release --bin sgl-router \
 FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 
 COPY --from=builder /work/target/release/sgl-router /usr/local/bin/sgl-router
+# Readable copies of the compiled-in API profile presets.
+COPY experimental/sgl-router/profiles /usr/share/sgl-router/profiles
 
 # Default config path; mount your own via `-v <host-path>:/etc/sgl-router`.
 ENV SGL_ROUTER_CONFIG=/etc/sgl-router/sgl-router.yaml

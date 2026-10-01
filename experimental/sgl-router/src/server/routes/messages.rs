@@ -36,6 +36,15 @@ pub(crate) async fn messages(
         Err(e) => return adapt(e.into_response(), None).await,
     };
     let chat_body = Bytes::from(serde_json::to_vec(&converted.chat).expect("serialize chat"));
+    let chat_body = match ctx
+        .config
+        .model
+        .profile
+        .apply(chat_body, &ctx.config.model.id)
+    {
+        Ok(a) => a.body,
+        Err(e) => return adapt(e.into_response(), None).await,
+    };
     let resp =
         match chat_completions_inner(ctx, headers, phase.map(|Extension(p)| p), chat_body).await {
             Ok(r) => r,

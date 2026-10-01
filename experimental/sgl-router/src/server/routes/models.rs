@@ -58,8 +58,7 @@ mod tests {
             cache_aware: None,
             decode_policy: None,
             sticky: None,
-            max_output_tokens: None,
-            sampling_overrides: Default::default(),
+            profile: Default::default(),
             forward_input_ids: true,
         };
         let app = crate::server::app::build_router(std::sync::Arc::new(ctx));
