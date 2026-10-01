@@ -172,6 +172,37 @@ if _use_aiter:
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
+
+def _restore_fnuz_block_weight(
+    layer: Module, weight_name: str, scale_name: str
+) -> None:
+    """Invert gfx94x block-FP8 finalization without changing parameter/storage identity.
+
+    Keeping old values valid also permits partial updates and empty sessions on gfx94x.
+    It does not on gfx95: the AITER shuffles there are neither flagged nor undone, so a
+    layer a session does not overwrite is shuffled a second time when it is finalized.
+    FN/FNUZ conversion is a bit reinterpretation paired with a scale change,
+    never a numeric cast. The shuffle is AITER's default (16, 16) FP8 layout.
+    """
+    weight = getattr(layer, weight_name)
+    if weight.dtype != torch.float8_e4m3fnuz:
+        return
+    if getattr(weight, "_fp8_block_aiter_shuffled", False):
+        shape = weight.shape
+        unpacked = (
+            weight.data.view(torch.uint8)
+            .view(-1, shape[-2] // 16, shape[-1] // 32, 2, 16, 16)
+            .permute(0, 1, 4, 2, 3, 5)
+            .contiguous()
+            .view(shape)
+        )
+        weight.data.view(torch.uint8).copy_(unpacked)
+        weight._fp8_block_aiter_shuffled = False
+        weight.is_shuffled = False
+    weight.data = weight.data.view(torch.float8_e4m3fn)
+    getattr(layer, scale_name).data.mul_(0.5)
+
+
 logger = logging.getLogger(__name__)
 
 DSV4_DEQUANT_FP4_TABLE = torch.tensor(
@@ -708,6 +739,18 @@ class Fp8LinearMethod(LinearMethodBase):
             params_dtype=params_dtype,
         )
 
+    def restore_weights_before_loading(self, layer: Module) -> None:
+        # The wire/checkpoint format is FN, even when gfx94x kernels use FNUZ.
+        # Restore before copy_ to avoid numeric FN -> FNUZ casts (and overflow).
+        if (
+            _is_fp8_fnuz
+            and self.block_quant
+            and self.is_checkpoint_fp8_serialized
+            and not self.use_mxfp8
+            and not self.quant_config.use_mxfp8
+        ):
+            _restore_fnuz_block_weight(layer, "weight", "weight_scale_inv")
+
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
         if self.convert_mxfp8_to_block:
             from sglang.srt.layers.quantization.mxfp8_block_convert import (
@@ -747,6 +790,8 @@ class Fp8LinearMethod(LinearMethodBase):
             return
         # If ROCm, normalize the weights and scales to e4m3fnuz
         if _is_fp8_fnuz:
+            if layer.weight.dtype == torch.float8_e4m3fnuz:
+                return  # Already finalized; never multiply scales twice.
             # activation_scheme: dynamic
             weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
                 weight=layer.weight,
@@ -779,8 +824,8 @@ class Fp8LinearMethod(LinearMethodBase):
             )
             weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
 
-        layer.weight.data = weight.data
-        layer.weight_scale_inv.data = weight_scale.data
+        copy_or_rebind_param(layer, "weight", weight)
+        copy_or_rebind_param(layer, "weight_scale_inv", weight_scale)
 
         # The preshuffle rewrites the weight into a layout only
         # aiter_w8a8_block_fp8_linear can read, so it is correct exactly when
@@ -1529,6 +1574,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         ):
             self._ensure_cutlass_buffers_initialized(layer)
 
+    def restore_weights_before_loading(self, layer: Module) -> None:
+        if (
+            _is_fp8_fnuz
+            and self.block_quant
+            and self.quant_config.is_checkpoint_fp8_serialized
+            and not self.quant_config.use_mxfp8
+            and not self.is_fp4_expert
+            and not _use_hip_int4
+        ):
+            for weight_name, scale_name in (
+                ("w13_weight", "w13_weight_scale_inv"),
+                ("w2_weight", "w2_weight_scale_inv"),
+            ):
+                _restore_fnuz_block_weight(layer, weight_name, scale_name)
+
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
         # AMD FP4 experts: use aiter's native MXFP4 MoE path
         if _use_aiter and self.is_fp4_expert:
@@ -1719,8 +1779,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             return
 
-        # If ROCm, normalize the weights and scales to e4m3fnuz
+        # If ROCm, normalize the weights and scales to e4m3fnuz.
         if _is_fp8_fnuz:
+            if layer.w13_weight.dtype == torch.float8_e4m3fnuz:
+                assert layer.w2_weight.dtype == torch.float8_e4m3fnuz
+                return  # Already finalized; do not re-shuffle or rescale.
             # activation_scheme: dynamic
             w13_weight, w13_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
                 weight=layer.w13_weight,
@@ -1732,26 +1795,29 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 weight_scale=layer.w2_weight_scale_inv,
                 input_scale=None,
             )
-            # Reset the parameter
-            layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
-            layer.w13_weight_scale_inv = torch.nn.Parameter(
-                w13_weight_scale, requires_grad=False
-            )
+            copy_or_rebind_param(layer, "w13_weight", w13_weight)
+            copy_or_rebind_param(layer, "w13_weight_scale_inv", w13_weight_scale)
+            copy_or_rebind_param(layer, "w2_weight", w2_weight)
+            copy_or_rebind_param(layer, "w2_weight_scale_inv", w2_weight_scale)
             layer.w13_input_scale = None
-            layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
-            layer.w2_weight_scale_inv = torch.nn.Parameter(
-                w2_weight_scale, requires_grad=False
-            )
             layer.w2_input_scale = None
-            if _use_aiter:
-                layer.w13_weight.data = shuffle_weight(
-                    layer.w13_weight.contiguous(), (16, 16)
-                )
-                layer.w2_weight.data = shuffle_weight(
-                    layer.w2_weight.contiguous(), (16, 16)
-                )
-                layer.w13_weight.is_shuffled = True
-                layer.w2_weight.is_shuffled = True
+            runner = getattr(self, "runner", None)
+            runner_is_aiter = (
+                runner.runner_backend.is_aiter()
+                if runner is not None
+                else get_moe_runner_backend().is_aiter()
+            )
+            if _use_aiter and runner_is_aiter:
+                for weight_name in ("w13_weight", "w2_weight"):
+                    weight = getattr(layer, weight_name)
+                    copy_or_rebind_param(
+                        layer,
+                        weight_name,
+                        shuffle_weight(weight.contiguous(), (16, 16)),
+                    )
+                    weight._fp8_block_aiter_shuffled = True
+                    # AITER dispatch reads the Parameter, not its .data view.
+                    weight.is_shuffled = True
         elif _use_aiter:
             # Pre-shuffle weights
             t = shuffle_weight(layer.w13_weight, (16, 16))

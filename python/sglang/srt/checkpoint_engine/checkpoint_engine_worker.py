@@ -124,8 +124,24 @@ class SGLangCheckpointEngineWorkerExtensionImpl(SGLangCheckpointEngineWorkerExte
         return get_device_module().current_device()
 
     def get_model_loader(self) -> Callable:
-        """Get the model weight loader function."""
-        return self.model_runner.model.load_weights
+        """Get the model weight loader function.
+
+        Restores checkpoint semantics before the first write, like the disk and session
+        paths do: an IPC reload writes into parameters that process_weights_after_loading
+        already converted (FNUZ block weights, doubled KV scales) and opens no session.
+        """
+        from sglang.srt.model_loader.loader import restore_weight
+
+        model = self.model_runner.model
+
+        def load_weights(weights):
+            # Idempotent: once restored, later buckets find the layers in checkpoint form.
+            restore_weight(
+                model, torch.device(get_device(), get_device_module().current_device())
+            )
+            return model.load_weights(weights)
+
+        return load_weights
 
     def get_post_hook(self) -> Optional[Callable]:
         """Get the post-processing hook after weight loading."""

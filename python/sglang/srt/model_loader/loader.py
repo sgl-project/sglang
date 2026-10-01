@@ -332,8 +332,8 @@ def _apply_quant_method_hook(model: nn.Module, target_device, hook_name: str) ->
 
 
 def restore_weight(model: nn.Module, target_device) -> None:
-    """Undo in-place quant packing so fresh weights can be loaded
-    (no-op for schemes that don't repack, e.g. plain fp8)."""
+    """Restore checkpoint layout and scale semantics before loading weights
+    (no-op for quantization methods without a restore hook)."""
     _apply_quant_method_hook(model, target_device, "restore_weights_before_loading")
 
 
@@ -1056,6 +1056,12 @@ class DefaultModelLoader(BaseModelLoader):
                 )
                 for name, loaded_weight in weights
             )
+
+        # Disk reloads do not use ModelRunner.begin_weight_update(). Restore
+        # checkpoint semantics before any writes, including empty/partial loads
+        # and new scales whose bytes happen to equal the old runtime scales.
+        # On initial load these hooks are no-ops; repeated restore is idempotent.
+        restore_weight(model, target_device)
 
         if is_nvfp4_online or is_modelopt_fp4_online:
             # Scope exact FP4 quantization math to load-time conversion only;
