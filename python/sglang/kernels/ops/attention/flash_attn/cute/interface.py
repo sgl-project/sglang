@@ -127,13 +127,16 @@ def _validate_head_dims(
     is_dedicate_kernel_shape = head_dim == 256 and head_dim_v == 256
     is_standard_range = 8 <= head_dim <= 128 and 8 <= head_dim_v <= 128
 
-    is_sm90_range = 8 <= head_dim <= 256 and 8 <= head_dim_v <= 256
+    is_sm90_range = (8 <= head_dim <= 256 and 8 <= head_dim_v <= 256) or (
+        head_dim == head_dim_v == 512
+    )
     if compute_capability == 9:
         assert (
             is_sm90_range and head_dim % alignment == 0 and head_dim_v % alignment == 0
         ), (
             f"(head_dim, head_dim_v)=({head_dim}, {head_dim_v}) is not supported on SM90. "
-            f"head_dim and head_dim_v must be between 8 and 256 and divisible by {alignment}."
+            f"head_dim and head_dim_v must be between 8 and 256 and divisible by {alignment}, "
+            "or both equal to 512."
         )
     elif compute_capability in [10, 11]:
         assert (
@@ -209,9 +212,11 @@ def _tile_size_fwd_sm90(
     elif head_dim <= 192:
         tile_n = 96 if is_local else (128 if head_dim_v <= 128 else 112)
         return FwdConfig(128, tile_n, True, True)
-    else:  # hdim 256
+    elif head_dim <= 256:
         tile_n = 64 if is_local else 80
         return FwdConfig(128, tile_n, True, True)
+    else:  # hdim 512
+        return FwdConfig(64, 64, False, True)
 
 
 def maybe_contiguous(x):
@@ -281,6 +286,22 @@ def num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits):
     # NOTE: We should revisit this heuristic after persistence is supported for split KV.
     # Sometimes, it's ideal to over-schedule splits for better efficiency.
     return min(num_SMs // total_mblocks, max_splits, num_n_blocks)
+
+
+
+def num_splits_heuristic_sm90_decode(total_mblocks, num_SMs, num_n_blocks, max_splits):
+    """Conservative short-span decode policy; all inputs are host-side bounds.
+
+    A short span (at most 32 KV tiles) with at least a quarter-SM wave of
+    independent query/head blocks amortizes poorly across split/reduce launches.
+    Keep it unsplit. For sparse grids or longer spans retain the upstream
+    occupancy heuristic. These thresholds are a policy, not an autotuned optimum.
+    """
+    if num_n_blocks <= 32 and total_mblocks * 4 >= num_SMs:
+        return 1
+    return max(1, num_splits_heuristic(
+        total_mblocks, num_SMs, num_n_blocks, max_splits
+    ))
 
 
 def _resolve_causal_local_window(
@@ -790,8 +811,8 @@ def _flash_attn_fwd(
             0,
             min(
                 max_seqlen_k,
-                (window_size_right or max_seqlen_k)
-                + (window_size_left or max_seqlen_k)
+                (max_seqlen_k if window_size_right is None else window_size_right)
+                + (max_seqlen_k if window_size_left is None else window_size_left)
                 + 1
                 + tile_m,
             ),
@@ -848,7 +869,10 @@ def _flash_attn_fwd(
         )
         num_splits = arch_forward_plan.num_splits
     elif num_splits < 1:
-        num_splits = num_splits_heuristic(
+        split_selector = num_splits_heuristic
+        if arch // 10 == 9 and max_seqlen_q == 1:
+            split_selector = num_splits_heuristic_sm90_decode
+        num_splits = split_selector(
             total_mblocks,
             num_SMs,
             num_n_blocks,
@@ -1423,8 +1447,7 @@ def _flash_attn_fwd(
                 pack_gqa=pack_gqa,
                 tile_m=tile_m,
                 tile_n=tile_n,
-                # num_stages=1,
-                num_stages=2,
+                num_stages=1 if max(head_dim, head_dim_v) > 256 else 2,
                 num_threads=num_threads,
                 Q_in_regs=False,
                 intra_wg_overlap=intra_wg_overlap,
