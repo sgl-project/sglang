@@ -946,6 +946,43 @@ class DeepseekV2MoE(nn.Module):
             if forward_batch is not None
             else None
         )
+        if _is_hip and _use_aiter and envs.SGLANG_DSV41_SHARED_ROUTER_FUSION.get():
+            from sglang.srt.models.deepseek_common.amd.shared_router import (
+                try_shared_router,
+            )
+
+            prepared = try_shared_router(
+                self, hidden_states, forward_batch, skip_shared_experts
+            )
+            if prepared is not None:
+                shared_output, topk_output = prepared
+                # The routed expert implementation, scaling, shared add, and
+                # collective remain the same as the normal HIP TP path.
+                final_hidden_states = self.experts(hidden_states, topk_output)
+                final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
+                    self.experts,
+                    final_hidden_states,
+                    shared_output,
+                    self.routed_scaling_factor,
+                )
+                if (
+                    self.is_deepseek_v4
+                    and self.tp_size > 1
+                    and not should_skip_post_experts_all_reduce(is_tp_path=True)
+                ):
+                    from sglang.srt.layers.moe.mhc_post_fusion import (
+                        current_mhc_post_fusion,
+                    )
+
+                    # Match forward_normal's current AMD reduction boundary:
+                    # fused MHC owns reduction when it succeeds; otherwise start
+                    # its statistics before the ordinary post-expert collective.
+                    mhc = current_mhc_post_fusion()
+                    if _hip_moe.fused_all_reduce_mhc(self, mhc, final_hidden_states):
+                        return final_hidden_states
+                    if mhc is not None:
+                        mhc.start_stats_before_all_reduce()
+                return post_experts_all_reduce(final_hidden_states)
         use_vision_topk = self.gate.e_score_correction_bias_vl is not None
         if use_vision_topk and _is_hip:
             use_vision_topk = _hip_moe.batch_has_images(forward_batch)
