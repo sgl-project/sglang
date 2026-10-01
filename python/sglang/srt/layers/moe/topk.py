@@ -1443,8 +1443,8 @@ def biased_topk_jit_kernel_impl(
     router_logits_partials: Optional[torch.Tensor] = None,
     num_shared_append: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """num_shared_append (partials only): the gate also writes the aiter shared-expert
-    columns that _post_process_topk_ids would otherwise append."""
+    """num_shared_append is only workable when router_logits_partials is not None
+    and it is only used by rocm_router_gate"""
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
     assert num_shared_append == 0 or router_logits_partials is not None
 
