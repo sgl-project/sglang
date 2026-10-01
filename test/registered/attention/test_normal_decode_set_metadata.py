@@ -17,12 +17,19 @@ from sglang.srt.layers.attention.flashattention_backend import (
     normal_decode_set_metadata,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.srt.utils import get_device
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_xpu_ci,
+)
 from sglang.test.test_utils import CustomTestCase
 
 # Register this test for CUDA CI in base-b (fast attention/kernel tests)
 register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=17, suite="stage-b-test-1-gpu-large-amd")
+# The XPU attention backend calls the same fused kernel (Triton XPU backend).
+register_xpu_ci(est_time=15, suite="stage-b-test-1-gpu-xpu")
 
 
 def reference_normal_decode_set_metadata(
@@ -76,12 +83,17 @@ def page_table_live_mask(
     return cols.view(1, -1) < live_pages.view(-1, 1)
 
 
-@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
+_HAS_XPU = hasattr(torch, "xpu") and torch.xpu.is_available()
+
+
+@unittest.skipIf(
+    not (torch.cuda.is_available() or _HAS_XPU), "Test requires CUDA or XPU"
+)
 class TestNormalDecodeSetMetadata(CustomTestCase):
     """Test fused Triton kernel in normal_decode_set_metadata."""
 
     def setUp(self):
-        self.device = "cuda"
+        self.device = get_device()
         self.dtype = torch.int32
 
     def _create_test_data(
