@@ -5,6 +5,7 @@ mod forward;
 mod preparation;
 mod reorg;
 
+use crate::buckets_reorg::BucketResolver;
 use crate::config::{SessionAffinityMode, DEFAULT_MIN_LOAD_CHOICES};
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
@@ -22,8 +23,8 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, Response};
 use bytes::Bytes;
-use forward::{forward_chat_request, SelectedWorkers};
-use preparation::{parse_routing_fields, PreparedChatRequest};
+use forward::{forward_request, SelectedWorkers};
+use preparation::{parse_routing_fields, PreparedRequest};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -41,19 +42,6 @@ pub async fn chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
-    match &ctx.chat_routing {
-        ChatRouting::Legacy => chat_completions_legacy(&ctx, headers, body).await,
-        ChatRouting::Reorg(resolvers) => {
-            reorg::chat_completions(&ctx, resolvers, headers, body).await
-        }
-    }
-}
-
-async fn chat_completions_legacy(
-    ctx: &AppContext,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response<Body>, ApiError> {
     let start = Instant::now();
     let mut fields = parse_routing_fields(&body)?;
     let model = ModelId(
@@ -62,34 +50,93 @@ async fn chat_completions_legacy(
             .take()
             .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?,
     );
+    let routing = ModelRouting::lookup(&ctx, &model)?;
+    let request = PreparedRequest::chat(
+        &ctx,
+        model,
+        fields,
+        body,
+        routing.needs_request_tokens(&ctx),
+    )?;
+    let workers = routing.select_workers(&ctx, &request, &headers).await?;
+    forward_request(&ctx, request, workers, headers, start).await
+}
 
-    let policy = ctx
-        .policies
-        .get(&model)
-        .ok_or_else(|| ApiError::ModelNotFound(model.0.clone()))?;
+/// SGLang's native `/generate`: same request and response schema as the engine.
+/// The body names no model, so it goes to the one this router serves.
+pub async fn generate(
+    State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
+    let start = Instant::now();
+    let model = ModelId(ctx.config.model.id.clone());
+    let routing = ModelRouting::lookup(&ctx, &model)?;
+    let request = PreparedRequest::generate(&ctx, model, body)?;
+    let workers = routing.select_workers(&ctx, &request, &headers).await?;
+    forward_request(&ctx, request, workers, headers, start).await
+}
 
-    // Find healthy workers: the prefill pool in PD mode, otherwise the plain pool.
-    let resolver = PdPoolResolver::new(Arc::clone(&ctx.registry));
-    let candidates = resolver
-        .prefill_candidates(&model)
-        .map_err(|error| pool_error(error, &model))?;
+/// A model's routing state, resolved before the request is prepared.
+enum ModelRouting<'a> {
+    Legacy {
+        policy: Arc<dyn Policy>,
+        resolver: PdPoolResolver,
+        candidates: Vec<Arc<Worker>>,
+    },
+    Reorg(&'a BucketResolver),
+}
 
-    let needs_tokens = policy.needs_request_tokens() || ctx.config.model.dp_aware;
-    let request = PreparedChatRequest::prepare(ctx, model, fields, body, needs_tokens)?;
+impl<'a> ModelRouting<'a> {
+    fn lookup(ctx: &'a AppContext, model: &ModelId) -> Result<Self, ApiError> {
+        let not_found = || ApiError::ModelNotFound(model.0.clone());
+        match &ctx.chat_routing {
+            ChatRouting::Legacy => {
+                let policy = ctx.policies.get(model).ok_or_else(not_found)?;
+                // Find healthy workers: the prefill pool in PD mode, otherwise the plain pool.
+                let resolver = PdPoolResolver::new(Arc::clone(&ctx.registry));
+                let candidates = resolver
+                    .prefill_candidates(model)
+                    .map_err(|error| pool_error(error, model))?;
+                Ok(Self::Legacy {
+                    policy,
+                    resolver,
+                    candidates,
+                })
+            }
+            ChatRouting::Reorg(resolvers) => {
+                resolvers.get(model).map(Self::Reorg).ok_or_else(not_found)
+            }
+        }
+    }
 
-    // Pick a plain worker, or a prefill worker followed by a decode peer in PD mode.
-    let workers = select_workers(
-        ctx,
-        &request,
-        &headers,
-        policy.as_ref(),
-        &candidates,
-        &resolver,
-    )
-    .await?;
+    fn needs_request_tokens(&self, ctx: &AppContext) -> bool {
+        match self {
+            Self::Legacy { policy, .. } => {
+                policy.needs_request_tokens() || ctx.config.model.dp_aware
+            }
+            // The same predicate gates `--no-tokenizer` at startup,
+            // so a load-only bucket skips the body parse.
+            Self::Reorg(resolver) => resolver.needs_request_tokens(),
+        }
+    }
 
-    // PD sends to both workers and returns the decode response.
-    forward_chat_request(ctx, request, workers, headers, start).await
+    /// Pick a plain worker, or a prefill worker followed by a decode peer in PD mode.
+    async fn select_workers(
+        &self,
+        ctx: &AppContext,
+        request: &PreparedRequest,
+        headers: &HeaderMap,
+    ) -> Result<SelectedWorkers, ApiError> {
+        match self {
+            Self::Legacy {
+                policy,
+                resolver,
+                candidates,
+            } => select_workers(ctx, request, headers, policy.as_ref(), candidates, resolver).await,
+            Self::Reorg(resolver) => reorg::select_workers(ctx, resolver, request, headers).await,
+        }
+    }
 }
 
 fn pool_error(error: PdResolveError, model: &ModelId) -> ApiError {
@@ -103,7 +150,7 @@ fn pool_error(error: PdResolveError, model: &ModelId) -> ApiError {
 
 async fn select_workers(
     ctx: &AppContext,
-    request: &PreparedChatRequest,
+    request: &PreparedRequest,
     headers: &HeaderMap,
     policy: &dyn Policy,
     candidates: &[Arc<Worker>],
@@ -131,7 +178,7 @@ async fn select_workers(
 /// a discarded prefill pick would already have bound affinity.
 fn prefills_with_decode(
     ctx: &AppContext,
-    request: &PreparedChatRequest,
+    request: &PreparedRequest,
     candidates: &[Arc<Worker>],
     resolver: &PdPoolResolver,
     routing: &RoutingContext<'_>,
@@ -226,7 +273,7 @@ fn nonempty_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 
 fn pick_prefill_worker(
     ctx: &AppContext,
-    request: &PreparedChatRequest,
+    request: &PreparedRequest,
     policy: &dyn Policy,
     candidates: &[Arc<Worker>],
     routing: &RoutingContext<'_>,
@@ -262,7 +309,7 @@ fn pick_prefill_worker(
 
 fn pick_decode_worker(
     ctx: &AppContext,
-    request: &PreparedChatRequest,
+    request: &PreparedRequest,
     prefill: &Worker,
     resolver: &PdPoolResolver,
     routing: &RoutingContext<'_>,
@@ -297,7 +344,7 @@ fn pick_decode_worker(
 /// Ask which workers already hold a KV prefix for this prompt; not a worker pick.
 async fn lookup_prefix_matches(
     ctx: &AppContext,
-    request: &PreparedChatRequest,
+    request: &PreparedRequest,
 ) -> Result<Option<ExternalPrefixSignal>, ApiError> {
     let signal = match (
         ctx.prefix_index.as_ref(),

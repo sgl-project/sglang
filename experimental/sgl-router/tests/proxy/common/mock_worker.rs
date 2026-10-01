@@ -73,6 +73,7 @@ impl MockWorker {
         // "tiny" model the tests register a tokenizer + policy under.
         let app = axum::Router::new()
             .route("/v1/chat/completions", post(chat))
+            .route("/generate", post(generate))
             .route("/server_info", get(serve_tiny_server_info))
             .route("/abort_request", abort_request_route(abort_log.clone()))
             .with_state(state);
@@ -422,32 +423,43 @@ async fn serve_tiny_server_info() -> Json<Value> {
 }
 
 #[allow(dead_code)] // Used by `MockWorker::start`, only some test files need it.
-async fn chat(State(s): State<MockWorkerState>, headers: HeaderMap, body: Bytes) -> Response<Body> {
-    {
-        let mut g = s.captured.lock().unwrap();
-        g.last_body = Some(body.clone());
-        for (k, v) in headers.iter() {
-            g.seen.insert(k.as_str().to_string());
-            if let Ok(val) = v.to_str() {
-                g.headers.insert(k.as_str().to_string(), val.to_string());
-            }
+fn capture_request(s: &MockWorkerState, headers: &HeaderMap, body: &Bytes) -> Value {
+    let mut g = s.captured.lock().unwrap();
+    g.last_body = Some(body.clone());
+    for (k, v) in headers.iter() {
+        g.seen.insert(k.as_str().to_string());
+        if let Ok(val) = v.to_str() {
+            g.headers.insert(k.as_str().to_string(), val.to_string());
         }
     }
-    let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-    let streaming = v.get("stream").and_then(|x| x.as_bool()).unwrap_or(false);
-    if streaming {
-        let chunks: Vec<_> = s
-            .stream_chunks
-            .iter()
-            .map(|c| Ok::<_, std::io::Error>(Bytes::from(*c)))
-            .collect();
-        let body = Body::from_stream(futures::stream::iter(chunks));
-        let mut r = Response::new(body);
-        *r.status_mut() = StatusCode::OK;
-        r.headers_mut().insert(
-            HeaderName::from_static("content-type"),
-            "text/event-stream".parse().unwrap(),
-        );
+    serde_json::from_slice(body).unwrap_or(Value::Null)
+}
+
+/// `Some` SSE response of `stream_chunks` when the request asked to stream.
+#[allow(dead_code)] // Used by `MockWorker::start`, only some test files need it.
+fn stream_response(s: &MockWorkerState, request: &Value) -> Option<Response<Body>> {
+    if request.get("stream").and_then(|x| x.as_bool()) != Some(true) {
+        return None;
+    }
+    let chunks: Vec<_> = s
+        .stream_chunks
+        .iter()
+        .map(|c| Ok::<_, std::io::Error>(Bytes::from(*c)))
+        .collect();
+    let body = Body::from_stream(futures::stream::iter(chunks));
+    let mut r = Response::new(body);
+    *r.status_mut() = StatusCode::OK;
+    r.headers_mut().insert(
+        HeaderName::from_static("content-type"),
+        "text/event-stream".parse().unwrap(),
+    );
+    Some(r)
+}
+
+#[allow(dead_code)] // Used by `MockWorker::start`, only some test files need it.
+async fn chat(State(s): State<MockWorkerState>, headers: HeaderMap, body: Bytes) -> Response<Body> {
+    let v = capture_request(&s, &headers, &body);
+    if let Some(r) = stream_response(&s, &v) {
         return r;
     }
     let resp = serde_json::json!({
@@ -461,4 +473,23 @@ async fn chat(State(s): State<MockWorkerState>, headers: HeaderMap, body: Bytes)
         }]
     });
     Json(resp).into_response()
+}
+
+/// SGLang's native `/generate` response shape, echoing the request's `rid`.
+#[allow(dead_code)] // Used by `MockWorker::start`, only some test files need it.
+async fn generate(
+    State(s): State<MockWorkerState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response<Body> {
+    let v = capture_request(&s, &headers, &body);
+    if let Some(r) = stream_response(&s, &v) {
+        return r;
+    }
+    Json(serde_json::json!({
+        "text": "ok",
+        "output_ids": [1, 2],
+        "meta_info": {"id": v["rid"], "finish_reason": {"type": "stop"}},
+    }))
+    .into_response()
 }

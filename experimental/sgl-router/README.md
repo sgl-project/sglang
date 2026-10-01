@@ -3,8 +3,9 @@
 Slim, KV-aware, OpenAI-compatible router for SGLang workers.
 
 Serves a single model and routes across its workers. Exposes
-`/v1/tokenize`, `/v1/detokenize`, `/v1/models`, `/v1/chat/completions`
-(buffered and SSE), plus `/healthz` / `/readyz` and `/metrics`. Worker
+`/v1/tokenize`, `/v1/detokenize`, `/v1/models`, `/v1/chat/completions` and
+SGLang's native [`/generate`](#native-generate) (buffered and SSE), plus
+`/healthz` / `/readyz` and `/metrics`. Worker
 pools come from either a static URL list or Kubernetes EndpointSlice
 discovery. Both edges speak cleartext HTTP/2 where the peer does — see
 [HTTP/2](#http2).
@@ -350,6 +351,28 @@ case under `hf`, `fast`, and `fast` with L1. Startup logs report the resolved
 backend and cache state. `/metrics` exposes only
 `sgl_router_tokenizer_l1_tokens_total{source="cached"|"encoded"}` to measure
 how much tokenization work the cache reuses.
+
+## Native `/generate`
+
+`/generate` (`POST` or `PUT`) has the engine's interface: the same
+`GenerateReqInput` body and the same response, buffered or SSE. The body names no
+model, so requests go to the one this router serves. Worker selection
+(`--chat-routing`, `--policy`), PD dispatch, and abort-on-disconnect are shared
+with chat completions.
+
+There is no chat template to render, so whenever a tokenizer is loaded the
+router tokenizes under any policy: it reads caller `input_ids` as sent, or
+tokenizes a single `text` prompt. A batch (`text` list or nested `input_ids`)
+routes on load, and the whole batch goes to one worker. `text` is tokenized
+without special tokens, while the engine adds them, so for a tokenizer that
+prepends BOS only `input_ids` requests match cached prefixes.
+
+The body is forwarded as sent, plus PD bootstrap fields and, for a single prompt
+whose caller sent none, a minted `rid`. The router does not forward its own
+`input_ids` here, and `--override-sampling-params` does not apply: `/generate`
+nests sampling parameters under `sampling_params`, which pass through untouched.
+Under `--dp-aware`, a PD batch or `n > 1` request leaves the prefill rank to the
+engine, which gives item `i` the bootstrap room `room + i`.
 
 ## DeepSeek V4
 

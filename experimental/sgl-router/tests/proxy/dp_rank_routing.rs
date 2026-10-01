@@ -185,3 +185,33 @@ async fn any_policy_picks_the_rank_with_the_deepest_prefix() {
         assert_eq!(send(&app, &worker, &[]).await.as_deref(), Some("3"));
     }
 }
+
+/// The engine gives batch item i the room `room + i`, so one pinned prefill rank would break decode.
+#[tokio::test]
+async fn pd_batch_leaves_the_prefill_rank_to_the_engine() {
+    let (prefill, decode) = (
+        MockWorker::start(vec![]).await,
+        MockWorker::start(vec![]).await,
+    );
+    let workers = [
+        (&prefill, WorkerMode::Prefill, 4),
+        (&decode, WorkerMode::Decode, 2),
+    ];
+    let request = Request::post("/generate")
+        .header("content-type", "application/json")
+        .header(KEY, "conv-pd")
+        .body(Body::from(json!({"text": ["a", "b"]}).to_string()))
+        .unwrap();
+    let app = router(sticky_config(), &workers, Default::default());
+    assert!(app.oneshot(request).await.unwrap().status().is_success());
+
+    let start = Instant::now();
+    while prefill.captured.lock().unwrap().last_body.is_none() {
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "no prefill request"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(prefill.captured.lock().unwrap().headers.get(RANK), None);
+}

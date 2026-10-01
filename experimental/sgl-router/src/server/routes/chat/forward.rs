@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Plain and PD chat forwarding, including load tracking and streaming metrics.
+//! Plain and PD forwarding, including load tracking and streaming metrics.
 
 use super::nonempty_header;
 use super::preparation::{
-    generate_room_id, generate_room_id_for_rank, BootstrapFields, PreparedChatRequest,
+    generate_room_id, generate_room_id_for_rank, BootstrapFields, PreparedRequest,
 };
 use crate::discovery::WorkerMode;
 use crate::policies::dp_rank::select_dp_rank;
@@ -27,7 +27,6 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-const CHAT_PATH: &str = "/v1/chat/completions";
 // Expose the selected decode worker to both PD workers and the client.
 const X_SGL_DECODE_URL: HeaderName = HeaderName::from_static("x-sgl-decode-url");
 // SGLang's DP controller dispatches to this rank; it outranks `routed_dp_rank` in the body.
@@ -41,9 +40,10 @@ pub(super) struct SelectedWorkers {
     pub(super) track_dispatch_timestamps: bool,
 }
 
-pub(super) async fn forward_chat_request(
+/// PD sends to both workers and returns the decode response.
+pub(super) async fn forward_request(
     ctx: &AppContext,
-    request: PreparedChatRequest,
+    request: PreparedRequest,
     workers: SelectedWorkers,
     mut headers: HeaderMap,
     request_started_at: Instant,
@@ -62,7 +62,10 @@ pub(super) async fn forward_chat_request(
     // Only the router chooses DP ranks; a client-supplied rank is never forwarded.
     headers.remove(X_DATA_PARALLEL_RANK);
     let dp_aware = ctx.config.model.dp_aware;
-    let prefill_rank = dp_aware
+    // The engine gives fan-out item i the room `room + i`, so in PD decode looks
+    // for each item on a different prefill rank; one pinned rank would break that.
+    let pin_prefill = dp_aware && !(decode.is_some() && request.fans_out);
+    let prefill_rank = pin_prefill
         .then(|| prompt_dp_rank(ctx, &request, &headers, &prefill))
         .flatten();
     let decode_rank = decode
@@ -101,6 +104,7 @@ pub(super) async fn forward_chat_request(
         };
         (decode, bootstrap)
     });
+    let path = request.path;
     let engine_rid = request.engine_rid();
     let body = request.into_outgoing_body(
         ctx,
@@ -122,6 +126,7 @@ pub(super) async fn forward_chat_request(
                 ctx,
                 &metrics,
                 Arc::clone(&prefill),
+                path,
                 prefill_headers,
                 body.clone(),
                 prefill_load_guards,
@@ -151,6 +156,7 @@ pub(super) async fn forward_chat_request(
     let response = forward_to_response_worker(
         ctx,
         &response_worker,
+        path,
         &response_headers,
         body,
         engine_rid.as_deref(),
@@ -193,7 +199,7 @@ pub(super) async fn forward_chat_request(
 /// prefill, so it is placed by load alone.
 fn prompt_dp_rank(
     ctx: &AppContext,
-    request: &PreparedChatRequest,
+    request: &PreparedRequest,
     headers: &HeaderMap,
     worker: &Worker,
 ) -> Option<u32> {
@@ -246,6 +252,7 @@ fn spawn_prefill_request(
     ctx: &AppContext,
     metrics: &DispatchMetrics,
     prefill_worker: Arc<Worker>,
+    path: &'static str,
     headers: HeaderMap,
     body: Bytes,
     load_guards: LoadGuards,
@@ -261,7 +268,7 @@ fn spawn_prefill_request(
                 &prefill_worker.url,
                 prefill_worker.protocol(),
                 &prefill_worker.breaker,
-                CHAT_PATH,
+                path,
                 &headers,
                 body,
                 None,
@@ -365,6 +372,7 @@ async fn forward_pd(
 async fn forward_to_response_worker(
     ctx: &AppContext,
     worker: &Worker,
+    path: &str,
     headers: &HeaderMap,
     body: Bytes,
     engine_rid: Option<&str>,
@@ -382,7 +390,7 @@ async fn forward_to_response_worker(
                 &worker.url,
                 worker.protocol(),
                 &worker.breaker,
-                CHAT_PATH,
+                path,
                 headers,
                 body,
                 engine_rid,
@@ -401,7 +409,7 @@ async fn forward_to_response_worker(
                 &worker.url,
                 worker.protocol(),
                 &worker.breaker,
-                CHAT_PATH,
+                path,
                 headers,
                 body,
                 engine_rid,
@@ -422,7 +430,7 @@ struct DispatchMetrics {
 impl DispatchMetrics {
     fn new(
         ctx: &AppContext,
-        request: &PreparedChatRequest,
+        request: &PreparedRequest,
         response_worker: &Worker,
         request_started_at: Instant,
     ) -> Self {
