@@ -49,3 +49,15 @@ class JsonArrayParser(BaseFormatDetector):
         by the constraint backends directly.
         """
         raise NotImplementedError("structure_info not used for JSON schema constraints")
+
+    def finish(self, tools):
+        normal = ""
+        if self._buffer:
+            leftover = self._buffer
+            if leftover.rstrip().endswith(self.eot_token):
+                # Fully closed JSON was already parsed into calls; do not re-emit.
+                self._buffer = ""
+            else:
+                normal = leftover
+                self._buffer = ""
+        return StreamingParseResult(normal_text=normal, calls=[])
