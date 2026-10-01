@@ -72,7 +72,6 @@ class TestMegaMoEAutotuneStartup(CustomTestCase):
 
         runner = SimpleNamespace(
             device="cuda",
-            tp_group=SimpleNamespace(world_size=1),
             forward_stream=Mock(),
             max_decode_logits_rows=Mock(),
             decode_num_tokens_per_req=Mock(),
@@ -119,6 +118,7 @@ class TestMegaMoEAutotuneStartup(CustomTestCase):
                 skip_ops = {"flashinfer_megamoe"} if skip else set()
                 with (
                     self.subTest(chunk_size=chunk_size, skip=skip, draft=draft),
+                    get_parallel().override(tp_group=SimpleNamespace(world_size=1)),
                     patch.dict(sys.modules, modules),
                     patch.dict(
                         os.environ,
@@ -173,6 +173,7 @@ class TestMegaMoEAutotuneStartup(CustomTestCase):
             # Cache-disabled startups in the same second must still write to
             # different files, even if they use the same device and rank.
             with (
+                get_parallel().override(tp_group=SimpleNamespace(world_size=1)),
                 patch.dict(sys.modules, modules),
                 patch.dict(os.environ, SGLANG_FLASHINFER_AUTOTUNE_CACHE="0"),
                 patch.multiple(
