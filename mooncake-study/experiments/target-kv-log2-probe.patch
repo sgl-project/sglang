@@ -1,0 +1,72 @@
+diff --git a/python/sglang/kernels/ops/attention/extend_attention.py b/python/sglang/kernels/ops/attention/extend_attention.py
+index 82fa160e4..a54ef1f80 100644
+--- a/python/sglang/kernels/ops/attention/extend_attention.py
++++ b/python/sglang/kernels/ops/attention/extend_attention.py
+@@ -989,6 +989,7 @@ def _fwd_kernel_unified(
+     USE_CUSTOM_MASK: tl.constexpr,
+     HAS_SINK: tl.constexpr,
+     PAGE_SIZE: tl.constexpr = 1,
++    USE_LOG2_SOFTMAX: tl.constexpr = False,
+     SCORE_MOD: tl.constexpr = None,
+     Aux0=None,
+     aux0_stride_t=0,
+@@ -1203,12 +1204,18 @@ def _fwd_kernel_unified(
+             qk = tl.where(final_mask, qk, float("-inf"))
+
+             # Online softmax
++            if USE_LOG2_SOFTMAX:
++                qk *= 1.44269504
+             row_max = tl.max(qk, 1)
+             row_max_fixed = tl.where(row_max == float("-inf"), -1e20, row_max)
+             n_e_max = tl.maximum(row_max_fixed, e_max)
+
+-            re_scale = tl.exp(e_max - n_e_max)
+-            p = tl.exp(qk - n_e_max[:, None])
++            if USE_LOG2_SOFTMAX:
++                re_scale = tl.exp2(e_max - n_e_max)
++                p = tl.exp2(qk - n_e_max[:, None])
++            else:
++                re_scale = tl.exp(e_max - n_e_max)
++                p = tl.exp(qk - n_e_max[:, None])
+             deno = deno * re_scale + tl.sum(p, 1)
+
+             # Load V
+@@ -1231,14 +1238,20 @@ def _fwd_kernel_unified(
+                 other=0.0,
+             )
+             p = p.to(v.dtype)
+-            acc = acc * re_scale[:, None] + tl.dot(p, v)
++            if USE_LOG2_SOFTMAX:
++                acc = tl.dot(p, v, acc * re_scale[:, None])
++            else:
++                acc = acc * re_scale[:, None] + tl.dot(p, v)
+
+             e_max = n_e_max
+
+     # Handle sink tokens
+     if HAS_SINK:
+         cur_sink = tl.load(sink_ptr + cur_head)
+-        deno += tl.exp(cur_sink - e_max)
++        if USE_LOG2_SOFTMAX:
++            deno += tl.exp2(cur_sink * 1.44269504 - e_max)
++        else:
++            deno += tl.exp(cur_sink - e_max)
+
+     # Store output
+     offs_o = (
+@@ -1277,6 +1290,7 @@ def extend_attention_fwd_unified(
+     page_size: int = 1,
+     score_mod=None,
+     aux_tensors=None,
++    use_log2_softmax: bool = False,
+ ):
+     """
+     Unified 1-stage extend attention for deterministic inference.
+@@ -1384,6 +1398,7 @@ def extend_attention_fwd_unified(
+         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
+         HAS_SINK=HAS_SINK,
+         PAGE_SIZE=page_size,
++        USE_LOG2_SOFTMAX=use_log2_softmax,
+         SCORE_MOD=score_mod,
+         Aux0=aux0,
+         aux0_stride_t=aux0_stride_t,

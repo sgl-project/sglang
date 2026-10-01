@@ -620,6 +620,83 @@ are unchanged from HEAD. `git diff --check` passes. All experiment jobs have
 terminated and the resident H100 queue resumed its idle workload. P8, P9 and
 P10 remain open with their original scope.
 
+## Attention Backend and Partition Isolation
+
+The retained BF16 fixture now has an attention-only diagnostic in
+`experiments/diagnose_target_kv_attention.py`. It observes the real serving
+Q/K/V after pool writes and compares independent math/SDPA implementations,
+then substitutes each result into the complete serving backbone. Source KV is
+read through the actual request mapping; FlashInfer probes copy it into their
+own continuous or page-size-one layouts. These are numerical experiments, not
+new production backends or performance measurements.
+
+`01790820269727254473-251a360b53b3` establishes that PyTorch SDPA actually
+selects `aten::_scaled_dot_product_cudnn_attention` in this environment
+(cuDNN version 92000). The backend name `sdpa` alone is therefore insufficient
+provenance. Using the same cuDNN path on the serving Q/K/V gives bit-exact full
+backbone results on the three anchors. More accurate mathematical evaluation
+does not reproduce that implementation's BF16 rounding:
+
+| Substituted attention versus SDPA reference | Failing corrected logits | Maximum logit error |
+| --- | ---: | ---: |
+| Production Triton | 31,040 | 0.13720703125 |
+| PyTorch cuDNN | 0 | 0 |
+| PyTorch Flash | 15,551 | 0.15625 |
+| PyTorch math | 27,792 | 0.15234375 |
+| FP64 math | 27,548 | 0.15234375 |
+| FlashInfer cuDNN, continuous KV | 2,237 | 0.125 |
+| FlashInfer cuDNN, page-size-one KV | 38,941 | 0.140625 |
+
+The pinned SpecForge DSpark offline examples use `flex_attention`, so that
+training choice was also tested explicitly without overwriting the SDPA gate.
+The default Triton path processes prefix and draft-block KV separately; the
+existing deterministic/unified path processes one combined index sequence.
+`01790821413528641824-f66d1834b514` confirms the following results against the
+FlexAttention reference at the unchanged `rtol=0.03, atol=0.03`:
+
+| Triton execution | Failing hidden values | Failing corrected logits | Maximum logit error |
+| --- | ---: | ---: | ---: |
+| Production split prefix/block | 56 | 24,668 | 0.125 |
+| Existing unified path | 1 | 1,762 | 0.125 |
+| Unified with experimental log2 softmax/dot accumulation | 1 | 1,652 | 0.09375 |
+
+The log2 change did not pass, so it is retained only as
+`experiments/target-kv-log2-probe.patch`, outside the production kernel. The
+BF16 diagnostic accepts `--probe-log2` only when that patch is present. The
+H100 copy was restored after the experiment. FlexAttention's short-query
+implementation also partitions KV into independent reductions; aligning the
+remaining partition/reduction behavior still requires work. Neither a different
+training backend nor a smaller error count constitutes a passed gate.
+
+The complete numerical records, current failed serving report, fixture/source
+digests and attention-dump digest are retained in
+[target-kv-attention-comparison.json](experiments/target-kv-attention-comparison.json).
+The sampled Q/K/V dump remains in the H100 lab fixtures, outside Git.
+
+Verification of the report changes:
+
+- `01790820480684197104-93daf89dbb67`: five parity regression tests and three
+  subtests pass in 14.20s, including failure-report invalidation and actual
+  serving fused/stacked/individual path comparisons.
+- `01790820481021818222-25739950b90e`: the actual SDPA gate retains its 31,040
+  corrected-logit failures while recording CUDA/cuDNN versions and observed
+  SDPA operators. Its report hash is
+  `700201af267eca222b0e2aa572e72f7b86ce1409a91af95f44f51e277a30e02f`.
+- `01790821324783856730-15e95c50251b`: the updated FlexAttention diagnostic
+  runs successfully with the unmodified production kernel and reproduces the
+  split/unified/reference-substitution comparisons. No serving certificate is
+  written by a diagnostic.
+- `01790821545474546786-5923c48b4090`: with the production kernel restored,
+  `--probe-log2` exits with the expected CLI status 2 and explains the missing
+  isolated experimental patch before opening a checkpoint.
+
+Ruff, JSON validation and patch applicability checks pass. The original
+worktree's staged-diff digest is unchanged; all experiments have terminated and
+the resident H100 resumed its idle workload.
+
+The serving implementation remains at the previous verified numerical policy.
+P8, P9 and P10 remain open; these experiments add no topology or SLO evidence.
+
 ## Next Implementation
 
 1. Broaden real-request coverage to prefill graphs, real retraction, cache eviction,

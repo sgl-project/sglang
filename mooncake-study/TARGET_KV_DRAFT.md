@@ -236,7 +236,9 @@ label and a partial final block. On success, a test-only cached CE+TV128 loss ch
 finite, nonzero encoder/backbone/Markov gradients and frozen shared weights.
 
 The gate writes `validation/parity.json` with pass/fail status, all stage errors,
-artifact/source digests, dtype, backends and runtime versions. Nonfinite values
+artifact/source digests, dtype, backends and runtime versions. It also records
+CUDA/cuDNN versions and the observed SDPA operators: PyTorch's `sdpa` selection
+can choose different kernels with different BF16 rounding. Nonfinite values
 fail. A failed rerun invalidates an older passing report; early artifact-loading
 failures leave no report. The command exits unsuccessfully on a failed comparison.
 This gate is separate from online capture's exact tensor readback test and is not

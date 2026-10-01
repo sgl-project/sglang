@@ -111,8 +111,9 @@ its serving-latency panels do not establish capture-overhead thresholds.
 ### BF16 Rounding Isolation
 
 The actual fixed-input parity command remains the serving gate. The following
-separate diagnostic runs three comparisons on one retained checkpoint/fixture:
-production, reference auxiliary arithmetic with real Triton attention, and
+separate diagnostic compares one retained checkpoint/fixture with the production
+path, existing unified-prefix/block Triton path, reference auxiliary arithmetic
+with real Triton attention, and
 reference auxiliary/attention arithmetic while retaining real paged KV writes
 and reads. It never writes `validation/parity.json` or certifies serving, and
 blocks execution of the target decoder.
@@ -128,6 +129,39 @@ This distinguishes layout/checkpoint errors from numerical differences in the
 same-input operators. It deliberately recomputes diagnostic attention after
 the actual paged backend runs, so its timing is not production performance and
 its equality result is not evidence for the unmodified attention backend.
+
+The attention-only experiment keeps the production auxiliary arithmetic and
+reads the actual paged pool. It compares PyTorch SDPA's selected implementation,
+explicit math/Flash/cuDNN implementations, FP32/FP64 mathematical references,
+and FlashInfer cuDNN on continuous and page-size-one KV. Each substitute is
+also exercised through the complete draft backbone. Its cuDNN probes require
+the pinned CUDA/cuDNN/FlashInfer environment; they are not serving backends.
+
+```bash
+PYTHONPATH=python:/path/to/SpecForge python mooncake-study/experiments/diagnose_target_kv_attention.py \
+  --checkpoint /path/to/retained-draft \
+  --target-path /models/Qwen3-0.6B \
+  --dump-attention /path/to/attention-inputs.safetensors
+```
+
+The optional dump contains only diagnostic Q/K/V and attention outputs, not a
+training export or serving certificate. The profiler records the SDPA operator
+actually selected; `sdpa` alone does not identify its numerical implementation.
+The fixed-input gate now includes observed SDPA operators and CUDA/cuDNN
+versions in both success and failure reports. This does not alter its tolerance.
+
+The pinned SpecForge DSpark offline example uses `flex_attention`. To compare
+that training choice explicitly, run the earlier BF16 diagnostic with
+`--reference-attention flex_attention`. Keep reports for different training
+backends separate; one backend's result does not certify another backend.
+
+`target-kv-log2-probe.patch` preserves a failed numerical experiment outside the
+production kernel. It changes the unified kernel's exponential base and uses
+the dot-product accumulator for the running output. To reproduce it, apply the
+patch in an isolated checkout, then add `--probe-log2` to the BF16 diagnostic.
+The command rejects this option when the patch is absent. The patch has not
+passed the full parity gate, and its causal, masked, sink and non-BF16 branches
+have not been validated; it is not a deployment configuration.
 
 Focused regressions:
 

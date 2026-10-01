@@ -1,7 +1,9 @@
 """Isolate BF16 auxiliary/attention rounding; never write a serving certificate."""
 
 import argparse
+import inspect
 import json
+from functools import partial
 from types import MethodType
 from unittest.mock import patch
 
@@ -47,7 +49,9 @@ class ProbeDone(Exception):
 
 
 @torch.no_grad()
-def probe(reference, serving, embed, head, tensors, anchors, **kwargs):
+def probe(
+    reference, serving, embed, head, tensors, anchors, *, probe_log2=False, **kwargs
+):
     from specforge.modeling.draft.dflash import eager_attention_forward
     from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
@@ -71,7 +75,12 @@ def probe(reference, serving, embed, head, tensors, anchors, **kwargs):
         actual = serving.forward(
             tensors=tensors, anchors=anchors, previous_tokens=previous
         )
-        report = {"diagnostic_only": True, "mode": mode, "dtype": "bfloat16"}
+        report = {
+            "diagnostic_only": True,
+            "mode": mode,
+            "dtype": "bfloat16",
+            "reference_attention": reference.backbone.config._attn_implementation,
+        }
         try:
             report.update(parity.compare_parity_outputs(actual, expected, **kwargs))
         except parity.FixedInputParityError as error:
@@ -79,6 +88,17 @@ def probe(reference, serving, embed, head, tensors, anchors, **kwargs):
         print(json.dumps(report), flush=True)
 
     compare("production")
+    with patch.object(serving.backend, "enable_deterministic", True):
+        compare("production_unified_extend")
+        if probe_log2:
+            with patch.object(
+                serving.backend,
+                "extend_attention_fwd_unified",
+                partial(
+                    serving.backend.extend_attention_fwd_unified, use_log2_softmax=True
+                ),
+            ):
+                compare("production_unified_log2")
     model = serving.model
     model._build_fused_kv_write_bundle = lambda pool: None
     model._fused_kv_write_cache = None
@@ -156,12 +176,35 @@ def main():
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--target-path", required=True)
     parser.add_argument(
-        "--reference-attention", choices=("eager", "sdpa"), default="sdpa"
+        "--probe-log2",
+        action="store_true",
+        help="Requires the diagnostic-only target-kv-log2-probe.patch to be applied",
+    )
+    parser.add_argument(
+        "--reference-attention",
+        choices=("eager", "sdpa", "flex_attention"),
+        default="sdpa",
     )
     args = parser.parse_args()
+    if args.probe_log2:
+        from sglang.kernels.ops.attention.extend_attention import (
+            extend_attention_fwd_unified,
+        )
+
+        if (
+            "use_log2_softmax"
+            not in inspect.signature(extend_attention_fwd_unified).parameters
+        ):
+            parser.error(
+                "--probe-log2 requires target-kv-log2-probe.patch in an isolated checkout"
+            )
     with (
         parity.single_gpu_parity_context(),
-        patch.object(parity, "check_fixed_input_parity", probe),
+        patch.object(
+            parity,
+            "check_fixed_input_parity",
+            partial(probe, probe_log2=args.probe_log2),
+        ),
         patch(
             "transformers.models.qwen3.modeling_qwen3.Qwen3Model.forward",
             side_effect=AssertionError("target decoder is forbidden"),

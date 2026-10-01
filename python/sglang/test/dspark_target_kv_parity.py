@@ -536,6 +536,8 @@ def validate_captured_checkpoint(directory, target_path, *, attention_backend="e
         "dtype": "bfloat16",
         "device": torch.cuda.get_device_name(),
         "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda,
+        "cudnn_version": torch.backends.cudnn.version(),
         "transformers_version": version("transformers"),
         "specforge_sources": {
             module.__name__: digest_bytes(Path(module.__file__).read_bytes())
@@ -557,11 +559,15 @@ def validate_captured_checkpoint(directory, target_path, *, attention_backend="e
         temporary.replace(report_path)
 
     write_report()
+    profile = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU])
     try:
-        with patch(
-            "transformers.models.qwen3.modeling_qwen3.Qwen3Model.forward",
-            side_effect=AssertionError(
-                "target decoder execution is forbidden in cached-data parity"
+        with (
+            profile,
+            patch(
+                "transformers.models.qwen3.modeling_qwen3.Qwen3Model.forward",
+                side_effect=AssertionError(
+                    "target decoder execution is forbidden in cached-data parity"
+                ),
             ),
         ):
             report.update(
@@ -569,14 +575,20 @@ def validate_captured_checkpoint(directory, target_path, *, attention_backend="e
                     directory, target_path, attention_backend=attention_backend
                 )
             )
+        report["status"] = "passed"
     except Exception as error:
         if isinstance(error, FixedInputParityError):
             report.update(error.report)
         report.update(status="failed", error=str(error))
-        write_report()
         raise
-    report["status"] = "passed"
-    write_report()
+    finally:
+        # SDPA chooses among several kernels whose BF16 results can differ.
+        report["observed_sdpa_operators"] = sorted(
+            event.key
+            for event in profile.key_averages()
+            if "scaled_dot_product" in event.key
+        )
+        write_report()
     return report
 
 
