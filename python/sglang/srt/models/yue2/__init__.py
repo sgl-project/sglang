@@ -1,0 +1,1 @@
+"""YuE 2 model-specific building blocks (registry-skipped support package)."""
