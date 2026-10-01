@@ -20,6 +20,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionSamplingParams,
     DiffusionServerArgs,
     DiffusionTestCase,
+    FLUX3_ACTION_CI_sampling_params,
     IDEOGRAM4_CI_sampling_params,
     JOY_ECHO_T2V_CI_sampling_params,
     LINGBOT_VIDEO_T2V_CI_sampling_params,
@@ -117,6 +118,18 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         PI05_ACTION_CI_sampling_params,
         run_perf_check=False,
         perf_warmup_requests=1,
+        run_component_accuracy_check=False,
+        run_t2v_input_reference_check=False,
+    ),
+    DiffusionTestCase(
+        "flux3_action_http",
+        DiffusionServerArgs(
+            model_path="black-forest-labs/flux-3-action-droid",
+        ),
+        FLUX3_ACTION_CI_sampling_params,
+        run_perf_check=False,
+        perf_warmup_requests=1,
+        # No Diffusers counterpart to compare components against.
         run_component_accuracy_check=False,
         run_t2v_input_reference_check=False,
     ),
