@@ -210,6 +210,8 @@ class PrefetchAck:
     # Number of hits in extra pools.
     pool_hits: Optional[dict[str, int]] = None
     completed_req: Optional[bool] = None
+    # Only emitted for a single-worker backend exception after I/O returns.
+    failed: bool = False
 
 
 class StorageOperation:
@@ -237,6 +239,9 @@ class StorageOperation:
         self.stats_requested_tokens = 0
         # Absolute token offset at which this storage-prefetched span starts.
         self.storage_start = 0
+        # Terminal consumption is scheduler-owned, including cancelled/stale ops.
+        self.terminal_ack_consumed = False
+        self.terminal_outcome: Optional[str] = None
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
@@ -1166,17 +1171,38 @@ class HiCacheController:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                self._page_transfer(operation)
+                failed = False
+                try:
+                    self._page_transfer(operation)
+                except Exception:
+                    # Multi-rank workers must keep their per-batch collective
+                    # sequence; this local recovery does not change that protocol.
+                    if not self._supports_local_prefetch_failure():
+                        raise
+                    logger.exception(
+                        "HiCache prefetch read failed: %s", operation.request_id
+                    )
+                    failed = True
 
                 self.prefetch_sync_queue.put(
                     PrefetchAck(
                         rid=operation.request_id,
                         completed_req=True,
                         operation=operation,
+                        failed=failed,
                     )
                 )
             except Empty:
                 continue
+
+    def _supports_local_prefetch_failure(self) -> bool:
+        # _create_sync_groups excludes single-rank groups. PP tickets also
+        # carry their own completion protocol, even before local allocation.
+        return getattr(self, "_supports_prefetch_failure_ack", False) and not (
+            self.prefetch_hits_sync_groups
+            or self.prefetch_completion_sync_groups
+            or getattr(self, "pp_prefetch_command_group", None) is not None
+        )
 
     def prefetch_rate_limited(self) -> bool:
         """
@@ -1235,7 +1261,25 @@ class HiCacheController:
                 if operation.is_terminated():
                     hash_value, storage_hit_count = [], 0
                 else:
-                    hash_value, storage_hit_count = self._storage_hit_query(operation)
+                    try:
+                        hash_value, storage_hit_count = self._storage_hit_query(
+                            operation
+                        )
+                    except Exception:
+                        if not self._supports_local_prefetch_failure():
+                            raise
+                        logger.exception(
+                            "HiCache prefetch query failed: %s", operation.request_id
+                        )
+                        self.prefetch_sync_queue.put(
+                            PrefetchAck(
+                                rid=operation.request_id,
+                                operation=operation,
+                                completed_req=True,
+                                failed=True,
+                            )
+                        )
+                        continue
                 storage_hit_count_tensor = torch.tensor(
                     storage_hit_count, dtype=torch.int
                 )

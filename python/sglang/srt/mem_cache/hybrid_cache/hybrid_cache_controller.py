@@ -208,6 +208,13 @@ class HybridCacheController(BaseHiCacheController):
         host_memory_mode: str = "cache",
     ):
         startup_storage_backend = storage_backend
+        # Only the resident Unified FULL drain currently consumes failure ACKs.
+        # Keep legacy and multi-pool consumers on their existing protocol.
+        self._supports_prefetch_failure_ack = (
+            host_memory_mode == "cache"
+            and len(mem_pool_host.entries) == 1
+            and mem_pool_host.anchor_entry.name == PoolName.KV
+        )
         self.extra_host_mem_release_queues: dict[PoolName, Queue[torch.Tensor]] = {}
         self.pp_prefetch_command_group = None
         self.pp_prefetch_command_thread = None
