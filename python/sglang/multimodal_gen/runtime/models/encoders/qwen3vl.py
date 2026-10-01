@@ -27,6 +27,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8 import (
     WeightOnlyFP8Linear,
     WeightOnlyFP8RowParallelLinear,
 )
+from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
+)
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
 from sglang.multimodal_gen.runtime.models.encoders.qwen3vl_vision import (
@@ -53,6 +56,8 @@ except ImportError:
 import torch
 import torch.nn as nn
 from transformers.activations import ACT2FN
+
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_conditioning
 
 logger = logging.getLogger(__name__)
 
@@ -504,9 +509,21 @@ class Qwen3VLTextModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embedding(
-            config.vocab_size, config.hidden_size, self.padding_idx
-        )
+        embedding_prefix = add_prefix("embed_tokens", prefix)
+        if quant_config is not None and quant_config.quantizes_embedding(
+            embedding_prefix
+        ):
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                params_dtype=torch.get_default_dtype(),
+                quant_config=quant_config,
+                prefix=embedding_prefix,
+            )
+        else:
+            self.embed_tokens = nn.Embedding(
+                config.vocab_size, config.hidden_size, self.padding_idx
+            )
         self.layers = nn.ModuleList(
             [
                 Qwen3VLTextDecoderLayer(
@@ -679,7 +696,16 @@ class Qwen3VLModel(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.visual = Qwen3VLVisionTransformer(config.vision_config)
+        vision_quant_config = (
+            quant_config
+            if quant_config is not None and quant_config.supports_srt_linear_layers
+            else None
+        )
+        self.visual = Qwen3VLVisionTransformer(
+            config.vision_config,
+            quant_config=vision_quant_config,
+            prefix=add_prefix("visual", prefix),
+        )
         self.language_model = Qwen3VLTextModel(
             config.text_config,
             quant_config=quant_config,
@@ -886,6 +912,7 @@ class Qwen3VLModel(nn.Module):
         # Same implementation as for images
         return self.get_image_features(pixel_values_videos, video_grid_thw)
 
+    @cached_conditioning
     def _get_flat_visual_features(
         self,
         pixel_values: torch.FloatTensor,
@@ -1167,7 +1194,11 @@ class Qwen3VLModel(nn.Module):
 
 
 class Qwen3VLForConditionalGeneration(TextEncoder):
-    layer_names = [*TextEncoder.layer_names, "model.visual.blocks"]
+    layer_names = [
+        *TextEncoder.layer_names,
+        "model.visual.blocks",
+        "model.visual.deepstack_merger_list",
+    ]
     default_bitsandbytes_target_modules = [
         ".gate_up_proj.",
         ".down_proj.",
@@ -1192,11 +1223,20 @@ class Qwen3VLForConditionalGeneration(TextEncoder):
 
     def __init__(self, config):
         super().__init__(config)
+        quant_config = config.quant_config
         config = config.arch_config
-        self.model = Qwen3VLModel(config)
+        self.model = Qwen3VLModel(
+            config, quant_config=quant_config, use_tensor_parallel=True, prefix="model"
+        )
         self.lm_head = nn.Linear(
             config.text_config.hidden_size, config.text_config.vocab_size, bias=False
         )
+        if getattr(config, "tie_word_embeddings", False) or getattr(
+            config.text_config, "tie_word_embeddings", False
+        ):
+            # Tied checkpoints may omit lm_head.weight, as Hugging Face does.
+            # Keep one registered parameter so strict native loading stays safe.
+            self.lm_head.weight = self.model.get_input_embeddings().weight
 
     @torch.no_grad()
     def forward(

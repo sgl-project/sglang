@@ -3,19 +3,21 @@ from typing import List, Optional
 
 import numpy as np
 import torch
-from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs_func as assign_extend_cache_locs_func,
 )
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
-from sglang.srt.runtime_context import get_schedule
+from sglang.srt.runtime_context import (
+    get_device,
+    get_schedule,
+    get_spec,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
@@ -29,10 +31,19 @@ from sglang.srt.speculative.spec_utils import (
     prepare_mamba_track_for_verify,
     record_stream_for_v2_verify,
 )
-from sglang.srt.utils import is_cpu
+from sglang.srt.utils import is_cpu, is_cuda, is_xpu
 from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
 
 _is_cpu = is_cpu()
+
+if is_xpu():
+    from sglang.kernels.ops.speculative.reconstruct_tree import (
+        reconstruct_indices_from_tree_mask_triton as reconstruct_indices_from_tree_mask,
+    )
+elif is_cuda():
+    from sglang.kernels.ops.speculative.tree import reconstruct_indices_from_tree_mask
+else:
+    from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
 logger = logging.getLogger(__name__)
 
@@ -81,26 +92,24 @@ class NGRAMWorker(BaseSpecWorker):
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
         super().__init__()
 
         self.server_args = server_args
-        self.enable_overlap = not server_args.disable_overlap_schedule
+        self.enable_overlap = not get_schedule().disable_overlap_schedule
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
-        self.tp_rank = ps.tp_rank
         self.page_size = get_schedule().page_size
-        self.draft_token_num: int = server_args.speculative_num_draft_tokens
-        self.max_trie_depth: int = server_args.speculative_ngram_max_trie_depth
-        self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
-        self.topk = server_args.speculative_eagle_topk
-        self.speculative_num_steps = server_args.speculative_num_steps
+        self.draft_token_num: int = get_spec().speculative_num_draft_tokens
+        self.max_trie_depth: int = get_spec().speculative_ngram_max_trie_depth
+        self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
+        self.topk = get_spec().speculative_eagle_topk
+        self.speculative_num_steps = get_spec().speculative_num_steps
         # req_to_token_pool / token_to_kv_pool_allocator are set in
         # alloc_memory_pool(), after the target pools are allocated.
-        self.device = server_args.device
+        self.device = get_device().device
 
         self.adaptive_controller = None
         # rids of the last decode batch; used to erase corpus match state for
@@ -109,26 +118,26 @@ class NGRAMWorker(BaseSpecWorker):
         self.grammar_tree_host: Optional[tuple] = None
 
         self.ngram_corpus = NgramCorpus(
-            min_bfs_breadth=server_args.speculative_ngram_min_bfs_breadth,
-            max_bfs_breadth=server_args.speculative_ngram_max_bfs_breadth,
-            match_type=server_args.speculative_ngram_match_type,
-            capacity=server_args.speculative_ngram_capacity,
-            max_trie_depth=server_args.speculative_ngram_max_trie_depth,
-            draft_token_num=server_args.speculative_num_draft_tokens,
-            external_sam_budget=server_args.speculative_ngram_external_sam_budget,
-            external_corpus_max_tokens=server_args.speculative_ngram_external_corpus_max_tokens,
+            min_bfs_breadth=get_spec().speculative_ngram_min_bfs_breadth,
+            max_bfs_breadth=get_spec().speculative_ngram_max_bfs_breadth,
+            match_type=get_spec().speculative_ngram_match_type,
+            capacity=get_spec().speculative_ngram_capacity,
+            max_trie_depth=get_spec().speculative_ngram_max_trie_depth,
+            draft_token_num=get_spec().speculative_num_draft_tokens,
+            external_sam_budget=get_spec().speculative_ngram_external_sam_budget,
+            external_corpus_max_tokens=get_spec().speculative_ngram_external_corpus_max_tokens,
         )
-        if server_args.speculative_ngram_external_corpus_path is not None:
+        if get_spec().speculative_ngram_external_corpus_path is not None:
             from sglang.srt.speculative.cpp_ngram.external_corpus import (
                 iter_external_corpus_chunks,
             )
 
-            corpus_path = server_args.speculative_ngram_external_corpus_path
+            corpus_path = get_spec().speculative_ngram_external_corpus_path
             chunks = list(
                 iter_external_corpus_chunks(
                     corpus_path,
                     target_worker.tokenizer,
-                    server_args.speculative_ngram_external_corpus_max_tokens,
+                    get_spec().speculative_ngram_external_corpus_max_tokens,
                 )
             )
             loaded = self.add_external_corpus(corpus_path, chunks)
@@ -147,15 +156,6 @@ class NGRAMWorker(BaseSpecWorker):
     def clear_cache_pool(self):
         self.ngram_corpus.reset()
         self._prev_decode_rids = set()
-
-    def update_weights_from_tensor(self, recv_req):
-        # NGRAM has no draft weights of its own — the n-gram corpus is a CPU
-        # lookup structure built from request token streams — and its
-        # `model_runner` is shared with the target worker. The scheduler
-        # mixin dispatches via `self.draft_worker or self.tp_worker`, so
-        # without this method any caller of `update_weights_from_tensor`
-        # under `--speculative-algorithm NGRAM` raises AttributeError.
-        return self.target_worker.update_weights_from_tensor(recv_req)
 
     def add_external_corpus(self, corpus_id: str, token_chunks: list[list[int]]) -> int:
         return self.ngram_corpus.load_external_corpus_named(corpus_id, token_chunks)
@@ -302,9 +302,9 @@ class NGRAMWorker(BaseSpecWorker):
         total_draft_token_num = len(req_drafts)
 
         # Check if speculative decoding is needed; here we always enforce it
-        assert (
-            total_draft_token_num == bs * self.draft_token_num
-        ), f"{total_draft_token_num=}, {bs=}, {self.draft_token_num=}"
+        assert total_draft_token_num == bs * self.draft_token_num, (
+            f"{total_draft_token_num=}, {bs=}, {self.draft_token_num=}"
+        )
         return req_drafts, mask
 
     def _prepare_for_speculative_decoding(self, batch: ScheduleBatch):
@@ -423,7 +423,7 @@ class NGRAMWorker(BaseSpecWorker):
         self.ngram_corpus.batch_put(batch_tokens)
 
     def forward_batch_generation(
-        self, batch: ScheduleBatch, on_publish=None
+        self, batch: ScheduleBatch, on_publish=None, pp_proxy_tensors=None
     ) -> GenerationBatchResult:
         fwd_stream = torch.get_device_module(self.device).current_stream()
         record_stream_for_v2_verify(batch, None, fwd_stream)
@@ -438,7 +438,7 @@ class NGRAMWorker(BaseSpecWorker):
 
         if batch.forward_mode.is_target_verify():
             batch_result = self.target_worker.forward_batch_generation(
-                batch, is_verify=True
+                batch, pp_proxy_tensors=pp_proxy_tensors, is_verify=True
             )
 
             logits_output, can_run_cuda_graph = (
@@ -524,7 +524,9 @@ class NGRAMWorker(BaseSpecWorker):
             batch.forward_mode = ForwardMode.DECODE
 
         else:
-            batch_result = self.target_worker.forward_batch_generation(batch)
+            batch_result = self.target_worker.forward_batch_generation(
+                batch, pp_proxy_tensors=pp_proxy_tensors
+            )
             logits_output, predict, can_run_cuda_graph = (
                 batch_result.logits_output,
                 batch_result.next_token_ids,

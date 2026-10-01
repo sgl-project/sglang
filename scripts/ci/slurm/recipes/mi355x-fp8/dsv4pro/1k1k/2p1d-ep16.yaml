@@ -58,7 +58,13 @@ runtime:
   # differ, so these split what the single-node EP<=8 recipes leave symmetric.
   wide_ep:
     kv_cache_dtype: fp8_e4m3
-    prefill_mem_fraction_static: 0.8
+    # 0.85, not the 0.8 the other ep16 recipes use. FP8 Pro weights are 218.92 GB
+    # per rank; at 0.8 of a 288 GB card the static budget is 230.4 GB, leaving
+    # ~11 GB for activations and the KV pool. max_total_num_tokens resolves to 0
+    # and the prefill engine aborts with "Not enough memory. Please try to
+    # increase --mem-fraction-static." The FP4 recipes fit at 0.8 because their
+    # weights are half the size, and the FP8 MTP recipe already runs at 0.85.
+    prefill_mem_fraction_static: 0.85
     decode_mem_fraction_static: 0.85
     prefill_chunked_prefill_size: 131072
     prefill_max_running_requests: 1024
@@ -69,7 +75,7 @@ runtime:
     # region over 4 GiB and mori registers each KV buffer as one region
     # (no chunking).  Largest buffer = max_total_num_tokens * 256 B, so the
     # ceiling is 16,777,216 tokens; 16,000,000 leaves headroom.
-    decode_extra_flags: "--max-total-tokens 16000000 --cuda-graph-bs 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99 100 101 102 103 104 105 106 107 108 109 110 111 112 113 114 115 116 117 118 119 120 121 122 123 124 125 126 127 128 --prefill-round-robin-balance"
+    decode_extra_flags: "--max-total-tokens 16000000 --cuda-graph-bs-decode 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99 100 101 102 103 104 105 106 107 108 109 110 111 112 113 114 115 116 117 118 119 120 121 122 123 124 125 126 127 128"
     prefill_extra_env:
       MORI_MAX_DISPATCH_TOKENS_PREFILL: 8192
       MORI_MAX_DISPATCH_TOKENS_DECODE: 256

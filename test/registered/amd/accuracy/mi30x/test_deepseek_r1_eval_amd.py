@@ -114,9 +114,8 @@ DEEPSEEK_R1_MODELS = [
         other_args=[
             "--chunked-prefill-size",
             "131072",
-            "--dp-size",
+            "--attn-dp-size",
             "8",
-            "--enable-dp-attention",
             "--mem-fraction-static",
             "0.85",
             "--trust-remote-code",
@@ -246,9 +245,9 @@ class TestDeepSeekR1EvalAMD(unittest.TestCase):
         for config in self.models:
             display_name = config.get_display_name()
             with self.subTest(model=display_name):
-                print(f"\n{'='*60}")
+                print(f"\n{'=' * 60}")
                 print(f"Testing: {display_name}")
-                print(f"{'='*60}")
+                print(f"{'=' * 60}")
 
                 env = os.environ.copy()
                 for key, value in config.env_vars.items():

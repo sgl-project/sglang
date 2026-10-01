@@ -4,7 +4,7 @@
 
 import logging
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import Optional, Sequence, Tuple
 
 import torch
 from torch.nn.parameter import Parameter, UninitializedParameter
@@ -14,7 +14,6 @@ from sglang.kernels.ops.embeddings.vocab_parallel_embedding import (
 )
 from sglang.srt.distributed import (
     divide,
-    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -22,12 +21,12 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import PackWeightMethod
-from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
     is_allocation_symmetric,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.parameter import BasevLLMParameter
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
@@ -234,6 +233,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         embedding_dim: int,
         *,
         params_dtype: Optional[torch.dtype] = None,
+        output_dtype: Optional[torch.dtype] = None,
         org_num_embeddings: Optional[int] = None,
         padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
         quant_config: Optional[QuantizationConfig] = None,
@@ -244,6 +244,7 @@ class VocabParallelEmbedding(torch.nn.Module):
     ):
         super().__init__()
         self.quant_config = quant_config
+        self.output_dtype = output_dtype
 
         self.enable_tp = enable_tp
         self.use_attn_tp_group = use_attn_tp_group
@@ -273,9 +274,9 @@ class VocabParallelEmbedding(torch.nn.Module):
         num_added_embeddings = num_embeddings - self.org_vocab_size
         self.use_presharded_weights = use_presharded_weights
         if use_presharded_weights:
-            assert (
-                num_added_embeddings == 0
-            ), "Lora is not supported with presharded weights."
+            assert num_added_embeddings == 0, (
+                "Lora is not supported with presharded weights."
+            )
 
         self.org_vocab_size_padded = pad_vocab_size(
             self.org_vocab_size, self.padding_size
@@ -383,71 +384,6 @@ class VocabParallelEmbedding(torch.nn.Module):
             added_vocab_end_index,
         )
 
-    def get_sharded_to_full_mapping(self) -> Optional[List[int]]:
-        """Get a mapping that can be used to reindex the gathered
-        logits for sampling.
-
-        During sampling, we gather logits from all ranks. The relationship
-        of index->token_id will follow the same format as outlined in the class
-        docstring. However, after the gather, we want to reindex the final
-        logits tensor to map index->token_id one-to-one (the index is always
-        equal the token_id it corresponds to). The indices returned by this
-        method allow us to do that.
-        """
-        if self.tp_size < 2:
-            return None
-
-        base_embeddings: List[int] = []
-        added_embeddings: List[int] = []
-        padding: List[int] = []
-        for tp_rank in range(self.tp_size):
-            shard_indices = self._get_indices(
-                self.num_embeddings_padded,
-                self.org_vocab_size_padded,
-                self.num_embeddings,
-                self.org_vocab_size,
-                tp_rank,
-                self.tp_size,
-            )
-            range_start = self.num_embeddings_per_partition * tp_rank
-            range_end = self.num_embeddings_per_partition * (tp_rank + 1)
-            base_embeddings.extend(
-                range(range_start, range_start + shard_indices.num_org_elements)
-            )
-            padding.extend(
-                range(
-                    range_start + shard_indices.num_org_elements,
-                    range_start + shard_indices.num_org_elements_padded,
-                )
-            )
-            added_embeddings.extend(
-                range(
-                    range_start + shard_indices.num_org_elements_padded,
-                    range_start
-                    + shard_indices.num_org_elements_padded
-                    + shard_indices.num_added_elements,
-                )
-            )
-            padding.extend(
-                range(
-                    range_start
-                    + shard_indices.num_org_elements_padded
-                    + shard_indices.num_added_elements,
-                    range_start
-                    + shard_indices.num_org_elements_padded
-                    + shard_indices.num_added_elements_padded,
-                )
-            )
-            assert (
-                range_start
-                + shard_indices.num_org_elements_padded
-                + shard_indices.num_added_elements_padded
-                == range_end
-            )
-        ret = base_embeddings + added_embeddings + padding
-        assert len(ret) == self.num_embeddings_padded
-        return ret
-
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
         output_dim = getattr(param, "output_dim", None)
         packed_dim = getattr(param, "packed_dim", None)
@@ -497,7 +433,9 @@ class VocabParallelEmbedding(torch.nn.Module):
             assert loaded_weight.shape[output_dim] == (
                 self.org_vocab_size
                 // (self.tp_size if self.use_presharded_weights else 1)
-            ), f"{self.org_vocab_size=} {self.use_presharded_weights=} {loaded_weight.shape[output_dim]=}"
+            ), (
+                f"{self.org_vocab_size=} {self.use_presharded_weights=} {loaded_weight.shape[output_dim]=}"
+            )
 
         # Copy the data.
         if not self.use_presharded_weights:
@@ -533,14 +471,17 @@ class VocabParallelEmbedding(torch.nn.Module):
         in-place fill deliberately stay outside the pool.
         """
         symm_alloc = use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
+            get_parallel().tp_group, disabled=not is_allocation_symmetric()
         )
         if self.tp_size == 1:
             with symm_alloc:
-                return self.quant_method.embedding(self, input_.long())
+                output_parallel = self.quant_method.embedding(self, input_.long())
+            if self.output_dtype is not None:
+                output_parallel = output_parallel.to(self.output_dtype)
+            return output_parallel
         if self._use_triton_embedding(input_):
             with symm_alloc:
-                return fused_vocab_parallel_embedding(
+                output_parallel = fused_vocab_parallel_embedding(
                     input_,
                     self.weight,
                     self.shard_indices.org_vocab_start_index,
@@ -549,6 +490,9 @@ class VocabParallelEmbedding(torch.nn.Module):
                     self.shard_indices.added_vocab_start_index,
                     self.shard_indices.added_vocab_end_index,
                 )
+            if self.output_dtype is not None:
+                output_parallel = output_parallel.to(self.output_dtype)
+            return output_parallel
         # Map out-of-shard ids to index 0, gather, then zero those rows.
         masked_input, input_mask = get_masked_input_and_mask(
             input_,
@@ -560,6 +504,8 @@ class VocabParallelEmbedding(torch.nn.Module):
         )
         with symm_alloc:
             output_parallel = self.quant_method.embedding(self, masked_input.long())
+        if self.output_dtype is not None:
+            output_parallel = output_parallel.to(self.output_dtype)
         output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
         return output_parallel
 

@@ -26,7 +26,6 @@ def _raising_gen():
 
 
 class TestAdvanceGenerator(CustomTestCase):
-
     def test_not_done_when_generator_yields(self):
         done, exc_tb = scheduler_hook._advance_generator(_yielding_gen())
 

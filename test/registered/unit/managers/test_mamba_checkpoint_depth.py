@@ -3,13 +3,16 @@
 DCP widens the tree page past the mamba chunk grid. A checkpoint picked on the
 finer grid names a depth no radix node can carry, so it gets attached to the
 preceding node and a later request resumes from a state that already covers
-tokens past that node.
+tokens past that node. The same happens when the depth is measured from a
+prefix that a chunked prefill left on the scheduler page but off the widened
+tree page: 64 + 512 = 576 is no 512-page boundary, and the finished request
+then frees two kv-row segments that share the page holding 576.
 """
 
 import unittest
 from array import array
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -22,13 +25,20 @@ from sglang.srt.server_args import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 CHUNK = 64
 
 
-def _track_seqlen(*, tree_page: int, prefix_len: int, extend_len: int) -> int:
-    """Run one extend through the tracker and report the donated depth."""
+def _track_seqlen(
+    *,
+    tree_page: int,
+    prefix_len: int,
+    extend_len: int,
+    dcp_enabled: bool = False,
+) -> int | None:
+    """Run one extend through the tracker and report the donated depth, or
+    None when the extend donates no checkpoint."""
     server_args = ServerArgs(model_path="dummy", page_size=CHUNK)
     # The property would otherwise load the HF config for the dummy model.
     server_args._mamba_cache_chunk_size = CHUNK
@@ -45,30 +55,73 @@ def _track_seqlen(*, tree_page: int, prefix_len: int, extend_len: int) -> int:
     )
     req.prefix_indices = torch.arange(prefix_len, dtype=torch.int64)
     req.set_extend_range(prefix_len, prefix_len + extend_len)
-    req.mamba_ping_pong_track_buffer = torch.tensor([0, 1], dtype=torch.int64)
-    req.mamba_next_track_idx = 0
+    req.kv.mamba_ping_pong_track_buffer = torch.tensor([0, 1], dtype=torch.int64)
+    req.kv.mamba_next_track_idx = 0
     req.mamba_branching_seqlen = None
 
     batch = ScheduleBatch(reqs=[req])
+    batch.model_config = SimpleNamespace(
+        hf_text_config=SimpleNamespace(mamba_chunk_size=CHUNK)
+    )
     batch.tree_cache = SimpleNamespace(page_size=tree_page)
     batch.req_to_token_pool = MagicMock()
     batch.req_to_token_pool.get_mamba_ping_pong_other_idx.return_value = 1
 
-    batch._mamba_radix_cache_v2_req_prepare_for_extend(req)
-    return req.mamba_last_track_seqlen
+    with patch(
+        "sglang.srt.managers.schedule_batch.get_parallel",
+        return_value=SimpleNamespace(dcp_enabled=dcp_enabled),
+    ):
+        entry = batch._mamba_radix_cache_v2_req_prepare_for_extend(req)
+    if not entry.track_mask:
+        assert req.kv.mamba_last_track_seqlen is None
+        return None
+    return req.kv.mamba_last_track_seqlen
 
 
 class TestMambaCheckpointDepth(unittest.TestCase):
     def test_widened_tree_page_moves_the_donated_depth_onto_it(self):
         # 4066 tokens past a 16384 prefix: the chunk grid would stop at 20416,
         # which a 256-token page cannot name.
-        depth = _track_seqlen(tree_page=256, prefix_len=16384, extend_len=4066)
+        depth = _track_seqlen(
+            tree_page=256,
+            prefix_len=16384,
+            extend_len=4066,
+            dcp_enabled=True,
+        )
         self.assertEqual(depth % 256, 0)
         self.assertEqual(depth, 20224)
 
     def test_unwidened_tree_page_keeps_the_chunk_grid(self):
         depth = _track_seqlen(tree_page=CHUNK, prefix_len=16384, extend_len=4066)
         self.assertEqual(depth, 20416)
+
+    def test_dcp_depth_satisfies_tree_page_and_snapshot_grids(self):
+        # (tree_page, prefix_len, extend_len) -> donated depth, or None when no
+        # prefix-relative kernel snapshot lands on an absolute tree page.
+        for tree_page, prefix_len, extend_len, expected in (
+            (512, 64, 540, 512),
+            (512, 448, 128, 512),
+            (512, 64, 400, None),
+            (512, 37, 540, None),
+        ):
+            with self.subTest(prefix_len=prefix_len, extend_len=extend_len):
+                self.assertEqual(
+                    _track_seqlen(
+                        tree_page=tree_page,
+                        prefix_len=prefix_len,
+                        extend_len=extend_len,
+                        dcp_enabled=True,
+                    ),
+                    expected,
+                )
+
+    def test_non_dcp_depth_remains_relative_to_chunked_prefill_prefix(self):
+        # Active requests can stop off the absolute grid between prefill chunks.
+        # Keep donating their prefix-relative snapshots when DCP is disabled.
+        self.assertEqual(
+            _track_seqlen(tree_page=16, prefix_len=4253, extend_len=16384),
+            20637,
+        )
 
 
 class TestMambaTrackGrid(unittest.TestCase):

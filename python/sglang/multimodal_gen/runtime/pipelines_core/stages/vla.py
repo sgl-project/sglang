@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from sglang.multimodal_gen.runtime.cache.conditioning import conditioning_weights_epoch
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     OutputBatch,
@@ -84,9 +85,11 @@ def _effective_prefix_cache_enabled(
     server_args: ServerArgs,
 ) -> bool:
     options = vla_options(batch)
-    return bool(options.get("enable_prefix_cache", True)) and bool(
-        server_args.pipeline_config.enable_global_prefix_cache
-    )
+    return (
+        not server_args.disable_conditioning_cache
+        and server_args.conditioning_cache_max_size_mb > 0
+        and bool(options.get("enable_prefix_cache", True))
+    ) and bool(server_args.pipeline_config.enable_global_prefix_cache)
 
 
 def _cuda_graph_enabled(batch: Req) -> bool:
@@ -260,7 +263,11 @@ class VLAPrefixEncodingStage(PipelineStage):
         """try querying the cache for PrefixContext with prefix cache key built from observations and other keys"""
         cache_enabled = _effective_prefix_cache_enabled(batch, server_args)
         if cache_enabled:
-            cache_key = self.policy_model.build_prefix_cache_key(observation)
+            cache_key = self.policy_model.build_prefix_cache_key(
+                observation,
+                bucket_prompt=_cuda_graph_enabled(batch),
+            )
+            cache_key = f"{conditioning_weights_epoch()}:{cache_key}"
             cached_context = self.prefix_cache.get(cache_key)
         else:
             cache_key = None
@@ -299,6 +306,7 @@ class VLAPrefixEncodingStage(PipelineStage):
                 "scope": "global",
                 "mode": "exact",
                 "prefix_len": cached_context.prefix_len,
+                "prompt_token_bucket": cached_context.layout.get("prompt_token_bucket"),
             }
             if split is not None:
                 self._send_prefix_result(batch, split, cached_context)
@@ -307,9 +315,11 @@ class VLAPrefixEncodingStage(PipelineStage):
         prefix_start = time.perf_counter()
 
         # 3. run encoding
+        cuda_graph_enabled = _cuda_graph_enabled(batch)
         prefix_context = self.policy_model.encode_prefix(
             observation,
-            use_cuda_graph=_cuda_graph_enabled(batch) and not cache_enabled,
+            use_cuda_graph=cuda_graph_enabled and not cache_enabled,
+            bucket_prompt=cuda_graph_enabled,
         )
         if cache_key is not None:
             prefix_context.cache_key_digest = cache_key
@@ -321,6 +331,7 @@ class VLAPrefixEncodingStage(PipelineStage):
             "scope": "global" if cache_enabled else "request",
             "mode": "exact" if cache_enabled else "disabled",
             "prefix_len": prefix_context.prefix_len,
+            "prompt_token_bucket": prefix_context.layout.get("prompt_token_bucket"),
         }
 
         # 4. update prefix kv cache
@@ -421,7 +432,6 @@ class VLAActionDenoisingStage(PipelineStage):
             )
         elif should_run_action:
             # broadcast PrefixContext from action root rank to action ranks
-            options = vla_options(batch)
             noise = observation.noise if observation is not None else None
             actions = self.policy_model.sample_actions(
                 observation,

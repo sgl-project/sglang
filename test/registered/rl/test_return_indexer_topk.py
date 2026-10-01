@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=270, stage="extra-b", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=306, stage="extra-b", runner_config="8-gpu-h200")
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
@@ -52,9 +52,8 @@ class TestReturnIndexerTopk(CustomTestCase):
             "--trust-remote-code",
             "--tp",
             "8",
-            "--dp",
+            "--attn-dp-size",
             "8",
-            "--enable-dp-attention",
             "--enable-return-indexer-topk",
             # Cap KV pool so the indexer-topk host buffer (488 KB / token for
             # V3.2) stays bounded; with the default ~600k tokens × 8 procs the

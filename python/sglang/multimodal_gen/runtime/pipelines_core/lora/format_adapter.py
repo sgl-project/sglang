@@ -337,8 +337,7 @@ def _convert_kohya_flux_via_diffusers(
         no_converter_warning="[LoRAFormatAdapter] No Kohya FLUX converter found.",
         success_info="[LoRAFormatAdapter] Converted Kohya FLUX LoRA using {name}",
         all_failed_warning=(
-            "[LoRAFormatAdapter] Kohya FLUX conversion failed; "
-            "last error: {last_err}"
+            "[LoRAFormatAdapter] Kohya FLUX conversion failed; last error: {last_err}"
         ),
     )
 
@@ -485,8 +484,7 @@ def _convert_ai_toolkit_flux_lora(
 
     sample = _sample_keys(final_out.keys(), 20)
     log.info(
-        "[LoRAFormatAdapter] after AI_TOOLKIT_FLUX conversion, "
-        "sample keys (<=20): %s",
+        "[LoRAFormatAdapter] after AI_TOOLKIT_FLUX conversion, sample keys (<=20): %s",
         ", ".join(sample),
     )
     return final_out
