@@ -8,7 +8,7 @@ import struct
 import threading
 import time
 from collections import defaultdict
-from typing import List, Optional, Set, Tuple, Union
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -247,6 +247,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
+            # Separate from failed_sessions, which _run_one_probe_pass clears
+            # on a successful probe: an incompatible decode is still reachable,
+            # so only a re-registration may lift this.
+            self.state_layout_rejections: Dict[str, str] = {}
+            # Peers already cleared at registration; skip the per-transfer check.
+            self.state_strides_validated: Set[str] = set()
             self.session_lock = threading.Lock()
             self.start_prefill_thread()
             # Per-room count of chunks not yet transferred; teardown waits for
@@ -762,6 +768,162 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
         )
 
+    def _state_stride_mismatch(
+        self,
+        *,
+        src_data_ptrs: list[int],
+        dst_data_ptrs: list[int],
+        item_lens: list[int],
+        dst_item_lens: list[int],
+        state_type: Optional[StateType] = None,
+        force_flat: bool = False,
+        src_layer_ids: Optional[List[int]] = None,
+        dst_layer_ids: Optional[List[int]] = None,
+    ) -> Optional[str]:
+        """First entry whose decode stride differs from prefill's, else None.
+
+        The destination is addressed as ``dst_ptr + dst_index * src_item_len``,
+        so mapped entries must agree on the stride or the write lands in the
+        wrong slot.
+        """
+        has_layer_ids = bool(src_layer_ids or dst_layer_ids)
+        # Mirrors the branch below in _send_kvcache_generic; keep the two in step.
+        is_single_region_swa = (
+            state_type == StateType.SWA
+            and len(src_data_ptrs) == 1
+            and len(dst_data_ptrs) == 1
+        )
+        if not (
+            self.is_mla_backend
+            or self.is_hybrid_mla_backend
+            or force_flat
+            or has_layer_ids
+            or is_single_region_swa
+        ):
+            # The MHA branch splits the entries into K/V and is not covered.
+            return None
+        if has_layer_ids:
+            pairs = build_transfer_entry_pairs(
+                src_layer_ids or [],
+                dst_layer_ids or [],
+                len(src_data_ptrs),
+                len(dst_data_ptrs),
+                allow_positional_fallback=self.pp_size == 1,
+            )
+            for i, j in pairs:
+                if item_lens[i] != dst_item_lens[j]:
+                    return (
+                        f"{state_type} item length mismatch for paired "
+                        f"entries src[{i}]={item_lens[i]} "
+                        f"dst[{j}]={dst_item_lens[j]}"
+                    )
+            return None
+        _, _, layers_current_pp_stage = self.get_mla_kv_ptrs_with_pp(
+            src_data_ptrs, dst_data_ptrs, state_type
+        )
+        # Lens are parallel to pointers, so the same slice gives each entry's
+        # decode stride.
+        _, mapped_dst_lens, _ = self.get_mla_kv_ptrs_with_pp(
+            item_lens, dst_item_lens, state_type
+        )
+        for layer_id in range(layers_current_pp_stage):
+            if item_lens[layer_id] != mapped_dst_lens[layer_id]:
+                return (
+                    f"{state_type} item length mismatch for positional "
+                    f"entry {layer_id}: prefill={item_lens[layer_id]} "
+                    f"decode={mapped_dst_lens[layer_id]}"
+                )
+        return None
+
+    def _publish_peer_registration(
+        self, mooncake_session_id: str, decode_kv_args: KVArgsRegisterInfo
+    ) -> Optional[str]:
+        """Record this peer's state-layout verdict, then publish its metadata.
+
+        Publishing last stops a transfer from reading the new layout while the
+        previous registration's verdict still stands. Returns the rejection
+        reason, if any.
+        """
+        fully_checked, mismatch = self._validate_peer_state_layout(decode_kv_args)
+        with self.session_lock:
+            self.failed_sessions.discard(mooncake_session_id)
+            self.session_failures.pop(mooncake_session_id, None)
+            self.state_layout_rejections.pop(mooncake_session_id, None)
+            self.state_strides_validated.discard(mooncake_session_id)
+            if mismatch is not None:
+                self.state_layout_rejections[mooncake_session_id] = mismatch
+            elif fully_checked:
+                self.state_strides_validated.add(mooncake_session_id)
+            self.decode_kv_args_table[mooncake_session_id] = decode_kv_args
+        return mismatch
+
+    def _validate_peer_state_layout(
+        self, registration_info: KVArgsRegisterInfo
+    ) -> Tuple[bool, Optional[str]]:
+        """Check every generic state component against one decode peer.
+
+        Neither side changes its entry sizes after registering, so one verdict
+        covers the whole session. Returns ``(fully_checked, mismatch_reason)``:
+        a reason rejects the peer, ``fully_checked`` retires the per-transfer
+        check.
+        """
+        state_types = getattr(self.kv_args, "state_types", [])
+        fully_checked = True
+        for i, st in enumerate(state_types):
+            if not self._is_generic_kvcache_state_type(st):
+                # Mamba, DSA tail and MiniMax send paths check their own layout.
+                continue
+            dst_data_ptrs = (
+                registration_info.dst_state_data_ptrs[i]
+                if i < len(registration_info.dst_state_data_ptrs)
+                else []
+            )
+            dst_item_lens = (
+                registration_info.dst_state_item_lens[i]
+                if i < len(registration_info.dst_state_item_lens)
+                else []
+            )
+            if not dst_data_ptrs or not dst_item_lens:
+                # Nothing published for this component; let the send path report it.
+                fully_checked = False
+                continue
+            try:
+                mismatch = self._state_stride_mismatch(
+                    src_data_ptrs=self.kv_args.state_data_ptrs[i],
+                    dst_data_ptrs=dst_data_ptrs,
+                    item_lens=self.kv_args.state_item_lens[i],
+                    dst_item_lens=dst_item_lens,
+                    state_type=st,
+                    force_flat=(
+                        st in (StateType.QSA_PENDING, StateType.QSA_COMPRESSED)
+                        or get_memory().enable_unified_memory
+                    ),
+                    src_layer_ids=(
+                        self.kv_args.state_layer_ids[i]
+                        if i < len(self.kv_args.state_layer_ids)
+                        else []
+                    ),
+                    dst_layer_ids=(
+                        registration_info.dst_state_layer_ids[i]
+                        if i < len(registration_info.dst_state_layer_ids)
+                        else []
+                    ),
+                )
+            except Exception as e:
+                # Pairing can reject a layout on its own; never let that kill
+                # the bootstrap thread. Fall back to the send path's check.
+                logger.warning(
+                    "Could not pre-check %s layout for session %s: %s",
+                    st,
+                    registration_info.mooncake_session_id,
+                    e,
+                )
+                fully_checked = False
+                continue
+            if mismatch is not None:
+                return False, mismatch
+        return fully_checked, None
+
     def _send_kvcache_generic(
         self,
         mooncake_session_id: str,
@@ -803,6 +965,30 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         layers_params = None
 
+        # Skipped once registration has cleared this peer's layout.
+        if (
+            dst_item_lens is not None
+            and mooncake_session_id not in self.state_strides_validated
+        ):
+            mismatch = self._state_stride_mismatch(
+                src_data_ptrs=src_data_ptrs,
+                dst_data_ptrs=dst_data_ptrs,
+                item_lens=item_lens,
+                dst_item_lens=dst_item_lens,
+                state_type=state_type,
+                force_flat=force_flat,
+                src_layer_ids=src_layer_ids,
+                dst_layer_ids=dst_layer_ids,
+            )
+            if mismatch is not None:
+                assert bootstrap_room is not None
+                logger.error(mismatch)
+                self.conclude_failure(
+                    bootstrap_room=bootstrap_room,
+                    failure_reason=mismatch,
+                )
+                return -1
+
         # Decode pp size should be equal to prefill pp size or 1
         # Published layer IDs give exact pairing; plain-MHA peers publish none
         # and keep positional slicing.
@@ -830,21 +1016,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     len(dst_data_ptrs),
                     allow_positional_fallback=self.pp_size == 1,
                 )
-                if dst_item_lens is not None:
-                    for i, j in pairs:
-                        if item_lens[i] != dst_item_lens[j]:
-                            assert bootstrap_room is not None
-                            failure_reason = (
-                                f"{state_type} item length mismatch for paired "
-                                f"entries src[{i}]={item_lens[i]} "
-                                f"dst[{j}]={dst_item_lens[j]}"
-                            )
-                            logger.error(failure_reason)
-                            self.conclude_failure(
-                                bootstrap_room=bootstrap_room,
-                                failure_reason=failure_reason,
-                            )
-                            return -1
                 layers_params = [
                     (src_data_ptrs[i], dst_data_ptrs[j], item_lens[i]) for i, j in pairs
                 ]
@@ -854,24 +1025,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         src_data_ptrs, dst_data_ptrs, state_type
                     )
                 )
-                if dst_item_lens is not None:
-                    _, mapped_dst_lens, _ = self.get_mla_kv_ptrs_with_pp(
-                        item_lens, dst_item_lens, state_type
-                    )
-                    for layer_id in range(layers_current_pp_stage):
-                        if item_lens[layer_id] != mapped_dst_lens[layer_id]:
-                            assert bootstrap_room is not None
-                            failure_reason = (
-                                f"{state_type} item length mismatch for positional "
-                                f"entry {layer_id}: prefill={item_lens[layer_id]} "
-                                f"decode={mapped_dst_lens[layer_id]}"
-                            )
-                            logger.error(failure_reason)
-                            self.conclude_failure(
-                                bootstrap_room=bootstrap_room,
-                                failure_reason=failure_reason,
-                            )
-                            return -1
                 layers_params = [
                     (
                         src_kv_ptrs[layer_id],
@@ -2198,10 +2351,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     if not req.is_dummy:
                         # Early exit if the request has failed
                         with self.session_lock:
-                            if req.mooncake_session_id in self.failed_sessions:
+                            layout_rejection = self.state_layout_rejections.get(
+                                req.mooncake_session_id
+                            )
+                            if (
+                                layout_rejection is not None
+                                or req.mooncake_session_id in self.failed_sessions
+                            ):
                                 self.conclude_failure(
                                     bootstrap_room=kv_chunk.room,
-                                    failure_reason=(
+                                    failure_reason=layout_rejection
+                                    or (
                                         "Decode instance could be dead, remote "
                                         f"mooncake session {req.mooncake_session_id} "
                                         "is not alive"
@@ -2586,15 +2746,19 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         self._init_dcp_pack_buffers_once(
                             decode_kv_args.dst_dcp_size, include_draft=True
                         )
-                    self.decode_kv_args_table[mooncake_session_id] = decode_kv_args
-                    with self.session_lock:
-                        if mooncake_session_id in self.failed_sessions:
-                            self.failed_sessions.remove(mooncake_session_id)
-                        if mooncake_session_id in self.session_failures:
-                            del self.session_failures[mooncake_session_id]
-                    logger.debug(
-                        f"Register KVArgs from {mooncake_session_id} successfully"
+                    layout_mismatch = self._publish_peer_registration(
+                        mooncake_session_id, decode_kv_args
                     )
+                    if layout_mismatch is not None:
+                        logger.error(
+                            "Rejecting state transfers to decode session %s: %s",
+                            mooncake_session_id,
+                            layout_mismatch,
+                        )
+                    else:
+                        logger.debug(
+                            f"Register KVArgs from {mooncake_session_id} successfully"
+                        )
                     continue
                 else:
                     required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
