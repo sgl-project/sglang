@@ -3389,8 +3389,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         ):
             # Fusing the split-K reduction with sinkhorn keeps it batch-invariant.
             main_stream = torch.cuda.current_stream()
-            if stats_stream is not None:
-                x.record_stream(stats_stream)
             with (
                 torch.cuda.stream(stats_stream)
                 if stats_stream is not None

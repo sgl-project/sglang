@@ -12,6 +12,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.schedule_batch import ForwardMode
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import get_schedule
+from sglang.srt.utils import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.layers.engram import EngramHasher
@@ -200,9 +201,14 @@ class NgramEmbeddingManager:
             lo = max(0, start - n1)
             ids = req.full_untruncated_fill_ids[lo:start]
             rows.append([0] * (n1 - len(ids)) + list(ids))
-        batch.engram_history = torch.tensor(
-            rows, dtype=torch.int32, device=self.engram_hasher.history.device
-        ).view(len(rows), n1)
+        device = self.engram_hasher.history.device
+        batch.engram_history = (
+            torch.tensor(
+                rows, dtype=torch.int32, pin_memory=is_pin_memory_available(device)
+            )
+            .to(device, non_blocking=True)
+            .view(len(rows), n1)
+        )
 
 
 def update_ngram_token_table_after_sampling(

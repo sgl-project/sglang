@@ -11,6 +11,7 @@ import torch
 
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import fp4_index_logits_decode
 from sglang.kernels.ops.attention.dsv4.index_logits import flat_index_logits_tiles
+from sglang.srt.utils import is_pin_memory_available
 
 from .types import (
     DecodeInputs,
@@ -161,7 +162,8 @@ def get_deep_gemm_prefill_data(
             continue
         j = torch.arange(lc, device=device)
         slot_chunks.append(
-            req_to_token[req_pool_indices[r], j * ratio].to(torch.int64) // ratio
+            req_to_token[req_pool_indices[r : r + 1], j * ratio].to(torch.int64)
+            // ratio
         )
         start += lc
     num_tokens = pos.shape[0]
@@ -173,7 +175,9 @@ def get_deep_gemm_prefill_data(
     weights = indexer.head_weights(inputs.x).float()
     compress_lens = ((pos + 1) // ratio).to(torch.int32)
     request_starts = torch.repeat_interleave(
-        torch.tensor(starts, dtype=torch.int32, device=device),
+        torch.tensor(
+            starts, dtype=torch.int32, pin_memory=is_pin_memory_available(device)
+        ).to(device, non_blocking=True),
         inputs.rows_per_request_device.to(torch.int64),
         output_size=num_tokens,
     )
