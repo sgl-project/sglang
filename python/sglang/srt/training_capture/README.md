@@ -200,6 +200,39 @@ keep strong references to registered source/receive memory until client close.
 Do not unregister quarantined arenas based on an exception alone. Closing a
 producer does not authorize deletion of published Store objects.
 
+## Global Target Identity
+
+`bind_rank_target_contract` inspects one loaded target rank at startup. Supply
+the serving TP/PP rank and world sizes, plus the DP replica ID. The model's PP
+group and local layer interval must agree with the actual KV pool. The native
+QKV projection must use ordinary matching query/KV TP groups. Every selected
+local layer reports its global geometry, actual logical head range, RoPE and K
+normalization; local K/V buffer shapes and dtypes are checked before export.
+Other PP stages' placeholder layers are never accessed. A stage without selected
+layers still checks its first local projection's TP placement.
+
+The returned `RankTargetContract` contains metadata only and can be serialized
+with `canonical_bytes`, then decoded with `msgspec.json.decode(...,
+type=RankTargetContract)`. Each rank hashes its local model/tokenizer artifacts
+using the existing identity rules. Expected immutable revisions are enforced
+when supplied. The teacher fingerprint still includes the resolved model
+configuration, dtype and output transform; no target forward is performed.
+
+Collect exactly one record per serving TP/PP rank, including inactive payload
+replicas, then call `assemble_target_contract(records, tp_size=..., pp_size=...,
+dp_rank=..., aux_tp_rank=...)`. It returns `(teacher, global_kv, layout)` only
+when artifact identity, vocabulary/output semantics, selected-layer order,
+storage parameters, PP intervals and replicated layer semantics agree. Actual
+head ranges must match the canonical layout even on non-owning replicas.
+The result can directly configure the partitioned buffers and snapshot APIs.
+
+The existing `bind_target_contract` and capture/DSpark callers use this path for
+a complete single-rank target. Passing a sharded target to that single-rank API
+fails instead of treating local heads as the complete model. These interfaces
+perform synchronous startup inspection; they do not implement cross-rank
+transport, startup error agreement, serving admission or live weight updates.
+The caller must bind immutable artifacts corresponding to the loaded model.
+
 ## Catalog Producer API
 
 ### Partitioned Writes
@@ -208,11 +241,13 @@ The writer also exposes the transport/publication boundary needed by a future
 TP/PP capture coordinator. These methods do not enable distributed inference
 capture; the current serving capability gates remain in force.
 
-1. Build one `plan_capture_layout(global_kv, tp_size=...,
-   pp_layer_ranges=..., aux_tp_rank=..., dp_rank=...)`. The explicit half-open
-   PP ranges must be contiguous from layer zero and cover every selected layer.
-   `global_kv` describes logical heads before TP sharding. The designated rank
-   on the last PP stage owns aux tensors and the manifest buffer.
+1. Obtain a validated global target contract and layout with
+   `assemble_target_contract`. For an already established global KV contract,
+   `plan_capture_layout(global_kv, tp_size=..., pp_layer_ranges=...,
+   aux_tp_rank=..., dp_rank=...)` also constructs the ownership plan directly.
+   The explicit half-open PP ranges must be contiguous from layer zero and cover
+   every selected layer. `global_kv` describes logical heads before TP sharding.
+   The designated rank on the last PP stage owns aux tensors and the manifest.
 2. Pass the rank's `CapturePartition` to `HostBufferPool` and, when it owns KV,
    `SelectedLayerKVExporter.from_pool`. Each owner allocates and exports only
    its local selected layers and head count. Source pool tensors already have
@@ -249,9 +284,9 @@ Preparation and assembly are background work after CUDA completion. Their views
 do not extend a buffer lease: each owner retains its Host slot until its Store
 writes complete, and the coordinator retains the manifest buffer until
 publication completes. Existing uncertain-transfer quarantine rules still apply.
-These APIs do not exchange descriptors between processes or bind local attention
-metadata into a global target contract. Admission agreement, rank identity,
-metadata transport, failure coordination and scheduler wiring remain required.
+These APIs do not exchange descriptors between processes. Distributed startup
+and admission agreement, metadata transport, failure coordination and scheduler
+wiring remain required.
 The planner covers ordinary dense TP/PP, not context parallelism or sparse KV.
 
 Receipts contain metadata only. They are trusted producer acknowledgements,
@@ -369,7 +404,9 @@ PYTHONPATH=python python3 test/registered/storage/test_training_capture_runtime.
 The first command includes CUDA ownership tests and compares canonical TP head
 ownership against the actual native QKV loader at TP sizes 1, 2, 4 and 8. It
 also checks rank-local budgets, PP layer selection, aux-only/inactive ranks and
-metadata assembly failures. The second requires the
+metadata assembly failures. Identity tests serialize rank records and reconstruct
+the same global teacher/KV contract from TP4/PP3 and a single-rank fixture, while
+rejecting replica, artifact and stage disagreements. The second requires the
 Mooncake SDK and `mooncake_master`. It starts an isolated master, writes through
 `SnapshotWriter` and a registered arena, and reads/validates every object from a
 different process over TCP. Its Catalog is a test double, not a real SpecForge

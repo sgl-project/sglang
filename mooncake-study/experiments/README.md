@@ -314,6 +314,29 @@ exchange, global logits and TP/PP scheduler integration remain open.
 111 passing tests / 104 subtests and a complete single-H100 runtime regression
 with 90 READY snapshots in 462.301s, including source/log hashes.
 
+### Global Target Identity
+
+`test/registered/unit/training_capture/test_identity.py` uses actual native QKV
+projections and RoPE instances with small synthetic artifact files and mock
+model/pool containers. It serializes every rank's startup record and requires
+the same global teacher/KV contract from TP4/PP3 and a complete single-rank
+fixture, preserving selected-layer order and replica head placement. Missing
+inactive ranks, changed artifacts, conflicting output transforms, wrong source
+geometry and inconsistent PP intervals fail before a global contract is returned.
+
+```bash
+python -m pytest -q -s test/registered/unit/training_capture/test_identity.py
+```
+
+The ordinary runtime test also exercises the shared single-rank binding path
+through real Qwen3 capture and the DSpark target-KV injector. Startup metadata
+requires records from every serving rank; per-sample Store publication requires
+only the layout's active payload owners. Neither fixture implements distributed
+startup transport or certifies TP/PP inference.
+[`capture-global-identity.json`](capture-global-identity.json) retains the
+initial fixture setup failure, corrected six tests / 31 subtests, and the
+464.049s H100 runtime regression with 90 READY snapshots and source/log hashes.
+
 ### BF16 Rounding Isolation
 
 The actual fixed-input parity command remains the serving gate. The following

@@ -32,7 +32,8 @@ it does not redefine the goal as the modules already implemented.
 | Mooncake adapter | Required hard pin, registered raw buffers, immutable retry verification, exact read length | Real cross-process TCP roundtrip passes; cross-node RDMA is pending |
 | Publication | Catalog producer client, manifest-last writer, durable metadata journal, fenced replay | Lost responses, failed puts, stale fences, missing/corrupt objects and identical retries tested; actual Catalog service is SpecForge-owned |
 | Partition publication | Owner-local writes and fenced all-owner publication receipts | Two independent writer processes publish logical head shards through real TCP Store; distributed inference admission and scheduler integration remain open |
-| Partition ownership | Canonical replicated-head owners, PP-local Host/device staging, local KV export and metadata assembly | Native QKV loader agreement at TP1/2/4/8, exact CUDA source-reuse checks and independent Store writers pass; global identity binding and distributed coordination remain open |
+| Partition ownership | Canonical replicated-head owners, PP-local Host/device staging, local KV export and metadata assembly | Native QKV loader agreement at TP1/2/4/8, exact CUDA source-reuse checks and independent Store writers pass; distributed coordination remains open |
+| Global target binding | Rank-local projection/pool inspection and all-rank global identity assembly | TP4/PP3 metadata fixture matches a full target contract; cross-rank transport and startup agreement remain open |
 | Runtime collection | Opt-in CLI config, capability gates, request ledger, prefill/decode hooks, invalidation and counters | Six real Qwen3-0.6B requests published through Mooncake; ordinary and CUDA graph replay executions pass |
 | Real model identity/parity | Weight/tokenizer artifact digests, actual selected-layer geometry, K norm and RoPE | Captured KV and teacher scores match online tensors exactly; full-vocabulary LSE matches within 1e-5; HF teacher logits pass numerical comparison, but cross-engine KV equivalence is not certified |
 | Draft serving | Explicit KV-input architecture, contract, encoder, incremental injector and invalidation | Real Qwen3 target plus synthetic KV draft passes ordinary/batched/graph generation; retained BF16 fixture passes full backbone/logit parity against pinned FlexAttention, with production exporter and trained-model validation still open |
@@ -1276,6 +1277,66 @@ existing `UP035` diagnostic is unchanged. Format and whitespace checks pass,
 the original worktree index is unchanged, both jobs have terminated, and the
 resident H100 has resumed its idle workload.
 
+## Global Target Contract from Local Ranks
+
+The previous identity binder treated `attention.num_kv_heads` as global and
+accessed every selected layer on one model instance. That was valid under the
+single-rank serving gate, but could not supply the global geometry required by
+distributed capture. `bind_rank_target_contract` now reads native QKV projection
+metadata and only the selected layers local to the actual PP stage. It checks
+TP placement, projection geometry and actual K/V source shapes/dtypes. Stages
+without selected layers still validate their first local projection. The existing
+artifact hashing, tokenizer checks, resolved configuration and output-transform
+fingerprint are preserved.
+
+`RankTargetContract` is strict serializable metadata. `assemble_target_contract`
+requires one record from every TP/PP rank, including replicated-head ranks with
+no payload ownership. It checks common teacher identity, global selected-layer
+order, storage parameters, complete PP intervals, equal replicated geometry and
+RoPE/norm semantics. Every observed logical head range must match the native
+canonical placement. It returns the global teacher, global KV spec and layout
+for rank-local pools/exporters. Single-rank capture and the DSpark target-KV
+injector now use the same binding/assembly path.
+
+The unit fixture uses real `QKVParallelLinear` and `RotaryEmbedding` instances,
+mock model/PP/pool containers, and temporary synthetic artifact files. TP4/PP3
+includes eight-head and two-head selected layers, inactive KV replicas and an
+aux-only final stage. JSON roundtrip and reversed record order preserve exactly
+the teacher/KV contract obtained from its complete single-rank model fixture.
+Negative cases reject missing inactive ranks, duplicate/foreign ranks, changed
+artifacts/output transforms, codec disagreement, wrong source shapes, wrong TP
+placement and PP gaps or inconsistent bounds.
+
+The initial broad run `01790842667772369764-94d14d07fdc8` passed 129 existing
+tests and 146 subtests, but the six new tests failed during RoPE fixture setup:
+the runtime execution namespace was unpublished. A scoped test-only execution
+config patch fixes the fixture; production logic did not change. Focused job
+`01790842813066987707-1db3ea37132c` then passes all six tests and 31 subtests
+in 10.55s. The fixture cleanup was subsequently made Python 3.10-compatible.
+Final job `01790842897169950408-7e882fad4b34` passes the same six tests and
+31 subtests in 10.28s with that cleanup.
+
+Because both capture and DSpark binding changed, full runtime job
+`01790842896845885942-174286d18b31` reruns real Qwen3 prefill/decode and
+passes in 464.049s, publishing 90 snapshots through Mooncake. Ordinary/graph
+and overlap capture, all four static DSpark memory-pressure modes, adaptive
+admission, scheduler latency protection and cache lifecycle scenarios pass.
+This exercises actual single-rank model/pool inspection and the draft injector,
+with successful Store readback after producer exit.
+
+This is startup metadata binding, not TP/PP model execution. Cross-rank record
+exchange, consistent startup failure handling, distributed admission, teacher
+top-128/LSE and scheduler integration remain required. The serving TP/PP/DP gates
+remain closed, and live target weight replacement remains a separate lifecycle
+requirement. Local artifact hashes assume immutable artifacts matching the loaded
+model; they do not hash live device parameter contents.
+
+Commands, the initial fixture failure, final results and source/log hashes are
+retained in [`capture-global-identity.json`](experiments/capture-global-identity.json).
+GPU and local source hashes match. Ruff, formatting, whitespace and host Python
+3.10 syntax checks pass. The original worktree index remains unchanged; all four
+jobs are terminal and the H100 has resumed its idle workload.
+
 ## Next Implementation
 
 1. Broaden real-request coverage to prefill graphs, automatic AR OOM retraction,
@@ -1283,9 +1344,9 @@ resident H100 has resumed its idle workload.
    saturated backpressure.
 2. Extend P8's passing retained BF16 fixture to production-exported and trained
    checkpoints, complete exporter compatibility and artifact/quality validation.
-3. Connect P9's implemented layout, rank-local buffers and owner-local Store
-   interface to global target identity, distributed capture admission/failure
-   agreement, descriptor exchange, global teacher scores and TP/PP scheduling.
+3. Connect P9's implemented global target binding, layout, rank-local buffers and
+   owner-local Store interface to distributed startup/admission/failure agreement,
+   descriptor exchange, global teacher scores and TP/PP scheduling.
    Complete TP/PP runtime validation, non-static speculative layouts,
    PD transfer and cross-node RDMA. Existing capability gates do
    not constitute implementation of these paths.

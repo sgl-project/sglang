@@ -1,0 +1,148 @@
+{
+  "purpose": "Bind global teacher and selected KV geometry from every actual ordinary TP/PP rank before capture buffer ownership is assigned",
+  "source_baseline": "a7474ef5c134c017f8c1e4e081ce0d92fc2cee93",
+  "environment_lock": "h100-runtime-lock.json",
+  "source_sha256": {
+    "python/sglang/srt/training_capture/identity.py": "99c8827e68a02ecca0cba1541250b4da2eb517882f436ab20b91b046b9f28114",
+    "test/registered/unit/training_capture/test_identity.py": "fa91ab0b2209530801556b7d3979538352952c404a57f8d68e81acf0bb848c87"
+  },
+  "interfaces": {
+    "bind_rank_target_contract": "Checks actual PP group/local layers, native QKV TP placement, local KV shapes/dtypes, artifacts and output semantics; returns serializable rank-local evidence with global head geometry.",
+    "RankTargetContract": "Strict metadata for one serving TP/PP rank. Includes selected local layers even when its replicated heads will not own Store payloads.",
+    "assemble_target_contract": "Requires every expected serving rank, common immutable teacher identity and codec/storage parameters, complete PP intervals, and actual head ranges matching canonical ownership. Returns teacher, global KVSpec and CaptureLayout.",
+    "bind_target_contract": "Existing single-rank entry point now uses rank inspection and global assembly, shared by capture and the DSpark target-KV injector."
+  },
+  "jobs": [
+    {
+      "job_id": "01790842667772369764-94d14d07fdc8",
+      "outcome": "failed",
+      "returncode": 1,
+      "finished_unix": 1790842721.106758,
+      "passed": 129,
+      "failed": 6,
+      "subtests": 146,
+      "seconds": 48.96,
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "-s",
+        "test/registered/unit/training_capture",
+        "test/registered/unit/spec/test_dspark_target_kv.py"
+      ],
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790842667772369764-94d14d07fdc8.log",
+      "log_sha256": "f4ff9e3be6f28a8005c00000f0d8a0b1e176fbebb72c8bba30fe41ebd1b41021",
+      "note": "All six new tests failed during real RoPE construction because the test had not supplied the runtime execution namespace. Existing capture and DSpark tests passed. Fixed with a scoped test-only get_exec patch; production code unchanged."
+    },
+    {
+      "job_id": "01790842813066987707-1db3ea37132c",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790842826.673046,
+      "tests": 6,
+      "subtests": 31,
+      "seconds": 10.55,
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "-s",
+        "test/registered/unit/training_capture/test_identity.py"
+      ],
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790842813066987707-1db3ea37132c.log",
+      "log_sha256": "2a8983466deb9a7c6e0cd744686b0f5a23368408847d48de309c2a43e556d160",
+      "note": "Passing fixture before replacing unittest.enterContext with Python 3.10-compatible patch cleanup. Final test source hash above includes that cleanup change."
+    },
+    {
+      "job_id": "01790842896845885942-174286d18b31",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790843373.4539542,
+      "tests": 1,
+      "seconds": 464.049,
+      "published_snapshots": 90,
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "test/registered/storage/test_training_capture_runtime.py",
+        "--model-path",
+        "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B"
+      ],
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790842896845885942-174286d18b31.log",
+      "log_sha256": "e6f30cd186834daa4a46102673414f7330ddf99c01fa1106f8b428046876ccfc",
+      "note": "Full single-H100 Qwen3 capture and static DSpark KV-input regression exercises the shared production binding; ordinary/graph/overlap, memory pressure, latency/admission and cache lifecycle pass."
+    },
+    {
+      "job_id": "01790842897169950408-7e882fad4b34",
+      "outcome": "completed",
+      "returncode": 0,
+      "finished_unix": 1790843386.2400038,
+      "tests": 6,
+      "subtests": 31,
+      "seconds": 10.28,
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "-s",
+        "test/registered/unit/training_capture/test_identity.py"
+      ],
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790842897169950408-7e882fad4b34.log",
+      "log_sha256": "ac3eda744edb6eb54cfb0b58056aaa0c46b2cab27fb51f1103526dbbb29fa95b",
+      "note": "Final Python 3.10-compatible fixture cleanup; tests match the source hashes recorded above."
+    }
+  ],
+  "fixture": {
+    "tp_size": 4,
+    "pp_size": 3,
+    "attention_layers": 6,
+    "selected_layer_ids": [
+      3,
+      1
+    ],
+    "selected_global_kv_heads": [
+      2,
+      8
+    ],
+    "aux_tp_rank": 1,
+    "native_components": [
+      "QKVParallelLinear",
+      "RotaryEmbedding"
+    ],
+    "mock_components": [
+      "model wrapper",
+      "PP group",
+      "KV pool container"
+    ],
+    "artifacts": "Small temporary synthetic weight/config/tokenizer bytes, not trained parameters",
+    "comparison": "Reversed and JSON-roundtripped rank records produce exactly the same global teacher/KV contract as the complete single-rank fixture."
+  },
+  "assertions": [
+    "Only local PP layers are inspected; other stages have inaccessible placeholders.",
+    "All serving ranks must report, including inactive replicas and a final stage with no selected KV.",
+    "Actual projection rank/group/geometry and local K/V shapes must agree.",
+    "Every selected layer uses global KV head count and observed logical local head range.",
+    "Missing/duplicate/foreign ranks, changed selected order and inconsistent dtype/page/chunk parameters cannot form a global contract.",
+    "Artifact or output-transform changes cannot join an existing identity; expected revision pins are enforced locally.",
+    "Replica geometry, head ranges and RoPE/norm semantics must agree.",
+    "PP gaps, incomplete model coverage and inconsistent stage bounds fail."
+  ],
+  "limits": [
+    "Distributed rank-record transport, collective startup error agreement, request admission, global teacher top-128/LSE and scheduler wiring remain pending. Serving TP/PP/DP gates stay closed.",
+    "TP4/PP3 tests inspect real native projection metadata in synthetic containers; they do not execute distributed model inference.",
+    "Only ordinary dense, unquantized BF16/FP16 NHD pools with standard RoPE are admitted. Query/KV TP groups must match.",
+    "Artifact hashes assume immutable local model/tokenizer files corresponding to the loaded model. Live device parameters and online weight replacement are not validated here.",
+    "No new RDMA, production Catalog, consumer, trained-draft quality or throughput/SLO claim.",
+    "Runtime integration is TP1/PP1 on one H100 with a synthetic KV-input draft and local TCP Store. The existing optional cross-engine HF KV diagnostic gate is not enabled."
+  ],
+  "checks": {
+    "local_gpu_source_hashes_equal": true,
+    "ruff_passed": true,
+    "format_and_whitespace_passed": true,
+    "host_python310_syntax_passed": true,
+    "original_worktree_index_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9",
+    "resident_gpu_idle_resumed": true
+  }
+}
