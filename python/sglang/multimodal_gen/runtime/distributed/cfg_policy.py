@@ -148,7 +148,7 @@ def _apply_cfg_normalization(
     scale = torch.where(
         new_norm > max_norm, max_norm / new_norm, torch.ones_like(new_norm)
     )
-    return noise_pred * scale
+    return (noise_pred * scale).to(noise_pred.dtype)
 
 
 def _rescale_noise_cfg(
