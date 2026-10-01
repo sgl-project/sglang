@@ -9,6 +9,7 @@ import triton.language as tl
 
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
 from sglang.kernels.kda_kernels import _cuda_source
+from sglang.kernels.ops.diffusion.common.numerics import round_bf16_to_fp32
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -20,6 +21,9 @@ _BIT_EXACT_DTYPES = (torch.float16, torch.bfloat16)
 _TRANSPOSE_TILE = 32
 _MAX_GRID_DIM = 65535
 _FAILED_RUNTIME_KEYS: set[tuple[int | None, torch.dtype]] = set()
+# The PTX conversions are NVIDIA-only: ROCm's LLVM aborts the process on the
+# "=h" constraint, so ROCm rounds without PTX instead.
+_USE_PTX_CVT = tl.constexpr(torch.version.hip is None)
 
 logger = logging.getLogger(__name__)
 
@@ -83,41 +87,44 @@ def _residual_gate_add_cuda_impl(
 
 
 @triton.jit
-def _round16_f32(x, IS_BF16: tl.constexpr):
+def _ptx_to16(x, IS_BF16: tl.constexpr):
     if IS_BF16:
         bits = tl.inline_asm_elementwise(
             "cvt.rn.bf16.f32 $0, $1;", "=h,r", [x], dtype=tl.int16, is_pure=True, pack=1
         )
-        return bits.to(tl.bfloat16, bitcast=True).to(tl.float32)
+        return bits.to(tl.bfloat16, bitcast=True)
     else:
         bits = tl.inline_asm_elementwise(
             "cvt.rn.f16.f32 $0, $1;", "=h,r", [x], dtype=tl.int16, is_pure=True, pack=1
+        )
+        return bits.to(tl.float16, bitcast=True)
+
+
+@triton.jit
+def _round16_f32(x, IS_BF16: tl.constexpr):
+    """RNE-round fp32 to bf16/fp16 precision, keeping an fp32 value."""
+    if _USE_PTX_CVT:
+        return _ptx_to16(x, IS_BF16).to(tl.float32)
+    elif IS_BF16:
+        return round_bf16_to_fp32(x)
+    else:
+        # Opaque on purpose: Triton on ROCm folds a plain fp32 -> fp16 -> fp32
+        # round trip away, which skips this rounding.
+        bits = tl.inline_asm_elementwise(
+            "v_cvt_f16_f32 $0, $1", "=v,v", [x], dtype=tl.int16, is_pure=True, pack=1
         )
         return bits.to(tl.float16, bitcast=True).to(tl.float32)
 
 
 @triton.jit
 def _store16(out_ptr, offs, value_f32, mask, IS_BF16: tl.constexpr):
-    if IS_BF16:
-        bits = tl.inline_asm_elementwise(
-            "cvt.rn.bf16.f32 $0, $1;",
-            "=h,r",
-            [value_f32],
-            dtype=tl.int16,
-            is_pure=True,
-            pack=1,
-        )
-        tl.store(out_ptr + offs, bits.to(tl.bfloat16, bitcast=True), mask=mask)
+    if _USE_PTX_CVT:
+        value = _ptx_to16(value_f32, IS_BF16)
+    elif IS_BF16:
+        value = value_f32.to(tl.bfloat16)
     else:
-        bits = tl.inline_asm_elementwise(
-            "cvt.rn.f16.f32 $0, $1;",
-            "=h,r",
-            [value_f32],
-            dtype=tl.int16,
-            is_pure=True,
-            pack=1,
-        )
-        tl.store(out_ptr + offs, bits.to(tl.float16, bitcast=True), mask=mask)
+        value = value_f32.to(tl.float16)
+    tl.store(out_ptr + offs, value, mask=mask)
 
 
 @triton.jit
@@ -244,26 +251,7 @@ def _rga_transposed(
         p32 = uv.to(tl.float32) * gv[:, None].to(tl.float32)
         pf = _round16_f32(p32, IS_BF16)
         o32 = rv.to(tl.float32) + pf
-        if IS_BF16:
-            bits = tl.inline_asm_elementwise(
-                "cvt.rn.bf16.f32 $0, $1;",
-                "=h,r",
-                [o32],
-                dtype=tl.int16,
-                is_pure=True,
-                pack=1,
-            )
-            tl.store(out + base + roffs, bits.to(tl.bfloat16, bitcast=True), mask=m2)
-        else:
-            bits = tl.inline_asm_elementwise(
-                "cvt.rn.f16.f32 $0, $1;",
-                "=h,r",
-                [o32],
-                dtype=tl.int16,
-                is_pure=True,
-                pack=1,
-            )
-            tl.store(out + base + roffs, bits.to(tl.float16, bitcast=True), mask=m2)
+        _store16(out, base + roffs, o32, m2, IS_BF16)
     else:
         tl.store(out + base + roffs, rv + uv * gv[:, None], mask=m2)
 
