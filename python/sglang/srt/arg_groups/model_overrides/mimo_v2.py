@@ -5,6 +5,7 @@ from typing import Any, Dict
 
 from sglang.srt.arg_groups.model_override_base import (
     _register_for,
+    is_attention_backend_not_set,
     resolving_view,
 )
 from sglang.srt.runtime_context import get_platform
@@ -21,6 +22,10 @@ def _mimo_v2_overrides(server_args: Any, hf_config: Any) -> dict:
     if cfg.speculative_algorithm == "EAGLE":
         logger.info("Enable multi-layer EAGLE speculative decoding for MiMoV2 model.")
         overrides["enable_multi_layer_eagle"] = True
+
+    if get_platform().is_sm100 and is_attention_backend_not_set(cfg):
+        overrides["attention_backend"] = "fa4"
+        logger.info("MiMoV2 on SM100: attention_backend=fa4.")
 
     # On Blackwell "auto" falls through to the triton fused-MoE runner, ~12%
     # slower at bs=1 decode. FP4 checkpoints use flashinfer_mxfp4 instead.

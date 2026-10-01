@@ -95,7 +95,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
         model_runner = cuda_graph_runner.model_runner
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
-        self._tp_group = model_runner.tp_group
+        self._tp_group = get_parallel().tp_group
         self._capture_stream: Optional[torch.cuda.Stream] = None
         self._in_actual_capture_pass = False
         self._compile_config: CompilationConfig = self.build_compilation_config(

@@ -39,6 +39,7 @@ use tracing::{debug, info, warn};
 use super::block_size_oracle::BlockSizeOracle;
 use super::bootstrap::{
     BootstrapState, BootstrapTracker, PeerRegistry, RankOutcome, VettedSnapshot,
+    SNAPSHOT_FETCH_CONNECT_TIMEOUT, SNAPSHOT_FETCH_READ_TIMEOUT,
 };
 use super::discovery::{fetch_event_config, EventConfig};
 use super::subscriber::{KvEventSubscriberRegistry, SubKind, WorkerEvent};
@@ -46,13 +47,24 @@ use super::tally::{EventKind, EventTally};
 use super::tree::{HashTree, KvWorkerId, Tiers};
 use super::wire::{KvCacheEvent, KvEventBatch};
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
-use fallback::{discard_graft, fail_rank, resolve_from_origin};
+use coordinator::bootstrap_coordinator;
+use fallback::{demote_unproven_rank, fail_rank, resolve_from_origin, resolve_gap};
 use graft::{apply_snapshot, leaves_gap, still_owed};
+use probe::{
+    spawn_splice_probe, PendingProof, ProbeTarget, SpliceVerdict, MAX_UNKNOWN_PROBES,
+    SPLICE_PROOF_SWEEP_INTERVAL, SPLICE_PROOF_TIMEOUT,
+};
 use producer::CachedSnapshot;
+use sweep::{
+    snapshot_fetch_timeout, SNAPSHOT_FETCH_ATTEMPTS_PER_DEADLINE, SNAPSHOT_FETCH_TIMEOUT_FLOOR,
+};
 
+mod coordinator;
 mod fallback;
 mod graft;
+mod probe;
 mod producer;
+mod sweep;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
@@ -76,6 +88,11 @@ const EVENT_CHANNEL_BUFFER: usize = 1024;
 /// snapshot is not arriving in time anyway.
 const PENDING_BATCH_LIMIT: usize = 1024;
 
+/// Depth of the obligation queue feeding the coordinator, sized well past a
+/// fleet's worker count. Overflow falls back as [`KvEventIndex::enqueue_bootstrap`]
+/// describes.
+const BOOTSTRAP_QUEUE_DEPTH: usize = 1024;
+
 /// Sequence number of the FIRST batch a publisher ever emits.
 ///
 /// SGLang's `ZmqEventPublisher` numbers batches from `itertools.count()`, and it
@@ -94,8 +111,6 @@ const PENDING_BATCH_LIMIT: usize = 1024;
 /// `pump_loop`.
 const STREAM_ORIGIN_SEQ: i64 = 0;
 
-// Constructed by the peer sweep, which lands next.
-#[allow(dead_code)]
 /// Control-plane messages for the pump task.
 ///
 /// Tree mutation MUST stay on the single writer (see the single-writer property
@@ -133,6 +148,20 @@ enum PumpControl {
         ranks: Vec<KvWorkerId>,
         done: Option<oneshot::Sender<()>>,
     },
+    /// Result of asking the fleet whether a rank's publisher moved past the
+    /// watermark of a snapshot whose splice was never proven locally.
+    ///
+    /// The probe runs off-pump because it does network I/O; the verdict comes
+    /// back here so the tree write stays on the single writer.
+    ///
+    /// `epoch` and `watermark` name the graft the verdict is about; see
+    /// [`PendingProof::watermark`].
+    SpliceProbe {
+        rank: KvWorkerId,
+        epoch: u64,
+        watermark: i64,
+        verdict: SpliceVerdict,
+    },
 }
 
 /// Per-worker bookkeeping kept inside [`KvEventIndex`] so `remove_worker`
@@ -169,6 +198,41 @@ impl KvIndexMetrics {
     pub fn new(tree: Arc<HashTree>, tally: Arc<EventTally>) -> Self {
         Self { tree, tally }
     }
+}
+
+/// Obligations handed to the coordinator and the instant their ranks began
+/// holding; a peer's export must be newer to splice.
+struct ObligationBatch {
+    obligations: Vec<(KvWorkerId, u64)>,
+    /// Folded into [`PendingSweep::freshness_floor`], which the sweep asks with.
+    ///
+    /// [`PendingSweep::freshness_floor`]: coordinator::PendingSweep::freshness_floor
+    holding_since: Instant,
+    /// Whether this batch may ride a sweep already in flight.
+    late_join: LateJoin,
+}
+
+/// What a batch accepts when it arrives while a sweep is already in flight.
+///
+/// The sweep asked for freshness on behalf of the ranks it started with, so a
+/// batch that arrives afterwards may be delivered against an export predating
+/// its own `holding_since` — which the pump then resolves [`RankOutcome::Gap`].
+/// Whether that is acceptable depends on what the batch has left to spend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LateJoin {
+    /// Ride the in-flight sweep's snapshot regardless.
+    ///
+    /// Used by discovery, whose workers land during the first fetch; a rank
+    /// that gaps this way still has its one retry.
+    Permitted,
+    /// Wait for a sweep that asks on this batch's behalf.
+    ///
+    /// Used by a gap retry, for which riding along is equivalent to dropping
+    /// it: `gap_retried` caps it at one, and a snapshot taken before the rank
+    /// resumed holding re-gaps by construction. Deferring costs one loop
+    /// iteration, since the coordinator re-enters `take_pending` as soon as it
+    /// has delivered.
+    Refused,
 }
 
 /// Bundle of `HashTree` + `KvEventSubscriberRegistry` + pump task.
@@ -214,6 +278,13 @@ pub struct KvEventIndex {
     /// Control channel into the pump, so snapshot grafting happens on the
     /// single writer rather than in the bootstrap task.
     ctrl_tx: mpsc::Sender<PumpControl>,
+    /// Client for snapshot fetches. Not `http`: its 2s total timeout suits
+    /// `/server_info` but cannot fit a multi-megabyte body, and every large
+    /// snapshot would be booked `unreachable`.
+    snapshot_http: reqwest::Client,
+    /// Obligations waiting for the coordinator to fold them into the sweep that
+    /// is in flight, or to start one. See [`bootstrap_coordinator`].
+    bootstrap_tx: mpsc::Sender<ObligationBatch>,
     /// Last built snapshot; see [`KvEventIndex::peer_snapshot_body`].
     snapshot_cache: Arc<AsyncMutex<Option<CachedSnapshot>>>,
     /// Worker-sourced `page_size` shared with prefix providers.
@@ -287,6 +358,46 @@ impl KvEventIndex {
         bootstrap: Arc<BootstrapTracker>,
         maintain_tree: bool,
     ) -> Arc<Self> {
+        // Connect and read timeouts cut a gone or stalled peer; the total
+        // bounds a progressing transfer to a fraction of the deadline so the
+        // sweep can reach another candidate (see `snapshot_fetch_timeout`).
+        let per_fetch = snapshot_fetch_timeout(bootstrap.timeout(), bootstrap.fetch_cap());
+        // A short `--kv-bootstrap-timeout-ms` can derive a per-fetch bound
+        // below the floor that the cap cannot lift; warn once so the operator
+        // raises the deadline.
+        if bootstrap.enabled() && per_fetch < SNAPSHOT_FETCH_TIMEOUT_FLOOR {
+            warn!(
+                per_fetch_ms = per_fetch.as_millis(),
+                bootstrap_timeout_ms = bootstrap.timeout().as_millis(),
+                fetch_cap_ms = bootstrap.fetch_cap().as_millis(),
+                floor_ms = SNAPSHOT_FETCH_TIMEOUT_FLOOR.as_millis(),
+                suggested_bootstrap_timeout_ms = (SNAPSHOT_FETCH_TIMEOUT_FLOOR
+                    * SNAPSHOT_FETCH_ATTEMPTS_PER_DEADLINE)
+                    .as_millis(),
+                "kv-bootstrap: the per-fetch timeout derived from --kv-bootstrap-timeout-ms \
+                 is below the floor a multi-megabyte snapshot needs, so peers will be \
+                 booked unreachable and every rank will boot cold; raise \
+                 --kv-bootstrap-timeout-ms (the fetch cap cannot lift this on its own)",
+            );
+        }
+        let snapshot_http = reqwest::Client::builder()
+            .connect_timeout(SNAPSHOT_FETCH_CONNECT_TIMEOUT)
+            .read_timeout(SNAPSHOT_FETCH_READ_TIMEOUT)
+            .timeout(per_fetch)
+            // A sibling router never redirects this route, so a redirect is
+            // either a misconfigured peer or a hostile one steering the fetch
+            // — and its multi-gigabyte buffering budget — at an arbitrary
+            // in-cluster URL. Refuse to follow: the 3xx lands as
+            // `FetchAnswer::NoBody` and the peer is just not a source.
+            .redirect(reqwest::redirect::Policy::none())
+            // No fallback to the introspection client: it follows redirects,
+            // which would silently reopen the hole the policy above closes
+            // (and its total timeout cannot fit a large snapshot anyway).
+            // Every option set here is an infallible setter — `build()` only
+            // fails when the TLS backend cannot initialize, and `new()`
+            // already treats that as fatal for the introspection client.
+            .build()
+            .expect("snapshot http client builds: no fallible builder options are set");
         let tree = Arc::new(HashTree::new());
         let (tx, rx) = mpsc::channel::<WorkerEvent>(EVENT_CHANNEL_BUFFER);
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<PumpControl>(16);
@@ -297,6 +408,7 @@ impl KvEventIndex {
         let live_workers: Arc<Mutex<HashSet<KvWorkerId>>> = Arc::new(Mutex::new(HashSet::new()));
         let pump_cancel = CancellationToken::new();
         let peers = Arc::new(PeerRegistry::new());
+        let (bootstrap_tx, bootstrap_rx) = mpsc::channel(BOOTSTRAP_QUEUE_DEPTH);
         let tally = Arc::new(EventTally::new());
         let pump = tokio::spawn(pump_loop(
             PumpDeps {
@@ -306,12 +418,16 @@ impl KvEventIndex {
                 cursors: cursors.clone(),
                 live_workers: live_workers.clone(),
                 bootstrap: Arc::clone(&bootstrap),
+                peers: Arc::clone(&peers),
+                snapshot_http: snapshot_http.clone(),
+                bootstrap_tx: bootstrap_tx.clone(),
+                ctrl_tx: ctrl_tx.downgrade(),
             },
             pump_cancel.clone(),
             rx,
             ctrl_rx,
         ));
-        Arc::new(Self {
+        let index = Arc::new(Self {
             tree,
             maintain_tree,
             subscribers,
@@ -327,9 +443,21 @@ impl KvEventIndex {
             bootstrap,
             peers,
             ctrl_tx,
+            snapshot_http,
+            bootstrap_tx,
             snapshot_cache: Arc::new(AsyncMutex::new(None)),
             block_size_oracle,
-        })
+        });
+        // Same gate as registration, so a coordinator exists exactly when
+        // obligations can be produced.
+        if index.peer_bootstrap_enabled() {
+            tokio::spawn(bootstrap_coordinator(
+                bootstrap_rx,
+                Arc::downgrade(&index),
+                pump_cancel,
+            ));
+        }
+        index
     }
 
     /// Shared handle to the bootstrap tracker. `/readyz` reads it to decide
@@ -509,12 +637,7 @@ impl KvEventIndex {
             .iter()
             .map(|&rank| KvWorkerId::new(worker_url.to_string(), rank))
             .collect();
-        let bootstrap_obligations: Vec<(KvWorkerId, u64)> =
-            if self.peer_bootstrap_enabled() && !bootstrap_ranks.is_empty() {
-                self.bootstrap.register(&bootstrap_ranks)
-            } else {
-                Vec::new()
-            };
+        let bootstrap_obligations = self.register_for_bootstrap(&bootstrap_ranks);
         self.workers.lock().insert(
             worker_url.to_string(),
             WorkerEntry {
@@ -524,10 +647,24 @@ impl KvEventIndex {
         if self.maintain_tree && !kv_dp_ranks.is_empty() {
             self.subscribers.add_worker(worker_url, &cfg).await;
         }
-        // Registered ranks hold their batches until an `ApplySnapshot` or
-        // `AbandonBootstrap` names them. Every production constructor passes a
-        // disabled tracker, which registers nothing.
-        drop(bootstrap_obligations);
+        if !bootstrap_obligations.is_empty() {
+            // Stamped HERE, after `subscribers.add_worker` — not at `register`.
+            // A peer's export has to beat the subscription, and anything earlier
+            // would let the sweep accept a snapshot taken during the subscribe
+            // window, which is precisely the hole the watermark check would then
+            // reject as `Gap`. `subscribers.add_worker` only spawns the SUB
+            // tasks, though: the connect completes asynchronously, so an export
+            // taken between this stamp and the connect can still gap, and the
+            // splice check is what catches it.
+            let batch = ObligationBatch {
+                obligations: bootstrap_obligations,
+                holding_since: Instant::now(),
+                late_join: LateJoin::Permitted,
+            };
+            // The stamp travels with the batch, so whichever sweep picks it up
+            // asks for an export newer than it.
+            self.enqueue_bootstrap(batch);
+        }
         // Mark only the ranks that have an actual SUB socket. `EngineReportedLoadTable`
         // then rejects missing or stale advertised ranks as a whole worker.
         if !load_dp_ranks.is_empty() {
@@ -544,6 +681,20 @@ impl KvEventIndex {
     /// independent of visible peers, because registering arms the deadline.
     fn peer_bootstrap_enabled(&self) -> bool {
         self.bootstrap.enabled()
+    }
+
+    /// Register the ranks a sweep should run for, returning their obligations.
+    ///
+    /// Only ranks the tracker does not already hold yield one:
+    /// `reconcile_unresolved_workers` re-calls `add_worker` for a worker it
+    /// already knows, and a rank that is `Pending` already has a sweep while a
+    /// terminal one has nothing left to fetch. A rank `remove_worker` forgot
+    /// registers as a new incarnation.
+    fn register_for_bootstrap(&self, ranks: &[KvWorkerId]) -> Vec<(KvWorkerId, u64)> {
+        if !self.peer_bootstrap_enabled() {
+            return Vec::new();
+        }
+        self.bootstrap.register(ranks)
     }
 
     /// Tear down a worker's subscribers and clear it from the tree.
@@ -651,6 +802,22 @@ struct PumpDeps {
     cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>>,
     live_workers: Arc<Mutex<HashSet<KvWorkerId>>>,
     bootstrap: Arc<BootstrapTracker>,
+    /// Peer set and client for the splice probe; see `spawn_splice_probe`. The
+    /// pump does not fetch snapshots for bootstrap itself — only this one
+    /// question, about state it already grafted.
+    peers: Arc<PeerRegistry>,
+    snapshot_http: reqwest::Client,
+    /// Obligation queue, so a gap-discarded rank can be handed back for another
+    /// sweep instead of staying cold with budget unspent.
+    bootstrap_tx: mpsc::Sender<ObligationBatch>,
+    /// Loopback into this pump's own control channel, so a probe answer arrives
+    /// on the single writer like every other tree mutation.
+    ///
+    /// Weak so the pump does not keep its own control channel open: the channel
+    /// still closes when every external sender is gone, which is what the
+    /// `ctrl_open` latch in `pump_loop` exists to observe. A probe upgrades it
+    /// for the duration of its pass.
+    ctrl_tx: mpsc::WeakSender<PumpControl>,
 }
 
 /// Drain `WorkerEvent`s: apply KV `Batch`es to the tree and `Load` snapshots
@@ -678,12 +845,17 @@ async fn pump_loop(
         cursors,
         live_workers,
         bootstrap,
+        peers,
+        snapshot_http,
+        bootstrap_tx,
+        ctrl_tx,
     } = deps;
     let pump_state = PumpState {
         tree: &tree,
         cursors: &cursors,
         tally: &tally,
         bootstrap: &bootstrap,
+        bootstrap_tx: &bootstrap_tx,
         live_workers: &live_workers,
     };
 
@@ -691,14 +863,16 @@ async fn pump_loop(
     // the only task that touches it, so no lock is needed.
     let mut held: HashMap<KvWorkerId, VecDeque<(i64, KvEventBatch)>> = HashMap::new();
     // Ranks grafted from a snapshot whose continuity with the live stream is
-    // not yet provable, mapped to the watermark the first arriving batch must
-    // not exceed by more than one.
+    // not yet provable, mapped to the watermark and when the wait started.
     //
     // WHY deferred: a snapshot can be grafted before the rank's first live
     // batch has even arrived, so there is nothing to compare the watermark
     // against yet. The check runs on whichever batch turns up first — held or
-    // live — and the entry is consumed by that one check.
-    let mut awaiting_splice_proof: HashMap<KvWorkerId, i64> = HashMap::new();
+    // live — and the entry is consumed by that one check, or by the sweep below
+    // if no batch ever arrives.
+    let mut awaiting_splice_proof: HashMap<KvWorkerId, PendingProof> = HashMap::new();
+    let mut proof_sweep = tokio::time::interval(SPLICE_PROOF_SWEEP_INTERVAL);
+    proof_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Once the control channel closes its `recv()` resolves immediately and
     // forever, so it must be dropped from the select or the loop spins hot.
     let mut ctrl_open = true;
@@ -754,9 +928,129 @@ async fn pump_loop(
                             );
                         }
                     }
+                    Some(PumpControl::SpliceProbe {
+                        rank,
+                        epoch,
+                        watermark,
+                        verdict,
+                    }) => {
+                        // The rank may have proven itself, been forgotten,
+                        // been re-registered, or been re-grafted by a gap retry
+                        // while the probe was in flight. The epoch rules out
+                        // another incarnation; the watermark rules out another
+                        // graft of this one, which a retry makes under the same
+                        // epoch.
+                        let proof = match awaiting_splice_proof.get_mut(&rank) {
+                            Some(proof)
+                                if proof.watermark == watermark
+                                    && bootstrap.epoch_of(&rank) == Some(epoch) =>
+                            {
+                                proof
+                            }
+                            _ => {
+                                debug!(
+                                    worker = ?rank,
+                                    epoch,
+                                    watermark,
+                                    "kv-bootstrap: dropping a probe verdict that no longer \
+                                     addresses live state",
+                                );
+                                continue;
+                            }
+                        };
+                        match verdict {
+                            SpliceVerdict::Advanced => {
+                                awaiting_splice_proof.remove(&rank);
+                                demote_unproven_rank(&pump_state, &mut held, &rank);
+                            }
+                            SpliceVerdict::NoAdvance => {
+                                debug!(
+                                    worker = ?rank,
+                                    watermark,
+                                    "kv-bootstrap: no peer is past the watermark; treating \
+                                     the silent stream as continuous",
+                                );
+                                awaiting_splice_proof.remove(&rank);
+                                bootstrap.record_rank_outcome(RankOutcome::Warm);
+                            }
+                            // No witness. Keep the rank warm and ask again — but
+                            // not forever: a fleet that never answers (a
+                            // single-replica deployment, say) would otherwise
+                            // leave the verdict unresolved and the probe looping.
+                            SpliceVerdict::Unknown => {
+                                proof.unknown_probes += 1;
+                                debug!(
+                                    worker = ?rank,
+                                    watermark = proof.watermark,
+                                    probes = proof.unknown_probes,
+                                    max_unknown_probes = MAX_UNKNOWN_PROBES,
+                                    "kv-bootstrap: no witness answered this probe",
+                                );
+                                if proof.unknown_probes >= MAX_UNKNOWN_PROBES {
+                                    info!(
+                                        worker = ?rank,
+                                        watermark = proof.watermark,
+                                        probes = proof.unknown_probes,
+                                        "kv-bootstrap: no peer could witness this rank's \
+                                         progress; keeping the grafted state unproven",
+                                    );
+                                    awaiting_splice_proof.remove(&rank);
+                                    bootstrap
+                                        .record_rank_outcome(RankOutcome::WarmUnwitnessed);
+                                }
+                            }
+                        }
+                    }
                     None => {
                         debug!("kv-events pump: control channel closed");
                         ctrl_open = false;
+                    }
+                }
+                continue;
+            }
+            // Ranks whose splice proof never arrived. Placed in the select rather
+            // than keyed off event arrival BECAUSE the failure mode is the absence
+            // of events: a rank that goes quiet right after a graft is exactly the
+            // one that would otherwise never be checked.
+            _ = proof_sweep.tick(), if !awaiting_splice_proof.is_empty() => {
+                // Do NOT discard on silence alone. Reaching the deferred path
+                // means nothing arrived between subscribing and grafting, and
+                // the subscriber is live before the snapshot is fetched — so
+                // silence is far more often "this rank published nothing" than
+                // "we lost a delta". Discarding on a timer would throw away a
+                // healthy warm tree on every quiet fleet, which is the exact
+                // regression this feature exists to prevent. Ask the fleet
+                // instead, and act only on positive evidence.
+                let now = Instant::now();
+                let mut targets = Vec::new();
+                for (rank, proof) in awaiting_splice_proof
+                    .iter_mut()
+                    .filter(|(_, p)| p.due_for_probe(SPLICE_PROOF_TIMEOUT))
+                {
+                    // Re-armed before probing so retries are spaced by the
+                    // timeout, never by the sweep tick.
+                    proof.since = now;
+                    // Forgotten: the `ForgetRanks` that follows drops the entry.
+                    let Some(epoch) = bootstrap.epoch_of(rank) else {
+                        continue;
+                    };
+                    targets.push(ProbeTarget {
+                        rank: rank.clone(),
+                        watermark: proof.watermark,
+                        epoch,
+                    });
+                }
+                // One pass for every due rank: a single cursor table per peer
+                // answers all of them, so asking per rank would multiply the
+                // fleet's work by the number of idle ranks.
+                if !targets.is_empty() {
+                    if let Some(ctrl_tx) = ctrl_tx.upgrade() {
+                        spawn_splice_probe(
+                            snapshot_http.clone(),
+                            Arc::clone(&peers),
+                            ctrl_tx,
+                            targets,
+                        );
                     }
                 }
                 continue;
@@ -952,21 +1246,27 @@ async fn pump_loop(
                 }
                 // First batch after a graft proves — or disproves — that the
                 // snapshot joins up with this rank's live stream.
-                let watermark = if awaiting_splice_proof.is_empty() {
+                let proof = if awaiting_splice_proof.is_empty() {
                     None
                 } else {
                     awaiting_splice_proof.remove(&worker)
                 };
-                if let Some(watermark) = watermark {
-                    if leaves_gap(seq, watermark) {
+                if let Some(proof) = proof {
+                    if leaves_gap(seq, proof.watermark) {
                         warn!(
                             worker = ?worker,
-                            peer_cursor = watermark,
+                            peer_cursor = proof.watermark,
                             first_live_seq = seq,
                             "kv-bootstrap: sequence gap between snapshot and live stream; \
                              discarding snapshot state for this rank to avoid stale cache entries",
                         );
-                        discard_graft(&pump_state, &worker, RankOutcome::Gap);
+                        // Held, not applied: `resolve_gap` either replays it after
+                        // clearing, or keeps it for the retry's graft.
+                        held.entry(worker.clone())
+                            .or_default()
+                            .push_back((seq, batch));
+                        resolve_gap(&pump_state, &mut held, &worker);
+                        continue;
                     } else {
                         // The deferred check passed: this rank's grafted state is
                         // now proven continuous with its live stream, which is the
@@ -987,6 +1287,9 @@ struct PumpState<'a> {
     tally: &'a EventTally,
     bootstrap: &'a BootstrapTracker,
     live_workers: &'a Mutex<HashSet<KvWorkerId>>,
+    /// Obligation queue, so the graft path can hand a gapped rank back for
+    /// another sweep. See [`resolve_gap`].
+    bootstrap_tx: &'a mpsc::Sender<ObligationBatch>,
 }
 
 /// Apply one batch, honouring the cursor's out-of-order filter.
