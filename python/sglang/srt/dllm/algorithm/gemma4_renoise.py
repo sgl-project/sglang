@@ -31,6 +31,21 @@ def _denoiser_statistics(logits: torch.Tensor, temperatures: torch.Tensor):
 _compiled_denoiser_statistics = torch.compile(_denoiser_statistics, dynamic=True)
 
 
+def _denoiser_statistics_cuda(logits: torch.Tensor, temperatures: torch.Tensor):
+    if (
+        torch.cuda.get_device_capability(logits.device)[0] == 10
+        and logits.dtype == temperatures.dtype == torch.float32
+        and logits.is_contiguous()
+        and temperatures.is_contiguous()
+        and logits.shape[-1] >= 65536
+        and logits.shape[0] * logits.shape[1] >= 32
+    ):
+        from sglang.kernels.ops.sampling.denoiser_statistics import denoiser_statistics
+
+        return denoiser_statistics(logits, temperatures)
+    return _compiled_denoiser_statistics(logits, temperatures)
+
+
 def _sample_denoiser(probabilities: torch.Tensor, generator: torch.Generator):
     # The exponential-race formulation samples the same categorical distribution
     # as multinomial. Probabilities come from softmax, so multinomial's repeated
@@ -296,7 +311,7 @@ class Gemma4Renoise(DllmAlgorithm):
             [self._temperature(state["step"]) for state in states]
         )
         statistics = (
-            _compiled_denoiser_statistics if logits.is_cuda else _denoiser_statistics
+            _denoiser_statistics_cuda if logits.is_cuda else _denoiser_statistics
         )
         probabilities, token_entropies, argmax_tokens = statistics(logits, temperatures)
         sorted_entropy, indices = torch.sort(token_entropies, dim=-1)
