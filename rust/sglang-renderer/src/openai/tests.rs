@@ -276,8 +276,69 @@ fn completion_lowering_validates_metadata_lengths_duplicates_and_scalar_rooms() 
             .flat_map(|request| request.requests.iter())
             .map(|request| request.metadata.bootstrap_room)
             .collect::<Vec<_>>(),
-        [Some(90), Some(90), Some(91), Some(91)]
+        [Some(90), Some(92), Some(91), Some(93)]
     );
+}
+
+#[test]
+fn completion_lowering_rejects_scalar_room_overflow_across_choices() {
+    let request: CompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "model", "prompt": "hello", "n": 3,
+        "bootstrap_room": i64::MAX - 1
+    }))
+    .unwrap();
+    let error = lower_text_completion_request(&renderer_config(), &request).unwrap_err();
+    assert!(error.to_string().contains("bootstrap_room overflows i64"));
+}
+
+#[tokio::test]
+async fn chat_preparation_expands_scalar_rooms_and_preserves_explicit_lists() {
+    use std::sync::Arc;
+
+    use crate::{DynamoTokenizer, RendererService};
+
+    let tokenizer = crate::engine::test_utils::tiny_tokenizer();
+    let renderer = RendererService::with_tokenizer(
+        renderer_config(),
+        Arc::new(DynamoTokenizer::new(tokenizer.clone(), tokenizer)),
+        1,
+        1,
+    );
+    for (room, expected) in [
+        (
+            serde_json::json!(100),
+            vec![Some(100), Some(101), Some(102)],
+        ),
+        (serde_json::json!([100]), vec![Some(100); 3]),
+        (serde_json::Value::Null, vec![None; 3]),
+    ] {
+        let request = serde_json::from_value(serde_json::json!({
+            "model": "model", "messages": [{"role": "user", "content": "hello"}],
+            "n": 3, "max_tokens": 1, "bootstrap_room": room
+        }))
+        .unwrap();
+        let (_, prepared) = super::chat::prepare_request(&renderer, request)
+            .await
+            .unwrap();
+        assert_eq!(
+            prepared
+                .requests
+                .iter()
+                .map(|request| request.metadata.bootstrap_room)
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+    let request = serde_json::from_value(serde_json::json!({
+        "model": "model", "messages": [{"role": "user", "content": "hello"}],
+        "n": 3, "max_tokens": 1, "bootstrap_room": i64::MAX - 1
+    }))
+    .unwrap();
+    let error = super::chat::prepare_request(&renderer, request)
+        .await
+        .err()
+        .expect("overflow must fail before submission");
+    assert!(error.message.contains("bootstrap_room overflows i64"));
 }
 
 #[test]
@@ -380,8 +441,7 @@ async fn route_operations_decode_tokens_without_http() {
     );
     for chat in [false, true] {
         for stream in [false, true] {
-            let mut body =
-                serde_json::json!({"model": "model", "n": 2, "max_tokens": 4, "stream": stream});
+            let mut body = serde_json::json!({"model": "model", "n": 2, "max_tokens": 4, "stream": stream, "bootstrap_room": 100});
             let responses = if chat {
                 body["messages"] = serde_json::json!([{"role": "user", "content": "hello"}]);
                 values(
@@ -426,4 +486,16 @@ async fn route_operations_decode_tokens_without_http() {
     let requests = transport.0.lock().unwrap();
     assert_eq!(requests.len(), 8);
     assert!(requests.iter().all(|request| !request.input_ids.is_empty()));
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.sampling_params.n == 1)
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.metadata.bootstrap_room)
+            .collect::<Vec<_>>(),
+        [Some(100), Some(101)].repeat(4)
+    );
 }
