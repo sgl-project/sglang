@@ -796,40 +796,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self.v_buffer[layer_id - self.start_layer],
         )
 
-    def get_kv_buffer_shape(self):
-        """One layer's KV as CUDA lays it out: ``(rows, 1, nope + rope)``.
-
-        The inherited implementation returns ``get_kv_buffer(start_layer)``'s
-        shapes, which on this pool are two *separate* paged tensors of
-        ``(pages, page_size, 1, dim)`` -- nope and rope kept apart, where CUDA's
-        MLA pool keeps one fused ``(rows, 1, kv_lora_rank + qk_rope_head_dim)``.
-
-        Its only caller is the DCP extend gather, which builds its buffer as
-        ``(seq_lens_sum, *shape[0][1:])`` (``layers/dcp/planner.py``). Under the
-        inherited reading that allocates ``page_size`` rows per token and drops
-        the rope half entirely: roughly a gigabyte at an 8k prefill and about
-        137 GiB at 1M, for a buffer that is then never read. So this reports
-        what the caller is actually asking -- how big is one token -- rather
-        than how this pool happens to store it, and reports it in CUDA's fused
-        form because that is the layout the gather writes and reads.
-
-        Note what the caller consumes: ``shape[0][1:]``, i.e. it drops the row
-        axis and keeps the rest as the per-token shape. So the row axis must be
-        PRESENT and leading even though its value is unused -- returning the
-        per-token shape directly makes the buffer 2-D and the gather then fails
-        on a rank with an empty prefix, which is where this was caught.
-
-        Both halves of the tuple are the same fused shape. The caller takes
-        ``[0]``; there is no separate v-shape to report once the two are fused,
-        and returning the rope-only shape as ``[1]`` would invite exactly the
-        per-half reading this override exists to prevent.
-        """
-        pages, page_size = self.k_buffer[0].shape[0], self.k_buffer[0].shape[1]
-        fused = torch.Size(
-            (pages * page_size, 1, self.kv_lora_rank + self.qk_rope_head_dim)
-        )
-        return fused, fused
-
     def get_mla_kv_buffer(
         self,
         layer: "RadixAttention",

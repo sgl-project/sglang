@@ -796,9 +796,6 @@ def _dcp_gather_extend_kv_npu(
     md = forward_batch.attn_dcp_metadata
     plan = getattr(forward_batch, "npu_dcp_extend_gather", None)
     if plan is None:
-        # The shared planner's context-sized buffer is for CUDA's kernels and is
-        # never read here, so drop it rather than hold it through every layer.
-        md.dcp_kv_buffer = None
         plan = plan_dcp_extend_gather(
             forward_batch.extend_prefix_lens_cpu,
             forward_batch.extend_seq_lens_cpu,

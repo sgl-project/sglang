@@ -32,6 +32,7 @@ from sglang.srt.layers.dcp.layout import (
 from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_device, get_parallel
+from sglang.srt.utils import is_npu
 
 
 def prepare_decode_context_parallel_metadata(
@@ -130,13 +131,16 @@ def prepare_decode_context_parallel_metadata(
     dcp_local_prefix_kv_indices = translator.translate_full_attn_ids(
         dcp_local_row(owned, parallel.dcp_size, interleave)
     )
-    dcp_kv_buffer = torch.empty(
-        (
-            seq_lens_sum,
-            *kv_buffer_shape[1:],
-        ),
-        dtype=kv_cache_dtype,
-        device=kv_cache_device,
+    # NPU gathers into its own reused buffers and never reads this one, which
+    # is context-sized: 1.15 GB per extend forward at a 1M prefix.
+    dcp_kv_buffer = (
+        None
+        if is_npu()
+        else torch.empty(
+            (seq_lens_sum, *kv_buffer_shape[1:]),
+            dtype=kv_cache_dtype,
+            device=kv_cache_device,
+        )
     )
     attn_dcp_metadata = DecodeContextParallelMetadata(
         dcp_kv_indptr=dcp_kv_indptr,
