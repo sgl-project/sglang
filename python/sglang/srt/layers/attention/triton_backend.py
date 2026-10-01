@@ -1834,17 +1834,21 @@ class TritonAttnBackend(AttentionBackend):
                 bidirectional_bmm_attention,
             )
 
-            # SWA metadata already contains only the allowed prefix window.
-            # Keep the current canvas fully bidirectional, as extend_attention
-            # does above. Round window padding up for aligned GEMM dimensions.
-            # The global context limit includes the current canvas: subtract
-            # it to avoid padding the score matrix beyond the context bound.
-            prefix_capacity = (
-                triton.cdiv(layer.sliding_window_size, 64) * 64
-                if layer.sliding_window_size is not None
-                and layer.sliding_window_size > 0
-                else min(self.max_context_len - q.shape[0], kv_indices.numel())
-            )
+            # SWA metadata already contains only the allowed prefix window;
+            # the current denoising canvas remains fully bidirectional.
+            if layer.sliding_window_size is not None and layer.sliding_window_size > 0:
+                prefix_capacity = triton.cdiv(layer.sliding_window_size, 64) * 64
+            else:
+                from sglang.srt.layers.attention.graph_variants import (
+                    get_dllm_bmm_capture_prefix_capacity,
+                )
+
+                # Bound the entire cached prefix, including a final canvas
+                # padded beyond the request's logical context length.
+                prefix_capacity = min(self.max_context_len, kv_indices.numel())
+                capture_capacity = get_dllm_bmm_capture_prefix_capacity()
+                if capture_capacity is not None:
+                    prefix_capacity = min(prefix_capacity, capture_capacity)
             result = bidirectional_bmm_attention(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                 k.contiguous(),

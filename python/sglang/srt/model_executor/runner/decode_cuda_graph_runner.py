@@ -52,6 +52,7 @@ from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.attention.graph_variants import (
     AttentionGraphVariants,
     create_attention_graph_variants,
+    create_dllm_bmm_graph_variants,
     create_dsv41_candidate_graph_variants,
 )
 from sglang.srt.layers.cp.utils import is_mla_cp_enabled
@@ -329,6 +330,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
             self.compile_bs = [bs for bs in self.compile_bs if bs <= max_requests]
         self.max_bs = max(self.capture_bs)
+        if self.attention_graph_variants is None:
+            self.attention_graph_variants = create_dllm_bmm_graph_variants(
+                model_runner,
+                self.attn_backend,
+                self.capture_forward_mode,
+                self.captured_req_width,
+                self.capture_bs,
+            )
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
 
