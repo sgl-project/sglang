@@ -1350,8 +1350,8 @@ class HybridCacheController(BaseHiCacheController):
             return self._page_backup_with_stable_layout(operation)
 
     def _page_backup_with_stable_layout(self, operation):
-        # MLA KV is replicated across TP ranks and should still be written only
-        # by TP0. Rank-sharded sidecars still need every TP rank.
+        # Write primary KV only on its selected shard writer. Rank-sharded
+        # sidecars can still need every TP rank.
         backup_transfers = [
             transfer
             for transfer in operation.pool_transfers or []

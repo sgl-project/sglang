@@ -21,16 +21,22 @@ import shutil
 import tempfile
 import time
 import unittest
+from contextlib import ExitStack
+from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheFile,
     HiCacheStorageConfig,
     MetadataCache,
 )
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.storage.file.lru_file_evictor import _parse_size_to_bytes
 from sglang.test.test_utils import CustomTestCase
 
@@ -536,6 +542,144 @@ class TestHiCacheFileMetadataIntegration(HiCacheFileLRUTestBase):
             )  # since mock_exists returns True, k3 exists physically
             mock_scandir.assert_not_called()
             mock_exists.assert_called_once()
+
+
+def _dcp_config(rank=0, tp=4, dcp=2, **overrides):
+    cfg = replace(
+        _make_config(
+            tp_rank=rank,
+            tp_size=tp,
+            is_mla=True,
+            model="test/model",
+            extra_config={
+                "max_size": "2",
+                "min_free_space": "0",
+                "eviction_ratio": 1.0,
+            },
+        ),
+        dcp_size=dcp,
+        dcp_rank=rank % dcp,
+        logical_page_size=64 * dcp,
+    )
+    return replace(cfg, **overrides)
+
+
+class TestDcpStorage(unittest.TestCase):
+    def setUp(self):
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.directory = self.stack.enter_context(tempfile.TemporaryDirectory())
+        self.stack.enter_context(
+            envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.override(self.directory)
+        )
+
+    def test_shard_keys_and_writer_selection(self):
+        for tp, dcp, mla in (
+            (2, 2, True),
+            (4, 2, True),
+            (4, 4, True),
+            (4, 1, True),
+            (4, 1, False),
+        ):
+            with self.subTest(tp=tp, dcp=dcp, mla=mla):
+                keys = []
+                for rank in range(tp):
+                    cfg = _dcp_config(rank, tp, dcp, is_mla_model=mla)
+                    backend = HiCacheFile(cfg)
+                    controller = HiCacheController.__new__(HiCacheController)
+                    controller.storage_config = cfg
+                    owner = not mla or rank < dcp
+                    self.assertEqual(cfg.is_storage_writer, owner)
+                    self.assertEqual(controller.backup_skip, not owner)
+                    self.assertEqual(backend._evictor.is_storage_owner, owner)
+                    key = backend._get_suffixed_key("page")
+                    keys.append(key)
+                    if dcp == 1:
+                        self.assertEqual(
+                            key, "page_test-model" + ("" if mla else f"_{rank}_{tp}")
+                        )
+                    elif rank >= dcp:
+                        self.assertEqual(key, keys[rank % dcp])
+                self.assertEqual(len(set(keys)), dcp if mla else tp)
+
+    def test_key_separation_and_invalid_identity(self):
+        variants = (
+            {},
+            {"tp_size": 2},
+            {"dcp_size": 4},
+            {"logical_page_size": 256},
+            {"model_name": "other"},
+            {"pp_size": 2, "pp_rank": 1},
+            {"attn_cp_size": 2, "attn_cp_rank": 1},
+        )
+        keys = [
+            HiCacheFile(_dcp_config(**v))._get_suffixed_key("page") for v in variants
+        ]
+        self.assertEqual(len(set(keys)), len(variants))
+        for invalid in (
+            {"dcp_size": 0},
+            {"dcp_rank": 2},
+            {"tp_rank": 1},
+            {"tp_rank": 4},
+            {"tp_size": 3},
+            {"is_mla_model": False},
+            {"logical_page_size": None},
+            {"logical_page_size": 127},
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                _dcp_config(**invalid)
+
+    def test_file_reload_and_owner_eviction(self):
+        for rank in range(4):
+            backend = HiCacheFile(_dcp_config(rank))
+            self.assertEqual(
+                backend.set(
+                    "page" if rank < 2 else "unowned",
+                    torch.full((2,), rank, dtype=torch.uint8),
+                ),
+                rank < 2,
+            )
+        self.assertEqual(len(list(Path(self.directory).glob("*.bin"))), 2)
+        # Independent backends model fresh engines, including replica readers.
+        readers = [HiCacheFile(_dcp_config(rank)) for rank in range(4)]
+        for rank, backend in enumerate(readers):
+            torch.testing.assert_close(
+                backend.get("page", torch.empty(2, dtype=torch.uint8)),
+                torch.full((2,), rank % 2, dtype=torch.uint8),
+            )
+        self.assertTrue(readers[0].set("next", torch.zeros(2, dtype=torch.uint8)))
+        self.assertFalse(readers[0].exists("page"))
+        self.assertTrue(readers[1].exists("page"))
+        self.assertEqual([b._evictor._total_bytes for b in readers], [2, 2, 0, 0])
+
+    def test_attachment_guards(self):
+        for case in ("backend", "non_mla", "dummy", "split", "scales", "extra_pool"):
+            host = MLATokenToKVPoolHost.__new__(MLATokenToKVPoolHost)
+            host.kv_buffer = None if case == "dummy" else object()
+            host.layout = "page_first"
+            if case == "split":
+                host.layout = "page_first_kv_split"
+            host.device_pool = SimpleNamespace(
+                kv_scale_buffer=object() if case == "scales" else None
+            )
+            cc = HiCacheController.__new__(HiCacheController)
+            cc.enable_storage = False
+            cc.storage_host_pool = object() if case == "non_mla" else host
+            cc.mem_pool_host = SimpleNamespace(
+                entries=[host] * (2 if case == "extra_pool" else 1)
+            )
+            cc._stop_storage_threads = mock.Mock()
+            with (
+                self.subTest(case=case),
+                mock.patch(
+                    "sglang.srt.managers.cache_controller.get_parallel",
+                    return_value=SimpleNamespace(attn_dcp_size=2),
+                ),
+                self.assertRaises(NotImplementedError),
+            ):
+                cc.attach_storage_backend("mooncake" if case == "backend" else "file")
+            cc._stop_storage_threads.assert_not_called()
+            self.assertFalse(cc.enable_storage)
 
 
 if __name__ == "__main__":
