@@ -25,8 +25,9 @@ pub fn config() -> Config {
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
             id: MODEL.into(),
-            tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+            tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),
             disable_input_ids_forwarding: false,
+            tokenizer: Default::default(),
             policy: PolicyKind::CacheAware,
             decode_policy: Default::default(),
             bucket_config: None,
@@ -37,6 +38,7 @@ pub fn config() -> Config {
             fused: None,
             eligibility: None,
             sampling_overrides: Default::default(),
+            default_chat_template_kwargs: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],

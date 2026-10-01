@@ -58,7 +58,13 @@ runtime:
   # differ, so these split what the single-node EP<=8 recipes leave symmetric.
   wide_ep:
     kv_cache_dtype: fp8_e4m3
-    prefill_mem_fraction_static: 0.8
+    # 0.85, not the 0.8 the other ep16 recipes use. FP8 Pro weights are 218.92 GB
+    # per rank; at 0.8 of a 288 GB card the static budget is 230.4 GB, leaving
+    # ~11 GB for activations and the KV pool. max_total_num_tokens resolves to 0
+    # and the prefill engine aborts with "Not enough memory. Please try to
+    # increase --mem-fraction-static." The FP4 recipes fit at 0.8 because their
+    # weights are half the size, and the FP8 MTP recipe already runs at 0.85.
+    prefill_mem_fraction_static: 0.85
     decode_mem_fraction_static: 0.85
     prefill_chunked_prefill_size: 131072
     prefill_max_running_requests: 1024

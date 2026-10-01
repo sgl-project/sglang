@@ -109,6 +109,8 @@ class MockReq:
     def get_fill_ids(self):
         return self.full_untruncated_fill_ids[: self.extend_range.end]
 
+    skip_radix_cache_insert = False
+
     def owned_kv_len(self):
         return self.kv.kv_committed_len
 
@@ -249,8 +251,8 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         # Step 2: cache_unfinished_req (dec old lock, inc new lock)
         cache.cache_unfinished_req(req)
 
-        # Step 3: cache_finished_req (dec lock)
-        cache.cache_finished_req(req, owned_kv_len=req.kv.kv_committed_len)
+        # Step 3: release_kv_cache (insert, free the rest, dec lock)
+        release_kv_cache(req, cache)
 
         # Verify: all non-root nodes should have lock_ref == 0
         # (root always has lock_ref == 1)
@@ -299,7 +301,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         cache.cache_unfinished_req(req)
 
         # Step 3: cache_finished_req (dec leaf)
-        cache.cache_finished_req(req, owned_kv_len=req.kv.kv_committed_len)
+        release_kv_cache(req, cache)
 
         # Root lock unchanged, all nodes unlocked
         self.assertEqual(cache.root_node.lock_ref, root_lock_before)
@@ -391,7 +393,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         req.kv.kv_allocated_len = len(row_vals)
 
         cache.token_to_kv_pool_allocator.reset_mock()
-        cache.cache_finished_req(req, owned_kv_len=req.kv.kv_committed_len)
+        release_kv_cache(req, cache)
 
         # The unnamed tail slot is freed as the segment past the radix key.
         segments = cache.token_to_kv_pool_allocator.free_segments.call_args.args[0]
@@ -686,7 +688,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
             )
 
             cache.cache_unfinished_req(req)
-            cache.cache_finished_req(req, owned_kv_len=req.kv.kv_committed_len)
+            release_kv_cache(req, cache)
 
         # After all iterations, root lock should be 1, no protected nodes
         self.assertEqual(cache.root_node.lock_ref, 1)

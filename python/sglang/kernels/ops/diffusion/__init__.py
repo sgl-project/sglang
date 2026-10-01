@@ -372,6 +372,20 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "Out-of-place fused QK-norm + RoPE (raw q/k preserved).",
     ),
     (
+        "diffusion.qknorm_complex_rope_cuda",
+        KernelBackend.JIT,
+        "rope.qknorm_complex_rope_jit:qknorm_complex_rope_cuda",
+        _CUDA,
+        "Bit-exact 128-wide RMSNorm + complex RoPE (Qwen-Image 2.1), CUDA.",
+    ),
+    (
+        "diffusion.qknorm_complex_rope_pack_",
+        KernelBackend.JIT,
+        "rope.qknorm_complex_rope_jit:qknorm_complex_rope_pack_",
+        _CUDA,
+        "Q/K RMSNorm + complex RoPE with prefix K/V packing into [B, P+S, H, 128] buffers, CUDA.",
+    ),
+    (
         "diffusion.vdn_delta_factors",
         KernelBackend.JIT,
         "attention.vdn_delta_factors_jit:vdn_delta_factors",
@@ -638,6 +652,10 @@ _EXPORTS: dict[str, str] = {
     "apply_rotary_embedding": "rope.rotary_triton",
     "can_use_fused_complex_rope": "rope.complex_rope_triton",
     "fused_complex_rope": "rope.complex_rope_triton",
+    "can_use_qknorm_complex_rope_cuda": "rope.qknorm_complex_rope_jit",
+    "can_use_qknorm_complex_rope_pack": "rope.qknorm_complex_rope_jit",
+    "qknorm_complex_rope_cuda": "rope.qknorm_complex_rope_jit",
+    "qknorm_complex_rope_pack_": "rope.qknorm_complex_rope_jit",
     # Tensor layout transformations fused with downstream quantization
     "try_flux2_token_cat_fp8": "sglang.kernels.kda_kernels.flux2_token_cat_fp8_triton",
     # Activation-function fusions

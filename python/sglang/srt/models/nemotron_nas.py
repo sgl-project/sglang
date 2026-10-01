@@ -40,7 +40,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.llama import LlamaAttention, LlamaMLP
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, make_pp_layers
 from sglang.utils import logger
 
 
@@ -197,11 +197,9 @@ class DeciModel(nn.Module):
                 prefix=prefix,
             )
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             get_layer,
-            pp_rank=get_parallel().pp_group.rank_in_group,
-            pp_size=get_parallel().pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
         if get_parallel().pp_group.is_last_rank:

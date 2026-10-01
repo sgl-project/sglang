@@ -422,7 +422,7 @@ class MambaMixer2(torch.nn.Module):
         set_weight_attrs(self.A, {"weight_loader": a_weight_loader})
         set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
 
-        # By default a layer communicator reduces the output under DP attention.
+        # By default the stage boundary reduces the output under DP attention.
         if reduce_results is None:
             reduce_results = not is_dp_attention_enabled()
         self.out_proj = RowParallelLinear(
