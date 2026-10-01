@@ -911,6 +911,10 @@ class Envs:
     # the SHUFFLE KV layout that enables pa_decode_gluon for full-attn
     # decode without runtime permutes.
     SGLANG_AITER_KV_CACHE_LAYOUT = EnvStr("nhd")
+    # MiniMax-M3 AMD: direct SHUFFLE main KV + AITER FlyDSL paged decode.
+    # The index cache remains NHD. Dense plans are created only for graph sizes.
+    SGLANG_MINIMAX_FLYDSL_DECODE = EnvBool(False)
+    SGLANG_MINIMAX_FLYDSL_PLAN = EnvBool(True)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     USE_ROCM_AITER_ROPE_BACKEND = EnvStr("0")

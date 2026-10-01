@@ -378,6 +378,7 @@ ARG TORCHAUDIO_ROCM_VERSION="2.11.0+rocm7.2"
 
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG AITER_COMMIT=""
+ARG AITER_APPLY_DEFAULT_BACKPORTS=1
 ENV AITER_COMMIT="${AITER_COMMIT:-${AITER_COMMIT_DEFAULT}}"
 
 ARG LLVM_REPO="https://github.com/jrbyrnes/llvm-project.git"
@@ -573,8 +574,10 @@ RUN pip uninstall -y aiter
 RUN git clone ${AITER_REPO} \
  && cd aiter \
  && git checkout -f ${AITER_COMMIT} \
- && git cherry-pick --no-commit 7b481fbcaf834ce98b66004ea329c2ca2bba87d7 \
- && git cherry-pick --no-commit 24a62b1c122f23645a19b9d8b0abd4750c59359b \
+ && if [ "$AITER_APPLY_DEFAULT_BACKPORTS" = "1" ]; then \
+      git cherry-pick --no-commit 7b481fbcaf834ce98b66004ea329c2ca2bba87d7 \
+      && git cherry-pick --no-commit 24a62b1c122f23645a19b9d8b0abd4750c59359b; \
+    fi \
  && sed -i 's/from functools import lru_cache/from functools import cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py \
  && sed -i 's/@lru_cache(maxsize=32)/@cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py \
  && git submodule update --init --recursive \

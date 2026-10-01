@@ -1,0 +1,379 @@
+{
+  "gpu": "AMD Radeon Graphics",
+  "torch": "2.10.0+rocm7.2.4.git3d3aa833",
+  "checks": [
+    {
+      "case": "dense-static-page16-heads1",
+      "max_abs_error": 0.008325181901454926,
+      "relative_l2_error": 0.006741174962371588,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "dense-planned-graph-page16-heads1",
+      "max_abs_error": 0.008325181901454926,
+      "relative_l2_error": 0.006741174962371588,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "dense-graph-changed-lengths-page16-heads1",
+      "max_abs_error": 0.009881776757538319,
+      "relative_l2_error": 0.0068650697357952595,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "dense-static-graph-int64-lengths-page16-heads1",
+      "max_abs_error": 0.008325181901454926,
+      "relative_l2_error": 0.006741174962371588,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "sparse-metadata-exact-page16-heads1",
+      "passed": true
+    },
+    {
+      "case": "sparse-page16-heads1",
+      "max_abs_error": 0.008325181901454926,
+      "relative_l2_error": 0.0076325018890202045,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "prefill-metadata-exact-page16-heads1",
+      "passed": true
+    },
+    {
+      "case": "sparse-prefill-prefix-page16-heads1",
+      "max_abs_error": 0.01792171597480774,
+      "relative_l2_error": 0.010234850458800793,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "dense-static-page16-heads2",
+      "max_abs_error": 0.011290445923805237,
+      "relative_l2_error": 0.006831633858382702,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "dense-planned-graph-page16-heads2",
+      "max_abs_error": 0.011290445923805237,
+      "relative_l2_error": 0.006831633858382702,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "dense-graph-changed-lengths-page16-heads2",
+      "max_abs_error": 0.009120631963014603,
+      "relative_l2_error": 0.006378293503075838,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "dense-static-graph-int64-lengths-page16-heads2",
+      "max_abs_error": 0.011290445923805237,
+      "relative_l2_error": 0.006831633858382702,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "sparse-metadata-exact-page16-heads2",
+      "passed": true
+    },
+    {
+      "case": "sparse-page16-heads2",
+      "max_abs_error": 0.011290445923805237,
+      "relative_l2_error": 0.007375917863100767,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "prefill-metadata-exact-page16-heads2",
+      "passed": true
+    },
+    {
+      "case": "sparse-prefill-prefix-page16-heads2",
+      "max_abs_error": 0.024296589195728302,
+      "relative_l2_error": 0.013329120352864265,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": false
+    },
+    {
+      "case": "dense-static-page64-heads1",
+      "max_abs_error": 0.009146831929683685,
+      "relative_l2_error": 0.006601522210985422,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "dense-planned-graph-page64-heads1",
+      "max_abs_error": 0.009146831929683685,
+      "relative_l2_error": 0.006601522210985422,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "dense-graph-changed-lengths-page64-heads1",
+      "max_abs_error": 0.008871443569660187,
+      "relative_l2_error": 0.007239090744405985,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "dense-static-graph-int64-lengths-page64-heads1",
+      "max_abs_error": 0.009146831929683685,
+      "relative_l2_error": 0.006601522210985422,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "sparse-metadata-exact-page64-heads1",
+      "passed": true
+    },
+    {
+      "case": "sparse-page64-heads1",
+      "max_abs_error": 0.009146831929683685,
+      "relative_l2_error": 0.007385169621556997,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "prefill-metadata-exact-page64-heads1",
+      "passed": true
+    },
+    {
+      "case": "sparse-prefill-prefix-page64-heads1",
+      "max_abs_error": 0.01930481195449829,
+      "relative_l2_error": 0.013819398358464241,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": false
+    },
+    {
+      "case": "dense-static-page64-heads2",
+      "max_abs_error": 0.009218215942382812,
+      "relative_l2_error": 0.007134619634598494,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "dense-planned-graph-page64-heads2",
+      "max_abs_error": 0.009218215942382812,
+      "relative_l2_error": 0.007134619634598494,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "dense-graph-changed-lengths-page64-heads2",
+      "max_abs_error": 0.008897319436073303,
+      "relative_l2_error": 0.006466647144407034,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "dense-static-graph-int64-lengths-page64-heads2",
+      "max_abs_error": 0.009218215942382812,
+      "relative_l2_error": 0.007134619634598494,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "sparse-metadata-exact-page64-heads2",
+      "passed": true
+    },
+    {
+      "case": "sparse-page64-heads2",
+      "max_abs_error": 0.009218215942382812,
+      "relative_l2_error": 0.007644148077815771,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "prefill-metadata-exact-page64-heads2",
+      "passed": true
+    },
+    {
+      "case": "sparse-prefill-prefix-page64-heads2",
+      "max_abs_error": 0.02120622992515564,
+      "relative_l2_error": 0.01209330279380083,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": false
+    },
+    {
+      "case": "dense-static-page128-heads1",
+      "max_abs_error": 0.008477368392050266,
+      "relative_l2_error": 0.006574622821062803,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "dense-planned-graph-page128-heads1",
+      "max_abs_error": 0.008477368392050266,
+      "relative_l2_error": 0.006574622821062803,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "dense-graph-changed-lengths-page128-heads1",
+      "max_abs_error": 0.008015677332878113,
+      "relative_l2_error": 0.006425919476896524,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "dense-static-graph-int64-lengths-page128-heads1",
+      "max_abs_error": 0.008477368392050266,
+      "relative_l2_error": 0.006574622821062803,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "sparse-metadata-exact-page128-heads1",
+      "passed": true
+    },
+    {
+      "case": "sparse-page128-heads1",
+      "max_abs_error": 0.008477368392050266,
+      "relative_l2_error": 0.007313169538974762,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "prefill-metadata-exact-page128-heads1",
+      "passed": true
+    },
+    {
+      "case": "sparse-prefill-prefix-page128-heads1",
+      "max_abs_error": 0.02256840467453003,
+      "relative_l2_error": 0.012493171729147434,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": false
+    },
+    {
+      "case": "dense-static-page128-heads2",
+      "max_abs_error": 0.008748099207878113,
+      "relative_l2_error": 0.00624458771198988,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "dense-planned-graph-page128-heads2",
+      "max_abs_error": 0.008748099207878113,
+      "relative_l2_error": 0.00624458771198988,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "dense-graph-changed-lengths-page128-heads2",
+      "max_abs_error": 0.009540015831589699,
+      "relative_l2_error": 0.0061960238963365555,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "dense-static-graph-int64-lengths-page128-heads2",
+      "max_abs_error": 0.008748099207878113,
+      "relative_l2_error": 0.00624458771198988,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "sparse-metadata-exact-page128-heads2",
+      "passed": true
+    },
+    {
+      "case": "sparse-page128-heads2",
+      "max_abs_error": 0.008748099207878113,
+      "relative_l2_error": 0.006775714457035065,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": true
+    },
+    {
+      "case": "prefill-metadata-exact-page128-heads2",
+      "passed": true
+    },
+    {
+      "case": "sparse-prefill-prefix-page128-heads2",
+      "max_abs_error": 0.02289554476737976,
+      "relative_l2_error": 0.011621746234595776,
+      "finite": true,
+      "atol": 0.01,
+      "rtol": 0.08,
+      "passed": false
+    }
+  ],
+  "passed": false
+}

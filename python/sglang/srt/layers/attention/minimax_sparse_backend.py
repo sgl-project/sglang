@@ -116,6 +116,14 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         assert isinstance(runner.token_to_kv_pool, MiniMaxSparseKVPool)
         self.is_npu = is_npu()
         self.kv_pool = runner.token_to_kv_pool
+        self.flydsl_kv = (
+            getattr(self.kv_pool.main_pool, "kv_cache_layout", "nhd") == "vectorized_5d"
+        )
+        self.flydsl_unit_scale = (
+            torch.ones(1, dtype=torch.float32, device=self.kv_pool.device)
+            if self.flydsl_kv
+            else None
+        )
         self.hisparse_coordinator = runner.hisparse_coordinator
         self.token_to_kv_pool = runner.token_to_kv_pool  # alias for TboAttnBackend
         self.req_to_token_pool = runner.req_to_token_pool  # pool obj for TboAttnBackend
@@ -162,6 +170,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
         self.block_size_q = 1
         self.block_size_k = sparse_cfg["sparse_block_size"]
+        if self.flydsl_kv and self.block_size_k % self.kv_pool.page_size:
+            raise ValueError("MiniMax FlyDSL pages must divide the sparse block size")
         if "sparse_init_block" in sparse_cfg:
             self.init_blocks = sparse_cfg["sparse_init_block"]
         else:
@@ -1573,8 +1583,24 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 max_seqblock_q=max_seqblock_q,
                 all_seqblock_q=all_seqblock_q,
                 q_scale=layer.q_scale_float,
-                k_scale=layer.k_scale_float,
-                v_scale=layer.v_scale_float,
+                k_scale=(
+                    (
+                        layer.k_scale
+                        if layer.k_scale is not None
+                        else self.flydsl_unit_scale
+                    )
+                    if self.flydsl_kv
+                    else layer.k_scale_float
+                ),
+                v_scale=(
+                    (
+                        layer.v_scale
+                        if layer.v_scale is not None
+                        else self.flydsl_unit_scale
+                    )
+                    if self.flydsl_kv
+                    else layer.v_scale_float
+                ),
                 idx_q_scale=layer.idx_q_scale_float,
                 idx_k_scale=layer.idx_k_scale_float,
                 idx_v_scale=layer.idx_v_scale_float,
@@ -1771,8 +1797,24 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 msa_kv_indices=msa_kv_indices,
                 msa_plan=msa_plan,
                 q_scale=layer.q_scale_float,
-                k_scale=layer.k_scale_float,
-                v_scale=layer.v_scale_float,
+                k_scale=(
+                    (
+                        layer.k_scale
+                        if layer.k_scale is not None
+                        else self.flydsl_unit_scale
+                    )
+                    if self.flydsl_kv
+                    else layer.k_scale_float
+                ),
+                v_scale=(
+                    (
+                        layer.v_scale
+                        if layer.v_scale is not None
+                        else self.flydsl_unit_scale
+                    )
+                    if self.flydsl_kv
+                    else layer.v_scale_float
+                ),
                 idx_q_scale=layer.idx_q_scale_float,
                 idx_k_scale=layer.idx_k_scale_float,
                 idx_v_scale=layer.idx_v_scale_float,

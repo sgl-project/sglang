@@ -85,7 +85,7 @@ def forward_extend_vectorized_5d(
     extend_no_prefix = forward_batch.extend_prefix_lens_cpu is not None and not any(
         forward_batch.extend_prefix_lens_cpu
     )
-    if extend_no_prefix:
+    if extend_no_prefix and not backend.minimax_flydsl:
         k_lin = k.contiguous().view(-1, layer.tp_k_head_num, layer.qk_head_dim)
         v_lin = v.contiguous().view(-1, layer.tp_v_head_num, layer.v_head_dim)
         total_tokens = k_lin.shape[0]
@@ -138,6 +138,7 @@ def forward_extend_vectorized_5d(
     # Resolve the raw 5D K/V buffer for this layer (going through the
     # SWA→sub-pool mapping when applicable).
     pool = backend.token_to_kv_pool
+    pool = getattr(pool, "main_pool", pool)
     if hasattr(pool, "layers_mapping"):
         sub_layer_id, sub_is_swa = pool.layers_mapping[layer.layer_id]
         sub_pool = pool.swa_kv_pool if sub_is_swa else pool.full_kv_pool
@@ -159,7 +160,17 @@ def forward_extend_vectorized_5d(
 
     # For fp8 K/V we hand the raw fp8 tensors and the layer's per-tensor
     # descales straight to aiter.
-    if sub_pool.dtype == fp8_dtype:
+    if backend.minimax_flydsl:
+        # Read the stored bytes, including calibrated descales. Q is BF16/FP16
+        # and has never been divided by a KV scale. Widening here also avoids
+        # feeding the sparse-prefill path a different Q quantization contract.
+        k_scale = layer.k_scale if layer.k_scale is not None else backend.k_scale
+        v_scale = layer.v_scale if layer.v_scale is not None else backend.v_scale
+        k_lin = k_lin.to(q.dtype).mul_(k_scale)
+        v_lin = v_lin.to(q.dtype).mul_(v_scale)
+        q_local = q
+        q_descale_local = k_descale_local = v_descale_local = None
+    elif sub_pool.dtype == fp8_dtype:
         q_local = q.to(fp8_dtype)
         q_descale_local = (
             layer.k_scale if layer.k_scale is not None else backend.k_scale
@@ -190,6 +201,7 @@ def forward_extend_vectorized_5d(
         kv_indices_lin,
         max_q,
         max_kv,
+        softmax_scale=layer.scaling,
         causal=True,
         logits_soft_cap=backend.logits_soft_cap,
         alibi_slopes=None,
@@ -265,6 +277,25 @@ def forward_decode_vectorized_5d(
     # Direct view of o as kernel output — saves a per-layer o.copy_ of
     # bs * H_q * D bf16 elementwise.
     o_view = o.view(-1, num_q_heads, layer.v_head_dim)
+    if backend.minimax_flydsl:
+        from sglang.srt.layers.attention.minimax_sparse_ops.flydsl_decode import decode
+
+        if sinks is not None or is_swa_layer or layer.logit_cap != 0:
+            raise ValueError("MiniMax FlyDSL expects full attention without sinks/cap")
+        planner = backend.flydsl_planner
+        decode(
+            o_view,
+            q_in,
+            k_cache,
+            v_cache,
+            planner.active_lengths if planner is not None else forward_batch.seq_lens,
+            block_tables_pa[:bs].contiguous(),
+            layer.scaling,
+            layer.k_scale if layer.k_scale is not None else backend.k_scale,
+            layer.v_scale if layer.v_scale is not None else backend.v_scale,
+            None if planner is None else planner.active_plan,
+        )
+        return
     exp_sums = torch.empty(
         (bs, num_kv_heads, max_part_num, q_group),
         dtype=torch.float32,
