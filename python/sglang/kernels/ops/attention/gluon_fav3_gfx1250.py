@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import functools
 import math
+import os
 from typing import NamedTuple
 
 import torch
@@ -280,6 +281,7 @@ class _AttentionProgram:
             [sequence_start, 0],
             self.k_buffer.index(buffer_index),
             warp_used_hint=0x0F,
+            cache_modifier=".cg",
         )
 
     @gluon.jit
@@ -289,6 +291,7 @@ class _AttentionProgram:
             [sequence_start, 0],
             self.v_buffer.index(buffer_index),
             warp_used_hint=0x0F,
+            cache_modifier=".cg",
         )
 
     @gluon.jit
@@ -331,9 +334,60 @@ class _AttentionProgram:
         return new_row_max_scaled, max_delta, new_row_max
 
     @gluon.jit
+    def softmax_prepare_fixed(self, row_max):
+        row_max_scaled = row_max * self.softmax_scale_log2
+        max_delta = gl.zeros(row_max.shape, gl.float32, row_max.type.layout)
+        return row_max_scaled, max_delta, row_max
+
+    @gluon.jit
     def softmax_finish(self, scores, new_row_max_scaled, max_delta):
         shifted = self.softmax_scale_log2 * scores - new_row_max_scaled[:, None]
         return gl.exp2(shifted), gl.exp2(max_delta)
+
+    @gluon.jit
+    def softmax_finish_fixed(self, scores, row_max_scaled, row_max):
+        shifted = self.softmax_scale_log2 * scores - row_max_scaled[:, None]
+        probabilities = gl.exp2(shifted)
+        alpha = gl.full(row_max.shape, 1.0, gl.float32, row_max.type.layout)
+        return probabilities, alpha
+
+    @gluon.jit
+    def softmax_part0_fixed(self, scores, row_max):
+        row_max_scaled = row_max * self.softmax_scale_log2
+        shifted = self.softmax_scale_log2 * scores - row_max_scaled[:, None]
+        probabilities = gl.exp2(shifted)
+        alpha = gl.full(row_max.shape, 1.0, gl.float32, row_max.type.layout)
+        return probabilities, alpha, row_max
+
+    @gluon.jit
+    def softmax_part0_mode(self, scores, row_max, fixed_shift: gl.constexpr):
+        if fixed_shift:
+            return self.softmax_part0_fixed(scores, row_max)
+        return self.softmax_part0(scores, row_max)
+
+    @gluon.jit
+    def softmax_prepare_mode(self, scores, row_max, fixed_shift: gl.constexpr):
+        if fixed_shift:
+            return self.softmax_prepare_fixed(row_max)
+        return self.softmax_prepare(scores, row_max)
+
+    @gluon.jit
+    def softmax_finish_mode(
+        self,
+        scores,
+        row_max_scaled,
+        max_delta,
+        row_max,
+        new_row_max,
+        fixed_shift: gl.constexpr,
+    ):
+        if fixed_shift:
+            probabilities, alpha = self.softmax_finish_fixed(
+                scores, row_max_scaled, row_max
+            )
+            return probabilities, alpha, row_max
+        probabilities, alpha = self.softmax_finish(scores, row_max_scaled, max_delta)
+        return probabilities, alpha, new_row_max
 
     @gluon.jit
     def softmax_part1(self, probabilities, row_sum, accumulator, alpha):
@@ -342,6 +396,25 @@ class _AttentionProgram:
         probabilities = probabilities.to(gl.bfloat16, fp_downcast_rounding="rtz")
         row_sum = row_sum * alpha + tile_sum
         return probabilities, row_sum, accumulator
+
+    @gluon.jit
+    def softmax_part1_fixed(self, probabilities, row_sum, accumulator):
+        tile_sum = gl.sum(probabilities, 1)
+        probabilities = probabilities.to(gl.bfloat16, fp_downcast_rounding="rtz")
+        return probabilities, row_sum + tile_sum, accumulator
+
+    @gluon.jit
+    def softmax_part1_mode(
+        self,
+        probabilities,
+        row_sum,
+        accumulator,
+        alpha,
+        fixed_shift: gl.constexpr,
+    ):
+        if fixed_shift:
+            return self.softmax_part1_fixed(probabilities, row_sum, accumulator)
+        return self.softmax_part1(probabilities, row_sum, accumulator, alpha)
 
     @gluon.jit
     def pv(self, probabilities, v, accumulator):
@@ -375,7 +448,12 @@ class _AttentionProgram:
             layout=layout,
         )
         output_buffer.store(output.to(self.output_ptr.dtype.element_ty))
-        gl.amd.cdna5.tdm.async_store(output_desc, [query_start, 0], output_buffer)
+        gl.amd.cdna5.tdm.async_store(
+            output_desc,
+            [query_start, 0],
+            output_buffer,
+            cache_modifier=".cs",
+        )
         gl.amd.cdna5.tdm.async_wait(0)
         output_buffer._keep_alive()
 
@@ -409,6 +487,7 @@ def _attention_forward_pipeline(
     BLOCK_N: gl.constexpr,
     HEAD_SIZE: gl.constexpr,
     TDM_OUTPUT: gl.constexpr = False,
+    FIXED_SHIFT: gl.constexpr = False,
 ):
     NUM_BUFFERS: gl.constexpr = 2
     NUM_WARPS: gl.constexpr = 4
@@ -568,6 +647,7 @@ def _attention_forward_pingpong(
     BLOCK_N: gl.constexpr,
     HEAD_SIZE: gl.constexpr,
     TDM_OUTPUT: gl.constexpr = False,
+    FIXED_SHIFT: gl.constexpr = False,
 ):
     NUM_BUFFERS: gl.constexpr = 2
     NUM_WARPS: gl.constexpr = 8
@@ -621,12 +701,20 @@ def _attention_forward_pingpong(
         dtype=gl.float32,
         layout=gl.SliceLayout(1, cfg.pv_layout),
     )
-    row_sum = gl.full(
-        [BLOCK_M],
-        1.0,
-        dtype=gl.float32,
-        layout=gl.SliceLayout(1, cfg.pv_layout),
-    )
+    if FIXED_SHIFT:
+        row_sum = gl.full(
+            [BLOCK_M],
+            0.0,
+            dtype=gl.float32,
+            layout=gl.SliceLayout(1, cfg.pv_layout),
+        )
+    else:
+        row_sum = gl.full(
+            [BLOCK_M],
+            1.0,
+            dtype=gl.float32,
+            layout=gl.SliceLayout(1, cfg.pv_layout),
+        )
     accumulator = gl.zeros([BLOCK_M, HEAD_SIZE], dtype=gl.float32, layout=cfg.pv_layout)
 
     program.prefetch_k(0, 0)
@@ -641,37 +729,45 @@ def _attention_forward_pingpong(
 
     iteration = 0
     for block_start in range(0, loop_blocks * BLOCK_N, BLOCK_N):
-        with gl.amd.warp_pipeline_stage("stage0", priority=0):
+        with gl.amd.warp_pipeline_stage("stage0"):
             next_v_start = block_start + 2 * BLOCK_N
             next_k_start = block_start + 3 * BLOCK_N
             scores = program.qk_full(k)
 
         gl.amd.cdna5.tdm.async_wait(2)
-        with gl.amd.warp_pipeline_stage("stage1", priority=1):
-            probabilities, row_sum, accumulator = program.softmax_part1(
-                probabilities, row_sum, accumulator, alpha
+        with gl.amd.warp_pipeline_stage("stage1"):
+            probabilities, row_sum, accumulator = program.softmax_part1_mode(
+                probabilities, row_sum, accumulator, alpha, FIXED_SHIFT
             )
             v = program.v_buffer.index(iteration % NUM_BUFFERS).load(
                 layout=program.cfg.v_layout
             )
             program.prefetch_k(next_k_start, (iteration + 1) % NUM_BUFFERS)
             if REBALANCE_SOFTMAX:
-                new_row_max_scaled, max_delta, new_row_max = program.softmax_prepare(
-                    scores, row_max
-                )
+                (
+                    new_row_max_scaled,
+                    max_delta,
+                    new_row_max,
+                ) = program.softmax_prepare_mode(scores, row_max, FIXED_SHIFT)
 
-        with gl.amd.warp_pipeline_stage("stage2", priority=0):
+        with gl.amd.warp_pipeline_stage("stage2"):
             accumulator = program.pv(probabilities, v, accumulator)
 
         gl.amd.cdna5.tdm.async_wait(2)
-        with gl.amd.warp_pipeline_stage("stage3", priority=1):
+        with gl.amd.warp_pipeline_stage("stage3"):
             if REBALANCE_SOFTMAX:
-                probabilities, alpha = program.softmax_finish(
-                    scores, new_row_max_scaled, max_delta
+                probabilities, alpha, row_max = program.softmax_finish_mode(
+                    scores,
+                    new_row_max_scaled,
+                    max_delta,
+                    row_max,
+                    new_row_max,
+                    FIXED_SHIFT,
                 )
-                row_max = new_row_max
             else:
-                probabilities, alpha, row_max = program.softmax_part0(scores, row_max)
+                probabilities, alpha, row_max = program.softmax_part0_mode(
+                    scores, row_max, FIXED_SHIFT
+                )
             k = (
                 program.k_buffer.index(iteration % NUM_BUFFERS)
                 .permute([1, 0])
@@ -685,13 +781,15 @@ def _attention_forward_pingpong(
         next_v_start = iteration * BLOCK_N + 2 * BLOCK_N
         next_k_start = iteration * BLOCK_N + 3 * BLOCK_N
         scores = program.qk(k, current_start)
-        probabilities, row_sum, accumulator = program.softmax_part1(
-            probabilities, row_sum, accumulator, alpha
+        probabilities, row_sum, accumulator = program.softmax_part1_mode(
+            probabilities, row_sum, accumulator, alpha, FIXED_SHIFT
         )
         v = program.load_v(iteration % NUM_BUFFERS, 2)
         program.prefetch_k(next_k_start, (iteration + 1) % NUM_BUFFERS)
         accumulator = program.pv(probabilities, v, accumulator)
-        probabilities, alpha, row_max = program.softmax_part0(scores, row_max)
+        probabilities, alpha, row_max = program.softmax_part0_mode(
+            scores, row_max, FIXED_SHIFT
+        )
         k = program.load_k(iteration % NUM_BUFFERS, 2)
         program.prefetch_v(next_v_start, iteration % NUM_BUFFERS)
         iteration += 1
@@ -700,26 +798,30 @@ def _attention_forward_pingpong(
     second_last_start = epilogue_base + 2 * BLOCK_N
     last_start = epilogue_base + 3 * BLOCK_N
 
-    probabilities, row_sum, accumulator = program.softmax_part1(
-        probabilities, row_sum, accumulator, alpha
+    probabilities, row_sum, accumulator = program.softmax_part1_mode(
+        probabilities, row_sum, accumulator, alpha, FIXED_SHIFT
     )
     v = program.load_v(iteration % NUM_BUFFERS, 2)
     accumulator = program.pv(probabilities, v, accumulator)
 
     scores = program.qk(k, second_last_start)
-    probabilities, alpha, row_max = program.softmax_part0(scores, row_max)
+    probabilities, alpha, row_max = program.softmax_part0_mode(
+        scores, row_max, FIXED_SHIFT
+    )
     k = program.load_k(iteration % NUM_BUFFERS, 1)
     program.prefetch_v(last_start, iteration % NUM_BUFFERS)
 
     scores = program.qk(k, last_start)
-    probabilities, row_sum, accumulator = program.softmax_part1(
-        probabilities, row_sum, accumulator, alpha
+    probabilities, row_sum, accumulator = program.softmax_part1_mode(
+        probabilities, row_sum, accumulator, alpha, FIXED_SHIFT
     )
     v = program.load_v((iteration + 1) % NUM_BUFFERS, 1)
     accumulator = program.pv(probabilities, v, accumulator)
-    probabilities, alpha, row_max = program.softmax_part0(scores, row_max)
-    probabilities, row_sum, accumulator = program.softmax_part1(
-        probabilities, row_sum, accumulator, alpha
+    probabilities, alpha, row_max = program.softmax_part0_mode(
+        scores, row_max, FIXED_SHIFT
+    )
+    probabilities, row_sum, accumulator = program.softmax_part1_mode(
+        probabilities, row_sum, accumulator, alpha, FIXED_SHIFT
     )
     v = program.load_v(iteration % NUM_BUFFERS, 0)
     accumulator = program.pv(probabilities, v, accumulator)
@@ -764,6 +866,15 @@ def select_fav3_launch_config(
     """Select the measured gfx1250 D128 launch policy."""
     if min(batch, num_heads, seqlen_q) <= 0:
         raise ValueError("batch, num_heads, and seqlen_q must be positive")
+    if batch == 2 and num_heads == 40 and seqlen_q == 176_400 and seqlen_k == 512:
+        return FAv3LaunchConfig(
+            "wan_cross",
+            128,
+            256,
+            4,
+            True,
+            "amdgpu-sched-strategy=iterative-ilp",
+        )
     if num_cus is None:
         num_cus = get_num_cus()
 
@@ -777,7 +888,15 @@ def select_fav3_launch_config(
             if seqlen_k is not None and seqlen_k <= 512
             else ""
         )
-        return FAv3LaunchConfig("pingpong", 256, 64, 8, True, scheduler)
+        use_fixed_shift = (
+            batch == 2
+            and num_heads == 40
+            and seqlen_q == 176_400
+            and seqlen_k == seqlen_q
+            and os.environ.get("SGLANG_GLUON_FAV3_WAN_FIXED_SHIFT", "0") == "1"
+        )
+        schedule = "wan_self" if use_fixed_shift else "pingpong"
+        return FAv3LaunchConfig(schedule, 256, 64, 8, True, scheduler)
     return FAv3LaunchConfig(
         "pipeline",
         128,
@@ -840,7 +959,6 @@ def gluon_fav3_attention(
             f"Gluon FAv3 requires gfx1250, found {arch or 'unknown GPU'}"
         )
 
-    output = torch.empty_like(query, memory_format=torch.contiguous_format)
     config = launch_config or select_fav3_launch_config(
         batch,
         num_heads,
@@ -848,7 +966,48 @@ def gluon_fav3_attention(
         seqlen_k=seqlen_k,
         num_cus=get_num_cus(query.device),
     )
-    if config.schedule not in ("pipeline", "pingpong"):
+    wan_self_contract = (
+        batch == 2 and num_heads == 40 and seqlen_q == 176_400 and seqlen_k == seqlen_q
+    )
+    fixed_shift = config.schedule == "wan_self"
+    if fixed_shift and (
+        not wan_self_contract
+        or os.environ.get("SGLANG_GLUON_FAV3_WAN_FIXED_SHIFT", "0") != "1"
+    ):
+        raise ValueError(
+            "wan_self FAv3 requires B2/S176400/H40/D128 and "
+            "SGLANG_GLUON_FAV3_WAN_FIXED_SHIFT=1"
+        )
+    if config.schedule == "wan_cross":
+        expected_geometry = (128, 256, 4)
+        actual_geometry = (config.block_m, config.block_n, config.num_warps)
+        if actual_geometry != expected_geometry:
+            raise ValueError(
+                "wan_cross requires (block_m, block_n, num_warps)="
+                f"{expected_geometry}, got {actual_geometry}"
+            )
+        if not config.tdm_output:
+            raise ValueError("wan_cross requires TDM output and generic online softmax")
+        if query.is_contiguous() and key.is_contiguous() and value.is_contiguous():
+            from sglang.kernels.ops.attention.gluon_fav3_wan_cross_gfx1250 import (
+                gluon_fav3_wan_cross_attention,
+            )
+
+            return gluon_fav3_wan_cross_attention(
+                query,
+                key,
+                value,
+                softmax_scale=softmax_scale,
+            )
+        config = FAv3LaunchConfig(
+            "pingpong",
+            256,
+            64,
+            8,
+            True,
+            "amdgpu-sched-strategy=max-ilp",
+        )
+    if config.schedule not in ("pipeline", "pingpong", "wan_self"):
         raise ValueError(f"unsupported FAv3 schedule: {config.schedule}")
     expected_geometry = (128, 64, 4) if config.schedule == "pipeline" else (256, 64, 8)
     actual_geometry = (config.block_m, config.block_n, config.num_warps)
@@ -859,9 +1018,10 @@ def gluon_fav3_attention(
         )
     kernel = (
         _attention_forward_pingpong
-        if config.schedule == "pingpong"
+        if config.schedule in ("pingpong", "wan_self")
         else _attention_forward_pipeline
     )
+    output = torch.empty_like(query, memory_format=torch.contiguous_format)
     grid = (batch, num_heads, math.ceil(seqlen_q / config.block_m))
     with torch.cuda.device(query.device):
         kernel[grid](
@@ -892,8 +1052,9 @@ def gluon_fav3_attention(
             config.block_n,
             head_size,
             TDM_OUTPUT=config.tdm_output,
+            FIXED_SHIFT=fixed_shift,
             num_warps=config.num_warps,
-            waves_per_eu=1,
+            waves_per_eu=2 if config.schedule in ("pingpong", "wan_self") else 1,
             llvm_fn_attrs=config.llvm_fn_attrs,
         )
     return output

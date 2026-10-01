@@ -178,16 +178,38 @@ def test_rocm_resolver_selects_gluon_only_for_exact_static_contract():
         )
 
 
-def test_server_args_keep_aiter_as_rocm_default_on_gfx1250():
+def test_server_args_select_device_specific_rocm_default(monkeypatch):
     args = object.__new__(ServerArgs)
     platform_path = (
         "sglang.multimodal_gen.runtime.server_args.server_args.current_platform"
     )
+    monkeypatch.delenv("SGLANG_GLUON_FAV3_WAN_FIXED_SHIFT", raising=False)
     with (
         mock.patch(f"{platform_path}.is_rocm", return_value=True),
         mock.patch(
             f"{platform_path}.get_device_capability",
             return_value=DeviceCapability(12, 5),
+        ),
+    ):
+        args._set_default_attention_backend()
+    assert args.attention_backend == "aiter"
+
+    monkeypatch.setenv("SGLANG_GLUON_FAV3_WAN_FIXED_SHIFT", "1")
+    with (
+        mock.patch(f"{platform_path}.is_rocm", return_value=True),
+        mock.patch(
+            f"{platform_path}.get_device_capability",
+            return_value=DeviceCapability(12, 5),
+        ),
+    ):
+        args._set_default_attention_backend()
+    assert args.attention_backend == "gluon_fav3"
+
+    with (
+        mock.patch(f"{platform_path}.is_rocm", return_value=True),
+        mock.patch(
+            f"{platform_path}.get_device_capability",
+            return_value=DeviceCapability(9, 5),
         ),
     ):
         args._set_default_attention_backend()
