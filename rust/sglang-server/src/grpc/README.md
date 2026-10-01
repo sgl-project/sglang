@@ -12,7 +12,7 @@ Runtime access and cancellation stay behind `FrontendHandle`.
 | Complete | Shared OpenAI completion preparation and response shaping. Text prompts and token-ID echo require a tokenizer. |
 | Detokenize | Existing detokenization operation (also used by completion echo); requires a tokenizer. |
 | HealthCheck | Startup readiness and, when enabled, the same activity probe used by HTTP health checks. |
-| GetIsReady | `UNIMPLEMENTED`: no pause-aware readiness operation in the Rust frontend. |
+| WatchEngineState | `UNIMPLEMENTED`: engine-state streaming is not exposed by this adapter. |
 | GetModelInfo | Typed model metadata. |
 | GetServerInfo | Typed, allowlisted server metadata and scheduler metrics; no private scheduler fields. |
 | ListModels | The configured served model and context limit, as in HTTP model listing. |

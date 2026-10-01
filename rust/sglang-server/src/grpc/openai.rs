@@ -5,7 +5,7 @@ use super::{GrpcService, ResponseStream, convert::ConvertError, response};
 use crate::openai::{self, OpenAiResponse};
 use futures::StreamExt;
 use serde_json::Value;
-use sglang_grpc_types::proto;
+use sglang_grpc_types::sglang::runtime::v1 as proto;
 use tonic::{Response, Status};
 
 impl GrpcService {

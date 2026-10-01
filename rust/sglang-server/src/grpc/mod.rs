@@ -202,7 +202,14 @@ impl SglangService for GrpcService {
         }
         let text = tokio::time::timeout(
             self.config.response_timeout,
-            self.frontend.detokenize(request.into_inner().tokens),
+            self.frontend.detokenize(
+                request
+                    .into_inner()
+                    .tokens
+                    .into_iter()
+                    .map(i64::from)
+                    .collect(),
+            ),
         )
         .await
         .map_err(|_| Status::deadline_exceeded("detokenization timed out"))?
