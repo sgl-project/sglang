@@ -490,7 +490,7 @@ def main():
         action="append",
         default=[],
         metavar="PATH=SECONDS",
-        help="Per-file timeout matched by path suffix; overrides --timeout-per-file. Repeatable.",
+        help="First-attempt timeout matched by path suffix; retries use --timeout-per-file. Repeatable.",
     )
     parser.add_argument(
         "--timeout-from-est-time",

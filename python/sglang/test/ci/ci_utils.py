@@ -237,7 +237,7 @@ def run_unittest_files(
         fork_worker_batch_size: Number of files served by one preloaded fork
                                 worker. Each file still runs in a fresh child
                                 process. One keeps the existing exec behavior.
-        timeout_overrides: Per-file timeouts keyed by path suffix; win over the above.
+        timeout_overrides: First-attempt timeouts keyed by path suffix; retries use the above.
     """
     coredump_enabled = cuda_coredump.is_enabled()
     if coredump_enabled:
@@ -261,14 +261,16 @@ def run_unittest_files(
             # FIXME: remove this branch after migrating all tests to use CIRegistry
             filename, estimated_time = file.name, file.estimated_time
 
-        file_timeout = (
+        base_timeout = (
             timeout_per_file
             if timeout_per_file is not None
             else derive_timeout_per_file(estimated_time)
         )
+        # An override caps only the first attempt; retries get the full budget.
+        first_timeout = base_timeout
         for suffix, override in (timeout_overrides or {}).items():
             if filename == suffix or filename.endswith("/" + suffix):
-                file_timeout = override
+                first_timeout = override
 
         process = None
         output_lines = []
@@ -341,6 +343,7 @@ def run_unittest_files(
         was_retried = False
 
         while attempt <= (max_attempts if enable_retry else 1):
+            file_timeout = first_timeout if attempt == 1 else base_timeout
             if attempt > 1:
                 logger.info(
                     f"\n[CI Retry] Attempt {attempt}/{max_attempts} for {filename}\n"
