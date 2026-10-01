@@ -139,6 +139,7 @@ pub(super) fn parse_engine_frame(payload: &str) -> Result<TokenDelta, ResponseEr
 pub(super) fn normalize_engine_output(
     output: &mut TokenDelta,
     emitted_tokens: &mut u64,
+    no_stop_trim: bool,
 ) -> Result<(), ResponseError> {
     let total = output.completion_tokens;
     let delta = total.checked_sub(*emitted_tokens).ok_or_else(|| {
@@ -148,9 +149,11 @@ pub(super) fn normalize_engine_output(
         ))
     })?;
     let output_len = u64::try_from(output.token_ids.len()).unwrap_or(u64::MAX);
-    let trimmed_stop_tokens = match output.finish_reason.as_ref() {
-        Some(GenerationFinishReason::Stop(Some(MatchedStop::Token(_)))) => 1,
-        Some(GenerationFinishReason::Stop(Some(MatchedStop::Tokens(ids)))) => {
+    // Retained stop IDs must not count as a missing cumulative suffix; doing so
+    // can mistake an incremental final frame for a cumulative one and drop IDs.
+    let trimmed_stop_tokens = match (no_stop_trim, output.finish_reason.as_ref()) {
+        (false, Some(GenerationFinishReason::Stop(Some(MatchedStop::Token(_))))) => 1,
+        (false, Some(GenerationFinishReason::Stop(Some(MatchedStop::Tokens(ids))))) => {
             u64::try_from(ids.len()).unwrap_or(u64::MAX)
         }
         _ => 0,
@@ -407,7 +410,7 @@ mod tests {
             ..Default::default()
         };
 
-        normalize_engine_output(&mut output, &mut emitted_tokens).unwrap();
+        normalize_engine_output(&mut output, &mut emitted_tokens, false).unwrap();
 
         assert_eq!(output.token_ids, [8]);
         assert_eq!(output.completion_tokens, 1);
@@ -429,11 +432,42 @@ mod tests {
                 ..Default::default()
             };
 
-            normalize_engine_output(&mut output, &mut emitted_tokens).unwrap();
+            normalize_engine_output(&mut output, &mut emitted_tokens, false).unwrap();
 
             assert!(output.token_ids.is_empty());
             assert_eq!(output.completion_tokens, 1);
             assert_eq!(emitted_tokens, 2);
+        }
+    }
+
+    #[test]
+    fn retained_stop_tokens_are_preserved_in_incremental_and_cumulative_frames() {
+        for cumulative in [false, true] {
+            let mut emitted_tokens = 1;
+            let mut output = TokenDelta {
+                token_ids: if cumulative { vec![7, 9] } else { vec![9] },
+                completion_tokens: 2,
+                finish_reason: Some(GenerationFinishReason::Stop(Some(MatchedStop::Token(9)))),
+                extras: Some(Box::new(GenerationOutputExtras {
+                    output_logprobs: if cumulative {
+                        vec![position(7, -0.5, &[]), position(9, -0.25, &[])]
+                    } else {
+                        vec![position(9, -0.25, &[])]
+                    },
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+
+            normalize_engine_output(&mut output, &mut emitted_tokens, true).unwrap();
+
+            assert_eq!(output.token_ids, [9], "cumulative={cumulative}");
+            assert_eq!(output.completion_tokens, 1);
+            assert_eq!(emitted_tokens, 2);
+            assert_eq!(
+                output.extras.unwrap().output_logprobs,
+                [position(9, -0.25, &[])]
+            );
         }
     }
 
@@ -446,7 +480,7 @@ mod tests {
             ..Default::default()
         };
 
-        let error = normalize_engine_output(&mut output, &mut emitted_tokens).unwrap_err();
+        let error = normalize_engine_output(&mut output, &mut emitted_tokens, false).unwrap_err();
 
         assert_eq!(error.kind, crate::ResponseErrorKind::Internal);
         assert!(error.message.contains("2 output token IDs"));
