@@ -19,11 +19,17 @@ _HIDDEN_SIZE = 2048
 _INTERMEDIATE_SIZE = 2048
 
 
-def _make_inputs(num_tokens, seed, input_per_token=True):
+def _make_inputs(
+    num_tokens,
+    seed,
+    input_per_token=True,
+    hidden_size=_HIDDEN_SIZE,
+    intermediate_size=_INTERMEDIATE_SIZE,
+):
     generator = torch.Generator(device="cuda").manual_seed(seed)
     x, x_scale = scaled_fp8_quant(
         torch.randn(
-            (num_tokens, _HIDDEN_SIZE),
+            (num_tokens, hidden_size),
             device="cuda",
             dtype=torch.bfloat16,
             generator=generator,
@@ -33,7 +39,7 @@ def _make_inputs(num_tokens, seed, input_per_token=True):
     )
     gate_up_weight, gate_up_weight_scale = scaled_fp8_quant(
         torch.randn(
-            (2 * _INTERMEDIATE_SIZE, _HIDDEN_SIZE),
+            (2 * intermediate_size, hidden_size),
             device="cuda",
             dtype=torch.bfloat16,
             generator=generator,
@@ -76,18 +82,24 @@ def _reference(
     return quantized, output_scale
 
 
-def _make_float_inputs(num_tokens, dtype, seed):
+def _make_float_inputs(
+    num_tokens,
+    dtype,
+    seed,
+    hidden_size=_HIDDEN_SIZE,
+    intermediate_size=_INTERMEDIATE_SIZE,
+):
     generator = torch.Generator(device="cuda").manual_seed(seed)
     return (
         torch.randn(
-            (num_tokens, _HIDDEN_SIZE),
+            (num_tokens, hidden_size),
             device="cuda",
             dtype=dtype,
             generator=generator,
         )
         * 0.25,
         torch.randn(
-            (2 * _INTERMEDIATE_SIZE, _HIDDEN_SIZE),
+            (2 * intermediate_size, hidden_size),
             device="cuda",
             dtype=dtype,
             generator=generator,
@@ -113,6 +125,8 @@ class TestCuteDSLDualGemm(CustomTestCase):
         num_tokens,
         seed,
         tactic=-1,
+        hidden_size=_HIDDEN_SIZE,
+        intermediate_size=_INTERMEDIATE_SIZE,
     ):
         if tactic < 0:
             from sglang.kernels.ops.gemm import dual_gemm_swiglu_fp8
@@ -124,6 +138,8 @@ class TestCuteDSLDualGemm(CustomTestCase):
         x, gate_up_weight, x_scale, gate_up_weight_scale = _make_inputs(
             num_tokens,
             seed,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
         )
         output_scale = None
         if not quant_mode.is_dynamic:
@@ -180,10 +196,23 @@ class TestCuteDSLDualGemm(CustomTestCase):
             atol=1e-1,
         )
 
-    def _check_float(self, num_tokens, dtype, seed):
+    def _check_float(
+        self,
+        num_tokens,
+        dtype,
+        seed,
+        hidden_size=_HIDDEN_SIZE,
+        intermediate_size=_INTERMEDIATE_SIZE,
+    ):
         from sglang.kernels.ops.gemm import dual_gemm_swiglu
 
-        x, gate_up_weight = _make_float_inputs(num_tokens, dtype, seed)
+        x, gate_up_weight = _make_float_inputs(
+            num_tokens,
+            dtype,
+            seed,
+            hidden_size,
+            intermediate_size,
+        )
         actual = dual_gemm_swiglu(x, gate_up_weight)
         expected = _float_reference(x, gate_up_weight)
         self.assertEqual(actual.dtype, dtype)
@@ -230,6 +259,49 @@ class TestCuteDSLDualGemm(CustomTestCase):
                     num_tokens,
                     seed=20261011,
                 )
+
+    def test_fp8_qwen_static_per_tensor_bs12(self):
+        """Qwen BS12 must not select an eight-token-column MMA tactic."""
+        self._check(
+            DualGemmQuantMode.STATIC_PER_TENSOR,
+            12,
+            seed=20261015,
+            hidden_size=3584,
+            intermediate_size=18944,
+        )
+
+    def test_bf16_qwen_bs12(self):
+        """The unquantized Qwen path must also use a 16-column MMA tactic."""
+        self._check_float(
+            12,
+            torch.bfloat16,
+            seed=20261016,
+            hidden_size=3584,
+            intermediate_size=18944,
+        )
+
+    def test_tactic_token_capacity_validation(self):
+        """Explicit eight-column tactics must reject batches above eight."""
+        from sglang.kernels.ops.gemm.cutedsl_dual_gemm import (
+            _dual_gemm_swiglu_fp8_run,
+            _dual_gemm_swiglu_run,
+        )
+
+        x, weight, x_scale, weight_scale = _make_inputs(16, seed=20261017)
+        with self.assertRaisesRegex(ValueError, "has 8 token columns"):
+            _dual_gemm_swiglu_fp8_run(
+                x,
+                weight,
+                x_scale,
+                weight_scale,
+                torch.ones((1,), device="cuda", dtype=torch.float32),
+                int(DualGemmQuantMode.STATIC_PER_TENSOR),
+                tactic=5,
+            )
+
+        x, weight = _make_float_inputs(16, torch.bfloat16, seed=20261018)
+        with self.assertRaisesRegex(ValueError, "has 8 token columns"):
+            _dual_gemm_swiglu_run(x, weight, tactic=1)
 
     def test_fp8_dynamic_two_cta(self):
         self._check(DualGemmQuantMode.DYNAMIC_PER_TOKEN, 1, seed=20261012, tactic=7)
@@ -314,6 +386,26 @@ class TestCuteDSLDualGemm(CustomTestCase):
         )
         self.assertEqual(
             _pick_fp8_tactic(
+                12,
+                3584,
+                18944,
+                num_sms,
+                DualGemmQuantMode.STATIC_PER_TENSOR,
+            ),
+            6,
+        )
+        self.assertEqual(
+            _pick_fp8_tactic(
+                16,
+                3584,
+                18944,
+                num_sms,
+                DualGemmQuantMode.DYNAMIC_PER_TOKEN,
+            ),
+            7,
+        )
+        self.assertEqual(
+            _pick_fp8_tactic(
                 8,
                 4096,
                 4096,
@@ -358,11 +450,11 @@ class TestCuteDSLDualGemm(CustomTestCase):
         )
         self.assertEqual(
             _pick_float16_tactic(16, 4096, 14336, num_sms, torch.float16),
-            0,
+            3,
         )
         self.assertEqual(
             _pick_float16_tactic(16, 3584, 18944, num_sms, torch.bfloat16),
-            1,
+            2,
         )
         self.assertEqual(
             _pick_float16_tactic(4, 4096, 18944, num_sms, torch.bfloat16),

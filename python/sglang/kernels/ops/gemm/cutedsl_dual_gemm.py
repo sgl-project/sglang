@@ -119,6 +119,33 @@ def _pick_fp8_tactic(
     quant_mode: DualGemmQuantMode,
 ) -> int:
     """Choose an FP8 tactic measured on B200 small-batch decode shapes."""
+    tactic = _pick_fp8_tactic_base(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        multiprocessor_count,
+        quant_mode,
+    )
+    if num_tokens > 8:
+        # Tactics 0, 1, 4, and 5 expose only eight MMA token columns. Preserve
+        # the selected K tile and feature width while promoting to a 16-column
+        # tactic. Dynamic quantization promotes narrow tactics to the wide form
+        # because two-CTA MMA halves guaranteed CTA residency.
+        if tactic in (0, 4):
+            return tactic + 3
+        if tactic in (1, 5):
+            return tactic + (2 if quant_mode.is_dynamic else 1)
+    return tactic
+
+
+def _pick_fp8_tactic_base(
+    num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    multiprocessor_count: int,
+    quant_mode: DualGemmQuantMode,
+) -> int:
+
     wide_feature_tiles = cute.ceil_div(intermediate_size, 128)
 
     # For grids below half a wave, paired 64-feature CTAs make the best use of
@@ -200,6 +227,29 @@ def _pick_float16_tactic(
     input_dtype: torch.dtype,
 ) -> int:
     """Choose a measured BF16/FP16 small-batch tactic."""
+    tactic = _pick_float16_tactic_base(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        multiprocessor_count,
+        input_dtype,
+    )
+    if num_tokens > 8:
+        # Tactics 0 and 1 expose only eight MMA token columns. Preserve the
+        # selected feature width while promoting to the corresponding 16-column
+        # paired tactic.
+        return {0: 3, 1: 2}.get(tactic, tactic)
+    return tactic
+
+
+def _pick_float16_tactic_base(
+    num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    multiprocessor_count: int,
+    input_dtype: torch.dtype,
+) -> int:
+
     wide_feature_tiles = cute.ceil_div(intermediate_size, 128)
 
     # The paired tactic wins decisively for very small projections. A narrow
@@ -1293,6 +1343,11 @@ def _dual_gemm_swiglu_fp8_run(
     cta_features, cta_tokens, cta_reduction, stages, use_2cta = _resolve_tactic(
         tactic, True
     )
+    if num_tokens > cta_tokens:
+        raise ValueError(
+            f"dual GEMM tactic {tactic} has {cta_tokens} token columns, "
+            f"but the input contains {num_tokens} tokens"
+        )
     resident_ctas_per_sm = 2 if cta_features == 64 and not use_2cta else 1
     feature_tiles = intermediate_size // cta_features
 
@@ -1417,6 +1472,11 @@ def _dual_gemm_swiglu_run(
     cta_features, cta_tokens, cta_reduction, stages, use_2cta = _resolve_tactic(
         tactic, False
     )
+    if num_tokens > cta_tokens:
+        raise ValueError(
+            f"dual GEMM tactic {tactic} has {cta_tokens} token columns, "
+            f"but the input contains {num_tokens} tokens"
+        )
     element_type = cutlass.BFloat16 if x.dtype == torch.bfloat16 else cutlass.Float16
     output = torch.empty(
         (num_tokens, intermediate_size), dtype=x.dtype, device=x.device
