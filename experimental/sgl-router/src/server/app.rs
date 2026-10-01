@@ -22,19 +22,45 @@ use tower_http::compression::{CompressionLayer, CompressionLevel};
 /// and URI so an operator investigating "client X gets 413s" has a
 /// server-side breadcrumb. The 413 is produced by axum's `DefaultBodyLimit`
 /// layer BEFORE the handler runs, so without this we would have no record
-/// of which request was rejected.
-async fn log_413(req: Request, next: Next) -> Response {
+/// of which request was rejected. axum's body is plain text, so it is also
+/// replaced with the protocol's JSON error envelope.
+async fn log_413(State(limit): State<usize>, req: Request, next: Next) -> Response {
     let method = req.method().clone();
     let uri = req.uri().clone();
     let resp = next.run(req).await;
-    if resp.status() == StatusCode::PAYLOAD_TOO_LARGE {
-        tracing::warn!(
-            %method,
-            %uri,
-            "request rejected with 413 PAYLOAD_TOO_LARGE (body exceeded route limit)",
-        );
+    if resp.status() != StatusCode::PAYLOAD_TOO_LARGE {
+        return resp;
     }
-    resp
+    tracing::warn!(
+        %method,
+        %uri,
+        "request rejected with 413 PAYLOAD_TOO_LARGE (body exceeded route limit)",
+    );
+    let mut json = route_error(
+        uri.path(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "request_too_large",
+        format!(
+            "request body exceeds the {} limit for this endpoint",
+            size_text(limit)
+        ),
+    );
+    // Keep the router's own headers (e.g. Server-Timing) from the original.
+    let (parts, _) = resp.into_parts();
+    for (k, v) in parts.headers.iter().filter(|(k, _)| {
+        *k != axum::http::header::CONTENT_TYPE && *k != axum::http::header::CONTENT_LENGTH
+    }) {
+        json.headers_mut().insert(k.clone(), v.clone());
+    }
+    json
+}
+
+fn size_text(bytes: usize) -> String {
+    match bytes {
+        b if b >= 1 << 20 && b % (1 << 20) == 0 => format!("{} MiB", b >> 20),
+        b if b >= 1 << 10 && b % (1 << 10) == 0 => format!("{} KiB", b >> 10),
+        b => format!("{b} byte"),
+    }
 }
 
 /// Infra endpoints excluded from the access log (logged at DEBUG instead) and
@@ -413,7 +439,7 @@ fn inference_routes(
     let layered = |h: MethodRouter<Arc<AppContext>>| {
         let h = h
             .layer(DefaultBodyLimit::max(limit))
-            .layer(middleware::from_fn(log_413));
+            .layer(middleware::from_fn_with_state(limit, log_413));
         if retype {
             h.layer(middleware::from_fn_with_state(
                 Arc::clone(ctx),

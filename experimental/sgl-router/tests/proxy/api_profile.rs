@@ -252,3 +252,36 @@ async fn profile_file_extends_a_preset_and_legacy_flags_win() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "disabled protocol");
 }
+
+#[tokio::test]
+async fn oversized_body_gets_a_json_413_in_each_protocol_envelope() {
+    let path = std::env::temp_dir().join(format!("api-profile-413-{}.yaml", std::process::id()));
+    std::fs::write(&path, "limits: {max_body_bytes: 1KiB}\n").unwrap();
+    let mock = MockWorker::start(vec![]).await;
+    let flags = ["--api-profile-file", path.to_str().unwrap()];
+    let user = json!([{"role": "user", "content": "x".repeat(2048)}]);
+
+    let (status, v) = post(
+        ctx(&mock.url, &flags),
+        "/v1/chat/completions",
+        json!({"model": MODEL, "messages": user}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(v["error"]["code"], "request_too_large", "{v}");
+    assert!(
+        v["error"]["message"].as_str().unwrap().contains("1 KiB"),
+        "{v}"
+    );
+
+    let (status, v) = post(
+        ctx(&mock.url, &flags),
+        "/v1/messages",
+        json!({"model": MODEL, "max_tokens": 8, "messages": user}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(v["type"], "error", "{v}");
+    assert_eq!(v["error"]["type"], "request_too_large", "{v}");
+    assert!(sent(&mock).is_none());
+}
