@@ -11,13 +11,7 @@ import { config } from '/src/snippets/configs/CircleStone/anima.jsx';
 
 ## 1. Quick start
 
-Install the diffusion dependencies on Linux with NVIDIA CUDA, then install this
-integration from its source checkout:
-
-```bash Installation
-uv pip install "sglang[diffusion]" --prerelease=allow
-uv pip install -e "python[diffusion]"
-```
+On Linux with NVIDIA CUDA, use a nightly Docker image containing this integration, or install from source, following the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation). Run the commands below inside that environment.
 
 Use the official `circlestone-labs/Anima-Base-v1.0-Diffusers` checkpoint. SGLang reads
 its `modular_model_index.json` directly; no checkpoint conversion or newer Diffusers
