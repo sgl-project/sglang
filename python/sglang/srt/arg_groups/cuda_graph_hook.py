@@ -409,24 +409,6 @@ def disable_prefill_cuda_graph_for_deepseek_trtllm_mla(server_args: Any):
     )
 
 
-def apply_glm5_chunked_prefill_default(server_args: Any):
-    """Set the opted-in GLM BCG chunk default before memory budgeting."""
-    cfg = resolving_view(server_args)
-    if (
-        get_platform().is_cuda
-        and (Phase.PREFILL, "backend") in server_args._cuda_graph_config_locked
-        and cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE
-        and cfg.chunked_prefill_size is None
-        and "Glm5NextForConditionalGeneration"
-        in model_config_of(server_args).hf_config.architectures
-    ):
-        declare_resolution(
-            server_args,
-            "_apply_glm5_chunked_prefill_default",
-            chunked_prefill_size=4096,
-        )
-
-
 def apply_glm5_prefill_cuda_graph_policy(server_args: Any):
     """Set capture sizes for explicitly enabled GLM breakable prefill graphs."""
     cfg = resolving_view(server_args)
