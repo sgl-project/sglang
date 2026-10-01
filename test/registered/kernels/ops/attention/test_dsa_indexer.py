@@ -22,13 +22,13 @@ from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
     TopkTransformMethod,
 )
-from sglang.srt.layers.attention.dsa_backend import (
-    DeepseekSparseAttnBackend,
-    DSAMetadata,
-)
 from sglang.srt.layers.attention.dsa.utils import (
     _fp8_mqa_logits_torch,
     _fp8_paged_mqa_logits_torch,
+)
+from sglang.srt.layers.attention.dsa_backend import (
+    DeepseekSparseAttnBackend,
+    DSAMetadata,
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.layers.layernorm import LayerNorm
@@ -947,9 +947,13 @@ class TestDSAIndexer(CustomTestCase):
         self.assertEqual(indexer.layer_id, self.config["layer_id"])
 
     @patch("sglang.srt.layers.attention.dsa.dsa_indexer.resolve_num_sms")
-    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.resolve_fp8_paged_mqa_logits_fn")
+    @patch(
+        "sglang.srt.layers.attention.dsa.dsa_indexer.resolve_fp8_paged_mqa_logits_fn"
+    )
     @patch("sglang.srt.layers.attention.dsa.dsa_indexer.resolve_fp8_mqa_logits_fn")
-    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.resolve_paged_mqa_logits_metadata_fn")
+    @patch(
+        "sglang.srt.layers.attention.dsa.dsa_indexer.resolve_paged_mqa_logits_metadata_fn"
+    )
     @patch("sglang.kernels.ops.attention.dsa.triton_kernel.act_quant")
     def test_forward_extend_mode(
         self,
@@ -1039,8 +1043,12 @@ class TestDSAIndexer(CustomTestCase):
         )
 
     @patch("sglang.srt.layers.attention.dsa.dsa_indexer.resolve_num_sms")
-    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.resolve_fp8_paged_mqa_logits_fn")
-    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.resolve_paged_mqa_logits_metadata_fn")
+    @patch(
+        "sglang.srt.layers.attention.dsa.dsa_indexer.resolve_fp8_paged_mqa_logits_fn"
+    )
+    @patch(
+        "sglang.srt.layers.attention.dsa.dsa_indexer.resolve_paged_mqa_logits_metadata_fn"
+    )
     @patch("sglang.kernels.ops.attention.dsa.triton_kernel.act_quant")
     def test_forward_decode_mode(
         self,
@@ -1187,14 +1195,18 @@ class TestDSAIndexer(CustomTestCase):
         kv_cache_fp8[..., :head_dim] = kv_values_fp8.view(torch.uint8).reshape(
             num_blocks, block_size, 1, head_dim
         )
-        kv_cache_fp8[..., head_dim:] = kv_scales.contiguous().view(
-            torch.uint8
-        ).reshape(num_blocks, block_size, 1, 4)
+        kv_cache_fp8[..., head_dim:] = (
+            kv_scales.contiguous()
+            .view(torch.uint8)
+            .reshape(num_blocks, block_size, 1, 4)
+        )
 
         weights = torch.rand(
             batch_size, num_heads, dtype=torch.float32, device=self.device
         )
-        context_lens = torch.tensor([70, 129, 150], dtype=torch.int32, device=self.device)
+        context_lens = torch.tensor(
+            [70, 129, 150], dtype=torch.int32, device=self.device
+        )
         block_table = torch.tensor(
             [[0, 1, 2], [2, 3, 4], [4, 1, 0]], dtype=torch.int32, device=self.device
         )
