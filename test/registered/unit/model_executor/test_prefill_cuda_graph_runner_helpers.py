@@ -323,7 +323,7 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
                     runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
                     runner._is_full_backend = False
                     runner._qwen_bcg_hc_sidechannel = False
-                    runner._qwen_bcg_pad_mtp_embeds = False
+                    runner._qwen_bcg_mtp_draft = False
                     runner._input_embeds_arg_idx = 3
                     backing = torch.zeros(4, 8)
                     supplied = torch.full((4, 8), 7.0) if first_rank else None
@@ -442,7 +442,7 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._is_full_backend = False
         runner._qwen_bcg_hc_sidechannel = False
-        runner._qwen_bcg_pad_mtp_embeds = True
+        runner._qwen_bcg_mtp_draft = True
         runner._input_embeds_arg_idx = None
         runner.buffer_registry = SimpleNamespace(has_slot=lambda _name: False)
         runner.backend = SimpleNamespace(replay=lambda *_args, **_kwargs: None)
@@ -463,6 +463,35 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
         )
 
         self.assertIs(output, live_embeds)
+
+    def test_bcg_mtp_draft_replay_leaves_input_embeds_slot_alone(self):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner._is_full_backend = False
+        runner._qwen_bcg_hc_sidechannel = False
+        runner._qwen_bcg_mtp_draft = True
+        runner._input_embeds_arg_idx = 3
+        runner.buffer_registry = SimpleNamespace(has_slot=lambda _name: True)
+        runner._fill_input_embeds_slot = lambda *_args, **_kwargs: self.fail(
+            "draft hc stream copied into the input_embeds slot"
+        )
+        runner.backend = SimpleNamespace(replay=lambda *_args, **_kwargs: "replayed")
+        runner.layer_model = SimpleNamespace(forward=None)
+        runner.model_runner = SimpleNamespace(
+            pp_group=SimpleNamespace(is_first_rank=True),
+            model=SimpleNamespace(
+                # The draft hands its hc stream to the body in the inputs_embeds slot.
+                forward=lambda ids, positions, batch, **_kwargs: runner.layer_model.forward(
+                    ids, positions, batch, torch.zeros((1, 8))
+                )
+            ),
+        )
+        runner._prefill_forward_context = lambda *_args, **_kwargs: nullcontext()
+        batch = SimpleNamespace(input_ids=None, positions=None, mm_input_embeds=None)
+
+        output = runner._execute_body_capture(
+            batch, batch, static_num_tokens=8, raw_num_tokens=1, shape_key=object()
+        )
+        self.assertEqual(output, "replayed")
 
 
 if __name__ == "__main__":

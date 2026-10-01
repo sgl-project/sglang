@@ -315,7 +315,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             model_runner.model_config.hf_config
         )
         self._qwen_bcg_hc_sidechannel = qwen_bcg and not model_runner.is_draft_worker
-        self._qwen_bcg_pad_mtp_embeds = qwen_bcg and model_runner.is_draft_worker
+        self._qwen_bcg_mtp_draft = qwen_bcg and model_runner.is_draft_worker
         self.prefer_eager_mixed_prefill = (
             self.prefill_backend_name == Backend.BREAKABLE
             and get_parallel().attn_dp_enabled
@@ -1256,7 +1256,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         rank-uniform; forward-time-only checking cannot split the group).
         """
         if contains_mm_inputs and (
-            self._qwen_bcg_hc_sidechannel or self._qwen_bcg_pad_mtp_embeds
+            self._qwen_bcg_hc_sidechannel or self._qwen_bcg_mtp_draft
         ):
             return False
         if self._is_full_backend and batch_size > self._capture_req_slots:
@@ -2040,9 +2040,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             # text-only batches they are get_input_embeddings()(input_ids).
             # Copy them into the slot before replay so the graph sees the
             # current request's embeddings (mirrors main's BCG closure).
+            # The Qwen4-Exp MTP draft passes its hyper-connection stream
+            # (hidden x hc_count) in the `inputs_embeds` position; it is not
+            # an embedding, so leave the slot alone.
             if (
                 self.model_runner.pp_group.is_first_rank
                 and self.buffer_registry.has_slot("input_embeds")
+                and not self._qwen_bcg_mtp_draft
             ):
                 self._fill_input_embeds_slot(args, layer_kwargs, static_num_tokens)
             hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)

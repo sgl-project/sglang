@@ -38,7 +38,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._is_full_backend = False
         runner._qwen_bcg_hc_sidechannel = False
-        runner._qwen_bcg_pad_mtp_embeds = False
+        runner._qwen_bcg_mtp_draft = False
         runner.enable_lora = False
         runner._capture_chunked_prefix = False
         runner.prefill_backend_name = backend
