@@ -19,7 +19,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2DecoderLayer
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel
 
 
 class MiMoMultiTokenPredictorLayer(nn.Module):
@@ -90,7 +89,6 @@ class MiMoMTP(nn.Module):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
-        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
 
         self.model = MiMoMultiTokenPredictorLayer(

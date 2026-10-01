@@ -9,6 +9,7 @@ from transformers import PretrainedConfig
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -113,17 +114,17 @@ class Dot3NoteModelNextN(nn.Module):
                 )
             )
 
-        residual = None
+        residual_batch.start(forward_batch)
         with get_global_expert_distribution_recorder().disable_this_region():
-            hidden_states, residual = head.decoder(
-                positions, hidden_states, forward_batch, residual, zero_allocator
+            hidden_states = head.decoder(
+                positions, hidden_states, forward_batch, zero_allocator
             )
+        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
 
         if not forward_batch.forward_mode.is_idle():
-            if residual is None:
-                hidden_states = head.shared_head.norm(hidden_states)
-            else:
-                hidden_states, _ = head.shared_head.norm(hidden_states, residual)
+            hidden_states = residual_batch.final_norm(
+                hidden_states, forward_batch, head.shared_head.norm
+            )
         return hidden_states
 
     def _embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -145,7 +146,6 @@ class Dots3NoteForCausalLMNextN(Dots3LanguageModelForCausalLM):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
-        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.pp_group = get_parallel().pp_group
         self.fuse_qkv_a_g_proj = True
