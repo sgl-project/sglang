@@ -64,7 +64,7 @@ def test_q8_validator_accepts_bf16_and_fp8_kv_on_sm90(kv_cache_dtype):
         ("flashmla_sparse_q8", "tilelang", torch.float16, False, 64, 9),
         ("flashmla_sparse_q8", "trtllm", torch.bfloat16, False, 64, 10),
         ("tilelang", "flashmla_sparse_q8", torch.bfloat16, False, 64, 9),
-        # NoPE rows in the packed fp8 layout have no prefix gather.
+        # An fp8 pool on a NoPE model is not supported yet.
         ("flashmla_sparse_q8", "flashmla_kv", torch.float8_e4m3fn, True, 0, 9),
     ],
 )

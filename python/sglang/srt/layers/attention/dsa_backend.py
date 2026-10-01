@@ -426,11 +426,13 @@ def _validate_flashmla_sparse_q8_backend(
                 "and reads a bfloat16 or fp8_e4m3 KV cache; "
                 f"got kv_cache_dtype={kv_cache_dtype}."
             )
-        # The packed fp8 prefix gather assumes 656-byte rows with a 64-dim rope tail.
+        # Not supported yet: an fp8_e4m3 pool on a NoPE model has not been validated
+        # through the q8 prefix gather, and the KPool tail guard stays closed for
+        # fp8 pools.
         if kv_cache_store_fp8 and qk_rope_head_dim == 0:
             raise ValueError(
                 "--dsa-prefill-backend flashmla_sparse_q8 does not support an "
-                "fp8_e4m3 KV cache for NoPE MLA models (qk_rope_head_dim=0); use "
+                "fp8_e4m3 KV cache for NoPE MLA models (qk_rope_head_dim=0) yet; use "
                 "--kv-cache-dtype bfloat16."
             )
         # An fp8 dtype that is NOT stored packed leaves the pool in the raw
