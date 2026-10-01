@@ -1,5 +1,6 @@
 import json
 import sys
+import tempfile
 import unittest
 from contextlib import ExitStack
 from enum import Enum
@@ -7,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
+from safetensors.torch import save_file
 
 import sglang.srt.model_loader.loader as loader_mod
 import sglang.srt.model_loader.weight_utils as weight_utils
@@ -199,7 +201,8 @@ class TestInstantTensorLoader(CustomTestCase):
                     self.get_parallel.return_value = SimpleNamespace(
                         world_group=SimpleNamespace(
                             world_size=world_size, device_group=device_group
-                        )
+                        ),
+                        tp_group=SimpleNamespace(world_size=1, device_group=object()),
                     )
                     result = list(
                         weight_utils.instanttensor_weights_iterator(
@@ -215,6 +218,44 @@ class TestInstantTensorLoader(CustomTestCase):
                         copy=True,
                     )
 
+    def test_explicit_load_group_reaches_safe_open(self):
+        self.is_initialized.return_value = True
+        world_group = SimpleNamespace(world_size=4, device_group=object())
+        tp_group = SimpleNamespace(world_size=2, device_group=object())
+        self.get_parallel.return_value = SimpleNamespace(
+            world_group=world_group, tp_group=tp_group
+        )
+
+        with patch.object(weight_utils.torch.distributed, "get_rank", return_value=2):
+            for group in (
+                tp_group,
+                None,
+                SimpleNamespace(world_size=1, device_group=object()),
+            ):
+                with self.subTest(group=group):
+                    self.safe_open.reset_mock()
+                    config = LoadConfig(load_format="instanttensor", load_group=group)
+                    loader = loader_mod.DefaultModelLoader(config)
+                    source = loader.Source("model", None)
+                    resolved = loader.ResolvedSource(
+                        source=source,
+                        hf_folder="model",
+                        weight_files=("model.safetensors",),
+                        use_safetensors=True,
+                    )
+                    list(loader._get_weights_iterator(source, resolved_source=resolved))
+                    self.safe_open.assert_called_once()
+                    self.assertIs(
+                        self.safe_open.call_args.kwargs["process_group"],
+                        tp_group.device_group if group is tp_group else None,
+                    )
+            self.get_parallel.assert_not_called()
+            list(weight_utils.instanttensor_weights_iterator(["model.safetensors"]))
+            self.assertIs(
+                self.safe_open.call_args.kwargs["process_group"],
+                world_group.device_group,
+            )
+
     def test_iterator_rejects_unsupported_files(self):
         for files in (["model.pt"], ["model.bin"], ["model.safetensors", "model.pt"]):
             with self.subTest(files=files):
@@ -225,6 +266,29 @@ class TestInstantTensorLoader(CustomTestCase):
                 self.assertIn(files[-1], str(raised.exception))
                 self.safe_open.assert_not_called()
                 self.get_device.assert_not_called()
+
+    def test_pp_embedding_can_reopen_instanttensor_checkpoint(self):
+        from sglang.srt.speculative.pp_draft_embedding import (
+            load_embedding_tensor,
+            prepare_checkpoint_files,
+        )
+
+        expected = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        name = "model.embed_tokens.weight"
+        with tempfile.TemporaryDirectory() as folder:
+            save_file({name: expected}, f"{folder}/model.safetensors")
+            with patch.object(loader_mod, "get_server_args", return_value=None):
+                hf_folder, weight_files, use_safetensors = prepare_checkpoint_files(
+                    folder,
+                    revision=None,
+                    load_config=LoadConfig(load_format="instanttensor"),
+                )
+                key, actual = load_embedding_tensor(
+                    hf_folder, weight_files, use_safetensors=use_safetensors
+                )
+        self.assertEqual(key, name)
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+        self.safe_open.assert_not_called()
 
 
 if __name__ == "__main__":
