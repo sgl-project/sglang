@@ -86,7 +86,7 @@ from sglang.srt.utils import (
     add_prefix,
     ceil_align,
     is_non_idle_and_non_empty,
-    make_layers,
+    make_pp_layers,
 )
 
 MiMoV2Config = None
@@ -992,7 +992,7 @@ class MiMoV2Model(nn.Module):
 
         # Use the provided decoder layer type or default to MiMoV2DecoderLayer
         decoder_layer_type = decoder_layer_type or MiMoV2DecoderLayer
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             layer_fn=lambda idx, prefix: decoder_layer_type(
                 layer_id=idx,
@@ -1000,8 +1000,6 @@ class MiMoV2Model(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:

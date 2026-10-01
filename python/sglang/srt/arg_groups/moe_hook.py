@@ -29,7 +29,7 @@ from sglang.srt.configs.moe_model_registry import (
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
-from sglang.srt.runtime_context import derive_attention_widths, get_platform
+from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 from sglang.srt.utils.common import is_sm100_supported, parse_connector_type
 
 logger = logging.getLogger(__name__)
@@ -269,8 +269,8 @@ def handle_a2a_moe(server_args: Any):
     if a2a_backend == "flashinfer_megamoe":
         validate_flashinfer_megamoe_model(server_args)
         validate_flashinfer_megamoe_envs()
-        assert cfg.enable_dp_attention and cfg.dp_size == cfg.tp_size, (
-            "FlashInfer MegaMOE is only supported with dp_size == tp_size and --enable-dp-attention"
+        assert attn_dp_enabled_of(cfg) and cfg.attn_dp_size == cfg.tp_size, (
+            "FlashInfer MegaMOE is only supported with --attn-dp-size equal to --tp-size"
         )
         if resolved_view(server_args).moe_runner_backend == "auto":
             declare_resolution(
@@ -400,11 +400,8 @@ def handle_a2a_moe(server_args: Any):
         )
 
     if a2a_now == "flashinfer":
-        assert (
-            resolved_view(server_args).enable_dp_attention
-            and cfg.dp_size == cfg.tp_size
-        ), (
-            "Flashinfer MoE A2A is only supported with dp_size == tp_size and --enable-dp-attention"
+        assert attn_dp_enabled_of(cfg) and cfg.attn_dp_size == cfg.tp_size, (
+            "Flashinfer MoE A2A is only supported with --attn-dp-size equal to --tp-size"
         )
         if cfg.deepep_mode != "auto":
             logger.warning("--deepep-mode is ignored for Flashinfer MoE A2A")
@@ -496,12 +493,12 @@ def handle_a2a_moe(server_args: Any):
                 deepep_mode="low_latency",
             )
             logger.warning("auto set deepep_mode=`low_latency` for PPLX EP")
-        # pplx-kernels' AllToAll needs numDPGroups (== attention dp_size) > 1;
+        # pplx-kernels' AllToAll needs numDPGroups (== attn_dp_size) > 1;
         # without DP attention numDPGroups == 1 and construction fails deep in
         # the kernel. This also implies ep_size >= 2.
-        assert resolved_view(server_args).enable_dp_attention and cfg.dp_size >= 2, (
-            "moe_a2a_backend='pplx' requires --enable-dp-attention with at "
-            "least 2 DP groups (--dp-size >= 2)."
+        assert cfg.attn_dp_size >= 2, (
+            "moe_a2a_backend='pplx' requires attention DP with at least 2 "
+            "groups (--attn-dp-size >= 2)."
         )
         # pplx runs the masked DeepGEMM expert path (sm_90a): reject other
         # runners and resolve auto -> deep_gemm. Unquantized bf16 pplx needs
@@ -555,13 +552,7 @@ def required_deepep_v2_prefill_tokens_per_rank(server_args: Any) -> int:
     ceiling = max_prefill_buffer_tokens(server_args) or (view.max_prefill_tokens or 0)
     # A per-DP chunk is scattered across tp_size // attn_dp_size ranks before
     # dispatch, so that is the per-EP-rank divisor (pure TP scatters across all).
-    attn_dp_size, _ = derive_attention_widths(
-        tp_size=view.tp_size,
-        attn_cp_size=view.attn_cp_size,
-        dp_size=view.dp_size,
-        enable_dp_attention=view.enable_dp_attention,
-    )
-    scatter_ranks = max(1, view.tp_size // attn_dp_size)
+    scatter_ranks = max(1, view.tp_size // view.attn_dp_size)
     return model_deepep_v2_prefill_dispatch_tokens(
         hf_config=model_config_of(server_args).hf_config,
         cfg=view,
@@ -596,8 +587,7 @@ def validate_deepep_v2_dispatch_token_budget(server_args: Any) -> None:
 
     graph_bs = decode_config.max_bs or 0
     if view.max_running_requests is not None:
-        attn_dp_size = view.dp_size if view.enable_dp_attention else 1
-        per_rank_pool_bs = max(1, view.max_running_requests // attn_dp_size)
+        per_rank_pool_bs = max(1, view.max_running_requests // view.attn_dp_size)
         graph_bs = min(graph_bs, per_rank_pool_bs)
     tokens_per_req = (
         max_speculative_num_draft_tokens(server_args) or 1

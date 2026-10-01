@@ -1,7 +1,7 @@
 //! Adapt SGLang's DeepSeek V4 effort profiles to Dynamo's native formatter.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DeepSeekV4Profile {
+pub enum DeepSeekV4Profile {
     Preview,
     Official,
 }

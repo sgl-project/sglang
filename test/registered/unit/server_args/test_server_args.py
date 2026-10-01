@@ -1523,8 +1523,7 @@ class TestFlashinferA2ADispatchType(CustomTestCase):
             moe_a2a_backend="flashinfer",
             moe_runner_backend=runner_backend,
             flashinfer_a2a_dispatch_type=dispatch_type,
-            enable_dp_attention=True,
-            dp_size=4,
+            attn_dp_size=4,
             tp_size=4,
         )
         server_args._model_config = SimpleNamespace(nvfp4_moe_meta=None)
@@ -1678,8 +1677,7 @@ class TestFlashinferMegaMoeConfig(CustomTestCase):
             quantization=quantization,
             moe_a2a_backend="flashinfer_megamoe",
             moe_runner_backend="flashinfer_megamoe",
-            enable_dp_attention=True,
-            dp_size=4,
+            attn_dp_size=4,
             tp_size=4,
         )
         server_args._model_config = SimpleNamespace(
@@ -1766,7 +1764,6 @@ class TestPortArgs(unittest.TestCase):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
-        server_args.enable_dp_attention = False
 
         port_args = PortArgs.init_new(server_args)
 
@@ -1781,7 +1778,6 @@ class TestPortArgs(unittest.TestCase):
 
         server_args = ServerArgs(model_path="dummy")
         server_args.nccl_port = None
-        server_args.enable_dp_attention = False
         server_args.decoupled_spec_role = "verifier"
         server_args.decoupled_spec_bind_endpoint = "ipc:///tmp/v"
         server_args.decoupled_spec_connect_endpoints = ["ipc:///tmp/d"]
@@ -1804,7 +1800,6 @@ class TestPortArgs(unittest.TestCase):
 
         server_args = ServerArgs(model_path="dummy")
         server_args.nccl_port = None
-        server_args.enable_dp_attention = False
         # decoupled_spec_role defaults to "null"
 
         port_args = PortArgs.init_new(server_args)
@@ -1814,7 +1809,6 @@ class TestPortArgs(unittest.TestCase):
     def test_init_new_decoupled_role_requires_endpoints(self):
         server_args = ServerArgs(model_path="dummy")
         server_args.nccl_port = None
-        server_args.enable_dp_attention = False
         server_args.decoupled_spec_role = "drafter"
         # endpoints intentionally left as their None defaults
 
@@ -1826,7 +1820,7 @@ class TestPortArgs(unittest.TestCase):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
-        server_args.enable_dp_attention = True
+        server_args.attn_dp_size = 2
         server_args.nnodes = 1
         server_args.dist_init_addr = None
 
@@ -1843,7 +1837,7 @@ class TestPortArgs(unittest.TestCase):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
-        server_args.enable_dp_attention = True
+        server_args.attn_dp_size = 4
         server_args.nnodes = 1
         server_args.dist_init_addr = "192.168.1.1:25000"
 
@@ -1861,7 +1855,7 @@ class TestPortArgs(unittest.TestCase):
         server_args.port = 30000
         server_args.nccl_port = None
 
-        server_args.enable_dp_attention = True
+        server_args.attn_dp_size = 2
         server_args.nnodes = 2
         server_args.dist_init_addr = "192.168.1.1:25000"
 
@@ -1879,7 +1873,7 @@ class TestPortArgs(unittest.TestCase):
         server_args.port = 30000
         server_args.nccl_port = None
 
-        server_args.enable_dp_attention = True
+        server_args.attn_dp_size = 2
         server_args.nnodes = 2
         server_args.dist_init_addr = "192.168.1.1"
 
@@ -1893,7 +1887,7 @@ class TestPortArgs(unittest.TestCase):
         server_args.port = 30000
         server_args.nccl_port = None
 
-        server_args.enable_dp_attention = True
+        server_args.attn_dp_size = 2
         server_args.nnodes = 2
         server_args.dist_init_addr = "192.168.1.1:abc"
 
@@ -2582,7 +2576,8 @@ class TestPipelineParallelCompat(CustomTestCase):
             speculative_algorithm="EAGLE",
             disaggregation_mode="null",
             speculative_adaptive=False,
-            enable_dp_attention=False,
+            attn_dp_size=1,
+            ep_join_mode=None,
         )
         with patch.object(
             validation_hook.envs.SGLANG_ENABLE_PP_SPEC, "get", return_value=True
@@ -3218,8 +3213,7 @@ class TestDeepEPv2Args(CustomTestCase):
         args = self._args(
             chunked_prefill_size=2048,
             tp_size=16,
-            dp_size=2,
-            enable_dp_attention=True,
+            attn_dp_size=2,
             max_running_requests=16,
         )
         with envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(255):
@@ -3234,8 +3228,7 @@ class TestDeepEPv2Args(CustomTestCase):
         args = self._args(
             chunked_prefill_size=2048,
             tp_size=16,
-            dp_size=1,
-            enable_dp_attention=False,
+            attn_dp_size=1,
             max_running_requests=16,
         )
         with envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(127):
@@ -3253,7 +3246,7 @@ class TestDeepEPv2Args(CustomTestCase):
 
         def prefill_dispatch_tokens(cfg, tokens):
             seen.append(tokens)
-            return -(-tokens // (cfg.tp_size // cfg.dp_size))
+            return -(-tokens // (cfg.tp_size // cfg.attn_dp_size))
 
         moe_model_registry.register_deepep_v2_model(
             "TestPrefillPolicyMoe", prefill_dispatch_tokens=prefill_dispatch_tokens
@@ -3264,8 +3257,7 @@ class TestDeepEPv2Args(CustomTestCase):
         args = self._args(
             chunked_prefill_size=2048,
             tp_size=16,
-            dp_size=2,
-            enable_dp_attention=True,
+            attn_dp_size=2,
             max_running_requests=16,
         )
         args._model_config.hf_config.architectures = ["TestPrefillPolicyMoe"]
@@ -3314,8 +3306,7 @@ class TestDeepEPv2Args(CustomTestCase):
             disaggregation_mode="decode",
             max_running_requests=256,
             tp_size=8,
-            dp_size=8,
-            enable_dp_attention=True,
+            attn_dp_size=8,
         )
         with envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(128):
             validate_deepep_v2_dispatch_token_budget(args)
@@ -3326,7 +3317,6 @@ class TestDeepEPv2Args(CustomTestCase):
             max_running_requests=256,
             tp_size=8,
             dp_size=1,
-            enable_dp_attention=False,
         )
         with envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(128):
             with self.assertRaisesRegex(ValueError, "decode CUDA graph"):
@@ -3347,8 +3337,7 @@ class TestDeepEPv2Args(CustomTestCase):
             speculative_algorithm="EAGLE",
             speculative_num_draft_tokens=8,
             max_running_requests=256,
-            dp_size=8,
-            enable_dp_attention=True,
+            attn_dp_size=8,
         )
         with envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(128):
             with self.assertRaisesRegex(ValueError, "tokens/request=8"):
@@ -3361,8 +3350,7 @@ class TestDeepEPv2Args(CustomTestCase):
             speculative_num_draft_tokens=4,
             speculative_adaptive=True,
             max_running_requests=128,
-            dp_size=8,
-            enable_dp_attention=True,
+            attn_dp_size=8,
         )
         with patch(
             "sglang.srt.arg_groups.moe_hook.max_speculative_num_draft_tokens",
@@ -3728,7 +3716,7 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
     With no EP a2a backend (moe_a2a_backend='none'), --enable-two-batch-overlap
     is only valid on the DeepSeek-V4 non-EP DP TP-MoE path (overlapping the DP
     all_gatherv / reduce_scatterv with the other ubatch's compute), which
-    requires --enable-dp-attention. This replaced the removed opt-in
+    requires attention DP (--attn-dp-size). This replaced the removed opt-in
     SGLANG_ENABLE_DP_TBO env: enabling DP TBO now needs no extra flag.
 
     dummy-model short-circuits __post_init__, so the guard handler is invoked
@@ -3738,26 +3726,25 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
         args = ServerArgs(model_path="dummy")
         args.enable_two_batch_overlap = True
         args.moe_a2a_backend = "none"
-        args.enable_dp_attention = False
         for key, value in overrides.items():
             setattr(args, key, value)
         return args
 
     def test_no_a2a_without_dp_attention_raises(self):
-        args = self._args(enable_dp_attention=False)
-        with self.assertRaisesRegex(ValueError, "enable-dp-attention"):
+        args = self._args()
+        with self.assertRaisesRegex(ValueError, "attn-dp-size"):
             check_two_batch_overlap(args)
 
     def test_no_a2a_with_dp_attention_ok(self):
-        # DP TBO path is valid: --enable-dp-attention + --enable-two-batch-overlap
+        # DP TBO path is valid: --attn-dp-size + --enable-two-batch-overlap
         # with a2a backend 'none' must NOT raise (no SGLANG_ENABLE_DP_TBO needed).
-        args = self._args(enable_dp_attention=True)
+        args = self._args(attn_dp_size=2)
         check_two_batch_overlap(args)
 
     def test_ep_a2a_backend_ok_without_dp_attention(self):
         # EP a2a path (e.g. deepep) overlaps dispatch/combine; the guard does not
         # require dp-attention there.
-        args = self._args(moe_a2a_backend="deepep", enable_dp_attention=False)
+        args = self._args(moe_a2a_backend="deepep")
         check_two_batch_overlap(args)
 
 
@@ -4016,9 +4003,8 @@ class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):
         # have settled by then; the dummy-model pipeline itself returns early.
         server_args = ServerArgs(
             model_path="dummy",
-            enable_dp_attention=True,
+            attn_dp_size=2,
             tp_size=2,
-            dp_size=2,
             chunked_prefill_size=8192,
             cuda_graph_config=CudaGraphConfig(
                 prefill=PhaseConfig(backend=Backend.DISABLED)
