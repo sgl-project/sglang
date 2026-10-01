@@ -132,7 +132,7 @@ def bidirectional_bmm_attention(q, k, v, pk, pv, ids, ptr, cap, scale=1.0, out=N
         cap,
         scale,
         triton.next_power_of_2(n),
-        num_warps=4 if n <= 2048 else 16,
+        num_warps=4 if n <= 2048 else (8 if n >= 8192 else 16),
     )
     result = torch.bmm(probs, vals, out_dtype=torch.float32)
     if out is None:
