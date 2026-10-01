@@ -89,6 +89,7 @@ fn spec(id: &str, mode: Stage, model: &str) -> WorkerSpec {
         mode,
         model_ids: vec![ModelId(model.into())],
         bootstrap_port: (mode == Stage::Prefill).then_some(8997),
+        ..Default::default()
     }
 }
 
