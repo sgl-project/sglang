@@ -2112,7 +2112,9 @@ def test_hybrid_backup_pool_pressure_preserves_host_victim(backend):
 @pytest.mark.parametrize("guard", ["none", "host_lock", "pending_dma"])
 def test_swa_host_pressure_retains_device_resident_backups(backend, guard):
     core, allocator = _swa_transfer_core(backend)
-    allocator.translate_loc_from_full_to_swa.side_effect = lambda values: values + 100
+    allocator.translate_swa_indices_for_transfer.side_effect = lambda values: (
+        values + 100
+    )
     core.is_write_back = True
     nodes = []
     for tokens, values in (([1, 2], [10, 11]), ([1, 2, 3], [20, 21, 12])):
@@ -2122,7 +2124,7 @@ def test_swa_host_pressure_retains_device_resident_backups(backend, guard):
                 core.set_component_device_value(
                     action.node_id,
                     ComponentType.SWA,
-                    allocator.translate_loc_from_full_to_swa(action.source_value),
+                    allocator.translate_swa_indices_for_transfer(action.source_value),
                 )
             else:
                 assert isinstance(action, (FreeDeviceKV, FreeDeviceKVFullOnly))
@@ -2272,7 +2274,7 @@ def test_swa_backup_resolves_relocated_full_virtual_ids(backend, unified, entryp
 
     core, allocator = _swa_transfer_core(backend, unified=unified)
     mapping = torch.arange(64) + 100
-    allocator.translate_loc_from_full_to_swa.side_effect = lambda indices: mapping[
+    allocator.translate_swa_indices_for_transfer.side_effect = lambda indices: mapping[
         indices
     ]
     values = [11, 7, 20, 4, 9, 13]
@@ -2297,10 +2299,10 @@ def test_swa_backup_resolves_relocated_full_virtual_ids(backend, unified, entryp
             ]
         },
     )
-    # Relocation changes kernel-facing SWA addresses while tree-owned Full
+    # Relocation changes physical SWA transfer addresses while tree-owned Full
     # virtual IDs and cached SWA physical snapshots stay unchanged.
     mapping[torch.tensor([11, 7, 13])] = torch.tensor([511, 407, 613])
-    allocator.translate_loc_from_full_to_swa.reset_mock()
+    allocator.translate_swa_indices_for_transfer.reset_mock()
     if entrypoint == "backup_spec":
         full, auxiliary = core.build_backup_spec(nodes[-1])
         assert full.tolist() == [13]
@@ -2315,14 +2317,16 @@ def test_swa_backup_resolves_relocated_full_virtual_ids(backend, unified, entryp
         [511, 407, 613] if unified else [111, 107, 113]
     )
     if unified:
-        allocator.translate_loc_from_full_to_swa.assert_called_once()
-        assert allocator.translate_loc_from_full_to_swa.call_args.args[0].tolist() == [
+        allocator.translate_swa_indices_for_transfer.assert_called_once()
+        assert allocator.translate_swa_indices_for_transfer.call_args.args[
+            0
+        ].tolist() == [
             11,
             7,
             13,
         ]
     else:
-        allocator.translate_loc_from_full_to_swa.assert_not_called()
+        allocator.translate_swa_indices_for_transfer.assert_not_called()
     assert core.get_component_device_value(nodes[0], ComponentType.SWA).tolist() == [
         111,
         107,
@@ -4554,7 +4558,7 @@ def test_unified_swa_backup_when_full_already_has_a_host_copy(backup_nodes):
         core.set_component_device_value(
             source_id,
             ComponentType.SWA,
-            allocator.translate_loc_from_full_to_swa(source_values),
+            allocator.translate_swa_indices_for_transfer(source_values),
         )
     backed_up = {}
     if backup_nodes == "parent":
@@ -4562,7 +4566,9 @@ def test_unified_swa_backup_when_full_already_has_a_host_copy(backup_nodes):
             PoolTransfer(
                 name=PoolName.SWA,
                 host_indices=torch.tensor([200, 201]),
-                device_indices=allocator.translate_loc_from_full_to_swa(node_values),
+                device_indices=allocator.translate_swa_indices_for_transfer(
+                    node_values
+                ),
                 nodes_to_load=[node],
             )
         ]
@@ -4577,7 +4583,7 @@ def test_unified_swa_backup_when_full_already_has_a_host_copy(backup_nodes):
     assert swa_transfer.nodes_to_load == [source_id for source_id, _ in sources]
     assert torch.equal(
         swa_transfer.device_indices,
-        allocator.translate_loc_from_full_to_swa(
+        allocator.translate_swa_indices_for_transfer(
             torch.cat([source_values for _, source_values in sources])
         ),
     )
@@ -4914,7 +4920,7 @@ def test_swa_rebuild_applies_through_the_python_allocator():
     # The cache executed SWARebuild through the allocator: the node holds the
     # full slice's SWA translation.
     stored = cache.tree_core.get_component_device_value(node, ComponentType.SWA)
-    expected = allocator.translate_loc_from_full_to_swa(full)
+    expected = allocator.translate_swa_indices_for_transfer(full)
     assert stored is not None
     assert stored.tolist() == expected.tolist()
     assert (allocator.full_to_swa_index_mapping[full.to(torch.int64)] > 0).all()
@@ -4950,7 +4956,9 @@ def test_recover_with_locked_full_applies_through_the_python_allocator():
     # The locked full keeps its slots, remapped onto the incoming full's SWA
     # translation; the incoming full is freed back to the allocator.
     stored = cache.tree_core.get_component_device_value(node, ComponentType.SWA)
-    assert stored.tolist() == allocator.translate_loc_from_full_to_swa(kept).tolist()
+    assert (
+        stored.tolist() == allocator.translate_swa_indices_for_transfer(kept).tolist()
+    )
     assert (allocator.full_to_swa_index_mapping[incoming.to(torch.int64)] == 0).all()
     assert (
         allocator.full_attn_allocator.available_size() == before_free + incoming.numel()

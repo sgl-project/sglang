@@ -831,6 +831,10 @@ class HiCacheController:
             self._l2_transfers(host_indices, device_indices, pool_transfers)
         )
 
+        self.mem_pool_device_allocator.set_hicache_transfer_done_event(
+            (id(self), "write"), completion.finish_event
+        )
+
         self.ack_write_queue.append(
             HiCacheAck(
                 start_event=completion.start_event,
@@ -973,6 +977,10 @@ class HiCacheController:
             start_event=producer_event.start_event,
             on_layer_done=producer_event.complete,
             transfer_layer_id_max=self.transfer_layer_id_max,
+        )
+
+        self.mem_pool_device_allocator.set_hicache_transfer_done_event(
+            (id(self), "load"), completion.finish_event
         )
 
         self.ack_load_queue.append(

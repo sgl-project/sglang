@@ -1767,14 +1767,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # A failed backup never issues the D->H copy, so the subtree root has
         # no host state and no in-flight DMA reading its device slots.
         assert not node.backuped and node.write_through_pending_id is None
-        if any(cd.host_lock_ref > 0 for cd in node.component_data):
+        if node.load_back_pending_id is not None or any(
+            cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in node.component_data
+        ):
             return result
         descendants: list[UnifiedTreeNode] = []
         stack = list(node.children.values())
         while stack:
             cur = stack.pop()
-            if any(
-                cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in cur.component_data
+            if (
+                cur.write_through_pending_id is not None
+                or cur.load_back_pending_id is not None
+                or any(
+                    cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in cur.component_data
+                )
             ):
                 return result
             descendants.append(cur)
@@ -1893,11 +1899,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         for spare_imminent_demotes in (True, False):
             if tracker[BASE_COMPONENT_TYPE] >= num_tokens:
                 break
-            # Completion order can differ across ranks; external handles agree.
-            candidates = sorted(
-                self.full_host_duplicates.values(), key=lambda node: node.id
-            )
-            for node in candidates:
+            for node in self.full_host_duplicates.values():
                 if tracker[BASE_COMPONENT_TYPE] >= num_tokens:
                     break
                 cd = node.component_data[BASE_COMPONENT_TYPE]

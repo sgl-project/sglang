@@ -1048,7 +1048,7 @@ class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
                     with self.assertRaisesRegex(ValueError, "sidecar read failed"):
                         cc._page_transfer_sidecar(operation, kv_completed_pages=1)
                 self.assertTrue(cc.prefetch_sync_queue.empty())
-        self.assertEqual(seen_prefixes, [["prefix"], ["prefix"]])
+        self.assertEqual(seen_prefixes, [["prefix", "h0"], ["prefix", "h0"]])
 
     def test_shorter_prefetch_reserves_full_and_swa_without_mutating_probe_keys(self):
         page_size = 4

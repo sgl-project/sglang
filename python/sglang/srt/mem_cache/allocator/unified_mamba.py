@@ -17,7 +17,7 @@ mamba-state end pools of one `UnifiedKVPool`."""
 from __future__ import annotations
 
 import logging
-from typing import Callable, List, Optional, Sequence
+from typing import Callable, Hashable, List, Optional, Sequence
 
 import torch
 from torch.profiler import record_function
@@ -455,3 +455,7 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             ):
                 return 0
             return fa.flush_opportunistic() + ma.flush_opportunistic()
+
+    def set_hicache_transfer_done_event(self, transfer_key: Hashable, event) -> None:
+        self.full_attn_allocator.set_hicache_transfer_done_event(transfer_key, event)
+        self.mamba_allocator.set_hicache_transfer_done_event(transfer_key, event)

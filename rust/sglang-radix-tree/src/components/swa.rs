@@ -211,18 +211,6 @@ impl SwaComponent {
 }
 
 impl SwaComponent {
-    fn next_host_unlocked_device_lru_node<K: ChildKeyType>(
-        tree_core: &UnifiedTreeCore<K>,
-        from: Option<NodeIdx_>,
-    ) -> Option<NodeIdx_> {
-        let lru = tree_core.device_lru_list(SWA);
-        let unlocked = |id: NodeIdx_| tree_core.arena.node(id).host_lock_ref(SWA) == 0;
-        match from {
-            Some(node_id) => lru.get_prev_where(node_id, unlocked),
-            None => lru.get_lru_where(unlocked),
-        }
-    }
-
     /// Queue a free of the given SWA host slots; empty tensors are dropped.
     fn release_swa_host_(&self, host_indices: Tensor, cache_actions: &mut Vec<CacheAction>) {
         if host_indices.numel() > 0 {
@@ -866,51 +854,6 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
 
     fn evict_device_end(&self, tree_core: &mut UnifiedTreeCore<K>) {
         tree_core.set_evict_device_end(SWA);
-    }
-
-    fn reclaim_coexisting_host_values(
-        &self,
-        tree_core: &mut UnifiedTreeCore<K>,
-        num_tokens: usize,
-        tracker: &mut HashMap<ComponentType, usize>,
-        device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-    ) {
-        for spare_imminent_demotes in [true, false] {
-            if tracker[&SWA] >= num_tokens {
-                break;
-            }
-            // Host-transfer completion can perturb the rank-local SWA LRU even
-            // when every rank has the same logical candidates. Snapshot the
-            // eligible walk, then canonicalize it by external node handle.
-            // Rank-consensus-controlled tree mutations keep those handles
-            // aligned while the LRU links themselves may differ.
-            let mut candidates = Vec::new();
-            let mut next = Self::next_host_unlocked_device_lru_node(tree_core, None);
-            while let Some(node_id) = next {
-                candidates.push(node_id);
-                next = Self::next_host_unlocked_device_lru_node(tree_core, Some(node_id));
-            }
-            candidates.sort_unstable_by_key(|&node_id| tree_core.arena.node(node_id).id);
-            for node_id in candidates {
-                if tracker[&SWA] >= num_tokens {
-                    break;
-                }
-                if spare_imminent_demotes && tree_core.evictable_device_leaves.contains(node_id) {
-                    continue;
-                }
-                if !tree_core.can_reclaim_coexisting_host_value_(node_id, SWA) {
-                    continue;
-                }
-                tree_core.release_coexisting_host_value_(
-                    node_id,
-                    SWA,
-                    tracker,
-                    device_frees,
-                    host_frees,
-                );
-            }
-        }
     }
 
     /// Evict SWA host resources.

@@ -758,10 +758,21 @@ class TestUnifiedRadixAllocationEvictionRealComponents(CustomTestCase):
         for session in _session_radix_cache_test_values():
             for pinned in (False, True):
                 with self.subTest(session=session, pinned=pinned):
-                    cache, first, second, leaf = self._build_internal_chain(ct, session)
+                    # This exercises the Rust backup barrier, independently of
+                    # the shared suite's default backend.
+                    with mock.patch(f"{__name__}._TREE_CORE_TEST_BACKEND", "rust"):
+                        cache, first, second, leaf = self._build_internal_chain(
+                            ct, session
+                        )
                     cache.tree_core.is_write_back = True
                     cache.tree_core.has_swa_host_pool = True
                     cache.tree_core.enable_swa_write_back_eviction_barrier()
+                    if session:
+                        # Session caches use main's Python fallback, whose
+                        # component backup is gated by the HiCache attachment.
+                        cache.tree_core.enable_hicache = True
+                        cache.host_pool_group = mock.Mock()
+                        cache.host_pool_group.get_pool.return_value = None
                     if pinned:
                         receipt = cache.inc_host_lock_ref(first).to_dec_params()
                     tracker = {ComponentType.FULL: 0, ct: 0}
@@ -8967,7 +8978,7 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
             [[1, 2, 3, 4, 5, 0]], dtype=torch.int64
         )
         cache.token_to_kv_pool_allocator = mock.Mock()
-        cache.token_to_kv_pool_allocator.translate_loc_from_full_to_swa.side_effect = (
+        cache.token_to_kv_pool_allocator.translate_swa_indices_for_transfer.side_effect = (
             lambda indices: indices + 100
         )
         req = mock.Mock(rid="req", seqlen=6)
@@ -8984,9 +8995,9 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
                 torch.tensor([103, 104, 105, 106]),
             )
         )
-        cache.token_to_kv_pool_allocator.translate_loc_from_full_to_swa.assert_called_once()
+        cache.token_to_kv_pool_allocator.translate_swa_indices_for_transfer.assert_called_once()
         cache.token_to_kv_pool_allocator.translate_kv_indices_for_transfer.assert_not_called()
-        cache.token_to_kv_pool_allocator.translate_swa_indices_for_transfer.assert_not_called()
+        cache.token_to_kv_pool_allocator.translate_loc_from_full_to_swa.assert_not_called()
 
     def test_backup_publish_node_ids_collects_component_nodes_once(self):
         comp_xfers = {
@@ -9072,12 +9083,13 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         cache = mock.MagicMock()
         alloc = cache.token_to_kv_pool_allocator
         source_value = torch.tensor([3, 4], dtype=torch.int64)
-        swa_value = alloc.translate_loc_from_full_to_swa.return_value
+        swa_value = torch.tensor([7, 8], dtype=torch.int64)
+        alloc.translate_swa_indices_for_transfer.return_value = swa_value
         _component_with_cache(ComponentType.SWA, cache).apply_component_action(
             SWARebuild(node_id=5, source_value=source_value),
         )
         # translate the source full to SWA and store it on the node (no free)
-        alloc.translate_loc_from_full_to_swa.assert_called_once_with(source_value)
+        alloc.translate_swa_indices_for_transfer.assert_called_once_with(source_value)
         alloc.free.assert_not_called()
         alloc.free_full.assert_not_called()
         cache.tree_core.set_component_device_value.assert_called_once_with(
@@ -9089,7 +9101,8 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         alloc = cache.token_to_kv_pool_allocator
         kept_full = torch.tensor([1, 2], dtype=torch.int64)
         incoming_full = torch.tensor([3, 4], dtype=torch.int64)
-        swa_value = alloc.translate_loc_from_full_to_swa.return_value
+        swa_value = torch.tensor([7, 8], dtype=torch.int64)
+        alloc.translate_swa_indices_for_transfer.return_value = swa_value
         _component_with_cache(ComponentType.SWA, cache).apply_component_action(
             RecoverSWAWithLockedFull(
                 node_id=5,
@@ -9098,7 +9111,7 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
             ),
         )
         # keep the locked full, remap it onto the incoming full's SWA translation
-        alloc.translate_loc_from_full_to_swa.assert_called_once_with(incoming_full)
+        alloc.translate_swa_indices_for_transfer.assert_called_once_with(incoming_full)
         alloc.set_full_to_swa_mapping.assert_called_once_with(kept_full, swa_value)
         # the incoming full's stale mapping is cleared, then its slot freed (full-only)
         alloc.clear_full_to_swa_mapping.assert_called_once_with(incoming_full)

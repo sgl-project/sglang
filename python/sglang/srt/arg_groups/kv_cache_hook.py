@@ -530,17 +530,9 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             )
         if cfg.disaggregation_decode_retraction_backup == "host_pool":
             model_config = model_config_of(server_args)
-            assert not cfg.disaggregation_decode_enable_radix_cache, (
-                "--enable-unified-memory host-pool decode retraction does not "
-                "support decode radix-cache H2D/D2H transfers yet."
-            )
             assert mambaish_config(model_config) is None, (
                 "--enable-unified-memory host-pool decode retraction does not "
                 "support hybrid-Mamba models."
-            )
-            assert not model_config.is_hybrid_swa, (
-                "--enable-unified-memory host-pool decode retraction does not "
-                "support hybrid-SWA H2D/D2H transfers yet."
             )
     assert cfg.speculative_algorithm in (None, "DSPARK"), (
         "--enable-unified-memory only supports --speculative-algorithm "
@@ -584,6 +576,15 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         "preserve unified page-envelope indices and compaction lifetimes. "
         "Use --enable-hierarchical-cache for supported L2/L3 transfers."
     )
+    if cfg.enable_hierarchical_cache:
+        assert cfg.pp_size == 1, (
+            "--enable-unified-memory with hierarchical cache does not support "
+            "pipeline parallelism (--pp-size > 1)."
+        )
+        assert not envs.SGLANG_DISABLE_LAZY_COMPACTION.get(), (
+            "--enable-unified-memory with hierarchical cache requires lazy "
+            "compaction so pending H2D physical reservations remain stable."
+        )
     if cfg.dcp_size > 1:
         _validate_unified_memory_dcp(server_args)
     # Prefill cuda-graph capture IS wired for the unified pool: the captured

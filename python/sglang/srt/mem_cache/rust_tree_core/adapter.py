@@ -376,12 +376,14 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         ] = None
         allocator = params.token_to_kv_pool_allocator
         if allocator is not None and ComponentType.SWA in self.tree_components:
-            from sglang.srt.mem_cache.allocator.unified_sub_pool import (
-                MultiEndedAllocator,
+            from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
+                UnifiedSWAAllocatorBase,
             )
 
-            if isinstance(allocator.swa_attn_allocator, MultiEndedAllocator):
-                self._swa_backup_index_mapper = allocator.translate_loc_from_full_to_swa
+            if isinstance(allocator, UnifiedSWAAllocatorBase):
+                self._swa_backup_index_mapper = (
+                    allocator.translate_swa_indices_for_transfer
+                )
         self.is_eagle = (
             params.is_eagle and ComponentType.MAMBA not in self.tree_components
         )

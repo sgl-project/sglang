@@ -83,6 +83,7 @@ def _staged_fixture(full_match=2):
     cc.storage_backend.batch_exists.return_value = 0
     cc.mem_pool_host = SimpleNamespace(
         free=Mock(),
+        anchor_entry=SimpleNamespace(host_pool=SimpleNamespace()),
         entry_map={
             PoolName.SWA: SimpleNamespace(
                 host_pool=SimpleNamespace(free=Mock()),

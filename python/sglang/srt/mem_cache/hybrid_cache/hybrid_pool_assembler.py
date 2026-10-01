@@ -272,6 +272,13 @@ def build_kv_only_group(
 
 def _swa_allocation_callbacks(allocator, bind=None, free_bound=None) -> dict:
     """Keep allocation and rollback in the same ID space for every SWA stack."""
+    from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
+
+    if isinstance(allocator, MultiEndedAllocator):
+        return dict(
+            device_alloc_fn=allocator.alloc_physical,
+            device_free_fn=allocator.cancel_physical_reservation,
+        )
     if bind is not None:
         assert free_bound is not None
         return dict(

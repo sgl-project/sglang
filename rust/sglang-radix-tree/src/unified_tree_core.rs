@@ -2551,7 +2551,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             // A failed backup never issues the D->H copy, so the subtree root has
             // no host state and no in-flight DMA reading its device slots.
             assert!(!node.backuped() && node.write_through_pending_id.is_none());
-            if node.is_host_locked() {
+            if node.is_host_locked() || node.is_load_back_pending() {
                 return Ok((false, result));
             }
         }
@@ -2565,7 +2565,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             .collect();
         while let Some(cur_id) = stack.pop() {
             let cur = self.arena.node(cur_id);
-            if cur.is_device_locked() || cur.is_host_locked() {
+            if cur.is_device_locked()
+                || cur.is_host_locked()
+                || cur.write_through_pending_id.is_some()
+                || cur.is_load_back_pending()
+            {
                 return Ok((false, result));
             }
             descendants.push(cur_id);

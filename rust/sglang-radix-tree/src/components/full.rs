@@ -204,11 +204,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
             if tracker[&FULL] >= num_tokens {
                 break;
             }
-            // Transfer completion can permute the set across ranks. Reclaim by
-            // the replicated tree's external handles, not set iteration order.
-            let mut candidates: Vec<NodeIdx_> =
-                tree_core.full_coexisting_host_nodes.iter().collect();
-            candidates.sort_unstable_by_key(|&node_id| tree_core.arena.node(node_id).id);
+            let candidates: Vec<NodeIdx_> = tree_core.full_coexisting_host_nodes.iter().collect();
             for node_id in candidates {
                 if tracker[&FULL] >= num_tokens {
                     break;

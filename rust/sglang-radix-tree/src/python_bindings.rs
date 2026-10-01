@@ -2863,11 +2863,6 @@ macro_rules! tree_core_binding {
                 catch_native_panic(|| self.inner.get_node_key_lengths(py, node_ids))
             }
 
-            /// Key lengths for mapping newly allocated FULL load-back rows.
-            fn get_node_key_lengths(&self, py: Python<'_>, node_ids: Vec<NodeId>) -> PyResult<Vec<usize>> {
-                self.inner.get_node_key_lengths(py, node_ids)
-            }
-
             /// A component's device value on a node, if set.
             fn get_component_device_value(
                 &self,

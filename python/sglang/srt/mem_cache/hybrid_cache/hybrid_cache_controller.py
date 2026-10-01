@@ -46,6 +46,7 @@ from sglang.srt.runtime_context import get_memory
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
+from sglang.srt.mem_cache.unified_memory_pool import UnifiedMHATokenToKVPool
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.utils import broadcast_pyobj
 
@@ -856,12 +857,18 @@ class HybridCacheController(BaseHiCacheController):
             ):
                 raise ValueError(f"Unresolved L2 transfer for {pool_transfer.name}.")
             entry = self.mem_pool_host.entry_map[pool_transfer.name]
+            indices = pool_transfer.device_indices
+            if pool_transfer.name == PoolName.SWA and isinstance(
+                entry.device_pool, UnifiedMHATokenToKVPool
+            ):
+                # SWA reload reserves physical slots before binding FULL ids.
+                indices = entry.device_pool._physical_to_kernel_indices(indices)
             transfers.append(
                 L2Transfer(
                     host_pool=entry.host_pool,
                     device_pool=entry.device_pool,
                     host_indices=pool_transfer.host_indices,
-                    device_indices=pool_transfer.device_indices,
+                    device_indices=indices,
                     layer_mapper=entry.layer_mapper,
                 )
             )

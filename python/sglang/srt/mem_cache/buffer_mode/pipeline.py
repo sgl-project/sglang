@@ -1383,7 +1383,7 @@ class BufferModePipeline:
                 -len(swa_dev) :
             ]
             allocator = cache.token_to_kv_pool_allocator
-            old_swa = allocator.full_to_swa_index_mapping[full_window.to(torch.int64)]
+            old_swa = allocator.translate_swa_indices_for_transfer(full_window)
             missing = old_swa <= 0
             window_start = span_end - len(swa_dev)
             repair_end = min(splice_base, span_end)
@@ -1485,8 +1485,19 @@ class BufferModePipeline:
         self._free_staging_now(f.host_indices, f.aux_xfers)
         for pool_name, device_indices in f.aux_device_releases:
             entry = cc.mem_pool_host.entry_map[pool_name]
-            free_fn = entry.device_free_fn or entry.device_pool.free
-            free_fn(device_indices)
+            from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
+                UnifiedSWAAllocatorBase,
+            )
+
+            allocator = cache.token_to_kv_pool_allocator
+            if pool_name == PoolName.SWA and isinstance(
+                allocator, UnifiedSWAAllocatorBase
+            ):
+                # H2D has completed; these redundant slots are no longer pending.
+                allocator.swa_attn_allocator.free_physical(device_indices)
+            else:
+                free_fn = entry.device_free_fn or entry.device_pool.free
+                free_fn(device_indices)
 
         cc.prefetch_tokens_occupied -= f.occupied_tokens
         logger.info(
