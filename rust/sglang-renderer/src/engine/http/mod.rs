@@ -161,15 +161,18 @@ impl GenerateTransport for HttpGenerateClient {
 #[derive(Default)]
 struct SseParser {
     bytes: Vec<u8>,
+    scan_from: usize,
 }
 
 impl SseParser {
     fn push(&mut self, chunk: &[u8]) -> Vec<String> {
         self.bytes.extend_from_slice(chunk);
         let mut payloads = Vec::new();
-        while let Some((end, separator_len)) = event_end(&self.bytes) {
+        while let Some((end, separator_len)) = event_end(&self.bytes[self.scan_from..]) {
+            let end = self.scan_from + end;
             let event = self.bytes.drain(..end).collect::<Vec<_>>();
             self.bytes.drain(..separator_len);
+            self.scan_from = 0;
             let event = String::from_utf8_lossy(&event);
             let data = event
                 .lines()
@@ -180,6 +183,8 @@ impl SseParser {
                 payloads.push(data);
             }
         }
+        // A CRLF separator can begin in the final three bytes of a prior chunk.
+        self.scan_from = self.bytes.len().saturating_sub(3);
         payloads
     }
 }
@@ -232,6 +237,45 @@ mod tests {
         let payloads = parser.push(b"data: {\"a\":1}\n\ndata: {\"b\":2}\r\n\r\n");
 
         assert_eq!(payloads, ["{\"a\":1}", "{\"b\":2}"]);
+    }
+
+    #[test]
+    fn sse_parser_preserves_events_at_every_fragment_boundary() {
+        let frames = ": heartbeat\r\n\r\ndata: {\"text\":\"你好\"}\n\ndata: first\r\ndata: second\r\n\r\ndata: [DONE]\n\n";
+        let expected = ["{\"text\":\"你好\"}", "first\nsecond", "[DONE]"];
+
+        for chunk_size in 1..=frames.len() {
+            let mut parser = SseParser::default();
+            let mut payloads = Vec::new();
+            for chunk in frames.as_bytes().chunks(chunk_size) {
+                payloads.extend(parser.push(chunk));
+                assert!(parser.push(b"").is_empty());
+            }
+            assert_eq!(payloads, expected, "chunk size {chunk_size}");
+        }
+
+        for split in 0..=frames.len() {
+            let mut parser = SseParser::default();
+            let mut payloads = parser.push(&frames.as_bytes()[..split]);
+            payloads.extend(parser.push(&frames.as_bytes()[split..]));
+            assert_eq!(payloads, expected, "split at byte {split}");
+        }
+    }
+
+    #[test]
+    fn sse_parser_preserves_large_fragmented_events_and_trailing_frames() {
+        let payload = format!("{{\"text\":\"{}\"}}", "x".repeat(64 * 1024));
+        let frame = format!("data: {payload}\r\n\r\ndata: next");
+        let mut parser = SseParser::default();
+        let mut payloads = Vec::new();
+
+        for chunk in frame.as_bytes().chunks(127) {
+            payloads.extend(parser.push(chunk));
+        }
+        assert_eq!(payloads, [payload]);
+        assert!(parser.push(b"\n").is_empty());
+        assert_eq!(parser.push(b"\ndata: [DONE]\n\n"), ["next", "[DONE]"]);
+        assert_eq!(parser.push(b"data: reused\r\n\r\n"), ["reused"]);
     }
 
     #[derive(Clone)]
@@ -370,6 +414,62 @@ mod tests {
         assert_eq!(request["stream"], true);
         assert!(request.get("incremental_streaming_output").is_none());
         assert_eq!(request["return_text_in_logprobs"], false);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn transport_preserves_fragmented_prompt_logprobs() {
+        async fn fragmented() -> axum::response::Response {
+            let frame = serde_json::json!({
+                "output_ids": [104],
+                "meta_info": {
+                    "prompt_tokens": 4096,
+                    "completion_tokens": 1,
+                    "finish_reason": {"type": "length"},
+                    "input_token_logprobs": (0..4096)
+                        .map(|id| serde_json::json!([-0.1, id, "你好"]))
+                        .collect::<Vec<_>>(),
+                }
+            });
+            let frames = format!(": heartbeat\n\ndata: {frame}\r\n\r\ndata: [DONE]\n\n");
+            let chunks = frames
+                .as_bytes()
+                .chunks(127)
+                .map(|chunk| Ok::<_, Infallible>(axum::body::Bytes::copy_from_slice(chunk)))
+                .collect::<Vec<_>>();
+            axum::response::Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(axum::body::Body::from_stream(futures::stream::iter(chunks)))
+                .unwrap()
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(
+            axum::serve(listener, Router::new().route("/generate", post(fragmented))).into_future(),
+        );
+        let client = HttpGenerateClient::new(format!("http://{address}")).unwrap();
+        let request = TokenIdsRequest {
+            rid: "fragmented-logprobs".into(),
+            input_ids: vec![65],
+            options: GenerationOptions::default(),
+            metadata: Default::default(),
+        };
+        let mut events = client.generate(request.into()).await.unwrap();
+        let output = events.next().await.unwrap().unwrap();
+        assert!(output.finish_reason.is_some());
+        assert_eq!(output.token_ids, [104]);
+        assert_eq!(output.prompt_tokens, 4096);
+        assert_eq!(output.completion_tokens, 1);
+        let logprobs = output.extras.unwrap().input_logprobs;
+        assert_eq!(logprobs.len(), 4096);
+        for (id, position) in logprobs.iter().enumerate() {
+            let token = &position.token;
+            assert_eq!(token.token_id, id as i32);
+            assert_eq!(token.logprob, Some(-0.1));
+            assert_eq!(token.text.as_deref(), Some("你好"));
+        }
+        assert!(events.next().await.is_none());
         server.abort();
     }
 
