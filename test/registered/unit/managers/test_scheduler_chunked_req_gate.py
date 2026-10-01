@@ -41,6 +41,7 @@ def _make_req(
     req.host_hit_length = 0
     req.kv = ReqKvInfo(req_pool_idx=req_pool_idx)
     req.skip_radix_cache_insert = False
+    req.finished_reason = None
     req.last_node = None
     req.lock_receipt = DecLockRefParams()
     req.session = None
