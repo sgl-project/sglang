@@ -1836,6 +1836,76 @@ runtime validation. The tests use one host, four Gloo processes, TCP Mooncake
 and a Catalog double; they do not establish multi-GPU inference, RDMA,
 production Catalog retention, training quality or performance SLO compliance.
 
+## Completed Cohort Writer Actors
+
+`CohortSnapshotWriter` now takes ownership of sealed or aborted partitioned
+request contexts and advances their Store publication on one background thread
+per rank. It waits for D2H before describing payloads, submits owner metadata,
+polls the agreed manifest, writes only local objects, exchanges receipts and
+publishes from aux. Inactive ranks own only their metadata/handle completion.
+Submissions freeze metadata, reject duplicate/foreign ownership and remain
+bounded by the reserved cohort count. Failed submission leaves the caller
+responsible for its context; successful submission forbids further inference-
+thread mutation.
+
+The actor visits every queued request instead of waiting synchronously for the
+first request's peers. This prevents different PP/TP completion orders from
+forming a circular metadata wait. Startup readiness includes worker-thread
+initialization and aux journal replay. Copy uncertainty quarantines the original
+slot, and closing the writer cannot acknowledge an in-flight copy.
+
+Aux publication exceptions retain the exact manifest, complete receipt set and
+original lease for idempotent reconciliation. `recover_partitions()` validates
+every stored tensor and retries using a new registered manifest buffer. Recovery
+also handles a failed directory sync after journal unlink, when a missing journal
+does not establish that publication failed. Recovery buffer allocation counts
+retained quarantined buffers against the receive budget. Cancellation, expiry
+and shutdown do not override an unresolved publication outcome.
+
+The cohort service now accepts `published` with `transfer_complete=False`:
+publication recovery can succeed while the original source still requires
+quarantine. It never reports that committed sample failed, and normal service
+close still refuses to tear down quarantined storage. `stored` still requires
+complete transfers. The deterministic regression fails on the previous service
+in job `01790859744928408454-fb2b1518cb3f` with `invalid local capture completion`
+(one expected failure, 10.39s); the old service hash is recorded in the evidence.
+
+Job `01790859862859096712-ee71b92aa398` passed 65 tests and 57 subtests in 113.07s:
+new writer lifecycle, snapshot publication/recovery, the existing single-rank
+coordinator, cohort lifecycle/metadata exchange and a real Store actor workflow.
+After tightening worker initialization readiness and adding two startup cases,
+job `01790860084879682234-d85878604758` passed all nine writer tests and the Store
+actor test in 52.79s. Writer tests cover copy-gated shutdown, duplicate submit,
+metadata mutation after submission, uncertain D2H, lost publish response with
+concurrent cancellation, journal cleanup failure, ambiguous manifest transport,
+published/quarantined ownership and startup failure/recovery readiness.
+
+The real TCP Mooncake case uses four Gloo processes and two bounded cohorts.
+Ranks 0/1 submit sample A first while ranks 2/3 submit B first; a barrier proves
+both initial submissions are waiting for metadata before second submissions
+arrive. Both samples then publish, all writer actors finish, and both Host slots
+per active owner return after service drain. Following producer exit, independent
+reader processes validate 32 objects / 4532 bytes per sample. Parent readers also
+compare every reconstructed KV/aux tensor exactly to the deterministic fixture.
+The contexts use the real collection/seal/partition APIs with CPU fixture tensors;
+this is not a distributed target-model or CUDA-forward test.
+
+All six changed/added Python files format and compile on host Python 3.10. Five
+pass Ruff; the Store test retains its two baseline diagnostics. The final Store
+fixture explicitly binds a synchronous polling lambda's loop variable for Ruff;
+that equivalent test-only binding was made after the last run. Final production
+sources match the tested GPU files. All three jobs are terminal; the resident
+idle load resumed. Full commands, final and tested hashes and limits are in
+`experiments/capture-cohort-writer.json`.
+
+Distributed serving remains gated. The writer actor is available for coordinator
+ownership, but request admission/finalization, partitioned forward collection,
+accepted-token propagation and global teacher scores still require runtime
+integration and TP/PP validation. Persistent unresolved fences/journal failures
+need Catalog reconciliation; this actor retains ownership rather than guessing
+a failed publication. No production Catalog, cross-node RDMA, trained quality or
+performance SLO result is established by this change.
+
 ## Next Implementation
 
 1. Broaden real-request coverage to prefill graphs, automatic AR OOM retraction,
@@ -1845,7 +1915,7 @@ production Catalog retention, training quality or performance SLO compliance.
    checkpoints, complete exporter compatibility and artifact/quality validation.
 3. Connect P9's implemented identity/resource startup agreement, cohort
    reservations and background lifecycle, scheduler ticket routing, descriptor
-   and receipt agreement, layout,
+   and receipt agreement, completed-context writer actors, layout,
    partitioned request contexts, rank-local buffers and
    owner-local Store interface
    to distributed request admission/failure agreement,

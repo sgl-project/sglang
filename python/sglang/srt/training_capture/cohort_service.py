@@ -303,6 +303,8 @@ class CaptureCohortService:
 
         An aux owner must resolve its publication journal before calling this.
         Failed/expired leases alone are not proof that a publication did not win.
+        Recovered publication may still leave the original source quarantined;
+        report published with transfer_complete=False in that case.
         """
         with self.lock:
             self._check_handle(handle)
@@ -311,7 +313,7 @@ class CaptureCohortService:
                 or (outcome == "published" and not self.partition.include_aux)
                 or (outcome == "stored" and self.partition.include_aux)
                 or type(transfer_complete) is not bool
-                or (outcome != "failed" and not transfer_complete)
+                or (outcome == "stored" and not transfer_complete)
             ):
                 raise ContractError("invalid local capture completion")
             if (

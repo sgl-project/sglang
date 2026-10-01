@@ -518,6 +518,10 @@ service retains the resources even if its caller drops its reference. Normal
 close does not destroy the dedicated group, close Store, synchronize CUDA, or
 unregister memory. The supervisor owns those actions after a successful close;
 uncertain transfers require explicit transport/device teardown or process exit.
+An aux owner can report `published` with `transfer_complete=False` after recovery
+using another manifest buffer. Publication wins, while the original Host slot
+remains quarantined and prevents a normal service close. A `stored` receipt still
+requires proven transfer completion.
 
 The scheduler request hooks below can carry these tickets, and the metadata
 exchange below coordinates completed owner partitions. Distributed coordinator
@@ -627,6 +631,53 @@ TCP Mooncake test also writes all partitions, exchanges receipts, publishes from
 aux and reads the entire sample after the producer processes exit. These are
 storage/control tests with synthetic tensors, not distributed model inference.
 The serving coordinator and global teacher/token delivery remain to be connected.
+
+### Completed-Context Writer
+
+`CohortSnapshotWriter(service)` owns the Store actor for one rank. Construct it
+after resources and the service are ready, call `start()`, and wait for
+`stats()["ready"]` before handing it completed actors. Aux startup replays its
+existing publication journal before becoming ready; a recovery error keeps it
+unready. Inactive ranks have a writer for metadata/handle completion but no Store.
+
+`submit(handle, context=..., metadata=..., execution_sha256=...)` transfers a
+sealed partitioned `RequestCaptureContext` and frozen `SnapshotMetadata` to the
+writer. Every bound rank submits, with no context/metadata on inactive ranks.
+The inference thread must stop touching the context after a successful submit.
+An exception leaves ownership with the caller, which must still drain/finish it.
+Submissions are bounded by `max_inflight_samples` and reject duplicate handles.
+`failure_reason=...` submits an aborted actor; its outstanding copies are still
+waited before acknowledging failure. A failure with no context means no copy was
+ever enqueued, such as an admission failure before context creation.
+
+One Store thread advances each queued actor through copies, manifest agreement,
+owner writes, receipt agreement and aux publication. Waiting for peer descriptors
+or receipts does not block processing another queued request. This matters when
+different PP/TP ranks finish requests in different orders. The worker never
+reads a serving request or calls a collective; it uses the cohort service's
+submission/polling APIs and only writer-owned completed Host views.
+
+Once aux attempts publication, an exception enters recovery rather than failing
+the capture. `SnapshotWriter.recover_partitions()` validates the exact frozen
+manifest/receipt set and each Store object, then retries the same identity using
+a fresh registered manifest buffer. It covers lost seal/publish responses and
+an exception after journal unlink; journal absence is not proof of failure.
+The original publication lease is retained across retries, including its fence.
+Recovery buffer allocation honors the Store receive/quarantine budget. Uncertain
+original arenas stay quarantined even if recovery confirms publication.
+
+`close(timeout)` stops admission, fails/drains unattempted actors and continues
+resolving attempted publications. A false result retains contexts and forbids
+resource teardown. True only proves that this writer stopped: the supervisor
+must also close the cohort service, resolve any quarantined transport/device
+storage, and then close resources and destroy the dedicated control group.
+Capture expiry, cancellation or shutdown cannot turn an ambiguous publish into
+a failed sample. Permanently rejected fences remain pending for reconciliation.
+
+This actor is exercised with real request contexts, four Gloo producer processes
+and TCP Mooncake, including opposite request completion orders and independent
+readers after producers exit. It is ready for distributed coordinator ownership;
+the serving factory and global teacher/accepted-token delivery remain gated.
 
 ### HTTP Contract
 

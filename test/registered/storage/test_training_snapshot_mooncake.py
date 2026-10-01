@@ -25,6 +25,7 @@ from safetensors.torch import save_file
 from sglang.srt.training_capture.catalog import CaptureLease, HTTPCaptureCatalog
 from sglang.srt.training_capture.cohort import CaptureCohortAllocator
 from sglang.srt.training_capture.cohort_service import CaptureCohortService
+from sglang.srt.training_capture.cohort_writer import CohortSnapshotWriter
 from sglang.srt.training_capture.config import CaptureConfig, StoreSetup
 from sglang.srt.training_capture.host_pool import HostBufferPool
 from sglang.srt.training_capture.mooncake_store import MooncakeSnapshotStore
@@ -52,6 +53,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.training_capture_catalog import TestCaptureCatalog
 from sglang.test.training_capture_partition import (
+    make_cohort_context,
     make_partitioned_snapshot,
     prepare_cohort_partition,
 )
@@ -61,7 +63,7 @@ from sglang.test.training_capture_utils import (
     read_snapshot,
 )
 
-register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=120, stage="base-b", runner_config="1-gpu-small")
 
 
 def free_port():
@@ -263,7 +265,7 @@ def prepare_store_rank(rank, root, master, catalog):
         dist.destroy_process_group()
 
 
-def publish_cohort_rank(rank, root, master, endpoint):
+def publish_cohort_rank(rank, root, master, endpoint, use_writer=False):
     """Independent producers share descriptors/receipts, never tensor pointers."""
     torch.set_num_threads(1)
     dist.init_process_group(
@@ -289,8 +291,8 @@ def publish_cohort_rank(rank, root, master, endpoint):
             local_hostname=f"127.0.0.1:{free_port()}", master_server_addr=master
         ),
         max_sample_tokens=8,
-        max_inflight_samples=1,
-        max_host_bytes=2 << 20,
+        max_inflight_samples=2 if use_writer else 1,
+        max_host_bytes=4 << 20 if use_writer else 2 << 20,
     )
     resources = CaptureResources()
     resources.catalog = HTTPCaptureCatalog(endpoint)
@@ -311,6 +313,9 @@ def publish_cohort_rank(rank, root, master, endpoint):
         )
         service = CaptureCohortService(allocator, poll_seconds=0.01)
         service.start()
+        if use_writer:
+            run_cohort_writer_actors(service, rank, root)
+            return
 
         def wait_for(call):
             deadline = time.monotonic() + 30
@@ -377,6 +382,87 @@ def publish_cohort_rank(rank, root, master, endpoint):
         resources.close()
         dist.destroy_process_group(control)
         dist.destroy_process_group()
+
+
+def run_cohort_writer_actors(service, rank, root):
+    """Opposite completion order must not block either sample's metadata quorum."""
+    worker = CohortSnapshotWriter(service, poll_seconds=0.01, retry_seconds=0.05)
+    worker.start()
+    layout, partition = service.allocator.layout, service.partition
+
+    def wait_for(call):
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            assert worker.error is None, worker.stats()
+            assert service.error is None
+            value = call()
+            if value:
+                return value
+            time.sleep(0.01)
+        raise TimeoutError(f"cohort actors stalled: {worker.stats()}")
+
+    try:
+        wait_for(lambda: worker.stats()["ready"])
+        actors = []
+        for index in range(2):
+            fingerprint = digest_bytes(f"actor-request-{index}".encode())
+            tickets = [
+                wait_for(lambda fingerprint=fingerprint: service.claim(fingerprint))
+                if rank == 0
+                else None
+            ]
+            dist.broadcast_object_list(tickets, src=0)
+            handle = service.bind(tickets[0], fingerprint)
+            assert handle is not None
+            context, metadata = make_cohort_context(handle.cohort, layout, rank)
+            actors.append((handle, context, metadata))
+        order = (0, 1) if rank < 2 else (1, 0)
+
+        def submit(index):
+            handle, context, metadata = actors[index]
+            worker.submit(
+                handle,
+                context=context,
+                metadata=metadata,
+                execution_sha256=digest_bytes(f"actor-execution-{index}".encode()),
+            )
+
+        submit(order[0])
+        wait_for(lambda: worker.stats()["states"].get("manifest") == 1)
+        dist.barrier()
+        assert actors[order[0]][0].manifest_payload is None
+        submit(order[1])
+        wait_for(lambda: worker.stats()["pending"] == 0)
+        assert (
+            worker.stats()["counters"].get(
+                "published" if partition.include_aux else "stored"
+            )
+            == 2
+        )
+        results = []
+        for handle, _, _ in actors:
+            manifest = decode_manifest(handle.manifest_payload)
+            results.append(
+                {
+                    "capture_id": handle.cohort.lease.capture_id,
+                    "manifest_sha256": digest_bytes(handle.manifest_payload),
+                    "objects_written": sum(
+                        obj.owner_id == partition.owner_id for obj in manifest.objects
+                    ),
+                }
+            )
+        dist.barrier()
+        assert worker.close(timeout=10)
+        assert service.close(timeout=20)
+        assert service.error is None
+        pool = service.allocator.resources.pool
+        assert pool is None or pool.stats()["free"] == 2
+        (Path(root) / f"rank-{rank}.json").write_bytes(
+            canonical_bytes({"samples": results, "writer": worker.stats()})
+        )
+    finally:
+        if not worker.close(timeout=10):
+            raise RuntimeError("writer still owns a capture or publication outcome")
 
 
 @unittest.skipUnless(
@@ -571,6 +657,102 @@ class TestTrainingSnapshotMooncake(CustomTestCase):
                     reader.stdout,
                 )
                 print("Background cohort publication: " + reader.stdout, flush=True)
+        finally:
+            for worker in workers:
+                if worker.pid is not None and worker.is_alive():
+                    worker.terminate()
+                    worker.join(timeout=5)
+                    if worker.is_alive():
+                        worker.kill()
+                        worker.join(timeout=5)
+            catalog.close()
+            store.close()
+
+    @unittest.skipUnless(dist.is_gloo_available(), "Gloo required")
+    def test_writer_actors_publish_oppositely_completed_requests(self):
+        store = connect(self.master_address, segment_bytes=64 << 20)
+        catalog = TestCaptureCatalog()
+        workers = []
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                context = mp.get_context("spawn")
+                workers = [
+                    context.Process(
+                        target=publish_cohort_rank,
+                        args=(rank, root, self.master_address, catalog.endpoint, True),
+                    )
+                    for rank in range(4)
+                ]
+                for worker in workers:
+                    worker.start()
+                deadline = time.monotonic() + 100
+                for worker in workers:
+                    worker.join(timeout=max(0, deadline - time.monotonic()))
+                self.assertEqual([worker.exitcode for worker in workers], [0] * 4)
+                results = [
+                    json.loads((Path(root) / f"rank-{rank}.json").read_bytes())
+                    for rank in range(4)
+                ]
+                for result in results:
+                    self.assertTrue(result["writer"]["stopping"])
+                    self.assertEqual(result["writer"]["pending"], 0)
+                    self.assertIsNone(result["writer"]["error"])
+                publications = catalog.wait_publications(2)
+                self.assertEqual(len(catalog.publications), 2)
+                expected_by_capture = {
+                    row["capture_id"]: row["manifest_sha256"]
+                    for row in results[0]["samples"]
+                }
+                for result in results:
+                    self.assertEqual(
+                        {
+                            row["capture_id"]: row["manifest_sha256"]
+                            for row in result["samples"]
+                        },
+                        expected_by_capture,
+                    )
+                base, expected = make_snapshot(response_length=4)
+                for publication in publications:
+                    self.assertEqual(
+                        publication["manifest_sha256"],
+                        expected_by_capture[publication["capture_id"]],
+                    )
+                    manifest, actual = read_snapshot(store, publication)
+                    for obj in base.objects:
+                        observed = actual[obj.name]
+                        if obj.kind == "kv":
+                            observed = observed[obj.token_range[0] : obj.token_range[1]]
+                        torch.testing.assert_close(
+                            observed, expected[obj.key], rtol=0, atol=0
+                        )
+                    reader = subprocess.run(
+                        [
+                            sys.executable,
+                            __file__,
+                            "--reader",
+                            "--master",
+                            self.master_address,
+                            "--manifest-key",
+                            publication["manifest_key"],
+                            "--manifest-size",
+                            str(publication["manifest_nbytes"]),
+                            "--manifest-sha256",
+                            publication["manifest_sha256"],
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=60,
+                        check=False,
+                    )
+                    self.assertEqual(
+                        reader.returncode, 0, reader.stdout + reader.stderr
+                    )
+                    self.assertIn(
+                        f'"validated_tensor_bytes": {manifest.total_tensor_bytes}',
+                        reader.stdout,
+                    )
+                    print("Writer actors: " + reader.stdout, flush=True)
+                self.assertFalse(catalog.errors)
         finally:
             for worker in workers:
                 if worker.pid is not None and worker.is_alive():

@@ -1,0 +1,146 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-01",
+  "base_commit": "7cc50261106d8bb7249750ce6546b4e9541511ae",
+  "feature": "Completed cohort writer actors and uncertain publication recovery",
+  "environment": {
+    "resident_job": "job-fe1ce1dcdea6-20261001023258",
+    "pod": "job-fe1ce1dcdea6-20261001023258-master-0",
+    "namespace": "qiji",
+    "container": "master",
+    "resident_gpu": "one H100 80GB",
+    "control_backend": "dedicated Gloo",
+    "store_transport": "TCP",
+    "catalog": "TestCaptureCatalog HTTP double",
+    "fixture_tensors": "CPU",
+    "host_python": "3.10.12",
+    "cwd": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang",
+    "submit_prefix": [
+      "kubectl",
+      "exec",
+      "-n",
+      "qiji",
+      "job-fe1ce1dcdea6-20261001023258-master-0",
+      "-c",
+      "master",
+      "--",
+      "python3",
+      "/gpfs/users/fuxuanwei-1/dspark-maas-lab/bin/gpu_worker.py",
+      "--state-dir",
+      "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state",
+      "submit",
+      "--cwd",
+      "/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang",
+      "--env",
+      "PYTHONPATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/sglang/python:/gpfs/users/fuxuanwei-1/dspark-maas-lab/specforge-reference",
+      "--env",
+      "PATH=/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    ]
+  },
+  "source_sha256": {
+    "python/sglang/srt/training_capture/cohort_writer.py": "c58d7c4eaacf05211b3e526c1afb2ab285bf054764fab74b290bb5538bb4a9c1",
+    "python/sglang/srt/training_capture/cohort_service.py": "ba7b4233b9d5a3092e733457e9d3688f13214f1bb8962d08e1c80efc4debd71d",
+    "python/sglang/srt/training_capture/snapshot_writer.py": "024cc676dc93c531ac34165646f2044479a24e04a5462f7a50b90d27188f883e",
+    "python/sglang/test/training_capture_partition.py": "f2c99d438fa5bac3706eaa333e10f3666a6cead73bfe32da9b7e2d71f554b525",
+    "test/registered/unit/training_capture/test_cohort_writer.py": "9de5e018577fb059fbc369be031b9ce9766f7810030fe5086b005fbdd4f455ba",
+    "test/registered/storage/test_training_snapshot_mooncake.py": "e5ab4e0adc141e81c5f064c9274a4d96dff38eb27f329976807c74d6dacd695b"
+  },
+  "jobs": [
+    {
+      "job_id": "01790859744928408454-fb2b1518cb3f",
+      "outcome": "failed",
+      "returncode": 1,
+      "expected_failure": true,
+      "tests_failed": 1,
+      "elapsed_seconds": 10.39,
+      "scope": "Regression proof using pre-fix service: confirmed publication with uncertain source was rejected.",
+      "pre_fix_service_sha256": "8567bfc34e0a94e0ec4707e5f1a9eab278302d627d2d7da277d7fb9292da116f",
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "test/registered/unit/training_capture/test_cohort_writer.py::TestCohortSnapshotWriter::test_publication_outcome_does_not_imply_source_completion"
+      ],
+      "result_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790859744928408454-fb2b1518cb3f.json",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790859744928408454-fb2b1518cb3f.log",
+      "log_sha256": "ad4b4f40b6fe6c5927982e9c971888f351c90780e89b5cb7b5167d4bfbd9d9ef"
+    },
+    {
+      "job_id": "01790859862859096712-ee71b92aa398",
+      "outcome": "completed",
+      "returncode": 0,
+      "tests_passed": 65,
+      "subtests_passed": 57,
+      "elapsed_seconds": 113.07,
+      "scope": "Writer, snapshot writer, existing coordinator, service, exchange and real Store opposite-completion actors. Before final startup-readiness adjustment and two extra unit cases.",
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "test/registered/unit/training_capture/test_cohort_writer.py",
+        "test/registered/unit/training_capture/test_snapshot_writer.py",
+        "test/registered/unit/training_capture/test_coordinator.py",
+        "test/registered/unit/training_capture/test_cohort_service.py",
+        "test/registered/unit/training_capture/test_cohort_exchange.py",
+        "test/registered/storage/test_training_snapshot_mooncake.py::TestTrainingSnapshotMooncake::test_writer_actors_publish_oppositely_completed_requests"
+      ],
+      "result_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790859862859096712-ee71b92aa398.json",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790859862859096712-ee71b92aa398.log",
+      "log_sha256": "c37e63f7811369981fa986594503592a0800b0dd768d7a5bc7aea0022d96ec4e"
+    },
+    {
+      "job_id": "01790860084879682234-d85878604758",
+      "outcome": "completed",
+      "returncode": 0,
+      "tests_passed": 10,
+      "elapsed_seconds": 52.79,
+      "scope": "Final production source and nine writer lifecycle cases plus real Store opposite-completion test. Followed only by equivalent test-only lambda binding for Ruff.",
+      "command": [
+        "/gpfs/users/fuxuanwei-1/dspark-maas-lab/venvs/capture/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "-s",
+        "test/registered/unit/training_capture/test_cohort_writer.py",
+        "test/registered/storage/test_training_snapshot_mooncake.py::TestTrainingSnapshotMooncake::test_writer_actors_publish_oppositely_completed_requests"
+      ],
+      "tested_sha256": {
+        "python/sglang/srt/training_capture/cohort_writer.py": "c58d7c4eaacf05211b3e526c1afb2ab285bf054764fab74b290bb5538bb4a9c1",
+        "python/sglang/srt/training_capture/cohort_service.py": "ba7b4233b9d5a3092e733457e9d3688f13214f1bb8962d08e1c80efc4debd71d",
+        "python/sglang/srt/training_capture/snapshot_writer.py": "024cc676dc93c531ac34165646f2044479a24e04a5462f7a50b90d27188f883e",
+        "python/sglang/test/training_capture_partition.py": "f2c99d438fa5bac3706eaa333e10f3666a6cead73bfe32da9b7e2d71f554b525",
+        "test/registered/unit/training_capture/test_cohort_writer.py": "9de5e018577fb059fbc369be031b9ce9766f7810030fe5086b005fbdd4f455ba",
+        "test/registered/storage/test_training_snapshot_mooncake.py": "942d578505ae9117ba584f488481210974857e8a9a4c826fc36972eb630f871a"
+      },
+      "result_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/results/01790860084879682234-d85878604758.json",
+      "log_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/state/logs/01790860084879682234-d85878604758.log",
+      "log_sha256": "b4ea9e9ea5ac37dcc24ad3fc1afd1e6b08c2359d709e1cd7515563313b9b4920"
+    }
+  ],
+  "verification": {
+    "writer_lifecycle_tests": 9,
+    "producer_processes": 4,
+    "active_owners": 3,
+    "concurrent_samples": 2,
+    "opposite_completion_order": true,
+    "producer_exit_before_independent_reader": true,
+    "reader_objects_per_sample": 32,
+    "reader_tensor_bytes_per_sample": 4532,
+    "exact_reconstructed_tensors": true,
+    "format": "All six files pass Ruff format --check",
+    "lint": "Five files pass Ruff; Store test has only baseline SIM115/PLW1510",
+    "compile": "All six files pass host Python 3.10 py_compile",
+    "diff_check": "passed",
+    "original_index_sha256": "2c878e06164f0d81477d13dbaf0b6e75693606e4160f6337ac50d682364badd9"
+  },
+  "limitations": [
+    "No distributed model forward; serving gates remain closed",
+    "CPU context fixtures, no actual CUDA-copy timing or performance claim",
+    "One host and TCP, no RDMA verification",
+    "Catalog double does not establish production retention/reconciliation",
+    "No trained draft quality or SLO compliance claim",
+    "Final test-only synchronous lambda binding was not rerun"
+  ]
+}

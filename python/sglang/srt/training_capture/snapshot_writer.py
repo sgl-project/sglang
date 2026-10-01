@@ -6,6 +6,7 @@ import base64
 import fcntl
 import os
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 import msgspec
@@ -281,6 +282,22 @@ class SnapshotWriter:
         data = canonical_bytes(manifest)
         if len(data) > manifest_buffer.numel() or manifest_buffer.dtype != torch.uint8:
             raise ContractError("manifest exceeds reserved Host buffer")
+        self._check_receipts(manifest, receipts, lease, data)
+        descriptor = self._manifest_object(manifest, data)
+        self.catalog.objects(
+            lease,
+            {
+                "phase": "REGISTERED",
+                "objects": [descriptor],
+                "idempotency_key": f"register-manifest-{lease.capture_id}-{descriptor['sha256']}",
+            },
+        )
+        self.journal.save(lease, data)
+        self._seal(manifest, data, lease)
+        return self._publish(manifest, data, manifest_buffer, lease)
+
+    @staticmethod
+    def _check_receipts(manifest, receipts, lease, data):
         digest = digest_bytes(data)
         seen = set()
         for receipt in receipts:
@@ -295,18 +312,39 @@ class SnapshotWriter:
             seen.add(receipt.owner_id)
         if seen != set(manifest.topology.owners):
             raise ContractError("missing owner write receipts")
-        descriptor = self._manifest_object(manifest, data)
-        self.catalog.objects(
-            lease,
-            {
-                "phase": "REGISTERED",
-                "objects": [descriptor],
-                "idempotency_key": f"register-manifest-{lease.capture_id}-{digest}",
-            },
+
+    @contextmanager
+    def _recovery_buffer(self, data):
+        retained = sum(
+            self.store.registered[p].numel() * self.store.registered[p].element_size()
+            for p in self.store.quarantined
         )
-        self.journal.save(lease, data)
-        self._seal(manifest, data, lease)
-        return self._publish(manifest, data, manifest_buffer, lease)
+        if retained + len(data) > self.store.max_receive_bytes:
+            raise ContractError("manifest recovery exceeds receive/quarantine budget")
+        buffer = torch.empty(len(data), dtype=torch.uint8, device="cpu")
+        self.store.register(buffer)
+        try:
+            yield buffer
+        finally:
+            if buffer.data_ptr() not in self.store.quarantined:
+                self.store.unregister(buffer)
+
+    def recover_partitions(self, manifest, receipts, lease):
+        """Reconcile an attempted publication using frozen in-memory metadata.
+
+        A missing/unreadable journal after an exception cannot prove failure:
+        publication may have committed before journal cleanup failed. Retry the
+        same identity and bytes, checking Store contents first and using a fresh
+        registered manifest buffer. Never reuse an uncertain source arena.
+        """
+        self._check_identity(manifest, lease)
+        validate_manifest(manifest)
+        data = canonical_bytes(manifest)
+        self._check_receipts(manifest, receipts, lease, data)
+        for obj in manifest.objects:
+            self.store.get_tensor(obj.key, obj.shape, DTYPES[obj.dtype], obj.sha256)
+        with self._recovery_buffer(data) as buffer:
+            return self.publish_partitions(manifest, receipts, buffer, lease)
 
     def _publish(self, manifest, data, manifest_buffer, lease):
         descriptor = self._manifest_object(manifest, data)
@@ -357,11 +395,6 @@ class SnapshotWriter:
             # object still exists before making the recovered reference visible.
             for obj in manifest.objects:
                 self.store.get_tensor(obj.key, obj.shape, DTYPES[obj.dtype], obj.sha256)
-            buffer = torch.empty(len(data), dtype=torch.uint8)
-            self.store.register(buffer)
-            try:
+            with self._recovery_buffer(data) as buffer:
                 receipts.append(self._publish(manifest, data, buffer, lease))
-            finally:
-                if buffer.data_ptr() not in self.store.quarantined:
-                    self.store.unregister(buffer)
         return receipts

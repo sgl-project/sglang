@@ -73,6 +73,51 @@ def prepare_cohort_partition(cohort, layout, rank):
     return metadata, prepared, tensors
 
 
+def make_cohort_context(cohort, layout, rank):
+    """Drive the real context API to a sealed, owner-local synthetic response."""
+    metadata, _, _ = prepare_cohort_partition(cohort, layout, rank)
+    partition = layout.partitions[rank]
+    if not partition.active:
+        return None, None
+    base, original = make_snapshot(response_length=4)
+    packed = {obj.name: original[obj.key] for obj in base.objects if obj.kind == "aux"}
+    tokens = packed["token_ids"].tolist()
+    valid = metadata.sequence.total_length - 1
+    sources = {
+        name: value[:valid].clone()
+        for name, value in cohort.slot.tensors.items()
+        if name.startswith("target_")
+    }
+    context = RequestCaptureContext(
+        slot=cohort.slot,
+        prompt_ids=tuple(tokens[: metadata.sequence.prompt_length]),
+        max_tokens=8,
+        vocab_size=metadata.teacher.vocab_size,
+        partition=partition,
+    )
+    if partition.heads:
+        exporter = SelectedLayerKVExporter(metadata.kv, sources, partition=partition)
+        context.export_kv(exporter, torch.arange(valid), end=valid)
+    else:
+        context.record_kv_progress(end=valid)
+    if partition.include_aux:
+        context.record_positions(torch.arange(valid), start=0)
+        context.record_teacher_range(
+            TeacherRows(
+                packed["teacher_topk_ids"],
+                packed["teacher_topk_logits"],
+                packed["teacher_logsumexp"],
+            ),
+            row=0,
+            position=metadata.sequence.prompt_length,
+            count=metadata.sequence.response_length,
+        )
+    for position in range(metadata.sequence.prompt_length, len(tokens)):
+        context.commit_token(position=position, token_id=tokens[position])
+    context.seal(metadata.sequence.stop_reason)
+    return context, metadata
+
+
 def make_partitioned_snapshot():
     original_manifest, original = make_snapshot(response_length=4)
     layout = plan_capture_layout(
