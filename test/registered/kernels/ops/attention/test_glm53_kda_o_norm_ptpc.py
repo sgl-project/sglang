@@ -13,7 +13,11 @@ from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=300, suite="jit-kernel-unit-test-amd")
+register_amd_ci(
+    est_time=300,
+    stage="stage-b",
+    runner_config="1-gpu-small-amd-mi35x",
+)
 
 
 @unittest.skipUnless(
