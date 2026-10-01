@@ -1711,8 +1711,8 @@ class ServingChatTestCase(CustomTestCase):
         )
         self.chat = OpenAIServingChat(self.tm, self.template_manager)
         call = (
-            'to=get_weather<|channel|>analysis<|message|><rfl:parameter name="city">'
-            "\nParis\n</rfl:parameter>"
+            "to=get_weather<|channel|>analysis <|constrain|>xml<|message|>"
+            '<rfl:parameter name="city">\nParis\n</rfl:parameter>'
         )
         full_call = "<|start|>assistant " + call
         thought = "<|channel|>analysis<|message|>Plan<|end|>"
@@ -1725,9 +1725,14 @@ class ServingChatTestCase(CustomTestCase):
             (
                 "<|start|>assistant<|channel|>analysis<|message|>So",
                 False,
-                # The call closer <|end|> is also Beam's think closer; a value
-                # must not hold it.
-                {full_call: True, full_call.replace("Paris", "Pa<|end|>ris"): False},
+                # The reasoning closer already wrote <|start|>assistant, and a
+                # value must not hold a call closer.
+                {
+                    " " + call: True,
+                    full_call: False,
+                    " "
+                    + call.replace("Paris", "Pa<|end|><|start|>assistantris"): False,
+                },
             ),
         ):
             for tool_choice, strict in (

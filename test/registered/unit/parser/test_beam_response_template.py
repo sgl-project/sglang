@@ -121,43 +121,39 @@ class TestBeamResponseTemplate(CustomTestCase):
         self.assertEqual(json.loads(calls[0].parameters), {"city": "Paris"})
         self.assertEqual(json.loads(calls[1].parameters), {"hour": 7})
 
-    def test_tool_call_accepts_constraint_marker_variants(self):
-        for constrain in (True, False):
-            with self.subTest(constrain=constrain):
-                parser = FunctionCallParser(
-                    tools=[_tool()],
-                    tool_call_parser="beam",
-                    prefix=PREFIX,
-                )
-                generation = _full_call(
-                    "get_weather",
-                    _parameter("city", "Paris"),
-                    constrain=constrain,
-                )
-
-                content, calls = parser.parse_non_stream(generation)
-
-                self.assertEqual(content, "")
-                self.assertEqual([call.name for call in calls], ["get_weather"])
-                self.assertEqual(
-                    json.loads(calls[0].parameters),
-                    {"city": "Paris"},
-                )
-
-    def test_declared_dotted_tool_name_is_kept(self):
+    def test_tool_call_requires_constraint_marker(self):
         parser = FunctionCallParser(
-            tools=[_tool("refl.search", {"query": {"type": "string"}})],
+            tools=[_tool()],
             tool_call_parser="beam",
             prefix=PREFIX,
         )
-
-        content, calls = parser.parse_non_stream(
-            _full_call("refl.search", _parameter("query", "weather"))
+        generation = _continuation_call(
+            "get_weather", _parameter("city", "Paris"), constrain=False
         )
 
-        self.assertEqual(content, "")
-        self.assertEqual([call.name for call in calls], ["refl.search"])
-        self.assertEqual(json.loads(calls[0].parameters), {"query": "weather"})
+        content, calls = parser.parse_non_stream(generation)
+
+        self.assertEqual(content, generation)
+        self.assertEqual(calls, [])
+
+    def test_declared_tool_names_are_kept(self):
+        for name in ("refl.search", "2fa_check"):
+            with self.subTest(name=name):
+                parser = FunctionCallParser(
+                    tools=[_tool(name, {"query": {"type": "string"}})],
+                    tool_call_parser="beam",
+                    prefix=PREFIX,
+                )
+                generation = _continuation_call(name, _parameter("query", "weather"))
+                _, tag = parser.get_structure_constraint("required")
+                grammar = Grammar.from_structural_tag(tag.model_dump_json())
+
+                content, calls = parser.parse_non_stream(generation)
+
+                self.assertTrue(_is_grammar_accept_string(grammar, generation))
+                self.assertEqual(content, "")
+                self.assertEqual([call.name for call in calls], [name])
+                self.assertEqual(json.loads(calls[0].parameters), {"query": "weather"})
 
     def test_forced_tool_calls_use_template_grammar(self):
         """Forced calls after the reasoning follow the template grammar, which
@@ -168,23 +164,29 @@ class TestBeamResponseTemplate(CustomTestCase):
             tools=[_tool(), count], tool_call_parser="beam", prefix=PREFIX
         )
         weather = ("get_weather", {"city": "Paris"})
-        weather_call = _full_call("get_weather", _parameter("city", "Paris"))
+        weather_call = _continuation_call("get_weather", _parameter("city", "Paris"))
         cases = [
             ("required", weather_call, [weather]),
             (
                 "required",
-                _full_call("get_weather", _parameter("city", "Paris"), constrain=False),
-                [weather],
+                _continuation_call(
+                    "get_weather", _parameter("city", "Paris"), constrain=False
+                ),
+                None,
             ),
             (
                 "required",
-                _full_call(
+                _continuation_call(
                     "get_weather", _parameter("city", "Paris"), terminator="<|end|>"
                 )
                 + _full_call("set_count", _parameter("count", "7")),
                 [weather, ("set_count", {"count": 7})],
             ),
-            ("required", _full_call("set_count", _parameter("count", "x")), None),
+            (
+                "required",
+                _continuation_call("set_count", _parameter("count", "x")),
+                None,
+            ),
             ("required", PREFIX + "<|channel|>final<|message|>Paris<|return|>", None),
             (
                 ToolChoice(type="function", function={"name": "set_count"}),
@@ -198,10 +200,10 @@ class TestBeamResponseTemplate(CustomTestCase):
             ),
             (
                 ToolChoice(type="function", function={"name": "get_weather"}),
-                _full_call(
+                _continuation_call(
                     "get_weather", _parameter("city", "Paris"), terminator="<|end|>"
                 )
-                + weather_call,
+                + _full_call("get_weather", _parameter("city", "Paris")),
                 None,
             ),
         ]
@@ -292,7 +294,7 @@ class TestBeamResponseTemplate(CustomTestCase):
 
         def call(n: str, loc: str, either: str = "1") -> str:
             arguments = {"n": n, "loc": loc, "either": either, "name": "Paris"}
-            return _full_call(
+            return _continuation_call(
                 "set_level", "".join(_parameter(k, v) for k, v in arguments.items())
             )
 
@@ -343,14 +345,15 @@ class TestBeamResponseTemplate(CustomTestCase):
         grammar = Grammar.from_structural_tag(tag.model_dump_json())
         city = _parameter("city", "ab")
         cases = [
-            ("get_weather", _parameter("city", "a<|end|>b"), None),
+            ("get_weather", _parameter("city", "a<|end|><|start|>assistantb"), None),
+            ("get_weather", _parameter("city", "a<|end|>b"), {"city": "a<|end|>b"}),
             ("get_weather", city, {"city": "ab"}),
             (
                 "get_weather",
                 city + _parameter("a<|end|>b", "x"),
                 {"city": "ab", "a<|end|>b": "x"},
             ),
-            ("set_note", _parameter("text", "a<|end|>b"), None),
+            ("set_note", _parameter("text", "a<|end|><|start|>assistantb"), None),
             ("set_note", _parameter("text", "ab"), {"text": "ab"}),
             (
                 "set_place",
@@ -388,7 +391,7 @@ class TestBeamResponseTemplate(CustomTestCase):
 
         for name, body, arguments in cases:
             with self.subTest(name=name, body=body):
-                call = _full_call(name, body)
+                call = _continuation_call(name, body)
                 accepted = _is_grammar_accept_string(grammar, call)
 
                 self.assertIs(accepted, arguments is not None)
@@ -406,7 +409,7 @@ class TestBeamResponseTemplate(CustomTestCase):
         )
         _, tag = parser.get_structure_constraint("required")
         grammar = Grammar.from_structural_tag(tag.model_dump_json())
-        framed = _full_call("set_mode", _parameter("mode", "\nab"))
+        framed = _continuation_call("set_mode", _parameter("mode", "\nab"))
         _, parsed = parser.parse_non_stream(framed)
 
         self.assertTrue(_is_grammar_accept_string(grammar, framed))
@@ -414,7 +417,25 @@ class TestBeamResponseTemplate(CustomTestCase):
         # Read back as "ab".
         bare = framed.replace("\n\nab\n", "\nab")
         self.assertFalse(_is_grammar_accept_string(grammar, bare))
-        for choice in ("a</rfl:parameter>b", "a<|end|>b"):
+        # Only the closer after a newline ends the value.
+        closer = _tool(
+            "set_mode", {"mode": {"type": "string", "enum": ["a</rfl:parameter>b"]}}
+        )
+        closer.function.strict = True
+        parser = FunctionCallParser(
+            tools=[closer], tool_call_parser="beam", prefix=PREFIX
+        )
+        _, tag = parser.get_structure_constraint("required")
+        grammar = Grammar.from_structural_tag(tag.model_dump_json())
+        framed = _continuation_call(
+            "set_mode", _parameter("mode", "a</rfl:parameter>b")
+        )
+        _, parsed = parser.parse_non_stream(framed)
+        self.assertTrue(_is_grammar_accept_string(grammar, framed))
+        self.assertEqual(
+            json.loads(parsed[0].parameters), {"mode": "a</rfl:parameter>b"}
+        )
+        for choice in ("a\n</rfl:parameter>b", "a<|end|><|start|>assistantb"):
             with self.subTest(choice=choice):
                 tool = _tool("set_mode", {"mode": {"type": "string", "enum": [choice]}})
                 tool.function.strict = True
@@ -423,7 +444,7 @@ class TestBeamResponseTemplate(CustomTestCase):
                 kind, _ = parser.get_structure_constraint("required")
 
                 self.assertEqual(kind, "json_schema")
-        named = _tool("set_mode", {"a<|end|>b": {"type": "string"}})
+        named = _tool("set_mode", {"a<|end|><|start|>assistantb": {"type": "string"}})
         named.function.strict = True
         with self.assertRaisesRegex(ValueError, "parameter name"):
             FunctionCallParser(
@@ -433,15 +454,15 @@ class TestBeamResponseTemplate(CustomTestCase):
     def test_strict_tools_constrain_automatic_tool_choice(self):
         count = _tool("set_count", {"count": {"type": "integer"}})
         count.function.strict = True
-        answer = PREFIX + "<|channel|>final<|message|>Sunny."
+        answer = "<|channel|>final<|message|>Sunny."
         cases = [
-            (_full_call("get_weather", _parameter("city", "P")), True),
+            (_continuation_call("get_weather", _parameter("city", "P")), True),
             (answer + "<|return|>", True),
             (
                 answer + "<|end|>" + _full_call("get_weather", _parameter("city", "P")),
                 False,
             ),
-            (_full_call("set_count", _parameter("count", "x")), False),
+            (_continuation_call("set_count", _parameter("count", "x")), False),
         ]
 
         self.assertIsNone(
