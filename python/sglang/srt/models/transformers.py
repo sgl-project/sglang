@@ -625,6 +625,11 @@ class TransformersBase(nn.Module):
                     torch_dtype=torch.get_default_dtype(),
                     trust_remote_code=True,
                 )
+                inner = getattr(self.model, "model", None)
+                if isinstance(inner, torch.nn.Module) and hasattr(
+                    self.model, "lm_head"
+                ):
+                    self.model = inner
         else:
             raise ValueError(
                 f"Model {model_cls} does not support custom attention backends "
@@ -671,13 +676,15 @@ class TransformersBase(nn.Module):
 
     def _init_parameters(self, module: nn.Module):
         """Materialize any parameters still on the meta device."""
+        target_dtype = torch.get_default_dtype()
         for name, param in module.named_parameters(recurse=False):
             if param.device == torch.device("meta"):
+                new_dtype = (
+                    target_dtype if torch.is_floating_point(param) else param.dtype
+                )
                 new_param = nn.Parameter(
-                    torch.empty_like(
-                        param.data,
-                        device=get_device(),
-                    )
+                    torch.empty(param.shape, dtype=new_dtype, device=get_device()),
+                    requires_grad=param.requires_grad,
                 )
                 setattr(module, name, new_param)
         for child in module.children():
@@ -1360,6 +1367,7 @@ class MultiModalMixin:
                 WeightsMapper(
                     orig_to_new_prefix={
                         "vision_tower.vision_model.": "model.vision_tower.",
+                        "model.vision_tower.vision_model.": "model.vision_tower.",
                     }
                 )
                 | self.weight_mapper
