@@ -34,10 +34,13 @@ Threshold: 0.92 follows this repo's `measured - 0.05` convention for sgl-eval
 gsm8k thresholds and matches the gfx950 gate, so the two arches stay directly
 comparable.
 
-Runtime: the 328 GB checkpoint has taken 2769-4143 s to load from this pool's
-shared cache, on top of the eval above. The workflow allows 18000 s. If that
-ever proves tight, prefer raising it over trimming the eval: a full-split score
-is what makes this arch's number comparable to the gfx950 one.
+Runtime: the 328 GB checkpoint has taken 2769-4650 s to load from this pool's
+shared cache, and the eval 1333-2374 s on top of that. In run 36678520753 the
+first launch on all three images was still loading at 5400 s and only the CI's
+online retry brought the server up, so the launch timeout below is 9000 s. The
+workflow allows 18000 s. If that ever proves tight, prefer raising it over
+trimming the eval: a full-split score is what makes this arch's number
+comparable to the gfx950 one.
 
 Eval harness: sgl-eval's gsm8k through run_sgl_eval, rather than the legacy
 few-shot scorer that run_combined_tests routes gsm8k to, because
@@ -64,12 +67,10 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-# Register for AMD CI - MI30x GLM-5.3-Flash accuracy test. A cold-cache load
-# of the 328 GB checkpoint has measured up to 4143 s and the full-split eval
-# adds roughly 900 s on the AITER MoE runner; 9000 s leaves room for a slower
-# image on top of that.
+# Register for AMD CI - MI30x GLM-5.3-Flash accuracy test. The 9000 s launch
+# budget below plus the slowest full-split eval measured (2374 s).
 register_amd_ci(
-    est_time=9000,
+    est_time=11400,
     suite="nightly-amd-accuracy-8-gpu-glm53-flash",
     nightly=True,
 )
@@ -79,7 +80,8 @@ BASELINE_ACCURACY = 0.92
 
 # Fetching and loading a 328 GB checkpoint against a cold cache is what this
 # budget has to cover; the default launch timeout is nowhere near enough.
-SERVER_LAUNCH_TIMEOUT = 5400
+# Loads have measured up to 4650 s, and a first launch has run past 5400 s.
+SERVER_LAUNCH_TIMEOUT = 9000
 
 
 class TestGLM53FlashEvalMI30x(unittest.TestCase):

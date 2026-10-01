@@ -1966,7 +1966,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
       # Measured 4419 s on rocm10, 2769 s of it loading the 328 GB checkpoint;
-      # this pool's shared cache has taken up to 4143 s for that load alone.
+      # this pool's shared cache has taken up to 4650 s for that load alone.
       # 18000 s leaves room for a slower image or a cold cache.
       - name: Accuracy Test ROCm (8-GPU GLM-5.3-Flash DSA+KDA)
         timeout-minutes: 360
