@@ -72,7 +72,7 @@ def speculative_sampling_block_kernel(
     VOCAB_SIZE: tl.constexpr,
     BLOCK_V: tl.constexpr,
 ):
-    """Block verification (arXiv:2403.10444, Algorithm 2).
+    """Block verification (arXiv:2403.10444, Algorithm 3).
 
     Per-request kernel over a linear (topk=1) chain of gamma = NUM_SLOTS - 1
     drafted tokens; same tensor contract as speculative_sampling_classic_kernel.

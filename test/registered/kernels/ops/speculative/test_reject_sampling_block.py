@@ -4,7 +4,7 @@ register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-s
 
 """Tests for speculative_sampling_block_kernel (block verification).
 
-Paper: https://arxiv.org/abs/2403.10444, Algorithm 2:
+Paper: https://arxiv.org/abs/2403.10444, Algorithm 3:
 h_i = Z_{i+1} / (Z_{i+1} + 1 - p_i), tau = argmax_i {coin_i < h_i}.
 """
 
@@ -27,7 +27,7 @@ _SENTINEL = 999999
 def block_verify_reference(
     candidates, target_probs, draft_probs, coins, coin_final, vocab_size
 ):
-    """Vectorized torch reference of Algorithm 2 (arXiv:2403.10444).
+    """Vectorized torch reference of Algorithm 3 (arXiv:2403.10444).
 
     Returns (accept_token_num, predict_map) in the kernel's slot layout:
     slot k < tau holds draft k+1, slot tau holds the final token, untouched

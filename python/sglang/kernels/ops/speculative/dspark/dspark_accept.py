@@ -14,7 +14,6 @@ from sglang.kernels.ops.speculative.reject_sampling import (
 )
 from sglang.srt.runtime_context import get_spec
 
-
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
