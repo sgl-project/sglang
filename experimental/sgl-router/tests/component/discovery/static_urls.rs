@@ -130,8 +130,9 @@ async fn static_urls_pd_role_resolved_end_to_end() {
         observability: ObservabilityConfig::default(),
         model: sgl_router::config::ModelConfig {
             id: "tiny".into(),
-            tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+            tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),
             disable_input_ids_forwarding: false,
+            tokenizer: Default::default(),
             policy: sgl_router::config::PolicyKind::RoundRobin,
             decode_policy: Default::default(),
             bucket_config: None,
@@ -142,6 +143,7 @@ async fn static_urls_pd_role_resolved_end_to_end() {
             fused: None,
             eligibility: None,
             sampling_overrides: Default::default(),
+            default_chat_template_kwargs: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec![url.clone()],

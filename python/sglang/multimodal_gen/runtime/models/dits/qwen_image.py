@@ -919,6 +919,7 @@ class QwenImageCrossAttention(nn.Module):
             if (
                 self._unquantized_added_qkv_is_packed
                 and not qwen_image_added_qkv_active(self)
+                and isinstance(self.to_added_qkv, MergedColumnParallelLinear)
             ):
                 return _split_unquantized_merged_linear(
                     self.to_added_qkv, encoder_hidden_states
