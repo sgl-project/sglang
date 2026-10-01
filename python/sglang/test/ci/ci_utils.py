@@ -264,6 +264,8 @@ def run_unittest_files(
             if timeout_per_file is not None
             else derive_timeout_per_file(estimated_time)
         )
+        if isinstance(file, CIRegistry) and file.timeout is not None:
+            file_timeout = file.timeout
 
         process = None
         output_lines = []

@@ -7,7 +7,7 @@ import torch
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_xpu_ci(est_time=30, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=30, suite="stage-b-test-1-gpu-xpu", timeout=120)
 
 
 class TestGemma4RMSNormXPU(CustomTestCase):

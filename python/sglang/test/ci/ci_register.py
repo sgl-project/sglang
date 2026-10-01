@@ -22,9 +22,9 @@ __all__ = [
 
 # `suite` stays in positional slot 2 for backward compat with existing
 # `register_cpu_ci(5, "base-a-test-cpu")` style positional calls. New fields
-# (`stage`, `runner_config`) are kwarg-only.
+# (`stage`, `runner_config`, `timeout`) are kwarg-only.
 _PARAM_ORDER = ("est_time", "suite", "nightly", "disabled")
-_KWARG_ONLY = ("stage", "runner_config")
+_KWARG_ONLY = ("stage", "runner_config", "timeout")
 _ALL_PARAMS = _PARAM_ORDER + _KWARG_ONLY
 _UNSET = object()
 
@@ -51,6 +51,8 @@ class CIRegistry:
     suite: Optional[str] = None
     nightly: bool = False
     disabled: Optional[str] = None
+    # Per-file time limit in seconds; overrides --timeout-per-file when set.
+    timeout: Optional[float] = None
 
     @property
     def effective_suite(self) -> Optional[str]:
@@ -67,6 +69,7 @@ def register_cpu_ci(
     *,
     stage: Optional[str] = None,
     runner_config: Optional[str] = None,
+    timeout: Optional[float] = None,
 ):
     """Marker for CPU CI registration (parsed via AST; runtime no-op)."""
     return None
@@ -80,6 +83,7 @@ def register_cuda_ci(
     *,
     stage: Optional[str] = None,
     runner_config: Optional[str] = None,
+    timeout: Optional[float] = None,
 ):
     """Marker for CUDA CI registration (parsed via AST; runtime no-op)."""
     return None
@@ -93,6 +97,7 @@ def register_amd_ci(
     *,
     stage: Optional[str] = None,
     runner_config: Optional[str] = None,
+    timeout: Optional[float] = None,
 ):
     """Marker for AMD CI registration (parsed via AST; runtime no-op)."""
     return None
@@ -106,6 +111,7 @@ def register_npu_ci(
     *,
     stage: Optional[str] = None,
     runner_config: Optional[str] = None,
+    timeout: Optional[float] = None,
 ):
     """Marker for NPU CI registration (parsed via AST; runtime no-op)."""
     return None
@@ -119,6 +125,7 @@ def register_xpu_ci(
     *,
     stage: Optional[str] = None,
     runner_config: Optional[str] = None,
+    timeout: Optional[float] = None,
 ):
     """Marker for XPU CI registration (parsed via AST; runtime no-op)."""
     return None
@@ -132,6 +139,7 @@ def register_musa_ci(
     *,
     stage: Optional[str] = None,
     runner_config: Optional[str] = None,
+    timeout: Optional[float] = None,
 ):
     """Marker for MUSA CI registration (parsed via AST; runtime no-op)."""
     return None
@@ -145,6 +153,7 @@ def register_mlx_ci(
     *,
     stage: Optional[str] = None,
     runner_config: Optional[str] = None,
+    timeout: Optional[float] = None,
 ):
     """Marker for MLX CI registration (parsed via AST; runtime no-op)."""
     return None
@@ -264,6 +273,16 @@ class RegistryVisitor(ast.NodeVisitor):
                 f"{self.filename}: disabled must be a string in {func_call.func.id}()"
             )
 
+        timeout = args["timeout"] if args["timeout"] is not _UNSET else None
+        if timeout is not None and (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or timeout <= 0
+        ):
+            raise ValueError(
+                f"{self.filename}: timeout must be a positive number in {func_call.func.id}()"
+            )
+
         return {
             "est_time": float(est_time),
             "stage": stage,
@@ -271,6 +290,7 @@ class RegistryVisitor(ast.NodeVisitor):
             "suite": suite,
             "nightly": nightly,
             "disabled": disabled,
+            "timeout": float(timeout) if timeout is not None else None,
         }
 
     def _collect_ci_registry(self, func_call: ast.Call):

@@ -20,7 +20,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=9, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=30, suite="extra-a-test-1-gpu-small-amd")
-register_xpu_ci(est_time=30, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=30, suite="stage-b-test-1-gpu-xpu", timeout=120)
 
 
 def _make_static_plan_input(*, bs_capacity: int, device) -> PlanInput:
