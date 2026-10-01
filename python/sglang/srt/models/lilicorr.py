@@ -10,6 +10,7 @@ from torch import nn
 from sglang.kernels.ops.speculative.lilicorr import lilicorr_sample_path
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4A16LinearMethod
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.speculative.lilicorr_utils import (
     LiLiCorrConfig,
@@ -18,6 +19,12 @@ from sglang.srt.speculative.lilicorr_utils import (
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
+
+
+def _apply_2d(layer: ReplicatedLinear, x: torch.Tensor) -> torch.Tensor:
+    # Quantized linear methods take [tokens, features] input.
+    out, _ = layer(x.reshape(-1, x.shape[-1]))
+    return out.view(*x.shape[:-1], -1)
 
 
 class LiLiCorrMLP(nn.Module):
@@ -39,9 +46,7 @@ class LiLiCorrMLP(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x, _ = self.up_proj(x)
-        x, _ = self.down_proj(F.silu(x))
-        return x
+        return _apply_2d(self.down_proj, F.silu(_apply_2d(self.up_proj, x)))
 
 
 class LiLiCorrLatticeAttention(nn.Module):
@@ -80,10 +85,8 @@ class LiLiCorrLatticeAttention(nn.Module):
         v = v.view(shape).transpose(1, 2)
         # attention_bias is [1, heads, L, L]; SDPA broadcasts it over the batch.
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_bias)
-        out, _ = self.out_proj(
-            out.transpose(1, 2).reshape(bsz, seq_len, self.hidden_size)
-        )
-        return out
+        out, _ = self.out_proj(out.transpose(1, 2).reshape(-1, self.hidden_size))
+        return out.view(bsz, seq_len, self.hidden_size)
 
 
 class LiLiCorrLayer(nn.Module):
@@ -298,7 +301,7 @@ class LiLiCorrHead(nn.Module):
         self, anchor_hidden: torch.Tensor, anchor_valid: torch.Tensor
     ) -> torch.Tensor:
         # Branch-free so there is no host sync inside the captured region.
-        anchor, _ = self.context_proj(anchor_hidden)
+        anchor = _apply_2d(self.context_proj, anchor_hidden)
         return anchor * anchor_valid.unsqueeze(-1).to(anchor.dtype)
 
     def score(
@@ -327,9 +330,8 @@ class LiLiCorrHead(nn.Module):
 
         token_states = token_embeddings
         if not already_projected and self.token_proj is not None:
-            token_states, _ = self.token_proj(token_embeddings)
-        pass_states, _ = self.pass_hidden_proj(pass_hidden)
-        pass_states = pass_states.unsqueeze(-2)
+            token_states = _apply_2d(self.token_proj, token_embeddings)
+        pass_states = _apply_2d(self.pass_hidden_proj, pass_hidden).unsqueeze(-2)
 
         log_probs = candidate_log_probs.float()
         features = torch.stack(
@@ -374,8 +376,9 @@ class LiLiCorrHead(nn.Module):
             dim=-1,
             eps=self.vector_eps,
         ).unbind(-2)
-        anchor_out, _ = self.anchor_out_head(anchor_state)
-        anchor_out = F.normalize(anchor_out, dim=-1, eps=self.vector_eps)
+        anchor_out = F.normalize(
+            _apply_2d(self.anchor_out_head, anchor_state), dim=-1, eps=self.vector_eps
+        )
 
         start_scores = (anchor_out[:, :, None, :] * in_vec[:, :, 0, :, :]).sum(dim=-1)
         pair_scores = torch.matmul(
@@ -438,9 +441,15 @@ def check_head_weight_coverage(head: LiLiCorrHead, seen: set) -> None:
     # The base loader silently drops unresolved weights, which would only show
     # up as a lower acceptance length.
     expected = {f"lilicorr.{name}" for name, _ in head.named_parameters()}
-    # Weight-only schemes register an input_scale the checkpoint does not carry.
-    required = {name for name in expected if not name.endswith(".input_scale")}
-    missing = sorted(required - seen)
+    # NVFP4 W4A16 registers an input_scale it never reads; checkpoints omit it.
+    optional = {
+        f"lilicorr.{name}.input_scale"
+        for name, module in head.named_modules()
+        if isinstance(
+            getattr(module, "quant_method", None), ModelOptNvFp4A16LinearMethod
+        )
+    }
+    missing = sorted(expected - optional - seen)
     if missing:
         raise ValueError(
             f"LiLiCorr checkpoint is missing {len(missing)} head parameters "
