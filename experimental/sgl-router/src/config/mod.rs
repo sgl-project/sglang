@@ -44,6 +44,11 @@ impl Config {
     /// Validate invariants not enforced by the CLI parser.
     pub(crate) fn validate(&self) -> Result<()> {
         ensure!(!self.model.id.is_empty(), "model id must be non-empty");
+        // Policies that read the prompt are checked against the built routing at startup.
+        ensure!(
+            self.model.tokenizer_path.is_some() || self.model.bucket_config.is_none(),
+            "--no-tokenizer is incompatible with --bucket-config"
+        );
         if let Some(bucket_config) = self.model.bucket_config.as_ref() {
             validate_bucket_config(bucket_config)?;
         }
@@ -60,6 +65,25 @@ impl Config {
              can check it against the pod's real budget",
             self.server.shutdown_drain_secs,
         );
+        if let Some(cache) = self.model.cache_aware.as_ref() {
+            let ms = cache.bootstrap_timeout_ms;
+            ensure!(
+                ms > 0,
+                "--kv-bootstrap-timeout-ms must be greater than zero; to boot cold, \
+                 leave --kv-peer-selector unset"
+            );
+            ensure!(
+                ms <= MAX_KV_BOOTSTRAP_TIMEOUT_MS,
+                "--kv-bootstrap-timeout-ms {ms} exceeds the {MAX_KV_BOOTSTRAP_TIMEOUT_MS}ms ceiling"
+            );
+            let cap = cache.bootstrap_fetch_timeout_cap_ms;
+            ensure!(
+                (MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS..=MAX_KV_BOOTSTRAP_TIMEOUT_MS)
+                    .contains(&cap),
+                "--kv-bootstrap-fetch-timeout-cap-ms {cap} is out of range \
+                 ({MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS}..={MAX_KV_BOOTSTRAP_TIMEOUT_MS}ms)"
+            );
+        }
         match &self.discovery {
             DiscoveryBackend::StaticUrls(s) => {
                 ensure!(
@@ -224,10 +248,12 @@ mod tests {
             observability: ObservabilityConfig::default(),
             model: ModelConfig {
                 id: model_id.into(),
-                tokenizer_path: "/tmp/tok.json".into(),
+                tokenizer_path: Some("/tmp/tok.json".into()),
                 disable_input_ids_forwarding: false,
+                tokenizer: Default::default(),
                 policy: PolicyKind::RoundRobin,
                 decode_policy: DecodePolicyKind::PowerOfTwo,
+                dp_aware: false,
                 bucket_config: None,
                 circuit_breaker: None,
                 cache_aware: None,
@@ -236,6 +262,7 @@ mod tests {
                 fused: None,
                 eligibility: None,
                 sampling_overrides: Default::default(),
+                default_chat_template_kwargs: Default::default(),
             },
             discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
                 urls: urls.iter().map(|s| s.to_string()).collect(),
@@ -248,6 +275,20 @@ mod tests {
     #[test]
     fn accepts_minimal_static_config() {
         cfg("qwen3", &["http://10.0.0.1:30000"]).validate().unwrap();
+    }
+
+    #[test]
+    fn disabled_tokenizer_rejects_length_buckets() {
+        let mut c = cfg("qwen3", &["http://10.0.0.1:30000"]);
+        c.model.tokenizer_path = None;
+        c.validate().unwrap();
+        c.model.bucket_config = Some(BucketConfig {
+            buckets: vec![],
+            ttft_slo_policy: SloBucketPolicy::Disabled,
+            tps_slo_policy: SloBucketPolicy::Disabled,
+        });
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("--no-tokenizer"), "{err}");
     }
 
     #[test]

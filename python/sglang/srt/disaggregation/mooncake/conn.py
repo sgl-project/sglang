@@ -777,6 +777,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_layer_ids: Optional[List[int]] = None,
         dst_device_data_indices: Optional[npt.NDArray[np.int32]] = None,
         dst_device_data_ptrs: Optional[set[int]] = None,
+        dst_item_lens: list[int] | None = None,
+        bootstrap_room: Optional[int] = None,
     ) -> int:
         """
         Generic KV cache transfer supporting both MHA and MLA architectures.
@@ -828,6 +830,21 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     len(dst_data_ptrs),
                     allow_positional_fallback=self.pp_size == 1,
                 )
+                if dst_item_lens is not None:
+                    for i, j in pairs:
+                        if item_lens[i] != dst_item_lens[j]:
+                            assert bootstrap_room is not None
+                            failure_reason = (
+                                f"{state_type} item length mismatch for paired "
+                                f"entries src[{i}]={item_lens[i]} "
+                                f"dst[{j}]={dst_item_lens[j]}"
+                            )
+                            logger.error(failure_reason)
+                            self.conclude_failure(
+                                bootstrap_room=bootstrap_room,
+                                failure_reason=failure_reason,
+                            )
+                            return -1
                 layers_params = [
                     (src_data_ptrs[i], dst_data_ptrs[j], item_lens[i]) for i, j in pairs
                 ]
@@ -837,6 +854,24 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         src_data_ptrs, dst_data_ptrs, state_type
                     )
                 )
+                if dst_item_lens is not None:
+                    _, mapped_dst_lens, _ = self.get_mla_kv_ptrs_with_pp(
+                        item_lens, dst_item_lens, state_type
+                    )
+                    for layer_id in range(layers_current_pp_stage):
+                        if item_lens[layer_id] != mapped_dst_lens[layer_id]:
+                            assert bootstrap_room is not None
+                            failure_reason = (
+                                f"{state_type} item length mismatch for positional "
+                                f"entry {layer_id}: prefill={item_lens[layer_id]} "
+                                f"decode={mapped_dst_lens[layer_id]}"
+                            )
+                            logger.error(failure_reason)
+                            self.conclude_failure(
+                                bootstrap_room=bootstrap_room,
+                                failure_reason=failure_reason,
+                            )
+                            return -1
                 layers_params = [
                     (
                         src_kv_ptrs[layer_id],
@@ -1359,10 +1394,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         each page to ensure correctness for any page_size and head-slicing configuration.
         This may introduce performance overhead (increased TTFT) for long sequences.
         """
+        from sglang.srt.disaggregation.common.staging_buffer import (
+            compute_head_slice_params,
+        )
+
         # Extract configuration
-        local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
         src_kv_item_len = self.kv_args.kv_item_lens[0]
-        dst_tp_rank_in_group = dst_tp_rank % dst_attn_tp_size
         page_size = self.kv_args.page_size
 
         # Use total KV head count (not per-rank) for correct head distribution.
@@ -1371,36 +1408,23 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if total_kv_heads <= 0:
             total_kv_heads = self.kv_args.kv_head_num * self.attn_tp_size
 
-        src_heads_per_rank = max(1, total_kv_heads // self.attn_tp_size)
         dst_heads_per_rank = max(1, total_kv_heads // dst_attn_tp_size)
         bytes_per_head_slice_to_send = (
             dst_kv_item_len // page_size // dst_heads_per_rank
         )
 
-        # GQA replication: how many prefill ranks share the same KV head
-        src_replication = max(1, self.attn_tp_size // total_kv_heads)
-
-        # Determine slicing parameters based on TP configuration
-        if self.attn_tp_size > dst_attn_tp_size:
-            # Send KVCache from multiple prefill instances to 1 decode instance
-            src_head_start_offset = 0
-            num_heads_to_send = src_heads_per_rank
-            unique_head_idx = local_tp_rank_in_group // src_replication
-            dst_head_start_offset = (
-                unique_head_idx * src_heads_per_rank
-            ) % dst_heads_per_rank
-        else:
-            # Send KVCache from 1 prefill instance to multiple decode instances
-            # GQA replication (total_kv_heads < dst_attn_tp_size): consecutive decode
-            # ranks share one KV head (QKVParallelLinear: tp_rank // num_kv_head_replicas),
-            # so map by integer division NOT modulo or ranks 1..r-1 fetch the wrong head.
-            dst_replication = max(1, dst_attn_tp_size // total_kv_heads)
-            unique_dst_head_idx = dst_tp_rank_in_group // dst_replication
-            src_head_start_offset = (
-                unique_dst_head_idx * dst_heads_per_rank
-            ) % src_heads_per_rank
-            num_heads_to_send = dst_heads_per_rank
-            dst_head_start_offset = 0
+        (
+            src_head_start_offset,
+            num_heads_to_send,
+            dst_head_start_offset,
+            _,
+        ) = compute_head_slice_params(
+            self.attn_tp_size,
+            dst_attn_tp_size,
+            self.kv_args.engine_rank,
+            dst_tp_rank,
+            total_kv_heads,
+        )
 
         src_data_ptrs = self.kv_args.kv_data_ptrs
         src_layer_ids = self.kv_args.kv_layer_ids
@@ -1777,7 +1801,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     raise RuntimeError(
                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."
                     )
-                if has_heterogeneous_attn_tp and is_qwen4_qsa_state:
+                if is_qwen4_qsa_state and target_rank_registration_info is not None:
+                    # Reject QSA state layout mismatches up front.
                     if len(dst_item_lens) != len(dst_data_ptrs):
                         raise RuntimeError(
                             f"Replicated {st.upper()} destination pointer/item-length "
@@ -1802,6 +1827,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             "prefill and decode entries: "
                             f"{layout_mismatches}"
                         )
+                if has_heterogeneous_attn_tp and is_qwen4_qsa_state:
                     local_tp_rank_in_group = (
                         self.kv_args.engine_rank % self.attn_tp_size
                     )
@@ -1860,9 +1886,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         ),
                         src_layer_ids=src_state_layer_ids,
                         dst_layer_ids=dst_state_layer_ids,
+                        dst_item_lens=dst_item_lens,
+                        bootstrap_room=req.room,
                     )
                     or rc
                 )
+                if self.request_status.get(req.room, KVPoll.Failed) == KVPoll.Failed:
+                    return rc
             elif st in (StateType.MINIMAX_INDEX_K, StateType.MINIMAX_DENSE_KV):
                 # Compacted layer lists require equal TP and PP=1 on both peers.
                 if self.pp_size is not None and self.pp_size > 1:
@@ -2338,6 +2368,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     executor,
                                     target_rank_registration_info,
                                 )
+                                if (
+                                    self.request_status.get(
+                                        kv_chunk.room, KVPoll.Failed
+                                    )
+                                    == KVPoll.Failed
+                                ):
+                                    break
                                 if state_rc != 0:
                                     with self.session_lock:
                                         self.session_failures[

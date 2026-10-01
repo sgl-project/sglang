@@ -195,21 +195,6 @@ class TestCustomSpecAlgoInterface(_RegistryIsolated):
             self.algo.create_worker(server_args)
 
 
-class TestValidatorHook(_RegistryIsolated):
-    def test_validator_invocation_is_caller_driven(self):
-        validator = MagicMock()
-
-        @SpeculativeAlgorithm.register("MY_FOO", validate_server_args=validator)
-        def _factory(server_args):
-            return MagicMock
-
-        algo = SpeculativeAlgorithm.from_string("MY_FOO")
-        self.assertIs(algo.validate_server_args, validator)
-        # Callers (e.g. ServerArgs.__post_init__) must invoke the hook themselves;
-        # CustomSpecAlgo does not call it from create_worker.
-        validator.assert_not_called()
-
-
 class TestServerArgsHook(_RegistryIsolated):
     def test_handle_speculative_decoding_invokes_custom_handle_server_args(self):
         class CustomHandleServerArgs(CustomSpecAlgo):

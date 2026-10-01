@@ -293,6 +293,7 @@ def decode_fp8_2buff(
     attn_sink: torch.Tensor,  # [H] fp32
     v_head_dim: int,
     qo_indptr: Optional[torch.Tensor] = None,
+    max_seqlen_q: int = 1,
     num_kv_splits: Optional[int] = None,
     compress_ratio: Optional[int] = None,
 ) -> torch.Tensor:
@@ -310,6 +311,9 @@ def decode_fp8_2buff(
 
     ``compress_ratio`` names the stream (0 SWA, 4 CSA, 128 HCA) so the split
     count past 40 tokens can fit the stream; None keeps the fixed 4.
+
+    ``max_seqlen_q`` above 1 puts several q rows in one tile, which the v4
+    dispatcher serves for gqa=16 at 1, 2 and 4 off the same 64-row tile.
     """
     from aiter.mla import mla_decode_fwd_v4_nm
 
@@ -339,24 +343,21 @@ def decode_fp8_2buff(
 
     if qo_indptr is None:
         qo_indptr = decode_qo_indptr(T, q.device)
-    # num_seqs comes from qo_indptr.numel()-1 and the kernel writes
-    # num_seqs * max_seqlen_q rows into `out`, so both have to be sized off q's
-    # own T. A qo_indptr built from a padded token count writes past `out`.
-    assert qo_indptr.shape[0] >= T + 1, (
-        f"qo_indptr holds {qo_indptr.shape[0]} entries, kernel reads {T + 1}"
+    n_seq = qo_indptr.shape[0] - 1
+    assert kv_indptr.shape[0] >= n_seq + 1, (
+        f"kv_indptr holds {kv_indptr.shape[0]} entries, kernel reads {n_seq + 1}"
     )
-    assert kv_indptr.shape[0] >= T + 1, (
-        f"kv_indptr holds {kv_indptr.shape[0]} entries, kernel reads {T + 1}"
-    )
-    qo_indptr = qo_indptr[: T + 1]
 
     rows = unified_kv.shape[0]
-    out = q_rope.new_empty((T, H, v_head_dim))
+    out = q_rope.new_empty((n_seq * max_seqlen_q, H, v_head_dim))
     # Left None, the wrapper's occupancy heuristic picks it, folds the cross-split
     # merge back into `out`, and leaves the final bf16 there whether or not it
     # split. Pinning it to 1 costs 6.9x at bs=1 kv=2048.
-    if num_kv_splits is None and T > _DECODE_SPLIT_TAIL_MIN_TOKENS:
-        num_kv_splits = _decode_fp8_tail_splits(T, compress_ratio)
+    # Sequences, not tokens: the wave-fitting rule counts the workgroups the
+    # kernel launches, which is n_seq x splits. They are the same number on the
+    # per-token path and differ once q rows share a tile.
+    if num_kv_splits is None and n_seq > _DECODE_SPLIT_TAIL_MIN_TOKENS:
+        num_kv_splits = _decode_fp8_tail_splits(n_seq, compress_ratio)
     mla_decode_fwd_v4_nm(
         q,
         q_rope,
@@ -366,7 +367,7 @@ def decode_fp8_2buff(
         qo_indptr,
         kv_indptr,
         kv_indices,
-        1,  # max_seqlen_q; qo_indptr is per-token so every sequence is one token
+        max_seqlen_q,
         sink=attn_sink,
         num_kv_splits=num_kv_splits,
     )
@@ -374,7 +375,7 @@ def decode_fp8_2buff(
     # ReqToTokenPool reserves, so the builders can't emit a zero-length one, and
     # the compare + masked_fill_ was costing a launch per layer for it. One would
     # come back NaN now (all-sink denominator); the guard UT pins that.
-    return out
+    return out[:T]
 
 
 @triton.jit

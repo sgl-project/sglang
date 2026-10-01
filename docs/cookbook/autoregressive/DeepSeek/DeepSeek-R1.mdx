@@ -95,7 +95,7 @@ DeepSeek-R1 shares the same MoE architecture as DeepSeek-V3, so the same hardwar
 python3 -m sglang.compile_deep_gemm --model deepseek-ai/DeepSeek-R1 --tp 8 --trust-remote-code
 ```
 
-**Data Parallelism Attention (`--enable-dp-attention`):** Recommended for high-throughput scenarios. Use `--enable-dp-attention --tp 8 --dp 8` on a single 8-GPU node.
+**Data Parallelism Attention (`--attn-dp-size`):** Recommended for high-throughput scenarios. Use `--tp 8 --attn-dp-size 8` on a single 8-GPU node.
 
 **NCCL timeout:** If model loading is slow, increase: `--dist-timeout 3600`.
 
@@ -977,11 +977,13 @@ Document model accuracy on standard benchmarks:
 - Benchmark Command
 
 ```bash Command
-python3 benchmark/gsm8k/bench_sglang.py \
-  --num-shots 8 \
-  --num-questions 1316 \
-  --parallel 1316
+sgl-eval run gsm8k \
+  --base-url http://127.0.0.1:30000/v1 \
+  --num-examples 1319 \
+  --num-threads 1316
 ```
+
+Historical results below use the removed harness and are not measurements of the sgl-eval command above.
 
 **Test Results:**
 
