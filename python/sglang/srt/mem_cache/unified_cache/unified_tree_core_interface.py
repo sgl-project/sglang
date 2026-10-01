@@ -45,12 +45,18 @@ class EvictDeviceNextNodeResult(BaseEvictionResult):
 
     ``node_id`` selects a leaf for the Controller to evict. ``made_progress``
     also covers an internal tombstone that returned no leaf, distinguishing it
-    from true walk exhaustion.
+    from true walk exhaustion. ``mamba_backup_node_id`` and
+    ``swa_backup_node_id`` pause an internal eviction until the Controller
+    finishes its best-effort host backup. ``swa_backup_num_tokens`` includes
+    all unbacked SWA segments in the backup window, not just the victim.
     """
 
     node_id: Optional[NodeId] = None
     made_progress: bool = False
     unbacked_tokens: int = 0
+    mamba_backup_node_id: Optional[NodeId] = None
+    swa_backup_node_id: Optional[NodeId] = None
+    swa_backup_num_tokens: int = 0
 
 
 class EvictDeviceLeafResult(BaseEvictionResult):
@@ -282,6 +288,15 @@ class UnifiedTreeCoreInterface(ABC):
         counts; the result carries the freed slots."""
         ...
 
+    def dec_window_lock_only(
+        self,
+        node_id: NodeId,
+        component_type: ComponentType,
+        params: DecLockRefParams,
+    ) -> DecSwaLockOnlyResult:
+        """Release one window's receipt without releasing peer components."""
+        raise NotImplementedError("This tree core does not support independent windows")
+
     # ==== Device eviction (driven step-wise by the Controller's evict()) ====
 
     @abstractmethod
@@ -308,6 +323,24 @@ class UnifiedTreeCoreInterface(ABC):
     ) -> EvictDeviceLeafResult:
         """Evict a leaf's device value; the result carries a BackupKV when a
         D->H backup must run (write_back) before the node can be demoted."""
+        ...
+
+    @abstractmethod
+    def finish_mamba_state_eviction(self, node_id: NodeId) -> EvictDeviceNextNodeResult:
+        """Resume the pending internal Mamba eviction after its backup attempt.
+
+        The controller must finish any submitted D->H transfer before calling.
+        A failed allocation still permits eviction to make device space.
+        """
+        ...
+
+    @abstractmethod
+    def finish_swa_state_eviction(self, node_id: NodeId) -> EvictDeviceNextNodeResult:
+        """Resume the pending internal SWA eviction after its backup attempt.
+
+        The controller must finish any submitted D->H transfer before calling.
+        A failed allocation still permits eviction to make device space.
+        """
         ...
 
     @abstractmethod
@@ -348,6 +381,10 @@ class UnifiedTreeCoreInterface(ABC):
     def component_evictable_size(self, component_type: ComponentType) -> int:
         """Evictable token count for one component (0 if the component is absent)."""
         ...
+
+    def component_protected_size(self, component_type: ComponentType) -> int:
+        """Protected token count for one component (0 if absent)."""
+        raise NotImplementedError("This tree core does not expose per-component sizes")
 
     @abstractmethod
     def full_evictable_size(self) -> int: ...
@@ -627,6 +664,29 @@ class UnifiedTreeCoreInterface(ABC):
     def finish_write_through(self, node_ids: list[NodeId], ack_id: int) -> None:
         """Clear the write-through-pending mark (when it matches ack_id) and record the
         host store event for each acked node."""
+        ...
+
+    @abstractmethod
+    def swa_tombstone_ranges(
+        self, key: RadixKey, start: int, end: int
+    ) -> list[tuple[int, int]]:
+        """Return maximal missing SWA ranges within the matched [start, end) span."""
+        ...
+
+    @abstractmethod
+    def attach_swa_window(
+        self,
+        key: RadixKey,
+        window_start: int,
+        window_end: int,
+        swa_values: torch.Tensor,
+    ) -> list[CacheAction | ComponentAction]:
+        """Attach a loaded SWA window to tombstoned spans, returning split actions.
+
+        The shared pipeline supplies page-aligned logical token offsets and
+        int64 values on the core's device. The entire span must be matched and
+        tombstoned before publication.
+        """
         ...
 
     @abstractmethod

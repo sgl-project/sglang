@@ -45,6 +45,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_memory,
+    get_model,
     get_parallel,
     get_schedule,
     get_spec,
@@ -191,6 +192,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
     def __init__(self, kvc: KVCacheConfigurator):
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
+        dcp_size = get_parallel().attn_dcp_size
         # Determine effective number of layers for KV cache
         if mambaish := mambaish_config(kvc.model_config):
             effective_layer_ids = [
@@ -232,6 +234,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         kvc=kvc,
                         num_layers=num_layers,
                     )
+                    if _is_npu and dcp_size > 1:
+                        target_indexer_size *= dcp_size
                     target_kv_size = self._cell_size - target_indexer_size
                     from sglang.srt.layers.cp.utils import (
                         get_glm_dsa_layer_split_effective_num_layers,
@@ -248,6 +252,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         num_layers=draft_num_layers,
                         allocate_all_layers=True,
                     )
+                    # The draft pool is replicated and consumes the widened
+                    # allocator-global slot space on NPU DCP.
+                    if _is_npu and dcp_size > 1:
+                        draft_kv_size *= dcp_size
+                        draft_indexer_size *= dcp_size
                     self._cell_size += draft_kv_size + draft_indexer_size
                 else:
                     self._cell_size = int(
@@ -336,10 +345,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
             # Add indexer KV cache overhead for DSA models (DeepSeek V3.2)
             if is_deepseek_dsa(model_config.hf_config):
-                cell_size += self._compute_dsa_indexer_cell_size(
+                indexer_cell_size = self._compute_dsa_indexer_cell_size(
                     kvc=kvc,
                     num_layers=num_layers,
                 )
+                if _is_npu and not kvc.is_draft_worker and dcp_size > 1:
+                    indexer_cell_size *= dcp_size
+                cell_size += indexer_cell_size
         elif is_minimax_sparse(model_config.hf_config):
             from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
 
@@ -455,6 +467,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         )
         from sglang.srt.mem_cache.qsa_kv_pool import (
             QSATokenToKVPool,
+            resolve_qsa_indexer_dtype,
         )
 
         if num_layers == 0:
@@ -467,6 +480,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             head_dim=qsa_profile.head_dim,
             compress_ratio=qsa_profile.compress_ratio,
             num_layers=num_layers,
+            compressed_dtype=resolve_qsa_indexer_dtype(get_model().qsa_indexer_dtype),
         )
 
     def _compute_dsa_indexer_cell_size(
@@ -809,7 +823,13 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         return self._solve_pool_sizes(max_total_num_tokens, page_size)
 
 
-def compute_swa_request_cap(*, page_size: int, window: int, attn_dp_size: int) -> int:
+def compute_swa_request_cap(
+    *,
+    page_size: int,
+    window: int,
+    attn_dp_size: int,
+    max_running_requests: int | None = None,
+) -> int:
     """Worst-case SWA slots the scheduler holds live at max_running_requests."""
     draft_tokens = get_spec().speculative_num_draft_tokens or 1
     eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
@@ -833,7 +853,9 @@ def compute_swa_request_cap(*, page_size: int, window: int, attn_dp_size: int) -
         decode_alloc = 2 * get_alloc_len_per_decode()
     per_request = trailing_tokens + decode_alloc
 
-    num_reqs = get_schedule().max_running_requests // attn_dp_size
+    if max_running_requests is None:
+        max_running_requests = get_schedule().max_running_requests
+    num_reqs = max_running_requests // attn_dp_size
     if get_disagg().disaggregation_mode == "decode":
         return (
             per_request * num_reqs
