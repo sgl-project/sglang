@@ -186,7 +186,9 @@ def remap_dcp_sparse_indices(
         raise ValueError(f"interleave_size must be positive, got {interleave_size}")
 
     # Float32 is faster than integer division/remainder on Ascend for this hot
-    # path.  Keep the math equivalent to localize_dcp_indices above.
+    # path.  Keep the math equivalent to localize_dcp_indices above. Exact only
+    # below 2**24 positions, 16.4x the 1M target, and it degrades to a wrong KV
+    # row rather than failing -- test_the_float32_bound_on_the_position_itself.
     topk_indices_fp32 = topk_indices.to(torch.float32)
     interleave_blocks = torch.floor(topk_indices_fp32 / interleave_size)
     local_owner_mask = (topk_indices_fp32 >= 0) & (
