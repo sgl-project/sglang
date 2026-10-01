@@ -82,6 +82,8 @@ def _get_dflash_layer_attention_params(
 
 
 class DFlashAttention(nn.Module):
+    round_rope_intermediates = False
+
     def __init__(self, config, layer_id: int, quant_config=None) -> None:
         super().__init__()
         hidden_size = int(config.hidden_size)
@@ -223,6 +225,7 @@ class DFlashAttention(nn.Module):
                 self.head_dim,
                 self.q_norm.variance_epsilon,
                 cast_x_before_out_mul=self.q_norm.cast_x_before_out_mul,
+                round_rope_intermediates=self.round_rope_intermediates,
             )
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         else:
@@ -238,7 +241,7 @@ class DFlashAttention(nn.Module):
                     or self.k_norm.cast_x_before_out_mul
                 ),
             )
-            q, k = self.rotary_emb(positions, q, k)
+            q, k = self.apply_qk_rope(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
         attn_output = self.apply_attention_output(attn_output, hidden_states)
         output, _ = self.o_proj(attn_output)
@@ -284,6 +287,9 @@ class DFlashAttention(nn.Module):
         dummy_q = k.new_empty(k.shape)
         _, k = self.rotary_emb(positions, dummy_q, k)
         return k
+
+    def apply_qk_rope(self, positions, q, k):
+        return self.rotary_emb(positions, q, k)
 
 
 class DFlashMLP(nn.Module):

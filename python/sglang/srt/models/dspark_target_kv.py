@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from collections import defaultdict
 
+import torch
 import torch.nn.functional as F
+from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.models.dflash import DFlashDecoderLayer
+from sglang.srt.models.dflash import DFlashAttention, DFlashDecoderLayer
 from sglang.srt.models.dspark import DSparkDraftModel, gather_and_crop_vocab
 from sglang.srt.speculative.dspark_components.dspark_target_kv_contract import (
     SharedHeadTransform,
@@ -35,12 +37,50 @@ class TargetKVRMSNorm(RMSNorm):
         return super().forward(residual), residual
 
 
+class TargetKVAttention(DFlashAttention):
+    round_rope_intermediates = True
+
+    def __init__(self, config, layer_id, quant_config=None):
+        super().__init__(config, layer_id, quant_config)
+        rotary = self.rotary_emb
+        if (
+            not hasattr(rotary, "cos_sin_cache")
+            or rotary.rotary_dim != self.head_dim
+            or not rotary.is_neox_style
+        ):
+            raise ContractError("KV draft requires full split-half table RoPE")
+
+    def _rotate(self, positions, value):
+        table = self.rotary_emb.cos_sin_cache[positions].to(value.dtype)
+        cosine, sine = table.chunk(2, dim=-1)
+        cosine, sine = cosine[:, None], sine[:, None]
+        first, second = value.reshape(len(positions), -1, self.head_dim).chunk(2, -1)
+        return torch.cat(
+            (first * cosine - second * sine, second * cosine + first * sine), -1
+        ).reshape_as(value)
+
+    def apply_qk_rope(self, positions, q, k):
+        return self._rotate(positions, q), self._rotate(positions, k)
+
+    def apply_k_rope(self, positions, k):
+        return self._rotate(positions, k)
+
+
+class TargetKVSiluAndMul(SiluAndMul):
+    def forward(self, x):
+        # The training MLP rounds SiLU before multiplying the up projection.
+        return self.forward_native(x)
+
+
 class TargetKVDecoderLayer(DFlashDecoderLayer):
+    attention_cls = TargetKVAttention
+
     def __init__(self, config, layer_id, quant_config=None):
         super().__init__(config, layer_id, quant_config)
         eps = float(getattr(config, "rms_norm_eps", 1e-6))
         self.input_layernorm = TargetKVRMSNorm(config.hidden_size, eps)
         self.post_attention_layernorm = TargetKVRMSNorm(config.hidden_size, eps)
+        self.mlp.act_fn = TargetKVSiluAndMul()
 
 
 class DSparkTargetKVDraftModel(DSparkDraftModel):

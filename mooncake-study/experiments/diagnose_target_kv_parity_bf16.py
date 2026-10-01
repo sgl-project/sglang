@@ -90,6 +90,12 @@ def probe(reference, serving, embed, head, tensors, anchors, **kwargs):
         layer.self_attn.use_table_qk_norm_rope = False
         rotary = layer.self_attn.rotary_emb
         rotary.forward = MethodType(hf_rope, rotary)
+        layer.self_attn.apply_qk_rope = lambda positions, q, k, rotary=rotary: rotary(
+            positions, q, k
+        )
+        layer.self_attn.apply_k_rope = lambda positions, k, rotary=rotary: rotary(
+            positions, k, k
+        )[1]
         layer.mlp.act_fn.forward = lambda value: (
             torch.nn.functional.silu(value.chunk(2, -1)[0]) * value.chunk(2, -1)[1]
         )

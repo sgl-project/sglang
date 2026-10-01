@@ -524,6 +524,8 @@ class DSparkDraftMixin:
                 return None
             if attn.k_norm.cast_x_before_out_mul != attn0.k_norm.cast_x_before_out_mul:
                 return None
+            if attn.round_rope_intermediates != attn0.round_rope_intermediates:
+                return None
             k_buf = pool.get_key_buffer(attn.attn.layer_id)
             v_buf = pool.get_value_buffer(attn.attn.layer_id)
             nh = kv_size // head_dim
@@ -562,6 +564,7 @@ class DSparkDraftMixin:
         weights, biases, k_norm_weights = [], [], []
         eps = None
         cast_before_weight = self.layers[0].self_attn.k_norm.cast_x_before_out_mul
+        round_rope_intermediates = self.layers[0].self_attn.round_rope_intermediates
         for layer in self.layers:
             attn = layer.self_attn
             can_slice, _ = can_dflash_slice_qkv_weight(attn.qkv_proj)
@@ -569,6 +572,7 @@ class DSparkDraftMixin:
                 not can_slice
                 or eps not in (None, attn.k_norm.variance_epsilon)
                 or attn.k_norm.cast_x_before_out_mul != cast_before_weight
+                or attn.round_rope_intermediates != round_rope_intermediates
             ):
                 self._stacked_ctx_kv_cache = None
                 return None
@@ -639,7 +643,7 @@ class DSparkDraftMixin:
                 locs = cache_loc
                 write_commit_lens = None
                 locs_row_width = None
-            k_norm = self.layers[0].self_attn.k_norm
+            attn0 = self.layers[0].self_attn
             fused_kv_norm_rope_write(
                 kv_all,
                 meta,
@@ -653,7 +657,8 @@ class DSparkDraftMixin:
                 eps,
                 commit_lens=write_commit_lens,
                 locs_row_width=locs_row_width,
-                cast_x_before_out_mul=k_norm.cast_x_before_out_mul,
+                cast_x_before_out_mul=attn0.k_norm.cast_x_before_out_mul,
+                round_rope_intermediates=attn0.round_rope_intermediates,
             )
             return
 
@@ -723,8 +728,7 @@ class DSparkDraftMixin:
         k_all = k32.to(ctx_hidden.dtype)
         # One RoPE over all layers' heads (shared rotary params + positions).
         k_flat = k_all.reshape(tokens, num_layers * kv_size)
-        dummy_q = k_flat.new_empty(k_flat.shape)
-        _, k_flat = attn0.rotary_emb(positions, dummy_q, k_flat)
+        k_flat = attn0.apply_k_rope(positions, k_flat)
         # [layers, tokens, heads, dim]: per-layer slices are contiguous views.
         k_all = (
             k_flat.view(tokens, num_layers, num_kv_heads, head_dim)

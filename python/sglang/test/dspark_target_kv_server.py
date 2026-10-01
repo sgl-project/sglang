@@ -20,7 +20,9 @@ def record(model, event):
         stream.write(json.dumps(event) + "\n")
 
 
-def rotate_split_half(value, positions, base, rotary_dim, inverse=False):
+def rotate_split_half(
+    value, positions, base, rotary_dim, inverse=False, *, round_intermediates=False
+):
     # Match standard target RoPE's FP32 frequency construction. Reciprocal
     # after pow differs from a negative exponent near BF16 rounding boundaries.
     frequency = 1.0 / (
@@ -32,6 +34,9 @@ def rotate_split_half(value, positions, base, rotary_dim, inverse=False):
     if inverse:
         sine = -sine
     first, second = value[..., :rotary_dim].float().chunk(2, dim=-1)
+    if round_intermediates:
+        first, second = first.to(value.dtype), second.to(value.dtype)
+        cosine, sine = cosine.to(value.dtype), sine.to(value.dtype)
     return torch.cat(
         (
             first * cosine - second * sine,
@@ -98,7 +103,11 @@ def observed_write(self, *, target_kv, pool, positions, cache_loc):
             cast_before_weight=True,
         )
         key = rotate_split_half(
-            key, positions, attn.rotary_emb.base, attn.rotary_emb.rotary_dim
+            key,
+            positions,
+            attn.rotary_emb.base,
+            attn.rotary_emb.rotary_dim,
+            round_intermediates=True,
         ).to(key.dtype)
         value = value.reshape_as(key)
         for component, expected, buffer in (

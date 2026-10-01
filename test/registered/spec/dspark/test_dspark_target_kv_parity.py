@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 from safetensors.torch import save_file
@@ -147,6 +148,41 @@ class TestTargetKVServingParity(CustomTestCase):
                 .item(),
                 0.03,
             )
+
+    def test_serving_fused_stacked_and_individual_paths_agree(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp) / "draft"
+            _, embed, head, tensors = make_parity_checkpoint(directory, "rnn")
+            serving = ServingKVParityRunner(
+                directory, embed=embed.cuda(), head=head.cuda()
+            )
+            model = serving.model
+            previous = torch.zeros(3, 3, device="cuda", dtype=torch.long)
+            inputs = {
+                "tensors": tensors,
+                "anchors": [1, 5, 12],
+                "previous_tokens": previous,
+            }
+            self.assertIsNotNone(model._fused_kv_write_bundle(serving.pool))
+            fused = serving.forward(**inputs)
+            expected = [
+                {
+                    name: [layer[row : row + 1] for layer in value]
+                    if name == "layers"
+                    else value[row : row + 1]
+                    for name, value in fused.items()
+                }
+                for row in range(3)
+            ]
+            with patch.object(model, "_fused_kv_write_bundle", return_value=None):
+                self.assertIsNotNone(model._stacked_ctx_kv_params())
+                stacked = serving.forward(**inputs)
+                compare_parity_outputs(stacked, expected, rtol=0.03, atol=0.03)
+                with patch.object(model, "_stacked_ctx_kv_params", return_value=None):
+                    for layer in model.layers:
+                        layer.self_attn.use_table_qk_norm_rope = False
+                    individual = serving.forward(**inputs)
+                compare_parity_outputs(individual, expected, rtol=0.03, atol=0.03)
 
     def test_all_failing_stages_and_nonfinite_values_are_reported(self):
         expected = {

@@ -81,11 +81,21 @@ and stacked context projection honor the same before-weight cast; their legacy
 default retains the previous semantics. A mixed norm policy falls back to
 individual operations. Parameter names and checkpoint weight layout are unchanged.
 
-Draft context projections use the dense DSpark K/V projection and draft RoPE
-implementation. RoPE, activation and attention rounding still require the full
-fixed-input gate against the chosen training implementation; matching RMSNorm
-alone does not certify backbone/logit parity. The current reference uses
-SpecForge's default Qwen3 modules, not its optional Liger provider.
+Draft context projections use the dense DSpark K/V projection. The draft
+backbone uses full split-half table RoPE: cosine/sine and each product round to
+the activation dtype before addition. The BF16 Q/K and context-write kernels
+retain fusion but disable floating-point contraction in this mode to preserve
+those boundaries. Stacked and individual projections use the same policy;
+mixed layer policies fall back to individual operations. The shared rotary
+cache is not mutated. The KV-input MLP uses native SiLU followed by a separate
+multiplication, preserving the narrow activation boundary. This introduces an
+extra kernel boundary; its latency impact has not been measured.
+
+Attention rounding still requires the full fixed-input gate against the chosen
+training implementation. Matching the auxiliary arithmetic does not certify
+backbone/logit parity. The current reference uses SpecForge's default Qwen3
+modules, not its optional Liger provider. Legacy hidden-input drafts keep their
+previous RoPE and activation behavior.
 The target shared output head's
 scale and softcap are applied in FP32 exactly once, before Markov correction.
 No random confidence head is created; static verification is required.

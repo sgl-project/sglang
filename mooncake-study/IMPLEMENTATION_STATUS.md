@@ -567,6 +567,59 @@ P8 remains open: normalization agreement alone does not establish full BF16
 backbone/logit agreement. RoPE, activation and attention arithmetic require
 further work, with existing tolerances unchanged.
 
+## KV Draft RoPE and Activation Rounding
+
+The KV-input attention class now rounds table cosine/sine and each RoPE product
+to the activation dtype, then performs the split-half addition. BF16 fused Q/K
+and context-write kernels share this rule, and stacked/individual projections
+honor it. Mixed layer RoPE policies reject fusion. The MLP uses the existing
+native SiLU followed by multiplication to preserve its narrow activation
+boundary. Shared rotary objects and legacy hidden-input policies are unchanged.
+The draft requires full split-half table RoPE; the target-KV feature codec's
+support for interleaved/partial target RoPE is separate.
+
+The first nonzero-position test run (`01790819159386743848-c81b2d50a39e`)
+caught contraction of intermediate products despite explicit BF16 casts.
+Disabling FP fusion only for the new rounding mode fixed the mismatch.
+`01790819245904207110-1917ebd413f5` then passed 41 tests and 52 subtests in
+15.61s. Coverage includes positions through 4095, padded QKV row strides,
+untouched V columns, masked multi-layer pool writes, changed inputs/positions
+under CUDA graph replay, native SiLU rounding, and both FP16/BF16 stacked paths.
+
+`01790819282208713198-14512f7efda7` reran the unchanged actual BF16 gate with
+SDPA reference and `rtol=0.03, atol=0.03`. Both decoder layers now pass. Hidden
+states still have 68 failing values; corrected logits have 31,040 failing values
+out of 1,367,424, with maximum error 0.13720703125. This improves on the previous
+78,083 corrected-logit failures and maximum error 0.21875, but the gate remains
+**failed**. The report is preserved in
+[target-kv-parity-bf16-rope-failure.json](experiments/target-kv-parity-bf16-rope-failure.json).
+These results match the previous diagnostic's reference-auxiliary/Triton path;
+attention rounding remains unresolved. SiLU's additional kernel boundary has
+not been measured against the P10 latency budget.
+
+Completed verification:
+
+- `01790819282609396282-192f11c163c8`: the complete runtime test passes in
+  335.809s, retaining all 66 snapshots, projected-KV checks, graph/overlap/abort
+  coverage, adaptive capture and the HTTP metrics check. Store transport is TCP
+  and Catalog remains a test double.
+- `01790819397443438748-c7f043ce5b0e`: 155 tests and 109 subtests pass in
+  33.98s. This adds an actual KV draft comparison of fused context/QK execution,
+  stacked context execution, and individual context/QK fallback at the same
+  unchanged tolerance, alongside the direct-kernel exact checks.
+- `01790819397753800871-9fdec0d87649`: the independent BF16 diagnostic now
+  reports identical stage statistics for production and substituted auxiliary
+  arithmetic. Replacing attention using the actual serving pool still produces
+  bit-exact layers, hidden states and logits on all three anchors. This remains
+  diagnostic substitution, not a production serving certificate. The failed
+  `validation/parity.json` hash stays
+  `f3c75c2dd18cdf8429008eee15f77c3c98970c116bdc7f213a1c0f399e71fac2`.
+
+New/owned model and test modules pass full Ruff; existing helper diagnostics
+are unchanged from HEAD. `git diff --check` passes. All experiment jobs have
+terminated and the resident H100 queue resumed its idle workload. P8, P9 and
+P10 remain open with their original scope.
+
 ## Next Implementation
 
 1. Broaden real-request coverage to prefill graphs, real retraction, cache eviction,
