@@ -101,9 +101,7 @@ def _receiver() -> SchedulerRequestReceiver:
         mm_receiver=None,
         tp_group=group,
         tp_cpu_group=group,
-        attn_tp_group=group,
         attn_tp_cpu_group=group,
-        attn_cp_group=group,
         attn_cp_cpu_group=group,
         world_group=group,
         server_args=SimpleNamespace(),
@@ -123,7 +121,7 @@ def _run_consensus_rank(rank: int, world_size: int, init_file: str) -> None:
     )
     try:
         req = _request(_failed_pointer() if rank == 1 else _successful_pointer())
-        parallel = SimpleNamespace(enable_dp_attention=False, tp_size=world_size)
+        parallel = SimpleNamespace(attn_dp_enabled=False, tp_size=world_size)
         receiver = _receiver()
         object.__setattr__(receiver, "tp_cpu_group", torch.distributed.group.WORLD)
         with (
@@ -171,7 +169,7 @@ def _run_image_receiver(rank, init_file, pipe):
             ),
             patch(
                 "sglang.srt.managers.scheduler_components.request_receiver.get_parallel",
-                return_value=SimpleNamespace(enable_dp_attention=False, tp_size=2),
+                return_value=SimpleNamespace(attn_dp_enabled=False, tp_size=2),
             ),
         ):
             for base in [30, 90]:
@@ -374,7 +372,7 @@ class TestShmRequestFailureConsensus(unittest.TestCase):
 
     def test_local_materialization_failure_becomes_request_error(self):
         req = _request(_failed_pointer())
-        parallel = SimpleNamespace(enable_dp_attention=False, tp_size=1)
+        parallel = SimpleNamespace(attn_dp_enabled=False, tp_size=1)
 
         with (
             patch(
@@ -398,7 +396,7 @@ class TestShmRequestFailureConsensus(unittest.TestCase):
 
     def test_peer_failure_rejects_the_local_request(self):
         req = _request(torch.zeros(1))
-        parallel = SimpleNamespace(enable_dp_attention=False, tp_size=2)
+        parallel = SimpleNamespace(attn_dp_enabled=False, tp_size=2)
 
         def inject_peer_failure(mask, **kwargs):
             mask.fill_(1)
@@ -430,7 +428,7 @@ class TestShmRequestFailureConsensus(unittest.TestCase):
         failed_req = _request(torch.zeros(1), rid="failed")
         healthy_req = _request(torch.zeros(1), rid="healthy")
         batch = BatchTokenizedEmbeddingReqInput(batch=[failed_req, healthy_req])
-        parallel = SimpleNamespace(enable_dp_attention=False, tp_size=1)
+        parallel = SimpleNamespace(attn_dp_enabled=False, tp_size=1)
 
         def materialize(req):
             if req.rid == "failed":

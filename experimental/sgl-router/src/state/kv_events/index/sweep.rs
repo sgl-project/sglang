@@ -89,11 +89,12 @@ pub(super) fn snapshot_fetch_timeout(deadline: Duration, cap: Duration) -> Durat
 }
 
 /// The handles a bounded peer sweep needs, cloned out of [`KvEventIndex`] so the
-/// sweep can run detached without borrowing `self`.
+/// sweep can run detached — or be awaited by the coordinator — without
+/// borrowing `self`.
 pub(super) struct BootstrapDeps {
     http: reqwest::Client,
-    peers: Arc<PeerRegistry>,
-    bootstrap: Arc<BootstrapTracker>,
+    pub(super) peers: Arc<PeerRegistry>,
+    pub(super) bootstrap: Arc<BootstrapTracker>,
     live_workers: Arc<Mutex<HashSet<KvWorkerId>>>,
     oracle: Arc<BlockSizeOracle>,
     ctrl_tx: mpsc::Sender<PumpControl>,
@@ -103,7 +104,7 @@ impl BootstrapDeps {
     /// Budget for one sweep. Before readiness settles, the remainder of the
     /// tracker's single `/readyz` window; once settled, a full `timeout()` for
     /// a late-discovered worker (`time_remaining` saturates at zero).
-    fn deadline(&self) -> Duration {
+    pub(super) fn deadline(&self) -> Duration {
         if self.bootstrap.settled() {
             return self.bootstrap.timeout();
         }
@@ -186,6 +187,30 @@ pub(super) async fn sweep_until_deadline(
     deadline: Duration,
     freshness_floor: Instant,
 ) -> SweepResult {
+    sweep_recording_settled(
+        deps,
+        obligations,
+        deadline,
+        freshness_floor,
+        &mut Vec::new(),
+    )
+    .await
+}
+
+/// [`sweep_until_deadline`], also appending to `settled` every obligation it
+/// released cold mid-sweep (see `settle_ranks_cold`).
+///
+/// For the coordinator, which decides after the sweep which obligations are
+/// still owed a look: the pump may not have drained a mid-sweep release yet, so
+/// a settled rank can still read `Pending` then, and only this list tells it
+/// apart from one the sweep never resolved.
+pub(super) async fn sweep_recording_settled(
+    deps: &BootstrapDeps,
+    obligations: &[(KvWorkerId, u64)],
+    deadline: Duration,
+    freshness_floor: Instant,
+    settled: &mut Vec<(KvWorkerId, u64)>,
+) -> SweepResult {
     let ctx = SweepCtx {
         http: &deps.http,
         peers: &deps.peers,
@@ -212,7 +237,7 @@ pub(super) async fn sweep_until_deadline(
                     return Some(SweepResult::FleetCold { peers_tried })
                 }
                 SweepPass::NothingToRecover { ranks, peers_tried } => {
-                    settle_ranks_cold(deps, &mut active, &ranks, peers_tried).await;
+                    settled.extend(settle_ranks_cold(deps, &mut active, &ranks, peers_tried).await);
                     if active.is_empty() {
                         return Some(SweepResult::RanksResolved);
                     }
@@ -249,12 +274,14 @@ pub(super) async fn sweep_until_deadline(
 /// since. The final delivery for this sweep still names these obligations; by
 /// then they are not `Pending`, which every pump handler already treats as a
 /// no-op.
+///
+/// Returns the obligations it released.
 async fn settle_ranks_cold(
     deps: &BootstrapDeps,
     active: &mut Vec<(KvWorkerId, u64)>,
     ranks: &[KvWorkerId],
     peers_tried: usize,
-) {
+) -> Vec<(KvWorkerId, u64)> {
     let (settled, rest): (Vec<_>, Vec<_>) = std::mem::take(active)
         .into_iter()
         .partition(|(r, _)| ranks.contains(r));
@@ -269,13 +296,14 @@ async fn settle_ranks_cold(
     if deps
         .ctrl_tx
         .send(PumpControl::AbandonBootstrap {
-            obligations: settled,
+            obligations: settled.clone(),
         })
         .await
         .is_err()
     {
         warn!("kv-bootstrap: pump is gone; per-rank cold settle discarded");
     }
+    settled
 }
 
 /// Whether the obligation `(rank, epoch)` still has a rank waiting on it: the
@@ -289,7 +317,7 @@ pub(super) fn still_pending(bootstrap: &BootstrapTracker, rank: &KvWorkerId, epo
 /// are owed. Every exit path that leaves ranks `Pending` sends exactly one,
 /// which is what releases them; [`SweepResult::RanksResolved`] sends none,
 /// because its ranks have already left `Pending`.
-async fn deliver_bootstrap(
+pub(super) async fn deliver_bootstrap(
     deps: &BootstrapDeps,
     obligations: Vec<(KvWorkerId, u64)>,
     result: SweepResult,
@@ -739,6 +767,7 @@ impl KvEventIndex {
             let ObligationBatch {
                 obligations,
                 holding_since,
+                late_join: _,
             } = batch;
             let deadline = deps.deadline();
             let result = sweep_until_deadline(&deps, &obligations, deadline, holding_since).await;
@@ -746,9 +775,9 @@ impl KvEventIndex {
         });
     }
 
-    /// Clone the handles a sweep needs, so it can run detached without
-    /// borrowing `self`.
-    fn bootstrap_deps(&self) -> BootstrapDeps {
+    /// Clone the handles a sweep needs, so it can run detached — or be awaited
+    /// by the coordinator — without borrowing `self`.
+    pub(super) fn bootstrap_deps(&self) -> BootstrapDeps {
         BootstrapDeps {
             http: self.snapshot_http.clone(),
             peers: Arc::clone(&self.peers),

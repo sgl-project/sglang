@@ -7,6 +7,7 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 from sglang.srt.arg_groups.overrides import model_config_of, resolving_view
+from sglang.srt.runtime_context import attn_dp_enabled_of
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +25,7 @@ def handle_layernorm_sp(server_args: ServerArgs) -> None:
     validate_layernorm_sp(
         architecture=architectures[0] if architectures else None,
         tp_size=cfg.tp_size,
-        enable_dp_attention=cfg.enable_dp_attention,
+        attn_dp_enabled=attn_dp_enabled_of(cfg),
         speculative_algorithm=cfg.speculative_algorithm,
     )
 
@@ -33,7 +34,7 @@ def validate_layernorm_sp(
     *,
     architecture: Optional[str],
     tp_size: int,
-    enable_dp_attention: bool,
+    attn_dp_enabled: bool,
     speculative_algorithm: Optional[str],
 ) -> None:
     """Fail loud for unsupported / incompatible configs. Callers gate on the flag."""
@@ -49,9 +50,9 @@ def validate_layernorm_sp(
             "--enable-layernorm-sp requires tp_size > 1: there is no sequence to "
             "shard across a single TP rank."
         )
-    if enable_dp_attention:
+    if attn_dp_enabled:
         raise ValueError(
-            "--enable-layernorm-sp is not compatible with --enable-dp-attention: "
+            "--enable-layernorm-sp is not compatible with attention DP: "
             "SP shards the sequence across the full TP group, which under DP "
             "attention spans data-parallel groups holding different sequences."
         )
