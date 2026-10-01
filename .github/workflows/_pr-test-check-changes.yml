@@ -100,8 +100,7 @@ jobs:
               - "scripts/ci/utils/*"
               - "test/**/!(*.md)"
               - "rust/*"
-              - "rust/!(sglang-renderer)/**"
-              - "rust/!(sglang-processor)/**"
+              - "rust/!(sglang-renderer|sglang-processor)/**"
               - "proto/**"
             renderer:
               - "rust/sglang-renderer/**"

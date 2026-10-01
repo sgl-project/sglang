@@ -44,7 +44,7 @@ fn config() -> Config {
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
             id: "tiny".into(),
-            tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+            tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),
             disable_input_ids_forwarding: false,
             tokenizer: Default::default(),
             policy: PolicyKind::RoundRobin,
@@ -337,14 +337,14 @@ async fn pd_mode_chat_dispatch_sets_final_decode_header() {
             url: prefill_a.url.clone(),
             mode: WorkerMode::Prefill,
             model_ids: vec![ModelId("tiny".into())],
-            bootstrap_port: None,
+            bootstrap_port: Some(8997),
         },
         WorkerSpec {
             id: WorkerId("p2".into()),
             url: prefill_b.url.clone(),
             mode: WorkerMode::Prefill,
             model_ids: vec![ModelId("tiny".into())],
-            bootstrap_port: None,
+            bootstrap_port: Some(8997),
         },
         WorkerSpec {
             id: WorkerId("d1".into()),
@@ -433,7 +433,7 @@ async fn pd_mode_prefill_only_returns_no_decode_workers_available() {
         url: prefill.url.clone(),
         mode: WorkerMode::Prefill,
         model_ids: vec![ModelId("tiny".into())],
-        bootstrap_port: None,
+        bootstrap_port: Some(8997),
     }]);
     let app = build_router(ctx);
 
@@ -461,7 +461,7 @@ async fn pd_mode_chat_response_carries_decode_affinity_header() {
             url: prefill.url.clone(),
             mode: WorkerMode::Prefill,
             model_ids: vec![ModelId("tiny".into())],
-            bootstrap_port: None,
+            bootstrap_port: Some(8997),
         },
         WorkerSpec {
             id: WorkerId("d1".into()),
