@@ -1,0 +1,1264 @@
+{
+  "purpose": "Single-H100 synthetic capture on/off measurements; no production SLO certification",
+  "baseline_job_id": "01790827387658540683-770722b0f254",
+  "baseline_returncode": 0,
+  "raw_report_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-baseline-20261001/report.json",
+  "raw_report_sha256": "94fb4d0b5f99517f581068793e7df3cfd8c4741e23a9a88d868172dcea08436b",
+  "baseline_log_sha256": "2a7383b8c02001bc19ffa1a124e007f00f8bbaec31b34652c9901fefd8b0ca81",
+  "baseline": {
+    "status": "completed",
+    "declared_source_revision": "347ca171d",
+    "driver_sha256": "a0a9200cde934b0821f9b417b48d2f0720f6c52b4b3dd276073183de130abe21",
+    "producer_source_sha256": {
+      "python/sglang/srt/training_capture/__init__.py": "84877adf938e0700c299e02d8a50d6e95f097b5585ef0841a34041aa95d0272f",
+      "python/sglang/srt/training_capture/admission.py": "b00f2ce37476ff60bc2f1924dc1d2e7ac4093dffbe4eab44dc2bd88afd96b44e",
+      "python/sglang/srt/training_capture/catalog.py": "e38f2c5d84f5c074154d5b484e629696d8428a2ea136d9c5a32801516bc38944",
+      "python/sglang/srt/training_capture/config.py": "395fe440b09e0eb506003be900578aeea29278e7820ba339c719bf77134aacd4",
+      "python/sglang/srt/training_capture/context.py": "8a3b3e5d4a18aa29e97713e497302b02e68475affecae0e2f96dda980fdde75d",
+      "python/sglang/srt/training_capture/coordinator.py": "fd45dc245b2999b6923f104f7d080518621a4bde09446c3f8164eedd89936524",
+      "python/sglang/srt/training_capture/host_pool.py": "51c867a0ce6e747e64ea31b1d12bae549a4c8ecf16852fee4267097126222cb9",
+      "python/sglang/srt/training_capture/identity.py": "f2629937313ce4edeb92f3d1c1e8b01420521d8ebf3f08ce6ea614197f0bfb93",
+      "python/sglang/srt/training_capture/kv_codec.py": "96794e4fd9a141200843451530bf9956e9d678766aa40f608f4bab23db5880f7",
+      "python/sglang/srt/training_capture/kv_exporter.py": "1cbe0d79d5e7cc30af1902f40efc023338c65e34d9a48ed60634c6e02434123f",
+      "python/sglang/srt/training_capture/latency.py": "483942c37807da9156bdf4ef96b994ab2894b8d94602c510d48c938d95c810dc",
+      "python/sglang/srt/training_capture/metrics.py": "58394b6a56012629e1416350e77e211c8387b543b19f81dd60649711b54ce60b",
+      "python/sglang/srt/training_capture/mooncake_store.py": "1c256830525cb30acfdd19a31826f2a006761c068d441bad2a0031a289a71202",
+      "python/sglang/srt/training_capture/protocol.py": "34dda38a141ec2b73abfc9e367e04cbfd043e4f3c725fdaea5028b5ba8362bac",
+      "python/sglang/srt/training_capture/snapshot.py": "cc72e0b308d416315e62c5832530d7fab1b2510c2f609ce8d6a53f2814479e92",
+      "python/sglang/srt/training_capture/snapshot_writer.py": "70aac420dfd7f81683ac57255bc57590dae5e6902172bee72ad72aa9c1684621",
+      "python/sglang/srt/training_capture/teacher.py": "ca48d11bf2eff16bf206aaa9928f820e6ed8d134e1b55622c68c116473a7a708"
+    },
+    "config": {
+      "model_path": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+      "source_revision": "347ca171d",
+      "output_dir": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-baseline-20261001",
+      "num_prompts": 2048,
+      "input_len": 128,
+      "output_len": 32,
+      "concurrency": 8,
+      "ratios": [
+        0.001,
+        0.01,
+        0.1
+      ],
+      "repeats": 2,
+      "seed": 42,
+      "layers": [
+        0,
+        14,
+        27
+      ],
+      "capture_slots": 16,
+      "host_mib": 256,
+      "segment_mib": 2048,
+      "phase_timeout": 600
+    },
+    "versions": {
+      "torch": "2.13.0",
+      "transformers": "5.12.1",
+      "sglang-kernel": "0.4.6.post1",
+      "mooncake-transfer-engine-cuda13": "0.3.11.post1"
+    },
+    "scope": {
+      "transport": "local TCP",
+      "catalog": "HTTP test double",
+      "adaptive": false,
+      "overlap": true,
+      "decode_cuda_graphs": true,
+      "prefill_cuda_graphs": false,
+      "client": "existing sglang.benchmark.serving, streaming native /generate",
+      "workload": "seeded fixed-length random-ids, closed-loop concurrency, not production traffic",
+      "timing": "Client timing excludes warmup, server launch, readback and post-response writer drain",
+      "payload_bytes": "Validated manifest tensor sizes; not D2H or wire byte counters",
+      "gpu_capture_kernel_time": null,
+      "d2h_bytes": null,
+      "rdma_bytes": null,
+      "production_slo_pass": null
+    },
+    "rounds": [
+      {
+        "repetition": 0,
+        "comparison": {
+          "baseline_bracket_mean": {
+            "median_ttft_ms": 97.61968906968832,
+            "p95_ttft_ms": 147.75914009660482,
+            "p99_ttft_ms": 201.79000699892637,
+            "median_tpot_ms": 3.314793891003055,
+            "p95_tpot_ms": 6.154829434930317,
+            "p99_tpot_ms": 7.0237606968129835,
+            "output_throughput": 1294.738586511966
+          },
+          "baseline_after_over_before": {
+            "median_ttft_ms": 1.116632045528219,
+            "p95_ttft_ms": 1.0320229233100646,
+            "p99_ttft_ms": 1.530617803140883,
+            "median_tpot_ms": 0.9926978503084778,
+            "p95_tpot_ms": 0.9911759276775299,
+            "p99_tpot_ms": 1.2498025795322414,
+            "output_throughput": 0.9819924900607649
+          },
+          "capture_over_baseline": [
+            {
+              "sample_ratio": 0.001,
+              "ratios": {
+                "median_ttft_ms": 1.0653800928717219,
+                "p95_ttft_ms": 0.9803847877919054,
+                "p99_ttft_ms": 0.7859796252645145,
+                "median_tpot_ms": 0.9988599391724663,
+                "p95_tpot_ms": 0.9985805963619167,
+                "p99_tpot_ms": 0.8918465054254946,
+                "output_throughput": 1.0095519220026279
+              }
+            },
+            {
+              "sample_ratio": 0.01,
+              "ratios": {
+                "median_ttft_ms": 1.071498888319576,
+                "p95_ttft_ms": 1.0009826808756106,
+                "p99_ttft_ms": 0.8079163435894583,
+                "median_tpot_ms": 1.0095731938174644,
+                "p95_tpot_ms": 1.0126121987119523,
+                "p99_tpot_ms": 0.9747304789412676,
+                "output_throughput": 0.9809487392226351
+              }
+            },
+            {
+              "sample_ratio": 0.1,
+              "ratios": {
+                "median_ttft_ms": 1.0773743484954728,
+                "p95_ttft_ms": 1.0742873232810641,
+                "p99_ttft_ms": 0.8614902650737698,
+                "median_tpot_ms": 1.2113356105789306,
+                "p95_tpot_ms": 1.1492189140284745,
+                "p99_tpot_ms": 1.2038672204479475,
+                "output_throughput": 0.8437204598229687
+              }
+            }
+          ]
+        },
+        "phases": [
+          {
+            "sample_ratio": null,
+            "server_args": [
+              "--skip-server-warmup",
+              "--enable-metrics",
+              "--enable-cache-report",
+              "--attention-backend",
+              "triton",
+              "--mem-fraction-static",
+              "0.25",
+              "--max-total-tokens",
+              "4096",
+              "--max-running-requests",
+              "8",
+              "--chunked-prefill-size",
+              "128",
+              "--random-seed",
+              "42",
+              "--cuda-graph-backend-decode",
+              "full",
+              "--cuda-graph-backend-prefill",
+              "disabled",
+              "--cuda-graph-max-bs-decode",
+              "8"
+            ],
+            "selected_requests": 0,
+            "actual_admission_fraction": 0,
+            "ready_fraction_of_admitted": null,
+            "ready_fraction_of_selected": null,
+            "capture_counter_delta": {},
+            "readback": {},
+            "post_client_capture_drain_seconds": 0.007743861526250839,
+            "serving": {
+              "completed": 2048,
+              "duration": 50.16142300143838,
+              "total_input_tokens": 262144,
+              "total_output_tokens": 65536,
+              "output_throughput": 1306.5020104816556,
+              "median_ttft_ms": 92.24058501422405,
+              "p95_ttft_ms": 145.43058387935162,
+              "p99_ttft_ms": 159.4788488000631,
+              "median_tpot_ms": 3.326940800874464,
+              "p95_tpot_ms": 6.182105106211478,
+              "p99_tpot_ms": 6.243890695754558,
+              "cache_report": {
+                "total_prompt_tokens": 262144,
+                "total_cached_tokens": 0,
+                "cache_hit_rate_pct": 0,
+                "device_cached_tokens": null,
+                "host_cached_tokens": null,
+                "storage_cached_tokens": null,
+                "storage_backend": null
+              }
+            },
+            "host_pool": null
+          },
+          {
+            "sample_ratio": 0.001,
+            "server_args": [
+              "--skip-server-warmup",
+              "--enable-metrics",
+              "--enable-cache-report",
+              "--attention-backend",
+              "triton",
+              "--mem-fraction-static",
+              "0.25",
+              "--max-total-tokens",
+              "4096",
+              "--max-running-requests",
+              "8",
+              "--chunked-prefill-size",
+              "128",
+              "--random-seed",
+              "42",
+              "--cuda-graph-backend-decode",
+              "full",
+              "--cuda-graph-backend-prefill",
+              "disabled",
+              "--cuda-graph-max-bs-decode",
+              "8",
+              "--training-capture-config",
+              "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-baseline-20261001/round-0-phase-1-0.001/capture.json"
+            ],
+            "selected_requests": 2,
+            "actual_admission_fraction": 0.0009765625,
+            "ready_fraction_of_admitted": 1,
+            "ready_fraction_of_selected": 1,
+            "capture_counter_delta": {
+              "considered": 2048,
+              "sampled_out": 2046,
+              "admitted": 2,
+              "overlap_forwards": 66,
+              "eager_forwards": 2,
+              "cuda_graph_forwards": 64,
+              "sealed": 2,
+              "writer_started": 2,
+              "copies_completed": 2,
+              "snapshot_built": 2,
+              "ready": 2
+            },
+            "readback": {
+              "validated_samples": 2,
+              "manifest_bytes": 28276,
+              "payload_bytes": 4002688,
+              "aux_payload_bytes": 70528,
+              "payload_objects": 52,
+              "kv_payload_bytes": 3932160
+            },
+            "post_client_capture_drain_seconds": 0.008040416985750198,
+            "serving": {
+              "completed": 2048,
+              "duration": 50.13825091347098,
+              "total_input_tokens": 262144,
+              "total_output_tokens": 65536,
+              "output_throughput": 1307.105828504121,
+              "median_ttft_ms": 104.00207340717316,
+              "p95_ttft_ms": 144.86081320792434,
+              "p99_ttft_ms": 158.6028340831399,
+              "median_tpot_ms": 3.3110148243365747,
+              "p95_tpot_ms": 6.1460932476385945,
+              "p99_tpot_ms": 6.264116432397596,
+              "cache_report": {
+                "total_prompt_tokens": 262144,
+                "total_cached_tokens": 0,
+                "cache_hit_rate_pct": 0,
+                "device_cached_tokens": null,
+                "host_cached_tokens": null,
+                "storage_cached_tokens": null,
+                "storage_backend": null
+              }
+            },
+            "host_pool": {
+              "allocated_bytes": 50913280,
+              "free": 0,
+              "filling": 16,
+              "quarantined": 0
+            }
+          },
+          {
+            "sample_ratio": 0.01,
+            "server_args": [
+              "--skip-server-warmup",
+              "--enable-metrics",
+              "--enable-cache-report",
+              "--attention-backend",
+              "triton",
+              "--mem-fraction-static",
+              "0.25",
+              "--max-total-tokens",
+              "4096",
+              "--max-running-requests",
+              "8",
+              "--chunked-prefill-size",
+              "128",
+              "--random-seed",
+              "42",
+              "--cuda-graph-backend-decode",
+              "full",
+              "--cuda-graph-backend-prefill",
+              "disabled",
+              "--cuda-graph-max-bs-decode",
+              "8",
+              "--training-capture-config",
+              "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-baseline-20261001/round-0-phase-2-0.01/capture.json"
+            ],
+            "selected_requests": 19,
+            "actual_admission_fraction": 0.00927734375,
+            "ready_fraction_of_admitted": 1,
+            "ready_fraction_of_selected": 1,
+            "capture_counter_delta": {
+              "considered": 2048,
+              "sampled_out": 2029,
+              "admitted": 19,
+              "overlap_forwards": 595,
+              "eager_forwards": 19,
+              "cuda_graph_forwards": 576,
+              "sealed": 19,
+              "writer_started": 19,
+              "copies_completed": 19,
+              "snapshot_built": 19,
+              "ready": 19
+            },
+            "readback": {
+              "validated_samples": 19,
+              "manifest_bytes": 268622,
+              "payload_bytes": 38025536,
+              "aux_payload_bytes": 670016,
+              "payload_objects": 494,
+              "kv_payload_bytes": 37355520
+            },
+            "post_client_capture_drain_seconds": 0.008179716765880585,
+            "serving": {
+              "completed": 2048,
+              "duration": 51.60021676123142,
+              "total_input_tokens": 262144,
+              "total_output_tokens": 65536,
+              "output_throughput": 1270.0721840618098,
+              "median_ttft_ms": 104.59938831627369,
+              "p95_ttft_ms": 147.90434017777443,
+              "p99_ttft_ms": 163.0294446274638,
+              "median_tpot_ms": 3.346527055386574,
+              "p95_tpot_ms": 6.232455366801831,
+              "p99_tpot_ms": 6.846273627973371,
+              "cache_report": {
+                "total_prompt_tokens": 262144,
+                "total_cached_tokens": 0,
+                "cache_hit_rate_pct": 0,
+                "device_cached_tokens": null,
+                "host_cached_tokens": null,
+                "storage_cached_tokens": null,
+                "storage_backend": null
+              }
+            },
+            "host_pool": {
+              "allocated_bytes": 50913280,
+              "free": 0,
+              "filling": 16,
+              "quarantined": 0
+            }
+          },
+          {
+            "sample_ratio": 0.1,
+            "server_args": [
+              "--skip-server-warmup",
+              "--enable-metrics",
+              "--enable-cache-report",
+              "--attention-backend",
+              "triton",
+              "--mem-fraction-static",
+              "0.25",
+              "--max-total-tokens",
+              "4096",
+              "--max-running-requests",
+              "8",
+              "--chunked-prefill-size",
+              "128",
+              "--random-seed",
+              "42",
+              "--cuda-graph-backend-decode",
+              "full",
+              "--cuda-graph-backend-prefill",
+              "disabled",
+              "--cuda-graph-max-bs-decode",
+              "8",
+              "--training-capture-config",
+              "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-baseline-20261001/round-0-phase-3-0.1/capture.json"
+            ],
+            "selected_requests": 190,
+            "actual_admission_fraction": 0.0927734375,
+            "ready_fraction_of_admitted": 1,
+            "ready_fraction_of_selected": 1,
+            "capture_counter_delta": {
+              "considered": 2048,
+              "sampled_out": 1858,
+              "admitted": 190,
+              "overlap_forwards": 4830,
+              "eager_forwards": 190,
+              "cuda_graph_forwards": 4640,
+              "sealed": 190,
+              "writer_started": 190,
+              "copies_completed": 190,
+              "snapshot_built": 190,
+              "ready": 190
+            },
+            "readback": {
+              "validated_samples": 190,
+              "manifest_bytes": 2686220,
+              "payload_bytes": 380255360,
+              "aux_payload_bytes": 6700160,
+              "payload_objects": 4940,
+              "kv_payload_bytes": 373555200
+            },
+            "post_client_capture_drain_seconds": 0.007983025163412094,
+            "serving": {
+              "completed": 2048,
+              "duration": 59.992817509919405,
+              "total_input_tokens": 262144,
+              "total_output_tokens": 65536,
+              "output_throughput": 1092.3974355624166,
+              "median_ttft_ms": 105.17294891178608,
+              "p95_ttft_ms": 158.73577110469336,
+              "p99_ttft_ms": 173.84012661874294,
+              "median_tpot_ms": 4.015327881901495,
+              "p95_tpot_ms": 7.073246399241109,
+              "p99_tpot_ms": 8.455675267163786,
+              "cache_report": {
+                "total_prompt_tokens": 262144,
+                "total_cached_tokens": 0,
+                "cache_hit_rate_pct": 0,
+                "device_cached_tokens": null,
+                "host_cached_tokens": null,
+                "storage_cached_tokens": null,
+                "storage_backend": null
+              }
+            },
+            "host_pool": {
+              "allocated_bytes": 50913280,
+              "free": 0,
+              "filling": 16,
+              "quarantined": 0
+            }
+          },
+          {
+            "sample_ratio": null,
+            "server_args": [
+              "--skip-server-warmup",
+              "--enable-metrics",
+              "--enable-cache-report",
+              "--attention-backend",
+              "triton",
+              "--mem-fraction-static",
+              "0.25",
+              "--max-total-tokens",
+              "4096",
+              "--max-running-requests",
+              "8",
+              "--chunked-prefill-size",
+              "128",
+              "--random-seed",
+              "42",
+              "--cuda-graph-backend-decode",
+              "full",
+              "--cuda-graph-backend-prefill",
+              "disabled",
+              "--cuda-graph-max-bs-decode",
+              "8"
+            ],
+            "selected_requests": 0,
+            "actual_admission_fraction": 0,
+            "ready_fraction_of_admitted": null,
+            "ready_fraction_of_selected": null,
+            "capture_counter_delta": {},
+            "readback": {},
+            "post_client_capture_drain_seconds": 0.007728610187768936,
+            "serving": {
+              "completed": 2048,
+              "duration": 51.08126946911216,
+              "total_input_tokens": 262144,
+              "total_output_tokens": 65536,
+              "output_throughput": 1282.9751625422766,
+              "median_ttft_ms": 102.99879312515259,
+              "p95_ttft_ms": 150.087696313858,
+              "p99_ttft_ms": 244.10116519778964,
+              "median_tpot_ms": 3.302646981131646,
+              "p95_tpot_ms": 6.127553763649156,
+              "p99_tpot_ms": 7.803630697871408,
+              "cache_report": {
+                "total_prompt_tokens": 262144,
+                "total_cached_tokens": 0,
+                "cache_hit_rate_pct": 0,
+                "device_cached_tokens": null,
+                "host_cached_tokens": null,
+                "storage_cached_tokens": null,
+                "storage_backend": null
+              }
+            },
+            "host_pool": null
+          }
+        ]
+      },
+      {
+        "repetition": 1,
+        "comparison": {
+          "baseline_bracket_mean": {
+            "median_ttft_ms": 89.81126826256514,
+            "p95_ttft_ms": 144.0379123203456,
+            "p99_ttft_ms": 158.57361769303674,
+            "median_tpot_ms": 3.313200878760507,
+            "p95_tpot_ms": 6.146741225834816,
+            "p99_tpot_ms": 6.192786791512082,
+            "output_throughput": 1315.9123422352027
+          },
+          "baseline_after_over_before": {
+            "median_ttft_ms": 1.0088484927290309,
+            "p95_ttft_ms": 1.0053236161551145,
+            "p99_ttft_ms": 1.027670722020762,
+            "median_tpot_ms": 1.0028027712263616,
+            "p95_tpot_ms": 1.0033478284301085,
+            "p99_tpot_ms": 1.003915756985543,
+            "output_throughput": 0.9963326885261142
+          },
+          "capture_over_baseline": [
+            {
+              "sample_ratio": 0.1,
+              "ratios": {
+                "median_ttft_ms": 1.1912767800067434,
+                "p95_ttft_ms": 1.1167819093867195,
+                "p99_ttft_ms": 1.131532032588405,
+                "median_tpot_ms": 1.2263700235810182,
+                "p95_tpot_ms": 1.1638883541772342,
+                "p99_tpot_ms": 1.3855021111615395,
+                "output_throughput": 0.819971962571117
+              }
+            },
+            {
+              "sample_ratio": 0.01,
+              "ratios": {
+                "median_ttft_ms": 1.1724140984754203,
+                "p95_ttft_ms": 1.0237720539003292,
+                "p99_ttft_ms": 1.0211496825909594,
+                "median_tpot_ms": 1.0111824201535404,
+                "p95_tpot_ms": 1.0128603370638842,
+                "p99_tpot_ms": 1.1084855966262486,
+                "output_throughput": 0.9660813052647474
+              }
+            },
+            {
+              "sample_ratio": 0.001,
+              "ratios": {
+                "median_ttft_ms": 1.1784663342428143,
+                "p95_ttft_ms": 1.0244227477149588,
+                "p99_ttft_ms": 1.042918249771005,
+                "median_tpot_ms": 1.0115189718890347,
+                "p95_tpot_ms": 1.0166885034430175,
+                "p99_tpot_ms": 1.0195874452809455,
+                "output_throughput": 0.977762324336056
+              }
+            }
+          ]
+        },
+        "phases": [
+          {
+            "sample_ratio": null,
+            "server_args": [
+              "--skip-server-warmup",
+              "--enable-metrics",
+              "--enable-cache-report",
+              "--attention-backend",
+              "triton",
+              "--mem-fraction-static",
+              "0.25",
+              "--max-total-tokens",
+              "4096",
+              "--max-running-requests",
+              "8",
+              "--chunked-prefill-size",
+              "128",
+              "--random-seed",
+              "42",
+              "--cuda-graph-backend-decode",
+              "full",
+              "--cuda-graph-backend-prefill",
+              "disabled",
+              "--cuda-graph-max-bs-decode",
+              "8"
+            ],
+            "selected_requests": 0,
+            "actual_admission_fraction": 0,
+            "ready_fraction_of_admitted": null,
+            "ready_fraction_of_selected": null,
+            "capture_counter_delta": {},
+            "readback": {},
+            "post_client_capture_drain_seconds": 0.00776170939207077,
+            "serving": {
+              "completed": 2048,
+              "duration": 49.711388394236565,
+              "total_input_tokens": 262144,
+              "total_output_tokens": 65536,
+              "output_throughput": 1318.329705062072,
+              "median_ttft_ms": 89.4156713038683,
+              "p95_ttft_ms": 143.65552887320516,
+              "p99_ttft_ms": 156.40963394194836,
+              "median_tpot_ms": 3.3085643043441157,
+              "p95_tpot_ms": 6.136469302638885,
+              "p99_tpot_ms": 6.1806857597924045,
+              "cache_report": {
+                "total_prompt_tokens": 262144,
+                "total_cached_tokens": 0,
+                "cache_hit_rate_pct": 0,
+                "device_cached_tokens": null,
+                "host_cached_tokens": null,
+                "storage_cached_tokens": null,
+                "storage_backend": null
+              }
+            },
+            "host_pool": null
+          },
+          {
+            "sample_ratio": 0.1,
+            "server_args": [
+              "--skip-server-warmup",
+              "--enable-metrics",
+              "--enable-cache-report",
+              "--attention-backend",
+              "triton",
+              "--mem-fraction-static",
+              "0.25",
+              "--max-total-tokens",
+              "4096",
+              "--max-running-requests",
+              "8",
+              "--chunked-prefill-size",
+              "128",
+              "--random-seed",
+              "42",
+              "--cuda-graph-backend-decode",
+              "full",
+              "--cuda-graph-backend-prefill",
+              "disabled",
+              "--cuda-graph-max-bs-decode",
+              "8",
+              "--training-capture-config",
+              "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-baseline-20261001/round-1-phase-1-0.1/capture.json"
+            ],
+            "selected_requests": 190,
+            "actual_admission_fraction": 0.0927734375,
+            "ready_fraction_of_admitted": 1,
+            "ready_fraction_of_selected": 1,
+            "capture_counter_delta": {
+              "considered": 2048,
+              "sampled_out": 1858,
+              "admitted": 190,
+              "overlap_forwards": 4830,
+              "eager_forwards": 190,
+              "cuda_graph_forwards": 4640,
+              "sealed": 190,
+              "writer_started": 190,
+              "copies_completed": 190,
+              "snapshot_built": 190,
+              "ready": 190
+            },
+            "readback": {
+              "validated_samples": 190,
+              "manifest_bytes": 2686220,
+              "payload_bytes": 380255360,
+              "aux_payload_bytes": 6700160,
+              "payload_objects": 4940,
+              "kv_payload_bytes": 373555200
+            },
+            "post_client_capture_drain_seconds": 0.008280854672193527,
+            "serving": {
+              "completed": 2048,
+              "duration": 60.737088207155466,
+              "total_input_tokens": 262144,
+              "total_output_tokens": 65536,
+              "output_throughput": 1079.0112258341546,
+              "median_ttft_ms": 106.99007846415043,
+              "p95_ttft_ms": 160.85893474519247,
+              "p99_ttft_ms": 179.43112794309852,
+              "median_tpot_ms": 4.063210239814174,
+              "p95_tpot_ms": 7.15412052889024,
+              "p99_tpot_ms": 8.580119173613285,
+              "cache_report": {
+                "total_prompt_tokens": 262144,
+                "total_cached_tokens": 0,
+                "cache_hit_rate_pct": 0,
+                "device_cached_tokens": null,
+                "host_cached_tokens": null,
+                "storage_cached_tokens": null,
+                "storage_backend": null
+              }
+            },
+            "host_pool": {
+              "allocated_bytes": 50913280,
+              "free": 0,
+              "filling": 16,
+              "quarantined": 0
+            }
+          },
+          {
+            "sample_ratio": 0.01,
+            "server_args": [
+              "--skip-server-warmup",
+              "--enable-metrics",
+              "--enable-cache-report",
+              "--attention-backend",
+              "triton",
+              "--mem-fraction-static",
+              "0.25",
+              "--max-total-tokens",
+              "4096",
+              "--max-running-requests",
+              "8",
+              "--chunked-prefill-size",
+              "128",
+              "--random-seed",
+              "42",
+              "--cuda-graph-backend-decode",
+              "full",
+              "--cuda-graph-backend-prefill",
+              "disabled",
+              "--cuda-graph-max-bs-decode",
+              "8",
+              "--training-capture-config",
+              "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-baseline-20261001/round-1-phase-2-0.01/capture.json"
+            ],
+            "selected_requests": 19,
+            "actual_admission_fraction": 0.00927734375,
+            "ready_fraction_of_admitted": 1,
+            "ready_fraction_of_selected": 1,
+            "capture_counter_delta": {
+              "considered": 2048,
+              "sampled_out": 2029,
+              "admitted": 19,
+              "overlap_forwards": 595,
+              "eager_forwards": 19,
+              "cuda_graph_forwards": 576,
+              "sealed": 19,
+              "writer_started": 19,
+              "copies_completed": 19,
+              "snapshot_built": 19,
+              "ready": 19
+            },
+            "readback": {
+              "validated_samples": 19,
+              "manifest_bytes": 268622,
+              "payload_bytes": 38025536,
+              "aux_payload_bytes": 670016,
+              "payload_objects": 494,
+              "kv_payload_bytes": 37355520
+            },
+            "post_client_capture_drain_seconds": 0.007947515696287155,
+            "serving": {
+              "completed": 2048,
+              "duration": 51.55126089975238,
+              "total_input_tokens": 262144,
+              "total_output_tokens": 65536,
+              "output_throughput": 1271.2783132005757,
+              "median_ttft_ms": 105.29599711298943,
+              "p95_ttft_ms": 147.46198933571577,
+              "p99_ttft_ms": 161.92739937454462,
+              "median_tpot_ms": 3.3502504830398867,
+              "p95_tpot_ms": 6.225790389843525,
+              "p99_tpot_ms": 6.864614961368421,
+              "cache_report": {
+                "total_prompt_tokens": 262144,
+                "total_cached_tokens": 0,
+                "cache_hit_rate_pct": 0,
+                "device_cached_tokens": null,
+                "host_cached_tokens": null,
+                "storage_cached_tokens": null,
+                "storage_backend": null
+              }
+            },
+            "host_pool": {
+              "allocated_bytes": 50913280,
+              "free": 0,
+              "filling": 16,
+              "quarantined": 0
+            }
+          },
+          {
+            "sample_ratio": 0.001,
+            "server_args": [
+              "--skip-server-warmup",
+              "--enable-metrics",
+              "--enable-cache-report",
+              "--attention-backend",
+              "triton",
+              "--mem-fraction-static",
+              "0.25",
+              "--max-total-tokens",
+              "4096",
+              "--max-running-requests",
+              "8",
+              "--chunked-prefill-size",
+              "128",
+              "--random-seed",
+              "42",
+              "--cuda-graph-backend-decode",
+              "full",
+              "--cuda-graph-backend-prefill",
+              "disabled",
+              "--cuda-graph-max-bs-decode",
+              "8",
+              "--training-capture-config",
+              "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-baseline-20261001/round-1-phase-3-0.001/capture.json"
+            ],
+            "selected_requests": 2,
+            "actual_admission_fraction": 0.0009765625,
+            "ready_fraction_of_admitted": 1,
+            "ready_fraction_of_selected": 1,
+            "capture_counter_delta": {
+              "considered": 2048,
+              "sampled_out": 2046,
+              "admitted": 2,
+              "overlap_forwards": 66,
+              "eager_forwards": 2,
+              "cuda_graph_forwards": 64,
+              "sealed": 2,
+              "writer_started": 2,
+              "copies_completed": 2,
+              "snapshot_built": 2,
+              "ready": 2
+            },
+            "readback": {
+              "validated_samples": 2,
+              "manifest_bytes": 28276,
+              "payload_bytes": 4002688,
+              "aux_payload_bytes": 70528,
+              "payload_objects": 52,
+              "kv_payload_bytes": 3932160
+            },
+            "post_client_capture_drain_seconds": 0.008100207895040512,
+            "serving": {
+              "completed": 2048,
+              "duration": 50.93539419397712,
+              "total_input_tokens": 262144,
+              "total_output_tokens": 65536,
+              "output_throughput": 1286.6495103663954,
+              "median_ttft_ms": 105.83955608308315,
+              "p95_ttft_ms": 147.55571391433477,
+              "p99_ttft_ms": 165.37931982427835,
+              "median_tpot_ms": 3.3513655465456744,
+              "p95_tpot_ms": 6.249321137945498,
+              "p99_tpot_ms": 6.314087663927386,
+              "cache_report": {
+                "total_prompt_tokens": 262144,
+                "total_cached_tokens": 0,
+                "cache_hit_rate_pct": 0,
+                "device_cached_tokens": null,
+                "host_cached_tokens": null,
+                "storage_cached_tokens": null,
+                "storage_backend": null
+              }
+            },
+            "host_pool": {
+              "allocated_bytes": 50913280,
+              "free": 0,
+              "filling": 16,
+              "quarantined": 0
+            }
+          },
+          {
+            "sample_ratio": null,
+            "server_args": [
+              "--skip-server-warmup",
+              "--enable-metrics",
+              "--enable-cache-report",
+              "--attention-backend",
+              "triton",
+              "--mem-fraction-static",
+              "0.25",
+              "--max-total-tokens",
+              "4096",
+              "--max-running-requests",
+              "8",
+              "--chunked-prefill-size",
+              "128",
+              "--random-seed",
+              "42",
+              "--cuda-graph-backend-decode",
+              "full",
+              "--cuda-graph-backend-prefill",
+              "disabled",
+              "--cuda-graph-max-bs-decode",
+              "8"
+            ],
+            "selected_requests": 0,
+            "actual_admission_fraction": 0,
+            "ready_fraction_of_admitted": null,
+            "ready_fraction_of_selected": null,
+            "capture_counter_delta": {},
+            "readback": {},
+            "post_client_capture_drain_seconds": 0.007746376097202301,
+            "serving": {
+              "completed": 2048,
+              "duration": 49.89436657726765,
+              "total_input_tokens": 262144,
+              "total_output_tokens": 65536,
+              "output_throughput": 1313.4949794083334,
+              "median_ttft_ms": 90.20686522126198,
+              "p95_ttft_ms": 144.42029576748607,
+              "p99_ttft_ms": 160.73760144412515,
+              "median_tpot_ms": 3.3178374531768986,
+              "p95_tpot_ms": 6.157013149030747,
+              "p99_tpot_ms": 6.204887823231759,
+              "cache_report": {
+                "total_prompt_tokens": 262144,
+                "total_cached_tokens": 0,
+                "cache_hit_rate_pct": 0,
+                "device_cached_tokens": null,
+                "host_cached_tokens": null,
+                "storage_cached_tokens": null,
+                "storage_backend": null
+              }
+            },
+            "host_pool": null
+          }
+        ]
+      }
+    ]
+  },
+  "environment_lock": "h100-runtime-lock.json",
+  "profile": {
+    "job_id": "01790827723119310326-05bdb014f266",
+    "returncode": 0,
+    "raw_report_path": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-profile-20261001/report.json",
+    "raw_report_sha256": "2d41984841e3520de44e91f6925fc811aec2a8a3aca4e93898f126c0a4536f15",
+    "log_sha256": "d38699fe1be3a1095af87e4f9532d5e72e2d6404dc0962e3b6408d782c3dec10",
+    "report": {
+      "status": "completed",
+      "config": {
+        "model_path": "/gpfs/models/huggingface.co/Qwen/Qwen3-0___6B",
+        "source_revision": "347ca171d",
+        "output_dir": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-profile-20261001",
+        "input_len": 128,
+        "output_len": 32,
+        "concurrency": 8,
+        "warmup_steps": 10,
+        "steps": 5,
+        "layers": [
+          0,
+          14,
+          27
+        ],
+        "capture_slots": 16,
+        "host_mib": 256,
+        "segment_mib": 2048,
+        "seed": 42
+      },
+      "scope": "Profiler-only scopes; probes wait for capture slots. GPU work attribution, not serving latency or throughput.",
+      "modes": [
+        {
+          "enabled": false,
+          "prefill": {
+            "input_len": 128,
+            "output_len": 1,
+            "batches": 5,
+            "requests": 40,
+            "capture_counter_delta": {},
+            "traces": [
+              "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-profile-20261001/off/prefill/prefill-1790828539.97187-TP-0.trace.json.gz"
+            ],
+            "capture_after": null
+          },
+          "decode": {
+            "input_len": 1,
+            "output_len": 32,
+            "batches": 5,
+            "requests": 40,
+            "capture_counter_delta": {},
+            "traces": [
+              "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-profile-20261001/off/decode/decode-1790828564.2246444-TP-0.trace.json.gz"
+            ],
+            "capture_after": null
+          }
+        },
+        {
+          "enabled": true,
+          "prefill": {
+            "input_len": 128,
+            "output_len": 1,
+            "batches": 5,
+            "requests": 40,
+            "capture_counter_delta": {
+              "considered": 40,
+              "excluded_health_check": 0,
+              "admitted": 40,
+              "overlap_forwards": 45,
+              "eager_forwards": 40,
+              "sealed": 40,
+              "writer_started": 40,
+              "copies_completed": 40,
+              "snapshot_built": 40,
+              "ready": 40,
+              "cuda_graph_forwards": 5
+            },
+            "traces": [
+              "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-profile-20261001/on/prefill/prefill-1790828634.611851-TP-0.trace.json.gz"
+            ],
+            "capture_after": {
+              "counters": {
+                "considered": 121,
+                "excluded_health_check": 1,
+                "admitted": 120,
+                "overlap_forwards": 135,
+                "eager_forwards": 120,
+                "sealed": 120,
+                "writer_started": 120,
+                "copies_completed": 120,
+                "snapshot_built": 120,
+                "ready": 120,
+                "cuda_graph_forwards": 15
+              },
+              "disabled_reason": null,
+              "enable_overlap": true,
+              "reservations": 6,
+              "states": {
+                "available": 6
+              },
+              "queued": 0,
+              "occupied_fraction": 0,
+              "writer_age_seconds": 0,
+              "host_pool": {
+                "allocated_bytes": 50913280,
+                "free": 10,
+                "filling": 6,
+                "quarantined": 0
+              },
+              "admission": {
+                "adaptive": false,
+                "configured_ratio": 1,
+                "target_ratio": 1,
+                "effective_ratio": 1,
+                "reason": "configured",
+                "cooldown_remaining_seconds": 0,
+                "occupied_fraction": 0,
+                "writer_age_seconds": 0,
+                "decreases": 0,
+                "recoveries": 0,
+                "failures": 0,
+                "pauses": 0,
+                "latency": null
+              }
+            }
+          },
+          "decode": {
+            "input_len": 1,
+            "output_len": 32,
+            "batches": 5,
+            "requests": 40,
+            "capture_counter_delta": {
+              "considered": 40,
+              "excluded_health_check": 0,
+              "admitted": 40,
+              "overlap_forwards": 165,
+              "eager_forwards": 5,
+              "sealed": 40,
+              "writer_started": 40,
+              "copies_completed": 40,
+              "snapshot_built": 40,
+              "ready": 40,
+              "cuda_graph_forwards": 160
+            },
+            "traces": [
+              "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-profile-20261001/on/decode/decode-1790828744.1996813-TP-0.trace.json.gz"
+            ],
+            "capture_after": {
+              "counters": {
+                "considered": 241,
+                "excluded_health_check": 1,
+                "admitted": 240,
+                "overlap_forwards": 630,
+                "eager_forwards": 135,
+                "sealed": 240,
+                "writer_started": 240,
+                "copies_completed": 240,
+                "snapshot_built": 240,
+                "ready": 240,
+                "cuda_graph_forwards": 495
+              },
+              "disabled_reason": null,
+              "enable_overlap": true,
+              "reservations": 10,
+              "states": {
+                "available": 10
+              },
+              "queued": 0,
+              "occupied_fraction": 0,
+              "writer_age_seconds": 0,
+              "host_pool": {
+                "allocated_bytes": 50913280,
+                "free": 6,
+                "filling": 10,
+                "quarantined": 0
+              },
+              "admission": {
+                "adaptive": false,
+                "configured_ratio": 1,
+                "target_ratio": 1,
+                "effective_ratio": 1,
+                "reason": "configured",
+                "cooldown_remaining_seconds": 0,
+                "occupied_fraction": 0,
+                "writer_age_seconds": 0,
+                "decreases": 0,
+                "recoveries": 0,
+                "failures": 0,
+                "pauses": 0,
+                "latency": null
+              }
+            }
+          }
+        }
+      ]
+    },
+    "analysis": [
+      {
+        "trace": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-profile-20261001/off/prefill/prefill-1790828539.97187-TP-0.trace.json.gz",
+        "sha256": "5f1fac07c54931e79915d1587f567e30630e54ceba477977b70b402f1c9b07e1",
+        "attribution": "CUDA correlation -> runtime/driver call contained in disjoint capture CPU scope",
+        "groups": {},
+        "all_kernel_us": 72829.4270000016,
+        "all_d2h_us": 100.70400000000001
+      },
+      {
+        "trace": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-profile-20261001/off/decode/decode-1790828564.2246444-TP-0.trace.json.gz",
+        "sha256": "9967d091f94ce37733941017f08df47eb0b44052217fde21e0258887e008b1d9",
+        "attribution": "CUDA correlation -> runtime/driver call contained in disjoint capture CPU scope",
+        "groups": {},
+        "all_kernel_us": 206433.25799999124,
+        "all_d2h_us": 375.5459999999997
+      },
+      {
+        "trace": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-profile-20261001/on/prefill/prefill-1790828634.611851-TP-0.trace.json.gz",
+        "sha256": "96ec277ab3dc14f79800817d6a11816f384368cff38590fab9b9e7a522e2c263",
+        "attribution": "CUDA correlation -> runtime/driver call contained in disjoint capture CPU scope",
+        "groups": {
+          "training_capture.kv": {
+            "cpu_calls": 45,
+            "cpu_scope_us": 34923.543999999994,
+            "gpu_kernel_calls": 540,
+            "gpu_kernel_us": 874.3349999999989,
+            "d2h_calls": 270,
+            "d2h_us": 2020.4759999999999,
+            "d2h_bytes": 62976000,
+            "d2h_events_missing_bytes": 0
+          },
+          "training_capture.positions_d2h": {
+            "cpu_calls": 45,
+            "cpu_scope_us": 4552.404,
+            "gpu_kernel_calls": 0,
+            "gpu_kernel_us": 0,
+            "d2h_calls": 45,
+            "d2h_us": 124,
+            "d2h_bytes": 41000,
+            "d2h_events_missing_bytes": 0
+          },
+          "training_capture.teacher": {
+            "cpu_calls": 45,
+            "cpu_scope_us": 24010.805000000004,
+            "gpu_kernel_calls": 1395,
+            "gpu_kernel_us": 3744.4319999999984,
+            "d2h_calls": 0,
+            "d2h_us": 0,
+            "d2h_bytes": 0,
+            "d2h_events_missing_bytes": 0
+          },
+          "training_capture.teacher_d2h": {
+            "cpu_calls": 45,
+            "cpu_scope_us": 11321.184000000005,
+            "gpu_kernel_calls": 0,
+            "gpu_kernel_us": 0,
+            "d2h_calls": 135,
+            "d2h_us": 322.1410000000001,
+            "d2h_bytes": 46260,
+            "d2h_events_missing_bytes": 0
+          }
+        },
+        "all_kernel_us": 77329.6920000011,
+        "all_d2h_us": 2580.1879999999965
+      },
+      {
+        "trace": "/gpfs/users/fuxuanwei-1/dspark-maas-lab/experiments/capture-profile-20261001/on/decode/decode-1790828744.1996813-TP-0.trace.json.gz",
+        "sha256": "2c30b851e17f475233e75e6a4037fefd65dcc140d03b89a64cdd880544b71b31",
+        "attribution": "CUDA correlation -> runtime/driver call contained in disjoint capture CPU scope",
+        "groups": {
+          "training_capture.kv": {
+            "cpu_calls": 1320,
+            "cpu_scope_us": 779515.755,
+            "gpu_kernel_calls": 15840,
+            "gpu_kernel_us": 25663.096000002046,
+            "d2h_calls": 7920,
+            "d2h_us": 20751.812000000453,
+            "d2h_bytes": 16220160,
+            "d2h_events_missing_bytes": 0
+          },
+          "training_capture.positions_d2h": {
+            "cpu_calls": 1320,
+            "cpu_scope_us": 114599.71200000006,
+            "gpu_kernel_calls": 0,
+            "gpu_kernel_us": 0,
+            "d2h_calls": 1320,
+            "d2h_us": 3504.7329999999897,
+            "d2h_bytes": 10560,
+            "d2h_events_missing_bytes": 0
+          },
+          "training_capture.teacher": {
+            "cpu_calls": 165,
+            "cpu_scope_us": 88233.42400000006,
+            "gpu_kernel_calls": 5115,
+            "gpu_kernel_us": 17189.553999999902,
+            "d2h_calls": 0,
+            "d2h_us": 0,
+            "d2h_bytes": 0,
+            "d2h_events_missing_bytes": 0
+          },
+          "training_capture.teacher_d2h": {
+            "cpu_calls": 1320,
+            "cpu_scope_us": 267459.00899999985,
+            "gpu_kernel_calls": 0,
+            "gpu_kernel_us": 0,
+            "d2h_calls": 3960,
+            "d2h_us": 10043.241999999924,
+            "d2h_bytes": 1356960,
+            "d2h_events_missing_bytes": 0
+          }
+        },
+        "all_kernel_us": 249826.04700000546,
+        "all_d2h_us": 34727.442000000585
+      }
+    ],
+    "tested_tools_sha256": {
+      "mooncake-study/experiments/profile_training_capture.py": "81a47d965e9a21d84749dc69d8dffa2f13510dd38a664506d9dd75e04ee9cb48",
+      "python/sglang/test/training_capture_profile_server.py": "bd0b7feebd99b1aa6d9888199d520fb8b3e4e3b4688b9679c9f01832663e153b",
+      "mooncake-study/experiments/summarize_capture_trace.py": "064da800ce355994e8485a0fb361cd5b5a8eb728e77cfc321d6a584045c29e32"
+    },
+    "trace_attribution_regression": {
+      "pre_fix_job": "01790829029991189479-7ecd7e83febd",
+      "pre_fix_returncode": 1,
+      "pre_fix_failure": "cpu_calls 2 != 1 because GPU user annotations were counted as CPU scopes",
+      "fixed_job": "01790829371490948615-9b53bbfd6e21",
+      "fixed_returncode": 0,
+      "tests": 3,
+      "subtests": 2,
+      "seconds": 10.05,
+      "log_sha256": "f5bebc515b5dee02cc612012ef15583563c68e55d917c3b6501333e579c79432",
+      "test_source_sha256": "4557308a42aece4e5bfb56be44b6a0f407695a070afadc2366f862ace461e2c9"
+    }
+  },
+  "limits": [
+    "One H100, Qwen3-0.6B BF16, TP=1, local TCP and test Catalog; not cross-node RDMA or production retention.",
+    "Seeded fixed-length random IDs at concurrency eight; not a production workload or a service SLO acceptance test.",
+    "The two rounds repeat the same seed; 0.1% sampling admits only two requests per phase, limiting overhead conclusions.",
+    "Round zero baseline TTFT p99 after/before is about 1.53. Bracketing does not eliminate tail-latency noise.",
+    "post_client_capture_drain_seconds starts after the benchmark subprocess exits, including its report processing; it is not last-response-to-READY latency.",
+    "Benchmark payload_bytes sums stored tensor objects, not physical D2H or network traffic.",
+    "Profiler probes run at 100% capture with reservation waits and annotations; their wall time cannot measure serving overhead.",
+    "Profile READY counts are checked; only the separate serving benchmark validates every measured snapshot after producer exit.",
+    "Profiler sums device work durations, not critical-path latency. CPU annotations are restricted to category user_annotation.",
+    "Overlap may enqueue one-ahead work discarded before publication, so captured trace bytes exceed logical committed rows.",
+    "Production rollout thresholds, capture-cost improvements, runtime dashboard acceptance and rollback checks remain open."
+  ]
+}

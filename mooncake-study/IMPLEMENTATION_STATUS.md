@@ -843,6 +843,64 @@ latency feedback, but it does not establish capture overhead or a service SLO:
 capture-off baselines, input-distribution controls, measured rollout thresholds
 and runtime dashboard acceptance remain required.
 
+## Capture Serving Baseline And GPU Attribution
+
+`benchmark_training_capture.py` now runs the existing streaming serving client
+against normal SGLang execution, with an isolated real TCP Store and HTTP test
+Catalog. It brackets capture phases with capture-off servers, reverses the
+sampling order on the second round, excludes warmup from counters, and validates
+all measured READY tensors after the producer exits. It records the actual
+admitted/selected/READY counts alongside client metrics and source hashes.
+Production execution has no added observer hooks or synchronous tensor copies.
+
+H100 job `01790827387658540683-770722b0f254` completed ten phases, each with 2,048
+requests of 128 input / 32 output tokens at concurrency eight. All 20,480 timed
+requests completed, yielding 655,360 output tokens. Across the two rounds, 422
+snapshots passed manifest, checksum and tensor-contract validation after producer
+exit. Every selected request was admitted and published, with no backpressure or
+quarantine. All phases report zero cached tokens. The target is Qwen3-0.6B BF16,
+with layers 0/14/27, normal overlap and decode CUDA graphs. Adaptive admission
+is disabled so that the configured sampling rates remain comparable.
+
+| Sampling | Snapshots Per Round | Throughput Change, Rounds 0 / 1 | TPOT p95 Change, Rounds 0 / 1 |
+| --- | ---: | ---: | ---: |
+| 0.1% | 2 | +1.0% / -2.2% | -0.1% / +1.7% |
+| 1% | 19 | -1.9% / -3.4% | +1.3% / +1.3% |
+| 10% | 190 | -15.6% / -18.0% | +14.9% / +16.4% |
+
+Each change uses that round's before/after baseline mean. Baseline throughput
+means are 1,294.74 and 1,315.91 output tokens/s. This is seeded synthetic traffic,
+not an SLO acceptance test: only two samples are admitted at 0.1%, both rounds
+reuse the same seed, and round zero's baseline TTFT p99 after/before is 1.53.
+The separate 32-request smoke run exercises 100% selection under pressure:
+22 snapshots publish while ten requests are excluded by backpressure; generation
+still completes for all 32 requests.
+
+`profile_training_capture.py` separately profiles 128-to-1 and 1-to-32 workloads
+using test-only CPU annotations around existing capture operations. Job
+`01790827723119310326-05bdb014f266` completes both off/on pairs with 40 measured
+READY samples per enabled workload. Its probes wait for reservations and are
+not latency measurements. In the decode workload, capture's KV/teacher kernels
+sum to 25.663/17.190ms and its 13,200 D2H operations sum to 34.300ms, transferring
+17,587,680 bytes. The many small gathers/copies are a measured optimization
+target. Overlap also stages one-ahead rows beyond the final publication prefix;
+actual DMA bytes are not interchangeable with stored tensor sizes.
+
+`summarize_capture_trace.py` attributes device events by CUDA launch correlation
+and records trace hashes. It excludes same-name GPU annotations from CPU counts.
+The regression reproduces double counting before the fix and passes afterward:
+job `01790829371490948615-9b53bbfd6e21`, three tests and two subtests in 10.05s.
+Missing DMA byte fields remain unknown, and ambiguous scope mappings fail.
+
+The retained configuration, versions, counters, client metrics, readback sizes,
+source/trace hashes and regression result are in
+[`capture-serving-performance.json`](experiments/capture-serving-performance.json).
+The source-backed profiler tables and rejected generic FP8 heuristic are in
+[`capture-profile-analysis.md`](experiments/capture-profile-analysis.md).
+The benchmark's post-client drain begins after the client process exits; it is
+not response-to-READY latency. These local TCP results do not establish RDMA,
+production Catalog retention, draft quality, rollout thresholds or a service SLO.
+
 ## Next Implementation
 
 1. Broaden real-request coverage to prefill graphs, real retraction, cache eviction,
@@ -853,8 +911,9 @@ and runtime dashboard acceptance remain required.
 3. Complete P9's topology work: TP/PP, non-static speculative layouts,
    PD transfer and cross-node RDMA. Existing capability gates do
    not constitute implementation of these paths.
-4. Complete P10's dashboard runtime acceptance, capture-on/off SLO benchmarks
-   and rollout/rollback checks. Per-model numerical/runtime validation and
+4. Reduce P10's measured capture overhead, extend capture-on/off benchmarks to
+   representative workloads and SLO thresholds, and complete dashboard runtime
+   acceptance and rollout/rollback checks. Per-model numerical/runtime validation and
    runtime identity coverage also need expansion beyond the tested combination.
 5. Integrate with the SpecForge-owned production Catalog and consumer when
    available. Test doubles do not prove retention, consumer checkpoint replay,

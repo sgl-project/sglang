@@ -130,6 +130,108 @@ the unit test explicitly covers `-707`. The transport-focused small-object test
 still uses its short lease. Runtime correctness does not require a 100ms
 transport deadline during process teardown.
 
+### Capture On/Off Benchmark
+
+`benchmark_training_capture.py` launches normal SGLang servers with overlap,
+decode CUDA graphs and tokenizer/detokenizer enabled. It reuses
+`sglang.benchmark.serving` for native streaming HTTP measurements. Each phase
+owns an isolated real Mooncake master/data segment and a Catalog test double,
+including baseline phases, so unrelated Store contents are never touched.
+Capture-off means that `--training-capture-config` is absent.
+
+Run through the resident worker, allowing 1800 seconds for the default matrix:
+
+```bash
+python mooncake-study/experiments/benchmark_training_capture.py \
+  --model-path /gpfs/models/huggingface.co/Qwen/Qwen3-0___6B \
+  --source-revision <implementation-git-commit> \
+  --output-dir /absolute/new/experiment-directory \
+  --num-prompts 2048 --input-len 128 --output-len 32 --concurrency 8 \
+  --ratios 0.001 0.01 0.1 --repeats 2
+```
+
+The output directory must be new. Source revision is supplied explicitly because
+the GPU staging directory does not contain `.git`; the report also records
+producer-file and driver digests and installed runtime versions. The default
+10% upper ratio is an experimental setting, not a production recommendation.
+Adjust selected layers, Host slots and segment capacity for another model.
+
+Every phase uses the same seeded, fixed-length `random-ids` workload. Warmup
+runs at batch sizes one and the concurrency limit, then flushes the prefix cache.
+The existing benchmark runs with streaming, greedy sampling, `ignore_eos` and
+no additional warmup. Concurrency is closed-loop: client semaphore wait is not
+part of request TTFT. The report retains cache-hit counts; this is synthetic
+load, not a claim about real request lengths, arrival rates or prefix sharing.
+
+Each round is bracketed by capture-off runs, and odd rounds reverse capture
+ratio order. `report.json` includes client TTFT/TPOT p50/p95/p99, output throughput,
+request success counts, baseline drift, ratios against the mean of the two
+baseline measurements, and per-phase capture counters. These ratios are
+descriptive measurements, not confidence intervals or an SLO pass/fail gate.
+
+Warmup counters/publications are excluded. After timed requests finish, the
+driver drains capture, stops the producer, then reads every measured READY
+snapshot from the surviving Store and validates its digest, tensor content and
+sequence lengths. It reports admitted/selected/READY fractions, backpressure,
+Host state and separate post-client drain time. The request stream never waits
+for capture slots. A zero-sample run is explicitly marked, so low-rate absence
+of data cannot be mistaken for validated capture. Payload and manifest byte
+totals describe successfully read objects, not measured D2H/RDMA traffic.
+
+The experiment currently leaves GPU capture-kernel time, D2H/wire counters and
+production SLO status unset. Those require separate profiling/transport evidence
+and deployment-specific thresholds. All servers and Store resources are closed
+before the worker resumes idle load; per-phase client logs/results and the
+incremental report remain in the experiment directory.
+
+`profile_training_capture.py` is a separate experiment for GPU attribution:
+
+```bash
+python mooncake-study/experiments/profile_training_capture.py \
+  --model-path /gpfs/models/huggingface.co/Qwen/Qwen3-0___6B \
+  --source-revision <implementation-git-commit> \
+  --output-dir /absolute/new/profile-directory
+```
+
+It collects capture-off/on traces for separate 128-to-1 prefill and 1-to-32
+decode workloads, batch size eight, ten warmup batches and five measured batches
+per workload. The server uses a test-only entrypoint that places CPU profiler
+scopes around teacher top-k/LSE, KV export, teacher D2H and position D2H. The
+underlying implementations are unchanged; no observer copies are introduced.
+Each probe waits for spare capture slots, so all measured requests in the enabled
+case must reach READY. This waiting and profiler overhead make its wall times
+unsuitable for the serving comparison above. The artifact records capture counts
+and trace paths. Analyze the traces with the repository's profiler triage skill;
+CPU scope time is not GPU time, and payload bytes are not a DMA measurement.
+
+For explicit capture attribution, run the standard-library trace summarizer on
+each enabled trace (omit `--require-capture` for the disabled traces):
+
+```bash
+python mooncake-study/experiments/summarize_capture_trace.py \
+  /path/to/on/decode/decode-TP-0.trace.json.gz \
+  --require-capture --output /path/to/capture-attribution.json
+```
+
+It follows CUDA correlation IDs from runtime/driver calls inside the CPU
+`user_annotation` ranges to kernels and D2H activity. Same-name GPU annotations
+are excluded from CPU counts. Missing byte fields remain unknown. The output
+includes trace hashes, operation counts, summed device durations and DMA bytes;
+these sums do not establish critical-path latency or an overlap opportunity.
+Overlap can enqueue work beyond the eventual terminal prefix, so actual DMA
+bytes can exceed the committed tensor sizes. The prefill probe also includes a
+small number of one-ahead decode forwards and is not a pure prefill trace.
+
+`post_client_capture_drain_seconds` in the serving benchmark begins after the
+client subprocess exits, including its result processing. It measures only the
+remaining drain at that point, not latency from the last response to READY.
+
+The retained H100 run is in
+[`capture-serving-performance.json`](capture-serving-performance.json), with
+scope, raw paths/hashes and two bracketed rounds of 0.1%, 1% and 10% sampling.
+[`capture-profile-analysis.md`](capture-profile-analysis.md) records the source
+attribution and the limits of the profiler's optimization suggestions.
+
 ### BF16 Rounding Isolation
 
 The actual fixed-input parity command remains the serving gate. The following
