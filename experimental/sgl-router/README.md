@@ -88,6 +88,14 @@ buckets and are not accepted on this path.
 
 Omitting `--chat-routing` keeps the existing policies and defaults.
 
+### Optional tokenizer for load-only routing
+
+`--no-tokenizer` skips tokenizer loading for load-only policies such as
+`power_of_two` and `session_aware`, on either routing path. Workers tokenize the
+original messages, and `/v1/tokenize` and `/v1/detokenize` are unavailable.
+Cache-aware routing, prefix-cache terms or filters, and `--bucket-config` still
+require a tokenizer.
+
 ### Fleet-wide sampling contract
 
 `--override-sampling-params` fixes the sampling configuration for every client
