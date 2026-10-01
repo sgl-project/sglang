@@ -122,7 +122,7 @@ class GigaChat35ModelNextN(nn.Module):
             hidden_states_before_norm = residual_batch.snapshot(
                 hidden_states, forward_batch
             )
-            hidden_states = residual_batch.norm(
+            hidden_states = residual_batch.final_norm(
                 hidden_states, forward_batch, self.shared_head.norm
             )
 
@@ -141,7 +141,6 @@ class GigaChat35ForCausalLMNextN(DeepseekV2WeightLoaderMixin, nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.pp_group = get_parallel().pp_group
-        self.tp_size = get_parallel().tp_size
         self.num_fused_shared_experts = 0
         self.draft_model_idx = draft_model_idx or 0
 

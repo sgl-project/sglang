@@ -61,7 +61,7 @@ from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
     declare_attn,
     declare_ffn,
-    enable_moe_dense_fully_dp,
+    is_dense_ffn_fully_dp,
     make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
@@ -131,7 +131,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_non_idle_and_non_empty,
     log_info_on_rank0,
-    make_layers,
+    make_pp_layers,
 )
 
 _is_cuda = is_cuda()
@@ -1553,7 +1553,7 @@ class Dots3DecoderLayer(nn.Module):
                 is_nextn=is_nextn,
             )
         else:
-            if enable_moe_dense_fully_dp():
+            if is_dense_ffn_fully_dp():
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
@@ -1577,12 +1577,12 @@ class Dots3DecoderLayer(nn.Module):
             (
                 declare_ffn(
                     sparse=self.is_layer_sparse,
-                    next_sparse=is_next_layer_sparse,
+                    next_layer_sparse=is_next_layer_sparse,
                 ),
                 self.post_attention_layernorm,
             ),
             previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_sparse=self.is_layer_sparse
+                sparse=is_previous_layer_sparse, next_layer_sparse=self.is_layer_sparse
             )
             if layer_id != 0
             else None,
@@ -1660,7 +1660,7 @@ class Dots3DecoderLayer(nn.Module):
     def op_mlp(self, state):
         hidden_states = state.pop("hidden_states_mlp_input")
         if not (
-            enable_moe_dense_fully_dp()
+            is_dense_ffn_fully_dp()
             and (not self.is_layer_sparse)
             and hidden_states.shape[0] == 0
         ):
@@ -1671,7 +1671,7 @@ class Dots3DecoderLayer(nn.Module):
             state.hidden_states_mlp_output = hidden_states
 
     def op_comm_postprocess_layer(self, state):
-        hidden_states = self.ffn_boundary.postprocess(
+        hidden_states = self.ffn_boundary.finish_complete_output(
             state.pop("hidden_states_mlp_output"), state.forward_batch
         )
 
@@ -1718,7 +1718,7 @@ class Dots3Model(nn.Module):
             self.embed_tokens = PPMissingLayer()
 
         self.alt_stream = torch.cuda.Stream() if _is_cuda else None
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Dots3DecoderLayer(
                 config=config,
@@ -1727,8 +1727,6 @@ class Dots3Model(nn.Module):
                 prefix=prefix,
                 alt_stream=self.alt_stream,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
@@ -1800,7 +1798,7 @@ class Dots3Model(nn.Module):
             return residual_batch.to_pp(hidden_states, forward_batch)
         else:
             if not forward_batch.forward_mode.is_idle():
-                hidden_states = residual_batch.norm(
+                hidden_states = residual_batch.final_norm(
                     hidden_states, forward_batch, self.norm
                 )
         return hidden_states
@@ -1834,7 +1832,6 @@ class Dots3LanguageModelForCausalLM(nn.Module):
 
         self.pp_group = get_parallel().pp_group
         self.config = config
-        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.determine_num_fused_shared_experts()
         self.model = Dots3Model(
@@ -2716,7 +2713,6 @@ class DotsNoteOmniForConditionalGeneration(nn.Module):
         )
         language_model = self.thinker.language_model
         self.pp_group = language_model.pp_group
-        self.tp_size = language_model.tp_size
         self.quant_config = language_model.quant_config
         self.num_fused_shared_experts = language_model.num_fused_shared_experts
         self.forward = self.thinker.forward

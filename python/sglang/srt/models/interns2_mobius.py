@@ -21,7 +21,10 @@ from sglang.srt.layers.layer_boundary import (
     make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
-from sglang.srt.layers.layer_boundary.residual.add_norm import Fp8Input, NormQuantRead
+from sglang.srt.layers.layer_boundary.residual.add_norm import (
+    Fp8Input,
+    NormQuantReadout,
+)
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -330,7 +333,6 @@ class InternS2MobiusRoutedExpertBank(nn.Module):
     ) -> None:
         super().__init__()
         self.bank_id = bank_id
-        self.tp_size = get_parallel().tp_size
         self.num_experts = config.num_experts
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
@@ -504,7 +506,7 @@ class InternS2MobiusLinearDecoderLayer(_InternS2MobiusDecoderMixin, nn.Module):
         self.attn_boundary, self.ffn_boundary = make_stages(
             (
                 declare_attn(
-                    read=NormQuantRead(
+                    read=NormQuantReadout(
                         fp8_input=Fp8Input.TUPLE_AND_BF16 if accepts_fp8_input else None
                     )
                 ),
@@ -513,11 +515,11 @@ class InternS2MobiusLinearDecoderLayer(_InternS2MobiusDecoderMixin, nn.Module):
             (
                 declare_ffn(
                     sparse=True,
-                    next_sparse=True,
+                    next_layer_sparse=True,
                 ),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn(sparse=True, next_sparse=True)
+            previous=declare_ffn(sparse=True, next_layer_sparse=True)
             if layer_id != 0
             else None,
             terminal=layer_id == config.num_hidden_layers - 1,
@@ -533,7 +535,7 @@ class InternS2MobiusLinearDecoderLayer(_InternS2MobiusDecoderMixin, nn.Module):
         hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
-            captured_last_layer_outputs=kwargs.get("captured_last_layer_outputs"),
+            capture_gathered=kwargs.get("captured_last_layer_outputs"),
         )
         if not forward_batch.forward_mode.is_idle():
             hidden_states = self.linear_attn(hidden_states, forward_batch)
@@ -636,7 +638,7 @@ class InternS2MobiusAttentionDecoderLayer(
         self.attn_boundary, self.ffn_boundary = make_stages(
             (
                 declare_attn(
-                    read=NormQuantRead(
+                    read=NormQuantReadout(
                         fp8_input=Fp8Input.TUPLE if accepts_fp8_input else None
                     )
                 ),
@@ -645,11 +647,11 @@ class InternS2MobiusAttentionDecoderLayer(
             (
                 declare_ffn(
                     sparse=True,
-                    next_sparse=True,
+                    next_layer_sparse=True,
                 ),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn(sparse=True, next_sparse=True)
+            previous=declare_ffn(sparse=True, next_layer_sparse=True)
             if layer_id != 0
             else None,
             terminal=layer_id == config.num_hidden_layers - 1,
@@ -669,7 +671,7 @@ class InternS2MobiusAttentionDecoderLayer(
         hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
-            captured_last_layer_outputs=captured_last_layer_outputs,
+            capture_gathered=captured_last_layer_outputs,
         )
         if not forward_batch.forward_mode.is_idle():
             hidden_states = self.self_attention(
@@ -800,10 +802,9 @@ class InternS2MobiusForCausalLM(Qwen3_5ForCausalLM):
                     input_deepstack_embeds[:, start : start + self.hidden_size],
                 )
 
-        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
-
-        if hidden_states.shape[0] != 0:
-            hidden_states = residual_batch.norm(hidden_states, forward_batch, self.norm)
+        hidden_states = residual_batch.final_norm(
+            hidden_states, forward_batch, self.norm, skip_empty=True
+        )
         return (
             hidden_states
             if not aux_hidden_states

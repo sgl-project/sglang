@@ -13,7 +13,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.layers.layer_boundary import UnreducedOutput
-from sglang.srt.layers.layer_boundary.fusions.allreduce import complete_attention_input
+from sglang.srt.layers.layer_boundary.fusions.allreduce import fused_attn_input
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
@@ -659,7 +659,7 @@ class TestAiterAllreduceFusionGate(CustomTestCase):
         hidden = torch.ones(8, 32)
         owed = UnreducedOutput(hidden, group=group if matching_group else object())
         with (
-            patch_communicator("apply_flashinfer_allreduce_fusion", return_value=False),
+            patch_communicator("flashinfer_ar_fusion_applies", return_value=False),
             patch_communicator("post_experts_reduction_group", return_value=group),
             patch_communicator("_use_aiter", use_aiter),
             get_parallel().override(tp_size=tp_world_size),
@@ -670,7 +670,7 @@ class TestAiterAllreduceFusionGate(CustomTestCase):
             ),
             get_flags().dp.override(enabled=dp_attention),
         ):
-            result = complete_attention_input(
+            result = fused_attn_input(
                 plan,
                 owed,
                 hidden.clone(),

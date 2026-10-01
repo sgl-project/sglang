@@ -12,9 +12,9 @@ import { config } from '/src/snippets/configs/Qwen/qwen-image-2.1.jsx';
 
 ## 1. Quick start
 
-Install the runtime dependencies with `uv pip install "sglang[diffusion]" --prerelease=allow`,
-then install this integration from its source checkout with
-`uv pip install -e "python[diffusion]"`. The picker uses `Qwen/Qwen-Image-2.1`;
+Use a nightly Docker image containing this integration, or install from source,
+following the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation).
+Run the commands below inside that environment. The picker uses `Qwen/Qwen-Image-2.1`;
 you can also set a local checkpoint directory under **Variables**. The recipes
 target NVIDIA CUDA on Linux; the picker marks which single-GPU workloads have
 been verified with the full checkpoint.
@@ -117,9 +117,12 @@ Qwen-Image 2.1 supports text-to-image generation, single- and multi-image editin
 and RGBA output. Use one checkpoint for all modes.
 
 For multi-round editing, send the previous output as the next reference image.
-The server does not retain conversation state. Condition-prefix KV caches are
-reused within one request; cross-request and dialogue-history caching are not
-implemented.
+The server does not retain conversation state. Repeated prompts and reference
+images can reuse exact encoder outputs and VAE posteriors through the default
+[conditioning cache](/docs/sglang-diffusion/caching-acceleration#conditioning-cache).
+Changing the prompt or image recomputes their joint embedding; unchanged images
+can still reuse vision features. Condition-prefix KV reuse stays within each
+request. Use `--disable-conditioning-cache` to turn off cross-request reuse.
 
 ## 3. Checkpoint layout
 

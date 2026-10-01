@@ -27,11 +27,11 @@ from sglang.srt.layers.flashinfer_comm_fusion import (
     uses_cutedsl_ar_fusion,
 )
 from sglang.srt.layers.layer_boundary.adapters.attention import (
-    _redistribute_from_attn_tp_shards,
-    _redistribute_to_attn_tp_shards,
+    attn_tp_gather,
+    attn_tp_slice,
     get_attn_tp_context,
 )
-from sglang.srt.layers.layer_boundary.residual import LayerResidual
+from sglang.srt.layers.layer_boundary.residual import LayerResidualOps
 from sglang.srt.layers.quantization.fp8_utils import (
     _use_aiter_bpreshuffle_gfx95,
     materialize_bpreshuffle_fp8_scale_tuple,
@@ -144,7 +144,7 @@ def _fused_rmsnorm_fp8_per_token_quant(
 FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
 
 
-def apply_flashinfer_allreduce_fusion(batch_size: int):
+def flashinfer_ar_fusion_applies(batch_size: int):
     return (
         # NOTE: flashinfer 0.6.1 caused performance regression on sm100 for allreduce fusion
         # Ref: https://github.com/sgl-project/sglang/issues/17237
@@ -163,7 +163,7 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
     )
 
 
-def aiter_all_reduce_fusion_enabled_for(forward_mode: ForwardMode) -> bool:
+def aiter_ar_fusion_enabled_for(forward_mode: ForwardMode) -> bool:
     comm = get_exec().comm
     if not comm.enable_aiter_allreduce_fusion:
         return False
@@ -172,9 +172,7 @@ def aiter_all_reduce_fusion_enabled_for(forward_mode: ForwardMode) -> bool:
     return not comm.disable_aiter_allreduce_fusion_in_decode
 
 
-def apply_aiter_all_reduce_fusion(
-    input_tensor: torch.Tensor, forward_batch: ForwardBatch
-):
+def aiter_ar_fusion_applies(input_tensor: torch.Tensor, forward_batch: ForwardBatch):
     n = input_tensor.shape[-1]
     total_bytes = input_tensor.numel() * input_tensor.element_size()
     # Aiter's should_custom_ar uses <= max_size/2 (64 MB); match that boundary.
@@ -185,7 +183,7 @@ def apply_aiter_all_reduce_fusion(
         and total_bytes <= 8 * 1024 * 8192
         and get_parallel().tp_size != 6
         and not is_dp_attention_enabled()
-        and aiter_all_reduce_fusion_enabled_for(forward_batch.forward_mode)
+        and aiter_ar_fusion_enabled_for(forward_batch.forward_mode)
     )
 
 
@@ -267,7 +265,7 @@ def _update_and_read_residual_aiter_fp8_per_token(
     )
 
 
-def _attn_input_update_and_read_residual(quant_format: str, keep_bf16: bool = False):
+def _norm_quant_kernel(quant_format: str, keep_bf16: bool = False):
     """Add the previous layer's output to the residual and read the attention
     input from it: the input norm, fused with the quantization this format
     wants. Without a residual (the first layer, or one already folded into
@@ -283,22 +281,22 @@ def _attn_input_update_and_read_residual(quant_format: str, keep_bf16: bool = Fa
     return _update_and_read_residual_plain
 
 
-class Add:
+class PlainAdd:
     """A plain residual: the output is added into it."""
 
-    adds_plainly = True
-    at_producer = False
-    can_defer_across_layers = True
+    is_plain_add = True
+    applied_at_exit = False
+    outlives_layer = True
 
     def update(self, hidden_states, residual):
         hidden_states += residual
         return hidden_states
 
-    def residual_to_attn_tp_shard(self, residual):
-        return _redistribute_to_attn_tp_shards(residual)
+    def slice_residual_attn_tp(self, residual):
+        return attn_tp_slice(residual)
 
-    def residual_from_attn_tp_shards(self, residual):
-        return _redistribute_from_attn_tp_shards(residual)
+    def gather_residual_attn_tp(self, residual):
+        return attn_tp_gather(residual)
 
 
 class Fp8Input(Enum):
@@ -309,14 +307,14 @@ class Fp8Input(Enum):
 
 
 @dataclass(frozen=True)
-class NormQuantRead:
+class NormQuantReadout:
     """The input is the residual's norm, fused with the quantization the
     consumer asks for (``quant_format``) and a post-residual addition; a plain
     add of the previous output runs in the same kernel. An empty batch skips
     the norm."""
 
-    norms_plainly = True
-    before_gather: bool = False
+    is_plain_norm = True
+    reads_before_dp_gather: bool = False
     fp8_input: Optional[Fp8Input] = None
     # The format the consumer's GEMM wants, when the model knows it at
     # construction. A per-forward ``quant_format`` overrides it.
@@ -328,13 +326,13 @@ class NormQuantRead:
         output alongside the quantized tuple."""
         return self.fp8_input is Fp8Input.TUPLE_AND_BF16
 
-    def enter(self, hidden_states):
+    def init_residual(self, hidden_states):
         return hidden_states
 
     def read(self, residual, norm, quant_format="", post_residual_addition=None):
         if residual.shape[0] == 0:
             return residual, residual
-        return _attn_input_update_and_read_residual(
+        return _norm_quant_kernel(
             quant_format or self.quant_format, self.keeps_bf16
         )(norm, residual, None, None)
 
@@ -347,24 +345,24 @@ class NormQuantRead:
         quant_format="",
         post_residual_addition=None,
     ):
-        if not update.adds_plainly:
+        if not update.is_plain_add:
             return self.read(update.update(hidden_states, residual), norm, quant_format)
         if hidden_states.shape[0] == 0:
             return hidden_states, hidden_states
-        return _attn_input_update_and_read_residual(
+        return _norm_quant_kernel(
             quant_format or self.quant_format, self.keeps_bf16
         )(norm, hidden_states, residual, post_residual_addition)
 
 
 @dataclass(frozen=True)
-class NormRead:
+class NormReadout:
     """The input is the residual's norm; a plain add of the previous output
     runs in the same kernel. An empty batch skips the norm."""
 
-    norms_plainly = True
-    before_gather: bool = False
+    is_plain_norm = True
+    reads_before_dp_gather: bool = False
 
-    def enter(self, hidden_states):
+    def init_residual(self, hidden_states):
         return hidden_states
 
     def read(self, residual, norm, quant_format="", post_residual_addition=None):
@@ -388,7 +386,7 @@ class NormRead:
         if residual is None:
             # The layer stack starts at this stage: its input is the residual.
             return self.read(hidden_states, norm, quant_format, post_residual_addition)
-        if not update.adds_plainly:
+        if not update.is_plain_add:
             return self.read(update.update(hidden_states, residual), norm, quant_format)
         if quant_format or post_residual_addition is not None:
             raise NotImplementedError(
@@ -399,14 +397,14 @@ class NormRead:
         return norm(hidden_states, residual)
 
 
-ADD = Add()
-NORM_QUANT_READ = NormQuantRead()
-NORM_READ = NormRead()
+PLAIN_ADD = PlainAdd()
+NORM_QUANT_READOUT = NormQuantReadout()
+NORM_READOUT = NormReadout()
 # A plain residual: the attention reads with its input norm and the quantization
 # it wants, the FFN with its norm, and each stage's output is added.
-PLAIN_RESIDUAL = LayerResidual(
-    attention_read=NORM_QUANT_READ,
-    attention_update=ADD,
-    ffn_read=NORM_READ,
-    ffn_update=ADD,
+PLAIN_RESIDUAL_OPS = LayerResidualOps(
+    attn_readout=NORM_QUANT_READOUT,
+    attn_update=PLAIN_ADD,
+    ffn_readout=NORM_READOUT,
+    ffn_update=PLAIN_ADD,
 )

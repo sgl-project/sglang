@@ -17,6 +17,7 @@ from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKerne
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     build_verify_intermediate_state_indices,
+    select_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.utils import is_cpu, is_cuda, is_npu
@@ -173,7 +174,7 @@ class KDAKernelDispatcher:
             else:
                 self.extend_kernel = triton_kernel
                 rank0_log(
-                    "PTX KDA prefill needs SM103 (GB300); falling back to Triton "
+                    "PTX KDA prefill needs SM100 or SM103; falling back to Triton "
                     "extend."
                 )
         elif prefill_backend.is_nvidia_kda():
@@ -196,7 +197,7 @@ class KDAKernelDispatcher:
                 f"Unsupported KDA prefill backend: {prefill_backend}. "
                 "KDA supports 'triton', 'helion', 'flashkda', 'cutedsl', "
                 "'nvidia_kda', or 'ptx_kda' (cutedsl/nvidia_kda prefill need "
-                "SM100, ptx_kda SM103)."
+                "SM100, ptx_kda SM100 or SM103)."
             )
 
         self.supports_packed_decode = getattr(
@@ -793,6 +794,28 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         return core_attn_out
 
+    def _convolve_prefill(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        mixed_qkv: torch.Tensor,
+        conv_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        # Depthwise conv is channel-independent, so one packed call over the
+        # full qkv width matches the decode path and saves two kernel launches.
+        return causal_conv1d_fn(
+            mixed_qkv.transpose(0, 1),
+            layer.conv_weights,
+            layer.bias,
+            activation="silu",
+            conv_states=conv_states,
+            has_initial_state=forward_batch.extend_prefix_lens > 0,
+            cache_indices=cache_indices,
+            query_start_loc=self.forward_metadata.query_start_loc,
+            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+        ).transpose(0, 1)
+
     def forward_extend(
         self,
         layer: RadixLinearAttention,
@@ -820,7 +843,6 @@ class KDAAttnBackend(MambaAttnBackendBase):
             raise RuntimeError(
                 "extend_prefix_lens cannot be None in non-TARGET_VERIFY mode."
             )
-        has_initial_state = forward_batch.extend_prefix_lens > 0
 
         physical_num_tokens = mixed_qkv.shape[0]
         logical_num_tokens = self.forward_metadata.logical_num_tokens
@@ -841,19 +863,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 self.forward_metadata.conv_states_mask_indices
             ] = mixed_qkv[self.forward_metadata.track_conv_indices]
 
-        # Depthwise conv is channel-independent, so one packed call over the
-        # full qkv width matches the decode path and saves two kernel launches.
-        qkv = causal_conv1d_fn(
-            mixed_qkv.transpose(0, 1),
-            layer.conv_weights,
-            layer.bias,
-            activation="silu",
-            conv_states=conv_states,
-            has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        ).transpose(0, 1)
+        qkv = self._convolve_prefill(
+            layer, forward_batch, mixed_qkv, conv_states, cache_indices
+        )
         q, k, v = qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
 
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
@@ -907,6 +919,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
             lower_bound=layer.lower_bound,
             beta_is_raw=gate_was_flat,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            extend_prefix_lens=forward_batch.extend_prefix_lens,
+            layer_id=layer.layer_id,
             # draft_extend_v2 must stay rollback-able, so kernels that commit state
             # in place (e.g. FlashKDA) must not run for it.
             is_spec_decode=forward_batch.forward_mode.is_draft_extend_v2(),
@@ -1014,7 +1028,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 replayssm_beta=replayssm_beta,
             )
         intermediate_conv_window_cache = mamba_cache_params.intermediate_conv_window[0]
-        intermediate_state_indices = self.verify_intermediate_state_indices
+        intermediate_state_indices = select_verify_intermediate_state_indices(
+            self.verify_intermediate_state_indices,
+            forward_batch.req_pool_indices,
+            cache_indices[: query_start_loc.shape[0] - 1] >= 0,
+            self.req_to_token_pool.size,
+        )
 
         draft_token_num = forward_batch.spec_info.draft_token_num
         ragged_layout = forward_batch.spec_info.ragged_verify_layout
