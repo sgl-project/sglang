@@ -62,6 +62,14 @@ class CosmosDreamsConfig(Cosmos3Config):
     # manifest once the checkpoint is known; adjust_num_frames rounds to it.
     chunk_size: int = 4
     temporal_compression_factor: int = 4
+    # Refreshed from the manifest: schema-5 exports take normalized unified rows
+    # and trained on plain captions, so request defaults follow them.
+    unified_actions: bool = False
+    prompt_json_caption: bool = True
+
+    # Decode each committed chunk with the causal Wan VAE on a side CUDA stream
+    # while the next chunk denoises, instead of one decode after the rollout.
+    overlap_vae_decode: bool = True
 
     # Sigma schedule per chunk, picked by the chunk's first latent frame (the last entry
     # repeats). None applies the step42 budget the checkpoints were distilled with: every
@@ -81,6 +89,8 @@ class CosmosDreamsConfig(Cosmos3Config):
             manifest = self._validate_checkpoint(self.model_path)
             self.chunk_size = manifest.chunk_size
             self.temporal_compression_factor = manifest.temporal_compression_factor
+            self.unified_actions = manifest.unified_actions
+            self.prompt_json_caption = manifest.training_prompt_as_json
             self._validate_history_settings(manifest)
 
     def _validate_history_settings(self, manifest: CosmosDreamsManifest) -> None:
@@ -135,10 +145,13 @@ class CosmosDreamsConfig(Cosmos3Config):
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         # Distilled checkpoints run one conditional branch per step, so CFG
         # parallel would only duplicate the rollout on a second GPU.
+        # The rollout decodes committed chunks while it runs, so the VAE stays
+        # resident next to the DiT.
         return replace(
             super().get_model_deployment_config(),
             auto_enable_cfg_parallel=False,
             supports_cfg_parallel=False,
+            keep_resident_components=("dit", "vae"),
         )
 
     def validate_server_args(self, server_args: Any) -> None:

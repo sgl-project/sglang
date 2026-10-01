@@ -19,8 +19,10 @@ from typing import TYPE_CHECKING, Any
 
 from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
     CosmosDreamsManifest,
+    CosmosDreamsUnifiedActionContract,
     EmbodimentContract,
     load_cosmos_dreams_manifest,
+    load_unified_normalizer,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     RealtimeEvent,
@@ -82,6 +84,25 @@ def idle_action_row(contract: EmbodimentContract) -> list[float]:
             row[offset] = 1.0
             row[offset + 4] = 1.0
     return row
+
+
+def session_idle_row(
+    manifest: CosmosDreamsManifest, *, embodiment: str, model_path: str | None
+) -> list[float]:
+    """Idle row for the session's embodiment, in the units the pipeline expects.
+
+    Native contracts take raw units; unified contracts take normalized rows, so
+    the identity poses are normalized with the export's statistics.
+    """
+    contract = manifest.action_contract
+    if isinstance(contract, CosmosDreamsUnifiedActionContract):
+        if model_path is None:
+            raise ValueError(
+                "Unified Cosmos-Dreams checkpoints need the export path to build idle rows."
+            )
+        normalizer = load_unified_normalizer(model_path, contract)
+        return normalizer.identity_row(contract.layout, embodiment=embodiment)
+    return idle_action_row(contract.embodiments[embodiment])
 
 
 def validate_action_row(value: Any, *, raw_action_dim: int) -> list[float]:
@@ -210,14 +231,19 @@ class CosmosDreamsRealtimeState:
         self.extra_sampling_fields: dict[str, Any] = {}
 
     def configure(
-        self, manifest: CosmosDreamsManifest, *, embodiment: str
+        self,
+        manifest: CosmosDreamsManifest,
+        *,
+        embodiment: str,
+        model_path: str | None = None,
     ) -> CosmosDreamsActionControlState:
-        contract = manifest.action_contract.embodiments[embodiment]
         self.manifest = manifest
         self.embodiment = embodiment
         self.actions = CosmosDreamsActionControlState(
-            idle_row=idle_action_row(contract),
-            raw_action_dim=contract.raw_action_dim,
+            idle_row=session_idle_row(
+                manifest, embodiment=embodiment, model_path=model_path
+            ),
+            raw_action_dim=manifest.action_input_dim(embodiment),
         )
         return self.actions
 
@@ -256,20 +282,20 @@ class CosmosDreamsRealtimeAdapter(BaseRealtimeModelAdapter):
         request: RealtimeVideoGenerationsRequest,
     ) -> None:
         state = self._state(session)
-        manifest = realtime_manifest(get_global_server_args().model_path)
+        model_path = get_global_server_args().model_path
+        manifest = realtime_manifest(model_path)
         condition_inputs = request.condition_inputs or {}
         embodiment = manifest.action_contract.resolve_embodiment(
             condition_inputs.get("domain_name"), condition_inputs.get("domain_id")
         )
-        actions = state.configure(manifest, embodiment=embodiment)
+        actions = state.configure(
+            manifest, embodiment=embodiment, model_path=model_path
+        )
         script = condition_inputs.get(ACTION_ROWS_CONDITION)
         if script is not None:
             actions.receive_script(
                 validate_action_script(
-                    script,
-                    raw_action_dim=manifest.action_contract.embodiments[
-                        embodiment
-                    ].raw_action_dim,
+                    script, raw_action_dim=manifest.action_input_dim(embodiment)
                 )
             )
         extra = request.model_extra or {}

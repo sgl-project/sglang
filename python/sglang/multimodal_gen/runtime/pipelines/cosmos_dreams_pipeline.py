@@ -76,6 +76,8 @@ class CosmosDreamsPipeline(ComposedPipelineBase):
                 scheduler=self.get_module("scheduler"),
                 manifest=manifest,
                 profile=profile,
+                vae=vae,
+                overlap_vae_decode=pipeline_config.overlap_vae_decode,
             )
         )
         self.add_stage(

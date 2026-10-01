@@ -246,6 +246,32 @@ def _gen_layer_forward(
     return hidden, k, v
 
 
+def project_actions(
+    projection: Any,
+    action_latents: torch.Tensor,
+    action_domain_ids: torch.Tensor,
+    *,
+    hidden_size: int,
+) -> torch.Tensor:
+    """Domain-aware projection of ``[1, N, action_dim]`` tokens.
+
+    One domain id applies to every token; ``N`` ids (``[N]`` or ``[1, N]``)
+    route each token through its own domain's weights, which mixed robot and
+    camera rows of unified checkpoints need.
+    """
+    domain_ids = action_domain_ids.reshape(-1)
+    if domain_ids.numel() == 1:
+        return projection(action_latents, domain_ids)
+    tokens = action_latents.shape[1]
+    if domain_ids.numel() != tokens:
+        raise ValueError(
+            f"Cosmos-Dreams per-token domain ids must have one entry per action token: "
+            f"{domain_ids.numel()} ids for {tokens} tokens."
+        )
+    flat = action_latents.reshape(tokens, action_latents.shape[-1])
+    return projection(flat, domain_ids).reshape(1, tokens, hidden_size)
+
+
 def _prefix_kv(text_kv: KVPair, history_kv: KVPair | None) -> KVPair:
     text_k, text_v = text_kv
     if history_kv is None or history_kv[0].shape[1] == 0:
@@ -540,8 +566,11 @@ class CosmosDreamsTransformer(Cosmos3OmniTransformer):
                 f"Cosmos-Dreams actions must have shape {expected_action_shape}, "
                 f"got {tuple(action_latents.shape)}"
             )
-        action_hidden = self.action_proj_in(
-            action_latents.to(vision_tokens.dtype), action_domain_ids
+        action_hidden = project_actions(
+            self.action_proj_in,
+            action_latents.to(vision_tokens.dtype),
+            action_domain_ids,
+            hidden_size=self.hidden_size,
         )
         action_hidden = action_hidden + self.action_modality_embed.to(
             action_hidden.dtype

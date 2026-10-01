@@ -4,6 +4,7 @@ partitioning, action packing, interleaved mRoPE ids, K/V history, and registry
 wiring."""
 
 import copy
+import hashlib
 import json
 import os
 import tempfile
@@ -20,6 +21,7 @@ from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
     canonical_sha256,
     float32_value,
     load_cosmos_dreams_manifest,
+    load_unified_normalizer,
     parse_cosmos_dreams_manifest,
     resolve_inference_profile,
 )
@@ -51,8 +53,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     append_kv_history,
     closest_canvas,
     crop_geometry_to_content,
+    domains_for_frames,
     fit_image_to_canvas,
     format_dreams_prompt,
+    frame_domain_ids,
     iter_ar_chunk_ranges,
     iter_clean_commit_frames,
     latent_frame_count,
@@ -323,27 +327,38 @@ class TestCosmosDreamsManifest(unittest.TestCase):
         manifest = parse_cosmos_dreams_manifest(_two_embodiment_artifact())
         contract = manifest.conditioning.embodiments["agibotworld"]
         rows = (torch.arange(4 * 29, dtype=torch.float32).view(4, 29) / 50.0).tolist()
-        common = dict(
-            contract=contract,
-            max_action_dim=64,
-            target_frame=2,
-            action_tokens_per_frame=4,
-        )
-        raw = prepare_action_rows(rows, pre_normalized=False, **common)
-        pre = prepare_action_rows(rows, pre_normalized=True, **common)
+        common = dict(manifest=manifest, embodiment="agibotworld", target_frame=2)
+        raw, domains = prepare_action_rows(rows, pre_normalized=False, **common)
+        pre, _ = prepare_action_rows(rows, pre_normalized=True, **common)
+        self.assertIsNone(domains)
+        self.assertEqual(tuple(raw.shape), (4, 64))
         self.assertEqual(tuple(pre.shape), (4, 64))
         torch.testing.assert_close(pre[:, :29], torch.tensor(rows))
-        self.assertTrue(torch.all(pre[:, 29:] == 0))
-        self.assertFalse(torch.allclose(raw[:, :29], pre[:, :29]))
-        with self.assertRaises(ValueError):  # width still enforced
-            prepare_action_rows([[0.0] * 9], pre_normalized=True, **common)
-        with self.assertRaises(ValueError):  # frame coverage still enforced
-            prepare_action_rows(rows[:2], pre_normalized=True, **common)
-        params = CosmosDreamsSamplingParams(action_normalization="none")
-        self.assertTrue(params.actions_pre_normalized)
-        self.assertFalse(CosmosDreamsSamplingParams().actions_pre_normalized)
+        torch.testing.assert_close(
+            raw[:, :29],
+            normalize_action_rows(torch.tensor(rows), contract.normalizer.transform),
+        )
+        self.assertEqual(pre[:, 29:].abs().sum().item(), 0.0)
         with self.assertRaises(ValueError):
-            CosmosDreamsSamplingParams(action_normalization="quantile")
+            prepare_action_rows(
+                (torch.arange(4 * 9, dtype=torch.float32).view(4, 9)).tolist(),
+                pre_normalized=True,
+                **common,
+            )
+        with self.assertRaises(ValueError):
+            prepare_action_rows(rows[:2], pre_normalized=True, **common)
+        with self.assertRaisesRegex(ValueError, "unified"):
+            prepare_action_rows(
+                rows,
+                pre_normalized=True,
+                domain_names=[
+                    "agibotworld",
+                    "camera_pose",
+                    "agibotworld",
+                    "agibotworld",
+                ],
+                **common,
+            )
 
     def test_two_embodiment_contract_resolves_and_normalizes(self):
         manifest = parse_cosmos_dreams_manifest(_two_embodiment_artifact())
@@ -673,6 +688,324 @@ class TestCosmosDreamsKVHistory(unittest.TestCase):
                 sink_frames=0,
                 window_frames=3,
             )
+
+
+UNIFIED_FIELDS = [
+    ("ego_pose", 0, 9),
+    ("right_wrist_pose", 9, 9),
+    ("right_fingertips", 18, 15),
+    ("right_gripper_width_m", 33, 1),
+    ("left_wrist_pose", 34, 9),
+    ("left_fingertips", 43, 15),
+    ("left_gripper_width_m", 58, 1),
+]
+UNIFIED_STATS_SHA = hashlib.sha256(
+    json.dumps({"global": {"q01": [-1.0] * 59, "q99": [1.0] * 59}}).encode()
+).hexdigest()
+
+
+def _unified_artifact() -> dict:
+    """A schema-5 (unified_v1) export: chunk 2, two-step sampler, unbounded history."""
+    artifact = _artifact()
+    artifact.update(
+        checkpoint_id="simulation_sfdmd_bimanual_prod_64N_chunk2_v001@iter_000001000",
+        checkpoint_iteration=1000,
+        chunk_size=2,
+        window_frames=None,
+        sink_frames=0,
+    )
+    artifact["fixed_step_sampler_config"]["t_list"] = [1.0, 0.8333333333333334]
+    conditioning = {
+        "mode": "action",
+        "schema_version": 5,
+        "action_tokens_per_frame": 4,
+        "model_action_dim": 64,
+        "num_embodiment_domains": 32,
+        "default_embodiment": "agibotworld",
+        "embodiments": {
+            "agibotworld": {"domain_id": 15, "input_action_dim": 59},
+            "agibot_gear_gripper": {"domain_id": 15, "input_action_dim": 59},
+            "camera_pose": {"domain_id": 2, "input_action_dim": 59},
+            "hand_pose": {"domain_id": 3, "input_action_dim": 59},
+        },
+        "padding": {"stage": "after_normalization_and_validity_mask", "value": 0.0},
+        "input_contract": {
+            "action_space": "normalized_unified_v1",
+            "action_dim": 59,
+            "domain_routing": "scalar_or_per_action_row",
+            "validity": "masked_to_zero_after_normalization_by_source",
+            "runtime_normalization": False,
+            "model_mode": "forward_dynamics",
+        },
+        "layout": {
+            "id": "unified_v1",
+            "pose_convention": "backward_chunk_anchored_16f",
+            "rotation_representation": "rot6d_columns",
+            "fields": [
+                {"name": name, "offset": offset, "size": size}
+                for name, offset, size in UNIFIED_FIELDS
+            ],
+        },
+        "normalizer": {
+            "method": "global_asinh_unified_v1",
+            "runtime_application": False,
+            "source": {
+                "artifact_path": f"cosmos3_nano_sim_bimanual_action_sources/{UNIFIED_STATS_SHA}.json",
+                "sha256": UNIFIED_STATS_SHA,
+                "path": "projects/cosmos3/cosmos3/datasets/action/normalizers/global_asinh_v1.json",
+                "repository_revision": "9368f59bb86ce27dbdc6110b327fe9a0ba154d2b",
+                "pose_convention_authority": "resolved_canonical_lance_training_config",
+            },
+        },
+        "training_config_excerpt": {
+            "experiment": "simulation_sfdmd_bimanual_prod_64N_chunk2_v001",
+            "loader": {"action_schema": "unified_v1", "format_prompt_as_json": False},
+        },
+        "contract_sha256": "0" * 64,
+    }
+    payload = {
+        k: v for k, v in conditioning.items() if k not in ("mode", "contract_sha256")
+    }
+    conditioning["contract_sha256"] = canonical_sha256(payload)
+    artifact["conditioning"] = conditioning
+    return artifact
+
+
+UNIFIED_MANIFEST = parse_cosmos_dreams_manifest(_unified_artifact())
+
+
+def _write_unified_export(root: str) -> None:
+    """Minimal export dir with the normalizer statistics the fixture names."""
+    sources = os.path.join(root, "cosmos3_nano_sim_bimanual_action_sources")
+    os.makedirs(sources, exist_ok=True)
+    with open(os.path.join(sources, f"{UNIFIED_STATS_SHA}.json"), "w") as handle:
+        handle.write(json.dumps({"global": {"q01": [-1.0] * 59, "q99": [1.0] * 59}}))
+
+
+class TestCosmosDreamsUnifiedContract(unittest.TestCase):
+    """Schema-5 exports: one normalized 59-D row layout, per-row domains,
+    unbounded history and a two-step sampler must load and validate."""
+
+    def test_unified_manifest_parses(self):
+        manifest = UNIFIED_MANIFEST
+        self.assertTrue(manifest.unified_actions)
+        self.assertIsNone(manifest.window_frames)
+        self.assertEqual(manifest.t_list, (1.0, 0.8333333333333334))
+        self.assertEqual(manifest.action_input_dim("camera_pose"), 59)
+        self.assertFalse(manifest.training_prompt_as_json)
+        contract = manifest.action_contract
+        self.assertEqual(contract.camera_domain_id, 2)
+        self.assertEqual(contract.resolve_embodiment(None, None), "agibotworld")
+        self.assertEqual(contract.resolve_embodiment(None, 15), "agibotworld")
+        self.assertEqual(contract.resolve_embodiment("hand_pose", 3), "hand_pose")
+        with self.assertRaises(ValueError):
+            contract.resolve_embodiment("camera_pose", 15)
+        # Two sigmas apply to every chunk; no step42 split remains to derive.
+        profile = CosmosDreamsConfig().inference_profile(manifest)
+        self.assertEqual(profile.frame_sigma_schedules, ((1.0, 0.8333333333333334),))
+        self.assertEqual(profile.window_frames, 226)
+        with self.assertRaisesRegex(ValueError, "window_frames=None"):
+            resolve_inference_profile(
+                manifest, history_mode="sliding", history_max_frames=901
+            )
+
+    def test_unified_contract_rejections(self):
+        def broken(mutate):
+            artifact = _unified_artifact()
+            mutate(artifact)
+            conditioning = artifact["conditioning"]
+            payload = {
+                k: v
+                for k, v in conditioning.items()
+                if k not in ("mode", "contract_sha256")
+            }
+            conditioning["contract_sha256"] = canonical_sha256(payload)
+            return artifact
+
+        cases = {
+            "runtime normalization": lambda a: a["conditioning"]["normalizer"].update(
+                runtime_application=True
+            ),
+            "other action space": lambda a: a["conditioning"]["input_contract"].update(
+                action_space="raw"
+            ),
+            "framewise layout": lambda a: a["conditioning"]["layout"].update(
+                pose_convention="backward_framewise"
+            ),
+            "layout gap": lambda a: a["conditioning"]["layout"]["fields"].pop(2),
+            "narrow embodiment": lambda a: a["conditioning"]["embodiments"][
+                "camera_pose"
+            ].update(input_action_dim=9),
+            "sinks without window": lambda a: a.update(sink_frames=1),
+            "unknown schema": lambda a: a["conditioning"].update(schema_version=4),
+        }
+        for label, mutate in cases.items():
+            with self.subTest(label), self.assertRaises(ValueError):
+                parse_cosmos_dreams_manifest(broken(mutate))
+        tampered = _unified_artifact()
+        tampered["conditioning"]["training_config_excerpt"]["experiment"] = "other"
+        with self.assertRaisesRegex(ValueError, "contract_sha256"):
+            parse_cosmos_dreams_manifest(tampered)
+
+    def test_unified_rows_route_per_row_and_keep_camera_slots_clean(self):
+        rows = torch.zeros(8, 59)
+        rows[:, 3] = 1.0
+        rows[:4, 12] = 1.0  # robot rows use wrist slots
+        payload = {
+            "action_space": "normalized_unified_v1",
+            "action": rows.tolist(),
+            "domain_names": ["agibotworld"] * 4 + ["camera_pose"] * 4,
+        }
+        padded, domains = prepare_action_rows(
+            payload,
+            manifest=UNIFIED_MANIFEST,
+            embodiment="agibotworld",
+            target_frame=3,
+            pre_normalized=True,
+        )
+        self.assertEqual(tuple(padded.shape), (8, 64))
+        self.assertEqual(domains.tolist(), [15] * 4 + [2] * 4)
+        # Frame 0 borrows the first real row's domain; the robot chunk collapses to one id.
+        self.assertEqual(
+            domains_for_frames(
+                domains,
+                scalar_domain=15,
+                frame_start=0,
+                frame_end=1,
+                action_tokens_per_frame=4,
+            ).tolist(),
+            [15],
+        )
+        mixed = domains_for_frames(
+            domains,
+            scalar_domain=15,
+            frame_start=1,
+            frame_end=3,
+            action_tokens_per_frame=4,
+        )
+        self.assertEqual(tuple(mixed.shape), (1, 8))
+        self.assertEqual(frame_domain_ids(mixed, 1, 4).tolist(), [[2, 2, 2, 2]])
+        self.assertEqual(frame_domain_ids(torch.tensor([15]), 1, 4).tolist(), [15])
+        # A single name or a uniform default-domain list means scalar routing.
+        _, scalar = prepare_action_rows(
+            dict(payload, domain_names=["agibotworld"]),
+            manifest=UNIFIED_MANIFEST,
+            embodiment="agibotworld",
+            target_frame=3,
+            pre_normalized=True,
+        )
+        self.assertIsNone(scalar)
+        # Camera rows may not carry robot slots.
+        with self.assertRaisesRegex(ValueError, "camera rows"):
+            prepare_action_rows(
+                dict(payload, domain_names=["camera_pose"] * 8),
+                manifest=UNIFIED_MANIFEST,
+                embodiment="agibotworld",
+                target_frame=3,
+                pre_normalized=True,
+            )
+        with self.assertRaisesRegex(ValueError, "59 slots"):
+            prepare_action_rows(
+                torch.zeros(8, 29).tolist(),
+                manifest=UNIFIED_MANIFEST,
+                embodiment="agibotworld",
+                target_frame=3,
+                pre_normalized=True,
+            )
+        with self.assertRaisesRegex(ValueError, "action_space"):
+            prepare_action_rows(
+                dict(payload, action_space="raw"),
+                manifest=UNIFIED_MANIFEST,
+                embodiment="agibotworld",
+                target_frame=3,
+                pre_normalized=True,
+            )
+
+    def test_per_token_projection_matches_scalar_routing(self):
+        from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
+            DomainAwareLinear,
+        )
+        from sglang.multimodal_gen.runtime.models.dits.cosmos_dreams import (
+            project_actions,
+        )
+
+        torch.manual_seed(0)
+        projection = DomainAwareLinear(64, 16, 32)
+        with torch.no_grad():
+            projection.fc.weight.normal_()
+            projection.bias.weight.normal_()
+        tokens = torch.randn(1, 8, 64)
+        scalar = project_actions(projection, tokens, torch.tensor([15]), hidden_size=16)
+        same = project_actions(
+            projection, tokens, torch.tensor([[15] * 8]), hidden_size=16
+        )
+        torch.testing.assert_close(scalar, same)
+        mixed = project_actions(
+            projection, tokens, torch.tensor([[15] * 4 + [2] * 4]), hidden_size=16
+        )
+        camera = project_actions(
+            projection, tokens[:, 4:], torch.tensor([2]), hidden_size=16
+        )
+        torch.testing.assert_close(mixed[:, :4], scalar[:, :4])
+        torch.testing.assert_close(mixed[:, 4:], camera)
+        with self.assertRaises(ValueError):
+            project_actions(projection, tokens, torch.tensor([15, 2]), hidden_size=16)
+
+    def test_unified_normalizer_identity_rows(self):
+        with tempfile.TemporaryDirectory() as root:
+            _write_unified_export(root)
+            normalizer = load_unified_normalizer(root, UNIFIED_MANIFEST.action_contract)
+        self.assertEqual(normalizer.offset, (0.0,) * 59)
+        self.assertEqual(normalizer.scale, (1.0,) * 59)
+        # q01=-1, q99=1: y = asinh(x) / asinh(1), so the unit value maps to 1.
+        self.assertAlmostEqual(normalizer.normalize([1.0] + [0.0] * 58)[0], 1.0)
+        camera = normalizer.identity_row(
+            UNIFIED_MANIFEST.action_contract.layout, embodiment="camera_pose"
+        )
+        self.assertEqual([i for i, v in enumerate(camera) if v], [3, 7])
+        robot = normalizer.identity_row(
+            UNIFIED_MANIFEST.action_contract.layout, embodiment="agibotworld"
+        )
+        self.assertEqual([i for i, v in enumerate(robot) if v], [3, 7, 12, 16, 37, 41])
+        bad = _unified_artifact()
+        with (
+            tempfile.TemporaryDirectory() as root,
+            self.assertRaisesRegex(ValueError, "sha256"),
+        ):
+            _write_unified_export(root)
+            path = os.path.join(
+                root,
+                "cosmos3_nano_sim_bimanual_action_sources",
+                f"{UNIFIED_STATS_SHA}.json",
+            )
+            with open(path, "a") as handle:
+                handle.write(" ")
+            load_unified_normalizer(
+                root, parse_cosmos_dreams_manifest(bad).action_contract
+            )
+
+    def test_unified_request_defaults_follow_the_training_loader(self):
+        config = CosmosDreamsConfig()
+        config.unified_actions = True
+        config.prompt_json_caption = False
+        params = CosmosDreamsSamplingParams(prompt="x", num_frames=9)
+        params._apply_checkpoint_defaults(config)
+        self.assertTrue(params.actions_pre_normalized)
+        self.assertFalse(params.format_prompt_as_json)
+        explicit = CosmosDreamsSamplingParams(
+            prompt="x", num_frames=9, format_prompt_as_json=True
+        )
+        explicit._explicit_fields = {"format_prompt_as_json"}
+        explicit._apply_checkpoint_defaults(config)
+        self.assertTrue(explicit.format_prompt_as_json)
+        rejected = CosmosDreamsSamplingParams(prompt="x", num_frames=9)
+        rejected._explicit_fields = {"action_normalization"}
+        with self.assertRaisesRegex(ValueError, "normalized unified_v1"):
+            rejected._apply_checkpoint_defaults(config)
+        native = CosmosDreamsSamplingParams(prompt="x", num_frames=9)
+        native._apply_checkpoint_defaults(CosmosDreamsConfig())
+        self.assertFalse(native.actions_pre_normalized)
+        self.assertTrue(native.format_prompt_as_json)
 
 
 class TestCosmosDreamsInferenceProfile(unittest.TestCase):

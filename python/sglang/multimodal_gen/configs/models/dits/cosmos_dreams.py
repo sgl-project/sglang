@@ -14,6 +14,7 @@ blocks are accepted and ignored.
 import hashlib
 import json
 import math
+import os
 import struct
 from collections.abc import Sequence
 from typing import Any
@@ -22,6 +23,20 @@ import msgspec
 
 COSMOS_DREAMS_SCHEMA_VERSION = 1
 ACTION_CONTRACT_SCHEMA_VERSION = 3
+# Schema 5: every embodiment shares the 59-slot unified_v1 row, normalized by the
+# client (imaginaire4 "normalized_unified_v1" sidecars); domains may vary per row.
+UNIFIED_ACTION_CONTRACT_SCHEMA_VERSION = 5
+UNIFIED_ACTION_SPACE = "normalized_unified_v1"
+UNIFIED_ACTION_DIM = 59
+UNIFIED_LAYOUT_ID = "unified_v1"
+UNIFIED_POSE_CONVENTION = "backward_chunk_anchored_16f"
+UNIFIED_NORMALIZER_METHOD = "global_asinh_unified_v1"
+UNIFIED_DOMAIN_ROUTING = "scalar_or_per_action_row"
+UNIFIED_VALIDITY = "masked_to_zero_after_normalization_by_source"
+PADDING_STAGE_AFTER_NORMALIZATION_AND_MASK = "after_normalization_and_validity_mask"
+CAMERA_EMBODIMENT = "camera_pose"
+# Slots of the unified row a camera-only row may use (ego pose); the rest must be zero.
+UNIFIED_CAMERA_SLOTS = 9
 HISTORY_MODE_FULL = "full"
 HISTORY_MODE_SLIDING = "sliding"
 HISTORY_MODES = (HISTORY_MODE_FULL, HISTORY_MODE_SLIDING)
@@ -171,44 +186,147 @@ class CosmosDreamsActionContract(
         Without a name, ``domain_id`` selects the embodiment when it is
         unambiguous; the default embodiment wins when it uses that domain.
         """
-        if name is None or not str(name).strip():
-            candidates = [
-                embodiment
-                for embodiment, contract in self.embodiments.items()
-                if domain_id is not None and contract.domain_id == int(domain_id)
-            ]
-            if domain_id is None or self.default_embodiment in candidates:
-                embodiment = self.default_embodiment
-            elif len(candidates) == 1:
-                embodiment = candidates[0]
-            elif not candidates:
-                raise ValueError(
-                    f"No Cosmos-Dreams embodiment uses domain_id={domain_id}; "
-                    f"known domains: {self.embodiment_to_domain}."
-                )
-            else:
-                raise ValueError(
-                    f"Cosmos-Dreams domain_id={domain_id} is ambiguous across "
-                    f"{sorted(candidates)}; supply domain_name."
-                )
-        else:
-            embodiment = str(name).strip().lower()
-        if embodiment not in self.embodiments:
-            raise ValueError(
-                f"Unknown Cosmos-Dreams embodiment {name!r}; expected one of "
-                f"{sorted(self.embodiments)}."
-            )
-        expected_domain = self.embodiments[embodiment].domain_id
-        if domain_id is not None and int(domain_id) != expected_domain:
-            raise ValueError(
-                f"Cosmos-Dreams embodiment {embodiment!r} requires "
-                f"domain_id={expected_domain}, got {domain_id}."
-            )
-        return embodiment
+        return _resolve_embodiment(
+            embodiments=self.embodiment_to_domain,
+            default_embodiment=self.default_embodiment,
+            name=name,
+            domain_id=domain_id,
+        )
 
     @property
     def embodiment_to_domain(self) -> dict[str, int]:
         return {name: contract.domain_id for name, contract in self.embodiments.items()}
+
+    @property
+    def mode(self) -> str:
+        return ACTION_CONDITIONING_MODE
+
+
+def _resolve_embodiment(
+    *,
+    embodiments: dict[str, int],
+    default_embodiment: str,
+    name: str | None,
+    domain_id: int | None,
+) -> str:
+    """Shared name/domain resolution of both action contract schemas."""
+    if name is None or not str(name).strip():
+        candidates = [
+            embodiment
+            for embodiment, domain in embodiments.items()
+            if domain_id is not None and domain == int(domain_id)
+        ]
+        if domain_id is None or default_embodiment in candidates:
+            embodiment = default_embodiment
+        elif len(candidates) == 1:
+            embodiment = candidates[0]
+        elif not candidates:
+            raise ValueError(
+                f"No Cosmos-Dreams embodiment uses domain_id={domain_id}; "
+                f"known domains: {embodiments}."
+            )
+        else:
+            raise ValueError(
+                f"Cosmos-Dreams domain_id={domain_id} is ambiguous across "
+                f"{sorted(candidates)}; supply domain_name."
+            )
+    else:
+        embodiment = str(name).strip().lower()
+    if embodiment not in embodiments:
+        raise ValueError(
+            f"Unknown Cosmos-Dreams embodiment {name!r}; expected one of "
+            f"{sorted(embodiments)}."
+        )
+    expected_domain = embodiments[embodiment]
+    if domain_id is not None and int(domain_id) != expected_domain:
+        raise ValueError(
+            f"Cosmos-Dreams embodiment {embodiment!r} requires "
+            f"domain_id={expected_domain}, got {domain_id}."
+        )
+    return embodiment
+
+
+class UnifiedEmbodimentContract(
+    msgspec.Struct, frozen=True, forbid_unknown_fields=True
+):
+    domain_id: int
+    input_action_dim: int
+
+
+class UnifiedInputContract(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+    action_space: str
+    action_dim: int
+    domain_routing: str
+    validity: str
+    runtime_normalization: bool
+    model_mode: str
+
+
+class UnifiedLayoutField(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+    name: str
+    offset: int
+    size: int
+
+
+class UnifiedLayout(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+    id: str
+    pose_convention: str
+    rotation_representation: str
+    fields: tuple[UnifiedLayoutField, ...]
+
+
+class UnifiedNormalizerReference(msgspec.Struct, frozen=True):
+    """Provenance of the client-side normalizer; ``source`` names the stats file
+    under ``cosmos3_nano_sim_bimanual_action_sources`` and its sha256."""
+
+    method: str
+    runtime_application: bool
+    source: dict[str, Any]
+
+
+class CosmosDreamsUnifiedActionContract(
+    msgspec.Struct, frozen=True, tag_field="mode", tag=ACTION_CONDITIONING_MODE
+):
+    """Schema-5 action contract: one normalized 59-D row layout for every embodiment."""
+
+    schema_version: int
+    action_tokens_per_frame: int
+    model_action_dim: int
+    num_embodiment_domains: int
+    default_embodiment: str
+    embodiments: dict[str, UnifiedEmbodimentContract]
+    padding: ActionPadding
+    input_contract: UnifiedInputContract
+    layout: UnifiedLayout
+    normalizer: UnifiedNormalizerReference
+    training_config_excerpt: dict[str, Any]
+    contract_sha256: str
+
+    def resolve_embodiment(self, name: str | None, domain_id: int | None) -> str:
+        return _resolve_embodiment(
+            embodiments=self.embodiment_to_domain,
+            default_embodiment=self.default_embodiment,
+            name=name,
+            domain_id=domain_id,
+        )
+
+    @property
+    def embodiment_to_domain(self) -> dict[str, int]:
+        return {name: contract.domain_id for name, contract in self.embodiments.items()}
+
+    @property
+    def camera_domain_id(self) -> int | None:
+        """Domain whose rows may only use the ego-pose slots, if declared."""
+        contract = self.embodiments.get(CAMERA_EMBODIMENT)
+        return None if contract is None else contract.domain_id
+
+    @property
+    def training_prompt_as_json(self) -> bool:
+        """Whether the training loader wrapped captions in the JSON action prompt."""
+        loader = self.training_config_excerpt.get("loader")
+        if isinstance(loader, dict) and "format_prompt_as_json" in loader:
+            return bool(loader["format_prompt_as_json"])
+        return True
 
     @property
     def mode(self) -> str:
@@ -237,7 +355,14 @@ class CosmosDreamsControlVideoContract(
         return CONTROL_VIDEO_CONDITIONING_MODE
 
 
-CosmosDreamsConditioning = CosmosDreamsActionContract | CosmosDreamsControlVideoContract
+CosmosDreamsActionConditioning = (
+    CosmosDreamsActionContract | CosmosDreamsUnifiedActionContract
+)
+CosmosDreamsConditioning = (
+    CosmosDreamsActionContract
+    | CosmosDreamsUnifiedActionContract
+    | CosmosDreamsControlVideoContract
+)
 
 
 class FixedStepSamplerConfig(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
@@ -254,7 +379,8 @@ class CosmosDreamsManifest(msgspec.Struct, frozen=True, forbid_unknown_fields=Tr
     checkpoint_iteration: int
     checkpoint_hash: str
     chunk_size: int
-    window_frames: int
+    # None: the checkpoint trained with an unbounded K/V history.
+    window_frames: int | None
     sink_frames: int
     text_cache_max_len: int
     attention_mode: str
@@ -282,13 +408,35 @@ class CosmosDreamsManifest(msgspec.Struct, frozen=True, forbid_unknown_fields=Tr
         return self.conditioning.mode
 
     @property
-    def action_contract(self) -> CosmosDreamsActionContract:
-        if not isinstance(self.conditioning, CosmosDreamsActionContract):
+    def action_contract(self) -> CosmosDreamsActionConditioning:
+        if not isinstance(
+            self.conditioning,
+            (CosmosDreamsActionContract, CosmosDreamsUnifiedActionContract),
+        ):
             raise ValueError(
                 f"Cosmos-Dreams checkpoint {self.checkpoint_id} is conditioned on "
                 f"{self.conditioning_mode!r}, not on actions."
             )
         return self.conditioning
+
+    @property
+    def unified_actions(self) -> bool:
+        """Schema-5 checkpoints take client-normalized 59-D unified rows."""
+        return isinstance(self.conditioning, CosmosDreamsUnifiedActionContract)
+
+    def action_input_dim(self, embodiment: str) -> int:
+        """Width of the action rows a request supplies for ``embodiment``."""
+        contract = self.action_contract.embodiments[embodiment]
+        if isinstance(contract, UnifiedEmbodimentContract):
+            return contract.input_action_dim
+        return contract.raw_action_dim
+
+    @property
+    def training_prompt_as_json(self) -> bool:
+        """Whether captions were wrapped in the JSON action prompt during training."""
+        if isinstance(self.conditioning, CosmosDreamsUnifiedActionContract):
+            return self.conditioning.training_prompt_as_json
+        return True
 
     @property
     def control_contract(self) -> CosmosDreamsControlVideoContract:
@@ -302,13 +450,39 @@ class CosmosDreamsManifest(msgspec.Struct, frozen=True, forbid_unknown_fields=Tr
     @property
     def action_tokens_per_frame(self) -> int:
         """Action tokens interleaved before each frame's patches; 0 without actions."""
-        if isinstance(self.conditioning, CosmosDreamsActionContract):
+        if isinstance(
+            self.conditioning,
+            (CosmosDreamsActionContract, CosmosDreamsUnifiedActionContract),
+        ):
             return self.conditioning.action_tokens_per_frame
         return 0
 
     @property
     def max_action_dim(self) -> int:
         return self.action_contract.model_action_dim
+
+
+class _ManifestBody(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+    """``CosmosDreamsManifest`` without ``conditioning``, which is converted separately."""
+
+    schema_version: int
+    checkpoint_id: str
+    checkpoint_iteration: int
+    checkpoint_hash: str
+    chunk_size: int
+    window_frames: int | None
+    sink_frames: int
+    text_cache_max_len: int
+    attention_mode: str
+    video_temporal_causal: bool
+    latent_patch_size: int
+    vae_spatial_compression_factor: int
+    temporal_compression_factor: int
+    fixed_step_sampler_config: FixedStepSamplerConfig
+    temporal_modality_margin: int
+    unified_3d_mrope_reset_spatial_ids: bool
+    base_fps: float
+    enable_fps_modulation: bool
 
 
 def _require_positive(name: str, value: int) -> None:
@@ -446,6 +620,114 @@ def _validate_action_contract(contract: CosmosDreamsActionContract) -> None:
         )
 
 
+def _validate_unified_action_contract(
+    contract: CosmosDreamsUnifiedActionContract, raw: dict[str, Any]
+) -> None:
+    if contract.schema_version != UNIFIED_ACTION_CONTRACT_SCHEMA_VERSION:
+        raise ValueError(
+            "Unsupported Cosmos-Dreams unified action contract schema_version="
+            f"{contract.schema_version}; expected {UNIFIED_ACTION_CONTRACT_SCHEMA_VERSION}."
+        )
+    for name in (
+        "action_tokens_per_frame",
+        "model_action_dim",
+        "num_embodiment_domains",
+    ):
+        _require_positive(name, getattr(contract, name))
+    expected_input = UnifiedInputContract(
+        action_space=UNIFIED_ACTION_SPACE,
+        action_dim=UNIFIED_ACTION_DIM,
+        domain_routing=UNIFIED_DOMAIN_ROUTING,
+        validity=UNIFIED_VALIDITY,
+        runtime_normalization=False,
+        model_mode="forward_dynamics",
+    )
+    if contract.input_contract != expected_input:
+        raise ValueError(
+            "Cosmos-Dreams unified input_contract is not the supported one: "
+            f"got {msgspec.to_builtins(contract.input_contract)}, "
+            f"expected {msgspec.to_builtins(expected_input)}."
+        )
+    layout = contract.layout
+    if (
+        layout.id != UNIFIED_LAYOUT_ID
+        or layout.pose_convention != UNIFIED_POSE_CONVENTION
+        or layout.rotation_representation != "rot6d_columns"
+    ):
+        raise ValueError(
+            "Cosmos-Dreams unified layout must be unified_v1 with "
+            f"{UNIFIED_POSE_CONVENTION} rot6d columns, got {msgspec.to_builtins(layout)}."
+        )
+    cursor = 0
+    for field in layout.fields:
+        if field.offset != cursor or field.size <= 0:
+            raise ValueError(
+                "Cosmos-Dreams unified layout fields must tile the row contiguously; "
+                f"field {field.name!r} starts at {field.offset}, expected {cursor}."
+            )
+        cursor += field.size
+    if cursor != UNIFIED_ACTION_DIM:
+        raise ValueError(
+            f"Cosmos-Dreams unified layout covers {cursor} slots, expected {UNIFIED_ACTION_DIM}."
+        )
+    if (
+        contract.normalizer.method != UNIFIED_NORMALIZER_METHOD
+        or contract.normalizer.runtime_application
+    ):
+        raise ValueError(
+            "Cosmos-Dreams unified rows must arrive normalized with "
+            f"{UNIFIED_NORMALIZER_METHOD}; got method={contract.normalizer.method!r}, "
+            f"runtime_application={contract.normalizer.runtime_application}."
+        )
+    if (
+        contract.padding.stage != PADDING_STAGE_AFTER_NORMALIZATION_AND_MASK
+        or contract.padding.value != 0.0
+    ):
+        raise ValueError(
+            "Cosmos-Dreams unified action padding must be zeros applied after "
+            "normalization and validity masking."
+        )
+    if not contract.embodiments:
+        raise ValueError(
+            "Cosmos-Dreams unified action contract must declare at least one embodiment."
+        )
+    if contract.default_embodiment not in contract.embodiments:
+        raise ValueError(
+            f"Cosmos-Dreams default_embodiment {contract.default_embodiment!r} is not declared."
+        )
+    if contract.model_action_dim < UNIFIED_ACTION_DIM:
+        raise ValueError(
+            f"Cosmos-Dreams model_action_dim={contract.model_action_dim} cannot hold "
+            f"{UNIFIED_ACTION_DIM}-D unified rows."
+        )
+    for embodiment, embodiment_contract in contract.embodiments.items():
+        if not 0 <= embodiment_contract.domain_id < contract.num_embodiment_domains:
+            raise ValueError(
+                f"Cosmos-Dreams embodiment {embodiment!r} domain_id="
+                f"{embodiment_contract.domain_id} is outside "
+                f"[0, {contract.num_embodiment_domains})."
+            )
+        if embodiment_contract.input_action_dim != UNIFIED_ACTION_DIM:
+            raise ValueError(
+                f"Cosmos-Dreams embodiment {embodiment!r} input_action_dim="
+                f"{embodiment_contract.input_action_dim} must be {UNIFIED_ACTION_DIM}."
+            )
+    if not _is_sha256_hex(contract.contract_sha256):
+        raise ValueError("Cosmos-Dreams contract_sha256 is not a SHA-256 hex digest.")
+    # The exporter hashes the whole block except the tag and the digest itself.
+    payload = {
+        key: value
+        for key, value in raw.items()
+        if key not in ("mode", "contract_sha256")
+    }
+    expected_hash = canonical_sha256(payload)
+    if contract.contract_sha256 != expected_hash:
+        raise ValueError(
+            "Cosmos-Dreams unified contract_sha256 does not match its payload: "
+            f"expected {expected_hash}, got {contract.contract_sha256}."
+        )
+
+
 def _validate_control_video_contract(
     contract: CosmosDreamsControlVideoContract,
 ) -> None:
@@ -482,8 +764,14 @@ def _validate_control_video_contract(
         )
 
 
-def validate_cosmos_dreams_manifest(manifest: CosmosDreamsManifest) -> None:
-    """Reject artifacts the causal runtime cannot honor exactly."""
+def validate_cosmos_dreams_manifest(
+    manifest: CosmosDreamsManifest, raw_conditioning: dict[str, Any] | None = None
+) -> None:
+    """Reject artifacts the causal runtime cannot honor exactly.
+
+    ``raw_conditioning`` is the artifact's conditioning block as exported; the
+    schema-5 digest covers it verbatim.
+    """
     if manifest.schema_version != COSMOS_DREAMS_SCHEMA_VERSION:
         raise ValueError(
             f"Unsupported Cosmos-Dreams artifact schema_version={manifest.schema_version}; "
@@ -491,7 +779,6 @@ def validate_cosmos_dreams_manifest(manifest: CosmosDreamsManifest) -> None:
         )
     for name in (
         "chunk_size",
-        "window_frames",
         "text_cache_max_len",
         "latent_patch_size",
         "vae_spatial_compression_factor",
@@ -500,9 +787,16 @@ def validate_cosmos_dreams_manifest(manifest: CosmosDreamsManifest) -> None:
         "checkpoint_iteration",
     ):
         _require_positive(name, getattr(manifest, name))
+    if manifest.window_frames is not None:
+        _require_positive("window_frames", manifest.window_frames)
     if isinstance(manifest.sink_frames, bool) or manifest.sink_frames < 0:
         raise ValueError(
             f"Cosmos-Dreams manifest sink_frames must be non-negative, got {manifest.sink_frames!r}."
+        )
+    if manifest.window_frames is None and manifest.sink_frames:
+        raise ValueError(
+            "Cosmos-Dreams manifest pins sink_frames without a K/V window "
+            f"(window_frames=None, sink_frames={manifest.sink_frames})."
         )
     if manifest.attention_mode != ATTENTION_MODE_THREE_WAY:
         raise ValueError(
@@ -532,8 +826,13 @@ def validate_cosmos_dreams_manifest(manifest: CosmosDreamsManifest) -> None:
         )
     _validate_sampler(manifest.fixed_step_sampler_config)
     conditioning = manifest.conditioning
-    if isinstance(conditioning, CosmosDreamsActionContract):
-        _validate_action_contract(conditioning)
+    if isinstance(
+        conditioning, (CosmosDreamsActionContract, CosmosDreamsUnifiedActionContract)
+    ):
+        if isinstance(conditioning, CosmosDreamsActionContract):
+            _validate_action_contract(conditioning)
+        else:
+            _validate_unified_action_contract(conditioning, raw_conditioning or {})
         if conditioning.action_tokens_per_frame != manifest.temporal_compression_factor:
             raise ValueError(
                 "Cosmos-Dreams action_tokens_per_frame must equal temporal_compression_factor; "
@@ -544,13 +843,49 @@ def validate_cosmos_dreams_manifest(manifest: CosmosDreamsManifest) -> None:
         _validate_control_video_contract(conditioning)
 
 
+def _conditioning_type(raw: Any) -> type:
+    """Pick the contract struct from the block's mode and schema version."""
+    if not isinstance(raw, dict):
+        raise ValueError("Cosmos-Dreams artifact conditioning must be an object.")
+    mode = raw.get("mode")
+    if mode == CONTROL_VIDEO_CONDITIONING_MODE:
+        return CosmosDreamsControlVideoContract
+    if mode != ACTION_CONDITIONING_MODE:
+        raise ValueError(
+            f"Cosmos-Dreams artifact conditioning mode must be "
+            f"{ACTION_CONDITIONING_MODE!r} or {CONTROL_VIDEO_CONDITIONING_MODE!r}, got {mode!r}."
+        )
+    schema = raw.get("schema_version")
+    if schema == UNIFIED_ACTION_CONTRACT_SCHEMA_VERSION:
+        return CosmosDreamsUnifiedActionContract
+    if schema == ACTION_CONTRACT_SCHEMA_VERSION:
+        return CosmosDreamsActionContract
+    raise ValueError(
+        "Unsupported Cosmos-Dreams action contract schema_version="
+        f"{schema!r}; expected {ACTION_CONTRACT_SCHEMA_VERSION} or "
+        f"{UNIFIED_ACTION_CONTRACT_SCHEMA_VERSION}."
+    )
+
+
 def parse_cosmos_dreams_manifest(artifact: dict[str, Any]) -> CosmosDreamsManifest:
     """Parse and validate the exporter's transformer-config artifact block."""
+    if not isinstance(artifact, dict) or "conditioning" not in artifact:
+        raise ValueError(
+            "Cosmos-Dreams schema-v1 artifact is invalid: missing `conditioning`."
+        )
+    raw_conditioning = artifact["conditioning"]
+    body = {key: value for key, value in artifact.items() if key != "conditioning"}
     try:
-        manifest = msgspec.convert(artifact, type=CosmosDreamsManifest)
+        conditioning = msgspec.convert(
+            raw_conditioning, type=_conditioning_type(raw_conditioning)
+        )
+        fields = msgspec.structs.asdict(msgspec.convert(body, type=_ManifestBody))
+        manifest = CosmosDreamsManifest(conditioning=conditioning, **fields)
     except msgspec.ValidationError as exc:
         raise ValueError(f"Cosmos-Dreams schema-v1 artifact is invalid: {exc}") from exc
-    validate_cosmos_dreams_manifest(manifest)
+    validate_cosmos_dreams_manifest(
+        manifest, raw_conditioning if isinstance(raw_conditioning, dict) else None
+    )
     return manifest
 
 
@@ -696,6 +1031,11 @@ def resolve_inference_profile(
             )
         window_frames = (history_max_frames - 1) // factor + 1
     else:
+        if manifest.window_frames is None:
+            raise ValueError(
+                "Cosmos-Dreams history_mode='sliding' needs a K/V window, but the "
+                f"artifact {manifest.checkpoint_id} declares window_frames=None."
+            )
         window_frames = manifest.window_frames
     return CosmosDreamsInferenceProfile(
         frame_sigma_schedules=schedules,
@@ -765,3 +1105,84 @@ def resolve_transfer_history_profile(
         window_frames=manifest.window_frames,
         sink_frames=manifest.sink_frames,
     )
+
+
+# Rotation identity in rot6d column form: the first two columns of I3.
+ROT6D_IDENTITY = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0)
+
+
+class UnifiedNormalizer(msgspec.Struct, frozen=True):
+    """Client-side ``global_asinh`` normalizer of unified_v1 rows.
+
+    ``y = asinh((raw - offset) / scale) / asinh(1)`` with ``offset = (q01 + q99) / 2``
+    and ``scale = (q99 - q01) / 2`` from the exported statistics (imaginaire4
+    ``ActionAsinhNormalization``). Slots a source lacks stay zero after normalization.
+    """
+
+    offset: tuple[float, ...]
+    scale: tuple[float, ...]
+
+    def normalize(self, raw: list[float]) -> list[float]:
+        if len(raw) != len(self.offset):
+            raise ValueError(
+                f"Unified rows have {len(self.offset)} slots, got {len(raw)}."
+            )
+        unit = math.asinh(1.0)
+        return [
+            math.asinh((value - offset) / scale) / unit
+            for value, offset, scale in zip(raw, self.offset, self.scale, strict=True)
+        ]
+
+    def identity_row(self, layout: UnifiedLayout, *, embodiment: str) -> list[float]:
+        """Normalized "no motion" row: identity poses in the slots the embodiment
+        fills (ego pose; wrists for non-camera embodiments), zeros elsewhere."""
+        raw = [0.0] * len(self.offset)
+        pose_fields = ["ego_pose"]
+        if embodiment != CAMERA_EMBODIMENT:
+            pose_fields += ["right_wrist_pose", "left_wrist_pose"]
+        filled: list[int] = []
+        for field in layout.fields:
+            if field.name in pose_fields and field.size == 9:
+                raw[field.offset + 3 : field.offset + 9] = ROT6D_IDENTITY
+                filled.extend(range(field.offset, field.offset + 9))
+        normalized = self.normalize(raw)
+        return [normalized[i] if i in set(filled) else 0.0 for i in range(len(raw))]
+
+
+def load_unified_normalizer(
+    model_path: str, contract: CosmosDreamsUnifiedActionContract
+) -> UnifiedNormalizer:
+    """Read the statistics file the contract's ``normalizer.source`` names."""
+    source = contract.normalizer.source
+    artifact_path = source.get("artifact_path")
+    if not isinstance(artifact_path, str) or not artifact_path:
+        raise ValueError(
+            "Cosmos-Dreams unified normalizer source has no artifact_path."
+        )
+    path = os.path.join(model_path, artifact_path)
+    with open(path, "rb") as handle:
+        data = handle.read()
+    expected = source.get("sha256")
+    if expected and hashlib.sha256(data).hexdigest() != expected:
+        raise ValueError(
+            f"Cosmos-Dreams unified normalizer statistics at {path} do not match "
+            f"the contract's sha256 {expected}."
+        )
+    stats = json.loads(data)
+    block = stats.get("global")
+    if not isinstance(block, dict) or "q01" not in block or "q99" not in block:
+        raise ValueError(
+            f"Cosmos-Dreams unified normalizer statistics at {path} lack global q01/q99."
+        )
+    low, high = block["q01"], block["q99"]
+    if len(low) != UNIFIED_ACTION_DIM or len(high) != UNIFIED_ACTION_DIM:
+        raise ValueError(
+            f"Cosmos-Dreams unified normalizer statistics must have {UNIFIED_ACTION_DIM} "
+            f"entries, got {len(low)} and {len(high)}."
+        )
+    offset = tuple(float((lo + hi) / 2.0) for lo, hi in zip(low, high, strict=True))
+    # imaginaire4 clamps the half range at 1e-8 so constant slots stay finite.
+    scale = tuple(
+        float(max((hi - lo) / 2.0, 1e-8)) for lo, hi in zip(low, high, strict=True)
+    )
+    return UnifiedNormalizer(offset=offset, scale=scale)

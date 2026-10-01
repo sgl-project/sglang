@@ -37,6 +37,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     CosmosDreamsRolloutStage,
     PreparedConditioning,
     _RolloutContext,
+    check_unified_rows,
     iter_ar_chunk_ranges,
     load_action_rows,
     normalize_action_rows,
@@ -114,12 +115,12 @@ def tick_action_rows(
     """
     if action_rows is None:
         return None
-    contract = manifest.action_contract.embodiments[embodiment]
     rows = load_action_rows(action_rows)
-    if rows.shape[-1] != contract.raw_action_dim:
+    width = manifest.action_input_dim(embodiment)
+    if rows.shape[-1] != width:
         raise ValueError(
-            f"Cosmos-Dreams embodiment {embodiment!r} requires raw action dimension "
-            f"{contract.raw_action_dim}, got {rows.shape[-1]}."
+            f"Cosmos-Dreams embodiment {embodiment!r} requires action rows of width "
+            f"{width}, got {rows.shape[-1]}."
         )
     expected = frames * manifest.action_tokens_per_frame
     if rows.shape[0] != expected:
@@ -127,7 +128,20 @@ def tick_action_rows(
             f"Cosmos-Dreams tick needs exactly {expected} action rows for {frames} latent "
             f"frames ({manifest.action_tokens_per_frame} pixel steps each), got {rows.shape[0]}."
         )
-    rows = normalize_action_rows(rows, contract.normalizer.transform)
+    contract = manifest.action_contract
+    if manifest.unified_actions:
+        # Unified rows arrive normalized; only the shape and camera rules apply.
+        rows = rows.to(dtype=torch.float32)
+        check_unified_rows(
+            rows,
+            contract=contract,
+            domain_ids=None,
+            scalar_domain=contract.embodiment_to_domain[embodiment],
+        )
+    else:
+        rows = normalize_action_rows(
+            rows, contract.embodiments[embodiment].normalizer.transform
+        )
     return pad_action_rows(rows, manifest.max_action_dim)
 
 

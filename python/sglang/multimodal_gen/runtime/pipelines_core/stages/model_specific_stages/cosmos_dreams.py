@@ -22,10 +22,13 @@ import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
     TEXT_TOKENS_TRAINING_MAX,
+    UNIFIED_ACTION_DIM,
+    UNIFIED_ACTION_SPACE,
+    UNIFIED_CAMERA_SLOTS,
     AffineTransform,
     CosmosDreamsInferenceProfile,
     CosmosDreamsManifest,
-    EmbodimentContract,
+    CosmosDreamsUnifiedActionContract,
 )
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
@@ -72,6 +75,11 @@ EXTRA_TEXT_IDS = "cosmos_dreams_text_ids"
 EXTRA_TEXT_MASK = "cosmos_dreams_text_mask"
 EXTRA_ACTION_ROWS = "cosmos_dreams_action_rows"
 EXTRA_DOMAIN_ID = "cosmos_dreams_domain_id"
+# Per-action-row domain ids ``[T]`` (unified checkpoints), or None for one domain.
+EXTRA_ACTION_DOMAIN_IDS = "cosmos_dreams_action_domain_ids"
+# Decoded video handed to the decoding stage when the rollout overlapped decoding
+# (the Cosmos3 stage already honours this key for pre-decoded output).
+EXTRA_DECODED_OUTPUT = "transfer_decoded_output"
 EXTRA_TARGET_LATENT_FRAMES = "cosmos_dreams_target_latent_frames"
 # (content_height, content_width) of the conditioning image inside the canvas.
 EXTRA_CONTENT_SIZE = "cosmos_dreams_content_size"
@@ -262,6 +270,134 @@ def load_action_rows(action: Any) -> torch.Tensor:
     return rows
 
 
+def load_action_payload(action: Any) -> tuple[torch.Tensor, list[str] | None]:
+    """Rows plus optional per-row embodiment names from a request value.
+
+    Besides the bare row forms of :func:`load_action_rows`, accepts the
+    imaginaire4 unified sidecar ``{"action_space": "normalized_unified_v1",
+    "action": rows, "domain_names": [...]}``.
+    """
+    if isinstance(action, str):
+        text = action.strip()
+        if os.path.isfile(text) and text.endswith(".json"):
+            with open(text, encoding="utf-8") as handle:
+                action = json.load(handle)
+        elif text.startswith("{"):
+            action = json.loads(text)
+    if isinstance(action, dict):
+        space = action.get("action_space")
+        if space is not None and space != UNIFIED_ACTION_SPACE:
+            raise ValueError(
+                f"Cosmos-Dreams action payload action_space must be {UNIFIED_ACTION_SPACE!r}, "
+                f"got {space!r}."
+            )
+        if "action" not in action:
+            raise ValueError(
+                "Cosmos-Dreams action payload object needs an `action` list."
+            )
+        names = action.get("domain_names")
+        if names is not None and (
+            not isinstance(names, list)
+            or not names
+            or any(not isinstance(name, str) for name in names)
+        ):
+            raise ValueError(
+                "Cosmos-Dreams action payload domain_names must be a non-empty list of names."
+            )
+        return load_action_rows(action["action"]), names
+    return load_action_rows(action), None
+
+
+def row_domain_ids(
+    names: list[str] | None,
+    *,
+    contract: CosmosDreamsUnifiedActionContract,
+    rows: int,
+    default_embodiment: str,
+) -> torch.Tensor | None:
+    """``[rows]`` domain ids for per-row routing, or None when one domain applies."""
+    if names is None or len(names) == 1 and len(names) != rows:
+        if names is not None:
+            contract.resolve_embodiment(names[0], None)
+        return None
+    if len(names) != rows:
+        raise ValueError(
+            f"Cosmos-Dreams domain_names must name one embodiment or one per action row; "
+            f"got {len(names)} names for {rows} rows."
+        )
+    ids = [
+        contract.embodiment_to_domain[contract.resolve_embodiment(name, None)]
+        for name in names
+    ]
+    if (
+        len(set(ids)) == 1
+        and ids[0] == contract.embodiment_to_domain[default_embodiment]
+    ):
+        return None
+    return torch.tensor(ids, dtype=torch.long)
+
+
+def check_unified_rows(
+    rows: torch.Tensor,
+    *,
+    contract: CosmosDreamsUnifiedActionContract,
+    domain_ids: torch.Tensor | None,
+    scalar_domain: int,
+) -> None:
+    """Width, finiteness and the camera rule (only ego-pose slots may be non-zero)."""
+    if rows.shape[-1] != UNIFIED_ACTION_DIM:
+        raise ValueError(
+            f"Cosmos-Dreams unified action rows must have {UNIFIED_ACTION_DIM} slots, "
+            f"got {rows.shape[-1]}."
+        )
+    if not torch.isfinite(rows).all():
+        raise ValueError(
+            "Cosmos-Dreams normalized actions must contain only finite values."
+        )
+    camera = contract.camera_domain_id
+    if camera is None:
+        return
+    if domain_ids is None:
+        camera_rows = rows if scalar_domain == camera else rows[:0]
+    else:
+        camera_rows = rows[domain_ids == camera]
+    if camera_rows.numel() and torch.count_nonzero(
+        camera_rows[:, UNIFIED_CAMERA_SLOTS:]
+    ):
+        raise ValueError(
+            f"Cosmos-Dreams camera rows must have zeros outside the first {UNIFIED_CAMERA_SLOTS} slots."
+        )
+
+
+def domains_for_frames(
+    row_domains: torch.Tensor | None,
+    *,
+    scalar_domain: int,
+    frame_start: int,
+    frame_end: int,
+    action_tokens_per_frame: int,
+) -> torch.Tensor:
+    """Domain id per action token of latent frames ``[start, end)``.
+
+    Returns ``[1]`` when one domain covers the chunk, else ``[1, F * A]``.
+    Frame 0 carries null actions and takes the first real row's domain, as the
+    reference packer does.
+    """
+    if row_domains is None:
+        return torch.tensor([scalar_domain], dtype=torch.long)
+    blocks: list[torch.Tensor] = []
+    for frame_idx in range(frame_start, frame_end):
+        if frame_idx == 0:
+            blocks.append(row_domains[:1].expand(action_tokens_per_frame))
+        else:
+            start = (frame_idx - 1) * action_tokens_per_frame
+            blocks.append(row_domains[start : start + action_tokens_per_frame])
+    selected = torch.cat(blocks)
+    if bool((selected == selected[0]).all()):
+        return selected[:1].clone()
+    return selected.unsqueeze(0)
+
+
 def normalize_action_rows(
     rows: torch.Tensor, transform: AffineTransform
 ) -> torch.Tensor:
@@ -297,40 +433,67 @@ def pad_action_rows(rows: torch.Tensor, model_action_dim: int) -> torch.Tensor:
 def prepare_action_rows(
     action: Any,
     *,
-    contract: EmbodimentContract,
-    max_action_dim: int,
+    manifest: CosmosDreamsManifest,
+    embodiment: str,
     target_frame: int,
-    action_tokens_per_frame: int,
     pre_normalized: bool,
-) -> torch.Tensor:
-    """Rows in the embodiment's raw units, or already normalized, padded for the model.
+    domain_names: list[str] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Model-width action rows for the rollout plus per-row domain ids (or None).
 
-    ``pre_normalized`` skips the contract's affine transform for callers that
-    hold model-space rows (the imaginaire4 benchmark sidecars, for example);
-    the width check and zero padding still apply.
+    Native contracts (schema 3) take rows in the embodiment's raw units and
+    apply the exported affine unless ``pre_normalized``. Unified contracts
+    (schema 5) take normalized 59-D rows only; ``domain_names`` from the
+    request or the sidecar route rows to embodiments individually.
     """
-    rows = load_action_rows(action)
-    if rows.shape[-1] != contract.raw_action_dim:
-        raise ValueError(
-            "Cosmos-Dreams action rows do not match the embodiment's raw action dim "
-            f"{contract.raw_action_dim}, got {rows.shape[-1]}."
+    rows, sidecar_names = load_action_payload(action)
+    if domain_names is None:
+        domain_names = sidecar_names
+    contract = manifest.action_contract
+    action_count = manifest.action_tokens_per_frame
+    domain_ids = None
+    if isinstance(contract, CosmosDreamsUnifiedActionContract):
+        domain_ids = row_domain_ids(
+            domain_names,
+            contract=contract,
+            rows=rows.shape[0],
+            default_embodiment=embodiment,
         )
-    if pre_normalized:
         rows = rows.to(dtype=torch.float32)
-        if not torch.isfinite(rows).all():
-            raise ValueError(
-                "Cosmos-Dreams normalized actions must contain only finite values."
-            )
+        check_unified_rows(
+            rows,
+            contract=contract,
+            domain_ids=domain_ids,
+            scalar_domain=contract.embodiment_to_domain[embodiment],
+        )
     else:
-        rows = normalize_action_rows(rows, contract.normalizer.transform)
-    rows = pad_action_rows(rows, max_action_dim)
-    required_rows = (target_frame - 1) * action_tokens_per_frame
+        if domain_names is not None and len(set(domain_names)) > 1:
+            raise ValueError(
+                "Per-row domain_names need a unified (schema-5) checkpoint; this "
+                "checkpoint routes one embodiment per request."
+            )
+        embodiment_contract = contract.embodiments[embodiment]
+        if rows.shape[-1] != embodiment_contract.raw_action_dim:
+            raise ValueError(
+                "Cosmos-Dreams action rows do not match the embodiment's raw action dim "
+                f"{embodiment_contract.raw_action_dim}, got {rows.shape[-1]}."
+            )
+        if pre_normalized:
+            rows = rows.to(dtype=torch.float32)
+            if not torch.isfinite(rows).all():
+                raise ValueError(
+                    "Cosmos-Dreams normalized actions must contain only finite values."
+                )
+        else:
+            rows = normalize_action_rows(rows, embodiment_contract.normalizer.transform)
+    rows = pad_action_rows(rows, manifest.max_action_dim)
+    required_rows = (target_frame - 1) * action_count
     if rows.shape[0] < required_rows:
         raise ValueError(
             f"Cosmos-Dreams action has {rows.shape[0]} rows but {target_frame} latent "
             f"frames need {required_rows} (one row per pixel step after frame 0)."
         )
-    return rows
+    return rows, domain_ids
 
 
 def actions_for_frames(
@@ -646,6 +809,61 @@ class CosmosDreamsImageStage(PipelineStage):
         return batch
 
 
+def frame_domain_ids(
+    chunk_domains: torch.Tensor, local_idx: int, action_tokens_per_frame: int
+) -> torch.Tensor:
+    """The chunk's domain ids restricted to one frame (``[1]`` stays ``[1]``)."""
+    if chunk_domains.ndim == 1:
+        return chunk_domains
+    start = local_idx * action_tokens_per_frame
+    return chunk_domains[:, start : start + action_tokens_per_frame]
+
+
+class CausalDecodeQueue:
+    """Decode committed latent chunks with the causal Wan VAE on a side stream.
+
+    Each chunk waits for the producing stream, decodes with the decoder's
+    feature cache carried across chunks, and lands in pinned host memory
+    asynchronously; ``finish`` drains the stream and concatenates the frames.
+    """
+
+    def __init__(self, vae: Any, *, device: torch.device) -> None:
+        self.vae = vae
+        self.device = device
+        self.stream = torch.cuda.Stream(device=device)
+        self.outputs: list[torch.Tensor] = []
+        self.submitted = 0
+        self.vae.reset_causal_decode_state()
+        config = vae.config
+        self._mean = torch.tensor(config.latents_mean, device=device).view(
+            1, -1, 1, 1, 1
+        )
+        self._std = torch.tensor(config.latents_std, device=device).view(1, -1, 1, 1, 1)
+
+    def _denormalize(self, latents: torch.Tensor) -> torch.Tensor:
+        vae_dtype = next(self.vae.parameters()).dtype
+        return (latents.float() * self._std + self._mean).to(vae_dtype)
+
+    def submit(self, latents: torch.Tensor) -> None:
+        self.stream.wait_stream(torch.cuda.current_stream(self.device))
+        latents = latents.detach()
+        latents.record_stream(self.stream)
+        with torch.cuda.stream(self.stream), torch.no_grad():
+            video = self.vae.causal_decode(self._denormalize(latents))
+            host = torch.empty(
+                video.shape, dtype=video.dtype, device="cpu", pin_memory=True
+            )
+            # Keep the destination referenced before the copy is enqueued.
+            self.outputs.append(host)
+            host.copy_(video, non_blocking=True)
+        self.submitted += 1
+
+    def finish(self) -> torch.Tensor:
+        self.stream.synchronize()
+        self.vae.reset_causal_decode_state()
+        return torch.cat(self.outputs, dim=2)
+
+
 class CosmosDreamsPrepareStage(PipelineStage):
     """Validate the request and build every input the rollout needs.
 
@@ -688,16 +906,17 @@ class CosmosDreamsPrepareStage(PipelineStage):
         embodiment: str,
         target_frame: int,
         pre_normalized: bool = False,
-    ) -> torch.Tensor | None:
+        domain_names: list[str] | None = None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if action is None:
-            return None
+            return None, None
         return prepare_action_rows(
             action,
-            contract=self.manifest.action_contract.embodiments[embodiment],
-            max_action_dim=self.manifest.max_action_dim,
+            manifest=self.manifest,
+            embodiment=embodiment,
             target_frame=target_frame,
-            action_tokens_per_frame=self.manifest.action_tokens_per_frame,
             pre_normalized=pre_normalized,
+            domain_names=domain_names,
         )
 
     def _encode_image_latent(
@@ -797,11 +1016,12 @@ class CosmosDreamsPrepareStage(PipelineStage):
         target_frame = latent_frame_count(
             batch.num_frames, manifest.temporal_compression_factor
         )
-        rows = self._prepare_action_rows(
+        rows, row_domains = self._prepare_action_rows(
             batch.sampling_params.action,
             embodiment=prepared.embodiment,
             target_frame=target_frame,
             pre_normalized=batch.sampling_params.actions_pre_normalized,
+            domain_names=batch.sampling_params.domain_names,
         )
         if rows is None:
             self.log_warning(
@@ -817,6 +1037,7 @@ class CosmosDreamsPrepareStage(PipelineStage):
         batch.extra[EXTRA_ACTION_ROWS] = (
             None if rows is None else rows.to(device=device)
         )
+        batch.extra[EXTRA_ACTION_DOMAIN_IDS] = row_domains
         batch.extra[EXTRA_DOMAIN_ID] = prepared.domain_id
         batch.extra[EXTRA_TARGET_LATENT_FRAMES] = target_frame
         batch.raw_latent_shape = (
@@ -953,12 +1174,25 @@ class _RolloutContext(msgspec.Struct):
 
     text_kv: list[KVPair]
     fps: float
+    # ``[1]`` request-level domain; ``row_domain_ids`` (``[T]``) overrides it per row.
     domain_ids: torch.Tensor
     tokens_per_frame: int
     latent_channels: int
     geometry: CosmosDreamsGeometry
     device: torch.device
     dtype: torch.dtype
+    row_domain_ids: torch.Tensor | None = None
+
+    def chunk_domain_ids(
+        self, frame_start: int, frame_end: int, action_count: int
+    ) -> torch.Tensor:
+        return domains_for_frames(
+            self.row_domain_ids,
+            scalar_domain=int(self.domain_ids[0].item()),
+            frame_start=frame_start,
+            frame_end=frame_end,
+            action_tokens_per_frame=action_count,
+        ).to(device=self.device)
 
 
 class CosmosDreamsRolloutStage(PipelineStage):
@@ -973,6 +1207,8 @@ class CosmosDreamsRolloutStage(PipelineStage):
         scheduler: FlowMatchEulerDiscreteScheduler,
         manifest: CosmosDreamsManifest,
         profile: CosmosDreamsInferenceProfile | None = None,
+        vae: Any = None,
+        overlap_vae_decode: bool = False,
     ) -> None:
         super().__init__()
         if not isinstance(transformer, CosmosDreamsTransformer):
@@ -982,6 +1218,10 @@ class CosmosDreamsRolloutStage(PipelineStage):
         self.transformer = transformer
         self.scheduler = validate_fixed_step_scheduler(scheduler, manifest)
         self.manifest = manifest
+        # With a VAE the rollout decodes committed chunks on a side stream; the
+        # decoding stage then only post-processes.
+        self.vae = vae
+        self.overlap_vae_decode = bool(overlap_vae_decode and vae is not None)
         # Without a resolved profile the stage runs the artifact as exported:
         # its t_list on every chunk and its K/V window.
         self.profile = profile or CosmosDreamsInferenceProfile(
@@ -1000,9 +1240,10 @@ class CosmosDreamsRolloutStage(PipelineStage):
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
-        return [
+        name = self._component_stage_name(stage_name)
+        uses = [
             ComponentUse(
-                self._component_stage_name(stage_name),
+                name,
                 "transformer",
                 phase="denoise",
                 preferred_ready_after_request=True,
@@ -1010,6 +1251,9 @@ class CosmosDreamsRolloutStage(PipelineStage):
                 start_at_stage_entry=False,
             )
         ]
+        if self.overlap_vae_decode:
+            uses.append(ComponentUse(name, "vae", keep_ready_after_warmup=True))
+        return uses
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         with self.use_declared_component(
@@ -1019,6 +1263,11 @@ class CosmosDreamsRolloutStage(PipelineStage):
                 batch.latents = self._rollout(batch)
         return batch
 
+    def _decode_queue(self, device: torch.device) -> "CausalDecodeQueue | None":
+        if not self.overlap_vae_decode or device.type != "cuda":
+            return None
+        return CausalDecodeQueue(self.vae, device=device)
+
     def _rollout(self, batch: Req) -> torch.Tensor:
         manifest = self.manifest
         device = get_local_torch_device()
@@ -1026,6 +1275,7 @@ class CosmosDreamsRolloutStage(PipelineStage):
             batch.extra[EXTRA_TEXT_IDS], batch.extra[EXTRA_TEXT_MASK]
         )
         geometry: CosmosDreamsGeometry = batch.extra[EXTRA_GEOMETRY]
+        row_domain_ids = batch.extra.get(EXTRA_ACTION_DOMAIN_IDS)
         context = _RolloutContext(
             text_kv=text_kv,
             fps=float(batch.fps),
@@ -1039,6 +1289,7 @@ class CosmosDreamsRolloutStage(PipelineStage):
             geometry=geometry,
             device=device,
             dtype=torch.bfloat16,
+            row_domain_ids=None if row_domain_ids is None else row_domain_ids.to("cpu"),
         )
         rows: torch.Tensor | None = batch.extra[EXTRA_ACTION_ROWS]
         target_frame: int = batch.extra[EXTRA_TARGET_LATENT_FRAMES]
@@ -1056,6 +1307,7 @@ class CosmosDreamsRolloutStage(PipelineStage):
             )
         history: list[KVPair] | None = None
         latents: list[torch.Tensor] = []
+        decode_queue = self._decode_queue(device)
         next_frame = 0
         if batch.image_latent is not None:
             initial_latent = batch.image_latent.to(device=device, dtype=context.dtype)
@@ -1070,8 +1322,13 @@ class CosmosDreamsRolloutStage(PipelineStage):
                     frame_idx=0,
                     action=action,
                     null_action=bool(null_indexes),
+                    domain_ids=context.chunk_domain_ids(
+                        0, 1, manifest.action_tokens_per_frame
+                    ),
                 )
             latents.append(initial_latent)
+            if decode_queue is not None:
+                decode_queue.submit(initial_latent)
             next_frame = 1
 
         for chunk_start, chunk_end in iter_ar_chunk_ranges(
@@ -1094,6 +1351,10 @@ class CosmosDreamsRolloutStage(PipelineStage):
                 device=device,
                 dtype=context.dtype,
             )
+            action_count = manifest.action_tokens_per_frame
+            chunk_domains = context.chunk_domain_ids(
+                chunk_start, chunk_end, action_count
+            )
             clean_chunk = self._denoise_chunk(
                 context,
                 noise,
@@ -1102,11 +1363,11 @@ class CosmosDreamsRolloutStage(PipelineStage):
                 frame_start=chunk_start,
                 action=action,
                 null_indexes=null_indexes,
+                domain_ids=chunk_domains,
             )
             for local_idx, frame_idx in iter_clean_commit_frames(
                 chunk_start, chunk_end, target_frame=target_frame
             ):
-                action_count = manifest.action_tokens_per_frame
                 history = self._commit_clean_frame(
                     context,
                     history,
@@ -1116,11 +1377,19 @@ class CosmosDreamsRolloutStage(PipelineStage):
                         :, local_idx * action_count : (local_idx + 1) * action_count
                     ],
                     null_action=local_idx in null_indexes,
+                    domain_ids=frame_domain_ids(chunk_domains, local_idx, action_count),
                 )
             latents.append(clean_chunk)
+            if decode_queue is not None:
+                decode_queue.submit(clean_chunk)
             self.log_info(
                 f"Committed latent frames [{chunk_start}, {chunk_end}) of {target_frame} "
                 f"({len(self.profile.sigmas_for_frame(chunk_start))} denoise steps)"
+            )
+        if decode_queue is not None:
+            batch.extra[EXTRA_DECODED_OUTPUT] = decode_queue.finish()
+            self.log_info(
+                "Decoded %d chunks during the rollout", decode_queue.submitted
             )
         return torch.cat(latents, dim=2)
 
@@ -1151,6 +1420,7 @@ class CosmosDreamsRolloutStage(PipelineStage):
         frame_start: int,
         action: torch.Tensor,
         null_indexes: tuple[int, ...],
+        domain_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Fixed-step SDE updates over the chunk's schedule; history K/V is read but never written."""
         return run_fixed_step_sde(
@@ -1164,7 +1434,7 @@ class CosmosDreamsRolloutStage(PipelineStage):
             text_kv=context.text_kv,
             fps=context.fps,
             action_latents=action,
-            action_domain_ids=context.domain_ids,
+            action_domain_ids=context.domain_ids if domain_ids is None else domain_ids,
             history_kv=history,
             null_action_frame_indexes=null_indexes,
         )
@@ -1178,6 +1448,7 @@ class CosmosDreamsRolloutStage(PipelineStage):
         frame_idx: int,
         action: torch.Tensor,
         null_action: bool,
+        domain_ids: torch.Tensor | None = None,
     ) -> list[KVPair]:
         """Refresh one clean frame (timestep 0, no time embedding) and commit its K/V."""
         return commit_clean_kv(
@@ -1192,6 +1463,6 @@ class CosmosDreamsRolloutStage(PipelineStage):
             frame_start=frame_idx,
             fps=context.fps,
             action_latents=action,
-            action_domain_ids=context.domain_ids,
+            action_domain_ids=context.domain_ids if domain_ids is None else domain_ids,
             null_action_frame_indexes=(0,) if null_action else (),
         )
