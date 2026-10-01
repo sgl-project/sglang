@@ -64,6 +64,17 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
     )
 
 
+def _pp_use_batched_result_relay() -> bool:
+    return get_parallel().pp_size == 2 and (
+        _is_npu
+        or (
+            torch.cuda.is_available()
+            and envs.SGLANG_PP_DSPARK_BATCHED_RESULT_RELAY.get()
+            and get_spec().speculative_dspark_pp_replicated_draft
+        )
+    )
+
+
 def _pp_snapshot_forward_batch(batch: ScheduleBatch) -> Optional[ScheduleBatch]:
     if batch.spec_algorithm.is_none():
         return None
@@ -1708,12 +1719,11 @@ class SchedulerPPMixin:
         batch_result = None
         send_output_work = []
 
-        # On NPU (HCCL), isend/irecv may block until a matching peer op is
-        # posted, so the parity-based send-first/recv-first ordering used
-        # for NPU is replaced by batch_isend_irecv which submits all
-        # send/recv operations atomically.
-        if _is_npu and get_parallel().pp_size == 2:
-            return self._pp2_only_send_recv_output_tensors_npu(
+        # HCCL requires paired submission for correctness. CUDA can opt into
+        # the same PP2 exchange for replicated DSpark to remove the odd rank's
+        # recv-before-send serialization from the result-relay critical path.
+        if _pp_use_batched_result_relay():
+            return self._pp2_send_recv_output_tensors_batched(
                 next_first_rank_mb_id,
                 next_mb_id,
                 mbs,
@@ -1796,7 +1806,7 @@ class SchedulerPPMixin:
 
         return next_pp_outputs, batch_result, d2h_event, send_output_work
 
-    def _pp2_only_send_recv_output_tensors_npu(
+    def _pp2_send_recv_output_tensors_batched(
         self: Scheduler,
         next_first_rank_mb_id: int,
         next_mb_id: int,
@@ -1810,13 +1820,10 @@ class SchedulerPPMixin:
         Optional[torch.Event],
         List[P2PWork],
     ]:
-        """NPU-specific output tensor send/recv using batch_isend_irecv.
+        """Exchange PP2 output tensors using batch_isend_irecv.
 
-        Pairs the send of output tensors to the next stage with the recv
-        of output tensors from the previous stage in a single
-        ``batch_isend_irecv`` call, avoiding the deadlock that can occur
-        on HCCL when separate isend/irecv calls block waiting for each
-        other.
+        HCCL uses this to avoid deadlock. Replicated DSpark can opt into it on
+        CUDA to submit both directions together instead of serializing them.
         """
         next_pp_outputs = None
         d2h_event = None
@@ -1826,14 +1833,15 @@ class SchedulerPPMixin:
         all_gather_group = self.attn_tp_group
 
         # ---- Prepare send dict ----
-        # On NPU, always send something (full output or a lightweight skip
-        # marker) so the peer's recv in batch_isend_irecv always has a
+        # Always send something (full output or a lightweight skip marker) so
+        # the peer's recv in batch_isend_irecv always has a
         # matching send.  Without this, SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM
         # would cause asymmetric skip decisions between adjacent ranks
         # (send target and recv target are different micro-batches), leading
         # to deadlock or forcing the user to disable the optimisation
         # entirely (≈10 % throughput loss).
         send_dict: Optional[Dict[str, torch.Tensor]] = None
+        send_ready_event = None
         if self.pp_group.is_last_rank:
             target_send = mbs[next_first_rank_mb_id]
             if target_send is not None:
@@ -1842,7 +1850,7 @@ class SchedulerPPMixin:
                     if _pp_can_skip_output_comm(target_send):
                         send_dict = {"__msg_type__": "output", "__skip__": True}
                     else:
-                        self.device_module.current_stream().wait_event(q_event)
+                        send_ready_event = q_event
                         send_dict = dict(pp_outputs_to_send.tensors)
                         send_dict["__msg_type__"] = "output"
         elif pp_outputs:
@@ -1862,7 +1870,7 @@ class SchedulerPPMixin:
             target_recv is not None and not target_recv.forward_mode.is_prebuilt()
         )
 
-        def _handle_recv_dict(recv_dict):
+        def _handle_recv_dict(recv_dict, output_recv_event=None):
             nonlocal next_pp_outputs, batch_result, d2h_event
             if recv_dict.get("__skip__"):
                 # _pp_make_skip_output_result returns next_pp_outputs=None
@@ -1877,26 +1885,46 @@ class SchedulerPPMixin:
                 next_pp_outputs = PPProxyTensors(recv_dict)
                 with self.copy_stream_ctx:
                     self.copy_stream.wait_stream(self.schedule_stream)
+                    if output_recv_event is not None:
+                        self.copy_stream.wait_event(output_recv_event)
                     batch_result = self._pp_prep_batch_result(
                         target_recv, mb_metadata[next_mb_id], next_pp_outputs
                     )
                     d2h_event = self.device_module.Event()
-                    d2h_event.record(self.device_module.current_stream())
+                    if (
+                        not _is_npu
+                        and batch_result.logits_output is not None
+                        and batch_result.logits_output.sampling_mask_output is not None
+                    ):
+                        batch_result.copy_done = d2h_event
+                        batch_result.copy_to_cpu(
+                            return_logprob=target_recv.return_logprob,
+                            return_hidden_states=False,
+                        )
+                    else:
+                        d2h_event.record(self.device_module.current_stream())
 
         # ---- Execute communication ----
         if send_dict is not None and should_recv:
             # Paired send + recv via batch_isend_irecv
             with torch.profiler.record_function("send_recv_res_dict"):
-                recv_dict = self.pp_group.send_recv_tensor_dict(
-                    send_tensor_dict=send_dict,
-                    send_all_gather_group=all_gather_group,
-                    recv_all_gather_group=all_gather_group,
-                )
-            _handle_recv_dict(recv_dict)
+                with self.pp_comm_stream_ctx:
+                    if send_ready_event is not None:
+                        self.device_module.current_stream().wait_event(send_ready_event)
+                    recv_dict = self.pp_group.send_recv_tensor_dict(
+                        send_tensor_dict=send_dict,
+                        send_all_gather_group=all_gather_group,
+                        recv_all_gather_group=all_gather_group,
+                    )
+                    output_recv_event = self._pp_record_comm_event()
+            _handle_recv_dict(recv_dict, output_recv_event)
         elif send_dict is not None:
             # Send only (recv not needed — target is None or prebuilt)
             send_output_work = self._pp_send_dict_to_next_stage(
-                send_dict, async_send=True, msg_type="output"
+                send_dict,
+                async_send=True,
+                msg_type="output",
+                ready_event=send_ready_event,
             )
         elif should_recv:
             # Recv only (no send needed)

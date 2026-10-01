@@ -19,6 +19,7 @@ from sglang.srt.managers.scheduler_components.pp_dspark_draft import (  # noqa: 
 from sglang.srt.managers.scheduler_pp_mixin import (  # noqa: E402
     SchedulerPPMixin,
     _pp_snapshot_forward_batch,
+    _pp_use_batched_result_relay,
 )
 from sglang.srt.managers.utils import GenerationBatchResult  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import (  # noqa: E402
@@ -54,6 +55,99 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 class TestDSparkPPContext(CustomTestCase):
+    def test_batched_result_relay_gate_is_cuda_pp2_replicated_dspark_only(self):
+        cases = [
+            (True, 2, True, True, True),
+            (True, 2, True, False, False),
+            (True, 2, False, True, False),
+            (True, 4, True, True, False),
+            (False, 2, True, True, False),
+        ]
+        for cuda_available, pp_size, replicated, enabled, expected in cases:
+            with (
+                self.subTest(
+                    cuda_available=cuda_available,
+                    pp_size=pp_size,
+                    replicated=replicated,
+                    enabled=enabled,
+                ),
+                patch(
+                    "sglang.srt.managers.scheduler_pp_mixin._is_npu",
+                    False,
+                ),
+                patch(
+                    "sglang.srt.managers.scheduler_pp_mixin.torch.cuda.is_available",
+                    return_value=cuda_available,
+                ),
+                patch(
+                    "sglang.srt.managers.scheduler_pp_mixin.get_parallel",
+                    return_value=SimpleNamespace(pp_size=pp_size),
+                ),
+                patch(
+                    "sglang.srt.managers.scheduler_pp_mixin.get_spec",
+                    return_value=SimpleNamespace(
+                        speculative_dspark_pp_replicated_draft=replicated
+                    ),
+                ),
+                patch(
+                    "sglang.srt.managers.scheduler_pp_mixin.envs."
+                    "SGLANG_PP_DSPARK_BATCHED_RESULT_RELAY.get",
+                    return_value=enabled,
+                ),
+            ):
+                self.assertEqual(_pp_use_batched_result_relay(), expected)
+
+    def test_batched_result_relay_waits_for_send_and_recv_events(self):
+        send_ready_event = Mock()
+        recv_event = Mock()
+        d2h_event = Mock()
+        current_stream = Mock()
+        batch_result = SimpleNamespace(logits_output=None)
+        target = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_prebuilt=Mock(return_value=False)),
+            return_logprob=False,
+        )
+        pp_group = SimpleNamespace(
+            is_last_rank=True,
+            send_recv_tensor_dict=Mock(return_value={"next_token_ids": torch.ones(1)}),
+        )
+        scheduler = SimpleNamespace(
+            pp_group=pp_group,
+            attn_tp_group=object(),
+            pp_comm_stream_ctx=nullcontext(),
+            copy_stream_ctx=nullcontext(),
+            copy_stream=Mock(),
+            schedule_stream=Mock(),
+            device_module=SimpleNamespace(
+                Event=Mock(return_value=d2h_event),
+                current_stream=Mock(return_value=current_stream),
+            ),
+            _pp_record_comm_event=Mock(return_value=recv_event),
+            _pp_prep_batch_result=Mock(return_value=batch_result),
+        )
+        outputs = PPProxyTensors({"accept_lens": torch.ones(1)})
+        queue = deque([(send_ready_event, outputs)])
+
+        next_outputs, result, event, send_work = (
+            SchedulerPPMixin._pp2_send_recv_output_tensors_batched(
+                scheduler,
+                next_first_rank_mb_id=0,
+                next_mb_id=0,
+                mbs=[target],
+                mb_metadata=[object()],
+                last_rank_comm_queue=queue,
+                pp_outputs=None,
+            )
+        )
+
+        current_stream.wait_event.assert_called_once_with(send_ready_event)
+        pp_group.send_recv_tensor_dict.assert_called_once()
+        scheduler.copy_stream.wait_event.assert_called_once_with(recv_event)
+        self.assertIs(result, batch_result)
+        self.assertIs(event, d2h_event)
+        self.assertIn("next_token_ids", next_outputs.tensors)
+        self.assertEqual(send_work, [])
+
     def test_forward_snapshot_copies_draft_counts_only_for_replicated_dspark(self):
         snapshot = SimpleNamespace()
         req = object()
